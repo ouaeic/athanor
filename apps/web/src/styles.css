@@ -2484,6 +2484,12 @@ select:focus-visible {
   border-radius: 13px;
   padding: 12px;
   box-shadow: 0 14px 38px #483e2824;
+  /* Anchored at the bottom with no top, so the card grows upward as the request gets longer - and
+     `.app-shell` clips what leaves the top with no scrollbar to say anything is missing. A long
+     command or a wide destination list could therefore push the request itself out of sight while
+     Approve stayed put, which is the one shape this card must never take. */
+  max-height: calc(100% - 200px);
+  overflow-y: auto;
 }
 .approval-symbol {
   display: grid;
@@ -2631,10 +2637,12 @@ select:focus-visible {
 }
 .approval-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 .primary,
-.ghost {
+.ghost,
+.secondary {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2668,6 +2676,30 @@ select:focus-visible {
 }
 .ghost:hover {
   background: #f3f4f0;
+}
+/**
+ * The quieter of two choices in a dialog - Cancel beside Save, Dismiss beside Try again.
+ *
+ * Global, because it was not: the only rule for it lived under `.self-hosted-settings`, so the same
+ * class that looked deliberate in settings rendered as a bare user-agent button on the sign-in
+ * screen, in five Inspector dialogs and in the rewind confirmation. A button styled by the browser
+ * next to one styled by us is the single loudest way an interface admits it was assembled rather
+ * than designed.
+ */
+.secondary {
+  border: 1px solid var(--line);
+  background: var(--panel-soft);
+  color: var(--text);
+}
+.secondary:hover {
+  border-color: #858f94;
+}
+.secondary:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.secondary svg {
+  width: 14px;
 }
 .wide {
   width: 100%;
@@ -4371,6 +4403,7 @@ select:focus-visible {
 .workspace-tools-button,
 .header-pill,
 .ghost,
+.secondary,
 .icon-btn,
 .modal-close,
 .settings-nav button,
@@ -4821,12 +4854,8 @@ a:focus-visible {
     0 0 16px #dbe7ec1d;
 }
 
-.self-hosted-settings .settings-list button.secondary,
-.self-hosted-settings .modal-actions > button.secondary {
-  border-color: #3e4448;
-  background: #17191b;
-  color: #cbd0d3;
-}
+/* The scoped rule that used to live here is gone: `.secondary` is defined once, globally, beside
+   `.primary` and `.ghost`, so settings and every dialog outside it draw the same button. */
 
 .self-hosted-settings :is(.settings-list, .recovery-list) button.icon-btn {
   width: 34px;
@@ -5686,6 +5715,7 @@ body,
   }
   .approval-drawer {
     bottom: calc(var(--bottom-bar) + 178px);
+    max-height: calc(100% - var(--bottom-bar) - 228px);
   }
 }
 
@@ -6057,6 +6087,36 @@ body,
 }
 .approval-copy small {
   color: #a29b8b;
+}
+
+/*
+ * The half of the card the owner is actually supposed to check.
+ *
+ * The dark contract above covered the drawer, the symbol and the prose, and stopped. Everything
+ * below - the labels, the values, the destination, the command as it will really run - kept its
+ * light-theme colour and sat at #4b4437 on a #191713 surface, which is close enough to invisible
+ * to be read as absent. The model's own sentence about what it wants was the brightest text on the
+ * card. That is precisely backwards: the wording is the part to be sceptical of and the facts are
+ * the part to trust, so the facts lead now.
+ */
+.approval-facts dt {
+  color: #d5b46a;
+}
+.approval-facts dd,
+.approval-request {
+  color: #d8d3c6;
+}
+.approval-facts .approval-destination dd span {
+  color: #a29b8b;
+}
+.approval-agent-wording {
+  border-left-color: #5e5647;
+}
+.approval-agent-wording > span {
+  color: #a29b8b;
+}
+.approval-agent-wording > p {
+  color: #b3ac9b;
 }
 
 /*

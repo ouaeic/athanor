@@ -54,11 +54,31 @@ const text = (value: unknown, fallback = ''): string =>
 const list = (value: unknown): string[] =>
   Array.isArray(value) ? value.map((item) => text(item)).filter(Boolean) : [];
 
+/**
+ * Characters that let a sentence say one thing and read as another: bidirectional overrides, which
+ * reverse the text after them, and zero-width marks, which hide inside a word.
+ *
+ * Stripped from everything this module shows, not only the model's wording. That was the split
+ * until now and it was the wrong way round: the sentence is the part the card teaches the owner
+ * to discount, while the arguments are the part it binds a hash to and asks them to trust. One
+ * U+202E inside a shell argument reverses the run of text after it, so the "Runs" row can read
+ * as one command while the bytes the worker executes are another - approving what you read has
+ * to mean approving what runs. This is the one place in the client
+ * where a hostile string is put in front of someone who is about to answer yes or no, and a
+ * sentence that renders as "Read an article" while containing something else is the cheapest
+ * version of the attack this whole card exists to blunt.
+ */
+const DIRECTIONAL = /[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g;
+
 /** Long enough to judge by, short enough that the buttons stay on screen. */
 const CLAMP = 400;
 
-const clamp = (value: string, limit = CLAMP): string =>
-  value.length > limit ? `${value.slice(0, limit)}…` : value;
+// Stripped before the length is measured, so the limit counts characters the owner can actually see
+// and the ellipsis lands where the text really stops.
+const clamp = (value: string, limit = CLAMP): string => {
+  const visible = value.replace(DIRECTIONAL, '');
+  return visible.length > limit ? `${visible.slice(0, limit)}…` : visible;
+};
 
 const fact = (label: string, value: string): ApprovalFact[] =>
   value ? [{ label, value: clamp(value) }] : [];
@@ -308,17 +328,6 @@ export const approvalFacts = (approval: Approval): ApprovalFact[] => {
       return [];
   }
 };
-
-/**
- * Characters that let a sentence say one thing and read as another: bidirectional overrides, which
- * reverse the text after them, and zero-width marks, which hide inside a word.
- *
- * Stripped from the model's own wording before it is shown. This is the one place in the client
- * where a hostile string is put in front of someone who is about to answer yes or no, and a
- * sentence that renders as "Read an article" while containing something else is the cheapest
- * version of the attack this whole card exists to blunt.
- */
-const DIRECTIONAL = /[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g;
 
 /**
  * The model's own wording, made safe to display and honest about its length.

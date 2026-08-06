@@ -34,8 +34,19 @@ const usableToken = (value: unknown): string =>
 export const deviceEnrollmentToken = (value: string): string => {
   const link = value.trim();
   if (link.length > MAX_LINK) return '';
-  if (!link.toLowerCase().startsWith(PREFIX)) return usableToken(link);
+  if (!link.toLowerCase().startsWith(PREFIX)) {
+    // A ticket on its own, which is what a scanned QR code leaves in the address fragment. Tried
+    // before the bare-code path because a ticket is far longer than a grant and would otherwise be
+    // rejected on length and reported as "not a link" — the one case where the owner did nothing
+    // wrong at all.
+    const fromTicket = grantInTicket(link);
+    return fromTicket || usableToken(link);
+  }
   const encoded = link.slice(PREFIX.length).split(/[?#/]/)[0] ?? '';
+  return grantInTicket(encoded);
+};
+
+const grantInTicket = (encoded: string): string => {
   if (!encoded) return '';
   try {
     // base64url is not what atob reads, and a ticket routinely lands on a length that needs the
@@ -56,3 +67,31 @@ export const deviceEnrollmentToken = (value: string): string => {
     return '';
   }
 };
+
+/**
+ * The grant a scanned QR code left in the address fragment, and a function to take it back out.
+ *
+ * The code encodes an ordinary `https://` address at this box, because that is the only kind a
+ * phone's camera will open — an `athanor://` code scans to nothing at all unless the native client
+ * is already installed, which on the device being added it is not. The ticket rides in the fragment
+ * rather than the path or the query, so it is never sent to the server in a request line and never
+ * reaches an access log or a proxy.
+ *
+ * `clear` replaces the entry instead of pushing one, so a one-time grant does not sit in the address
+ * bar or come back with the Back button.
+ */
+const PAIR_FRAGMENT = 'pair=';
+
+/** The grant a scanned code left in `location.hash`, or nothing when the fragment is not one. */
+export const grantInPairingFragment = (hash: string): string => {
+  const value = hash.replace(/^#/, '');
+  if (!value.startsWith(PAIR_FRAGMENT)) return '';
+  return deviceEnrollmentToken(decodeURIComponent(value.slice(PAIR_FRAGMENT.length)));
+};
+
+/**
+ * Whether the address is carrying a pairing fragment at all, which is a different question from
+ * whether the grant in it is any good: a mistyped one still has to come out of the address bar.
+ */
+export const isPairingFragment = (hash: string): boolean =>
+  hash.replace(/^#/, '').startsWith(PAIR_FRAGMENT);

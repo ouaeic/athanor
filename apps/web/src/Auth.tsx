@@ -3,7 +3,7 @@ import { startAuthentication, startRegistration } from '@simplewebauthn/browser'
 import { ArrowRight, Copy, Download, KeyRound, ShieldCheck } from 'lucide-react';
 import { api } from './api.js';
 import { authActionLabel, authHeading, canSubmitAuth, type AuthMode } from './auth-form.js';
-import { deviceEnrollmentToken } from './device-link.js';
+import { deviceEnrollmentToken, grantInPairingFragment, isPairingFragment } from './device-link.js';
 import { recoveryFile } from './account-recovery.js';
 import { BrandMark } from './BrandMark.js';
 import { ServerInstall } from './ServerInstall.js';
@@ -34,6 +34,18 @@ export function Auth({ onReady }: { onReady: () => void }) {
    */
   useEffect(() => {
     let active = true;
+    // A scanned QR code arrives here: the address opens this page with the ticket in its fragment,
+    // and the grant comes straight out of it, so pairing a phone is scan, tap, done — with nothing
+    // typed, pasted, or read off another screen.
+    const scanned = grantInPairingFragment(window.location.hash);
+    if (scanned) {
+      setPairingCode(scanned);
+      setDeviceLink(scanned);
+    }
+    // Replaced rather than pushed, and done whether or not the grant parsed: a one-time code should
+    // not sit in the address bar, land in history, or come back with the Back button.
+    if (isPairingFragment(window.location.hash))
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
     void Promise.all([
       api.nativeBootstrap().catch(() => null),
       api.legal().catch(() => undefined)
@@ -47,8 +59,8 @@ export function Auth({ onReady }: { onReady: () => void }) {
         }
       }
       setLegal(server);
-      if (server?.registrationAvailable) setMode('register');
-      else if (server && native?.pairingCode) setMode('enroll');
+      if (server?.registrationAvailable && !scanned) setMode('register');
+      else if (server && (scanned || native?.pairingCode)) setMode('enroll');
     });
     return () => {
       active = false;
@@ -88,7 +100,9 @@ export function Auth({ onReady }: { onReady: () => void }) {
       } else if (mode === 'enroll') {
         const pending = await api.enrollOptions(pairingCode);
         const response = await startRegistration({ optionsJSON: pending.options });
-        await api.enrollVerify({ challengeId: pending.challengeId, response });
+        // The link is sent again because the box now spends it here rather than when it handed out
+        // the options, so a dismissed or timed-out biometric prompt leaves it usable for a retry.
+        await api.enrollVerify({ challengeId: pending.challengeId, token: pairingCode, response });
         // The ceremony proved a fresh authenticator, so the box signs this device in as it verifies:
         // there is no recovery code to show, because the account already has one.
         onReady();

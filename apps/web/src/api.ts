@@ -449,7 +449,7 @@ export const api = {
   taskAction: (id: string, action: 'pause' | 'resume' | 'cancel') =>
     request<Task>(`/v1/tasks/${id}/${action}`, mutation('POST', {})),
   createEnrollment: (label: string) =>
-    request<{ id: string; expiresAt: string; uri: string }>(
+    request<{ id: string; expiresAt: string; uri: string; webUri: string }>(
       '/v1/devices/enrollments',
       mutation('POST', { label })
     ),

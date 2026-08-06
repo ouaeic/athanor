@@ -3558,7 +3558,17 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
       return {
         id: enrollment.id,
         expiresAt: enrollment.expiresAt,
-        uri: `athanor://pair/${ticket}`
+        uri: `athanor://pair/${ticket}`,
+        /**
+         * The same grant as an address a camera can open.
+         *
+         * `athanor://` is what the native client registers, and it is the right thing to hand a
+         * native client — but it is the wrong thing to put in a QR code, because the device being
+         * added is by definition one that has nothing installed yet. Pointing a phone at that code
+         * did nothing at all. This is an ordinary link to this box, so any camera opens it, and the
+         * ticket rides in the fragment where it never appears in a request line or an access log.
+         */
+        webUri: `${config.PUBLIC_APP_URL.replace(/\/+$/, '')}/#pair=${ticket}`
       };
     });
   });

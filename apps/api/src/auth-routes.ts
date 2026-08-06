@@ -563,7 +563,9 @@ export const registerAuthRoutes = (
     '/v1/auth/enroll/options',
     async (request) => {
       const token = z.string().min(20).max(200).parse(request.body?.token);
-      const enrollment = await store.consumeDeviceEnrollment(enrollmentTokenHash(token));
+      // Read, not spent. The grant is spent in enroll/verify, once an authenticator has actually
+      // produced a credential, so dismissing the biometric prompt costs nothing but the tap.
+      const enrollment = await store.findDeviceEnrollment(enrollmentTokenHash(token));
       if (!enrollment)
         throw new AthanorError(
           'enrollment_invalid',
@@ -600,10 +602,12 @@ export const registerAuthRoutes = (
   app.post<{
     Body: {
       challengeId: string;
+      token?: string;
       deviceLabel?: string;
       response: Parameters<typeof verifyRegistrationResponse>[0]['response'];
     };
   }>('/v1/auth/enroll/verify', async (request, reply) => {
+    const token = z.string().min(20).max(200).parse(request.body?.token);
     const pending = await store.consumeChallenge(request.body.challengeId, 'passkey_add');
     if (!pending?.username)
       throw new AthanorError('enrollment_invalid', 'Enrollment challenge expired', 401);
@@ -619,6 +623,18 @@ export const registerAuthRoutes = (
     });
     if (!verification.verified || !verification.registrationInfo)
       throw new AthanorError('enrollment_invalid', 'New device verification failed', 401);
+    // Spent here, now that an authenticator has actually produced a credential. The UPDATE is
+    // atomic and still guarded on `consumed_at IS NULL`, so a second device racing the same link
+    // finds nothing and exactly one passkey is ever created from it. The owner check matters
+    // because the challenge and the grant arrive as two separate claims about who this is, and
+    // agreeing on the account is the only thing that makes them one claim.
+    const enrollment = await store.consumeDeviceEnrollment(enrollmentTokenHash(token));
+    if (!enrollment || enrollment.userId !== owner.id)
+      throw new AthanorError(
+        'enrollment_invalid',
+        'This device link has expired or was already used. Create a new one from a device that is already signed in.',
+        403
+      );
     const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo;
     const added = await store.addPasskey({
       userId: owner.id,

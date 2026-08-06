@@ -2867,15 +2867,53 @@ describe('authentication posture', () => {
     expect(opened.statusCode, opened.body).toBe(200);
     expect(opened.json<{ challengeId: string }>().challengeId).toMatch(/[0-9a-f-]{36}/);
 
-    // Single use: the same grant a second time is spent, which is what stops a photographed screen
-    // from being a standing credential.
-    const replayed = await app.inject({
+    // Asking for the ceremony again is fine, and has to be: the authenticator prompt can be
+    // dismissed, time out, or lose to a phone call, and burning the grant on the way in meant the
+    // owner had to walk back to a signed-in device and mint another one behind a passkey
+    // confirmation. Nothing is weakened by this - a set of options is not a credential.
+    const reopened = await app.inject({
       method: 'POST',
       url: '/v1/auth/enroll/options',
       payload: { token: ticket.pairingCode }
     });
-    expect(replayed.statusCode).toBe(403);
-    expect(replayed.json<{ error: { code: string } }>().error.code).toBe('enrollment_invalid');
+    expect(reopened.statusCode, reopened.body).toBe(200);
+
+    // Single use still, but spent where a credential actually appears. A ceremony that fails
+    // verification leaves the grant alone, so the retry above stays available.
+    const refused = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/enroll/verify',
+      payload: {
+        challengeId: reopened.json<{ challengeId: string }>().challengeId,
+        token: ticket.pairingCode,
+        response: { id: 'not-a-credential', rawId: 'not-a-credential', type: 'public-key' }
+      }
+    });
+    expect(refused.statusCode).toBeGreaterThanOrEqual(400);
+    const afterFailure = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/enroll/options',
+      payload: { token: ticket.pairingCode }
+    });
+    expect(afterFailure.statusCode, afterFailure.body).toBe(200);
+
+    // Revoking it from the signed-in device is still immediate, which is what stops a photographed
+    // screen from being a standing credential once the owner notices.
+    const listed = await app.inject({ method: 'GET', url: '/v1/devices/enrollments', headers: { cookie } });
+    const enrollmentId = listed.json<Array<{ id: string }>>()[0]?.id;
+    expect(enrollmentId).toBeTruthy();
+    await app.inject({
+      method: 'DELETE',
+      url: `/v1/devices/enrollments/${enrollmentId}`,
+      headers: { cookie }
+    });
+    const revoked = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/enroll/options',
+      payload: { token: ticket.pairingCode }
+    });
+    expect(revoked.statusCode).toBe(403);
+    expect(revoked.json<{ error: { code: string } }>().error.code).toBe('enrollment_invalid');
 
     const invented = await app.inject({
       method: 'POST',

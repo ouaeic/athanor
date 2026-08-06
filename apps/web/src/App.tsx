@@ -311,8 +311,17 @@ export function App() {
       // in a store the browser silently stops accepting writes to. The open conversation is spared
       // explicitly: bootstrap carries only the newest page, and an older one is still openable from
       // search or a link — losing its half-typed draft on refresh would be the original bug again.
+      //
+      // So is every conversation the server just sent a draft for. Without that, a draft on a
+      // conversation older than the bootstrap page was written three statements above and deleted
+      // here in the same tick, on every device, so the box held a sentence no client could ever
+      // show — the failure looked exactly like the draft never having been saved at all.
       const open = savedDraft.current.taskId;
-      pruneDrafts([...next.tasks.map((item) => item.id), ...(open ? [open] : [])]);
+      pruneDrafts([
+        ...next.tasks.map((item) => item.id),
+        ...(next.drafts ?? []).flatMap((draft) => (draft.taskId ? [draft.taskId] : [])),
+        ...(open ? [open] : [])
+      ]);
       const requested = new URLSearchParams(window.location.search);
       const requestedTaskId = requested.get('task') ?? undefined;
       const requestedWorkspaceId = requested.get('workspace') ?? undefined;
@@ -973,6 +982,14 @@ export function App() {
     setPendingSend(optimistic);
     setPrompt('');
     clearDraft(task?.id);
+    // And on the box, explicitly. Emptying the composer schedules the debounce above to save a
+    // blank draft, which the server turns into a delete - but on a new conversation `setTaskId` runs
+    // before those 900ms elapse, the effect's cleanup cancels the pending save, and the re-run
+    // returns early on the changed id. The row for the sentence just sent therefore survived, and
+    // every other device picked it up at its next bootstrap and put an already-sent message back in
+    // the composer, one Enter away from sending it twice.
+    if (serverPreferencesLoaded.current && workspaceId)
+      void api.saveDraft({ workspaceId, taskId: task?.id ?? null, body: '' }).catch(() => undefined);
     setAttachments([]);
     setBusy(true);
     setError('');

@@ -1631,6 +1631,31 @@ export class DataStore {
    * Redeems an enrollment exactly once. The consumed_at guard is inside the UPDATE so two devices
    * racing the same QR code cannot both succeed: the second matches no row.
    */
+  /**
+   * Whether this grant is still good, without spending it.
+   *
+   * The registration ceremony needs to know whose account it is building options for before the
+   * authenticator has done anything, and that question used to be asked by consuming the grant. A
+   * biometric prompt the owner dismissed - or an authenticator that timed out, or a phone that rang
+   * mid-tap - therefore burned the link permanently, and the only way forward was to walk back to a
+   * device that is already signed in and mint another one behind a passkey confirmation. Reading it
+   * here and spending it in `consumeDeviceEnrollment` once a credential actually exists keeps the
+   * same single-use guarantee: the UPDATE is still the only thing that marks it spent, so a second
+   * device racing for the same link still loses.
+   */
+  async findDeviceEnrollment(tokenHash: string): Promise<{ userId: string } | null> {
+    const result = await this.database.query(
+      `SELECT user_id FROM device_enrollments
+       WHERE token_hash = $1
+         AND consumed_at IS NULL
+         AND revoked_at IS NULL
+         AND expires_at > NOW()`,
+      [tokenHash]
+    );
+    const userId = optionalText(result.rows[0]?.user_id);
+    return userId ? { userId } : null;
+  }
+
   async consumeDeviceEnrollment(tokenHash: string): Promise<{ userId: string } | null> {
     const result = await this.database.query(
       `UPDATE device_enrollments SET consumed_at = NOW()

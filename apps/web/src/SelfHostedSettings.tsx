@@ -163,7 +163,8 @@ export function SelfHostedSettings({
     notificationSettingsDraft(defaultNotificationSettings())
   );
   const [reissuedRecoveryCode, setReissuedRecoveryCode] = useState('');
-  const [enrollment, setEnrollment] = useState<{ id: string; expiresAt: string; uri: string }>();
+  const [enrollment, setEnrollment] =
+    useState<{ id: string; expiresAt: string; uri: string; webUri: string }>();
   const [enrollmentQr, setEnrollmentQr] = useState('');
   const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
   const [deleteAccountConfirmation, setDeleteAccountConfirmation] = useState('');
@@ -911,10 +912,10 @@ export function SelfHostedSettings({
         {enrollment ? (
           <div className="enrollment-card">
             {enrollmentQr && <img src={enrollmentQr} alt="Device enrollment code" />}
-            <code>{enrollment.uri}</code>
+            <code>{enrollment.webUri}</code>
             <span>Expires {new Date(enrollment.expiresAt).toLocaleTimeString()} · single use</span>
             <div className="enrollment-actions">
-              <CopyButton value={enrollment.uri} label="Copy link" />
+              <CopyButton value={enrollment.webUri} label="Copy link" />
               <button
                 onClick={() =>
                   void act(async () => {
@@ -939,7 +940,7 @@ export function SelfHostedSettings({
                 // Loaded on demand: the encoder is only needed on this one screen.
                 const { toDataURL } = await import('qrcode');
                 setEnrollmentQr(
-                  await toDataURL(created.uri, {
+                  await toDataURL(created.webUri, {
                     errorCorrectionLevel: 'M',
                     margin: 2,
                     width: 240,
