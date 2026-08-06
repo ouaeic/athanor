@@ -2645,6 +2645,16 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
     });
   });
 
+  /**
+   * One computer per owner, made once.
+   *
+   * Deliberately counts a `failed` row as existing. A failed computer is the owner's computer with
+   * their files in it that did not come up; provisioning a second one beside it would leave the
+   * first orphaned and take its data out of reach, which is a worse answer than a computer that
+   * needs starting. Repairing it is a different act, and the clients do it: the workbench asks the
+   * box to resume a `failed` or `hibernated` computer on load and every five minutes, and Settings
+   * offers the same call as a button.
+   */
   const ensurePrimaryWorkspace = async (user: UserRecord): Promise<WorkspaceRecord[]> => {
     const existing = await store.listWorkspaces(user.id);
     if (existing.length) return existing;

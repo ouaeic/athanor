@@ -37,8 +37,12 @@ export const sendBlock = (input: {
   if (!input.workspaceAvailable)
     return {
       code: 'workspace_unavailable',
+      // athanor is already trying: the client asks the box to start a computer that is asleep or
+      // failed, on load and every five minutes. Saying "check the server" while that is happening
+      // sent the owner off to look at something being handled, and there was nothing on the other
+      // screen to do anyway - which is how a computer that failed to start once became permanent.
       message:
-        'The agent computer is not responding, so this cannot run yet. Check the server from Settings.',
+        'Starting the agent computer. This cannot run until it is up; if it stays this way, Settings has a button to start it again.',
       actionLabel: 'Open Settings'
     };
   if (!input.providerConfigured)

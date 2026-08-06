@@ -1631,6 +1631,29 @@ export function SelfHostedSettings({
                 {workspace ? ` · ${formatBytes(workspace.storageBytes)} used` : ''}
               </small>
             </span>
+            {/*
+              The way back from "Needs attention".
+
+              A computer that failed to start stayed failed: every message was answered "Workspace
+              is not running" and no screen offered anything to do about it, which is reachable on a
+              first sign-in if the runner is slow to answer while the box is being provisioned. The
+              call is the same one a sleeping computer is woken with — it was simply never offered
+              for this state.
+            */}
+            {workspace && ['failed', 'hibernated'].includes(workspace.status) && (
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() =>
+                  void act(async () => {
+                    await api.workspaceAction(workspace.id, 'resume');
+                    setNotice('Starting the agent computer. It is usable again in a few seconds.');
+                  })
+                }
+              >
+                <RotateCcw /> Start it again
+              </button>
+            )}
           </div>
           <div>
             <span>

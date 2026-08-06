@@ -709,7 +709,13 @@ export function App() {
     let active = true;
     const keepAlive = async () => {
       try {
-        if (workspace.status === 'hibernated') {
+        // `failed` as well as `hibernated`. Resume is the same call for both - it asks the runner
+        // to bring the computer up and marks it running - but the client only ever made it for a
+        // sleeping one, so a computer that failed to start stayed failed for good: every message
+        // was answered "Workspace is not running", and no screen anywhere offered a way to try
+        // again. It is reachable on a first sign-in, when the runner happens not to answer while
+        // bootstrap is provisioning.
+        if (workspace.status === 'hibernated' || workspace.status === 'failed') {
           const resumed = await api.workspaceAction(workspace.id, 'resume');
           if (active)
             setData((current) =>
