@@ -532,6 +532,29 @@ for (const { file, name } of upgradePaths) {
 }
 say(`Upgrade paths: ${upgradePaths.length} carry the non-interactive and withdrawn-unit handling.`);
 
+/**
+ * The install command the app prints has to name a revision that exists.
+ *
+ * It pins a tag so a new box lands on a known release rather than on whatever `main` is in the
+ * middle of, and the box's own guarded update path moves it forward from there. Nothing offline can
+ * prove a tag exists on the remote - but it can prove the repository agrees with itself, which is
+ * the half that actually went wrong: the string said v0.1.0 while no tag had ever been cut, so the
+ * one command a new owner is handed answered 404. Cutting a release is now "bump the version, tag
+ * it", and never "remember to edit a string in a React component".
+ */
+const declaredVersion = JSON.parse(read('package.json')).version;
+const installUi = read('apps/web/src/ServerInstall.tsx');
+const pinnedRefs = [...installUi.matchAll(/\/(?:v)?(\d+\.\d+\.\d+)\/|ATHANOR_REF=v(\d+\.\d+\.\d+)/g)]
+  .map((match) => match[1] ?? match[2])
+  .filter(Boolean);
+if (!pinnedRefs.length) fail('apps/web/src/ServerInstall.tsx pins no revision for the installer');
+for (const pinned of pinnedRefs)
+  if (pinned !== declaredVersion)
+    fail(
+      `apps/web/src/ServerInstall.tsx offers v${pinned} while package.json says ${declaredVersion}; the printed command would fetch a revision this checkout is not`
+    );
+say(`Install command: pins v${declaredVersion}, which is what this checkout calls itself.`);
+
 if (failures.length > 0) {
   process.stderr.write(`\n${failures.map((message) => `- ${message}`).join('\n')}\n`);
   process.exitCode = 1;
