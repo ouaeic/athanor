@@ -681,6 +681,31 @@ if [ -z "$candidate_hostname" ]; then
   done
 fi
 
+# A name the owner has already pointed at this computer.
+#
+# Most servers need nothing here: the loops above find the name the provider gave the machine, which
+# is why a rented server usually arrives with one already. What had no way of being said was "this
+# address is static and I have put a domain in front of it" - an A record is all such a server needs,
+# and dynamic DNS, which exists to chase an address that moves, is the wrong tool for it entirely.
+# Without this the install finished, the browser then refused to make a passkey, and the way out was
+# a second SSH session.
+if [ -n "${ATHANOR_HOSTNAME:-}" ]; then
+  requested_name=$(printf '%s' "$ATHANOR_HOSTNAME" | tr 'A-Z' 'a-z' | sed 's/\.$//')
+  case "$requested_name" in
+    *.*) ;;
+    *) fail "ATHANOR_HOSTNAME must be a domain name with at least two labels, not '$ATHANOR_HOSTNAME'" ;;
+  esac
+  case "$requested_name" in
+    *[!a-z0-9.-]*|-*|*-|.*|*.) fail "ATHANOR_HOSTNAME is not a valid domain name: '$ATHANOR_HOSTNAME'" ;;
+  esac
+  # Warned rather than refused: a record added minutes ago may not have reached this resolver yet,
+  # and refusing would send the owner back to a shell, which is the thing being removed.
+  if ! getent ahosts "$requested_name" >/dev/null 2>&1; then
+    warn "$requested_name does not resolve from this computer yet; continuing, but clients cannot reach it until the DNS record is live"
+  fi
+  candidate_hostname="$requested_name"
+fi
+
 primary_host=""
 if [ -n "$candidate_hostname" ]; then
   primary_host="$candidate_hostname"
@@ -1047,7 +1072,13 @@ case "$webauthn_rp_id" in
   *) server_has_hostname="" ;;
 esac
 if [ -z "$server_has_hostname" ]; then
-  warn "this computer has no hostname, so signing in from a browser is not possible: a passkey is bound to a domain name and the standard does not allow an IP address. Run sudo athanor ddns configure to get one"
+  warn "this computer has no hostname, so signing in from a browser is not possible: a passkey is bound to a domain name and the standard does not allow an IP address"
+  # Ordered by what is true of most servers. A rented server has a fixed address, so it needs one A
+  # record and nothing else; dynamic DNS exists for an address that changes, which is a home
+  # connection, and offering it first sent owners of perfectly stable servers to configure a service
+  # that solves a problem they do not have.
+  say "  Fixed address: point a domain at $(printf '%s' "$ipv4_addresses" | awk '{print $1}') and re-run with ATHANOR_HOSTNAME=your.domain, or run sudo athanor set-hostname your.domain"
+  say "  Address that changes, as on a home connection: sudo athanor ddns configure"
 fi
 
 # None of this proves a request from the internet arrives, which cannot be tested from the

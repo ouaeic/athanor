@@ -375,7 +375,10 @@ doctor() {
     if [ -n "$configured_ddns_provider" ]; then
       check_warn "dynamic DNS publishes $configured_ddns_hostname but it is not the public origin; run sudo athanor set-hostname $configured_ddns_hostname"
     else
-      check_warn "get a hostname in about a minute: sudo athanor ddns configure"
+      # A fixed address needs one A record, which is what a rented server has. Dynamic DNS chases an
+      # address that moves and is the answer to a different question, so it is named second.
+      check_warn "fixed address: point a domain at this server and run sudo athanor set-hostname your.domain"
+      check_warn "address that changes, as on a home connection: sudo athanor ddns configure"
     fi
   fi
   expected_identity=$(

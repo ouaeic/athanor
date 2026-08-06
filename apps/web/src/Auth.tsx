@@ -313,9 +313,11 @@ export function Auth({ onReady }: { onReady: () => void }) {
               browser error with no explanation, so the condition is stated with the fix instead.
             */
             <div className="form-error" role="alert">
-              This server is reached by IP address, and passkeys require a hostname. On the server
-              run <code>sudo athanor ddns configure</code> to get one, or point a domain at it and
-              run <code>sudo athanor set-hostname your.domain</code>.
+              This server is reached by IP address, and a passkey has to be bound to a domain name —
+              the standard does not allow an address. If the server&rsquo;s address is fixed, which
+              is the usual case for a rented one, point a domain at it and run{' '}
+              <code>sudo athanor set-hostname your.domain</code>. Only if its address changes, as on
+              a home connection, does it need <code>sudo athanor ddns configure</code>.
             </div>
           )}
           <button className="primary wide" disabled={!ready} onClick={() => void submit()}>

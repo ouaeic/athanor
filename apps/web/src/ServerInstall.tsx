@@ -45,9 +45,20 @@ export function ServerInstall({ onClose }: { onClose: () => void }) {
           {copied ? <Check /> : <Clipboard />}
         </button>
       </div>
+      {/*
+        Named here rather than discovered afterwards. Most servers arrive with a usable name and
+        need nothing, but the ones that do not used to finish installing, refuse to make a passkey
+        because the standard binds one to a domain and not to an address, and send the owner back
+        for a second SSH session — which is the one thing this command exists to avoid.
+      */}
       <p className="server-install-footnote">
         Use a fresh supported Ubuntu or Debian server. The installer prints a QR code and one-time
         connection ticket for your client.
+      </p>
+      <p className="server-install-footnote">
+        Most servers already have a usable hostname. If yours does not, point a domain at its
+        address first and add <code>ATHANOR_HOSTNAME=your.domain</code> to the command — signing in
+        from a browser needs a domain name, because a passkey cannot be bound to an address.
       </p>
     </Dialog>
   );
