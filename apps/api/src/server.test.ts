@@ -2592,7 +2592,7 @@ describe('spending caps', () => {
     stubProviderAndRunner();
     const directory = await mkdtemp(join(tmpdir(), 'athanor-api-spend-'));
     disposers.push(() => rm(directory, { recursive: true, force: true }));
-    const { app } = await buildServer(isolatedConfig(directory));
+    const { app, database } = await buildServer(isolatedConfig(directory));
     disposers.push(() => app.close());
 
     const owner = sessionCookie(
@@ -2641,6 +2641,55 @@ describe('spending caps', () => {
       monthlyCapUsd: null,
       timeZone: 'Europe/Lisbon'
     });
+
+    /*
+     * The direction decides whether a passkey is asked for.
+     *
+     * Removing the cap is the one control between the owner and an unbounded provider bill, and it
+     * used to need nothing but an unlocked browser - while reading an export, which spends nothing,
+     * needed a passkey. Tightening still needs nothing: it cannot cost anybody anything, and asking
+     * would put a biometric prompt in front of a routine adjustment.
+     */
+    await database.query("UPDATE sessions SET step_up_at=NOW()-INTERVAL '10 minutes'");
+    const tightened = await app.inject({
+      method: 'PUT',
+      url: '/v1/spend-limits',
+      headers: { cookie: owner, 'idempotency-key': 'spend-limits-tighter' },
+      payload: { dailyCapUsd: 1 }
+    });
+    expect(tightened.statusCode, tightened.body).toBe(200);
+    expect(tightened.json()).toMatchObject({ dailyCapUsd: 1 });
+
+    for (const [key, payload] of [
+      ['spend-limits-raise', { dailyCapUsd: 50 }],
+      ['spend-limits-clear', { dailyCapUsd: null }]
+    ] as const) {
+      const loosened = await app.inject({
+        method: 'PUT',
+        url: '/v1/spend-limits',
+        headers: { cookie: owner, 'idempotency-key': key },
+        payload
+      });
+      expect(loosened.statusCode, loosened.body).toBe(403);
+      expect(loosened.json<{ error: { code: string } }>().error.code).toBe('step_up_required');
+    }
+    // And the cap it refused to change is still the one that was there.
+    expect(
+      (
+        await app.inject({ method: 'GET', url: '/v1/spend-limits', headers: { cookie: owner } })
+      ).json<{ dailyCapUsd: number | null }>()
+    ).toMatchObject({ dailyCapUsd: 1 });
+    // Stepped up again, and the cap put back where the rest of this test expects it — which is
+    // itself the loosening path working once the passkey is fresh.
+    await database.query('UPDATE sessions SET step_up_at=NOW()');
+    const restored = await app.inject({
+      method: 'PUT',
+      url: '/v1/spend-limits',
+      headers: { cookie: owner, 'idempotency-key': 'spend-limits-restore' },
+      payload: { dailyCapUsd: 2 }
+    });
+    expect(restored.statusCode, restored.body).toBe(200);
+    expect(restored.json()).toMatchObject({ dailyCapUsd: 2 });
 
     const rejectedZone = await app.inject({
       method: 'PUT',

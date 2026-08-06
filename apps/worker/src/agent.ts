@@ -2317,6 +2317,7 @@ export class AgentWorker {
     // The next step usually costs about what the last one did. A first step has nothing to go on,
     // so it is priced at a token amount: the point is to catch a runaway, not to predict precisely.
     const estimateUsd = Math.max(0.01, state.lastStepUsd ?? 0.01);
+    let guardFailure = '';
     const decision = await this.store
       .spendGuard({
         userId: task.userId,
@@ -2324,8 +2325,41 @@ export class AgentWorker {
         estimateUsd,
         includeOpenCommitments: true
       })
-      .catch(() => null);
-    if (!decision || decision.outcome === 'allow') return false;
+      .catch((cause: unknown) => {
+        guardFailure = cause instanceof Error ? cause.message : 'the spending guard did not answer';
+        return null;
+      });
+    /*
+     * A brake that cannot answer stops the car.
+     *
+     * This used to swallow the failure and return "do not halt", so one transient database error
+     * removed the owner's daily ceiling for that step, silently and with nothing written anywhere.
+     * The cap exists precisely so an unattended run cannot get away from the person who is asleep,
+     * and the only thing left underneath it is the compute-credit backstop, which sits far above
+     * where anyone sets a daily limit. Pausing costs a resumable task; failing open costs money
+     * that is already gone by the time it is noticed.
+     */
+    if (!decision) {
+      const reason = guardFailure || 'the spending guard did not answer';
+      await event(
+        this.store,
+        task,
+        key,
+        'status',
+        'Paused: athanor could not check this against your spending caps, so it stopped rather than spend past them.',
+        { blockedBy: 'spend_guard_unavailable', reason, estimateUsd }
+      );
+      await this.store.updateTask({
+        id: task.id,
+        workerId: this.config.WORKER_ID,
+        status: 'paused',
+        actualComputeCredits: state.credits,
+        agentStateCiphertext: encryptJson(state, key, `task-state:${task.id}`),
+        clearLease: true
+      });
+      return true;
+    }
+    if (decision.outcome === 'allow') return false;
 
     if (decision.outcome === 'warn') {
       // Warn once per window, or a long task narrates the same sentence every step.
@@ -3007,22 +3041,26 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         response.usage
       );
     state.credits += credit;
-    await this.store
-      .recordUsage({
-        userId: task.userId,
-        workspaceId: task.workspaceId,
-        taskId: task.id,
-        kind: 'model_inference',
-        resourceClass: model.usageClass,
-        quantity: response.usage.computeSeconds ?? response.usage.totalTokens,
-        unit: response.usage.computeSeconds ? 'gpu_seconds' : 'tokens',
-        credits: credit,
-        costUsd,
-        state: 'settled',
-        idempotencyKey: stepUsageKey(task.id, turn, state.step),
-        providerRef: `${response.metadata.provider}:${response.metadata.model}`
-      })
-      .catch(() => undefined);
+    // Not swallowed. This is the one billed call in the product whose ledger write was allowed to
+    // fail quietly: the provider had already charged for it, so the money was gone while the box's
+    // own total said otherwise, and every spending decision for the rest of that day was computed
+    // from a number known to be wrong. There is no route in the product to add an entry by hand.
+    // The cost *event* below may still fail without taking the turn down - it is the transcript's
+    // account of the charge, not the charge itself.
+    await this.store.recordUsage({
+      userId: task.userId,
+      workspaceId: task.workspaceId,
+      taskId: task.id,
+      kind: 'model_inference',
+      resourceClass: model.usageClass,
+      quantity: response.usage.computeSeconds ?? response.usage.totalTokens,
+      unit: response.usage.computeSeconds ? 'gpu_seconds' : 'tokens',
+      credits: credit,
+      costUsd,
+      state: 'settled',
+      idempotencyKey: stepUsageKey(task.id, turn, state.step),
+      providerRef: `${response.metadata.provider}:${response.metadata.model}`
+    });
     await event(this.store, task, key, 'cost', 'Handoff completed', {
       credits: credit,
       costUsd,

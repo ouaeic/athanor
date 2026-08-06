@@ -4599,6 +4599,25 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
     const user = requireUser(request.user);
     return idempotent(request, reply, user, async () => {
       const input = UpdateSpendLimitsRequest.parse(request.body);
+      /*
+       * A passkey to loosen the brake, nothing to tighten it.
+       *
+       * Adding a device needs a passkey and reading an export needs a passkey, while removing the
+       * one control standing between the owner and an unbounded provider bill needed only an
+       * unlocked browser. Asking on every edit would be friction on a routine adjustment, and the
+       * direction is what matters: raising a ceiling or clearing it is the escalation, lowering one
+       * cannot hurt. A cap that was null is already unlimited, so setting a number there is a
+       * tightening even though it "changes" the value.
+       */
+      const current = await store.effectiveSpendLimits(user.id);
+      const loosens = (was: number | null, next: number | null | undefined): boolean =>
+        next !== undefined && (next === null ? was !== null : was !== null && next > was);
+      if (
+        loosens(current.dailyCapUsd, input.dailyCapUsd) ||
+        loosens(current.monthlyCapUsd, input.monthlyCapUsd) ||
+        loosens(current.defaultTaskCapUsd, input.defaultTaskCapUsd)
+      )
+        await requireRecentStepUp(request, user);
       try {
         // An omitted field is left alone and an explicit null clears that cap, so an absent key is
         // forwarded as an absent key rather than as undefined.

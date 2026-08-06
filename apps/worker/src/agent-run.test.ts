@@ -1255,6 +1255,44 @@ describe('the web route a run is pinned to', () => {
     return { log, probe };
   };
 
+  /*
+   * A brake that cannot answer stops the car.
+   *
+   * The guard's result used to be `.catch(() => null)`, and null meant "do not halt" - so one
+   * transient database error removed the owner's daily ceiling for that step, silently, with
+   * nothing written anywhere. The cap exists so an unattended overnight run cannot get away from
+   * somebody who is asleep, and the only thing underneath it sits far above where anyone sets a
+   * daily limit.
+   */
+  it('stops rather than spend when the spending guard cannot answer', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const updates: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      spendGuard: async () => {
+        throw new Error('database is not accepting connections');
+      },
+      updateTask: async (input: Record<string, unknown>) => {
+        updates.push(input);
+        return task;
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('should never be asked for')], log);
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    // Nothing was bought.
+    expect(log.modelRequests).toHaveLength(0);
+    // And the owner is told why, in a state a reply can resume.
+    expect(updates.some((update) => update.status === 'paused')).toBe(true);
+    const stated = probe.events.find(
+      (entry) => (entry.payload as { blockedBy?: string } | undefined)?.blockedBy === 'spend_guard_unavailable'
+    );
+    expect(stated?.summary).toContain('could not check this against your spending caps');
+  });
+
   it('keeps the whole web in house on a zero-retention conversation', async () => {
     // The default posture, and the one that must never depend on a caller passing the right flag:
     // a provider-side search would send the query - routinely the most revealing sentence in a
