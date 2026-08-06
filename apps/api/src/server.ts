@@ -3113,8 +3113,44 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
      * Restoring is what makes the rewind true, so it happens before anything is written: a failed
      * restore must leave no task claiming a rewind that did not happen.
      */
+    let safetySnapshotId: string | null = null;
     const restoreComputer = async (): Promise<void> => {
       if (!restoredCheckpoint) return;
+      /*
+       * Two things restoring a snapshot has always done, and rewinding the computer never did.
+       *
+       * The first is refusing while the agent is working. This deletes and rewrites the filesystem
+       * under whatever is running: a file being written mid-call lands in a tree that is about to
+       * be replaced, and the step continues against a machine that silently became a different one.
+       *
+       * The second is a way back. Every other destructive act in the product takes a point first;
+       * this one asked the owner to choose a past state and then made the present unreachable by
+       * any route in the product. The id goes into the transcript note, so the sentence saying what
+       * happened also says how to undo it.
+       */
+      await assertWorkspaceHasNoActiveWork(user.id, workspace.id, {
+        refusal:
+          'The agent is working on this computer. Stop or pause it before putting its files back.',
+        busyStatuses: EXECUTING_STATUSES
+      });
+      const safety = await store.createWorkspaceSnapshot({
+        userId: user.id,
+        workspaceId: workspace.id,
+        name: `Safety before rewind · ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`,
+        sizeBytes: 0
+      });
+      const archived = await runner.request<{ sizeBytes: number }>({
+        workspaceId: workspace.id,
+        userId: user.id,
+        role: 'control',
+        scopes: ['workspace.manage'],
+        path: `/v1/workspaces/${workspace.id}/snapshots`,
+        method: 'POST',
+        contentType: 'application/json',
+        body: JSON.stringify({ snapshotId: safety.id })
+      });
+      await store.completeWorkspaceSnapshot(String(safety.id), archived.sizeBytes);
+      safetySnapshotId = String(safety.id);
       await runner.request({
         workspaceId: workspace.id,
         userId: user.id,
@@ -3141,7 +3177,10 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
           {
             filesystemRestored: true,
             restoredCheckpointId: restoredCheckpoint!.id,
-            rewoundToEventId: target.id
+            rewoundToEventId: target.id,
+            // How to undo the undo. Named in the transcript because that is where somebody looks
+            // when they realise the state they just left was the one they wanted.
+            safetySnapshotId
           },
           dataKey,
           `task-event:${parent.id}`
@@ -4634,15 +4673,34 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
     }
   );
 
+  /**
+   * Refuses while the computer is in use, for two different meanings of "in use".
+   *
+   * Changing the set of recovery points asks the wider question: anything not settled might still
+   * write, and the owner is doing maintenance rather than working, so waiting is cheap.
+   *
+   * Rewinding the files asks the narrower one. It is reached from a conversation, and that
+   * conversation is almost always `awaiting_user` — it is waiting for the person now clicking the
+   * button. Refusing on that would have made "put the computer back" unreachable from the only
+   * screen that offers it. What must not happen is the tree being replaced under a step that is
+   * running or about to be picked up by a worker.
+   */
+  const EXECUTING_STATUSES = ['queued', 'planning', 'running'] as const;
+
   const assertWorkspaceHasNoActiveWork = async (
     userId: string,
-    workspaceId: string
+    workspaceId: string,
+    options?: { refusal?: string; busyStatuses?: readonly string[] }
   ): Promise<void> => {
+    const settled = ['paused', 'completed', 'failed', 'cancelled'];
+    const busy = options?.busyStatuses
+      ? (task: { status: string }) => options.busyStatuses!.includes(task.status)
+      : (task: { status: string }) => !settled.includes(task.status);
     const tasks = await store.listTasks(userId, workspaceId);
-    if (tasks.some((task) => !['paused', 'completed', 'failed', 'cancelled'].includes(task.status)))
+    if (tasks.some(busy))
       throw new AthanorError(
         'workspace_busy',
-        'Pause or finish every agent task before changing recovery points',
+        options?.refusal ?? 'Pause or finish every agent task before changing recovery points',
         409
       );
   };

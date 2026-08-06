@@ -3216,6 +3216,10 @@ describe('rewinding the computer, not only the conversation', () => {
         if (requestUrl.includes('workspace-manager.test')) {
           const url = new URL(requestUrl);
           runnerCalls.push(`${init?.method ?? 'GET'} ${url.pathname}`);
+          // The safety point taken before the tree is replaced, so the state one second before the
+          // click is still reachable afterwards.
+          if (url.pathname.endsWith('/snapshots') && (init?.method ?? 'GET') === 'POST')
+            return json({ sizeBytes: 2_048 });
           if (url.pathname.endsWith('/preview'))
             return json({
               checkpointId: 'preview',
@@ -3364,6 +3368,26 @@ describe('rewinding the computer, not only the conversation', () => {
       computer: { modifiedCount: 1, packagesInstalled: [{ name: 'ripgrep' }] }
     });
 
+    /*
+     * Not while a step could be writing. This replaces the tree under whatever is running, so a
+     * file being written mid-call lands in a directory that is about to be deleted and the step
+     * carries on against a machine that silently became a different one. The task is still
+     * `queued` from the setup above, which is exactly that case.
+     */
+    const busy = await app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/trajectory`,
+      headers: { cookie, 'idempotency-key': 'rewind-busy' },
+      payload: { operation: 'branch', eventId: firstMessage.id, rewind: 'both' }
+    });
+    expect(busy.statusCode).toBe(409);
+    expect(busy.json<{ error: { code: string } }>().error.code).toBe('workspace_busy');
+
+    // Waiting for the owner is not working: this is the state the conversation is in when somebody
+    // is looking at it and reaches for the rewind, so refusing here would put the control out of
+    // reach of the only screen that offers it.
+    await store.updateTask({ id: taskId, status: 'awaiting_user' });
+
     runnerCalls.length = 0;
     const rewound = await app.inject({
       method: 'POST',
@@ -3376,6 +3400,12 @@ describe('rewinding the computer, not only the conversation', () => {
       rewind: 'both',
       restoredCheckpointId: checkpoint.id
     });
+    // A safety point first, then the restore. Every other destructive act in the product takes one;
+    // this one asked the owner to choose a past state and then made the present unreachable.
+    expect(runnerCalls.indexOf(`POST /v1/workspaces/${workspaceId}/snapshots`)).toBeGreaterThanOrEqual(0);
+    expect(runnerCalls.indexOf(`POST /v1/workspaces/${workspaceId}/snapshots`)).toBeLessThan(
+      runnerCalls.indexOf(`POST /v1/workspaces/${workspaceId}/checkpoints/${checkpoint.id}/restore`)
+    );
     expect(runnerCalls).toContain(
       `POST /v1/workspaces/${workspaceId}/checkpoints/${checkpoint.id}/restore`
     );

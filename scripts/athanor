@@ -31,6 +31,13 @@ fail() {
   exit 1
 }
 
+# Something went wrong that is not a reason to stop. There was only `fail` before, so every part of
+# a long operation that could go wrong slightly was written as though it could only go wrong fatally
+# - which is how reinstalling optional packages came to be able to abandon a restore halfway.
+warn() {
+  printf 'athanor: %s\n' "$1" >&2
+}
+
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
     command -v sudo >/dev/null 2>&1 || fail "this command must run as root"
@@ -721,10 +728,23 @@ set_hostname() {
 # Keeps the most recent backups this script created and removes the rest. A destination the
 # operator named themselves is theirs to manage and is never touched, which is why only the
 # generated timestamp directories match.
+# A backup is a directory with a verified SHA256SUMS in it. Anything else is wreckage from a run
+# that died partway, and it used to count: five failed runs in a row - which is what a full disk
+# produces - left five unusable directories occupying all five retained slots, each run having
+# deleted a good backup to make room for rubbish. Failed runs are cleared here too, so the disk does
+# not fill with them.
 prune_backups() {
   [ -d "$athanor_backup_root" ] || return 0
+  find "$athanor_backup_root" -mindepth 1 -maxdepth 1 -type d -name '*.partial' 2>/dev/null |
+    while IFS= read -r abandoned; do
+      rm -rf -- "$abandoned"
+      printf 'Removed incomplete backup %s\n' "$abandoned"
+    done
   find "$athanor_backup_root" -mindepth 1 -maxdepth 1 -type d \
     -name '????????T??????Z' 2>/dev/null |
+    while IFS= read -r candidate; do
+      [ -f "$candidate/SHA256SUMS" ] && printf '%s\n' "$candidate"
+    done |
     sort -r |
     tail -n +$((athanor_backup_keep + 1)) |
     while IFS= read -r superseded; do
@@ -739,10 +759,33 @@ backup_athanor() {
   [ "$restart_mode" = "restart" ] || [ "$restart_mode" = "keep-stopped" ] ||
     fail "invalid internal backup restart mode"
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
-  destination="${1:-$athanor_backup_root/$stamp}"
+  final_destination="${1:-$athanor_backup_root/$stamp}"
+  # Written aside and renamed at the end, so a run that dies partway leaves something obviously
+  # unfinished rather than a directory that looks like a backup and cannot restore one.
+  destination="$final_destination.partial"
+  rm -rf -- "$destination"
   install -d -m 0700 "$destination"
+  # Backups fail mostly because the disk is full, which is exactly when every retained copy is
+  # already there. Refusing before stopping the services costs the owner nothing; discovering it
+  # after the archive is half-written costs them the outage and a slot.
+  required_kb=$(du -sk "$athanor_home" 2>/dev/null | awk '{print $1}')
+  available_kb=$(df -Pk "$athanor_backup_root" 2>/dev/null | awk 'NR == 2 {print $4}')
+  if [ -n "$required_kb" ] && [ -n "$available_kb" ] &&
+    [ "$available_kb" -lt "$((required_kb + 524288))" ]; then
+    prune_backups
+    available_kb=$(df -Pk "$athanor_backup_root" 2>/dev/null | awk 'NR == 2 {print $4}')
+  fi
+  if [ -n "$required_kb" ] && [ -n "$available_kb" ] &&
+    [ "$available_kb" -lt "$((required_kb + 524288))" ]; then
+    rm -rf -- "$destination"
+    fail "not enough room for a backup: $((available_kb / 1024)) MiB free, about $(((required_kb + 524288) / 1024)) MiB needed. Free space or move $athanor_backup_root to a larger disk."
+  fi
   systemctl stop athanor.target
-  trap 'systemctl start athanor.target >/dev/null 2>&1 || true' EXIT INT TERM
+  # Only ever names the partial directory, and is emptied the moment the finished backup takes its
+  # real name — otherwise a failure in the seconds after the rename would delete the good copy this
+  # run had just produced.
+  partial_destination="$destination"
+  trap 'rm -rf -- "$partial_destination"; systemctl start athanor.target >/dev/null 2>&1 || true' EXIT INT TERM
   runuser -u postgres -- pg_dump -Fc athanor >"$destination/database.dump"
   # The services are down for the whole of this archive, so what goes into it is outage time.
   # Package caches and installed dependency trees are the bulk of a working agent computer and
@@ -771,11 +814,19 @@ backup_athanor() {
   fi
   chmod 0600 "$destination/database.dump" "$destination/workspaces.tar.gz" \
     "$destination/configuration.tar.gz"
+  # Which revision this copy belongs to, so `athanor rollback` knows what code the data came from.
+  git -C "$athanor_root" rev-parse --verify HEAD >"$destination/revision" 2>/dev/null ||
+    : >"$destination/revision"
+  chmod 0600 "$destination/revision"
   (
     cd "$destination"
-    sha256sum database.dump workspaces.tar.gz configuration.tar.gz packages.txt >SHA256SUMS
+    sha256sum database.dump workspaces.tar.gz configuration.tar.gz packages.txt revision >SHA256SUMS
   )
-  last_backup_destination="$destination"
+  rm -rf -- "$final_destination"
+  mv -- "$destination" "$final_destination"
+  partial_destination=""
+  destination="$final_destination"
+  last_backup_destination="$final_destination"
   if [ "$restart_mode" = "restart" ]; then
     systemctl start athanor.target
   fi
@@ -803,8 +854,13 @@ restore_athanor() {
     awk 'NF == 2 {print $2}' "$source_directory/SHA256SUMS" | sort | tr '\n' ' ' |
       sed 's/ $//'
   )
+  # Every shape a backup has ever had, oldest first. A copy made by an older release has to stay
+  # restorable by a newer one: the whole point of the file is the day the current release is the
+  # thing that went wrong.
   case "$checksum_names" in
-    "configuration.tar.gz database.dump workspaces.tar.gz"|"configuration.tar.gz database.dump packages.txt workspaces.tar.gz") ;;
+    "configuration.tar.gz database.dump workspaces.tar.gz") ;;
+    "configuration.tar.gz database.dump packages.txt workspaces.tar.gz") ;;
+    "configuration.tar.gz database.dump packages.txt revision workspaces.tar.gz") ;;
     *) fail "backup checksum manifest contains unexpected files" ;;
   esac
   (cd "$source_directory" && sha256sum --check --strict SHA256SUMS)
@@ -840,21 +896,6 @@ SQL
   chown -R athanor:athanor "$athanor_home"
   restore_workspace_ownership
   tar -C "$config_parent" -xzf "$source_directory/configuration.tar.gz"
-  if [ -f "$source_directory/packages.txt" ]; then
-    set --
-    while IFS= read -r package_name; do
-      [ -n "$package_name" ] || continue
-      case "$package_name" in
-        *[!A-Za-z0-9+._:-]*|-*|*::*|*:|.*|/*)
-          fail "backup contains an unsafe package name"
-          ;;
-      esac
-      set -- "$@" "$package_name"
-    done <"$source_directory/packages.txt"
-    if [ "$#" -gt 0 ]; then
-      "$(runtime_path /usr/local/sbin/athanor-system-packages)" install "$@"
-    fi
-  fi
   restored_password=$(sed -n 's|^DATABASE_URL=postgres://athanor:\([^@]*\)@.*|\1|p' \
     "$athanor_config/control.env")
   [ -n "$restored_password" ] || fail "restored database password is missing"
@@ -864,6 +905,36 @@ SQL
   systemctl start athanor.target
   wait_until_serving
   trap - EXIT INT TERM
+
+  # Last, and never fatal.
+  #
+  # This is disaster recovery and the last step of every update rollback, and it used to run between
+  # wiping the database and resetting the role password - so one withdrawn package, or a host with
+  # no network, aborted the restore at the one moment the server could not reach its own database.
+  # The owner was left with a box that had their data and could not open it. Nothing here is needed
+  # to serve: the agent reinstalls what it needs, and an unsafe name is now skipped rather than
+  # taken as a reason to stop a restore that has already succeeded.
+  if [ -f "$source_directory/packages.txt" ]; then
+    set --
+    skipped_packages=""
+    while IFS= read -r package_name; do
+      [ -n "$package_name" ] || continue
+      case "$package_name" in
+        *[!A-Za-z0-9+._:-]*|-*|*::*|*:|.*|/*)
+          skipped_packages="$skipped_packages $package_name"
+          continue
+          ;;
+      esac
+      set -- "$@" "$package_name"
+    done <"$source_directory/packages.txt"
+    [ -z "$skipped_packages" ] ||
+      warn "skipped package names that are not safe to pass to a package manager:$skipped_packages"
+    if [ "$#" -gt 0 ]; then
+      if ! "$(runtime_path /usr/local/sbin/athanor-system-packages)" install "$@"; then
+        warn "could not reinstall the packages this backup recorded; athanor is serving and the agent will install what it needs. To retry: sudo $(runtime_path /usr/local/sbin/athanor-system-packages) install $*"
+      fi
+    fi
+  fi
   printf 'Restore complete.\n'
 }
 
@@ -989,6 +1060,59 @@ announce_outage() {
   fi
 }
 
+# Go back to the release a backup was taken from, on purpose.
+#
+# The update path already knows how to undo itself, but only while it is failing. A release that
+# passes every automatic gate and is still wrong - which is what the printed "keep this backup until
+# post-update checks pass" is warning about - left the owner with a verified backup, an instruction
+# to keep it, and no command that consumes it. Restoring alone was not enough either: it puts the
+# data back under the new code, which is the half that was wrong.
+rollback_athanor() {
+  need_root rollback "${1:-}"
+  source_directory="${1:-}"
+  if [ -z "$source_directory" ]; then
+    source_directory=$(
+      find "$athanor_backup_root" -mindepth 1 -maxdepth 1 -type d -name '????????T??????Z' \
+        2>/dev/null |
+        while IFS= read -r candidate; do
+          [ -f "$candidate/SHA256SUMS" ] && printf '%s\n' "$candidate"
+        done |
+        sort -r |
+        sed -n '1p'
+    )
+    [ -n "$source_directory" ] ||
+      fail "no complete backup found in $athanor_backup_root; pass one: sudo athanor rollback /path/to/backup"
+    printf 'Rolling back to the newest complete backup: %s\n' "$source_directory"
+  fi
+  [ -f "$source_directory/SHA256SUMS" ] ||
+    fail "usage: sudo athanor rollback [/path/to/backup]"
+  target_revision=""
+  [ -f "$source_directory/revision" ] && target_revision=$(cat "$source_directory/revision")
+  if [ -n "$target_revision" ]; then
+    git -C "$athanor_root" cat-file -e "$target_revision^{commit}" 2>/dev/null ||
+      fail "revision $target_revision is not in this checkout; fetch it first or restore without changing code: sudo athanor restore $source_directory --yes"
+    printf 'Putting the code back to %s and the data back to %s.\n' \
+      "$target_revision" "$source_directory"
+    git -C "$athanor_root" reset --hard "$target_revision" >/dev/null ||
+      fail "could not put the checkout back to $target_revision"
+    cd "$athanor_root" || fail "could not enter $athanor_root"
+    CI=true pnpm install --frozen-lockfile || fail "could not install dependencies for $target_revision"
+    CI=true pnpm -r build || fail "could not build $target_revision"
+    install_runtime_files
+    nginx -t
+    systemctl daemon-reload
+  else
+    # A backup from before revisions were recorded. The data still goes back; the code cannot, and
+    # saying so is better than guessing at a revision.
+    printf 'This backup does not record a revision, so only the data is put back.\n'
+  fi
+  restore_athanor "$source_directory" --yes
+  "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)" >/dev/null 2>&1 || true
+  printf 'Rollback complete. Run sudo athanor doctor to confirm, and note that auto-update will\n'
+  printf 'move this server forward again at its next window unless you turn it off:\n'
+  printf '  sudo athanor auto-update off\n'
+}
+
 update_athanor() {
   need_root update
   [ -d "$athanor_root/.git" ] || fail "$athanor_root is not a Git checkout"
@@ -1005,13 +1129,27 @@ update_athanor() {
   outage_started=$(date +%s)
   backup_athanor "" keep-stopped
   rollback_backup="$last_backup_destination"
+  # Whether the new release has been allowed to touch the database yet.
+  #
+  # Migrations run when the new code starts, so until `restart_athanor` the schema and every row are
+  # exactly what the running release left. The rollback used to drop and pg_restore the owner's only
+  # database regardless - so the two commonest unattended failures, an unreachable remote and a
+  # registry hiccup at install, both destroyed and rebuilt a database that nothing had touched, and
+  # any conversation written between the backup and the failure was lost to a fault that never
+  # reached the data.
+  database_at_risk=0
 
   rollback_update() {
     original_status=$?
     trap - EXIT INT TERM
     set +e
-    printf 'athanor update failed; restoring revision %s and backup %s\n' \
-      "$previous_revision" "$rollback_backup" >&2
+    if [ "$database_at_risk" -eq 1 ]; then
+      printf 'athanor update failed after the new release started; restoring revision %s and backup %s\n' \
+        "$previous_revision" "$rollback_backup" >&2
+    else
+      printf 'athanor update failed before the new release started; restoring revision %s. The database was not touched and is left alone; backup %s is kept.\n' \
+        "$previous_revision" "$rollback_backup" >&2
+    fi
     rollback_ok=1
     git -C "$athanor_root" reset --hard "$previous_revision" >/dev/null 2>&1 ||
       rollback_ok=0
@@ -1026,7 +1164,14 @@ update_athanor() {
     systemctl daemon-reload || rollback_ok=0
     systemctl enable athanor-network-watch.service athanor-network-refresh.timer \
       athanor-network-refresh.path >/dev/null 2>&1 || rollback_ok=0
-    (restore_athanor "$rollback_backup" --yes) || rollback_ok=0
+    if [ "$database_at_risk" -eq 1 ]; then
+      (restore_athanor "$rollback_backup" --yes) || rollback_ok=0
+    else
+      # The checkout and the runtime files are back; nothing else changed, so this only has to put
+      # the services the backup stopped back on.
+      systemctl start athanor.target >/dev/null 2>&1 || rollback_ok=0
+      wait_until_serving || rollback_ok=0
+    fi
     "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)" >/dev/null 2>&1 ||
       rollback_ok=0
     if [ "$rollback_ok" -eq 1 ]; then
@@ -1053,6 +1198,9 @@ update_athanor() {
   systemctl enable --now athanor-network-watch.service athanor-network-refresh.timer \
     athanor-network-refresh.path
   "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)"
+  # Past this line the new release is running and its migrations have had the database, so a failure
+  # from here does need the backup put back.
+  database_at_risk=1
   restart_athanor
   trap - EXIT INT TERM
   outage_seconds=$(($(date +%s) - outage_started))
@@ -1198,6 +1346,7 @@ case "$command_name" in
   backup) backup_athanor "${1:-}" ;;
   restore) restore_athanor "${1:-}" "${2:-}" ;;
   update) update_athanor ;;
+  rollback) rollback_athanor "${1:-}" ;;
   auto-update) auto_update "${1:-status}" ;;
   relay) relay_command "${1:-status}" ;;
   uninstall) uninstall_athanor ;;
@@ -1215,7 +1364,7 @@ case "$command_name" in
     ;;
   help|*)
     printf '%s\n' \
-      'Usage: athanor {install|start|stop|restart|status|logs|doctor|connect|pairing-code|set-hostname HOST|backup [dir]|restore DIR --yes|update|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...}' \
+      'Usage: athanor {install|start|stop|restart|status|logs|doctor|connect|pairing-code|set-hostname HOST|backup [dir]|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...}' \
       '' \
       'Browser sign-in needs a hostname: a passkey is bound to a domain name and the WebAuthn' \
       'standard does not allow an IP address. If this server has no name, run:' \
