@@ -50,6 +50,7 @@ import { UndoProvider, UndoToasts, useUndoQueue } from './Undo.js';
 import { CommandPalette, type Command } from './CommandPalette.js';
 import {
   clearDraft,
+  draftWrittenAt,
   pruneDrafts,
   readDraft,
   readInspectorChoice,
@@ -309,8 +310,17 @@ export function App() {
       // must never be replaced by an older one the box is still holding.
       for (const draft of next.drafts ?? []) {
         const key = draft.taskId ?? undefined;
-        if (readDraft(key)) continue;
-        writeDraft(key, draft.body);
+        const mine = readDraft(key);
+        const sent = new Date(draft.updatedAt).getTime();
+        // Newest wins, rather than local always winning. Keeping the local copy unconditionally
+        // meant a device that had once seen a draft could never be told about a newer one — and
+        // adopting also writes to this device's store, so every device that so much as looked was
+        // frozen on the version it first saw and would eventually write it back over the box's.
+        // The composer being typed in right now is still spared: `mine` is only overridden by a
+        // sentence the box saw later than this device last wrote one.
+        const newer = !mine || (Number.isFinite(sent) && sent > draftWrittenAt(key));
+        if (!newer) continue;
+        writeDraft(key, draft.body, Number.isFinite(sent) ? sent : Date.now());
         if ((key ?? undefined) === (savedDraft.current.taskId ?? undefined)) {
           savedDraft.current = { taskId: savedDraft.current.taskId, prompt: draft.body };
           setPrompt(draft.body);

@@ -75,15 +75,35 @@ const draftKey = (taskId: string | undefined): string => `${DRAFT_PREFIX}${taskI
 
 export const readDraft = (taskId: string | undefined): string => read(draftKey(taskId)) ?? '';
 
-export const writeDraft = (taskId: string | undefined, draft: string): void => {
+/**
+ * When this device last wrote that draft, kept in a key of its own.
+ *
+ * Beside the draft rather than inside it, so the stored value stays the plain string it has always
+ * been and a draft written by an older build simply has no time against it. That case reads as
+ * "older than anything the box could send", which is the safe way round: an unstamped local draft
+ * loses to a dated one from the box rather than silently overwriting it.
+ */
+const draftStampKey = (taskId: string | undefined): string => `${draftKey(taskId)}:at`;
+
+export const draftWrittenAt = (taskId: string | undefined): number => {
+  const stamp = Number(read(draftStampKey(taskId)));
+  return Number.isFinite(stamp) && stamp > 0 ? stamp : 0;
+};
+
+export const writeDraft = (taskId: string | undefined, draft: string, at = Date.now()): void => {
   if (!draft) {
     remove(draftKey(taskId));
+    remove(draftStampKey(taskId));
     return;
   }
   write(draftKey(taskId), draft.slice(0, MAX_DRAFT_LENGTH));
+  write(draftStampKey(taskId), String(at));
 };
 
-export const clearDraft = (taskId: string | undefined): void => remove(draftKey(taskId));
+export const clearDraft = (taskId: string | undefined): void => {
+  remove(draftKey(taskId));
+  remove(draftStampKey(taskId));
+};
 
 /**
  * Drops drafts for conversations this device can no longer open.
@@ -101,7 +121,11 @@ export const pruneDrafts = (liveTaskIds: Iterable<string>): void => {
     for (let index = 0; index < storage.length; index += 1) {
       const key = storage.key(index);
       if (!key?.startsWith(DRAFT_PREFIX)) continue;
-      const taskId = key.slice(DRAFT_PREFIX.length);
+      // A draft's time is stored beside it under the same key with `:at` on the end. Taken
+      // literally that suffix reads as part of the conversation id, so every live draft's stamp
+      // looked like a draft for a conversation that no longer exists and was swept on the next
+      // load - leaving the draft dated by nothing at all.
+      const taskId = key.slice(DRAFT_PREFIX.length).replace(/:at$/, '');
       if (taskId !== 'new' && !live.has(taskId)) stale.push(key);
     }
   } catch {

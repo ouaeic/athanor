@@ -5263,15 +5263,22 @@ export class DataStore {
   async listMessageDrafts(
     userId: string,
     workspaceId: string
-  ): Promise<Array<{ taskId: string | null; bodyCiphertext: EncryptedEnvelope }>> {
+  ): Promise<
+    Array<{ taskId: string | null; bodyCiphertext: EncryptedEnvelope; updatedAt: string }>
+  > {
     const result = await this.database.query(
-      `SELECT task_id, body_ciphertext FROM message_drafts
+      // `updated_at` travels with the draft because a device cannot otherwise tell a sentence newer
+      // than its own from one it wrote and has already moved past. Without it the client could only
+      // ever choose "keep mine", so a device that had once seen a draft was frozen on that version
+      // for good and would eventually write it back over a newer one.
+      `SELECT task_id, body_ciphertext, updated_at FROM message_drafts
        WHERE user_id=$1 AND workspace_id=$2`,
       [userId, workspaceId]
     );
     return result.rows.map((row) => ({
       taskId: optionalText(row.task_id) ?? null,
-      bodyCiphertext: json<EncryptedEnvelope>(row.body_ciphertext)
+      bodyCiphertext: json<EncryptedEnvelope>(row.body_ciphertext),
+      updatedAt: new Date(row.updated_at as string).toISOString()
     }));
   }
 

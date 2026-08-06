@@ -4050,9 +4050,19 @@ describe('a half-typed message', () => {
 
     // Read back the way a second device gets it: through bootstrap, decrypted by the box.
     const next = await app.inject({ method: 'GET', url: '/v1/bootstrap', headers: { cookie } });
+    // `updatedAt` travels with it: without a time against the sentence, a device that had once
+    // seen a draft could only ever keep its own copy, and would eventually write that stale copy
+    // back over a newer one.
     expect(next.json<{ drafts: unknown[] }>().drafts).toEqual([
-      { workspaceId, taskId: null, body: 'a sentence begun on another device' }
+      {
+        workspaceId,
+        taskId: null,
+        body: 'a sentence begun on another device',
+        updatedAt: expect.any(String)
+      }
     ]);
+    const [onlyDraft] = next.json<{ drafts: Array<{ updatedAt: string }> }>().drafts;
+    expect(Number.isFinite(new Date(onlyDraft!.updatedAt).getTime())).toBe(true);
 
     // And the box holds no plaintext of it, because a draft is the owner's words like any other.
     const stored = await database.query('SELECT body_ciphertext FROM message_drafts');

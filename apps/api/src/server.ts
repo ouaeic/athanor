@@ -2091,7 +2091,8 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
             return rows.map((row) => ({
               workspaceId: workspace.id,
               taskId: row.taskId,
-              body: decryptJson<{ body: string }>(row.bodyCiphertext, key).body
+              body: decryptJson<{ body: string }>(row.bodyCiphertext, key).body,
+              updatedAt: row.updatedAt
             }));
           } catch {
             return [];

@@ -45,6 +45,8 @@ export interface MessageDraft {
   workspaceId: string;
   taskId: string | null;
   body: string;
+  /** When the box last saw this change, so a device can tell a newer sentence from its own. */
+  updatedAt: string;
 }
 
 export interface Bootstrap {
