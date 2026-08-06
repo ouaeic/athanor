@@ -944,6 +944,14 @@ cat >/etc/avahi/services/athanor.service <<EOF
 </service-group>
 EOF
 
+# The unattended update runs git as root from a systemd timer, and the checkout usually belongs to
+# the person who cloned it. Git refuses a repository owned by somebody else - "detected dubious
+# ownership" - and it refuses it only in that context: `sudo athanor update` works, because sudo
+# leaves SUDO_UID behind for git to match against, while the timer has no such variable. The result
+# was an update that passed every manual test and silently never ran on its own. Recorded
+# system-wide because the timer's root has no user configuration to read.
+git config --system --add safe.directory "$athanor_root" 2>/dev/null || true
+
 systemctl daemon-reload
 systemctl enable avahi-daemon nginx athanor.target
 # The services are enabled individually as well as being wanted by the target. The target alone did
