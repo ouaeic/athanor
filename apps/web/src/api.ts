@@ -162,6 +162,8 @@ export const api = {
       privacyUrl: string | null;
       passkeysUsable: boolean;
       registrationAvailable: boolean;
+      /** One account on the box, so recovery has nothing to disambiguate and asks for no name. */
+      singleOwner: boolean;
     }>('/v1/legal'),
   devLogin: (username: string) =>
     request('/v1/auth/dev', { method: 'POST', body: JSON.stringify({ username }) }),

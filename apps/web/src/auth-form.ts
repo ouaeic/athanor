@@ -27,6 +27,8 @@ export interface AuthFormState {
   passkeysUsable: boolean;
   /** Whether the box has answered with what it is. Claiming it before then would guess at it. */
   serverKnown: boolean;
+  /** Whether the box has exactly one account, in which case recovery needs no name to find it. */
+  singleOwner?: boolean;
 }
 
 /**
@@ -41,6 +43,11 @@ export const canSubmitAuth = (state: AuthFormState): boolean => {
   if (state.mode === 'login') return true;
   if (state.mode === 'enroll')
     return state.serverKnown && state.pairingCode.trim().length >= CODE_MIN_LENGTH;
+  // Recovery on a single-owner box asks for the code and nothing else: there is one account to
+  // find, and the name was a display name typed once at setup, being asked for months later on the
+  // one day the owner has already lost every passkey.
+  if (state.mode === 'recover' && state.singleOwner)
+    return state.recoveryCode.trim().length >= CODE_MIN_LENGTH;
   if (!state.name.trim()) return false;
   if (state.mode === 'recover') return state.recoveryCode.trim().length >= CODE_MIN_LENGTH;
   return state.serverKnown && state.pairingCode.trim().length >= CODE_MIN_LENGTH;

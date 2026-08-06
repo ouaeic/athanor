@@ -1493,7 +1493,16 @@ export const buildServer = async (
     sourceUrl: config.PUBLIC_SOURCE_URL ?? null,
     privacyUrl: config.PUBLIC_PRIVACY_URL ?? null,
     passkeysUsable,
-    registrationAvailable: config.REGISTRATION_MODE === 'open' || (await store.countUsers()) === 0
+    registrationAvailable: config.REGISTRATION_MODE === 'open' || (await store.countUsers()) === 0,
+    /**
+     * Whether recovery needs to be told which account it is for.
+     *
+     * On a box with one owner it does not, and asking made the last-resort path depend on
+     * remembering a display name typed once during setup. Nothing is disclosed by saying so that
+     * `registrationAvailable` does not already say: a box that refuses registration is a box that
+     * has been claimed.
+     */
+    singleOwner: (await store.countUsers()) === 1
   }));
   app.get('/readyz', async (_request, reply) => {
     try {

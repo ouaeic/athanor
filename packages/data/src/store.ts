@@ -1323,6 +1323,17 @@ export class DataStore {
     return Number(result.rows[0]?.count ?? 0);
   }
 
+  /**
+   * The only account on this box, when there is exactly one - which is the shape athanor is for.
+   *
+   * `LIMIT 2` rather than `LIMIT 1` so one query answers "exactly one" instead of "at least one":
+   * the caller needs to know there is nothing to disambiguate, not merely that somebody exists.
+   */
+  async soleUser(): Promise<UserRecord | null> {
+    const result = await this.database.query('SELECT * FROM users LIMIT 2');
+    return result.rows.length === 1 && result.rows[0] ? mapUser(result.rows[0]) : null;
+  }
+
   async getUserById(id: string): Promise<UserRecord | null> {
     const result = await this.database.query('SELECT * FROM users WHERE id = $1', [id]);
     return result.rows[0] ? mapUser(result.rows[0]) : null;

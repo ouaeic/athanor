@@ -352,10 +352,20 @@ export const registerAuthRoutes = (
   app.post<{ Body: { username: string; recoveryCode: string; nativeOrigin?: string } }>(
     '/v1/auth/recover/options',
     async (request) => {
-      const username = internalUsername(request.body.username);
-      const rateKey = `${request.ip}:${username}`;
-      checkRecoveryRate(rateKey);
-      const user = await store.getUserByUsername(username);
+      /*
+       * On a box with one owner the name is not a question worth asking.
+       *
+       * It was asked, and it was the display name typed once during setup - months later, on the
+       * worst day the owner will have with this software, with the recovery code in front of them
+       * and no passkey left. Guessing it wrong answered "the username or recovery code is not
+       * valid", which reads as the code being wrong, and the code is the thing that cannot be
+       * guessed again. There is nothing to disambiguate here: one account, one code, and the code
+       * is the secret. The rate limit keys on the account that was actually resolved, so a wrong
+       * name can no longer spend somebody else's budget or dodge its own.
+       */
+      const sole = await store.soleUser();
+      const user = sole ?? (await store.getUserByUsername(internalUsername(request.body.username)));
+      checkRecoveryRate(`${request.ip}:${user?.username ?? internalUsername(request.body.username)}`);
       const verified = await verifyRecoveryCode(
         request.body.recoveryCode,
         user?.recoveryHash ?? (await dummyRecoveryHash)
@@ -363,7 +373,7 @@ export const registerAuthRoutes = (
       if (!user?.recoveryHash || !verified) {
         throw new AthanorError(
           'recovery_failed',
-          'The username or recovery code is not valid',
+          sole ? 'That recovery code is not valid' : 'The username or recovery code is not valid',
           401
         );
       }
@@ -382,7 +392,9 @@ export const registerAuthRoutes = (
         authenticatorSelection: { residentKey: 'required', userVerification: 'required' }
       });
       const challengeId = await store.createChallenge({
-        username,
+        // The account this actually resolved to, which on a single-owner box is the only one and
+        // not whatever was typed. `recover/verify` reads the name back off this challenge.
+        username: user.username,
         challenge: options.challenge,
         kind: 'recovery',
         ttlSeconds: 300,

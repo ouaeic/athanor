@@ -74,7 +74,8 @@ export function Auth({ onReady }: { onReady: () => void }) {
     recoveryCode,
     busy,
     passkeysUsable: legal?.passkeysUsable !== false,
-    serverKnown: Boolean(legal)
+    serverKnown: Boolean(legal),
+    singleOwner: legal?.singleOwner === true
   });
 
   // Enter submits from any field, not only from the last one. It used to be wired to the recovery
@@ -279,16 +280,24 @@ export function Auth({ onReady }: { onReady: () => void }) {
           )}
           {mode === 'recover' && (
             <>
-              <label>
-                Name used during setup
-                <input
-                  autoComplete="name"
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  onKeyDown={submitOnEnter}
-                  placeholder="Ada"
-                />
-              </label>
+              {/*
+                Asked only where it could matter. A box with one account has nothing to
+                disambiguate, and this field was a display name typed once during setup - wanted
+                back months later, on the day every passkey is already gone, where guessing it
+                wrong reported the recovery code as invalid.
+              */}
+              {!legal?.singleOwner && (
+                <label>
+                  Name used during setup
+                  <input
+                    autoComplete="name"
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    onKeyDown={submitOnEnter}
+                    placeholder="Ada"
+                  />
+                </label>
+              )}
               <label>
                 Recovery code
                 <input
