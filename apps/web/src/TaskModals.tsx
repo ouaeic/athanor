@@ -561,10 +561,11 @@ export function Approvals({
           </blockquote>
         )}
         {/* An absolute timestamp answers a question nobody asked. What decides whether to get up
-            and answer this is how long is left. */}
-        <small>
-          {approvalReach(item)} · {expiryPhrase(item.expiresAt)}
-        </small>
+            and answer this is how long is left.
+
+            How far the request reaches is the card's headline, above; repeating it here said the
+            same sentence twice on a card already fighting to keep its buttons on screen. */}
+        <small>{expiryPhrase(item.expiresAt)}</small>
       </div>
       <div className="approval-actions">
         {elsewhere && onOpenTask && (

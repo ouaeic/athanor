@@ -30,12 +30,6 @@ const UNREACHABLE_REASON =
 
 const PENDING_REASON = 'Working out what this would change on the computer…';
 
-/** What the dialog knows so far. A preview that failed is a state, not a silent absence. */
-export type RewindPreviewState =
-  | { status: 'loading' }
-  | { status: 'ready'; preview: TaskRewindPreview }
-  | { status: 'failed'; message: string };
-
 export interface RewindOffer {
   /** Whether the computer can be put back to this point at all. */
   computerAvailable: boolean;

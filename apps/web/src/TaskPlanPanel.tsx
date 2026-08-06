@@ -173,7 +173,13 @@ export function TaskPlanPanel({ task, refreshKey }: { task: Task; refreshKey: nu
     setHistoryOpen(next);
     if (!next) return;
     try {
-      setHistory(await api.taskPlans(task.id));
+      // "Earlier versions" means earlier than the one in the editor, and the route returns every
+      // version including that one. Offering it back listed the present as its own past, and
+      // choosing it enabled a Save that wrote a version identical to the current one - which is
+      // still a write, so it bumped the version and handed every other device a
+      // plan_version_conflict over a change nobody made.
+      const revisions = await api.taskPlans(task.id);
+      setHistory(revisions.filter((revision) => revision.version !== plan?.version));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not load plan history');
     }

@@ -5750,6 +5750,22 @@ body,
     gap: 15px;
     padding: 0 12px;
   }
+  /*
+    A plan step is three columns: a 92px status, the title, and the row's controls. On a 375px
+    screen that leaves the title about 110px of a single non-wrapping line — enough for two words
+    of a sentence written on a laptop, and the plan is mostly read on a phone rather than edited.
+    The title takes the full width and the status and controls share the line under it.
+  */
+  .task-plan-steps li {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .task-plan-steps li > input {
+    grid-column: 1 / -1;
+    order: -1;
+  }
+  .task-plan-row-actions {
+    justify-self: end;
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -6871,66 +6887,6 @@ button.spend-bar:hover .spend-bar-name {
 .notice-row:disabled:hover {
   border-color: var(--line);
   background: var(--panel-soft);
-}
-
-/*
-  Generated media, under the spend report it belongs to. The rows reuse .settings-list so a
-  generation reads like every other thing the owner has on this box; only the three states need
-  colour, and only failure needs to be loud — it is the one an owner was never told about.
-*/
-.media-jobs {
-  margin-top: 15px;
-}
-.media-availability {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-  margin: 8px 0 0;
-  color: #7c8387;
-  font-size: 11px;
-  line-height: 1.5;
-}
-.media-availability.refused {
-  color: #9a8f8c;
-}
-.media-availability svg {
-  width: 13px;
-  height: 13px;
-  flex-shrink: 0;
-}
-.media-job-list {
-  margin-top: 10px;
-}
-.media-job.live {
-  border-color: #3c4c55;
-}
-.media-job.failed {
-  border-color: #5c3f3a;
-}
-.media-job-status {
-  color: #b6bcc0;
-}
-.media-job.failed .media-job-status {
-  color: #d6a79f;
-}
-/* Specific enough to beat the shared settings-list button styling: this is a link, not a control. */
-.self-hosted-settings .settings-list button.media-job-task {
-  display: inline-block;
-  min-height: 0;
-  margin-top: 6px;
-  padding: 0;
-  border: 0;
-  background: none;
-  box-shadow: none;
-  color: #9aa7ae;
-  font-size: 11px;
-  text-align: left;
-  text-decoration: underline;
-  text-underline-offset: 3px;
-  cursor: pointer;
-}
-.self-hosted-settings .settings-list button.media-job-task:hover {
-  color: #dce0e2;
 }
 
 /*

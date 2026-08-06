@@ -223,3 +223,34 @@ export const splitAttachments = (markdown: string): { body: string; paths: strin
   }
   return { body: before.trimEnd(), paths };
 };
+
+/** What travels with a draft: the file, not this device's progress bar or its object URL. */
+export interface DraftAttachment {
+  path: string;
+  name: string;
+  sizeBytes: number;
+  mimeType: string;
+}
+
+/**
+ * The attachments worth keeping, in the shape the box stores.
+ *
+ * Only the finished ones. An upload still in flight has no path to refer to, and a failed one is a
+ * thing to retry on the device holding the bytes rather than a fact about the message.
+ */
+export const draftAttachments = (attachments: readonly Attachment[]): DraftAttachment[] =>
+  attachments
+    .filter((item) => item.status === 'ready' && item.path)
+    .map(({ path, name, sizeBytes, mimeType }) => ({ path, name, sizeBytes, mimeType }));
+
+/** And back again, on the device that is picking the message up. */
+export const attachmentsFromDraft = (saved: readonly DraftAttachment[]): Attachment[] =>
+  saved.map((item) => ({
+    id: item.path,
+    name: item.name,
+    sizeBytes: item.sizeBytes,
+    mimeType: item.mimeType,
+    path: item.path,
+    status: 'ready' as const,
+    progress: 1
+  }));

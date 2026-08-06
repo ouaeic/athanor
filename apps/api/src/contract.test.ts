@@ -130,7 +130,6 @@ const stubUpstreams = (holdModel?: { reached: () => void; release: Promise<void>
 
 const configFor = (directory: string, overrides: Partial<ApiConfig> = {}): ApiConfig => ({
   DEPLOYMENT_MODE: 'development',
-  REGISTRATION_MODE: 'first_user',
   MODEL_CATALOG_SCOPE: 'reviewed_open_weight',
   CONNECTION_MANIFEST_PATH: join(directory, 'connection.json'),
   RELAY_STATE_DIR: join(directory, 'relay'),

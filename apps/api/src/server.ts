@@ -1493,7 +1493,7 @@ export const buildServer = async (
     sourceUrl: config.PUBLIC_SOURCE_URL ?? null,
     privacyUrl: config.PUBLIC_PRIVACY_URL ?? null,
     passkeysUsable,
-    registrationAvailable: config.REGISTRATION_MODE === 'open' || (await store.countUsers()) === 0,
+    registrationAvailable: (await store.countUsers()) === 0,
     /**
      * Whether recovery needs to be told which account it is for.
      *
@@ -2088,12 +2088,26 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
           try {
             const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
             const rows = await store.listMessageDrafts(user.id, workspace.id);
-            return rows.map((row) => ({
-              workspaceId: workspace.id,
-              taskId: row.taskId,
-              body: decryptJson<{ body: string }>(row.bodyCiphertext, key).body,
-              updatedAt: row.updatedAt
-            }));
+            return rows.map((row) => {
+              // `attachments` is absent from a draft written before they travelled with one, so it
+              // reads as none rather than as a decryption failure that would drop the sentence too.
+              const opened = decryptJson<{
+                body: string;
+                attachments?: Array<{
+                  path: string;
+                  name: string;
+                  sizeBytes: number;
+                  mimeType: string;
+                }>;
+              }>(row.bodyCiphertext, key);
+              return {
+                workspaceId: workspace.id,
+                taskId: row.taskId,
+                body: opened.body,
+                attachments: opened.attachments ?? [],
+                updatedAt: row.updatedAt
+              };
+            });
           } catch {
             return [];
           }
@@ -2133,14 +2147,12 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
       models,
       instance: {
         mode: 'self_hosted',
-        registrationMode: config.REGISTRATION_MODE,
         providerConfigured: Boolean(
           providerCredential?.status === 'active' ||
           config.AI_API_KEY ||
           config.OPENROUTER_API_KEY ||
           (config.AI_PROVIDER === 'openai-compatible' && config.AI_DEFAULT_MODEL)
         ),
-        providerSource: providerCredential ? 'encrypted_database' : 'server_environment',
         enforceZeroDataRetention: await requiresZeroDataRetention(user.id),
         /**
          * Where a web search on this box is answered, for each of the two privacy routes a
@@ -2148,8 +2160,7 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
          * conversation's own `privacyRoute`, so the client can answer "did that query leave this
          * computer" for the transcript in front of it without asking again.
          */
-        webSearch: await webSearchRoutesFor(user.id),
-        sourceUrl: config.PUBLIC_SOURCE_URL ?? null
+        webSearch: await webSearchRoutesFor(user.id)
       },
       legal: {
         applicationLicense: 'AGPL-3.0-only',
@@ -6502,13 +6513,22 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
     if (!workspace?.wrappedKey)
       throw new AthanorError('workspace_not_found', 'Workspace not found', 404);
     const body = input.body.trim();
+    // Files already uploaded count as a draft even with nothing typed yet: dropping the row on an
+    // empty body would have thrown away the attachments the owner had just spent a minute
+    // uploading, which is the state a message that is mostly files sits in.
+    const attachments = (input.attachments ?? []).filter((item) => item.path);
     await store.saveMessageDraft({
       userId: user.id,
       workspaceId: workspace.id,
       taskId: input.taskId ?? null,
-      bodyCiphertext: body
-        ? encryptJson({ body: input.body }, unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id), `draft:${workspace.id}`)
-        : null
+      bodyCiphertext:
+        body || attachments.length
+          ? encryptJson(
+              { body: input.body, attachments },
+              unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id),
+              `draft:${workspace.id}`
+            )
+          : null
     });
     return { saved: true };
   });

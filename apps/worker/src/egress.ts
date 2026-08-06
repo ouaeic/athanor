@@ -133,11 +133,3 @@ export const classifyDestination = (
   return { sink: false, host, noveltyBytes, reason: '' };
 };
 
-/** Every destination in one call that the policy would stop, in the order they were requested. */
-export const sinkDestinations = (
-  urls: readonly string[],
-  context: DestinationContext
-): DestinationVerdict[] =>
-  urls
-    .map((url) => classifyDestination(url, context))
-    .filter((verdict): verdict is DestinationVerdict => verdict.sink);

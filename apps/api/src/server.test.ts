@@ -128,7 +128,6 @@ describe('API production boundaries', () => {
     disposers.push(() => rm(directory, { recursive: true, force: true }));
     const config: ApiConfig = {
       DEPLOYMENT_MODE: 'development',
-      REGISTRATION_MODE: 'first_user',
       MODEL_CATALOG_SCOPE: 'reviewed_open_weight',
       CONNECTION_MANIFEST_PATH: join(directory, 'connection.json'),
       RELAY_STATE_DIR: join(directory, 'relay'),
@@ -1486,7 +1485,6 @@ describe('API production boundaries', () => {
 
 const isolatedConfig = (directory: string): ApiConfig => ({
   DEPLOYMENT_MODE: 'development',
-  REGISTRATION_MODE: 'open',
   MODEL_CATALOG_SCOPE: 'provider_catalog',
   CONNECTION_MANIFEST_PATH: join(directory, 'connection.json'),
   RELAY_STATE_DIR: join(directory, 'relay'),
@@ -4044,7 +4042,20 @@ describe('a half-typed message', () => {
       method: 'PUT',
       url: '/v1/drafts',
       headers: { cookie },
-      payload: { workspaceId, body: 'a sentence begun on another device' }
+      payload: {
+        workspaceId,
+        body: 'a sentence begun on another device',
+        // A message that is mostly its files used to sync as an empty draft: the tray lived in one
+        // composer's memory, so the other device saw the sentence and none of the attachments.
+        attachments: [
+          {
+            path: 'workspace/uploads/abc-report.pdf',
+            name: 'report.pdf',
+            sizeBytes: 1024,
+            mimeType: 'application/pdf'
+          }
+        ]
+      }
     });
     expect(saved.statusCode, saved.body).toBe(200);
 
@@ -4058,6 +4069,14 @@ describe('a half-typed message', () => {
         workspaceId,
         taskId: null,
         body: 'a sentence begun on another device',
+        attachments: [
+          {
+            path: 'workspace/uploads/abc-report.pdf',
+            name: 'report.pdf',
+            sizeBytes: 1024,
+            mimeType: 'application/pdf'
+          }
+        ],
         updatedAt: expect.any(String)
       }
     ]);

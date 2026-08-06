@@ -45,7 +45,6 @@ const directory = await mkdtemp(join(tmpdir(), 'athanor-live-'));
 
 const config = {
   DEPLOYMENT_MODE: 'development',
-  REGISTRATION_MODE: 'first_user',
   MODEL_CATALOG_SCOPE: 'provider_catalog',
   CONNECTION_MANIFEST_PATH: join(directory, 'connection.json'),
   RELAY_STATE_DIR: join(directory, 'relay'),

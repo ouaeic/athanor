@@ -67,7 +67,14 @@ import { rewindOffer, rewindResultNotice, type TrajectoryDraft } from './rewind.
 import { RewindDialog } from './RewindDialog.js';
 import { shortcutRows, windowShortcut } from './shortcuts.js';
 import { hostStoragePercent } from './usage-model.js';
-import { attachmentPath, planUploads, voiceNoteExtension, type Attachment } from './attachments.js';
+import {
+  attachmentPath,
+  attachmentsFromDraft,
+  draftAttachments,
+  planUploads,
+  voiceNoteExtension,
+  type Attachment
+} from './attachments.js';
 import { Composer } from './Composer.js';
 import { webSearchNote, webSearchRouteFor } from './web-search-route.js';
 
@@ -182,7 +189,21 @@ export function App() {
   const savedDraft = useRef({ taskId, prompt });
   useEffect(() => {
     if (savedDraft.current.taskId !== taskId) {
-      writeDraft(savedDraft.current.taskId, savedDraft.current.prompt);
+      const leaving = savedDraft.current;
+      writeDraft(leaving.taskId, leaving.prompt);
+      // Banked on the box too, not only in this browser. Switching conversation cancels the
+      // debounce below before it has run, so the last thing typed before moving away - which is
+      // most of what anyone types, since moving away is how you stop typing - was saved locally and
+      // never sent. Those keystrokes became the one version no other device could ever see.
+      if (serverPreferencesLoaded.current && workspaceId)
+        void api
+          .saveDraft({
+            workspaceId,
+            taskId: leaving.taskId ?? null,
+            body: leaving.prompt,
+            attachments: draftAttachments(attachments)
+          })
+          .catch(() => undefined);
       const restored = readDraft(taskId);
       savedDraft.current = { taskId, prompt: restored };
       setPrompt(restored);
@@ -202,7 +223,12 @@ export function App() {
       // already saved, and there is nothing here worth interrupting someone mid-sentence for.
       if (!serverPreferencesLoaded.current || !workspaceId) return;
       void api
-        .saveDraft({ workspaceId, taskId: taskId ?? null, body: prompt })
+        .saveDraft({
+          workspaceId,
+          taskId: taskId ?? null,
+          body: prompt,
+          attachments: draftAttachments(attachments)
+        })
         .catch(() => undefined);
     }, 900);
     return () => window.clearTimeout(timer);
@@ -324,6 +350,10 @@ export function App() {
         if ((key ?? undefined) === (savedDraft.current.taskId ?? undefined)) {
           savedDraft.current = { taskId: savedDraft.current.taskId, prompt: draft.body };
           setPrompt(draft.body);
+          // The files come back with the sentence. Only onto an empty tray: anything mid-upload on
+          // this device belongs to the message being written here and is not the box's to replace.
+          const carried = attachmentsFromDraft(draft.attachments ?? []);
+          if (carried.length) setAttachments((current) => (current.length ? current : carried));
         }
       }
       serverPreferencesLoaded.current = true;
@@ -774,6 +804,23 @@ export function App() {
       document.removeEventListener('visibilitychange', refresh);
     };
   }, [auth, taskIsActive]);
+  /**
+   * A conversation started somewhere else, on a device nobody has touched.
+   *
+   * Bootstrap re-ran on focus, on regaining the network and on becoming visible - all of which
+   * require somebody to pick the device up. A tablet left open on the desk therefore showed the
+   * sidebar it had when it was set down, however much had happened on the laptop since, which is
+   * the exact opposite of what "the same computer from anywhere" promises. A minute is slow enough
+   * to be nothing on a box serving one person and quick enough that the list is never a surprise;
+   * only while the tab is actually being looked at, so a backgrounded phone stays silent.
+   */
+  useEffect(() => {
+    if (auth !== 'ready') return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void load();
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [auth, load]);
   useEffect(() => {
     setEvents([]);
     lastSequence.current = 0;
@@ -1021,7 +1068,9 @@ export function App() {
     // every other device picked it up at its next bootstrap and put an already-sent message back in
     // the composer, one Enter away from sending it twice.
     if (serverPreferencesLoaded.current && workspaceId)
-      void api.saveDraft({ workspaceId, taskId: task?.id ?? null, body: '' }).catch(() => undefined);
+      void api
+        .saveDraft({ workspaceId, taskId: task?.id ?? null, body: '', attachments: [] })
+        .catch(() => undefined);
     setAttachments([]);
     setBusy(true);
     setError('');

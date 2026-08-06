@@ -826,7 +826,6 @@ fi
 
 control_env="$athanor_config/control.env"
 set_env_value "$control_env" DEPLOYMENT_MODE production
-set_env_value "$control_env" REGISTRATION_MODE first_user
 set_env_value "$control_env" REGISTRATION_BOOTSTRAP_TOKEN "$pairing_code"
 set_env_value "$control_env" REGISTRATION_BOOTSTRAP_EXPIRES_AT "$pairing_expires"
 set_env_value "$control_env" PUBLIC_APP_URL "$public_url"

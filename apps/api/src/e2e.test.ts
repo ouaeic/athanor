@@ -211,7 +211,6 @@ const start = async (
 
   const config: ApiConfig = {
     DEPLOYMENT_MODE: 'development',
-    REGISTRATION_MODE: 'first_user',
     MODEL_CATALOG_SCOPE: 'reviewed_open_weight',
     CONNECTION_MANIFEST_PATH: join(directory, 'connection.json'),
     RELAY_STATE_DIR: join(directory, 'relay'),

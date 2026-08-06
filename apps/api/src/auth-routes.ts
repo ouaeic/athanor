@@ -194,10 +194,14 @@ export const registerAuthRoutes = (
       nativeOrigin?: string;
     };
   }>('/v1/auth/register/options', async (request) => {
-    if (config.REGISTRATION_MODE === 'first_user' && (await store.countUsers()) > 0)
+    // One owner, always. There used to be a REGISTRATION_MODE that could be set to 'open', which no
+    // shipped path ever wrote and which turned a single-owner box into one anybody could claim an
+    // account on - reachable only by editing the environment over SSH, which is to say by the one
+    // route this software is trying to stop needing.
+    if ((await store.countUsers()) > 0)
       throw new AthanorError(
         'registration_closed',
-        'This athanor server already has an owner. Sign in or ask the owner to enable registration.',
+        'This athanor server already has an owner. Sign in, or add this device from one that is already signed in.',
         403
       );
     await requireFirstOwnerPairing(request.body.pairingCode);
@@ -234,7 +238,7 @@ export const registerAuthRoutes = (
       response: Parameters<typeof verifyRegistrationResponse>[0]['response'];
     };
   }>('/v1/auth/register/verify', async (request, reply) => {
-    if (config.REGISTRATION_MODE === 'first_user' && (await store.countUsers()) > 0)
+    if ((await store.countUsers()) > 0)
       throw new AthanorError(
         'registration_closed',
         'This athanor server already has an owner.',

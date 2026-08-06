@@ -45,6 +45,8 @@ export interface MessageDraft {
   workspaceId: string;
   taskId: string | null;
   body: string;
+  /** Files already uploaded against it. Progress and thumbnails stay on the device that uploaded. */
+  attachments: Array<{ path: string; name: string; sizeBytes: number; mimeType: string }>;
   /** When the box last saw this change, so a device can tell a newer sentence from its own. */
   updatedAt: string;
 }
@@ -61,9 +63,7 @@ export interface Bootstrap {
   usage: UsageSummary;
   instance: {
     mode: 'self_hosted';
-    registrationMode: 'first_user' | 'open';
     providerConfigured: boolean;
-    providerSource: 'encrypted_database' | 'server_environment';
     enforceZeroDataRetention: boolean;
     /** Where a search is answered, per privacy route. Absent from a box older than this field. */
     webSearch?: WebSearchRoutes;

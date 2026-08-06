@@ -1259,7 +1259,29 @@ export type OwnerPreferences = z.infer<typeof OwnerPreferences>;
 export const SaveDraftRequest = z.object({
   workspaceId: Id,
   taskId: Id.nullish(),
-  body: z.string().max(200_000)
+  body: z.string().max(200_000),
+  /**
+   * The files already uploaded against this half-written message.
+   *
+   * They were held in the composer's own memory and nowhere else, so a message that was mostly its
+   * attachments synced as an empty draft: the other device saw the sentence and none of the files,
+   * and switching conversation on the first device dropped them there too while leaving the
+   * uploaded bytes on the agent computer with nothing referring to them.
+   *
+   * Only the durable facts travel. Upload progress and a locally-made thumbnail belong to the
+   * device that did the uploading.
+   */
+  attachments: z
+    .array(
+      z.object({
+        path: z.string().min(1).max(1_024),
+        name: z.string().min(1).max(240),
+        sizeBytes: z.number().int().nonnegative(),
+        mimeType: z.string().max(255)
+      })
+    )
+    .max(50)
+    .optional()
 });
 export type SaveDraftRequest = z.input<typeof SaveDraftRequest>;
 

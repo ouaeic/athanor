@@ -23,7 +23,6 @@ const Config = z.object({
    * ever written `production`.
    */
   DEPLOYMENT_MODE: z.enum(['development', 'production']).default('development'),
-  REGISTRATION_MODE: z.enum(['first_user', 'open']).default('first_user'),
   REGISTRATION_BOOTSTRAP_TOKEN: z.preprocess(
     (value) => (value === '' ? undefined : value),
     z.string().min(20).max(200).optional()
