@@ -1,0 +1,55 @@
+[Unit]
+Description=athanor %i service
+PartOf=athanor.target
+After=network-online.target postgresql.service athanor-runner.service
+Wants=network-online.target
+# Pulls the database in rather than only ordering behind it, so a boot that did not already have
+# postgresql enabled still ends with a working box instead of a service that starts and finds
+# nothing to talk to.
+Wants=postgresql.service
+# Wants, not Requires: a wedged runner costs the agent its hands, not the owner their whole
+# interface. Under Requires= a runner that crash-looped into `failed` stopped the API, the worker
+# and everything else with it, turning "tools are unavailable" into an nginx 502 for the product.
+Wants=athanor-runner.service
+# The control-plane services are restarted by `athanor restart` and by the update path, both of
+# which can restart them several times in quick succession; the default start limit would count
+# those as a flap and refuse to bring them back.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=athanor-control
+Group=athanor-control
+WorkingDirectory=/opt/athanor
+EnvironmentFile=/etc/athanor/control.env
+ExecStart=/usr/local/lib/athanor/athanor-service %i
+# `always`, not `on-failure`: a service that exits cleanly for its own reasons — an unhandled
+# shutdown signal, a library calling exit(0) on a bad config read — is still the whole product being
+# down, and there is nobody sitting at a console to notice. An explicit `systemctl stop`, which is
+# what `athanor restart` and the update path use, is not a restart trigger, so this does not fight
+# either of them. One second, because the gap is a user staring at a dead page.
+Restart=always
+RestartSec=1
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/athanor-control
+# The relay's identity key and settings. Under /etc because it is configuration the owner chose and
+# it has to survive an update and travel in the configuration backup; writable here because the API
+# is what turns the relay on and off. Leading "-" so a server that has not re-run the installer
+# still starts.
+ReadWritePaths=-/etc/athanor/relay
+# The control plane serves requests; it does not run agent commands, so a rising process count
+# here is a leak rather than work. Core dumps go the same way as the runner's.
+TasksMax=512
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,37 @@
+{
+  "relayDomain": "relay.example",
+  "listenHost": "0.0.0.0",
+  "httpsPort": 443,
+  "controlPort": 443,
+  "httpPort": 80,
+  "metricsHost": "127.0.0.1",
+  "metricsPort": 9095,
+  "tlsCertPath": "/etc/athanor-relay/tls/fullchain.pem",
+  "tlsKeyPath": "/etc/athanor-relay/tls/privkey.pem",
+  "registryPath": "/var/lib/athanor-relay/registry.json",
+  "registrationEnabled": true,
+  "logClientIps": false,
+  "logLevel": "info",
+  "limits": {
+    "perPeer": {
+      "concurrentStreams": 64,
+      "newStreamsPerMinute": 300,
+      "rateBps": 10485760,
+      "burstBytes": 52428800,
+      "monthlyBytes": 26843545600
+    },
+    "global": {
+      "maxPeers": 256,
+      "monthlyBytes": 15000000000000,
+      "shapedRateBps": 1048576,
+      "shapeAtFraction": 0.9,
+      "halfOpenPreSni": 2048,
+      "enrollingSessions": 32
+    },
+    "perSourceIp": {
+      "newConnPerMinute": 120,
+      "burst": 60,
+      "maxTrackedSources": 20000
+    }
+  }
+}

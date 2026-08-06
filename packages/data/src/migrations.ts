@@ -1,0 +1,2108 @@
+export const migrations = [
+  {
+    version: 1,
+    name: 'initial_schema',
+    sql: `
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS users (
+        id UUID PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL,
+        recovery_hash TEXT,
+        plan_id TEXT NOT NULL DEFAULT 'community',
+        payment_customer_ref TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS passkeys (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        credential_id TEXT NOT NULL UNIQUE,
+        public_key TEXT NOT NULL,
+        counter BIGINT NOT NULL DEFAULT 0,
+        transports JSONB NOT NULL DEFAULT '[]'::jsonb,
+        device_type TEXT NOT NULL,
+        backed_up BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS passkeys_user_idx ON passkeys(user_id);
+
+      CREATE TABLE IF NOT EXISTS auth_challenges (
+        id UUID PRIMARY KEY,
+        username TEXT,
+        challenge TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('registration', 'authentication')),
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        id_hash TEXT PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at TIMESTAMPTZ NOT NULL,
+        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
+
+      CREATE TABLE IF NOT EXISTS workspaces (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        shape TEXT NOT NULL,
+        status TEXT NOT NULL,
+        storage_bytes BIGINT NOT NULL DEFAULT 0,
+        storage_limit_bytes BIGINT NOT NULL,
+        image_revision TEXT NOT NULL,
+        region TEXT NOT NULL,
+        runner_ref TEXT,
+        last_active_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS workspaces_user_idx ON workspaces(user_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS workspace_keys (
+        workspace_id UUID PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+        key_version INTEGER NOT NULL DEFAULT 1,
+        wrapped_key TEXT NOT NULL,
+        wrapping_mode TEXT NOT NULL DEFAULT 'hosted',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        rotated_at TIMESTAMPTZ
+      );
+
+      CREATE TABLE IF NOT EXISTS tasks (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        privacy_route TEXT NOT NULL,
+        max_compute_credits DOUBLE PRECISION NOT NULL,
+        reserved_compute_credits DOUBLE PRECISION NOT NULL DEFAULT 0,
+        actual_compute_credits DOUBLE PRECISION NOT NULL DEFAULT 0,
+        prompt_ciphertext JSONB NOT NULL,
+        agent_state_ciphertext JSONB,
+        lease_owner TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        attempt INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS tasks_user_idx ON tasks(user_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS tasks_queue_idx ON tasks(status, created_at);
+
+      CREATE TABLE IF NOT EXISTS task_events (
+        id UUID PRIMARY KEY,
+        task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        payload_ciphertext JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(task_id, sequence)
+      );
+      CREATE INDEX IF NOT EXISTS task_events_cursor_idx ON task_events(task_id, sequence);
+
+      CREATE TABLE IF NOT EXISTS artifacts (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,
+        name_ciphertext JSONB NOT NULL,
+        mime_type TEXT NOT NULL,
+        size_bytes BIGINT NOT NULL,
+        version INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        storage_key TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS artifacts_workspace_idx ON artifacts(workspace_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS approvals (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        action TEXT NOT NULL,
+        origin TEXT,
+        side_effect TEXT NOT NULL,
+        preview_ciphertext JSONB NOT NULL,
+        preview_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        expires_at TIMESTAMPTZ NOT NULL,
+        resolved_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS approvals_user_idx ON approvals(user_id, status, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS capability_grants (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id UUID REFERENCES tasks(id) ON DELETE CASCADE,
+        subject TEXT NOT NULL,
+        action TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        origin TEXT,
+        uses_remaining INTEGER,
+        expires_at TIMESTAMPTZ NOT NULL,
+        revoked_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS model_releases (
+        id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        revision TEXT NOT NULL,
+        availability TEXT NOT NULL,
+        openness TEXT NOT NULL,
+        license TEXT NOT NULL,
+        commercial_use BOOLEAN NOT NULL,
+        privacy_route TEXT NOT NULL,
+        context_tokens INTEGER NOT NULL,
+        modalities JSONB NOT NULL,
+        capabilities JSONB NOT NULL,
+        usage_class TEXT NOT NULL,
+        recommendation_tags JSONB NOT NULL,
+        measured_quality DOUBLE PRECISION,
+        measured_latency_ms DOUBLE PRECISION,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS provider_connections (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        label TEXT NOT NULL,
+        secret_ciphertext JSONB NOT NULL,
+        base_url TEXT,
+        privacy_route TEXT NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS usage_entries (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID REFERENCES workspaces(id) ON DELETE SET NULL,
+        task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,
+        kind TEXT NOT NULL,
+        resource_class TEXT NOT NULL,
+        quantity DOUBLE PRECISION NOT NULL,
+        unit TEXT NOT NULL,
+        credits DOUBLE PRECISION NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('reserved', 'settled', 'released', 'credited')),
+        provider_ref TEXT,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS usage_user_period_idx ON usage_entries(user_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        plan_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        period_start TIMESTAMPTZ NOT NULL,
+        period_end TIMESTAMPTZ NOT NULL,
+        included_credits DOUBLE PRECISION NOT NULL,
+        overage_limit_credits DOUBLE PRECISION NOT NULL DEFAULT 0,
+        storage_limit_bytes BIGINT NOT NULL,
+        external_ref TEXT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS browser_leases (
+        workspace_id UUID PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+        holder TEXT NOT NULL CHECK (holder IN ('agent', 'user', 'secure_input')),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash TEXT,
+        expires_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS idempotency_records (
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        response_status INTEGER NOT NULL,
+        response_body JSONB NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(user_id, idempotency_key)
+      );
+    `
+  },
+  {
+    version: 2,
+    name: 'media_jobs',
+    sql: `
+      CREATE TABLE IF NOT EXISTS media_jobs (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('image','video','audio')),
+        status TEXT NOT NULL DEFAULT 'queued',
+        model_id TEXT NOT NULL,
+        prompt_ciphertext JSONB NOT NULL,
+        parameters_ciphertext JSONB NOT NULL,
+        result_ciphertext JSONB,
+        max_credits DOUBLE PRECISION NOT NULL,
+        actual_credits DOUBLE PRECISION NOT NULL DEFAULT 0,
+        lease_owner TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        attempt INTEGER NOT NULL DEFAULT 0,
+        error_code TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS media_jobs_queue_idx ON media_jobs(status, created_at);
+      CREATE INDEX IF NOT EXISTS media_jobs_user_idx ON media_jobs(user_id, created_at DESC);
+    `
+  },
+  {
+    version: 3,
+    name: 'privacy_operations_and_artifact_versions',
+    sql: `
+      CREATE TABLE IF NOT EXISTS api_operations (
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        method TEXT NOT NULL,
+        path TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('running','completed','failed')),
+        response_status INTEGER,
+        response_body JSONB,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(user_id, idempotency_key)
+      );
+      CREATE INDEX IF NOT EXISTS api_operations_expiry_idx ON api_operations(expires_at);
+
+      CREATE TABLE IF NOT EXISTS webhook_events (
+        provider TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(provider, event_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS security_events (
+        id UUID PRIMARY KEY,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS security_events_user_idx ON security_events(user_id, created_at DESC);
+
+      ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS logical_key TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS artifacts_logical_version_idx
+        ON artifacts(workspace_id, logical_key, version);
+    `
+  },
+  {
+    version: 4,
+    name: 'cloud_only_privacy_routes',
+    sql: `
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tasks_cloud_privacy_route') THEN
+          ALTER TABLE tasks ADD CONSTRAINT tasks_cloud_privacy_route
+            CHECK (privacy_route IN ('ollama_zdr','external'));
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'models_cloud_privacy_route') THEN
+          ALTER TABLE model_releases ADD CONSTRAINT models_cloud_privacy_route
+            CHECK (privacy_route IN ('ollama_zdr','external'));
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'providers_cloud_privacy_route') THEN
+          ALTER TABLE provider_connections ADD CONSTRAINT providers_cloud_privacy_route
+            CHECK (privacy_route IN ('ollama_zdr','external'));
+        END IF;
+      END $$;
+    `
+  },
+  {
+    version: 5,
+    name: 'content_free_push_notifications',
+    sql: `
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx
+        ON push_subscriptions(user_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS notification_deliveries (
+        subscription_id UUID NOT NULL REFERENCES push_subscriptions(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('approval_required','task_finished')),
+        resource_id UUID NOT NULL,
+        delivered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(subscription_id, kind, resource_id)
+      );
+      CREATE INDEX IF NOT EXISTS notification_deliveries_time_idx
+        ON notification_deliveries(delivered_at);
+    `
+  },
+  {
+    version: 6,
+    name: 'user_visible_sessions',
+    sql: `
+      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS public_id UUID;
+      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS device_label TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS sessions_public_id_idx ON sessions(public_id);
+      CREATE INDEX IF NOT EXISTS sessions_user_active_idx
+        ON sessions(user_id, expires_at DESC);
+      ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS session_public_id UUID
+        REFERENCES sessions(public_id) ON DELETE CASCADE;
+    `
+  },
+  {
+    version: 7,
+    name: 'passkey_step_up_sessions',
+    // The challenge-kind constraint was widened again by 9 and 10. Re-applying this one on top of
+    // those would narrow it back and fail against any live recovery or passkey_add challenge, so
+    // it stands down once a later migration has already taken the decision.
+    sql: `
+      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS step_up_at TIMESTAMPTZ;
+      DO $ath$ BEGIN
+        IF EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 9) THEN RETURN; END IF;
+        ALTER TABLE auth_challenges DROP CONSTRAINT IF EXISTS auth_challenges_kind_check;
+        ALTER TABLE auth_challenges ADD CONSTRAINT auth_challenges_kind_check
+          CHECK (kind IN ('registration', 'authentication', 'step_up'));
+      END $ath$;
+    `
+  },
+  {
+    version: 8,
+    name: 'workspace_volume_snapshots',
+    sql: `
+      CREATE TABLE IF NOT EXISTS workspace_snapshots (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('creating','ready','failed','deleting')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS workspace_snapshots_user_idx
+        ON workspace_snapshots(user_id, workspace_id, created_at DESC);
+    `
+  },
+  {
+    version: 9,
+    name: 'passkey_account_recovery',
+    // Superseded by 10 in the same way migration 7 is superseded by this one.
+    sql: `
+      DO $ath$ BEGIN
+        IF EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 10) THEN RETURN; END IF;
+        ALTER TABLE auth_challenges DROP CONSTRAINT IF EXISTS auth_challenges_kind_check;
+        ALTER TABLE auth_challenges ADD CONSTRAINT auth_challenges_kind_check
+          CHECK (kind IN ('registration', 'authentication', 'step_up', 'recovery'));
+      END $ath$;
+    `
+  },
+  {
+    version: 10,
+    name: 'additional_passkeys',
+    sql: `
+      ALTER TABLE auth_challenges DROP CONSTRAINT IF EXISTS auth_challenges_kind_check;
+      ALTER TABLE auth_challenges ADD CONSTRAINT auth_challenges_kind_check
+        CHECK (kind IN ('registration', 'authentication', 'step_up', 'recovery', 'passkey_add'));
+    `
+  },
+  {
+    version: 11,
+    name: 'durable_task_schedules',
+    sql: `
+      CREATE TABLE IF NOT EXISTS task_schedules (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        title_ciphertext JSONB NOT NULL,
+        prompt_ciphertext JSONB NOT NULL,
+        model_id TEXT NOT NULL,
+        privacy_route TEXT NOT NULL CHECK (privacy_route IN ('ollama_zdr','external')),
+        max_compute_credits DOUBLE PRECISION NOT NULL CHECK (max_compute_credits > 0),
+        spec JSONB NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        next_run_at TIMESTAMPTZ,
+        last_run_at TIMESTAMPTZ,
+        last_task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,
+        last_error_code TEXT,
+        lease_owner TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS task_schedules_user_idx
+        ON task_schedules(user_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS task_schedules_due_idx
+        ON task_schedules(enabled, next_run_at)
+        WHERE enabled = TRUE;
+
+      CREATE TABLE IF NOT EXISTS task_schedule_runs (
+        schedule_id UUID NOT NULL REFERENCES task_schedules(id) ON DELETE CASCADE,
+        scheduled_for TIMESTAMPTZ NOT NULL,
+        task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('queued','failed')),
+        error_code TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(schedule_id, scheduled_for)
+      );
+      CREATE INDEX IF NOT EXISTS task_schedule_runs_task_idx ON task_schedule_runs(task_id);
+    `
+  },
+  {
+    version: 12,
+    name: 'capability_scoped_connectors',
+    sql: `
+      CREATE TABLE IF NOT EXISTS connectors (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('github','webdav')),
+        label TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        scopes JSONB NOT NULL,
+        secret_ciphertext JSONB NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        last_used_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS connectors_user_idx
+        ON connectors(user_id, enabled, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS connector_audit_events (
+        id UUID PRIMARY KEY,
+        connector_id UUID NOT NULL REFERENCES connectors(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,
+        operation TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('succeeded','failed','denied')),
+        status_code INTEGER,
+        request_bytes INTEGER NOT NULL DEFAULT 0 CHECK (request_bytes >= 0),
+        response_bytes INTEGER NOT NULL DEFAULT 0 CHECK (response_bytes >= 0),
+        duration_ms INTEGER NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS connector_audit_user_idx
+        ON connector_audit_events(user_id, created_at DESC);
+    `
+  },
+  {
+    version: 13,
+    name: 'authenticated_workspace_previews',
+    sql: `
+      CREATE TABLE IF NOT EXISTS workspace_previews (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        label TEXT NOT NULL,
+        port INTEGER NOT NULL CHECK (port BETWEEN 1024 AND 65535 AND port <> 4300),
+        slug TEXT NOT NULL UNIQUE,
+        access_token_hash TEXT NOT NULL,
+        visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','public')),
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','revoked')),
+        expires_at TIMESTAMPTZ NOT NULL,
+        last_accessed_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS workspace_previews_user_idx
+        ON workspace_previews(user_id, workspace_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS workspace_previews_active_idx
+        ON workspace_previews(slug, expires_at) WHERE status='active';
+    `
+  },
+  {
+    version: 14,
+    name: 'revocable_scoped_api_tokens',
+    sql: `
+      CREATE TABLE IF NOT EXISTS api_tokens (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        label TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        token_prefix TEXT NOT NULL,
+        scopes JSONB NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        last_used_at TIMESTAMPTZ,
+        revoked_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS api_tokens_user_idx
+        ON api_tokens(user_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS api_tokens_active_idx
+        ON api_tokens(token_hash, expires_at) WHERE revoked_at IS NULL;
+    `
+  },
+  {
+    version: 15,
+    name: 'organizations_and_shared_workspaces',
+    sql: `
+      CREATE TABLE IF NOT EXISTS organizations (
+        id UUID PRIMARY KEY,
+        owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        policy JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS organization_members (
+        organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('owner','admin','editor','viewer')),
+        joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (organization_id,user_id)
+      );
+      CREATE INDEX IF NOT EXISTS organization_members_user_idx
+        ON organization_members(user_id,joined_at DESC);
+      CREATE TABLE IF NOT EXISTS organization_workspaces (
+        organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL UNIQUE REFERENCES workspaces(id) ON DELETE CASCADE,
+        added_by UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (organization_id,workspace_id)
+      );
+      CREATE INDEX IF NOT EXISTS organization_workspaces_org_idx
+        ON organization_workspaces(organization_id,created_at DESC);
+      CREATE TABLE IF NOT EXISTS organization_audit_events (
+        id UUID PRIMARY KEY,
+        organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+        actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        kind TEXT NOT NULL,
+        target_id UUID,
+        outcome TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS organization_audit_idx
+        ON organization_audit_events(organization_id,created_at DESC);
+    `
+  },
+  {
+    version: 16,
+    name: 'versioned_editable_task_plans',
+    sql: `
+      CREATE TABLE IF NOT EXISTS task_plans (
+        id UUID PRIMARY KEY,
+        task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL CHECK (version > 0),
+        parent_version INTEGER,
+        branch_name TEXT NOT NULL,
+        steps_ciphertext JSONB NOT NULL,
+        created_by TEXT NOT NULL CHECK (created_by IN ('agent','user')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(task_id,version)
+      );
+      CREATE INDEX IF NOT EXISTS task_plans_task_idx
+        ON task_plans(task_id,version DESC);
+    `
+  },
+  {
+    version: 17,
+    name: 'attested_key_release_receipts',
+    sql: `
+      UPDATE workspace_keys SET wrapping_mode='hosted'
+        WHERE wrapping_mode NOT IN ('hosted','attested');
+      ALTER TABLE workspace_keys DROP CONSTRAINT IF EXISTS workspace_keys_wrapping_mode_check;
+      ALTER TABLE workspace_keys
+        ADD CONSTRAINT workspace_keys_wrapping_mode_check
+        CHECK (wrapping_mode IN ('hosted','attested'));
+      CREATE TABLE IF NOT EXISTS key_release_receipts (
+        id UUID PRIMARY KEY,
+        service TEXT NOT NULL,
+        policy_hash TEXT NOT NULL,
+        image_digest TEXT NOT NULL,
+        hardware TEXT NOT NULL,
+        attested_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS key_release_receipts_service_idx
+        ON key_release_receipts(service,created_at DESC);
+    `
+  },
+  {
+    version: 18,
+    name: 'hosted_provider_only_routes',
+    // This one deletes and rewrites rows rather than only touching the schema, and migration 21
+    // replaced 'ollama_zdr' with 'provider_zdr' afterwards. Re-applying it on a database that has
+    // already reached 21 would rewrite every provider_zdr task to 'external' and delete the whole
+    // model catalogue, so it stands down entirely once its successor has run.
+    sql: `
+      DO $ath$ BEGIN
+        IF EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 21) THEN RETURN; END IF;
+
+        UPDATE tasks SET privacy_route='external'
+          WHERE privacy_route NOT IN ('ollama_zdr','external');
+        UPDATE task_schedules SET privacy_route='external'
+          WHERE privacy_route NOT IN ('ollama_zdr','external');
+        DELETE FROM model_releases
+          WHERE privacy_route NOT IN ('ollama_zdr','external');
+        DELETE FROM provider_connections
+          WHERE privacy_route NOT IN ('ollama_zdr','external');
+
+        ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_cloud_privacy_route;
+        ALTER TABLE tasks ADD CONSTRAINT tasks_cloud_privacy_route
+          CHECK (privacy_route IN ('ollama_zdr','external'));
+        ALTER TABLE model_releases DROP CONSTRAINT IF EXISTS models_cloud_privacy_route;
+        ALTER TABLE model_releases ADD CONSTRAINT models_cloud_privacy_route
+          CHECK (privacy_route IN ('ollama_zdr','external'));
+        ALTER TABLE provider_connections DROP CONSTRAINT IF EXISTS providers_cloud_privacy_route;
+        ALTER TABLE provider_connections ADD CONSTRAINT providers_cloud_privacy_route
+          CHECK (privacy_route IN ('ollama_zdr','external'));
+        ALTER TABLE task_schedules DROP CONSTRAINT IF EXISTS task_schedules_privacy_route_check;
+        ALTER TABLE task_schedules ADD CONSTRAINT task_schedules_privacy_route_check
+          CHECK (privacy_route IN ('ollama_zdr','external'));
+      END $ath$;
+    `
+  },
+  {
+    version: 19,
+    name: 'workspace_compute_metering',
+    sql: `
+      ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS compute_metered_at TIMESTAMPTZ;
+      CREATE INDEX IF NOT EXISTS workspaces_compute_meter_idx
+        ON workspaces(status,compute_metered_at)
+        WHERE status='running';
+    `
+  },
+  {
+    version: 20,
+    name: 'snapshot_storage_accounting',
+    sql: `
+      ALTER TABLE workspace_snapshots
+        ADD COLUMN IF NOT EXISTS size_bytes BIGINT NOT NULL DEFAULT 0;
+    `
+  },
+  {
+    version: 21,
+    name: 'provider_neutral_hosted_inference',
+    sql: `
+      ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_cloud_privacy_route;
+      ALTER TABLE model_releases DROP CONSTRAINT IF EXISTS models_cloud_privacy_route;
+      ALTER TABLE provider_connections DROP CONSTRAINT IF EXISTS providers_cloud_privacy_route;
+      ALTER TABLE task_schedules DROP CONSTRAINT IF EXISTS task_schedules_privacy_route_check;
+
+      UPDATE tasks SET privacy_route='provider_zdr' WHERE privacy_route='ollama_zdr';
+      UPDATE task_schedules SET privacy_route='provider_zdr' WHERE privacy_route='ollama_zdr';
+      UPDATE model_releases SET privacy_route='provider_zdr' WHERE privacy_route='ollama_zdr';
+      UPDATE provider_connections SET privacy_route='provider_zdr' WHERE privacy_route='ollama_zdr';
+
+      ALTER TABLE tasks ADD CONSTRAINT tasks_cloud_privacy_route
+        CHECK (privacy_route IN ('provider_zdr','external'));
+      ALTER TABLE model_releases ADD CONSTRAINT models_cloud_privacy_route
+        CHECK (privacy_route IN ('provider_zdr','external'));
+      ALTER TABLE provider_connections ADD CONSTRAINT providers_cloud_privacy_route
+        CHECK (privacy_route IN ('provider_zdr','external'));
+      ALTER TABLE task_schedules ADD CONSTRAINT task_schedules_privacy_route_check
+        CHECK (privacy_route IN ('provider_zdr','external'));
+
+      ALTER TABLE model_releases ADD COLUMN IF NOT EXISTS provider_model_id TEXT;
+      UPDATE model_releases SET provider_model_id=id WHERE provider_model_id IS NULL;
+      ALTER TABLE model_releases ALTER COLUMN provider_model_id SET NOT NULL;
+
+      ALTER TABLE provider_connections
+        ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
+    `
+  },
+  {
+    version: 22,
+    name: 'resumable_workspace_orders',
+    sql: `
+      CREATE TABLE IF NOT EXISTS workspace_orders (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        request_ciphertext JSONB NOT NULL,
+        required_plan_id TEXT NOT NULL CHECK (required_plan_id IN ('core','pro','power')),
+        storage_addon_blocks INTEGER NOT NULL DEFAULT 0 CHECK (storage_addon_blocks >= 0),
+        status TEXT NOT NULL CHECK (status IN (
+          'pending_checkout','pending_payment','provisioning','completed','failed','cancelled'
+        )),
+        checkout_session_ref TEXT,
+        workspace_id UUID REFERENCES workspaces(id) ON DELETE SET NULL,
+        failure_code TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS workspace_orders_user_idx
+        ON workspace_orders(user_id,created_at DESC);
+      CREATE INDEX IF NOT EXISTS workspace_orders_pending_idx
+        ON workspace_orders(status,updated_at)
+        WHERE status IN ('pending_checkout','pending_payment','provisioning');
+    `
+  },
+  {
+    version: 23,
+    name: 'task_conversation_branches',
+    sql: `
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_task_id UUID
+        REFERENCES tasks(id) ON DELETE SET NULL;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS branched_from_event_id UUID
+        REFERENCES task_events(id) ON DELETE SET NULL;
+      CREATE INDEX IF NOT EXISTS tasks_parent_idx
+        ON tasks(parent_task_id,created_at DESC) WHERE parent_task_id IS NOT NULL;
+    `
+  },
+  {
+    version: 24,
+    name: 'durable_task_message_queue',
+    sql: `
+      CREATE TABLE IF NOT EXISTS task_message_queue (
+        id UUID PRIMARY KEY,
+        task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        prompt_ciphertext JSONB NOT NULL,
+        model_id TEXT NOT NULL,
+        privacy_route TEXT NOT NULL CHECK (privacy_route IN ('provider_zdr','external')),
+        max_compute_credits DOUBLE PRECISION NOT NULL CHECK (max_compute_credits > 0),
+        resource_class TEXT NOT NULL,
+        reservation_key TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'queued'
+          CHECK (status IN ('queued','promoted','cancelled')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        promoted_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS task_message_queue_fifo_idx
+        ON task_message_queue(task_id,created_at,id) WHERE status='queued';
+    `
+  },
+  {
+    version: 25,
+    name: 'persistent_publications_and_custom_domains',
+    sql: `
+      ALTER TABLE workspace_previews ALTER COLUMN expires_at DROP NOT NULL;
+      ALTER TABLE workspace_previews ADD COLUMN IF NOT EXISTS hosting_mode TEXT
+        NOT NULL DEFAULT 'always_ready'
+        CHECK (hosting_mode IN ('on_demand','always_ready'));
+      ALTER TABLE workspace_previews ADD COLUMN IF NOT EXISTS custom_domain TEXT;
+      ALTER TABLE workspace_previews ADD COLUMN IF NOT EXISTS domain_status TEXT
+        CHECK (domain_status IN ('pending','active','failed'));
+      ALTER TABLE workspace_previews ADD COLUMN IF NOT EXISTS domain_verification_hash TEXT;
+      ALTER TABLE workspace_previews ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ;
+      CREATE UNIQUE INDEX IF NOT EXISTS workspace_previews_custom_domain_idx
+        ON workspace_previews(LOWER(custom_domain)) WHERE custom_domain IS NOT NULL;
+    `
+  },
+  {
+    version: 26,
+    name: 'trajectory_controls_and_security_modes',
+    sql: `
+      ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS security_mode TEXT
+        NOT NULL DEFAULT 'balanced'
+        CHECK (security_mode IN ('review','balanced','autonomous'));
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS security_mode TEXT
+        NOT NULL DEFAULT 'balanced'
+        CHECK (security_mode IN ('review','balanced','autonomous'));
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS fork_kind TEXT
+        CHECK (fork_kind IN ('branch','edit','retry'));
+      CREATE INDEX IF NOT EXISTS tasks_trajectory_idx
+        ON tasks(parent_task_id,fork_kind,created_at DESC)
+        WHERE parent_task_id IS NOT NULL;
+    `
+  },
+  {
+    version: 27,
+    name: 'managed_ai_costs_and_customer_keys',
+    sql: `
+      ALTER TABLE usage_entries ADD COLUMN IF NOT EXISTS cost_usd DOUBLE PRECISION
+        NOT NULL DEFAULT 0 CHECK (cost_usd >= 0);
+      CREATE INDEX IF NOT EXISTS usage_managed_ai_window_idx
+        ON usage_entries(user_id,created_at)
+        WHERE kind='model_inference' AND state='settled';
+
+      CREATE TABLE IF NOT EXISTS managed_provider_credentials (
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        secret_ciphertext JSONB NOT NULL,
+        external_ref TEXT NOT NULL,
+        monthly_limit_usd DOUBLE PRECISION NOT NULL CHECK (monthly_limit_usd >= 0),
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled','error')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(user_id,provider)
+      );
+    `
+  },
+  {
+    version: 28,
+    name: 'versioned_customer_legal_acceptance',
+    sql: `
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS legal_documents_version TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS legal_accepted_at TIMESTAMPTZ;
+    `
+  },
+  {
+    version: 29,
+    name: 'single_computer_gpu_tier',
+    sql: `
+      ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS gpu_tier TEXT
+        NOT NULL DEFAULT 'off'
+        CHECK (gpu_tier IN ('off','boost','pro','ultra'));
+    `
+  },
+  {
+    version: 30,
+    name: 'encrypted_memory_and_reviewed_skills',
+    sql: `
+      CREATE TABLE IF NOT EXISTS workspace_memories (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        target TEXT NOT NULL CHECK (target IN ('workspace','user')),
+        content_ciphertext JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS workspace_memories_workspace_idx
+        ON workspace_memories(workspace_id,target,created_at);
+
+      CREATE TABLE IF NOT EXISTS workspace_skills (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        name_hash TEXT NOT NULL,
+        document_ciphertext JSONB NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','stale','archived')),
+        pinned BOOLEAN NOT NULL DEFAULT FALSE,
+        use_count INTEGER NOT NULL DEFAULT 0 CHECK (use_count >= 0),
+        last_used_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(workspace_id,name_hash)
+      );
+      CREATE INDEX IF NOT EXISTS workspace_skills_workspace_idx
+        ON workspace_skills(workspace_id,enabled,updated_at DESC);
+    `
+  },
+  {
+    version: 31,
+    name: 'challenge_bound_webauthn_context',
+    sql: `
+      ALTER TABLE auth_challenges ADD COLUMN IF NOT EXISTS expected_origin TEXT;
+      ALTER TABLE auth_challenges ADD COLUMN IF NOT EXISTS rp_id TEXT;
+    `
+  },
+  {
+    version: 32,
+    name: 'mcp_http_and_durable_oauth_pairing',
+    sql: `
+      ALTER TABLE connectors DROP CONSTRAINT IF EXISTS connectors_kind_check;
+      ALTER TABLE connectors ADD CONSTRAINT connectors_kind_check
+        CHECK (kind IN ('github','webdav','mcp_http'));
+      ALTER TABLE connectors ADD COLUMN IF NOT EXISTS auth_mode TEXT NOT NULL DEFAULT 'secret';
+      ALTER TABLE connectors DROP CONSTRAINT IF EXISTS connectors_auth_mode_check;
+      ALTER TABLE connectors ADD CONSTRAINT connectors_auth_mode_check
+        CHECK (auth_mode IN ('secret','none','bearer','oauth'));
+
+      CREATE TABLE IF NOT EXISTS connector_oauth_attempts (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        label TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        scopes JSONB NOT NULL,
+        state_hash TEXT NOT NULL UNIQUE,
+        secret_ciphertext JSONB NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS connector_oauth_attempts_expiry_idx
+        ON connector_oauth_attempts(expires_at);
+    `
+  },
+  {
+    version: 33,
+    name: 'deletable_accounts_and_bounded_growth',
+    // organization_workspaces.added_by pointed at users(id) ON DELETE RESTRICT, which made every
+    // account that ever attached a workspace to an organization undeletable - RESTRICT fires even
+    // when the referencing row would itself be removed by another cascade. SET NULL is the right
+    // replacement rather than CASCADE: the share is a property of the workspace, not of the person
+    // who set it up, so deleting a member must not silently unshare a workspace somebody else owns.
+    sql: `
+      ALTER TABLE organization_workspaces ALTER COLUMN added_by DROP NOT NULL;
+      DO $$
+      DECLARE restricting_constraint TEXT;
+      BEGIN
+        FOR restricting_constraint IN
+          SELECT c.conname FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=ANY(c.conkey)
+          WHERE c.conrelid='organization_workspaces'::regclass
+            AND c.contype='f' AND a.attname='added_by' AND c.confdeltype<>'n'
+        LOOP
+          EXECUTE format(
+            'ALTER TABLE organization_workspaces DROP CONSTRAINT %I',restricting_constraint
+          );
+        END LOOP;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=ANY(c.conkey)
+          WHERE c.conrelid='organization_workspaces'::regclass
+            AND c.contype='f' AND a.attname='added_by'
+        ) THEN
+          ALTER TABLE organization_workspaces
+            ADD CONSTRAINT organization_workspaces_added_by_fkey
+            FOREIGN KEY (added_by) REFERENCES users(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+
+      CREATE INDEX IF NOT EXISTS usage_entries_task_idx
+        ON usage_entries(task_id) WHERE task_id IS NOT NULL;
+
+      ALTER TABLE workspace_memories ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ;
+      CREATE INDEX IF NOT EXISTS workspace_memories_expiry_idx
+        ON workspace_memories(valid_until) WHERE valid_until IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS task_events_delta_idx
+        ON task_events(task_id,sequence) WHERE kind='assistant_delta';
+
+      CREATE INDEX IF NOT EXISTS tasks_legacy_title_idx
+        ON tasks(created_at) WHERE title NOT LIKE '{"v":%';
+      CREATE INDEX IF NOT EXISTS task_events_legacy_summary_idx
+        ON task_events(id) WHERE summary NOT LIKE 'Encrypted % event';
+    `
+  },
+  {
+    version: 34,
+    name: 'device_enrollments',
+    // Adding a device later must not send the owner back to a server console for the installer's
+    // pairing code. An already-authenticated client mints a short-lived, single-use grant instead.
+    // Only the hash is stored, so a database copy cannot be replayed into a working enrollment.
+    sql: `
+      CREATE TABLE IF NOT EXISTS device_enrollments(
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash TEXT NOT NULL UNIQUE,
+        label TEXT NOT NULL,
+        issued_by_session TEXT,
+        expires_at TIMESTAMPTZ NOT NULL,
+        consumed_at TIMESTAMPTZ,
+        revoked_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS device_enrollments_user_idx
+        ON device_enrollments(user_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS device_enrollments_expiry_idx
+        ON device_enrollments(expires_at);
+    `
+  },
+  {
+    version: 35,
+    name: 'tiered_agent_memory',
+    // Tiered memory: an append-only verbatim layer (mem.source) that is never rewritten, and a
+    // curated overlay (mem.item) of episodes, facts, procedures and entities that cites it through
+    // mem.evidence. Bodies stay encrypted like every other owner artefact, so the lexical surface
+    // is a keyed blind index built by @athanor/core: each lexeme becomes an HMAC token before it
+    // reaches the server. Positions and field weights survive that substitution, which is what
+    // keeps @@, ts_rank_cd and the BM25 function below working over data the database cannot read.
+    //
+    // pg_trgm, btree_gin and pgvector are all attempted and all optional. Fuzzy matching therefore
+    // runs on keyed trigram arrays through the built-in array GIN operator class, which computes
+    // exactly the Jaccard score similarity() would - the lexical floor never depends on an
+    // extension being installed, and embeddings never become load-bearing.
+    sql: `
+      CREATE SCHEMA IF NOT EXISTS mem;
+
+      DO $ath$ BEGIN CREATE EXTENSION IF NOT EXISTS pg_trgm;
+      EXCEPTION WHEN OTHERS THEN NULL; END $ath$;
+      DO $ath$ BEGIN CREATE EXTENSION IF NOT EXISTS btree_gin;
+      EXCEPTION WHEN OTHERS THEN NULL; END $ath$;
+      DO $ath$ BEGIN CREATE EXTENSION IF NOT EXISTS vector;
+      EXCEPTION WHEN OTHERS THEN NULL; END $ath$;
+
+      -- 'entity' is carried here and nowhere above. It was a declared memory kind that nothing ever
+      -- wrote: the agent could filter a recall to it and always got an empty answer back, because
+      -- what it described - a statement about a person, place or system - is what a fact already
+      -- is. PostgreSQL has no way to drop a value from an enum in use, and inventing one would
+      -- mean rewriting the type and every column that references it to remove a word no row holds.
+      DO $ath$ BEGIN
+        CREATE TYPE mem.kind AS ENUM ('source','episode','fact','procedure','entity');
+      EXCEPTION WHEN duplicate_object THEN NULL; END $ath$;
+      DO $ath$ BEGIN
+        CREATE TYPE mem.trust AS ENUM ('stated','derived','inferred');
+      EXCEPTION WHEN duplicate_object THEN NULL; END $ath$;
+      DO $ath$ BEGIN
+        CREATE TYPE mem.status AS ENUM
+          ('active','superseded','disputed','archived','retracted');
+      EXCEPTION WHEN duplicate_object THEN NULL; END $ath$;
+      DO $ath$ BEGIN
+        CREATE TYPE mem.embed_state AS ENUM ('none','pending','ok','skipped','failed');
+      EXCEPTION WHEN duplicate_object THEN NULL; END $ath$;
+
+      CREATE TABLE IF NOT EXISTS mem.predicate (
+        name TEXT PRIMARY KEY,
+        cardinality TEXT NOT NULL CHECK (cardinality IN ('one','many')),
+        is_temporal BOOLEAN NOT NULL DEFAULT TRUE,
+        description TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS mem.item (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        kind mem.kind NOT NULL,
+        status mem.status NOT NULL DEFAULT 'active',
+        trust mem.trust NOT NULL,
+        document_ciphertext JSONB NOT NULL,
+        title_tokens TEXT NOT NULL DEFAULT '',
+        tag_tokens TEXT NOT NULL DEFAULT '',
+        body_tokens TEXT NOT NULL DEFAULT '',
+        tags_hashed TEXT[] NOT NULL DEFAULT '{}',
+        trigrams TEXT[] NOT NULL DEFAULT '{}',
+        dedupe_key TEXT NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        retired_at TIMESTAMPTZ,
+        valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        valid_to TIMESTAMPTZ,
+        subject_key TEXT,
+        predicate TEXT REFERENCES mem.predicate(name),
+        pred_functional BOOLEAN NOT NULL DEFAULT FALSE,
+        object_key TEXT,
+        episode_id UUID REFERENCES mem.item(id) ON DELETE SET NULL,
+        task_id UUID,
+        trigger_key TEXT,
+        last_verified TIMESTAMPTZ,
+        ok_count INTEGER NOT NULL DEFAULT 0 CHECK (ok_count >= 0),
+        fail_count INTEGER NOT NULL DEFAULT 0 CHECK (fail_count >= 0),
+        pin BOOLEAN NOT NULL DEFAULT FALSE,
+        use_count INTEGER NOT NULL DEFAULT 0 CHECK (use_count >= 0),
+        cited_count INTEGER NOT NULL DEFAULT 0 CHECK (cited_count >= 0),
+        neg_count INTEGER NOT NULL DEFAULT 0 CHECK (neg_count >= 0),
+        last_used_at TIMESTAMPTZ,
+        salience REAL NOT NULL DEFAULT 0,
+        tokens_est INTEGER NOT NULL DEFAULT 0 CHECK (tokens_est >= 0),
+        indexed BOOLEAN NOT NULL DEFAULT TRUE,
+        tsv TSVECTOR,
+        tsv_len INTEGER NOT NULL DEFAULT 0,
+        embed_state mem.embed_state NOT NULL DEFAULT 'none',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CHECK (kind <> 'fact' OR (subject_key IS NOT NULL AND predicate IS NOT NULL))
+      );
+
+      CREATE TABLE IF NOT EXISTS mem.source (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        channel TEXT NOT NULL
+          CHECK (channel IN ('chat','terminal','file','browser','desktop','tool')),
+        role TEXT,
+        task_id UUID,
+        episode_id UUID REFERENCES mem.item(id) ON DELETE SET NULL,
+        -- Provenance carries paths, URLs and command lines, which are content: it is sealed like
+        -- the body. origin_key is the keyed hash of the locator, so an archived row that has left
+        -- the lexical index is still reachable by where it came from.
+        origin_ciphertext JSONB NOT NULL DEFAULT '{}'::jsonb,
+        origin_key TEXT,
+        body_ciphertext JSONB NOT NULL,
+        chunk_ix INTEGER NOT NULL DEFAULT 0,
+        chunk_of UUID,
+        tokens_est INTEGER NOT NULL DEFAULT 0 CHECK (tokens_est >= 0),
+        indexed BOOLEAN NOT NULL DEFAULT TRUE,
+        body_tokens TEXT NOT NULL DEFAULT '',
+        tsv TSVECTOR,
+        tsv_len INTEGER NOT NULL DEFAULT 0,
+        embed_state mem.embed_state NOT NULL DEFAULT 'none',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS mem.link (
+        src_id UUID NOT NULL REFERENCES mem.item(id) ON DELETE CASCADE,
+        dst_id UUID NOT NULL,
+        rel TEXT NOT NULL CHECK
+          (rel IN ('supersedes','contradicts','supports','derived_from','about','part_of')),
+        weight REAL NOT NULL DEFAULT 1,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (src_id, dst_id, rel)
+      );
+
+      CREATE TABLE IF NOT EXISTS mem.evidence (
+        item_id UUID NOT NULL REFERENCES mem.item(id) ON DELETE CASCADE,
+        source_id UUID NOT NULL REFERENCES mem.source(id) ON DELETE CASCADE,
+        span INT4RANGE,
+        PRIMARY KEY (item_id, source_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS mem.item_use (
+        id UUID PRIMARY KEY,
+        item_id UUID NOT NULL REFERENCES mem.item(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id UUID,
+        used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        cited BOOLEAN NOT NULL DEFAULT FALSE,
+        outcome TEXT NOT NULL DEFAULT 'unknown' CHECK (outcome IN ('ok','fail','unknown'))
+      );
+
+      CREATE TABLE IF NOT EXISTS mem.fact_candidate (
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        subject_key TEXT NOT NULL,
+        predicate TEXT NOT NULL,
+        object_key TEXT NOT NULL,
+        n_episodes INTEGER NOT NULL DEFAULT 1 CHECK (n_episodes > 0),
+        first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        episode_ids UUID[] NOT NULL DEFAULT '{}',
+        draft_ciphertext JSONB,
+        PRIMARY KEY (workspace_id, subject_key, predicate, object_key)
+      );
+
+      CREATE TABLE IF NOT EXISTS mem.lexeme_df (
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        lexeme TEXT NOT NULL,
+        df BIGINT NOT NULL DEFAULT 1,
+        PRIMARY KEY (workspace_id, lexeme)
+      );
+
+      CREATE TABLE IF NOT EXISTS mem.corpus_stats (
+        workspace_id UUID PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+        n_docs BIGINT NOT NULL DEFAULT 0,
+        sum_len BIGINT NOT NULL DEFAULT 0,
+        refreshed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS mem.pack (
+        task_id UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        brief_version TEXT,
+        body_ciphertext JSONB NOT NULL,
+        sha256 TEXT NOT NULL,
+        item_ids UUID[] NOT NULL,
+        tokens_est INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      -- The weighted tsvector and its token count have to be produced together: a generated column
+      -- is computed after BEFORE triggers, so tsv_len could not be derived from it, and on PG18 a
+      -- generated column without STORED is VIRTUAL and cannot back an index at all.
+      CREATE OR REPLACE FUNCTION mem.index_row() RETURNS trigger LANGUAGE plpgsql AS $ath$
+      BEGIN
+        IF TG_TABLE_NAME = 'item' THEN
+          IF NEW.indexed THEN
+            NEW.tsv :=
+                setweight(to_tsvector('simple', NEW.title_tokens), 'A')
+             || setweight(to_tsvector('simple', NEW.tag_tokens), 'B')
+             || setweight(to_tsvector('simple', NEW.body_tokens), 'D');
+          ELSE
+            NEW.tsv := NULL;
+          END IF;
+          NEW.pred_functional := NEW.predicate IS NOT NULL AND EXISTS (
+            SELECT 1 FROM mem.predicate p
+            WHERE p.name = NEW.predicate AND p.cardinality = 'one');
+        ELSE
+          NEW.tsv := CASE WHEN NEW.indexed
+            THEN setweight(to_tsvector('simple', NEW.body_tokens), 'D') ELSE NULL END;
+        END IF;
+        NEW.tsv_len := COALESCE(
+          (SELECT SUM(COALESCE(array_length(positions, 1), 1)) FROM unnest(NEW.tsv)), 0)::int;
+        RETURN NEW;
+      END $ath$;
+
+      CREATE OR REPLACE TRIGGER t_mem_item_index
+        BEFORE INSERT OR UPDATE OF title_tokens, tag_tokens, body_tokens, predicate, indexed
+        ON mem.item FOR EACH ROW EXECUTE FUNCTION mem.index_row();
+      CREATE OR REPLACE TRIGGER t_mem_source_index
+        BEFORE INSERT OR UPDATE OF body_tokens, indexed
+        ON mem.source FOR EACH ROW EXECUTE FUNCTION mem.index_row();
+
+      -- Document frequency is maintained incrementally. Rebuilding it with ts_stat over the whole
+      -- corpus is a sequential scan plus a hash aggregate over every lexeme; ~100 cheap upserts per
+      -- inserted row costs nothing at a few thousand writes a day.
+      CREATE OR REPLACE FUNCTION mem.accrue_corpus_stats() RETURNS trigger
+      LANGUAGE plpgsql AS $ath$
+      BEGIN
+        IF NEW.tsv IS NOT NULL THEN
+          INSERT INTO mem.lexeme_df (workspace_id, lexeme, df)
+          SELECT NEW.workspace_id, u.lexeme, 1 FROM unnest(NEW.tsv) u
+          ON CONFLICT (workspace_id, lexeme) DO UPDATE SET df = mem.lexeme_df.df + 1;
+        END IF;
+        INSERT INTO mem.corpus_stats (workspace_id, n_docs, sum_len)
+        VALUES (NEW.workspace_id, 1, NEW.tsv_len)
+        ON CONFLICT (workspace_id) DO UPDATE
+          SET n_docs = mem.corpus_stats.n_docs + 1,
+              sum_len = mem.corpus_stats.sum_len + EXCLUDED.sum_len;
+        RETURN NULL;
+      END $ath$;
+
+      CREATE OR REPLACE TRIGGER t_mem_item_df AFTER INSERT ON mem.item
+        FOR EACH ROW EXECUTE FUNCTION mem.accrue_corpus_stats();
+      CREATE OR REPLACE TRIGGER t_mem_source_df AFTER INSERT ON mem.source
+        FOR EACH ROW EXECUTE FUNCTION mem.accrue_corpus_stats();
+
+      -- BM25F-lite: real IDF, real TF saturation, real length normalisation and field weights,
+      -- none of which ts_rank has. It only ever runs over a candidate set bounded by a GIN probe.
+      CREATE OR REPLACE FUNCTION mem.bm25(
+        q_lex TEXT[], q_idf FLOAT8[], tsv TSVECTOR, doc_len INT, avg_len FLOAT8,
+        k1 FLOAT8 DEFAULT 1.2, b FLOAT8 DEFAULT 0.75
+      ) RETURNS FLOAT8 LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $ath$
+        SELECT COALESCE(SUM(
+            q_idf[array_position(q_lex, u.lexeme)]
+            * (f.tf * (k1 + 1))
+            / (f.tf + k1 * (1 - b + b * doc_len / NULLIF(avg_len, 0)))
+        ), 0)
+        FROM unnest(tsv) AS u
+        CROSS JOIN LATERAL (
+          SELECT COALESCE(array_length(u.positions, 1), 1)::float8
+               * CASE WHEN 'A' = ANY(u.weights) THEN 3.0
+                      WHEN 'B' = ANY(u.weights) THEN 2.0
+                      WHEN 'C' = ANY(u.weights) THEN 1.5
+                      ELSE 1.0 END AS tf
+        ) AS f
+        WHERE u.lexeme = ANY(q_lex);
+      $ath$;
+
+      -- Recency, trust and salience are not opinions about relevance, so they multiply the fused
+      -- rank instead of joining it as ranking channels. The 0.35 decay floor keeps an old fact
+      -- retrievable forever; the 0.12 factor keeps a retired fact findable for "what did I use
+      -- before?" while making it essentially never win a present-tense query.
+      CREATE OR REPLACE FUNCTION mem.prior(
+        kind mem.kind, trust mem.trust, valid_to TIMESTAMPTZ, observed_at TIMESTAMPTZ,
+        salience REAL, pin BOOLEAN, t_now TIMESTAMPTZ, temporal_intent BOOLEAN
+      ) RETURNS FLOAT8 LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $ath$
+        SELECT
+            (CASE trust WHEN 'stated' THEN 1.00 WHEN 'derived' THEN 0.85 ELSE 0.60 END)
+          * (CASE WHEN valid_to IS NULL OR valid_to > t_now THEN 1.00
+                  WHEN temporal_intent THEN 0.60 ELSE 0.12 END)
+          * (0.35 + 0.65 * exp(-0.6931471805599453
+                * extract(epoch FROM t_now - observed_at) / 86400.0
+                / CASE kind WHEN 'source'    THEN 21.0
+                            WHEN 'episode'   THEN 45.0
+                            WHEN 'procedure' THEN 240.0
+                            ELSE 1200.0 END))
+          * (1.0 + 0.15 * ln(1 + greatest(salience, 0)))
+          * (CASE WHEN pin THEN 1.6 ELSE 1.0 END);
+      $ath$;
+
+      CREATE INDEX IF NOT EXISTS mem_item_tsv_gin ON mem.item USING gin (tsv)
+        WITH (fastupdate = off) WHERE status = 'active';
+      CREATE INDEX IF NOT EXISTS mem_source_tsv_gin ON mem.source USING gin (tsv)
+        WITH (fastupdate = on, gin_pending_list_limit = 2048) WHERE indexed;
+      CREATE INDEX IF NOT EXISTS mem_item_trigram_gin ON mem.item USING gin (trigrams);
+      CREATE INDEX IF NOT EXISTS mem_item_tags_gin ON mem.item USING gin (tags_hashed);
+      CREATE INDEX IF NOT EXISTS mem_item_subject_idx
+        ON mem.item (workspace_id, subject_key, predicate, valid_from DESC)
+        WHERE kind = 'fact' AND status = 'active';
+      -- One current value per functional predicate. The predicate's cardinality is materialised
+      -- into pred_functional by the trigger because an index predicate may not contain a subquery.
+      CREATE UNIQUE INDEX IF NOT EXISTS mem_fact_current_one
+        ON mem.item (workspace_id, subject_key, predicate)
+        WHERE kind = 'fact' AND status = 'active' AND valid_to IS NULL AND pred_functional;
+      CREATE INDEX IF NOT EXISTS mem_item_kind_idx
+        ON mem.item (workspace_id, kind, observed_at DESC) WHERE status = 'active';
+      CREATE INDEX IF NOT EXISTS mem_item_pin_idx
+        ON mem.item (workspace_id) WHERE pin AND status = 'active';
+      CREATE INDEX IF NOT EXISTS mem_item_episode_idx
+        ON mem.item (episode_id) WHERE episode_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS mem_source_task_idx
+        ON mem.source (workspace_id, task_id, occurred_at);
+      CREATE INDEX IF NOT EXISTS mem_source_episode_idx
+        ON mem.source (episode_id, occurred_at);
+      CREATE INDEX IF NOT EXISTS mem_source_origin_idx
+        ON mem.source (workspace_id, origin_key, occurred_at DESC) WHERE origin_key IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS mem_link_dst_idx ON mem.link (dst_id, rel);
+      CREATE INDEX IF NOT EXISTS mem_evidence_source_idx ON mem.evidence (source_id);
+      CREATE INDEX IF NOT EXISTS mem_item_use_idx ON mem.item_use (item_id, used_at DESC);
+      CREATE INDEX IF NOT EXISTS mem_fact_candidate_seen_idx
+        ON mem.fact_candidate (workspace_id, last_seen);
+
+      -- pgvector is strictly optional: without it these columns never exist and no query in the
+      -- store references them, so the lexical floor is unaffected.
+      DO $ath$ BEGIN
+        IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+          EXECUTE 'ALTER TABLE mem.item ADD COLUMN IF NOT EXISTS embedding halfvec(1024)';
+          EXECUTE 'ALTER TABLE mem.source ADD COLUMN IF NOT EXISTS embedding halfvec(1024)';
+          EXECUTE 'CREATE INDEX IF NOT EXISTS mem_item_vec_hnsw ON mem.item'
+            || ' USING hnsw (embedding halfvec_cosine_ops)'
+            || ' WITH (m = 16, ef_construction = 200)'
+            || ' WHERE status = ''active'' AND embedding IS NOT NULL';
+          EXECUTE 'CREATE INDEX IF NOT EXISTS mem_source_vec_hnsw ON mem.source'
+            || ' USING hnsw (embedding halfvec_cosine_ops)'
+            || ' WITH (m = 16, ef_construction = 200)'
+            || ' WHERE embedding IS NOT NULL';
+        END IF;
+      END $ath$;
+    `
+  },
+  {
+    version: 36,
+    name: 'real_currency_spend_caps',
+    // A compute credit is a scheduling unit: the same nominal budget is cents on one model and
+    // tens of dollars on another, so it can never answer "stop before this costs me more than X".
+    // Provider cost per call was already being written to usage_entries.cost_usd and never read
+    // back for anything that could halt work. These tables are what turns that column into a
+    // ceiling: per-account daily and monthly caps, a per-task ceiling carried on the task itself,
+    // and a once-per-window alert record so a soft threshold warns instead of nagging.
+    sql: `
+      CREATE TABLE IF NOT EXISTS spend_limits (
+        user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        daily_cap_usd DOUBLE PRECISION CHECK (daily_cap_usd IS NULL OR daily_cap_usd >= 0),
+        monthly_cap_usd DOUBLE PRECISION CHECK (monthly_cap_usd IS NULL OR monthly_cap_usd >= 0),
+        default_task_cap_usd DOUBLE PRECISION
+          CHECK (default_task_cap_usd IS NULL OR default_task_cap_usd > 0),
+        warn_at_percent INTEGER NOT NULL DEFAULT 80
+          CHECK (warn_at_percent BETWEEN 1 AND 99),
+        time_zone TEXT NOT NULL DEFAULT 'UTC',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      -- The primary key is the whole point: one row per window occurrence per level means an
+      -- insert that changes nothing is how a caller learns it has already warned about this day.
+      CREATE TABLE IF NOT EXISTS spend_alerts (
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        window_name TEXT NOT NULL CHECK (window_name IN ('daily','monthly')),
+        window_start TIMESTAMPTZ NOT NULL,
+        level TEXT NOT NULL CHECK (level IN ('warning','exceeded')),
+        spent_usd DOUBLE PRECISION NOT NULL CHECK (spent_usd >= 0),
+        cap_usd DOUBLE PRECISION NOT NULL CHECK (cap_usd >= 0),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, window_name, window_start, level)
+      );
+      CREATE INDEX IF NOT EXISTS spend_alerts_recent_idx
+        ON spend_alerts(user_id, created_at DESC);
+
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS max_spend_usd DOUBLE PRECISION
+        CHECK (max_spend_usd IS NULL OR max_spend_usd > 0);
+      ALTER TABLE task_schedules ADD COLUMN IF NOT EXISTS max_spend_usd DOUBLE PRECISION
+        CHECK (max_spend_usd IS NULL OR max_spend_usd > 0);
+      ALTER TABLE task_message_queue ADD COLUMN IF NOT EXISTS max_spend_usd DOUBLE PRECISION
+        CHECK (max_spend_usd IS NULL OR max_spend_usd > 0);
+
+      -- provider_ref is "<provider>:<model>" and was the only record of which model was billed.
+      -- Splitting it once here means the per-model breakdown is a GROUP BY rather than a scan
+      -- with string surgery in it, and rows written before this column existed keep their model.
+      ALTER TABLE usage_entries ADD COLUMN IF NOT EXISTS model_id TEXT;
+      UPDATE usage_entries SET model_id =
+        substring(provider_ref FROM strpos(provider_ref, ':') + 1)
+        WHERE model_id IS NULL AND provider_ref IS NOT NULL AND strpos(provider_ref, ':') > 0;
+
+      -- Every spend query filters on real money changing hands, whatever it was spent on: model
+      -- calls, media generation and anything added later all land in the same partial index.
+      CREATE INDEX IF NOT EXISTS usage_entries_spend_idx
+        ON usage_entries(user_id, created_at)
+        WHERE state='settled' AND cost_usd > 0;
+      CREATE INDEX IF NOT EXISTS usage_entries_task_spend_idx
+        ON usage_entries(task_id, created_at)
+        WHERE task_id IS NOT NULL AND state='settled' AND cost_usd > 0;
+      -- Open tasks are what a start-time cap has to price in, and there are never many of them.
+      CREATE INDEX IF NOT EXISTS tasks_open_spend_idx
+        ON tasks(user_id)
+        WHERE max_spend_usd IS NOT NULL
+          AND status IN ('draft','queued','planning','running','awaiting_user',
+                         'awaiting_resource','paused');
+    `
+  },
+  {
+    version: 37,
+    name: 'memory_trigram_cardinality',
+    // Jaccard bounds the two trigram set sizes against each other, so the stored set's cardinality
+    // alone decides whether a row could ever clear the similarity threshold. Reading it off the
+    // array meant detoasting every candidate just to find out, which is most of what the fuzzy
+    // recall channel was paying for; materialising it makes that decision free.
+    sql: `
+      ALTER TABLE mem.item ADD COLUMN IF NOT EXISTS trigram_len INTEGER NOT NULL DEFAULT 0;
+
+      CREATE OR REPLACE FUNCTION mem.index_row() RETURNS trigger LANGUAGE plpgsql AS $ath$
+      BEGIN
+        IF TG_TABLE_NAME = 'item' THEN
+          IF NEW.indexed THEN
+            NEW.tsv :=
+                setweight(to_tsvector('simple', NEW.title_tokens), 'A')
+             || setweight(to_tsvector('simple', NEW.tag_tokens), 'B')
+             || setweight(to_tsvector('simple', NEW.body_tokens), 'D');
+          ELSE
+            NEW.tsv := NULL;
+          END IF;
+          NEW.pred_functional := NEW.predicate IS NOT NULL AND EXISTS (
+            SELECT 1 FROM mem.predicate p
+            WHERE p.name = NEW.predicate AND p.cardinality = 'one');
+          NEW.trigram_len := COALESCE(cardinality(NEW.trigrams), 0);
+        ELSE
+          NEW.tsv := CASE WHEN NEW.indexed
+            THEN setweight(to_tsvector('simple', NEW.body_tokens), 'D') ELSE NULL END;
+        END IF;
+        NEW.tsv_len := COALESCE(
+          (SELECT SUM(COALESCE(array_length(positions, 1), 1)) FROM unnest(NEW.tsv)), 0)::int;
+        RETURN NEW;
+      END $ath$;
+
+      CREATE OR REPLACE TRIGGER t_mem_item_index
+        BEFORE INSERT OR UPDATE OF title_tokens, tag_tokens, body_tokens, predicate, indexed,
+                                   trigrams
+        ON mem.item FOR EACH ROW EXECUTE FUNCTION mem.index_row();
+
+      UPDATE mem.item SET trigram_len = COALESCE(cardinality(trigrams), 0)
+        WHERE trigram_len <> COALESCE(cardinality(trigrams), 0);
+    `
+  },
+  {
+    version: 38,
+    name: 'turn_checkpoints_and_rewind_scope',
+    // Editing a message has always made a new conversation path and left the computer exactly as
+    // the agent left it - which reads, to an owner, as an undo that did not take. These are the
+    // records behind the other half: one row per automatic checkpoint, so a point in the transcript
+    // can be turned back into a point on the filesystem, and two columns on tasks so a fork says
+    // which of the two it actually rewound. The bytes themselves live with the runner; this is the
+    // index over them.
+    //
+    // workspace_snapshots is untouched. Those are the named recovery points the owner asks for and
+    // keeps, and they answer a different question.
+    sql: `
+      CREATE TABLE IF NOT EXISTS workspace_checkpoints (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,
+        turn INTEGER NOT NULL DEFAULT 0,
+        -- Where in the transcript this checkpoint sits, so "put the computer back to here" can be
+        -- answered from a timeline position rather than by guessing from timestamps.
+        event_sequence INTEGER,
+        mechanism TEXT NOT NULL CHECK (mechanism IN ('btrfs','zfs','content')),
+        -- Null under btrfs and ZFS: a filesystem snapshot is instant because it counts nothing.
+        file_count INTEGER CHECK (file_count IS NULL OR file_count >= 0),
+        total_bytes BIGINT CHECK (total_bytes IS NULL OR total_bytes >= 0),
+        stored_bytes BIGINT NOT NULL DEFAULT 0 CHECK (stored_bytes >= 0),
+        duration_ms INTEGER NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS workspace_checkpoints_workspace_idx
+        ON workspace_checkpoints(workspace_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS workspace_checkpoints_task_idx
+        ON workspace_checkpoints(task_id, event_sequence DESC NULLS LAST)
+        WHERE task_id IS NOT NULL;
+
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS rewind_scope TEXT
+        CHECK (rewind_scope IN ('conversation','computer','both'));
+      -- SET NULL rather than CASCADE: checkpoints are pruned on a retention policy, and losing the
+      -- record of a fork because the point it came from was tidied away would be the wrong trade.
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS restored_checkpoint_id UUID
+        REFERENCES workspace_checkpoints(id) ON DELETE SET NULL;
+    `
+  },
+  {
+    version: 39,
+    name: 'notification_settings_and_spend_pause',
+    // Notifications the owner can actually govern: which kinds reach a device, and when the box is
+    // allowed to wake them. Deliberately no time zone column - quiet hours read the one already on
+    // spend_limits, because a second copy of the owner's day is a second answer to "when does my
+    // day roll over" and they will disagree.
+    //
+    // spend_paused_at is the only thing that tells a spend pause apart from an ordinary Pause. A
+    // task the owner paused needs no notification; a task the box stopped because it reached a
+    // ceiling is the one that is waiting for them and will wait forever unheard.
+    sql: `
+      CREATE TABLE IF NOT EXISTS notification_settings (
+        user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        approval_required BOOLEAN NOT NULL DEFAULT TRUE,
+        task_finished BOOLEAN NOT NULL DEFAULT TRUE,
+        spend_paused BOOLEAN NOT NULL DEFAULT TRUE,
+        quiet_start_minute INTEGER CHECK (quiet_start_minute BETWEEN 0 AND 1439),
+        quiet_end_minute INTEGER CHECK (quiet_end_minute BETWEEN 0 AND 1439),
+        quiet_allow_approvals BOOLEAN NOT NULL DEFAULT TRUE,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      ALTER TABLE notification_deliveries DROP CONSTRAINT IF EXISTS notification_deliveries_kind_check;
+      ALTER TABLE notification_deliveries ADD CONSTRAINT notification_deliveries_kind_check
+        CHECK (kind IN ('approval_required','task_finished','spend_paused'));
+
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS spend_paused_at TIMESTAMPTZ;
+    `
+  },
+  {
+    version: 40,
+    name: 'conversation_shelf_and_title_source',
+    // The sidebar is the owner's memory of what they have been doing, and it needs three things
+    // this table could not answer.
+    //
+    // title_source records who named a conversation. The first ten words of the prompt is a
+    // placeholder, not a name, and it is the only value a generated title may overwrite: once the
+    // owner has renamed a conversation, or the box has read the first exchange and titled it, that
+    // name is theirs and nothing rewrites it.
+    //
+    // pinned and archived_at are the two ways a conversation leaves the flow of recency without
+    // being destroyed. archived_at is a timestamp rather than a flag so "recently archived" can be
+    // shown and an undo can name what it is undoing.
+    //
+    // The index carries the sidebar's exact ordering, including the GREATEST() expression, so the
+    // owner's first page never sorts the whole table.
+    sql: `
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS title_source TEXT NOT NULL DEFAULT 'prompt';
+      ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_title_source_check;
+      ALTER TABLE tasks ADD CONSTRAINT tasks_title_source_check
+        CHECK (title_source IN ('prompt','generated','owner'));
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+
+      CREATE INDEX IF NOT EXISTS tasks_activity_idx
+        ON tasks(user_id, pinned DESC, GREATEST(updated_at, created_at) DESC, id DESC);
+      -- A conversation still wearing its placeholder name is a small and shrinking set, so the
+      -- titler finds its work without reading the owner's whole history.
+      CREATE INDEX IF NOT EXISTS tasks_untitled_idx
+        ON tasks(created_at DESC) WHERE title_source = 'prompt';
+    `
+  },
+  {
+    version: 41,
+    name: 'drop_unreached_tables',
+    // Six tables no code reads and no code writes. Each was created for something the product
+    // decided against, and each has been carried by every install since - through every backup,
+    // every restore and every schema dump - as a row of columns describing a feature that is not
+    // there.
+    //
+    //   capability_grants   - capability tokens are signed and stateless; nothing was ever granted.
+    //   browser_leases      - the browser holder lives with the runner that enforces it.
+    //   idempotency_records - superseded by api_operations, which is the table the API actually
+    //                         writes. The only statement that still named this one was a DELETE in
+    //                         the five-minute maintenance sweep, deleting from an empty table.
+    //   webhook_events      - billing webhook de-duplication, for billing this product does not do.
+    //   workspace_orders    - a checkout and payment flow, in a program the owner runs themselves.
+    //   key_release_receipts- attestation receipts for a key-release service that is not deployed.
+    //
+    // Every one is empty on every install, because nothing has ever inserted into any of them, so
+    // this drops no owner data. They are dropped rather than left in place because a schema is
+    // documentation: a table called workspace_orders says this program takes payments.
+    sql: `
+      DROP TABLE IF EXISTS capability_grants;
+      DROP TABLE IF EXISTS browser_leases;
+      DROP TABLE IF EXISTS idempotency_records;
+      DROP TABLE IF EXISTS webhook_events;
+      DROP TABLE IF EXISTS workspace_orders;
+      DROP TABLE IF EXISTS key_release_receipts;
+    `
+  },
+  {
+    version: 42,
+    name: 'previews_expire_from_disuse',
+    // expires_at used to be a countdown started at creation, capped at 24 hours, on the private
+    // link to an app running on the owner's own computer. The owner's phone could not open it the
+    // next morning, and the only thing that did not expire was publishing to the public internet.
+    //
+    // The column stays, and now measures the opposite thing: how long the link has left if nobody
+    // opens it. Every request through the preview gateway pushes it back out, so a preview in use
+    // never lapses, and one nobody has touched for a month closes rather than leaving a bearer
+    // token live in a chat history forever.
+    //
+    // Live private previews are given the full idle window here rather than being left on whatever
+    // was left of their old countdown, which for most of them is minutes. Ones that had already
+    // lapsed stay lapsed: this restores nothing the owner has already lost.
+    sql: `
+      UPDATE workspace_previews SET expires_at = NOW() + INTERVAL '30 days', updated_at = NOW()
+       WHERE status = 'active' AND visibility = 'private'
+         AND (expires_at IS NULL OR expires_at > NOW());
+      CREATE INDEX IF NOT EXISTS workspace_previews_idle_idx
+        ON workspace_previews(expires_at) WHERE status = 'active' AND expires_at IS NOT NULL;
+    `
+  },
+  {
+    version: 43,
+    name: 'agent_raised_notifications',
+    // Every push this box could send was derived from a state change it happened to notice, so the
+    // one message worth sending - "the page you asked me to watch changed" - had no way to exist,
+    // and the messages nobody asked for fired on a timer. This table is the agent's own half: one
+    // row per notification it decided to raise, with the sentence encrypted under the workspace key
+    // exactly like a conversation title, because what the agent has to say about the owner's work
+    // is the owner's business and the notifier holds no key.
+    //
+    // resource_id in the delivery ledger is this row's id, so each raised notification reaches each
+    // subscribed device once and stays delivered.
+    sql: `
+      CREATE TABLE IF NOT EXISTS agent_notifications (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('agent_message','takeover_needed')),
+        message_ciphertext JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS agent_notifications_task_idx
+        ON agent_notifications(task_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS agent_notifications_user_idx
+        ON agent_notifications(user_id, created_at DESC);
+
+      ALTER TABLE notification_deliveries DROP CONSTRAINT IF EXISTS notification_deliveries_kind_check;
+      ALTER TABLE notification_deliveries ADD CONSTRAINT notification_deliveries_kind_check
+        CHECK (kind IN ('approval_required','task_finished','spend_paused',
+                        'agent_message','takeover_needed'));
+    `
+  },
+  {
+    version: 44,
+    name: 'drop_workspace_shape_and_user_plan',
+    // Two columns that decided things this product does not decide.
+    //
+    // workspaces.shape was a four-value enum - light, standard, heavy, analysis - written on
+    // creation, validated on two routes, gated by a plan and by an organisation policy, and sent to
+    // the runner in the provisioning body. The runner never read it, and neither did the worker,
+    // the resource paths or the client: there is one computer, it is the machine the owner
+    // installed this on, and no value of this column ever changed anything about it.
+    //
+    // users.plan_id defaulted to 'community' and nothing could ever set it to anything else, but
+    // every ceiling on the box was looked up through it with a fallback. A row carrying any other
+    // string - a restored backup, a hand-edited table - would have quietly applied a stranger's
+    // limits to the owner's own machine. subscriptions.plan_id stays: usage has to accrue against
+    // a named period, and that is the column that names it.
+    sql: `
+      ALTER TABLE workspaces DROP COLUMN IF EXISTS shape;
+      ALTER TABLE users DROP COLUMN IF EXISTS plan_id;
+    `
+  },
+  {
+    version: 45,
+    name: 'drop_gpu_tier_and_payment_reference',
+    // The same defect as workspaces.shape, twice more.
+    //
+    // gpu_tier was four values - off, boost, pro, ultra - written on creation, re-validated on
+    // resize, and refused unless an installer flag was on. The runner is never told which one was
+    // chosen, so nothing about the machine changes: three of the four are names for "on" and none
+    // of them turns anything on. GPU passthrough on the owner's own hardware is a property of how
+    // they installed this, not a tier they subscribe to.
+    //
+    // users.payment_customer_ref has never been written by any code in this repository. It is a
+    // payment-processor customer id, in a program the owner runs on their own machine.
+    sql: `
+      ALTER TABLE workspaces DROP COLUMN IF EXISTS gpu_tier;
+      ALTER TABLE users DROP COLUMN IF EXISTS payment_customer_ref;
+    `
+  },
+  {
+    version: 46,
+    name: 'drop_organizations',
+    // athanor is one person's computer. There is one account on it, it holds the keys to its own
+    // workspace, and every screen in the product is written for that person - so a subsystem for
+    // sharing a workspace with colleagues under a policy an administrator sets was never a feature
+    // this product could finish. What it was instead was a second answer to "who may do this",
+    // sitting underneath every read in the store as a pair of LEFT JOINs, and a policy object that
+    // could refuse a privacy route, a credit ceiling, a connector or a public preview on the
+    // owner's own machine.
+    //
+    //   organizations          - the group, its owner and its policy.
+    //   organization_members   - who else was in it, at which of four roles.
+    //   organization_workspaces- which computers the group could reach.
+    //   organization_audit_events - who did what to the group.
+    //
+    // The rows are dropped, not migrated: nothing that reads them survives this release, and on a
+    // single-owner install the membership row for the owner's own workspaces adds no access their
+    // user_id did not already give them. workspaces.user_id is now the whole of the answer.
+    //
+    // subscriptions.external_ref goes in the same statement because it is the last of the
+    // payment-processor columns: a reference to a customer record at a billing provider, in a
+    // program the owner installed on their own hardware. Nothing has ever written it.
+    sql: `
+      DROP TABLE IF EXISTS organization_audit_events;
+      DROP TABLE IF EXISTS organization_workspaces;
+      DROP TABLE IF EXISTS organization_members;
+      DROP TABLE IF EXISTS organizations;
+      ALTER TABLE subscriptions DROP COLUMN IF EXISTS external_ref;
+    `
+  },
+  {
+    version: 47,
+    name: 'mail_and_calendar_connector_kinds',
+    // The two kinds the connector layer now speaks. A mailbox is reached over IMAP and SMTP and a
+    // calendar over CalDAV, neither of which is an HTTPS API, which is why the column had to be
+    // told about them rather than just the contract enum.
+    sql: `
+      ALTER TABLE connectors DROP CONSTRAINT IF EXISTS connectors_kind_check;
+      ALTER TABLE connectors ADD CONSTRAINT connectors_kind_check
+        CHECK (kind IN ('github','webdav','mcp_http','imap','caldav'));
+    `
+  },
+  {
+    version: 48,
+    name: 'notification_switches_for_agent_raised_kinds',
+    // The two kinds the agent raises arrived with no switch, on the reasoning that the agent asking
+    // for the owner is not the same as the box reporting on itself. In practice that means the one
+    // notification the owner explicitly asked for - "tell me when this changes" - is also the only
+    // one they cannot turn down, and an agent that decides everything is worth saying can only be
+    // silenced by revoking the device. Both default to TRUE, so nothing an install already does
+    // changes; what changes is that there is a way to stop it.
+    sql: `
+      ALTER TABLE notification_settings
+        ADD COLUMN IF NOT EXISTS agent_message BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE notification_settings
+        ADD COLUMN IF NOT EXISTS takeover_needed BOOLEAN NOT NULL DEFAULT TRUE;
+    `
+  },
+  {
+    version: 49,
+    name: 'drop_subscription_allowance',
+    // The last of the hosted shape. `subscriptions` held one row per owner carrying a plan id that
+    // could only ever be 'community', a status that was always 'active', an included allowance of a
+    // billion credits and an overage limit of zero - and a billing period that was written when the
+    // row was created and never advanced again, so usage accrued against the month of the install
+    // for as long as the box lived. Two gates read it: a compute-credit ceiling no real value could
+    // reach, and an "is the subscription active" check on scheduled runs that could only fail if
+    // the row were missing. What actually stops a runaway is the owner's own spend cap, in the
+    // currency the provider bills, which is checked in the same statement and stays.
+    //
+    // The index goes with it. It was named for a managed AI service and covered one query - what
+    // the usage pane calls provider spend - which now asks the same question the spending caps ask,
+    // through the same statement they use. Nothing filters on the kind any more, and the general
+    // usage_user_period_idx serves what is left, so a partial index on a predicate no query writes
+    // is only a write cost.
+    sql: `
+      DROP TABLE IF EXISTS subscriptions;
+      DROP INDEX IF EXISTS usage_managed_ai_window_idx;
+    `
+  },
+  {
+    version: 50,
+    name: 'drop_terms_acceptance_and_provider_connections',
+    // Two more pieces of the hosted shape, both of them halves.
+    //
+    // The legal columns recorded that an owner had accepted a versioned document. Nothing served a
+    // document to accept: the route that would have said one was outstanding answered a hardcoded
+    // "nothing is outstanding", the version setting was read in exactly one place - to copy it into
+    // the row at registration - and the method that would have recorded a later acceptance was
+    // never called. An owner installing AGPL software on their own machine is not presented with
+    // terms by that machine, so this is removed rather than finished.
+    //
+    // provider_connections predates managed_provider_credentials, which is where the inference
+    // credential has lived since the provider settings screen was written. Nothing has inserted a
+    // row here in the life of the current code - the four store methods that read and wrote it had
+    // no caller anywhere - so what remained was a table carrying an encrypted secret and a
+    // terms_accepted_at column, which a backup faithfully copied and a restore faithfully restored.
+    sql: `
+      ALTER TABLE users DROP COLUMN IF EXISTS legal_documents_version;
+      ALTER TABLE users DROP COLUMN IF EXISTS legal_accepted_at;
+      DROP TABLE IF EXISTS provider_connections;
+    `
+  },
+  {
+    version: 51,
+    name: 'drop_columns_no_code_writes',
+    // Five columns that were declared and never written, and one CHECK that allowed a value nothing
+    // can produce. A column carrying a default nobody updates is worse than a missing one: it is
+    // served on every response as a number that looks measured.
+    //
+    // tasks.reserved_compute_credits was read into every task record and served on every task, and
+    // no statement anywhere set it, so every task reported a reservation of zero. What is actually
+    // reserved lives in usage_entries with state='reserved', which is where the usage summary's
+    // reservedCredits already comes from - one place, in the currency the provider bills.
+    //
+    // workspaces.last_active_at promises the thing touchWorkspace does not do: it sets updated_at.
+    // workspace_keys.key_version and rotated_at were the schema half of key rotation; the code half
+    // was never written, and a version column that is always 1 tells a reader rotation happened.
+    //
+    // wrapping_mode's 'attested' arm belonged to hardware key release, whose receipts table
+    // migration 41 already dropped. packages/core mints 'hosted' and nothing else can reach here.
+    //
+    // workspace_previews.hosting_mode stored a choice between an always-awake site and one that
+    // idles, and neither half exists: nothing in this codebase hibernates a workspace on its own
+    // and nothing holds one awake. The one place it was read inverted the promise - the mode sold
+    // as "always on" was the only one that refused to wake a sleeping box. Publishing now means one
+    // thing, so the gateway wakes the computer for any live preview and the column goes.
+    sql: `
+      ALTER TABLE tasks DROP COLUMN IF EXISTS reserved_compute_credits;
+      ALTER TABLE workspaces DROP COLUMN IF EXISTS last_active_at;
+      ALTER TABLE workspace_keys DROP COLUMN IF EXISTS key_version;
+      ALTER TABLE workspace_keys DROP COLUMN IF EXISTS rotated_at;
+      ALTER TABLE workspace_previews DROP COLUMN IF EXISTS hosting_mode;
+      UPDATE workspace_keys SET wrapping_mode='hosted' WHERE wrapping_mode <> 'hosted';
+      ALTER TABLE workspace_keys DROP CONSTRAINT IF EXISTS workspace_keys_wrapping_mode_check;
+      ALTER TABLE workspace_keys
+        ADD CONSTRAINT workspace_keys_wrapping_mode_check CHECK (wrapping_mode = 'hosted');
+    `
+  },
+  {
+    version: 52,
+    name: 'memory_alias_surface',
+    // A fourth weighted field on mem.item, carrying the component words of the entry's compound
+    // terms: the parts of its subject, object, title, tags and the identifiers in its body.
+    //
+    // The tokenizer keeps `athanor-relay`, `imap_idle_notify_interval` and `/srv/athanor/var/log`
+    // whole on purpose - shredding them is how a stemmer destroys the substance of an agent
+    // computer's memory. The cost was that a fact whose subject is `athanor-relay` shared no lexeme
+    // with "what port does the relay listen on": not a low rank, no channel at all. The lexical
+    // channel could not reach it, the structural channel matches subject keys by exact equality so
+    // `relay` was not `athanor-relay`, and the fuzzy channel is built from identifier-shaped query
+    // terms, of which a plain-English question has none. A fact about a named service was
+    // unretrievable by the name people use for it.
+    //
+    // C weight sits below the title (A) and tags (B) and above the body (D), which is the right
+    // order: an entry actually titled "relay" should still win over one that merely contains a
+    // compound with `relay` in it. The column is populated by `buildMemoryItemIndex`, so it is
+    // keyed exactly like every other token here and PostgreSQL still cannot read any of it.
+    //
+    // Rows written before this migration keep an empty alias field until they are rewritten; the
+    // index key lives in the worker, so no backfill is possible from inside the database.
+    sql: `
+      ALTER TABLE mem.item ADD COLUMN IF NOT EXISTS alias_tokens TEXT NOT NULL DEFAULT '';
+
+      CREATE OR REPLACE FUNCTION mem.index_row() RETURNS trigger LANGUAGE plpgsql AS $ath$
+      BEGIN
+        IF TG_TABLE_NAME = 'item' THEN
+          IF NEW.indexed THEN
+            NEW.tsv :=
+                setweight(to_tsvector('simple', NEW.title_tokens), 'A')
+             || setweight(to_tsvector('simple', NEW.tag_tokens), 'B')
+             || setweight(to_tsvector('simple', NEW.alias_tokens), 'C')
+             || setweight(to_tsvector('simple', NEW.body_tokens), 'D');
+          ELSE
+            NEW.tsv := NULL;
+          END IF;
+          NEW.pred_functional := NEW.predicate IS NOT NULL AND EXISTS (
+            SELECT 1 FROM mem.predicate p
+            WHERE p.name = NEW.predicate AND p.cardinality = 'one');
+          NEW.trigram_len := COALESCE(cardinality(NEW.trigrams), 0);
+        ELSE
+          NEW.tsv := CASE WHEN NEW.indexed
+            THEN setweight(to_tsvector('simple', NEW.body_tokens), 'D') ELSE NULL END;
+        END IF;
+        NEW.tsv_len := COALESCE(
+          (SELECT SUM(COALESCE(array_length(positions, 1), 1)) FROM unnest(NEW.tsv)), 0)::int;
+        RETURN NEW;
+      END $ath$;
+
+      CREATE OR REPLACE TRIGGER t_mem_item_index
+        BEFORE INSERT OR UPDATE OF
+          title_tokens, tag_tokens, alias_tokens, body_tokens, trigrams, predicate, indexed
+        ON mem.item FOR EACH ROW EXECUTE FUNCTION mem.index_row();
+    `
+  },
+  {
+    version: 53,
+    name: 'checkpoint_order_taken',
+    // Which of two checkpoints was taken first, as a fact rather than an inference.
+    //
+    // A turn that checkpoints twice before writing an event produces two rows carrying the same
+    // event_sequence, and only the earlier one sits in front of all the work at that position -
+    // the later one already contains the changes an undo is being asked to drop. That order was
+    // read from created_at, which is NOW(): transaction start time, at whatever resolution the
+    // clock and the transaction boundaries happen to give. When two rows tie, the ordering falls
+    // through to the identifier, and a UUID says nothing about when it was made - so the undo can
+    // restore the wrong checkpoint, silently, and only on a machine that has been lived in.
+    //
+    // A sequence cannot tie. The backfill orders existing rows the way the old query read them, so
+    // no installation changes its answer for a checkpoint it already has.
+    sql: `
+      ALTER TABLE workspace_checkpoints
+        ADD COLUMN IF NOT EXISTS taken_seq BIGINT;
+
+      CREATE SEQUENCE IF NOT EXISTS workspace_checkpoints_taken_seq
+        OWNED BY workspace_checkpoints.taken_seq;
+
+      UPDATE workspace_checkpoints c
+        SET taken_seq = ordered.rank
+        FROM (
+          SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC, id ASC) AS rank
+          FROM workspace_checkpoints
+        ) ordered
+        WHERE c.id = ordered.id AND c.taken_seq IS NULL;
+
+      SELECT setval(
+        'workspace_checkpoints_taken_seq',
+        GREATEST((SELECT COALESCE(MAX(taken_seq), 0) FROM workspace_checkpoints), 1));
+
+      ALTER TABLE workspace_checkpoints
+        ALTER COLUMN taken_seq SET DEFAULT nextval('workspace_checkpoints_taken_seq');
+
+      UPDATE workspace_checkpoints SET taken_seq = nextval('workspace_checkpoints_taken_seq')
+        WHERE taken_seq IS NULL;
+
+      ALTER TABLE workspace_checkpoints ALTER COLUMN taken_seq SET NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS workspace_checkpoints_undo_idx
+        ON workspace_checkpoints(task_id, event_sequence DESC, taken_seq ASC);
+    `
+  },
+  {
+    version: 54,
+    name: 'drop_unused_memory_embeddings',
+    // Removes the semantic channel that was never built.
+    //
+    // Migration 35 created halfvec(1024) columns on mem.item and mem.source, two partial HNSW
+    // indexes over them, and an embed_state enum to sequence a queue that does not exist. Nothing
+    // has ever written a vector and no query has ever read one, so what shipped was an index of
+    // nothing, a state machine with one state, and a memoryCapabilities() flag reporting a channel
+    // the retrieval query has no branch for. That is worse than not having it: it reads as a
+    // component the main path depends on, and every later change to recall has to be explained
+    // against a surface that contributes nothing.
+    //
+    // Finishing it is not a question of where to get vectors. Memory bodies are sealed before they
+    // reach PostgreSQL and are searchable only through a keyed blind index, built in
+    // packages/core/src/memory.ts, so the database never holds the plaintext. An embedding is a
+    // dense derivative of that same plaintext, close enough that the text can be reconstructed from
+    // the vector, and it has to sit unencrypted beside the ciphertext to be searchable at all -
+    // which hands anything with read access on the database a recoverable copy of exactly the text
+    // the encryption is there to hide. It does not matter what produced the vector, which is what
+    // makes this the objection that decides it. The two costs easier to reach for do not decide
+    // anything: an embedding API puts a second vendor on the write path, which athanor's rule
+    // against third-party SaaS on a core path forbids, and a local model is a new runtime
+    // dependency with a download behind it - both true, but a model running on this computer
+    // answers the first outright, and the second is a price rather than a reason.
+    //
+    // What the channel would have bought - reaching a stored row from a paraphrase that shares none
+    // of its words - is therefore not bought at all. The agent asking its own memory a question in
+    // its own words (`recallMemory` in apps/worker/src/memory-runtime.ts) narrows that rather than
+    // closing it: the pack a task opens with is built before the agent has said anything. The gap
+    // is the price of the encryption, and it is carried as a probe the memory eval asserts still
+    // misses (packages/data/src/memory-eval.ts) rather than being talked out of existence here.
+    //
+    // The column drops are guarded because they only exist where pgvector was installed. The
+    // extension itself is left alone: this migration removes what athanor put in the database, and
+    // an extension the owner may be using elsewhere is not athanor's to withdraw.
+    sql: `
+      DROP INDEX IF EXISTS mem.mem_item_vec_hnsw;
+      DROP INDEX IF EXISTS mem.mem_source_vec_hnsw;
+
+      ALTER TABLE mem.item DROP COLUMN IF EXISTS embedding;
+      ALTER TABLE mem.source DROP COLUMN IF EXISTS embedding;
+      ALTER TABLE mem.item DROP COLUMN IF EXISTS embed_state;
+      ALTER TABLE mem.source DROP COLUMN IF EXISTS embed_state;
+
+      DROP TYPE IF EXISTS mem.embed_state;
+    `
+  },
+  {
+    version: 55,
+    name: 'checkpoint_anchors_its_turn',
+    // Re-points existing undo points at the message whose turn they hold.
+    //
+    // A checkpoint recorded the transcript position at the moment it was taken, which is always
+    // after the message that started the turn and after the status lines that follow it. But what
+    // the checkpoint holds is the computer as it was BEFORE that turn did anything. Rewinding
+    // resolves on `event_sequence <= the message you picked`, so picking the message you sent -
+    // which is what the client offers - could never match the undo point for the work that message
+    // caused. On a first turn the owner was told the computer could not be put back at all; on a
+    // later one they silently got the previous turn's point, which throws away a turn they never
+    // asked to undo.
+    //
+    // Each row moves back to the last user message at or before where it was taken, which is the
+    // opening of its own turn. Rows with no user message before them - a scheduled run, which
+    // starts without one - keep the number they have.
+    sql: `
+      UPDATE workspace_checkpoints c
+      SET event_sequence = COALESCE(
+        (SELECT MAX(e.sequence) FROM task_events e
+          WHERE e.task_id = c.task_id AND e.kind = 'user_message'
+            AND e.sequence <= c.event_sequence),
+        c.event_sequence)
+      WHERE c.task_id IS NOT NULL AND c.event_sequence IS NOT NULL;
+    `
+  },
+  {
+    version: 56,
+    name: 'generated_media_is_not_a_queue',
+    // Drops the media job queue, because generation is now part of the call that asks for it.
+    //
+    // The queue never bought asynchrony. The agent had to poll a `media_status` tool, which slept
+    // inside the turn until the row changed, so the turn blocked either way; what the queue added
+    // was a second service, a second runner client, two encrypted columns and a spend check that
+    // had to sum every unfinished row because none of them had reached the ledger yet. An image
+    // takes about ten seconds on a computer where a shell command may take an hour.
+    //
+    // Nothing is lost with the table. The generated files are in the workspace where they were
+    // written, and what each generation cost is in usage_entries, which is where the owner's
+    // spending was always read from.
+    sql: `DROP TABLE IF EXISTS media_jobs;`
+  },
+  {
+    version: 57,
+    name: 'deleting_a_conversation_takes_its_memory_with_it',
+    // Deleting a task removed its events, its plans and its approvals, and left every memory row
+    // the same conversation had produced: the episode, and - worse - the chunks of the owner's own
+    // words held verbatim in mem.source. On a computer that offers to keep no logs, "delete this
+    // conversation" has to mean it, and the only version of that which cannot be forgotten by a
+    // later caller is one the schema enforces.
+    //
+    // Only the episode and its sources carry task_id. A promoted fact does not, deliberately: it is
+    // something the owner stated on more than one day, distilled away from any single conversation,
+    // so it survives the deletion of the one that happened to observe it.
+    //
+    // Existing orphans are removed rather than detached. A row whose task no longer exists is
+    // memory of a conversation the owner has already deleted, and keeping it was the defect.
+    sql: `
+      DELETE FROM mem.source WHERE task_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = mem.source.task_id);
+      DELETE FROM mem.item WHERE task_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = mem.item.task_id);
+      ALTER TABLE mem.item DROP CONSTRAINT IF EXISTS mem_item_task_id_fkey;
+      ALTER TABLE mem.item ADD CONSTRAINT mem_item_task_id_fkey
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE;
+      ALTER TABLE mem.source DROP CONSTRAINT IF EXISTS mem_source_task_id_fkey;
+      ALTER TABLE mem.source ADD CONSTRAINT mem_source_task_id_fkey
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE;
+    `
+  },
+  {
+    version: 58,
+    name: 'a_correction_can_reach_a_running_task',
+    // A message sent while a task was working could only wait for it to stop. If the agent had
+    // misread the request, or the owner changed their mind, or it was heading down a road they
+    // could see was wrong, the only options were to watch it finish or cancel the whole turn and
+    // lose the work. The one channel for steering was the one that could not be used while there
+    // was anything to steer.
+    //
+    // The column marks a message the owner wants applied now rather than after: the running turn
+    // picks it up at its next step boundary and carries on with it, keeping everything already
+    // done. Queue-for-later stays the default, because "do this next" and "no, not that" are
+    // genuinely different intentions and guessing between them from timing alone would get it
+    // wrong in whichever direction the guess was made.
+    sql: `
+      ALTER TABLE task_message_queue
+        ADD COLUMN IF NOT EXISTS interrupt BOOLEAN NOT NULL DEFAULT FALSE;
+    `
+  },
+  {
+    version: 59,
+    name: 'choices_follow_the_owner_not_the_device',
+    // The owner's choices lived in localStorage, so they were facts about a browser rather than
+    // about the person. Pick a model on the laptop and the phone still offers the old one; the two
+    // devices disagree about a setting the owner set once, and neither is wrong from where it sits.
+    // On a computer whose whole point is being the same computer from anywhere, a setting that does
+    // not travel is a setting that is not really set.
+    //
+    // JSONB rather than a column per choice: these are small, they are read together in one
+    // bootstrap, and adding the next one should not be a migration. The shape is validated on the
+    // way in and again on the way out, so a row written by a newer build cannot break an older one.
+    sql: `
+      ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS preferences JSONB NOT NULL DEFAULT '{}'::jsonb;
+    `
+  },
+  {
+    version: 60,
+    name: 'a_half_typed_message_follows_the_owner',
+    // The draft lived in localStorage, which made "close the laptop, pick it up on the phone" - the
+    // sentence the client's own storage module gives as its reason for existing - true only if both
+    // happened on the same device. Start a message on the laptop and the phone shows an empty box.
+    //
+    // Encrypted with the workspace key like every other thing the owner wrote, because that is what
+    // it is: their words, not a setting. One row per conversation, plus one for the message not yet
+    // attached to a conversation, which is where most first sentences are typed.
+    sql: `
+      CREATE TABLE IF NOT EXISTS message_drafts (
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        -- NULL is the draft for a conversation that does not exist yet. The unique index below
+        -- cannot enforce that on its own, because NULLs are never equal to one another in SQL.
+        task_id UUID REFERENCES tasks(id) ON DELETE CASCADE,
+        body_ciphertext JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS message_drafts_task_idx
+        ON message_drafts(workspace_id, task_id) WHERE task_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS message_drafts_new_idx
+        ON message_drafts(workspace_id) WHERE task_id IS NULL;
+    `
+  }
+] as const;

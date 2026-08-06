@@ -1,0 +1,12 @@
+[Unit]
+Description=Record a failed athanor certificate renewal
+# Started by OnFailure= on the renewal unit, never on its own.
+RefuseManualStart=no
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/athanor/athanor-certificate alert-failed
+# The journal is the one place a failure is already being written, so it is written at the level
+# that shows up in `journalctl -p err` rather than buried among informational lines.
+SyslogIdentifier=athanor-certificate
+SyslogLevel=err

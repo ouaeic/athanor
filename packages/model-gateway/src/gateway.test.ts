@@ -1,0 +1,180 @@
+import { AthanorError } from '@athanor/core';
+import { describe, expect, it } from 'vitest';
+import { ModelGateway } from './gateway.js';
+import { OpenAICompatibleAdapter } from './openai-compatible.js';
+import type { ModelAdapter, ModelRequest, ModelResponse, ProviderModel } from './protocol.js';
+import type { RetryPolicy } from './retry.js';
+
+const instantPolicy = (waits: number[]): RetryPolicy => ({
+  maxAttempts: 3,
+  baseDelayMs: 500,
+  maxDelayMs: 20_000,
+  random: () => 0,
+  sleep: async (ms) => {
+    waits.push(ms);
+  }
+});
+
+const stubAdapter = (chat: (input: ModelRequest) => Promise<ModelResponse>): ModelAdapter => ({
+  provider: 'test',
+  privacyRoute: 'provider_zdr',
+  list: async (): Promise<ProviderModel[]> => [],
+  chat
+});
+
+const completion = (text: string): ModelResponse => ({
+  text,
+  toolCalls: [],
+  finishReason: 'stop',
+  usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
+  metadata: {
+    provider: 'test',
+    model: 'test-model',
+    latencyMs: 1,
+    privacyRoute: 'provider_zdr'
+  }
+});
+
+const baseRequest: ModelRequest = {
+  model: 'test-model',
+  messages: [{ role: 'user', content: 'Inspect the workspace' }],
+  tools: [],
+  temperature: 0.2
+};
+
+describe('ModelGateway.chat retries', () => {
+  it('rides out transient upstream faults with backoff instead of failing the task', async () => {
+    const waits: number[] = [];
+    let attempts = 0;
+    const gateway = new ModelGateway({ retry: instantPolicy(waits) }).register(
+      'test',
+      stubAdapter(async () => {
+        attempts += 1;
+        if (attempts === 1) throw new AthanorError('provider_unavailable', 'upstream down', 503);
+        if (attempts === 2) throw new AthanorError('provider_quota_exhausted', 'rate limited', 429);
+        return completion('recovered');
+      })
+    );
+
+    await expect(gateway.chat('test', baseRequest)).resolves.toMatchObject({ text: 'recovered' });
+    expect(attempts).toBe(3);
+    expect(waits).toEqual([250, 500]);
+  });
+
+  it('gives up when the attempt budget runs out', async () => {
+    const waits: number[] = [];
+    let attempts = 0;
+    const gateway = new ModelGateway({ retry: instantPolicy(waits) }).register(
+      'test',
+      stubAdapter(async () => {
+        attempts += 1;
+        throw new AthanorError('provider_unavailable', 'upstream down', 503);
+      })
+    );
+
+    await expect(gateway.chat('test', baseRequest)).rejects.toThrow('upstream down');
+    expect(attempts).toBe(3);
+  });
+
+  it('never replays a request that already streamed text to the caller', async () => {
+    const waits: number[] = [];
+    const deltas: string[] = [];
+    let attempts = 0;
+    const gateway = new ModelGateway({ retry: instantPolicy(waits) }).register(
+      'test',
+      stubAdapter(async (input) => {
+        attempts += 1;
+        await input.onTextDelta?.('half an answer');
+        throw new AthanorError('provider_unavailable', 'stream cut', 503);
+      })
+    );
+
+    await expect(
+      gateway.chat('test', {
+        ...baseRequest,
+        onTextDelta: (delta) => {
+          deltas.push(delta);
+        }
+      })
+    ).rejects.toThrow('stream cut');
+    expect(attempts).toBe(1);
+    expect(deltas).toEqual(['half an answer']);
+  });
+
+  it('does not retry a request the owner cancelled', async () => {
+    const controller = new AbortController();
+    let attempts = 0;
+    const gateway = new ModelGateway({ retry: instantPolicy([]) }).register(
+      'test',
+      stubAdapter(async () => {
+        attempts += 1;
+        controller.abort();
+        throw new AthanorError('provider_unavailable', 'cancelled mid-flight', 503);
+      })
+    );
+
+    await expect(
+      gateway.chat('test', { ...baseRequest, signal: controller.signal })
+    ).rejects.toThrow('cancelled mid-flight');
+    expect(attempts).toBe(1);
+  });
+
+  it('fails fast on a permanent provider rejection', async () => {
+    let attempts = 0;
+    const gateway = new ModelGateway({ retry: instantPolicy([]) }).register(
+      'test',
+      stubAdapter(async () => {
+        attempts += 1;
+        throw new AthanorError('provider_request_failed', 'unknown model');
+      })
+    );
+
+    await expect(gateway.chat('test', baseRequest)).rejects.toThrow('unknown model');
+    expect(attempts).toBe(1);
+  });
+
+  it('replays a stream the connection dropped before any text reached the owner', async () => {
+    let attempts = 0;
+    const adapter = new OpenAICompatibleAdapter({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      provider: 'test',
+      privacyRoute: 'provider_zdr',
+      fetch: (async () => {
+        attempts += 1;
+        if (attempts === 1)
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.error(new TypeError('terminated'));
+              }
+            }),
+            { headers: { 'content-type': 'text/event-stream' } }
+          );
+        return new Response(
+          'data: {"choices":[{"finish_reason":"stop","delta":{"content":"recovered"}}]}\n\ndata: [DONE]\n\n',
+          { headers: { 'content-type': 'text/event-stream' } }
+        );
+      }) as typeof fetch
+    });
+    const deltas: string[] = [];
+    const gateway = new ModelGateway({ retry: instantPolicy([]) }).register('test', adapter);
+
+    await expect(
+      gateway.chat('test', {
+        ...baseRequest,
+        onTextDelta: (delta) => {
+          deltas.push(delta);
+        }
+      })
+    ).resolves.toMatchObject({ text: 'recovered' });
+    expect(attempts).toBe(2);
+    expect(deltas).toEqual(['recovered']);
+  });
+
+  it('still rejects an unregistered provider without retrying', async () => {
+    const gateway = new ModelGateway();
+    await expect(gateway.chat('missing', baseRequest)).rejects.toThrow(
+      'Provider missing is not configured'
+    );
+  });
+});

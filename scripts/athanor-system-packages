@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "athanor-system-packages must run through the installed sudo policy" >&2
+  exit 1
+fi
+
+operation="${1:-}"
+shift || true
+
+case "$operation" in
+  update)
+    [ "$#" -eq 0 ] || {
+      echo "update does not accept additional arguments" >&2
+      exit 1
+    }
+    exec /usr/bin/apt-get update
+    ;;
+  install)
+    [ "$#" -gt 0 ] || {
+      echo "install requires at least one Debian package name" >&2
+      exit 1
+    }
+    for package_name in "$@"; do
+      case "$package_name" in
+        *[!A-Za-z0-9+._:-]*|-*|*::*|*:|.*|/*)
+          echo "Rejected unsafe package name: $package_name" >&2
+          exit 1
+          ;;
+      esac
+    done
+    /usr/bin/apt-get update
+    /usr/bin/apt-get install -y --no-install-recommends "$@"
+    /usr/bin/install -d -m 0755 /var/lib/athanor
+    package_manifest=/var/lib/athanor/installed-packages
+    temporary_manifest=$(/usr/bin/mktemp /var/lib/athanor/installed-packages.XXXXXX)
+    {
+      [ ! -f "$package_manifest" ] || /usr/bin/cat "$package_manifest"
+      /usr/bin/printf '%s\n' "$@"
+    } | /usr/bin/sort -u >"$temporary_manifest"
+    /usr/bin/chmod 0644 "$temporary_manifest"
+    /usr/bin/mv "$temporary_manifest" "$package_manifest"
+    ;;
+  *)
+    echo "Usage: athanor-system-packages {update|install PACKAGE...}" >&2
+    exit 1
+    ;;
+esac

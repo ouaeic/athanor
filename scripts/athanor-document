@@ -1,0 +1,484 @@
+#!/usr/bin/python3
+"""Bounded, dependency-light extraction and search for user-owned documents."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import html
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+import zipfile
+from collections import Counter
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Iterable
+
+
+SUPPORTED = {
+    ".csv",
+    ".docx",
+    ".html",
+    ".htm",
+    ".json",
+    ".md",
+    ".odp",
+    ".ods",
+    ".odt",
+    ".pdf",
+    ".pptx",
+    ".rtf",
+    ".svg",
+    ".tsv",
+    ".txt",
+    ".xlsx",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+MAX_SOURCE_BYTES = 250 * 1024 * 1024
+MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024
+TOKEN = re.compile(r"[\w-]{2,}", re.UNICODE)
+
+
+class TextHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag in {"script", "style", "noscript"}:
+            self.hidden += 1
+        elif tag in {"p", "br", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript"}:
+            self.hidden = max(0, self.hidden - 1)
+        elif tag in {"p", "div", "li", "tr"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self.hidden:
+            self.parts.append(data)
+
+
+def safe_target(raw: str, *, directory_ok: bool = False) -> Path:
+    root = Path.cwd().resolve()
+    requested = Path(raw)
+    target = (root / requested).resolve() if not requested.is_absolute() else requested.resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as error:
+        raise ValueError("Document path must stay inside the current workspace") from error
+    if directory_ok and target.is_dir():
+        return target
+    if not target.is_file():
+        raise ValueError("Document path is not a regular file")
+    if target.stat().st_size > MAX_SOURCE_BYTES:
+        raise ValueError("Document exceeds the 250 MB extraction limit")
+    return target
+
+
+def normalized(text: str) -> str:
+    text = text.replace("\x00", "")
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    return text.strip()
+
+
+def bounded_member(archive: zipfile.ZipFile, name: str) -> bytes:
+    info = archive.getinfo(name)
+    if info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+        raise ValueError(f"Archive member is too large: {name}")
+    with archive.open(info) as member:
+        return member.read(MAX_ARCHIVE_MEMBER_BYTES + 1)
+
+
+def xml_text(data: bytes, paragraph_tags: set[str] | None = None) -> str:
+    paragraph_tags = paragraph_tags or {"p", "tr", "row"}
+    root = ET.fromstring(data)
+    parts: list[str] = []
+    for element in root.iter():
+        local = element.tag.rsplit("}", 1)[-1]
+        if local in {"t", "text", "tab"} and element.text:
+            parts.append(element.text)
+        if local in paragraph_tags:
+            parts.append("\n")
+    return normalized(" ".join(parts).replace(" \n ", "\n"))
+
+
+def extract_docx(target: Path) -> str:
+    with zipfile.ZipFile(target) as archive:
+        return xml_text(bounded_member(archive, "word/document.xml"))
+
+
+def natural_key(name: str) -> list[object]:
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)]
+
+
+def extract_pptx(target: Path) -> str:
+    with zipfile.ZipFile(target) as archive:
+        names = sorted(
+            (
+                name
+                for name in archive.namelist()
+                if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+            ),
+            key=natural_key,
+        )
+        return normalized(
+            "\n\n".join(
+                f"[Slide {index}]\n{xml_text(bounded_member(archive, name))}"
+                for index, name in enumerate(names, 1)
+            )
+        )
+
+
+def extract_xlsx(target: Path) -> str:
+    with zipfile.ZipFile(target) as archive:
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root = ET.fromstring(bounded_member(archive, "xl/sharedStrings.xml"))
+            for item in root:
+                shared.append(
+                    "".join(
+                        node.text or "" for node in item.iter() if node.tag.rsplit("}", 1)[-1] == "t"
+                    )
+                )
+        sheets = sorted(
+            (
+                name
+                for name in archive.namelist()
+                if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)
+            ),
+            key=natural_key,
+        )
+        parts: list[str] = []
+        for sheet_index, name in enumerate(sheets, 1):
+            parts.append(f"[Sheet {sheet_index}]")
+            root = ET.fromstring(bounded_member(archive, name))
+            for row in (node for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "row"):
+                cells: list[str] = []
+                for cell in (
+                    node for node in row if node.tag.rsplit("}", 1)[-1] == "c"
+                ):
+                    kind = cell.attrib.get("t")
+                    value = next(
+                        (
+                            node.text or ""
+                            for node in cell.iter()
+                            if node.tag.rsplit("}", 1)[-1] in {"v", "t"}
+                        ),
+                        "",
+                    )
+                    if kind == "s" and value.isdigit() and int(value) < len(shared):
+                        value = shared[int(value)]
+                    cells.append(value)
+                parts.append("\t".join(cells))
+        return normalized("\n".join(parts))
+
+
+def extract_open_document(target: Path) -> str:
+    with zipfile.ZipFile(target) as archive:
+        return xml_text(bounded_member(archive, "content.xml"))
+
+
+def extract_pdf(target: Path, start_page: int, end_page: int) -> tuple[str, int | None]:
+    pages: int | None = None
+    info = subprocess.run(
+        ["/usr/bin/pdfinfo", str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    for line in info.stdout.splitlines():
+        if line.startswith("Pages:"):
+            try:
+                pages = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+    command = [
+        "/usr/bin/pdftotext",
+        "-f",
+        str(start_page),
+        "-l",
+        str(end_page),
+        "-layout",
+        str(target),
+        "-",
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, timeout=90)
+    if result.returncode != 0:
+        raise ValueError(
+            normalized(result.stderr.decode("utf-8", "replace")) or "PDF extraction failed"
+        )
+    return normalized(result.stdout.decode("utf-8", "replace")), pages
+
+
+def extract_text(target: Path, start_page: int = 1, end_page: int = 20) -> tuple[str, int | None]:
+    suffix = target.suffix.lower()
+    if suffix == ".pdf":
+        return extract_pdf(target, start_page, end_page)
+    if suffix == ".docx":
+        return extract_docx(target), None
+    if suffix == ".pptx":
+        return extract_pptx(target), None
+    if suffix == ".xlsx":
+        return extract_xlsx(target), None
+    if suffix in {".odt", ".ods", ".odp"}:
+        return extract_open_document(target), None
+    data = target.read_bytes()
+    text = data.decode("utf-8", "replace")
+    if suffix in {".html", ".htm"}:
+        parser = TextHTMLParser()
+        parser.feed(text)
+        return normalized(html.unescape(" ".join(parser.parts))), None
+    if suffix in {".xml", ".svg"}:
+        try:
+            return xml_text(data, {"p", "text", "g"}), None
+        except ET.ParseError:
+            pass
+    if suffix in {".csv", ".tsv"}:
+        dialect = "excel-tab" if suffix == ".tsv" else "excel"
+        rows = csv.reader(text.splitlines(), dialect=dialect)
+        return normalized("\n".join("\t".join(row) for row in rows)), None
+    if suffix == ".rtf":
+        text = re.sub(r"\\'[0-9a-fA-F]{2}", " ", text)
+        text = re.sub(r"\\[a-zA-Z]+-?\d* ?", " ", text)
+        text = text.replace("{", " ").replace("}", " ")
+    return normalized(text), None
+
+
+def chunks(text: str, size: int = 2_400) -> Iterable[str]:
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    current = ""
+    for paragraph in paragraphs:
+        if current and len(current) + len(paragraph) + 2 > size:
+            yield current
+            current = ""
+        current = f"{current}\n\n{paragraph}".strip()
+        while len(current) > size * 2:
+            yield current[:size]
+            current = current[size:]
+    if current:
+        yield current
+
+
+def located_chunks(text: str, suffix: str) -> Iterable[tuple[str, int | None]]:
+    if suffix == ".pdf":
+        for page, page_text in enumerate(text.split("\f"), 1):
+            for chunk in chunks(page_text):
+                yield chunk, page
+        return
+    for chunk in chunks(text):
+        yield chunk, None
+
+
+def bm25_score(
+    query: str,
+    text: str,
+    name: str,
+    counts: Counter[str],
+    token_count: int,
+    document_frequency: Counter[str],
+    corpus_size: int,
+    average_length: float,
+) -> float:
+    terms = list(dict.fromkeys(term.lower() for term in TOKEN.findall(query)))
+    if not terms:
+        return 0
+    k1 = 1.5
+    b = 0.75
+    normalized_length = token_count / max(1.0, average_length)
+    score = 0.0
+    for term in terms:
+        frequency = counts[term]
+        if not frequency:
+            continue
+        inverse_frequency = math.log(
+            1
+            + (corpus_size - document_frequency[term] + 0.5)
+            / (document_frequency[term] + 0.5)
+        )
+        score += inverse_frequency * (
+            frequency * (k1 + 1)
+            / (frequency + k1 * (1 - b + b * normalized_length))
+        )
+    haystack = text.lower()
+    phrase = query.strip().lower()
+    if phrase and phrase in haystack:
+        score += 4
+    lowered_name = name.lower()
+    score += 1.5 * sum(1 for term in terms if term in lowered_name)
+    coverage = sum(1 for term in terms if counts[term]) / len(terms)
+    return score + coverage * 2
+
+
+def read_command(args: argparse.Namespace) -> dict[str, object]:
+    target = safe_target(args.path)
+    text, pages = extract_text(target, args.start_page, args.end_page)
+    total = len(text)
+    clipped = text[: args.max_chars]
+    return {
+        "path": os.path.relpath(target, Path.cwd()),
+        "format": target.suffix.lower().lstrip(".") or "text",
+        "text": clipped,
+        "characters": total,
+        "truncated": total > len(clipped),
+        "pages": pages,
+        "pageRange": (
+            {"start": args.start_page, "end": args.end_page}
+            if target.suffix.lower() == ".pdf"
+            else None
+        ),
+    }
+
+
+def candidate_files(root: Path, max_files: int) -> Iterable[Path]:
+    ignored = {".git", ".athanor", "node_modules", "dist", "build", ".venv", "__pycache__"}
+    seen = 0
+    for directory, names, files in os.walk(root):
+        names[:] = sorted(
+            name for name in names if name not in ignored and not name.startswith(".")
+        )
+        for name in sorted(files):
+            target = Path(directory) / name
+            if target.suffix.lower() not in SUPPORTED or target.is_symlink():
+                continue
+            try:
+                if target.stat().st_size > MAX_SOURCE_BYTES:
+                    continue
+            except OSError:
+                continue
+            yield target
+            seen += 1
+            if seen >= max_files:
+                return
+
+
+def search_command(args: argparse.Namespace) -> dict[str, object]:
+    root = safe_target(args.path, directory_ok=True)
+    files = [root] if root.is_file() else list(candidate_files(root, args.max_files))
+    query_terms = list(dict.fromkeys(term.lower() for term in TOKEN.findall(args.query)))
+    if not query_terms:
+        raise ValueError("Search query must contain at least one word")
+    candidates: list[tuple[Path, str, int | None, Counter[str], int]] = []
+    document_frequency: Counter[str] = Counter()
+    corpus_size = 0
+    corpus_tokens = 0
+    failures = 0
+    for target in files:
+        try:
+            text, _pages = extract_text(target, 1, args.max_pages)
+        except (OSError, ValueError, ET.ParseError, zipfile.BadZipFile, subprocess.TimeoutExpired):
+            failures += 1
+            continue
+        for chunk, page in located_chunks(text, target.suffix.lower()):
+            counts = Counter(term.lower() for term in TOKEN.findall(chunk))
+            token_count = sum(counts.values())
+            corpus_size += 1
+            corpus_tokens += token_count
+            present = {term for term in query_terms if counts[term]}
+            document_frequency.update(present)
+            if present or any(term in target.name.lower() for term in query_terms):
+                candidates.append((target, chunk, page, counts, token_count))
+    average_length = corpus_tokens / max(1, corpus_size)
+    ranked = [
+        (
+            bm25_score(
+                args.query,
+                chunk,
+                target.name,
+                counts,
+                token_count,
+                document_frequency,
+                corpus_size,
+                average_length,
+            ),
+            target,
+            chunk,
+            page,
+        )
+        for target, chunk, page, counts, token_count in candidates
+    ]
+    ranked.sort(key=lambda item: (-item[0], str(item[1]), item[3] or 0))
+    results: list[dict[str, object]] = []
+    per_file: Counter[str] = Counter()
+    for score, target, excerpt, page in ranked:
+        relative = os.path.relpath(target, Path.cwd())
+        if per_file[relative] >= 3:
+            continue
+        result: dict[str, object] = {
+            "path": relative,
+            "score": round(score, 3),
+            "excerpt": excerpt[: args.excerpt_chars],
+        }
+        if page is not None:
+            result["page"] = page
+        results.append(result)
+        per_file[relative] += 1
+        if len(results) >= args.max_results:
+            break
+    return {
+        "query": args.query,
+        "path": os.path.relpath(root, Path.cwd()),
+        "filesConsidered": len(files),
+        "filesSkipped": failures,
+        "results": results,
+        "method": "private source-linked BM25 retrieval; ask follow-up searches with synonyms when wording may differ",
+    }
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(prog="athanor-document")
+    subparsers = result.add_subparsers(dest="command", required=True)
+    read = subparsers.add_parser("read")
+    read.add_argument("--path", required=True)
+    read.add_argument("--start-page", type=int, default=1)
+    read.add_argument("--end-page", type=int, default=20)
+    read.add_argument("--max-chars", type=int, default=80_000)
+    search = subparsers.add_parser("search")
+    search.add_argument("--path", default=".")
+    search.add_argument("--query", required=True)
+    search.add_argument("--max-files", type=int, default=500)
+    search.add_argument("--max-results", type=int, default=12)
+    search.add_argument("--max-pages", type=int, default=500)
+    search.add_argument("--excerpt-chars", type=int, default=2_400)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.command == "read":
+            if args.start_page < 1 or args.end_page < args.start_page or args.end_page > 10_000:
+                raise ValueError("Invalid page range")
+            args.max_chars = min(200_000, max(1_000, args.max_chars))
+            payload = read_command(args)
+        else:
+            args.max_files = min(2_000, max(1, args.max_files))
+            args.max_results = min(50, max(1, args.max_results))
+            args.max_pages = min(10_000, max(1, args.max_pages))
+            args.excerpt_chars = min(8_000, max(300, args.excerpt_chars))
+            payload = search_command(args)
+        json.dump(payload, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    except (OSError, ValueError, ET.ParseError, zipfile.BadZipFile, subprocess.TimeoutExpired) as error:
+        json.dump({"error": str(error)}, sys.stderr, ensure_ascii=False)
+        sys.stderr.write("\n")
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

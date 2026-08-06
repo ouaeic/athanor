@@ -1,0 +1,28 @@
+{
+  "name": "@athanor/relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "athanor-relay": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "NODE_OPTIONS=--conditions=development tsx watch src/cli.ts serve",
+    "start": "node dist/cli.js serve",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "NODE_OPTIONS=--conditions=development vitest run --exclude 'dist/**'"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  }
+}

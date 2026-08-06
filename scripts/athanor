@@ -1,0 +1,1221 @@
+#!/bin/sh
+set -eu
+
+athanor_root="${ATHANOR_ROOT:-/opt/athanor}"
+athanor_config="${ATHANOR_CONFIG:-/etc/athanor}"
+athanor_state="${ATHANOR_STATE:-/var/lib/athanor}"
+athanor_home="${ATHANOR_HOME:-/home/athanor}"
+athanor_backup_root="${ATHANOR_BACKUP_ROOT:-/var/backups/athanor}"
+# Every update leaves a full copy of the database and every workspace behind. Unpruned, the
+# mechanism that protects the disk is the one that fills it. Five is enough to step back past a
+# bad release without keeping months of them.
+athanor_backup_keep="${ATHANOR_BACKUP_KEEP:-5}"
+# No single step of an update may run forever. Exceeding this rolls the server back rather than
+# leaving it stopped and half-built with nobody watching.
+athanor_update_step_seconds="${ATHANOR_UPDATE_STEP_SECONDS:-1800}"
+# How long a restart is given to come back serving. Longer than the sixty seconds this used to
+# allow, because it now waits for migrations to finish against a populated database rather than
+# for a socket to open. Overridable for a server slow enough to need it.
+athanor_ready_timeout_seconds="${ATHANOR_READY_TIMEOUT_SECONDS:-180}"
+athanor_runtime_prefix="${ATHANOR_RUNTIME_PREFIX:-}"
+service_units="athanor-runner.service athanor@api.service athanor@worker.service athanor@registry.service athanor@notifications.service athanor-network-watch.service"
+auto_update_timer="athanor-auto-update.timer"
+last_backup_destination=""
+
+runtime_path() {
+  printf '%s%s' "$athanor_runtime_prefix" "$1"
+}
+
+fail() {
+  printf 'athanor: %s\n' "$1" >&2
+  exit 1
+}
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    command -v sudo >/dev/null 2>&1 || fail "this command must run as root"
+    exec sudo -E "$0" "$@"
+  fi
+}
+
+set_control_value() {
+  config_key="$1"
+  temporary=$(mktemp "$athanor_config/control.env.XXXXXX")
+  # The value reaches awk through the environment, never through `-v`: this file holds the
+  # pairing code and other secrets, and a process argument list is world-readable through
+  # /proc/PID/cmdline for as long as the command runs.
+  ATHANOR_CONFIG_VALUE="$2" awk -v key="$config_key" '
+    BEGIN { replaced = 0; value = ENVIRON["ATHANOR_CONFIG_VALUE"] }
+    index($0, key "=") == 1 {
+      if (!replaced) print key "=" value
+      replaced = 1
+      next
+    }
+    { print }
+    END { if (!replaced) print key "=" value }
+  ' "$athanor_config/control.env" >"$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$athanor_config/control.env"
+}
+
+# Prints why the running release is not usable, or nothing when it is.
+#
+# /healthz answers `{"ok":true}` from a static literal: it is true of a build that cannot reach
+# PostgreSQL, cannot read its own schema, and serves an error to every request. Using it as the
+# update's rollback gate meant a broken release cleared the gate, the rollback trap was cleared,
+# and the operator was told the update was complete while the product was dead. Each check below
+# needs something the previous one does not.
+release_readiness_failure() {
+  # The database, from inside the new build's own pool.
+  curl -fsS --max-time 10 http://127.0.0.1:4100/readyz >/dev/null 2>&1 || {
+    printf 'the API cannot reach the database'
+    return 0
+  }
+  # A real request, served end to end: this route counts users, so it goes through the store and
+  # the schema rather than answering from a literal.
+  case "$(curl -fsS --max-time 10 http://127.0.0.1:4100/v1/legal 2>/dev/null)" in
+    *'"applicationLicense"'*) ;;
+    *)
+      printf 'the API did not serve a request that reads from the database'
+      return 0
+      ;;
+  esac
+  # The schema the new code expects is the schema the database has. Migrations run at service
+  # startup, so a migration that failed leaves the old version applied under the new build.
+  migrations_source="$athanor_root/packages/data/src/migrations.ts"
+  if [ -r "$migrations_source" ]; then
+    expected_migration=$(
+      sed -n 's/^ *version: \([0-9][0-9]*\),$/\1/p' "$migrations_source" | sort -n | sed -n '$p'
+    )
+    applied_migration=$(
+      runuser -u postgres -- psql -tAqc \
+        'SELECT COALESCE(MAX(version), 0) FROM schema_migrations' athanor 2>/dev/null |
+        tr -d '[:space:]'
+    )
+    if [ -n "$expected_migration" ] && [ "$applied_migration" != "$expected_migration" ]; then
+      printf 'the database is at schema version %s but this release expects %s' \
+        "${applied_migration:-unknown}" "$expected_migration"
+      return 0
+    fi
+  fi
+  # The worker leases tasks and the runner executes them; a release where either never comes up
+  # is a computer that answers and does nothing.
+  worker_metrics=$(curl -fsS --max-time 10 http://127.0.0.1:4201/metrics 2>/dev/null) || {
+    printf 'the worker is not answering'
+    return 0
+  }
+  # Answering is not the same as working. A worker whose lease keeps failing serves this endpoint
+  # perfectly while accepting no tasks at all, so the release passed its own gate on a process that
+  # had done nothing since it started. The counter is read the same way the idle check reads
+  # athanor_worker_active, a few lines below.
+  lease_errors=$(printf '%s\n' "$worker_metrics" |
+    sed -n 's/^athanor_worker_lease_errors_total //p' | sed -n '1p' | tr -d '[:space:]')
+  case "$lease_errors" in
+  '' | 0) ;;
+  *)
+    printf 'the worker is answering but cannot lease tasks (%s failures)' "$lease_errors"
+    return 0
+    ;;
+  esac
+  curl -fsS --max-time 10 http://127.0.0.1:4300/healthz >/dev/null 2>&1 || {
+    printf 'the workspace runner is not answering'
+    return 0
+  }
+}
+
+wait_until_serving() {
+  attempt=1
+  readiness=""
+  while [ "$attempt" -le "$athanor_ready_timeout_seconds" ]; do
+    readiness=$(release_readiness_failure)
+    [ -n "$readiness" ] || return 0
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  fail "this release is not serving: $readiness; run sudo athanor logs"
+}
+
+start_athanor() {
+  need_root start
+  systemctl start athanor.target
+  systemctl reload-or-restart nginx
+  wait_until_serving
+  printf 'athanor is running. Use “athanor connect” to show the client connection details.\n'
+}
+
+stop_athanor() {
+  need_root stop
+  systemctl stop athanor.target
+  for unit_name in $service_units; do systemctl stop "$unit_name"; done
+  printf 'athanor services stopped; files and database were preserved.\n'
+}
+
+# systemd stops wanting a unit that a release has withdrawn, which keeps it from starting again but
+# never stops the copy already running: it goes on holding its port and its database connections
+# until somebody reboots. `service_units` above is the list this release ships, so anything still up
+# under the instance template and absent from it is stopped here.
+stop_withdrawn_units() {
+  withdrawn=$(systemctl list-units --state=active --no-legend 'athanor@*.service' 2>/dev/null |
+    awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^athanor@.*\.service$/) { print $i; break } }') ||
+    return 0
+  for unit_name in $withdrawn; do
+    case " $service_units " in
+    *" $unit_name "*) ;;
+    *)
+      printf 'Stopping %s, which this release no longer installs.\n' "$unit_name"
+      systemctl stop "$unit_name" 2>/dev/null || true
+      systemctl disable "$unit_name" 2>/dev/null || true
+      ;;
+    esac
+  done
+}
+
+restart_athanor() {
+  need_root restart
+  systemctl start athanor.target
+  stop_withdrawn_units
+  for unit_name in $service_units; do systemctl restart "$unit_name"; done
+  systemctl reload-or-restart nginx
+  wait_until_serving
+  printf 'athanor restarted.\n'
+}
+
+status_athanor() {
+  # First, because it is the one condition whose other symptom is a browser refusing to open the
+  # server at all - by which point the owner cannot be told anything through the interface.
+  if [ -r "$athanor_state/certificate.error" ]; then
+    printf 'athanor: TLS renewal failed at %s - %s\n' \
+      "$(sed -n '1p' "$athanor_state/certificate.error")" \
+      "$(sed -n '2p' "$athanor_state/certificate.error")" >&2
+    printf 'athanor: clients will see a security warning once the certificate expires. Run sudo athanor certificate issue.\n\n' >&2
+  fi
+  systemctl --no-pager --full status athanor.target nginx.service || true
+  for unit_name in $service_units; do
+    systemctl --no-pager --full status "$unit_name" || true
+  done
+}
+
+logs_athanor() {
+  journalctl -f --no-hostname -n 250 \
+    -u athanor-runner.service \
+    -u athanor@api.service \
+    -u athanor@worker.service \
+    -u athanor@registry.service \
+    -u athanor@notifications.service \
+    -u nginx.service
+}
+
+control_env_value() {
+  [ -r "$athanor_config/control.env" ] || return 0
+  sed -n "s/^$1=//p" "$athanor_config/control.env" | sed -n '1p'
+}
+
+relay_directory="$athanor_config/relay"
+relay_settings="$relay_directory/settings.json"
+relay_status_file="$relay_directory/status.json"
+
+relay_setting() {
+  [ -r "$relay_settings" ] || return 0
+  jq -r "$1 // empty" "$relay_settings" 2>/dev/null || true
+}
+
+relay_status_value() {
+  [ -r "$relay_status_file" ] || return 0
+  jq -r "$1 // empty" "$relay_status_file" 2>/dev/null || true
+}
+
+relay_public_hostname() {
+  relay_label=$(relay_setting .label)
+  relay_host=$(relay_setting .host)
+  [ -n "$relay_label" ] && [ -n "$relay_host" ] || return 0
+  printf '%s.%s' "$relay_label" "$relay_host"
+}
+
+# Bytes moved through the relay this month, as the relay itself last reported them. Printed
+# because the relay is a control path, not a media path: a desktop preview will exhaust a
+# hobbyist quota in hours and the owner should see that coming rather than be cut off.
+relay_used_summary() {
+  relay_used_bytes=$(relay_status_value .usedBytes)
+  case "$relay_used_bytes" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  printf ', %s MiB used this month' "$((relay_used_bytes / 1048576))"
+}
+
+doctor() {
+  need_root doctor
+  failed=0
+  check_ok() { printf 'ok    %s\n' "$1"; }
+  check_fail() {
+    printf 'fail  %s\n' "$1"
+    failed=1
+  }
+  check_note() { printf 'note  %s\n' "$1"; }
+  # A warning is a working server that is missing a capability the owner probably wants, not a
+  # fault. It must not fail the run, or an operator who deliberately runs address-only would
+  # have `doctor` return non-zero forever and stop reading it.
+  check_warn() { printf 'warn  %s\n' "$1"; }
+
+  if [ -f "$athanor_config/control.env" ] && [ -f "$athanor_config/runner.env" ]; then
+    check_ok "private configuration exists"
+  else
+    check_fail "configuration is missing"
+  fi
+  if [ "$(stat -c '%a' "$athanor_config/control.env" 2>/dev/null || printf 0)" = 600 ] &&
+    [ "$(stat -c '%a' "$athanor_config/runner.env" 2>/dev/null || printf 0)" = 600 ]; then
+    check_ok "configuration permissions"
+  else
+    check_fail "configuration must be mode 0600"
+  fi
+  for unit_name in $service_units nginx.service postgresql.service; do
+    if systemctl is-active --quiet "$unit_name"; then
+      check_ok "$unit_name"
+    else
+      check_fail "$unit_name is not running"
+    fi
+  done
+  if systemctl is-active --quiet athanor-network-refresh.timer; then
+    check_ok "network reconciliation timer"
+  else
+    check_fail "network reconciliation timer is not running"
+  fi
+  # "It could not make my CV" is the report this exists to pre-empt. The skill library prescribes
+  # these by name, so a gap here is a job that fails in front of the owner rather than here.
+  document_python=/usr/local/lib/athanor/python/bin/python3
+  missing_document_tools=""
+  [ -x "$document_python" ] || missing_document_tools="$document_python"
+  for document_binary in athanor-office-convert athanor-pdf-tables typst soffice qpdf ocrmypdf \
+    pdftotext pdftoppm pdffonts pdfinfo magick dot ffmpeg; do
+    command -v "$document_binary" >/dev/null 2>&1 ||
+      missing_document_tools="$missing_document_tools $document_binary"
+  done
+  if [ -x "$document_python" ]; then
+    for document_module in pptx docx openpyxl pandas matplotlib PIL pypdf; do
+      "$document_python" -c "import $document_module" >/dev/null 2>&1 ||
+        missing_document_tools="$missing_document_tools python:$document_module"
+    done
+  fi
+  for document_font in Carlito Caladea 'Liberation Sans' 'DejaVu Sans'; do
+    fc-list 2>/dev/null | grep -qi "$document_font" ||
+      missing_document_tools="$missing_document_tools font:$document_font"
+  done
+  if [ -z "$missing_document_tools" ]; then
+    check_ok "document toolchain: documents, decks, spreadsheets and PDFs"
+  else
+    check_fail "document toolchain is incomplete, so document jobs will fail:$missing_document_tools. Run sudo athanor update to reinstall it"
+  fi
+  configured_ddns_provider=$(
+    sed -n 's/^DDNS_PROVIDER=//p' "$athanor_config/control.env" 2>/dev/null | sed -n '1p'
+  )
+  configured_ddns_hostname=$(
+    sed -n 's/^DDNS_HOSTNAME=//p' "$athanor_config/control.env" 2>/dev/null | sed -n '1p'
+  )
+  if [ -n "$configured_ddns_provider" ]; then
+    ddns_published_epoch=$(sed -n '2p' "$athanor_state/ddns.state" 2>/dev/null || true)
+    case "$ddns_published_epoch" in
+      ''|*[!0-9]*) ddns_published_epoch=0 ;;
+    esac
+    # The publisher re-sends an unchanged address every 24 hours, so a record older
+    # than two days means the provider has been rejecting or dropping the update.
+    if [ "$(( $(date +%s) - ddns_published_epoch ))" -lt 172800 ]; then
+      check_ok "dynamic DNS: $configured_ddns_hostname published through $configured_ddns_provider"
+    else
+      check_fail "dynamic DNS has not published for two days; run sudo athanor ddns test"
+    fi
+    if [ -r "$athanor_state/ddns.error" ]; then
+      check_note "last dynamic DNS error: $(sed -n '2p' "$athanor_state/ddns.error")"
+    fi
+  else
+    check_note "dynamic DNS is not configured"
+  fi
+  # Off is the shipped state and the right one for most servers: a public address or a
+  # dynamic-DNS name reaches this computer directly, with nobody in between. Saying so plainly
+  # matters, because a check that only ever mentions the relay when it is missing reads as a
+  # server that is not finished.
+  if [ "$(relay_setting .enabled)" != true ]; then
+    check_note "relay: off, and that is fine - this server is reached directly, with nobody in between"
+  else
+    relay_hostname=$(relay_public_hostname)
+    case "$(relay_status_value .state)" in
+      online)
+        check_ok "relay: online at $relay_hostname$(relay_used_summary)"
+        case "$(relay_status_value .quota)" in
+          warn) check_warn "relay: close to the traffic allowance the relay operator granted" ;;
+          shaped) check_warn "relay: over the allowance and being slowed by the relay" ;;
+          blocked) check_fail "relay: over the allowance and blocked by the relay; use a direct address until the next period" ;;
+        esac
+        ;;
+      connecting|waiting)
+        check_warn "relay: not connected at the moment; clients using $relay_hostname cannot reach this server until it reconnects"
+        ;;
+      revoked)
+        check_fail "relay: the relay operator revoked this server; enroll again or run sudo athanor relay off"
+        ;;
+      *)
+        check_warn "relay: switched on but the connection has not reported in; run sudo athanor logs"
+        ;;
+    esac
+  fi
+  # A WebAuthn Relying Party ID has to be a registrable domain name; the specification does not
+  # allow an address literal. A server reached only by address therefore has publicly trusted
+  # TLS, an installable app and push notifications, but no way to register or use a passkey in a
+  # browser, so the owner can only sign in from a native client.
+  configured_rp_id=$(
+    sed -n 's/^WEBAUTHN_RP_ID=//p' "$athanor_config/control.env" 2>/dev/null | sed -n '1p'
+  )
+  case "$configured_rp_id" in
+    ''|'['*|*:*) rp_id_is_hostname="" ;;
+    *[!0-9.]*) rp_id_is_hostname=yes ;;
+    *) rp_id_is_hostname="" ;;
+  esac
+  if [ -n "$rp_id_is_hostname" ]; then
+    check_ok "browser sign-in origin https://$configured_rp_id"
+  else
+    check_warn "this server has no hostname, so browser sign-in cannot work: a passkey is bound to a domain name and the standard does not allow an IP address"
+    if [ -n "$configured_ddns_provider" ]; then
+      check_warn "dynamic DNS publishes $configured_ddns_hostname but it is not the public origin; run sudo athanor set-hostname $configured_ddns_hostname"
+    else
+      check_warn "get a hostname in about a minute: sudo athanor ddns configure"
+    fi
+  fi
+  expected_identity=$(
+    openssl pkey -in "$athanor_config/tls/server.key" -pubout 2>/dev/null |
+      openssl pkey -pubin -outform DER 2>/dev/null |
+      openssl dgst -sha256 -binary |
+      openssl base64 -A
+  )
+  manifest_identity=$(
+    jq -r '.identity // empty' "$athanor_state/connection.json" 2>/dev/null || true
+  )
+  if [ "$manifest_identity" = "sha256/$expected_identity" ]; then
+    check_ok "stable connection identity"
+  else
+    check_fail "connection manifest does not match the server identity"
+  fi
+  # "It answered" and "it can actually work" are different diagnoses that lead to different next
+  # steps, so both are reported. The second reuses release_readiness_failure - the same function the
+  # update's rollback gate trusts - rather than probing /healthz, which this file's own comment
+  # above explains is a static literal that is true of a build serving an error to every request.
+  # One copy of the readiness rules, because a second copy is a second chance to drift back to
+  # checking the literal.
+  if curl -fsS --max-time 5 http://127.0.0.1:4100/healthz >/dev/null 2>&1; then
+    check_ok "API is answering"
+    readiness=$(release_readiness_failure)
+    if [ -n "$readiness" ]; then
+      check_fail "the running release is not usable: $readiness"
+    else
+      check_ok "the running release is serving real requests"
+    fi
+  else
+    check_fail "API is not answering at all; run sudo athanor logs"
+  fi
+  # The notifier stays up and serves this endpoint when Web Push is not configured, because an
+  # optional feature that crash-loops a unit hides its own reason. So "it answered" is not the same
+  # as "notifications are being delivered", and the endpoint says which of the two this is.
+  notifications_health=$(curl -fsS --max-time 5 http://127.0.0.1:4203/healthz 2>/dev/null || true)
+  case "$notifications_health" in
+    *'"deliveryEnabled":true'*) check_ok "push notification delivery" ;;
+    *'"deliveryEnabled":false'*)
+      check_warn "push notifications are switched off: no Web Push signing keys in /etc/athanor/control.env; re-run the installer to generate a pair"
+      ;;
+    *) check_fail "the notification service is not answering; run sudo athanor logs" ;;
+  esac
+  if pg_isready -q -h 127.0.0.1 -U athanor -d athanor; then
+    check_ok "PostgreSQL"
+  else
+    check_fail "PostgreSQL"
+  fi
+  # Stock Debian maps a Unix account to the same-named database role over the local socket. The
+  # agent computer runs on this host and the role is called athanor too, so if this ever answers
+  # a command can open the database as the owner of every encrypted row.
+  if runuser -u athanor -- psql -h /var/run/postgresql -U athanor -d athanor \
+    -c 'SELECT 1' >/dev/null 2>&1; then
+    check_fail "the database still accepts local socket authentication as athanor; re-run the installer"
+  else
+    check_ok "database reachable only with the password in root-owned configuration"
+  fi
+  # These two are what make the boundary in SECURITY.md true. A command that runs as the runner's
+  # own account can read the runner's process and its capability signing secret, and a root
+  # package helper on the agent's PATH is a root install with no approval card.
+  configured_sandbox=$(
+    sed -n 's/^AGENT_SANDBOX_HELPER=//p' "$athanor_config/runner.env" 2>/dev/null | sed -n '1p'
+  )
+  if [ -n "$configured_sandbox" ] && [ -x "$configured_sandbox" ] &&
+    runuser -u athanor -- sudo -n "$configured_sandbox" check 2>/dev/null |
+    grep -q '^user=athanor-agent$'; then
+    check_ok "agent commands run as athanor-agent, not as the runner"
+  else
+    check_fail "agent commands are not confined to their own account; re-run the installer"
+  fi
+  if [ -e /usr/local/bin/athanor-package-helper ]; then
+    check_fail "the root package helper is still on the agent PATH; run sudo athanor update"
+  else
+    check_ok "root helpers are off the agent PATH"
+  fi
+  if nginx -t >/dev/null 2>&1; then
+    check_ok "TLS gateway configuration"
+  else
+    check_fail "TLS gateway configuration"
+  fi
+  # The failure this catches looks like nothing at all: every service running, every log clean, and
+  # the whole site answering 403. SELinux forbids the proxy from opening a loopback connection
+  # unless this boolean is on, and the athanor API is exactly that.
+  if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
+    if [ "$(getsebool httpd_can_network_connect 2>/dev/null | sed 's/.*--> //')" = "on" ]; then
+      check_ok "SELinux permits the gateway to reach athanor"
+    else
+      check_fail "SELinux is refusing the gateway; run: setsebool -P httpd_can_network_connect 1"
+    fi
+  fi
+  served_certificate="$athanor_config/tls/server.crt"
+  certificate_expiry=$(
+    openssl x509 -in "$served_certificate" -noout -enddate 2>/dev/null |
+      sed 's/^notAfter=//'
+  )
+  # A certificate covering a bare address is issued under the shortlived profile and lasts 160
+  # hours by design, so a flat 30-day margin would report a healthy server as failing every day
+  # of its life. The margin has to match the certificate's own lifetime, exactly as the renewal
+  # threshold does: renewal starts at 72 hours, so anything above that is on schedule.
+  if openssl x509 -in "$served_certificate" -noout -ext subjectAltName 2>/dev/null |
+    grep -q 'IP Address'; then
+    certificate_margin=259200
+    certificate_margin_label="72 hours"
+  else
+    certificate_margin=2592000
+    certificate_margin_label="30 days"
+  fi
+  # Recorded by the renewal timer. Reported even when the served certificate is still inside its
+  # margin: a renewal that has been failing for a day is the only warning before the certificate
+  # runs out, and after that the owner's first sign of trouble is a browser refusing to connect.
+  if [ -r "$athanor_state/certificate.error" ]; then
+    check_fail "TLS renewal failed at $(sed -n '1p' "$athanor_state/certificate.error"): $(sed -n '2p' "$athanor_state/certificate.error")"
+  fi
+  if openssl x509 -in "$served_certificate" -noout -checkend "$certificate_margin" >/dev/null 2>&1; then
+    check_ok "TLS certificate valid until $certificate_expiry"
+  elif [ "$(control_env_value ACME_ENABLED)" = true ]; then
+    check_fail "TLS certificate expires within $certificate_margin_label and renewal has not replaced it ($certificate_expiry)"
+  else
+    check_fail "TLS certificate expires within $certificate_margin_label ($certificate_expiry); run sudo athanor certificate enable --agree-tos --email you@example.com"
+  fi
+  if
+    ss -ltnH | awk '
+      {
+        count = split($4, fields, ":")
+        port = fields[count]
+        if (port ~ /^(4100|4201|4203|4300|4400)$/) {
+          if ($4 !~ /^127[.]0[.]0[.]1:/ && $4 !~ /^\[::1\]:/) exposed = 1
+          found[port] = 1
+        }
+      }
+      END {
+        required[4100] = required[4201] = required[4203] = 1
+        required[4300] = required[4400] = 1
+        for (port in required) if (!found[port]) missing = 1
+        exit exposed || missing
+      }
+    '
+  then
+    check_ok "private service ports are loopback-only"
+  else
+    check_fail "one or more private services are missing or exposed"
+  fi
+  if
+    runuser -u athanor -- curl -fsSI --max-time 15 https://openrouter.ai/ >/dev/null 2>&1
+  then
+    check_ok "agent computer internet access"
+  else
+    check_fail "agent computer cannot reach the internet"
+  fi
+  if
+    runuser -u athanor -- env HOME="$athanor_home" \
+      node -e "require('fs').accessSync(process.env.HOME + '/.cache/ms-playwright')"
+  then
+    check_ok "managed Chromium dependency"
+  else
+    check_fail "managed Chromium dependency"
+  fi
+  if systemctl is-enabled --quiet "$auto_update_timer" 2>/dev/null; then
+    check_note "unattended updates are on (weekly)"
+  else
+    check_note "unattended updates are off; run sudo athanor auto-update on to enable them"
+  fi
+  available_kb=$(df -Pk "$athanor_home" | awk 'NR == 2 {print $4}')
+  if [ "$available_kb" -ge 10485760 ]; then
+    check_ok "disk headroom $((available_kb / 1048576)) GiB"
+  else
+    check_fail "less than 10 GiB disk headroom"
+  fi
+  [ "$failed" -eq 0 ]
+}
+
+connection_details() {
+  [ -r "$athanor_config/control.env" ] ||
+    fail "run this command as root to read the active pairing code"
+  pairing_code=$(sed -n 's/^REGISTRATION_BOOTSTRAP_TOKEN=//p' "$athanor_config/control.env")
+  pairing_expires=$(sed -n 's/^REGISTRATION_BOOTSTRAP_EXPIRES_AT=//p' "$athanor_config/control.env")
+  current_epoch=$(date +%s)
+  case "$pairing_expires" in
+    ''|*[!0-9]*) pairing_expires=0 ;;
+  esac
+  if [ -z "$pairing_code" ] || [ "$pairing_expires" -le "$current_epoch" ]; then
+    pairing_code=$(openssl rand -hex 16)
+    pairing_expires=$((current_epoch + 86400))
+    set_control_value REGISTRATION_BOOTSTRAP_TOKEN "$pairing_code"
+    set_control_value REGISTRATION_BOOTSTRAP_EXPIRES_AT "$pairing_expires"
+    systemctl restart athanor@api.service
+    wait_until_serving
+  fi
+  identity_key="$athanor_config/tls/server.key"
+  [ -f "$identity_key" ] || fail "server identity key is missing"
+  server_identity=$(
+    openssl pkey -in "$identity_key" -pubout 2>/dev/null |
+      openssl pkey -pubin -outform DER 2>/dev/null |
+      openssl dgst -sha256 -binary |
+      openssl base64 -A
+  )
+  "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)"
+  endpoints_json=$(jq -c '.endpoints' "$athanor_state/connection.json")
+  ticket=$(
+    # The JavaScript is intentionally single-quoted so the shell cannot expand ticket data.
+    # shellcheck disable=SC2016
+    node -e '
+      const payload = {
+        version: 2,
+        endpoints: JSON.parse(process.argv[1]),
+        identity: `sha256/${process.argv[2]}`,
+        discovery: { mdnsService: "_athanor._tcp.local", mdnsPort: 443 },
+        pairingCode: process.argv[3],
+        expiresAt: Number(process.argv[4])
+      };
+      process.stdout.write(Buffer.from(JSON.stringify(payload)).toString("base64url"));
+    ' "$endpoints_json" "$server_identity" "$pairing_code" "$pairing_expires"
+  )
+  pairing_uri="athanor://pair/$ticket"
+  printf '\nScan with the athanor client or paste this connection ticket:\n\n'
+  qrencode -t ANSIUTF8 "$pairing_uri" || true
+  printf '\n%s\n\n' "$pairing_uri"
+  printf 'One-time pairing code: %s\n' "$pairing_code"
+  printf 'Server identity: sha256/%s\n' "$server_identity"
+  printf 'Detected endpoints:\n'
+  printf '%s' "$endpoints_json" | jq -r '.[] | "  " + .'
+}
+
+# Reachability through a relay is settings-screen work - enrolling needs a token from the relay
+# operator, and only the running server can redeem one. What belongs on the server itself is the
+# honest picture and the switch that ends the tunnel without a browser.
+relay_command() {
+  need_root relay "$@"
+  case "${1:-status}" in
+    status)
+      if [ "$(relay_setting .enabled)" != true ]; then
+        printf 'Relay: off\n'
+        if [ -n "$(relay_setting .label)" ]; then
+          printf 'An enrollment with %s is saved; turn it back on with sudo athanor relay on.\n' \
+            "$(relay_setting .host)"
+        else
+          printf 'This server is reached directly, with nobody in between. A relay is only needed\n'
+          printf 'when inbound connections cannot arrive at all - see docs/relay.md.\n'
+        fi
+        return 0
+      fi
+      printf 'Relay:    on, through %s\n' "$(relay_setting .host)"
+      printf 'Address:  https://%s\n' "$(relay_public_hostname)"
+      printf 'State:    %s%s\n' \
+        "$(relay_status_value .state)" "$(relay_used_summary)"
+      relay_error=$(relay_status_value .lastError)
+      [ -z "$relay_error" ] || printf 'Last error: %s\n' "$relay_error"
+      printf 'The relay operator sees connection metadata and byte counts. They cannot read the\n'
+      printf 'traffic: TLS terminates on this computer.\n'
+      ;;
+    on)
+      [ -n "$(relay_setting .label)" ] ||
+        fail "this server has no relay enrollment; add one from Settings, which needs a hostname and an enrollment token"
+      relay_set_enabled true
+      printf 'The relay is on again at https://%s\n' "$(relay_public_hostname)"
+      ;;
+    off)
+      [ -r "$relay_settings" ] || fail "this server has no relay to turn off"
+      relay_set_enabled false
+      printf 'The relay is off: the tunnel is closed and this server no longer advertises the relay\n'
+      printf 'address. The enrollment is kept, so sudo athanor relay on needs no new token.\n'
+      ;;
+    *) fail "usage: athanor relay {status|on|off}" ;;
+  esac
+}
+
+# The API owns this file, so the ownership and mode have to be put back exactly: it holds the
+# relay identity's settings and nothing but the control account may read them.
+relay_set_enabled() {
+  relay_temp=$(mktemp "$relay_settings.XXXXXX")
+  jq --argjson enabled "$1" '.enabled = $enabled' "$relay_settings" >"$relay_temp" || {
+    rm -f "$relay_temp"
+    fail "the relay settings could not be read"
+  }
+  chmod 0600 "$relay_temp"
+  chown athanor-control:athanor-control "$relay_temp"
+  mv "$relay_temp" "$relay_settings"
+  # The running server holds the connection open, so the file alone does not close it.
+  systemctl restart athanor@api.service
+  wait_until_serving
+  "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)"
+}
+
+pairing_code() {
+  need_root pairing-code
+  fresh_code=$(openssl rand -hex 16)
+  fresh_expiry=$(( $(date +%s) + 86400 ))
+  set_control_value REGISTRATION_BOOTSTRAP_TOKEN "$fresh_code"
+  set_control_value REGISTRATION_BOOTSTRAP_EXPIRES_AT "$fresh_expiry"
+  systemctl restart athanor@api.service
+  connection_details
+  printf '\nThis code expires in 24 hours and is consumed when the first owner is created.\n'
+}
+
+set_hostname() {
+  need_root set-hostname "${1:-}"
+  requested_hostname="${1:-}"
+  hostname_value=$(
+    node -e '
+      const value = process.argv[1].trim().toLowerCase().replace(/[.]$/, "");
+      const labels = value.split(".");
+      if (
+        value.length > 253 ||
+        labels.length < 2 ||
+        labels.some((label) =>
+          !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)
+        )
+      ) process.exit(1);
+      process.stdout.write(value);
+    ' "$requested_hostname"
+  ) || fail "use a DNS hostname such as ai.example.com"
+  getent ahosts "$hostname_value" >/dev/null 2>&1 ||
+    fail "$hostname_value does not resolve yet; finish dynamic-DNS setup and try again"
+
+  public_url="https://$hostname_value"
+  set_control_value PUBLIC_APP_URL "$public_url"
+  set_control_value PREVIEW_BASE_URL "$public_url/__athanor/preview"
+  set_control_value PUBLIC_RUNNER_URL "wss://$hostname_value/runner"
+  set_control_value WEBAUTHN_RP_ID "$hostname_value"
+  set_control_value WEBAUTHN_ORIGIN "$public_url"
+  "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)"
+  # A trusted certificate issued before this hostname existed does not carry it, and a browser
+  # reaching the new origin would get a name mismatch. Reissue now rather than leaving the
+  # server broken until the renewal timer notices the missing name.
+  if [ "$(sed -n 's/^ACME_ENABLED=//p' "$athanor_config/control.env" | sed -n '1p')" = true ]; then
+    "$(runtime_path /usr/local/lib/athanor/athanor-certificate)" issue ||
+      printf 'athanor: the certificate could not be reissued for %s; the previous certificate is still serving. Run sudo athanor certificate issue once the name is reachable.\n' \
+        "$hostname_value" >&2
+  fi
+  restart_athanor
+  printf 'Stable hostname saved: %s\n' "$hostname_value"
+  printf 'Browser sign-in now works: a passkey can be bound to %s, which it could never be to an\n' \
+    "$hostname_value"
+  printf 'IP address.\n'
+  printf 'Run “sudo athanor pairing-code” and scan the refreshed QR ticket on a client.\n'
+  printf 'Native-client passkeys remain valid. Direct-browser passkeys from the old origin must be added again.\n'
+}
+
+# Keeps the most recent backups this script created and removes the rest. A destination the
+# operator named themselves is theirs to manage and is never touched, which is why only the
+# generated timestamp directories match.
+prune_backups() {
+  [ -d "$athanor_backup_root" ] || return 0
+  find "$athanor_backup_root" -mindepth 1 -maxdepth 1 -type d \
+    -name '????????T??????Z' 2>/dev/null |
+    sort -r |
+    tail -n +$((athanor_backup_keep + 1)) |
+    while IFS= read -r superseded; do
+      rm -rf -- "$superseded"
+      printf 'Removed superseded backup %s\n' "$superseded"
+    done
+}
+
+backup_athanor() {
+  need_root backup "${1:-}"
+  restart_mode="${2:-restart}"
+  [ "$restart_mode" = "restart" ] || [ "$restart_mode" = "keep-stopped" ] ||
+    fail "invalid internal backup restart mode"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  destination="${1:-$athanor_backup_root/$stamp}"
+  install -d -m 0700 "$destination"
+  systemctl stop athanor.target
+  trap 'systemctl start athanor.target >/dev/null 2>&1 || true' EXIT INT TERM
+  runuser -u postgres -- pg_dump -Fc athanor >"$destination/database.dump"
+  # The services are down for the whole of this archive, so what goes into it is outage time.
+  # Package caches and installed dependency trees are the bulk of a working agent computer and
+  # every one of them can be fetched again, so they are skipped; everything the agent produced
+  # or was given, including its browser profile and its logins, is kept. Level 1 compression
+  # roughly halves the processor time for a few per cent of size, which is the right trade when
+  # the interface is offline until it finishes.
+  tar -C "$athanor_home" \
+    --exclude=node_modules \
+    --exclude=.pnpm-store \
+    --exclude=.npm \
+    --exclude=.venv \
+    --exclude=__pycache__ \
+    --exclude=./.cache/pip \
+    --exclude=./.cache/pypoetry \
+    --use-compress-program='gzip -1' \
+    -cf "$destination/workspaces.tar.gz" .
+  config_parent=$(dirname "$athanor_config")
+  config_name=$(basename "$athanor_config")
+  tar -C "$config_parent" -czf "$destination/configuration.tar.gz" "$config_name"
+  if [ -f "$athanor_state/installed-packages" ]; then
+    install -m 0600 "$athanor_state/installed-packages" "$destination/packages.txt"
+  else
+    : >"$destination/packages.txt"
+    chmod 0600 "$destination/packages.txt"
+  fi
+  chmod 0600 "$destination/database.dump" "$destination/workspaces.tar.gz" \
+    "$destination/configuration.tar.gz"
+  (
+    cd "$destination"
+    sha256sum database.dump workspaces.tar.gz configuration.tar.gz packages.txt >SHA256SUMS
+  )
+  last_backup_destination="$destination"
+  if [ "$restart_mode" = "restart" ]; then
+    systemctl start athanor.target
+  fi
+  trap - EXIT INT TERM
+  # Only after the new backup is complete and checksummed, so a failed run never costs the
+  # operator the copy they still had.
+  [ -n "${1:-}" ] || prune_backups
+  printf 'Checksum-verified backup created at %s\n' "$destination"
+  printf 'Dependency trees and package caches were skipped; the agent reinstalls those.\n'
+  printf 'It contains server keys and must be stored as securely as the server.\n'
+}
+
+restore_athanor() {
+  source_directory="${1:-}"
+  confirmation="${2:-}"
+  [ -f "$source_directory/database.dump" ] &&
+    [ -f "$source_directory/workspaces.tar.gz" ] &&
+    [ -f "$source_directory/configuration.tar.gz" ] &&
+    [ -f "$source_directory/SHA256SUMS" ] ||
+    fail "usage: sudo athanor restore /path/to/backup --yes"
+  [ "$confirmation" = "--yes" ] ||
+    fail "restore replaces the database, workspace files, and server keys; re-run with --yes"
+  need_root restore "$source_directory" "$confirmation"
+  checksum_names=$(
+    awk 'NF == 2 {print $2}' "$source_directory/SHA256SUMS" | sort | tr '\n' ' ' |
+      sed 's/ $//'
+  )
+  case "$checksum_names" in
+    "configuration.tar.gz database.dump workspaces.tar.gz"|"configuration.tar.gz database.dump packages.txt workspaces.tar.gz") ;;
+    *) fail "backup checksum manifest contains unexpected files" ;;
+  esac
+  (cd "$source_directory" && sha256sum --check --strict SHA256SUMS)
+  workspace_listing=$(mktemp)
+  configuration_listing=$(mktemp)
+  trap 'rm -f "$workspace_listing" "$configuration_listing"' EXIT INT TERM
+  tar -tzf "$source_directory/workspaces.tar.gz" >"$workspace_listing" ||
+    fail "workspace backup is not a readable gzip archive"
+  awk '$0 ~ /^\// || $0 ~ /(^|\/)[.][.]($|\/)/ {exit 1}' "$workspace_listing" ||
+    fail "workspace backup contains an unsafe path"
+  tar -tzf "$source_directory/configuration.tar.gz" >"$configuration_listing" ||
+    fail "configuration backup is not a readable gzip archive"
+  config_parent=$(dirname "$athanor_config")
+  config_name=$(basename "$athanor_config")
+  awk -v root="$config_name" '$0 !~ ("^" root "(/|$)") {exit 1}' "$configuration_listing" ||
+    fail "configuration backup contains an unexpected path"
+  rm -f "$workspace_listing" "$configuration_listing"
+  trap - EXIT INT TERM
+  systemctl stop athanor.target
+  for unit_name in $service_units; do systemctl stop "$unit_name"; done
+  trap 'systemctl start athanor.target >/dev/null 2>&1 || true' EXIT INT TERM
+  runuser -u postgres -- psql -v ON_ERROR_STOP=1 -v database_name=athanor \
+    -d postgres <<'SQL'
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = :'database_name' AND pid <> pg_backend_pid();
+SQL
+  runuser -u postgres -- dropdb --if-exists athanor
+  runuser -u postgres -- createdb -O athanor athanor
+  runuser -u postgres -- pg_restore -d athanor <"$source_directory/database.dump"
+  find "$athanor_home" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  tar -C "$athanor_home" -xzf "$source_directory/workspaces.tar.gz"
+  chown -R athanor:athanor "$athanor_home"
+  restore_workspace_ownership
+  tar -C "$config_parent" -xzf "$source_directory/configuration.tar.gz"
+  if [ -f "$source_directory/packages.txt" ]; then
+    set --
+    while IFS= read -r package_name; do
+      [ -n "$package_name" ] || continue
+      case "$package_name" in
+        *[!A-Za-z0-9+._:-]*|-*|*::*|*:|.*|/*)
+          fail "backup contains an unsafe package name"
+          ;;
+      esac
+      set -- "$@" "$package_name"
+    done <"$source_directory/packages.txt"
+    if [ "$#" -gt 0 ]; then
+      "$(runtime_path /usr/local/sbin/athanor-system-packages)" install "$@"
+    fi
+  fi
+  restored_password=$(sed -n 's|^DATABASE_URL=postgres://athanor:\([^@]*\)@.*|\1|p' \
+    "$athanor_config/control.env")
+  [ -n "$restored_password" ] || fail "restored database password is missing"
+  runuser -u postgres -- psql -v ON_ERROR_STOP=1 -v password="$restored_password" <<'SQL'
+SELECT format('ALTER ROLE athanor WITH LOGIN PASSWORD %L', :'password')\gexec
+SQL
+  systemctl start athanor.target
+  wait_until_serving
+  trap - EXIT INT TERM
+  printf 'Restore complete.\n'
+}
+
+# Agent commands run as athanor-agent and reach their workspace through a group shared with the
+# runner. A restored archive carries whatever ownership it was taken with, so without this a
+# recovered server comes back with every command unable to read the files it just recovered.
+# Everything except .athanor joins the group; the browser profile, the desktop session and the
+# artifact store stay the runner's alone, which is what keeps the owner's logins out of reach.
+restore_workspace_ownership() {
+  getent group athanor-agent >/dev/null 2>&1 || return 0
+  chown athanor:athanor-agent "$athanor_home"
+  chmod 2710 "$athanor_home"
+  for restored_workspace in "$athanor_home"/*/; do
+    [ -d "$restored_workspace" ] || continue
+    chgrp athanor-agent "$restored_workspace"
+    chmod 2770 "$restored_workspace"
+    find "$restored_workspace" -mindepth 1 -maxdepth 1 ! -name .athanor -exec \
+      chgrp -R athanor-agent {} + 2>/dev/null || true
+    find "$restored_workspace" -mindepth 1 -maxdepth 1 ! -name .athanor -exec \
+      chmod -R g+rwX {} + 2>/dev/null || true
+  done
+}
+
+install_runtime_files() {
+  install -D -m 0755 scripts/athanor "$(runtime_path /usr/local/bin/athanor)"
+  # Deliberately outside every directory on the agent's PATH, and not executable by the account
+  # agent commands run as: named directly it would be a root package install with no capability
+  # scope and no approval. An update also removes the copy earlier releases left on the PATH.
+  rm -f "$(runtime_path /usr/local/bin/athanor-package-helper)"
+  install -D -m 0750 -o root -g athanor scripts/athanor-package-helper \
+    "$(runtime_path /usr/local/lib/athanor/athanor-package-helper)"
+  install -D -m 0755 scripts/athanor-system-packages \
+    "$(runtime_path /usr/local/sbin/athanor-system-packages)"
+  # Drops an agent command to its own unprivileged account, which the runner cannot do itself.
+  install -D -m 0755 scripts/athanor-sandbox \
+    "$(runtime_path /usr/local/lib/athanor/athanor-sandbox)"
+  install -D -m 0755 scripts/athanor-service \
+    "$(runtime_path /usr/local/lib/athanor/athanor-service)"
+  install -D -m 0755 scripts/athanor-network-refresh \
+    "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)"
+  install -D -m 0755 scripts/athanor-network-watch \
+    "$(runtime_path /usr/local/lib/athanor/athanor-network-watch)"
+  # The network refresh and the renewal timer run these by absolute path, so an update that
+  # skipped them would keep running the previous release's dynamic-DNS and ACME code.
+  install -D -m 0755 scripts/athanor-ddns \
+    "$(runtime_path /usr/local/lib/athanor/athanor-ddns)"
+  install -D -m 0755 scripts/athanor-certificate \
+    "$(runtime_path /usr/local/lib/athanor/athanor-certificate)"
+  install -D -m 0755 scripts/athanor-document \
+    "$(runtime_path /usr/local/lib/athanor/athanor-document)"
+  install -D -m 0755 scripts/athanor-snapshot \
+    "$(runtime_path /usr/local/lib/athanor/athanor-snapshot)"
+  install -D -m 0755 infra/native/start-desktop-session.sh \
+    "$(runtime_path /usr/local/lib/athanor/start-desktop-session.sh)"
+  install -D -m 0755 infra/native/athanor-desktop-bridge.py \
+    "$(runtime_path /usr/local/lib/athanor/athanor-desktop-bridge.py)"
+  install -D -m 0644 infra/native/athanor@.service \
+    "$(runtime_path /etc/systemd/system/athanor@.service)"
+  install -D -m 0644 infra/native/athanor-runner.service \
+    "$(runtime_path /etc/systemd/system/athanor-runner.service)"
+  install -D -m 0644 infra/native/athanor.target \
+    "$(runtime_path /etc/systemd/system/athanor.target)"
+  install -D -m 0644 infra/native/athanor-network-refresh.service \
+    "$(runtime_path /etc/systemd/system/athanor-network-refresh.service)"
+  install -D -m 0644 infra/native/athanor-network-refresh.timer \
+    "$(runtime_path /etc/systemd/system/athanor-network-refresh.timer)"
+  install -D -m 0644 infra/native/athanor-network-refresh.path \
+    "$(runtime_path /etc/systemd/system/athanor-network-refresh.path)"
+  # The relay identity key and settings live here, so an update has to provision the directory as
+  # well as the installer: the unit that makes it writable names it, and a server updated from an
+  # earlier release has never seen it.
+  install -d -m 0700 -o athanor-control -g athanor-control \
+    "$(runtime_path /etc/athanor/relay)"
+  install -D -m 0644 infra/native/athanor-network-watch.service \
+    "$(runtime_path /etc/systemd/system/athanor-network-watch.service)"
+  # Installed but never enabled here: unattended updates stay opt-in, and an operator who
+  # turned them on keeps the enablement symlink across updates.
+  install -D -m 0644 infra/native/athanor-auto-update.service \
+    "$(runtime_path /etc/systemd/system/athanor-auto-update.service)"
+  install -D -m 0644 infra/native/athanor-auto-update.timer \
+    "$(runtime_path /etc/systemd/system/athanor-auto-update.timer)"
+  # Also installed without being enabled: `athanor certificate enable` turns this one on once the
+  # operator has accepted the certificate authority's subscriber agreement.
+  install -D -m 0644 infra/native/athanor-certificate-renew.service \
+    "$(runtime_path /etc/systemd/system/athanor-certificate-renew.service)"
+  install -D -m 0644 infra/native/athanor-certificate-renew.timer \
+    "$(runtime_path /etc/systemd/system/athanor-certificate-renew.timer)"
+  # Started only by OnFailure= on the renewal unit, so it is installed but never enabled.
+  install -D -m 0644 infra/native/athanor-certificate-alert.service \
+    "$(runtime_path /etc/systemd/system/athanor-certificate-alert.service)"
+  # An owner locked out by an expired certificate reaches for ssh; this is what greets them there.
+  install -D -m 0755 infra/native/athanor-motd \
+    "$(runtime_path /etc/update-motd.d/99-athanor)"
+  install -D -m 0644 infra/native/nginx.conf \
+    "$(runtime_path /etc/nginx/sites-available/athanor)"
+}
+
+# No step of an update may run without a bound. `timeout` is coreutils, so it is on every host
+# this installs on; where it is missing the step still runs, because refusing to update at all is
+# worse than an unbounded one.
+run_update_step() {
+  step_label="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=TERM --kill-after=60 "$athanor_update_step_seconds" "$@" ||
+      fail "the update step '$step_label' passed $((athanor_update_step_seconds / 60)) minutes and was stopped"
+  else
+    "$@"
+  fi
+}
+
+announce_outage() {
+  previous_outage=$(cat "$athanor_state/last-update-outage-seconds" 2>/dev/null || printf '')
+  case "$previous_outage" in
+    ''|*[!0-9]*) previous_outage="" ;;
+  esac
+  if [ -n "$previous_outage" ]; then
+    printf 'athanor: stopping the server now for the backup, rebuild and restart. The previous update was offline for about %s minutes.\n' \
+      "$(((previous_outage + 59) / 60))"
+  else
+    printf 'athanor: stopping the server now for the backup, rebuild and restart. This run is bounded to %s minutes per step and its duration is reported at the end.\n' \
+      "$((athanor_update_step_seconds / 60))"
+  fi
+}
+
+update_athanor() {
+  need_root update
+  [ -d "$athanor_root/.git" ] || fail "$athanor_root is not a Git checkout"
+  [ -z "$(git -C "$athanor_root" status --porcelain)" ] ||
+    fail "$athanor_root has local changes; preserve or remove them before updating"
+  # `wait_for_idle_worker` returns before the stop, so a task that the API queued in between used
+  # to be killed mid-flight. Re-checked here, where the remaining window is a fraction of a second.
+  if [ "${athanor_require_idle:-0}" = 1 ] && ! worker_is_idle; then
+    printf 'athanor: a task started while the update was preparing; the next weekly window will retry.\n'
+    return 0
+  fi
+  previous_revision=$(git -C "$athanor_root" rev-parse --verify HEAD)
+  announce_outage
+  outage_started=$(date +%s)
+  backup_athanor "" keep-stopped
+  rollback_backup="$last_backup_destination"
+
+  rollback_update() {
+    original_status=$?
+    trap - EXIT INT TERM
+    set +e
+    printf 'athanor update failed; restoring revision %s and backup %s\n' \
+      "$previous_revision" "$rollback_backup" >&2
+    rollback_ok=1
+    git -C "$athanor_root" reset --hard "$previous_revision" >/dev/null 2>&1 ||
+      rollback_ok=0
+    if cd "$athanor_root"; then
+      CI=true pnpm install --frozen-lockfile >/dev/null 2>&1 || rollback_ok=0
+      CI=true pnpm -r build >/dev/null 2>&1 || rollback_ok=0
+      install_runtime_files || rollback_ok=0
+    else
+      rollback_ok=0
+    fi
+    nginx -t >/dev/null 2>&1 || rollback_ok=0
+    systemctl daemon-reload || rollback_ok=0
+    systemctl enable athanor-network-watch.service athanor-network-refresh.timer \
+      athanor-network-refresh.path >/dev/null 2>&1 || rollback_ok=0
+    (restore_athanor "$rollback_backup" --yes) || rollback_ok=0
+    "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)" >/dev/null 2>&1 ||
+      rollback_ok=0
+    if [ "$rollback_ok" -eq 1 ]; then
+      printf 'Rollback completed; the failed update was not activated.\n' >&2
+    else
+      printf 'Automatic rollback was incomplete; keep the backup and run sudo athanor doctor.\n' >&2
+    fi
+    exit "$original_status"
+  }
+  trap rollback_update EXIT
+  trap 'exit 130' INT TERM
+
+  run_update_step "fetching the new revision" git -C "$athanor_root" pull --ff-only
+  cd "$athanor_root"
+  # CI=true because this runs from a timer with no terminal. When the new revision removes a
+  # workspace package, pnpm decides the modules directory must be rebuilt and stops to ask first;
+  # with nothing to answer it, the update aborts on ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY and
+  # rolls straight back, so the box could never leave the release that dropped the package.
+  run_update_step "installing dependencies" env CI=true pnpm install --frozen-lockfile
+  run_update_step "building" env CI=true pnpm -r build
+  install_runtime_files
+  nginx -t
+  systemctl daemon-reload
+  systemctl enable --now athanor-network-watch.service athanor-network-refresh.timer \
+    athanor-network-refresh.path
+  "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)"
+  restart_athanor
+  trap - EXIT INT TERM
+  outage_seconds=$(($(date +%s) - outage_started))
+  # Recorded so the next run can tell the operator what to expect before it takes the server away.
+  install -d -m 0755 "$athanor_state" 2>/dev/null || true
+  printf '%s\n' "$outage_seconds" >"$athanor_state/last-update-outage-seconds" 2>/dev/null || true
+  printf 'Update complete after %s minutes offline. Keep rollback backup %s until post-update checks pass.\n' \
+    "$(((outage_seconds + 59) / 60))" "$rollback_backup"
+}
+
+# A worker that cannot be reached counts as idle: it is not running anything either.
+worker_is_idle() {
+  active_tasks=$(
+    curl -fsS --max-time 5 http://127.0.0.1:4201/metrics 2>/dev/null |
+      sed -n 's/^athanor_worker_active //p' |
+      sed -n '1p'
+  )
+  case "$active_tasks" in
+    ''|0) return 0 ;;
+  esac
+  return 1
+}
+
+# Waits for the worker to become idle so an unattended update never interrupts a task
+# that is already running.
+wait_for_idle_worker() {
+  waited_seconds=0
+  while [ "$waited_seconds" -lt 1800 ]; do
+    worker_is_idle && return 0
+    sleep 30
+    waited_seconds=$((waited_seconds + 30))
+  done
+  return 1
+}
+
+auto_update_run() {
+  systemctl is-enabled --quiet "$auto_update_timer" 2>/dev/null ||
+    fail "unattended updates are off; run sudo athanor auto-update on"
+  [ -d "$athanor_root/.git" ] || fail "$athanor_root is not a Git checkout"
+  git -C "$athanor_root" fetch --quiet --prune ||
+    fail "the update source could not be reached"
+  upstream_revision=$(git -C "$athanor_root" rev-parse --verify --quiet '@{upstream}') ||
+    fail "$athanor_root has no upstream branch to update from"
+  if [ "$(git -C "$athanor_root" rev-parse --verify HEAD)" = "$upstream_revision" ]; then
+    printf 'athanor: already up to date.\n'
+    return 0
+  fi
+  if ! wait_for_idle_worker; then
+    printf 'athanor: a task is still running; the next weekly window will retry.\n'
+    return 0
+  fi
+  # Set as an ordinary variable rather than a command prefix: whether a prefix assignment survives
+  # a function call is not the same across shells.
+  athanor_require_idle=1
+  update_athanor
+}
+
+auto_update() {
+  need_root auto-update "${1:-status}"
+  case "${1:-status}" in
+    on)
+      systemctl enable --now "$auto_update_timer"
+      printf 'Unattended updates are on: weekly, at a randomised time.\n'
+      printf 'Each run backs up first and rolls the server back if the update fails.\n'
+      ;;
+    off)
+      systemctl disable --now "$auto_update_timer" >/dev/null 2>&1 || true
+      printf 'Unattended updates are off. Run “sudo athanor update” to update by hand.\n'
+      ;;
+    status)
+      if systemctl is-enabled --quiet "$auto_update_timer" 2>/dev/null; then
+        printf 'Unattended updates: on\n'
+        systemctl list-timers --no-pager --no-legend "$auto_update_timer" || true
+      else
+        printf 'Unattended updates: off\n'
+      fi
+      printf 'Installed revision: %s\n' \
+        "$(git -C "$athanor_root" rev-parse --short HEAD 2>/dev/null || printf 'unknown')"
+      ;;
+    run) auto_update_run ;;
+    *) fail "usage: athanor auto-update {on|off|status}" ;;
+  esac
+}
+
+uninstall_athanor() {
+  need_root uninstall
+  systemctl disable --now athanor.target >/dev/null 2>&1 || true
+  systemctl disable --now athanor-network-watch.service athanor-network-refresh.timer \
+    athanor-network-refresh.path athanor-auto-update.timer athanor-certificate-renew.timer \
+    >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/athanor-certificate-renew.service \
+    /etc/systemd/system/athanor-certificate-renew.timer \
+    /etc/systemd/system/athanor-certificate-alert.service \
+    /etc/update-motd.d/99-athanor \
+    /etc/systemd/system/athanor@.service \
+    /etc/systemd/system/athanor-runner.service \
+    /etc/systemd/system/athanor-network-refresh.service \
+    /etc/systemd/system/athanor-network-refresh.timer \
+    /etc/systemd/system/athanor-network-refresh.path \
+    /etc/systemd/system/athanor-network-watch.service \
+    /etc/systemd/system/athanor-auto-update.service \
+    /etc/systemd/system/athanor-auto-update.timer \
+    /etc/systemd/system/athanor.target \
+    /etc/nginx/sites-enabled/athanor
+  # The agent account keeps passwordless root for the package helper for as long as this
+  # rule exists, so it has to go with the services it was granted for.
+  rm -f /etc/sudoers.d/athanor-packages
+  # Stop advertising a server that no longer answers, otherwise clients keep finding it.
+  rm -f /etc/avahi/services/athanor.service
+  # Installed only on a host whose ImageMagick had no `magick` of its own. Matched on its own marker
+  # so that a real ImageMagick 7, or anything else an operator put there, is left alone.
+  if grep -q 'athanor ImageMagick 6 compatibility' /usr/local/bin/magick 2>/dev/null; then
+    rm -f /usr/local/bin/magick
+  fi
+  systemctl reload avahi-daemon >/dev/null 2>&1 ||
+    systemctl restart avahi-daemon >/dev/null 2>&1 || true
+  systemctl daemon-reload
+  systemctl reload nginx >/dev/null 2>&1 || true
+  printf 'athanor was disabled, the agent sudo rule and the local advertisement were removed.\n'
+  printf '/home/athanor, /etc/athanor, the database, and backups were preserved.\n'
+}
+
+command_name="${1:-help}"
+if [ "$#" -gt 0 ]; then shift; fi
+
+case "$command_name" in
+  install)
+    need_root install
+    exec /bin/sh "$athanor_root/scripts/install-native.sh"
+    ;;
+  start) start_athanor ;;
+  stop) stop_athanor ;;
+  restart) restart_athanor ;;
+  status) status_athanor ;;
+  logs) logs_athanor ;;
+  doctor) doctor ;;
+  connect)
+    need_root connect
+    connection_details
+    ;;
+  pairing-code) pairing_code ;;
+  set-hostname) set_hostname "${1:-}" ;;
+  backup) backup_athanor "${1:-}" ;;
+  restore) restore_athanor "${1:-}" "${2:-}" ;;
+  update) update_athanor ;;
+  auto-update) auto_update "${1:-status}" ;;
+  relay) relay_command "${1:-status}" ;;
+  uninstall) uninstall_athanor ;;
+  certificate)
+    # Operator-invoked only. Requesting a publicly trusted certificate means accepting the CA's
+    # subscriber agreement, which athanor will not do on the operator's behalf during install.
+    # The sub-command has to survive the re-exec through sudo, otherwise `athanor certificate
+    # issue` run without sudo would silently become `athanor certificate` and print status.
+    need_root certificate "$@"
+    exec /bin/sh "$athanor_root/scripts/athanor-certificate" "$@"
+    ;;
+  ddns)
+    need_root ddns "$@"
+    exec /bin/sh "$athanor_root/scripts/athanor-ddns" "$@"
+    ;;
+  help|*)
+    printf '%s\n' \
+      'Usage: athanor {install|start|stop|restart|status|logs|doctor|connect|pairing-code|set-hostname HOST|backup [dir]|restore DIR --yes|update|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...}' \
+      '' \
+      'Browser sign-in needs a hostname: a passkey is bound to a domain name and the WebAuthn' \
+      'standard does not allow an IP address. If this server has no name, run:' \
+      '  sudo athanor ddns configure'
+    ;;
+esac

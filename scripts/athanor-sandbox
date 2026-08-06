@@ -1,0 +1,96 @@
+#!/bin/sh
+set -eu
+
+# Runs one agent command as the dedicated `athanor-agent` account instead of as the runner's own
+# account. Changing user identity needs privilege the runner deliberately does not have, so it
+# asks for it here, through a sudoers rule only the runner's account may use.
+#
+# The helper only ever hands back *less* privilege than its caller already has: a different
+# unprivileged user, no route to a higher one, and optionally no network. That is why it is safe
+# for it to accept an arbitrary command line - there is nothing a caller could gain by lying to
+# it that it did not already have.
+
+agent_user="athanor-agent"
+
+fail() {
+  printf 'athanor-sandbox: %s\n' "$1" >&2
+  # Distinct from the exit statuses a real command produces, so a sandbox failure is not read as
+  # the command itself having failed.
+  exit 125
+}
+
+[ "$(id -u)" -eq 0 ] || fail "this helper runs through the installed sudo policy"
+[ -x /usr/bin/setpriv ] || fail "/usr/bin/setpriv is missing; install util-linux"
+
+agent_uid=$(id -u "$agent_user" 2>/dev/null) || fail "the $agent_user account does not exist"
+agent_gid=$(id -g "$agent_user" 2>/dev/null) || fail "the $agent_user account has no group"
+
+# Group-writable, nothing for anyone else. The runner shares a group with the agent account so
+# each can read and change the other's workspace files; the browser profile and the rest of
+# .athanor stay owner-only, which is what keeps the cookie jar out of the agent's reach.
+umask 0007
+
+# --no-new-privs is what actually stops a command reaching a higher account. It is inherited by
+# every descendant and cannot be removed, so a set-user-ID binary - sudo, su, pkexec, or a
+# symbolic link to one under any name - confers nothing, no matter which interpreter spelled the
+# command. The kernel clears every capability on the transition away from root, so the command
+# starts with none.
+run_as_agent() {
+  exec /usr/bin/setpriv \
+    --reuid "$agent_uid" --regid "$agent_gid" --clear-groups --no-new-privs \
+    -- /usr/bin/env -i "$@"
+}
+
+mode="${1:-}"
+shift || true
+
+case "$mode" in
+  run)
+    network="${1:-}"
+    shift || true
+    [ "$#" -gt 0 ] || fail "no command was given"
+    case "$network" in
+      network)
+        run_as_agent "$@"
+        ;;
+      isolated)
+        # Loopback comes up inside the new namespace: without it a command cannot even reach a
+        # port its own subprocess is listening on, which breaks ordinary local tooling for no
+        # security benefit. The shell text is fixed and the command arrives through "$@", so
+        # nothing from the caller is ever interpreted.
+        exec /usr/bin/unshare --net -- /bin/sh -c '
+          ip link set lo up 2>/dev/null || true
+          exec "$@"
+        ' athanor-sandbox /usr/bin/setpriv \
+          --reuid "$agent_uid" --regid "$agent_gid" --clear-groups --no-new-privs \
+          -- /usr/bin/env -i "$@"
+        ;;
+      *)
+        fail "the network mode must be network or isolated"
+        ;;
+    esac
+    ;;
+  shell)
+    # The owner's interactive terminal. Separated from `run` only so the sudoers policy can give
+    # this one a pseudo-terminal: without one the shell has no controlling terminal of its own
+    # and loses job control, which is the difference between a usable terminal and a broken one.
+    [ "$#" -gt 0 ] || fail "no command was given"
+    run_as_agent "$@"
+    ;;
+  check)
+    # The installer runs this and refuses to finish if the answer is wrong, so that a box can
+    # never come up believing it sandboxes agent commands when it does not.
+    printf 'user=%s\n' "$(
+      /usr/bin/setpriv --reuid "$agent_uid" --regid "$agent_gid" --clear-groups --no-new-privs \
+        -- /usr/bin/id -un
+    )"
+    if /usr/bin/unshare --net -- /bin/true >/dev/null 2>&1; then
+      printf 'network-isolation=yes\n'
+    else
+      printf 'network-isolation=no\n'
+    fi
+    ;;
+  *)
+    fail "usage: athanor-sandbox {run network|isolated [VAR=VALUE...] COMMAND [ARG...]|shell [VAR=VALUE...] COMMAND [ARG...]|check}"
+    ;;
+esac

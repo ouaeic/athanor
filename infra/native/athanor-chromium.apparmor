@@ -1,0 +1,18 @@
+# Chromium builds its renderer sandbox out of an unprivileged user namespace, and Ubuntu 23.10 and
+# later refuse those by default under AppArmor (kernel.apparmor_restrict_unprivileged_userns=1).
+# The distribution ships profiles for its own packaged chrome and chromium, and athanor's Chromium
+# is neither: it lives under the agent account's Playwright cache, so nothing covers it and the
+# browser cannot start at all - the research fan-out and the search route were the only two things
+# on the box that simply did not work, and they failed with a page of Chromium log.
+#
+# This grants exactly one permission - creating a user namespace - to exactly the two binaries
+# athanor manages. Without it the runner still works, by launching with the renderer sandbox off,
+# which is a real reduction: the process that browses arbitrary content keeps a weaker boundary.
+# The point of the profile is that the first choice succeeds instead of the fallback.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile athanor-chromium /home/athanor/.cache/ms-playwright/**/{chrome,chrome-headless-shell} flags=(unconfined) {
+  userns,
+  include if exists <local/athanor-chromium>
+}

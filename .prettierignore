@@ -1,0 +1,6 @@
+pnpm-lock.yaml
+dist
+coverage
+src-tauri/target
+apps/desktop/src-tauri/gen
+OPEN_CLOUD_AI_WORKSPACE_BLUEPRINT.md

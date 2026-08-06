@@ -1,0 +1,30 @@
+# The only Python libraries athanor pins itself. Everything else the document skills use -
+# python-docx, openpyxl, pandas, matplotlib, Pillow, lxml, XlsxWriter - is packaged by Debian and
+# Ubuntu, and the distribution's own pin is the better pin: it is signed, mirrored, and security
+# supported. What is listed here is what apt cannot give a vetted procedure.
+#
+# pypdf is here because Debian 12 ships 3.4.1 and Ubuntu 24.04 ships 4.0.2, and the AcroForm
+# writer API changed between them. A skill that says "call PdfWriter(clone_from=...)" is either
+# right or wrong depending on which release the box booted, and a procedure that is sometimes
+# right is the thing this library exists to stop.
+#
+# Installed with --require-hashes --no-deps --only-binary=:all:, so pip takes exactly these two
+# wheels and nothing else, and a compromised mirror cannot substitute a different build.
+# Licences: pypdf is BSD-3-Clause, typing_extensions is PSF-2.0. Both are compatible with
+# distributing athanor under AGPL-3.0-or-later.
+
+pypdf==6.14.2 \
+    --hash=sha256:3f07891af76dc002657e04993ab9b4de81de29f9013b9761d0b7968bff12e946
+
+# python-pptx is here because Ubuntu dropped it: 24.04 packages python3-pptx and 26.04 does not,
+# so a box that installs cleanly today would have had no way to build a slide deck at all. Its
+# four dependencies - Pillow, lxml, XlsxWriter, typing_extensions - are still packaged everywhere
+# athanor supports and come from apt, which is why --no-deps is safe here.
+# Licence: MIT, compatible with distributing athanor under AGPL-3.0-or-later.
+python-pptx==1.0.2 \
+    --hash=sha256:160838e0b8565a8b1f67947675886e9fea18aa5e795db7ae531606d68e785cba
+
+# pypdf imports typing_extensions on Python 3.10 and older, which Ubuntu 22.04 still ships. It is
+# listed explicitly because --no-deps means pip will not go and find it.
+typing_extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8

@@ -1,0 +1,129 @@
+import type { DataStore, PendingNotificationRecord } from '@athanor/data';
+import {
+  defaultNotificationSettings,
+  type ApprovalSideEffect,
+  type NotificationSubject,
+  type OwnerNotificationSettings
+} from './model.js';
+import { PRESENCE_WINDOW_MS } from './policy.js';
+
+/**
+ * The pending row as this service reads it.
+ *
+ * This was a widened copy while the data layer still knew two kinds and carried no title. It now
+ * carries both, so the alias exists only to keep the service's own vocabulary in one place.
+ */
+export type PendingRow = PendingNotificationRecord;
+
+const optionalText = (value: unknown): string | null =>
+  typeof value === 'string' && value.length > 0 ? value : null;
+
+const sideEffect = (value: unknown): ApprovalSideEffect | null =>
+  value === 'workspace_write' ||
+  value === 'external_reversible' ||
+  value === 'external_consequential'
+    ? value
+    : null;
+
+/**
+ * The owner's preferences, with the day boundary taken from the spending caps.
+ *
+ * There is one notion of the owner's day on this server and it belongs to the caps, so quiet hours
+ * read it rather than storing a second copy that could disagree with it.
+ *
+ * Every failure here lands on the defaults, which is every kind on: a settings row that cannot be
+ * read must not be able to silence a notification the owner never switched off. That is the whole
+ * reason this is a merge over the defaults rather than a substitution of them.
+ */
+export const ownerSettings = async (
+  store: DataStore,
+  userId: string
+): Promise<OwnerNotificationSettings> => {
+  const limits = await store.effectiveSpendLimits(userId).catch(() => null);
+  const defaults = defaultNotificationSettings(limits?.timeZone ?? 'UTC');
+  const stored = await store.notificationSettings(userId).catch(() => null);
+  return stored
+    ? { ...stored, kinds: { ...defaults.kinds, ...stored.kinds }, timeZone: defaults.timeZone }
+    : defaults;
+};
+
+/**
+ * Whether the owner is at the keyboard right now.
+ *
+ * Every authenticated request refreshes the session's last-seen stamp, and the client polls the
+ * open conversation and the approval list every three seconds while work is running, so a session
+ * touched inside the presence window means the screen this notification describes is already in
+ * front of them. The service worker also refuses to raise a notification over a focused window;
+ * this is the half that stops the phone from lighting up in the first place.
+ */
+export const ownerPresent = async (
+  store: DataStore,
+  userId: string,
+  now: Date,
+  windowMs = PRESENCE_WINDOW_MS
+): Promise<boolean> => {
+  const sessions = await store.listSessions(userId).catch(() => []);
+  return sessions.some((session) => {
+    const seen = Date.parse(String(session.lastSeenAt));
+    return Number.isFinite(seen) && now.getTime() - seen <= windowMs;
+  });
+};
+
+/**
+ * Everything the wording needs, gathered from rows this service can already read.
+ *
+ * The approval's tool name and side-effect class are plaintext columns, and the task carries its
+ * own settled spend and ceiling, so an approval and a spend pause are fully worded today. The
+ * conversation title and anything the agent asked to have said are encrypted with a workspace key
+ * this service does not hold, which is why they arrive on the pending row instead.
+ */
+export const notificationSubject = async (
+  store: DataStore,
+  row: PendingRow
+): Promise<{ subject: NotificationSubject; eventAt: Date }> => {
+  const task = await store.getTask(row.userId, row.taskId).catch(() => null);
+  const startedAt = task ? Date.parse(task.createdAt) : Number.NaN;
+  const endedAt = task ? Date.parse(task.updatedAt) : Number.NaN;
+  const subject: NotificationSubject = {
+    kind: row.kind,
+    taskId: row.taskId,
+    resourceId: row.resourceId,
+    taskTitle: row.taskTitle ?? task?.legacyTitle ?? null,
+    taskStatus: row.taskStatus ?? task?.status ?? null,
+    approvalAction: null,
+    approvalSideEffect: null,
+    message: row.message,
+    spentUsd: task?.spentUsd ?? null,
+    capUsd: task?.maxSpendUsd ?? null,
+    // Wall-clock from the first message to the last change. There is no separate finished-at on
+    // the record, and for a conversation that just reached a terminal state they are the same
+    // thing; a receipt that says "in 6 min" is worth more than one that says nothing.
+    durationMs:
+      Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt > startedAt
+        ? endedAt - startedAt
+        : null
+  };
+  // When the reported thing happened travels on the row, which is the only value that is right for
+  // every kind: a task's last update is not when its approval was raised, nor when the agent asked
+  // for the owner, and the staleness horizon is measured against exactly this.
+  const carried = Date.parse(row.eventAt);
+  const eventAt = Number.isFinite(carried)
+    ? new Date(carried)
+    : Number.isFinite(endedAt)
+      ? new Date(endedAt)
+      : new Date();
+
+  if (row.kind === 'approval_required') {
+    const approvals = await store.listApprovals(row.userId, 'pending').catch(() => []);
+    const approval = approvals.find((item) => String(item.id) === row.resourceId);
+    subject.approvalAction = optionalText(approval?.action);
+    subject.approvalSideEffect = sideEffect(approval?.sideEffect);
+    // A spend pause and a finished task both report money; an approval reports a decision, and a
+    // dollar figure beside it reads as though the money is what is being approved.
+    subject.spentUsd = null;
+    subject.capUsd = null;
+    subject.durationMs = null;
+  }
+
+  return { subject, eventAt };
+};

@@ -1,0 +1,590 @@
+import { useEffect, useMemo, useState } from 'react';
+import {
+  BellRing,
+  BookOpen,
+  CalendarClock,
+  LockKeyhole,
+  MessageSquare,
+  Pause,
+  Play,
+  ShieldAlert,
+  ShieldCheck,
+  Trash2,
+  X,
+  Zap
+} from 'lucide-react';
+import { api } from './api.js';
+import {
+  approvalDiffState,
+  approvalReach,
+  expiryPhrase,
+  needsComputer,
+  nextApproval
+} from './approval-copy.js';
+import {
+  agentSentence,
+  approvalDestinations,
+  approvalFacts,
+  approvalRequestText
+} from './approval-facts.js';
+import { describeFailure } from './failure-text.js';
+import { Dialog } from './Dialog.js';
+import { DiffView } from './DiffView.js';
+import { fileChangesFromTool, type FileChange } from './diff.js';
+import { noticeWhen, type AgentNotification } from './notice-log.js';
+import { contextNote } from './provenance.js';
+import { scheduleDescription, scheduleSpecFromForm, scheduleStanding } from './schedule-rows.js';
+import { useUndo } from './Undo.js';
+import type { Approval, ModelRelease, TaskEvent, TaskSchedule, Workspace } from './types.js';
+
+const localDateTimeInput = (date: Date): string =>
+  new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+
+export function ScheduleModal({
+  schedules,
+  workspaces,
+  models,
+  defaultWorkspaceId,
+  initialPrompt,
+  onClose,
+  onChanged
+}: {
+  schedules: TaskSchedule[];
+  workspaces: Workspace[];
+  models: ModelRelease[];
+  defaultWorkspaceId?: string;
+  initialPrompt: string;
+  onClose: () => void;
+  onChanged: () => Promise<void>;
+}) {
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const [title, setTitle] = useState('');
+  const [prompt, setPrompt] = useState(initialPrompt);
+  const workspaceId = defaultWorkspaceId ?? workspaces[0]?.id ?? '';
+  const privacyRoute =
+    models.find((model) => model.availability === 'available')?.privacyRoute ?? 'provider_zdr';
+  const eligibleModels = models.filter(
+    (model) => model.privacyRoute === privacyRoute && model.availability === 'available'
+  );
+  const [modelId, setModelId] = useState(eligibleModels[0]?.id ?? '');
+  // Cron is not offered here: a five-field expression is not something anyone should have to write
+  // to get a daily briefing, and the four shapes below are what people actually schedule. The
+  // agent can still create one on request, and `scheduleDescription` still reads it back.
+  const [kind, setKind] = useState<'once' | 'interval' | 'daily' | 'weekly'>('daily');
+  const [runAt, setRunAt] = useState(localDateTimeInput(new Date(Date.now() + 60 * 60_000)));
+  const [localTime, setLocalTime] = useState('09:00');
+  const [everyMinutes, setEveryMinutes] = useState(60);
+  const [weekdays, setWeekdays] = useState<number[]>([1]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [removed, setRemoved] = useState<string[]>([]);
+  const visibleSchedules = schedules.filter((schedule) => !removed.includes(schedule.id));
+  const undo = useUndo();
+
+  useEffect(() => {
+    if (!eligibleModels.some((model) => model.id === modelId))
+      setModelId(eligibleModels[0]?.id ?? '');
+  }, [eligibleModels, modelId]);
+
+  const create = async () => {
+    if (!workspaceId || !prompt.trim() || !modelId) return;
+    setBusy(true);
+    setError('');
+    try {
+      const built = scheduleSpecFromForm({
+        kind,
+        runAt,
+        localTime,
+        everyMinutes,
+        weekdays,
+        timeZone
+      });
+      if (!built.ok) throw new Error(built.message);
+      const spec = built.spec;
+      await api.createSchedule({
+        workspaceId,
+        prompt: prompt.trim(),
+        ...(title.trim() ? { title: title.trim() } : {}),
+        modelId,
+        privacyRoute,
+        // The same ceiling a message typed into the composer gets. Real spending is bounded by the
+        // daily and monthly caps in Settings, which is one control instead of two currencies.
+        maxComputeCredits: 5,
+        spec
+      });
+      setPrompt('');
+      setTitle('');
+      await onChanged();
+    } catch (cause) {
+      setError(describeFailure(cause, 'Could not create schedule'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog className="modal schedule-modal" labelledBy="schedule-title" onClose={onClose}>
+      <button className="modal-close" aria-label="Close scheduled work" onClick={onClose}>
+        <X />
+      </button>
+      <h2 id="schedule-title">Scheduled work</h2>
+      <p className="subtle">
+        Runs on your agent computer whether or not you are here, under the same approval rules.
+      </p>
+      <div className="schedule-layout">
+        <div className="schedule-existing">
+          <strong>Your schedules</strong>
+          {!visibleSchedules.length && <small>No scheduled work yet.</small>}
+          {visibleSchedules.map((schedule) => (
+            <div className={`schedule-row ${schedule.enabled ? '' : 'paused'}`} key={schedule.id}>
+              <CalendarClock />
+              <span>
+                <strong>{schedule.title}</strong>
+                <small>{scheduleDescription(schedule.spec)}</small>
+                <small>{scheduleStanding(schedule)}</small>
+              </span>
+              <button
+                className="icon-btn"
+                title="Run now"
+                disabled={busy}
+                onClick={async () => {
+                  setBusy(true);
+                  setError('');
+                  try {
+                    await api.scheduleAction(schedule.id, 'run');
+                    await onChanged();
+                  } catch (cause) {
+                    setError(describeFailure(cause, 'Could not run schedule'));
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                <Zap />
+              </button>
+              <button
+                className="icon-btn"
+                title={schedule.enabled ? 'Pause schedule' : 'Resume schedule'}
+                disabled={busy}
+                onClick={async () => {
+                  setBusy(true);
+                  setError('');
+                  try {
+                    await api.scheduleAction(schedule.id, schedule.enabled ? 'pause' : 'resume');
+                    await onChanged();
+                  } catch (cause) {
+                    setError(describeFailure(cause, 'Could not update schedule'));
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                {schedule.enabled ? <Pause /> : <Play />}
+              </button>
+              <button
+                className="icon-btn destructive"
+                title="Delete schedule"
+                disabled={busy}
+                onClick={() => {
+                  setRemoved((current) => [...current, schedule.id]);
+                  undo({
+                    message: `Deleted “${schedule.title}”`,
+                    commit: async () => {
+                      await api.deleteSchedule(schedule.id);
+                      await onChanged();
+                    },
+                    restore: () =>
+                      setRemoved((current) => current.filter((id) => id !== schedule.id))
+                  });
+                }}
+              >
+                <Trash2 />
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="schedule-form">
+          <strong>Create a schedule</strong>
+          <label>
+            Name <small>optional</small>
+            <input
+              maxLength={160}
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+            />
+          </label>
+          <label>
+            What should athanor do?
+            <textarea rows={4} value={prompt} onChange={(event) => setPrompt(event.target.value)} />
+          </label>
+          <div className="schedule-grid">
+            <label>
+              Repeats
+              <select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}>
+                <option value="once">Once</option>
+                <option value="interval">At an interval</option>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+              </select>
+            </label>
+            {kind === 'once' && (
+              <label>
+                Run at
+                <input
+                  type="datetime-local"
+                  value={runAt}
+                  onChange={(event) => setRunAt(event.target.value)}
+                />
+              </label>
+            )}
+            {kind === 'interval' && (
+              <label>
+                Every minutes
+                <input
+                  type="number"
+                  min={15}
+                  max={10080}
+                  value={everyMinutes}
+                  onChange={(event) => setEveryMinutes(Number(event.target.value))}
+                />
+              </label>
+            )}
+            {(kind === 'daily' || kind === 'weekly') && (
+              <label>
+                Local time
+                <input
+                  type="time"
+                  value={localTime}
+                  onChange={(event) => setLocalTime(event.target.value)}
+                />
+              </label>
+            )}
+          </div>
+          {kind === 'weekly' && (
+            <div className="weekday-picker">
+              {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((name, day) => (
+                <button
+                  type="button"
+                  aria-label={
+                    ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][
+                      day
+                    ]
+                  }
+                  aria-pressed={weekdays.includes(day)}
+                  className={weekdays.includes(day) ? 'active' : ''}
+                  key={`${name}-${day}`}
+                  onClick={() =>
+                    setWeekdays((current) =>
+                      current.includes(day)
+                        ? current.filter((item) => item !== day)
+                        : [...current, day].sort()
+                    )
+                  }
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+          )}
+          <label>
+            Model for every run
+            <select value={modelId} onChange={(event) => setModelId(event.target.value)}>
+              {!eligibleModels.length && <option value="">Connect an AI provider first</option>}
+              {eligibleModels.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.displayName}
+                </option>
+              ))}
+            </select>
+          </label>
+          <small className="schedule-zone">
+            Times are {timeZone}. Anything consequential still waits for you.
+          </small>
+          {error && (
+            <div className="form-error" role="alert">
+              {error}
+            </div>
+          )}
+          <button
+            className="primary wide"
+            disabled={
+              busy ||
+              !workspaceId ||
+              !prompt.trim() ||
+              !modelId ||
+              (kind === 'weekly' && !weekdays.length)
+            }
+            onClick={() => void create()}
+          >
+            <CalendarClock /> {busy ? 'Saving…' : 'Create schedule'}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+/**
+ * Everything athanor has told the owner, in one place and across every conversation.
+ *
+ * Each of these already appeared twice: once in the conversation it was decided in, and once on
+ * whatever device happened to be awake. Neither is somewhere you can look something up — the first
+ * needs the conversation found first, and the second is gone the moment it is swiped away. This is
+ * the record, newest first, and every row opens the work it came out of.
+ */
+export function NoticeLog({
+  notices,
+  onOpenTask,
+  onClose
+}: {
+  notices: AgentNotification[];
+  onOpenTask: (taskId: string) => void;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog className="modal notice-modal" labelledBy="notice-title" onClose={onClose}>
+      <button className="modal-close" aria-label="Close messages" onClick={onClose}>
+        <X />
+      </button>
+      <h2 id="notice-title">What athanor told you</h2>
+      <p className="subtle">
+        Messages athanor decided to send, whether or not a device was awake to receive them.
+      </p>
+      <div className="notice-list">
+        {/* Reachable while empty: the last notice can be read, and then the list refreshes under
+            the open dialog. An empty box with a heading over it reads as a failure to load. */}
+        {!notices.length && (
+          <small>Nothing yet. athanor only writes here when it has something.</small>
+        )}
+        {notices.map((notice) => (
+          <button
+            key={notice.id}
+            className="notice-row"
+            // A row with no conversation behind it is still worth reading; it is just not a way in.
+            disabled={!notice.taskId}
+            onClick={() => {
+              onOpenTask(notice.taskId);
+              onClose();
+            }}
+          >
+            {notice.kind === 'takeover_needed' ? <ShieldAlert /> : <BellRing />}
+            <span>
+              <strong>{notice.message}</strong>
+              <small>
+                {notice.taskTitle || 'Untitled conversation'} · {noticeWhen(notice.createdAt)}
+              </small>
+            </span>
+          </button>
+        ))}
+      </div>
+    </Dialog>
+  );
+}
+
+/**
+ * The change a file-touching approval would make, taken from the arguments the approval is bound
+ * to. `file_write` only carries the new contents, so the current file is read back to diff
+ * against; if it does not exist yet the diff correctly shows a new file.
+ */
+const useApprovalDiffs = (
+  approvalId: string,
+  workspaceId: string | undefined,
+  changes: FileChange[]
+): { changes: FileChange[]; ready: boolean } => {
+  const [current, setCurrent] = useState<Record<string, string | null>>({});
+  const missing = changes
+    .filter((change) => change.before === undefined)
+    .map((change) => change.path)
+    .join('\n');
+  useEffect(() => {
+    setCurrent({});
+    if (!workspaceId || !missing) return;
+    let active = true;
+    void Promise.all(
+      missing.split('\n').map(async (path) => {
+        const bytes = await api.file(workspaceId, path).catch(() => undefined);
+        return [path, bytes ? new TextDecoder().decode(new Uint8Array(bytes)) : null] as const;
+      })
+    ).then((entries) => {
+      if (active) setCurrent(Object.fromEntries(entries));
+    });
+    return () => {
+      active = false;
+    };
+  }, [approvalId, workspaceId, missing]);
+  return approvalDiffState(changes, current);
+};
+
+/**
+ * The half of the card the agent did not write.
+ *
+ * Every row here is read out of the argument object the worker will execute, which the approval
+ * carries a hash of and re-checks before it acts. The heading says where it came from, because the
+ * whole value of the separation is that the owner can tell which half is which — a card whose facts
+ * and whose prose look alike is a card whose prose still does the persuading.
+ */
+function RequestFacts({ approval }: { approval: Approval }) {
+  const facts = approvalFacts(approval);
+  const destinations = approvalDestinations(approval);
+  if (!facts.length && !destinations.length) {
+    const request = approvalRequestText(approval);
+    return request ? <pre className="approval-request">{request}</pre> : null;
+  }
+  return (
+    <dl className="approval-facts">
+      {facts.map((item) => (
+        <div key={item.label}>
+          <dt>{item.label}</dt>
+          <dd>{item.value}</dd>
+        </div>
+      ))}
+      {destinations.map((destination) => (
+        <div key={destination.url} className="approval-destination">
+          <dt>Reaches</dt>
+          <dd>
+            <strong>{destination.host}</strong>
+            {destination.carriedCharacters > 0 && (
+              <span>
+                {' '}
+                · the address carries {destination.carriedCharacters} characters of data past the
+                host
+              </span>
+            )}
+          </dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+export function Approvals({
+  approvals,
+  workspaceId,
+  openTaskId,
+  openTaskEvents,
+  onOpenTask,
+  onOpenComputer,
+  onResolve
+}: {
+  approvals: Approval[];
+  workspaceId?: string;
+  openTaskId: string | undefined;
+  /**
+   * The trajectory of the conversation on screen, when there is one, so the card can say whether
+   * the agent asking had anybody else's text in its context. Only ever read for an approval that
+   * belongs to that conversation: for one raised elsewhere the card offers to open it instead of
+   * answering a question it cannot answer.
+   */
+  openTaskEvents?: TaskEvent[];
+  onOpenTask?: (taskId: string) => void;
+  /** The browser is part of the computer's screen, so a handoff of either lands in one place. */
+  onOpenComputer?: () => void;
+  onResolve: (id: string, decision: 'approve' | 'deny') => Promise<void>;
+}) {
+  const item = nextApproval(approvals, openTaskId);
+  // The countdown has to move on its own; the approval list is refetched far less often than the
+  // last minute of an expiry window is worth watching.
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => tick((current) => current + 1), 20_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  /*
+   * Stated only when this card belongs to the conversation on screen and that conversation has
+   * actually loaded. An empty array is a trajectory nobody has fetched yet, and reading it as "this
+   * conversation has read nothing from outside" would be the card's one false sentence.
+   *
+   * Memoised because a streaming turn re-renders this drawer on every delta, and the report is a
+   * pass over the whole trajectory. It recomputes when the trajectory grows, which is when the
+   * answer can actually change, and not when a countdown ticks.
+   */
+  const here = Boolean(item && (!openTaskId || item.taskId === openTaskId));
+  const context = useMemo(
+    () => (here && openTaskEvents?.length ? contextNote(openTaskEvents) : undefined),
+    [here, openTaskEvents]
+  );
+  const structured = item && typeof item.preview !== 'string' ? item.preview : undefined;
+  const { changes, ready } = useApprovalDiffs(
+    item?.id ?? '',
+    workspaceId,
+    item ? fileChangesFromTool(structured?.tool, structured?.arguments) : []
+  );
+  if (!item) return null;
+  // The model-authored strings, folded into one attributed quotation. The headline used to be
+  // `action` on its own and the body `preview`, which repeats it — so a compromised agent got the
+  // top line, the body, and the last word.
+  const wording = agentSentence(item);
+  const elsewhere = Boolean(openTaskId) && item.taskId !== openTaskId;
+  return (
+    <div className="approval-drawer" role="alertdialog" aria-live="assertive" aria-label="Approval">
+      <div className="approval-symbol">
+        <LockKeyhole />
+      </div>
+      <div className="approval-copy">
+        <p className="eyebrow">
+          Your confirmation is required
+          {approvals.length > 1 ? ` · ${approvals.length} waiting` : ''}
+        </p>
+        {/* What the box will do, said by the box. `item.action` is the model's own sentence for
+            every tool that takes a `purpose`, so it is no longer the headline: the headline is the
+            reversibility class and the tool, both of which the harness recorded itself. */}
+        <strong>{approvalReach(item)}</strong>
+        <RequestFacts approval={item} />
+        {/* Where the request came from, as against what it does. Both answers are drawn, because a
+            line that only appears when something is wrong teaches its own absence to mean safety. */}
+        {context && (
+          <p className={`approval-context ${context.exposed ? 'exposed' : 'clean'}`}>
+            {context.exposed ? <BookOpen /> : <ShieldCheck />}
+            <span>{context.text}</span>
+          </p>
+        )}
+        {changes.length > 0 && ready && (
+          <div className="approval-diffs">
+            {changes.map((change) => (
+              <DiffView
+                key={`${item.id}-${change.path}`}
+                path={change.path}
+                before={change.before}
+                after={change.after}
+                defaultOpen={changes.length === 1}
+              />
+            ))}
+          </div>
+        )}
+        {/* The model's own words, kept and attributed. An agent working honestly has a reason worth
+            reading; an agent following an injected instruction writes one too, and the owner is
+            told which of the two kinds of statement they are looking at. */}
+        {wording && (
+          <blockquote className="approval-agent-wording">
+            <span>athanor&apos;s own description, written by the model</span>
+            <p>{wording}</p>
+          </blockquote>
+        )}
+        {/* An absolute timestamp answers a question nobody asked. What decides whether to get up
+            and answer this is how long is left. */}
+        <small>
+          {approvalReach(item)} · {expiryPhrase(item.expiresAt)}
+        </small>
+      </div>
+      <div className="approval-actions">
+        {elsewhere && onOpenTask && (
+          <button className="ghost" onClick={() => onOpenTask(item.taskId)}>
+            <MessageSquare /> Open conversation
+          </button>
+        )}
+        {needsComputer(item) && onOpenComputer && (
+          <button className="ghost" onClick={onOpenComputer}>
+            Open computer
+          </button>
+        )}
+        <button className="ghost" onClick={() => void onResolve(item.id, 'deny')}>
+          Deny
+        </button>
+        {/* "Approve once" implied a persistent approve that does not exist. */}
+        <button className="primary" onClick={() => void onResolve(item.id, 'approve')}>
+          Approve
+        </button>
+      </div>
+    </div>
+  );
+}

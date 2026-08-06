@@ -1,0 +1,24 @@
+[Unit]
+Description=Renew the athanor TLS certificate
+After=network-online.target nginx.service
+Wants=network-online.target
+# Four attempts, a quarter of an hour apart. The common failure is a machine that has just come
+# back online with DNS or its uplink not settled, which the next few minutes usually fix; waiting
+# for the six-hourly tick instead means hours of browser warnings for a fault that cleared almost
+# immediately.
+StartLimitIntervalSec=1h
+StartLimitBurst=4
+# A renewal that keeps failing is invisible: the served certificate simply expires and every
+# client gets a full-page warning with nothing said to the owner. This records the failure where
+# `athanor doctor` and the login banner will report it.
+OnFailure=athanor-certificate-alert.service
+
+[Service]
+Type=oneshot
+# `renew` is a no-op unless ACME is enabled and the certificate is inside its renewal window,
+# so the timer can run often and cheaply. Issuance failure leaves the served certificate in
+# place, which is why a failed run is not allowed to disable the timer.
+ExecStart=/usr/local/lib/athanor/athanor-certificate renew
+TimeoutStartSec=15min
+Restart=on-failure
+RestartSec=15min

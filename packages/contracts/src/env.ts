@@ -1,0 +1,114 @@
+import { z } from 'zod';
+
+/**
+ * The settings more than one athanor process reads, declared once.
+ *
+ * The API, the worker, the media orchestrator and the notifier are separate units on a packaged
+ * install, and systemd starts all four from the same /etc/athanor/control.env. A key declared
+ * twice is therefore a key two units can disagree about: TASK_MAX_STEPS was bounded at 200 in the
+ * API and 400 in the worker, so an operator who raised it to 300 got a worker that accepted the
+ * number and an API that refused to start, with nothing in either message to say the other half
+ * had a different opinion. The same file, read two ways, is the whole failure.
+ *
+ * Only genuinely shared keys belong here. A process keeps the settings only it reads - the API's
+ * listener and WebAuthn boundary, the runner's executable paths, the notifier's signing keys -
+ * because a declaration nobody else consults is not a contract, it is just configuration.
+ *
+ * packages/contracts/src/env.test.ts is what keeps this true: it reads every config schema in the
+ * repository, finds each key declared in more than one of them, and fails if a declaration has
+ * drifted from the one below.
+ */
+export const sharedEnv = {
+  /**
+   * Where the data lives. `pglite` is an embedded database inside the process, which is what a
+   * checkout gets with no PostgreSQL to install; a packaged install writes `postgres` and a real
+   * connection string.
+   */
+  DATABASE_DRIVER: z.enum(['pglite', 'postgres']).default('pglite'),
+  DATABASE_URL: z.string().default('postgres://athanor:athanor@localhost:5432/athanor'),
+  PGLITE_PATH: z.string().default('.athanor/postgres'),
+  /**
+   * The key every workspace key is wrapped under. Optional here and required by each process at
+   * load, so the failure is one sentence naming the key rather than a schema dump.
+   */
+  DATA_MASTER_KEY: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(1).optional()
+  ),
+  /** Authenticates every call between an athanor process and the workspace runner. */
+  RUNNER_SHARED_SECRET: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32).optional()
+  ),
+  WORKSPACE_RUNNER_URL: z.string().url().default('http://127.0.0.1:4300'),
+  PREVIEW_BASE_URL: z.string().url().default('http://preview.localhost:4400'),
+  PUBLIC_APP_URL: z.string().url().default('http://localhost:5173'),
+  OPENROUTER_BASE_URL: z.string().url().default('https://openrouter.ai/api/v1'),
+  OPENROUTER_API_KEY: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(20).optional()
+  ),
+  AI_PROVIDER: z.enum(['openrouter', 'openai-compatible']).default('openrouter'),
+  AI_BASE_URL: z.string().url().default('https://openrouter.ai/api/v1'),
+  AI_API_KEY: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(1).optional()
+  ),
+  AI_DEFAULT_MODEL: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(1).max(300).optional()
+  ),
+  AI_REQUIRE_ZDR: z
+    .string()
+    .default('true')
+    .transform((value) => value === 'true'),
+  /**
+   * Takes provider-side web search and fetch off this box for every task, whatever route a
+   * conversation was started on.
+   *
+   * Separate from AI_REQUIRE_ZDR because it answers a different question. Zero retention is about
+   * what the provider keeps of an inference request; this is about whether a search query is sent
+   * to a search service at all. An operator who is content for inference to be retained may still
+   * not want the questions they ask leaving the machine, and the provider's own zero-retention
+   * enforcement explicitly does not cover tools, so one setting could not honestly stand for both.
+   */
+  AI_FORCE_INHOUSE_WEB: z
+    .string()
+    .default('false')
+    .transform((value) => value === 'true'),
+  ALLOW_INSECURE_PROVIDER_URLS: z
+    .string()
+    .default('false')
+    .transform((value) => value === 'true'),
+  /**
+   * A deployment restriction on which hosts a connector may reach at all. Empty is the default and
+   * means the owner's own choice stands.
+   */
+  CONNECTOR_ALLOWED_HOST_SUFFIXES: z.string().default(''),
+  /**
+   * How many tasks one worker runs at once.
+   *
+   * Almost all of a step is spent waiting on the model provider or the workspace runner, so a
+   * second slot costs little and stops one long build or one stalled provider from holding the
+   * whole queue. It stays deliberately low because each in-flight task also holds a full context
+   * window in memory on a machine that is running everything else too.
+   */
+  WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(2),
+  /**
+   * The floor under an idle worker's re-check. Pickup itself is signalled by the write, so this
+   * only bounds how long a task that became leasable without one - an expired lease - waits.
+   */
+  WORKER_POLL_MS: z.coerce.number().int().min(100).default(1000),
+  /**
+   * How many model calls one turn may spend before the harness takes the last word.
+   *
+   * Sixty was chosen when a turn was a conversation. It is not what a real job costs: a job
+   * application is a posting capture, a dossier read, two tailored documents, a render proof and
+   * twenty-five form fields read back one at a time. Both that and a sourced report cleared sixty
+   * on the first honest measurement, and the ceiling was a crash rather than a stop, so the owner
+   * paid for the whole trajectory and got a red error mid-form. A turn is bounded by the compute
+   * budget and the spend caps as well, both of which are the owner's own numbers - this one is a
+   * runaway guard, and it was set tight enough to cut off ordinary work instead.
+   */
+  TASK_MAX_STEPS: z.coerce.number().int().min(1).max(400).default(120)
+};

@@ -1,0 +1,7154 @@
+.server-install-link {
+  margin: 18px auto 0;
+  padding: 4px 8px;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  box-shadow: none;
+  font-size: 12px;
+  text-decoration: underline;
+  text-decoration-color: #555b60;
+  text-underline-offset: 3px;
+}
+.server-install-link:hover {
+  color: #f1f2f2;
+  background: transparent;
+  box-shadow: none;
+}
+.server-install-backdrop {
+  z-index: 120;
+}
+.server-install-modal {
+  width: min(620px, calc(100vw - 28px));
+  max-height: min(860px, calc(100vh - 28px));
+  overflow: auto;
+}
+.server-install-heading {
+  display: flex;
+  gap: 13px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.server-install-heading h2,
+.server-install-heading p {
+  margin: 0;
+}
+.server-install-icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border: 1px solid #6b7176;
+  border-radius: 13px;
+  background: linear-gradient(145deg, #2d3033, #17191b);
+  box-shadow:
+    inset 0 1px 0 #83888c55,
+    0 0 18px #d7dbde18;
+}
+.server-install-icon svg {
+  width: 20px;
+}
+
+.server-install-footnote {
+  margin: 9px 0 0;
+  color: #999ea2;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.server-install-modal > .wide {
+  margin-top: 13px;
+}
+.server-install-modal .optional {
+  color: #858a8e;
+  font-weight: 400;
+}
+
+.install-command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 8px;
+  align-items: center;
+  margin-top: 12px;
+}
+.install-command code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #d9dcde;
+  font-size: 12px;
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+button {
+  color: inherit;
+}
+
+/*
+ * A themed default for a button nobody dressed.
+ *
+ * Twenty-nine buttons carry no class at all - the "Try again" in every failed panel among them -
+ * and a bare button takes the user agent's own styling: a light grey pill, on a canvas built to be
+ * black. It read as a piece of some other program that had wandered in, and it appeared exactly
+ * where something had already gone wrong and the owner was least inclined to trust the screen.
+ *
+ * `:not([class])` is the whole of the safety here. It cannot touch a button that any stylesheet
+ * has an opinion about, so the many classed and icon buttons are untouched by construction, and a
+ * button added later without a class is dressed rather than left bare.
+ */
+button:not([class]) {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 7px 13px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:not([class]):hover:enabled {
+  border-color: var(--accent);
+  background: var(--panel-strong);
+}
+button:not([class]):disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid #52705f;
+  outline-offset: 2px;
+}
+.app-shell {
+  display: grid;
+  grid-template-columns: 272px minmax(460px, 1fr) minmax(330px, 38vw);
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #f5f3ed;
+}
+.app-shell.inspector-closed {
+  grid-template-columns: 272px minmax(460px, 1fr);
+}
+.sidebar {
+  background: #ebe9e2;
+  border-right: 1px solid #d9dad4;
+  padding: 18px 14px 12px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  height: 38px;
+  gap: 10px;
+  padding: 0 6px;
+  font-family: Manrope, system-ui, sans-serif;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.45px;
+}
+.brand.light {
+  color: white;
+}
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  color: #d7d9da;
+  background:
+    radial-gradient(circle at 32% 18%, #303234 0, transparent 42%),
+    linear-gradient(145deg, #1d1f20, #0b0c0d 72%);
+  border: 1px solid #ffffff18;
+  box-shadow:
+    inset 0 1px 0 #ffffff12,
+    0 1px 2px #00000066;
+}
+.brand-mark svg {
+  width: 18px;
+}
+.brand-mark.large {
+  width: 52px;
+  height: 52px;
+  border-radius: 16px;
+}
+.brand-mark.large svg {
+  width: 28px;
+}
+.brand .collapse {
+  margin-left: auto;
+}
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  cursor: pointer;
+  color: #69776f;
+}
+.icon-btn:hover {
+  background: #e1e2dc;
+  color: var(--text);
+}
+.icon-btn svg {
+  width: 17px;
+  height: 17px;
+}
+.queue-pill {
+  cursor: default;
+  background: #eef2df;
+  color: #52601f;
+}
+.queued-user-message {
+  opacity: 0.82;
+  border-style: dashed;
+}
+.queued-user-message .message-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.queued-user-message .message-meta svg {
+  width: 13px;
+  height: 13px;
+}
+.workspace-switcher {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) 16px;
+  width: 100%;
+  min-width: 0;
+  gap: 10px;
+  text-align: left;
+  align-items: center;
+  border: 1px solid #d8dad3;
+  background: #f4f3ee;
+  padding: 8px;
+  border-radius: 12px;
+  margin: 14px 0 10px;
+  cursor: pointer;
+}
+.workspace-switcher > span:nth-child(2) {
+  min-width: 0;
+}
+.workspace-switcher > svg:last-child {
+  justify-self: end;
+  width: 15px;
+  height: 15px;
+}
+.workspace-switcher:hover {
+  border-color: #b8bdb5;
+}
+.workspace-avatar {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  background: #d8e6dc;
+  color: #274d3b;
+  border-radius: 9px;
+  font-weight: 700;
+}
+.workspace-switcher strong,
+.workspace-switcher small {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.workspace-switcher strong {
+  font-size: 13px;
+}
+.workspace-switcher small {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 2px;
+  text-transform: capitalize;
+}
+.new-task {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  border-radius: 10px;
+  color: white;
+  background: var(--text);
+  padding: 10px 11px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 3px 10px #14201918;
+}
+.new-task:hover {
+  background: #26372f;
+}
+.new-task kbd {
+  margin-left: auto;
+  opacity: 0.55;
+  font-size: 12px;
+  font-weight: 400;
+}
+.schedule-task {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 7px;
+  padding: 8px 10px;
+  border: 1px solid #d6d9d2;
+  border-radius: 10px;
+  background: #f4f3ee;
+  color: #4d5f56;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.schedule-task:hover {
+  border-color: #aeb8b0;
+  background: #eef1eb;
+}
+.schedule-task span {
+  min-width: 20px;
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #dfe5dc;
+  text-align: center;
+  font-size: 12px;
+}
+.search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: #e2e1db;
+  border-radius: 9px;
+  margin: 12px 0 10px;
+  padding: 0 9px;
+  color: #748078;
+}
+.search input {
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  height: 34px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.task-list {
+  overflow: auto;
+  flex: 1;
+  margin: 0 -5px;
+  padding: 0 5px;
+}
+.task-row {
+  display: grid;
+  width: 100%;
+  grid-template-columns: 8px 1fr;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  padding: 9px 8px;
+  margin: 2px 0;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.task-row:hover {
+  background: #e2e1da;
+}
+.task-row.active {
+  background: #fff;
+  box-shadow: 0 1px 5px #24332b0c;
+}
+.task-copy {
+  min-width: 0;
+}
+.task-copy strong,
+.task-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-copy strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+.task-copy small {
+  color: #87918b;
+  font-size: 12px;
+  margin-top: 3px;
+  text-transform: capitalize;
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #6b7276;
+}
+.status-dot.running,
+.status-dot.planning,
+.status-dot.queued {
+  background: #65a879;
+  box-shadow: 0 0 0 3px #65a8791c;
+}
+.status-dot.awaiting_user {
+  background: #e9a33c;
+}
+.status-dot.failed {
+  background: #c95f54;
+}
+.status-dot.completed {
+  background: #738078;
+}
+.empty-mini {
+  display: flex;
+  gap: 8px;
+  padding: 18px 10px;
+  color: #849089;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.empty-mini svg {
+  flex: none;
+  color: #959a9e;
+}
+.sidebar-bottom {
+  border-top: 1px solid #2d3033;
+  padding-top: 8px;
+}
+.account-row {
+  display: grid;
+  grid-template-columns: 30px 1fr 16px;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  border-radius: 9px;
+  padding: 7px;
+  text-align: left;
+  cursor: pointer;
+}
+.account-row:hover {
+  background: #e1e1da;
+}
+.user-avatar {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: #354b40;
+  color: #e9ffc2;
+  font-size: 12px;
+  font-weight: 700;
+}
+.account-row strong,
+.account-row small {
+  display: block;
+}
+.account-row strong {
+  font-size: 13px;
+}
+.account-row small {
+  font-size: 12px;
+  color: #87918a;
+  text-transform: capitalize;
+  margin-top: 2px;
+}
+.workbench {
+  min-width: 0;
+  position: relative;
+  background: var(--panel-soft);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.workbench-header {
+  height: 58px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 0 18px;
+  border-bottom: 1px solid #e4e4de;
+  background: #fbfaf6d9;
+  backdrop-filter: blur(12px);
+  z-index: 4;
+}
+.task-title {
+  min-width: 0;
+}
+.task-title strong,
+.task-title span {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.task-title strong {
+  font:
+    600 13px Manrope,
+    sans-serif;
+  max-width: 420px;
+}
+.task-title span {
+  font-size: 12px;
+  color: #85918a;
+  margin-top: 3px;
+  text-transform: capitalize;
+}
+.task-title i {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #66a879;
+  margin-right: 5px;
+}
+.message-meta {
+  display: flex !important;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.message-meta button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  background: transparent;
+  color: #7b8780;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.user-message:hover .message-meta button,
+.message-meta button:focus-visible {
+  opacity: 1;
+}
+.message-meta svg {
+  width: 11px;
+  height: 11px;
+}
+
+@media (hover: none) {
+  .message-meta button {
+    opacity: 1;
+  }
+}
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+}
+.header-pill {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #dfe1db;
+  background: #fff;
+  border-radius: 9px;
+  padding: 6px 9px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.header-pill svg {
+  width: 13px;
+}
+.workspace-tools-button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  border: 1px solid #dfe1db;
+  background: #fff;
+  border-radius: 9px;
+  padding: 6px 9px;
+  color: #536159;
+  font:
+    600 10px Manrope,
+    sans-serif;
+  cursor: pointer;
+}
+.workspace-tools-button:hover,
+.workspace-tools-button.active {
+  border-color: #41464a;
+  background: #1b1d1f;
+  color: #eef0f1;
+}
+.workspace-tools-button svg {
+  width: 15px;
+  height: 15px;
+}
+.mobile-menu {
+  display: none;
+}
+.chat-canvas {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  scroll-behavior: smooth;
+}
+.timeline {
+  max-width: 820px;
+  padding: 30px 34px 170px;
+  margin: 0 auto;
+}
+.user-brief {
+  margin: 0 0 27px auto;
+  background: #e9ece6;
+  border: 1px solid #2d3033;
+  border-radius: 16px 16px 5px 16px;
+  width: fit-content;
+  max-width: 80%;
+  padding: 11px 14px;
+}
+.user-brief p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+.user-brief span {
+  display: block;
+  color: #89928d;
+  font-size: 12px;
+  margin-top: 5px;
+}
+.task-plan-panel {
+  margin: 0 0 24px;
+  padding: 14px;
+  border: 1px solid #dce2da;
+  border-radius: 14px;
+  background: #fbfcf8;
+  box-shadow: 0 5px 20px rgba(31, 49, 40, 0.04);
+}
+.task-plan-panel > header,
+.task-plan-heading,
+.task-plan-actions,
+.task-plan-row-actions,
+.task-plan-history-title {
+  display: flex;
+  align-items: center;
+}
+.task-plan-panel > header {
+  justify-content: space-between;
+  gap: 12px;
+}
+.task-plan-heading {
+  gap: 9px;
+}
+.task-plan-heading > svg {
+  width: 17px;
+  color: #959a9e;
+}
+.task-plan-heading strong,
+.task-plan-heading span {
+  display: block;
+}
+.task-plan-heading strong {
+  font-size: 12px;
+}
+.task-plan-heading span {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #849089;
+}
+.task-plan-actions {
+  gap: 6px;
+}
+.task-plan-actions button,
+.task-plan-row-actions button,
+.task-plan-add {
+  border: 1px solid #2d3033;
+  background: #151719;
+  color: #959a9e;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.task-plan-actions button {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+.task-plan-actions button > svg,
+.task-plan-row-actions svg,
+.task-plan-add svg {
+  width: 13px;
+  height: 13px;
+}
+.task-plan-actions .save {
+  background: var(--text);
+  border-color: var(--text);
+  color: #fff;
+}
+.task-plan-actions button:disabled,
+.task-plan-row-actions button:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+.task-plan-progress {
+  height: 3px;
+  margin: 12px 0;
+  overflow: hidden;
+  border-radius: 3px;
+  background: #e9ece7;
+}
+.task-plan-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #78a58a;
+  transition: width 180ms ease;
+}
+
+.task-plan-steps input,
+.task-plan-steps select {
+  min-width: 0;
+  border: 1px solid #2d3033;
+  border-radius: 7px;
+  background: #151719;
+  color: #e1e4e5;
+  font: inherit;
+}
+
+.task-plan-steps {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+.task-plan-steps li {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) auto;
+  gap: 7px;
+  margin: 6px 0;
+}
+.task-plan-steps input {
+  padding: 7px 8px;
+  font-size: 13px;
+}
+.task-plan-steps input[readonly] {
+  background: transparent;
+  border-color: transparent;
+}
+.task-plan-steps select {
+  padding: 5px 6px;
+  font-size: 12px;
+}
+.task-plan-row-actions {
+  gap: 3px;
+}
+.task-plan-row-actions button {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  padding: 0;
+}
+.task-plan-add {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 9px;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+.task-plan-conflict {
+  margin: 10px 0;
+  padding: 7px 9px;
+  border-radius: 7px;
+  background: #22201c;
+  color: #c4b69a;
+  font-size: 12px;
+}
+.task-plan-conflict button {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.task-plan-error {
+  margin: 9px 0 0;
+  color: #d2aaa5;
+  font-size: 12px;
+}
+.task-plan-history {
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid #2d3033;
+}
+.task-plan-history-title {
+  gap: 5px;
+  margin-bottom: 5px;
+  font-size: 12px;
+  color: #7e8983;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.task-plan-history-title svg {
+  width: 12px;
+}
+.task-plan-history > button {
+  display: grid;
+  grid-template-columns: 14px 1fr auto;
+  width: 100%;
+  gap: 6px;
+  align-items: center;
+  border: 0;
+  border-radius: 6px;
+  padding: 6px;
+  background: transparent;
+  color: #959a9e;
+  text-align: left;
+  cursor: pointer;
+  font-size: 12px;
+}
+.task-plan-history > button:hover {
+  background: #f0f3ee;
+}
+.task-plan-history > button svg {
+  width: 12px;
+}
+.task-plan-history > button em {
+  color: #8b958f;
+  font-size: 11px;
+  font-style: normal;
+}
+.tiny-spinner {
+  width: 11px;
+  height: 11px;
+  border: 1px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+.assistant-message {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 12px;
+  margin: 22px 0;
+}
+.ai-avatar {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  background: var(--text);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+.markdown {
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.65;
+  color: #29342f;
+}
+.markdown > :first-child {
+  margin-top: 3px;
+}
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3 {
+  font-family: Manrope, sans-serif;
+  letter-spacing: -0.02em;
+}
+.markdown h2 {
+  font-size: 18px;
+}
+.markdown h3 {
+  font-size: 15px;
+}
+.markdown code {
+  font-family: ui-monospace, monospace;
+  background: #edf0eb;
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+.markdown pre {
+  overflow: auto;
+  background: #17221d;
+  color: #deebe2;
+  padding: 14px;
+  border-radius: 10px;
+}
+.markdown pre code {
+  background: transparent;
+  padding: 0;
+}
+.markdown a {
+  color: #316d50;
+}
+.system-event,
+.completion-card {
+  display: flex;
+  gap: 11px;
+  align-items: flex-start;
+  margin: 14px 40px;
+  padding: 11px 13px;
+  border: 1px solid #e1e4dd;
+  background: #f7f8f4;
+  border-radius: 11px;
+}
+.system-event > svg,
+.completion-card > svg {
+  display: grid;
+  place-items: center;
+  flex: none;
+  color: #959a9e;
+}
+.system-event > svg,
+.completion-card > svg {
+  width: 16px;
+  height: 16px;
+}
+.system-event strong,
+.system-event span,
+.completion-card strong,
+.completion-card span {
+  display: block;
+}
+.system-event strong,
+.completion-card strong {
+  font-size: 13px;
+}
+.system-event span,
+.completion-card span {
+  font-size: 12px;
+  color: #7d8983;
+  margin-top: 3px;
+  line-height: 1.4;
+}
+.completion-card .completion-summary {
+  margin-top: 5px;
+  color: #7d8983;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.completion-card .completion-summary > :first-child {
+  margin-top: 0;
+}
+.completion-card .completion-summary > :last-child {
+  margin-bottom: 0;
+}
+.system-event.approval {
+  background: #fff8e8;
+  border-color: #f0d9a7;
+}
+.system-event.error {
+  background: #fff0ed;
+  border-color: #edcbc4;
+  color: #943c33;
+}
+.system-event.warning {
+  background: #fff8e9;
+  border-color: #ead6ac;
+}
+.tool-event {
+  margin: 8px 40px;
+  border: 1px solid #e2e4de;
+  background: #fafaf7;
+  border-radius: 10px;
+  overflow: hidden;
+}
+.tool-event summary {
+  display: grid;
+  grid-template-columns: 16px 1fr 15px;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 11px;
+  cursor: pointer;
+  font-size: 12px;
+  color: #959a9e;
+  list-style: none;
+}
+.tool-event summary::-webkit-details-marker {
+  display: none;
+}
+.tool-event summary svg {
+  width: 13px;
+}
+.tool-event summary svg:last-child {
+  transition: 0.2s;
+}
+.tool-event[open] summary svg:last-child {
+  transform: rotate(90deg);
+}
+.tool-event.success summary > svg:first-child {
+  color: #4b8c62;
+}
+.tool-event pre {
+  margin: 0;
+  border-top: 1px solid #2d3033;
+  max-height: 240px;
+  overflow: auto;
+  padding: 10px 12px;
+  background: #151719;
+  color: #959a9e;
+  font:
+    9px/1.5 ui-monospace,
+    monospace;
+  white-space: pre-wrap;
+}
+
+.browser-capture-card {
+  margin: 15px 40px 8px;
+  overflow: hidden;
+  border: 1px solid #dce2dc;
+  border-radius: 13px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(31, 49, 40, 0.06);
+}
+.browser-capture-card > img {
+  display: block;
+  width: 100%;
+  max-height: 390px;
+  object-fit: contain;
+  background: #131517;
+}
+.browser-capture-card figcaption,
+.browser-capture-card figcaption > span {
+  display: flex;
+  align-items: center;
+}
+.browser-capture-card figcaption {
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+}
+.browser-capture-card figcaption > span {
+  min-width: 0;
+  gap: 7px;
+  font-size: 12px;
+}
+.browser-capture-card figcaption svg {
+  width: 14px;
+  color: #959a9e;
+}
+.browser-capture-card button,
+.artifact-actions button,
+.artifact-actions a {
+  border: 1px solid #2d3033;
+  background: #151719;
+  color: #e1e4e5;
+  text-decoration: none;
+  border-radius: 7px;
+  padding: 5px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.cost-event {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #98a09b;
+  font-size: 12px;
+  margin: 7px 48px;
+}
+.cost-event svg {
+  width: 12px;
+}
+.artifact-card {
+  display: grid;
+  grid-template-columns: 28px 1fr auto;
+  gap: 10px;
+  align-items: center;
+  margin: 12px 40px;
+  padding: 11px;
+  border: 1px solid #dce2dc;
+  background: #fff;
+  border-radius: 11px;
+}
+.artifact-card.with-preview {
+  grid-template-columns: 62px 1fr auto;
+}
+.pdf-review-card {
+  height: min(62vh, 520px);
+  min-height: 300px;
+  overflow: hidden;
+  margin: 12px 40px 0;
+  border: 1px solid #2d3033;
+  border-radius: 11px;
+  background: #131517;
+}
+.pdf-review-card iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+.artifact-thumb {
+  display: block;
+  width: 62px;
+  height: 48px;
+  overflow: hidden;
+  padding: 0 !important;
+  border-radius: 8px !important;
+}
+.artifact-thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.artifact-actions {
+  display: flex !important;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  margin: 0 !important;
+}
+.artifact-actions a {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.artifact-actions svg {
+  width: 12px;
+  height: 12px;
+}
+.preview-chat-card {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  margin: 14px 40px;
+  padding: 13px;
+  border: 1px solid #cfdccf;
+  border-radius: 13px;
+  background: linear-gradient(135deg, #f8fbf3, #eef5e9);
+  box-shadow: 0 8px 24px rgba(42, 69, 51, 0.06);
+}
+.preview-chat-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  color: #bac0c4;
+  background: #272a2d;
+}
+.preview-chat-icon svg {
+  width: 18px;
+}
+.preview-chat-card p {
+  margin: 0 0 4px;
+}
+.preview-chat-card strong,
+.preview-chat-card > div > span {
+  display: block;
+}
+.preview-chat-card strong {
+  font-size: 12px;
+}
+.preview-chat-card > div > span {
+  margin-top: 3px;
+  color: #78847d;
+  font-size: 12px;
+}
+/*
+ * The three things the agent addresses to a person rather than to itself: a stop it cannot get
+ * past, a message it decided was worth sending, and a ceiling only the owner can move. All sit in
+ * the conversation at full width, because all were previously folded into a collapsed tool log.
+ */
+.handoff-card,
+.spend-pause-card,
+.agent-note {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  margin: 14px 40px;
+  padding: 14px;
+  border: 1px solid #5d5750;
+  border-radius: 13px;
+  background: #1b1a18;
+}
+.agent-note {
+  grid-template-columns: 22px minmax(0, 1fr);
+  border-color: #4a545a;
+  background: #171a1c;
+}
+.spend-pause-card > svg,
+.handoff-card > svg,
+.agent-note > svg {
+  width: 20px;
+  color: #c2b393;
+}
+.spend-pause-card .eyebrow {
+  margin-bottom: 4px;
+}
+.spend-pause-card strong {
+  display: block;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.spend-pause-card button {
+  border-radius: 8px;
+  padding: 7px 12px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.agent-note > svg {
+  color: #a8b6bd;
+}
+.handoff-card p,
+.agent-note p {
+  margin: 0;
+}
+.handoff-card .eyebrow,
+.agent-note .eyebrow {
+  margin-bottom: 4px;
+}
+.handoff-card strong,
+.handoff-card > div > span,
+.agent-note strong {
+  display: block;
+}
+.handoff-card strong,
+.agent-note strong {
+  font-size: 13px;
+}
+.handoff-card > div > span {
+  margin-top: 3px;
+  font-size: 12px;
+  color: #9aa19c;
+}
+.handoff-card > div > p {
+  margin-top: 7px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #c4c9cb;
+}
+.agent-note .markdown {
+  margin-top: 4px;
+  font-size: 13px;
+}
+.handoff-card button {
+  border-radius: 8px;
+  padding: 7px 12px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.artifact-card > svg {
+  width: 20px;
+  color: #959a9e;
+}
+.artifact-card strong,
+.artifact-card span {
+  display: block;
+}
+.artifact-card strong {
+  font-size: 13px;
+}
+.artifact-card span {
+  font-size: 12px;
+  color: #87918b;
+  margin-top: 3px;
+}
+.artifact-card button,
+.artifact-card a {
+  border: 1px solid #d9ddd7;
+  background: #f7f8f4;
+  color: inherit;
+  text-decoration: none;
+  border-radius: 7px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+.completion-card {
+  background: #eff8ef;
+  border-color: #cae1cd;
+}
+.completion-card > svg {
+  color: #377750;
+}
+.completion-card span {
+  max-width: 560px;
+  white-space: pre-wrap;
+}
+
+@keyframes pulse {
+  0%,
+  70%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  35% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+.spin {
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.empty-canvas {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  height: 100%;
+  min-height: 360px;
+  padding: 40px 60px 190px;
+  color: #959a9e;
+}
+.empty-canvas h1 {
+  font:
+    600 28px Manrope,
+    sans-serif;
+  letter-spacing: -0.04em;
+  color: var(--text);
+  margin: 3px 0 10px;
+}
+.empty-canvas > p:not(.eyebrow) {
+  max-width: 540px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.starter-capabilities {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 7px;
+  margin: 18px 0 14px;
+}
+.starter-capabilities span {
+  border: 1px solid #dce2da;
+  border-radius: 999px;
+  padding: 7px 10px;
+  background: #f9faf6;
+  color: #536159;
+  font-size: 12px;
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 12px;
+  font-weight: 700;
+  color: #7f8a84;
+}
+
+.composer-wrap {
+  position: absolute;
+  z-index: 3;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 48px 24px 14px;
+  background: linear-gradient(transparent, #fbfaf6 38%);
+  pointer-events: none;
+}
+.composer {
+  max-width: 820px;
+  margin: 0 auto;
+  background: white;
+  border: 1px solid #d9ddd6;
+  border-radius: 16px;
+  padding: 10px 10px 8px;
+  box-shadow: 0 13px 36px #2b392f18;
+  pointer-events: auto;
+}
+.composer:focus-within {
+  border-color: #9ca99f;
+  box-shadow:
+    0 13px 36px #2b392f18,
+    0 0 0 2px #b7c9bd2b;
+}
+.composer textarea {
+  display: block;
+  width: 100%;
+  min-height: 45px;
+  max-height: 160px;
+  resize: none;
+  border: 0;
+  outline: 0;
+  padding: 4px 5px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.composer textarea::placeholder {
+  color: #9aa39e;
+}
+.composer-bottom {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+.mobile-capture {
+  display: none;
+}
+.icon-btn.recording {
+  color: white;
+  background: var(--danger);
+  animation: recording-pulse 1.4s ease-in-out infinite;
+}
+@keyframes recording-pulse {
+  50% {
+    box-shadow: 0 0 0 5px #bd43372b;
+  }
+}
+.security-select,
+.model-select {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid #e1e3de;
+  border-radius: 8px;
+  background: #f8f8f5;
+}
+.security-select svg,
+.model-select svg {
+  width: 12px;
+  position: absolute;
+  left: 7px;
+  color: #65806f;
+  pointer-events: none;
+}
+.security-select svg:last-child,
+.model-select svg:last-child {
+  left: auto;
+  right: 5px;
+  color: #8b948f;
+}
+.security-select select,
+.model-select select {
+  appearance: none;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  padding: 5px 21px 5px 23px;
+  font-size: 12px;
+  color: #59675f;
+  max-width: 145px;
+}
+.model-select {
+  max-width: 230px;
+}
+.model-select select {
+  max-width: 220px;
+}
+.security-select select {
+  max-width: 120px;
+}
+.model-connect-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 27px;
+  border: 1px solid #d8ddd7;
+  border-radius: 8px;
+  padding: 0 9px;
+  background: #f3f6f1;
+  color: #476453;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.model-connect-button:hover {
+  background: #eaf1e8;
+}
+.model-connect-button svg {
+  width: 12px;
+}
+.send-btn {
+  display: grid;
+  place-items: center;
+  flex: none;
+  border: 0;
+  background: var(--text);
+  color: var(--accent);
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.send-btn:hover {
+  background: #2c4035;
+}
+.send-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.send-btn svg {
+  width: 15px;
+}
+.composer-foot {
+  display: flex;
+  justify-content: center;
+  gap: 16px;
+  max-width: 760px;
+  margin: 7px auto 0;
+  color: #909993;
+  font-size: 11px;
+  pointer-events: auto;
+}
+.composer-foot span {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.composer-privacy {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: inherit;
+}
+.composer-privacy:hover {
+  color: #d9dee1;
+}
+.composer-privacy.provider-policy {
+  color: #c9a39b;
+}
+.composer-foot svg {
+  width: 10px;
+}
+.inline-error {
+  position: absolute;
+  z-index: 5;
+  bottom: 144px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  max-width: 80%;
+  border: 1px solid #e9c4bd;
+  background: #fff0ed;
+  color: #943d34;
+  border-radius: 9px;
+  padding: 8px 10px;
+  font-size: 12px;
+  box-shadow: 0 4px 15px #51251e14;
+}
+.inline-error button {
+  border: 0;
+  background: transparent;
+  display: grid;
+}
+.inline-error svg {
+  width: 13px;
+}
+.inline-notice {
+  position: absolute;
+  z-index: 5;
+  bottom: 144px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  max-width: 80%;
+  border: 1px solid #c9d9ca;
+  background: #eff7ef;
+  color: #365a42;
+  border-radius: 9px;
+  padding: 8px 10px;
+  font-size: 12px;
+  box-shadow: 0 4px 15px #1f432714;
+}
+.inline-notice button {
+  display: grid;
+  border: 0;
+  background: transparent;
+  color: inherit;
+}
+.inline-notice svg {
+  width: 13px;
+}
+.inspector {
+  min-width: 0;
+  background: #f2f1ec;
+  border-left: 1px solid #2d3033;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.inspector-loading {
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+.inspector-tabs {
+  height: 58px;
+  flex: none;
+  display: flex;
+  align-items: end;
+  gap: 11px;
+  padding: 0 18px;
+  border-bottom: 1px solid #2d3033;
+}
+.inspector-tabs button {
+  border: 0;
+  background: transparent;
+  height: 39px;
+  padding: 0 1px;
+  color: #87918b;
+  font-size: 12px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.inspector-tabs button.active {
+  color: var(--text);
+  border-color: #40594b;
+  font-weight: 600;
+}
+.inspector-content {
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+.pane-toolbar,
+.browser-controls {
+  height: 45px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 10px;
+  border-bottom: 1px solid #2d3033;
+  background: #151719;
+}
+
+.computer-toolbar {
+  align-items: center;
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  min-height: 46px;
+  padding: 0 14px;
+}
+
+.computer-toolbar > span {
+  align-items: center;
+  display: flex;
+  gap: 9px;
+  min-width: 0;
+}
+
+.computer-toolbar svg {
+  height: 16px;
+  width: 16px;
+}
+
+.computer-toolbar strong {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.computer-toolbar small {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.computer-pane .browser-viewport {
+  background:
+    radial-gradient(circle at 50% 25%, rgba(217, 255, 92, 0.05), transparent 38%), #111815;
+}
+.breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  color: #959a9e;
+  font-size: 12px;
+}
+.breadcrumbs span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-list {
+  overflow: auto;
+  padding: 6px;
+}
+/*
+  Rename and delete sit beside the row rather than inside it: the row is already a button, and a
+  button inside a button is neither valid nor reachable by keyboard.
+*/
+.file-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 2px;
+}
+.file-row > .icon-btn {
+  flex: none;
+  opacity: 0.55;
+}
+.file-row:hover > .icon-btn,
+.file-row:focus-within > .icon-btn {
+  opacity: 1;
+}
+.file-naming {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: end;
+  padding: 10px 12px;
+  border-bottom: 1px solid #292c2f;
+}
+.file-naming label {
+  grid-column: 1 / -1;
+  color: #969ca0;
+  font-size: 11px;
+}
+.file-naming input {
+  min-width: 0;
+  border: 1px solid #2f3336;
+  border-radius: 9px;
+  background: #0c0d0e;
+  color: #e7e9ea;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+.file-naming input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.file-list .file-open {
+  display: grid;
+  grid-template-columns: 25px 1fr;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.file-list .file-open:hover {
+  background: #e7e7e1;
+}
+.file-list .file-open > svg {
+  width: 18px;
+  color: #71837a;
+}
+.file-list strong,
+.file-list small {
+  display: block;
+}
+.file-list strong {
+  font-size: 12px;
+}
+.file-list small {
+  font-size: 11px;
+  color: #929a95;
+  margin-top: 2px;
+}
+.file-preview {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+.preview-header {
+  height: 42px;
+  display: grid;
+  grid-template-columns: 18px 1fr 32px;
+  gap: 7px;
+  align-items: center;
+  padding: 0 10px;
+  border-bottom: 1px solid #2d3033;
+  font-size: 12px;
+}
+.preview-header svg {
+  width: 15px;
+}
+.file-preview > pre {
+  flex: 1;
+  margin: 0;
+  padding: 13px;
+  overflow: auto;
+  background: #151719;
+  color: #e1e4e5;
+  font:
+    10px/1.6 ui-monospace,
+    monospace;
+  white-space: pre-wrap;
+}
+.file-preview > img,
+.file-preview > video {
+  max-width: 100%;
+  max-height: calc(100vh - 105px);
+  object-fit: contain;
+  margin: auto;
+}
+.pane-loading {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  color: #818d87;
+  font-size: 12px;
+}
+.pane-loading svg {
+  width: 15px;
+}
+.empty-pane {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 40px;
+  color: #8a958f;
+}
+.empty-pane.grow {
+  flex: 1;
+}
+.empty-pane svg {
+  width: 28px;
+  margin-bottom: 9px;
+  color: #829288;
+}
+.empty-pane strong {
+  font-size: 13px;
+  color: #959a9e;
+}
+.empty-pane span {
+  font-size: 12px;
+  line-height: 1.5;
+  margin-top: 5px;
+  max-width: 240px;
+}
+.browser-controls .address {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 1;
+  border: 1px solid #2d3033;
+  background: #151719;
+  border-radius: 7px;
+  padding: 0 7px;
+}
+.address svg {
+  width: 11px;
+  color: #6e8075;
+}
+.address input {
+  height: 27px;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font-size: 12px;
+  color: #959a9e;
+}
+.browser-viewport {
+  position: relative;
+  min-height: 0;
+  flex: 1;
+  background: #dfe2dd;
+  overflow: auto;
+  padding-bottom: 42px;
+}
+.browser-viewport > img,
+.remote-frame-button > img {
+  display: block;
+  width: 100%;
+  min-height: 300px;
+  object-fit: contain;
+  object-position: top;
+  background: #101214;
+}
+.browser-viewport.loading > img,
+.browser-viewport.loading > .remote-frame-button {
+  opacity: 0.6;
+}
+.remote-frame-button {
+  display: block;
+  width: 100%;
+  min-height: 300px;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  line-height: 0;
+}
+.remote-frame-button[aria-disabled='true'] {
+  cursor: default;
+}
+.remote-frame-button.interactive {
+  cursor: crosshair;
+}
+.remote-frame-button:focus-visible {
+  outline: 3px solid #2d3033;
+  outline-offset: -3px;
+}
+.browser-status {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #17231eea;
+  color: #e8eee9;
+  border-radius: 9px;
+  padding: 7px 9px;
+  font-size: 12px;
+  box-shadow: 0 3px 14px #10201933;
+}
+.browser-status span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.browser-status span svg {
+  width: 12px;
+  color: var(--accent);
+}
+.browser-status button {
+  border: 1px solid #65746b;
+  background: #26372f;
+  color: white;
+  border-radius: 6px;
+  padding: 4px 7px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.browser-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  border-top: 1px solid #2d3033;
+  color: #79857f;
+  font-size: 11px;
+}
+.browser-note svg {
+  width: 11px;
+}
+.terminal-pane {
+  flex: 1;
+  min-height: 0;
+  background: #111815;
+  padding: 8px;
+}
+.terminal-pane .xterm {
+  height: 100%;
+}
+.usage-pane {
+  padding: 22px;
+  overflow: auto;
+}
+.meter-card {
+  padding: 15px 0;
+  border-top: 1px solid #2d3033;
+}
+.meter-card > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+}
+.meter-card span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.meter-card .meter {
+  height: 7px;
+  border-radius: 10px;
+  background: #131517;
+  margin: 9px 0 7px;
+  overflow: hidden;
+}
+.meter i {
+  display: block;
+  height: 100%;
+  background: #466955;
+  border-radius: inherit;
+}
+.meter.storage i {
+  background: #7d8488;
+}
+.meter-card small {
+  display: block;
+  color: #87918b;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/*
+ * A challenge is not a browser error: nothing retries it and no message clears it. It is a request
+ * for the owner, so it sits above the screen with the two controls that actually resolve it.
+ */
+.wall-banner {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 4px 10px;
+  margin: 0 10px 8px;
+  padding: 11px;
+  border: 1px solid #5d5750;
+  border-radius: 10px;
+  background: #1b1a18;
+}
+.wall-banner > svg {
+  width: 18px;
+  color: #c2b393;
+}
+.wall-banner strong,
+.wall-banner span,
+.wall-banner small {
+  display: block;
+}
+.wall-banner strong {
+  font-size: 13px;
+}
+.wall-banner span {
+  margin-top: 3px;
+  font-size: 11px;
+  color: #9aa19c;
+}
+.wall-banner small {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #c4c9cb;
+}
+.wall-actions {
+  grid-column: 2;
+  display: flex;
+  gap: 6px;
+  margin-top: 9px;
+}
+.wall-actions button {
+  border-radius: 8px;
+  padding: 6px 11px;
+  font-size: 12px;
+}
+
+.browser-error {
+  position: absolute;
+  inset: auto 12px 54px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 10px;
+  align-items: center;
+  padding: 11px;
+  border: 1px solid #5f4844;
+  background: #151719;
+  border-radius: 9px;
+  box-shadow: 0 8px 25px #4d2b221f;
+}
+.browser-error strong,
+.browser-error span {
+  display: block;
+}
+.browser-error strong {
+  font-size: 12px;
+  color: #d2aaa5;
+}
+.browser-error span {
+  font-size: 11px;
+  color: #8b6f68;
+}
+.browser-error button {
+  grid-column: 2;
+  grid-row: 1/3;
+  border: 1px solid #5f4844;
+  background: #151719;
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.browser-viewport > img.interactive {
+  cursor: crosshair;
+}
+.browser-status > div {
+  display: flex;
+  gap: 5px;
+}
+.browser-input {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto auto auto;
+  gap: 5px;
+  align-items: center;
+  padding: 7px 8px;
+  background: #f7f6f2;
+  border-top: 1px solid #2d3033;
+}
+/* The agent has handed the field back so the owner can type a credential it must never see. That
+   is a different mode, so it has to look like one. */
+.browser-input.secure {
+  background: #1a2023;
+  box-shadow: inset 0 0 0 1px #47535a;
+}
+.browser-input > svg {
+  width: 13px;
+  color: #959a9e;
+}
+.browser-input input {
+  min-width: 0;
+  height: 28px;
+  border: 1px solid #d8dcd5;
+  border-radius: 6px;
+  padding: 0 8px;
+  font-size: 12px;
+  background: white;
+}
+.browser-input button {
+  height: 28px;
+  border: 1px solid #41464a;
+  border-radius: 6px;
+  background: #151719;
+  padding: 0 7px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.usage-warning {
+  position: absolute;
+  z-index: 4;
+  right: 24px;
+  bottom: 144px;
+  left: 24px;
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  gap: 9px;
+  align-items: center;
+  width: min(820px, calc(100% - 48px));
+  margin: 0 auto;
+  padding: 10px 12px;
+  border: 1px solid #ddcf9d;
+  background: #fff9df;
+  border-radius: 9px;
+  color: #625523;
+  font-size: 12px;
+}
+.usage-warning > svg {
+  width: 16px;
+}
+.usage-warning strong {
+  display: block;
+  font-size: 12px;
+}
+.usage-warning button {
+  border: 0;
+  border-radius: 6px;
+  background: #665a28;
+  color: white;
+  padding: 6px 9px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.usage-warning.critical {
+  border-color: #e2afa4;
+  background: #fff0ec;
+  color: #7d352c;
+}
+.usage-warning.elevated {
+  border-color: #e0bea0;
+  background: #fff5e9;
+  color: #754e2c;
+}
+.usage-warning.critical button {
+  background: #8b4037;
+}
+.preview-pane {
+  gap: 12px;
+  overflow: auto;
+  padding: 16px;
+}
+.preview-create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 78px auto;
+  gap: 7px;
+  align-items: end;
+  border: 1px solid #dde1da;
+  border-radius: 9px;
+  background: #f8f8f5;
+  padding: 9px;
+}
+.preview-create label {
+  color: #959a9e;
+  font-size: 11px;
+  font-weight: 600;
+}
+.preview-create input {
+  width: 100%;
+  height: 32px;
+  margin-top: 4px;
+  border: 1px solid #d8dcd5;
+  border-radius: 7px;
+  background: white;
+  padding: 0 7px;
+  font-size: 12px;
+}
+.preview-create .primary {
+  grid-column: 3;
+  grid-row: 1;
+  height: 32px;
+  white-space: nowrap;
+}
+.preview-boundary {
+  display: flex;
+  gap: 7px;
+  color: #718078;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.preview-boundary svg {
+  width: 13px;
+  flex: none;
+}
+.custom-domain-panel {
+  display: grid;
+  gap: 6px;
+  border: 1px solid #2d3033;
+  border-radius: 9px;
+  background: #151719;
+  padding: 9px;
+}
+.custom-domain-panel > span {
+  color: #718078;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.custom-domain-panel > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.domain-connect-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 6px;
+}
+.domain-connect-row input {
+  min-width: 0;
+  height: 31px;
+  border: 1px solid #2d3033;
+  border-radius: 7px;
+  padding: 0 7px;
+  font-size: 12px;
+}
+.domain-dns-records {
+  display: grid;
+  gap: 6px;
+  border-top: 1px solid #2d3033;
+  padding-top: 7px;
+  color: #959a9e;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.domain-dns-records p {
+  margin: 0;
+}
+.domain-dns-records code {
+  overflow-wrap: anywhere;
+  color: #314f40;
+  background: #e8eee9;
+  border-radius: 3px;
+  padding: 1px 3px;
+}
+.domain-dns-records button {
+  justify-self: start;
+}
+.preview-list {
+  display: grid;
+  gap: 6px;
+}
+.preview-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid #2d3033;
+  border-radius: 8px;
+  background: #151719;
+  padding: 8px;
+}
+.preview-row.revoked,
+.preview-row.expired {
+  opacity: 0.6;
+}
+.preview-row strong,
+.preview-row small {
+  display: block;
+}
+.preview-row strong {
+  font-size: 12px;
+}
+.preview-row small {
+  margin-top: 2px;
+  color: #849089;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.preview-actions {
+  display: flex;
+  gap: 3px;
+}
+.preview-actions button,
+.preview-frame-wrap > div button {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  border: 1px solid #2d3033;
+  border-radius: 6px;
+  background: #151719;
+  color: #959a9e;
+}
+.preview-actions button:last-child {
+  color: #d2aaa5;
+}
+.preview-actions svg,
+.preview-frame-wrap > div button svg {
+  width: 12px;
+}
+.preview-frame-wrap {
+  min-height: 360px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #2d3033;
+  border-radius: 9px;
+  background: #151719;
+}
+.preview-frame-wrap > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-bottom: 1px solid #2d3033;
+  color: #748078;
+  font-size: 11px;
+}
+.preview-frame-wrap > div button {
+  display: flex;
+  width: auto;
+  gap: 4px;
+  padding: 0 7px;
+  font-size: 11px;
+}
+.preview-frame-wrap iframe {
+  min-height: 330px;
+  flex: 1;
+  border: 0;
+  background: white;
+}
+.deliverable-library {
+  display: grid;
+  gap: 6px;
+  border-top: 1px solid #2d3033;
+  margin-top: 18px;
+  padding-top: 13px;
+}
+.deliverable-library > div:first-child small,
+.deliverable-library > small {
+  color: #7d8983;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.deliverable-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 27px 27px;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 2px;
+  border-bottom: 1px solid #2d3033;
+}
+.deliverable-row > svg {
+  width: 15px;
+  color: #668071;
+}
+.deliverable-row strong,
+.deliverable-row small {
+  display: block;
+}
+.deliverable-row strong {
+  overflow: hidden;
+  color: #e1e4e5;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.deliverable-row small {
+  margin-top: 2px;
+  color: #8a948e;
+  font-size: 11px;
+}
+.deliverable-row a,
+.deliverable-row button {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  padding: 0;
+  border: 1px solid #2d3033;
+  border-radius: 6px;
+  background: #151719;
+  color: #959a9e;
+}
+.deliverable-row button {
+  color: #d2aaa5;
+}
+.deliverable-row a svg,
+.deliverable-row button svg {
+  width: 12px;
+}
+.empty-pane.compact {
+  padding: 24px 10px;
+}
+.approval-drawer {
+  position: absolute;
+  z-index: 8;
+  left: 18px;
+  right: 18px;
+  bottom: 150px;
+  display: grid;
+  grid-template-columns: 34px 1fr auto;
+  gap: 12px;
+  align-items: center;
+  background: #fffaf0;
+  border: 1px solid #ebd8ae;
+  border-radius: 13px;
+  padding: 12px;
+  box-shadow: 0 14px 38px #483e2824;
+}
+.approval-symbol {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: #f3dfae;
+  color: #805d1f;
+}
+.approval-symbol svg {
+  width: 17px;
+}
+.approval-copy {
+  min-width: 0;
+}
+.approval-copy .eyebrow {
+  margin: 0 0 3px;
+  color: #9a6e22;
+}
+.approval-copy > strong {
+  font-size: 13px;
+}
+.approval-copy > p:not(.eyebrow) {
+  max-height: 45px;
+  overflow: auto;
+  margin: 4px 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #6f6654;
+  white-space: pre-wrap;
+}
+.approval-copy small {
+  font-size: 11px;
+  color: #958d7d;
+}
+
+/*
+ * The two halves of the card, deliberately unalike.
+ *
+ * Above: what the box will do, read out of the argument object it will execute. Below: the model's
+ * own sentence about it, set as a quotation with its author named. The separation is the point —
+ * an agent following an injected instruction writes the sentence, and cannot write the arguments
+ * without changing the request the approval is bound to.
+ */
+.approval-facts {
+  display: grid;
+  gap: 2px;
+  max-height: 132px;
+  overflow: auto;
+  margin: 5px 0 0;
+}
+.approval-facts > div {
+  display: grid;
+  grid-template-columns: minmax(88px, auto) minmax(0, 1fr);
+  gap: 9px;
+  align-items: baseline;
+}
+.approval-facts dt {
+  color: #9a6e22;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: right;
+}
+.approval-facts dd {
+  margin: 0;
+  color: #4b4437;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.approval-facts .approval-destination dd strong {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-size: 12px;
+}
+.approval-facts .approval-destination dd span {
+  color: #7a7161;
+}
+.approval-request {
+  max-height: 132px;
+  overflow: auto;
+  margin: 5px 0 0;
+  color: #4b4437;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+/*
+ * Where the request came from, as against what it does.
+ *
+ * Both states are drawn and both are quiet. The exposed one is not an error — a research task
+ * reaches this state on purpose — so it is warmer rather than louder, and the clean one is dimmer
+ * still: it exists to stop the absence of a warning being read as a warning that never came.
+ */
+.approval-context {
+  display: grid;
+  grid-template-columns: 13px minmax(0, 1fr);
+  gap: 7px;
+  align-items: start;
+  margin: 7px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.approval-context > svg {
+  width: 13px;
+  height: 13px;
+  margin-top: 1px;
+}
+.approval-context.exposed {
+  color: #c9bda9;
+}
+.approval-context.exposed > svg {
+  color: #e0cb9d;
+}
+.approval-context.clean {
+  color: #7f8781;
+}
+.approval-context.clean > svg {
+  color: #6f7a72;
+}
+
+.approval-agent-wording {
+  margin: 7px 0 0;
+  padding: 0 0 0 9px;
+  border-left: 2px solid #e0cb9d;
+}
+.approval-agent-wording > span {
+  display: block;
+  color: #9a8e75;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.approval-agent-wording > p {
+  max-height: 54px;
+  overflow: auto;
+  margin: 2px 0 0;
+  color: #6f6654;
+  font-size: 12px;
+  font-style: italic;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.approval-actions {
+  display: flex;
+  gap: 6px;
+}
+.primary,
+.ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border-radius: 9px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.primary {
+  border: 1px solid var(--text);
+  background: var(--text);
+  color: white;
+}
+.primary:hover {
+  background: #293c32;
+}
+.primary:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.primary svg,
+.ghost svg {
+  width: 14px;
+}
+.ghost {
+  border: 1px solid #d9dcd5;
+  background: #fff;
+  color: #54625a;
+}
+.ghost:hover {
+  background: #f3f4f0;
+}
+.wide {
+  width: 100%;
+  height: 42px;
+}
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  background: #19231f66;
+  backdrop-filter: blur(5px);
+  padding: 22px;
+}
+.modal {
+  position: relative;
+  width: min(620px, 100%);
+  max-height: calc(100vh - 44px);
+  overflow: auto;
+  background: #fbfaf6;
+  border: 1px solid #dfe0da;
+  border-radius: 18px;
+  padding: 26px;
+  box-shadow: 0 25px 80px #12201840;
+}
+
+.modal h2 {
+  font:
+    600 23px Manrope,
+    sans-serif;
+  letter-spacing: -0.04em;
+  margin: 4px 0 5px;
+}
+.subtle {
+  color: #7a8680;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.modal-close {
+  position: absolute;
+  right: 15px;
+  top: 15px;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: #efefea;
+  cursor: pointer;
+}
+.modal-close svg {
+  width: 15px;
+}
+.modal label,
+.auth-form label {
+  display: block;
+  color: #56635c;
+  font-size: 12px;
+  font-weight: 600;
+  margin: 16px 0 6px;
+}
+.modal label > input:not([type='range']):not([type='checkbox']):not([type='radio']),
+.auth-form label input {
+  display: block;
+  width: 100%;
+  height: 39px;
+  margin-top: 6px;
+  border: 1px solid #d8dcd5;
+  border-radius: 9px;
+  background: #fff;
+  padding: 0 10px;
+  color: var(--text);
+  outline: 0;
+  font-size: 13px;
+}
+.modal input[type='checkbox'],
+.modal input[type='radio'] {
+  width: 15px;
+  height: 15px;
+  accent-color: #315840;
+}
+
+.modal input[type='range'] {
+  width: 100%;
+  accent-color: #315840;
+  margin-top: 11px;
+}
+
+.recovery-heading {
+  margin-top: 28px;
+}
+
+.recovery-create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  margin: 12px 0;
+}
+
+.recovery-create input {
+  min-width: 0;
+}
+
+.recovery-create button,
+.settings-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.recovery-create button svg,
+.settings-row-actions svg {
+  width: 15px;
+}
+
+.recovery-list > div {
+  gap: 12px;
+}
+
+.settings-row-actions {
+  flex: none;
+}
+
+.restore-confirmation {
+  display: grid;
+  gap: 10px;
+  margin: 13px 0 20px;
+  padding: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface-raised);
+}
+
+.restore-confirmation > span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.restore-confirmation code {
+  color: var(--text);
+}
+
+@media (max-width: 600px) {
+  .recovery-create {
+    grid-template-columns: 1fr;
+  }
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 23px;
+}
+.trajectory-modal {
+  width: min(570px, 100%);
+}
+.trajectory-modal textarea {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 11px 12px;
+  resize: vertical;
+  border: 1px solid #2d3033;
+  border-radius: 10px;
+  background: #151719;
+  color: var(--text);
+  font: inherit;
+  line-height: 1.55;
+  outline: 0;
+}
+.trajectory-scope-note {
+  display: flex;
+  gap: 9px;
+  margin-top: 16px;
+  padding: 11px 12px;
+  border: 1px solid #d8dfd4;
+  border-radius: 10px;
+  background: #f3f7f0;
+  color: #54675c;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.trajectory-scope-note svg {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+}
+.modal .trajectory-stop-source {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  line-height: 1.45;
+}
+.trajectory-stop-source input {
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+.trajectory-modal .modal-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.trajectory-modal .modal-actions svg {
+  width: 13px;
+  height: 13px;
+}
+.form-error {
+  border: 1px solid #eac8c1;
+  background: #fff0ed;
+  color: #97463d;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  margin: 10px 0;
+}
+.settings-modal {
+  width: min(760px, 100%);
+}
+
+.settings-nav {
+  display: flex;
+  gap: 5px;
+  margin: 18px 0 2px;
+  padding: 4px;
+  overflow-x: auto;
+  border: 1px solid #dedfd9;
+  border-radius: 11px;
+  background: #f0f0eb;
+}
+.settings-nav button {
+  flex: 1 0 auto;
+  min-height: 32px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0 10px;
+  background: transparent;
+  color: #737f78;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.settings-nav button:hover {
+  color: var(--text);
+  background: #f7f7f3;
+}
+.settings-nav button.active {
+  color: var(--text);
+  background: white;
+  box-shadow: 0 1px 3px #1f2c2514;
+}
+.schedule-modal {
+  width: min(1040px, calc(100vw - 32px));
+  max-height: min(880px, calc(100vh - 32px));
+  overflow: auto;
+}
+.schedule-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.85fr) minmax(360px, 1.15fr);
+  gap: 18px;
+  margin-top: 18px;
+}
+.schedule-existing,
+.schedule-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.schedule-existing > strong,
+.schedule-form > strong {
+  font-family: Manrope, sans-serif;
+  font-size: 13px;
+}
+.schedule-existing > small {
+  padding: 18px;
+  border: 1px dashed #2d3033;
+  border-radius: 11px;
+  color: var(--muted);
+  text-align: center;
+}
+/* Icon, copy, then run/pause/delete: four columns for five children wrapped the delete button
+   onto a line of its own. */
+.schedule-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 30px 30px 30px;
+  align-items: center;
+  gap: 7px;
+  padding: 9px;
+  border: 1px solid #2d3033;
+  border-radius: 11px;
+  background: #151719;
+}
+.schedule-row.paused {
+  opacity: 0.7;
+}
+.schedule-row > svg {
+  width: 18px;
+  color: #959a9e;
+}
+.schedule-row span,
+.schedule-row strong,
+.schedule-row small {
+  display: block;
+  min-width: 0;
+}
+.schedule-row strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.schedule-row small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.schedule-form {
+  padding: 14px;
+  border: 1px solid #2d3033;
+  border-radius: 13px;
+  background: #151719;
+}
+.schedule-form textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid #2d3033;
+  border-radius: 9px;
+  background: #151719;
+  padding: 9px;
+}
+.schedule-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+/* Every field in this form stacks its label above its control; a select that did not made two
+   rows of the same form read as two different forms. */
+.schedule-form select,
+.schedule-form input {
+  width: 100%;
+  margin-top: 5px;
+}
+.weekday-picker {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 5px;
+}
+.weekday-picker button {
+  height: 31px;
+  border: 1px solid #2d3033;
+  border-radius: 8px;
+  background: #151719;
+  cursor: pointer;
+  font-size: 12px;
+}
+.weekday-picker button.active {
+  border-color: #315f49;
+  background: #dce9df;
+  color: #234b38;
+  font-weight: 700;
+}
+.schedule-zone {
+  color: var(--muted);
+  font-size: 12px;
+}
+.settings-section {
+  border-top: 1px solid #2d3033;
+  padding: 18px 0;
+}
+.settings-section[hidden] {
+  display: none;
+}
+.settings-section:first-of-type {
+  margin-top: 20px;
+}
+.section-heading {
+  display: grid;
+  grid-template-columns: 27px 1fr;
+  gap: 10px;
+}
+.section-heading > svg {
+  width: 20px;
+  color: #959a9e;
+}
+.section-heading strong,
+.section-heading span {
+  display: block;
+}
+.section-heading strong {
+  font-size: 12px;
+}
+.section-heading span {
+  font-size: 12px;
+  color: #7d8983;
+  line-height: 1.5;
+  margin-top: 3px;
+}
+
+.privacy-boundary {
+  display: flex;
+  gap: 7px;
+  margin-top: 10px;
+  color: #7c8781;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.privacy-boundary svg {
+  width: 13px;
+  flex: none;
+}
+
+.danger-button {
+  border: 1px solid #e2c5c1;
+  background: #fff5f3;
+  color: #9b4038;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.auth-legal-links {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+.auth-page {
+  display: grid;
+  grid-template-columns: 1.05fr 0.95fr;
+  width: 100%;
+  height: 100%;
+  background: #f8f6f1;
+}
+.auth-story {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 36px 42px;
+  background:
+    radial-gradient(circle at 70% 20%, #486455 0, transparent 34%),
+    linear-gradient(145deg, #14201b, #22332a 65%, #1b2822);
+  overflow: hidden;
+}
+.auth-story:after {
+  content: '';
+  position: absolute;
+  width: 560px;
+  height: 560px;
+  right: -230px;
+  bottom: -300px;
+  border: 1px solid #d9ff5c33;
+  border-radius: 50%;
+  box-shadow:
+    0 0 0 80px #d9ff5c08,
+    0 0 0 160px #d9ff5c05;
+}
+.auth-hero-copy {
+  position: relative;
+  z-index: 1;
+  margin: auto 0;
+  max-width: 590px;
+}
+/* Sized for a sentence, not for a slogan: this panel used to carry a marketing headline. */
+.auth-hero-copy h1 {
+  font:
+    600 clamp(26px, 2.6vw, 38px)/1.1 Manrope,
+    sans-serif;
+  letter-spacing: -0.04em;
+  color: white;
+  margin: 10px 0 12px;
+}
+.auth-hero-copy > p:last-child {
+  max-width: 510px;
+  color: #bac8c0;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.auth-form-wrap {
+  display: grid;
+  place-items: center;
+  padding: 30px;
+}
+.auth-form {
+  width: min(390px, 100%);
+}
+.auth-form h2,
+.recovery-card h1 {
+  font:
+    600 28px Manrope,
+    sans-serif;
+  letter-spacing: -0.05em;
+  margin: 4px 0 7px;
+}
+.auth-form .subtle {
+  margin-bottom: 24px;
+}
+.auth-form > .primary {
+  margin-top: 19px;
+}
+.auth-form > .ghost {
+  margin-top: 8px;
+}
+.switch-auth {
+  text-align: center;
+  color: #88928c;
+  font-size: 12px;
+  margin-top: 18px;
+}
+/* A button that reads as a sentence has to look like the link it behaves as; underlined, it stops
+   being mistaken for a heading above the real links. */
+.switch-auth button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #355f49;
+  font-weight: 500;
+  font-size: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.mobile-brand {
+  display: none;
+}
+.recovery-card {
+  width: min(500px, calc(100% - 40px));
+  margin: auto;
+  text-align: center;
+  padding: 38px;
+  background: white;
+  border: 1px solid #dfe1da;
+  border-radius: 18px;
+  box-shadow: 0 20px 60px #26382f17;
+}
+.recovery-card > p:not(.eyebrow) {
+  color: #748078;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.success-icon {
+  display: grid;
+  place-items: center;
+  width: 50px;
+  height: 50px;
+  margin: 0 auto 15px;
+  border-radius: 50%;
+  background: #e5f4df;
+  color: #36784f;
+}
+.recovery-code {
+  display: block;
+  margin: 20px 0;
+  padding: 16px;
+  border: 1px dashed #41464a;
+  background: #151719;
+  border-radius: 10px;
+  font:
+    12px ui-monospace,
+    monospace;
+  word-break: break-all;
+}
+.splash {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  gap: 12px;
+  color: #959a9e;
+  font-size: 13px;
+  background: #0c0d0e;
+}
+.mobile-sidebar,
+.mobile-scrim,
+.mobile-tabs {
+  display: none;
+}
+@media (max-width: 1100px) {
+  .app-shell {
+    grid-template-columns: 232px minmax(420px, 1fr) minmax(300px, 36vw);
+  }
+  .app-shell.inspector-closed {
+    grid-template-columns: 232px 1fr;
+  }
+
+  .timeline {
+    padding-left: 25px;
+    padding-right: 25px;
+  }
+  .system-event,
+  .completion-card,
+  .tool-event,
+  .artifact-card,
+  .browser-capture-card,
+  .handoff-card,
+  .spend-pause-card,
+  .agent-note,
+  .preview-chat-card {
+    margin-left: 30px;
+    margin-right: 30px;
+  }
+}
+@media (max-width: 800px) {
+  .app-shell,
+  .app-shell.inspector-closed {
+    display: block;
+  }
+  .app-shell > .sidebar {
+    display: none;
+  }
+  .workbench {
+    height: 100%;
+  }
+  .mobile-menu {
+    display: grid;
+  }
+  .mobile-sidebar {
+    display: block;
+    position: fixed;
+    z-index: 25;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 280px;
+    transform: translateX(-102%);
+    transition: transform 0.24s ease;
+  }
+  .mobile-sidebar.open {
+    transform: none;
+  }
+  .mobile-sidebar .sidebar {
+    height: 100%;
+    display: flex;
+  }
+  .mobile-scrim {
+    display: block;
+    position: fixed;
+    z-index: 24;
+    inset: 0;
+    border: 0;
+    background: #17211d77;
+  }
+  .inspector {
+    position: fixed;
+    z-index: 12;
+    inset: 58px 0 52px;
+    border-left: 0;
+    background: #131517;
+  }
+  .chat-canvas {
+    padding-bottom: 47px;
+  }
+  .composer-wrap {
+    bottom: 48px;
+    padding-left: 11px;
+    padding-right: 11px;
+  }
+  .usage-warning,
+  .inline-error,
+  .inline-notice {
+    bottom: 188px;
+    max-width: calc(100% - 22px);
+  }
+  .usage-warning {
+    right: 11px;
+    left: 11px;
+    width: auto;
+  }
+  .model-select {
+    max-width: 190px;
+  }
+  .model-select select {
+    max-width: 180px;
+  }
+  .mobile-capture {
+    display: inline-grid;
+  }
+  .mobile-tabs {
+    position: fixed;
+    z-index: 20;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 52px;
+    display: flex;
+    justify-content: space-around;
+    background: #151719;
+    border-top: 1px solid #2d3033;
+    backdrop-filter: blur(15px);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .mobile-tabs button {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    /* An equal share each, down to a 320px screen, where five labels no longer fit at their
+       natural width and the last one would otherwise be cut off the end of the bar. */
+    flex: 1 1 0;
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    color: #8a948f;
+    font-size: 11px;
+  }
+  .mobile-tabs button svg {
+    width: 16px;
+    height: 16px;
+  }
+  .mobile-tabs button.active {
+    color: #e7e9ea;
+  }
+  .approval-drawer {
+    bottom: 164px;
+    grid-template-columns: 30px 1fr;
+  }
+  .approval-actions {
+    grid-column: 2;
+  }
+  .auth-page {
+    grid-template-columns: 1fr;
+  }
+  .auth-story {
+    display: none;
+  }
+  .mobile-brand {
+    display: flex;
+    margin-bottom: 70px;
+  }
+
+  .settings-nav {
+    flex-wrap: wrap;
+    overflow: visible;
+  }
+  .settings-nav button {
+    flex: 1 0 calc(33.333% - 5px);
+  }
+
+  .preview-create {
+    grid-template-columns: 1fr;
+  }
+  .preview-create .primary {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .schedule-layout,
+  .schedule-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .timeline {
+    padding: 22px 14px 190px;
+  }
+  .system-event,
+  .completion-card,
+  .tool-event,
+  .artifact-card,
+  .browser-capture-card,
+  .handoff-card,
+  .spend-pause-card,
+  .agent-note,
+  .preview-chat-card {
+    margin-left: 15px;
+    margin-right: 15px;
+  }
+  .user-brief {
+    max-width: 90%;
+  }
+  .empty-canvas {
+    padding-left: 25px;
+    padding-right: 25px;
+  }
+
+  .modal {
+    padding: 22px 18px;
+  }
+  .auth-form-wrap {
+    padding: 22px;
+  }
+  .auth-form h2 {
+    font-size: 25px;
+  }
+}
+@media (max-width: 430px) {
+  .workspace-tools-button span {
+    display: none;
+  }
+  .workspace-tools-button {
+    width: 32px;
+    justify-content: center;
+    padding: 0;
+  }
+  .starter-capabilities {
+    max-width: 300px;
+  }
+  .preview-chat-card {
+    grid-template-columns: 34px minmax(0, 1fr);
+  }
+  .preview-chat-card .artifact-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+  .artifact-card.with-preview {
+    grid-template-columns: 48px minmax(0, 1fr);
+  }
+  .artifact-thumb {
+    width: 48px;
+    height: 42px;
+  }
+  .artifact-card .artifact-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+  .model-select {
+    max-width: 145px;
+  }
+  .model-select select {
+    max-width: 140px;
+  }
+  .composer > .composer-bottom > .composer-tools > .icon-btn {
+    display: none;
+  }
+  .composer > .composer-bottom > .composer-tools > .mobile-capture,
+  .composer > .composer-bottom > .composer-tools > .composer-attachment {
+    display: inline-grid;
+  }
+  .composer-wrap {
+    padding-bottom: 7px;
+  }
+  .workbench-header {
+    padding: 0 9px;
+  }
+  .header-pill {
+    font-size: 0;
+  }
+  .header-pill svg {
+    margin: 0;
+  }
+  .timeline {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+  .tool-event,
+  .system-event,
+  .completion-card,
+  .artifact-card,
+  .browser-capture-card,
+  .preview-chat-card {
+    margin-left: 8px;
+    margin-right: 8px;
+  }
+  .assistant-message {
+    grid-template-columns: 24px 1fr;
+    gap: 8px;
+  }
+  .ai-avatar {
+    width: 24px;
+    height: 24px;
+  }
+  .approval-drawer {
+    left: 7px;
+    right: 7px;
+  }
+  .approval-symbol {
+    display: none;
+  }
+  .approval-drawer {
+    grid-template-columns: 1fr;
+  }
+  .approval-actions {
+    grid-column: 1;
+  }
+  .auth-form-wrap {
+    align-items: start;
+    padding-top: 30px;
+  }
+  .mobile-brand {
+    margin-bottom: 55px;
+  }
+}
+
+/* Dark-only product surface. System fonts avoid a third-party font request and
+   the near-black canvas keeps OLED pixels genuinely quiet. */
+:root {
+  color-scheme: dark;
+  color: #e7e9ea;
+  background: #0c0d0e;
+  font-family:
+    Inter,
+    ui-sans-serif,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    sans-serif;
+  font-synthesis: none;
+  --text: #e7e9ea;
+  --muted: #959a9e;
+  --line: #2a2d30;
+  --accent: #aeb5b9;
+  --accent-hover: #c8cdd0;
+  --accent-soft: #24272a;
+  --accent-muted: #969da1;
+  --danger: #bd7770;
+  --panel-soft: #151719;
+  --panel-strong: #191b1d;
+}
+
+html,
+body,
+#root,
+.app-shell,
+.workbench,
+.auth-page {
+  background: #0c0d0e;
+  color: #e7e9ea;
+}
+
+.sidebar,
+.inspector,
+.computer-pane,
+.files-pane {
+  background: #101214;
+}
+
+.workbench-header,
+.inspector-tabs,
+.computer-toolbar,
+.mobile-tabs {
+  background: #131517ef;
+  border-color: #292c2f;
+  backdrop-filter: blur(16px);
+}
+
+.composer-wrap {
+  background: linear-gradient(transparent, #0c0d0e 38%);
+}
+
+.composer,
+.modal,
+.auth-form-wrap,
+.settings-section,
+.settings-nav,
+.browser-input,
+.file-preview,
+.terminal-pane,
+.workspace-switcher,
+.schedule-task,
+.deliverable-row,
+.preview-create,
+.tool-event,
+.system-event,
+.artifact-card,
+.browser-capture-card,
+.preview-chat-card,
+.completion-card {
+  background: #151719;
+  border-color: #2d3033;
+  color: #e1e4e5;
+  box-shadow: none;
+}
+
+.workspace-switcher:hover,
+.schedule-task:hover,
+.task-row:hover,
+.account-row:hover,
+.icon-btn:hover,
+.file-list .file-open:hover,
+.ghost:hover,
+.settings-nav button:hover,
+.task-plan-history > button:hover {
+  background: #1b1d1f;
+  border-color: #41464a;
+  color: #eef0f1;
+}
+
+.schedule-task span {
+  background: #292d30;
+  color: #dfe2e4;
+  box-shadow: inset 0 0 0 1px #3a3f43;
+}
+
+.task-row.active,
+.settings-nav button.active,
+.workspace-tools-button.active {
+  background: #202326;
+  border-color: #788085;
+  color: #eceeef;
+}
+
+input,
+textarea,
+select,
+.task-plan-add,
+.task-plan-steps input,
+.browser-input input,
+.preview-create input,
+.preview-create select,
+.modal input,
+.modal textarea,
+.modal select,
+.ghost,
+.artifact-actions a,
+.artifact-card a,
+.workspace-tools-button,
+.header-pill,
+.model-select {
+  background: #131517;
+  border-color: #303438;
+  color: #e1e4e5;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: #747a7e;
+}
+
+.primary,
+.new-task,
+.send-btn,
+.task-plan-actions .save {
+  background: linear-gradient(135deg, #8e969b 0%, #c8cdd0 48%, #9da5aa 100%);
+  border-color: #aeb5b9;
+  color: #16191b;
+  box-shadow: inset 0 1px 0 #ffffff3b;
+}
+
+.primary:hover,
+.new-task:hover,
+.send-btn:hover {
+  background: linear-gradient(135deg, #a0a8ad 0%, #d5d9db 48%, #adb4b8 100%);
+  border-color: #c8cdd0;
+  color: #151719;
+}
+
+.brand-mark,
+.ai-avatar,
+.completion-card > svg {
+  background: #272a2d;
+  color: #bac0c4;
+}
+
+.user-brief {
+  background: #1f2224;
+  color: #e9ebec;
+}
+
+.markdown code {
+  background: #1f2224;
+}
+
+.markdown pre,
+.terminal-pane {
+  background: #0c0d0e;
+  color: #dadddf;
+}
+
+.task-plan-progress,
+.meter {
+  background: #262a2c;
+}
+
+.queue-pill,
+.workspace-avatar {
+  background: #262a2c;
+  color: #b3b9bc;
+}
+
+.system-event.approval,
+.system-event.warning,
+.usage-warning {
+  background: #22201c;
+  border-color: #5e5647;
+  color: #c4b69a;
+}
+
+.system-event.error,
+.inline-error,
+.form-error,
+.usage-warning.critical,
+.danger-button {
+  background: #231b1a;
+  border-color: #5f4844;
+  color: #d2aaa5;
+}
+
+.completion-card {
+  background: #1f2224;
+  border-color: #545a5e;
+}
+
+.browser-viewport,
+.artifact-thumb {
+  background: #101214;
+}
+
+.auth-story {
+  background:
+    radial-gradient(circle at 14% 18%, #24272a 0, transparent 34%),
+    radial-gradient(circle at 84% 76%, #1a1d1f 0, transparent 38%), #0e1012;
+}
+
+.modal-backdrop {
+  background: #000000bf;
+}
+
+.eyebrow,
+small,
+.composer-foot,
+.message-meta,
+.section-heading span {
+  color: #959a9e;
+}
+
+a {
+  color: #b7bdc1;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline-color: #8d969b;
+}
+
+@media (max-width: 840px) {
+  .mobile-tabs,
+  .inspector {
+    background: #101214f5;
+  }
+}
+
+/* Higher-specificity dark contracts for controls that deliberately carried
+   light-theme component styles above. These keep every interactive surface
+   dark instead of leaving bright islands inside the OLED-first shell. */
+.search,
+.starter-capabilities span,
+.security-select,
+.model-select {
+  border-color: #303438;
+  background: #151719;
+  color: #d9dcde;
+}
+
+.model-connect-button {
+  border-color: #34383b;
+  background: #181a1c;
+  color: #bec3c6;
+}
+
+.model-connect-button:hover {
+  border-color: #51575b;
+  background: #1f2224;
+}
+
+.security-select select,
+.model-select select {
+  color: #d0d4d6;
+}
+
+.search {
+  border: 1px solid #2a2d30;
+}
+
+.modal-close {
+  border: 1px solid #34383b;
+  background: #181a1c;
+  color: #d9dcde;
+}
+
+.modal label,
+.auth-form label {
+  color: #dce0e2;
+}
+
+.modal label > input:not([type='range']):not([type='checkbox']):not([type='radio']),
+.auth-form label input {
+  border-color: #34383b;
+  background: #101214;
+  color: #e1e4e5;
+}
+
+/* Warm, non-technical accents for semantic states and nested controls that
+   predate the dark surface. Clay, stone, umber, and muted ochre replace every
+   visible green signal without weakening status contrast. */
+.queue-pill,
+.workspace-avatar {
+  background: #292d30;
+  color: #b6bcc0;
+}
+
+.new-task:hover,
+.primary:hover,
+.send-btn:hover {
+  background: linear-gradient(135deg, #a0a8ad 0%, #d5d9db 48%, #adb4b8 100%);
+  border-color: #c8cdd0;
+  color: #151719;
+}
+
+.new-task,
+.inline-notice {
+  box-shadow: none;
+}
+
+.status-dot.running,
+.status-dot.planning,
+.status-dot.queued,
+.task-title i {
+  background: var(--accent);
+  box-shadow: none;
+}
+
+.status-dot.completed {
+  background: #858d92;
+}
+
+.user-avatar {
+  background: #2d3033;
+  color: #bec4c7;
+}
+
+.task-plan-progress span,
+.meter i {
+  background: linear-gradient(90deg, #8c9499, #c2c7ca);
+}
+
+.markdown {
+  color: #d8d5d0;
+}
+
+.markdown a,
+.switch-auth button {
+  color: #b7bdc1;
+}
+
+.tool-event.success summary > svg:first-child {
+  color: #b2b9bc;
+}
+
+.completion-card,
+.inline-notice {
+  border-color: #555b5f;
+  background: #1f2224;
+  color: #c5cacc;
+}
+
+.completion-card > svg {
+  background: #292d30;
+  color: #bdc3c6;
+}
+
+.browser-status {
+  background: #1b1e20ee;
+  color: #dfe2e4;
+  box-shadow: 0 3px 14px #09090955;
+}
+
+.browser-status button {
+  border-color: #565d61;
+  background: #272a2d;
+}
+
+/* Keep the conversation calm: results stay visible, execution detail lives in one disclosure. */
+.task-activity {
+  margin: 14px 0;
+  overflow: hidden;
+  border: 1px solid #2d3134;
+  border-radius: 13px;
+  background: #121416;
+  color: #d9dde0;
+}
+
+.task-activity > summary {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 9px 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.task-activity > summary::-webkit-details-marker {
+  display: none;
+}
+
+.task-activity-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  background: #1d2022;
+  color: #aeb5b9;
+}
+
+.task-activity-icon svg,
+.task-activity-chevron {
+  width: 14px;
+  height: 14px;
+}
+
+.task-activity-copy strong,
+.task-activity-copy small {
+  display: block;
+}
+
+.task-activity-copy strong {
+  color: #dce0e2;
+  font-size: 13px;
+}
+
+.task-activity-copy small {
+  margin-top: 3px;
+  color: #858c90;
+  font-size: 12px;
+}
+
+.task-activity-chevron {
+  color: #686f73;
+  transition: transform 160ms ease;
+}
+
+.task-activity[open] .task-activity-chevron {
+  transform: rotate(90deg);
+}
+
+.task-activity-body {
+  padding: 12px;
+  border-top: 1px solid #292d30;
+  background: #0f1112;
+}
+
+.task-activity .task-plan-panel {
+  margin: 0 0 12px;
+  border-color: #2c3033;
+  background: #151719;
+  box-shadow: none;
+}
+
+.task-activity .task-plan-actions button,
+.task-activity .task-plan-steps select:disabled {
+  border-color: #34383b;
+  background: #1d2022;
+  color: #aeb5b9;
+  opacity: 1;
+  -webkit-text-fill-color: #aeb5b9;
+}
+
+.task-activity .task-plan-actions button:hover {
+  border-color: #555c60;
+  background: #272b2e;
+  color: #eef0f1;
+}
+
+.task-activity .tool-event,
+.task-activity .system-event,
+.task-activity .cost-event,
+.task-activity .assistant-message,
+.task-activity .browser-capture-card {
+  margin-right: 0;
+  margin-left: 0;
+}
+
+.task-activity .assistant-message {
+  margin-top: 14px;
+  margin-bottom: 14px;
+}
+
+.task-activity .ai-avatar {
+  width: 24px;
+  height: 24px;
+  border: 1px solid #34383b;
+  background: #202326;
+  color: #bcc2c5;
+}
+
+.task-result {
+  margin: 10px 0;
+  padding: 14px;
+  border-color: #3b4043;
+  background: #181b1d;
+}
+
+.task-result > div {
+  min-width: 0;
+}
+
+.task-result > svg {
+  color: #b9c0c3;
+}
+
+.task-result p {
+  max-width: 640px;
+  margin: 5px 0 0;
+  color: #b5bbbe;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.result-details {
+  margin-top: 9px;
+  color: #858c90;
+  font-size: 12px;
+}
+
+.result-details > summary {
+  width: fit-content;
+  cursor: pointer;
+}
+
+.result-details .completion-summary {
+  padding-top: 7px;
+  color: #aab0b3;
+}
+
+.verification-receipt ul {
+  margin: 8px 0 0;
+  padding-left: 16px;
+  color: #aab0b3;
+}
+
+/* The harness's own run. Each check is a tick or a warning, the label the model gave it, and the
+   exit code the harness saw — set in monospace because it is quoted output, not prose. */
+.verification-receipt .harness-checks {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.verification-receipt .harness-checks li {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 4px 0;
+}
+
+.verification-receipt .harness-checks svg {
+  width: 13px;
+  height: 13px;
+  margin-top: 2px;
+}
+
+.verification-receipt .harness-checks .passed svg {
+  color: #7fb08e;
+}
+
+.verification-receipt .harness-checks .failed svg {
+  color: #d09a76;
+}
+
+.verification-receipt .harness-checks strong {
+  display: block;
+  color: #cbd0d3;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.verification-receipt .harness-checks code {
+  display: block;
+  margin-top: 2px;
+  overflow-x: auto;
+  color: #8f979b;
+  font:
+    11px/1.5 ui-monospace,
+    monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.verification-receipt > .eyebrow {
+  margin: 12px 0 0;
+  font-size: 11px;
+}
+
+.completion-card .completion-harness-caveat {
+  max-width: 560px;
+  margin-top: 8px;
+  color: #c2b393;
+}
+
+/* A turn that stopped at its step limit hands over what it did not reach; that list is the point
+   of the card, so it is never behind a disclosure. */
+.completion-card .completion-outstanding-label {
+  display: block;
+  max-width: 560px;
+  margin-top: 9px;
+  font-size: 12px;
+  color: #c2b393;
+}
+.completion-card .completion-outstanding {
+  margin: 5px 0 0;
+  padding-left: 16px;
+  color: #aab0b3;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.completion-card.interrupted {
+  border-color: #5d5750;
+  background: #1b1a18;
+}
+.completion-card.interrupted > svg {
+  background: none;
+  color: #c2b393;
+}
+
+.timeline > .artifact-card,
+.timeline > .preview-chat-card,
+.timeline > .pdf-review-card,
+.timeline > .browser-capture-card {
+  margin-right: 0;
+  margin-left: 0;
+}
+
+.task-plan-panel {
+  border-color: #2d3033;
+  background: #151719;
+  color: #e1e4e5;
+  box-shadow: none;
+}
+
+.artifact-actions button,
+.artifact-actions a,
+.artifact-card button,
+.artifact-card a {
+  border-color: #34383b;
+  background: #1c1f21;
+  color: #c7cccf;
+}
+
+.artifact-actions button:hover,
+.artifact-actions a:hover,
+.artifact-card button:hover,
+.artifact-card a:hover {
+  border-color: #555c60;
+  background: #262a2d;
+  color: #eef0f1;
+}
+
+.weekday-picker button.active,
+.mobile-tabs button.active {
+  border-color: #788085;
+  background: #272a2d;
+  color: #c7cccf;
+}
+
+.modal input[type='checkbox'],
+.modal input[type='radio'],
+.modal input[type='range'] {
+  accent-color: var(--accent);
+}
+
+.domain-dns-records code {
+  background: #222527;
+  color: #ced2d4;
+}
+
+.auth-story:after {
+  display: none;
+}
+
+.auth-hero-copy > p:last-child {
+  color: #b2b7ba;
+}
+
+.recovery-card {
+  border-color: #2d3033;
+  background: #151719;
+  box-shadow: none;
+}
+
+.success-icon {
+  background: #292d30;
+  color: #bdc3c6;
+}
+
+.artifact-thumb {
+  background: #191b1d !important;
+}
+
+.empty-mini,
+.subtle,
+.task-copy small,
+.task-title span,
+.account-row small,
+.message-meta button,
+.cost-event {
+  color: var(--muted);
+}
+
+.account-row strong {
+  color: #dce0e2;
+}
+
+/* Monochrome neon layer. Silver light is reserved for interactive edges,
+   focus, and the agent's idle mark so the OLED-first canvas stays quiet. */
+:root {
+  --silver-edge: #aeb8bd;
+  --silver-hot: #edf4f6;
+  --silver-glow: #dbe7ec2e;
+  --silver-glow-soft: #dbe7ec14;
+}
+
+@property --neon-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+.sidebar {
+  border-right-color: #454b4f;
+  box-shadow: 1px 0 20px #dbe7ec0d;
+}
+
+.workbench-header {
+  border-bottom-color: #353a3e;
+  box-shadow: 0 1px 18px #dbe7ec0a;
+}
+
+.composer {
+  border-color: #42484c;
+  box-shadow:
+    inset 0 1px 0 #ffffff0d,
+    0 0 0 1px #dbe7ec08,
+    0 0 20px #dbe7ec09;
+  transition:
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms ease;
+}
+
+.composer:focus-within {
+  border-color: var(--silver-edge);
+  box-shadow:
+    inset 0 1px 0 #ffffff1a,
+    0 0 0 1px #edf4f62e,
+    0 0 28px var(--silver-glow);
+  transform: translateY(-1px);
+}
+
+.new-task {
+  border: 1px solid #778187;
+  background: linear-gradient(145deg, #25292c, #17191b);
+  color: #edf1f3;
+  box-shadow:
+    inset 0 1px 0 #ffffff1c,
+    0 0 0 1px #edf4f612,
+    0 0 15px var(--silver-glow-soft);
+}
+
+.new-task:hover {
+  border-color: var(--silver-hot);
+  background: linear-gradient(145deg, #30363a, #1d2022);
+  color: #ffffff;
+  box-shadow:
+    inset 0 1px 0 #ffffff2e,
+    0 0 0 1px #edf4f638,
+    0 0 22px var(--silver-glow);
+}
+
+.primary,
+.send-btn,
+.task-plan-actions .save {
+  box-shadow:
+    inset 0 1px 0 #ffffff52,
+    0 0 0 1px #edf4f61c,
+    0 0 16px #dbe7ec20;
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    filter 160ms ease;
+}
+
+.primary:hover,
+.send-btn:hover,
+.task-plan-actions .save:hover {
+  box-shadow:
+    inset 0 1px 0 #ffffff6b,
+    0 0 0 1px #ffffff42,
+    0 0 24px #dbe7ec3b;
+  filter: brightness(1.05);
+}
+
+.workspace-switcher,
+.schedule-task,
+.workspace-tools-button,
+.header-pill,
+.ghost,
+.icon-btn,
+.modal-close,
+.settings-nav button,
+.artifact-actions button,
+.artifact-actions a,
+.artifact-card button,
+.artifact-card a {
+  transition:
+    border-color 150ms ease,
+    background 150ms ease,
+    color 150ms ease,
+    box-shadow 150ms ease,
+    transform 150ms ease;
+}
+
+.workspace-switcher:hover,
+.schedule-task:hover,
+.workspace-tools-button:hover,
+.header-pill:hover,
+.ghost:hover,
+.icon-btn:hover,
+.modal-close:hover,
+.settings-nav button:hover,
+.artifact-actions button:hover,
+.artifact-actions a:hover,
+.artifact-card button:hover,
+.artifact-card a:hover {
+  border-color: #858f94;
+  box-shadow:
+    inset 0 0 0 1px #edf4f610,
+    0 0 14px var(--silver-glow-soft);
+}
+
+.task-row.active,
+.settings-nav button.active,
+.workspace-tools-button.active {
+  border-color: #9ba5aa;
+  box-shadow:
+    inset 0 0 0 1px #edf4f622,
+    0 0 16px #dbe7ec17;
+}
+
+.brand-mark {
+  border: 1px solid #5c6469;
+  box-shadow:
+    inset 0 1px 0 #ffffff12,
+    0 0 12px #dbe7ec12;
+}
+
+/*
+ * The travelling edge highlight, on the message box and nothing else.
+ *
+ * It was also on the new-conversation button and the tools toggle, which put three separate
+ * things orbiting and pulsing on one screen at three different rates. The eye had nowhere to
+ * rest and no way to tell which of them meant anything - and none of them did; it is decoration.
+ * On the one control the whole product is pointed at, it reads as the box being alive and ready
+ * for a sentence. Repeated on the furniture around it, it read as a screen that would not settle.
+ */
+.composer {
+  position: relative;
+  isolation: isolate;
+}
+
+.composer::before {
+  position: absolute;
+  z-index: 3;
+  inset: -2px;
+  padding: 1.5px;
+  border-radius: inherit;
+  background: conic-gradient(
+    from var(--neon-angle),
+    transparent 0deg 122deg,
+    #87909500 136deg,
+    #aeb8bdc4 155deg,
+    #ffffff 174deg,
+    #cbd7dcc2 190deg,
+    transparent 208deg 276deg,
+    #87909500 286deg,
+    #b9c5caad 304deg,
+    #ffffff 320deg,
+    #b7c3c8a1 334deg,
+    transparent 348deg 360deg
+  );
+  content: '';
+  opacity: 0.94;
+  pointer-events: none;
+  filter: drop-shadow(0 0 6px #e9f5fabd);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation:
+    neon-edge-orbit 4.8s linear infinite,
+    neon-edge-pulse 2.4s ease-in-out infinite;
+}
+
+.composer::before {
+  inset: -3px;
+  padding: 2px;
+  animation-duration: 5.8s, 2.8s;
+}
+
+.composer:focus-within::before {
+  opacity: 1;
+  animation-duration: 2.8s, 1.45s;
+}
+
+.empty-canvas .eyebrow {
+  color: #aeb8bd;
+  text-shadow:
+    0 0 7px #edf7fb4f,
+    0 0 15px #dbe7ec24;
+  animation: signal-caption-pulse 2.7s ease-in-out infinite;
+}
+
+.modal {
+  border-color: #4b5256;
+  box-shadow:
+    0 28px 80px #000000b8,
+    inset 0 0 0 1px #edf4f60c,
+    0 0 30px #dbe7ec12;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+a:focus-visible {
+  outline: 1px solid var(--silver-hot);
+  outline-offset: 3px;
+  box-shadow:
+    0 0 0 1px #edf4f638,
+    0 0 18px #dbe7ec45;
+}
+
+.composer textarea:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+@keyframes neon-edge-orbit {
+  to {
+    --neon-angle: 360deg;
+  }
+}
+
+@keyframes neon-edge-pulse {
+  0%,
+  100% {
+    opacity: 0.48;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes signal-caption-pulse {
+  0%,
+  100% {
+    opacity: 0.68;
+    text-shadow:
+      0 0 5px #edf7fb35,
+      0 0 11px #dbe7ec1c;
+  }
+  50% {
+    opacity: 1;
+    text-shadow:
+      0 0 9px #f7fdff8c,
+      0 0 20px #dbe7ec45;
+  }
+}
+
+/* Self-hosted settings use a deliberately small set of reusable layout
+   primitives. Keep advanced controls readable without turning the modal into
+   a second dashboard. */
+.self-hosted-settings {
+  max-height: min(820px, calc(100dvh - 48px));
+  overflow: auto;
+}
+
+.self-hosted-settings .settings-section {
+  padding: 20px 0 4px;
+}
+
+.self-hosted-settings .section-heading.compact {
+  margin-top: 18px;
+}
+
+.self-hosted-settings .settings-section > hr {
+  height: 1px;
+  margin: 20px 0 0;
+  border: 0;
+  background: var(--line);
+}
+
+.form-grid {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.form-grid.two {
+  grid-template-columns: minmax(160px, 0.72fr) minmax(280px, 1.28fr);
+}
+
+.form-grid > label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: #bec3c6;
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.form-grid :is(input, select, textarea) {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  border: 1px solid #34383b;
+  border-radius: 9px;
+  background: #101214;
+  padding: 0 10px;
+  color: #e1e4e5;
+  outline: 0;
+}
+
+.form-grid textarea {
+  min-height: 132px;
+  padding-block: 10px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.form-grid :is(input, select, textarea):focus {
+  border-color: #7f898e;
+  box-shadow: 0 0 0 3px #dbe7ec12;
+}
+
+.self-hosted-settings .settings-section > label:not(.toggle-line) {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 14px;
+  color: #bec3c6;
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.self-hosted-settings .settings-section > label:not(.toggle-line) :is(input, select, textarea) {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  border: 1px solid #34383b;
+  border-radius: 9px;
+  background: #101214;
+  padding: 0 10px;
+  color: #e1e4e5;
+  outline: 0;
+}
+
+.self-hosted-settings .settings-section > label:not(.toggle-line) textarea {
+  min-height: 180px;
+  padding-block: 10px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.self-hosted-settings
+  .settings-section
+  > label:not(.toggle-line)
+  :is(input, select, textarea):focus {
+  border-color: #7f898e;
+  box-shadow: 0 0 0 3px #dbe7ec12;
+}
+
+.toggle-line {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  margin-top: 14px;
+  padding: 11px 12px;
+  border: 1px solid #2f3336;
+  border-radius: 10px;
+  background: #131517;
+  cursor: pointer;
+}
+
+.toggle-line > input {
+  width: 15px;
+  height: 15px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+}
+
+.toggle-line span,
+.toggle-line strong,
+.toggle-line small {
+  display: block;
+  min-width: 0;
+}
+
+.toggle-line strong {
+  color: #dce0e2;
+  font-size: 12px;
+}
+
+.toggle-line small {
+  margin-top: 4px;
+  color: #969ca0;
+  font-size: 11px;
+  font-weight: 450;
+  line-height: 1.5;
+}
+
+/* Where searches go, under the switch that decides it. Stated rather than offered: there is no
+   control here, because the answer follows from the privacy route and the credential above. */
+.web-search-route {
+  display: grid;
+  margin: 10px 0 0;
+  padding: 0 12px;
+}
+
+.web-search-route strong {
+  color: #dce0e2;
+  font-size: 12px;
+}
+
+.web-search-route span {
+  color: #b5bbbe;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.web-search-route small {
+  margin-top: 2px;
+  color: #969ca0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.settings-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 13px;
+}
+
+.settings-list > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid #2f3336;
+  border-radius: 11px;
+  background: #131517;
+  padding: 12px;
+}
+
+.settings-list > div > span,
+.settings-list strong,
+.settings-list small {
+  display: block;
+  min-width: 0;
+}
+
+/* Two controls in the row's single action cell, which is a two-column grid. */
+.settings-row-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* A row that opens what it names, styled as the row rather than as a button on it. */
+.settings-list-open {
+  display: block;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.settings-list-open:hover strong {
+  color: #f1f3f4;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.settings-list strong {
+  color: #dce0e2;
+  font-size: 12px;
+}
+
+.settings-list small {
+  margin-top: 4px;
+  color: #969ca0;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.settings-list code {
+  color: #d4dade;
+  font-size: 0.96em;
+}
+
+.settings-list button {
+  min-height: 33px;
+  white-space: nowrap;
+}
+
+.self-hosted-settings .modal-actions > button,
+.self-hosted-settings .settings-list button,
+.self-hosted-settings .recovery-create button,
+.self-hosted-settings .restore-confirmation button,
+.self-hosted-settings .settings-section > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  border: 1px solid #596166;
+  border-radius: 9px;
+  padding: 0 12px;
+  background: linear-gradient(180deg, #272b2e 0%, #1c1f21 100%);
+  color: #e7eaeb;
+  box-shadow: inset 0 1px 0 #ffffff12;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 680;
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    color 150ms ease,
+    background 150ms ease;
+}
+
+.self-hosted-settings .modal-actions > button:hover,
+.self-hosted-settings .settings-list button:hover,
+.self-hosted-settings .recovery-create button:hover,
+.self-hosted-settings .restore-confirmation button:hover,
+.self-hosted-settings .settings-section > button:hover {
+  border-color: #a7b0b5;
+  background: linear-gradient(180deg, #303538 0%, #222527 100%);
+  box-shadow:
+    inset 0 1px 0 #ffffff1c,
+    0 0 16px #dbe7ec1d;
+}
+
+.self-hosted-settings .settings-list button.secondary,
+.self-hosted-settings .modal-actions > button.secondary {
+  border-color: #3e4448;
+  background: #17191b;
+  color: #cbd0d3;
+}
+
+.self-hosted-settings :is(.settings-list, .recovery-list) button.icon-btn {
+  width: 34px;
+  padding: 0;
+}
+
+.self-hosted-settings .privacy-boundary button.icon-btn {
+  display: inline-flex;
+  width: 34px;
+  min-width: 34px;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #596166;
+  border-radius: 9px;
+  background: #1c1f21;
+  color: #e7eaeb;
+  cursor: pointer;
+}
+
+.self-hosted-settings .settings-section > button {
+  margin-top: 12px;
+}
+
+.self-hosted-settings .settings-list a {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #43494d;
+  border-radius: 8px;
+  padding: 0 10px;
+  color: #d9dddf;
+  font-size: 12px;
+  font-weight: 680;
+  text-decoration: none;
+}
+
+.self-hosted-settings .settings-list a:hover {
+  border-color: #899297;
+  background: #202326;
+}
+
+.self-hosted-settings
+  :is(.modal-actions, .settings-list, .recovery-create, .restore-confirmation)
+  button
+  svg,
+.self-hosted-settings .settings-section > button svg,
+.self-hosted-settings .privacy-boundary button.icon-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.self-hosted-settings button.danger {
+  border-color: #684943;
+  background: #211918;
+  color: #d6aba3;
+}
+
+.self-hosted-settings button:disabled {
+  cursor: not-allowed;
+  opacity: 0.38;
+  box-shadow: none;
+}
+
+/* The supplied brand artwork already contains its wordmark. Keep it compact
+   and let the transparent engraving sit directly on the dark shell. */
+.brand.brand-logo {
+  height: 64px;
+  gap: 0;
+  padding: 0;
+}
+
+.brand-logo .brand-mark,
+.splash .brand-mark.large {
+  width: 62px;
+  height: 62px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 2px 4px #0000008f) drop-shadow(0 0 9px #e4edf01c);
+  user-select: none;
+}
+
+.auth-story .brand-logo {
+  height: 112px;
+}
+
+.auth-story .brand-logo .brand-mark {
+  width: 112px;
+  height: 112px;
+}
+
+.mobile-brand.brand-logo {
+  height: 76px;
+}
+
+.mobile-brand.brand-logo .brand-mark {
+  width: 76px;
+  height: 76px;
+}
+
+.splash .brand-mark.large {
+  width: 108px;
+  height: 108px;
+}
+
+.sidebar > .computer-summary {
+  grid-template-columns: 54px minmax(0, 1fr);
+  gap: 7px;
+  min-height: 76px;
+  margin: 0 0 12px;
+  padding: 8px 9px 8px 7px;
+  border-color: #50575b;
+  border-radius: 13px;
+  background: linear-gradient(145deg, #1b1e20, #141618 72%);
+  box-shadow:
+    inset 0 1px 0 #ffffff12,
+    0 0 18px #dbe7ec0d;
+}
+
+.sidebar > .computer-summary:hover {
+  border-color: #aeb8bd;
+  background: linear-gradient(145deg, #23272a, #181b1d 72%);
+  box-shadow:
+    inset 0 1px 0 #ffffff22,
+    0 0 0 1px #edf4f61a,
+    0 0 22px #dbe7ec2b;
+}
+
+.sidebar > .computer-summary .agent-brand-avatar {
+  width: 54px;
+  height: 54px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+}
+
+.agent-brand-avatar img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 2px 4px #000000a8) drop-shadow(0 0 8px #e4edf019);
+  transform: scale(1.27);
+}
+
+.sidebar > .computer-summary strong {
+  font-size: 12px;
+  letter-spacing: -0.015em;
+}
+
+.sidebar > .computer-summary > span:nth-child(2) {
+  justify-self: stretch;
+  text-align: center;
+}
+
+@media (max-width: 680px) {
+  .self-hosted-settings {
+    max-height: 100dvh;
+  }
+
+  .form-grid.two,
+  .connect-grid,
+  .settings-list > div {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-list button {
+    justify-self: start;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Conversation transcript, message actions and rich Markdown.
+   Appended after the dark palette so these components inherit its variables.
+   --------------------------------------------------------------------------- */
+
+.timeline-viewport {
+  position: relative;
+  min-height: 0;
+  height: 100%;
+  overflow: auto;
+  scroll-behavior: smooth;
+}
+
+.jump-to-latest {
+  position: sticky;
+  bottom: 18px;
+  left: 50%;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  translate: -50%;
+  padding: 7px 13px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: 0 6px 22px #00000066;
+  cursor: pointer;
+}
+.jump-to-latest svg {
+  width: 14px;
+  height: 14px;
+}
+
+.assistant-message-body {
+  min-width: 0;
+}
+
+/* A caret only while text is still arriving, so a finished answer is visually settled. */
+.streaming-caret {
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  margin-left: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  vertical-align: text-bottom;
+  animation: streaming-caret-blink 1.05s steps(2, start) infinite;
+}
+@keyframes streaming-caret-blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+.message-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-end;
+  margin-top: 7px;
+  min-height: 22px;
+}
+.assistant-message .message-actions {
+  justify-content: flex-start;
+}
+.message-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity 120ms ease,
+    color 120ms ease,
+    background 120ms ease;
+}
+.user-message:hover .message-actions button,
+.assistant-message:hover .message-actions button,
+.message-actions button:focus-visible {
+  opacity: 1;
+}
+.message-actions button:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+.message-actions svg {
+  width: 13px;
+  height: 13px;
+}
+/* Touch devices have no hover, so the actions must always be reachable. */
+@media (hover: none) {
+  .message-actions button {
+    opacity: 1;
+  }
+}
+
+.user-message .markdown {
+  font-size: 13px;
+}
+.user-message .markdown > :first-child {
+  margin-top: 0;
+}
+.user-message .markdown > :last-child {
+  margin-bottom: 0;
+}
+
+/* Code blocks: language label, wrap toggle and copy, with the caption outside the scroll area. */
+.code-block {
+  margin: 13px 0;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #0c0d0e;
+  overflow: hidden;
+}
+.code-block figcaption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px 6px 13px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-soft);
+}
+.code-language {
+  color: var(--muted);
+  font-size: 13px;
+  font-variant: all-small-caps;
+  letter-spacing: 0.06em;
+}
+.code-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.code-block pre {
+  margin: 0;
+  padding: 13px;
+  overflow-x: auto;
+  background: transparent;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.code-block.wrapped pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.copy-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+.copy-button:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+.copy-button svg {
+  width: 13px;
+  height: 13px;
+}
+.code-actions .copy-button span {
+  display: none;
+}
+
+/* Wide tables scroll inside their own box instead of widening the whole transcript. */
+.table-scroll {
+  overflow-x: auto;
+  margin: 13px 0;
+}
+.table-scroll table {
+  margin: 0;
+}
+
+.markdown .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
+}
+
+.conversation-cost {
+  justify-content: flex-end;
+  opacity: 0.75;
+}
+
+/* Composer: auto-grown height, drop target and a real stop control. */
+.composer textarea {
+  /* The JS height sync writes an explicit pixel height; overflow keeps the cap meaningful. */
+  overflow-y: auto;
+}
+
+.composer-wrap.dropping .composer {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px #aeb5b933;
+}
+.composer-wrap.dropping .composer::after {
+  content: 'Drop files to attach them';
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: inherit;
+  background: #0c0d0ecc;
+  color: var(--text);
+  font-size: 13px;
+  pointer-events: none;
+}
+.composer {
+  position: relative;
+}
+
+.send-btn.stopping {
+  background: var(--danger);
+  color: #fff;
+}
+
+/* Distinct from Send without competing with Stop: this one redirects work rather than ending it. */
+.send-btn.correcting {
+  background: var(--surface-3, transparent);
+  border: 1px solid var(--border);
+  color: var(--text-1);
+}
+
+/* Command palette (⌘K). */
+.palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 140;
+  display: grid;
+  align-items: start;
+  justify-items: center;
+  padding: max(9vh, 48px) 16px 16px;
+  background: #05060699;
+  backdrop-filter: blur(2px);
+}
+.palette {
+  width: min(620px, 100%);
+  max-height: min(60vh, 520px);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--panel-strong);
+  box-shadow: 0 24px 70px #00000088;
+  overflow: hidden;
+}
+.palette-field {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 13px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.palette-field svg {
+  width: 16px;
+  height: 16px;
+  color: var(--muted);
+  flex: none;
+}
+.palette-field input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+}
+.palette-field kbd {
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.palette-results {
+  overflow-y: auto;
+  padding: 6px;
+}
+.palette-group {
+  margin: 8px 8px 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant: all-small-caps;
+  letter-spacing: 0.08em;
+}
+.palette-entry {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.palette-entry[data-active='true'] {
+  background: var(--accent-soft);
+}
+.palette-entry svg {
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  flex: none;
+}
+.palette-label {
+  flex: none;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.palette-hint {
+  flex: 1;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.palette-empty {
+  margin: 18px 12px;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+/* Fork / version switcher above a branched conversation. */
+.fork-bar {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  margin: 0 0 20px;
+  padding: 7px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 12px;
+}
+.fork-bar > svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+.fork-bar span {
+  flex: 1;
+  min-width: 0;
+}
+.fork-bar button {
+  padding: 1px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.fork-bar button:disabled {
+  color: #4c5155;
+  cursor: default;
+}
+.fork-bar button:not(:disabled):hover {
+  background: var(--accent-soft);
+}
+.fork-bar .fork-origin {
+  flex: none;
+  font-size: 13px;
+}
+
+/* Sidebar conversation rows: open target plus rename/delete affordances. */
+.task-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.task-row .task-open {
+  display: flex;
+  flex: 1;
+  gap: 9px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px 9px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  box-shadow: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.task-row-actions {
+  display: flex;
+  gap: 1px;
+  flex: none;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.task-row:hover .task-row-actions,
+.task-row:focus-within .task-row-actions {
+  opacity: 1;
+}
+.task-row-actions button {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.task-row-actions button:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+.task-row.renaming input {
+  width: 100%;
+  padding: 8px 9px;
+  border: 1px solid var(--accent);
+  border-radius: 9px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: 13px;
+}
+@media (hover: none) {
+  .task-row-actions {
+    opacity: 1;
+  }
+}
+
+/* The tabpanel wrapper must not change the inspector's flex layout. */
+.inspector-panel {
+  display: contents;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /*
+   * The whole of what this interface does about the preference, in one block.
+   *
+   * There were two, and they disagreed. An earlier one listed a dozen controls and turned their
+   * transitions off, under a comment saying it kept "the small luminance-only edge effects alive"
+   * — which its own rule body never did, and which this block then contradicted outright a
+   * thousand lines later. What survived was this policy and a comment describing the other one.
+   *
+   * The policy itself is unchanged and deliberate: a looping decorative animation is the case the
+   * preference exists for, so the orbiting edge highlight on the composer, the new-conversation
+   * button and the tools toggle stops with everything else, along with the streaming caret and the
+   * timeline's smooth scroll - both of which had their own block until it turned out the rules
+   * below already covered them. The spinner is the one exception, slowed rather than frozen,
+   * because it is the only sign that long work is still alive.
+   *
+   * Worth knowing when this looks like a bug: on macOS the switch is Accessibility → Display →
+   * Reduce motion, and browsers report it faithfully. An owner who wants the edge highlight back
+   * turns it off there rather than here — an interface that ignored the setting would be deciding
+   * something about somebody's eyes that is not its to decide.
+   */
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .spin {
+    animation: spin 2.4s linear infinite !important;
+    animation-duration: 2.4s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
+/* Device enrollment code. */
+.enrollment-card {
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--panel-soft);
+  text-align: center;
+}
+.enrollment-card img {
+  width: 200px;
+  height: 200px;
+  border-radius: 9px;
+}
+.enrollment-card code {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+}
+.enrollment-card > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.enrollment-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/*
+ * The model picker sits in a flex row with the attachment buttons and had min-width:0, so it was
+ * the element that gave way when space ran short - collapsing far below its own max-width and
+ * clipping the label mid-word ("Recommende"). It now keeps a floor wide enough to read, and any
+ * remaining overflow ends in an ellipsis rather than a severed word.
+ */
+.composer-tools .model-select {
+  flex: 0 1 auto;
+  min-width: 150px;
+}
+.composer-tools .model-select select {
+  width: 100%;
+  text-overflow: ellipsis;
+}
+@media (max-width: 680px) {
+  .composer-tools .model-select {
+    min-width: 120px;
+  }
+}
+
+/*
+ * The security control was capped at 120px while its labels needed more, so the selected mode was
+ * clipped mid-word. The labels are now single words and the cap has room for the longest of them;
+ * the full explanation of each mode lives in Settings rather than in a control this size.
+ */
+.composer-tools .security-select select {
+  max-width: none;
+  width: 100%;
+}
+.composer-tools .security-select {
+  flex: 0 0 auto;
+  min-width: 132px;
+}
+
+/* ---------------------------------------------------------------------------
+   Small-screen geometry: the phone is the primary device, so the shell is sized
+   in dynamic viewport units and every fixed edge accounts for the safe area.
+   --------------------------------------------------------------------------- */
+
+/*
+ * `height: 100%` resolves against a layout viewport that Chrome on Android does not shrink when
+ * the software keyboard opens, so the composer sat behind the keyboard with no way to scroll to
+ * it (the shell clips overflow). `dvh` tracks the visible viewport, and the viewport meta now
+ * asks for `interactive-widget=resizes-content` so the two agree.
+ */
+html,
+body,
+#root,
+.app-shell,
+.workbench {
+  height: 100dvh;
+}
+.mobile-sidebar .sidebar {
+  height: 100dvh;
+}
+
+:root {
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-top: env(safe-area-inset-top, 0px);
+  --bottom-bar: 0px;
+}
+
+/*
+ * The composer is the primary input of a product used on a phone, so nothing in it may collapse
+ * below a tappable size. The row wraps instead: the icons keep their 32px target and the two
+ * selects take a second line when 375px cannot hold them, rather than the icons shrinking to
+ * their 17px min-content and the model picker landing on top of Send.
+ */
+.composer-tools {
+  flex-wrap: wrap;
+  row-gap: 6px;
+  gap: 4px;
+}
+.composer-bottom {
+  align-items: flex-end;
+}
+.composer-tools > .icon-btn {
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+}
+.composer-tools .security-select,
+.composer-tools .model-select {
+  flex: 1 1 auto;
+  min-width: 116px;
+  max-width: 100%;
+}
+.composer-tools .security-select select,
+.composer-tools .model-select select {
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+@media (max-width: 430px) {
+  .composer-tools .security-select {
+    min-width: 104px;
+  }
+  .composer-tools .model-select,
+  .composer-tools .model-select select {
+    max-width: none;
+  }
+}
+
+@media (max-width: 800px) {
+  /*
+   * With `viewport-fit=cover` the home indicator eats into the bar: a 52px box with the inset as
+   * padding under `border-box` left a 17px strip, thinner than the icon plus its label. The bar
+   * now grows by the inset instead of being eaten by it, and everything anchored above it moves
+   * with it rather than overlapping.
+   */
+  :root {
+    --bottom-bar: calc(52px + var(--safe-bottom));
+  }
+  .mobile-tabs {
+    height: var(--bottom-bar);
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+  .workbench-header {
+    height: calc(58px + var(--safe-top));
+    padding-top: var(--safe-top);
+  }
+  .mobile-sidebar {
+    padding-top: var(--safe-top);
+  }
+  .inspector {
+    inset: calc(58px + var(--safe-top)) 0 var(--bottom-bar);
+  }
+  .composer-wrap {
+    bottom: var(--bottom-bar);
+  }
+  .chat-canvas {
+    padding-bottom: 0;
+  }
+  /*
+   * Anchored to the bar rather than to a fixed distance from the bottom of the screen: the
+   * composer is taller on a phone now that its controls wrap, and a fixed 188px put every notice
+   * on top of the box the user is typing in.
+   */
+  .usage-warning,
+  .inline-error,
+  .inline-notice,
+  .composer-block {
+    bottom: calc(var(--bottom-bar) + 182px);
+  }
+  .approval-drawer {
+    bottom: calc(var(--bottom-bar) + 178px);
+  }
+}
+
+/*
+ * Seven surfaces never fit a 375px row, and without a scroll affordance the last two were simply
+ * unreachable - clipped by `.app-shell { overflow: hidden }`.
+ */
+.inspector-tabs {
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  scroll-snap-type: x proximity;
+}
+.inspector-tabs::-webkit-scrollbar {
+  display: none;
+}
+.inspector-tabs button {
+  flex: 0 0 auto;
+  scroll-snap-align: start;
+}
+@media (max-width: 430px) {
+  .inspector-tabs {
+    gap: 15px;
+    padding: 0 12px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Repairable blocks, undo, diffs and the recovery-code gate.
+   --------------------------------------------------------------------------- */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The one thing standing between a typed message and a running agent, with its repair action. */
+.composer-block {
+  position: absolute;
+  z-index: 6;
+  left: 50%;
+  bottom: 144px;
+  transform: translateX(-50%);
+  width: min(760px, calc(100% - 36px));
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid #3c4a3f;
+  border-radius: 12px;
+  background: #171b18;
+  color: #dfe4e0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.composer-block > svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--accent);
+}
+.composer-block > span {
+  flex: 1;
+  min-width: 0;
+}
+.composer-block button {
+  flex: none;
+  border: 1px solid #4b5750;
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: #212724;
+  color: #e7ece8;
+  font-size: 12px;
+  cursor: pointer;
+}
+.composer-block button:hover {
+  background: #2a312d;
+}
+
+/* Above the modal scrim: a delete made from inside Settings must still be undoable. */
+.undo-stack {
+  position: fixed;
+  z-index: 60;
+  left: 50%;
+  bottom: calc(18px + var(--safe-bottom, 0px) + var(--bottom-bar, 0px));
+  transform: translateX(-50%);
+  display: grid;
+  gap: 8px;
+  width: min(460px, calc(100vw - 24px));
+}
+.undo-toast {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 10px 9px 14px;
+  border: 1px solid #34383b;
+  border-radius: 12px;
+  background: #1b1e20;
+  box-shadow: 0 16px 40px #00000059;
+  color: #e7e9ea;
+  font-size: 12px;
+}
+.undo-toast > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.undo-action {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  flex: none;
+  border: 1px solid #4a5054;
+  border-radius: 8px;
+  padding: 5px 10px;
+  background: #22262a;
+  color: #eef0f1;
+  font-size: 12px;
+  cursor: pointer;
+}
+.undo-action:hover {
+  background: #2b3034;
+}
+.undo-action svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* A file change is shown as the change, not as a sentence describing it. */
+.file-diff {
+  margin: 8px 0;
+  border: 1px solid #2d3033;
+  border-radius: 10px;
+  background: #121416;
+  overflow: hidden;
+}
+.file-diff > summary {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  color: #cfd3d5;
+  font-size: 12px;
+  cursor: pointer;
+}
+.file-diff > summary svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--muted);
+}
+.file-diff-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.file-diff-stat {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+}
+.diff-body {
+  max-height: 340px;
+  overflow: auto;
+  border-top: 1px solid #2d3033;
+}
+.diff-empty {
+  margin: 0;
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.diff-hunk {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+.diff-hunk-header td {
+  padding: 4px 10px;
+  background: #16191b;
+  color: #7f878b;
+}
+.diff-gutter {
+  width: 1%;
+  padding: 0 6px;
+  color: #5d6367;
+  text-align: right;
+  user-select: none;
+  white-space: nowrap;
+}
+.diff-text {
+  padding: 0 8px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.diff-sign {
+  display: inline-block;
+  width: 1ch;
+  margin-right: 6px;
+  color: #6f7679;
+}
+.diff-line.add {
+  background: #16251b;
+  color: #cfe9d7;
+}
+.diff-line.remove {
+  background: #2a1a1a;
+  color: #ecd2ce;
+}
+.diff-line.add .diff-sign {
+  color: #7fbf95;
+}
+.diff-line.remove .diff-sign {
+  color: #cf8d84;
+}
+.approval-diffs {
+  margin: 4px 0;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.overwrite-choice {
+  margin: 10px;
+  padding: 12px;
+  border: 1px solid #4a4436;
+  border-radius: 12px;
+  background: #1b1a15;
+  font-size: 12px;
+}
+.overwrite-choice > strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.recovery-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin: 12px 0 10px;
+}
+.recovery-confirm {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  margin: 6px 0 12px;
+  color: #d3d7d9;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.recovery-confirm input {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.notification-kinds {
+  display: grid;
+  gap: 8px;
+  margin-top: 13px;
+}
+/*
+  The label wraps its own text rather than a <span> of it: a screen reader has to find the name of
+  the control it is labelling, and one level of nesting is as deep as that search goes.
+*/
+.toggle-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  column-gap: 11px;
+  row-gap: 4px;
+  align-items: start;
+  border: 1px solid #2f3336;
+  border-radius: 11px;
+  background: #131517;
+  padding: 12px;
+  margin-top: 8px;
+  cursor: pointer;
+}
+.notification-kinds > .toggle-row {
+  margin-top: 0;
+}
+.toggle-row input {
+  grid-row: 1 / span 2;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+}
+.toggle-row strong,
+.toggle-row small {
+  grid-column: 2;
+  display: block;
+}
+.toggle-row strong {
+  color: #dce0e2;
+  font-size: 12px;
+}
+.toggle-row small {
+  color: #969ca0;
+  font-size: 11px;
+  line-height: 1.55;
+}
+/* What the switches above add up to, in one sentence, so the rule is legible before it is saved. */
+.settings-summary {
+  margin: 12px 0 0;
+  color: #b7bec2;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.link-button {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 12px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* The first screen's chips run the example instead of merely describing it. */
+.starter-capabilities button {
+  border: 1px solid #303438;
+  border-radius: 999px;
+  padding: 7px 12px;
+  background: #151719;
+  color: #d9dcde;
+  font-size: 12px;
+  cursor: pointer;
+}
+.starter-capabilities button:hover {
+  border-color: #51575b;
+  background: #1f2224;
+}
+
+/*
+ * The approval card was the last light-theme island in the shell: cream background with the
+ * inherited near-white body colour on top of it, so the action being approved was barely legible
+ * on the one card where reading it is the whole point. Same amber signal, dark surface.
+ */
+.approval-drawer {
+  background: #191713;
+  border-color: #4a4231;
+  box-shadow: 0 14px 38px #00000059;
+  color: #eceae4;
+}
+.approval-symbol {
+  background: #3a3120;
+  color: #e3c88a;
+}
+.approval-copy .eyebrow {
+  color: #d5b46a;
+}
+.approval-copy > p:not(.eyebrow) {
+  color: #cec9ba;
+}
+.approval-copy small {
+  color: #a29b8b;
+}
+
+/*
+ * `.usage-warning.elevated` outranks the plain `.usage-warning` dark contract on specificity, so
+ * the first storage warning anyone ever sees rendered as a cream card in an OLED-first shell. The
+ * critical variant was already covered; this is its missing twin.
+ */
+.usage-warning.elevated {
+  background: #22201c;
+  border-color: #5e5647;
+  color: #cbbb9c;
+}
+.usage-warning.elevated button {
+  background: #4c452f;
+  color: #f0e7d3;
+}
+
+/* ---------------------------------------------------------------------------
+ * Spend. The one figure a self-hoster pays for directly, so it leads the Usage
+ * pane rather than sitting under a disk gauge. Dark-only, like everything else.
+ */
+.spend-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding: 4px 0 14px;
+}
+.spend-card {
+  border: 1px solid #292c2f;
+  border-radius: 11px;
+  background: #151719;
+  padding: 11px 12px 12px;
+  min-width: 0;
+}
+.spend-card-label {
+  display: block;
+  font-size: 11px;
+  color: #8b9296;
+  letter-spacing: 0.02em;
+}
+.spend-card strong {
+  display: block;
+  margin-top: 3px;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  color: #e7e9ea;
+}
+.spend-card small {
+  display: block;
+  margin-top: 6px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: #7c8387;
+}
+.spend-card .meter.spend {
+  height: 5px;
+  border-radius: 10px;
+  margin: 9px 0 0;
+  overflow: hidden;
+}
+/* The window's own state drives the colour, so a breach is legible without reading the caption. */
+.spend-card.warning {
+  border-color: #5e5647;
+}
+.spend-card.warning .meter i {
+  background: linear-gradient(90deg, #8a7644, #d8bd7c);
+}
+.spend-card.exceeded {
+  border-color: #6b4a44;
+}
+.spend-card.exceeded strong {
+  color: #eab5aa;
+}
+.spend-card.exceeded .meter i {
+  background: linear-gradient(90deg, #8c4f43, #d99384);
+}
+.spend-note {
+  margin: 0 0 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #7c8387;
+}
+.spend-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 10px 0 9px;
+}
+.spend-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 2px 8px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+button.spend-bar {
+  cursor: pointer;
+}
+button.spend-bar:hover .spend-bar-name {
+  color: #e7e9ea;
+  text-decoration: underline;
+}
+.spend-bar-name {
+  font-size: 12px;
+  color: #c8ccce;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.spend-bar-value {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: #e7e9ea;
+}
+.spend-bar i {
+  grid-column: 1 / -1;
+  height: 4px;
+  border-radius: 10px;
+  background: linear-gradient(90deg, #8c9499, #c2c7ca);
+}
+.spend-bar small {
+  grid-column: 1 / -1;
+  font-size: 10.5px;
+  color: #757c80;
+}
+/* The cost of a conversation, on the conversation, where the decision to continue is made. */
+.task-spend {
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  color: #949b9f;
+}
+.task-spend::before {
+  content: ' · ';
+  color: #5c6266;
+}
+
+/*
+ * Leaving. An account you cannot delete and files you cannot take with you are not really yours,
+ * so both live at the bottom of the Server page, marked but not hidden.
+ */
+.danger-heading > svg {
+  color: #d0a097;
+}
+.danger-confirmation {
+  border-color: #684943;
+  background: #1a1615;
+}
+.danger-confirmation > strong {
+  color: #eecfc8;
+}
+.danger-confirmation code {
+  color: #eecfc8;
+}
+
+/* Standing instructions are a file on the agent computer, so they are edited as one. */
+.self-hosted-settings .brief-path {
+  font:
+    11px/1.5 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  color: #7c8387;
+  font-weight: 500;
+}
+.self-hosted-settings .brief-editor textarea {
+  min-height: 132px;
+  font:
+    12px/1.55 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+}
+
+/*
+ * Attachments as objects, not as text.
+ *
+ * The chip is the whole affordance: what the file is, how far up it is, and the one control that
+ * takes it back. It sits above the textarea inside the composer so it reads as part of the message
+ * being written rather than as a notification about it.
+ */
+.attachment-tray {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 0 0 9px;
+  padding: 0;
+  list-style: none;
+}
+.attachment-chip {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  max-width: 260px;
+  padding: 6px 7px;
+  border: 1px solid #2a2d30;
+  border-radius: 11px;
+  background: #151719;
+}
+.attachment-chip.failed {
+  border-color: #684943;
+  background: #1a1615;
+}
+.attachment-thumb {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border-radius: 7px;
+  object-fit: cover;
+  background: #1d2023;
+}
+.attachment-thumb.glyph {
+  display: grid;
+  place-items: center;
+  color: #8d9498;
+}
+.attachment-thumb.glyph svg {
+  width: 15px;
+  height: 15px;
+}
+.attachment-thumb.loading {
+  display: block;
+  background: linear-gradient(100deg, #1d2023, #26292c, #1d2023);
+}
+.attachment-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+.attachment-copy strong {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment-copy small,
+.attachment-copy a {
+  color: #8d9498;
+  font-size: 11px;
+}
+.attachment-copy a {
+  justify-self: start;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.attachment-chip.failed .attachment-copy small {
+  color: #eecfc8;
+}
+.attachment-progress {
+  display: block;
+  height: 3px;
+  margin-top: 2px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: #24272a;
+}
+.attachment-progress i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 120ms linear;
+}
+.attachment-remove {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #8d9498;
+  cursor: pointer;
+}
+.attachment-remove:hover {
+  background: #24272a;
+  color: #e7e9ea;
+}
+.attachment-remove svg {
+  width: 13px;
+  height: 13px;
+}
+.attachment-tray.sent {
+  margin: 8px 0 0;
+}
+
+/* Which model wrote the answer, when, and what that turn cost. Quiet until wanted. */
+.answer-meta {
+  display: block;
+  margin-top: 4px;
+  color: #6f767a;
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.assistant-message:hover .answer-meta,
+.assistant-message:focus-within .answer-meta {
+  opacity: 1;
+}
+@media (hover: none) {
+  .answer-meta {
+    opacity: 1;
+  }
+}
+
+/* What a research answer was based on, in front of the answer rather than inside a closed log. */
+.answer-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 11px 0 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: source;
+}
+.answer-sources a {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 7px;
+  align-items: center;
+  max-width: 250px;
+  padding: 5px 9px 5px 6px;
+  border: 1px solid #2a2d30;
+  border-radius: 999px;
+  background: #151719;
+  color: inherit;
+  text-decoration: none;
+}
+.answer-sources a:hover {
+  border-color: #3b4044;
+  background: #1a1d1f;
+}
+.source-index {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border-radius: 999px;
+  background: #24272a;
+  color: #b6bcc0;
+  font-size: 10px;
+  font-weight: 700;
+}
+.source-copy {
+  display: grid;
+  min-width: 0;
+}
+.source-copy strong {
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.source-copy small {
+  color: #7c8387;
+  font-size: 10px;
+}
+
+/* "Step 2 of 5" belongs where the spinner is, not one click behind it. */
+.task-activity-progress {
+  display: block;
+  height: 3px;
+  margin-top: 6px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: #24272a;
+}
+.task-activity-progress i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 200ms ease;
+}
+
+/* A long agentic task mounts a window of the transcript; this reaches the rest of it. */
+.earlier-in-conversation {
+  align-self: center;
+  margin: 4px auto 14px;
+  padding: 6px 14px;
+  border: 1px solid #2a2d30;
+  border-radius: 999px;
+  background: #151719;
+  color: #b6bcc0;
+  font-size: 12px;
+  cursor: pointer;
+}
+.earlier-in-conversation:hover {
+  border-color: #3b4044;
+  color: #e7e9ea;
+}
+
+/* The same control for the list of conversations, which is a list with the same shape of end. */
+.earlier-conversations {
+  width: 100%;
+  margin: 6px 0 10px;
+  padding: 7px 10px;
+  border: 1px solid #24272a;
+  border-radius: 9px;
+  background: none;
+  color: #8b9297;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.earlier-conversations:hover:not(:disabled) {
+  border-color: #34383b;
+  color: #d6dadd;
+}
+
+.earlier-conversations:disabled {
+  cursor: default;
+}
+
+/* The connection is down; the box is not. This says so without unmounting the workbench. */
+.offline-strip {
+  border-color: #4a4033;
+  background: #1a1713;
+  color: #e6d7c2;
+}
+.offline-strip svg {
+  width: 15px;
+  height: 15px;
+  flex: none;
+}
+
+/* Conversations grouped by when they were last touched. */
+.task-bucket-label {
+  margin: 12px 0 2px;
+  padding: 0 8px;
+  color: #6f767a;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.task-bucket:first-child .task-bucket-label {
+  margin-top: 0;
+}
+.search-result.active-result .task-row {
+  background: #1c1f21;
+  box-shadow: inset 0 0 0 1px #3b4044;
+}
+.task-elsewhere {
+  display: inline-flex;
+  gap: 3px;
+  align-items: center;
+  margin-right: 6px;
+  color: #8d9498;
+  font-style: normal;
+}
+.search-scope {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  padding: 4px 8px 0;
+  color: #8d9498;
+  font-size: 12px;
+}
+
+/* The shortcuts, in one place, because three of them existed and none were discoverable. */
+.shortcut-sheet {
+  width: min(420px, calc(100vw - 28px));
+}
+.shortcut-list {
+  display: grid;
+  gap: 2px;
+  margin: 14px 0 0;
+}
+.shortcut-list > div {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid #1e2123;
+}
+.shortcut-list dt,
+.shortcut-list dd {
+  margin: 0;
+}
+.shortcut-list dd {
+  color: #b6bcc0;
+  font-size: 13px;
+}
+.shortcut-list kbd {
+  display: inline-block;
+  padding: 3px 8px;
+  border: 1px solid #2f3336;
+  border-radius: 7px;
+  background: #17191b;
+  color: #cfd4d7;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+/*
+ * The relay. Off by default, and the screen says so before it says anything else, because turning
+ * it on puts a third party in the path of every connection to this box.
+ */
+.relay-status {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  gap: 11px;
+  align-items: center;
+  margin: 12px 0 0;
+  padding: 12px 14px;
+  border: 1px solid #2a2d30;
+  border-radius: 13px;
+  background: #141618;
+}
+.relay-status > span:nth-child(2) {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.relay-status strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.relay-status small {
+  color: #8d9498;
+  font-size: 12px;
+}
+.relay-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: #4a5054;
+}
+.relay-status.online .relay-dot {
+  background: #7fb894;
+}
+.relay-status.working .relay-dot {
+  background: #c6b378;
+}
+.relay-status.attention .relay-dot {
+  background: #d0a097;
+}
+.relay-address {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 8px;
+  padding: 9px 12px;
+  border: 1px solid #2a2d30;
+  border-radius: 11px;
+  background: #111315;
+}
+.relay-address code {
+  overflow: hidden;
+  flex: 1;
+  color: #cfd4d7;
+  font:
+    12px/1.5 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.relay-enroll {
+  display: grid;
+  gap: 9px;
+  margin-top: 12px;
+}
+.relay-enroll label {
+  display: grid;
+  gap: 4px;
+  color: #8d9498;
+  font-size: 12px;
+}
+.relay-enroll button {
+  justify-self: start;
+}
+.relay-list {
+  margin-top: 10px;
+}
+
+/*
+ * One pane switcher on a phone. The Inspector's own tab strip and the bottom bar were doing the
+ * same job twice, in 110px of an 812px screen, and only one of them reached every destination.
+ */
+@media (max-width: 800px) {
+  .inspector-tabs {
+    display: none;
+  }
+}
+
+/* The trajectory dialog predates the dark surface: its note kept a pale green card and grey-green
+   text from the superseded palette, which reads as a light patch on the near-black canvas. */
+.trajectory-scope-note {
+  border-color: var(--line);
+  background: var(--panel-soft);
+  color: var(--muted);
+}
+.trajectory-rewind {
+  display: grid;
+  gap: 6px;
+  margin-top: 16px;
+  padding: 0;
+  border: 0;
+}
+.trajectory-rewind legend {
+  padding: 0 0 6px;
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.trajectory-rewind label {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  cursor: pointer;
+}
+.trajectory-rewind label.selected {
+  border-color: var(--accent-muted);
+  background: var(--panel-strong);
+}
+.trajectory-rewind input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+.trajectory-rewind .rewind-label {
+  color: var(--text);
+  font-size: 13px;
+}
+.trajectory-rewind .rewind-hint {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.trajectory-rewind label.unavailable {
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* What the restore would actually do to the files, listed before it is agreed to. */
+.rewind-effects {
+  display: grid;
+  gap: 5px;
+  margin: 10px 0 0;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  list-style: none;
+  color: #c8ccce;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.rewind-effects .rewind-caveat {
+  color: #c4b69a;
+}
+
+/*
+  A mailbox is nine fields rather than the one or two the narrow-then-wide grid was drawn for, and
+  a port ending up in the wide column next to a host in the narrow one reads as two forms. Equal
+  columns keep every pair the same size as each other.
+*/
+.connect-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+/* Read-only or read-and-send, decided at connect time. Two rows, same shape as any other switch. */
+.access-choice {
+  display: grid;
+  gap: 8px;
+  margin-top: 13px;
+}
+.access-choice > .toggle-row {
+  margin-top: 0;
+}
+
+/* Everything athanor has said, across conversations: one row per message, newest first. */
+.notice-modal {
+  width: min(620px, calc(100vw - 32px));
+  max-height: min(760px, calc(100vh - 32px));
+  overflow: auto;
+}
+.notice-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+}
+.notice-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 11px;
+  align-items: start;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--panel-soft);
+  text-align: left;
+  cursor: pointer;
+}
+.notice-row:hover {
+  border-color: #41464a;
+  background: #1b1d1f;
+}
+.notice-row > svg {
+  width: 17px;
+  margin-top: 1px;
+  color: var(--muted);
+}
+.notice-row strong,
+.notice-row small {
+  display: block;
+}
+.notice-row strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+.notice-row small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.notice-row:disabled {
+  cursor: default;
+}
+.notice-row:disabled:hover {
+  border-color: var(--line);
+  background: var(--panel-soft);
+}
+
+/*
+  Generated media, under the spend report it belongs to. The rows reuse .settings-list so a
+  generation reads like every other thing the owner has on this box; only the three states need
+  colour, and only failure needs to be loud — it is the one an owner was never told about.
+*/
+.media-jobs {
+  margin-top: 15px;
+}
+.media-availability {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin: 8px 0 0;
+  color: #7c8387;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.media-availability.refused {
+  color: #9a8f8c;
+}
+.media-availability svg {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+}
+.media-job-list {
+  margin-top: 10px;
+}
+.media-job.live {
+  border-color: #3c4c55;
+}
+.media-job.failed {
+  border-color: #5c3f3a;
+}
+.media-job-status {
+  color: #b6bcc0;
+}
+.media-job.failed .media-job-status {
+  color: #d6a79f;
+}
+/* Specific enough to beat the shared settings-list button styling: this is a link, not a control. */
+.self-hosted-settings .settings-list button.media-job-task {
+  display: inline-block;
+  min-height: 0;
+  margin-top: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  color: #9aa7ae;
+  font-size: 11px;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.self-hosted-settings .settings-list button.media-job-task:hover {
+  color: #dce0e2;
+}
+
+/*
+  The thirteen things an API token may be granted. Each row is the sentence and the tick together,
+  because a checkbox labelled with a scope string is a decision made without the facts.
+*/
+.token-scopes {
+  display: grid;
+  gap: 6px;
+  margin-top: 13px;
+  padding: 0;
+  border: 0;
+}
+.token-scopes legend {
+  padding: 0 0 6px;
+  color: #969ca0;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.self-hosted-settings .token-scopes label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  margin: 0;
+  padding: 9px 11px;
+  border: 1px solid #2f3336;
+  border-radius: 10px;
+  background: #131517;
+  cursor: pointer;
+}
+.token-scopes input {
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+.token-scopes strong {
+  display: block;
+  color: #dce0e2;
+  font-size: 12px;
+}
+.token-scopes small {
+  display: block;
+  grid-column: 2;
+  margin-top: 3px;
+  color: #969ca0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/*
+  The one rewind that leaves the transcript alone. It has to be findable afterwards: everything
+  above and below it reads the same, and every file underneath it changed.
+*/
+.computer-rewound {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  margin: 14px 40px;
+  padding: 14px;
+  border: 1px solid #4a545a;
+  border-radius: 13px;
+  background: #171a1c;
+}
+.computer-rewound > svg {
+  width: 20px;
+  color: #a8b6bd;
+}
+.computer-rewound strong {
+  display: block;
+  font-size: 13px;
+}
+.computer-rewound > div > span {
+  display: block;
+  margin-top: 3px;
+  color: #9aa19c;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.computer-rewound button {
+  border-radius: 8px;
+  padding: 7px 12px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+@media (width <= 720px) {
+  .computer-rewound {
+    grid-template-columns: 22px minmax(0, 1fr);
+    margin: 14px 0;
+  }
+  .computer-rewound button {
+    grid-column: 2;
+    justify-self: start;
+  }
+}
+
+/*
+ * A resource athanor's own message asked this browser to fetch from somewhere else, and did not
+ * get. It is styled as a fact rather than as an error: nothing has gone wrong with the client, and
+ * the owner is being told where the thing lives so they can decide whether to go and look.
+ */
+.blocked-resource {
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
+  max-width: 100%;
+  padding: 3px 9px;
+  border: 1px dashed #3b4044;
+  border-radius: 999px;
+  background: #151719;
+  color: #9aa19c;
+  font-size: 12px;
+  line-height: 1.5;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.blocked-resource::before {
+  content: '⃠';
+  color: #7d8489;
+}
+a.blocked-resource:hover {
+  border-color: #555b5f;
+  background: #1a1d1f;
+  color: #c5cacc;
+}
+
+/*
+ * The same fact, said once at the foot of the message that asked for it.
+ *
+ * Warmer than the inline mark and cooler than an error, because nothing has gone wrong for the
+ * owner — a request was not made. It carries the left rule the other provenance surfaces use, so a
+ * reader recognises the family before reading a word of it.
+ */
+.markdown .blocked-resource-summary {
+  margin: 14px 0 0;
+  padding: 8px 0 8px 12px;
+  border-left: 2px solid #4a4033;
+}
+.markdown .blocked-resource-summary strong {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: #c9bda9;
+}
+.markdown .blocked-resource-summary span {
+  display: block;
+  margin-top: 2px;
+  color: #8d9599;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * The point in a conversation where content nobody here wrote entered it.
+ *
+ * Drawn as a divider rather than as an alert. Nothing has gone wrong — a research task crosses this
+ * line on purpose — but everything below it was produced by a model with an outsider's text in its
+ * context, and that is worth seeing without being alarmed by.
+ */
+.external-content-mark {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  margin: 16px 40px;
+  padding: 9px 0;
+  border-top: 1px solid #2a2d30;
+  border-bottom: 1px solid #2a2d30;
+}
+.external-content-mark > svg {
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  color: #8d9599;
+}
+.external-content-mark strong {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: #c5cacc;
+}
+.external-content-mark span {
+  display: block;
+  margin-top: 2px;
+  color: #8d9599;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* The same fact, gathered, for a conversation the owner was not watching while it ran. */
+.provenance-summary {
+  margin: 14px 40px;
+  border: 1px solid #2a2d30;
+  border-radius: 11px;
+  background: #151719;
+}
+.provenance-summary > summary {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 14px;
+  gap: 9px;
+  align-items: center;
+  padding: 9px 12px;
+  color: #a9b0b4;
+  font-size: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+.provenance-summary > summary::-webkit-details-marker {
+  display: none;
+}
+.provenance-summary > summary svg {
+  width: 14px;
+  height: 14px;
+  color: #7d8489;
+}
+.provenance-summary[open] > summary svg:last-child {
+  transform: rotate(90deg);
+}
+.provenance-summary > div {
+  padding: 0 12px 11px 37px;
+}
+.provenance-summary .eyebrow {
+  margin: 6px 0 3px;
+  color: #7d8489;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.provenance-summary ul {
+  margin: 0;
+  padding-left: 16px;
+  color: #b6bcc0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.provenance-summary p:not(.eyebrow) {
+  margin: 0;
+  color: #8d9599;
+  font-size: 12px;
+  line-height: 1.5;
+}
+@media (width <= 720px) {
+  .external-content-mark,
+  .provenance-summary {
+    margin-right: 0;
+    margin-left: 0;
+  }
+}
+
+/*
+ * The model's own working. Quiet by default and folded once the answer arrives: it is how the
+ * answer was reached, which is worth being able to see and not worth being shown by default at the
+ * top of what was asked for. Open while it streams, because during those seconds it is the only
+ * thing happening.
+ */
+.agent-thinking {
+  border-left: 2px solid var(--line);
+  margin: 6px 0 10px;
+  padding-left: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.agent-thinking > summary {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  gap: 7px;
+  list-style: none;
+  padding: 2px 0;
+  user-select: none;
+}
+.agent-thinking > summary::-webkit-details-marker {
+  display: none;
+}
+.agent-thinking > summary svg {
+  height: 14px;
+  width: 14px;
+}
+.agent-thinking > summary:hover {
+  color: var(--accent);
+}
+.agent-thinking[open] > summary {
+  margin-bottom: 4px;
+}
+.agent-thinking p:last-child {
+  margin-bottom: 0;
+}

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <radialGradient id="background" cx="22%" cy="13%" r="100%">
+      <stop stop-color="#242628"/>
+      <stop offset=".48" stop-color="#111315"/>
+      <stop offset="1" stop-color="#08090a"/>
+    </radialGradient>
+    <linearGradient id="metal" x1="96" y1="83" x2="318" y2="365">
+      <stop stop-color="#fbfbfb"/>
+      <stop offset=".34" stop-color="#9fa4a8"/>
+      <stop offset=".64" stop-color="#eff0f0"/>
+      <stop offset="1" stop-color="#686e72"/>
+    </linearGradient>
+    <linearGradient id="word" x1="365" y1="218" x2="855" y2="354">
+      <stop stop-color="#f4f5f5"/>
+      <stop offset=".43" stop-color="#b7bbbe"/>
+      <stop offset=".7" stop-color="#eeeeee"/>
+      <stop offset="1" stop-color="#8b9094"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#background)"/>
+  <circle cx="166" cy="123" r="290" fill="#fff" opacity=".018"/>
+  <rect x="72" y="76" width="1056" height="478" rx="38" fill="#fff" opacity=".018" stroke="#fff" stroke-opacity=".09"/>
+  <g transform="translate(102 140) scale(2.4)">
+    <path d="M48 24h32M52 24v20L33 85.5A14 14 0 0 0 45.8 104h36.4A14 14 0 0 0 95 85.5L76 44V24" fill="none" stroke="url(#metal)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M41 80h46M54 80c1.5-8.7 4.9-16.2 10-23 5.1 6.8 8.5 14.3 10 23" fill="none" stroke="url(#metal)" stroke-width="5.8" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="390" y="305" fill="url(#word)" font-family="Inter, Arial, sans-serif" font-size="110" font-weight="590" letter-spacing="-5">athanor</text>
+  <text x="397" y="376" fill="#b2b5b7" font-family="Inter, Arial, sans-serif" font-size="29" font-weight="420" letter-spacing="-.4">your private cloud computer, through chat</text>
+  <text x="397" y="436" fill="#777c7f" font-family="Inter, Arial, sans-serif" font-size="17" font-weight="430" letter-spacing="1.2">OPEN SOURCE · MANAGED OPEN-WEIGHT AI · ZERO CONTENT LOGGING</text>
+</svg>

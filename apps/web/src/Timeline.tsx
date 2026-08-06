@@ -1,0 +1,1127 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  AlertTriangle,
+  ArrowDown,
+  BellRing,
+  BookOpen,
+  Brain,
+  Check,
+  CheckCircle2,
+  ChevronRight,
+  CircleDollarSign,
+  Clock3,
+  ExternalLink,
+  FileOutput,
+  Globe2,
+  GitBranch,
+  Hourglass,
+  LoaderCircle,
+  MonitorUp,
+  Pencil,
+  RotateCcw,
+  ShieldAlert,
+  UserRoundCheck
+} from 'lucide-react';
+import type { BotWall, Task, TaskEvent } from './types.js';
+import { TaskPlanPanel, planProgress, useTaskPlan } from './TaskPlanPanel.js';
+import { CopyButton, Markdown } from './Markdown.js';
+import { DiffView } from './DiffView.js';
+import { fileChangesFromTool } from './diff.js';
+import {
+  activityOverview,
+  botWallClearance,
+  buildConversation,
+  compactResultSummary,
+  conversationCost,
+  formatBytes,
+  forkFamily,
+  formatTokens,
+  hostOf,
+  liveActivityId,
+  previewLifetime,
+  reasoningEffortLabel,
+  settledToolStarts,
+  type ConversationNode,
+  type ConversationSource,
+  type SpendPause
+} from './timeline-state.js';
+import { externalRead, provenanceReport, sourcesPhrase } from './provenance.js';
+import { completionCard, verificationReceiptLabel, type HarnessCheck } from './completion-card.js';
+import { terminalTaskStatuses } from './task-status.js';
+import { formatUsd } from './usage-model.js';
+import { fileKindLabel, splitAttachments } from './attachments.js';
+import { AttachmentStrip } from './AttachmentTray.js';
+
+type Surface = 'files' | 'computer' | 'terminal' | 'preview';
+
+/**
+ * The one page the agent cannot get past, said out loud.
+ *
+ * A challenge stops that tab and that site and nothing else: athanor keeps the browser and keeps
+ * working elsewhere, so this is a request rather than a stopped task. The one thing that clears it
+ * is a person opening the page, which is what the button is for.
+ */
+function Handoff({ wall, onOpenSurface }: { wall: BotWall; onOpenSurface?: (s: Surface) => void }) {
+  return (
+    <div className="handoff-card">
+      <ShieldAlert />
+      <div>
+        <p className="eyebrow">One page needs you</p>
+        <strong>{hostOf(wall.url)} is checking that a person is here</strong>
+        <span>
+          {wall.vendor}
+          {wall.reason ? ` · ${wall.reason}` : ''}
+        </span>
+        <p>
+          athanor will not answer a challenge on your behalf. It has left this page alone and is
+          carrying on with the rest of the work; {hostOf(wall.url)} stays closed to it until you
+          open it and hand the browser back. {botWallClearance(wall)}
+        </p>
+      </div>
+      {onOpenSurface && (
+        <button className="primary" onClick={() => onOpenSurface('computer')}>
+          Open it
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A run the owner's own spending ceiling stopped, said where they are reading.
+ *
+ * The box has already worked out the sentence — what was spent, against what, in which window — so
+ * all this adds is the way to act on it. Resume alone is not that: the ceiling is still where it
+ * was, and the next step would halt against it again.
+ */
+function SpendPauseCard({ pause, onOpenCaps }: { pause: SpendPause; onOpenCaps?: () => void }) {
+  return (
+    <div className="spend-pause-card">
+      <CircleDollarSign />
+      <div>
+        <p className="eyebrow">Paused by your spending cap</p>
+        <strong>{pause.message}</strong>
+      </div>
+      {onOpenCaps && (
+        <button className="primary" onClick={onOpenCaps}>
+          Spending caps
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** A message the agent chose to send, shown where it was decided as well as on the device. */
+function AgentNote({ headline, detail }: { headline: string; detail: string }) {
+  return (
+    <div className="agent-note">
+      <BellRing />
+      <div>
+        <p className="eyebrow">athanor told you</p>
+        <strong>{headline}</strong>
+        {detail && <Markdown>{detail}</Markdown>}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The computer went back; this conversation did not.
+ *
+ * The one rewind that forks nothing is also the one an owner can otherwise not see happened: the
+ * transcript above and below it is unchanged, and every file underneath it is different. So it gets
+ * a line of its own rather than a row inside a collapsed activity group.
+ */
+function ComputerRewound({ onOpenSurface }: { onOpenSurface?: (surface: Surface) => void }) {
+  return (
+    <div className="computer-rewound">
+      <RotateCcw />
+      <div>
+        <strong>The computer was put back</strong>
+        <span>
+          Files went back to an earlier point in this conversation. Nothing installed since then was
+          removed, and this conversation carried on from where it was.
+        </span>
+      </div>
+      {onOpenSurface && (
+        <button className="secondary" onClick={() => onOpenSurface('files')}>
+          Open files
+        </button>
+      )}
+    </div>
+  );
+}
+
+const payload = (event: TaskEvent) =>
+  event.payload && typeof event.payload === 'object'
+    ? (event.payload as Record<string, unknown>)
+    : {};
+const textValue = (value: unknown, fallback = ''): string =>
+  typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+    ? String(value)
+    : fallback;
+const truncateLongStrings = (_key: string, value: unknown): unknown =>
+  typeof value === 'string' && value.length > 4000 ? `${value.slice(0, 4000)}…` : value;
+
+function MessageActions({
+  markdown,
+  event,
+  onEdit,
+  onRetry,
+  onBranch
+}: {
+  markdown: string;
+  event: TaskEvent;
+  onEdit?: (event: TaskEvent) => void;
+  onRetry?: (event: TaskEvent) => void;
+  onBranch?: (event: TaskEvent) => void;
+}) {
+  return (
+    <span className="message-actions">
+      <CopyButton value={markdown} />
+      {onEdit && (
+        <button onClick={() => onEdit(event)} title="Edit this message and send it again">
+          <Pencil /> Edit
+        </button>
+      )}
+      {onRetry && (
+        <button onClick={() => onRetry(event)} title="Answer again from the message before this">
+          <RotateCcw /> Retry
+        </button>
+      )}
+      {onBranch && (
+        <button
+          onClick={() => onBranch(event)}
+          title="Start a branch here, keeping this conversation"
+        >
+          <GitBranch /> Branch
+        </button>
+      )}
+    </span>
+  );
+}
+
+function UserMessage({
+  node,
+  workspaceId,
+  onEdit,
+  onBranch
+}: {
+  node: Extract<ConversationNode, { kind: 'user' }>;
+  workspaceId: string | undefined;
+  onEdit?: (event: TaskEvent) => void;
+  onBranch?: (event: TaskEvent) => void;
+}) {
+  // The files the message carried are shown as files. They used to be a line of UUID paths inside
+  // the sentence, because that is literally what the message was.
+  const { body, paths } = splitAttachments(node.markdown);
+  return (
+    <article className="user-brief user-message">
+      {body && <Markdown>{body}</Markdown>}
+      <AttachmentStrip workspaceId={workspaceId} paths={paths} />
+      <MessageActions
+        markdown={body || node.markdown}
+        event={node.event}
+        {...(onEdit ? { onEdit } : {})}
+        {...(onBranch ? { onBranch } : {})}
+      />
+    </article>
+  );
+}
+
+const shortTime = (iso: string): string => {
+  const at = new Date(iso);
+  return Number.isNaN(at.getTime())
+    ? ''
+    : at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+};
+
+/**
+ * Which model wrote this, when, and what it cost.
+ *
+ * Model selection defaults to Automatic and re-ranks on every bootstrap, so the model that answered
+ * turn three may not be the one that answers turn four — and when a reply is wrong the first
+ * question is which model that was. All three facts were already in the event log and all three
+ * were folded into a collapsed activity group.
+ */
+function MessageMeta({
+  node,
+  modelName
+}: {
+  node: Extract<ConversationNode, { kind: 'assistant' }>;
+  modelName?: (id: string) => string;
+}) {
+  const parts = [
+    node.model ? (modelName?.(node.model) ?? node.model.split('/').pop()) : '',
+    shortTime(node.event.createdAt),
+    node.costUsd ? formatUsd(node.costUsd) : ''
+  ].filter(Boolean);
+  if (!parts.length) return null;
+  return <span className="message-meta answer-meta">{parts.join(' · ')}</span>;
+}
+
+/** What a research answer was actually based on, in front of the answer rather than inside a log. */
+function Sources({ sources }: { sources: ConversationSource[] }) {
+  return (
+    <ol className="answer-sources" aria-label="Sources for this answer">
+      {sources.map((source, index) => (
+        <li key={source.url}>
+          <a href={source.url} target="_blank" rel="noreferrer noopener">
+            <span className="source-index">{index + 1}</span>
+            <span className="source-copy">
+              <strong>{source.title}</strong>
+              <small>{source.host}</small>
+            </span>
+          </a>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function AssistantMessage({
+  node,
+  modelName,
+  onRetry,
+  onBranch
+}: {
+  node: Extract<ConversationNode, { kind: 'assistant' }>;
+  modelName?: (id: string) => string;
+  onRetry?: (event: TaskEvent) => void;
+  onBranch?: (event: TaskEvent) => void;
+}) {
+  return (
+    <article className="assistant-message">
+      <div className="ai-avatar" aria-hidden="true">
+        a
+      </div>
+      <div className="assistant-message-body">
+        <Markdown>{node.markdown}</Markdown>
+        {node.sources && node.sources.length > 0 && <Sources sources={node.sources} />}
+        {node.streaming ? (
+          <span className="streaming-caret" role="img" aria-label="Still writing" />
+        ) : (
+          <>
+            <MessageActions
+              markdown={node.markdown}
+              event={node.event}
+              {...(onRetry ? { onRetry } : {})}
+              {...(onBranch ? { onBranch } : {})}
+            />
+            <MessageMeta node={node} {...(modelName ? { modelName } : {})} />
+          </>
+        )}
+      </div>
+    </article>
+  );
+}
+
+function Event({
+  event,
+  onOpenSurface,
+  settled = false,
+  compactCompletion = false,
+  harness = []
+}: {
+  event: TaskEvent;
+  onOpenSurface?: (surface: Surface) => void;
+  settled?: boolean;
+  compactCompletion?: boolean;
+  /** The acceptance checks the harness ran for this completion, where the turn declared any. */
+  harness?: HarnessCheck[];
+}) {
+  const data = payload(event);
+  /*
+   * A plan event carries the plan, which the panel above the log already draws; its second line
+   * here read two payload fields no server has ever written, so every plan carried an empty one.
+   * A status line is a note about the run rather than an outcome, and both used to end with a tick
+   * beside sentences like "this turn is nearly out of steps".
+   */
+  if (event.kind === 'plan' || event.kind === 'status')
+    return (
+      <div className="cost-event">
+        <Clock3 />
+        <span>{event.summary}</span>
+      </div>
+    );
+  if (event.kind === 'tool_started') {
+    const changes = fileChangesFromTool(textValue(data.tool), data.arguments);
+    return (
+      <details className={`tool-event ${settled ? 'success' : ''}`}>
+        <summary>
+          {settled ? <Check /> : <LoaderCircle className="spin" />}
+          <span>{settled ? event.summary.replace(/^Running\s+/i, '') : event.summary}</span>
+          <ChevronRight />
+        </summary>
+        {changes.length > 0 ? (
+          changes.map((change) => (
+            <DiffView
+              key={`${event.id}-${change.path}`}
+              path={change.path}
+              before={change.before}
+              after={change.after}
+              defaultOpen={changes.length === 1}
+            />
+          ))
+        ) : (
+          <pre>{JSON.stringify(data.arguments ?? {}, null, 2)}</pre>
+        )}
+      </details>
+    );
+  }
+  if (event.kind === 'tool_result') {
+    const result = data.result as Record<string, unknown> | undefined;
+    const screenshot = result?.screenshotBase64;
+    const isDesktop = Boolean(result && ('activeApplication' in result || 'nodes' in result));
+    return (
+      <>
+        {typeof screenshot === 'string' && screenshot.length > 0 && (
+          <figure className="browser-capture-card">
+            <img
+              src={`data:image/jpeg;base64,${screenshot}`}
+              alt={
+                isDesktop
+                  ? 'Screenshot from the private agent computer'
+                  : 'Screenshot from the private browser'
+              }
+            />
+            <figcaption>
+              <span>
+                {isDesktop ? <MonitorUp /> : <Globe2 />}
+                <strong>
+                  {isDesktop
+                    ? textValue(result?.activeApplication, 'Agent computer')
+                    : textValue(result?.title, 'Private browser')}
+                </strong>
+              </span>
+              {onOpenSurface && (
+                <button onClick={() => onOpenSurface('computer')}>Open computer</button>
+              )}
+            </figcaption>
+          </figure>
+        )}
+        <details className="tool-event success">
+          <summary>
+            <Check />
+            <span>{event.summary}</span>
+            <ChevronRight />
+          </summary>
+          <pre>{JSON.stringify(data.result ?? {}, truncateLongStrings, 2)}</pre>
+        </details>
+      </>
+    );
+  }
+  if (event.kind === 'approval_requested')
+    return (
+      <div className="system-event approval">
+        <UserRoundCheck />
+        <div>
+          <strong>Waiting for your approval</strong>
+          <span>{event.summary}</span>
+        </div>
+      </div>
+    );
+  if (event.kind === 'artifact') {
+    const artifactId = textValue(data.artifactId);
+    const mimeType = textValue(data.mimeType, 'application/octet-stream');
+    const name = textValue(data.name, event.summary);
+    const size = formatBytes(Number(data.sizeBytes));
+    const url = artifactId ? `/v1/artifacts/${encodeURIComponent(artifactId)}/content` : '';
+    return (
+      <>
+        {url && mimeType === 'application/pdf' && (
+          <div className="pdf-review-card">
+            <iframe src={`${url}#toolbar=0&navpanes=0`} title={event.summary} />
+          </div>
+        )}
+        <div className={`artifact-card ${mimeType.startsWith('image/') ? 'with-preview' : ''}`}>
+          {url && mimeType.startsWith('image/') ? (
+            <a className="artifact-thumb" href={url} target="_blank" rel="noreferrer">
+              <img src={url} alt={name} loading="lazy" />
+            </a>
+          ) : (
+            <FileOutput />
+          )}
+          <div>
+            <strong>{name}</strong>
+            <span>
+              {fileKindLabel(mimeType, name)}
+              {size ? ` · ${size}` : ''}
+            </span>
+          </div>
+          <span className="artifact-actions">
+            {onOpenSurface && <button onClick={() => onOpenSurface('files')}>Files</button>}
+            {url && (
+              <a href={url} target="_blank" rel="noreferrer">
+                Open
+              </a>
+            )}
+            {url && (
+              <a href={url} download={name}>
+                Download
+              </a>
+            )}
+          </span>
+        </div>
+      </>
+    );
+  }
+  if (event.kind === 'preview') {
+    const url = textValue(data.url);
+    return (
+      <div className="preview-chat-card">
+        <span className="preview-chat-icon">
+          <MonitorUp />
+        </span>
+        <div>
+          <p className="eyebrow">
+            {textValue(data.visibility) === 'public' ? 'Published site' : 'Private preview'}
+          </p>
+          <strong>{textValue(data.label, event.summary)}</strong>
+          <span>
+            Port {textValue(data.port)} ·{' '}
+            {previewLifetime(typeof data.expiresAt === 'string' ? data.expiresAt : null)}
+          </span>
+        </div>
+        <span className="artifact-actions">
+          {onOpenSurface && <button onClick={() => onOpenSurface('preview')}>Preview</button>}
+          {url && (
+            <a href={url} target="_blank" rel="noreferrer">
+              <ExternalLink /> Open
+            </a>
+          )}
+        </span>
+      </div>
+    );
+  }
+  /*
+   * A crossing into untrusted content is not a warning, and drawing it as one teaches the owner to
+   * dismiss the row that matters most. It is a change of character in the transcript: from here on,
+   * everything the agent writes was produced with an outsider's text in its context. It is drawn as
+   * a divider across the conversation, at the point where that became true.
+   */
+  const crossing = externalRead(event);
+  if (crossing)
+    return (
+      <div className="external-content-mark">
+        <BookOpen />
+        <div>
+          <strong>Read content from {crossing.origin}</strong>
+          <span>
+            {crossing.tool ? `${crossing.tool} · ` : ''}Nobody here wrote it. Everything below was
+            produced with it in context.
+          </span>
+        </div>
+      </div>
+    );
+  // The heading used to be a fixed phrase that added nothing above `event.summary`, which already
+  // says what happened. What is worth a line of its own is what the owner can do about it.
+  if (event.kind === 'warning' || event.kind === 'error')
+    return (
+      <div className={`system-event ${event.kind}`}>
+        <AlertTriangle />
+        <div>
+          <strong>{event.summary}</strong>
+          {textValue(data.message) && <span>{textValue(data.message)}</span>}
+        </div>
+      </div>
+    );
+  if (event.kind === 'cost') {
+    const effort = reasoningEffortLabel(data.reasoningEffort);
+    return (
+      <div className="cost-event">
+        <CircleDollarSign />
+        <span>
+          {event.summary}
+          {effort ? ` · ${effort}` : ''}
+        </span>
+      </div>
+    );
+  }
+  if (event.kind === 'completed') {
+    const card = completionCard(event, harness);
+    const conciseSummary = compactCompletion ? compactResultSummary(card.summary) : card.summary;
+    const hasMore =
+      compactCompletion && conciseSummary !== compactResultSummary(card.summary, 50_000);
+    const receipt = verificationReceiptLabel(card);
+    return (
+      <div className={`completion-card task-result ${card.interrupted ? 'interrupted' : ''}`}>
+        {card.interrupted ? <Hourglass /> : <CheckCircle2 />}
+        <div>
+          <strong>{card.headline}</strong>
+          <p>{conciseSummary}</p>
+          {hasMore && (
+            <details className="result-details">
+              <summary>Full summary</summary>
+              <div className="completion-summary">
+                <Markdown>{card.summary}</Markdown>
+              </div>
+            </details>
+          )}
+          {/* The one thing a step-limited turn needs to hand over: what it did not get to. It is
+              open rather than folded away, because it is the reason this card is not a result. */}
+          {card.outstanding.length > 0 && (
+            <>
+              <span className="completion-outstanding-label">
+                Still open — reply to carry on from here
+              </span>
+              <ul className="completion-outstanding">
+                {card.outstanding.map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            </>
+          )}
+          {/* A tick worth less than the last one says so beside the tick, never inside a
+              disclosure: it is the difference between "this was proved" and "this passed checks
+              that were already passing", and it is unreadable anywhere else. */}
+          {card.harnessCaveats.map((caveat) => (
+            <span className="completion-harness-caveat" key={caveat}>
+              {caveat}
+            </span>
+          ))}
+          {receipt && (
+            <details className="result-details verification-receipt">
+              <summary>{receipt}</summary>
+              {/* The harness's own run leads, because it is the only evidence here that the agent
+                  did not write, and each line keeps the exit code it actually observed. */}
+              {card.harness.length > 0 && (
+                <ul className="harness-checks">
+                  {card.harness.map((check) => (
+                    <li
+                      key={check.id || check.label}
+                      className={check.passed ? 'passed' : 'failed'}
+                    >
+                      {check.passed ? <Check /> : <AlertTriangle />}
+                      <span>
+                        <strong>{check.label}</strong>
+                        <code>{check.detail}</code>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {card.harness.length > 0 && card.evidence.length > 0 && (
+                <p className="eyebrow">What the agent says it checked</p>
+              )}
+              {(card.evidence.length > 0 || card.caveats.length > 0) && (
+                <ul>
+                  {card.evidence.map((claim) => (
+                    <li key={claim}>{claim}</li>
+                  ))}
+                  {card.caveats.map((risk) => (
+                    <li key={risk}>Caveat: {risk}</li>
+                  ))}
+                </ul>
+              )}
+            </details>
+          )}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="cost-event">
+      <Check />
+      <span>{event.summary}</span>
+    </div>
+  );
+}
+
+/**
+ * `overview`, `settled` and `planSequence` are derived from the whole event log, which is why they
+ * are passed in rather than computed here: every group would otherwise re-derive them from the
+ * full array on every frame of a streaming answer.
+ */
+function ActivityLog({
+  task,
+  events,
+  overview,
+  settled,
+  planSequence,
+  live,
+  onOpenSurface
+}: {
+  task: Task;
+  events: Array<{ event: TaskEvent; index: number }>;
+  overview: string;
+  settled: (event: TaskEvent) => boolean;
+  planSequence: number;
+  /** Whether this is the group the agent is working in right now. */
+  live: boolean;
+  onOpenSurface?: (surface: Surface) => void;
+}) {
+  const terminal = terminalTaskStatuses.has(task.status);
+  const [open, setOpen] = useState(false);
+  const plan = useTaskPlan(task.id, planSequence);
+  const progress = live ? planProgress(plan?.steps ?? []) : null;
+  return (
+    <details
+      className={`task-activity ${terminal ? 'finished' : 'active'}`}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <span className="task-activity-icon">
+          {live && !terminal ? <LoaderCircle className="spin" /> : <CheckCircle2 />}
+        </span>
+        <span className="task-activity-copy">
+          <strong>{live && !terminal ? 'Agent activity' : 'Work log'}</strong>
+          {/*
+            "Step 2 of 5 · Writing a file" rather than "Thinking": the count is the answer to the
+            question a waiting owner is actually asking, and it used to cost a click to reach. It
+            belongs only to the group being worked in — every earlier group repeating the live
+            progress made the transcript claim the agent was in four places at once.
+          */}
+          <small>
+            {progress && !terminal
+              ? `Step ${Math.min(progress.completed + 1, progress.total)} of ${progress.total} · ${progress.current || overview}`
+              : live
+                ? overview
+                : `${events.length} ${events.length === 1 ? 'step' : 'steps'}`}
+          </small>
+          {progress && !terminal && (
+            <span
+              className="task-activity-progress"
+              role="progressbar"
+              aria-label={`${progress.completed} of ${progress.total} steps done`}
+              aria-valuenow={progress.completed}
+              aria-valuemin={0}
+              aria-valuemax={progress.total}
+            >
+              <i style={{ width: `${(progress.completed / progress.total) * 100}%` }} />
+            </span>
+          )}
+        </span>
+        <ChevronRight className="task-activity-chevron" />
+      </summary>
+      {open && (
+        <div className="task-activity-body">
+          <TaskPlanPanel task={task} refreshKey={planSequence} />
+          {events.map(({ event }) => (
+            <Event
+              key={event.id}
+              event={event}
+              settled={settled(event)}
+              {...(onOpenSurface ? { onOpenSurface } : {})}
+            />
+          ))}
+        </div>
+      )}
+    </details>
+  );
+}
+
+/**
+ * Sticks the view to the newest content only while the reader is already at the bottom. Streaming
+ * appends an event every ~160 characters, so an unconditional scroll makes it impossible to read
+ * anything earlier while the agent is still working.
+ */
+const useStickyScroll = (dependency: number) => {
+  const container = useRef<HTMLDivElement>(null);
+  const end = useRef<HTMLDivElement>(null);
+  const [pinned, setPinned] = useState(true);
+
+  const onScroll = useCallback(() => {
+    const node = container.current;
+    if (!node) return;
+    const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
+    setPinned(distance < 120);
+  }, []);
+
+  useEffect(() => {
+    if (pinned) end.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [dependency, pinned]);
+
+  const jump = useCallback(() => {
+    setPinned(true);
+    end.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, []);
+
+  return { container, end, pinned, onScroll, jump };
+};
+
+function CostSummary({ events }: { events: TaskEvent[] }) {
+  const total = conversationCost(events);
+  if (!total.inputTokens && !total.outputTokens) return null;
+  const cacheShare = total.inputTokens
+    ? Math.round((total.cachedInputTokens / total.inputTokens) * 100)
+    : 0;
+  return (
+    <div className="cost-event conversation-cost">
+      <CircleDollarSign />
+      <span>
+        {total.costUsd > 0 ? `${formatUsd(total.costUsd)} · ` : ''}
+        {formatTokens(total.inputTokens)} in · {formatTokens(total.outputTokens)} out
+        {cacheShare > 0 ? ` · ${cacheShare}% cached` : ''}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * What this conversation read from outside, and what it did after.
+ *
+ * It sits at the foot of the transcript beside the running cost, because both answer the same kind
+ * of question about a conversation the owner was not watching. A conversation that never left this
+ * computer draws nothing: the panel has to be rare enough to be read.
+ */
+function ProvenanceSummary({ events }: { events: TaskEvent[] }) {
+  const report = provenanceReport(events);
+  if (!report) return null;
+  const after = report.changes.reduce((total, change) => total + change.count, 0);
+  return (
+    <details className="provenance-summary">
+      <summary>
+        <BookOpen />
+        <span>
+          Read from outside · {sourcesPhrase(report.sources)} ·{' '}
+          {after > 0
+            ? `${after} action${after === 1 ? '' : 's'} after it`
+            : 'nothing changed after it'}
+        </span>
+        <ChevronRight />
+      </summary>
+      <div>
+        <p className="eyebrow">Where the content came from</p>
+        <ul>
+          {report.sources.map((source) => (
+            <li key={source}>{source}</li>
+          ))}
+        </ul>
+        <p className="eyebrow">What athanor did afterwards that changed something</p>
+        {report.changes.length > 0 ? (
+          <ul>
+            {report.changes.map((change) => (
+              <li key={change.label}>
+                {change.label}
+                {change.count > 1 ? ` · ${change.count} times` : ''}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>Nothing. Everything after the read was reading, thinking, or writing this answer.</p>
+        )}
+      </div>
+    </details>
+  );
+}
+
+const forkLabel: Record<string, string> = {
+  edit: 'Edited message',
+  retry: 'Regenerated answer',
+  branch: 'Branch'
+};
+
+/**
+ * "Version 2 of 3" across the forks taken from one point, with a way back to the original.
+ *
+ * This is the only place a fork is described now. The workbench header carried the same two facts —
+ * a "Branch" label under the title and an "Original" button beside it — so a forked conversation
+ * said it three times on one screen, and the header's version of it could not say which version of
+ * how many. The one case the header covered and this did not was a parent too old to be in the
+ * loaded list, which is why the way back is drawn from the task's own `parentTaskId` rather than
+ * from a sibling that happens to be on this device.
+ */
+function ForkBar({
+  task,
+  tasks,
+  onOpenTask
+}: {
+  task: Task;
+  tasks: Task[];
+  onOpenTask: (taskId: string) => void;
+}) {
+  const family = forkFamily(task, tasks);
+  const hasVersions = family.index >= 0 && family.versions.length > 1;
+  const parentId = family.parent?.id ?? task.parentTaskId ?? undefined;
+  if (!hasVersions && family.children.length === 0 && !parentId) return null;
+  return (
+    <div className="fork-bar">
+      <GitBranch />
+      {hasVersions ? (
+        <>
+          <button
+            disabled={family.index === 0}
+            aria-label="Previous version"
+            onClick={() => onOpenTask(family.versions[family.index - 1]!.id)}
+          >
+            ‹
+          </button>
+          <span>
+            {forkLabel[task.forkKind ?? 'branch'] ?? 'Branch'} · version {family.index + 1} of{' '}
+            {family.versions.length}
+          </span>
+          <button
+            disabled={family.index === family.versions.length - 1}
+            aria-label="Next version"
+            onClick={() => onOpenTask(family.versions[family.index + 1]!.id)}
+          >
+            ›
+          </button>
+        </>
+      ) : family.children.length > 0 ? (
+        <span>
+          {family.children.length} {family.children.length === 1 ? 'branch' : 'branches'} taken from
+          this conversation
+        </span>
+      ) : (
+        <span>{forkLabel[task.forkKind ?? 'branch'] ?? 'Branch'}</span>
+      )}
+      {parentId && (
+        <button className="fork-origin" onClick={() => onOpenTask(parentId)}>
+          Open original
+        </button>
+      )}
+    </div>
+  );
+}
+
+const starters = [
+  {
+    label: 'Build and host an app',
+    prompt: 'Build a small web app and host it on this computer, then show me the preview link.'
+  },
+  {
+    label: 'Analyze large files',
+    prompt:
+      'I will upload a large data file. Load it, summarise what is in it, and chart the trend.'
+  },
+  {
+    label: 'Research across the web',
+    prompt: 'Research this topic across several sources and write me a short briefing with links: '
+  }
+];
+
+/**
+ * How many transcript entries are mounted before the reader asks for more.
+ *
+ * A task the agent worked on for an hour replays its whole event log, and every node of it used to
+ * be rendered: thousands of DOM elements, screenshots included, before the newest message appears.
+ * The window is generous enough that an ordinary conversation never notices it exists.
+ */
+const VISIBLE_NODE_WINDOW = 80;
+
+export function Timeline({
+  task,
+  tasks = [],
+  events,
+  missing = false,
+  modelName,
+  onOpenSurface,
+  onOpenTask,
+  onOpenSpendCaps,
+  onBranch,
+  onEdit,
+  onRetry,
+  onStarter
+}: {
+  task: Task | undefined;
+  tasks?: Task[];
+  events: TaskEvent[];
+  missing?: boolean;
+  modelName?: (id: string) => string;
+  onOpenSurface?: (surface: Surface) => void;
+  onOpenTask?: (taskId: string) => void;
+  /** Where a run stopped by a spending ceiling sends the owner, since only they can raise it. */
+  onOpenSpendCaps?: () => void;
+  onBranch?: (event: TaskEvent) => void;
+  onEdit?: (event: TaskEvent) => void;
+  onRetry?: (event: TaskEvent) => void;
+  onStarter?: (prompt: string) => void;
+}) {
+  const scroll = useStickyScroll(events.length);
+  const status = task?.status ?? 'queued';
+  const [revealed, setRevealed] = useState(VISIBLE_NODE_WINDOW);
+  useEffect(() => setRevealed(VISIBLE_NODE_WINDOW), [task?.id]);
+  /*
+   * Every one of these reads the entire event log, and a streaming answer re-renders this component
+   * once per delta. Without the memo the whole transcript is rebuilt hundreds of times for a single
+   * reply — which on a phone is the entire interaction budget.
+   */
+  const transcript = useMemo(() => {
+    let planSequence = 0;
+    for (let index = events.length - 1; index >= 0; index -= 1)
+      if (events[index]!.kind === 'plan') {
+        planSequence = events[index]!.sequence;
+        break;
+      }
+    return {
+      nodes: buildConversation(events, status),
+      overview: activityOverview(status, events),
+      settled: settledToolStarts(events, status),
+      planSequence
+    };
+  }, [events, status]);
+  if (missing)
+    return (
+      <div className="empty-canvas">
+        <h1>That conversation is gone</h1>
+        <p>
+          It was deleted, or the link points at another install. Everything still here is in the
+          sidebar and in search.
+        </p>
+      </div>
+    );
+  // The empty canvas gives way the moment there is something to show, which for a brand new
+  // conversation is the optimistic copy of the message the user just sent.
+  if (!task && events.length === 0)
+    return (
+      // Five stacked elements used to stand between opening athanor and typing: an eyebrow that
+      // repeated the heading, the heading, a paragraph, the examples, and a note explaining that
+      // panes open when needed - which the interface demonstrates the first time it happens.
+      // What is left is the question and three concrete examples, because examples teach what
+      // this can do better than a sentence claiming it - and each one writes the first message.
+      <div className="empty-canvas">
+        <h1>What should we get done?</h1>
+        <div className="starter-capabilities">
+          {starters.map((starter) => (
+            <button key={starter.label} type="button" onClick={() => onStarter?.(starter.prompt)}>
+              {starter.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+
+  const hidden = Math.max(0, transcript.nodes.length - revealed);
+  const nodes = hidden ? transcript.nodes.slice(hidden) : transcript.nodes;
+  // Only the newest activity group is the one the agent is working in; the rest are history.
+  const lastActivityId = liveActivityId(transcript.nodes);
+
+  return (
+    <div
+      className="timeline-viewport"
+      ref={scroll.container}
+      onScroll={scroll.onScroll}
+      /* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- A scroll container that
+         cannot be reached from the keyboard is a WCAG 2.1.1 failure; the transcript is often the
+         only scrollable thing on screen and frequently contains no focusable element at all. */
+      tabIndex={0}
+      role="log"
+      aria-label={`Conversation: ${task?.title ?? 'New conversation'}`}
+    >
+      <div className="timeline">
+        {task && onOpenTask && <ForkBar task={task} tasks={tasks} onOpenTask={onOpenTask} />}
+        {hidden > 0 && (
+          <button
+            className="earlier-in-conversation"
+            onClick={() => setRevealed((current) => current + VISIBLE_NODE_WINDOW)}
+          >
+            Earlier in this conversation · {hidden} more
+          </button>
+        )}
+        {task && nodes.length === 0 && (
+          <div className="user-brief">
+            <p>{task.title}</p>
+            <span className="message-meta">
+              Sent to {modelName?.(task.modelId) ?? task.modelId.split('/').pop()}
+            </span>
+          </div>
+        )}
+        {nodes.map((node) => {
+          if (node.kind === 'user')
+            return (
+              <UserMessage
+                key={node.id}
+                node={node}
+                workspaceId={task?.workspaceId}
+                {...(onEdit ? { onEdit } : {})}
+                {...(onBranch ? { onBranch } : {})}
+              />
+            );
+          if (node.kind === 'assistant')
+            return (
+              <AssistantMessage
+                key={node.id}
+                node={node}
+                {...(modelName ? { modelName } : {})}
+                {...(onRetry ? { onRetry } : {})}
+                {...(onBranch ? { onBranch } : {})}
+              />
+            );
+          if (node.kind === 'queued')
+            return (
+              <article className="user-brief queued-user-message" key={node.id}>
+                <Markdown>{node.markdown}</Markdown>
+                <span className="message-meta">
+                  <Clock3 /> Queued · runs after the current turn
+                </span>
+              </article>
+            );
+          if (node.kind === 'thinking')
+            return (
+              <details className="agent-thinking" key={node.id} open={node.streaming}>
+                <summary>
+                  <Brain />
+                  {node.streaming ? 'Thinking' : 'How it got there'}
+                </summary>
+                <Markdown>{node.markdown}</Markdown>
+              </details>
+            );
+          if (node.kind === 'activity')
+            return task ? (
+              <ActivityLog
+                key={node.id}
+                task={task}
+                events={node.events}
+                overview={transcript.overview}
+                settled={transcript.settled}
+                planSequence={transcript.planSequence}
+                live={node.id === lastActivityId}
+                {...(onOpenSurface ? { onOpenSurface } : {})}
+              />
+            ) : null;
+          if (node.kind === 'handoff')
+            return (
+              <Handoff
+                key={node.id}
+                wall={node.wall}
+                {...(onOpenSurface ? { onOpenSurface } : {})}
+              />
+            );
+          if (node.kind === 'told')
+            return (
+              <AgentNote
+                key={node.id}
+                headline={node.notice.headline}
+                detail={node.notice.detail}
+              />
+            );
+          if (node.kind === 'rewound')
+            return <ComputerRewound key={node.id} {...(onOpenSurface ? { onOpenSurface } : {})} />;
+          if (node.kind === 'paused')
+            return (
+              <SpendPauseCard
+                key={node.id}
+                pause={node.pause}
+                {...(onOpenSpendCaps ? { onOpenCaps: onOpenSpendCaps } : {})}
+              />
+            );
+          if (node.kind === 'completion')
+            return (
+              <Event
+                key={node.id}
+                event={node.event}
+                compactCompletion
+                {...(node.harness ? { harness: node.harness } : {})}
+              />
+            );
+          return (
+            <Event key={node.id} event={node.event} {...(onOpenSurface ? { onOpenSurface } : {})} />
+          );
+        })}
+        {/* Shown while the money is being spent, not only once it has been: the cost events are
+            already in the stream and waiting for the task to finish is waiting too long. */}
+        <ProvenanceSummary events={events} />
+        <CostSummary events={events} />
+        <div ref={scroll.end} />
+      </div>
+      {!scroll.pinned && (
+        <button className="jump-to-latest" onClick={scroll.jump} title="Jump to the newest message">
+          <ArrowDown /> Latest
+        </button>
+      )}
+    </div>
+  );
+}

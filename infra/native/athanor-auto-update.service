@@ -1,0 +1,14 @@
+[Unit]
+Description=athanor unattended update
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# `athanor update` rebuilds the checkout, replaces the runtime, and restarts every unit,
+# so this one deliberately runs without the sandboxing the long-lived services use.
+ExecStart=/usr/local/bin/athanor auto-update run
+# Bounded, because this runs unattended and the server is stopped for most of it. `athanor update`
+# bounds each of its own steps as well; this is the backstop for the run as a whole, including the
+# half-hour it may spend waiting for a running task to finish before it starts.
+TimeoutStartSec=2h

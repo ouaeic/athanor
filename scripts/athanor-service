@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+root_dir="${ATHANOR_ROOT:-/opt/athanor}"
+node="${ATHANOR_NODE:-/usr/bin/node}"
+
+case "${1:-}" in
+  api) entry="apps/api/dist/index.js" ;;
+  worker) entry="apps/worker/dist/index.js" ;;
+  registry) entry="services/model-registry/dist/index.js" ;;
+  media) entry="services/media-orchestrator/dist/index.js" ;;
+  notifications) entry="services/notifications/dist/index.js" ;;
+  runner) entry="services/workspace-runner/dist/index.js" ;;
+  *)
+    echo "Usage: athanor-service {api|worker|registry|media|notifications|runner}" >&2
+    exit 1
+    ;;
+esac
+
+cd "$root_dir"
+exec "$node" "$entry"

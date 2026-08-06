@@ -1,0 +1,65 @@
+[Unit]
+Description=athanor native agent computer
+PartOf=athanor.target
+After=network-online.target
+Wants=network-online.target
+# The runner is the unit an agent command can wedge, so it must always be allowed back. Under the
+# default start limit a crash loop - a command that exhausts memory, a browser that will not
+# start - leaves the unit `failed` and never retried.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=athanor
+Group=athanor
+# Agent commands run as athanor-agent, a different account, and reach their workspace through
+# this shared group. Without it the runner could not read back what a command wrote.
+SupplementaryGroups=athanor-agent
+WorkingDirectory=/opt/athanor
+EnvironmentFile=/etc/athanor/runner.env
+ExecStart=/usr/local/lib/athanor/athanor-service runner
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+# Group-writable so the runner and the agent account can each work on the same workspace files;
+# nothing for anyone else. The browser profile is created 0700 in code and stays owner-only.
+UMask=0007
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# An agent command is a child of this unit, so without this it could read the runner's own
+# /proc entry - and with it every variable the runner was started with. Paired with the separate
+# account for agent commands: hidepid hides processes belonging to *other* users, so it only
+# means anything once the command is not running as the runner.
+ProtectProc=invisible
+
+# Everything the agent runs stays in this unit's control group, so these bound the whole agent
+# computer at once. PostgreSQL, the API and the interface share this machine, and without a
+# ceiling a hallucinated command takes them down rather than only itself. Reclaim begins at
+# MemoryHigh and only the hard cap kills, so a heavy build finishes slowly instead of being
+# killed outright.
+MemoryHigh=60%
+MemoryMax=80%
+# Swapping a runaway command out does not save the box; it makes every other service crawl and
+# fills the disk with swap on the way.
+MemorySwapMax=0
+# Where a fork bomb stops. The per-command RLIMIT_NPROC is deliberately lower, so the offending
+# command fails first and the runner keeps enough headroom to reap it.
+TasksMax=4096
+LimitNOFILE=65536
+# A core dump from an out-of-memory command is the size of the memory it was using, written to
+# the disk these limits exist to protect.
+LimitCORE=0
+# A command killed for memory must not stop the runner: the correct consequence is one failed
+# tool call, not a workspace that disappears from under every other task.
+OOMPolicy=continue
+# Weight rather than CPUQuota: a quota would slow legitimate work even on an idle machine, while
+# a weight gives the agent the whole processor when nothing else wants it and yields to the
+# database and the API when they do.
+CPUWeight=50
+IOWeight=50
+
+[Install]
+WantedBy=multi-user.target

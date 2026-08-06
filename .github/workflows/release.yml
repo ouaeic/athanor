@@ -1,0 +1,356 @@
+name: Release clients
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9 # v6.0.8
+        with:
+          version: 11.9.0
+          run_install: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - id: release
+        env:
+          ATHANOR_RELEASE_TAG: ${{ github.ref_name }}
+        run: pnpm release:check
+      - run: pnpm license:check
+      - run: pnpm license:rust
+      - run: pnpm native:configure
+      - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+
+  desktop:
+    name: ${{ matrix.name }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-22.04
+            args: ''
+            rust-targets: ''
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            args: ''
+            rust-targets: ''
+          - name: macOS universal
+            runner: macos-15
+            args: '--target universal-apple-darwin'
+            rust-targets: 'x86_64-apple-darwin,aarch64-apple-darwin'
+          - name: Windows x64
+            runner: windows-2025
+            args: '--config src-tauri/tauri.windows.release.conf.json'
+            rust-targets: ''
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9 # v6.0.8
+        with:
+          version: 11.9.0
+          run_install: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install --yes
+          libwebkit2gtk-4.1-dev
+          libappindicator3-dev
+          librsvg2-dev
+          patchelf
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm native:configure
+      - name: Require Apple distribution and notarization credentials
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.ATHANOR_MACOS_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.ATHANOR_MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.ATHANOR_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.ATHANOR_APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.ATHANOR_APPLE_TEAM_ID }}
+        run: |
+          test -n "$APPLE_CERTIFICATE"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$APPLE_ID"
+          test -n "$APPLE_PASSWORD"
+          test -n "$APPLE_TEAM_ID"
+      - name: Import the protected Windows signing certificate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.ATHANOR_WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.ATHANOR_WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE -or -not $env:WINDOWS_CERTIFICATE_PASSWORD) {
+            throw "Protected Windows signing credentials are required"
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "athanor-release.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          )
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate `
+            -FilePath $certificatePath `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password $password
+          if (-not $certificate.HasPrivateKey) {
+            throw "The Windows release certificate has no private key"
+          }
+          $config = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $certificate.Thumbprint
+                digestAlgorithm = "sha256"
+                timestampUrl = "http://timestamp.digicert.com"
+              }
+            }
+          }
+          $config |
+            ConvertTo-Json -Depth 4 |
+            Set-Content apps/desktop/src-tauri/tauri.windows.release.conf.json -Encoding utf8
+      - name: Remove build-machine paths from native artifacts
+        run: node apps/desktop/release-build-env.mjs --github-env
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.ATHANOR_MACOS_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.ATHANOR_MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.ATHANOR_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.ATHANOR_APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.ATHANOR_APPLE_TEAM_ID }}
+        with:
+          projectPath: apps/desktop
+          tauriScript: pnpm exec tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: 'athanor ${{ needs.validate.outputs.version }}'
+          releaseBody: |
+            Native athanor clients. This release is a draft until the documented
+            platform-signing and packaged-client acceptance gates are complete.
+          releaseDraft: true
+          prerelease: false
+          retryAttempts: 2
+          args: ${{ matrix.args }}
+      - name: Verify native artifact privacy
+        run: node apps/desktop/check-native-binary.mjs apps/desktop/src-tauri/target
+      - name: Verify macOS signing, notarization, and stapling
+        if: runner.os == 'macOS'
+        run: |
+          app_count=$(
+            find apps/desktop/src-tauri/target -type d -name athanor.app | wc -l | tr -d ' '
+          )
+          dmg_count=$(
+            find apps/desktop/src-tauri/target -type f -name '*.dmg' | wc -l | tr -d ' '
+          )
+          test "$app_count" -eq 1
+          test "$dmg_count" -eq 1
+          app=$(find apps/desktop/src-tauri/target -type d -name athanor.app)
+          dmg=$(find apps/desktop/src-tauri/target -type f -name '*.dmg')
+          node apps/desktop/verify-macos-artifact.mjs \
+            "$app" \
+            --require-distribution \
+            --expected-architectures=arm64,x86_64
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --display --verbose=4 "$app" 2>&1 | grep 'TeamIdentifier='
+          xcrun stapler validate "$app"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type execute --verbose=2 "$app"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+      - name: Verify Windows Authenticode signatures and timestamps
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $artifacts = Get-ChildItem `
+            apps/desktop/src-tauri/target/release/bundle `
+            -Recurse `
+            -File |
+            Where-Object { $_.Extension -in ".exe", ".msi" }
+          if ($artifacts.Count -lt 2) {
+            throw "Expected signed Windows application and installer artifacts"
+          }
+          foreach ($artifact in $artifacts) {
+            $signature = Get-AuthenticodeSignature $artifact.FullName
+            if ($signature.Status -ne "Valid" -or -not $signature.TimeStamperCertificate) {
+              throw "Invalid or untimestamped Authenticode signature: $($artifact.FullName)"
+            }
+          }
+
+  android:
+    name: Android universal
+    needs: [validate, desktop]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9 # v6.0.8
+        with:
+          version: 11.9.0
+          run_install: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            apps/desktop/src-tauri/gen/android/**/*.gradle*
+            apps/desktop/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - name: Install pinned Android SDK components
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;29.0.14206865'
+      - name: Export the pinned NDK path
+        run: echo "NDK_HOME=${ANDROID_HOME}/ndk/29.0.14206865" >> "$GITHUB_ENV"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm native:configure
+      - name: Require protected Android signing credentials
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ATHANOR_ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ATHANOR_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ATHANOR_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ATHANOR_ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE_BASE64"
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
+      - name: Materialize the protected Android keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ATHANOR_ANDROID_KEYSTORE_BASE64 }}
+        run: printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "${RUNNER_TEMP}/athanor-release.jks"
+      - name: Build, sign, and audit Android APK and app bundle
+        env:
+          CI: true
+          CARGO_TARGET_DIR: ${{ runner.temp }}/athanor-target
+          GRADLE_USER_HOME: ${{ runner.temp }}/athanor-gradle
+          ATHANOR_ANDROID_KEYSTORE: ${{ runner.temp }}/athanor-release.jks
+          ATHANOR_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ATHANOR_ANDROID_KEYSTORE_PASSWORD }}
+          ATHANOR_ANDROID_KEY_ALIAS: ${{ secrets.ATHANOR_ANDROID_KEY_ALIAS }}
+          ATHANOR_ANDROID_KEY_PASSWORD: ${{ secrets.ATHANOR_ANDROID_KEY_PASSWORD }}
+          ATHANOR_ANDROID_REQUIRE_SIGNED: '1'
+        run: pnpm --filter @athanor/desktop android:build -- --apk --aab --ci
+      - name: Attach signed Android artifacts to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mapfile -t assets < <(
+            find apps/desktop/src-tauri/gen/android/app/build/outputs \
+              -type f \( -name '*.apk' -o -name '*.aab' \) | sort
+          )
+          test "${#assets[@]}" -eq 2
+          gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+
+  ios:
+    name: iOS App Store
+    needs: [validate, desktop]
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9 # v6.0.8
+        with:
+          version: 11.9.0
+          run_install: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: aarch64-apple-ios
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm native:configure
+      - name: Require protected iOS distribution credentials
+        env:
+          IOS_CERTIFICATE: ${{ secrets.ATHANOR_IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.ATHANOR_IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.ATHANOR_IOS_MOBILE_PROVISION }}
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.ATHANOR_APPLE_TEAM_ID }}
+        run: |
+          test -n "$IOS_CERTIFICATE"
+          test -n "$IOS_CERTIFICATE_PASSWORD"
+          test -n "$IOS_MOBILE_PROVISION"
+          test -n "$APPLE_DEVELOPMENT_TEAM"
+      - name: Build, sign, and audit the iOS App Store package
+        env:
+          CI: true
+          CARGO_TARGET_DIR: ${{ runner.temp }}/athanor-target
+          IOS_CERTIFICATE: ${{ secrets.ATHANOR_IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.ATHANOR_IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.ATHANOR_IOS_MOBILE_PROVISION }}
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.ATHANOR_APPLE_TEAM_ID }}
+        run: >-
+          pnpm --filter @athanor/desktop ios:build --
+          --target aarch64
+          --ci
+          --export-method app-store-connect
+      - name: Attach the signed iOS artifact to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          asset_count=$(
+            find apps/desktop/src-tauri/gen/apple/build -type f -name '*.ipa' | wc -l | tr -d ' '
+          )
+          test "$asset_count" -eq 1
+          asset=$(find apps/desktop/src-tauri/gen/apple/build -type f -name '*.ipa')
+          gh release upload "${GITHUB_REF_NAME}" "$asset" --clobber
+
+  checksums:
+    needs: [validate, desktop, android, ios]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download draft release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download "${GITHUB_REF_NAME}" --dir release-assets
+      - name: Create SHA-256 manifest
+        working-directory: release-assets
+        run: |
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' |
+            sort -z |
+            xargs -0 sha256sum > "${RUNNER_TEMP}/ATHANOR_SHA256SUMS"
+          mv "${RUNNER_TEMP}/ATHANOR_SHA256SUMS" SHA256SUMS
+      - name: Upload SHA-256 manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" release-assets/SHA256SUMS --clobber

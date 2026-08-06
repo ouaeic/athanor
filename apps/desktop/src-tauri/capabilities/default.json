@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "System and file permissions only for the bundled bootstrap document",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:event:default", "notification:default", "deep-link:default"]
+}

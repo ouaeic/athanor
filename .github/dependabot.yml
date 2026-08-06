@@ -1,0 +1,21 @@
+version: 2
+# Keep release actions reviewable; workflows pin every action to an immutable commit.
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      javascript:
+        patterns: ['*']
+  - package-ecosystem: cargo
+    directory: /apps/desktop/src-tauri
+    schedule: { interval: weekly }
+    groups:
+      rust:
+        patterns: ['*']
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      actions:
+        patterns: ['*']

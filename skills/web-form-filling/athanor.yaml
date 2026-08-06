@@ -1,0 +1,33 @@
+schema: 1
+id: web-form-filling
+version: 2.1.0
+catalog_line: 'Enumerate, plan, batch-fill and read back any web form or portal; submit only on approval.'
+
+lineage:
+  parent: null
+  origin: builtin
+  approved_by: null
+  approved_at: null
+
+requires:
+  tools: [browser_snapshot, read_elements, browser_action, file_read, files_list, image_read]
+  binaries: []
+
+capability:
+  fs.read: ['$WORKSPACE/**']
+  fs.write: ['$WORKSPACE/**']
+  net.hosts: []
+  exec: []
+  connectors: []
+  spend: none
+
+verify:
+  - check: 'Every planned field was read back with read_elements after the batch that set it and holds the intended value with no validation message.'
+  - check: 'No upload, Enter press or submit click travelled inside a batch; each was its own approved call.'
+  - check: 'The completed form was presented to the owner and explicitly approved before submitting.'
+  - check: 'After submission a reference number or re-fetched record confirms it landed.'
+  - check: 'Any field populated by the site own autofill was read back and corrected against the owner source data rather than accepted.'
+
+budget:
+  max_body_tokens: 5000
+  max_activation_ms: 1800000

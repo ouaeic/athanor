@@ -1,0 +1,41 @@
+node_modules/
+.pnpm-store/
+dist/
+coverage/
+.env
+.env.local
+.DS_Store
+__pycache__/
+*.py[cod]
+._*
+*.log
+/data/
+.athanor/
+.opencloud/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/android/buildSrc/.kotlin/
+services/workspace-runner/workspaces/
+playwright-report/
+test-results/
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+
+# Design notes are working research: they weigh other people's software against ours, which is
+# exactly what research does and exactly what this project must never publish. They stay on the
+# machine of whoever wrote them. The engineering conclusions belong in the code, next to the code.
+docs/design/
+
+# The names the published-text check watches for. Committing a list of other people's products to
+# the repository that exists to never discuss them would break the rule it enforces, so the list
+# stays local. See the header inside the file.
+scripts/guarded-product-names.txt
+
+# Working material for the orchestration build - design notes, same rule as docs/design/.
+.orchestration-plan.md
+
+# Isolated worktrees created for parallel agent work; never part of a release.
+.claude/worktrees/

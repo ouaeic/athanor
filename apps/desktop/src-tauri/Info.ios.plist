@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>CFBundleURLName</key>
+      <string>org.athanor.ai</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>athanor</string>
+      </array>
+    </dict>
+  </array>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSExceptionDomains</key>
+    <dict>
+      <key>localhost</key>
+      <dict>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key>
+        <true/>
+        <key>NSIncludesSubdomains</key>
+        <false/>
+      </dict>
+    </dict>
+  </dict>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_athanor._tcp</string>
+  </array>
+  <key>NSCameraUsageDescription</key>
+  <string>athanor uses the camera only when you choose to attach a photo to a task on your remote computer.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>athanor looks for your paired computer on the local network so it can reconnect directly.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>athanor uses the microphone only while you record a voice note for a task on your remote computer.</string>
+  <key>NSPhotoLibraryUsageDescription</key>
+  <string>athanor reads only the photos you explicitly select for a task on your remote computer.</string>
+</dict>
+</plist>

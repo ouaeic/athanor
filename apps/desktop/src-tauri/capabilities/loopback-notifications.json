@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "loopback-notifications",
+  "description": "Native notifications only for the private in-app loopback gateway",
+  "local": false,
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://localhost:*/*"]
+  },
+  "platforms": ["android", "iOS"],
+  "permissions": ["notification:default"]
+}

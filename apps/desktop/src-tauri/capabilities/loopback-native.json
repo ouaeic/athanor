@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "loopback-native",
+  "description": "Folder grants only for the private in-app loopback gateway",
+  "local": false,
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://localhost:*/*"]
+  },
+  "permissions": [
+    "allow-native-capabilities",
+    "allow-choose-folder",
+    "allow-revoke-folder",
+    "allow-list-local-folder",
+    "allow-read-local-file"
+  ]
+}

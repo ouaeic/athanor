@@ -1,0 +1,45 @@
+schema: 1
+id: deployment
+version: 2.0.0
+catalog_line: 'Run an app here: bind 0.0.0.0, prove it with curl, preview it, say what a restart ends.'
+
+lineage:
+  parent: null
+  origin: builtin
+  approved_by: null
+  approved_at: null
+
+requires:
+  tools:
+    [
+      shell,
+      process,
+      publish_preview,
+      publish_site,
+      file_read,
+      file_write,
+      browser_snapshot,
+      browser_action,
+      files_list
+    ]
+  binaries: [systemctl, journalctl]
+
+capability:
+  fs.read: ['$WORKSPACE/**']
+  fs.write: ['$WORKSPACE/**']
+  net.hosts: []
+  exec: [systemctl, journalctl, curl]
+  connectors: []
+  spend: none
+
+verify:
+  - run: 'curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:PORT/health'
+    assert: 'expected status code and expected response body'
+  - check: 'The health check passed twice, sixty seconds apart, so a crash loop cannot pass.'
+  - check: 'The rollback command is written down and was validated before the switch.'
+  - check: 'Public publishing, if any, was explicitly approved by the owner.'
+  - check: 'The report says how long the app stays up on its own, and no systemd service was described as installed unless the owner installed it.'
+
+budget:
+  max_body_tokens: 5000
+  max_activation_ms: 1800000

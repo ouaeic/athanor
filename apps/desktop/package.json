@@ -1,0 +1,23 @@
+{
+  "name": "@athanor/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
+    "test": "node --test release-build-env.test.mjs verify-android-artifact.test.mjs verify-ios-artifact.test.mjs verify-macos-artifact.test.mjs",
+    "native:build": "node verify-native-config.mjs && node build-native.mjs",
+    "info": "tauri info",
+    "android:init": "tauri android init",
+    "android:dev": "tauri android dev",
+    "android:build": "node build-mobile.mjs android",
+    "android:verify": "node verify-android-artifact.mjs",
+    "ios:init": "tauri ios init",
+    "ios:dev": "tauri ios dev",
+    "ios:build": "node build-mobile.mjs ios",
+    "ios:verify": "node verify-ios-artifact.mjs",
+    "macos:verify": "node verify-macos-artifact.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4"
+  }
+}
