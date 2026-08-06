@@ -35,6 +35,8 @@ export interface User {
   /** Choices the server holds for this owner, so every device they sign in on agrees. */
   preferences?: {
     model?: { automatic: boolean; preference: 'fast' | 'balanced' | 'best'; modelId: string };
+    /** Where this owner was, so a device that launches with no address to go on can go there. */
+    place?: { taskId?: string | null; workspaceId?: string | null };
   };
 }
 

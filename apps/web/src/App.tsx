@@ -222,6 +222,18 @@ export function App() {
   useEffect(() => {
     writeInspectorChoice({ open: inspectorOpen, tab: inspectorTab });
   }, [inspectorOpen, inspectorTab]);
+  // Where the owner is, told to the box so the next device can start there. Debounced like the
+  // model choice, and only once the server's own answer has arrived, so opening the app never
+  // reports the blank conversation it shows for an instant on the way to the real one.
+  useEffect(() => {
+    if (!serverPreferencesLoaded.current || !workspaceId) return;
+    const timer = window.setTimeout(() => {
+      void api
+        .savePreferences({ place: { taskId: taskId ?? null, workspaceId } })
+        .catch(() => undefined);
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [taskId, workspaceId]);
   useEffect(() => {
     if (trajectory?.operation !== 'edit') return;
     const frame = window.requestAnimationFrame(() => trajectoryPrompt.current?.focus());
@@ -327,13 +339,23 @@ export function App() {
       const requestedWorkspaceId = requested.get('workspace') ?? undefined;
       const requestedTask = next.tasks.find((item) => item.id === requestedTaskId);
       const requestedWorkspace = next.workspaces.find((item) => item.id === requestedWorkspaceId);
+      // Where the box last saw this owner, used only when the address says nothing. A link always
+      // wins — following one is a deliberate instruction about where to go, and the saved place is
+      // only a guess at where they would otherwise want to be. Installed to a home screen there is
+      // never a query to read, which is exactly the case this exists for.
+      const place = requestedTaskId || requestedWorkspaceId ? undefined : next.user.preferences?.place;
+      const resumedTaskId = requestedTaskId ?? place?.taskId ?? undefined;
+      const resumedTask = requestedTask ?? next.tasks.find((item) => item.id === resumedTaskId);
       // A linked conversation is kept even when the bootstrap page does not carry it; it is
       // fetched on demand below rather than silently redirecting the user to a blank new task.
-      setTaskId((current) => current ?? requestedTaskId);
+      setTaskId((current) => current ?? resumedTaskId);
       setWorkspaceId((current) =>
         current && next.workspaces.some((item) => item.id === current)
           ? current
-          : (requestedTask?.workspaceId ?? requestedWorkspace?.id ?? next.workspaces[0]?.id)
+          : (resumedTask?.workspaceId ??
+            requestedWorkspace?.id ??
+            next.workspaces.find((item) => item.id === place?.workspaceId)?.id ??
+            next.workspaces[0]?.id)
       );
     } catch (cause) {
       /*

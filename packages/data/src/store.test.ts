@@ -277,11 +277,15 @@ describe('DataStore', () => {
     await store.mergeUserPreferences(user.id, {
       model: { automatic: false, preference: 'best', modelId: 'vendor/one' }
     });
-    // A second device saving a different key must not erase the first.
-    const merged = await store.mergeUserPreferences(user.id, { somethingElse: true });
+    // A second device saving a different key must not erase the first. `place` is the live example:
+    // it is written every time the owner opens another conversation, so if this merged badly it
+    // would silently reset the model choice several times an hour.
+    const merged = await store.mergeUserPreferences(user.id, {
+      place: { taskId: 'task-one', workspaceId: 'workspace-one' }
+    });
     expect(merged).toMatchObject({
       model: { automatic: false, preference: 'best', modelId: 'vendor/one' },
-      somethingElse: true
+      place: { taskId: 'task-one', workspaceId: 'workspace-one' }
     });
     await expect(store.getUserById(user.id)).resolves.toMatchObject({
       preferences: { model: { modelId: 'vendor/one' } }

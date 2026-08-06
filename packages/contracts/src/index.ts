@@ -1234,6 +1234,23 @@ export const OwnerPreferences = z.object({
       preference: z.enum(['fast', 'balanced', 'best']),
       modelId: z.string().max(200)
     })
+    .optional(),
+  /**
+   * Which conversation, on which computer, the owner had open.
+   *
+   * Held here rather than in the address bar, because the address bar is the one place a second
+   * device cannot see. Installed to a home screen the app launches at `/` with no query at all, so
+   * every launch landed on a blank new conversation however long the owner had spent in an old one
+   * - the opposite of picking up where they left off, on the device most likely to be picked up.
+   *
+   * Nullable rather than absent when there is no conversation: a new conversation is a real place to
+   * be, and the owner who deliberately left one should not be returned to it by the next device.
+   */
+  place: z
+    .object({
+      taskId: Id.nullish(),
+      workspaceId: Id.nullish()
+    })
     .optional()
 });
 export type OwnerPreferences = z.infer<typeof OwnerPreferences>;
