@@ -153,6 +153,11 @@ const conversationalKinds = new Set([
   'artifact',
   'preview',
   'approval_requested',
+  // The answer belongs beside the question. Without this the request sat in the transcript reading
+  // "Waiting for your approval" for as long as the conversation existed, while the decision that
+  // answered it was filed inside a collapsed activity group - so the one thing the owner might scroll
+  // back to check, whether they said yes, was the one thing the transcript would not say.
+  'approval_resolved',
   'warning',
   'error',
   'completed'

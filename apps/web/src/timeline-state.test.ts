@@ -1010,3 +1010,30 @@ describe('how long a preview lasts', () => {
     expect(previewLifetime('not a date')).toBe('stays available');
   });
 });
+
+describe('an approval and the answer it got', () => {
+  /*
+   * The request was conversational and the decision was not, so the transcript kept the question in
+   * plain sight and filed the answer inside a collapsed activity group. Scrolling back to check
+   * whether you had said yes told you only that something was waiting for you.
+   */
+  it('keeps the decision in the transcript beside the request', () => {
+    const nodes = buildConversation(
+      [
+        event(1, 'approval_requested', { approvalId: 'a1', sideEffect: 'writes a file' }),
+        event(2, 'approval_resolved', { approvalId: 'a1', decision: 'approved' })
+      ],
+      'running'
+    );
+    // Nothing was filed away into a collapsed group, and both rows are in the transcript in order.
+    expect(nodes.some((node) => node.kind === 'activity')).toBe(false);
+    const shown = nodes.flatMap((node) => ('event' in node ? [node.event.kind] : []));
+    expect(shown).toEqual(['approval_requested', 'approval_resolved']);
+  });
+
+  it('keeps a request nobody answered on its own', () => {
+    const nodes = buildConversation([event(1, 'approval_requested', { approvalId: 'a1' })], 'running');
+    const shown = nodes.flatMap((node) => ('event' in node ? [node.event.kind] : []));
+    expect(shown).toEqual(['approval_requested']);
+  });
+});

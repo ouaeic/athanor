@@ -47,6 +47,10 @@ export const useTaskPlan = (taskId: string, refreshKey: number): TaskPlan | null
   useEffect(() => {
     let active = true;
     setPlan(null);
+    // An empty id is a caller saying it does not want the plan on this render - a work log from
+    // twenty minutes ago has no use for today's. Hooks cannot be called conditionally, so the
+    // condition lives here instead, and the request is simply not made.
+    if (!taskId) return;
     const read = () =>
       void api
         .taskPlan(taskId)

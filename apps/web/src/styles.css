@@ -975,6 +975,15 @@ select:focus-visible {
   background: #fff8e8;
   border-color: #f0d9a7;
 }
+/* The answer is quieter than the question. A request is a thing to act on and is coloured like one;
+   a decision already taken is a record, and colouring it the same made a finished conversation look
+   like a screen full of things still wanting attention. Theme variables, so this is right in the
+   dark shell without a second rule that can be forgotten. */
+.system-event.approval[class*='decision-'] {
+  background: var(--panel-soft);
+  border-color: var(--line);
+  color: var(--text);
+}
 .system-event.error {
   background: #fff0ed;
   border-color: #edcbc4;

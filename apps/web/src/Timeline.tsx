@@ -20,7 +20,8 @@ import {
   Pencil,
   RotateCcw,
   ShieldAlert,
-  UserRoundCheck
+  UserRoundCheck,
+  XCircle
 } from 'lucide-react';
 import type { BotWall, Task, TaskEvent } from './types.js';
 import { TaskPlanPanel, planProgress, useTaskPlan } from './TaskPlanPanel.js';
@@ -416,11 +417,35 @@ function Event({
       <div className="system-event approval">
         <UserRoundCheck />
         <div>
-          <strong>Waiting for your approval</strong>
+          {/*
+            Stated in the past, because that is where it is by the time anyone reads it back. It
+            said "Waiting for your approval" whether or not it had been waited on, so every answered
+            request in the history of the conversation went on claiming to be blocked. What is
+            actually still waiting has its own card, which is unmissable and carries the buttons.
+          */}
+          <strong>Approval requested</strong>
           <span>{event.summary}</span>
         </div>
       </div>
     );
+  if (event.kind === 'approval_resolved') {
+    const decision = textValue(data.decision, 'resolved');
+    return (
+      <div className={`system-event approval decision-${decision}`}>
+        {decision === 'approved' ? <CheckCircle2 /> : <XCircle />}
+        <div>
+          <strong>
+            {decision === 'approved'
+              ? 'You approved this'
+              : decision === 'expired'
+                ? 'Expired before it was answered'
+                : 'You did not approve this'}
+          </strong>
+          <span>{event.summary}</span>
+        </div>
+      </div>
+    );
+  }
   if (event.kind === 'artifact') {
     const artifactId = textValue(data.artifactId);
     const mimeType = textValue(data.mimeType, 'application/octet-stream');
@@ -653,7 +678,10 @@ function ActivityLog({
 }) {
   const terminal = terminalTaskStatuses.has(task.status);
   const [open, setOpen] = useState(false);
-  const plan = useTaskPlan(task.id, planSequence);
+  // Only the live group asks. This component is mounted once per activity group, so the plan - one
+  // record on the box - was fetched once per group, and every one of those reads was discarded by
+  // the `live ?` below except the last.
+  const plan = useTaskPlan(live ? task.id : '', planSequence);
   const progress = live ? planProgress(plan?.steps ?? []) : null;
   return (
     <details
@@ -697,7 +725,13 @@ function ActivityLog({
       </summary>
       {open && (
         <div className="task-activity-body">
-          <TaskPlanPanel task={task} refreshKey={planSequence} />
+          {/*
+            The plan belongs to the conversation, not to one group of its steps, and it is a live
+            editor with a Save button. Rendered in every group, a work log from twenty minutes ago
+            presented today's plan as its own under a heading reading "Live plan", and expanding two
+            groups put two editors for one record on the screen at once.
+          */}
+          {live && <TaskPlanPanel task={task} refreshKey={planSequence} />}
           {events.map(({ event }) => (
             <Event
               key={event.id}
