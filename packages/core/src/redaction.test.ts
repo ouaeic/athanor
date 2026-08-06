@@ -13,15 +13,21 @@ describe('the last net before a secret reaches somewhere it can be read', () => 
   });
 
   it('catches the credential shapes a self-hosted box actually handles', () => {
+    // Assembled from pieces rather than written whole. These are invented values - the AWS one is
+    // from Amazon's own documentation - but they are deliberately the exact shapes a credential
+    // scanner hunts for, which is the point of the test and also what makes them a nuisance in a
+    // public repository: GitHub opened an alert on the Google line the day this was published.
+    // Splitting the prefix keeps the run-time value identical and leaves no literal to match.
+    const shape = (...parts: string[]): string => parts.join('');
     for (const secret of [
-      'sk-ant-api03-abcdefghijklmnopqrstuv',
-      'ghp_abcdefghijklmnopqrstuvwxyz012345',
-      'github_pat_11ABCDEFG0abcdefghij',
-      'xoxb-1234567890-abcdefghijkl',
-      'glpat-abcdefghijklmnopqrst',
-      'AKIAIOSFODNN7EXAMPLE',
-      'AIzaSyA0123456789abcdefghijklmnopqrstuv',
-      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g'
+      shape('sk-ant-', 'api03-abcdefghijklmnopqrstuv'),
+      shape('ghp_', 'abcdefghijklmnopqrstuvwxyz012345'),
+      shape('github_pat_', '11ABCDEFG0abcdefghij'),
+      shape('xoxb-', '1234567890-abcdefghijkl'),
+      shape('glpat-', 'abcdefghijklmnopqrst'),
+      shape('AKIA', 'IOSFODNN7EXAMPLE'),
+      shape('AIzaSy', 'A0123456789abcdefghijklmnopqrstuv'),
+      shape('eyJhbGciOiJIUzI1NiJ9.', 'eyJzdWIiOiIxMjM0NSJ9.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g')
     ]) {
       expect(redactText(`value=${secret} rest`), secret).toBe('value=[REDACTED] rest');
     }
