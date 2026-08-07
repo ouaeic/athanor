@@ -44,17 +44,55 @@ export const resolveInside = (root: string, requested = '.'): string => {
   return resolved;
 };
 
+const ARTIFACTS = path.join('.athanor', 'artifacts');
+
+const isUserData = (relative: string): boolean =>
+  relative === 'workspace' ||
+  relative.startsWith(`workspace${path.sep}`) ||
+  relative === ARTIFACTS ||
+  relative.startsWith(`${ARTIFACTS}${path.sep}`);
+
+/**
+ * The container's own directories, which are not the agent's and are never a bare name's meaning.
+ * `.athanor` holds the runner's private state - the browser profile among it - and `.config` the
+ * guest's settings. `workspace` is left out on purpose: a path already rooted there is user data
+ * and is accepted above before this is consulted.
+ */
+const CONTAINER_ONLY = new Set(['.athanor', '.config']);
+
+/**
+ * Where a path the agent gave means what the agent meant by it.
+ *
+ * Commands run in `workspace/`, so an agent that has just listed its own directory and asks to
+ * write `notes.md` means `workspace/notes.md`. This resolved against the container one level up
+ * instead, where nothing of the agent's lives and nothing is writable, so the write was refused -
+ * and the agent, told only that the path was wrong, guessed at prefixes and spent the owner's
+ * money doing it. A plain relative name is therefore read the way the shell reads it.
+ *
+ * Only a plain one. A path that is absolute, that steps upwards through `..`, or that names one of
+ * the container's own directories is resolved and checked exactly as before, and refused if it
+ * lands outside the two roots. Folding those back inside would answer an attempt worth seeing with
+ * a write worth nothing: an agent reaching for `.athanor/browser/Cookies` should be told no, not
+ * quietly handed `workspace/.athanor/browser/Cookies`. This changes which directory a bare name
+ * starts from, not what any path is allowed to reach.
+ */
 export const assertUserDataPath = (root: string, requested = 'workspace'): string => {
-  const resolved = resolveInside(root, requested);
-  const relative = path.relative(path.resolve(root), resolved);
-  const artifacts = path.join('.athanor', 'artifacts');
-  const allowed =
-    relative === 'workspace' ||
-    relative.startsWith(`workspace${path.sep}`) ||
-    relative === artifacts ||
-    relative.startsWith(`${artifacts}${path.sep}`);
-  if (!allowed) throw new Error('Only workspace files and published artifacts are accessible');
-  return relative;
+  const resolvedRoot = path.resolve(root);
+  const asGiven = path.relative(resolvedRoot, resolveInside(root, requested));
+  if (isUserData(asGiven)) return asGiven;
+  const segments = requested.split(/[/\\]/).filter(Boolean);
+  const bareName =
+    !path.isAbsolute(requested) &&
+    !segments.includes('..') &&
+    !CONTAINER_ONLY.has(segments[0] ?? '');
+  if (bareName) {
+    const nested = path.relative(
+      resolvedRoot,
+      resolveInside(root, path.join('workspace', requested))
+    );
+    if (isUserData(nested)) return nested;
+  }
+  throw new Error('Only workspace files and published artifacts are accessible');
 };
 
 const rejectSymlinkComponents = async (

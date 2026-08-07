@@ -4652,6 +4652,10 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         // `logo.png` or `generated/logo.png` - which the schema's wording invites - would have had
         // its file refused after the provider had already billed for it. Resolving the destination
         // first turns that into a free refusal, and a bare name into the obvious thing.
+        //
+        // `assertUserDataPath` reads a bare name the same way, so this predicts the runner rather
+        // than departing from it. It stays because prediction is the point: the check has to happen
+        // on this side of the provider's invoice, not at the write.
         const extension = kind === 'image' ? 'png' : 'mp3';
         const requested = textValue(call.arguments.path).trim().replace(/^\.\//, '');
         if (requested.split('/').includes('..'))

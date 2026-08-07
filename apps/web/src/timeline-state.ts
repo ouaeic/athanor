@@ -650,14 +650,20 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
       // frames underneath it can be dropped from the log. It supersedes the open node rather than
       // extending it: a client that watched the stream has those frames already, and appending
       // would show the same thinking twice over.
+      //
+      // Frames merge whether the task is still running or is being replayed. Merging used to be
+      // for live turns only, so a conversation reloaded after it finished broke the one block its
+      // author had watched arrive into a frame-by-frame stack of identical "How it got there"
+      // rows - forty of them for a turn that streamed as one. The reader of a finished task is
+      // owed what the reader of a running one saw.
       const markdown = payloadText(event, 'markdown');
       const whole = eventPayload(event).replace === true;
       const openThinking = nodes[nodes.length - 1];
-      if (openThinking?.kind === 'thinking' && !terminal) {
+      if (openThinking?.kind === 'thinking') {
         nodes[nodes.length - 1] = {
           ...openThinking,
           markdown: whole ? markdown : openThinking.markdown + markdown,
-          streaming: true
+          streaming: !terminal
         };
         return;
       }

@@ -72,6 +72,19 @@ describe('the model\u2019s own working', () => {
     expect(thinking[0]).toMatchObject({ markdown: 'Let me check the file.', streaming: true });
   });
 
+  it('joins them the same way once the task is finished and the log is replayed', () => {
+    // Merging was for live turns only, so reloading a finished conversation broke the one block its
+    // author had watched arrive into a row per frame, each headed the same three words. A turn that
+    // streamed as one paragraph came back as forty of them.
+    const nodes = buildConversation(
+      [reasoning('1', 'Let me '), reasoning('2', 'check the file.')],
+      'completed'
+    );
+    const thinking = nodes.filter((node) => node.kind === 'thinking');
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0]).toMatchObject({ markdown: 'Let me check the file.', streaming: false });
+  });
+
   it('supersedes the frames with the row that carries the whole of the thinking', () => {
     // That row exists so the frames can be dropped from the log; a client that watched them arrive
     // still has them, and appending it would show the same thinking a second time.

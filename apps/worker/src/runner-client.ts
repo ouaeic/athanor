@@ -72,6 +72,11 @@ const isTimeout = (error: unknown): boolean => asRecord(error)?.name === 'Timeou
  * `Workspace tool failed (409): {…}` threw every one of them away and left the model a JSON blob to
  * guess at. A body that is not shaped like that keeps the old sentence, since there is nothing else
  * to say about it.
+ *
+ * The file routes below used to answer with the bare status instead - `File write failed (400)`,
+ * for a runner that had already said which paths it accepts. A model cannot act on a number, so it
+ * guessed at paths and spent the owner's money doing it. Every route reports the reason it was
+ * given.
  */
 const runnerFailure = async (response: Response): Promise<Error> => {
   const body = (await response.text().catch(() => '')).slice(0, 4_000);
@@ -259,7 +264,7 @@ export class AgentRunnerClient {
       },
       FILE_REQUEST_TIMEOUT_MS
     );
-    if (!response.ok) throw new Error(`File read failed (${response.status})`);
+    if (!response.ok) throw await runnerFailure(response);
     return response.text();
   }
 
@@ -282,7 +287,7 @@ export class AgentRunnerClient {
       },
       FILE_REQUEST_TIMEOUT_MS
     );
-    if (!response.ok) throw new Error(`File read failed (${response.status})`);
+    if (!response.ok) throw await runnerFailure(response);
     return { content: await response.text(), sha256: response.headers.get('x-content-sha256') };
   }
 
@@ -327,7 +332,7 @@ export class AgentRunnerClient {
       },
       FILE_REQUEST_TIMEOUT_MS
     );
-    if (!response.ok) throw new Error(`File read failed (${response.status})`);
+    if (!response.ok) throw await runnerFailure(response);
     const count = (header: string): number | undefined => {
       const raw = response.headers.get(header);
       return raw === null || !Number.isFinite(Number(raw)) ? undefined : Number(raw);
@@ -365,7 +370,7 @@ export class AgentRunnerClient {
       },
       FILE_REQUEST_TIMEOUT_MS
     );
-    if (!response.ok) throw new Error(`Image read failed (${response.status})`);
+    if (!response.ok) throw await runnerFailure(response);
     const mimeType =
       response.headers.get('content-type')?.split(';', 1)[0] ?? 'application/octet-stream';
     if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mimeType)) {
@@ -394,7 +399,7 @@ export class AgentRunnerClient {
       },
       FILE_REQUEST_TIMEOUT_MS
     );
-    if (!response.ok) throw new Error(`Artifact read failed (${response.status})`);
+    if (!response.ok) throw await runnerFailure(response);
     return {
       mimeType:
         response.headers.get('content-type')?.split(';', 1)[0] ?? 'application/octet-stream',
@@ -423,7 +428,7 @@ export class AgentRunnerClient {
       },
       FILE_REQUEST_TIMEOUT_MS
     );
-    if (!response.ok) throw new Error(`Artifact snapshot failed (${response.status})`);
+    if (!response.ok) throw await runnerFailure(response);
     return response.json();
   }
 
@@ -451,7 +456,7 @@ export class AgentRunnerClient {
       },
       FILE_REQUEST_TIMEOUT_MS
     );
-    if (!response.ok) throw new Error(`File write failed (${response.status})`);
+    if (!response.ok) throw await runnerFailure(response);
     return response.json();
   }
 }

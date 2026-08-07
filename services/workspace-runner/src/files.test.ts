@@ -54,8 +54,31 @@ describe('workspace files', () => {
     expect(assertUserDataPath(root, '.athanor/artifacts/result.png')).toBe(
       '.athanor/artifacts/result.png'
     );
-    expect(() => assertUserDataPath(root, 'root/.codex/auth.json')).toThrow('Only workspace files');
+    expect(() => assertUserDataPath(root, '/etc/shadow')).toThrow('escapes workspace');
     expect(() => assertUserDataPath(root, '.athanor/browser/Cookies')).toThrow(
+      'Only workspace files'
+    );
+    expect(() => assertUserDataPath(root, '.config/gh/hosts.yml')).toThrow('Only workspace files');
+  });
+
+  /*
+   * Commands run in `workspace/`, so a bare name has to mean there and not in the container above
+   * it. It used to mean the container, which is unwritable, and the agent was told only that the
+   * path was wrong - so it burned turns guessing prefixes. The refusals above are the other half:
+   * a name that reaches for the container's own directories is still answered, not redirected.
+   */
+  it('reads a bare name from the directory commands actually run in', () => {
+    expect(assertUserDataPath(root, 'machine.md')).toBe(path.join('workspace', 'machine.md'));
+    expect(assertUserDataPath(root, 'notes/today.md')).toBe(
+      path.join('workspace', 'notes', 'today.md')
+    );
+    expect(assertUserDataPath(root, '.')).toBe('workspace');
+    expect(assertUserDataPath(root)).toBe('workspace');
+    // Unchanged: an explicit root still means itself rather than a copy nested under workspace.
+    expect(assertUserDataPath(root, 'workspace/machine.md')).toBe(
+      path.join('workspace', 'machine.md')
+    );
+    expect(() => assertUserDataPath(root, 'workspace/../.athanor/browser/Cookies')).toThrow(
       'Only workspace files'
     );
   });
@@ -376,6 +399,8 @@ describe('renaming and folders', () => {
     expect(() => assertUserDataPath(root, '.athanor/browser/Cookies')).toThrow(
       'Only workspace files'
     );
+    // A traversal that lands back inside is still refused rather than folded into a write.
+    expect(() => assertUserDataPath(root, '../athanor/escape.pdf')).toThrow('escapes workspace');
   });
 
   it('carries a status the file browser can act on', () => {
