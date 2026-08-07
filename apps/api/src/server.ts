@@ -4002,6 +4002,11 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
     '/v1/tasks/:taskId/events/stream',
     async (request, reply) => {
       const user = requireUser(request.user);
+      // Which credential opened this stream, so it can be re-checked while it is still open. A
+      // session's own revocation already closes it - the cookie stops resolving on the next
+      // request - but this connection makes no further requests, and a bearer token was checked
+      // only at the moment it began.
+      const streamToken = request.apiToken?.id ?? null;
       const task = await store.getTask(user.id, request.params.taskId);
       if (!task) throw new AthanorError('task_not_found', 'Task not found');
       const workspace = await store.getWorkspace(user.id, task.workspaceId);
@@ -4084,6 +4089,22 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
           }
           // Re-read through the caller's own access scope so a revoked membership ends the stream
           // instead of leaking events for the rest of the connection's life.
+          /*
+           * A revoked token stops being able to read part-way through, not only at the next
+           * request. This stream is opened once and then lives for as long as the task does, so
+           * revoking a token the owner no longer trusts left it reading every event of every
+           * conversation until the task finished - which for a long job is hours after they
+           * pressed the button and believed they had cut it off.
+           */
+          if (streamToken) {
+            const stillValid = (await store.listApiTokens(user.id)).some(
+              (candidate) => candidate.id === streamToken
+            );
+            if (!stillValid) {
+              close();
+              return;
+            }
+          }
           const latest = await store.getTask(user.id, task.id);
           if (!latest) {
             close();

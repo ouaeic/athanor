@@ -287,24 +287,26 @@ export const registerAuthRoutes = (
   app.post<{ Body: { username?: string; nativeOrigin?: string } }>(
     '/v1/auth/login/options',
     async (request) => {
-      const requestedUsername = request.body.username?.trim().toLowerCase();
-      const user = requestedUsername ? await store.getUserByUsername(requestedUsername) : undefined;
-      const passkeys = user ? await store.listPasskeys(user.id) : [];
+      /*
+       * The same answer for everybody, because this route has no session behind it.
+       *
+       * Naming a username used to change the reply: a real one came back with that account's
+       * credential ids and their transports, an invented one came back with an empty list. So
+       * anyone who could reach the sign-in page could ask whether a given owner existed on this box
+       * and, when they did, learn how many authenticators they had and whether any was a phone or a
+       * security key - which is a shopping list for whoever wants to be standing next to them.
+       *
+       * Nothing is lost by refusing to say. Registration and enrollment both force
+       * `residentKey: 'required'`, so every credential this box has ever issued is discoverable,
+       * and `login/verify` resolves the account from the credential the authenticator returns
+       * rather than from anything claimed here. A username in the body is now simply ignored.
+       */
       const context = webauthnContext(request.body.nativeOrigin);
       const options = await generateAuthenticationOptions({
         rpID: context.rpId,
-        userVerification: 'required',
-        ...(requestedUsername
-          ? {
-              allowCredentials: passkeys.map((key) => ({
-                id: key.credentialId,
-                transports: key.transports as AuthenticatorTransport[]
-              }))
-            }
-          : {})
+        userVerification: 'required'
       });
       const challengeId = await store.createChallenge({
-        ...(requestedUsername ? { username: requestedUsername } : {}),
         challenge: options.challenge,
         kind: 'authentication',
         expectedOrigin: context.expectedOrigin,
