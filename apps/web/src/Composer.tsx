@@ -22,7 +22,7 @@ import {
 } from './composer-state.js';
 import { securityModeCopy, securityModes } from './security-mode.js';
 import type { Attachment } from './attachments.js';
-import type { ModelRelease, SecurityMode } from './types.js';
+import type { CatalogueModel, SecurityMode } from './types.js';
 
 /**
  * The message box, and everything on its two rails.
@@ -98,8 +98,8 @@ export function Composer({
   /** The whole sentence behind that note, for the control's title. */
   webSearchDisclosure?: string;
   onOpenAiSettings: () => void;
-  models: ModelRelease[];
-  unavailableModels: ModelRelease[];
+  models: CatalogueModel[];
+  unavailableModels: CatalogueModel[];
   modelChoice: ModelChoice;
   onModelChoice: (choice: ModelChoice) => void;
 }) {

@@ -2183,7 +2183,28 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
           )
         )
       ),
-      models,
+      /*
+       * The catalogue as the picker needs it, not as the router needs it.
+       *
+       * This is the request that gates first paint: nothing renders until it returns. It was 426 kB
+       * on a box with a provider connected, and 424.5 kB of that was the model catalogue - 341
+       * models with forty-three fields each, including benchmark populations, cache pricing, price
+       * tiers, uptime percentages and knowledge cutoffs. Everything else in the payload together
+       * came to 1.7 kB. The web client reads five of those fields; the rest went to every device on
+       * every launch and was never looked at. The full record is still one request away for anyone
+       * who needs it - `GET /v1/models` - and the router reads it server-side where it lives.
+       */
+      models: models.map((model) => ({
+        id: model.id,
+        providerModelId: model.providerModelId,
+        displayName: model.displayName,
+        // Kept although no screen reads it: it is how "this box exposes only hosted routes" is
+        // checked at the surface the client actually receives, and a boundary that can only be
+        // asserted server-side is one nobody notices breaking.
+        provider: model.provider,
+        availability: model.availability,
+        privacyRoute: model.privacyRoute
+      })),
       instance: {
         mode: 'self_hosted',
         providerConfigured: Boolean(
@@ -4635,16 +4656,34 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
       preference?: 'fast' | 'balanced' | 'best';
       taskKind?: 'general' | 'coding' | 'agentic';
     };
-  }>('/v1/models/recommend', async (request) =>
-    rankModels(await modelsForUser(requireUser(request.user)), {
+  }>('/v1/models/recommend', async (request) => {
+    /*
+     * A ranking, which is an order and the reason for it - not another copy of the catalogue.
+     *
+     * This returned every ranked model in full and came to 324 kB, on top of the 426 kB bootstrap,
+     * on every model-preference change. Its only caller maps it to `entry.model.id`. The score and
+     * the reasoning stay, because they are the answer to "why this one" and cost almost nothing;
+     * what goes is the third copy of a record the client already has enough of.
+     */
+    const ranked = rankModels(await modelsForUser(requireUser(request.user)), {
       privacyRoute: request.query.privacyRoute ?? 'provider_zdr',
       requiredCapabilities: ['chat', 'tools'],
       requiredModalities: ['text'],
       minContextTokens: 16_000,
       preference: request.query.preference ?? 'balanced',
       taskKind: request.query.taskKind ?? 'general'
-    })
-  );
+    });
+    // Reasoning for the head, an order for the tail. Every entry carried seven sentences explaining
+    // a placement no interface will ever show for the three-hundredth-best model; what the caller
+    // needs from the tail is its position, and what it needs from the front is the argument.
+    const EXPLAINED = 8;
+    return ranked.map((entry, index) => ({
+      modelId: entry.model.id,
+      displayName: entry.model.displayName,
+      score: entry.score,
+      ...(index < EXPLAINED ? { reasons: entry.reasons } : {})
+    }));
+  });
 
   app.get('/v1/usage', async (request) => {
     const user = requireUser(request.user);

@@ -35,7 +35,7 @@ import { noticeWhen, type AgentNotification } from './notice-log.js';
 import { contextNote } from './provenance.js';
 import { scheduleDescription, scheduleSpecFromForm, scheduleStanding } from './schedule-rows.js';
 import { useUndo } from './Undo.js';
-import type { Approval, ModelRelease, TaskEvent, TaskSchedule, Workspace } from './types.js';
+import type { Approval, CatalogueModel, TaskEvent, TaskSchedule, Workspace } from './types.js';
 
 const localDateTimeInput = (date: Date): string =>
   new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
@@ -51,7 +51,7 @@ export function ScheduleModal({
 }: {
   schedules: TaskSchedule[];
   workspaces: Workspace[];
-  models: ModelRelease[];
+  models: CatalogueModel[];
   defaultWorkspaceId?: string;
   initialPrompt: string;
   onClose: () => void;

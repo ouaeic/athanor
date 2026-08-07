@@ -53,6 +53,17 @@ export interface MessageDraft {
   updatedAt: string;
 }
 
+/** What the picker and the transcript need to know about a model. */
+export interface CatalogueModel {
+  id: string;
+  providerModelId: string;
+  displayName: string;
+  /** Which service answers for it. Carried so the hosted-routes boundary is checkable here. */
+  provider: string;
+  availability: ModelRelease['availability'];
+  privacyRoute: ModelRelease['privacyRoute'];
+}
+
 export interface Bootstrap {
   user: User;
   drafts?: MessageDraft[];
@@ -61,7 +72,13 @@ export interface Bootstrap {
   /** Where the conversation list resumes, or null when this page was all of them. */
   tasksCursor?: string | null;
   schedules: TaskSchedule[];
-  models: ModelRelease[];
+  /**
+   * The catalogue as this client uses it: enough to name a model, order the picker and keep the
+   * privacy routes apart. The full record - prices, benchmarks, cache behaviour, retirement dates -
+   * is the router's business and lives on the server; shipping it here put 424 kB in front of first
+   * paint for five fields' worth of reading.
+   */
+  models: CatalogueModel[];
   usage: UsageSummary;
   instance: {
     mode: 'self_hosted';

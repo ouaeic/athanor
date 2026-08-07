@@ -432,7 +432,7 @@ export const api = {
     privacyRoute: 'provider_zdr' | 'external',
     preference: 'fast' | 'balanced' | 'best'
   ) =>
-    request<Array<{ model: Bootstrap['models'][number]; score: number; reasons: string[] }>>(
+    request<Array<{ modelId: string; displayName: string; score: number; reasons?: string[] }>>(
       `/v1/models/recommend?privacyRoute=${encodeURIComponent(privacyRoute)}&preference=${encodeURIComponent(preference)}`
     ),
   task: (id: string) => request<Task>(`/v1/tasks/${id}`),

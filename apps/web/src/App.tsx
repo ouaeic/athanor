@@ -24,7 +24,7 @@ import { Timeline } from './Timeline.js';
 import type {
   Approval,
   Bootstrap,
-  ModelRelease,
+  CatalogueModel,
   SecurityMode,
   Task,
   TaskEvent,
@@ -686,7 +686,7 @@ export function App() {
           (model) => model.privacyRoute === privacyRoute && model.availability === 'available'
         ) ?? []
       ).sort((left, right) => {
-        const ranked = (model: ModelRelease) => {
+        const ranked = (model: CatalogueModel) => {
           const index = recommendedModelIds.indexOf(model.id);
           return index === -1 ? Number.MAX_SAFE_INTEGER : index;
         };
@@ -752,8 +752,8 @@ export function App() {
       .recommendModels(privacyRoute, modelPreference)
       .then((ranked) => {
         if (!active) return;
-        setRecommendedModelIds(ranked.map((entry) => entry.model.id));
-        if (modelAutomatic) setModelId(ranked[0]?.model.id ?? '');
+        setRecommendedModelIds(ranked.map((entry) => entry.modelId));
+        if (modelAutomatic) setModelId(ranked[0]?.modelId ?? '');
       })
       .catch(() => {
         if (active) setRecommendedModelIds([]);
