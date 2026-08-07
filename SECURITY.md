@@ -69,9 +69,19 @@ login shell that is separate from the `athanor` account the runner itself runs a
 
 One exception, stated plainly because the boundary is the point: a program started through
 `desktop_launch` is spawned by the runner directly and therefore runs as `athanor`, not as
-`athanor-agent`. The desktop session's X display is reachable by both accounts, but its D-Bus socket
-is private to the runner, so sandboxing that one launch is an architectural change — the session
-itself has to move to the agent account — rather than a flag. Until it does, three things stand in
+`athanor-agent`.
+
+Closing it is a real piece of work rather than a flag, and the reason is worth writing down because
+the obvious fix makes things worse. Sandboxing only the launch does not work: the session's D-Bus
+socket belongs to whoever started the session, so a program dropped to the other account reaches the
+display and not the bus, and anything wanting the session bus fails. Starting the session as
+`athanor-agent` instead was tried and refused by the box: the session keeps its state under
+`.athanor/`, which is `drwx--S--- athanor:athanor` on purpose — the agent's own files live in
+`workspace/` and the runner's bookkeeping, including artifact and checkpoint metadata, is
+deliberately out of the agent's reach. Opening it would trade this boundary for a worse one. The
+fix is to separate the session's runner-owned bookkeeping from the session's processes, so the
+directories are made by the runner and only the processes drop; until somebody does that
+carefully, the exception stands. Until it does, three things stand in
 front of it: the same command policy that refuses destructive and privilege-seeking invocations on
 the shell path, a refusal to launch anything resolving outside the workspace, and an approval card
 whenever the turn has read untrusted content. Treat `desktop_launch` as the one tool whose blast
