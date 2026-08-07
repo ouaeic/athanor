@@ -140,7 +140,13 @@ removed. Native Linux is the only production server architecture.
 - Exercise OpenCode installation, at least one officially supported publisher login, and persisted
   session behavior on the released build.
 - Repeat browser, full GUI takeover, path-preview, package-persistence, long-task/reconnect, and
-  no-content log-canary drills against the signed release artifacts.
+  no-content log-canary drills against the signed release artifacts. `scripts/release-drill.mjs`
+  passes end to end against a live installation built from source (2026-08-07): the document
+  toolchain builds a CV, report, tables, deck, workbook and letter; Chromium navigates and returns a
+  visual snapshot and extracted text; a GUI desktop launches and is observed semantically and
+  visually; previews are detected and proxied; path traversal and unauthenticated runner control are
+  refused; and a recovery point restores the workspace byte-for-byte. What remains is repeating it
+  against the *signed artifacts* rather than a source build.
 - Restore onto a clean second host from an encrypted off-host backup.
 - Exercise packaged clients with VoiceOver, NVDA, and TalkBack and complete an independent release
   security review.
