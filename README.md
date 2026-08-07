@@ -230,6 +230,9 @@ Read [Security](SECURITY.md), [Privacy](docs/PRIVACY.md), and the
 
 ## Development
 
+Node 24 and pnpm 11 are required — the pinned pnpm refuses to start on anything older, and the
+server installer provisions Node 24 for the same reason.
+
 ```bash
 cp .env.example .env
 # .env ships with placeholders that the services refuse to start on. Three need real values:

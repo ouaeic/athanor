@@ -555,6 +555,28 @@ for (const pinned of pinnedRefs)
     );
 say(`Install command: pins v${declaredVersion}, which is what this checkout calls itself.`);
 
+/**
+ * One Node version, agreed on by the three things that have an opinion.
+ *
+ * `engines` said >=20.20.0 while the installer provisions 24, CI runs 24, and the pinned pnpm
+ * refuses to start below 22.13 - so somebody on the version this repository blessed could not run
+ * `pnpm install` at all, and what they got was `ERR_UNKNOWN_BUILTIN_MODULE: node:sqlite`, which
+ * says nothing about Node being too old. The installer's number is the real one, because it is the
+ * one that has to be true on somebody else's server.
+ */
+const installerNodeMajor = Number(
+  /^node_required_major=(\d+)/m.exec(read('scripts/install-native.sh'))?.[1]
+);
+const declaredNodeMajor = Number(
+  /^>=(\d+)/.exec(JSON.parse(read('package.json')).engines?.node ?? '')?.[1]
+);
+if (!installerNodeMajor) fail('scripts/install-native.sh no longer states node_required_major');
+else if (declaredNodeMajor !== installerNodeMajor)
+  fail(
+    `package.json engines.node allows Node ${declaredNodeMajor} while the installer requires ${installerNodeMajor}; a contributor on the lower one cannot run this repository`
+  );
+else say(`Node version: engines and the installer both require ${installerNodeMajor}.`);
+
 if (failures.length > 0) {
   process.stderr.write(`\n${failures.map((message) => `- ${message}`).join('\n')}\n`);
   process.exitCode = 1;

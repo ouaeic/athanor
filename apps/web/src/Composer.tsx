@@ -1,4 +1,4 @@
-import { useRef, useState, type RefObject } from 'react';
+import { useRef, useState, type ReactNode, type RefObject } from 'react';
 import {
   ArrowUp,
   CalendarClock,
@@ -38,6 +38,7 @@ import type { ModelRelease, SecurityMode } from './types.js';
  * like a frozen app.
  */
 export function Composer({
+  banners,
   prompt,
   onPrompt,
   textareaRef,
@@ -67,6 +68,8 @@ export function Composer({
   modelChoice,
   onModelChoice
 }: {
+  /** Whatever must appear directly above the composer: a storage warning, a block, a notice. */
+  banners?: ReactNode;
   prompt: string;
   onPrompt: (value: string) => void;
   textareaRef?: RefObject<HTMLTextAreaElement | null>;
@@ -124,6 +127,18 @@ export function Composer({
         onUploadFiles([...event.dataTransfer.files]);
       }}
     >
+      {/*
+        Anything that has to sit above the composer sits inside it, in flow.
+
+        These used to be absolutely positioned against the viewport with a hand-tuned `bottom` -
+        144px, then 188px at one breakpoint, then `var(--bottom-bar) + 182px` at another - while the
+        composer they were meant to clear is itself bottom-pinned and grows as the owner types. So
+        the numbers were always chasing a moving target, and a storage warning painted over the
+        first line of the sentence being written: the one moment the wording matters most. Stacked
+        here they move with the composer at every width and every height, and there is no number to
+        keep in sync.
+      */}
+      {banners}
       <div className="composer">
         <AttachmentTray attachments={attachments} onRemove={onRemoveAttachment} />
         <textarea

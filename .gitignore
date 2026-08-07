@@ -29,6 +29,10 @@ crash.*.log
 # machine of whoever wrote them. The engineering conclusions belong in the code, next to the code.
 docs/design/
 
+# Local agent and editor tooling. A launch profile here names paths on one person's machine, and
+# this repository is published; nothing in it belongs to the product.
+.claude/
+
 # The names the published-text check watches for. Committing a list of other people's products to
 # the repository that exists to never discuss them would break the rule it enforces, so the list
 # stays local. See the header inside the file.

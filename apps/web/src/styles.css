@@ -1575,15 +1575,14 @@ select:focus-visible {
   width: 10px;
 }
 .inline-error {
-  position: absolute;
-  z-index: 5;
-  bottom: 144px;
-  left: 50%;
-  transform: translateX(-50%);
+  /* Stacked above the composer in flow; see .usage-warning for why none of these are positioned. */
   display: flex;
   gap: 9px;
   align-items: center;
-  max-width: 80%;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 auto 8px;
+  pointer-events: auto;
   border: 1px solid #e9c4bd;
   background: #fff0ed;
   color: #943d34;
@@ -1601,15 +1600,14 @@ select:focus-visible {
   width: 13px;
 }
 .inline-notice {
-  position: absolute;
-  z-index: 5;
-  bottom: 144px;
-  left: 50%;
-  transform: translateX(-50%);
+  /* Stacked above the composer in flow; see .usage-warning for why none of these are positioned. */
   display: flex;
   gap: 9px;
   align-items: center;
-  max-width: 80%;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 auto 8px;
+  pointer-events: auto;
   border: 1px solid #c9d9ca;
   background: #eff7ef;
   color: #365a42;
@@ -2199,18 +2197,17 @@ select:focus-visible {
   cursor: pointer;
 }
 .usage-warning {
-  position: absolute;
-  z-index: 4;
-  right: 24px;
-  bottom: 144px;
-  left: 24px;
+  /* In flow, inside the composer's own bottom-pinned area. It used to be positioned against the
+     viewport with a hand-tuned `bottom`, which could not track a composer that grows as the owner
+     types - so it painted over the first line of the sentence being written. */
   display: grid;
   grid-template-columns: 18px 1fr auto;
   gap: 9px;
   align-items: center;
-  width: min(820px, calc(100% - 48px));
-  margin: 0 auto;
+  width: min(820px, 100%);
+  margin: 0 auto 8px;
   padding: 10px 12px;
+  pointer-events: auto;
   border: 1px solid #ddcf9d;
   background: #fff9df;
   border-radius: 9px;
@@ -3398,13 +3395,7 @@ select:focus-visible {
   .usage-warning,
   .inline-error,
   .inline-notice {
-    bottom: 188px;
-    max-width: calc(100% - 22px);
-  }
-  .usage-warning {
-    right: 11px;
-    left: 11px;
-    width: auto;
+    max-width: 100%;
   }
   .model-select {
     max-width: 190px;
@@ -5733,12 +5724,8 @@ body,
    * composer is taller on a phone now that its controls wrap, and a fixed 188px put every notice
    * on top of the box the user is typing in.
    */
-  .usage-warning,
-  .inline-error,
-  .inline-notice,
-  .composer-block {
-    bottom: calc(var(--bottom-bar) + 182px);
-  }
+  /* Nothing to offset any more: these stack above the composer inside the same bottom-pinned
+     area, so they move with it at every width. */
   .approval-drawer {
     bottom: calc(var(--bottom-bar) + 178px);
     max-height: calc(100% - var(--bottom-bar) - 228px);
@@ -5803,12 +5790,9 @@ body,
 
 /* The one thing standing between a typed message and a running agent, with its repair action. */
 .composer-block {
-  position: absolute;
-  z-index: 6;
-  left: 50%;
-  bottom: 144px;
-  transform: translateX(-50%);
-  width: min(760px, calc(100% - 36px));
+  width: min(760px, 100%);
+  margin: 0 auto 8px;
+  pointer-events: auto;
   display: flex;
   gap: 10px;
   align-items: center;

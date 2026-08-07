@@ -1927,82 +1927,86 @@ export function App() {
               }}
             />
           </section>
-          {/*
-          A banner above the composer is the most expensive place in the interface, so storage only
-          earns it once the situation is actually actionable. Seventy percent full on a large disk
-          is normal and warning about it teaches people to ignore banners; ninety-five percent is
-          about to block their work. The wording carries the one number that decides what to do.
-        */}
-          {storagePercent >= 90 && !error && !notice && !showBlock && (
-            <div className={`usage-warning ${storagePercent >= 95 ? 'critical' : 'elevated'}`}>
-              <HardDrive />
-              <span>
-                {workspace?.hostStorageAvailableBytes !== undefined
-                  ? `${formatBytes(workspace.hostStorageAvailableBytes)} of disk left`
-                  : `${storagePercent.toFixed(0)}% of the disk is used`}
-                {storagePercent >= 95 ? ' — new work will start failing.' : '.'}
-              </span>
-              <button
-                onClick={() => {
-                  setInspectorTab('files');
-                  setInspectorOpen(true);
-                }}
-              >
-                Files
-              </button>
-            </div>
-          )}
-          {blocked && showBlock && (
-            <div className="composer-block" role="status">
-              <Sparkles />
-              <span>{blocked.message}</span>
-              <button
-                onClick={() =>
-                  blocked.code === 'private_route_unavailable' ||
-                  blocked.code === 'provider_missing'
-                    ? openSettings('ai')
-                    : openSettings('server')
-                }
-              >
-                {blocked.actionLabel}
-              </button>
-            </div>
-          )}
-          {/*
-          The last-known state stays on screen behind this. A dropped connection is a strip, not a
-          sign-out: the box is still working and this device reconnects on its own.
-        */}
-          {offline && (
-            <div className="inline-error offline-strip" role="status">
-              <WifiOff />
-              <span>Can’t reach your athanor — retrying. It keeps working while you wait.</span>
-              <button onClick={() => void load()}>Retry now</button>
-            </div>
-          )}
-          {streamDegraded && !offline && (
-            <div className="inline-notice" role="status">
-              <span>
-                Reconnecting to this conversation — new activity may arrive a little late.
-              </span>
-            </div>
-          )}
-          {error && (
-            <div className="inline-error" role="alert">
-              <span>{error}</span>
-              <button onClick={() => setError('')} aria-label="Dismiss error">
-                <X />
-              </button>
-            </div>
-          )}
-          {notice && (
-            <div className="inline-notice" role="status">
-              <span>{notice}</span>
-              <button onClick={() => setNotice('')} aria-label="Dismiss status">
-                <X />
-              </button>
-            </div>
-          )}
           <Composer
+            banners={
+              <>
+              {/*
+              A banner above the composer is the most expensive place in the interface, so storage only
+              earns it once the situation is actually actionable. Seventy percent full on a large disk
+              is normal and warning about it teaches people to ignore banners; ninety-five percent is
+              about to block their work. The wording carries the one number that decides what to do.
+            */}
+              {storagePercent >= 90 && !error && !notice && !showBlock && (
+                <div className={`usage-warning ${storagePercent >= 95 ? 'critical' : 'elevated'}`}>
+                  <HardDrive />
+                  <span>
+                    {workspace?.hostStorageAvailableBytes !== undefined
+                      ? `${formatBytes(workspace.hostStorageAvailableBytes)} of disk left`
+                      : `${storagePercent.toFixed(0)}% of the disk is used`}
+                    {storagePercent >= 95 ? ' — new work will start failing.' : '.'}
+                  </span>
+                  <button
+                    onClick={() => {
+                      setInspectorTab('files');
+                      setInspectorOpen(true);
+                    }}
+                  >
+                    Files
+                  </button>
+                </div>
+              )}
+              {blocked && showBlock && (
+                <div className="composer-block" role="status">
+                  <Sparkles />
+                  <span>{blocked.message}</span>
+                  <button
+                    onClick={() =>
+                      blocked.code === 'private_route_unavailable' ||
+                      blocked.code === 'provider_missing'
+                        ? openSettings('ai')
+                        : openSettings('server')
+                    }
+                  >
+                    {blocked.actionLabel}
+                  </button>
+                </div>
+              )}
+              {/*
+              The last-known state stays on screen behind this. A dropped connection is a strip, not a
+              sign-out: the box is still working and this device reconnects on its own.
+            */}
+              {offline && (
+                <div className="inline-error offline-strip" role="status">
+                  <WifiOff />
+                  <span>Can’t reach your athanor — retrying. It keeps working while you wait.</span>
+                  <button onClick={() => void load()}>Retry now</button>
+                </div>
+              )}
+              {streamDegraded && !offline && (
+                <div className="inline-notice" role="status">
+                  <span>
+                    Reconnecting to this conversation — new activity may arrive a little late.
+                  </span>
+                </div>
+              )}
+              {error && (
+                <div className="inline-error" role="alert">
+                  <span>{error}</span>
+                  <button onClick={() => setError('')} aria-label="Dismiss error">
+                    <X />
+                  </button>
+                </div>
+              )}
+              {notice && (
+                <div className="inline-notice" role="status">
+                  <span>{notice}</span>
+                  <button onClick={() => setNotice('')} aria-label="Dismiss status">
+                    <X />
+                  </button>
+                </div>
+              )}
+              </>
+            }
             prompt={prompt}
             onPrompt={setPrompt}
             textareaRef={composer}
