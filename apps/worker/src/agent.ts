@@ -89,6 +89,7 @@ import {
   recallMemory,
   recordMemoryPackOutcome,
   recordTurnEpisode,
+  searchMemorySessions,
   shouldConsolidateMemory
 } from './memory-runtime.js';
 import { AgentRunnerClient, withRunnerAbort } from './runner-client.js';
@@ -3310,26 +3311,53 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         );
       case 'file_read': {
         const path = textValue(call.arguments.path);
+        /*
+         * A window is read as a window.
+         *
+         * Asking for lines 900-920 used to pull the entire file across the runner boundary and into
+         * this process, decode it, split it, and throw all but twenty lines away. On a log or a
+         * dataset that is the difference between a small request and one that can exhaust the
+         * worker - and the runner has always had a ranged reader, which nothing called.
+         *
+         * The whole-file path stays for the unbounded case, because it is the only one that
+         * returns the hash `file_write` needs: a whole-file write does not fail on a concurrent
+         * change, it silently discards it, and this tree has at least three other writers - the
+         * agent's own shell, a second worker slot, and the owner in the file browser.
+         */
+        const requestedStart = Number(call.arguments.startLine ?? 0);
+        const requestedEnd = Number(call.arguments.endLine ?? 0);
+        const windowed = requestedStart > 0 || requestedEnd > 0;
+        if (windowed) {
+          const startLine = Math.max(1, requestedStart || 1);
+          const endLine = Math.max(startLine, requestedEnd || startLine + 200);
+          const read = await this.#runner.readFileLines(task.workspaceId, task.id, path, {
+            startLine,
+            endLine,
+            maxBytes: 400_000
+          });
+          return {
+            path,
+            startLine: read.startLine,
+            endLine: read.endLine,
+            ...(read.totalLines === undefined ? {} : { totalLines: read.totalLines }),
+            // Where to carry on from, when the window was cut short by its own byte budget rather
+            // than by reaching the end. Without it a truncated read is a dead end.
+            ...(read.nextStartLine === undefined ? {} : { nextStartLine: read.nextStartLine }),
+            truncated: read.truncated,
+            content: read.content
+          };
+        }
         const read = await this.#runner.readFileWithHash(task.workspaceId, task.id, path);
-        const content = read.content;
-        // Remembered so a later whole-file write can say what it is replacing. `file_write` sends
-        // it and the runner refuses the write if the file has moved on since - a whole-file write
-        // does not fail on a concurrent change, it silently discards it, and this tree has at
-        // least three other writers: the agent's own shell, a second worker slot, and the owner in
-        // the file browser.
         if (state && read.sha256)
           state.readFileHashes = { ...(state.readFileHashes ?? {}), [path]: read.sha256 };
-        const lines = content.split('\n');
-        const requestedStart = Number(call.arguments.startLine ?? 1);
-        const startLine = Math.min(lines.length || 1, Math.max(1, requestedStart));
-        const requestedEnd = Number(call.arguments.endLine ?? lines.length);
-        const endLine = Math.min(lines.length, Math.max(startLine, requestedEnd));
+        const lines = read.content.split('\n');
         return {
           path,
-          startLine,
-          endLine,
+          startLine: 1,
+          endLine: lines.length,
           totalLines: lines.length,
-          content: lines.slice(startLine - 1, endLine).join('\n')
+          truncated: false,
+          content: read.content
         };
       }
       case 'document_read': {
@@ -4050,92 +4078,27 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         };
       }
       case 'session_search': {
-        const query = boundedKnowledge(call.arguments.query, 500).toLowerCase();
-        const maxResults = Math.min(50, Math.max(1, Number(call.arguments.maxResults ?? 12)));
-        const selectedTaskId = textValue(call.arguments.taskId);
-        const tasks = (await this.store.listTasks(task.userId, task.workspaceId)).filter(
-          (candidate) => !selectedTaskId || candidate.id === selectedTaskId
-        );
-        const matches: Array<{
-          taskId: string;
-          title: string;
-          eventId?: string;
-          sequence?: number;
-          kind: string;
-          excerpt: string;
-          createdAt: string;
-          score: number;
-        }> = [];
-        const queryTerms = [...new Set(query.split(/\s+/).filter((term) => term.length > 1))];
-        const score = (value: string): number => {
-          const lower = value.toLowerCase();
-          return (
-            (lower.includes(query) ? 8 : 0) +
-            queryTerms.reduce((total, term) => total + (lower.includes(term) ? 1 : 0), 0)
-          );
-        };
-        const excerpt = (value: string): string => {
-          const flat = value.replace(/\s+/g, ' ').trim();
-          const lower = flat.toLowerCase();
-          const indexes = [lower.indexOf(query), ...queryTerms.map((term) => lower.indexOf(term))]
-            .filter((index) => index >= 0)
-            .sort((left, right) => left - right);
-          const at = indexes[0] ?? 0;
-          const start = Math.max(0, at - 180);
-          return `${start > 0 ? '…' : ''}${flat.slice(start, start + 700)}${
-            start + 700 < flat.length ? '…' : ''
-          }`;
-        };
-        for (const candidate of tasks) {
-          let title = candidate.legacyTitle ?? 'Private task';
-          if (candidate.titleCiphertext?.aad === `task-title:${task.workspaceId}`)
-            title = decryptJson<{ title: string }>(candidate.titleCiphertext, key).title;
-          if (candidate.promptCiphertext.aad === `task-prompt:${task.workspaceId}`) {
-            const prompt = decryptJson<{ prompt: string }>(candidate.promptCiphertext, key).prompt;
-            const rank = score(`${title}\n${prompt}`);
-            if (rank)
-              matches.push({
-                taskId: candidate.id,
-                title,
-                kind: 'user_message',
-                excerpt: excerpt(prompt),
-                createdAt: candidate.createdAt,
-                score: rank
-              });
-          }
-          for (const item of await this.store.listTaskEvents(candidate.id)) {
-            if (!item.payloadCiphertext?.aad?.startsWith(`task-event:${candidate.id}`)) continue;
-            let payload: unknown;
-            try {
-              payload = decryptJson<unknown>(item.payloadCiphertext, key);
-            } catch {
-              continue;
-            }
-            const content = JSON.stringify(payload);
-            const rank = score(`${title}\n${content}`);
-            if (!rank) continue;
-            matches.push({
-              taskId: candidate.id,
-              title,
-              eventId: item.id,
-              sequence: item.sequence,
-              kind: item.kind,
-              excerpt: excerpt(content),
-              createdAt: item.createdAt,
-              score: rank
-            });
-          }
-        }
-        return {
-          query,
-          matches: matches
-            .sort(
-              (left, right) =>
-                right.score - left.score ||
-                new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()
-            )
-            .slice(0, maxResults)
-        };
+        /*
+         * The index, not a scan.
+         *
+         * This walked every task, opened every event, lowercased it and counted substring hits -
+         * an O(everything) pass that reads the whole history to answer one question, scores by how
+         * many times a word appears rather than by how much it distinguishes, and finds nothing at
+         * all for a word the owner spelled differently. `searchMemorySessions` is the ranked query
+         * the memory index was built for: it applies the same bounds, returns the turns either
+         * side of the leading hits, and says how far back the record actually goes when it finds
+         * nothing - which is a different answer from "it never came up".
+         */
+        return searchMemorySessions({
+          store: this.store,
+          workspaceId: task.workspaceId,
+          dataKey: key,
+          query: boundedKnowledge(call.arguments.query, 500),
+          maxResults: Number(call.arguments.maxResults ?? 12),
+          ...(textValue(call.arguments.taskId)
+            ? { taskId: textValue(call.arguments.taskId) }
+            : {})
+        });
       }
       /**
        * The read path's second half. The pack is chosen once from the opening request and frozen so

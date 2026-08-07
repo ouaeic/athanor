@@ -1360,12 +1360,18 @@ export function SelfHostedSettings({
               <Radio />
               <div>
                 <strong>Reaching this box from outside</strong>
+                {/*
+                  The caveats are stated here rather than linked. /docs/relay.md is not a route this
+                  server has: nginx answers any unmatched path with the app, so the link opened
+                  athanor again in a new tab, which reads as the page having failed to load. And
+                  they are exactly the things somebody should know before turning it on.
+                */}
                 <span>
                   You probably do not need this. Use it only when your connection gives the box no
-                  address of its own — a relay you name and enroll with carries the traffic instead.{' '}
-                  <a href="/docs/relay.md" target="_blank" rel="noreferrer noopener">
-                    How the relay works
-                  </a>
+                  address of its own — a relay you name and enroll with carries the traffic instead.
+                  Whoever runs that relay controls the name it gives you and can see the traffic
+                  arrive, and this server&rsquo;s certificate does not cover the relay&rsquo;s
+                  label, so a browser reaching you that way is trusting the relay operator too.
                 </span>
               </div>
             </div>
@@ -1374,9 +1380,9 @@ export function SelfHostedSettings({
               <span>
                 <strong>{relayStatusLine(relay).text}</strong>
                 {relayQuotaNote(relay) && <small>{relayQuotaNote(relay)}</small>}
-                {relay.status.lastError && !relay.enabled && (
-                  <small>{relay.status.lastError}</small>
-                )}
+                {/* In every state, not only while it is off. The one moment the reason matters is
+                    when the relay is on and failing, which is precisely when this hid it. */}
+                {relay.status.lastError && <small>{relay.status.lastError}</small>}
               </span>
               {relay.label && (
                 <button

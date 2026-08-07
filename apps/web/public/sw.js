@@ -127,11 +127,16 @@ const cachedAsset = async (request) => {
  * as it would with no worker installed, which is the honest outcome.
  */
 const cachedDocument = async (request, isNavigation) => {
+  const url = new URL(request.url);
   try {
     const response = await fetch(request);
     // The shell is refreshed on every visit so that offline shows the deployment whose assets this
     // device actually has, rather than whichever one happened to be live when the worker installed.
-    if (isNavigation && response.ok) {
+    // Only the app's own root is the app. Any navigation used to be written over the shell, so
+    // opening a published preview - which the box serves from the same origin under
+    // /__athanor/preview/ - replaced the cached athanor with somebody's static site, and every
+    // later offline launch opened that instead.
+    if (isNavigation && response.ok && url.pathname === '/') {
       const cache = await caches.open(SHELL);
       await cache.put('/index.html', response.clone());
     }
@@ -161,7 +166,15 @@ self.addEventListener('fetch', (event) => {
     );
     return;
   }
-  if (event.request.method !== 'GET' || url.pathname.startsWith('/v1/')) return;
+  // Previews are other people's pages served from this origin. They are not the app, they must not
+  // be answered with the app shell when the network is gone, and nothing about them belongs in a
+  // cache keyed to this install.
+  if (
+    event.request.method !== 'GET' ||
+    url.pathname.startsWith('/v1/') ||
+    url.pathname.startsWith('/__athanor/preview/')
+  )
+    return;
   if (url.origin === self.location.origin && url.pathname.startsWith('/assets/')) {
     event.respondWith(cachedAsset(event.request));
     return;
