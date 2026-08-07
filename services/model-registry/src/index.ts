@@ -44,14 +44,30 @@ while (running) {
   // than weakening privacy requirements or emptying the model picker.
   let reason: string | null = null;
   try {
-    const catalog = config.OPENROUTER_REGISTRY_KEY
-      ? await refreshOpenRouterCatalog(seedModels(), {
+    if (config.OPENROUTER_REGISTRY_KEY) {
+      // A real refresh, and a replace rather than an upsert: a model the provider has withdrawn
+      // should leave the picker rather than sit in it until somebody tries to use it.
+      await store.replaceModelCatalog(
+        await refreshOpenRouterCatalog(seedModels(), {
           baseUrl: config.OPENROUTER_BASE_URL,
           apiKey: config.OPENROUTER_REGISTRY_KEY,
           scope: config.MODEL_CATALOG_SCOPE
         })
-      : seedModels();
-    await store.upsertModels(catalog);
+      );
+    } else if (!(await store.listModels()).length) {
+      /*
+       * No key, so there is nothing to refresh from — but an empty catalogue still needs something
+       * in it, and this is the only thing that puts it there on a new box.
+       *
+       * It used to write the seed on every pass regardless. No shipped path sets a registry key, so
+       * within an hour of finishing setup the static seed landed on top of the catalogue the API
+       * had enriched from the owner's own provider account: the curated models went back to
+       * availability 'review' and lost their prices, which took them out of the picker and made any
+       * task or schedule pinned to one fail with model_unavailable. The owner's fix was to re-save
+       * their provider key, and an hour later it happened again.
+       */
+      await store.upsertModels(seedModels());
+    }
   } catch (error) {
     reason = refreshFailureReason(error);
   }
