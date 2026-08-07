@@ -3,7 +3,7 @@ import { Check, Clipboard, Server, X } from 'lucide-react';
 import { Dialog } from './Dialog.js';
 
 const installCommand =
-  'curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.0/install.sh | sudo env ATHANOR_REF=v0.1.0 sh';
+  'curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.1/install.sh | sudo env ATHANOR_REF=v0.1.1 sh';
 
 export function ServerInstall({ onClose }: { onClose: () => void }) {
   const [copied, setCopied] = useState(false);

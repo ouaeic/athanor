@@ -549,6 +549,16 @@ doctor() {
   else
     check_fail "managed Chromium dependency"
   fi
+  # Whether an update could arrive at all, which is a different question from whether the timer is
+  # enabled. A checkout that is not following a branch reports "on" and never moves.
+  if git -C "$athanor_root" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+    update_source_ok=yes
+  else
+    update_source_ok=""
+  fi
+  if [ -z "$update_source_ok" ]; then
+    check_warn "this checkout follows no branch, so no update can ever arrive; sudo athanor update repairs it"
+  fi
   if systemctl is-enabled --quiet "$auto_update_timer" 2>/dev/null; then
     check_note "unattended updates are on (weekly)"
   else
@@ -1189,6 +1199,22 @@ update_athanor() {
   trap rollback_update EXIT
   trap 'exit 130' INT TERM
 
+  # A checkout with nowhere to pull from is repaired rather than reported as up to date.
+  #
+  # Installing at a pinned tag leaves a detached HEAD, and `git pull --ff-only` answers "Already up
+  # to date" on one of those - for ever. Every box installed by the documented command was therefore
+  # frozen on the release it was installed with, receiving no fix of any kind, while `doctor`
+  # reported unattended updates were on. Putting it on a branch that follows the upstream is all it
+  # needs, and it keeps the revision it is on while doing so.
+  if ! git -C "$athanor_root" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+    printf 'This checkout was not following a branch, so it could never have updated. Fixing that.\n'
+    git -C "$athanor_root" fetch --tags --prune origin ||
+      fail "could not reach the source to repair this checkout"
+    git -C "$athanor_root" checkout -B athanor HEAD ||
+      fail "could not put this checkout on a branch"
+    git -C "$athanor_root" branch --set-upstream-to=origin/main athanor ||
+      fail "could not follow origin/main for updates"
+  fi
   run_update_step "fetching the new revision" git -C "$athanor_root" pull --ff-only
   cd "$athanor_root"
   # CI=true because this runs from a timer with no terminal. When the new revision removes a

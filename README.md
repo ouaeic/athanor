@@ -17,7 +17,7 @@ subscription, or OpenCode with a publisher login it officially supports.
 On a fresh Debian, Ubuntu, Fedora, RHEL, Rocky, AlmaLinux, Arch or openSUSE computer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.0/install.sh | sudo env ATHANOR_REF=v0.1.0 sh
+curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.1/install.sh | sudo env ATHANOR_REF=v0.1.1 sh
 ```
 
 The command is pinned to a tag rather than a branch. The install action in the native client goes
