@@ -63,9 +63,19 @@ The relevant adversaries are:
 
 ## Native host boundary
 
-The agent computer is the installed Linux host. Tools, Chromium, GUI programs, publisher CLIs, and
-user-installed software run as `athanor-agent`, an unprivileged account with no login shell that is
-separate from the `athanor` account the runner itself runs as. Commands reach it through a
+The agent computer is the installed Linux host. Shell commands, background processes, Chromium,
+publisher CLIs, and user-installed software run as `athanor-agent`, an unprivileged account with no
+login shell that is separate from the `athanor` account the runner itself runs as.
+
+One exception, stated plainly because the boundary is the point: a program started through
+`desktop_launch` is spawned by the runner directly and therefore runs as `athanor`, not as
+`athanor-agent`. The desktop session's X display is reachable by both accounts, but its D-Bus socket
+is private to the runner, so sandboxing that one launch is an architectural change — the session
+itself has to move to the agent account — rather than a flag. Until it does, three things stand in
+front of it: the same command policy that refuses destructive and privilege-seeking invocations on
+the shell path, a refusal to launch anything resolving outside the workspace, and an approval card
+whenever the turn has read untrusted content. Treat `desktop_launch` as the one tool whose blast
+radius is the runner account rather than the agent account. Commands reach it through a
 root-owned helper that only ever hands back less privilege than it was called with, and that sets
 `no_new_privs` — which is inherited by every descendant and cannot be removed, so a set-user-ID
 binary confers nothing no matter which interpreter spelled the command.

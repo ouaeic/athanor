@@ -53,7 +53,7 @@ import {
   type AcceptanceResult
 } from './acceptance.js';
 import type { WorkerConfig } from './config.js';
-import { originOf, rememberOrigin } from './egress.js';
+import { classifyDestination, originOf, rememberOrigin } from './egress.js';
 import {
   BASE_SYSTEM_PROMPT,
   COMPACT_CONTEXT_TOOL,
@@ -2540,7 +2540,16 @@ export class AgentWorker {
      * question the owner was told had one. Absent means in house, which is the refusing direction
      * and the only one a missing fact may ever move this towards.
      */
-    webPlan?: WebToolPlan
+    webPlan?: WebToolPlan,
+    /**
+     * What the lead already knows about where this run is allowed to go.
+     *
+     * A specialist reads the web with the same tool the lead does and had no destination policy at
+     * all - so a turn that had read a poisoned page, and could therefore no longer reach an unnamed
+     * host itself, could ask a specialist to "verify this at <url>" and the data left anyway. It has
+     * no approval channel of its own, so the answer here is refusal rather than a card.
+     */
+    destinations?: { knownOrigins: string[]; ownerText: string }
   ): Promise<{
     name: string;
     model: string;
@@ -2738,6 +2747,23 @@ ${clockLine(new Date(), timeZone)}
             role: 'tool',
             toolCallId: call.id,
             content: 'Denied: delegated specialists are read-only. Return findings to the lead.'
+          });
+          continue;
+        }
+        const reaching =
+          call.name === 'parallel_web_read' && Array.isArray(call.arguments.urls)
+            ? call.arguments.urls.map(String)
+            : [];
+        const sinks = destinations
+          ? reaching.map((url) => classifyDestination(url, destinations)).filter((v) => v.sink)
+          : [];
+        if (sinks.length) {
+          messages.push({
+            role: 'tool',
+            toolCallId: call.id,
+            content: `Denied: ${sinks
+              .map((verdict) => verdict.host)
+              .join(', ')} is not somewhere this run has been sent. A specialist cannot ask the user, so report what you have and let the lead decide.`
           });
           continue;
         }
@@ -4544,7 +4570,20 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
               call.id,
               index,
               missions.length,
-              webPlan
+              webPlan,
+              {
+                knownOrigins: [
+                  ...(state?.knownOrigins ?? []),
+                  ...originsFromOwnerMessages(state?.messages ?? [])
+                    .map(originOf)
+                    .filter(Boolean)
+                ],
+                ownerText: (state?.messages ?? [])
+                  .filter((message) => message.role === 'user')
+                  .map((message) => message.content)
+                  .join('\n')
+                  .slice(0, 40_000)
+              }
             )
           )
         );
