@@ -1646,6 +1646,50 @@ describe('workspace authorization boundaries', () => {
     expect(ownerDelete.statusCode, ownerDelete.body).toBe(200);
     expect(runnerDeletes).toHaveLength(1);
     expect(runnerDeletes[0]).toContain('.athanor/artifacts/');
+
+    /*
+     * An artifact never decides how the browser treats it.
+     *
+     * `publish_artifact` takes a free-form mimeType from the agent, and the agent takes what
+     * amounts to instructions from any page it reads. Replayed into the response, a `text/html`
+     * artifact opened from the Saved results list is a script on this box's own origin, holding the
+     * owner's session - and there is no CSP on /v1/ to catch it. So the declaration is constrained
+     * here rather than trusted.
+     */
+    const hostileTypes = ['text/html', 'image/svg+xml', 'application/xhtml+xml'];
+    for (const [index, hostile] of hostileTypes.entries()) {
+      const published = await app.inject({
+        method: 'POST',
+        url: `/v1/workspaces/${workspaceId}/artifacts`,
+        headers: { cookie: owner, 'idempotency-key': `authz-artifact-hostile-000${index}` },
+        payload: { path: 'workspace/report.md', name: 'page.html', mimeType: hostile }
+      });
+      expect(published.statusCode, published.body).toBe(200);
+      const served = await app.inject({
+        method: 'GET',
+        url: `/v1/artifacts/${published.json<{ id: string }>().id}/content`,
+        headers: { cookie: owner }
+      });
+      expect(served.statusCode).toBe(200);
+      expect(served.headers['content-type']).toContain('application/octet-stream');
+      expect(String(served.headers['content-disposition'])).toContain('attachment');
+      expect(String(served.headers['content-security-policy'])).toContain('sandbox');
+      expect(served.headers['x-content-type-options']).toBe('nosniff');
+    }
+    // A type that is safe to look at is still shown, or the rule would have cost the feature.
+    const image = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/artifacts`,
+      headers: { cookie: owner, 'idempotency-key': 'authz-artifact-image' },
+      payload: { path: 'workspace/report.md', name: 'chart.png', mimeType: 'image/png' }
+    });
+    const shown = await app.inject({
+      method: 'GET',
+      url: `/v1/artifacts/${image.json<{ id: string }>().id}/content`,
+      headers: { cookie: owner }
+    });
+    expect(shown.headers['content-type']).toContain('image/png');
+    expect(String(shown.headers['content-disposition'])).toContain('inline');
   }, 30_000);
 
   test('throttles repeated passkey ceremonies from one caller', async () => {

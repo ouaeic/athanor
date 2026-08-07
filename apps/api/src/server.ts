@@ -5574,10 +5574,49 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
         unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id),
         `artifact-name:${workspace.id}`
       ).name;
+      /*
+       * Stored data does not get to choose how the browser treats this response.
+       *
+       * The type came from `publish_artifact`, whose `mimeType` is a free-form string the agent
+       * supplies - and the agent takes instructions, in effect, from any page it reads. Replaying
+       * it into `reply.type()` with `content-disposition: inline` meant a poisoned page could have
+       * the agent save `text/html` with a script in it, which the owner then opened from the Saved
+       * results list as a top-level document on this box's own origin. There is no CSP on /v1/ to
+       * catch it, so that script ran with the owner's session against every route it can reach:
+       * their transcripts, their files, their connectors, and - inside the five-minute step-up
+       * window - a device enrollment that registers an attacker's own passkey for good.
+       *
+       * `nosniff` does not help when the declared type *is* the dangerous one, so the declaration
+       * itself is what has to be constrained. Anything not on this list is handed over as bytes to
+       * download rather than as a document to run, and the sandbox header is the same belt the
+       * preview gateway already wears for agent-authored pages on this origin.
+       */
+      const declared = String(artifact.mimeType).toLowerCase().split(';', 1)[0]?.trim() ?? '';
+      const inlineSafe = new Set([
+        'image/png',
+        'image/jpeg',
+        'image/gif',
+        'image/webp',
+        'image/avif',
+        'application/pdf',
+        'text/plain',
+        'audio/mpeg',
+        'audio/mp4',
+        'audio/ogg',
+        'audio/wav',
+        'video/mp4',
+        'video/webm'
+      ]);
+      const renderInline = inlineSafe.has(declared);
       return reply
-        .type(String(artifact.mimeType))
+        .type(renderInline ? declared : 'application/octet-stream')
         .header('x-content-sha256', String(artifact.sha256))
-        .header('content-disposition', `inline; filename*=UTF-8''${encodeURIComponent(name)}`)
+        .header('x-content-type-options', 'nosniff')
+        .header('content-security-policy', "sandbox; default-src 'none'")
+        .header(
+          'content-disposition',
+          `${renderInline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(name)}`
+        )
         .send(content);
     }
   );

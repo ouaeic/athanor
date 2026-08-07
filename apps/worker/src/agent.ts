@@ -4714,7 +4714,19 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         const name = textValue(call.arguments.name, sourcePath.split('/').at(-1) ?? 'artifact');
         const requestedMime = textValue(call.arguments.mimeType);
         const source = await this.#runner.readBytes(task.workspaceId, task.id, sourcePath);
-        const mimeType = requestedMime || source.mimeType;
+        /*
+         * A type the agent asked for is a type an injected instruction may have asked for.
+         *
+         * The reader's job is to be sceptical of what it reads, and this string ends up deciding
+         * how a browser treats the bytes. `text/html` or an SVG here is a script on the owner's own
+         * origin the moment they open what the agent saved. The serving route refuses to render
+         * anything outside its own allowlist anyway, so this is the second lock rather than the
+         * only one - but a hostile value should not be sitting in the database waiting for a future
+         * reader that trusts it.
+         */
+        const scriptableMime =
+          /^(?:text\/html|application\/xhtml)|(?:\+xml)$|^image\/svg/i.test(requestedMime);
+        const mimeType = (!scriptableMime && requestedMime) || source.mimeType;
         const storageKey = `.athanor/artifacts/${randomUUID()}`;
         await this.#runner.writeBytes(task.workspaceId, task.id, storageKey, source.bytes);
         const artifact = await this.store.createArtifact({
