@@ -923,33 +923,6 @@ describe('DataStore', () => {
       accessTokenHash: 'public-hash',
       expiresAt: null
     });
-    await expect(
-      store.beginWorkspacePreviewDomain({
-        userId: user.id,
-        id: preview.id,
-        domain: 'app.customer.example',
-        verificationHash: 'verification-hash'
-      })
-    ).resolves.toMatchObject({
-      customDomain: 'app.customer.example',
-      domainStatus: 'pending'
-    });
-    await expect(
-      store.getWorkspacePreviewByCustomDomain('app.customer.example')
-    ).resolves.toBeNull();
-    await expect(store.verifyWorkspacePreviewDomain(user.id, preview.id)).resolves.toMatchObject({
-      domainStatus: 'active'
-    });
-    await expect(
-      store.getWorkspacePreviewByCustomDomain('APP.CUSTOMER.EXAMPLE')
-    ).resolves.toMatchObject({ id: preview.id });
-    await expect(store.clearWorkspacePreviewDomain(user.id, preview.id)).resolves.toMatchObject({
-      customDomain: null,
-      domainStatus: null
-    });
-    await expect(
-      store.getWorkspacePreviewByCustomDomain('app.customer.example')
-    ).resolves.toBeNull();
     await store.touchWorkspacePreview(preview.id);
     expect((await store.getWorkspacePreviewBySlug(preview.slug))?.lastAccessedAt).not.toBeNull();
     await expect(store.revokeWorkspacePreview(user.id, preview.id)).resolves.toBe(true);

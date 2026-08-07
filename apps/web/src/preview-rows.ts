@@ -30,16 +30,11 @@ export const previewPortProblem = (port: number): string => {
  * works, and how long it has left.
  */
 export const previewSummary = (
-  preview: Pick<
-    WorkspacePreview,
-    'visibility' | 'status' | 'expiresAt' | 'customDomain' | 'domainStatus'
-  >
+  preview: Pick<WorkspacePreview, 'visibility' | 'status' | 'expiresAt'>
 ): string => {
   const parts = [preview.visibility === 'public' ? 'Public link' : 'Private preview'];
   // "active" on every row is the stored enum printed where a sentence should be.
   if (preview.status !== 'active') parts.push(preview.status);
   parts.push(previewLifetime(preview.expiresAt));
-  if (preview.customDomain)
-    parts.push(`${preview.customDomain} (${preview.domainStatus ?? 'pending'})`);
   return parts.join(' · ');
 };

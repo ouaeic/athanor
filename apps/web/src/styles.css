@@ -1821,15 +1821,30 @@ select:focus-visible {
   min-height: 0;
   flex: 1;
 }
+/*
+  Flex, not a three-column grid.
+ 
+  The row declares an icon, a name and one control, and renders up to six: revert and save appear
+  while editing, download and close are always there. Every child past the third wrapped onto an
+  implicit row inside a header fixed at 42px, so on an editable file the controls the owner needs -
+  including Close - were pushed out of the header and clipped. The children carry their own widths;
+  only the name has to be told to yield.
+*/
 .preview-header {
   height: 42px;
-  display: grid;
-  grid-template-columns: 18px 1fr 32px;
-  gap: 7px;
+  display: flex;
   align-items: center;
+  gap: 7px;
   padding: 0 10px;
   border-bottom: 1px solid #2d3033;
   font-size: 12px;
+}
+.preview-header > strong {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .preview-header svg {
   width: 15px;

@@ -8,8 +8,6 @@ const preview = (overrides: Partial<WorkspacePreview> = {}): WorkspacePreview =>
   label: 'App preview',
   port: 3000,
   visibility: 'private',
-  customDomain: null,
-  domainStatus: null,
   status: 'active',
   url: 'https://box.example/__athanor/preview/abc',
   expiresAt: null,
@@ -51,14 +49,6 @@ describe('what a preview row says about itself', () => {
   it('never claims a published site keeps the computer awake', () => {
     expect(previewSummary(preview({ visibility: 'public' }))).toBe('Public link · stays available');
     expect(previewSummary(preview({ visibility: 'public' }))).not.toContain('awake');
-  });
-
-  it('carries the custom domain and how far its verification got', () => {
-    expect(
-      previewSummary(
-        preview({ visibility: 'public', customDomain: 'app.example.com', domainStatus: 'pending' })
-      )
-    ).toBe('Public link · stays available · app.example.com (pending)');
   });
 
   it('reports an idle deadline as the deadline it is', () => {

@@ -372,8 +372,6 @@ export const WorkspacePreview = z.object({
   label: z.string().min(1).max(80),
   port: z.number().int().min(1024).max(65_535),
   visibility: z.enum(['private', 'public']),
-  customDomain: z.string().nullable(),
-  domainStatus: z.enum(['pending', 'active', 'failed']).nullable(),
   status: z.enum(['active', 'revoked', 'expired']),
   url: z.string().url(),
   /**

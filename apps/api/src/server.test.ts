@@ -969,60 +969,6 @@ describe('API production boundaries', () => {
       headers: { host: previewHost }
     });
     expect(publicPage.statusCode).toBe(200);
-    const domainStarted = await app.inject({
-      method: 'PUT',
-      url: `/v1/previews/${privatePreview.id}/domain`,
-      headers: { cookie: cookie!, 'idempotency-key': 'preview-domain-0001' },
-      payload: { domain: 'app.customer.example' }
-    });
-    expect(domainStarted.statusCode, domainStarted.body).toBe(200);
-    expect(domainStarted.json()).toMatchObject({
-      preview: { customDomain: 'app.customer.example', domainStatus: 'pending' },
-      verification: {
-        type: 'TXT',
-        name: '_athanor.app.customer.example',
-        trafficTarget: 'preview.localhost'
-      }
-    });
-    expect(
-      (
-        await previewApp.inject({
-          method: 'GET',
-          url: '/__athanor/domain-allow?domain=app.customer.example'
-        })
-      ).statusCode
-    ).toBe(404);
-    const currentUser = await store.getUserByUsername('private-user');
-    await store.verifyWorkspacePreviewDomain(currentUser!.id, privatePreview.id);
-    expect(
-      (
-        await previewApp.inject({
-          method: 'GET',
-          url: '/__athanor/domain-allow?domain=app.customer.example'
-        })
-      ).statusCode
-    ).toBe(200);
-    const customDomainPage = await previewApp.inject({
-      method: 'GET',
-      url: '/',
-      headers: { host: 'app.customer.example' }
-    });
-    expect(customDomainPage.statusCode).toBe(200);
-    const domainCleared = await app.inject({
-      method: 'DELETE',
-      url: `/v1/previews/${privatePreview.id}/domain`,
-      headers: { cookie: cookie!, 'idempotency-key': 'preview-domain-clear-0001' }
-    });
-    expect(domainCleared.statusCode, domainCleared.body).toBe(200);
-    expect(domainCleared.json()).toMatchObject({ customDomain: null, domainStatus: null });
-    expect(
-      (
-        await previewApp.inject({
-          method: 'GET',
-          url: '/__athanor/domain-allow?domain=app.customer.example'
-        })
-      ).statusCode
-    ).toBe(404);
     // Taking a site off the public internet hands the owner their private link back, still
     // persistent. It used to hand back two hours.
     const unpublished = await app.inject({

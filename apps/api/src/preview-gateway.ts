@@ -129,10 +129,12 @@ export const buildPreviewGateway = async (
   };
 
   const previewFor = async (request: FastifyRequest): Promise<WorkspacePreviewRecord> => {
+    // The slug in the path is the only way in. A preview could once also be reached by a custom
+    // domain, but nothing ever routed a foreign host here - one nginx server block matches every
+    // name and only the preview path regex proxies to this gateway - so the lookup answered
+    // requests that could not arrive, while the owner was handed a link that did not work.
     const slug = slugFor(request);
-    const preview = slug
-      ? await store.getWorkspacePreviewBySlug(slug)
-      : await store.getWorkspacePreviewByCustomDomain(request.hostname.toLowerCase());
+    const preview = slug ? await store.getWorkspacePreviewBySlug(slug) : null;
     if (
       !preview ||
       preview.status !== 'active' ||
@@ -381,14 +383,6 @@ export const buildPreviewGateway = async (
     });
     await store.touchWorkspacePreview(preview.id);
   };
-
-  app.get('/__athanor/domain-allow', async (request, reply) => {
-    const rawDomain = (request.query as { domain?: unknown }).domain;
-    const domain = typeof rawDomain === 'string' ? rawDomain.trim().toLowerCase() : '';
-    if (!domain || !(await store.getWorkspacePreviewByCustomDomain(domain)))
-      return reply.status(404).send({ allowed: false });
-    return { allowed: true };
-  });
 
   app.route({ method: 'GET', url: '/*', handler: proxyHttp, wsHandler: proxySocket });
   app.route({

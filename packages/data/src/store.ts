@@ -6058,17 +6058,6 @@ export class DataStore {
     return result.rows[0] ? mapWorkspacePreview(result.rows[0]) : null;
   }
 
-  async getWorkspacePreviewByCustomDomain(domain: string): Promise<WorkspacePreviewRecord | null> {
-    const result = await this.database.query(
-      `SELECT * FROM workspace_previews
-       WHERE LOWER(custom_domain)=LOWER($1) AND domain_status='active'
-         AND visibility='public' AND status='active'
-         AND (expires_at IS NULL OR expires_at>NOW())`,
-      [domain]
-    );
-    return result.rows[0] ? mapWorkspacePreview(result.rows[0]) : null;
-  }
-
   async rotateWorkspacePreviewAccess(
     userId: string,
     id: string,
@@ -6103,49 +6092,6 @@ export class DataStore {
        status='active',published_at=CASE WHEN $3='public' THEN NOW() ELSE published_at END,
        updated_at=NOW() WHERE id=$1 AND user_id=$2 RETURNING *`,
       [id, userId, visibility, accessTokenHash, PREVIEW_IDLE_INTERVAL]
-    );
-    return result.rows[0] ? mapWorkspacePreview(result.rows[0]) : null;
-  }
-
-  async beginWorkspacePreviewDomain(input: {
-    userId: string;
-    id: string;
-    domain: string;
-    verificationHash: string;
-  }): Promise<WorkspacePreviewRecord | null> {
-    const result = await this.database.query(
-      `UPDATE workspace_previews SET custom_domain=$3,domain_status='pending',
-       domain_verification_hash=$4,updated_at=NOW()
-       WHERE id=$1 AND user_id=$2 AND visibility='public' AND status='active'
-       RETURNING *`,
-      [input.id, input.userId, input.domain, input.verificationHash]
-    );
-    return result.rows[0] ? mapWorkspacePreview(result.rows[0]) : null;
-  }
-
-  async verifyWorkspacePreviewDomain(
-    userId: string,
-    id: string
-  ): Promise<WorkspacePreviewRecord | null> {
-    const result = await this.database.query(
-      `UPDATE workspace_previews SET domain_status='active',updated_at=NOW()
-       WHERE id=$1 AND user_id=$2 AND custom_domain IS NOT NULL
-         AND domain_verification_hash IS NOT NULL AND visibility='public' AND status='active'
-       RETURNING *`,
-      [id, userId]
-    );
-    return result.rows[0] ? mapWorkspacePreview(result.rows[0]) : null;
-  }
-
-  async clearWorkspacePreviewDomain(
-    userId: string,
-    id: string
-  ): Promise<WorkspacePreviewRecord | null> {
-    const result = await this.database.query(
-      `UPDATE workspace_previews SET custom_domain=NULL,domain_status=NULL,
-       domain_verification_hash=NULL,updated_at=NOW()
-       WHERE id=$1 AND user_id=$2 RETURNING *`,
-      [id, userId]
     );
     return result.rows[0] ? mapWorkspacePreview(result.rows[0]) : null;
   }

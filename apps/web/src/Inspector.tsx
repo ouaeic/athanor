@@ -13,7 +13,6 @@ import {
   FolderPlus,
   Globe2,
   HardDrive,
-  Link2,
   LoaderCircle,
   LockKeyhole,
   Monitor,
@@ -1191,6 +1190,10 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
     const term = new Terminal({
       cursorBlink: true,
       convertEol: true,
+      // xterm paints into a canvas, so without this a screen reader is handed a blank element and
+      // everything the agent's shell prints - the one surface where the output *is* the content -
+      // is silent. The option makes xterm keep its accessibility buffer and announce new lines.
+      screenReaderMode: true,
       fontFamily: '"SFMono-Regular", Consolas, monospace',
       fontSize: 13,
       theme: {
@@ -1254,13 +1257,6 @@ function PreviewPane({ workspace }: { workspace: Workspace }) {
   const [activeUrl, setActiveUrl] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [domainPreviewId, setDomainPreviewId] = useState('');
-  const [domain, setDomain] = useState('');
-  const [domainVerification, setDomainVerification] = useState<{
-    name: string;
-    value: string;
-    trafficTarget: string;
-  }>();
   const load = () =>
     void api
       .previews(workspace.id)
@@ -1285,7 +1281,6 @@ function PreviewPane({ workspace }: { workspace: Workspace }) {
       setBusy(false);
     }
   };
-  const domainPreview = previews.find((preview) => preview.id === domainPreviewId);
   // A dead button with no reason on it is the worst of both: this says which port to use instead.
   const portProblem = previewPortProblem(port);
   // No title card: the tab is called Preview and the form under it says what it does.
@@ -1339,116 +1334,6 @@ function PreviewPane({ workspace }: { workspace: Workspace }) {
         <LockKeyhole />
         <span>A preview cannot read your athanor session, even if its code tries.</span>
       </div>
-      {domainPreviewId && (
-        <div className="custom-domain-panel">
-          <div>
-            <strong>Custom domain</strong>
-            <button
-              className="icon-btn"
-              aria-label="Close custom domain"
-              onClick={() => {
-                setDomainPreviewId('');
-                setDomainVerification(undefined);
-              }}
-            >
-              <X />
-            </button>
-          </div>
-          <span>Use a subdomain you control, such as app.example.com.</span>
-          <div className="domain-connect-row">
-            <input
-              value={domain}
-              placeholder="app.example.com"
-              onChange={(event) => setDomain(event.target.value.toLowerCase())}
-            />
-            <button
-              className="secondary"
-              disabled={busy || !domain.trim()}
-              onClick={async () => {
-                setBusy(true);
-                setError('');
-                try {
-                  await api.stepUp();
-                  const result = await api.setPreviewDomain(domainPreviewId, domain.trim());
-                  setDomainVerification(result.verification);
-                  setPreviews((current) =>
-                    current.map((item) => (item.id === result.preview.id ? result.preview : item))
-                  );
-                } catch (cause) {
-                  setError(cause instanceof Error ? cause.message : 'Could not connect domain');
-                } finally {
-                  setBusy(false);
-                }
-              }}
-            >
-              {domainPreview?.customDomain ? 'Update' : 'Connect'}
-            </button>
-            {domainPreview?.customDomain && (
-              <button
-                className="danger-button"
-                disabled={busy}
-                onClick={async () => {
-                  setBusy(true);
-                  setError('');
-                  try {
-                    await api.stepUp();
-                    const updated = await api.clearPreviewDomain(domainPreviewId);
-                    setPreviews((current) =>
-                      current.map((item) => (item.id === updated.id ? updated : item))
-                    );
-                    setDomain('');
-                    setDomainVerification(undefined);
-                    setDomainPreviewId('');
-                  } catch (cause) {
-                    setError(
-                      cause instanceof Error ? cause.message : 'Could not disconnect domain'
-                    );
-                  } finally {
-                    setBusy(false);
-                  }
-                }}
-              >
-                Disconnect
-              </button>
-            )}
-          </div>
-          {domainVerification && (
-            <div className="domain-dns-records">
-              <p>
-                Add TXT <code>{domainVerification.name}</code> with value{' '}
-                <code>{domainVerification.value}</code>.
-              </p>
-              <p>
-                Point <code>{domain}</code> to <code>{domainVerification.trafficTarget}</code> with
-                CNAME (or your DNS provider's ALIAS/flattening for an apex).
-              </p>
-              <button
-                className="primary"
-                disabled={busy}
-                onClick={async () => {
-                  setBusy(true);
-                  setError('');
-                  try {
-                    const updated = await api.verifyPreviewDomain(domainPreviewId);
-                    setPreviews((current) =>
-                      current.map((item) => (item.id === updated.id ? updated : item))
-                    );
-                    setDomainVerification(undefined);
-                    setDomainPreviewId('');
-                    setActiveUrl(updated.url);
-                  } catch (cause) {
-                    setError(cause instanceof Error ? cause.message : 'DNS is not ready yet');
-                  } finally {
-                    setBusy(false);
-                  }
-                }}
-              >
-                Verify DNS
-              </button>
-            </div>
-          )}
-        </div>
-      )}
       <div className="preview-list">
         {previews.map((preview) => (
           <div className={`preview-row ${preview.status}`} key={preview.id}>
@@ -1496,19 +1381,6 @@ function PreviewPane({ workspace }: { workspace: Workspace }) {
               >
                 {preview.visibility === 'public' ? <LockKeyhole /> : <Share2 />}
               </button>
-              {preview.visibility === 'public' && (
-                <button
-                  title="Connect custom domain"
-                  disabled={busy || preview.status !== 'active'}
-                  onClick={() => {
-                    setDomainPreviewId(preview.id);
-                    setDomain(preview.customDomain ?? '');
-                    setDomainVerification(undefined);
-                  }}
-                >
-                  <Link2 />
-                </button>
-              )}
               <button
                 title={
                   preview.visibility === 'public'

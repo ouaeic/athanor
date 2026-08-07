@@ -144,6 +144,21 @@ export function App() {
   const [noticeLog, setNoticeLog] = useState(false);
   const [shortcutSheet, setShortcutSheet] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
+  // Escape closes the navigation drawer, and the control that opened it gets the focus back. Every
+  // other overlay gets both from Dialog; this one covers the screen on a phone and had neither, so
+  // a keyboard was left inside a drawer with no way out but the pointer.
+  const navOpener = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!mobileNav) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileNav(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      navOpener.current?.focus();
+    };
+  }, [mobileNav]);
   const [inspectorOpen, setInspectorOpen] = useState(storedInspector.current?.open ?? false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>(
     storedInspector.current?.tab ?? 'files'
@@ -1730,7 +1745,17 @@ export function App() {
             loadingEarlier={loadingEarlier}
           />
         </div>
-        {mobileNav && <button className="mobile-scrim" onClick={() => setMobileNav(false)} />}
+        {mobileNav && (
+          // Named, because a bare button is announced as "button" and nothing else. It is the one
+          // overlay in the product that is not a Dialog - the panel it dims is the same sidebar the
+          // desktop layout uses, so it cannot simply be wrapped in one - which is why Escape and a
+          // name had to be given to it directly.
+          <button
+            className="mobile-scrim"
+            aria-label="Close navigation"
+            onClick={() => setMobileNav(false)}
+          />
+        )}
         <Sidebar
           user={data.user}
           workspaces={data.workspaces}
@@ -1759,7 +1784,10 @@ export function App() {
             <button
               className="icon-btn mobile-menu"
               aria-label="Open navigation"
-              onClick={() => setMobileNav(true)}
+              onClick={(event) => {
+                navOpener.current = event.currentTarget;
+                setMobileNav(true);
+              }}
             >
               <Menu />
             </button>

@@ -847,10 +847,13 @@ export const buildServer = async (
     preview: WorkspacePreviewRecord,
     accessToken?: string
   ): WorkspacePreview => {
-    const url =
-      preview.customDomain && preview.domainStatus === 'active'
-        ? new URL(`${previewBase.protocol}//${preview.customDomain}/`)
-        : new URL(workspacePreviewUrl(preview.slug));
+    // Always the slug. A preview used to be able to report a custom domain as its address once a
+    // TXT record verified, but nothing ever routed such a host here: there is one nginx server
+    // block, it matches any name, and only the preview path regex reaches the gateway - so the
+    // owner was handed a link that answered with a certificate warning and then with athanor's own
+    // sign-in page. The feature is gone rather than half-present; the columns behind it are left in
+    // place for now so a rollback to the previous release still reads its own rows.
+    const url = new URL(workspacePreviewUrl(preview.slug));
     if (accessToken && preview.visibility === 'private')
       url.searchParams.set('access', accessToken);
     return {
@@ -859,8 +862,6 @@ export const buildServer = async (
       label: preview.label,
       port: preview.port,
       visibility: preview.visibility,
-      customDomain: preview.customDomain,
-      domainStatus: preview.domainStatus,
       status:
         preview.status === 'active' &&
         preview.expiresAt !== null &&
@@ -5850,114 +5851,6 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
         );
         if (!preview) throw new AthanorError('preview_not_found', 'Preview not found', 404);
         return workspacePreviewResponse(preview, accessToken);
-      });
-    }
-  );
-
-  app.put<{ Params: { previewId: string } }>(
-    '/v1/previews/:previewId/domain',
-    async (request, reply) => {
-      const user = requireUser(request.user);
-      await requireRecentStepUp(request, user);
-      return idempotent(request, reply, user, async () => {
-        const input = SetWorkspacePreviewDomainRequest.parse(request.body);
-        if (
-          input.domain === previewBase.hostname ||
-          input.domain.endsWith(`.${previewBase.hostname}`)
-        )
-          throw new AthanorError(
-            'custom_domain_reserved',
-            'Choose a domain outside the athanor preview namespace'
-          );
-        const existing = await store.getWorkspacePreview(user.id, request.params.previewId);
-        if (!existing || existing.visibility !== 'public')
-          throw new AthanorError(
-            'public_preview_required',
-            'Publish this app before connecting a custom domain',
-            409
-          );
-        const verificationToken = `athanor-domain=${randomBytes(24).toString('base64url')}`;
-        let preview: Awaited<ReturnType<DataStore['beginWorkspacePreviewDomain']>>;
-        try {
-          preview = await store.beginWorkspacePreviewDomain({
-            userId: user.id,
-            id: existing.id,
-            domain: input.domain,
-            verificationHash: sha256(verificationToken)
-          });
-        } catch (error) {
-          if ((error as { code?: string }).code === '23505')
-            throw new AthanorError(
-              'custom_domain_in_use',
-              'That domain is already connected to another published app',
-              409
-            );
-          throw error;
-        }
-        if (!preview) throw new AthanorError('preview_not_found', 'Preview not found', 404);
-        return {
-          preview: workspacePreviewResponse(preview),
-          verification: {
-            type: 'TXT' as const,
-            name: `_athanor.${input.domain}`,
-            value: verificationToken,
-            trafficTarget: previewBase.hostname
-          }
-        };
-      });
-    }
-  );
-
-  app.post<{ Params: { previewId: string } }>(
-    '/v1/previews/:previewId/domain/verify',
-    async (request, reply) => {
-      const user = requireUser(request.user);
-      return idempotent(request, reply, user, async () => {
-        const existing = await store.getWorkspacePreview(user.id, request.params.previewId);
-        if (
-          !existing?.customDomain ||
-          !existing.domainVerificationHash ||
-          existing.visibility !== 'public'
-        )
-          throw new AthanorError(
-            'domain_verification_not_started',
-            'Connect a custom domain before verifying it',
-            409
-          );
-        const records = await resolveTxt(`_athanor.${existing.customDomain}`).catch(() => []);
-        const verified = records
-          .map((parts) => parts.join(''))
-          .some((value) => sha256(value) === existing.domainVerificationHash);
-        if (!verified)
-          throw new AthanorError(
-            'domain_dns_pending',
-            'The ownership TXT record is not visible yet. DNS changes can take time to propagate.',
-            409
-          );
-        const preview = await store.verifyWorkspacePreviewDomain(user.id, existing.id);
-        if (!preview) throw new AthanorError('preview_not_found', 'Preview not found', 404);
-        await recordSecurityEvent(store, {
-          userId: user.id,
-          kind: 'preview_custom_domain',
-          outcome: 'completed',
-          metadata: { previewId: preview.id, workspaceId: preview.workspaceId }
-        });
-        return workspacePreviewResponse(preview);
-      });
-    }
-  );
-
-  app.delete<{ Params: { previewId: string } }>(
-    '/v1/previews/:previewId/domain',
-    async (request, reply) => {
-      const user = requireUser(request.user);
-      await requireRecentStepUp(request, user);
-      return idempotent(request, reply, user, async () => {
-        const existing = await store.getWorkspacePreview(user.id, request.params.previewId);
-        if (!existing) throw new AthanorError('preview_not_found', 'Preview not found', 404);
-        const preview = await store.clearWorkspacePreviewDomain(user.id, existing.id);
-        if (!preview) throw new AthanorError('preview_not_found', 'Preview not found', 404);
-        return workspacePreviewResponse(preview);
       });
     }
   );

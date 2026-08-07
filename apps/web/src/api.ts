@@ -774,21 +774,6 @@ export const api = {
     ),
   revokePreview: (id: string) =>
     request<{ revoked: boolean }>(`/v1/previews/${id}`, mutation('DELETE', {})),
-  setPreviewDomain: async (id: string, domain: string) => {
-    const result = await request<{
-      preview: WorkspacePreview;
-      verification: { type: 'TXT'; name: string; value: string; trafficTarget: string };
-    }>(`/v1/previews/${id}/domain`, mutation('PUT', { domain }));
-    return { ...result, preview: previewForClient(result.preview) };
-  },
-  verifyPreviewDomain: async (id: string) =>
-    previewForClient(
-      await request<WorkspacePreview>(`/v1/previews/${id}/domain/verify`, mutation('POST', {}))
-    ),
-  clearPreviewDomain: async (id: string) =>
-    previewForClient(
-      await request<WorkspacePreview>(`/v1/previews/${id}/domain`, mutation('DELETE', {}))
-    ),
   artifacts: (workspaceId: string) =>
     request<Artifact[]>(`/v1/workspaces/${workspaceId}/artifacts`),
   deleteArtifact: (id: string) =>
