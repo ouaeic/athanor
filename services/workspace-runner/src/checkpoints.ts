@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import {
   chmod,
@@ -413,13 +413,29 @@ const blobPath = (directory: string, hash: string): string => {
  * Same content, one copy on disk - and a clone rather than a copy where the filesystem can do it.
  * `COPYFILE_FICLONE` is a reflink on btrfs and XFS, which costs no data blocks at all; everywhere
  * else the kernel falls back to a plain copy, so this is never worse than copying.
+ *
+ * The scratch name carries a nonce because the destination does not identify the writer: blobs are
+ * addressed by content, the copies run in parallel, and two changed files that happen to hold the
+ * same bytes - an empty file, a duplicated asset, a dependency vendored twice - arrive here at the
+ * same moment for the same blob. Sharing one `.partial` meant the second writer deleted the first
+ * one's finished copy out from under it, and the first one's rename failed with ENOENT and took
+ * the whole checkpoint down: the turn ran with no undo point because the workspace contained two
+ * identical files. Each writer now renames its own copy into place, and last writer wins on
+ * identical bytes.
  */
 const cloneFile = async (from: string, to: string): Promise<void> => {
   await mkdir(path.dirname(to), { recursive: true, mode: 0o700 });
-  const temporary = `${to}.partial`;
-  await rm(temporary, { force: true });
-  await copyFile(from, temporary, constants.COPYFILE_FICLONE);
-  await rename(temporary, to);
+  const temporary = `${to}.${randomUUID()}.partial`;
+  try {
+    await copyFile(from, temporary, constants.COPYFILE_FICLONE);
+    await rename(temporary, to);
+  } catch (error) {
+    // A rename that never happened leaves the copy behind. Blob collection would sweep it, but
+    // that only runs after a prune has fallen due, so this cleans up after itself instead of
+    // leaving the store carrying a dead copy of a file until then.
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
 };
 
 const byPath = (left: CheckpointChange, right: CheckpointChange): number =>

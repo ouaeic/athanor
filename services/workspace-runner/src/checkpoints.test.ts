@@ -173,6 +173,29 @@ describe('turn checkpoints', () => {
     expect(await storeSize(workspaceRoot)).toBe(body.length);
   });
 
+  it('survives a turn whose new files hold identical content, which share one blob', async () => {
+    // The copies run in parallel and a blob is named by its content, so duplicates that are new in
+    // the same turn all reach for the one destination at once. They used to share a scratch name
+    // too: the second writer deleted the first one's finished copy, the first one's rename failed,
+    // and the turn ran with no undo point because the workspace happened to contain two identical
+    // files. Sixteen of them, which is the width of the copy pass.
+    const { workspaceRoot, root } = await workspace();
+    const checkpoints = new WorkspaceCheckpoints(config(workspaceRoot));
+    const body = randomBytes(64 * 1024);
+    for (let index = 0; index < 16; index += 1)
+      await writeFile(path.join(root, 'workspace', `copy-${index}.bin`), body);
+
+    const created = await checkpoints.create(WORKSPACE_ID, root, { checkpointId: randomUUID() });
+    expect(created.changedFileCount).toBe(16);
+    expect(await blobCount(workspaceRoot)).toBe(1);
+    expect(await storeSize(workspaceRoot)).toBe(body.length);
+    // The point of the checkpoint: it can still put the workspace back.
+    await rm(path.join(root, 'workspace', 'copy-7.bin'));
+    await expect(checkpoints.restore(WORKSPACE_ID, root, created.id)).resolves.toMatchObject({
+      restoredFileCount: 1
+    });
+  });
+
   it('runs one at a time per workspace, so two concurrent turns cannot tear a checkpoint', async () => {
     const { workspaceRoot, root } = await workspace();
     const checkpoints = new WorkspaceCheckpoints(config(workspaceRoot));
