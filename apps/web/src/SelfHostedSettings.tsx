@@ -1722,9 +1722,18 @@ export function SelfHostedSettings({
           <div>
             <span>
               <strong>Backups and updates</strong>
+              {/*
+                What the box does on its own, then what to type if you want to intervene. This read
+                as three commands and nothing else, which told an owner that keeping their server
+                current was their job and their shell's - when unattended updates back up first,
+                verify the new release is serving, and roll themselves back if it is not.
+              */}
               <small>
-                On the server: <code>sudo athanor backup</code>, <code>sudo athanor update</code>,{' '}
-                <code>sudo athanor doctor</code>.
+                Updates install themselves weekly, taking a verified backup first and rolling back
+                if the new release does not serve. To intervene, on the server:{' '}
+                <code>sudo athanor update</code> now, <code>sudo athanor rollback</code> to undo a
+                release that installed cleanly and still went wrong, <code>sudo athanor backup</code>{' '}
+                for a copy on demand, and <code>sudo athanor doctor</code> for the full report.
               </small>
             </span>
           </div>
