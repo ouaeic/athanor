@@ -2,8 +2,9 @@
 
 ## Supported server
 
-The production server supports Ubuntu and Debian on `amd64` and `arm64`. It installs directly on the
-host. No Docker Engine, Compose, nested VM, machine image, PRoot guest, Tailscale, VPN, or SSH tunnel
+The production server supports four distribution families on `amd64` and `arm64`: Debian and
+Ubuntu, Fedora/RHEL/Rocky/AlmaLinux, Arch, and openSUSE. The installer detects which it is on and
+uses that family's package manager. It installs directly on the host. No Docker Engine, Compose, nested VM, machine image, PRoot guest, Tailscale, VPN, or SSH tunnel
 is part of the architecture.
 
 A small installation is comfortable with 4 vCPU, 8–16 GB RAM, and 40 GB free disk. Large builds,

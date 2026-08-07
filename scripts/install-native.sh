@@ -829,6 +829,18 @@ set_env_value "$control_env" DEPLOYMENT_MODE production
 set_env_value "$control_env" REGISTRATION_BOOTSTRAP_TOKEN "$pairing_code"
 set_env_value "$control_env" REGISTRATION_BOOTSTRAP_EXPIRES_AT "$pairing_expires"
 set_env_value "$control_env" PUBLIC_APP_URL "$public_url"
+# Where this build came from, so the app can offer it.
+#
+# The licence row in Settings says the source is always available and links it when the server knows
+# a URL - and nothing ever wrote one, so the link never appeared under a sentence promising it. The
+# clone origin is the honest answer and the installer has had it all along. An https URL only: a
+# local path or an ssh remote is not something a browser can open.
+source_origin=$(git -C "$athanor_root" remote get-url origin 2>/dev/null || true)
+case "$source_origin" in
+  https://*)
+    set_env_value "$control_env" PUBLIC_SOURCE_URL "${source_origin%.git}"
+    ;;
+esac
 set_env_value "$control_env" PREVIEW_BASE_URL "$public_url/__athanor/preview"
 set_env_value "$control_env" API_HOST 127.0.0.1
 set_env_value "$control_env" API_PORT 4100

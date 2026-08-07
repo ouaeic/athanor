@@ -2,7 +2,7 @@
 
 **One private AI computer, available from every device.**
 
-athanor is free, open-source software that turns an Ubuntu or Debian computer into a persistent AI
+athanor is free, open-source software that turns a Linux computer into a persistent AI
 agent. The user works in a polished chat interface; the agent can use the machine’s files, terminal,
 browser, installed GUI applications, long-running processes, and hosted previews. The computer view
 stays out of the way until the user or agent needs it.
@@ -14,7 +14,7 @@ subscription, or OpenCode with a publisher login it officially supports.
 
 ## Install
 
-On a fresh Ubuntu or Debian computer:
+On a fresh Debian, Ubuntu, Fedora, RHEL, Rocky, AlmaLinux, Arch or openSUSE computer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.0/install.sh | sudo env ATHANOR_REF=v0.1.0 sh
@@ -232,9 +232,18 @@ Read [Security](SECURITY.md), [Privacy](docs/PRIVACY.md), and the
 
 ```bash
 cp .env.example .env
+# .env ships with placeholders that the services refuse to start on. Three need real values:
+printf 'DATA_MASTER_KEY=%s\n' "$(openssl rand -base64 32)" >>.env
+printf 'SESSION_SIGNING_KEY=%s\n' "$(openssl rand -base64 32)" >>.env
+printf 'RUNNER_SHARED_SECRET=%s\n' "$(openssl rand -base64 32)" >>.env
 pnpm install --frozen-lockfile
 pnpm dev
 ```
+
+`pnpm dev` starts the web client, the API, the worker and the workspace runner together, and each
+service reads `.env` from the repository root. A development database is not required: with
+`DATABASE_DRIVER=pglite`, which `.env.example` sets, the stack keeps its data in `.athanor/postgres`
+under the repository.
 
 Open `http://localhost:5173` and run the full source verification with:
 

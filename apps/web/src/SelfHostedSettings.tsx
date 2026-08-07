@@ -1704,7 +1704,14 @@ export function SelfHostedSettings({
           <div>
             <span>
               <strong>License</strong>
-              <small>GNU AGPL-3.0-only · source is always available</small>
+              {/* True either way. The source of this build is on the machine serving this page,
+                  which is what the licence actually guarantees; the link is an extra when the
+                  server knows where it came from, and the row used to promise it unconditionally
+                  while showing nothing. */}
+              <small>
+                GNU AGPL-3.0-only ·{' '}
+                {legal.sourceUrl ? 'source is always available' : 'the source of this build is in /opt/athanor on this server'}
+              </small>
             </span>
             {legal.sourceUrl && (
               <a href={legal.sourceUrl} target="_blank" rel="noreferrer">

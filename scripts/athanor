@@ -309,7 +309,12 @@ doctor() {
   if [ -z "$missing_document_tools" ]; then
     check_ok "document toolchain: documents, decks, spreadsheets and PDFs"
   else
-    check_fail "document toolchain is incomplete, so document jobs will fail:$missing_document_tools. Run sudo athanor update to reinstall it"
+    # A note, not a failure. These names are the ones Debian uses, and the installer supports four
+    # distribution families - so on Fedora, Arch or openSUSE some of them are simply called
+    # something else or come from a package that family does not carry, and reporting that as a
+    # broken installation made `doctor` fail forever on three families out of four. What is true is
+    # narrower: the jobs needing the missing piece will not work.
+    check_warn "some document tooling is missing, so jobs needing it will fail:$missing_document_tools. On Debian and Ubuntu, sudo athanor update reinstalls it; on other families it may be packaged under another name"
   fi
   configured_ddns_provider=$(
     sed -n 's/^DDNS_PROVIDER=//p' "$athanor_config/control.env" 2>/dev/null | sed -n '1p'
