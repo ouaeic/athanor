@@ -1249,6 +1249,20 @@ export const OwnerPreferences = z.object({
       taskId: Id.nullish(),
       workspaceId: Id.nullish()
     })
+    .optional(),
+  /**
+   * Whether the computer panel is open, and on which tab.
+   *
+   * A device-local choice until now, which made it one of the few things about this software that
+   * was a fact about a browser rather than about its owner: open the files on the laptop, pick the
+   * phone up, and the phone had its own idea. On a computer whose whole point is being the same
+   * computer from anywhere, a panel that does not travel is not a setting.
+   */
+  inspector: z
+    .object({
+      open: z.boolean(),
+      tab: z.enum(['files', 'computer', 'terminal', 'preview'])
+    })
     .optional()
 });
 export type OwnerPreferences = z.infer<typeof OwnerPreferences>;

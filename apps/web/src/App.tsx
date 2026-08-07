@@ -263,6 +263,16 @@ export function App() {
   }, [modelAutomatic, modelPreference, modelId]);
   useEffect(() => {
     writeInspectorChoice({ open: inspectorOpen, tab: inspectorTab });
+    // And to the box, on the same debounce as the other choices, so the panel is the owner's
+    // rather than this browser's. Written only once the server's own answer has arrived, or the
+    // first render would publish this device's default over whatever the box was holding.
+    if (!serverPreferencesLoaded.current) return;
+    const timer = window.setTimeout(() => {
+      void api
+        .savePreferences({ inspector: { open: inspectorOpen, tab: inspectorTab } })
+        .catch(() => undefined);
+    }, 600);
+    return () => window.clearTimeout(timer);
   }, [inspectorOpen, inspectorTab]);
   // Where the owner is, told to the box so the next device can start there. Debounced like the
   // model choice, and only once the server's own answer has arrived, so opening the app never
@@ -340,6 +350,12 @@ export function App() {
       // What the owner chose, from the one place that is the same on every device they use. Applied
       // once per load and before any save is allowed, so the device adopts the shared answer rather
       // than arguing with it. A box that has never been told anything leaves this device's copy be.
+      // The panel the owner left open, wherever they left it open.
+      const savedInspector = next.user.preferences?.inspector;
+      if (savedInspector) {
+        setInspectorOpen(savedInspector.open);
+        setInspectorTab(savedInspector.tab);
+      }
       const savedModel = next.user.preferences?.model;
       if (savedModel) {
         setModelPreference(savedModel.preference);
@@ -440,10 +456,37 @@ export function App() {
    * show, which is the same thing to a reader: the entry point only exists once there is something
    * behind it.
    */
+  /**
+   * Notices already seen, so a packaged shell rings once per notice rather than once per poll.
+   *
+   * Seeded on the first load rather than left empty: a shell opening to four waiting notices should
+   * show them, not raise four notifications about things that happened while it was closed.
+   */
+  const announcedNotices = useRef<Set<string> | null>(null);
   const loadNotices = useCallback(() => {
     void api
       .agentNotifications()
-      .then((list) => setNotices(list ?? []))
+      .then((list) => {
+        const next = list ?? [];
+        setNotices(next);
+        if (!announcedNotices.current) {
+          announcedNotices.current = new Set(next.map((notice) => notice.id));
+          return;
+        }
+        // Web Push cannot reach a packaged shell - it has no subscription and never will - so the
+        // one client that is an installed application was the one the box could tell nothing. It
+        // is already polling for these, so it raises them itself, and only when nobody is looking
+        // at the window: a notification about something already on screen is noise.
+        if (!nativeBridge.available() || document.visibilityState === 'visible') {
+          announcedNotices.current = new Set(next.map((notice) => notice.id));
+          return;
+        }
+        for (const notice of next) {
+          if (announcedNotices.current.has(notice.id)) continue;
+          announcedNotices.current.add(notice.id);
+          void nativeBridge.notify(notice.taskTitle || 'athanor', notice.message);
+        }
+      })
       .catch(() => undefined);
   }, []);
   useEffect(() => {

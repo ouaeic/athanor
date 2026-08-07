@@ -227,12 +227,42 @@ pub async fn start(state: Arc<ClientState>) -> Result<String, String> {
         }
     });
 
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(|error| format!("Could not start the private client gateway: {error}"))?;
+    /*
+     * The same port every launch, because the port is part of the origin.
+     *
+     * Binding 0 takes whatever is free, so the shell came up on a different origin each time it
+     * started - and a browser keys local storage to an origin including its port. Every launch was
+     * therefore a brand new profile: the model choice, the open panel, and every draft this device
+     * had not yet synced were all addressed to an origin that no longer existed. The port is
+     * remembered beside the server profile and reused; if something else has taken it in the
+     * meantime the ephemeral bind is still there as a fallback, which is no worse than before.
+     */
+    let port_path = state.profile_path.with_file_name("client-gateway-port");
+    let remembered = std::fs::read_to_string(&port_path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|port| *port >= 1024);
+    let listener = match remembered {
+        Some(port) => match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(bound) => bound,
+            Err(_) => TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .map_err(|error| {
+                    format!("Could not start the private client gateway: {error}")
+                })?,
+        },
+        None => TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(|error| format!("Could not start the private client gateway: {error}"))?,
+    };
     let address = listener
         .local_addr()
         .map_err(|error| format!("Could not read the private client address: {error}"))?;
+    if remembered != Some(address.port()) {
+        // Best effort: a shell that cannot write this still runs, it just starts somewhere else
+        // next time, which is exactly what it did before.
+        let _ = std::fs::write(&port_path, address.port().to_string());
+    }
     let origin = format!("http://localhost:{}", address.port());
     *state.local_origin.write().await = origin.clone();
     let router = Router::new()

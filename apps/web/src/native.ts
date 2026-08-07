@@ -68,5 +68,32 @@ export const nativeBridge = {
       Array<{ name: string; relativePath: string; isDirectory: boolean; sizeBytes: number }>
     >('list_local_folder', { token, relative }),
   readFile: (token: string, relative: string) =>
-    core()?.invoke<number[]>('read_local_file', { token, relative })
+    core()?.invoke<number[]>('read_local_file', { token, relative }),
+  /**
+   * Raise a notification through the operating system rather than through Web Push.
+   *
+   * A packaged shell has no push subscription and never will: delivery was Web Push only, so on
+   * desktop and mobile the box could tell the owner nothing at all. It does not need a delivery
+   * route of its own - it is already polling for approvals and notices - so it raises the
+   * notification locally when something arrives and the window is not being looked at.
+   *
+   * The plugin and its capability were already shipped and simply never called.
+   */
+  notify: async (title: string, body: string): Promise<boolean> => {
+    const bridge = core();
+    if (!bridge) return false;
+    try {
+      const granted = await bridge.invoke<boolean>('plugin:notification|is_permission_granted');
+      if (!granted) {
+        const outcome = await bridge.invoke<string>('plugin:notification|request_permission');
+        if (outcome !== 'granted') return false;
+      }
+      await bridge.invoke('plugin:notification|notify', { options: { title, body } });
+      return true;
+    } catch {
+      // A shell built without the plugin, or a platform that refused: the in-app notice is still
+      // there, and there is nothing here worth interrupting anybody with.
+      return false;
+    }
+  }
 };

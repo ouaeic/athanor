@@ -37,6 +37,8 @@ export interface User {
     model?: { automatic: boolean; preference: 'fast' | 'balanced' | 'best'; modelId: string };
     /** Where this owner was, so a device that launches with no address to go on can go there. */
     place?: { taskId?: string | null; workspaceId?: string | null };
+    /** Whether the computer panel is open and on which tab, so every device agrees. */
+    inspector?: { open: boolean; tab: 'files' | 'computer' | 'terminal' | 'preview' };
   };
 }
 
