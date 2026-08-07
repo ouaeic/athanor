@@ -41,6 +41,17 @@ if (!runnerSecret) {
 }
 
 const only = process.argv.slice(2).filter((value) => !value.startsWith('-'));
+/*
+ * Which model to hold every job to, when the point is to test athanor rather than to let its router
+ * shop. A credit-limited account wants one known-cheap model and no surprises, and without this the
+ * drill picked whatever ranked best for each job - which is the right default for judging the
+ * router and the wrong one for judging the loop on somebody's last few dollars.
+ *
+ * The route follows: a model is only offered on the privacy route its provider actually supports,
+ * so pinning a model without letting the route follow it just makes the task unroutable.
+ */
+const pinnedModel = process.env.ATHANOR_DRILL_MODEL ?? '';
+const pinnedRoute = process.env.ATHANOR_DRILL_ROUTE ?? '';
 const directory = await mkdtemp(join(tmpdir(), 'athanor-live-'));
 
 const config = {
@@ -126,6 +137,25 @@ try {
   });
   await store.upsertModels(catalog);
   ok('live model catalogue', `${catalog.length} models offered by this account`);
+  if (pinnedModel) {
+    // Checked before a single job runs, because discovering it three jobs in costs the three jobs.
+    const match = catalog.find(
+      (model) => model.id === pinnedModel || model.providerModelId === pinnedModel
+    );
+    if (!match) {
+      const near = catalog
+        .filter((model) => model.id.includes(pinnedModel.split('/').pop() ?? pinnedModel))
+        .slice(0, 5)
+        .map((model) => model.id);
+      throw new Error(
+        `ATHANOR_DRILL_MODEL=${pinnedModel} is not in this account's catalogue.${near.length ? ` Did you mean: ${near.join(', ')}` : ''}`
+      );
+    }
+    ok(
+      'pinned model',
+      `${match.id} on the ${pinnedRoute || 'provider_zdr'} route${match.privacyRoute === (pinnedRoute || 'provider_zdr') ? '' : ` - note this model is offered on ${match.privacyRoute}, so set ATHANOR_DRILL_ROUTE=${match.privacyRoute}`}`
+    );
+  }
 
   const login = await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: {} });
   const setCookie = login.headers['set-cookie'];
@@ -191,7 +221,8 @@ const runJob = async (job) => {
     payload: {
       workspaceId,
       prompt: job.prompt,
-      privacyRoute: 'provider_zdr',
+      ...(pinnedModel ? { modelId: pinnedModel } : {}),
+      privacyRoute: pinnedRoute || 'provider_zdr',
       maxComputeCredits: 200,
       maxSpendUsd: job.budgetUsd ?? 0.5
     }
@@ -252,7 +283,8 @@ const runJob = async (job) => {
         headers: { cookie, 'idempotency-key': `live-drill-correction-${taskId}` },
         payload: {
           prompt: job.interrupt,
-          privacyRoute: 'provider_zdr',
+          ...(pinnedModel ? { modelId: pinnedModel } : {}),
+          privacyRoute: pinnedRoute || 'provider_zdr',
           maxComputeCredits: 100,
           interrupt: true
         }
