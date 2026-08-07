@@ -1926,6 +1926,45 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
     }
   };
 
+  /**
+   * Put the catalogue back if something flattened it.
+   *
+   * The registry service used to write the static seed over the enriched catalogue once an hour,
+   * which left every model at availability 'review' with no prices - out of the picker, and
+   * `model_unavailable` for anything pinned to one. That is fixed at the source, but a box that
+   * already hit it stays flattened until its owner happens to re-save their provider key, and
+   * nothing tells them that is the cure. So it repairs itself: if every model in the catalogue is
+   * still in the seeded state and the owner has a working credential, ask the provider again.
+   *
+   * Runs without being awaited. It is a repair, not a precondition - the server should answer
+   * requests while it happens, and a provider that is down must not delay startup.
+   */
+  const repairFlattenedCatalog = async (): Promise<void> => {
+    const catalog = await store.listModels();
+    if (!catalog.length || catalog.some((model) => String(model.availability) !== 'review')) return;
+    const owner = await store.soleUser();
+    if (!owner) return;
+    const saved = await store.getManagedProviderCredential(owner.id, 'inference');
+    if (saved?.status !== 'active') return;
+    const secret = decryptJson<{ provider?: string; baseUrl?: string; apiKey?: string }>(
+      saved.secretCiphertext,
+      masterKey,
+      inferenceCredentialAad(owner.id)
+    );
+    if (secret.provider !== 'openrouter' || !secret.apiKey) return;
+    const live = await refreshOpenRouterCatalog(seedModels(), {
+      baseUrl: secret.baseUrl ?? config.OPENROUTER_BASE_URL,
+      apiKey: secret.apiKey,
+      scope: config.MODEL_CATALOG_SCOPE,
+      ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
+    });
+    await store.upsertModels(live);
+    log.info('models.catalog_repaired', { models: live.length });
+  };
+  void repairFlattenedCatalog().catch((error: unknown) => {
+    log.warn('models.catalog_repair_failed', errorFields(error));
+  });
+
   const modelsForUser = async (user: UserRecord) => {
     const requireZdr = await requiresZeroDataRetention(user.id);
     return (await store.listModels()).map((record) => {
