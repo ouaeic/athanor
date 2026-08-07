@@ -1593,6 +1593,20 @@ export const inlineScriptBody = (args: readonly string[]): string =>
     .join('\n');
 
 /**
+ * Everything the command will actually execute, wherever it was written down.
+ *
+ * `shell` accepts a `stdin` string, and an interpreter reads a script from it exactly as it reads
+ * one from `-c`. Every classifier here - the destinations it may reach, the paths it writes, whether
+ * it is destructive, whether it came from untrusted content - read only `executable` and `args`, so
+ * moving the script into `stdin` walked past all of them at once. It appeared once in this file, in
+ * the schema that declares it, and nowhere else.
+ */
+export const commandScript = (args: Record<string, unknown>): string => {
+  const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
+  return [inlineScriptBody(commandArgs), textValue(args.stdin)].filter(Boolean).join('\n');
+};
+
+/**
  * A redirection whose target leaves the workspace: absolute, home-relative, or climbing out with
  * `..`. `2>&1`, `->` and a plain `>` comparison are all excluded by construction, since none of
  * them is followed by a path shaped like one of those three.
@@ -1997,9 +2011,7 @@ const URL_IN_COMMAND = /https?:\/\/[^\s'"`<>\\)]+/g;
 
 const shellDestinations = (args: Record<string, unknown>): string[] => {
   const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
-  const command = [textValue(args.executable), ...commandArgs, inlineScriptBody(commandArgs)].join(
-    ' '
-  );
+  const command = [textValue(args.executable), ...commandArgs, commandScript(args)].join(' ');
   return [...new Set(command.match(URL_IN_COMMAND) ?? [])];
 };
 
@@ -2080,7 +2092,7 @@ const NETWORK_CLIENT_EXECUTABLES = new Set([
 export const untrustedShellOrigin = (args: Record<string, unknown>): string | null => {
   const executable = textValue(args.executable).split('/').pop()?.toLowerCase() ?? '';
   const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
-  const script = inlineScriptBody(commandArgs);
+  const script = commandScript(args);
   const lowerArgs = commandArgs.map((argument) => argument.toLowerCase());
   const networkGit =
     executable === 'git' && NETWORK_GIT_SUBCOMMANDS.has(gitSubcommand(commandArgs) ?? '');
@@ -2156,7 +2168,7 @@ export const writtenPaths = (name: string, args: Record<string, unknown>): strin
   if (name === 'shell') {
     if (!isMutatingToolCall(name, args)) return [];
     const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
-    return [...commandArgs, ...inlineScriptBody(commandArgs).split(/[\s'"`>|;()]+/)].filter(
+    return [...commandArgs, ...commandScript(args).split(/[\s'"`>|;()]+/)].filter(
       Boolean
     );
   }
@@ -2267,11 +2279,26 @@ export const approvalRequirement = (
         action: 'Publish a private preview from a turn that read untrusted content',
         preview: `This turn has read untrusted content (${taintSources.slice(0, 3).join(', ')}). A preview link is reachable from outside this computer.`
       };
-    if (name === 'shell') {
+    /*
+     * `shell` and `desktop_launch` are the same act wearing two names.
+     *
+     * Both take an executable and arguments and run them on the owner's computer. Only `shell` was
+     * judged here, so on a turn that had already read untrusted content an injected instruction
+     * could reach `desktop_launch` and get a card-free duplicate of the command the floor would
+     * have stopped - and that one runs as the runner's own account rather than the sandboxed agent,
+     * so it was the better of the two to be handed.
+     */
+    if (name === 'shell' || name === 'desktop_launch') {
       const verdicts = shellDestinations(args)
         .map((url) => classifyDestination(url, destinations))
         .filter((verdict) => verdict.sink);
       if (verdicts.length) return destinationCard(verdicts, taintSources, 'this command');
+      if (name === 'desktop_launch')
+        return {
+          sideEffect: 'external_consequential',
+          action: `Open ${textValue(args.executable, 'an application')} on the desktop`,
+          preview: `Launch ${[textValue(args.executable, 'an application'), ...(Array.isArray(args.args) ? args.args.map(String) : [])].join(' ')} on the agent computer's desktop, after this turn read untrusted content (${taintSources.slice(0, 3).join(', ')}).`
+        };
       if (args.network === true)
         return {
           sideEffect: 'external_reversible',
@@ -2392,7 +2419,7 @@ export const approvalRequirement = (
       packageRemovalExecutables.has(executable) &&
       lowerArgs.some((argument) => packageRemovalCommands.has(argument));
     const destructiveScript =
-      commandInterpreters.has(executable) && isDestructiveScript(inlineScriptBody(commandArgs));
+      commandInterpreters.has(executable) && isDestructiveScript(commandScript(args));
     if (
       !(
         consequentialExecutables.has(executable) ||
