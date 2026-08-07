@@ -147,7 +147,12 @@ removed. Native Linux is the only production server architecture.
   visually; previews are detected and proxied; path traversal and unauthenticated runner control are
   refused; and a recovery point restores the workspace byte-for-byte. What remains is repeating it
   against the *signed artifacts* rather than a source build.
-- Restore onto a clean second host from an encrypted off-host backup.
+- Restore onto a clean second host from an encrypted off-host backup. The in-place half is
+  exercised (2026-08-07): `sudo athanor backup` writes aside and renames only once checksummed and
+  records the revision it was taken from, `sudo athanor rollback DIR` puts code and data back
+  together, and the box came up with every check passing and the owner still signed in. A backup
+  written by the previous release is still accepted, which is the property that matters on the day
+  the current release is what went wrong. What remains is doing it onto a *second* host.
 - Exercise packaged clients with VoiceOver, NVDA, and TalkBack and complete an independent release
   security review.
 
