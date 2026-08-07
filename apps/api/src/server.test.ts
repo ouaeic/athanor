@@ -130,6 +130,7 @@ describe('API production boundaries', () => {
       DEPLOYMENT_MODE: 'development',
       MODEL_CATALOG_SCOPE: 'reviewed_open_weight',
       CONNECTION_MANIFEST_PATH: join(directory, 'connection.json'),
+      ATHANOR_STATE_PATH: directory,
       RELAY_STATE_DIR: join(directory, 'relay'),
       RELAY_LOCAL_HOST: '127.0.0.1',
       RELAY_LOCAL_PORT: 443,
@@ -1433,6 +1434,7 @@ const isolatedConfig = (directory: string): ApiConfig => ({
   DEPLOYMENT_MODE: 'development',
   MODEL_CATALOG_SCOPE: 'provider_catalog',
   CONNECTION_MANIFEST_PATH: join(directory, 'connection.json'),
+  ATHANOR_STATE_PATH: directory,
   RELAY_STATE_DIR: join(directory, 'relay'),
   RELAY_LOCAL_HOST: '127.0.0.1',
   RELAY_LOCAL_PORT: 443,
@@ -2914,6 +2916,52 @@ describe('authentication posture', () => {
       payload: { token: 'w6Yl8Qk2nT4vXbR7pL0sZaC3dF5gH9jK' }
     });
     expect(invented.statusCode).toBe(403);
+  }, 30_000);
+
+  /*
+   * Renewal starts about thirty days before a certificate expires, and the helper writes down why
+   * it failed. Nothing read that file, so the app was reachable and silent for a month and the
+   * owner found out when every device refused at once - with a shell as the only way to ask why.
+   */
+  test('reports what the box wrote down about its own failures', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-diagnostics-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+
+    // Nothing written is the healthy answer: both helpers delete their file on the next success.
+    const healthy = await app.inject({
+      method: 'GET',
+      url: '/v1/instance/diagnostics',
+      headers: { cookie }
+    });
+    expect(healthy.statusCode, healthy.body).toBe(200);
+    expect(healthy.json()).toEqual({ certificate: null, dynamicDns: null });
+
+    await writeFile(
+      join(directory, 'certificate.error'),
+      '2026-08-01T03:14:00Z\nacme: DNS-01 challenge was not answered\n'
+    );
+    const failing = await app.inject({
+      method: 'GET',
+      url: '/v1/instance/diagnostics',
+      headers: { cookie }
+    });
+    expect(failing.json()).toMatchObject({
+      certificate: {
+        failedAt: '2026-08-01T03:14:00Z',
+        reason: 'acme: DNS-01 challenge was not answered'
+      },
+      dynamicDns: null
+    });
+
+    // Signed out, it says nothing: this names what is wrong with somebody's server.
+    expect((await app.inject({ method: 'GET', url: '/v1/instance/diagnostics' })).statusCode).toBe(
+      401
+    );
   }, 30_000);
 
   test('throttles account recovery per caller as well as per username', async () => {

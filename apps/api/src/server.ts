@@ -1,6 +1,6 @@
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { resolveTxt } from 'node:dns/promises';
+import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
@@ -3670,6 +3670,40 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
    * path of every connection. There is no default relay and nothing here contacts anyone until an
    * owner names one.
    */
+  /**
+   * What the box knows is wrong with itself, said where the owner is already looking.
+   *
+   * The certificate helper and the dynamic DNS helper each write a timestamped reason when they
+   * fail, and nothing read either file. Renewal starts about thirty days before expiry, so a
+   * failing certificate had a month in which the app was reachable, could have said what happened
+   * and offered the command, and instead said nothing at all - until it expired, at which point
+   * every device refused at once and the only way to find out why was a shell.
+   *
+   * Read-only, and deliberately thin: it reports what the box already wrote down rather than
+   * running probes of its own. `athanor doctor` remains the fuller account for somebody who is
+   * already at a terminal.
+   */
+  app.get('/v1/instance/diagnostics', async (request) => {
+    requireUser(request.user);
+    const read = async (name: string): Promise<{ failedAt: string; reason: string } | null> => {
+      try {
+        const [failedAt, ...rest] = (
+          await readFile(join(config.ATHANOR_STATE_PATH, name), 'utf8')
+        ).split('\n');
+        const reason = rest.join('\n').trim();
+        return failedAt?.trim() ? { failedAt: failedAt.trim(), reason } : null;
+      } catch {
+        // Absent is the healthy answer: both helpers delete their file on the next success.
+        return null;
+      }
+    };
+    const [certificate, dynamicDns] = await Promise.all([
+      read('certificate.error'),
+      read('ddns.error')
+    ]);
+    return { certificate, dynamicDns };
+  });
+
   app.get('/v1/relay', async (request) => {
     requireUser(request.user);
     return relay.report();

@@ -213,6 +213,7 @@ const start = async (
     DEPLOYMENT_MODE: 'development',
     MODEL_CATALOG_SCOPE: 'reviewed_open_weight',
     CONNECTION_MANIFEST_PATH: join(directory, 'connection.json'),
+    ATHANOR_STATE_PATH: directory,
     RELAY_STATE_DIR: join(directory, 'relay'),
     RELAY_LOCAL_HOST: '127.0.0.1',
     RELAY_LOCAL_PORT: 443,

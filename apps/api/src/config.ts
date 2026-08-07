@@ -115,6 +115,15 @@ const Config = z.object({
    */
   CONNECTION_MANIFEST_PATH: z.string().default('/var/lib/athanor/connection.json'),
   /**
+   * Where the box writes down what went wrong with the parts of itself the API does not run.
+   *
+   * The certificate helper and the dynamic DNS helper both record a failure here, world-readable,
+   * and until now nothing read them: renewal begins about thirty days before expiry, so a failing
+   * certificate had a month in which the app was perfectly reachable and said nothing, and the
+   * first the owner heard of it was every device refusing to connect at once.
+   */
+  ATHANOR_STATE_PATH: z.string().default('/var/lib/athanor'),
+  /**
    * Durable home for the relay identity key and the relay settings. The key is this box's address
    * on every relay it has enrolled with, so it must outlive an update and a rebuild of the source
    * tree; the installer creates this directory owned by the control account and readable by nobody

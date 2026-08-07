@@ -135,6 +135,10 @@ export function SelfHostedSettings({
     timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
   });
   const [relay, setRelay] = useState<RelayReport | null>();
+  const [diagnostics, setDiagnostics] = useState<{
+    certificate: { failedAt: string; reason: string } | null;
+    dynamicDns: { failedAt: string; reason: string } | null;
+  }>();
   const [relayHost, setRelayHost] = useState('');
   const [relayToken, setRelayToken] = useState('');
   const [brief, setBrief] = useState('');
@@ -242,6 +246,12 @@ export function SelfHostedSettings({
       .relay()
       .then(setRelay)
       .catch(() => setRelay(null));
+  }, []);
+  useEffect(() => {
+    void api
+      .instanceDiagnostics()
+      .then(setDiagnostics)
+      .catch(() => undefined);
   }, []);
   useEffect(() => {
     void notificationState()
@@ -1620,6 +1630,36 @@ export function SelfHostedSettings({
             <span>Nobody bills you for athanor. Your server and your model provider do.</span>
           </div>
         </div>
+        {/*
+          What the box already wrote down about itself, said a month before it becomes an outage.
+          The certificate helper begins renewing about thirty days out and records why it failed;
+          nothing read that file, so the app stayed silent and perfectly usable right up to the
+          morning every device refused at once, with a shell as the only way to find out why.
+        */}
+        {(diagnostics?.certificate || diagnostics?.dynamicDns) && (
+          <div className="usage-warning critical" role="alert">
+            <strong>This server needs attention</strong>
+            {diagnostics.certificate && (
+              <p>
+                Renewing the HTTPS certificate has been failing since{' '}
+                {new Date(diagnostics.certificate.failedAt).toLocaleDateString()}. Until it
+                succeeds this stays reachable, and when the current certificate expires every
+                device will refuse to connect. On the server:{' '}
+                <code>sudo athanor certificate renew</code>.
+                {diagnostics.certificate.reason ? ` (${diagnostics.certificate.reason})` : ''}
+              </p>
+            )}
+            {diagnostics.dynamicDns && (
+              <p>
+                Publishing this server&rsquo;s address has been failing since{' '}
+                {new Date(diagnostics.dynamicDns.failedAt).toLocaleDateString()}, so if its address
+                changes, clients will not find it. On the server:{' '}
+                <code>sudo athanor ddns configure</code>.
+                {diagnostics.dynamicDns.reason ? ` (${diagnostics.dynamicDns.reason})` : ''}
+              </p>
+            )}
+          </div>
+        )}
         <div className="settings-list">
           <div>
             <span>

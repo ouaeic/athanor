@@ -772,6 +772,12 @@ export const api = {
     previewForClient(
       await request<WorkspacePreview>(`/v1/previews/${id}/unpublish`, mutation('POST', {}))
     ),
+  /** What the box has written down about the parts of itself the API does not run. */
+  instanceDiagnostics: () =>
+    request<{
+      certificate: { failedAt: string; reason: string } | null;
+      dynamicDns: { failedAt: string; reason: string } | null;
+    }>('/v1/instance/diagnostics'),
   revokePreview: (id: string) =>
     request<{ revoked: boolean }>(`/v1/previews/${id}`, mutation('DELETE', {})),
   artifacts: (workspaceId: string) =>
