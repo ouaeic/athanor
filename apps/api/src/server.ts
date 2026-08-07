@@ -26,7 +26,6 @@ import {
   ModelRelease,
   resolveWebToolPlan,
   PublishWorkspacePreviewRequest,
-  SetWorkspacePreviewDomainRequest,
   TaskEventWindowQuery,
   TaskPageQuery,
   UpdateTaskPlanRequest,

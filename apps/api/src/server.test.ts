@@ -4137,24 +4137,26 @@ describe('a half-typed message', () => {
     // `updatedAt` travels with it: without a time against the sentence, a device that had once
     // seen a draft could only ever keep its own copy, and would eventually write that stale copy
     // back over a newer one.
-    expect(next.json<{ drafts: unknown[] }>().drafts).toEqual([
-      {
-        workspaceId,
-        taskId: null,
-        body: 'a sentence begun on another device',
-        attachments: [
-          {
-            path: 'workspace/uploads/abc-report.pdf',
-            name: 'report.pdf',
-            sizeBytes: 1024,
-            mimeType: 'application/pdf'
-          }
-        ],
-        updatedAt: expect.any(String)
-      }
-    ]);
-    const [onlyDraft] = next.json<{ drafts: Array<{ updatedAt: string }> }>().drafts;
-    expect(Number.isFinite(new Date(onlyDraft!.updatedAt).getTime())).toBe(true);
+    const drafts = next.json<{ drafts: Array<Record<string, unknown>> }>().drafts;
+    expect(drafts).toHaveLength(1);
+    const [draft] = drafts;
+    // The stamp has to be a real time; the rest is compared whole, so a field leaking into this
+    // payload fails here rather than travelling to every device unnoticed.
+    expect(Number.isFinite(new Date(String(draft?.updatedAt)).getTime())).toBe(true);
+    expect({ ...draft, updatedAt: 'checked separately' }).toEqual({
+      workspaceId,
+      taskId: null,
+      body: 'a sentence begun on another device',
+      attachments: [
+        {
+          path: 'workspace/uploads/abc-report.pdf',
+          name: 'report.pdf',
+          sizeBytes: 1024,
+          mimeType: 'application/pdf'
+        }
+      ],
+      updatedAt: 'checked separately'
+    });
 
     // And the box holds no plaintext of it, because a draft is the owner's words like any other.
     const stored = await database.query('SELECT body_ciphertext FROM message_drafts');

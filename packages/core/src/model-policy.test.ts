@@ -438,16 +438,6 @@ const sonnet: RoutableModel = {
 
 const unpriced: RoutableModel = { ...base, id: 'unpriced', displayName: 'Unpriced' };
 
-const cheapUnmeasured: RoutableModel = {
-  ...base,
-  id: 'cheap',
-  displayName: 'Cheap Unmeasured',
-  contextTokens: 1_000_000,
-  measuredQuality: null,
-  inputUsdPerMillionTokens: 0.1,
-  outputUsdPerMillionTokens: 0.4
-};
-
 /** "The best benchmarked model for the task under $2 per million in and $10 per million out." */
 const ceiling: ModelRequest = {
   ...request,
