@@ -115,10 +115,13 @@ athanor does not silently add a relay, VPN, or tracking directory; see
   running brief of anything already condensed, and the current plan.
 - Capability-aware model routing: a lead model without vision receives bounded observations from the
   best eligible vision model and remains responsible for the result.
-- Web Push to the owner's own devices for an approval, a finished task, a paused spend, a notice the
-  agent decided to raise, and a page only a person can get past. Every kind has its own switch and a
-  switched-off kind is dropped by the server rather than hidden by the phone; quiet hours still let
-  an approval through, and everything the agent has said is kept in one list across conversations.
+- Notifications to the owner's own devices for an approval, a finished task, a paused spend, a
+  notice the agent decided to raise, and a page only a person can get past. Browsers and installed
+  web apps receive them over Web Push; the packaged desktop and mobile clients, which have no push
+  subscription, raise them through the operating system themselves. Every kind has its own switch
+  and a switched-off kind is dropped by the server rather than hidden by the phone; quiet hours
+  still let an approval through, and everything the agent has said is kept in one list across
+  conversations.
 
 ### Models and specialist tools
 
@@ -168,6 +171,7 @@ sudo athanor logs
 sudo athanor backup [directory]
 sudo athanor restore DIRECTORY --yes
 sudo athanor update
+sudo athanor rollback [directory]
 sudo athanor auto-update {status|on|off}
 sudo athanor certificate
 sudo athanor ddns

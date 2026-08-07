@@ -577,6 +577,34 @@ else if (declaredNodeMajor !== installerNodeMajor)
   );
 else say(`Node version: engines and the installer both require ${installerNodeMajor}.`);
 
+/**
+ * Every command the box answers to is a command the README lists.
+ *
+ * Documentation drift is the failure this repository keeps having: a command is added and the list
+ * an owner reads is not, so the one thing that would have helped them is the one thing they cannot
+ * find. `athanor rollback` shipped and went unmentioned. Both sides are discovered here rather than
+ * listed, so the next command is covered by existing.
+ */
+const dispatch = read('scripts/athanor');
+const dispatchStart = dispatch.indexOf('case "$command_name" in');
+const dispatchBlock = dispatchStart === -1 ? '' : dispatch.slice(dispatchStart);
+const shippedCommands = new Set(
+  [...dispatchBlock.matchAll(/^  ([a-z][a-z-]*)\)/gm)].map((match) => match[1])
+);
+// `help` is the fallback arm and `install` is run by the installer, not by an owner reading this.
+for (const internal of ['help', 'install']) shippedCommands.delete(internal);
+const documented = new Set(
+  [...read('README.md').matchAll(/^sudo athanor ([a-z][a-z-]*)/gm)].map((match) => match[1])
+);
+const undocumented = [...shippedCommands].filter((name) => !documented.has(name)).sort();
+const imaginary = [...documented].filter((name) => !shippedCommands.has(name)).sort();
+if (!shippedCommands.size) fail('scripts/athanor no longer has a recognisable command dispatch');
+else if (undocumented.length)
+  fail(`scripts/athanor answers to ${undocumented.join(', ')}, which the README never mentions`);
+else if (imaginary.length)
+  fail(`README documents ${imaginary.join(', ')}, which scripts/athanor does not answer to`);
+else say(`Server commands: ${shippedCommands.size} shipped, all of them documented.`);
+
 if (failures.length > 0) {
   process.stderr.write(`\n${failures.map((message) => `- ${message}`).join('\n')}\n`);
   process.exitCode = 1;
