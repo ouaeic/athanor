@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
+import { sandboxedInvocation, type AgentSandbox } from './sandbox.js';
 import type { DesktopAction, DesktopHolder, DesktopLaunchRequest } from '@athanor/contracts';
 import {
   DISPLAY_PROTOCOL,
@@ -839,7 +840,18 @@ export class DesktopManager {
     private readonly bridgeExecutable?: string,
     private readonly sessionExecutable?: string,
     /** Root-owned helpers a launched program may not name; see `launch`. */
-    private readonly privilegedHelpers: readonly (string | undefined)[] = []
+    private readonly privilegedHelpers: readonly (string | undefined)[] = [],
+    /**
+     * How a command is dropped to the agent account.
+     *
+     * The whole desktop runs under this, not just the programs launched into it. Running only the
+     * launch under it would not work: the session's D-Bus socket is created private to whoever
+     * started the session, so a launched program dropped to another account could reach the display
+     * and not the bus. Starting the session as the agent account puts both on the same side, and
+     * then every window on that desktop - Xvfb, the window manager, the accessibility bridge and
+     * anything the agent opens - is confined the way a shell command already was.
+     */
+    private readonly sandbox?: AgentSandbox
   ) {}
 
   get configured(): boolean {
@@ -885,9 +897,23 @@ export class DesktopManager {
     );
     const envFile = path.join(root, '.athanor', 'desktop', 'environment');
     await rm(envFile, { force: true });
-    const process = spawn(this.sessionExecutable!, [root, display], {
+    // `processEnv` types its values as possibly absent; the helper takes assignments, so the empty
+    // ones are dropped rather than passed as the string "undefined".
+    const sessionEnv = Object.fromEntries(
+      Object.entries(processEnv(root)).filter(([, value]) => typeof value === 'string')
+    ) as Record<string, string>;
+    const sessionInvocation = this.sandbox
+      ? sandboxedInvocation(
+          { executable: this.sessionExecutable!, args: [root, display] },
+          sessionEnv,
+          this.sandbox,
+          false
+        )
+      : { executable: this.sessionExecutable!, args: [root, display] };
+    const process = spawn(sessionInvocation.executable, sessionInvocation.args, {
       cwd: root,
-      env: { ...processEnv(root) },
+      // The helper installs the environment itself, from arguments, because elevation resets it.
+      env: this.sandbox ? {} : { ...sessionEnv },
       // The session's own stderr is the only account of why it did not come up, and discarding it
       // left "GUI desktop session failed to start" as the whole story - which cost a long
       // afternoon the first time a real box refused. Kept to a few kilobytes because this is a
@@ -1341,9 +1367,27 @@ export class DesktopManager {
     const extraArgs = /(?:chromium|chrome|electron)$/i.test(path.basename(request.executable))
       ? ['--force-renderer-accessibility=complete']
       : [];
-    const child = spawn(request.executable, [...extraArgs, ...request.args], {
+    /*
+     * Dropped to the agent account, like every other command.
+     *
+     * This spawned the agent's chosen executable directly, so a program opened on the desktop ran
+     * as the runner rather than as the confined account a shell command elevates down to - the same
+     * command, the greater privilege, for asking for a window instead of a prompt. It works because
+     * the session above is started the same way: the display and the D-Bus socket both belong to
+     * that account, so a program dropped into them finds everything it needs.
+     */
+    const launchEnv = { ...session.env, ...safeEnv } as Record<string, string>;
+    const invocation = this.sandbox
+      ? sandboxedInvocation(
+          { executable: request.executable, args: [...extraArgs, ...request.args] },
+          launchEnv,
+          this.sandbox,
+          false
+        )
+      : { executable: request.executable, args: [...extraArgs, ...request.args] };
+    const child = spawn(invocation.executable, invocation.args, {
       cwd,
-      env: { ...session.env, ...safeEnv },
+      env: this.sandbox ? {} : launchEnv,
       stdio: 'ignore',
       detached: true,
       shell: false
