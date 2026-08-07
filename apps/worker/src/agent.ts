@@ -2314,6 +2314,52 @@ export class AgentWorker {
    * resuming carries on from here. Failing would throw away a long task over its last dollar, and
    * checking afterwards would always overshoot by one step.
    */
+  /**
+   * Tells the owner's devices, once per window, that their ceiling is in play.
+   *
+   * "Warn me at 80% of my daily cap" only ever appeared inside whichever task happened to cross it,
+   * which for unattended work - the point of the machine - is a 3am scheduled run nobody opens for
+   * hours. The threshold was decorative. `claimSpendAlert` is the deduplication: it inserts on a
+   * unique window and returns false if this box has already said this about this window, so a long
+   * task that keeps stepping does not keep ringing a phone.
+   */
+  async #raiseSpendAlert(
+    task: TaskRecord,
+    key: Uint8Array,
+    decision: SpendDecision,
+    level: 'warning' | 'exceeded'
+  ): Promise<void> {
+    const names = level === 'warning' ? decision.warnedBy : decision.blockedBy ? [decision.blockedBy] : [];
+    for (const name of names) {
+      if (name !== 'daily' && name !== 'monthly') continue;
+      const window = decision.windows.find((candidate) => candidate.name === name);
+      if (!window?.startsAt || window.capUsd === null) continue;
+      const claimed = await this.store
+        .claimSpendAlert({
+          userId: task.userId,
+          windowName: name,
+          windowStart: new Date(window.startsAt),
+          level,
+          spentUsd: window.spentUsd,
+          capUsd: window.capUsd
+        })
+        .catch(() => false);
+      if (!claimed) continue;
+      const headline =
+        level === 'exceeded'
+          ? `Work paused: the ${name} spending cap of $${window.capUsd.toFixed(2)} is reached.`
+          : `Spending has passed the warning point of your ${name} cap: $${window.spentUsd.toFixed(2)} of $${window.capUsd.toFixed(2)}.`;
+      await this.store
+        .createAgentNotification({
+          userId: task.userId,
+          taskId: task.id,
+          kind: 'agent_message',
+          messageCiphertext: encryptJson({ message: headline }, key, agentNotificationAad(task.id))
+        })
+        .catch(() => undefined);
+    }
+  }
+
   async #haltIfOutOfMoney(task: TaskRecord, key: Uint8Array, state: AgentState): Promise<boolean> {
     // The next step usually costs about what the last one did. A first step has nothing to go on,
     // so it is priced at a token amount: the point is to catch a runaway, not to predict precisely.
@@ -2372,6 +2418,7 @@ export class AgentWorker {
           windows: decision.windows,
           estimateUsd
         });
+        await this.#raiseSpendAlert(task, key, decision, 'warning');
       }
       return false;
     }
@@ -2381,6 +2428,7 @@ export class AgentWorker {
       windows: decision.windows,
       estimateUsd
     });
+    await this.#raiseSpendAlert(task, key, decision, 'exceeded');
     await this.store.updateTask({
       id: task.id,
       workerId: this.config.WORKER_ID,

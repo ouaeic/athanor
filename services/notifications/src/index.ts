@@ -125,10 +125,18 @@ while (running) {
         continue;
       }
 
+      // Bounded. A push endpoint is a third party's server on the far side of the internet, and
+      // without a timeout one that accepts the connection and then says nothing holds this loop -
+      // and therefore every other device's notification behind it - until the socket gives up on
+      // its own, which can be minutes.
       await webpush.sendNotification(
         { endpoint: item.endpoint, keys: { p256dh: item.p256dh, auth: item.auth } },
         JSON.stringify(notificationPayload(subject)),
-        { TTL: 600, urgency: item.kind === 'approval_required' ? 'high' : 'normal' }
+        {
+          TTL: 600,
+          urgency: item.kind === 'approval_required' ? 'high' : 'normal',
+          timeout: 10_000
+        }
       );
       await settle(item);
       delivered += 1;
@@ -140,6 +148,25 @@ while (running) {
           : 0;
       if (statusCode === 404 || statusCode === 410) {
         await store.deletePushSubscriptionById(item.id);
+      } else {
+        /*
+         * Said out loud, once per run, per endpoint.
+         *
+         * The only record of a failure was `failed`, a counter on a metrics port bound to loopback
+         * - so a device whose notifications had silently stopped working looked exactly like a
+         * device nothing had happened on, and the owner's first clue was noticing they had stopped
+         * arriving. The host is enough to identify which push service is refusing without putting
+         * the endpoint's secret path in the journal.
+         */
+        let host = 'the push service';
+        try {
+          host = new URL(item.endpoint).host;
+        } catch {
+          // An endpoint that will not parse is worth reporting as much as one that will.
+        }
+        process.stderr.write(
+          `athanor-notifications: ${host} refused a notification${statusCode ? ` (HTTP ${statusCode})` : ''}; it stays queued and will be retried\n`
+        );
       }
     }
   }

@@ -10,7 +10,9 @@ const execFile = promisify(execFileCallback);
 const MAX_COMMAND_OUTPUT = 64 * 1024 * 1024;
 const EXPECTED_PERMISSIONS = new Set([
   'android.permission.INTERNET',
+  'android.permission.MODIFY_AUDIO_SETTINGS',
   'android.permission.POST_NOTIFICATIONS',
+  'android.permission.RECORD_AUDIO',
   'android.permission.RECEIVE_BOOT_COMPLETED',
   'android.permission.WAKE_LOCK',
   'org.athanor.ai.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'

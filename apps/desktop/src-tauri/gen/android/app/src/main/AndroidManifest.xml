@@ -1,6 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!--
+      A voice note is recorded through getUserMedia in the webview, which Android refuses without
+      this. The composer offers the control on every client, so on the packaged Android app the
+      button was there, the permission prompt never appeared, and recording failed with nothing
+      said. MODIFY_AUDIO_SETTINGS goes with it: the recorder needs to select an input route.
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <application
         android:allowBackup="false"
