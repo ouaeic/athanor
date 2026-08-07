@@ -1,7 +1,7 @@
 {
   "name": "athanor",
   "short_name": "athanor",
-  "description": "A private, open-source AI cloud computer.",
+  "description": "One private AI computer, available from every device.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#050706",

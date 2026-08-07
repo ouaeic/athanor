@@ -25,6 +25,14 @@ function DiffBody({ diff }: { diff: FileDiffModel }) {
                   <span aria-hidden="true" className="diff-sign">
                     {line.kind === 'add' ? '+' : line.kind === 'remove' ? '-' : ' '}
                   </span>
+                  {/* The glyph is hidden from assistive technology because it reads as punctuation,
+                      which left added and removed lines sounding identical - the one distinction a
+                      diff exists to make. Said in words instead, for that reader only. */}
+                  {line.kind !== 'context' && (
+                    <span className="sr-only">
+                      {line.kind === 'add' ? 'added ' : 'removed '}
+                    </span>
+                  )}
                   {line.text || ' '}
                 </td>
               </tr>

@@ -7,19 +7,15 @@ import {
   classifyModelTask,
   coarsenTaskKind,
   contextHeadroomScore,
-  describeSpendCeiling,
   effectivePricePerMillionTokens,
   inferModelTask,
   isModelEligible,
   isPrivacyRouteEligible,
   modelTaskKinds,
-  parseSpendCeiling,
   priceCeilingBreach,
   qualityScore,
   rankModels,
   readRoutingMetadata,
-  reportPriceCeiling,
-  selectModel,
   taskProfile,
   type ModelRequest,
   type RoutableModel,
@@ -505,78 +501,6 @@ describe('the owner price ceiling', () => {
   it('never constrains a model the owner picked by name', () => {
     const picked = rankModels([opus, sonnet], { ...ceiling, requestedId: 'opus' });
     expect(picked.map((item) => item.model.id)).toEqual(['opus']);
-    expect(selectModel([opus, sonnet], { ...ceiling, requestedId: 'opus' })).toMatchObject({
-      ceilingOutcome: 'no_ceiling'
-    });
-  });
-});
-
-describe('selectModel', () => {
-  it('picks the best benchmarked model under the ceiling, even when an unmeasured one scores higher', () => {
-    const selection = selectModel([opus, sonnet, cheapUnmeasured], {
-      ...ceiling,
-      taskKind: 'bulk_summarisation'
-    });
-    expect(selection.ceilingOutcome).toBe('within');
-    expect(selection.choice?.model.id).toBe('sonnet');
-    expect(selection.message).toBeNull();
-    // The unmeasured model is cheaper and has more context, so it tops the raw ranking; the ceiling
-    // promise is "best benchmarked", which is why the choice is not simply ranked[0].
-    expect(selection.ranked[0]?.model.id).toBe('cheap');
-    expect(selection.ranked.some((item) => item.model.id === 'opus')).toBe(false);
-  });
-
-  it('says when it had to relax to an unmeasured model', () => {
-    const selection = selectModel([opus, cheapUnmeasured], ceiling);
-    expect(selection.ceilingOutcome).toBe('relaxed_unbenchmarked');
-    expect(selection.choice?.model.id).toBe('cheap');
-    expect(selection.message).toBe(
-      'No benchmarked model fits your ceiling of $2.00/$10.00 per million tokens; using Cheap Unmeasured, which is unmeasured.'
-    );
-  });
-
-  it('picks nothing rather than silently spending over a ceiling nobody is awake to lift', () => {
-    const selection = selectModel([opus], ceiling);
-    expect(selection.ceilingOutcome).toBe('blocked');
-    expect(selection.choice).toBeNull();
-    expect(selection.cheapestAboveCeiling?.id).toBe('opus');
-    expect(selection.message).toBe(
-      'No model under $2.00/$10.00 per million tokens can do this on the zero-retention route; the cheapest that can is Claude Opus 5 at $5.00/$25.00.'
-    );
-  });
-
-  it('leaves an unconstrained selection exactly as the ranking left it', () => {
-    const selection = selectModel([opus, sonnet], { ...request, taskKind: 'agentic' });
-    expect(selection.ceilingOutcome).toBe('no_ceiling');
-    expect(selection.choice?.model.id).toBe(selection.ranked[0]?.model.id);
-    expect(selection.message).toBeNull();
-  });
-});
-
-describe('reportPriceCeiling', () => {
-  it('measures what the ceiling costs against the live catalogue rather than asserting it', () => {
-    const report = reportPriceCeiling([opus, sonnet], { ...ceiling, preference: 'best' });
-    expect(report.eligibleCount).toBe(1);
-    expect(report.benchmarkedCount).toBe(1);
-    expect(report.bestUnderCeiling?.model.id).toBe('sonnet');
-    expect(report.bestWithoutCeiling?.model.id).toBe('opus');
-    expect(report.lines).toHaveLength(3);
-    expect(report.lines[0]).toContain('Under your ceiling: Claude Sonnet 5');
-    expect(report.lines[1]).toContain('Without a ceiling: Claude Opus 5');
-    expect(report.lines[2]).toBe(
-      'Difference: $3.00 more per million input and $15.00 more per million output.'
-    );
-  });
-
-  it('reports an empty eligible set so a settings screen can refuse the ceiling instead of failing later', () => {
-    const report = reportPriceCeiling([opus], {
-      ...ceiling,
-      maxInputUsdPerMillionTokens: 0.001,
-      maxOutputUsdPerMillionTokens: 0.001
-    });
-    expect(report.eligibleCount).toBe(0);
-    expect(report.bestUnderCeiling).toBeNull();
-    expect(report.lines[0]).toContain('Under your ceiling: nothing');
   });
 });
 
@@ -737,80 +661,6 @@ describe('routing metadata round trip', () => {
     expect(rankModels([restore(configured), base], request).map((item) => item.model.id)).toEqual([
       'fast'
     ]);
-  });
-});
-
-describe('the ceiling in a sentence', () => {
-  it("reads the owner's own words", () => {
-    expect(parseSpendCeiling('under $2 per million input and $10 per million output')).toEqual({
-      ok: true,
-      ceiling: { maxInputUsdPerMillionTokens: 2, maxOutputUsdPerMillionTokens: 10 },
-      sentence:
-        'The best benchmarked model for the task under $2.00 per million input and $10.00 per million output tokens.'
-    });
-    for (const phrasing of [
-      '$2 in and $10 out',
-      '$2/M input, $10/M output',
-      'input $2, output $10',
-      'prompt at $2 per million and completion at $10 per million',
-      '2 dollars per million input and 10 dollars per million output'
-    ]) {
-      const read = parseSpendCeiling(phrasing);
-      expect(read.ok ? read.ceiling : read.problem).toEqual({
-        maxInputUsdPerMillionTokens: 2,
-        maxOutputUsdPerMillionTokens: 10
-      });
-    }
-  });
-
-  it('is invisible to an owner who does not want one', () => {
-    for (const phrasing of ['', '   ', 'none', 'no limit', 'unlimited']) {
-      const read = parseSpendCeiling(phrasing);
-      expect(read.ok && read.ceiling).toBeNull();
-    }
-    expect(describeSpendCeiling(null)).toBe(
-      'No spending ceiling; athanor picks the best model for the work.'
-    );
-  });
-
-  it('takes one rate on its own', () => {
-    const read = parseSpendCeiling('nothing over $3 per million output');
-    expect(read.ok && read.ceiling).toEqual({ maxOutputUsdPerMillionTokens: 3 });
-    expect(read.ok && read.sentence).toBe(
-      'The best benchmarked model for the task under $3.00 per million output tokens.'
-    );
-  });
-
-  it('refuses what it cannot read instead of guessing at a spending control', () => {
-    expect(parseSpendCeiling('under $2')).toEqual({
-      ok: false,
-      problem:
-        'Say which rate each figure is, for example "under $2 per million input and $10 per million output".'
-    });
-    expect(parseSpendCeiling('keep it cheap please')).toMatchObject({ ok: false });
-    // "in" as an ordinary English word is not an input rate.
-    expect(parseSpendCeiling('under $2 in total')).toMatchObject({ ok: false });
-    // A thousands separator is refused, never truncated to a ceiling a thousandfold tighter.
-    expect(parseSpendCeiling('$2,000 per million input')).toMatchObject({ ok: false });
-    expect(parseSpendCeiling('$2 input and $3 input')).toEqual({
-      ok: false,
-      problem: 'Two different input rates: $2.00 and $3.00.'
-    });
-  });
-
-  it('hands the router something it already understands', () => {
-    const read = parseSpendCeiling(
-      'the best model under $2 per million input and $10 per million output'
-    );
-    expect(read.ok).toBe(true);
-    if (!read.ok || !read.ceiling) throw new Error('expected a ceiling');
-    const selection = selectModel([opus, sonnet], {
-      ...request,
-      taskKind: 'agentic',
-      ...read.ceiling
-    });
-    expect(selection.ceilingOutcome).toBe('within');
-    expect(selection.choice?.model.id).toBe('sonnet');
   });
 });
 

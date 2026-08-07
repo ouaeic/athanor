@@ -944,57 +944,6 @@ const cheapestFirst = (left: RoutableModel, right: RoutableModel): number => {
   return leftPrice - rightPrice || left.id.localeCompare(right.id);
 };
 
-/**
- * "The best benchmarked model for the task under the owner's ceiling", with an answer for the case
- * where nothing fits. It is an eligibility filter and never a weight: below the ceiling the ranking
- * is exactly the ranking, and an explicitly requested model is never constrained by it, because the
- * ceiling governs what athanor picks for you and never what you pick for yourself.
- */
-export const selectModel = (models: RoutableModel[], request: ModelRequest): ModelSelection => {
-  const ranked = rankModels(models, request);
-  if (!hasPriceCeiling(request) || request.requestedId)
-    return {
-      ranked,
-      choice: ranked[0] ?? null,
-      ceilingOutcome: 'no_ceiling',
-      message: null,
-      cheapestAboveCeiling: null
-    };
-  if (ranked.length === 0) {
-    const cheapest = models
-      .filter((model) => meetsRequirements(model, request))
-      .sort(cheapestFirst)[0];
-    return {
-      ranked,
-      choice: null,
-      ceilingOutcome: 'blocked',
-      message: cheapest
-        ? `No model under ${describeCeiling(request)} per million tokens can do this on ${routeLabel(request.privacyRoute)}; the cheapest that can is ${cheapest.displayName} at ${describePrice(cheapest, request)}.`
-        : `No model under ${describeCeiling(request)} per million tokens can do this on ${routeLabel(request.privacyRoute)}, and nothing on that route can do it at any price.`,
-      cheapestAboveCeiling: cheapest ?? null
-    };
-  }
-  const benchmarked = ranked.find(isBenchmarked);
-  if (benchmarked)
-    return {
-      ranked,
-      choice: benchmarked,
-      ceilingOutcome: 'within',
-      message: null,
-      cheapestAboveCeiling: null
-    };
-  const choice = ranked[0] ?? null;
-  return {
-    ranked,
-    choice,
-    ceilingOutcome: 'relaxed_unbenchmarked',
-    message: choice
-      ? `No benchmarked model fits your ceiling of ${describeCeiling(request)} per million tokens; using ${choice.model.displayName}, which is unmeasured.`
-      : null,
-    cheapestAboveCeiling: null
-  };
-};
-
 export interface PriceCeilingReport {
   /** How many models the ceiling leaves for this request. Zero means the ceiling must be refused. */
   readonly eligibleCount: number;
@@ -1009,44 +958,6 @@ const scoreLine = (ranked: RankedModel, request: ModelRequest, lead: string): st
   const profile = taskProfile(request.taskKind ?? 'general');
   const benchmark = describeBenchmark(ranked.model, profile, ranked.breakdown.quality);
   return `${lead}: ${ranked.model.displayName} - ${benchmark} at ${describePrice(ranked.model, request)} per million tokens.`;
-};
-
-/**
- * What a ceiling costs the owner, measured against their own live catalogue rather than asserted.
- * A settings screen shows these three lines and refuses to save a ceiling with nothing under it,
- * naming what the cheapest capable model actually costs instead of failing at the next task.
- */
-export const reportPriceCeiling = (
-  models: RoutableModel[],
-  request: ModelRequest
-): PriceCeilingReport => {
-  const constrained = rankModels(models, request);
-  const unconstrained = rankModels(models, withoutCeiling(request));
-  const bestUnderCeiling = constrained.find(isBenchmarked) ?? constrained[0] ?? null;
-  const bestWithoutCeiling = unconstrained.find(isBenchmarked) ?? unconstrained[0] ?? null;
-  const lines: string[] = [];
-  if (bestUnderCeiling) lines.push(scoreLine(bestUnderCeiling, request, 'Under your ceiling'));
-  else
-    lines.push(
-      `Under your ceiling: nothing. No model on ${routeLabel(request.privacyRoute)} is priced under ${describeCeiling(request)} per million tokens.`
-    );
-  if (bestWithoutCeiling) lines.push(scoreLine(bestWithoutCeiling, request, 'Without a ceiling'));
-  if (bestUnderCeiling && bestWithoutCeiling) {
-    const under = pricesAtPromptSize(bestUnderCeiling.model, request.minContextTokens);
-    const over = pricesAtPromptSize(bestWithoutCeiling.model, request.minContextTokens);
-    lines.push(
-      under.input !== null && over.input !== null && under.output !== null && over.output !== null
-        ? `Difference: ${formatUsd(Math.max(0, over.input - under.input))} more per million input and ${formatUsd(Math.max(0, over.output - under.output))} more per million output.`
-        : 'Difference: one of the two publishes no price, so there is nothing to compare.'
-    );
-  }
-  return {
-    eligibleCount: constrained.length,
-    benchmarkedCount: constrained.filter(isBenchmarked).length,
-    bestUnderCeiling,
-    bestWithoutCeiling,
-    lines
-  };
 };
 
 /** The owner's ceiling on its own, apart from any one request. */
@@ -1096,61 +1007,6 @@ const isOutputRole = (role: string): boolean =>
 const formatCeilingUsd = (usd: number): string => `${formatUsd(usd)} per million`;
 
 /** The canonical reading of a ceiling, so an owner sees back what athanor understood. */
-export const describeSpendCeiling = (ceiling: SpendCeiling | null): string => {
-  const input = ceiling?.maxInputUsdPerMillionTokens;
-  const output = ceiling?.maxOutputUsdPerMillionTokens;
-  if (typeof input !== 'number' && typeof output !== 'number')
-    return 'No spending ceiling; athanor picks the best model for the work.';
-  const parts = [
-    ...(typeof input === 'number' ? [`${formatCeilingUsd(input)} input`] : []),
-    ...(typeof output === 'number' ? [`${formatCeilingUsd(output)} output`] : [])
-  ];
-  return `The best benchmarked model for the task under ${parts.join(' and ')} tokens.`;
-};
-
-/**
- * Reads "the best benchmarked model for the task under $2 per million input and $10 per million
- * output" out of the sentence an owner actually types.
- *
- * This is the whole of how the ceiling is reached: one sentence for an owner who wants one, and
- * nothing at all - no field, no default, no ceiling - for an owner who does not. It is deliberately
- * literal. Every figure has to say which rate it is, because the two are not interchangeable and a
- * single blended number is what made the old field unable to express this at all.
- */
-export const parseSpendCeiling = (sentence: string): SpendCeilingReading => {
-  const text = sentence.trim().toLowerCase().replace(/\s+/g, ' ');
-  if (text.length === 0 || NO_CEILING.test(text))
-    return { ok: true, ceiling: null, sentence: describeSpendCeiling(null) };
-  const found = new Map<'input' | 'output', number>();
-  let conflict: string | null = null;
-  const take = (role: string, raw: string): void => {
-    const amount = Number(raw);
-    if (!Number.isFinite(amount) || amount < 0) return;
-    const key = isOutputRole(role) ? 'output' : 'input';
-    const existing = found.get(key);
-    if (existing !== undefined && existing !== amount)
-      conflict = `Two different ${key} rates: ${formatUsd(existing)} and ${formatUsd(amount)}.`;
-    else found.set(key, amount);
-  };
-  for (const match of text.matchAll(amountThenRole)) take(match[2] ?? '', match[1] ?? '');
-  for (const match of text.matchAll(roleThenAmount)) take(match[1] ?? '', match[2] ?? '');
-  if (conflict !== null) return { ok: false, problem: conflict };
-  if (found.size === 0)
-    return {
-      ok: false,
-      problem: /\d/.test(text)
-        ? 'Say which rate each figure is, for example "under $2 per million input and $10 per million output".'
-        : 'Name a rate per million tokens, for example "under $2 per million input and $10 per million output".'
-    };
-  const input = found.get('input');
-  const output = found.get('output');
-  const ceiling: SpendCeiling = {
-    ...(input === undefined ? {} : { maxInputUsdPerMillionTokens: input }),
-    ...(output === undefined ? {} : { maxOutputUsdPerMillionTokens: output })
-  };
-  return { ok: true, ceiling, sentence: describeSpendCeiling(ceiling) };
-};
-
 export interface TaskSignals {
   readonly prompt: string;
   /**

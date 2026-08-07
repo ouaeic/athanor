@@ -30,7 +30,11 @@ export const apiTokenScopeCopy: readonly ApiTokenScopeCopy[] = [
   {
     scope: 'workspaces:write',
     label: 'Change this computer',
-    detail: 'Publish and revoke links, and drive the browser, desktop and terminal.'
+    // The terminal and the live browser and desktop streams are refused to bearer tokens
+    // outright, whatever they hold, so a description promising them sends a script into a 403 the
+    // wording itself caused.
+    detail:
+      'Publish and revoke links, and drive the browser and desktop. It cannot open a terminal or a live screen stream, which need a signed-in device.'
   },
   {
     scope: 'tasks:read',

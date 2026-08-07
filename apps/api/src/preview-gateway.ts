@@ -221,7 +221,7 @@ export const buildPreviewGateway = async (
         .send(
           code === 'preview_compute_limit'
             ? '<!doctype html><title>Site paused</title><h1>Site paused</h1><p>The workspace owner needs to add active compute time before this on-demand site can wake.</p>'
-            : '<!doctype html><title>Preview unavailable</title><h1>Preview unavailable</h1><p>This preview expired, was revoked, or its cloud workspace is sleeping.</p>'
+            : '<!doctype html><title>Preview unavailable</title><h1>Preview unavailable</h1><p>This preview expired, was revoked, or the computer serving it is asleep.</p>'
         );
     }
     if (!hasAccess(request, preview))

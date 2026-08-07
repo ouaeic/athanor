@@ -1992,7 +1992,7 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
       const preparingEventCiphertext = encryptJson(
         {
           __athanorEventVersion: 1,
-          summary: 'Scheduled run is preparing its cloud workspace',
+          summary: 'Scheduled run is starting the computer',
           payload: { scheduleId: schedule.id, scheduledFor: schedule.nextRunAt }
         },
         key,
@@ -5773,7 +5773,7 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
         if (workspace.status !== 'running')
           throw new AthanorError(
             'workspace_unavailable',
-            'The cloud workspace must be running before exposing a preview'
+            'The computer must be running before exposing a preview'
           );
         const check = await runner.request<{ available: boolean }>({
           workspaceId: workspace.id,
@@ -5785,7 +5785,7 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
         if (!check.available)
           throw new AthanorError(
             'preview_port_unavailable',
-            `No service is listening on cloud workspace port ${input.port}`
+            `Nothing is listening on port ${input.port} of this computer`
           );
         const accessToken = randomBytes(32).toString('base64url');
         let preview: WorkspacePreviewRecord;

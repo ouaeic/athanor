@@ -800,39 +800,6 @@ describe('DataStore', () => {
     await expect(store.listWorkspaceSnapshots(user.id, workspace.id)).resolves.toEqual([]);
   });
 
-  it('meters running workspace time exactly once and stops at hibernation', async () => {
-    const user = await store.createUser({ username: 'metered', displayName: 'Metered' });
-    const workspace = await store.createWorkspace({
-      userId: user.id,
-      name: 'Metered workspace',
-      storageLimitBytes: 10 * 1024 ** 3,
-      imageRevision: 'dev',
-      region: 'auto',
-      wrappedKey: 'wrapped'
-    });
-    await store.updateWorkspaceStatus(workspace.id, 'running');
-    const end = new Date('2026-07-21T12:00:00.000Z');
-    await database.query('UPDATE workspaces SET compute_metered_at=$2 WHERE id=$1', [
-      workspace.id,
-      new Date(end.getTime() - 3_600_000).toISOString()
-    ]);
-    await expect(store.settleWorkspaceCompute(workspace.id, 2.754, end)).resolves.toBeCloseTo(
-      2.754
-    );
-    await expect(store.settleWorkspaceCompute(workspace.id, 2.754, end)).resolves.toBe(0);
-    await store.updateWorkspaceStatus(workspace.id, 'hibernated');
-    await expect(
-      store.settleWorkspaceCompute(workspace.id, 2.754, new Date(end.getTime() + 3_600_000))
-    ).resolves.toBe(0);
-    await expect(
-      store.usageTotals(
-        user.id,
-        new Date('2026-07-21T00:00:00.000Z'),
-        new Date('2026-07-22T00:00:00.000Z')
-      )
-    ).resolves.toMatchObject({ settled: 2.754, reserved: 0 });
-  });
-
   it('stores connector secrets as ciphertext and records content-free capability audit', async () => {
     const user = await store.createUser({ username: 'connector', displayName: 'Connector' });
     const connector = await store.createConnector({

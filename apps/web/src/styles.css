@@ -2966,7 +2966,9 @@ select:focus-visible {
   border-radius: 8px;
   padding: 0 10px;
   background: transparent;
-  color: #737f78;
+  /* #737f78 on this surface is under 4.5:1, and these are the labels somebody reads to find the
+     page they want rather than decoration they can skip. */
+  color: var(--muted);
   cursor: pointer;
   font-size: 12px;
   font-weight: 600;

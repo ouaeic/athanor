@@ -1175,12 +1175,17 @@ if [ -z "$server_has_hostname" ]; then
   printf '\nThis computer has no hostname, so it is reachable only by address. Signing in from a\n'
   printf 'browser needs a hostname: a passkey is bound to a domain name and the WebAuthn standard\n'
   printf 'does not allow an IP address, so today only the native clients can sign in.\n'
-  printf 'The shortest way to fix that, free, about a minute:\n'
+  # Fixed address first, because that is what a rented server has. Dynamic DNS chases an address
+  # that moves, and leading with it sent owners of perfectly stable servers to set up a service
+  # against a problem they do not have.
+  printf '\nIf this address is fixed, which it usually is on a rented server, point a domain at\n'
+  printf '%s and then:\n' "$(printf '%s' "$ipv4_addresses" | awk '{print $1}')"
+  printf '  sudo athanor set-hostname your.domain\n'
+  printf 'Or re-run this installer with ATHANOR_HOSTNAME=your.domain to do it in one step.\n'
+  printf '\nIf the address changes, as on a home connection, dynamic DNS is the tool for that:\n'
   printf '  1. create a name at https://www.duckdns.org or https://desec.io\n'
   printf '  2. sudo athanor ddns configure\n'
-  printf 'That publishes this computer address under the name, makes the name the public origin,\n'
-  printf 'and puts it in the TLS certificate. If your domain already uses Cloudflare DNS, choose\n'
-  printf 'Cloudflare in the same command and use a name you own.\n'
+  printf 'Either way the name becomes the public origin and goes into the TLS certificate.\n'
 fi
 if [ -z "${ATHANOR_ACME_EMAIL:-}" ]; then
   printf '\nThis server is using a self-signed certificate, so browsers will warn and cannot\n'

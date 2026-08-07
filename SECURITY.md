@@ -11,9 +11,10 @@ assessment within seven. Security fixes target the current release line.
 
 ## Threat model
 
-athanor is designed for one owner. The installer ships `REGISTRATION_MODE=first_user`, so the first
-account claims the server and registration then closes; there is no sharing model, no roles and no
-second party to authorize against. It is not a hardened hostile multi-tenant compute service.
+athanor is designed for one owner. Registration closes the moment the first account is created —
+there is no setting that reopens it — and claiming the server needs the single-use pairing token the
+installer prints, which expires and can be rotated with `sudo athanor pairing-code`. There is no
+sharing model, no roles and no second party to authorize against. It is not a hardened hostile multi-tenant compute service.
 Anyone with root access to the host, control of the configured operating-system package
 repositories, live process memory, or an unencrypted backup can compromise the installation.
 
@@ -136,7 +137,8 @@ Losing `DATA_MASTER_KEY` makes encrypted records unrecoverable. Rotating or repl
 2. Expose only SSH as needed and Nginx on 80/443; use `athanor doctor` to verify every private service
    remains loopback-only.
 3. Restrict SSH, disable password login where practical, and protect the server provider account.
-4. Keep `REGISTRATION_MODE=first_user`; rotate an unused pairing ticket after accidental disclosure.
+4. Rotate an unused pairing ticket after accidental disclosure: `sudo athanor pairing-code`.
+   Registration closes on its own once an owner exists and cannot be reopened by configuration.
 5. Do not rewrite the passkey origin after owner registration. Native clients follow address changes
    by the pinned server identity.
 6. Keep custom connector and MCP hosts to the minimum required.

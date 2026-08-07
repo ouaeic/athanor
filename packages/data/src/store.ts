@@ -2032,58 +2032,6 @@ export class DataStore {
     return result.rows.map(mapWorkspace);
   }
 
-  async settleWorkspaceCompute(
-    id: string,
-    creditsPerHour: number,
-    at = new Date()
-  ): Promise<number> {
-    return this.database.transaction(async (transaction) => {
-      const result = await transaction.query<{
-        id: string;
-        user_id: string;
-        status: string;
-        compute_metered_at: unknown;
-        updated_at: unknown;
-      }>(
-        `SELECT id,user_id,status,compute_metered_at,updated_at
-         FROM workspaces WHERE id=$1 FOR UPDATE`,
-        [id]
-      );
-      const workspace = result.rows[0];
-      if (!workspace || workspace.status !== 'running') return 0;
-      const startedAt = new Date(String(workspace.compute_metered_at ?? workspace.updated_at));
-      const milliseconds = Math.max(0, at.getTime() - startedAt.getTime());
-      if (milliseconds === 0) return 0;
-      const hours = milliseconds / 3_600_000;
-      const credits = hours * creditsPerHour;
-      const idempotencyKey = `workspace-runtime:${id}:${startedAt.toISOString()}:${at.toISOString()}`;
-      await transaction.query(
-        `INSERT INTO usage_entries(
-          id,user_id,workspace_id,kind,resource_class,quantity,unit,credits,state,idempotency_key,
-          created_at
-         ) VALUES ($1,$2,$3,'workspace_compute',$4,$5,'hours',$6,'settled',$7,$8)
-         ON CONFLICT(idempotency_key) DO NOTHING`,
-        [
-          randomUUID(),
-          workspace.user_id,
-          id,
-          // There is one computer and it is the box this is installed on, so the class of thing
-          // these hours were spent on says exactly that.
-          'workspace',
-          hours,
-          credits,
-          idempotencyKey,
-          at.toISOString()
-        ]
-      );
-      await transaction.query('UPDATE workspaces SET compute_metered_at=$2 WHERE id=$1', [
-        id,
-        at.toISOString()
-      ]);
-      return credits;
-    });
-  }
-
   async touchWorkspace(userId: string, id: string): Promise<void> {
     await this.database.query('UPDATE workspaces SET updated_at=NOW() WHERE id=$1 AND user_id=$2', [
       id,
