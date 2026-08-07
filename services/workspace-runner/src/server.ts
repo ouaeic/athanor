@@ -108,8 +108,7 @@ export const buildServer = async (config: RunnerConfig) => {
   const desktop = new DesktopManager(
     config.DESKTOP_BRIDGE_EXECUTABLE,
     config.DESKTOP_SESSION_EXECUTABLE,
-    privilegedHelpers,
-    sandbox
+    privilegedHelpers
   );
   // The browser runs on the workspace's own X server when there is one, so a page sees an
   // ordinary desktop and a person taking over finds the browser on the screen they are watching.
