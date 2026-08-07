@@ -12,7 +12,21 @@ declare module 'fastify' {
 }
 
 export const authenticateRunnerRequest = (secret: string) => {
-  const consumed = new Map<string, number>();
+  /*
+   * Two ledgers, because they defend against different people.
+   *
+   * A capability nonce is single-use, so every verified request leaves an entry until it expires.
+   * One shared map meant an unauthenticated flood on a published preview link - which mints a
+   * `preview:<port>` capability per request, from anyone on the internet who has the link - filled
+   * the only ledger there was, and once full every caller was refused: the agent's own file reads,
+   * its shell commands, the owner's terminal. A public page could therefore stop the private
+   * computer working, without a credential of any kind.
+   *
+   * Splitting them means preview traffic can only ever exhaust the preview ledger. The floods stop
+   * previews, which is the thing the flood is aimed at anyway, and the agent carries on.
+   */
+  const consumedByPreview = new Map<string, number>();
+  const consumedByAgent = new Map<string, number>();
   return async (request: FastifyRequest) => {
     const header = request.headers.authorization;
     const protocols =
@@ -34,6 +48,8 @@ export const authenticateRunnerRequest = (secret: string) => {
       throw new Error('Capability token is bound to a different workspace');
     }
     const now = Math.floor(Date.now() / 1000);
+    const servingPreview = request.capability.scopes.every((scope) => scope.startsWith('preview:'));
+    const consumed = servingPreview ? consumedByPreview : consumedByAgent;
     if (consumed.has(request.capability.nonce)) {
       throw new Error('Capability token has already been consumed');
     }
