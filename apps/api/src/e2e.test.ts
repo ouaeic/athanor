@@ -399,6 +399,28 @@ describe('a task from prompt to completion', () => {
     expect(summaries).toContain('Plan steps are still open');
   }, 30_000);
 
+  test('does not hold a finish against the plan the harness wrote for itself', async () => {
+    /*
+     * When no plan is declared the harness writes one - three boilerplate lines beginning "Inspect
+     * the request, inputs, and current workspace state" - and it used to hold the finish against
+     * its own boilerplate. Measured on one research task: the answer was written, and six of the
+     * ten model turns came after it, this hold among them. The hold above still applies to a plan
+     * somebody chose to write, which is the one the owner is actually watching.
+     */
+    // `mkdir` rather than `echo`: the fallback plan is only written once the turn has changed
+    // something, and a command that changes nothing never reaches the case this covers.
+    const harness = await start([
+      { toolCalls: [toolCall('call-1', 'shell', { executable: 'mkdir', args: ['-p', 'out'] })] },
+      { content: 'Done.', toolCalls: [groundedFinish('Made the directory.', 'call-1')] }
+    ]);
+    const taskId = await harness.createTask('Just do the thing');
+    expect(await harness.settle(taskId)).toBe('completed');
+    const summaries = (await harness.events(taskId)).map((event) => event.summary ?? '');
+    // The harness did write itself a plan - that is the precondition this test is about.
+    expect(summaries).toContain('Initial execution plan');
+    expect(summaries).not.toContain('Plan steps are still open');
+  }, 30_000);
+
   test('a conversational answer with no tools completes without inventing evidence', async () => {
     const harness = await start([
       {

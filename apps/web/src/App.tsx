@@ -202,6 +202,14 @@ export function App() {
    * composer part of the conversation rather than part of the window.
    */
   const savedDraft = useRef({ taskId, prompt });
+  /*
+   * The last body this device handed to the box, so its own echo is recognisable when it comes
+   * back. Without it the composer emptied itself mid-sentence: the local copy is written on a
+   * debounce and stamped with this clock, the box stamps its copy with its own and later, so the
+   * next refresh saw the device's own previous sentence looking newer than the one being typed and
+   * adopted it - deleting every character since. It reads as the box refusing to record typing.
+   */
+  const sentDraft = useRef<Record<string, string>>({});
   useEffect(() => {
     if (savedDraft.current.taskId !== taskId) {
       const leaving = savedDraft.current;
@@ -211,6 +219,10 @@ export function App() {
       // most of what anyone types, since moving away is how you stop typing - was saved locally and
       // never sent. Those keystrokes became the one version no other device could ever see.
       if (serverPreferencesLoaded.current && workspaceId)
+        sentDraft.current = {
+          ...sentDraft.current,
+          [leaving.taskId ?? '']: leaving.prompt
+        };
         void api
           .saveDraft({
             workspaceId,
@@ -237,6 +249,7 @@ export function App() {
       // request rather than a string assignment, and a failure is silent: the device's own copy is
       // already saved, and there is nothing here worth interrupting someone mid-sentence for.
       if (!serverPreferencesLoaded.current || !workspaceId) return;
+      sentDraft.current = { ...sentDraft.current, [taskId ?? '']: prompt };
       void api
         .saveDraft({
           workspaceId,
@@ -375,8 +388,17 @@ export function App() {
         // frozen on the version it first saw and would eventually write it back over the box's.
         // The composer being typed in right now is still spared: `mine` is only overridden by a
         // sentence the box saw later than this device last wrote one.
+        // This device's own sentence, handed back. It is never news, whatever the clocks say.
+        if (draft.body === sentDraft.current[key ?? '']) continue;
         const newer = !mine || (Number.isFinite(sent) && sent > draftWrittenAt(key));
         if (!newer) continue;
+        // And nothing replaces a sentence somebody is in the middle of. A draft from another
+        // device is worth adopting; it is not worth adopting into the box they are typing in.
+        const composing =
+          (key ?? undefined) === (savedDraft.current.taskId ?? undefined) &&
+          document.activeElement === composer.current &&
+          savedDraft.current.prompt !== draft.body;
+        if (composing) continue;
         writeDraft(key, draft.body, Number.isFinite(sent) ? sent : Date.now());
         if ((key ?? undefined) === (savedDraft.current.taskId ?? undefined)) {
           savedDraft.current = { taskId: savedDraft.current.taskId, prompt: draft.body };

@@ -653,6 +653,13 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     // dispatched with no path and no content, failed on a validation error that named neither the
     // truncation nor the remedy, and the turn spent its remaining steps rewriting the same file.
     // The call is marked instead, and the loop refuses it with an explanation.
+    /*
+     * Two different failures wore one name. A call whose arguments will not parse was always
+     * reported as having been cut off at the output limit, and a smaller model writing malformed
+     * JSON - which it does far more often - was told to send a shorter payload, which is no help at
+     * all. The provider says which it was: `length` is the only finish reason that means truncation.
+     */
+    const stoppedAtLimit = choice?.finish_reason === 'length';
     const toolCalls = (choice?.message?.tool_calls ?? []).map((call) => {
       try {
         return {
@@ -666,6 +673,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
           name: call.function.name,
           arguments: {},
           parseFailed: true as const,
+          ...(stoppedAtLimit ? { argumentsTruncated: true as const } : {}),
           rawArguments: call.function.arguments
         };
       }

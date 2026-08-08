@@ -102,6 +102,8 @@ export interface ModelToolCall {
    * never be executed. The raw string is kept for the message that explains the refusal.
    */
   parseFailed?: true;
+  /** True only when the provider says it stopped at the output limit; otherwise the JSON was bad. */
+  argumentsTruncated?: true;
   rawArguments?: string;
 }
 

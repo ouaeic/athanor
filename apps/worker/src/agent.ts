@@ -263,6 +263,8 @@ interface AgentState {
   acceptanceCaveat?: string;
   /** Whether this turn has already been sent back once for a plan whose steps were left open. */
   planCoverageNagged?: boolean;
+  /** True while the only plan on record is the boilerplate one the harness wrote for itself. */
+  planIsFallback?: boolean;
   /**
    * Where untrusted content entered this turn, and when.
    *
@@ -1195,6 +1197,7 @@ export const startTurnState = <T extends Record<string, unknown>>(
     acceptanceNagged: false,
     acceptanceBaselineRefusals: 0,
     planCoverageNagged: false,
+    planIsFallback: false,
     // Per turn, like the counters above: the workspace may well have changed between turns, so a
     // read that was uninformative to repeat inside one turn is an ordinary read in the next.
     seenCalls: {},
@@ -3529,6 +3532,8 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
             'A plan needs at least one step with a title. Send steps as ["Read the brief", …] or [{"title":"Read the brief","status":"in_progress"}, …]; a step with no title is dropped. To retire a step, keep its title and set its status to skipped rather than removing it.'
           );
         const branchName = textValue(call.arguments.branchName, 'Main').slice(0, 80);
+        // From here the plan is the model's, and the hold on finish means what it says again.
+        if (state) state.planIsFallback = false;
         try {
           const created = await this.store.createTaskPlan({
             taskId: task.id,
@@ -6601,6 +6606,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             ),
             createdBy: 'agent'
           });
+          state.planIsFallback = true;
           await event(this.store, task, key, 'plan', 'Initial execution plan', {
             planId: plan.id,
             version: plan.version,
@@ -7343,11 +7349,21 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         if (call.parseFailed) {
           const truncations = (state.argumentTruncations ?? 0) + 1;
           state.argumentTruncations = truncations;
-          await event(this.store, task, key, 'warning', `${call.name} was cut off mid-argument`, {
-            tool: call.name,
-            attempt: truncations,
-            bytes: call.rawArguments?.length ?? 0
-          });
+          const cutOff = call.argumentsTruncated === true;
+          await event(
+            this.store,
+            task,
+            key,
+            'warning',
+            cutOff
+              ? `${call.name} was cut off mid-argument`
+              : `${call.name} arrived with arguments that would not parse`,
+            {
+              tool: call.name,
+              attempt: truncations,
+              bytes: call.rawArguments?.length ?? 0
+            }
+          );
           await this.#recordToolResult(
             task,
             key,
@@ -7355,10 +7371,16 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             call,
             {
               skipped: true,
-              reason:
-                truncations >= MAX_ARGUMENT_TRUNCATIONS
+              /*
+               * Which of the two it was decides what to do about it, and they used to be told
+               * apart by guesswork - every unparseable call was reported as truncation, so a model
+               * that had simply written bad JSON was advised to send less of it.
+               */
+              reason: cutOff
+                ? truncations >= MAX_ARGUMENT_TRUNCATIONS
                   ? `The arguments for ${call.name} were cut off at the model's output limit for the ${truncations}th time, so it was not run. Stop retrying this call: do the work in smaller pieces, or finish and say what could not be written.`
                   : `The arguments for ${call.name} were cut off at the model's output limit, so it was not run and nothing changed. Re-issue it with a smaller payload - write the file in parts with file_write then file_patch, or shorten the content.`
+                : `The arguments for ${call.name} were not valid JSON, so it was not run and nothing changed. Send the call again with well-formed arguments - the payload was ${call.rawArguments?.length ?? 0} characters, so length was not the problem.`
             },
             model,
             catalog
@@ -7437,7 +7459,18 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
           // did four of nine steps and gave up left a panel reading nine of nine. Asked once, with
           // the titles named; a turn that has genuinely finished answers it in one line.
           const outstanding = await this.#outstandingPlanSteps(task, key).catch(() => []);
-          if (outstanding.length && !state.planCoverageNagged) {
+          /*
+           * Only against a plan somebody chose to write.
+           *
+           * The hold exists because a turn that did four of nine steps and gave up used to leave a
+           * panel reading nine of nine - the owner watches those statuses. But when no plan was
+           * declared the harness writes one for itself, three boilerplate lines beginning "Inspect
+           * the request, inputs, and current workspace state", and then held the finish against its
+           * own boilerplate. Measured on one research task: the answer was written, and six of the
+           * ten model turns came after it, this hold among them. Nothing is lost by dropping it -
+           * the outstanding steps still travel into the completion for the turn that resumes.
+           */
+          if (outstanding.length && !state.planCoverageNagged && !state.planIsFallback) {
             state.planCoverageNagged = true;
             state.messages.push({
               role: 'tool',
