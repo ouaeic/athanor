@@ -86,6 +86,34 @@ export function ScheduleModal({
       setModelId(eligibleModels[0]?.id ?? '');
   }, [eligibleModels, modelId]);
 
+  /*
+   * The default is the recommendation, not whatever the catalogue happens to list first.
+   *
+   * Listed first was `claude-3-haiku` - alphabetical, and years old - so a schedule created without
+   * touching this ran every morning on it. The composer has always asked the box which model it
+   * would pick; this is the same question, and a run nobody is watching is the last place to answer
+   * it by accident. Only the untouched default moves: once the owner has chosen, this leaves it be.
+   */
+  const [modelTouched, setModelTouched] = useState(false);
+  useEffect(() => {
+    if (modelTouched) return;
+    let active = true;
+    void api
+      .recommendModels(privacyRoute === 'provider_zdr' ? 'provider_zdr' : 'external', 'balanced')
+      .then((ranked) => {
+        const best = ranked.find((entry) =>
+          eligibleModels.some((model) => model.id === entry.modelId)
+        );
+        if (active && best) setModelId(best.modelId);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+    // Deliberately not keyed on eligibleModels: that array is rebuilt on every render, and asking
+    // again on each one would fight the owner's own selection.
+  }, [privacyRoute, modelTouched]);
+
   const create = async () => {
     if (!workspaceId || !prompt.trim() || !modelId) return;
     setBusy(true);
@@ -288,7 +316,13 @@ export function ScheduleModal({
           )}
           <label>
             Model for every run
-            <select value={modelId} onChange={(event) => setModelId(event.target.value)}>
+            <select
+              value={modelId}
+              onChange={(event) => {
+                setModelTouched(true);
+                setModelId(event.target.value);
+              }}
+            >
               {!eligibleModels.length && <option value="">Connect an AI provider first</option>}
               {eligibleModels.map((model) => (
                 <option key={model.id} value={model.id}>
