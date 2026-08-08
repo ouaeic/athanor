@@ -208,10 +208,18 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
       if (retry) window.clearTimeout(retry);
       socket?.close();
       socketRef.current = undefined;
+      // Clear the src first and revoke a tick later. This cleanup does not only run on unmount: it
+      // runs whenever the surface changes, which is every time the owner switches tab. Revoking
+      // here and now killed the URL the element was still displaying, so the view went black and
+      // stayed black until the new socket produced its first frame - a page appearing and then
+      // vanishing. Letting the empty src commit first means the element has already let go.
       const drained = drainFrames(framesRef.current);
       framesRef.current = drained.slots;
-      for (const url of drained.revoke) URL.revokeObjectURL(url);
       setFrameUrl('');
+      if (drained.revoke.length)
+        setTimeout(() => {
+          for (const url of drained.revoke) URL.revokeObjectURL(url);
+        }, 0);
     };
   }, [workspaceId, kind, reconnectNonce]);
 
