@@ -3885,9 +3885,18 @@ select:focus-visible {
 }
 
 @media (max-width: 840px) {
-  .mobile-tabs,
-  .inspector {
+  /*
+   * The bar floats over the transcript, so a little translucency belongs to it. The panel does
+   * not: on a phone it covers the whole screen, and at 96% the conversation underneath showed
+   * through it - white text ghosted behind a file list, legible enough to read. There is nothing
+   * worth seeing through a panel that is covering everything, and the siblings that are meant to
+   * float carry a backdrop blur this never had.
+   */
+  .mobile-tabs {
     background: #101214f5;
+  }
+  .inspector {
+    background: #101214;
   }
 }
 
