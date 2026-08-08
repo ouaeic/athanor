@@ -35,6 +35,11 @@ import { describeFailure } from './failure-text.js';
 import { botWallClearance, formatBytes, hostOf } from './timeline-state.js';
 import { previewPortProblem, previewSummary } from './preview-rows.js';
 import { advanceFrame, drainFrames, emptyFrameSlots, type FrameSlots } from './remote-frame.js';
+import {
+  canDecodeVideo,
+  parseDisplayMessage,
+  type DisplayVideoConfig
+} from './display-protocol.js';
 import { DiffView } from './DiffView.js';
 import { useUndo } from './Undo.js';
 import type {
@@ -135,6 +140,17 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
   const socketRef = useRef<WebSocket | undefined>(undefined);
   /** See `remote-frame.ts`: the newest frame and the one behind it, which is not safe to revoke. */
   const framesRef = useRef<FrameSlots>(emptyFrameSlots);
+  /** Where decoded video lands. Only the computer surface uses it; the browser surface is JPEG. */
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const decoderRef = useRef<VideoDecoder | null>(null);
+  /**
+   * A freshly configured decoder cannot start mid-GOP. Access units that arrive before the first
+   * keyframe are dropped rather than fed in, because feeding them raises an error the viewer would
+   * have to recover from for no gain - the next keyframe is along shortly.
+   */
+  const needKeyframeRef = useRef(true);
+  /** True once video has actually painted, which is what decides whether the still is still shown. */
+  const [painting, setPainting] = useState(false);
   useEffect(() => {
     if (!kind) return;
     const route = surfaceRoutes[kind];
@@ -142,6 +158,85 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
     let retry: number | undefined;
     let stopped = false;
     let attempts = 0;
+
+    const showJpeg = (data: ArrayBuffer): void => {
+      const next = URL.createObjectURL(new Blob([data], { type: 'image/jpeg' }));
+      const advanced = advanceFrame(framesRef.current, next);
+      framesRef.current = advanced.slots;
+      if (advanced.revoke) URL.revokeObjectURL(advanced.revoke);
+      setFrameUrl(next);
+    };
+
+    const paint = (frame: VideoFrame): void => {
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        frame.close();
+        return;
+      }
+      // The runner may resize the display mid-session; the canvas follows rather than scaling.
+      if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
+      if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
+      canvas.getContext('2d')?.drawImage(frame, 0, 0);
+      // Closing is not optional: a VideoFrame holds a decoder buffer, and leaking a few stalls the
+      // whole pipeline rather than merely wasting memory.
+      frame.close();
+      setPainting(true);
+      setError('');
+    };
+
+    const configureDecoder = (config: DisplayVideoConfig): void => {
+      if (!canDecodeVideo()) {
+        setError('This browser cannot play the computer stream, so only the last still is shown.');
+        return;
+      }
+      try {
+        if (decoderRef.current && decoderRef.current.state !== 'closed') decoderRef.current.close();
+      } catch {
+        // A decoder that was already torn down is not a problem worth reporting.
+      }
+      try {
+        const decoder = new VideoDecoder({
+          output: paint,
+          error: () => setError('The computer stream could not be decoded.')
+        });
+        decoder.configure({
+          codec: config.codec,
+          codedWidth: config.width,
+          codedHeight: config.height,
+          optimizeForLatency: true
+        });
+        decoderRef.current = decoder;
+        needKeyframeRef.current = true;
+      } catch {
+        setError('This browser cannot play the codec the computer is sending.');
+      }
+    };
+
+    const decodeVideo = (message: {
+      keyframe: boolean;
+      timestamp: number;
+      payload: Uint8Array;
+    }) => {
+      const decoder = decoderRef.current;
+      if (!decoder || decoder.state !== 'configured') return;
+      if (needKeyframeRef.current) {
+        if (!message.keyframe) return;
+        needKeyframeRef.current = false;
+      }
+      try {
+        decoder.decode(
+          new EncodedVideoChunk({
+            type: message.keyframe ? 'key' : 'delta',
+            timestamp: message.timestamp,
+            data: message.payload
+          })
+        );
+      } catch {
+        // One bad access unit should cost one frame, not the stream: wait for the next keyframe.
+        needKeyframeRef.current = true;
+      }
+    };
+
     const connect = async () => {
       attempts += 1;
       if (stopped) return;
@@ -160,13 +255,32 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
         socketRef.current = socket;
         socket.onmessage = (event) => {
           if (event.data instanceof ArrayBuffer) {
-            const next = URL.createObjectURL(new Blob([event.data], { type: 'image/jpeg' }));
-            const advanced = advanceFrame(framesRef.current, next);
-            framesRef.current = advanced.slots;
-            if (advanced.revoke) URL.revokeObjectURL(advanced.revoke);
-            setFrameUrl(next);
-            setError('');
             attempts = 0;
+            // Two different wires behind one hook. The browser surface publishes Chromium's
+            // screencast as bare JPEG bytes; the computer surface speaks `athanor.display.v1`,
+            // where a type byte says whether this is a video configuration, an H.264 access unit
+            // or a JPEG tile. Reading the framed one as a bare image is what painted the computer
+            // black - and reading the bare one as framed would break the browser, which works.
+            if (kind !== 'display') {
+              showJpeg(event.data);
+              setError('');
+              return;
+            }
+            const message = parseDisplayMessage(event.data);
+            if (message.kind === 'config') {
+              configureDecoder(message.config);
+              return;
+            }
+            if (message.kind === 'video') {
+              decodeVideo(message);
+              return;
+            }
+            if (message.kind === 'jpeg') {
+              // `payload` is a view onto the socket's buffer; copy it so the Blob owns its bytes.
+              showJpeg(message.payload.slice().buffer);
+              setError('');
+              return;
+            }
             return;
           }
           const message = JSON.parse(String(event.data)) as {
@@ -213,6 +327,14 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
       // here and now killed the URL the element was still displaying, so the view went black and
       // stayed black until the new socket produced its first frame - a page appearing and then
       // vanishing. Letting the empty src commit first means the element has already let go.
+      try {
+        if (decoderRef.current && decoderRef.current.state !== 'closed') decoderRef.current.close();
+      } catch {
+        // Already gone.
+      }
+      decoderRef.current = null;
+      needKeyframeRef.current = true;
+      setPainting(false);
       const drained = drainFrames(framesRef.current);
       framesRef.current = drained.slots;
       setFrameUrl('');
@@ -242,6 +364,8 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
   };
   return {
     frameUrl,
+    canvasRef,
+    painting,
     state,
     error,
     stalled,
@@ -1074,8 +1198,10 @@ function Computer({
           </div>
         </div>
       )}
-      <div className={`browser-viewport ${surface.frameUrl ? '' : 'loading'}`}>
-        {surface.frameUrl || (kind === 'display' && desktop?.screenshotBase64) ? (
+      <div className={`browser-viewport ${surface.frameUrl || surface.painting ? '' : 'loading'}`}>
+        {surface.painting ||
+        surface.frameUrl ||
+        (kind === 'display' && desktop?.screenshotBase64) ? (
           <button
             type="button"
             className={`remote-frame-button ${holder === 'user' ? 'interactive' : ''}`}
@@ -1088,11 +1214,28 @@ function Computer({
             onClick={(event) => void clickFrame(event)}
             onKeyDown={(event) => void keyFrame(event)}
           >
-            <img
-              draggable={false}
-              src={surface.frameUrl || `data:image/jpeg;base64,${desktop?.screenshotBase64 ?? ''}`}
-              alt=""
-            />
+            {/*
+              Decoded video paints here. The canvas is mounted for the computer surface whether or
+              not a frame has arrived, because the decoder needs somewhere to draw the very first
+              one - and it is hidden until it has, so the still underneath stays visible instead of
+              a black rectangle. That black rectangle was the bug.
+            */}
+            {kind === 'display' && (
+              <canvas
+                ref={surface.canvasRef}
+                className="remote-frame-canvas"
+                hidden={!surface.painting}
+              />
+            )}
+            {!surface.painting && (
+              <img
+                draggable={false}
+                src={
+                  surface.frameUrl || `data:image/jpeg;base64,${desktop?.screenshotBase64 ?? ''}`
+                }
+                alt=""
+              />
+            )}
           </button>
         ) : holder === 'secure_input' ? (
           <div className="empty-pane">

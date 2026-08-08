@@ -1964,13 +1964,22 @@ select:focus-visible {
   padding-bottom: 42px;
 }
 .browser-viewport > img,
-.remote-frame-button > img {
+.remote-frame-button > img,
+.remote-frame-button > .remote-frame-canvas {
   display: block;
   width: 100%;
   min-height: 300px;
   object-fit: contain;
   object-position: top;
   background: #101214;
+}
+/* The canvas carries the decoder's own pixel dimensions, so height has to follow the width the
+   layout gives it rather than the intrinsic size, or a 1280x720 desktop draws 720px tall. */
+.remote-frame-button > .remote-frame-canvas {
+  height: auto;
+}
+.remote-frame-button > .remote-frame-canvas[hidden] {
+  display: none;
 }
 .browser-viewport.loading > img,
 .browser-viewport.loading > .remote-frame-button {
