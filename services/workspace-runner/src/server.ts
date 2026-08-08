@@ -669,12 +669,21 @@ export const buildServer = async (config: RunnerConfig) => {
         signal: AbortSignal.timeout(60_000)
       });
     } catch {
-      return reply.status(502).send({
-        error: {
-          code: 'preview_unavailable',
-          message: `No workspace service answered on port ${port}`
-        }
-      });
+      /*
+       * A page, because a person is looking at it.
+       *
+       * Everything else this service answers is read by the worker, so JSON is right for it - but
+       * these bytes go through the preview gateway to a browser, unchanged. The owner opened the
+       * link they were given and got `{"error":{"code":"preview_unavailable",…}}` rendered as text.
+       * The gateway's own two failure pages are HTML for exactly this reason; this one was the odd
+       * one out because it is raised a layer further down.
+       */
+      return reply
+        .status(502)
+        .type('text/html; charset=utf-8')
+        .send(
+          `<!doctype html><title>Nothing is listening</title><h1>Nothing is listening</h1><p>The app on port ${port} is not answering. It may have stopped, or never started - ask athanor to start it again.</p>`
+        );
     }
     reply.status(response.status);
     const cookies: string[] = [];
