@@ -269,11 +269,11 @@ interface AgentState {
   /**
    * The web route this run has been running under, so the decision cannot move mid-run.
    *
-   * Two of the facts behind it are the owner's stored credential, which they can edit from the
-   * settings page while a task is still running. Without this, turning zero retention off would
-   * move a task that began under the in-house promise onto the provider's search without the owner
-   * ever being asked about that task. `resolveWebToolPlan` only ever reads it to refuse, so
-   * recording it can move the answer one way and not the other.
+   * The fact behind it is the owner's stored credential, which they can replace from the settings
+   * page while a task is still running. Without this, repointing the box at a provider that answers
+   * searches would move a task that began under the in-house promise onto that search service,
+   * without the owner ever being asked about that task. `resolveWebToolPlan` only ever reads it to
+   * refuse, so recording it can move the answer one way and not the other.
    */
   webToolMode?: WebToolMode;
   /** Hosts the owner named, a search returned, or this turn already read. Bounded. */
@@ -2549,7 +2549,7 @@ export class AgentWorker {
      * host itself, could ask a specialist to "verify this at <url>" and the data left anyway. It has
      * no approval channel of its own, so the answer here is refusal rather than a card.
      */
-    destinations?: { knownOrigins: string[]; ownerText: string }
+    destinations?: { knownOrigins: string[]; ownerText: string; selfOrigins?: string[] }
   ): Promise<{
     name: string;
     model: string;
@@ -2795,6 +2795,17 @@ ${clockLine(new Date(), timeZone)}
       usageCredits,
       ...untrustedSources()
     };
+  }
+
+  /**
+   * The addresses that are this installation rather than somewhere it could send anything.
+   *
+   * Read from configuration rather than from anything the model wrote, for the same reason the
+   * host and byte count on the approval card are: a destination the agent can name is a
+   * destination the agent can lie about.
+   */
+  #selfOrigins(): string[] {
+    return [originOf(this.config.PUBLIC_APP_URL)].filter(Boolean);
   }
 
   async #assertProviderConfigured(task: TaskRecord): Promise<void> {
@@ -4582,7 +4593,8 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
                   .filter((message) => message.role === 'user')
                   .map((message) => message.content)
                   .join('\n')
-                  .slice(0, 40_000)
+                  .slice(0, 40_000),
+                selfOrigins: this.#selfOrigins()
               }
             )
           )
@@ -5224,7 +5236,8 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         .filter((message) => message.role === 'user')
         .map((message) => message.content)
         .join('\n')
-        .slice(0, 40_000)
+        .slice(0, 40_000),
+      selfOrigins: this.#selfOrigins()
     });
     if (!['browser_action', 'desktop_action'].includes(call.name)) return declared;
     const surface = call.name === 'browser_action' ? 'browser' : 'desktop';
@@ -6022,18 +6035,16 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
      * withdrawn on a route that sends no provider tool and takes the web off the task entirely.
      *
      * `startedMode` carries the mode from the saved state, and it can only ever refuse: a run that
-     * started in house finishes in house even if the credential that held it there is edited
-     * mid-run. The other direction is deliberately not pinned - a fact that has just made this
-     * task more private takes effect on the next step, and protecting a cache prefix is not a
-     * reason to withhold it.
+     * started in house finishes in house even if the credential is replaced mid-run with one whose
+     * provider does answer searches. The other direction is deliberately not pinned - a fact that
+     * has just made this task more private takes effect on the next step, and protecting a cache
+     * prefix is not a reason to withhold it.
      *
      * Resolved here, ahead of the runtime block, because the block has to say which route is in
      * force: on the provider's route the query itself leaves this computer, and that is the one
      * fact about the web the model cannot work out from its tool schemas.
      */
     const webPlan = resolveWebToolPlan({
-      privacyRoute: task.privacyRoute === 'provider_zdr' ? 'provider_zdr' : 'external',
-      enforceZeroDataRetention: credential.enforceZeroDataRetention,
       provider: credential.provider,
       forceInHouse: this.config.AI_FORCE_INHOUSE_WEB,
       ...(savedState?.webToolMode ? { startedMode: savedState.webToolMode } : {})
@@ -7012,29 +7023,28 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         if (call.name === 'finish') {
           const summary = textValue(call.arguments.summary, assistantText || 'Task complete');
           const checked = completionVerification(state, call.arguments.verification);
-          if (!checked.ok) {
+          /*
+           * Past the ceiling the turn ends honestly, exactly as a failed acceptance check does
+           * below, rather than being thrown away.
+           *
+           * This used to raise `completion_unverified`, which marks the task FAILED. Observed: an
+           * agent built the page it was asked for, served it, published a working preview and
+           * wrote a correct summary - and the run was binned, because each time it curled its own
+           * server to check the result, that shell call became the newest change and made the
+           * evidence it had just cited stale. Thirty-one turns and a live deliverable, reported to
+           * the owner as a failure. Verification failing is not the work failing, and a harness
+           * that cannot tell the difference must not be the one deciding.
+           *
+           * So the completion stands and the doubt travels with it: the turn finishes, and what
+           * could not be established is carried into `remainingRisks`, where the completion card
+           * already shows it. The owner sees what was made and is told plainly that athanor could
+           * not prove it.
+           */
+          const unverifiable =
+            !checked.ok && (state.finishRejections ?? 0) + 1 >= MAX_FINISH_REJECTIONS;
+          if (!checked.ok && !unverifiable) {
             const rejections = (state.finishRejections ?? 0) + 1;
             state.finishRejections = rejections;
-            if (rejections >= MAX_FINISH_REJECTIONS) {
-              // Stop here rather than at the step limit. The work already done is durable and the
-              // task stays continuable, so the user gets the real reason instead of paying for
-              // another fifty attempts at the same malformed call.
-              await event(
-                this.store,
-                task,
-                key,
-                'warning',
-                'Stopped: completion could not be verified',
-                {
-                  reason: checked.reason,
-                  attempts: rejections
-                }
-              );
-              throw new AthanorError(
-                'completion_unverified',
-                `The agent reported the task complete ${rejections} times without evidence that stands up: ${checked.reason} Its work so far is saved - reply to continue, or check the steps above.`
-              );
-            }
             state.messages.push({
               role: 'tool',
               toolCallId: call.id,
@@ -7050,6 +7060,15 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             });
             continue;
           }
+          if (unverifiable)
+            await event(
+              this.store,
+              task,
+              key,
+              'warning',
+              'Finished, but athanor could not verify it',
+              { reason: checked.ok ? '' : checked.reason, attempts: MAX_FINISH_REJECTIONS }
+            );
           state.finishRejections = 0;
           // The plan is the one artefact the owner watches while long work runs, and until now the
           // harness force-marked every outstanding step completed on the way out - so a turn that
@@ -7092,7 +7111,17 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             await event(this.store, task, key, 'status', 'Asked for an acceptance record', {});
             continue;
           }
-          let verification = checked.verification;
+          // An unverifiable finish still completes, carrying the reason it could not be established
+          // where the owner reads it rather than where only the log would.
+          let verification: CompletionVerification = checked.ok
+            ? checked.verification
+            : {
+                status: 'not_applicable',
+                evidence: [],
+                remainingRisks: [
+                  `athanor could not confirm this completion after ${MAX_FINISH_REJECTIONS} attempts: ${checked.reason} Check the result before relying on it.`
+                ]
+              };
           let acceptanceEvidence: string[] = [];
           // Held outside the block so the finish below can keep the commands that passed. Only the
           // commands: an artifact check says a file exists, which is about this afternoon, where a
@@ -7124,9 +7153,9 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
               // Bounded like every other refusal in this loop: past the ceiling the turn ends
               // honestly rather than spending the rest of the budget on the same failure.
               verification = {
-                ...checked.verification,
+                ...verification,
                 remainingRisks: [
-                  ...checked.verification.remainingRisks,
+                  ...verification.remainingRisks,
                   ...failed.map((result) => `${result.label} — ${result.detail}`)
                 ].slice(0, 20)
               };

@@ -413,9 +413,15 @@ describe('a task from prompt to completion', () => {
 });
 
 describe('a completion that cannot be grounded', () => {
-  test('stops after three attempts instead of spending the whole step budget', async () => {
-    // This used to retry until TASK_MAX_STEPS - around sixty billed calls against a full context -
-    // and then fail with a step-limit error that told the owner nothing about what went wrong.
+  test('finishes with the doubt recorded rather than throwing the work away', async () => {
+    // Two bounds, and they are not the same bound. Retrying until TASK_MAX_STEPS - around sixty
+    // billed calls against a full context - is waste, so the attempts are still capped at three.
+    // But the run used to be marked FAILED at that cap, and that was wrong: an agent built the page
+    // it was asked for, served it, published a working preview and summarised it correctly, and the
+    // whole thing was binned because every time it curled its own server to check the result, that
+    // call became the newest change and staled the evidence it had just cited. Verification failing
+    // is not the work failing. The turn completes and the reason travels with it, in the remaining
+    // risks the completion card already shows.
     const harness = await start(
       [
         { toolCalls: [toolCall('call-1', 'shell', { executable: 'echo', args: ['work'] })] },
@@ -433,11 +439,14 @@ describe('a completion that cannot be grounded', () => {
     );
 
     const taskId = await harness.createTask('Do some work');
-    expect(await harness.settle(taskId)).toBe('failed');
-    expect(harness.completions()).toBeLessThanOrEqual(5);
+    expect(await harness.settle(taskId)).toBe('completed');
+    // The cap is what stops the budget being spent on the same malformed call: the step budget here
+    // is 40. It is not 5 any more because a finish that is allowed to land goes on through the plan
+    // and acceptance holds it used to be killed before reaching.
+    expect(harness.completions()).toBeLessThanOrEqual(10);
 
     const summaries = (await harness.events(taskId)).map((event) => event.summary ?? '');
-    expect(summaries.some((line) => line.includes('could not be verified'))).toBe(true);
+    expect(summaries.some((line) => line.includes('could not verify it'))).toBe(true);
   }, 30_000);
 });
 

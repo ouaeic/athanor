@@ -1,3 +1,4 @@
+import { isPublicHttpUrl } from '@athanor/core';
 /**
  * Where a request is allowed to go once untrusted content is in the turn.
  *
@@ -23,6 +24,8 @@ export interface DestinationContext {
   readonly knownOrigins: readonly string[];
   /** The owner's own words this task; material already in them is not novel. */
   readonly ownerText: string;
+  /** This installation's own address, which is not somewhere data can be sent to. */
+  readonly selfOrigins?: readonly string[];
 }
 
 export interface DestinationVerdict {
@@ -110,6 +113,24 @@ export const classifyDestination = (
       reason: `the ${url.protocol.replace(':', '')} scheme is not a web read`
     };
   const host = url.hostname.toLowerCase();
+  /*
+   * Somewhere data cannot go is not somewhere data can be sent.
+   *
+   * This asked the owner to approve the agent reading its own web server. A single "build a page
+   * and serve it" run raised ten approval cards, and every one of them was athanor talking to
+   * itself: four to `localhost:8080`, three to its own preview URL on its own domain. Nothing left
+   * the machine in any of them, and the owner learned to click Approve without reading - which is
+   * the only way this rule can actually fail.
+   *
+   * Loopback and the private ranges are decided by `isPublicHttpUrl` in core rather than by a
+   * second opinion held here, because a spelling that walks past one of two lists is exactly how
+   * this class of check breaks. Publishing something to the internet is still gated, on the tool
+   * that does it: `publish_site` raises its own card and this is not a way round it.
+   */
+  if (!isPublicHttpUrl(url.toString()))
+    return { sink: false, host, noveltyBytes: 0, reason: '' };
+  if ((context.selfOrigins ?? []).some((origin) => origin && host === origin.toLowerCase()))
+    return { sink: false, host, noveltyBytes: 0, reason: '' };
   // Compared case-insensitively and without the separators a URL adds, so a path segment that the
   // owner wrote as two words still counts as theirs.
   const corpus = `${context.ownerText}\n${context.knownOrigins.join('\n')}`.toLowerCase();

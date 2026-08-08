@@ -2207,6 +2207,8 @@ export interface ApprovalContext {
   knownOrigins?: readonly string[];
   /** The owner's own words this task, for the destination policy's novelty bound. */
   ownerText?: string;
+  /** This installation's own address, which is not a destination data can leave by. */
+  selfOrigins?: readonly string[];
 }
 
 const destinationCard = (
@@ -2244,7 +2246,8 @@ export const approvalRequirement = (
   if (tainted) {
     const destinations = {
       knownOrigins: context.knownOrigins ?? [],
-      ownerText: context.ownerText ?? ''
+      ownerText: context.ownerText ?? '',
+      selfOrigins: context.selfOrigins ?? []
     };
     if (name === 'parallel_web_read') {
       const verdicts = (Array.isArray(args.urls) ? args.urls.map(String) : [])
