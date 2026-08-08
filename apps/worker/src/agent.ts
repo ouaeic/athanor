@@ -444,6 +444,17 @@ export const acceptanceBaselineNote = (results: readonly AcceptanceResult[]): st
  * Both are stated to the model when they happen and carried into the completion the owner reads,
  * because the alternative is a green tick that means something weaker than the last one did.
  */
+/**
+ * Whether a completion should carry the retrofit caveat, which is a narrower question than whether
+ * the record was late. See the call site: athanor's own hold is what makes it late in the ordinary
+ * case, and a sentence printed on every task is one nobody reads.
+ */
+export const acceptanceRetrofitCaveat = (state: {
+  mutated?: boolean;
+  acceptanceNagged?: boolean;
+}): string | undefined =>
+  state.mutated && !state.acceptanceNagged ? ACCEPTANCE_RETROFIT_CAVEAT : undefined;
+
 export const ACCEPTANCE_RETROFIT_CAVEAT =
   'The acceptance checks were declared after this turn had already changed things, so the harness never saw them fail on the unfinished job.';
 export const ACCEPTANCE_ALREADY_PASSED_CAVEAT =
@@ -7610,7 +7621,18 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
           // Once the turn has already changed something there is no such reading to be had - what
           // passes now may be the work or may always have been true - so the record is taken and the
           // completion says the harness never watched it fail.
-          let caveat = state.mutated ? ACCEPTANCE_RETROFIT_CAVEAT : undefined;
+          /*
+           * Not said when athanor is the reason it is late.
+           *
+           * The only thing that ever asks for an acceptance record is the hold on finish, and that
+           * hold fires because the turn has already changed something - so a model that does as it
+           * is told declares its checks after the work by construction, and the caveat printed on
+           * the card was on every completed task in the product. A sentence that is always there
+           * carries nothing, and it teaches the owner to skim the line where the real one will
+           * eventually be. It is kept for the turn that was late on its own account, which is the
+           * only turn it tells anybody anything about.
+           */
+          let caveat = acceptanceRetrofitCaveat(state);
           let baseline: AcceptanceResult[] | null = null;
           if (!state.mutated) {
             baseline = await this.#runAcceptanceChecks(task, key, record, { purpose: 'baseline' });

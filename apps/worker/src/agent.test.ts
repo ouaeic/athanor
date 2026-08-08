@@ -34,6 +34,8 @@ import {
   createStreamFlusher,
   delegateBudget,
   MAX_PLAN_STEPS,
+  ACCEPTANCE_RETROFIT_CAVEAT,
+  acceptanceRetrofitCaveat,
   degenerateRepeat,
   previewUrl,
   normalizeAssistantText,
@@ -67,6 +69,23 @@ describe('agent chat output', () => {
     expect(normalizeAssistantText(' into chatLet me inspect the workspace.')).toBe(
       'Let me inspect the workspace.'
     );
+  });
+
+  it('does not caveat a completion for lateness athanor asked for', () => {
+    /*
+     * The only thing that asks for an acceptance record is the hold on finish, and that hold fires
+     * because the turn has already changed something. So a model that complies declares its checks
+     * after the work by construction, and this sentence was on every completed task in the product.
+     * A caveat that is always there says nothing and teaches the owner to skim the line where a
+     * real one will one day be.
+     */
+    expect(acceptanceRetrofitCaveat({ mutated: true, acceptanceNagged: true })).toBeUndefined();
+    // Late on its own account, with nobody having asked: that is worth saying.
+    expect(acceptanceRetrofitCaveat({ mutated: true, acceptanceNagged: false })).toBe(
+      ACCEPTANCE_RETROFIT_CAVEAT
+    );
+    // Declared before anything changed, which is the case the whole mechanism is built around.
+    expect(acceptanceRetrofitCaveat({ mutated: false, acceptanceNagged: false })).toBeUndefined();
   });
 
   it('points a preview link at the page rather than at a file index', () => {
