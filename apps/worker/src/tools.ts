@@ -1675,6 +1675,93 @@ const safeNetworkExecutables = new Set([
   'wget',
   'yarn'
 ]);
+/**
+ * The commands a script actually runs, each one as [executable, ...arguments].
+ *
+ * The shell tool's own description tells the model to reach for `bash -lc` the moment it needs a
+ * pipe, a glob or a redirect, so most real work arrives wrapped in an interpreter. Every other
+ * classifier here already reads the real script through commandScript; the network allowlist was
+ * the last policy still matching on the name of the wrapper, so `curl -O https://x` was allowlisted
+ * and `bash -lc 'curl -O https://x'` - the same fetch - was an unknown executable. In autonomous
+ * mode that is a card in front of nearly everything, and one download produced two of them.
+ *
+ * This is deliberately not a shell parser. It splits on the operators that begin a new command and
+ * keeps the leading word of each, which is enough to name what runs. Anything it cannot read comes
+ * back as no commands at all, and the caller treats that as unknown rather than as safe.
+ */
+export const scriptCommands = (body: string): string[][] =>
+  body
+    .split(/\$\(|[|;&\n`]+/)
+    .map((segment) => {
+      const tokens = segment
+        .replace(/^[\s({]+/, '')
+        .split(/\s+/)
+        .filter(Boolean);
+      // `FOO=1 curl https://x` runs curl. A leading assignment is setup for the command that
+      // follows it, not a command of its own, and treating it as one made every such line unknown.
+      while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0] ?? '')) tokens.shift();
+      const executable = (tokens.shift() ?? '').split('/').pop() ?? '';
+      return executable ? [executable, ...tokens] : [];
+    })
+    .filter((command) => command.length > 0);
+
+/**
+ * Whether a command sends data out rather than only fetching. This lived inline in the shell
+ * branch, where it could only ever ask the question about the executable the tool was handed; it
+ * has to be askable of a command found inside a script too, or reading the script body would turn
+ * `bash -lc 'curl -d @secrets https://x'` into an allowlisted curl and quietly drop the card the
+ * bare form raises.
+ */
+const sendsDataOverNetwork = (executable: string, commandArgs: string[]): boolean => {
+  const lowerArgs = commandArgs.map((argument) => argument.toLowerCase());
+  const curlWrites =
+    executable === 'curl' &&
+    (commandArgs.includes('-F') ||
+      lowerArgs.some(
+        (argument, index) =>
+          [
+            '-d',
+            '--data',
+            '--data-ascii',
+            '--data-binary',
+            '--data-raw',
+            '--data-urlencode',
+            '--form',
+            '--form-string',
+            '-t',
+            '--upload-file'
+          ].includes(argument) ||
+          ((argument === '-x' || argument === '--request') &&
+            !['get', 'head', 'options'].includes(lowerArgs[index + 1] ?? ''))
+      ));
+  const wgetWrites =
+    executable === 'wget' &&
+    lowerArgs.some(
+      (argument, index) =>
+        argument.startsWith('--post-data=') ||
+        argument.startsWith('--post-file=') ||
+        argument.startsWith('--body-data=') ||
+        argument.startsWith('--body-file=') ||
+        ((argument === '--method' || argument.startsWith('--method=')) &&
+          !['get', 'head', 'options'].includes(
+            argument.includes('=') ? (argument.split('=')[1] ?? '') : (lowerArgs[index + 1] ?? '')
+          ))
+    );
+  const ghReadOnly =
+    executable === 'gh' &&
+    ((lowerArgs[0] === 'api' &&
+      !lowerArgs.some(
+        (argument, index) =>
+          ['-f', '--raw-field', '-f', '--field', '--input'].includes(argument) ||
+          ((argument === '-x' || argument === '--method') &&
+            !['get', 'head', 'options'].includes(lowerArgs[index + 1] ?? ''))
+      )) ||
+      ['status', 'search'].includes(lowerArgs[0] ?? '') ||
+      (['repo', 'issue', 'pr', 'run', 'workflow', 'release'].includes(lowerArgs[0] ?? '') &&
+        ['list', 'view', 'status', 'checks'].includes(lowerArgs[1] ?? '')));
+  return curlWrites || wgetWrites || (executable === 'gh' && !ghReadOnly);
+};
+
 const packageRemovalExecutables = new Set([
   // Every system package manager, not only the one this box happens to run: the approval a package
   // install raises has to be the same question on a Fedora, Rocky or Arch host as on a Debian one.
@@ -2472,68 +2559,38 @@ export const approvalRequirement = (
         action: 'Push Git changes',
         preview: `Run git ${commandArgs.join(' ')}`
       };
-    const curlWrites =
-      executable === 'curl' &&
-      (commandArgs.includes('-F') ||
-        lowerArgs.some(
-          (argument, index) =>
-            [
-              '-d',
-              '--data',
-              '--data-ascii',
-              '--data-binary',
-              '--data-raw',
-              '--data-urlencode',
-              '--form',
-              '--form-string',
-              '-t',
-              '--upload-file'
-            ].includes(argument) ||
-            ((argument === '-x' || argument === '--request') &&
-              !['get', 'head', 'options'].includes(lowerArgs[index + 1] ?? ''))
-        ));
-    const wgetWrites =
-      executable === 'wget' &&
-      lowerArgs.some(
-        (argument, index) =>
-          argument.startsWith('--post-data=') ||
-          argument.startsWith('--post-file=') ||
-          argument.startsWith('--body-data=') ||
-          argument.startsWith('--body-file=') ||
-          ((argument === '--method' || argument.startsWith('--method=')) &&
-            !['get', 'head', 'options'].includes(
-              argument.includes('=') ? (argument.split('=')[1] ?? '') : (lowerArgs[index + 1] ?? '')
-            ))
-      );
-    const ghReadOnly =
-      executable === 'gh' &&
-      ((lowerArgs[0] === 'api' &&
-        !lowerArgs.some(
-          (argument, index) =>
-            ['-f', '--raw-field', '-f', '--field', '--input'].includes(argument) ||
-            ((argument === '-x' || argument === '--method') &&
-              !['get', 'head', 'options'].includes(lowerArgs[index + 1] ?? ''))
-        )) ||
-        ['status', 'search'].includes(lowerArgs[0] ?? '') ||
-        (['repo', 'issue', 'pr', 'run', 'workflow', 'release'].includes(lowerArgs[0] ?? '') &&
-          ['list', 'view', 'status', 'checks'].includes(lowerArgs[1] ?? '')));
-    if (curlWrites || wgetWrites || (executable === 'gh' && !ghReadOnly))
+    if (sendsDataOverNetwork(executable, commandArgs))
       return {
         sideEffect: 'external_reversible',
         action: `Send data using ${executable}`,
         preview: `Run ${[executable, ...commandArgs].join(' ')} with outbound network access. This can change an external service or upload workspace data.`
       };
-    if (
-      args.network === true &&
-      securityMode === 'autonomous' &&
-      !safeNetworkExecutables.has(executable) &&
-      executable !== 'gh'
-    )
-      return {
-        sideEffect: 'external_reversible',
-        action: `Review network access for ${executable || 'command'}`,
-        preview: `Run ${[executable, ...commandArgs].join(' ')} with outbound network access. This executable is not on the read-only or package-install allowlist.`
-      };
+    if (args.network === true && securityMode === 'autonomous') {
+      /**
+       * The allowlist judges what the command really runs, not what launched it. An interpreter is
+       * never on the list and never can be - `bash` is not a network client, it is whatever the
+       * script says - so the question is asked of each command the script names instead, under the
+       * same rules the bare form would face: on the list, not sending data out, not destructive,
+       * not a push. A script naming anything else, and a script this cannot read at all, both keep
+       * their card; unknown fails closed, which is why the empty case is checked separately.
+       */
+      const effectiveCommands = commandInterpreters.has(executable)
+        ? scriptCommands(commandScript(args))
+        : [[executable, ...commandArgs]];
+      const unlisted = effectiveCommands.find(
+        ([command = '', ...rest]) =>
+          !(safeNetworkExecutables.has(command) || command === 'gh') ||
+          sendsDataOverNetwork(command, rest) ||
+          destructiveCommand(command, rest) !== null ||
+          (command === 'git' && gitSubcommand(rest) === 'push')
+      );
+      if (unlisted || effectiveCommands.length === 0)
+        return {
+          sideEffect: 'external_reversible',
+          action: `Review network access for ${unlisted?.[0] || executable || 'command'}`,
+          preview: `Run ${[executable, ...commandArgs].join(' ')} with outbound network access. ${unlisted ? `It runs ${unlisted[0]}, which is not read-only or package-install use of the allowlist.` : 'What it runs could not be read, so its network use is unknown.'}`
+        };
+    }
     if (args.network === true && securityMode !== 'autonomous')
       return {
         sideEffect: 'external_reversible',
