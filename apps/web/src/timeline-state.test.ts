@@ -1088,7 +1088,7 @@ describe('an approval and the answer it got', () => {
    * plain sight and filed the answer inside a collapsed activity group. Scrolling back to check
    * whether you had said yes told you only that something was waiting for you.
    */
-  it('keeps the decision in the transcript beside the request', () => {
+  it('keeps the decision in the transcript, on the request it answered', () => {
     const nodes = buildConversation(
       [
         event(1, 'approval_requested', { approvalId: 'a1', sideEffect: 'writes a file' }),
@@ -1096,8 +1096,26 @@ describe('an approval and the answer it got', () => {
       ],
       'running'
     );
-    // Nothing was filed away into a collapsed group, and both rows are in the transcript in order.
+    // Nothing was filed away into a collapsed group.
     expect(nodes.some((node) => node.kind === 'activity')).toBe(false);
+    // And it is one row, not two. It used to be two: the question, then a card underneath saying
+    // "You approved this" and repeating nothing else. A run with ten approvals rendered twenty.
+    const shown = nodes.flatMap((node) => ('event' in node ? [node.event.kind] : []));
+    expect(shown).toEqual(['approval_requested']);
+    const request = nodes.find((node) => node.kind === 'notice');
+    expect(request?.kind === 'notice' ? request.resolution?.kind : undefined).toBe(
+      'approval_resolved'
+    );
+  });
+
+  it('leaves an unrelated decision alone rather than folding it into the wrong request', () => {
+    const nodes = buildConversation(
+      [
+        event(1, 'approval_requested', { approvalId: 'a1' }),
+        event(2, 'approval_resolved', { approvalId: 'other', decision: 'approved' })
+      ],
+      'running'
+    );
     const shown = nodes.flatMap((node) => ('event' in node ? [node.event.kind] : []));
     expect(shown).toEqual(['approval_requested', 'approval_resolved']);
   });

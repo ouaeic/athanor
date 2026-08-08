@@ -322,7 +322,8 @@ function Event({
   onOpenSurface,
   settled = false,
   compactCompletion = false,
-  harness = []
+  harness = [],
+  resolution
 }: {
   event: TaskEvent;
   onOpenSurface?: (surface: Surface) => void;
@@ -330,6 +331,8 @@ function Event({
   compactCompletion?: boolean;
   /** The acceptance checks the harness ran for this completion, where the turn declared any. */
   harness?: HarnessCheck[];
+  /** The decision, when this is an approval that has since been answered. */
+  resolution?: TaskEvent;
 }) {
   const data = payload(event);
   /*
@@ -412,22 +415,40 @@ function Event({
       </>
     );
   }
-  if (event.kind === 'approval_requested')
+  if (event.kind === 'approval_requested') {
+    /*
+     * The question and its answer, on one card.
+     *
+     * They used to be two: "Approval requested", then a second card underneath saying "You approved
+     * this" and repeating nothing useful. Ten approvals in one run meant twenty cards. What is
+     * still waiting has its own card elsewhere, unmissable and carrying the buttons; this is the
+     * record of what was asked and what was said, which is one fact.
+     */
+    const decision = resolution ? textValue(payload(resolution).decision, 'resolved') : '';
+    const answered =
+      decision === 'approved'
+        ? 'You approved it'
+        : decision === 'expired'
+          ? 'It expired before it was answered'
+          : decision
+            ? 'You did not approve it'
+            : '';
     return (
-      <div className="system-event approval">
-        <UserRoundCheck />
+      <div className={`system-event approval${decision ? ` decision-${decision}` : ''}`}>
+        {decision === 'approved' ? (
+          <CheckCircle2 />
+        ) : decision ? (
+          <XCircle />
+        ) : (
+          <UserRoundCheck />
+        )}
         <div>
-          {/*
-            Stated in the past, because that is where it is by the time anyone reads it back. It
-            said "Waiting for your approval" whether or not it had been waited on, so every answered
-            request in the history of the conversation went on claiming to be blocked. What is
-            actually still waiting has its own card, which is unmissable and carries the buttons.
-          */}
-          <strong>Approval requested</strong>
+          <strong>{answered || 'Approval requested'}</strong>
           <span>{event.summary}</span>
         </div>
       </div>
     );
+  }
   if (event.kind === 'approval_resolved') {
     const decision = textValue(data.decision, 'resolved');
     return (
@@ -1162,7 +1183,12 @@ export function Timeline({
               />
             );
           return (
-            <Event key={node.id} event={node.event} {...(onOpenSurface ? { onOpenSurface } : {})} />
+            <Event
+              key={node.id}
+              event={node.event}
+              {...(node.kind === 'notice' && node.resolution ? { resolution: node.resolution } : {})}
+              {...(onOpenSurface ? { onOpenSurface } : {})}
+            />
           );
         })}
         {/* Shown while the money is being spent, not only once it has been: the cost events are

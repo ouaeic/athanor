@@ -395,7 +395,8 @@ export type ConversationNode =
   | { kind: 'thinking'; id: string; event: TaskEvent; markdown: string; streaming: boolean }
   | { kind: 'activity'; id: string; events: Array<{ event: TaskEvent; index: number }> }
   | { kind: 'output'; id: string; event: TaskEvent }
-  | { kind: 'notice'; id: string; event: TaskEvent }
+  /** `resolution` is present on an approval that has since been answered; the two render as one. */
+  | { kind: 'notice'; id: string; event: TaskEvent; resolution?: TaskEvent }
   /** The agent stopped at a challenge and the browser is waiting for the owner. */
   | { kind: 'handoff'; id: string; event: TaskEvent; wall: BotWall }
   /** A spending ceiling the owner set stopped the run; only they can decide what happens next. */
@@ -864,6 +865,33 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
       });
       pendingHarness = undefined;
       return;
+    }
+    /*
+     * A decision belongs on the question, not underneath it.
+     *
+     * These were two cards: "Approval requested — allow this command to localhost", then "You
+     * approved this — approved action resumed". One run raised ten of them, so twenty cards, and
+     * the second of each pair carried nothing the first did not except the word yes. The request
+     * node is rewritten in place with the decision on it, so the transcript keeps what was asked
+     * and what was answered in the one place a reader looks for them.
+     */
+    if (event.kind === 'approval_resolved') {
+      const approvalId = payloadText(event, 'approvalId');
+      const asked = approvalId
+        ? nodes.findIndex(
+            (node) =>
+              node.kind === 'notice' &&
+              node.event.kind === 'approval_requested' &&
+              payloadText(node.event, 'approvalId') === approvalId
+          )
+        : -1;
+      if (asked >= 0) {
+        const request = nodes[asked];
+        if (request?.kind === 'notice') {
+          nodes[asked] = { ...request, resolution: event };
+          return;
+        }
+      }
     }
     nodes.push({ kind: 'notice', id: event.id, event });
   });
