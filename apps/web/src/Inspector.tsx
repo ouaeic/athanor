@@ -1043,20 +1043,41 @@ function Computer({
         };
   const paneRef = useRef<HTMLDivElement | null>(null);
   const [expanded, setExpanded] = useState(false);
-  // Tracked from the event rather than from our own click, because Escape and the browser's own
-  // chrome can leave full screen without going anywhere near that button.
+  /**
+   * Expanding is ours; real full screen is a bonus on top of it.
+   *
+   * `requestFullscreen` is refused in more places than it is documented to be - an embedded view, a
+   * policy, a browser that wants a different kind of gesture - and it was measured being refused
+   * here on a genuine click. Depending on it would mean the owner presses the button and nothing
+   * happens, silently, which is the failure this pane has already had enough of. So the pane
+   * maximises itself over the window first, which cannot fail, and the native call is attempted
+   * afterwards for the people whose browser allows it.
+   */
   useEffect(() => {
-    const sync = () => setExpanded(document.fullscreenElement === paneRef.current);
-    document.addEventListener('fullscreenchange', sync);
-    return () => document.removeEventListener('fullscreenchange', sync);
-  }, []);
+    if (!expanded) return;
+    // `KeyboardEvent` is React's in this file; this listener is on the window, so it wants the DOM one.
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setExpanded(false);
+    };
+    const onFullscreenChange = () => {
+      if (!document.fullscreenElement) setExpanded(false);
+    };
+    window.addEventListener('keydown', onKey);
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+    };
+  }, [expanded]);
   const toggleExpanded = async (): Promise<void> => {
+    const next = !expanded;
+    setExpanded(next);
     try {
-      if (document.fullscreenElement) await document.exitFullscreen();
-      else await paneRef.current?.requestFullscreen();
+      if (next) await paneRef.current?.requestFullscreen();
+      else if (document.fullscreenElement) await document.exitFullscreen();
     } catch {
-      // Refused - an iframe without the permission, or a browser that will not grant it. The pane
-      // keeps working at its ordinary size, which is what it did before this button existed.
+      // Refused. The pane is already maximised over the window, so there is nothing to report and
+      // nothing for the owner to do differently.
     }
   };
 
@@ -1154,7 +1175,10 @@ function Computer({
   };
 
   return (
-    <div className="inspector-content browser-pane computer-pane" ref={paneRef}>
+    <div
+      className={`inspector-content browser-pane computer-pane${expanded ? ' expanded' : ''}`}
+      ref={paneRef}
+    >
       <div className="computer-toolbar">
         <span>
           <Monitor />
