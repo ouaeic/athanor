@@ -614,15 +614,36 @@ select:focus-visible {
 .mobile-menu {
   display: none;
 }
+/*
+ * Holds the scrollport; it is not one itself. Two nested scrollers meant a wheel event near the
+ * bottom could move either of them, which is the other half of why the transcript appeared to
+ * bob. `.timeline-viewport` is the one and only thing that scrolls.
+ */
 .chat-canvas {
   flex: 1;
   min-height: 0;
-  overflow: auto;
-  scroll-behavior: smooth;
+  overflow: hidden;
+  position: relative;
+}
+/*
+ * The transcript softens as it reaches the composer. The fade used to be painted onto the composer
+ * itself, which worked only because the composer was lying on top of the transcript; it belongs to
+ * the thing that scrolls. Anchored to the scrollport, it carries no composer-derived number and is
+ * right at every width.
+ */
+.chat-canvas::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 36px;
+  pointer-events: none;
+  background: linear-gradient(transparent, var(--panel-soft));
 }
 .timeline {
   max-width: 820px;
-  padding: 30px 34px 170px;
+  padding: 30px 34px 30px;
   margin: 0 auto;
 }
 .user-brief {
@@ -1345,7 +1366,7 @@ select:focus-visible {
   text-align: center;
   height: 100%;
   min-height: 360px;
-  padding: 40px 60px 190px;
+  padding: 40px 60px 40px;
   color: #959a9e;
 }
 .empty-canvas h1 {
@@ -1385,14 +1406,20 @@ select:focus-visible {
   color: #7f8a84;
 }
 
+/*
+ * In flow, as the last row of the workbench column, rather than floating over the transcript.
+ *
+ * It used to be absolutely positioned, which meant every surface above it had to reserve its
+ * height as a constant - and its height is not constant. It grows with a second line of typing,
+ * with a banner, with an approval card. Seven of those constants existed (170, 190, 190, 150,
+ * 200, 178, 228) and they disagreed with each other and with the composer; the transcript's
+ * reserved 170px against a real 190px is why the last twenty pixels of a conversation could not
+ * be scrolled to. A flex row cannot be wrong about its own height, so all seven are gone and
+ * none of them was replaced by a measurement.
+ */
 .composer-wrap {
-  position: absolute;
-  z-index: 3;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  padding: 48px 24px 14px;
-  background: linear-gradient(transparent, #fbfaf6 38%);
+  flex: none;
+  padding: 10px 24px 14px;
   pointer-events: none;
 }
 .composer {
@@ -2491,11 +2518,8 @@ select:focus-visible {
   padding: 24px 10px;
 }
 .approval-drawer {
-  position: absolute;
-  z-index: 8;
-  left: 18px;
-  right: 18px;
-  bottom: 150px;
+  max-width: 820px;
+  margin: 0 auto 8px;
   display: grid;
   grid-template-columns: 34px 1fr auto;
   gap: 12px;
@@ -2505,11 +2529,10 @@ select:focus-visible {
   border-radius: 13px;
   padding: 12px;
   box-shadow: 0 14px 38px #483e2824;
-  /* Anchored at the bottom with no top, so the card grows upward as the request gets longer - and
-     `.app-shell` clips what leaves the top with no scrollbar to say anything is missing. A long
-     command or a wide destination list could therefore push the request itself out of sight while
-     Approve stayed put, which is the one shape this card must never take. */
-  max-height: calc(100% - 200px);
+  /* Bounded against the viewport rather than against the composer's height, and it scrolls its own
+     overflow. A long command or a wide destination list used to push the request itself out of
+     sight while Approve stayed put, which is the one shape this card must never take. */
+  max-height: 40vh;
   overflow-y: auto;
 }
 .approval-symbol {
@@ -3384,11 +3407,7 @@ select:focus-visible {
     border-left: 0;
     background: #131517;
   }
-  .chat-canvas {
-    padding-bottom: 47px;
-  }
   .composer-wrap {
-    bottom: 48px;
     padding-left: 11px;
     padding-right: 11px;
   }
@@ -3443,7 +3462,6 @@ select:focus-visible {
     color: #e7e9ea;
   }
   .approval-drawer {
-    bottom: 164px;
     grid-template-columns: 30px 1fr;
   }
   .approval-actions {
@@ -3482,7 +3500,7 @@ select:focus-visible {
   }
 
   .timeline {
-    padding: 22px 14px 190px;
+    padding: 22px 14px 22px;
   }
   .system-event,
   .completion-card,
@@ -3664,8 +3682,8 @@ body,
   backdrop-filter: blur(16px);
 }
 
-.composer-wrap {
-  background: linear-gradient(transparent, #0c0d0e 38%);
+.chat-canvas::after {
+  background: linear-gradient(transparent, #0c0d0e);
 }
 
 .composer,
@@ -5716,19 +5734,13 @@ body,
   .composer-wrap {
     bottom: var(--bottom-bar);
   }
-  .chat-canvas {
-    padding-bottom: 0;
-  }
   /*
-   * Anchored to the bar rather than to a fixed distance from the bottom of the screen: the
-   * composer is taller on a phone now that its controls wrap, and a fixed 188px put every notice
-   * on top of the box the user is typing in.
+   * The tab bar is the column's bottom padding, so every row above it - transcript, banners,
+   * approval card, composer - is laid out inside what is left. It used to be a distance each of
+   * them measured from the bottom of the screen separately, and they disagreed.
    */
-  /* Nothing to offset any more: these stack above the composer inside the same bottom-pinned
-     area, so they move with it at every width. */
-  .approval-drawer {
-    bottom: calc(var(--bottom-bar) + 178px);
-    max-height: calc(100% - var(--bottom-bar) - 228px);
+  .workbench {
+    padding-bottom: var(--bottom-bar);
   }
 }
 

@@ -103,6 +103,38 @@ describe('the model\u2019s own working', () => {
     expect(thinking[0]).toMatchObject({ markdown: 'Let me check the file.' });
   });
 
+  it('keeps every step of a turn’s thinking when a step is superseded by its whole text', () => {
+    /*
+     * `replace` carries ONE model step's reasoning, and a turn has several. Now that a turn is one
+     * thinking block, a row that replaced the whole node would delete the earlier steps - paid-for
+     * reasoning vanishing from the record on a row whose job is to tidy it. A `cost` event closes
+     * a step, so the replace can only reach back to the start of its own.
+     */
+    const whole = (id: string, markdown: string): TaskEvent =>
+      ({ ...reasoning(id, markdown), payload: { markdown, replace: true } }) as TaskEvent;
+    const nodes = buildConversation(
+      [
+        reasoning('1', 'Step one: '),
+        reasoning('2', 'read the file.'),
+        whole('3', 'Step one: read the file.'),
+        event(4, 'cost', { costUsd: 0.001 }),
+        reasoning('5', 'Step two: '),
+        reasoning('6', 'write it back.'),
+        whole('7', 'Step two: write it back.')
+      ],
+      'completed'
+    );
+    const thinking = nodes.filter((node) => node.kind === 'thinking');
+    expect(thinking).toHaveLength(1);
+    const only = thinking[0];
+    if (only?.kind !== 'thinking') throw new Error('expected one thinking node');
+    expect(only.markdown).toContain('Step one: read the file.');
+    expect(only.markdown).toContain('Step two: write it back.');
+    // And neither step is in there twice.
+    expect(only.markdown.match(/Step one/g)).toHaveLength(1);
+    expect(only.markdown.match(/Step two/g)).toHaveLength(1);
+  });
+
   it('closes the thinking when the answer it produced arrives', () => {
     const nodes = buildConversation([reasoning('1', 'Working.'), answer('2', 'Done.')], 'running');
     const thinking = nodes.find((node) => node.kind === 'thinking');
@@ -778,20 +810,46 @@ describe('a run stopped by a spending cap', () => {
 
 describe('liveActivityId', () => {
   it('picks the newest activity group, which is the only one the agent is working in', () => {
+    // Two groups because there are two turns. This used to split on the assistant message in the
+    // middle of one turn, which is how a single request grew a work log per thought; the boundary
+    // that opens a new group is the owner speaking again.
     const nodes = buildConversation(
       [
         event(1, 'user_message', { markdown: 'Build the deck' }),
         event(2, 'tool_started'),
         event(3, 'tool_result'),
         event(4, 'assistant_message', { markdown: 'Here is the outline.' }),
-        event(5, 'tool_started'),
-        event(6, 'tool_result')
+        event(5, 'user_message', { markdown: 'Now add the numbers' }),
+        event(6, 'tool_started'),
+        event(7, 'tool_result')
       ],
       'running'
     );
     const groups = nodes.filter((node) => node.kind === 'activity');
     expect(groups).toHaveLength(2);
     expect(liveActivityId(nodes)).toBe(groups[1]?.id);
+  });
+
+  it('keeps one turn as one group however much the agent says while working', () => {
+    // The shape the owner complained about: a two-byte file write rendered as six work logs and
+    // four thinking rows, because every frame of reasoning and every line of narration closed the
+    // group and opened another.
+    const nodes = buildConversation(
+      [
+        event(1, 'user_message', { markdown: 'Write check.md containing ok' }),
+        event(2, 'assistant_reasoning', { markdown: 'Let me write it.' }),
+        event(3, 'tool_started'),
+        event(4, 'tool_result'),
+        event(5, 'assistant_message', { markdown: 'Writing it now.' }),
+        event(6, 'assistant_reasoning', { markdown: ' Then check it.' }),
+        event(7, 'tool_started'),
+        event(8, 'tool_result'),
+        event(9, 'completed', { markdown: 'Done.' })
+      ],
+      'completed'
+    );
+    expect(nodes.filter((node) => node.kind === 'activity')).toHaveLength(1);
+    expect(nodes.filter((node) => node.kind === 'thinking')).toHaveLength(1);
   });
 
   it('has nothing to mark live when nothing has run yet', () => {

@@ -1931,6 +1931,44 @@ export function App() {
             banners={
               <>
               {/*
+                The approval card is a banner like the others, so it lives where they live: in
+                flow, inside the composer, above the box. It used to be absolutely positioned at
+                `bottom: 150px` against a composer that is 190px tall, so it overlapped the thing
+                it sat above and carried two more composer-height guesses of its own.
+              */}
+              <Approvals
+                approvals={approvals}
+                {...(workspace ? { workspaceId: workspace.id } : {})}
+                onOpenTask={setTaskId}
+                openTaskId={taskId}
+                /* So the card can say whether the agent asking had anybody else's text in its context.
+                   These are the events of the conversation on screen; the card reads them only for an
+                   approval that belongs to it. */
+                openTaskEvents={events}
+                onOpenComputer={() => openInspector('computer')}
+                /*
+                  The card only goes when the decision actually landed. It used to be an unguarded
+                  `async` called as `void onResolve(...)`, so an expired approval or a dropped
+                  connection produced an unhandled rejection and a button that did nothing at all — on
+                  the one control where doing nothing silently is least acceptable. The wording matches
+                  what the lock-screen path already says for the same three outcomes.
+                */
+                onResolve={async (id, decision) => {
+                  try {
+                    await api.resolveApproval(id, decision);
+                    setApprovals((items) => items.filter((item) => item.id !== id));
+                    setError('');
+                  } catch (cause) {
+                    if (cause instanceof ApiFailure && cause.status === 404) {
+                      setApprovals((items) => items.filter((item) => item.id !== id));
+                      setError('That request was already answered, or it expired.');
+                      return;
+                    }
+                    setError(describeFailure(cause, 'That decision could not be sent'));
+                  }
+                }}
+              />
+              {/*
               A banner above the composer is the most expensive place in the interface, so storage only
               earns it once the situation is actually actionable. Seventy percent full on a large disk
               is normal and warning about it teaches people to ignore banners; ninety-five percent is
@@ -2042,38 +2080,6 @@ export function App() {
               setModelAutomatic(choice.automatic);
               if (choice.automatic) setModelPreference(choice.preference);
               else setModelId(choice.modelId);
-            }}
-          />
-          <Approvals
-            approvals={approvals}
-            {...(workspace ? { workspaceId: workspace.id } : {})}
-            onOpenTask={setTaskId}
-            openTaskId={taskId}
-            /* So the card can say whether the agent asking had anybody else's text in its context.
-               These are the events of the conversation on screen; the card reads them only for an
-               approval that belongs to it. */
-            openTaskEvents={events}
-            onOpenComputer={() => openInspector('computer')}
-            /*
-              The card only goes when the decision actually landed. It used to be an unguarded
-              `async` called as `void onResolve(...)`, so an expired approval or a dropped
-              connection produced an unhandled rejection and a button that did nothing at all — on
-              the one control where doing nothing silently is least acceptable. The wording matches
-              what the lock-screen path already says for the same three outcomes.
-            */
-            onResolve={async (id, decision) => {
-              try {
-                await api.resolveApproval(id, decision);
-                setApprovals((items) => items.filter((item) => item.id !== id));
-                setError('');
-              } catch (cause) {
-                if (cause instanceof ApiFailure && cause.status === 404) {
-                  setApprovals((items) => items.filter((item) => item.id !== id));
-                  setError('That request was already answered, or it expired.');
-                  return;
-                }
-                setError(describeFailure(cause, 'That decision could not be sent'));
-              }
             }}
           />
           {/*

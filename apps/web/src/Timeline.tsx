@@ -753,26 +753,46 @@ function ActivityLog({
  */
 const useStickyScroll = (dependency: number) => {
   const container = useRef<HTMLDivElement>(null);
-  const end = useRef<HTMLDivElement>(null);
   const [pinned, setPinned] = useState(true);
+  /*
+   * Read inside the effect rather than depended on, so following the newest content happens when
+   * new content arrives and not when the reader crosses the threshold themselves. Scrolling down
+   * by hand used to flip `pinned`, which re-ran the effect, which animated the view out from under
+   * the hand that was moving it - the other half of the bob.
+   */
+  const pinnedNow = useRef(true);
+
+  const scrollToEnd = useCallback((node: HTMLDivElement | null) => {
+    /*
+     * The container is scrolled the same way `onScroll` measures it. It used to call
+     * `scrollIntoView` on a sentinel inside `.timeline`, so the target was the sentinel's box and
+     * the test was the scrollport's - two different bottoms, differing by exactly the padding the
+     * transcript reserved. They could not both be satisfied, so the view settled a little short
+     * and tried again on every frame. Scrolling the scrollport to its own scrollHeight makes the
+     * effect's target and the predicate's distance the same quantity by construction.
+     */
+    node?.scrollTo({ top: node.scrollHeight, behavior: 'smooth' });
+  }, []);
 
   const onScroll = useCallback(() => {
     const node = container.current;
     if (!node) return;
     const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
-    setPinned(distance < 120);
+    pinnedNow.current = distance < 120;
+    setPinned(pinnedNow.current);
   }, []);
 
   useEffect(() => {
-    if (pinned) end.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [dependency, pinned]);
+    if (pinnedNow.current) scrollToEnd(container.current);
+  }, [dependency, scrollToEnd]);
 
   const jump = useCallback(() => {
+    pinnedNow.current = true;
     setPinned(true);
-    end.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, []);
+    scrollToEnd(container.current);
+  }, [scrollToEnd]);
 
-  return { container, end, pinned, onScroll, jump };
+  return { container, pinned, onScroll, jump };
 };
 
 function CostSummary({ events }: { events: TaskEvent[] }) {
@@ -1149,7 +1169,6 @@ export function Timeline({
             already in the stream and waiting for the task to finish is waiting too long. */}
         <ProvenanceSummary events={events} />
         <CostSummary events={events} />
-        <div ref={scroll.end} />
       </div>
       {!scroll.pinned && (
         <button className="jump-to-latest" onClick={scroll.jump} title="Jump to the newest message">

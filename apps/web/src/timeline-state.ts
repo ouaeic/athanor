@@ -163,6 +163,24 @@ const conversationalKinds = new Set([
   'completed'
 ]);
 
+/**
+ * The conversational events that close the work log where they stand.
+ *
+ * A turn boundary, and the things whose meaning depends on sitting next to what produced them: a
+ * decision beside its request, an output card where it was produced, the completion card last.
+ * Everything else conversational - the agent's prose, its reasoning, a warning, an error - renders
+ * in transcript order without breaking the group, because none of them is a boundary of the work.
+ */
+const activityBoundary = new Set([
+  'user_message',
+  'queued_message',
+  'approval_requested',
+  'approval_resolved',
+  'artifact',
+  'preview',
+  'completed'
+]);
+
 export interface ConversationSource {
   url: string;
   host: string;
@@ -548,21 +566,64 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
     openStreamed = false;
     openAssistantIndex = -1;
   };
+  /*
+   * The turn's thinking, held by position rather than by being whatever happens to be last.
+   *
+   * `thinkingStepStart` is where the current model step's reasoning begins inside that node. A step
+   * closes with its `cost` event, and the row that carries a whole step's reasoning (`replace`)
+   * supersedes only its own step. Without that scoping a node spanning several steps would be
+   * truncated back to one step's text by the first `replace` row to arrive - the earlier steps'
+   * reasoning silently deleted - and without holding the node by index, that row lands after the
+   * answer and renders the same thinking a second time underneath it.
+   */
+  let openThinkingIndex = -1;
+  let thinkingStepStart = 0;
+  const openThinking = (): Extract<ConversationNode, { kind: 'thinking' }> | undefined => {
+    const node = openThinkingIndex >= 0 ? nodes[openThinkingIndex] : undefined;
+    return node?.kind === 'thinking' ? node : undefined;
+  };
+
+  /*
+   * Where the work log belongs, remembered from when its first entry arrived.
+   *
+   * The group is placed where the agent started working, but it is not closed until the turn ends,
+   * so it collects everything the turn did rather than everything it did between two thoughts. The
+   * two used to be the same moment, which is why one file write rendered as six work logs: every
+   * reasoning frame closed the open group and started another.
+   */
+  let activityAnchor = -1;
+  const openActivity = (event: TaskEvent, index: number): void => {
+    if (activityAnchor < 0) activityAnchor = nodes.length;
+    activity.push({ event, index });
+    /*
+     * Sources are collected as the pages are read, not when the group is closed. The group now
+     * stays open until the end of the turn, and the answer it feeds is written before that - so
+     * reading them off the flush cited nothing at all.
+     */
+    const seen = new Set(pendingSources.map((source) => source.url));
+    for (const source of sourcesFromEvents([event]))
+      if (!seen.has(source.url)) {
+        seen.add(source.url);
+        pendingSources = [...pendingSources, source];
+      }
+  };
 
   const flushActivity = (): void => {
-    if (!activity.length) return;
-    /*
-     * A group holding nothing but the turn's own cost events is a disclosure that opens onto "Step
-     * 4 completed". What was spent is already on the answer and in the conversation total, so this
-     * would be a collapsed panel under every reply whose only content is a step counter.
-     */
-    if (activity.every((item) => item.event.kind === 'cost')) {
-      activity = [];
+    if (!activity.length) {
+      activityAnchor = -1;
       return;
     }
-    nodes.push({ kind: 'activity', id: `activity-${activity[0]!.event.id}`, events: activity });
-    pendingSources = sourcesFromEvents(activity.map((item) => item.event));
+    const at = activityAnchor >= 0 ? activityAnchor : nodes.length;
+    nodes.splice(at, 0, {
+      kind: 'activity',
+      id: `activity-${activity[0]!.event.id}`,
+      events: activity
+    });
+    // Everything the group was inserted in front of has moved down one.
+    if (openAssistantIndex >= at) openAssistantIndex += 1;
+    if (openThinkingIndex >= at) openThinkingIndex += 1;
     activity = [];
+    activityAnchor = -1;
   };
 
   events.forEach((event, index) => {
@@ -606,7 +667,7 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
     if (wall) {
       const site = hostOf(wall.url);
       if (site && site === standingWallSite) {
-        activity.push({ event, index });
+        openActivity(event, index);
         return;
       }
       standingWallSite = site;
@@ -633,14 +694,32 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
           // Spent on the answer it belongs to; the next one gets its own.
           pendingModel = '';
         } else pendingModel = model;
+        // A model step ends here, so the next step's reasoning starts after everything written so
+        // far and a `replace` row can no longer reach back past it.
+        thinkingStepStart = openThinking()?.markdown.length ?? 0;
+        /*
+         * And it goes no further. What was spent is already on the answer and in the conversation
+         * total; inside the work log it rendered as a "Step 4 completed" row per model call, which
+         * is a disclosure opening onto a counter.
+         */
+        return;
       }
       // A tool start that already has its result is noise while running and redundant once the
       // task is finished; the matching tool_result carries the same label plus the outcome.
       if (event.kind === 'tool_started' && settled(event)) return;
-      activity.push({ event, index });
+      openActivity(event, index);
       return;
     }
-    flushActivity();
+    /*
+     * A turn is the unit, not a step.
+     *
+     * This used to flush on every conversational event, so anything the agent said or thought
+     * mid-turn closed the work log and opened another - six of them, plus four thinking rows, for
+     * a task that wrote two bytes. Only the boundaries below actually need the group closed: the
+     * end of the turn, and the things that must be read in place next to what produced them. The
+     * agent's own reasoning and prose are not among them, and no test protected that.
+     */
+    if (activityBoundary.has(event.kind)) flushActivity();
 
     if (event.kind === 'assistant_reasoning') {
       // Frames append onto the open thinking node, and a new turn opens a new one - the same rule
@@ -658,24 +737,29 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
       // owed what the reader of a running one saw.
       const markdown = payloadText(event, 'markdown');
       const whole = eventPayload(event).replace === true;
-      const openThinking = nodes[nodes.length - 1];
-      if (openThinking?.kind === 'thinking') {
-        nodes[nodes.length - 1] = {
-          ...openThinking,
-          markdown: whole ? markdown : openThinking.markdown + markdown,
+      const open = openThinking();
+      if (open) {
+        // `replace` carries one model step's whole reasoning, so it supersedes that step and not
+        // the ones before it in the same turn.
+        const kept = whole ? open.markdown.slice(0, thinkingStepStart) : open.markdown;
+        const separator = whole && kept && !kept.endsWith('\n\n') ? '\n\n' : '';
+        nodes[openThinkingIndex] = {
+          ...open,
+          markdown: kept + separator + markdown,
           streaming: !terminal
         };
         return;
       }
+      openThinkingIndex = nodes.length;
+      thinkingStepStart = 0;
       nodes.push({ kind: 'thinking', id: event.id, event, markdown, streaming: !terminal });
       return;
     }
 
     if (event.kind === 'assistant_message' || event.kind === 'assistant_delta') {
       // The answer arriving closes the thinking that produced it.
-      const previous = nodes[nodes.length - 1];
-      if (previous?.kind === 'thinking' && previous.streaming)
-        nodes[nodes.length - 1] = { ...previous, streaming: false };
+      const thinking = openThinking();
+      if (thinking?.streaming) nodes[openThinkingIndex] = { ...thinking, streaming: false };
       const open = openAnswer();
       const fragment = streamFragment(event);
       const streaming = event.kind === 'assistant_delta' && !terminal;
@@ -741,6 +825,14 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
       return;
     }
     closeAnswer();
+    /*
+     * A turn boundary. The next turn's reasoning starts a block of its own rather than continuing
+     * the last one, which is what keeps two turns from reading as one.
+     */
+    if (event.kind === 'user_message' || event.kind === 'queued_message') {
+      openThinkingIndex = -1;
+      thinkingStepStart = 0;
+    }
 
     if (event.kind === 'user_message') {
       nodes.push({
