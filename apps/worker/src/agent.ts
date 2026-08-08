@@ -6076,8 +6076,6 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
      * fact about the web the model cannot work out from its tool schemas.
      */
     const webPlan = resolveWebToolPlan({
-      privacyRoute: task.privacyRoute === 'provider_zdr' ? 'provider_zdr' : 'external',
-      enforceZeroDataRetention: credential.enforceZeroDataRetention,
       provider: credential.provider,
       forceInHouse: this.config.AI_FORCE_INHOUSE_WEB,
       ...(savedState?.webToolMode ? { startedMode: savedState.webToolMode } : {})
