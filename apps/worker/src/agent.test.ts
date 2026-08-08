@@ -35,6 +35,7 @@ import {
   delegateBudget,
   MAX_PLAN_STEPS,
   degenerateRepeat,
+  previewUrl,
   normalizeAssistantText,
   patchFailure,
   planStepsFromArguments,
@@ -65,6 +66,30 @@ describe('agent chat output', () => {
   it('removes a provider routing marker from the start of chat text', () => {
     expect(normalizeAssistantText(' into chatLet me inspect the workspace.')).toBe(
       'Let me inspect the workspace.'
+    );
+  });
+
+  it('points a preview link at the page rather than at a file index', () => {
+    /*
+     * The owner asked for a page and a link. The agent started a file server on the workspace and
+     * published its port, so the link opened on an index of every file in there while the page it
+     * had just written sat one path away. Saying so in the tool description was tried first and the
+     * model went on serving the workspace root, so the address itself carries the answer now.
+     */
+    const base = 'https://box.example/__athanor/preview';
+    expect(previewUrl(base, 'abc', undefined, 'inspire.html')).toBe(
+      'https://box.example/__athanor/preview/abc/inspire.html'
+    );
+    // A leading slash is the owner's, not a second root.
+    expect(previewUrl(base, 'abc', undefined, '/inspire.html')).toBe(
+      'https://box.example/__athanor/preview/abc/inspire.html'
+    );
+    // An app that serves its own root keeps the address it always had, token and all.
+    expect(previewUrl(base, 'abc', 'tok')).toBe(
+      'https://box.example/__athanor/preview/abc/?access=tok'
+    );
+    expect(previewUrl(base, 'abc', 'tok', 'app/index.html')).toBe(
+      'https://box.example/__athanor/preview/abc/app/index.html?access=tok'
     );
   });
 

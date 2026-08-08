@@ -277,6 +277,8 @@ export interface WorkspacePreviewRecord {
   port: number;
   slug: string;
   accessTokenHash: string;
+  /** Where inside the served port the owner should land; null when its root is the app. */
+  entryPath: string | null;
   visibility: 'private' | 'public';
   customDomain: string | null;
   domainStatus: 'pending' | 'active' | 'failed' | null;

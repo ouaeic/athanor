@@ -392,7 +392,27 @@ export const CreateWorkspacePreviewRequest = z.object({
     .int()
     .min(1024)
     .max(65_535)
-    .refine((port) => port !== 4300)
+    .refine((port) => port !== 4300),
+  /*
+   * Where inside the served port the owner lands.
+   *
+   * Absolute and relative to the port, never to a host: a value carrying a scheme, a host or a
+   * `..` segment is refused rather than cleaned up, because the only thing it could be doing is
+   * pointing the link somewhere the preview is not.
+   */
+  entryPath: z
+    .string()
+    .max(300)
+    .transform((value) => value.trim())
+    .refine(
+      (value) =>
+        value === '' ||
+        (!/^[a-z][a-z0-9+.-]*:/i.test(value) &&
+          !value.startsWith('//') &&
+          !value.split(/[/\\]/).includes('..')),
+      'entryPath cannot leave the preview'
+    )
+    .optional()
 });
 export type CreateWorkspacePreviewRequest = z.input<typeof CreateWorkspacePreviewRequest>;
 

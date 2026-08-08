@@ -898,14 +898,19 @@ export const agentTools: ModelTool[] = [
        * research PDFs included, and not on the page it had just written. The page was one path
        * away and worked. Nothing in the tool had ever said which address the owner arrives at.
        */
-      'Expose an app already listening on a port of this computer as a private link only the user can open, and place an Open button directly in chat. It closes after a month with no visits, and they can revoke it whenever they like. Start the server first, bind it to 0.0.0.0, and serve the app itself: the user lands on that port’s root, so a file server aimed at the workspace hands them an index of your files rather than what you built. Use publish_site only when they asked for a deployment the public can reach.',
+      'Expose an app already listening on a port of this computer as a private link only the user can open, and place an Open button directly in chat. It closes after a month with no visits, and they can revoke it whenever they like. Start the server first and bind it to 0.0.0.0. The user lands on that port’s root, so give path when the root is a file index rather than your app. Use publish_site only when they asked for a deployment the public can reach.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['port', 'label'],
       properties: {
         port: { type: 'integer', minimum: 1024, maximum: 65535 },
-        label: { type: 'string' }
+        label: { type: 'string' },
+        path: {
+          type: 'string',
+          description:
+            'Where inside that port the user should land - "index.html" for a file server aimed at a folder. Omit when the root is already the app.'
+        }
       }
     }
   },

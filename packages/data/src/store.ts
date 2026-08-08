@@ -493,6 +493,7 @@ const mapWorkspacePreview = (row: Record<string, unknown>): WorkspacePreviewReco
   port: Number(row.port),
   slug: String(row.slug),
   accessTokenHash: String(row.access_token_hash),
+  entryPath: optionalText(row.entry_path),
   visibility: String(row.visibility) as WorkspacePreviewRecord['visibility'],
   customDomain: optionalText(row.custom_domain),
   domainStatus: optionalText(row.domain_status) as WorkspacePreviewRecord['domainStatus'],
@@ -5941,6 +5942,7 @@ export class DataStore {
     port: number;
     slug: string;
     accessTokenHash: string;
+    entryPath?: string | null;
     maxPreviews?: number;
   }): Promise<WorkspacePreviewRecord> {
     const maxPreviews = input.maxPreviews ?? MAX_WORKSPACE_PREVIEWS;
@@ -5955,8 +5957,8 @@ export class DataStore {
       if (Number(count.rows[0]?.count ?? 0) >= maxPreviews) throw new Error('preview_limit');
       const result = await tx.query(
         `INSERT INTO workspace_previews(
-           id,user_id,workspace_id,label,port,slug,access_token_hash,expires_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()+$8::interval) RETURNING *`,
+           id,user_id,workspace_id,label,port,slug,access_token_hash,entry_path,expires_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()+$9::interval) RETURNING *`,
         [
           randomUUID(),
           input.userId,
@@ -5965,6 +5967,7 @@ export class DataStore {
           input.port,
           input.slug,
           input.accessTokenHash,
+          input.entryPath ?? null,
           PREVIEW_IDLE_INTERVAL
         ]
       );

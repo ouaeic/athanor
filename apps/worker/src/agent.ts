@@ -1097,7 +1097,12 @@ export const performConnectorAction = async (input: {
   return attachmentSavedResult(result, destination);
 };
 
-const previewUrl = (base: string, slug: string, accessToken?: string): string => {
+export const previewUrl = (
+  base: string,
+  slug: string,
+  accessToken?: string,
+  entryPath?: string | null
+): string => {
   const url = new URL(base);
   const basePath = url.pathname.replace(/\/+$/, '');
   if (basePath) {
@@ -1106,6 +1111,8 @@ const previewUrl = (base: string, slug: string, accessToken?: string): string =>
     url.hostname = `${slug}.${url.hostname}`;
     url.pathname = '/';
   }
+  // Where the owner lands. A preview whose port really does serve its own root has none.
+  if (entryPath) url.pathname = `${url.pathname.replace(/\/+$/, '')}/${entryPath.replace(/^\/+/, '')}`;
   url.search = '';
   url.hash = '';
   if (accessToken) url.searchParams.set('access', accessToken);
@@ -5101,19 +5108,35 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           );
         const accessToken = randomBytes(32).toString('base64url');
         const slug = randomBytes(16).toString('hex');
+        /*
+         * Refused rather than cleaned up. The only thing a scheme, a host or a `..` could be doing
+         * here is pointing the owner's link somewhere the preview is not.
+         */
+        const entryPath = textValue(call.arguments.path).trim().replace(/^\/+/, '').slice(0, 300);
+        if (
+          entryPath &&
+          (/^[a-z][a-z0-9+.-]*:/i.test(entryPath) ||
+            entryPath.startsWith('//') ||
+            entryPath.split(/[/\\]/).includes('..'))
+        )
+          throw new AthanorError(
+            'preview_path_invalid',
+            'A preview path is a path inside the served port, not a URL, and it may not climb out of it'
+          );
         const created = await this.store.createWorkspacePreview({
           userId: task.userId,
           workspaceId: task.workspaceId,
           label,
           port,
           slug,
-          accessTokenHash: sha256(accessToken)
+          accessTokenHash: sha256(accessToken),
+          entryPath: entryPath || null
         });
         const preview = {
           previewId: created.id,
           label,
           port,
-          url: previewUrl(this.config.PREVIEW_BASE_URL, slug, accessToken),
+          url: previewUrl(this.config.PREVIEW_BASE_URL, slug, accessToken, entryPath),
           visibility: 'private',
           expiresAt: created.expiresAt
         };

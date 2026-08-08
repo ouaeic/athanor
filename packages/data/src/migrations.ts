@@ -2104,5 +2104,20 @@ export const migrations = [
       CREATE UNIQUE INDEX IF NOT EXISTS message_drafts_new_idx
         ON message_drafts(workspace_id) WHERE task_id IS NULL;
     `
+  },
+  {
+    version: 61,
+    name: 'a_preview_opens_on_the_thing_it_published',
+    // A preview is a port, and the owner lands on that port's root. Asked to build a page and
+    // publish a link, an agent starts a file server on the workspace and publishes it - so the
+    // link opens on an index of every file in there, and the page it just wrote sits one path away.
+    // Telling the model about it in the tool description was tried first and did not take.
+    //
+    // Nullable, because a preview of an app that really does serve its own root wants no path at
+    // all, and every preview published before this has none.
+    sql: `
+      ALTER TABLE workspace_previews
+        ADD COLUMN IF NOT EXISTS entry_path TEXT;
+    `
   }
 ] as const;

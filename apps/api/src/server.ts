@@ -852,6 +852,13 @@ export const buildServer = async (
     // sign-in page. The feature is gone rather than half-present; the columns behind it are left in
     // place for now so a rollback to the previous release still reads its own rows.
     const url = new URL(workspacePreviewUrl(preview.slug));
+    /*
+     * The entry path rides on every address handed out, not only on the one minted at publish
+     * time: the Preview tab asks for a fresh address whenever it opens one, and a link that
+     * forgot where to land would be the same file index all over again.
+     */
+    if (preview.entryPath)
+      url.pathname = `${url.pathname.replace(/\/+$/, '')}/${preview.entryPath.replace(/^\/+/, '')}`;
     if (accessToken && preview.visibility === 'private')
       url.searchParams.set('access', accessToken);
     return {
@@ -5937,6 +5944,7 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
             port: input.port,
             slug: randomBytes(16).toString('hex'),
             accessTokenHash: sha256(accessToken),
+            entryPath: input.entryPath || null,
             maxPreviews: serverLimits.maxPreviews
           });
         } catch (error) {
