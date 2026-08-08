@@ -1035,6 +1035,25 @@ describe('API production boundaries', () => {
     });
     expect(reviewedTask.statusCode, reviewedTask.body).toBe(200);
     expect(reviewedTask.json()).toMatchObject({ securityMode: 'review' });
+    /*
+     * And back the other way with no passkey. Loosening used to demand a step-up inside the last
+     * five minutes, so reaching Autonomous meant a fingerprint every time - on the setting whose
+     * whole purpose is to be interrupted less. The session is already passkey-bound, and somebody
+     * holding it can send tasks regardless; the prompt bought almost nothing and cost the owner the
+     * control they reach for most. Step-up stays on the provider credential and on raising a
+     * spending cap, which is asserted elsewhere in this file.
+     */
+    await database.query("UPDATE sessions SET step_up_at=NOW()-INTERVAL '10 minutes'");
+    const autonomousTask = await app.inject({
+      method: 'PATCH',
+      url: `/v1/tasks/${taskId}/security-mode`,
+      headers: { cookie: cookie!, 'idempotency-key': 'task-security-autonomous-0001' },
+      payload: { securityMode: 'autonomous' }
+    });
+    expect(autonomousTask.statusCode, autonomousTask.body).toBe(200);
+    expect(autonomousTask.json()).toMatchObject({ securityMode: 'autonomous' });
+    // Put the step-up back where the rest of this test found it.
+    await database.query('UPDATE sessions SET step_up_at=NOW()');
     await database.query("UPDATE tasks SET security_mode='balanced' WHERE id=$1", [taskId]);
     const firstPlan = await app.inject({
       method: 'POST',

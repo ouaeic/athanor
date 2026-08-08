@@ -1050,14 +1050,26 @@ install_runtime_files() {
 # No step of an update may run without a bound. `timeout` is coreutils, so it is on every host
 # this installs on; where it is missing the step still runs, because refusing to update at all is
 # worse than an unbounded one.
+# Says which of the two things happened.
+#
+# Both used to be reported as the timeout: `timeout ... || fail "passed N minutes"` fires on any
+# non-zero exit, so a build that failed in ninety seconds was announced as one that had run for half
+# an hour. `timeout` exits 124 when it is the one that stopped the command, and that is the only
+# case the old sentence was ever true for; everything else is the step's own failure and should say
+# so, with its exit code, because that is what tells someone where to look.
 run_update_step() {
   step_label="$1"
   shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout --signal=TERM --kill-after=60 "$athanor_update_step_seconds" "$@" ||
-      fail "the update step '$step_label' passed $((athanor_update_step_seconds / 60)) minutes and was stopped"
+    timeout --signal=TERM --kill-after=60 "$athanor_update_step_seconds" "$@" || update_step_status=$?
   else
-    "$@"
+    "$@" || update_step_status=$?
+  fi
+  if [ "${update_step_status:-0}" -ne 0 ]; then
+    if [ "${update_step_status}" -eq 124 ] || [ "${update_step_status}" -eq 137 ]; then
+      fail "the update step '$step_label' passed $((athanor_update_step_seconds / 60)) minutes and was stopped"
+    fi
+    fail "the update step '$step_label' failed with exit ${update_step_status}"
   fi
 }
 

@@ -219,7 +219,6 @@ const scheduleErrorMessage = (code: string): string =>
     spend_cap_reached: 'The run would have gone past your spending cap.'
   })[code] ?? 'The scheduled run could not start safely.';
 
-const securityModeRank = { autonomous: 0, balanced: 1, review: 2 } as const;
 
 const publicPaths = new Set([
   '/healthz',
@@ -4198,8 +4197,18 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
           'Only the task owner can change its security mode',
           403
         );
-      if (securityModeRank[input.securityMode] < securityModeRank[task.securityMode])
-        await requireRecentStepUp(request, user);
+      /*
+       * No second factor for choosing how much this run asks.
+       *
+       * Loosening used to demand a passkey inside the last five minutes, so in practice moving a
+       * conversation to Autonomous meant a fingerprint every single time - on the setting whose
+       * entire purpose is to be interrupted less. The session is already bound to a passkey; asking
+       * again buys almost nothing here, because an attacker holding it can send tasks anyway, and
+       * it costs the owner the one control they reach for most.
+       *
+       * Step-up stays where it protects something that cannot be undone by changing a setting
+       * back: the provider credential, and raising a spending ceiling.
+       */
       return idempotent(request, reply, user, async () => {
         const updated = await store.updateTaskSecurityMode(user.id, task.id, input.securityMode);
         if (!updated) throw new AthanorError('task_not_found', 'Task not found');
@@ -5244,8 +5253,8 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
           'Only the workspace owner can change its default security mode',
           403
         );
-      if (securityModeRank[input.securityMode] < securityModeRank[workspace.securityMode])
-        await requireRecentStepUp(request, user);
+      // The same reasoning as the per-task route above: this is the setting the owner changes most,
+      // and a passkey on it made Autonomous unreachable in practice.
       return idempotent(request, reply, user, async () => {
         const updated = await store.updateWorkspaceSecurityMode(
           user.id,

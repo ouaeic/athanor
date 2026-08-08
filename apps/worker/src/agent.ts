@@ -3333,7 +3333,16 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
             : [];
         const steps = planStepsFromArguments(call.arguments.steps, previous);
         if (!steps.length)
-          throw new AthanorError('invalid_plan', 'A plan needs at least one concrete step');
+          /*
+           * Says what shape would have worked. It used to say only that a step was needed, which
+           * is the one thing the model already knew - and the failure is almost always a step
+           * whose title arrived under another key or as an empty string, so a model told only
+           * "needs at least one step" sends the same thing again. Seen twice in one run.
+           */
+          throw new AthanorError(
+            'invalid_plan',
+            'A plan needs at least one step with a title. Send steps as ["Read the brief", …] or [{"title":"Read the brief","status":"in_progress"}, …]; a step with no title is dropped. To retire a step, keep its title and set its status to skipped rather than removing it.'
+          );
         const branchName = textValue(call.arguments.branchName, 'Main').slice(0, 80);
         try {
           const created = await this.store.createTaskPlan({
