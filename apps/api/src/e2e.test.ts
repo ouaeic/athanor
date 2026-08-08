@@ -451,17 +451,21 @@ describe('a completion that cannot be grounded', () => {
 });
 
 describe('a task the model never completes', () => {
-  test('stops nagging instead of spending the whole step budget on prose', async () => {
-    // The model answers, forever, and never calls finish. This used to consume every remaining
-    // step - one billed call each - and end with a step-limit error that named nothing.
+  test('keeps the answer when the model never calls finish, and says it did not', async () => {
+    // The model answers, forever, and never calls finish. Nagging used to consume every remaining
+    // step - one billed call each - so the bound stays. What changed is the ending: it used to be
+    // FAILED, and that threw away work that was often correct. Asked what the top story on a news
+    // site was, the agent searched, opened the page and wrote the right headline with its address
+    // five times over - a reply cut off at the output limit is continued, and each continuation is
+    // another answer without a finish - and all five were binned.
     const harness = await start([{ content: 'Here is my answer, but I will never call finish.' }], {
       maxSteps: 40
     });
     const taskId = await harness.createTask('Answer something');
-    expect(await harness.settle(taskId)).toBe('failed');
-    expect(harness.completions()).toBeLessThanOrEqual(6);
+    expect(await harness.settle(taskId)).toBe('completed');
+    expect(harness.completions()).toBeLessThanOrEqual(8);
     const summaries = (await harness.events(taskId)).map((event) => event.summary ?? '');
-    expect(summaries.some((line) => line.includes('never completed the task'))).toBe(true);
+    expect(summaries.some((line) => line.includes('without calling finish'))).toBe(true);
   }, 30_000);
 });
 

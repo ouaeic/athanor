@@ -67,6 +67,20 @@ describe('agent chat output', () => {
     );
   });
 
+  it('drops the control tokens a model opens its own turn with', () => {
+    // A completion cut off at the output limit is continued, and the model starts the next piece
+    // the way it starts any turn. The owner's transcript carried a correct, cited answer about a
+    // news front page that began with the opener, four times over.
+    expect(
+      normalizeAssistantText('<\uFF5Cbegin\u2581of\u2581sentence\uFF5C>The top story is X.')
+    ).toBe('The top story is X.');
+    expect(normalizeAssistantText('Done.<|im_end|>')).toBe('Done.');
+    // Prose and code keep their pipes.
+    expect(normalizeAssistantText('Use `a <| b` and the table | column | here.')).toBe(
+      'Use `a <| b` and the table | column | here.'
+    );
+  });
+
   it('suppresses leaked internal plan fragments', () => {
     expect(normalizeAssistantText('4. [pending] Finish with a concise summary')).toBe('');
   });

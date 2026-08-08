@@ -2020,8 +2020,21 @@ export const planStepsFromArguments = (
   return steps;
 };
 
+/**
+ * The control tokens a model marks its own turns with, which are not words it said.
+ *
+ * They surface when a completion is continued after being cut off at the output limit: the model
+ * starts the next piece the way it starts any turn, and that opener is decoded as ordinary text.
+ * Seen in the owner's own transcript - a correct, cited answer about the front page of a news site
+ * that began `<｜begin▁of▁sentence｜>`, four times over. Matched with both the ASCII bar and the
+ * fullwidth one, and bounded to short token-shaped runs so that a pipe inside real prose or a code
+ * block is left alone.
+ */
+const MODEL_CONTROL_TOKEN = /<[|｜][a-zA-Z0-9_▁\-. ]{0,40}[|｜]>/g;
+
 export const normalizeAssistantText = (value: string): string => {
   const normalized = value
+    .replace(MODEL_CONTROL_TOKEN, '')
     .trim()
     .replace(/^into chat\s*/i, '')
     .trim();
@@ -7139,20 +7152,43 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         const nags = (state.completionNags ?? 0) + 1;
         state.completionNags = nags;
         if (nags >= MAX_COMPLETION_NAGS) {
+          /*
+           * The answer stands; only the paperwork is missing.
+           *
+           * This used to raise, which marks the task FAILED. Observed: asked what the top story on
+           * a news site was, the agent searched, opened the page, and wrote the correct headline
+           * with its address and its source - five times, because a reply cut off at the output
+           * limit is continued and each continuation is another answer without a finish. Five
+           * correct answers, thrown away, reported to the owner as a failure.
+           *
+           * Not calling the tool is a real thing to record, and it is recorded: the turn completes
+           * as interrupted, with what is missing written into the caveats the completion card
+           * already shows. The bound stays - it is what stops the step budget going on nagging.
+           */
           await event(
             this.store,
             task,
             key,
             'warning',
-            'Stopped: the agent never completed the task',
-            {
-              attempts: nags
+            'Answered without calling finish',
+            { attempts: nags }
+          );
+          const stillOpen = await this.#outstandingPlanSteps(task, key).catch(() => []);
+          await this.#completeTurn(task, key, state, {
+            summary:
+              assistantText.slice(0, 400) ||
+              `Answered after ${state.step} steps without calling finish.`,
+            interrupted: true,
+            ...(stillOpen.length ? { outstanding: stillOpen } : {}),
+            verification: {
+              status: 'not_applicable',
+              evidence: [],
+              remainingRisks: [
+                `The agent answered ${nags} times without calling finish, so athanor never checked this against the request. Read the answer before relying on it, or reply to carry on.`
+              ]
             }
-          );
-          throw new AthanorError(
-            'completion_not_called',
-            `The agent answered ${nags} times without calling finish, so the task was never completed. Its work so far is saved - reply to continue, or check the steps above.`
-          );
+          });
+          return;
         }
         state.messages.push({
           role: 'system',
