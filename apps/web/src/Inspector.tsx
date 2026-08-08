@@ -34,6 +34,7 @@ import { nextTabIndex } from './focus-trap.js';
 import { describeFailure } from './failure-text.js';
 import { botWallClearance, formatBytes, hostOf } from './timeline-state.js';
 import { previewPortProblem, previewSummary } from './preview-rows.js';
+import { advanceFrame, drainFrames, emptyFrameSlots, type FrameSlots } from './remote-frame.js';
 import { DiffView } from './DiffView.js';
 import { useUndo } from './Undo.js';
 import type {
@@ -132,7 +133,8 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
   const [stalled, setStalled] = useState(false);
   const [reconnectNonce, setReconnectNonce] = useState(0);
   const socketRef = useRef<WebSocket | undefined>(undefined);
-  const frameUrlRef = useRef('');
+  /** See `remote-frame.ts`: the newest frame and the one behind it, which is not safe to revoke. */
+  const framesRef = useRef<FrameSlots>(emptyFrameSlots);
   useEffect(() => {
     if (!kind) return;
     const route = surfaceRoutes[kind];
@@ -159,8 +161,9 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
         socket.onmessage = (event) => {
           if (event.data instanceof ArrayBuffer) {
             const next = URL.createObjectURL(new Blob([event.data], { type: 'image/jpeg' }));
-            if (frameUrlRef.current) URL.revokeObjectURL(frameUrlRef.current);
-            frameUrlRef.current = next;
+            const advanced = advanceFrame(framesRef.current, next);
+            framesRef.current = advanced.slots;
+            if (advanced.revoke) URL.revokeObjectURL(advanced.revoke);
             setFrameUrl(next);
             setError('');
             attempts = 0;
@@ -176,9 +179,10 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
             setState((current) => ({ ...current, ...incoming }));
             setError('');
             // Secure input is a promise that nothing is watching, and a stale frame would break it.
-            if (incoming.holder === 'secure_input' && frameUrlRef.current) {
-              URL.revokeObjectURL(frameUrlRef.current);
-              frameUrlRef.current = '';
+            if (incoming.holder === 'secure_input' && framesRef.current.current) {
+              const drained = drainFrames(framesRef.current);
+              framesRef.current = drained.slots;
+              for (const url of drained.revoke) URL.revokeObjectURL(url);
               setFrameUrl('');
             }
           } else if (message.type === 'control_error') {
@@ -204,8 +208,9 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
       if (retry) window.clearTimeout(retry);
       socket?.close();
       socketRef.current = undefined;
-      if (frameUrlRef.current) URL.revokeObjectURL(frameUrlRef.current);
-      frameUrlRef.current = '';
+      const drained = drainFrames(framesRef.current);
+      framesRef.current = drained.slots;
+      for (const url of drained.revoke) URL.revokeObjectURL(url);
       setFrameUrl('');
     };
   }, [workspaceId, kind, reconnectNonce]);
