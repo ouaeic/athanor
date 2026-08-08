@@ -34,6 +34,7 @@ import {
   createStreamFlusher,
   delegateBudget,
   MAX_PLAN_STEPS,
+  degenerateRepeat,
   normalizeAssistantText,
   patchFailure,
   planStepsFromArguments,
@@ -65,6 +66,31 @@ describe('agent chat output', () => {
     expect(normalizeAssistantText(' into chatLet me inspect the workspace.')).toBe(
       'Let me inspect the workspace.'
     );
+  });
+
+  it('spots a model that has stopped writing and started looping', () => {
+    // The observed case, verbatim: seventeen thousand output tokens of one sentence, ended only by
+    // the provider's 900-second ceiling.
+    const looped = 'The user is not watching the screen right now. '.repeat(40);
+    expect(degenerateRepeat(looped)).toContain('not watching the screen');
+    // Answered, then looped: the tail is what matters, not the whole answer.
+    expect(degenerateRepeat(`Here is the real answer.\n\n${looped}`)).toBeTruthy();
+  });
+
+  it('leaves prose, tables and code alone', () => {
+    expect(degenerateRepeat('A perfectly ordinary paragraph that says a thing once.')).toBe('');
+    expect(
+      degenerateRepeat(
+        ['| host | port |', '| a.example | 80 |', '| b.example | 443 |', '| c.example | 8080 |']
+          .join('\n')
+          .repeat(2)
+      )
+    ).toBe('');
+    // A loop body whose lines differ is not a loop in the output.
+    const code = Array.from({ length: 30 }, (_, i) => `  console.log('step ${i}');`).join('\n');
+    expect(degenerateRepeat(code)).toBe('');
+    // Short repeats are somebody writing, not a model looping.
+    expect(degenerateRepeat('ha '.repeat(30))).toBe('');
   });
 
   it('drops the control tokens a model opens its own turn with', () => {

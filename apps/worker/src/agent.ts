@@ -2033,6 +2033,36 @@ export const planStepsFromArguments = (
  */
 const MODEL_CONTROL_TOKEN = /<[|｜][a-zA-Z0-9_▁\-. ]{0,40}[|｜]>/g;
 
+/**
+ * A model that has stopped writing and started looping, caught while it is still doing it.
+ *
+ * Twice in one evening a cheap model answered correctly and then repeated a single sentence until
+ * the provider's own 900-second ceiling stopped it - "The user is not watching the screen right
+ * now.", seventeen thousand output tokens of it, a quarter of an hour, and a run the owner was
+ * shown as a failure. There was nothing watching for it: the counters in this file bound how often
+ * a turn may be refused, never whether it is still saying anything new.
+ *
+ * The tail is examined rather than the whole answer, and only the last chunk of it: find where the
+ * final forty characters last occurred, take the gap as the period, and count how many times that
+ * unit tiles the end. Five consecutive repeats of at least fifteen characters is the bar. Prose,
+ * code and tables do not do that - a table's rows differ, a loop's body differs - and a shorter
+ * unit is left alone because "ha ha ha ha ha" is a thing people write.
+ */
+export const degenerateRepeat = (text: string): string => {
+  const tail = text.slice(-4_000);
+  const probeLength = 40;
+  if (tail.length < probeLength * 2) return '';
+  const probe = tail.slice(-probeLength);
+  const previous = tail.lastIndexOf(probe, tail.length - probeLength - 1);
+  if (previous < 0) return '';
+  const period = tail.length - probeLength - previous;
+  if (period < 15) return '';
+  const unit = tail.slice(tail.length - period);
+  let repeats = 1;
+  while (repeats < 12 && tail.endsWith(unit.repeat(repeats + 1))) repeats += 1;
+  return repeats >= 5 ? unit.trim() : '';
+};
+
 export const normalizeAssistantText = (value: string): string => {
   const normalized = value
     .replace(MODEL_CONTROL_TOKEN, '')
@@ -6990,6 +7020,18 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       // Renewed for the same reason a long tool call is: the lease is two minutes and a
       // high-reasoning turn on a full window routinely runs longer, at which point any other worker
       // polling for work can lease this task and run the identical trajectory a second time.
+      /*
+       * Stopped the moment it starts looping rather than at the provider's ceiling.
+       *
+       * A model that answers and then repeats one sentence spends the whole output budget on it -
+       * seventeen thousand tokens and a quarter of an hour, twice in one evening, ending in a
+       * timeout the owner is shown as a failure. Nothing here was watching the text itself. The
+       * check runs on the accumulating tail and aborts this request; the loop below then tells the
+       * model what it did, which is a correction it can act on rather than a dead turn.
+       */
+      let loopedOn = '';
+      const looping = new AbortController();
+      let streamed = '';
       const response = await this.#withLeaseRenewal(task, () =>
         withRequestDeadline((signal) =>
           gateway.chat(provider, {
@@ -7005,10 +7047,17 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             maxTokens: maxOutputTokens,
             reasoningEffort,
             sessionId: sha256(`athanor-task:${task.id}`).slice(0, 64),
-            signal,
+            signal: AbortSignal.any([signal, looping.signal]),
             onTextDelta: (delta) => {
               const frame = streamFlusher.push(delta);
               if (frame !== null) emitStreamFrame(frame);
+              if (loopedOn) return;
+              streamed = (streamed + delta).slice(-4_000);
+              const repeat = degenerateRepeat(streamed);
+              if (repeat) {
+                loopedOn = repeat;
+                looping.abort();
+              }
             },
             onReasoningDelta: (delta) => {
               const frame = reasoningFlusher.push(delta);
@@ -7016,7 +7065,25 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             }
           })
         )
-      );
+      ).catch((error: unknown) => {
+        // Only the abort this turn raised itself. Everything else - a real cancel, a deadline, a
+        // provider fault - is still the caller's to handle, and is rethrown untouched.
+        if (!loopedOn) throw error;
+        return null;
+      });
+      if (response === null) {
+        const finalLoopFrame = streamFlusher.drain();
+        if (finalLoopFrame !== null) emitStreamFrame(finalLoopFrame);
+        await streamEvents;
+        await event(this.store, task, key, 'warning', 'Stopped a repeating answer', {
+          repeated: loopedOn.slice(0, 200)
+        });
+        state.messages.push({
+          role: 'system',
+          content: `Your last reply began repeating "${loopedOn.slice(0, 120)}" and was stopped. Do not restate it. Say the next thing that is actually new, or call finish if the work is done.`
+        });
+        continue;
+      }
       const finalFrame = streamFlusher.drain();
       if (finalFrame !== null) emitStreamFrame(finalFrame);
       const finalReasoning = reasoningFlusher.drain();
