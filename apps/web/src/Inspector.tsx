@@ -15,6 +15,8 @@ import {
   HardDrive,
   LoaderCircle,
   LockKeyhole,
+  Maximize2,
+  Minimize2,
   Monitor,
   PencilLine,
   Play,
@@ -1039,6 +1041,25 @@ function Computer({
           width: surface.state?.width ?? desktop?.width ?? PAGE_VIEWPORT.width,
           height: surface.state?.height ?? desktop?.height ?? PAGE_VIEWPORT.height
         };
+  const paneRef = useRef<HTMLDivElement | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  // Tracked from the event rather than from our own click, because Escape and the browser's own
+  // chrome can leave full screen without going anywhere near that button.
+  useEffect(() => {
+    const sync = () => setExpanded(document.fullscreenElement === paneRef.current);
+    document.addEventListener('fullscreenchange', sync);
+    return () => document.removeEventListener('fullscreenchange', sync);
+  }, []);
+  const toggleExpanded = async (): Promise<void> => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await paneRef.current?.requestFullscreen();
+    } catch {
+      // Refused - an iframe without the permission, or a browser that will not grant it. The pane
+      // keeps working at its ordinary size, which is what it did before this button existed.
+    }
+  };
+
   const clickFrame = async (event: MouseEvent<HTMLButtonElement>) => {
     if (event.detail === 0 || holder !== 'user') return;
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -1133,7 +1154,7 @@ function Computer({
   };
 
   return (
-    <div className="inspector-content browser-pane computer-pane">
+    <div className="inspector-content browser-pane computer-pane" ref={paneRef}>
       <div className="computer-toolbar">
         <span>
           <Monitor />
@@ -1151,6 +1172,19 @@ function Computer({
               ? `${desktop.windows.length} ${desktop.windows.length === 1 ? 'window' : 'windows'} open`
               : 'Nothing open yet'}
         </small>
+        {/*
+          A screen the size of a sidebar is not a screen you can work on. Full screen is the whole
+          pane rather than the picture alone, so taking over and typing stay reachable without
+          dropping out again - and Escape leaves, because the browser already means that here.
+        */}
+        <button
+          className="icon-btn"
+          aria-label={expanded ? 'Leave full screen' : 'Show this computer full screen'}
+          title={expanded ? 'Leave full screen' : 'Full screen'}
+          onClick={() => void toggleExpanded()}
+        >
+          {expanded ? <Minimize2 /> : <Maximize2 />}
+        </button>
       </div>
       <div className="browser-controls">
         <div className="address">
@@ -1205,6 +1239,14 @@ function Computer({
           <button
             type="button"
             className={`remote-frame-button ${holder === 'user' ? 'interactive' : ''}`}
+            // Clicks are mapped proportionally against this element's box, so the box has to be the
+            // same shape as the screen inside it. Given here rather than in the stylesheet because
+            // only the running stream knows its shape, and it can change mid-session.
+            style={
+              frameSize.width && frameSize.height
+                ? { aspectRatio: `${frameSize.width} / ${frameSize.height}` }
+                : undefined
+            }
             aria-disabled={holder !== 'user'}
             aria-label={
               holder === 'user'
