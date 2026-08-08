@@ -1342,7 +1342,9 @@ describe('the web route a run is pinned to', () => {
     // And the owner is told why, in a state a reply can resume.
     expect(updates.some((update) => update.status === 'paused')).toBe(true);
     const stated = probe.events.find(
-      (entry) => (entry.payload as { blockedBy?: string } | undefined)?.blockedBy === 'spend_guard_unavailable'
+      (entry) =>
+        (entry.payload as { blockedBy?: string } | undefined)?.blockedBy ===
+        'spend_guard_unavailable'
     );
     expect(stated?.summary).toContain('could not check this against your spending caps');
   });
@@ -1352,9 +1354,7 @@ describe('the web route a run is pinned to', () => {
     // has never heard of it is a request that fails, so an unrecognised endpoint arrives refused.
     const { log } = await runOnce(makeTask(), config({ TASK_MAX_STEPS: 1 }), [model]);
     const request = log.modelRequests[0];
-    expect(toolNames(request)).toEqual(
-      expect.arrayContaining(['web_search', 'parallel_web_read'])
-    );
+    expect(toolNames(request)).toEqual(expect.arrayContaining(['web_search', 'parallel_web_read']));
     expect(toolNames(request)).not.toContain('openrouter:web_search');
   });
 
@@ -1495,9 +1495,9 @@ describe('the web route a run is pinned to', () => {
     // reads it. The middle one is the whole mechanism - a provider-side tool can only be spent by a
     // request whose purpose is to spend it.
     const search = log.modelRequests[1] ?? {};
-    expect(
-      ((search.tools ?? []) as Array<{ type?: string }>).map((tool) => tool.type)
-    ).toEqual(['openrouter:web_search']);
+    expect(((search.tools ?? []) as Array<{ type?: string }>).map((tool) => tool.type)).toEqual([
+      'openrouter:web_search'
+    ]);
     // No function tools beside it. The gateway refuses this outright, so a regression here is a
     // failed run rather than a model quietly choosing between two answerers.
     expect(toolNames(search)).toEqual(['openrouter:web_search']);
@@ -2290,7 +2290,9 @@ describe('searching code for something that is not a regular expression', () => 
   it('takes the query literally without also demanding a whole word', async () => {
     // These were one flag, so the only way to search for `a[0]` as text was to also require word
     // boundaries around it - which is a different question, and often the wrong one.
-    const { log } = await run({ query: 'a[0]', literal: true }, [found('t.ts:1:7:const a[0] = 1;')]);
+    const { log } = await run({ query: 'a[0]', literal: true }, [
+      found('t.ts:1:7:const a[0] = 1;')
+    ]);
     const [first] = searches(log);
     expect(first).toContain('--fixed-strings');
     expect(first).not.toContain('--word-regexp');
@@ -2747,7 +2749,6 @@ describe('spending the owner’s money on generated media', () => {
   });
 });
 
-
 describe('reaching the built-in skill library', () => {
   const toolResult = async (args: Record<string, unknown>): Promise<Record<string, unknown>> => {
     const task = makeTask();
@@ -2853,8 +2854,10 @@ describe('what would prove the job is done', () => {
     step: 0,
     credits: 0,
     // A turn that has already changed something, with one earlier result available to cite: the
-    // state a real finish arrives in.
+    // state a real finish arrives in. It is fixing an importer, so the change is code - which is
+    // what puts it in front of the acceptance gate at all.
     mutated: true,
+    mutatedBeyondProse: true,
     turnToolResults: { 'call-0': { name: 'file_read', success: true } },
     ...over
   });
@@ -2997,8 +3000,12 @@ describe('what would prove the job is done', () => {
 
     await worker.run(task).catch(() => undefined);
 
-    expect(probe.events.some((entry) => entry.summary === 'Finish refused: a check failed')).toBe(
-      true
+    // Named, and a status rather than a warning: the model gets to fix this and finish, so a turn
+    // that recovers used to carry a standing red line over its own "all passed" completion card.
+    const refusal = probe.events.find((entry) => entry.summary.startsWith('Finish refused:'));
+    expect(refusal?.kind).toBe('status');
+    expect(refusal?.summary).toBe(
+      'Finish refused: 1 of 1 acceptance check failed — the importer test passes'
     );
     // The turn did not complete. It ends at its step limit instead, which is the honest ending -
     // and what the model is told back is the harness's own observation rather than a verdict: an
@@ -3008,6 +3015,103 @@ describe('what would prove the job is done', () => {
     const answer = lastMessage(log, 1);
     expect(answer).toContain('Finish refused (acceptance 1 of 4)');
     expect(answer).toContain('AssertionError: expected 3 rows');
+  });
+
+  /**
+   * The hold exists so a turn that changed code says what would prove it. A report is a change too,
+   * but nothing executable can prove it: the only check available is reading back the file just
+   * written, which passes whatever the file says. Held anyway, a research task invents a check,
+   * fails it, and is refused its own finish - which is what happened to a real one.
+   */
+  it('holds for acceptance on code but not on prose, on the extension alone', async () => {
+    const heldFor = async (path: string): Promise<boolean> => {
+      const task = makeTask();
+      const probe = probeStore(() => task);
+      const log: FetchLog = { calls: [], modelRequests: [] };
+      installFetch(
+        [
+          toolFrame('call-1', 'file_write', { path, content: 'Some words.\n' }),
+          // A read-only look at the result, so the finish below cites an observation ordered after
+          // the change rather than the change itself. `ls` writes nothing, so it leaves the
+          // prose/code question this test is about entirely to the extension.
+          toolFrame('call-2', 'shell', { executable: 'ls', args: ['workspace'] }),
+          toolFrame('call-3', 'finish', {
+            summary: 'Wrote the file.',
+            verification: {
+              status: 'verified',
+              evidence: [
+                { claim: 'The file is on disk', source: 'tool_result', toolCallId: 'call-2' }
+              ],
+              remainingRisks: []
+            }
+          }),
+          textFrame('Done.')
+        ],
+        log,
+        { route: execRoute(0) }
+      );
+      const worker = new AgentWorker(
+        probe.store,
+        config({ TASK_MAX_STEPS: 8 }),
+        masterKey,
+        runnerSecret
+      );
+
+      await worker.run(task).catch(() => undefined);
+
+      return probe.events.some((entry) => entry.summary === 'Asked for an acceptance record');
+    };
+
+    // The same turn, the same write, the same finish. Only the extension differs, so neither result
+    // can be explained by anything else in the run.
+    expect(await heldFor('workspace/notes.ts')).toBe(true);
+    expect(await heldFor('workspace/notes.md')).toBe(false);
+  });
+
+  /**
+   * A real task asked for a report file "and the gist in your reply". It wrote the report, published
+   * it, and completed without an assistant message at all - the owner got a Result card and a
+   * download. Nothing in the loop required the turn to say anything.
+   */
+  it('answers with the finish summary when the turn never said anything itself', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-1', 'shell', { executable: 'ls', args: ['workspace'] }),
+        // A finish, with no prose in the same frame and none before it.
+        toolFrame('call-2', 'finish', {
+          summary: 'The workspace has three files in it.',
+          verification: {
+            status: 'verified',
+            evidence: [
+              { claim: 'Listed the workspace', source: 'tool_result', toolCallId: 'call-1' }
+            ],
+            remainingRisks: []
+          }
+        }),
+        textFrame('Done.')
+      ],
+      log,
+      { route: execRoute(0) }
+    );
+    const worker = new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 4 }),
+      masterKey,
+      runnerSecret
+    );
+
+    await worker.run(task).catch(() => undefined);
+
+    const spoken = probe.events.filter((entry) => entry.kind === 'assistant_message');
+    expect(spoken).toHaveLength(1);
+    expect(spoken[0]?.summary).toBe('The workspace has three files in it.');
+    // Before the completion, so the owner reads the answer above the card rather than under it.
+    expect(probe.events.indexOf(spoken[0]!)).toBeLessThan(
+      probe.events.findIndex((entry) => entry.kind === 'completed')
+    );
   });
 
   it('completes when the harness runs the checks and they pass', async () => {
@@ -3343,7 +3447,11 @@ describe('a correction sent while the task is working', () => {
         id: 'followup-1',
         taskId,
         userId,
-        promptCiphertext: encryptJson({ prompt: 'Then deploy it' }, dataKey, `task-message:${taskId}`),
+        promptCiphertext: encryptJson(
+          { prompt: 'Then deploy it' },
+          dataKey,
+          `task-message:${taskId}`
+        ),
         modelId: model.id,
         privacyRoute: 'provider_zdr',
         maxComputeCredits: 5,
@@ -3361,7 +3469,10 @@ describe('a correction sent while the task is working', () => {
       }
     });
     const log: FetchLog = { calls: [], modelRequests: [] };
-    installFetch([toolFrame('call-1', 'files_list', { path: 'workspace' }), textFrame('Done.')], log);
+    installFetch(
+      [toolFrame('call-1', 'files_list', { path: 'workspace' }), textFrame('Done.')],
+      log
+    );
     await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
       .run(task)
       .catch(() => undefined);

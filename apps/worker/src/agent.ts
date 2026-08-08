@@ -79,11 +79,7 @@ import {
   type CompactionOutcome,
   type ContextBrief
 } from './context.js';
-import {
-  managedMediaCatalog,
-  mediaDimension,
-  mediaEstimateUsd
-} from './media.js';
+import { managedMediaCatalog, mediaDimension, mediaEstimateUsd } from './media.js';
 import {
   buildTaskMemoryPack,
   extractTurn,
@@ -154,6 +150,16 @@ interface AgentState {
    * what `completionVerification` checks evidence ordering against.
    */
   mutated?: boolean;
+  /**
+   * Whether any of those changes was something other than prose. A report, a README or a CSV is a
+   * change, but there is nothing executable that could prove it: the only check available is reading
+   * back the file just written, which passes whatever the file says. Demanding one anyway is how a
+   * research task ends up inventing a check, failing it, and being refused its own finish - so the
+   * acceptance gate asks only when code, commands or config were touched.
+   */
+  mutatedBeyondProse?: boolean;
+  /** Whether this turn has said anything to the owner in its own voice. */
+  answered?: boolean;
   turnToolResults?: Record<
     string,
     {
@@ -460,10 +466,10 @@ export const acceptanceBaselineNote = (results: readonly AcceptanceResult[]): st
  * case, and a sentence printed on every task is one nobody reads.
  */
 export const acceptanceRetrofitCaveat = (state: {
-  mutated?: boolean;
+  mutatedBeyondProse?: boolean;
   acceptanceNagged?: boolean;
 }): string | undefined =>
-  state.mutated && !state.acceptanceNagged ? ACCEPTANCE_RETROFIT_CAVEAT : undefined;
+  state.mutatedBeyondProse && !state.acceptanceNagged ? ACCEPTANCE_RETROFIT_CAVEAT : undefined;
 
 export const ACCEPTANCE_RETROFIT_CAVEAT =
   'The acceptance checks were declared after this turn had already changed things, so the harness never saw them fail on the unfinished job.';
@@ -1133,7 +1139,8 @@ export const previewUrl = (
     url.pathname = '/';
   }
   // Where the owner lands. A preview whose port really does serve its own root has none.
-  if (entryPath) url.pathname = `${url.pathname.replace(/\/+$/, '')}/${entryPath.replace(/^\/+/, '')}`;
+  if (entryPath)
+    url.pathname = `${url.pathname.replace(/\/+$/, '')}/${entryPath.replace(/^\/+/, '')}`;
   url.search = '';
   url.hash = '';
   if (accessToken) url.searchParams.set('access', accessToken);
@@ -1200,6 +1207,8 @@ export const startTurnState = <T extends Record<string, unknown>>(
     notices: 0,
     // A new turn has changed nothing yet, so its evidence ordering and its plan both start over.
     mutated: false,
+    mutatedBeyondProse: false,
+    answered: false,
     // The effort ladder and the two finish gates are per turn, like the counters above.
     acceptanceFailures: 0,
     acceptanceNagged: false,
@@ -2463,7 +2472,8 @@ export class AgentWorker {
     decision: SpendDecision,
     level: 'warning' | 'exceeded'
   ): Promise<void> {
-    const names = level === 'warning' ? decision.warnedBy : decision.blockedBy ? [decision.blockedBy] : [];
+    const names =
+      level === 'warning' ? decision.warnedBy : decision.blockedBy ? [decision.blockedBy] : [];
     for (const name of names) {
       if (name !== 'daily' && name !== 'monthly') continue;
       const window = decision.windows.find((candidate) => candidate.name === name);
@@ -2743,7 +2753,7 @@ export class AgentWorker {
       'parallel_web_read',
       'code_search',
       'repo_overview',
-          'session_search'
+      'session_search'
     ]);
     const tools = agentToolsFor().filter((tool) => allowed.has(tool.name));
     // A specialist asked what the latest guidance says, or which of two dated documents supersedes
@@ -2906,7 +2916,9 @@ ${clockLine(new Date(), timeZone)}
             toolCallId: call.id,
             content: `Denied: ${sinks
               .map((verdict) => verdict.host)
-              .join(', ')} is not somewhere this run has been sent. A specialist cannot ask the user, so report what you have and let the lead decide.`
+              .join(
+                ', '
+              )} is not somewhere this run has been sent. A specialist cannot ask the user, so report what you have and let the lead decide.`
           });
           continue;
         }
@@ -3307,10 +3319,12 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       content: assistantText,
       ...(response.toolCalls.length ? { toolCalls: response.toolCalls } : {})
     });
-    if (assistantText)
+    if (assistantText) {
+      state.answered = true;
       await event(this.store, task, key, 'assistant_message', assistantText.slice(0, 500), {
         markdown: assistantText
       });
+    }
 
     let summary = '';
     let deliverables: unknown[] = [];
@@ -4438,9 +4452,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           dataKey: key,
           query: boundedKnowledge(call.arguments.query, 500),
           maxResults: Number(call.arguments.maxResults ?? 12),
-          ...(textValue(call.arguments.taskId)
-            ? { taskId: textValue(call.arguments.taskId) }
-            : {})
+          ...(textValue(call.arguments.taskId) ? { taskId: textValue(call.arguments.taskId) } : {})
         });
       }
       /**
@@ -4464,9 +4476,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           taskId: task.id,
           query: textValue(call.arguments.query),
           ...(kinds.length ? { kinds } : {}),
-          ...(textValue(call.arguments.scope) === 'archive'
-            ? { scope: 'archive' as const }
-            : {}),
+          ...(textValue(call.arguments.scope) === 'archive' ? { scope: 'archive' as const } : {}),
           ...(textValue(call.arguments.asOf) ? { asOf: textValue(call.arguments.asOf) } : {}),
           ...(call.arguments.includeSuperseded === undefined
             ? {}
@@ -5037,8 +5047,9 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
          * only one - but a hostile value should not be sitting in the database waiting for a future
          * reader that trusts it.
          */
-        const scriptableMime =
-          /^(?:text\/html|application\/xhtml)|(?:\+xml)$|^image\/svg/i.test(requestedMime);
+        const scriptableMime = /^(?:text\/html|application\/xhtml)|(?:\+xml)$|^image\/svg/i.test(
+          requestedMime
+        );
         const mimeType = (!scriptableMime && requestedMime) || source.mimeType;
         const storageKey = `.athanor/artifacts/${randomUUID()}`;
         await this.#runner.writeBytes(task.workspaceId, task.id, storageKey, source.bytes);
@@ -5300,8 +5311,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       // origins the turn has been to, the row the timeline draws - reads a search the same way
       // whoever ran it.
       case 'web_search':
-        if (webPlan?.mode === 'server')
-          return this.#providerWebSearch(task, call, webPlan, state);
+        if (webPlan?.mode === 'server') return this.#providerWebSearch(task, call, webPlan, state);
         return this.#runner.call(
           task.workspaceId,
           task.id,
@@ -6244,6 +6254,16 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
     // looking at nine of nine - and the completion contract could not catch it, because it checks
     // evidence for one claim rather than coverage of the plan. Coverage is now asked for at the
     // finish gate instead, where the model can still answer it.
+    // A turn that never said anything. The model can do all of its work through tools and call
+    // finish without once writing in its own voice, and the owner is then left with a Result card
+    // and a file - which is what happened to someone who had asked, in the same sentence, for a
+    // report and for the gist of it in the reply. The summary is the model's own account of what it
+    // did, so it is promoted to the answer rather than a sentence of athanor's being invented here.
+    // It costs no extra model turn, and a turn that did reply is untouched.
+    if (!state.answered && completion.summary.trim())
+      await event(this.store, task, key, 'assistant_message', completion.summary.slice(0, 500), {
+        markdown: completion.summary
+      }).catch(() => undefined);
     await event(this.store, task, key, 'completed', options.label ?? 'Task completed', completion);
     await this.#captureMemory(task, key, state, completion);
     const turn = state.turn ?? 0;
@@ -7259,10 +7279,12 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
           : {}),
         ...(response.toolCalls.length ? { toolCalls: response.toolCalls } : {})
       });
-      if (assistantText)
+      if (assistantText) {
+        state.answered = true;
         await event(this.store, task, key, 'assistant_message', assistantText.slice(0, 500), {
           markdown: assistantText
         });
+      }
       if (await honorUserControl()) return;
 
       // A reply that stopped at the provider's output ceiling is half a sentence, and it used to be
@@ -7319,14 +7341,9 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
            * as interrupted, with what is missing written into the caveats the completion card
            * already shows. The bound stays - it is what stops the step budget going on nagging.
            */
-          await event(
-            this.store,
-            task,
-            key,
-            'warning',
-            'Answered without calling finish',
-            { attempts: nags }
-          );
+          await event(this.store, task, key, 'warning', 'Answered without calling finish', {
+            attempts: nags
+          });
           const stillOpen = await this.#outstandingPlanSteps(task, key).catch(() => []);
           await this.#completeTurn(task, key, state, {
             summary:
@@ -7537,7 +7554,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
           // turn started: whatever this turn just did, that record is not evidence of it.
           const inheritedAcceptance = (state.acceptanceTurn ?? 0) !== turn;
           if (
-            state.mutated &&
+            state.mutatedBeyondProse &&
             (!state.acceptance || inheritedAcceptance) &&
             !state.acceptanceNagged
           ) {
@@ -7586,9 +7603,25 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
                   toolCallId: call.id,
                   content: acceptanceFailureMessage(results, attempt, MAX_ACCEPTANCE_FAILURES)
                 });
-                await event(this.store, task, key, 'warning', 'Finish refused: a check failed', {
-                  acceptance: results
-                });
+                // A status, not a warning. This refusal is transient by construction: the model is
+                // told what failed and gets to fix it, and the turn that recovers used to carry a
+                // standing red line contradicting the "all passed" on its own completion card. A
+                // failure that is never recovered from is not lost - it reaches the owner as a
+                // remaining risk below, which is where a finished task's problems belong.
+                //
+                // The summary says which check, because the old one said only that "a check" failed
+                // and the payload naming it was never rendered anywhere.
+                await event(
+                  this.store,
+                  task,
+                  key,
+                  'status',
+                  `Finish refused: ${failed.length} of ${results.length} acceptance ${results.length === 1 ? 'check' : 'checks'} failed — ${failed
+                    .map((result) => result.label)
+                    .join('; ')
+                    .slice(0, 160)}`,
+                  { acceptance: results }
+                );
                 continue;
               }
               // Bounded like every other refusal in this loop: past the ceiling the turn ends
@@ -7832,7 +7865,10 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         await this.#ensureTurnUndoPoint(task, key, state, call.name);
         // Recorded on intent rather than on success, because a write that failed is still a turn
         // doing material work, and that is what the user-visible plan is for.
-        if (isMutatingToolCall(call.name, call.arguments)) state.mutated = true;
+        if (isMutatingToolCall(call.name, call.arguments)) {
+          state.mutated = true;
+          if (!writesOnlyProse(call.name, call.arguments)) state.mutatedBeyondProse = true;
+        }
         await event(this.store, task, key, 'tool_started', `Running ${call.name}`, {
           toolCallId: call.id,
           tool: call.name,

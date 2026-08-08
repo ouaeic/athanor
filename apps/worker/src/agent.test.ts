@@ -79,13 +79,17 @@ describe('agent chat output', () => {
      * A caveat that is always there says nothing and teaches the owner to skim the line where a
      * real one will one day be.
      */
-    expect(acceptanceRetrofitCaveat({ mutated: true, acceptanceNagged: true })).toBeUndefined();
+    expect(
+      acceptanceRetrofitCaveat({ mutatedBeyondProse: true, acceptanceNagged: true })
+    ).toBeUndefined();
     // Late on its own account, with nobody having asked: that is worth saying.
-    expect(acceptanceRetrofitCaveat({ mutated: true, acceptanceNagged: false })).toBe(
+    expect(acceptanceRetrofitCaveat({ mutatedBeyondProse: true, acceptanceNagged: false })).toBe(
       ACCEPTANCE_RETROFIT_CAVEAT
     );
     // Declared before anything changed, which is the case the whole mechanism is built around.
-    expect(acceptanceRetrofitCaveat({ mutated: false, acceptanceNagged: false })).toBeUndefined();
+    expect(
+      acceptanceRetrofitCaveat({ mutatedBeyondProse: false, acceptanceNagged: false })
+    ).toBeUndefined();
   });
 
   it('points a preview link at the page rather than at a file index', () => {
@@ -1059,6 +1063,8 @@ describe('what a new turn keeps and what it drops', () => {
     completionNags: 4,
     notices: 3,
     mutated: true,
+    mutatedBeyondProse: true,
+    answered: true,
     acceptanceFailures: 1,
     acceptanceNagged: true,
     acceptanceBaselineRefusals: 2,
@@ -1089,6 +1095,12 @@ describe('what a new turn keeps and what it drops', () => {
     expect(next.notices).toBe(0);
     // A fresh turn believing it had already changed something reorders its own evidence rules.
     expect(next.mutated).toBe(false);
+    // Carried forward, this is the one that would hold a pure-answer turn to an acceptance record
+    // on the strength of code the turn before it touched.
+    expect(next.mutatedBeyondProse).toBe(false);
+    // Every turn owes the owner an answer of its own. Carried forward, the second one could finish
+    // in silence on the strength of the first one having spoken.
+    expect(next.answered).toBe(false);
     expect(next.acceptanceFailures).toBe(0);
     expect(next.acceptanceNagged).toBe(false);
     expect(next.acceptanceBaselineRefusals).toBe(0);
@@ -1163,9 +1175,9 @@ describe('completion verification', () => {
     const code = state({
       'call-1': { name: 'file_write', success: true, mutating: true }
     });
-    expect(completionVerification(code, { status: 'verified', evidence: ['call-1'] })).toMatchObject(
-      { ok: false }
-    );
+    expect(
+      completionVerification(code, { status: 'verified', evidence: ['call-1'] })
+    ).toMatchObject({ ok: false });
   });
 
   it('takes an id as evidence, and still refuses a claim that cites nothing', () => {
@@ -1177,9 +1189,9 @@ describe('completion verification', () => {
      * that carries the guarantee, so the id alone is enough and a full item still works.
      */
     const turn = state({ 'call-1': { name: 'file_write', success: true } });
-    expect(completionVerification(turn, { status: 'verified', evidence: ['call-1'] })).toMatchObject(
-      { ok: true }
-    );
+    expect(
+      completionVerification(turn, { status: 'verified', evidence: ['call-1'] })
+    ).toMatchObject({ ok: true });
     // A source it did not bother to name is read off what it cited, which can only ever be stricter.
     expect(
       completionVerification(turn, {
@@ -1246,7 +1258,9 @@ describe('completion verification', () => {
       }),
       {
         status: 'verified',
-        evidence: [{ claim: 'The deck has six slides', source: 'tool_result', toolCallId: 'call-2' }]
+        evidence: [
+          { claim: 'The deck has six slides', source: 'tool_result', toolCallId: 'call-2' }
+        ]
       }
     );
     expect(built.ok).toBe(true);
@@ -1787,7 +1801,10 @@ describe('what the turn treats as somebody else’s words', () => {
     expect(
       originsFromResult(call('parallel_web_read'), {
         sources: [
-          { requestedUrl: 'https://www.postgresql.org/docs/', url: 'https://www.postgresql.org/docs/current/' },
+          {
+            requestedUrl: 'https://www.postgresql.org/docs/',
+            url: 'https://www.postgresql.org/docs/current/'
+          },
           // A source that could not be read still says where the turn went.
           { requestedUrl: 'https://example.invalid/x', error: 'Source was not read' }
         ]
@@ -1809,7 +1826,9 @@ describe('what the turn treats as somebody else’s words', () => {
       untrustedOriginOfResult(call('parallel_web_read'), {
         // The shape the runner actually answers with. This fixture used to say `pages`, which
         // nothing sends - so the assertion passed while the label named no host at all.
-        sources: [{ requestedUrl: 'https://vendor.example/pricing', url: 'https://vendor.example/pricing' }]
+        sources: [
+          { requestedUrl: 'https://vendor.example/pricing', url: 'https://vendor.example/pricing' }
+        ]
       })
     ).toBe('web page vendor.example');
     expect(
@@ -1975,7 +1994,11 @@ describe('what a long task remembers of its early work', () => {
 
     // And the next turn starts empty: carrying these forward would put work in the Touched list of
     // a turn that predates it, which is worse than the absence this exists to fix.
-    const next = startTurnState(state, { prompt: 'now do the other thing', turn: 2, reservationKey: 'r' });
+    const next = startTurnState(state, {
+      prompt: 'now do the other thing',
+      turn: 2,
+      reservationKey: 'r'
+    });
     expect(next.carriedArtifacts).toEqual([]);
   });
 });
