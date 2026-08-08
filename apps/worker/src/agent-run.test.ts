@@ -7,8 +7,10 @@ import {
   approvalPreviewHash,
   DELEGATE_MAX_STEPS,
   MAX_NOTICES_PER_TURN,
+  startTurnState,
   UNTRUSTED_NOTICE_MARKER
 } from './agent.js';
+import { RUNTIME_CONTEXT_MARKER } from './context.js';
 import { managedMediaCatalog } from './media.js';
 import type { WorkerConfig } from './config.js';
 
@@ -985,6 +987,55 @@ describe('what a delegated specialist is sent', () => {
     ).toEqual({ query: 'regulator guidance 2026', limit: 10 });
   });
 
+  it('brings back all three specialists, not the first one and a half', async () => {
+    // Three missions may run and each specialist may write 8,192 output tokens, so three full
+    // reports are far more than the 24,000 characters the lead's window keeps of one tool result -
+    // and that result is cut from the middle, which is right for one long document and wrong for a
+    // list. Measured on three 14,000-character reports: the first arrived, the second was cut in
+    // half, the third was not there at all, and the only thing the lead was told is that some
+    // characters had been omitted - not which specialist it had lost.
+    const report = (marker: string): string =>
+      `${marker}-OPENS ${'finding '.repeat(1_700)} ${marker}-CONCLUDES`;
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-1', 'delegate', {
+          missions: [
+            { name: 'filings', instruction: 'Read the filings.' },
+            { name: 'transcripts', instruction: 'Read the transcripts.' },
+            { name: 'coverage', instruction: 'Read the coverage.' }
+          ]
+        }),
+        completion({ role: 'assistant', content: report('ONE') }),
+        completion({ role: 'assistant', content: report('TWO') }),
+        completion({ role: 'assistant', content: report('THREE') }),
+        textFrame('Reported.')
+      ],
+      log
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const leadResult = log.modelRequests
+      .flatMap(
+        (request) =>
+          (request.messages ?? []) as Array<{
+            role?: string;
+            tool_call_id?: string;
+            content?: string;
+          }>
+      )
+      .find((message) => message.role === 'tool' && message.tool_call_id === 'call-1');
+    for (const marker of ['ONE', 'TWO', 'THREE']) {
+      expect(leadResult?.content).toContain(`${marker}-OPENS`);
+      expect(leadResult?.content).toContain(`${marker}-CONCLUDES`);
+    }
+  });
+
   /**
    * The specialist's reads are the lead's reads.
    *
@@ -1795,6 +1846,88 @@ describe('finding things on the internet', () => {
     ).toEqual({ query: 'athanor board pack template', limit: 10 });
   });
 
+  it('reads twelve pages at a twelfth of the window each, so all twelve come back', async () => {
+    // Twelve pages at the 20,000 the model may ask for is 214,670 characters arriving through a
+    // 24,000-character result that is cut from the middle: measured, page one came back and the
+    // other eleven were gone along with their URLs, so the harness paid runner time and provider
+    // bandwidth for eleven pages the model could never see and was never told were missing.
+    const urls = Array.from({ length: 12 }, (_unused, index) => `https://source-${index}.test/doc`);
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [], runnerRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-r', 'parallel_web_read', { urls, maxCharactersPerPage: 20_000 }),
+        textFrame('Read them.')
+      ],
+      log
+    );
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const body = log.runnerRequests?.find((request) => request.url.includes('/browser/read-many'))
+      ?.body as { urls: string[]; maxCharactersPerPage: number } | undefined;
+    expect(body?.urls).toHaveLength(12);
+    expect(body?.maxCharactersPerPage).toBe(1_500);
+    expect(body!.maxCharactersPerPage * 12).toBeLessThanOrEqual(24_000);
+
+    // And the model is told, because a page cut without a mark reads as a page that did not
+    // mention the thing, and a model reasons from what a source does not say.
+    const result = log.modelRequests
+      .flatMap(
+        (request) =>
+          (request.messages ?? []) as Array<{
+            role?: string;
+            tool_call_id?: string;
+            content?: string;
+          }>
+      )
+      .find((message) => message.role === 'tool' && message.tool_call_id === 'call-r');
+    expect(result?.content).toContain('1,500 characters');
+    expect(result?.content).toContain('Read a URL on its own for more of it');
+  });
+
+  it('gives one page the whole allowance, because it is not sharing the window with anything', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [], runnerRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-r', 'parallel_web_read', {
+          urls: ['https://source.test/doc'],
+          maxCharactersPerPage: 20_000
+        }),
+        textFrame('Read it.')
+      ],
+      log
+    );
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(
+      (
+        log.runnerRequests?.find((request) => request.url.includes('/browser/read-many'))?.body as
+          | { maxCharactersPerPage: number }
+          | undefined
+      )?.maxCharactersPerPage
+    ).toBe(20_000);
+    // Nothing was shortened, so there is nothing to say about it.
+    expect(
+      log.modelRequests
+        .flatMap(
+          (request) =>
+            (request.messages ?? []) as Array<{
+              role?: string;
+              tool_call_id?: string;
+              content?: string;
+            }>
+        )
+        .find((message) => message.role === 'tool' && message.tool_call_id === 'call-r')?.content
+    ).not.toContain('Read a URL on its own');
+  });
+
   it('tells the owner about a challenge once per site, and keeps the wall as data', async () => {
     // The runner detects the wall and scopes it, but it has no database identity: nothing it can do
     // reaches the owner's phone. A wall hit three times used to reach it zero times.
@@ -2488,9 +2621,17 @@ describe('what would prove the job is done', () => {
       return execResponse(code);
     };
 
+  /**
+   * The last thing this request actually said to the model. The runtime block sits at the very end
+   * of every window - that is where its clock is free to change - so it is stepped over here rather
+   * than in each assertion.
+   */
   const lastMessage = (log: FetchLog, request: number): string => {
     const messages = (log.modelRequests[request]?.messages ?? []) as Array<{ content: string }>;
-    return messages.at(-1)?.content ?? '';
+    return (
+      [...messages].reverse().find((message) => !message.content.startsWith(RUNTIME_CONTEXT_MARKER))
+        ?.content ?? ''
+    );
   };
 
   const acceptanceState = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -3089,5 +3230,148 @@ describe('an agent that asks the same question twice', () => {
     // files_list is read-only but not in the set: listing a directory twice is how you notice
     // something appeared in it.
     expect(snapshots).toBe(2);
+  });
+});
+
+describe('the prompt prefix a follow-up turn re-sends', () => {
+  /** The messages of one recorded request, as the provider received them. */
+  const requestMessages = (
+    log: FetchLog,
+    request: number
+  ): Array<{ role: string; content: string }> =>
+    (log.modelRequests[request]?.messages ?? []) as Array<{ role: string; content: string }>;
+
+  /** How many leading messages two requests agree on, byte for byte. */
+  const sharedPrefix = (
+    left: Array<{ role: string; content: string }>,
+    right: Array<{ role: string; content: string }>
+  ): number => {
+    let shared = 0;
+    while (
+      shared < left.length &&
+      shared < right.length &&
+      JSON.stringify(left[shared]) === JSON.stringify(right[shared])
+    )
+      shared += 1;
+    return shared;
+  };
+
+  it('is byte-identical up to the point where the new turn starts talking', async () => {
+    // Only the clock is faked. The run awaits real timers, and what this is about is what the
+    // window looks like when a follow-up arrives some minutes after the turn before it.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-01T09:12:00.000Z'));
+
+    let task = makeTask();
+    const probe = probeStore(() => task);
+    const first: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Tidied.')], first);
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const saved = decryptCheckpoints(probe.checkpoints).at(-1);
+    expect(saved?.messages.length).toBeGreaterThan(0);
+    const followUp = startTurnState(saved as unknown as Record<string, unknown>, {
+      prompt: 'Now archive last year’s notes too',
+      turn: 1,
+      reservationKey: 'reservation-2'
+    });
+
+    vi.setSystemTime(new Date('2026-07-01T09:17:00.000Z'));
+    task = makeTask(followUp);
+    const second: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Archived.')], second);
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const opening = requestMessages(first, 0);
+    const resumed = requestMessages(second, 0);
+    const shared = sharedPrefix(opening, resumed);
+
+    // The whole of the first turn's opening request is re-sent unchanged except its last message,
+    // and that last message is the runtime block - the only thing in the window meant to change.
+    // Every byte the provider cached for the first turn is still readable on the second.
+    expect(shared).toBe(opening.length - 1);
+    expect(opening.at(-1)?.content.startsWith(RUNTIME_CONTEXT_MARKER)).toBe(true);
+    expect(resumed.at(-1)?.content.startsWith(RUNTIME_CONTEXT_MARKER)).toBe(true);
+    // Vacuous if the clock had not moved: the point is that the volatile bytes DID change and the
+    // prefix survived anyway.
+    expect(resumed.at(-1)?.content).not.toBe(opening.at(-1)?.content);
+    // And the first thing the second turn sends that the first did not is the first turn's own
+    // reply, not a system block quietly reinserted ahead of the trajectory.
+    expect(resumed[shared]?.role).not.toBe('system');
+  });
+
+  it('carries every installed system block ahead of the original request, and the runtime block behind everything', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Tidied.')], log);
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const messages = requestMessages(log, 0);
+    const goal = messages.findIndex((message) => message.role === 'user');
+    // Every system block the harness installs belongs in front of the goal, because that is the
+    // region `condensableStart` protects and the anchor breakpoint closes. The runtime block is the
+    // one exception, and it is at the very end where rewriting it is free.
+    expect(goal).toBeGreaterThan(0);
+    expect(messages.slice(0, goal).every((message) => message.role === 'system')).toBe(true);
+    expect(
+      messages.slice(0, goal).some((message) => message.content.startsWith(RUNTIME_CONTEXT_MARKER))
+    ).toBe(false);
+    expect(messages.at(-1)?.content.startsWith(RUNTIME_CONTEXT_MARKER)).toBe(true);
+  });
+
+  it('ranks the curated knowledge block once, so a follow-up does not reshuffle it', async () => {
+    // Two entries the two requests would rank in opposite orders: the first shares a word with the
+    // opening request, the second with the follow-up. The block says it is frozen for the run, and
+    // this is what makes that true.
+    const memory = (id: string, content: string): Record<string, unknown> => ({
+      id,
+      target: 'workspace',
+      contentCiphertext: encryptJson({ content }, dataKey, `workspace-memory:${workspaceId}`),
+      updatedAt: '2026-06-01T00:00:00.000Z'
+    });
+    let task = makeTask();
+    const probe = probeStore(() => task);
+    const store = {
+      ...(probe.store as unknown as Record<string, unknown>),
+      listWorkspaceMemories: async () => [
+        memory('memory-notes', 'Notes live under workspace/notes'),
+        memory('memory-archive', 'Archive anything older than a year into workspace/archive')
+      ]
+    } as unknown as DataStore;
+
+    const first: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Tidied.')], first);
+    await new AgentWorker(store, config(), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const saved = decryptCheckpoints(probe.checkpoints).at(-1);
+    task = makeTask(
+      startTurnState(saved as unknown as Record<string, unknown>, {
+        prompt: 'Now archive last year’s notes too',
+        turn: 1,
+        reservationKey: 'reservation-2'
+      })
+    );
+    const second: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Archived.')], second);
+    await new AgentWorker(store, config(), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const knowledge = (log: FetchLog): string =>
+      requestMessages(log, 0).find((message) =>
+        message.content.startsWith('CURATED ENCRYPTED KNOWLEDGE')
+      )?.content ?? '';
+    expect(knowledge(first)).toContain('workspace/notes');
+    expect(knowledge(first)).toContain('workspace/archive');
+    expect(knowledge(second)).toBe(knowledge(first));
   });
 });

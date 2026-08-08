@@ -36,6 +36,7 @@ import type {
   MemoryUseOutcome
 } from '@athanor/data';
 import type { ModelMessage } from '@athanor/model-gateway';
+import { preambleInsertIndex } from './context.js';
 
 /* ------------------------------------------------------------------------ *
  * Encryption contexts
@@ -232,8 +233,7 @@ export const injectMemoryPack = (
   );
   if (existing >= 0) messages.splice(existing, 1);
   if (!pack || pack.itemIds.length === 0) return -1;
-  let end = 0;
-  while (messages[end]?.role === 'system') end += 1;
+  const end = preambleInsertIndex(messages);
   messages.splice(end, 0, memoryPackMessage(pack.body));
   return end;
 };

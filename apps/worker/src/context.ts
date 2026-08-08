@@ -258,7 +258,7 @@ ${clockLine(clock.now, clock.timeZone)}${
  * It says what is gone and nothing about where to find it; where a caller knows a real way to get
  * the rest, it passes one in `recovery` and that is what the model is told.
  */
-const truncateMiddle = (
+export const truncateMiddle = (
   value: string,
   maximum: number,
   label: string,
@@ -287,14 +287,32 @@ const json = (value: unknown): string => {
 const RECENT_TOOL_OUTPUT_CHARS = 24_000;
 const OLDER_TOOL_OUTPUT_CHARS = 2_000;
 /**
- * Where the older-result floor starts falling, as a share of the input budget.
+ * Where the older-result floor starts falling, and where it reaches the hard floor - measured in
+ * tokens of actual work rather than as a share of whatever window the chosen model happens to have.
  *
  * The floor used to be applied unconditionally, which meant a twelve-step trajectory occupying 38%
  * of a 160,000-token budget still had the middle cut out of seven of its twelve tool results - the
- * agent re-reading files it had read four steps earlier while 60% of the window sat empty. Nothing
- * is reduced below this line; past it the floor slides from the full bound down to the hard floor,
- * so pressure is answered in proportion instead of pre-emptively.
+ * agent re-reading files it had read four steps earlier while 60% of the window sat empty. That is
+ * why nothing is reduced before the start line, and why past it the floor slides in proportion
+ * instead of dropping.
+ *
+ * Expressing the start as a share of the budget then produced the opposite fault, and a perverse
+ * one: on a million-token model half the budget is 480,000 tokens, which no ordinary task ever
+ * reaches, so the squeeze never ran at all. Replaying a seventeen-turn research conversation -
+ * three page reads and an answer per turn - against this function measured 11,966,272 input tokens
+ * on a 1,000,000-token model with the floor sitting at 24,000 characters on every one of the
+ * seventeen turns, against 4,511,284 for identical work on a 200,000-token model whose share-based
+ * start was reached on turn three. Choosing the larger window made the same conversation cost two
+ * and a half times more. Anchored here it costs 4,813,534 on either model.
+ *
+ * 80,000 rather than lower because the twelve-step trajectory the paragraph above defends measures
+ * 68,899 tokens, so it stays whole by intent and not by rounding; and because every model whose own
+ * half-budget already sits below this line behaves exactly as it did before - the 200,000-token
+ * conversation costs 4,511,284 either way. The share below survives as that clamp: a small window
+ * must still start squeezing halfway through itself, whatever the absolute lines say.
  */
+const TOOL_OUTPUT_SQUEEZE_START_TOKENS = 80_000;
+const TOOL_OUTPUT_SQUEEZE_FLOOR_TOKENS = 192_000;
 const TOOL_OUTPUT_SQUEEZE_SHARE = 0.5;
 
 export const olderToolOutputChars = (
@@ -303,8 +321,9 @@ export const olderToolOutputChars = (
   /** The floor already applied to this task; the squeeze is one-way so it can only tighten. */
   appliedFloor = RECENT_TOOL_OUTPUT_CHARS
 ): number => {
-  const start = inputBudget * TOOL_OUTPUT_SQUEEZE_SHARE;
-  const pressure = (estimatedTokens - start) / Math.max(1, inputBudget - start);
+  const start = Math.min(TOOL_OUTPUT_SQUEEZE_START_TOKENS, inputBudget * TOOL_OUTPUT_SQUEEZE_SHARE);
+  const floored = Math.min(TOOL_OUTPUT_SQUEEZE_FLOOR_TOKENS, inputBudget);
+  const pressure = (estimatedTokens - start) / Math.max(1, floored - start);
   const scaled =
     RECENT_TOOL_OUTPUT_CHARS -
     (RECENT_TOOL_OUTPUT_CHARS - OLDER_TOOL_OUTPUT_CHARS) * Math.min(1, Math.max(0, pressure));
@@ -315,6 +334,27 @@ export const olderToolOutputChars = (
 };
 /** The same for tool-call arguments once a call is no longer recent. */
 const COMPACTED_TOOL_ARGUMENT_CHARS = 4_000;
+
+/**
+ * What each part of a many-part result may return, so that every part asked for survives the window
+ * instead of the first one surviving whole and the rest not at all.
+ *
+ * A result is cut from the middle, which is right for one long document and wrong for a list. Two
+ * tools return lists: parallel_web_read allows twelve URLs at up to 20,000 characters each, and
+ * delegate returns up to three specialist reports of up to 8,192 output tokens. Measured on a
+ * twelve-page read - 214,670 characters serialized, cut to 24,000 - page 0's opening survived and
+ * pages 1 to 11 vanished along with their URLs, so the harness paid runner time and bandwidth for
+ * eleven pages the model could never see and was never told were missing. Three pages of 12,000
+ * lose the third the same way, which is the ordinary case for a three-mission delegate call.
+ *
+ * Dividing the window between the parts actually requested costs the same tokens and returns twelve
+ * sources instead of one. The subtraction is what each part carries besides its text - its URL or
+ * its name, its title, and what JSON escaping adds - measured at twelve parts to land on 24,000
+ * exactly rather than just over it.
+ */
+const PART_ENVELOPE_CHARS = 500;
+export const perPartOutputChars = (parts: number): number =>
+  Math.max(1_000, Math.floor(RECENT_TOOL_OUTPUT_CHARS / Math.max(1, parts)) - PART_ENVELOPE_CHARS);
 
 export const serializeToolResultForModel = (
   result: unknown,
@@ -502,6 +542,17 @@ const preambleEnd = (messages: ModelMessage[]): number => {
   }
   return end;
 };
+
+/**
+ * Where a preamble block belongs: at the end of the leading run of system messages.
+ *
+ * Every caller used to hard-code its own index - the brief at 2, the curated knowledge at 2 or 3
+ * depending on whether the brief was there, the memory pack by walking the run itself. Those
+ * numbers were all counting the same thing and only agreed by luck; the moment one system block
+ * moved out of the head they would have started inserting preamble after the user's goal, which is
+ * exactly where `condensableStart` stops protecting it.
+ */
+export const preambleInsertIndex = (messages: ModelMessage[]): number => preambleEnd(messages) + 1;
 
 /**
  * The first index a compaction may touch.
@@ -979,11 +1030,22 @@ const stablePrefixEnd = (
  */
 const CACHE_CHECKPOINT_STRIDE = 8;
 
-/** Block content is only well defined for these roles, and an image message carries its own blocks. */
+/**
+ * Block content is only well defined for these roles, and an image message carries its own blocks.
+ *
+ * The runtime block is refused as well. It is the one message written to be rewritten - the agent
+ * re-pushes it at the tail of the window on every step so its clock stays current where changing
+ * bytes is free - so a breakpoint landing on it pays the 1.25x write premium for a prefix the next
+ * step can never read. Refused here rather than by shortening the stable prefix, because a window
+ * that still carries the block near its head (a saved one from before it moved, or a fork that
+ * hoisted every system message) would then cache nothing at all, which is far worse than marking
+ * one message too far.
+ */
 const cacheEligible = (message: ModelMessage | undefined): boolean =>
   !!message &&
   (message.role === 'system' || message.role === 'user' || message.role === 'tool') &&
-  !message.images?.length;
+  !message.images?.length &&
+  !isRuntimeContext(message);
 
 /**
  * Marks the prompt prefixes worth caching.

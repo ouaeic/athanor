@@ -21,6 +21,7 @@ import {
   contextShortfall,
   MINIMUM_WORKING_TOKENS,
   modelInputBudget,
+  perPartOutputChars,
   planCompaction,
   prepareModelContext,
   renderContextBrief,
@@ -1171,6 +1172,27 @@ describe('how much tool output survives the window', () => {
     expect(olderToolOutputChars(budget * 1.1, budget)).toBe(2_000);
   });
 
+  it('charges the same work the same whether the model has a large window or a small one', () => {
+    // Measured before this: replaying a seventeen-turn research conversation - three page reads and
+    // an answer per turn - cost 11,966,272 input tokens on a 1,000,000-token model and 4,511,284 on
+    // a 200,000-token one, because half of a million-token budget is a line no ordinary task ever
+    // crosses and the floor therefore never moved off 24,000 characters. Picking the roomier model
+    // made identical work cost two and a half times more.
+    const trajectory = 150_000;
+    const large = modelInputBudget(1_000_000, 16_384);
+    const small = modelInputBudget(262_144, 16_384);
+    expect(olderToolOutputChars(trajectory, large)).toBeLessThan(24_000);
+    expect(olderToolOutputChars(trajectory, large)).toBe(olderToolOutputChars(trajectory, small));
+  });
+
+  it('leaves a window that is only half full of a small model alone', () => {
+    // The clamp that keeps the absolute lines from starving a small window: it still has to start
+    // squeezing halfway through itself, whatever those lines say.
+    const budget = modelInputBudget(80_000, 8_000);
+    expect(olderToolOutputChars(budget * 0.4, budget)).toBe(24_000);
+    expect(olderToolOutputChars(budget * 0.9, budget)).toBeLessThan(24_000);
+  });
+
   it('never raises a floor it has already applied', () => {
     // stablePrefixEnd depends on the reduction being one-way: a result restored to its full length
     // after a compaction frees room would rewrite bytes the provider has already cached.
@@ -1226,6 +1248,43 @@ describe('how much tool output survives the window', () => {
     const tools = prepared.messages.filter((message) => message.role === 'tool');
     expect(tools.at(-1)?.content).toContain('TAIL');
     expect(tools.at(-1)?.content.length).toBe(24_000);
+  });
+});
+
+describe('a result that is a list of parts rather than one document', () => {
+  const read = (parts: number, perPart: number): unknown => ({
+    sources: Array.from({ length: parts }, (_unused, index) => ({
+      requestedUrl: `https://example.test/source-${index}/a/path/to/a/document`,
+      finalUrl: `https://example.test/source-${index}/a/path/to/a/document`,
+      title: `Source ${index}: a page title of about the length a real page has`,
+      text: `PART${index}START ${'word '.repeat(Math.floor(perPart / 5))} PART${index}END`
+    })),
+    requested: parts,
+    read: parts
+  });
+  const surviving = (serialized: string, parts: number, edge: 'START' | 'END'): number[] =>
+    Array.from({ length: parts }, (_unused, index) => index).filter((index) =>
+      serialized.includes(`PART${index}${edge}`)
+    );
+
+  it('brings back every part asked for instead of the first part whole and the rest missing', () => {
+    // Measured on the allowance parallel_web_read used to send: twelve pages at 20,000 characters
+    // is 214,670 characters against a 24,000-character result cut from the middle, and what came
+    // back was page zero and an unattributed fragment - the other eleven URLs were not even named,
+    // so the model could not tell it had lost them, let alone ask for them again.
+    const whole = serializeToolResultForModel(read(12, 20_000));
+    expect(surviving(whole, 12, 'START')).toEqual([0]);
+
+    const shared = serializeToolResultForModel(read(12, perPartOutputChars(12)));
+    expect(surviving(shared, 12, 'START')).toHaveLength(12);
+    expect(surviving(shared, 12, 'END')).toHaveLength(12);
+  });
+
+  it('leaves a single-part result the whole allowance, because it is not sharing with anything', () => {
+    expect(perPartOutputChars(1)).toBeGreaterThanOrEqual(20_000);
+    const alone = serializeToolResultForModel(read(1, 20_000));
+    expect(surviving(alone, 1, 'START')).toEqual([0]);
+    expect(surviving(alone, 1, 'END')).toEqual([0]);
   });
 });
 
