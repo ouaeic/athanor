@@ -3336,11 +3336,22 @@ select:focus-visible {
   display: none;
 }
 @media (max-width: 1100px) {
+  /*
+   * The middle column gives way; it used to have a floor nothing could satisfy.
+   *
+   * `232px + minmax(420px, …) + minmax(300px, …)` cannot be drawn in less than 952px, and the
+   * phone layout does not begin until 800px - so between those two numbers the shell simply
+   * overflowed. `.app-shell` is `overflow: hidden`, so there was not even a scrollbar to say so:
+   * the sidebar and the panel were cut off at the edges. Every tablet held upright lands in that
+   * band - 820px and 834px are two of the commonest.
+   *
+   * A conversation can be narrow. It cannot be off the screen.
+   */
   .app-shell {
-    grid-template-columns: 232px minmax(420px, 1fr) minmax(300px, 36vw);
+    grid-template-columns: 232px minmax(0, 1fr) minmax(280px, 36vw);
   }
   .app-shell.inspector-closed {
-    grid-template-columns: 232px 1fr;
+    grid-template-columns: 232px minmax(0, 1fr);
   }
 
   .timeline {
