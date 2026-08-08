@@ -668,29 +668,21 @@ describe('OpenAICompatibleAdapter', () => {
 
   const providerSearchPlan = resolveWebToolPlan({ provider: 'openrouter' });
 
-  it('sends a provider-side tool beside the function tools, unwrapped', async () => {
+  it('sends a provider-side tool unwrapped, in the tools array it shares with none', async () => {
     const capture: { body?: unknown } = {};
     await cachingAdapter(capture).chat({
       model: 'z-ai/glm-5.2',
-      messages: [{ role: 'user', content: 'What changed in the rules this week?' }],
-      tools: [{ name: 'shell', description: 'Run a command', parameters: {} }],
+      messages: [{ role: 'user', content: 'Query: what changed in the rules this week?' }],
+      // Empty, because this is the request athanor builds to spend one provider search and nothing
+      // else. A function tool here would be a second answerer for the same question.
+      tools: [],
       serverTools: providerSearchPlan.serverTools,
       temperature: 0.2
     });
 
     // A server tool wrapped as `{type:'function'}` would be a claim that this box answers the call.
     expect((capture.body as { tools: unknown[] }).tools).toEqual([
-      {
-        type: 'function',
-        function: { name: 'shell', description: 'Run a command', parameters: {} }
-      },
-      { type: 'openrouter:web_search', engine: 'auto', max_results: 10, max_uses: 8 },
-      {
-        type: 'openrouter:web_fetch',
-        engine: 'openrouter',
-        max_uses: 12,
-        max_content_tokens: 20_000
-      }
+      { type: 'openrouter:web_search', engine: 'auto', max_results: 10, max_uses: 2 }
     ]);
   });
 
@@ -752,14 +744,11 @@ describe('OpenAICompatibleAdapter', () => {
     });
 
     const body = capture.body as { tools: Array<{ type: string }>; provider: unknown };
-    expect(body.tools.map((tool) => tool.type)).toEqual([
-      'openrouter:web_search',
-      'openrouter:web_fetch'
-    ]);
+    expect(body.tools.map((tool) => tool.type)).toEqual(['openrouter:web_search']);
     expect(body.provider).toMatchObject({ zdr: true, data_collection: 'deny' });
   });
 
-  it('refuses a catalogue that still offers the in-house tool the provider one replaces', async () => {
+  it('refuses a search request that also offers the model a search tool of its own', async () => {
     const request = vi.fn(async () => new Response('{}', { status: 200 }));
     const adapter = new OpenAICompatibleAdapter({
       baseUrl: 'https://openrouter.ai/api/v1',

@@ -676,6 +676,12 @@ describe('the catalogue as the model reads it', () => {
     // worse than a thin description because the model believes it. So every snake_case token in
     // every description has to resolve to something actually declared - a tool name, a connector
     // action, a parameter, or a value one of the enums accepts.
+    //
+    // Declared is not the same as sent, and the gap between them is where the fabricated research
+    // answer came from: `web_search` was declared here and withdrawn from the catalogue of every run
+    // on the provider's route, so four descriptions went on pointing at a tool the model was not
+    // holding. That half is asserted against the catalogue as it actually goes out, in
+    // agent-run.test.ts under "the web route a run is pinned to".
     const declared = new Set<string>([
       ...agentTools.map((tool) => tool.name),
       ...Object.keys(connectorActions),

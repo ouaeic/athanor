@@ -62,10 +62,22 @@ import { z } from 'zod';
  * next step, because withholding a privacy fact that has just become true to protect a cache prefix
  * is the wrong trade every time.
  *
- * That prefix is the reason the tool block is worth keeping still at all. The catalogue is
- * serialised into the cached prompt prefix, so a mode that changed mid-task would end the prefix at
- * the tool catalogue and re-bill the whole window at full input rate on that step. Which is a cost
- * worth paying exactly once, in the direction that protects the owner, and never in the other.
+ * What the mode does not decide, and used to, is which tools the model is offered. That was the
+ * mistake this revision repairs. A provider-side tool has no `function.name`: it is a name the
+ * provider recognises on a request, not a name a model can call. It nevertheless travelled in the
+ * same tools array as the function tools, with `web_search` and `parallel_web_read` withdrawn to
+ * make room for it - so on the route this product ships on, the model was told by its operating
+ * contract to start with a search, went looking for the search tool, found nothing by that name,
+ * and had no name for what had replaced it. Asked to research something and cite sources, it made
+ * no tool call at all and answered out of memory with invented projects, invented dates and
+ * invented addresses. The catalogue was not degraded on that route; it was lying, and four other
+ * tool descriptions still pointed at the two tools that had been taken away.
+ *
+ * So the catalogue is the same on both routes, and the mode decides only who answers a call. The
+ * model calls `web_search` under one name, with one description, wherever it is running; in house
+ * that call is answered by the workspace's own browser, and on the provider's route it is answered
+ * by a request athanor builds for the tool below and nothing else. The provider tool is an
+ * implementation of a capability now, rather than a substitute for the name of one.
  */
 
 export const WebToolMode = z.enum(['in_house', 'server']);
@@ -162,8 +174,9 @@ const resolveWebToolRoute = (input: WebToolRouteInput): WebToolRoute => {
 
 /**
  * A provider-side tool, which is not a function the client implements but a name the provider
- * recognises and runs on its own infrastructure. It travels in the same `tools` array as a function
- * tool and has to survive serialisation without being wrapped in `{type:'function'}`.
+ * recognises and runs on its own infrastructure. It travels in a `tools` array like a function tool
+ * and has to survive serialisation without being wrapped in `{type:'function'}` - which would be
+ * precisely the claim that this box answers the call.
  */
 export interface ServerWebTool {
   readonly type: string;
@@ -173,30 +186,40 @@ export interface ServerWebTool {
 /**
  * Ceilings, pinned rather than left null.
  *
- * A provider search is billed per request and its results re-enter the prompt on every later step
- * of the same task, so an unbounded research loop is the expensive failure here, not the individual
- * call. Eight searches and twelve fetches is more than any single turn has ever needed and is a
- * bound a runaway cannot cross; ten results is what one page of results has always been on the
- * in-house route, so the two modes hand the model the same amount of material.
+ * These bound one request, and the request they bound is now the one athanor builds to answer a
+ * single `web_search` call rather than the agent's own step. That is what moved the use ceiling from
+ * eight to two: eight was sized against a whole turn's research loop, where the runaway was the
+ * expensive failure, and this request has one query to run. Two rather than one so that a provider
+ * that reformulates a query it got nothing back from may do so once, which is the same second
+ * attempt the tool's own description tells the model to make.
+ *
+ * Ten results is what one page of results has always been on the in-house route, so a search returns
+ * the same amount of material to judge whichever route answered it.
  */
-export const SERVER_WEB_SEARCH_MAX_USES = 8;
+export const SERVER_WEB_SEARCH_MAX_USES = 2;
 export const SERVER_WEB_SEARCH_MAX_RESULTS = 10;
-export const SERVER_WEB_FETCH_MAX_USES = 12;
-/**
- * Roughly an eighth of the working window. The provider's own default is 100,000, which is a
- * documentation page that costs a quarter of the context to read.
- */
-export const SERVER_WEB_FETCH_MAX_CONTENT_TOKENS = 20_000;
 
 /**
- * Every provider-side tool athanor sends, each carried beside the in-house tool it stands in for.
+ * Every provider-side tool athanor sends, each carried beside the in-house tool whose calls it
+ * answers.
  *
  * The pairing lives in the same structure as the tool rather than in a list beside it because the
- * two can never be allowed to disagree: a provider tool added without withdrawing what it replaces
- * hands the model two ways to do one thing, which is the failure this module exists to prevent, and
- * a withdrawal left behind after a provider tool is dropped takes the web off the task entirely.
- * Only the tool half is ever serialised - `supersedes` is athanor's own bookkeeping and has no
- * business on the wire.
+ * two can never be allowed to disagree. It no longer means a withdrawal - the in-house name stays in
+ * the model's catalogue on every route - it means a request carrying this tool must not also offer
+ * the model a function tool of that name, because such a request would be asking the provider to
+ * search while telling the model to search for itself, and the answer would depend on which of the
+ * two the model happened to reach for. `duplicatedWebCapabilities` below is what enforces it on the
+ * way out. Only the tool half is ever serialised - `supersedes` is athanor's own bookkeeping and has
+ * no business on the wire.
+ *
+ * The provider's `web_fetch` used to stand here beside its search, and it is deliberately gone. It
+ * was never callable by name either, so all it ever bought was pages the provider decided on its own
+ * to fetch - and it cost `parallel_web_read`, withdrawn to make room for it, which is the tool three
+ * other descriptions send the model to for the second half of a research pass. Reading a page whose
+ * address is already known is not what a datacenter address gets refused for; a search engine
+ * challenging the box is. So the in-house reader answers reads on every route, the browser is still
+ * there for everything behind a session or a login, and the one thing this box genuinely cannot do
+ * for itself is the one thing the provider is asked to do.
  */
 const PROVIDER_WEB_TOOLS = Object.freeze([
   Object.freeze({
@@ -211,19 +234,6 @@ const PROVIDER_WEB_TOOLS = Object.freeze([
         max_uses: SERVER_WEB_SEARCH_MAX_USES
       })
     })
-  }),
-  Object.freeze({
-    supersedes: 'parallel_web_read',
-    tool: Object.freeze({
-      type: 'openrouter:web_fetch',
-      parameters: Object.freeze({
-        // The provider's own fetch engine, which is the free one; the paid engines buy nothing the
-        // browser fallback does not already do better.
-        engine: 'openrouter',
-        max_uses: SERVER_WEB_FETCH_MAX_USES,
-        max_content_tokens: SERVER_WEB_FETCH_MAX_CONTENT_TOKENS
-      })
-    })
   })
 ]);
 
@@ -231,54 +241,44 @@ const SERVER_WEB_TOOLS: readonly ServerWebTool[] = Object.freeze(
   PROVIDER_WEB_TOOLS.map((entry) => entry.tool)
 );
 
-const SUPERSEDED_IN_HOUSE_WEB_TOOLS: readonly string[] = Object.freeze(
-  PROVIDER_WEB_TOOLS.map((entry) => entry.supersedes)
-);
-
 /**
  * Everything one run needs to know about the web, decided in a single call.
  *
- * The route, the provider tools to send and the in-house tools to withdraw are one decision, so
- * they are one call. Asking separately would mean resolving twice against facts the owner can edit
- * from the settings page between the two reads, and the two answers that disagree are the exact
- * pair the tool catalogue cannot survive: the provider's search sent while `web_search` is still
- * offered, so the model holds two descriptions of one capability, or the in-house tools withdrawn
- * on a route that sends no provider tool at all, which takes the web off the task entirely.
+ * The route and the tools that implement it are one decision, so they are one call. Asking
+ * separately would mean resolving twice against facts the owner can edit from the settings page
+ * between the two reads, and a run whose disclosure says one thing while its searches go somewhere
+ * else is the failure this module exists to prevent.
  *
- * `supersedes` names the in-house tools that have to leave the catalogue exactly when the provider
- * ones enter it, and is empty on every route that stayed in house. `web_search` is one capability
- * under one name in both modes, so sending both would be a duplicate key in the tools array before
- * it was ever a quality problem. `parallel_web_read` and the provider's `web_fetch` keep different
- * names because they are genuinely different calls - one reads twelve sources at once, the other
- * reads one - and giving them a single name would be a lie to the model about how to call it. What
- * matters is not that the names match but that the model is never holding both.
+ * `serverTools` is empty on every route that stayed in house, and on the provider's route it is what
+ * a search request carries. It is not a catalogue addition and must never be sent with the agent's
+ * own tools beside it: the model is offered `web_search` by name on both routes, so a request that
+ * carried both would be asking the same question twice, of two different answerers, in one breath.
  *
- * The browser tools are deliberately never withdrawn. A provider fetch beats a throwaway browser on
- * a static page - one request instead of a browser launch, and no anti-bot challenge to meet - and
- * it loses outright on anything with a session, a login, a paywall or a form behind it, which is
- * what `browser_action` and `browser_snapshot` are for. Withdrawing them in server mode would trade
- * the half of the web that needs a real browser for the half that does not.
+ * Nothing is withdrawn from the model's catalogue any more, which is why there is no longer a list
+ * of withdrawals here. The browser tools in particular were always kept - they are the half of the
+ * web nothing else reaches, everything behind a session, a login, a paywall or a form - and now
+ * `web_search` and `parallel_web_read` are kept for the stronger reason that a tool the model cannot
+ * name is a tool the model does not have.
  */
 export interface WebToolPlan extends WebToolRoute {
   readonly serverTools: readonly ServerWebTool[];
-  readonly supersedes: readonly string[];
 }
 
 export const resolveWebToolPlan = (input: WebToolRouteInput): WebToolPlan => {
   const route = resolveWebToolRoute(input);
   return route.mode === 'server'
-    ? { ...route, serverTools: SERVER_WEB_TOOLS, supersedes: SUPERSEDED_IN_HOUSE_WEB_TOOLS }
-    : { ...route, serverTools: [], supersedes: [] };
+    ? { ...route, serverTools: SERVER_WEB_TOOLS }
+    : { ...route, serverTools: [] };
 };
 
 /**
- * The in-house tools still in a catalogue that is being sent with the provider tools beside them.
+ * The function tools on a request that is also asking the provider to do their job.
  *
  * The pairing above is a rule the request has to hold, and a rule nobody checks is a convention.
- * This is what lets the gateway check it on the way out: the withdrawal happens where the tool
- * catalogue is built and the sending happens two packages away, so an agent that adds the provider
- * tools and forgets the withdrawal would otherwise be told by nothing at all, and the first
- * evidence would be a model choosing between two descriptions of one capability mid-task.
+ * This is what lets the gateway check it on the way out, one line before the wire: the search
+ * request is built in the worker and sent two packages away, so a caller that reached for the
+ * agent's catalogue instead of an empty one would otherwise be told by nothing at all, and the
+ * first evidence would be a model that sometimes searched one way and sometimes the other.
  */
 export const duplicatedWebCapabilities = (
   serverTools: readonly ServerWebTool[],
@@ -293,7 +293,11 @@ export const duplicatedWebCapabilities = (
 
 /**
  * The provider-side tools athanor deliberately does not send, recorded here because this is the
- * file somebody reaches for when they notice the list is longer than two.
+ * file somebody reaches for when they notice how short the list above is.
+ *
+ * `openrouter:web_fetch`: dropped, and the argument is above `PROVIDER_WEB_TOOLS` because it is the
+ * argument for what that list holds. In one line: it cost `parallel_web_read` and bought pages this
+ * box can fetch for itself.
  *
  * `openrouter:shell`, code execution and hosted interpreters: refused. They run in network-isolated
  * containers that cannot install a package at runtime and cannot see the owner's files, against a

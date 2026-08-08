@@ -240,7 +240,7 @@ ${clockLine(clock.now, clock.timeZone)}${
 }
 - Persistent working root: workspace${toolchainSummary ? `\n- Document toolchain: ${toolchainSummary}` : ''}${
   webSearchRoute === 'server'
-    ? '\n- Web search and page fetches on this run are answered by your model provider, which sees the query: search for what you need to find, and keep the user’s own content out of the words you search with. The browser tools are unaffected and are still how you reach anything behind a session, a login or a form.'
+    ? '\n- Web searches on this run are answered by your model provider, which sees the query: search for what you need to find, and keep the user’s own content out of the words you search with. Nothing else about the web changes - web_search is called exactly as its description says, and reading pages, whether with parallel_web_read or in the browser, still happens on this computer.'
     : ''
 }
 - Check real capacity with \`df -h /home/athanor\` before storage-heavy work; the user interface reports agent-file usage separately.

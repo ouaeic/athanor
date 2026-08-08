@@ -12,7 +12,24 @@ import type { ApiConfig } from './config.js';
 import type { RunnerClient } from './runner-client.js';
 import { HOST_SESSION_COOKIE, SESSION_COOKIE } from './session.js';
 
-const productionAccessCookie = '__Host-athanor-preview-access';
+/**
+ * `__Secure-`, not `__Host-`, because this cookie is deliberately scoped to one preview's path.
+ *
+ * The `__Host-` prefix requires `Path=/` exactly, and the browser rejects any cookie carrying it
+ * that says otherwise - silently, as a malformed cookie rather than as an error. This one is set
+ * with `Path=/__athanor/preview/<slug>/` on purpose, so no browser ever stored it: the gateway
+ * answered the tokenised link with a 303 and a Set-Cookie, the redirect came back with nothing
+ * attached, and the owner was told to "open this preview from your authenticated athanor
+ * workspace" - which is what they had just done. Every private preview athanor has ever published
+ * was unopenable, including the link at the end of "build me something and give me a link".
+ *
+ * `__Secure-` carries the half of the guarantee that applies here - it may only be set over HTTPS -
+ * and leaves the path alone, which is what keeps one preview's token off another preview's
+ * requests.
+ */
+const productionAccessCookie = '__Secure-athanor-preview-access';
+/** Its predecessor, still read so a preview opened before this fix keeps working. */
+const legacyProductionAccessCookie = '__Host-athanor-preview-access';
 const developmentAccessCookie = 'athanor-preview-access';
 /**
  * The shipped layout serves previews from the same origin as the authenticated app, so the browser
@@ -20,9 +37,13 @@ const developmentAccessCookie = 'athanor-preview-access';
  * neither read the operator's session nor set a cookie athanor would later trust.
  */
 const athanorCookieNames = new Set(
-  [SESSION_COOKIE, HOST_SESSION_COOKIE, developmentAccessCookie, productionAccessCookie].map(
-    (name) => name.toLowerCase()
-  )
+  [
+    SESSION_COOKIE,
+    HOST_SESSION_COOKIE,
+    developmentAccessCookie,
+    productionAccessCookie,
+    legacyProductionAccessCookie
+  ].map((name) => name.toLowerCase())
 );
 const blockedHeaders = new Set([
   'authorization',
@@ -174,7 +195,8 @@ export const buildPreviewGateway = async (
     const queryToken = new URL(request.raw.url ?? '/', 'http://preview.invalid').searchParams.get(
       'access'
     );
-    const token = queryToken ?? request.cookies[accessCookie];
+    const token =
+      queryToken ?? request.cookies[accessCookie] ?? request.cookies[legacyProductionAccessCookie];
     return Boolean(token && safeEqual(token, preview.accessTokenHash));
   };
 
@@ -241,7 +263,8 @@ export const buildPreviewGateway = async (
     // The row's idle deadline moves forward on every visit, and the cookie carrying the token has
     // to move with it. Without this the browser forgets a preview the owner uses daily on the
     // thirtieth day, and they are sent back to the chat message to find the link again.
-    const cookieToken = request.cookies[accessCookie];
+    const cookieToken =
+      request.cookies[accessCookie] ?? request.cookies[legacyProductionAccessCookie];
     if (preview.visibility === 'private' && cookieToken)
       reply.setCookie(accessCookie, cookieToken, accessCookieOptions(preview));
     const headers = previewHeaders(request);

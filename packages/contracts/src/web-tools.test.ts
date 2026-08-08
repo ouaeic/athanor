@@ -4,8 +4,6 @@ import {
   resolveWebToolPlan,
   serverToolUseFrom,
   webCitationsFrom,
-  SERVER_WEB_FETCH_MAX_CONTENT_TOKENS,
-  SERVER_WEB_FETCH_MAX_USES,
   SERVER_WEB_SEARCH_MAX_RESULTS,
   SERVER_WEB_SEARCH_MAX_USES,
   WEB_TOOL_DISCLOSURE,
@@ -21,8 +19,6 @@ const resolveWebToolRoute = (input: WebToolRouteInput) => {
 };
 
 const serverWebTools = (input: WebToolRouteInput) => resolveWebToolPlan(input).serverTools;
-const supersededInHouseWebTools = (input: WebToolRouteInput) =>
-  resolveWebToolPlan(input).supersedes;
 
 /** The only combination of facts that lets a query leave the box. Everything else is a refusal. */
 const permitting: WebToolRouteInput = { provider: 'openrouter' };
@@ -119,7 +115,6 @@ describe('web tool route', () => {
       disclosure: WEB_TOOL_DISCLOSURE.in_house
     });
     expect(serverWebTools({ ...permitting, startedMode: 'in_house' })).toEqual([]);
-    expect(supersededInHouseWebTools({ ...permitting, startedMode: 'in_house' })).toEqual([]);
   });
 
   it('still moves a run onto the in-house route the moment a refusing fact becomes true', () => {
@@ -168,21 +163,13 @@ describe('provider web tools', () => {
       expect(serverWebTools(refusing)).toEqual([]);
   });
 
-  it('sends both provider tools with their ceilings pinned, never null', () => {
+  it('sends the one provider tool with its ceilings pinned, never null', () => {
     const tools = serverWebTools(permitting);
-    expect(tools.map((tool) => tool.type)).toEqual([
-      'openrouter:web_search',
-      'openrouter:web_fetch'
-    ]);
+    expect(tools.map((tool) => tool.type)).toEqual(['openrouter:web_search']);
     expect(tools[0]?.parameters).toEqual({
       engine: 'auto',
       max_results: SERVER_WEB_SEARCH_MAX_RESULTS,
       max_uses: SERVER_WEB_SEARCH_MAX_USES
-    });
-    expect(tools[1]?.parameters).toEqual({
-      engine: 'openrouter',
-      max_uses: SERVER_WEB_FETCH_MAX_USES,
-      max_content_tokens: SERVER_WEB_FETCH_MAX_CONTENT_TOKENS
     });
     // Left null, these are the unbounded research loop that arrives as a surprise on the bill.
     for (const tool of tools)
@@ -190,9 +177,24 @@ describe('provider web tools', () => {
   });
 
   /**
-   * The cache guard. The tool block is serialised into the prompt prefix; if the same mode ever
-   * produced two different byte strings, the prefix would end at the tool catalogue and the whole
-   * window would be re-billed at full input rate on that step.
+   * The provider's fetch is gone, and this is the assertion that keeps it gone.
+   *
+   * It could not be called by name any more than the search could, so all it ever did was let the
+   * provider fetch pages on its own initiative - and it cost `parallel_web_read`, withdrawn to make
+   * room for it, which is the tool three other descriptions send the model to for the second half of
+   * a research pass. What a datacenter address gets refused for is asking a search engine, not
+   * reading a page whose address is already known, so this box keeps the reads it can do.
+   */
+  it('asks the provider for the search it cannot run here, and nothing it can', () => {
+    expect(serverWebTools(permitting).map((tool) => tool.type)).not.toContain(
+      'openrouter:web_fetch'
+    );
+    expect(serverWebTools(permitting)).toHaveLength(1);
+  });
+
+  /**
+   * One frozen value, handed to every caller rather than rebuilt per call, so nothing a caller does
+   * to what it was given can change what the next task sends to a search service.
    */
   it('serialises byte-identically on repeated calls for the same facts', () => {
     const first = JSON.stringify(serverWebTools(permitting));
@@ -213,72 +215,60 @@ describe('provider web tools', () => {
 
   it('puts nothing on the wire but the two fields the provider reads', () => {
     // `supersedes` is athanor's own bookkeeping. A third key here would travel in the tools array
-    // of every request on this route, where the provider has no field to put it in.
+    // of the search request, where the provider has no field to put it in.
     for (const tool of serverWebTools(permitting))
       expect(Object.keys(tool).sort()).toEqual(['parameters', 'type']);
   });
 
-  it('names the real in-house tools the provider ones stand in for, one for one', () => {
-    // The failure this prevents: `parallel_web_read` left in the catalogue beside the provider's
-    // web_fetch, so the model holds two ways to read a public page and has to guess between them.
-    const superseded = supersededInHouseWebTools(permitting);
-    expect([...superseded]).toEqual(['web_search', 'parallel_web_read']);
-    // Exactly one withdrawal per provider tool, and no name withdrawn twice - the pairing is the
-    // only thing standing between "one capability" and "two descriptions of one capability".
-    expect(superseded).toHaveLength(serverWebTools(permitting).length);
-    expect(new Set(superseded).size).toBe(superseded.length);
-  });
-
-  it('withdraws nothing at all on any route that stayed in house', () => {
-    // A withdrawal applied in the wrong mode does not degrade the web, it removes it: these are
-    // the only two web tools the in-house catalogue has.
-    for (const refusing of [
-      { ...permitting, provider: 'custom' },
-      { ...permitting, forceInHouse: true },
-      { ...permitting, startedMode: 'in_house' as const }
-    ])
-      expect(supersededInHouseWebTools(refusing)).toEqual([]);
-  });
-
-  it('never withdraws the browser, which is the half of the web the provider cannot reach', () => {
-    // Provider fetch wins on a static page and cannot sign in, fill a form or hold a session.
-    for (const browserTool of ['browser_action', 'browser_snapshot', 'read_elements', 'print_pdf'])
-      expect(supersededInHouseWebTools(permitting)).not.toContain(browserTool);
-  });
-
-  it('answers the tools and the withdrawals from one verdict, on every combination of facts', () => {
-    // The pair that disagrees is the whole failure: provider tools sent while the in-house ones are
-    // still offered, or the in-house ones withdrawn on a route that sends no provider tool at all.
+  /**
+   * The plan hands out no list of tools to take away, and that absence is the fix.
+   *
+   * A provider-side tool has no `function.name`, so withdrawing the in-house tool it answers for
+   * left the model with a capability it had been told to use and no name to call it by: told to
+   * start research with a search, it went looking for `web_search`, found nothing, and answered from
+   * memory with invented sources. The verdict decides where a query goes. What the model is offered
+   * is not its business any more.
+   */
+  it('takes no tool away from the model, on any combination of facts', () => {
     for (const provider of ['openrouter', 'custom', ''])
       for (const forceInHouse of [true, false, undefined])
         for (const startedMode of ['in_house', 'server', undefined] as const) {
           const plan = resolveWebToolPlan({ provider, forceInHouse, startedMode });
-          const sendsProviderTools = plan.serverTools.length > 0;
-          expect(sendsProviderTools).toBe(plan.mode === 'server');
-          expect(plan.supersedes.length > 0).toBe(sendsProviderTools);
+          expect(Object.keys(plan).sort()).toEqual([
+            'disclosure',
+            'mode',
+            'reason',
+            'serverTools'
+          ]);
+          expect(plan.serverTools.length > 0).toBe(plan.mode === 'server');
           expect(plan.disclosure).toBe(WEB_TOOL_DISCLOSURE[plan.mode]);
         }
   });
 });
 
 describe('duplicated web capabilities', () => {
-  it('names an in-house tool left in the catalogue beside the provider tool that replaces it', () => {
+  /**
+   * What this guards is no longer the agent's catalogue but the search request itself. That request
+   * asks the provider to run one search and must offer the model no function tools at all: a request
+   * carrying both would be asking the same question of two answerers in one breath, and which one
+   * came back would depend on what the model reached for.
+   */
+  it('names a function tool on a request that is asking the provider to do its job', () => {
     const plan = resolveWebToolPlan(permitting);
     expect(
       duplicatedWebCapabilities(plan.serverTools, ['shell', 'web_search', 'file_read'])
     ).toEqual(['web_search']);
-    expect(duplicatedWebCapabilities(plan.serverTools, [...plan.supersedes])).toEqual([
-      'web_search',
-      'parallel_web_read'
-    ]);
   });
 
-  it('says nothing about a catalogue that withdrew what it had to', () => {
+  it('says nothing about the empty catalogue a search request actually carries', () => {
     const plan = resolveWebToolPlan(permitting);
+    expect(duplicatedWebCapabilities(plan.serverTools, [])).toEqual([]);
     expect(
       duplicatedWebCapabilities(plan.serverTools, ['shell', 'browser_action', 'browser_snapshot'])
     ).toEqual([]);
-    // The in-house route sends no provider tool, so every web tool in the catalogue belongs there.
+    // And the agent's own request, which offers `web_search` by name on every route, is only ever
+    // in breach if somebody puts a provider tool on it - which is what makes this the check that
+    // the two arrangements cannot be mixed.
     const inHouse = resolveWebToolPlan({ ...permitting, forceInHouse: true });
     expect(
       duplicatedWebCapabilities(inHouse.serverTools, ['web_search', 'parallel_web_read'])

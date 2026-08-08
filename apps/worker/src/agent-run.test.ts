@@ -12,6 +12,7 @@ import {
 } from './agent.js';
 import { RUNTIME_CONTEXT_MARKER } from './context.js';
 import { managedMediaCatalog } from './media.js';
+import { agentTools } from './tools.js';
 import type { WorkerConfig } from './config.js';
 
 const masterKey = Buffer.alloc(32, 5);
@@ -1267,9 +1268,10 @@ describe('asking memory a question mid-task', () => {
  * Where this run's searches go, and what the model is therefore holding.
  *
  * The decision belongs to `resolveWebToolPlan` in @athanor/contracts and to nothing else, so these
- * exercise the wiring rather than the verdict: that the worker asks once per run, sends what the
- * plan says to send, withdraws what it says to withdraw, and never lets a mid-run credential edit
- * move a task onto a route the owner was not asked about.
+ * exercise the wiring rather than the verdict: that the worker asks once per run, offers the model
+ * the same tools whichever answer it got, spends the provider's search only when the model calls
+ * `web_search`, and never lets a mid-run credential edit move a task onto a route the owner was not
+ * asked about.
  */
 describe('the web route a run is pinned to', () => {
   const toolNames = (request: Record<string, unknown> | undefined): string[] =>
@@ -1294,12 +1296,13 @@ describe('the web route a run is pinned to', () => {
     task: TaskRecord,
     workerConfig: Omit<WorkerConfig, 'WORKER_HEALTH_PORT' | 'WORKER_HEALTH_HOST'>,
     catalog: ModelRelease[],
-    body = textFrame('thinking')
+    /** One body, or a script of them: a search spends a provider call of its own between steps. */
+    body: string | string[] = textFrame('thinking')
   ): Promise<{ log: FetchLog; probe: StoreProbe }> => {
     const probe = probeStore(() => task);
     const store = { ...probe.store, listModels: async () => catalog } as unknown as DataStore;
     const log: FetchLog = { calls: [], modelRequests: [] };
-    installFetch([body], log);
+    installFetch(Array.isArray(body) ? body : [body], log);
     await new AgentWorker(store, workerConfig, masterKey, runnerSecret)
       .run(task)
       .catch(() => undefined);
@@ -1374,28 +1377,36 @@ describe('the web route a run is pinned to', () => {
       config({ AI_PROVIDER: 'openrouter', AI_REQUIRE_ZDR: true, TASK_MAX_STEPS: 1 }),
       [openrouterModel]
     );
-    const names = toolNames(log.modelRequests[0]);
-    expect(names).toContain('openrouter:web_search');
-    expect(names).not.toContain('web_search');
+    expect(toolNames(log.modelRequests[0])).toContain('web_search');
     expect(
       probe.events.find((entry) => entry.summary.includes("model provider's search service"))
     ).toBeDefined();
   });
 
-  it('sends the provider’s tools and withdraws the in-house pair they stand in for', async () => {
+  /**
+   * The failure this whole arrangement was rebuilt to stop.
+   *
+   * The provider's search has no `function.name`, so no model can call it; it used to be sent in the
+   * agent's own tools array with `web_search` withdrawn to make room. The model was told by its
+   * operating contract to start research with a search, went looking for the search tool, and found
+   * neither it nor any name for what had replaced it - so asked for three notable projects with
+   * sources, it made no tool call at all and answered from memory with fabricated names, fabricated
+   * dates and fabricated addresses.
+   */
+  it('offers the model the same catalogue on the provider route, and no tool it cannot call', async () => {
     const { log, probe } = await runOnce(standardTask(), serverConfig, [openrouterModel]);
     const names = toolNames(log.modelRequests[0]);
-    expect(names).toContain('openrouter:web_search');
-    expect(names).toContain('openrouter:web_fetch');
-    // The withdrawal is the half that cannot be forgotten: leaving these in hands the model two
-    // descriptions of one capability, which the gateway refuses outright rather than sends.
-    expect(names).not.toContain('web_search');
-    expect(names).not.toContain('parallel_web_read');
-    // The browser is deliberately not withdrawn - it is the half of the web a provider fetch
-    // cannot reach, everything behind a session, a login, a paywall or a form.
+    // The two tools the four cross-referencing descriptions send the model to, present under the
+    // names those descriptions use.
+    expect(names).toContain('web_search');
+    expect(names).toContain('parallel_web_read');
+    // And nothing the model has no way to invoke. A provider-side tool on this request would be a
+    // second answerer for a question the model can already ask.
+    expect(names).not.toContain('openrouter:web_search');
+    expect(names).not.toContain('openrouter:web_fetch');
     expect(names).toContain('browser_action');
     expect(names).toContain('browser_snapshot');
-    // And the owner is told, in one sentence, where their queries now go.
+    // The owner is told, in one sentence, where their queries now go.
     expect(
       probe.events.find((entry) => entry.summary.includes("model provider's search service"))
     ).toBeDefined();
@@ -1408,6 +1419,175 @@ describe('the web route a run is pinned to', () => {
       .map((message) => message.content)
       .join('\n');
     expect(systemText).toContain('answered by your model provider, which sees the query');
+  });
+
+  /**
+   * The rule the fabricated answer broke, checked against the catalogue as it actually goes out.
+   *
+   * The descriptions are the only map the model has of this computer and they cross-reference
+   * constantly - "hand the promising URLs to parallel_web_read", "use web_search to find that
+   * address", "each specialist gets web_search and parallel_web_read". `tools.test.ts` already holds
+   * every one of those names to something declared. What it cannot see is a run that then removes
+   * the tool: four descriptions went on pointing at `web_search` and `parallel_web_read` after the
+   * provider route withdrew them, and a model that trusts its own catalogue looked for a tool that
+   * was not there and answered from memory instead.
+   *
+   * `connector_action` is the one name allowed to dangle, and only because what is missing there is
+   * the capability itself rather than the tool - nothing is connected, every call would fail, and
+   * `connector_list` names it in the course of being the call that says so.
+   */
+  it('sends no description naming a tool this run took out of the catalogue', async () => {
+    const { log } = await runOnce(standardTask(), serverConfig, [openrouterModel]);
+    const sent = new Set(toolNames(log.modelRequests[0]));
+    const declared = new Set(agentTools.map((tool) => tool.name));
+    for (const tool of agentTools)
+      if (sent.has(tool.name))
+        for (const token of tool.description.match(/[a-z][a-z0-9]*(?:_[a-z0-9]+)+/g) ?? [])
+          if (declared.has(token) && token !== 'connector_action')
+            expect(
+              sent.has(token),
+              `${tool.name} sends the model to ${token}, which this run did not offer it`
+            ).toBe(true);
+    expect(sent.has('connector_action')).toBe(false);
+  });
+
+  /** What the model was handed back for its last tool call, which is where a search result lands. */
+  const lastToolResult = (request: Record<string, unknown> | undefined): string =>
+    ((request?.messages ?? []) as Array<{ role: string; content: string }>)
+      .filter((message) => message.role === 'tool')
+      .map((message) => message.content)
+      .at(-1) ?? '';
+
+  /** A provider response to the search request athanor builds, with the sources it retrieved. */
+  const searched = (
+    citations: Array<{ url: string; title?: string; content?: string }>,
+    requests = 1
+  ): string =>
+    JSON.stringify({
+      choices: [
+        {
+          finish_reason: 'stop',
+          message: {
+            content: citations.map((citation) => `${citation.title} ${citation.url}`).join('\n'),
+            annotations: citations.map((citation) => ({
+              type: 'url_citation',
+              url_citation: citation
+            }))
+          }
+        }
+      ],
+      usage: {
+        prompt_tokens: 90,
+        completion_tokens: 40,
+        total_tokens: 130,
+        server_tool_use: { web_search_requests: requests }
+      }
+    });
+
+  it('answers a web_search call by spending the provider’s search on a request built for it', async () => {
+    const { log } = await runOnce(
+      standardTask(),
+      config({ ...serverConfig, TASK_MAX_STEPS: 2 }),
+      [openrouterModel],
+      toolFrame('call-search', 'web_search', { query: 'agent frameworks released in 2026' })
+    );
+    // Three provider calls for one search: the step that asked, the search itself, the step that
+    // reads it. The middle one is the whole mechanism - a provider-side tool can only be spent by a
+    // request whose purpose is to spend it.
+    const search = log.modelRequests[1] ?? {};
+    expect(
+      ((search.tools ?? []) as Array<{ type?: string }>).map((tool) => tool.type)
+    ).toEqual(['openrouter:web_search']);
+    // No function tools beside it. The gateway refuses this outright, so a regression here is a
+    // failed run rather than a model quietly choosing between two answerers.
+    expect(toolNames(search)).toEqual(['openrouter:web_search']);
+    const asked = ((search.messages ?? []) as Array<{ role: string; content: string }>)
+      .map((message) => message.content)
+      .join('\n');
+    expect(asked).toContain('agent frameworks released in 2026');
+    // The query and nothing else. The conversation, the workspace and the user's own words stay on
+    // this computer; what leaves it is what the disclosure says leaves it.
+    expect(asked).not.toContain('Tidy the notes');
+  });
+
+  it('hands the search back as ranked rows and taints the turn with what it read', async () => {
+    const { log, probe } = await runOnce(
+      standardTask(),
+      config({ ...serverConfig, TASK_MAX_STEPS: 2 }),
+      [openrouterModel],
+      [
+        toolFrame('call-search', 'web_search', { query: 'rate decision' }),
+        searched([
+          { url: 'https://regulator.example/notice', title: 'Notice', content: 'Held at 4.25.' },
+          { url: 'https://press.example/story', title: 'Story', content: 'Rates unchanged.' }
+        ]),
+        textFrame('Two sources say the rate held.')
+      ]
+    );
+    const result = lastToolResult(log.modelRequests[2]);
+    // The same shape the in-house search returns, because the model was given one description of
+    // what a search returns and both routes have to keep it.
+    expect(result).toContain('"rank":1');
+    expect(result).toContain('https://regulator.example/notice');
+    expect(result).toContain('"site":"press.example"');
+    expect(result).toContain('Held at 4.25.');
+    // A search is a read of pages nobody on this computer chose, so the floor rises exactly as it
+    // does for an in-house search - the route may change who fetched, never what it counts as.
+    const transition = probe.events.find(
+      (entry) => entry.kind === 'warning' && entry.summary.startsWith('Untrusted content entered')
+    );
+    expect(transition?.summary).toContain('web search results');
+    expect((transition?.payload as { tool?: string } | undefined)?.tool).toBe('web_search');
+  });
+
+  it('refuses to pass off a provider that never searched as a web with nothing on the subject', async () => {
+    // The failure mode this route exists to remove, arriving one level down. A response with no
+    // sources and no search spent is the provider answering from the model's memory; handing that
+    // back as an empty result list would let the agent report "nothing found" about a search that
+    // never happened, which is how the original fabrication looked from inside the model.
+    const { log } = await runOnce(
+      standardTask(),
+      config({ ...serverConfig, TASK_MAX_STEPS: 2 }),
+      [openrouterModel],
+      [
+        toolFrame('call-search', 'web_search', { query: 'rate decision' }),
+        JSON.stringify({
+          choices: [{ finish_reason: 'stop', message: { content: 'I already know this.' } }],
+          usage: { prompt_tokens: 90, completion_tokens: 5, total_tokens: 95 }
+        }),
+        textFrame('The search did not run.')
+      ]
+    );
+    const result = lastToolResult(log.modelRequests[2]);
+    expect(result).toContain('did not run a search');
+    expect(result).toContain('not evidence that nothing exists');
+  });
+
+  it('keeps a run whose deployment forced the in-house route off the provider entirely', async () => {
+    // The one switch that restores the old behaviour, asserted where it matters: not merely that no
+    // provider tool is offered, but that a search actually goes to the runner instead.
+    const log: FetchLog = { calls: [], modelRequests: [], runnerRequests: [] };
+    const probe = probeStore(() => standardTask());
+    const store = {
+      ...probe.store,
+      listModels: async () => [openrouterModel]
+    } as unknown as DataStore;
+    installFetch(
+      [toolFrame('call-search', 'web_search', { query: 'rate decision' }), textFrame('Done.')],
+      log
+    );
+    await new AgentWorker(
+      store,
+      config({ ...serverConfig, AI_FORCE_INHOUSE_WEB: true, TASK_MAX_STEPS: 2 }),
+      masterKey,
+      runnerSecret
+    )
+      .run(standardTask())
+      .catch(() => undefined);
+
+    expect(log.calls.some((call) => call.includes('/browser/search'))).toBe(true);
+    for (const request of log.modelRequests)
+      expect(toolNames(request)).not.toContain('openrouter:web_search');
   });
 
   it('finishes in house when it started in house, however the credential changed underneath', async () => {

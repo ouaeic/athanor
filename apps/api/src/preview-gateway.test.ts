@@ -107,6 +107,51 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+describe('the cookie that carries a private preview\u2019s access', () => {
+  /*
+   * A browser silently discards a `__Host-` cookie whose Path is not `/`. This one is scoped to a
+   * single preview on purpose, so the prefix and the path could never both hold - and every
+   * private preview athanor published was therefore unopenable: the tokenised link answered with a
+   * 303 and a Set-Cookie the browser threw away, the redirect arrived carrying nothing, and the
+   * owner was told to open the preview from the workspace they had just opened it from. Nothing
+   * caught it, because the tests here only ever checked which cookies are stripped on the way out.
+   */
+  it('is one a browser will actually keep', async () => {
+    // The path layout, which is what the installer ships: the cookie is then scoped to one
+    // preview's path, and that is exactly the case the prefix forbids. A subdomain layout puts it
+    // at the root and hides the bug.
+    const secureConfig = {
+      ...config,
+      PREVIEW_BASE_URL: 'https://app.example.test/__athanor/preview'
+    } as unknown as ApiConfig;
+    const runner = new RunnerClient(
+      'http://workspace-manager.test',
+      'runner-secret-with-at-least-32-characters'
+    );
+    const gateway = await buildPreviewGateway(store, secureConfig, runner);
+    disposers.push(() => gateway.close());
+
+    const response = await gateway.inject({
+      method: 'GET',
+      url: `/__athanor/preview/${slug}/?access=${accessToken}`,
+      headers: { host: 'app.example.test' }
+    });
+
+    expect(response.statusCode).toBe(303);
+    const setCookie = [response.headers['set-cookie'] ?? []]
+      .flat()
+      .map((value) => String(value))
+      .find((value) => value.toLowerCase().includes('preview-access'));
+    expect(setCookie, 'the redirect has to hand the browser the token').toBeTruthy();
+    const path = /;\s*path=([^;]+)/i.exec(setCookie ?? '')?.[1]?.trim();
+    if (setCookie?.startsWith('__Host-')) expect(path).toBe('/');
+    // Whatever prefix it carries, it must be confined to this preview or set at the root - never
+    // scoped in a way the prefix forbids.
+    expect(setCookie).toMatch(/;\s*Secure/i);
+    expect(path === '/' || path?.includes(slug)).toBe(true);
+  });
+});
+
 describe('preview gateway credential isolation', () => {
   it('never forwards athanor session, preview access or authorization credentials', async () => {
     const { gateway, forwarded } = await buildGateway();

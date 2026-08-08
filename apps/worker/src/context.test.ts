@@ -786,9 +786,12 @@ describe('runtime context in the cached preamble', () => {
     );
     expect(line).toContain('answered by your model provider, which sees the query');
     expect(line).toContain('keep the user’s own content out of the words you search with');
-    // The browser is not withdrawn on any route, and a run told otherwise would stop reaching
-    // everything behind a login.
-    expect(line).toContain('browser tools are unaffected');
+    // And it is told, in the same breath, that this is the only thing the route changes. A run that
+    // reads a privacy notice about the web and infers that its web tools are therefore different
+    // starts improvising around tools that work perfectly well, which is a more expensive mistake
+    // than the one this sentence exists to prevent.
+    expect(line).toContain('web_search is called exactly as its description says');
+    expect(line).toContain('still happens on this computer');
   });
 
   it('falls back to UTC rather than throwing on an unusable time zone', () => {
