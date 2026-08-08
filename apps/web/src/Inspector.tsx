@@ -1083,7 +1083,11 @@ function Computer({
 
   const clickFrame = async (event: MouseEvent<HTMLButtonElement>) => {
     if (event.detail === 0 || holder !== 'user') return;
-    const bounds = event.currentTarget.getBoundingClientRect();
+    // Measured against the picture, not the button around it. The button is a layout box and can be
+    // a different shape from what is drawn inside it - it is, in full screen - and mapping a click
+    // through the wrong box lands it somewhere the owner did not point.
+    const painted = event.currentTarget.querySelector('canvas:not([hidden]), img');
+    const bounds = (painted ?? event.currentTarget).getBoundingClientRect();
     await surface.send({
       type: 'click_at',
       x: Math.max(
