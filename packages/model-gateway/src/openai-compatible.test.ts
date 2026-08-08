@@ -666,11 +666,7 @@ describe('OpenAICompatibleAdapter', () => {
     expect(described[2]?.contextTokens).toBeNull();
   });
 
-  const providerSearchPlan = resolveWebToolPlan({
-    privacyRoute: 'external',
-    enforceZeroDataRetention: false,
-    provider: 'openrouter'
-  });
+  const providerSearchPlan = resolveWebToolPlan({ provider: 'openrouter' });
 
   it('sends a provider-side tool beside the function tools, unwrapped', async () => {
     const capture: { body?: unknown } = {};
@@ -700,11 +696,7 @@ describe('OpenAICompatibleAdapter', () => {
 
   it('sends nothing extra when the plan withheld the provider tools', async () => {
     const capture: { body?: unknown } = {};
-    const inHouse = resolveWebToolPlan({
-      privacyRoute: 'provider_zdr',
-      enforceZeroDataRetention: false,
-      provider: 'openrouter'
-    });
+    const inHouse = resolveWebToolPlan({ provider: 'openrouter', forceInHouse: true });
     await cachingAdapter(capture).chat({
       model: 'z-ai/glm-5.2',
       messages: [{ role: 'user', content: 'go' }],
@@ -722,12 +714,26 @@ describe('OpenAICompatibleAdapter', () => {
   });
 
   /**
-   * The line the product holds. Zero-retention enforcement covers inference routing and says in
-   * terms that it does not cover tools, so this combination would put the query outside the
-   * guarantee the owner was shown, with the badge still showing.
+   * This used to be a refusal, and the refusal was the bug.
+   *
+   * Zero-retention enforcement covers inference routing and says in terms that it does not cover
+   * tools - so a search query sits outside that guarantee whether the tools are sent or withheld,
+   * and withholding them protected nothing. What it did do was take search off every box configured
+   * the shipped way, because the flag ships on, and this adapter is the last code before the wire:
+   * an owner who reached this point had already been told by the plan and by the settings page that
+   * their searches would be answered by the provider, and then got an error instead.
+   *
+   * So the connection carries both, and both halves are asserted here: the provider block that
+   * makes the inference request zero-retention, and the search tools it never covered.
    */
-  it('refuses to send a provider tool on a connection under zero-retention enforcement', async () => {
-    const request = vi.fn(async () => new Response('{}', { status: 200 }));
+  it('sends provider search on a zero-retention connection, which the flag never covered', async () => {
+    const capture: { body?: unknown } = {};
+    const request = vi.fn(async (_url: string, init: { body: string }) => {
+      capture.body = JSON.parse(init.body);
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), {
+        status: 200
+      });
+    });
     const adapter = new OpenAICompatibleAdapter({
       baseUrl: 'https://openrouter.ai/api/v1',
       apiKey: 'managed-key',
@@ -737,20 +743,20 @@ describe('OpenAICompatibleAdapter', () => {
       fetch: request as unknown as typeof fetch
     });
 
-    const failure = await adapter
-      .chat({
-        model: 'z-ai/glm-5.2',
-        messages: [{ role: 'user', content: 'go' }],
-        tools: [],
-        serverTools: providerSearchPlan.serverTools,
-        temperature: 0.2
-      })
-      .catch((error: unknown) => error);
+    await adapter.chat({
+      model: 'z-ai/glm-5.2',
+      messages: [{ role: 'user', content: 'go' }],
+      tools: [],
+      serverTools: providerSearchPlan.serverTools,
+      temperature: 0.2
+    });
 
-    expect((failure as AthanorError).code).toBe('server_tools_refused');
-    // Nothing reached the provider: the refusal is what protects the query, not a note after it.
-    expect(request).not.toHaveBeenCalled();
-    expect(isRetryableError(failure)).toBe(false);
+    const body = capture.body as { tools: Array<{ type: string }>; provider: unknown };
+    expect(body.tools.map((tool) => tool.type)).toEqual([
+      'openrouter:web_search',
+      'openrouter:web_fetch'
+    ]);
+    expect(body.provider).toMatchObject({ zdr: true, data_collection: 'deny' });
   });
 
   it('refuses a catalogue that still offers the in-house tool the provider one replaces', async () => {

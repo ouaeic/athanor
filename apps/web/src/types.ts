@@ -24,7 +24,7 @@ import type {
   WorkspaceSnapshot
 } from '@athanor/contracts';
 import type { SecurityMode } from '@athanor/contracts';
-import type { WebSearchRoutes } from './web-search-route.js';
+import type { WebSearchRoute } from './web-search-route.js';
 
 export type { Artifact } from '@athanor/contracts';
 
@@ -84,8 +84,8 @@ export interface Bootstrap {
     mode: 'self_hosted';
     providerConfigured: boolean;
     enforceZeroDataRetention: boolean;
-    /** Where a search is answered, per privacy route. Absent from a box older than this field. */
-    webSearch?: WebSearchRoutes;
+    /** Where a search on this box is answered. Absent from a box older than this field. */
+    webSearch?: WebSearchRoute;
     sourceUrl: string | null;
   };
   legal: {

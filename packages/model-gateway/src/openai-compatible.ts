@@ -467,31 +467,26 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
    * will answer the call. `type` is written after the settings so a parameter bag that carries a
    * `type` of its own cannot rename the tool being requested.
    *
-   * Both checks are refusals rather than repairs, and both are here rather than only at the call
-   * site because this is the last code that runs before the request leaves the machine:
+   * The check below is a refusal rather than a repair, and it is here rather than only at the call
+   * site because this is the last code that runs before the request leaves the machine. A catalogue
+   * that still offers the in-house tool the provider one stands in for hands the model two
+   * descriptions of one capability. That is not a wire error - the provider would accept it - so
+   * nothing downstream would ever report it; it would surface as a model that sometimes searches one
+   * way and sometimes the other, which is the shape of failure nobody traces back to a tools array.
    *
-   * Zero-data-retention enforcement covers inference routing and explicitly does not cover tools,
-   * so a provider-side search on a zero-retention connection would send the query - routinely the
-   * most revealing sentence in the conversation - outside the guarantee the owner was shown. The
-   * plan that chose these tools already refuses that combination; a request that arrives here
-   * holding both is a bug in a caller, and the honest answer to it is to fail rather than to send
-   * the query and record the disclosure afterwards.
-   *
-   * A catalogue that still offers the in-house tool the provider one stands in for hands the model
-   * two descriptions of one capability. That is not a wire error - the provider would accept it -
-   * so nothing downstream would ever report it; it would surface as a model that sometimes searches
-   * one way and sometimes the other, which is the shape of failure nobody traces back to a tools
-   * array.
+   * A second refusal used to stand beside it: server tools on a connection that enforces zero data
+   * retention. It was reasoning from the true half of a fact. Zero-retention enforcement covers
+   * inference routing and explicitly does not cover tools - which means a search query is outside
+   * that guarantee however this request is built, so refusing to send the tools never protected the
+   * query. It only ensured that a box configured the shipped way could not search, since the flag
+   * ships on. Where a query may go is now settled once, by the plan in @athanor/contracts, and
+   * disclosed to the owner in the words that plan hands back; a request arriving here with both is
+   * the ordinary case on a zero-retention box, not a caller's bug.
    */
   #serverToolPayload(input: ModelRequest): Array<Record<string, unknown>> {
     const serverTools = input.serverTools ?? [];
     if (serverTools.length === 0) return [];
     const requested = serverTools.map((tool) => tool.type).join(', ');
-    if (this.#enforceZeroDataRetention)
-      throw new AthanorError(
-        'server_tools_refused',
-        `${this.provider} is configured for zero data retention, which does not cover provider-side tools, so ${requested} was not sent`
-      );
     const duplicated = duplicatedWebCapabilities(
       serverTools,
       input.tools.map((tool) => tool.name)

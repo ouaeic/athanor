@@ -6,20 +6,44 @@ import { z } from 'zod';
  * athanor can answer a search two ways. In house means the workspace's own browser on the owner's
  * own machine: nothing leaves the box but the request the engine would have received from a person
  * sitting at it. On the provider means the model provider runs the search itself and hands the
- * model structured results with citations - faster, cheaper, immune to the anti-bot challenge that
- * takes the in-house route off a task, and a disclosure the owner has to have agreed to.
+ * model structured results with citations - faster, cheaper, and reachable from an address a search
+ * engine will not serve directly.
  *
- * The disclosure is the whole reason this decision is a contract rather than a flag. OpenRouter's
- * zero-data-retention enforcement is documented as covering inference routing only: "It does not
- * apply to plugins and tools you choose to enable, such as web search." athanor's default posture
- * is zero retention on, and a search query is frequently the most revealing sentence in a
- * conversation - more revealing than the answer. So a provider-side search on a zero-retention task
- * would send that sentence to a third party with the zero-retention badge still showing, which is
- * the one failure this product cannot survive. The gate is therefore not a default that a call site
- * can pass a different argument to: `resolveWebToolPlan` takes the privacy facts and asks the same
- * question of them that everything else here does, so there is no way to reach provider search
- * without the privacy question being answered on the way in. The one mode it accepts, `startedMode`
- * below, can only ever refuse - there is no argument in this module that turns provider search on.
+ * That last clause is why this file reads the way it does now. The in-house route is a browser
+ * making an ordinary request from wherever athanor is installed, and athanor is built to be
+ * installed on a server. Search engines challenge datacenter address ranges as a matter of course,
+ * so on the deployment this product is designed for the in-house route does not degrade, it fails:
+ * the engine answers with an anti-bot challenge instead of results, and it will answer the same way
+ * to the next attempt, because what it is refusing is the address. Nothing in this repository may
+ * work around a challenge. So a box whose only route is the in-house one is a box that cannot
+ * search at all, and it finds that out one abandoned research task at a time.
+ *
+ * This module used to let zero data retention decide that, and it decided it twice. It read the
+ * owner's stored credential enforcing zero retention, and it read the conversation's own privacy
+ * route, and refused the provider on either. Those are not two facts: the credential's setting is
+ * what labels every model in the catalogue `provider_zdr`, and a task may only run on a model whose
+ * route matches its own, so a task's privacy route is a copy of the credential flag rather than
+ * anything a conversation ever chose. The flag ships on. The result was that the shipped default
+ * bought a promise about inference by spending the entire web, on every box, without saying so.
+ *
+ * The promise it was spending that on was never athanor's to make. Zero-data-retention enforcement
+ * is documented as covering inference routing only: "It does not apply to plugins and tools you
+ * choose to enable, such as web search." A search query is frequently the most revealing sentence
+ * in a conversation - more revealing than the answer - and it falls outside that guarantee whichever
+ * way this file resolves. So reading the retention flag as a refusal never kept a query private. It
+ * only kept the search from happening, and left the owner believing otherwise.
+ *
+ * What the owner is actually owed is the truth about where their queries go, in the place they
+ * type them and in the model's own runtime context. That is what `WEB_TOOL_DISCLOSURE` is, and it
+ * is the reason this decision is a contract rather than a flag: the settings page, the composer and
+ * the tools that go on the wire all read this one verdict, so they cannot come to disagree.
+ *
+ * The two questions are therefore answered by the two settings that are about them. What a provider
+ * may keep of an inference request is the credential's business, and reaches the wire as the
+ * provider block on the request. Whether a search query may be sent to a search service at all is
+ * `AI_FORCE_INHOUSE_WEB`, which was built for exactly this question, says so where it is declared,
+ * and restores every previous refusal in one line of environment - no credential edit, and so no
+ * passkey step-up, for an owner who wants the old behaviour back.
  *
  * What the two modes disclose, stated exactly rather than approximately. Provider search discloses
  * the query string, any domain filters, and an approximate location if one is configured, to
@@ -28,15 +52,15 @@ import { z } from 'zod';
  * conversation, the workspace, or any file. The in-house route discloses the query to the search
  * engine and nothing to the model provider.
  *
- * The mode is decided once per run, and the decision only ever moves one way afterwards. Two of the
- * facts above are the owner's stored credential, which they can edit from the settings page while a
- * task is still running: turning zero-retention off mid-run would otherwise flip a task that began
- * under the in-house promise into one sending its queries to a third party, without the owner ever
- * being asked about that task. So a run carries the mode it started on, in `startedMode`, and a run
- * that started in house stays in house until it ends. The other direction is deliberately not
- * pinned: a credential that turns zero retention on takes effect on the very next step, because
- * withholding a privacy fact that has just become true to protect a cache prefix is the wrong trade
- * every time.
+ * The mode is decided once per run, and the decision only ever moves one way afterwards. The
+ * provider is read from the owner's stored credential, which they can replace from the settings
+ * page while a task is still running: repointing a box at OpenRouter mid-run would otherwise flip a
+ * task that began under the in-house promise into one sending its queries to a third party, without
+ * the owner ever being asked about that task. So a run carries the mode it started on, in
+ * `startedMode`, and a run that started in house stays in house until it ends. The other direction
+ * is deliberately not pinned: a change that takes provider search off this box applies on the very
+ * next step, because withholding a privacy fact that has just become true to protect a cache prefix
+ * is the wrong trade every time.
  *
  * That prefix is the reason the tool block is worth keeping still at all. The catalogue is
  * serialised into the cached prompt prefix, so a mode that changed mid-task would end the prefix at
@@ -54,10 +78,6 @@ export type WebToolMode = z.infer<typeof WebToolMode>;
 export const WebToolRouteReason = z.enum([
   /** The deployment turned provider-side web tools off for every task on this box. */
   'forced_in_house',
-  /** The conversation itself was started on the zero-retention route. */
-  'zero_retention_task',
-  /** The owner's provider credential enforces zero retention, whatever this task asked for. */
-  'zero_retention_credential',
   /** The model is reached through an endpoint that has no provider-side web tools to offer. */
   'provider_has_no_server_tools',
   /**
@@ -71,10 +91,6 @@ export const WebToolRouteReason = z.enum([
 export type WebToolRouteReason = z.infer<typeof WebToolRouteReason>;
 
 export interface WebToolRouteInput {
-  /** The privacy route the conversation was started under. */
-  privacyRoute: 'provider_zdr' | 'external';
-  /** Whether the owner's stored inference credential enforces zero data retention. */
-  enforceZeroDataRetention: boolean;
   /** Which kind of endpoint the task's model is reached through. */
   provider: string;
   /** The deployment-wide override, `AI_FORCE_INHOUSE_WEB`. Absent means the owner has not set it. */
@@ -98,9 +114,9 @@ export interface WebToolRoute {
  * The only two sentences athanor says about this.
  *
  * Deliberately not a per-search confirmation: a prompt on every search makes the tool unusable, and
- * an owner who has to answer the same question thirty times stops reading it by the fourth. The
- * decision was already made when they chose the conversation's privacy route; this states what that
- * choice meant.
+ * an owner who has to answer the same question thirty times stops reading it by the fourth. This is
+ * a standing statement about the box instead, shown where a conversation is typed and carried into
+ * the model's runtime context, so nobody has to open the source to learn where a query went.
  */
 export const WEB_TOOL_DISCLOSURE: Readonly<Record<WebToolMode, string>> = Object.freeze({
   in_house: 'Web searches run on your own computer.',
@@ -115,11 +131,15 @@ export const WEB_TOOL_DISCLOSURE: Readonly<Record<WebToolMode, string>> = Object
  * the one provider that has server tools rather than against a list of ones that do not, so a new
  * kind of endpoint arrives refused rather than arrives trusted.
  *
+ * The deployment override is checked first because it is the one an operator set deliberately, and
+ * every refusal reaches the same mode: an operator who took provider search off this box should be
+ * told that is what decided it, not told about their model.
+ *
  * The run pin is checked last of the refusals rather than first, so it is only ever the reported
- * reason when it is the thing actually holding the line. A run that started in house because the
- * conversation is zero-retention is still told that is why, on every step, which is the sentence
- * the owner can act on; `pinned_in_house_for_run` appears only when the fact that refused this run
- * has since stopped being true.
+ * reason when it is the thing actually holding the line. A run held in house by the deployment
+ * switch is still told that is why, on every step, which is the sentence the owner can act on;
+ * `pinned_in_house_for_run` appears only when the fact that refused this run has since stopped
+ * being true.
  *
  * Not exported: `resolveWebToolPlan` below is the only way in, because a caller holding the mode
  * on its own is a caller that can send the provider's tools while keeping the in-house ones.
@@ -131,8 +151,6 @@ const resolveWebToolRoute = (input: WebToolRouteInput): WebToolRoute => {
     disclosure: WEB_TOOL_DISCLOSURE.in_house
   });
   if (input.forceInHouse === true) return inHouse('forced_in_house');
-  if (input.privacyRoute === 'provider_zdr') return inHouse('zero_retention_task');
-  if (input.enforceZeroDataRetention) return inHouse('zero_retention_credential');
   if (input.provider !== 'openrouter') return inHouse('provider_has_no_server_tools');
   if (input.startedMode === 'in_house') return inHouse('pinned_in_house_for_run');
   return {

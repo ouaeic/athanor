@@ -3978,12 +3978,14 @@ describe('mail and calendar connectors', () => {
 
 describe('where web searches are answered', () => {
   /**
-   * The one disclosure athanor cannot get wrong. OpenRouter's zero-retention enforcement is
-   * documented as covering inference routing only - "It does not apply to plugins and tools you
-   * choose to enable, such as web search" - so a provider-side search on a zero-retention
-   * conversation would put the query outside every guarantee the product makes while the badge
-   * still showed. The settings surface has to state where the line falls before an owner picks a
-   * route, and it has to reach that verdict through the same function the worker sends the request
+   * The one disclosure athanor cannot get wrong. A search query is routinely the most revealing
+   * sentence in a conversation, and OpenRouter's zero-retention enforcement is documented as
+   * covering inference routing only - "It does not apply to plugins and tools you choose to enable,
+   * such as web search". That cuts both ways, and the product used to read only one half of it:
+   * because the guarantee never covered a search, refusing to send the search tools protected
+   * nothing, while quietly costing a server-hosted box the only search route that works from a
+   * datacenter address. What the owner is actually owed is the sentence saying where their queries
+   * go, and it has to reach that verdict through the same function the worker sends the request
    * with, or the two can disagree about a task that has already run.
    */
   const stubProviderCalls = () =>
@@ -4021,17 +4023,13 @@ describe('where web searches are answered', () => {
       expect(connected.statusCode, connected.body).toBe(200);
     }
     return (await app.inject({ method: 'GET', url: '/v1/providers', headers: { cookie } })).json<{
-      webSearch: {
-        standard: { mode: string; reason: string; disclosure: string };
-        zeroRetention: { mode: string; reason: string; disclosure: string };
-      };
+      webSearch: { mode: string; reason: string; disclosure: string };
     }>();
   };
 
   /*
    * The same verdict has to reach the screen where a conversation is actually typed. The client
-   * asks once, at startup, because every screen that can start a conversation needs it and the
-   * conversation's own privacy route picks which of the two answers applies to it.
+   * asks once, at startup, because every screen that can start a conversation needs it.
    */
   test('carries the same answer in the bootstrap every client starts from', async () => {
     stubProviderCalls();
@@ -4054,68 +4052,66 @@ describe('where web searches are answered', () => {
     ).json<{ instance: { webSearch: unknown } }>();
     const settings = (
       await app.inject({ method: 'GET', url: '/v1/providers', headers: { cookie } })
-    ).json<{ webSearch: { zeroRetention: { mode: string } } }>();
+    ).json<{ webSearch: { mode: string } }>();
     expect(bootstrap.instance.webSearch).toEqual(settings.webSearch);
-    expect(settings.webSearch.zeroRetention.mode).toBe('in_house');
+    expect(settings.webSearch.mode).toBe('server');
   }, 30_000);
 
-  test('keeps a zero-retention conversation off the provider whatever else is configured', async () => {
-    stubProviderCalls();
-    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-websearch-zdr-'));
-    disposers.push(() => rm(directory, { recursive: true, force: true }));
-    const settings = await providerSettings(isolatedConfig(directory), {
-      enforceZeroDataRetention: false
-    });
-    expect(settings.webSearch.zeroRetention).toMatchObject({
-      mode: 'in_house',
-      reason: 'zero_retention_task'
-    });
-    expect(settings.webSearch.zeroRetention.disclosure).toContain('your own computer');
-    // The same account, on an ordinary conversation, is told the opposite in one sentence.
-    expect(settings.webSearch.standard).toMatchObject({
-      mode: 'server',
-      reason: 'provider_search_available'
-    });
-    expect(settings.webSearch.standard.disclosure).toContain('sees the query');
-  }, 30_000);
-
-  test('keeps every conversation off the provider when the credential enforces zero retention', async () => {
+  /**
+   * The bug this whole wave is about, held down at the surface an owner actually reads.
+   *
+   * The shipped default is a credential that refuses data retention, and that used to take
+   * provider-side search off the box - which on a server is the only search route that works, since
+   * search engines answer a datacenter address with an anti-bot challenge rather than results. The
+   * owner was never offered that trade: nothing on this page said their privacy setting had also
+   * bought them a box that cannot search, and no setting on this page could give it back.
+   *
+   * It bought nothing either. The retention promise covers inference routing and says in terms that
+   * it does not cover tools, so the query was outside it whichever way this resolved. What is owed
+   * is the sentence, and the sentence is what this asserts.
+   */
+  test('still answers searches on the provider when the credential enforces zero retention', async () => {
     stubProviderCalls();
     const directory = await mkdtemp(join(tmpdir(), 'athanor-api-websearch-cred-'));
     disposers.push(() => rm(directory, { recursive: true, force: true }));
     const settings = await providerSettings(isolatedConfig(directory), {
       enforceZeroDataRetention: true
     });
-    expect(settings.webSearch.standard).toMatchObject({
-      mode: 'in_house',
-      reason: 'zero_retention_credential'
+    expect(settings.webSearch).toMatchObject({
+      mode: 'server',
+      reason: 'provider_search_available'
     });
-    expect(settings.webSearch.zeroRetention.mode).toBe('in_house');
+    // And says so, in the words the worker puts in front of the model on the same run.
+    expect(settings.webSearch.disclosure).toContain('sees the query');
   }, 30_000);
 
   test('lets the deployment take provider search off the box, and says that is what did it', async () => {
     stubProviderCalls();
     const directory = await mkdtemp(join(tmpdir(), 'athanor-api-websearch-forced-'));
     disposers.push(() => rm(directory, { recursive: true, force: true }));
+    // The switch that is about search rather than about retention, and the whole of the way back
+    // to the old behaviour - reachable from the environment, with no credential edit and so no
+    // passkey step-up in the way.
     const settings = await providerSettings(
       { ...isolatedConfig(directory), AI_FORCE_INHOUSE_WEB: true },
-      { enforceZeroDataRetention: false }
+      { enforceZeroDataRetention: true }
     );
-    expect(settings.webSearch.standard).toMatchObject({
+    expect(settings.webSearch).toMatchObject({
       mode: 'in_house',
       reason: 'forced_in_house'
     });
+    expect(settings.webSearch.disclosure).toContain('your own computer');
   }, 30_000);
 
   test('answers for a box configured from its environment and never connected by hand', async () => {
     stubProviderCalls();
     const directory = await mkdtemp(join(tmpdir(), 'athanor-api-websearch-env-'));
     disposers.push(() => rm(directory, { recursive: true, force: true }));
-    // AI_REQUIRE_ZDR is the shipped default, so the shipped answer is the in-house one.
+    // AI_REQUIRE_ZDR is the shipped default and no longer speaks to this question at all.
     const settings = await providerSettings(isolatedConfig(directory), null);
-    expect(settings.webSearch.standard).toMatchObject({
-      mode: 'in_house',
-      reason: 'zero_retention_credential'
+    expect(settings.webSearch).toMatchObject({
+      mode: 'server',
+      reason: 'provider_search_available'
     });
   }, 30_000);
 });

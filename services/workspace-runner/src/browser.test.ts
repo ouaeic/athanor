@@ -12,6 +12,7 @@ import {
   assertAgentReachableUrl,
   botWallMessage,
   reviewBotWall,
+  searchWallMessage,
   stepDestinations,
   type BotWall,
   browserLaunchLadder,
@@ -1055,9 +1056,9 @@ describe('search route', () => {
   /**
    * The other half of it. A challenge used to close the engine for the whole session, so the first
    * one took every later search off the task - and the tool's own advice, carry on elsewhere, had
-   * no elsewhere to point at. It now costs one search and a minute, and it says so: the browser
-   * wording would claim a stopped tab and a closed site, neither of which is true here, and the
-   * agent acts on that sentence.
+   * no elsewhere to point at. It now costs one search, and it says so: the browser wording would
+   * claim a stopped tab and a closed site, neither of which is true here, and the agent acts on
+   * that sentence.
    */
   it('reports a search challenge as costing the search rather than the web', async () => {
     const challenged = isolatedSearchBrowser({
@@ -1077,7 +1078,6 @@ describe('search route', () => {
     // left to take over - the browser it happened in was closed before this was thrown.
     expect(refusal.name).toBe('SearchWallError');
     expect(refusal.message).toContain('every other tool still work');
-    expect(refusal.message).toContain('available again in about a minute');
     expect(refusal.message).not.toContain('closed to you');
     // Backing off, and saying so from memory rather than launching a second browser to be refused.
     await expect(
@@ -1085,6 +1085,32 @@ describe('search route', () => {
     ).rejects.toThrow('anti-bot challenge instead of results');
     expect(challenged.opened).toHaveLength(1);
     expect(challenged.closedCount()).toBe(1);
+  });
+
+  /**
+   * The sentence used to end with a prognosis it had no way to make: searching would be available
+   * again in about a minute, so search again shortly. That was the backoff timer read out as if it
+   * were a forecast. On the deployment athanor is built for it was worse than vague - a server's
+   * address is what most engines are refusing, so the next attempt meets the same challenge and the
+   * one after that, and every retry the sentence invited cost the owner a turn and a bill to be
+   * refused again. The agent acts on this sentence, so it now says only what is known.
+   */
+  it('does not promise the agent that the same search will work again in a minute', () => {
+    const message = searchWallMessage({
+      vendor: 'Unnamed bot wall',
+      url: 'https://html.duckduckgo.com/html/?q=anything',
+      reason: 'page is asking the visitor to prove they are human',
+      evidence: 'page'
+    });
+    for (const promise of ['about a minute', 'shortly', 'again later', 'try again in'])
+      expect(message).not.toContain(promise);
+    // What it does say: retrying is the one thing that cannot help, and here is what still can.
+    expect(message).toContain('refusing this computer, not this query');
+    expect(message).toContain('Read a source you already have the address of');
+    // And the failure the whole route exists to prevent - an agent that decides the web is gone,
+    // stops researching, and starts inventing addresses instead.
+    expect(message).toContain('every other tool still work');
+    expect(message).toContain('rather than guessing at addresses');
   });
 
   it('clears the search backoff when the browser session is closed', async () => {

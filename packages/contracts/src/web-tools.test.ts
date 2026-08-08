@@ -10,6 +10,7 @@ import {
   SERVER_WEB_SEARCH_MAX_USES,
   WEB_TOOL_DISCLOSURE,
   WebCitation,
+  WebToolRouteReason,
   type WebToolRouteInput
 } from './web-tools.js';
 
@@ -24,14 +25,10 @@ const supersededInHouseWebTools = (input: WebToolRouteInput) =>
   resolveWebToolPlan(input).supersedes;
 
 /** The only combination of facts that lets a query leave the box. Everything else is a refusal. */
-const permitting: WebToolRouteInput = {
-  privacyRoute: 'external',
-  enforceZeroDataRetention: false,
-  provider: 'openrouter'
-};
+const permitting: WebToolRouteInput = { provider: 'openrouter' };
 
 describe('web tool route', () => {
-  it('answers searches on the provider only when nothing about the task forbids it', () => {
+  it('answers searches on the provider only when nothing about the box forbids it', () => {
     expect(resolveWebToolRoute(permitting)).toEqual({
       mode: 'server',
       reason: 'provider_search_available',
@@ -39,22 +36,29 @@ describe('web tool route', () => {
     });
   });
 
-  // The documented boundary this whole module exists for: OpenRouter's zero-retention flag governs
-  // inference routing and says in terms that it does not cover tools. A provider-side search on a
-  // zero-retention task would put the query - usually the most revealing sentence in the
-  // conversation - outside every guarantee athanor makes, with the badge still showing.
-  it('refuses the provider on a zero-retention task even when the credential permits it', () => {
-    expect(resolveWebToolRoute({ ...permitting, privacyRoute: 'provider_zdr' })).toMatchObject({
-      mode: 'in_house',
-      reason: 'zero_retention_task'
-    });
-  });
-
-  it('refuses the provider when the credential enforces zero retention, whatever the task asked', () => {
-    expect(resolveWebToolRoute({ ...permitting, enforceZeroDataRetention: true })).toMatchObject({
-      mode: 'in_house',
-      reason: 'zero_retention_credential'
-    });
+  /**
+   * The precedence this module used to have, and why it is gone.
+   *
+   * Two refusals stood above the provider check: a credential enforcing zero data retention, and a
+   * conversation started on the zero-retention route. On an OpenRouter box those are one bit - the
+   * credential's flag is what labels every model `provider_zdr`, and a task may only run on a model
+   * whose route matches its own - and that bit ships on. So the shipped default refused provider
+   * search everywhere, which on a server is the only search that works, and the owner was never
+   * told that is what their privacy setting bought.
+   *
+   * It bought nothing. Zero-retention enforcement covers inference routing and says in terms that
+   * it does not cover tools, so the query was outside that guarantee either way; refusing only
+   * decided that the search would not happen. The retention facts are therefore not inputs here at
+   * all, and this asserts the absence rather than trusting a comment to hold the line - a reason
+   * added back would be a refusal added back.
+   */
+  it('names no retention reason, because a promise about inference never covered a search', () => {
+    expect(WebToolRouteReason.options).toEqual([
+      'forced_in_house',
+      'provider_has_no_server_tools',
+      'pinned_in_house_for_run',
+      'provider_search_available'
+    ]);
   });
 
   it('refuses an endpoint that has no server tools, rather than sending a name it will reject', () => {
@@ -76,13 +80,27 @@ describe('web tool route', () => {
     // Every refusal reaches the same mode; only the reason differs, and the reason is what the
     // settings page shows. An operator who set the override should not be told it was their model.
     expect(
-      resolveWebToolRoute({
-        privacyRoute: 'provider_zdr',
-        enforceZeroDataRetention: true,
-        provider: 'custom',
-        forceInHouse: true
-      }).reason
+      resolveWebToolRoute({ provider: 'custom', forceInHouse: true, startedMode: 'in_house' })
+        .reason
     ).toBe('forced_in_house');
+  });
+
+  /**
+   * The switch an owner who wants the old behaviour reaches for.
+   *
+   * It is the whole of the escape hatch now, so it has to be enough on its own: with it set, this
+   * box searches in house on every task, exactly as a zero-retention credential used to make it -
+   * and unlike the credential it takes no passkey step-up to set, which matters to an owner whose
+   * saved credential is the thing holding their box in the broken state.
+   */
+  it('restores the old in-house-everywhere behaviour from the one switch that is about search', () => {
+    for (const provider of ['openrouter', 'custom'])
+      for (const startedMode of ['in_house', 'server', undefined] as const)
+        expect(resolveWebToolRoute({ provider, forceInHouse: true, startedMode })).toEqual({
+          mode: 'in_house',
+          reason: 'forced_in_house',
+          disclosure: WEB_TOOL_DISCLOSURE.in_house
+        });
   });
 
   it('never resolves to the provider from an unspecified override', () => {
@@ -90,9 +108,10 @@ describe('web tool route', () => {
       expect(resolveWebToolRoute({ ...permitting, forceInHouse }).mode).toBe('server');
   });
 
-  // The owner can edit the stored credential from the settings page while a task is still running.
-  // Without the pin, turning zero retention off mid-run would move a task that began under the
-  // in-house promise onto the provider's search, for a task the owner was never asked about.
+  // The owner can replace the stored credential from the settings page while a task is still
+  // running. Without the pin, repointing the box at a provider that answers searches would move a
+  // task that began under the in-house promise onto that search service, for a task the owner was
+  // never asked about.
   it('keeps a run that started in house there after the fact that refused it stops being true', () => {
     expect(resolveWebToolRoute({ ...permitting, startedMode: 'in_house' })).toEqual({
       mode: 'in_house',
@@ -103,11 +122,10 @@ describe('web tool route', () => {
     expect(supersededInHouseWebTools({ ...permitting, startedMode: 'in_house' })).toEqual([]);
   });
 
-  it('still moves a run onto the in-house route the moment a privacy fact becomes true', () => {
-    // The pin is one-directional on purpose: a credential that turns zero retention on takes
-    // effect on the next step, cache prefix or no cache prefix.
+  it('still moves a run onto the in-house route the moment a refusing fact becomes true', () => {
+    // The pin is one-directional on purpose: a deployment that takes provider search off the box
+    // takes effect on the next step, cache prefix or no cache prefix.
     for (const refusing of [
-      { ...permitting, enforceZeroDataRetention: true },
       { ...permitting, forceInHouse: true },
       { ...permitting, provider: 'custom' }
     ])
@@ -122,15 +140,11 @@ describe('web tool route', () => {
   });
 
   it('reports the fact that refused this run, not the pin, while that fact still holds', () => {
-    // Every step of a zero-retention conversation should say so; the pin is not an explanation the
-    // owner can act on, and it is only the honest answer once nothing else refuses.
+    // The pin is not an explanation the owner can act on, and it is only the honest answer once
+    // nothing else refuses.
     expect(
-      resolveWebToolRoute({
-        ...permitting,
-        privacyRoute: 'provider_zdr',
-        startedMode: 'in_house'
-      }).reason
-    ).toBe('zero_retention_task');
+      resolveWebToolRoute({ ...permitting, forceInHouse: true, startedMode: 'in_house' }).reason
+    ).toBe('forced_in_house');
   });
 
   it('says one sentence per mode and never asks a question', () => {
@@ -147,10 +161,9 @@ describe('web tool route', () => {
 describe('provider web tools', () => {
   it('hands out nothing at all on any route that refused the provider', () => {
     for (const refusing of [
-      { ...permitting, privacyRoute: 'provider_zdr' as const },
-      { ...permitting, enforceZeroDataRetention: true },
       { ...permitting, provider: 'custom' },
-      { ...permitting, forceInHouse: true }
+      { ...permitting, forceInHouse: true },
+      { ...permitting, startedMode: 'in_house' as const }
     ])
       expect(serverWebTools(refusing)).toEqual([]);
   });
@@ -220,10 +233,9 @@ describe('provider web tools', () => {
     // A withdrawal applied in the wrong mode does not degrade the web, it removes it: these are
     // the only two web tools the in-house catalogue has.
     for (const refusing of [
-      { ...permitting, privacyRoute: 'provider_zdr' as const },
-      { ...permitting, enforceZeroDataRetention: true },
       { ...permitting, provider: 'custom' },
-      { ...permitting, forceInHouse: true }
+      { ...permitting, forceInHouse: true },
+      { ...permitting, startedMode: 'in_house' as const }
     ])
       expect(supersededInHouseWebTools(refusing)).toEqual([]);
   });
@@ -237,23 +249,15 @@ describe('provider web tools', () => {
   it('answers the tools and the withdrawals from one verdict, on every combination of facts', () => {
     // The pair that disagrees is the whole failure: provider tools sent while the in-house ones are
     // still offered, or the in-house ones withdrawn on a route that sends no provider tool at all.
-    for (const privacyRoute of ['provider_zdr', 'external'] as const)
-      for (const enforceZeroDataRetention of [true, false])
-        for (const provider of ['openrouter', 'custom'])
-          for (const forceInHouse of [true, false, undefined])
-            for (const startedMode of ['in_house', 'server', undefined] as const) {
-              const plan = resolveWebToolPlan({
-                privacyRoute,
-                enforceZeroDataRetention,
-                provider,
-                forceInHouse,
-                startedMode
-              });
-              const sendsProviderTools = plan.serverTools.length > 0;
-              expect(sendsProviderTools).toBe(plan.mode === 'server');
-              expect(plan.supersedes.length > 0).toBe(sendsProviderTools);
-              expect(plan.disclosure).toBe(WEB_TOOL_DISCLOSURE[plan.mode]);
-            }
+    for (const provider of ['openrouter', 'custom', ''])
+      for (const forceInHouse of [true, false, undefined])
+        for (const startedMode of ['in_house', 'server', undefined] as const) {
+          const plan = resolveWebToolPlan({ provider, forceInHouse, startedMode });
+          const sendsProviderTools = plan.serverTools.length > 0;
+          expect(sendsProviderTools).toBe(plan.mode === 'server');
+          expect(plan.supersedes.length > 0).toBe(sendsProviderTools);
+          expect(plan.disclosure).toBe(WEB_TOOL_DISCLOSURE[plan.mode]);
+        }
   });
 });
 
@@ -275,7 +279,7 @@ describe('duplicated web capabilities', () => {
       duplicatedWebCapabilities(plan.serverTools, ['shell', 'browser_action', 'browser_snapshot'])
     ).toEqual([]);
     // The in-house route sends no provider tool, so every web tool in the catalogue belongs there.
-    const inHouse = resolveWebToolPlan({ ...permitting, privacyRoute: 'provider_zdr' });
+    const inHouse = resolveWebToolPlan({ ...permitting, forceInHouse: true });
     expect(
       duplicatedWebCapabilities(inHouse.serverTools, ['web_search', 'parallel_web_read'])
     ).toEqual([]);

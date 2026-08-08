@@ -311,6 +311,8 @@ export function SelfHostedSettings({
       URL.revokeObjectURL(href);
     });
 
+  const webSearch = webSearchSummary(provider?.webSearch);
+
   const pages: Array<{ id: SettingsPage; label: string }> = [
     { id: 'ai', label: 'AI' },
     { id: 'agent', label: 'Agent' },
@@ -472,13 +474,12 @@ export function SelfHostedSettings({
           server's answer, from the one resolver that also decides what goes on the wire - so this
           page and the agent can never hold two opinions about where a query went.
         */}
-        {webSearchSummary(provider?.webSearch).map((line) => (
-          <p className="web-search-route" key={line.scope || 'both'}>
-            {line.scope ? <strong>{line.scope}</strong> : null}
-            <span>{line.disclosure}</span>
-            {line.reason ? <small>{line.reason}</small> : null}
+        {webSearch ? (
+          <p className="web-search-route">
+            <span>{webSearch.disclosure}</span>
+            {webSearch.reason ? <small>{webSearch.reason}</small> : null}
           </p>
-        ))}
+        ) : null}
         {providerKind === 'openai-compatible' && (
           <label className="toggle-line">
             <input

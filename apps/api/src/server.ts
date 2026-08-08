@@ -2215,12 +2215,10 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
         ),
         enforceZeroDataRetention: await requiresZeroDataRetention(user.id),
         /**
-         * Where a web search on this box is answered, for each of the two privacy routes a
-         * conversation can be started on. Which one applies to the conversation on screen is the
-         * conversation's own `privacyRoute`, so the client can answer "did that query leave this
-         * computer" for the transcript in front of it without asking again.
+         * Where a web search on this box is answered, so the client can say "this query leaves the
+         * computer" beside the box it is typed in without asking again.
          */
-        webSearch: await webSearchRoutesFor(user.id)
+        webSearch: await webSearchRouteFor(user.id)
       },
       legal: {
         applicationLicense: 'AGPL-3.0-only',
@@ -4277,13 +4275,16 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
   };
 
   /**
-   * Where this box's web searches are answered, for each of the two privacy routes a conversation
-   * can be started on.
+   * Where this box's web searches are answered.
    *
-   * Both are reported rather than only the one in force, because the honest thing to tell an owner
-   * is what their choice of route will mean before they make it - and because on a zero-retention
-   * conversation the answer is fixed no matter what the credential or the deployment says. The
-   * verdict itself is not computed here: `resolveWebToolPlan` in @athanor/contracts is the only
+   * One verdict, not two. This used to publish an answer per privacy route, on the reasoning that
+   * an owner should be told what choosing a route would mean before they chose it - but no box ever
+   * offered that choice. A model's privacy route is set from the credential's retention flag and a
+   * task may only run on a model whose route matches its own, so every conversation on a given box
+   * is on the same route, and the second heading described a conversation that could not be started
+   * here. Where a query goes is a fact about the box, so it is reported as one.
+   *
+   * The verdict itself is not computed here: `resolveWebToolPlan` in @athanor/contracts is the only
    * place in this repository that decides it, so the sentence on the settings page and the tools
    * that go on the wire cannot come from two different opinions.
    *
@@ -4291,40 +4292,36 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
    * withdraw, which are the worker's business and not an owner's: what an owner is owed here is
    * where their queries go and what decided it.
    *
-   * Neither answer carries `startedMode`, and that is the difference between this question and the
+   * The answer carries no `startedMode`, and that is the difference between this question and the
    * one a running task asks. The settings page asks what a conversation started now would do; a
    * task already in flight is additionally held to the mode it started on, so a credential edited
    * mid-run cannot move that task onto the provider's search behind the owner's back.
    */
-  const webSearchRoutes = (secret: { provider: string; enforceZeroDataRetention: boolean }) => {
-    const facts = {
-      enforceZeroDataRetention: secret.enforceZeroDataRetention,
+  const webSearchRoute = (secret: { provider: string }) => {
+    const { mode, reason, disclosure } = resolveWebToolPlan({
       provider: secret.provider,
       forceInHouse: config.AI_FORCE_INHOUSE_WEB
-    };
-    const verdict = (privacyRoute: 'provider_zdr' | 'external') => {
-      const { mode, reason, disclosure } = resolveWebToolPlan({ ...facts, privacyRoute });
-      return { mode, reason, disclosure };
-    };
-    return { standard: verdict('external'), zeroRetention: verdict('provider_zdr') };
+    });
+    return { mode, reason, disclosure };
   };
 
   /**
-   * The same two verdicts, for a client that has not asked for the provider settings.
+   * The same verdict, for a client that has not asked for the provider settings.
    *
-   * Every screen that can start a conversation needs this, because the conversation's own privacy
-   * route decides which of the two applies to it - so it travels in the first response the client
-   * gets rather than costing a second request that most sessions would make and few would use.
+   * Every screen that can start a conversation needs this, so it travels in the first response the
+   * client gets rather than costing a second request that most sessions would make and few would
+   * use.
    *
-   * A credential that cannot be read answers as though it enforced zero retention. That is the same
-   * choice `requiresZeroDataRetention` makes a few hundred lines up, for the same reason: the one
-   * thing an unreadable privacy fact must never do is widen what leaves the box.
+   * A credential that cannot be read answers with the deployment's own configured provider, which
+   * is the only thing left that is true about this box. The retention flag used to be read here as
+   * well, and an unreadable one was assumed to be on; it is no longer part of this question, so
+   * there is no longer a privacy fact to be cautious about on the way past.
    */
-  const webSearchRoutesFor = async (userId: string) => {
+  const webSearchRouteFor = async (userId: string) => {
     try {
-      return webSearchRoutes((await inferenceCredential(userId)).secret);
+      return webSearchRoute((await inferenceCredential(userId)).secret);
     } catch {
-      return webSearchRoutes({ provider: config.AI_PROVIDER, enforceZeroDataRetention: true });
+      return webSearchRoute({ provider: config.AI_PROVIDER });
     }
   };
 
@@ -4339,7 +4336,7 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
         modelId: secret.modelId ?? null,
         hasApiKey: Boolean(secret.apiKey),
         enforceZeroDataRetention: secret.enforceZeroDataRetention,
-        webSearch: webSearchRoutes(secret)
+        webSearch: webSearchRoute(secret)
       };
     }
     return {
@@ -4350,10 +4347,7 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
       modelId: config.AI_DEFAULT_MODEL ?? null,
       hasApiKey: Boolean(config.AI_API_KEY ?? config.OPENROUTER_API_KEY),
       enforceZeroDataRetention: config.AI_REQUIRE_ZDR,
-      webSearch: webSearchRoutes({
-        provider: config.AI_PROVIDER,
-        enforceZeroDataRetention: config.AI_REQUIRE_ZDR
-      })
+      webSearch: webSearchRoute({ provider: config.AI_PROVIDER })
     };
   };
 

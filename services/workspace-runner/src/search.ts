@@ -58,9 +58,14 @@ export type SearchRoute = 'isolated' | 'session';
  * Far shorter than the half hour a site is closed for in the session browser, and deliberately so:
  * that cooldown exists because retrying from the same profile, the same cookies and the same tab is
  * the retry the challenge is asking for, made against the owner's own address. A fresh isolated
- * browser is a different client every time, so the only thing worth avoiding here is hammering -
- * one minute is long enough that no loop can sit on the engine and short enough that a task is
- * never left without search. This is the whole of what a challenge now costs.
+ * browser is a different client every time, so the only thing worth avoiding here is hammering, and
+ * a minute is long enough that no loop can sit on the engine.
+ *
+ * It is a rate limit and not a remedy, which is a distinction the wording of the refusal used to
+ * lose: waiting it out helps when the challenge was about a moment, and does nothing at all when it
+ * was about the address, which is the usual case on a server. `searchWallMessage` no longer promises
+ * otherwise. The route that does work from a datacenter address is the provider's own search, which
+ * `resolveWebToolPlan` in @athanor/contracts hands this box by default.
  */
 export const SEARCH_WALL_BACKOFF_MS = 60_000;
 

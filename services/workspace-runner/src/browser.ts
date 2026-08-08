@@ -626,10 +626,9 @@ export class BotWallError extends Error {
  *
  * A wall in the session browser is a page standing open on the owner's screen that only they can
  * clear, so it crosses the wire as data and reaches their phone. A wall in the search route is a
- * results page in a browser that has already been closed: there is nothing to take over, nobody
- * needs to be interrupted, and the only true statement about it is that searching is unavailable
- * for the next minute. Raising the first for the second would page an owner about a page that no
- * longer exists.
+ * results page in a browser that has already been closed: there is nothing to take over and nobody
+ * needs to be interrupted. Raising the first for the second would page an owner about a page that
+ * no longer exists.
  */
 export class SearchWallError extends Error {
   constructor(readonly wall: BotWall) {
@@ -815,9 +814,17 @@ export const botWallMessage = (wall: BotWallReport | BotWall): string => {
  * closed to the browser, and nobody has to open anything. Saying so precisely matters because the
  * agent acts on this sentence - told the web was gone, it would stop researching, which is the
  * failure the whole route was rebuilt to end.
+ *
+ * It used to say searching would be available again in about a minute, and to search again shortly.
+ * That was the backoff timer described as if it were a prognosis, and on the deployment this
+ * product is built for it was simply false: a server's address is what most engines are refusing,
+ * so the next attempt meets the same challenge, and the one after that. Every retry the sentence
+ * invited was a turn and a bill spent to be refused again. What it says now is the part that is
+ * actually known - this engine did not answer, from here - and it names the routes that do not go
+ * through it, without promising that waiting fixes anything.
  */
 export const searchWallMessage = (wall: BotWall): string =>
-  `Blocked by ${wall.vendor}: the search engine answered with an anti-bot challenge instead of results (${wall.reason}). Nothing else is affected - the browser, every site and every other tool still work, and searching is available again in about a minute. Do not touch the challenge. Read a source you already have the address of, or open a different search engine in the browser, and search again shortly.`;
+  `Blocked by ${wall.vendor}: the search engine answered with an anti-bot challenge instead of results (${wall.reason}). Nothing else is affected - the browser, every site and every other tool still work. Do not touch the challenge, and do not simply repeat the same search: this engine is refusing this computer, not this query, so an immediate retry meets the same challenge. Read a source you already have the address of, or open a different search engine in the browser. If you needed search to make progress and have no other way in, say so and stop rather than guessing at addresses.`;
 
 /** Actions whose approval depends on which control they land on, so preflight must resolve it. */
 const ELEMENT_POLICY_ACTIONS: BrowserAction['type'][] = [

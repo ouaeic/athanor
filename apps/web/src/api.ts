@@ -32,7 +32,7 @@ import type {
   User
 } from './types.js';
 import type { UsageResponse } from './usage-model.js';
-import type { WebSearchRoutes } from './web-search-route.js';
+import type { WebSearchRoute } from './web-search-route.js';
 import {
   notificationSettingsFromResponse,
   type NotificationSettings,
@@ -58,8 +58,8 @@ export interface ProviderSettings {
   modelId: string | null;
   hasApiKey: boolean;
   enforceZeroDataRetention: boolean;
-  /** Where a web search would be answered on each privacy route, under this credential. */
-  webSearch?: WebSearchRoutes;
+  /** Where a web search would be answered under this credential. */
+  webSearch?: WebSearchRoute;
 }
 
 let nativeGateway = false;

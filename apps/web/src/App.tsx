@@ -76,7 +76,7 @@ import {
   type Attachment
 } from './attachments.js';
 import { Composer } from './Composer.js';
-import { webSearchNote, webSearchRouteFor } from './web-search-route.js';
+import { webSearchNote } from './web-search-route.js';
 
 const Inspector = lazy(() =>
   import('./Inspector.js').then(({ Inspector: InspectorComponent }) => ({
@@ -663,12 +663,8 @@ export function App() {
     data?.models.find((model) => model.id === modelId)?.privacyRoute ??
     data?.models.find((model) => model.availability === 'available')?.privacyRoute ??
     'provider_zdr';
-  /*
-   * The route the search would take from here. An open conversation was started on a privacy route
-   * and keeps it for life, so it answers for itself; an empty composer answers for the route the
-   * model about to be used belongs to.
-   */
-  const webRoute = webSearchRouteFor(data?.instance.webSearch, task?.privacyRoute ?? privacyRoute);
+  /* The route a search takes from this box, which is a fact about the box rather than the tab. */
+  const webRoute = data?.instance.webSearch;
   const taskIsActive = isLiveTask(task);
   /*
    * A stopped conversation continues in place.

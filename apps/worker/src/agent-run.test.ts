@@ -1293,16 +1293,42 @@ describe('the web route a run is pinned to', () => {
     expect(stated?.summary).toContain('could not check this against your spending caps');
   });
 
-  it('keeps the whole web in house on a zero-retention conversation', async () => {
-    // The default posture, and the one that must never depend on a caller passing the right flag:
-    // a provider-side search would send the query - routinely the most revealing sentence in a
-    // conversation - to a third party with the zero-retention badge still showing.
+  it('keeps the whole web in house on an endpoint with no search service to offer', async () => {
+    // Not a privacy refusal - a capability one. Sending a provider tool name to an endpoint that
+    // has never heard of it is a request that fails, so an unrecognised endpoint arrives refused.
     const { log } = await runOnce(makeTask(), config({ TASK_MAX_STEPS: 1 }), [model]);
     const request = log.modelRequests[0];
     expect(toolNames(request)).toEqual(
       expect.arrayContaining(['web_search', 'parallel_web_read'])
     );
     expect(toolNames(request)).not.toContain('openrouter:web_search');
+  });
+
+  /**
+   * The box this wave was written for.
+   *
+   * A credential that enforces zero data retention is the shipped default, and it used to take
+   * provider-side search off the run - which on a server is the only search that works, because a
+   * datacenter address is answered with an anti-bot challenge instead of results. The owner was
+   * never offered that trade and it bought nothing: the retention promise covers inference routing
+   * and says in terms that it does not cover tools, so the query sat outside it either way.
+   *
+   * What the run is held to instead is the disclosure, and both halves are asserted here - the
+   * provider block that keeps the inference request zero-retention, and the sentence telling the
+   * model its queries now leave this computer.
+   */
+  it('searches on the provider from a zero-retention box, and tells the run that it does', async () => {
+    const { log, probe } = await runOnce(
+      standardTask(),
+      config({ AI_PROVIDER: 'openrouter', AI_REQUIRE_ZDR: true, TASK_MAX_STEPS: 1 }),
+      [openrouterModel]
+    );
+    const names = toolNames(log.modelRequests[0]);
+    expect(names).toContain('openrouter:web_search');
+    expect(names).not.toContain('web_search');
+    expect(
+      probe.events.find((entry) => entry.summary.includes("model provider's search service"))
+    ).toBeDefined();
   });
 
   it('sends the provider’s tools and withdraws the in-house pair they stand in for', async () => {
