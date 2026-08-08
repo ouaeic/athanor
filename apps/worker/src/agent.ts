@@ -120,6 +120,7 @@ import {
   approvalRequirement,
   isMutatingToolCall,
   isQuarantinedDownloadPath,
+  surfaceActionRequest,
   untrustedShellOrigin,
   writesOnlyDurableInstructions,
   type ApprovalContext
@@ -5236,7 +5237,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           task.id,
           consequentialApproved ? ['browser.control', 'browser.consequential'] : 'browser.control',
           `${root}/browser/action`,
-          call.arguments.action
+          surfaceActionRequest(call.arguments)
         );
       case 'desktop_observe':
         return this.#runner.call(
@@ -5260,7 +5261,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           task.id,
           consequentialApproved ? ['desktop.control', 'desktop.consequential'] : 'desktop.control',
           `${root}/desktop/action`,
-          call.arguments.action
+          surfaceActionRequest(call.arguments)
         );
       case 'connector_list':
         return (await this.store.listConnectors(task.userId))
@@ -5435,7 +5436,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         task.id,
         `${surface}.read`,
         `/v1/workspaces/${task.workspaceId}/${surface}/preflight`,
-        call.arguments.action
+        surfaceActionRequest(call.arguments)
       );
       if (policy.sensitiveInput) {
         return {
@@ -7598,14 +7599,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
                 preview: approval.preview,
                 tool: call.name,
                 arguments: approval.handoffOnly
-                  ? {
-                      action: {
-                        type: textValue(
-                          (call.arguments.action as { type?: unknown } | undefined)?.type,
-                          'secure_input'
-                        )
-                      }
-                    }
+                  ? { action: textValue(call.arguments.action, 'secure_input') }
                   : call.arguments
               },
               key,

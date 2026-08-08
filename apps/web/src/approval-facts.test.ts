@@ -44,7 +44,8 @@ describe('what the card states about the request', () => {
     const facts = approvalFacts(
       approval('browser_action', {
         purpose: 'Continue reading the article',
-        action: { type: 'click', selector: 'button#confirm-transfer' }
+        action: 'click',
+        selector: 'button#confirm-transfer'
       })
     );
     expect(facts).toContainEqual({ label: 'Does', value: 'Click' });
@@ -55,13 +56,11 @@ describe('what the card states about the request', () => {
     const facts = approvalFacts(
       approval('browser_action', {
         purpose: 'Fill in the form',
-        action: {
-          type: 'batch',
-          actions: [
-            { type: 'type', selector: '#amount', text: '5000' },
-            { type: 'click', selector: '#submit' }
-          ]
-        }
+        action: 'batch',
+        actions: [
+          { action: 'type', selector: '#amount', text: '5000' },
+          { action: 'click', selector: '#submit' }
+        ]
       })
     );
     expect(facts[0]?.label).toBe('Runs 2 steps');
@@ -117,7 +116,8 @@ describe('where the request reaches', () => {
     expect(
       approvalDestinations(
         approval('browser_action', {
-          action: { type: 'navigate', url: 'https://bank.example/pay' }
+          action: 'navigate',
+          url: 'https://bank.example/pay'
         })
       )
     ).toEqual([{ host: 'bank.example', url: 'https://bank.example/pay', carriedCharacters: 3 }]);
@@ -143,7 +143,8 @@ describe('where the request reaches', () => {
       approvalDestinations(
         approval('browser_action', {
           purpose: 'Just reading https://trusted.example/docs',
-          action: { type: 'click', selector: '#go' }
+          action: 'click',
+          selector: '#go'
         })
       )
     ).toEqual([]);

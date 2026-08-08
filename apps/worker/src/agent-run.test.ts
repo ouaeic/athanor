@@ -3209,10 +3209,13 @@ describe('how full the window is believed to be', () => {
           {
             finish_reason: 'tool_calls',
             delta: {
-              // Real bulk, so there is something to condense - but only about 3k tokens of it by
-              // the characters-divided-by-four estimate, well under the trigger. What the provider
-              // reports is the number under test.
-              content: 'x'.repeat(40_000),
+              // Real bulk, so there is something to condense. It was 40,000 characters, which was
+              // enough only while the tool catalogue was its old size: the catalogue is subtracted
+              // from the input budget the trigger is a share of, so shrinking the catalogue by two
+              // thousand tokens raised the threshold and the estimate stopped reaching it. That is
+              // the right behaviour and the wrong calibration for a test about which *number* is
+              // believed, so the fixture now clears the trigger with room rather than by a hair.
+              content: 'x'.repeat(120_000),
               tool_calls: [
                 {
                   index: 0,

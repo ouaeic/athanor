@@ -100,13 +100,11 @@ describe('the card that asks before something irreversible', () => {
         preview: {
           tool: 'browser_action',
           arguments: {
-            action: {
-              type: 'batch',
-              actions: [
-                { type: 'type', selector: '#amount', text: '5000' },
-                { type: 'click', selector: '#submit' }
-              ]
-            }
+            action: 'batch',
+            actions: [
+              { action: 'type', selector: '#amount', text: '5000' },
+              { action: 'click', selector: '#submit' }
+            ]
           }
         }
       })

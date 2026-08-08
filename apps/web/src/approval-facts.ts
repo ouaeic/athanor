@@ -199,41 +199,46 @@ const stepVerbs: Record<string, string> = {
 
 const stepVerb = (type: string): string => stepVerbs[type] ?? type.replaceAll('_', ' ');
 
+/*
+ * The verb and its fields are siblings, not a nested object.
+ *
+ * browser_action and desktop_action used to declare a variant per verb and carry the chosen one
+ * under `action`; they now declare one property bag with the verb in `action` as a string, which is
+ * about five kilobytes cheaper per request. The card reads the same fields it always read - this is
+ * only where they sit.
+ */
 const browserFacts = (args: Record<string, unknown>): ApprovalFact[] => {
-  const action = record(args.action);
-  if (!action) return [];
-  const type = text(action.type);
-  const steps = Array.isArray(action.actions) ? action.actions : [];
+  const type = text(args.action);
+  const steps = Array.isArray(args.actions) ? args.actions : [];
   const facts: ApprovalFact[] = [];
   if (type === 'batch') {
-    // A batch is many actions wearing one type. What it is has to be the list, not the wrapper.
+    // A batch is many actions wearing one name. What it is has to be the list, not the wrapper.
     facts.push({
       label: `Runs ${steps.length} step${steps.length === 1 ? '' : 's'}`,
       value: clamp(
         steps
-          .map((step, index) => `${index + 1}. ${stepVerb(text(record(step)?.type, 'step'))}`)
+          .map((step, index) => `${index + 1}. ${stepVerb(text(record(step)?.action, 'step'))}`)
           .join('  ·  ')
       )
     });
   } else if (type) {
     facts.push({ label: 'Does', value: stepVerb(type) });
   }
-  facts.push(...fact('Selector', text(action.selector)));
-  facts.push(...fact('Types', text(action.text)));
-  facts.push(...fact('Key', text(action.key)));
-  facts.push(...fact('Sends files', list(action.paths).join(', ')));
-  facts.push(...fact('Answers the dialog with', text(action.response)));
+  facts.push(...fact('Selector', text(args.selector)));
+  facts.push(...fact('Types', text(args.text)));
+  facts.push(...fact('Key', text(args.key)));
+  facts.push(...fact('Sends files', list(args.paths).join(', ')));
+  facts.push(...fact('Answers the dialog with', text(args.response)));
   return facts;
 };
 
 const desktopFacts = (args: Record<string, unknown>): ApprovalFact[] => {
-  const action = record(args.action);
   const facts = fact('Application', text(args.application) || text(args.name));
-  if (!action) return facts;
-  facts.push(...fact('Does', action.type ? stepVerb(text(action.type)) : ''));
-  facts.push(...fact('Control', text(action.nodeId)));
-  facts.push(...fact('Types', text(action.text)));
-  facts.push(...fact('Key', text(action.key)));
+  const type = text(args.action);
+  facts.push(...fact('Does', type ? stepVerb(type) : ''));
+  facts.push(...fact('Control', text(args.nodeId)));
+  facts.push(...fact('Types', text(args.text)));
+  facts.push(...fact('Key', text(args.key)));
   return facts;
 };
 

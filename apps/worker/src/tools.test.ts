@@ -9,6 +9,7 @@ import {
   isMutatingToolCall,
   memoryApprovalReason,
   scriptCommands,
+  surfaceActionRequest,
   untrustedShellOrigin
 } from './tools.js';
 import { MAX_NOTICES_PER_TURN } from './agent.js';
@@ -41,7 +42,8 @@ describe('agent approval policy', () => {
   it('requires approval for external submissions and destructive commands', () => {
     expect(
       approvalRequirement('browser_action', {
-        action: { type: 'click', selector: '[data-athanor-ref="oc-4"]' },
+        action: 'click',
+        selector: '[data-athanor-ref="oc-4"]',
         purpose: 'Submit the job application'
       })?.sideEffect
     ).toBe('external_consequential');
@@ -50,25 +52,76 @@ describe('agent approval policy', () => {
     ).toBe('external_consequential');
     expect(
       approvalRequirement('desktop_action', {
-        action: { type: 'invoke', nodeId: '0/2' },
+        action: 'invoke',
+        nodeId: '0/2',
         purpose: 'Submit the application from the installed desktop app'
       })?.sideEffect
     ).toBe('external_consequential');
   });
 
+  /*
+   * The verb has two spellings and both have to mean the same thing everywhere.
+   *
+   * `action` is what the tool declares; `type` is what the runner's union uses, what this tool's
+   * own `steps:[{index,type,…}]` result reports back, and what a turn already in flight replays out
+   * of its own history after a deploy. While the approval broker read one and the request builder
+   * read the other, `{action:'hover', type:'click_at'}` raised no card - hover is on the review-mode
+   * read-only list - and executed a click at coordinates, and the same shape inside a batch step
+   * skipped the per-step scan while rebuilding into a request the runner accepts.
+   */
+  it('cannot be told one verb by the gate and another by the runner', () => {
+    const shadowed = {
+      action: 'hover',
+      selector: '#x',
+      type: 'click_at',
+      x: 500,
+      y: 400,
+      purpose: 'Pay the invoice'
+    };
+    // The declared verb wins in both places, so the stray `type` cannot smuggle a coordinate click
+    // past a gate that was shown a hover. A hover raises no card because it is a hover - and what
+    // is sent is a hover too, which is the whole of the property.
+    for (const mode of ['balanced', 'review'] as const)
+      expect(approvalRequirement('browser_action', shadowed, mode)).toBeNull();
+    expect(surfaceActionRequest(shadowed)).toEqual({
+      type: 'hover',
+      selector: '#x',
+      x: 500,
+      y: 400
+    });
+    // Spelled the other way round, it is a coordinate click to both, and that does raise a card.
+    const clickAt = { action: 'click_at', x: 500, y: 400, purpose: 'Pay the invoice' };
+    expect(approvalRequirement('browser_action', clickAt)?.sideEffect).toBe(
+      'external_consequential'
+    );
+    expect(surfaceActionRequest(clickAt)).toEqual({ type: 'click_at', x: 500, y: 400 });
+
+    // A step written the old way is understood rather than skipped, so its floor still applies.
+    const oldShapeStep = {
+      action: 'batch',
+      purpose: 'Fill the application',
+      actions: [{ type: 'click', selector: 'button#submit-application' }]
+    };
+    expect(approvalRequirement('browser_action', oldShapeStep)?.sideEffect).toBe(
+      'external_consequential'
+    );
+    expect(surfaceActionRequest(oldShapeStep)).toEqual({
+      type: 'batch',
+      actions: [{ type: 'click', selector: 'button#submit-application' }]
+    });
+  });
+
   it('judges a batched browser action by its steps, not by the word "batch"', () => {
-    // A batch is up to twenty-four actions carrying one type. While approval keyed on that type,
-    // wrapping the submit click in a batch with the fields ahead of it walked the whole external
-    // -submission floor: no card, no record, and the form was gone.
+    // A batch is up to twenty-four actions carrying one action name. While approval keyed on that
+    // name, wrapping the submit click in a batch with the fields ahead of it walked the whole
+    // external-submission floor: no card, no record, and the form was gone.
     const submitted = approvalRequirement('browser_action', {
-      action: {
-        type: 'batch',
-        actions: [
-          { type: 'type', selector: '#name', text: 'Ada' },
-          { type: 'type', selector: '#email', text: 'ada@example.com' },
-          { type: 'click', selector: 'button#submit-application' }
-        ]
-      },
+      action: 'batch',
+      actions: [
+        { action: 'type', selector: '#name', text: 'Ada' },
+        { action: 'type', selector: '#email', text: 'ada@example.com' },
+        { action: 'click', selector: 'button#submit-application' }
+      ],
       purpose: 'Fill the application and submit it'
     });
     expect(submitted?.sideEffect).toBe('external_consequential');
@@ -77,13 +130,11 @@ describe('agent approval policy', () => {
     // The strongest step wins, and it is found wherever it sits in the batch.
     expect(
       approvalRequirement('browser_action', {
-        action: {
-          type: 'batch',
-          actions: [
-            { type: 'upload', selector: '#cv', paths: ['workspace/cv.pdf'] },
-            { type: 'type', selector: '#note', text: 'hello' }
-          ]
-        },
+        action: 'batch',
+        actions: [
+          { action: 'upload', selector: '#cv', paths: ['workspace/cv.pdf'] },
+          { action: 'type', selector: '#note', text: 'hello' }
+        ],
         purpose: 'Attach the CV'
       })
     ).toMatchObject({ sideEffect: 'external_consequential' });
@@ -91,14 +142,12 @@ describe('agent approval policy', () => {
     // A batch that only fills fields is still an ordinary batch.
     expect(
       approvalRequirement('browser_action', {
-        action: {
-          type: 'batch',
-          actions: [
-            { type: 'click', selector: '#name' },
-            { type: 'type', selector: '#name', text: 'Ada' },
-            { type: 'select_option', selector: '#country', values: ['ZA'] }
-          ]
-        },
+        action: 'batch',
+        actions: [
+          { action: 'click', selector: '#name' },
+          { action: 'type', selector: '#name', text: 'Ada' },
+          { action: 'select_option', selector: '#country', values: ['ZA'] }
+        ],
         purpose: 'Fill the applicant details'
       })
     ).toBeNull();
@@ -109,7 +158,8 @@ describe('agent approval policy', () => {
     expect(approvalRequirement('file_write', { path: 'report.md' })).toBeNull();
     expect(
       approvalRequirement('desktop_action', {
-        action: { type: 'focus', nodeId: '0/2' },
+        action: 'focus',
+        nodeId: '0/2',
         purpose: 'Focus the report title'
       })
     ).toBeNull();
@@ -119,6 +169,90 @@ describe('agent approval policy', () => {
         input: { limit: 10 }
       })
     ).toBeNull();
+  });
+
+  it('still stops on every browser and desktop action that ever had a floor', () => {
+    /*
+     * One row per gate, because the gates and the schema were changed in the same commit.
+     *
+     * browser_action and desktop_action used to arrive as a nested object tagged with `type` and
+     * now arrive as a flat bag whose verb is a sibling `action` string - a five-kilobyte saving on
+     * every request, and a rewrite of the exact comparisons that decide whether the owner is asked.
+     * A gate that quietly stopped matching would not fail any other test in this file: the call
+     * would simply run, and the first anybody heard of it would be a submitted form or an uploaded
+     * CV. So each one is named here with the shape it now reads.
+     */
+    const floors: ReadonlyArray<readonly [string, Record<string, unknown>, string]> = [
+      ['browser_action', { action: 'upload', selector: '#cv', paths: ['workspace/cv.pdf'] }, 'cv'],
+      ['browser_action', { action: 'click_at', x: 100, y: 200 }, 'ambiguous'],
+      ['browser_action', { action: 'press', key: 'Enter' }, 'submit the focused form'],
+      ['browser_action', { action: 'dialog', response: 'accept' }, 'page confirmation'],
+      ['browser_action', { action: 'click', selector: 'button#pay-now' }, 'Selector'],
+      ['browser_action', { action: 'double_click', selector: '#confirm' }, 'Selector'],
+      ['desktop_action', { action: 'click_at', x: 10, y: 10 }, 'ambiguous'],
+      ['desktop_action', { action: 'drag', fromX: 1, fromY: 1, toX: 2, toY: 2 }, 'ambiguous'],
+      ['desktop_action', { action: 'press', key: 'Enter' }, 'desktop control'],
+      ['desktop_action', { action: 'invoke', nodeId: '0/2' }, 'Accessibility node']
+    ];
+    for (const [tool, args, evidence] of floors) {
+      const card = approvalRequirement(tool, { ...args, purpose: 'Send the payment' });
+      expect(card?.sideEffect, `${tool} ${String(args.action)} raises no card`).toBe(
+        'external_consequential'
+      );
+      expect(card?.preview, `${tool} ${String(args.action)}`).toContain(evidence);
+    }
+    // A prompt dialog asks for private text, which is a different card and a different remedy.
+    expect(
+      approvalRequirement('browser_action', {
+        action: 'dialog',
+        response: 'accept',
+        promptText: 'password',
+        purpose: 'Answer the prompt'
+      })?.preview
+    ).toContain('secure input');
+    // And review mode holds the floor open for everything that is not plainly a read.
+    expect(
+      approvalRequirement('browser_action', { action: 'type', selector: '#a', text: 'x' }, 'review')
+        ?.sideEffect
+    ).toBe('workspace_write');
+    expect(
+      approvalRequirement('desktop_action', { action: 'set_text', nodeId: '0/2' }, 'review')
+        ?.sideEffect
+    ).toBe('workspace_write');
+    expect(
+      approvalRequirement('browser_action', { action: 'hover', selector: '#a' }, 'review')
+    ).toBeNull();
+  });
+
+  it('shows the owner where a tainted turn is steering the browser, batched or not', () => {
+    // The destination card reads the navigate url out of the same flat bag. It used to read
+    // action.url, and a batch hides a navigate behind one wrapper, so both are checked.
+    const tainted = { taintSources: ['web page hostile.example'], ownerText: '' };
+    expect(
+      approvalRequirement(
+        'browser_action',
+        { action: 'navigate', url: 'https://elsewhere.example/collect?d=1' },
+        'balanced',
+        tainted
+      )
+    ).toMatchObject({
+      sideEffect: 'external_reversible',
+      action: 'Allow this page to elsewhere.example'
+    });
+    expect(
+      approvalRequirement(
+        'browser_action',
+        {
+          action: 'batch',
+          actions: [{ action: 'navigate', url: 'https://elsewhere.example/collect?d=1' }]
+        },
+        'balanced',
+        tainted
+      )
+    ).toMatchObject({
+      sideEffect: 'external_reversible',
+      action: 'Allow this page to elsewhere.example'
+    });
   });
 
   it('requires approval for connector writes and stronger approval for deletes', () => {
@@ -430,7 +564,7 @@ describe('agent approval policy', () => {
     expect(
       approvalRequirement(
         'browser_action',
-        { action: { type: 'click', selector: 'button[type=submit]' }, purpose: 'Submit form' },
+        { action: 'click', selector: 'button[type=submit]', purpose: 'Submit form' },
         'autonomous'
       )?.sideEffect
     ).toBe('external_consequential');
@@ -634,14 +768,28 @@ describe('the size of the catalogue the model is sent', () => {
     // rectangle is the largest single accuracy gain available on that surface and it is one
     // screenshot. Three tools were deleted in between and their room is already spent.
     //
+    // Then lowered, for the first time, from 60,200 to 51,900. Nothing was withdrawn to do it: the
+    // catalogue measured 60,077 bytes and now measures 51,751, and it still declares every tool,
+    // every action and every field it declared before. The saving was scaffolding. browser_action
+    // and desktop_action stated their actions as a twenty- and a ten-variant `oneOf`, in which
+    // roughly two thirds of the bytes were the repeated
+    // {"type":"object","additionalProperties":false,…,"properties":{"type":{"const":…}}} frame and
+    // the selector and tabId definitions written out six and seventeen times; re-stated as a flat
+    // property bag with a sibling `action` enum - the shape connector_action already used - they
+    // cost 3.4 kB and 2.2 kB instead of 8.3 kB and 3.8 kB. connector_action's 48-field input bag
+    // then gave up the per-field lengths and prose that the Zod schemas in @athanor/core re-check
+    // anyway, and a handful of "because" clauses that only restated the operating contract went.
+    //
     // The number moves for a capability and not for prose, which is the distinction this ceiling
-    // exists to enforce.
-    expect(bytes).toBeLessThan(60_200);
-    // Where the bytes actually are, because it is not where it looks. browser_action serializes to
-    // ~9.4 kB and only ~1 kB of that is prose: the rest is nineteen declared action variants, and
-    // every one of them is an interface fact a model would otherwise guess at and burn a round
-    // trip on. Prose is what gets trimmed here; schemas are the substrate the model reasons over
-    // and are deliberately not the place to save tokens.
+    // exists to enforce - and it moves down for an encoding, which is the other half of the same
+    // rule.
+    expect(bytes).toBeLessThan(51_900);
+    // Where the bytes actually are, because it is not where it looks. connector_action is now the
+    // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
+    // union of what twenty-four actions across mail, calendar and repositories accept. Those are
+    // interface facts a model would otherwise guess at and burn a round trip on. Prose that
+    // restates the system prompt is what gets trimmed here; what a call has to contain is not
+    // prose, and is deliberately not where tokens are saved.
     for (const tool of sent)
       expect(Buffer.byteLength(tool.description), `${tool.name} description`).toBeLessThan(1_400);
   });
@@ -862,7 +1010,7 @@ describe('which calls count as changing something', () => {
   it('treats writes, external actions and consequential commands as changes', () => {
     expect(isMutatingToolCall('file_write', { path: 'a', content: 'b' })).toBe(true);
     expect(isMutatingToolCall('file_patch', {})).toBe(true);
-    expect(isMutatingToolCall('browser_action', { action: { type: 'click' } })).toBe(true);
+    expect(isMutatingToolCall('browser_action', { action: 'click' })).toBe(true);
     expect(isMutatingToolCall('shell', { executable: 'rm', args: ['-rf', 'build'] })).toBe(true);
     expect(isMutatingToolCall('shell', { executable: 'git', args: ['push'] })).toBe(true);
     expect(isMutatingToolCall('schedule', { action: 'create' })).toBe(true);
@@ -1293,40 +1441,171 @@ describe('what a tainted turn may still do through shell', () => {
 });
 
 describe('declared action shapes', () => {
-  const shapes = (name: string): Array<Record<string, unknown>> => {
-    const tool = agentTools.find((entry) => entry.name === name);
-    const action = (tool?.parameters.properties as Record<string, { oneOf?: unknown }>).action;
-    return (action?.oneOf ?? []) as Array<Record<string, unknown>>;
+  const properties = (name: string): Record<string, Record<string, unknown>> =>
+    (agentTools.find((entry) => entry.name === name)?.parameters.properties ?? {}) as Record<
+      string,
+      Record<string, unknown>
+    >;
+  const verbs = (name: string): string[] => (properties(name).action?.enum ?? []) as string[];
+  const verbGuide = (name: string): string => {
+    const described = properties(name).action?.description;
+    return typeof described === 'string' ? described : '';
   };
-  const named = (name: string, type: string): Record<string, unknown> | undefined =>
-    shapes(name).find(
-      (shape) => (shape.properties as { type?: { const?: string } })?.type?.const === type
-    );
 
-  it('names the browser fields instead of burying them in prose', () => {
-    const type = named('browser_action', 'type');
-    expect(Object.keys((type?.properties ?? {}) as object)).toEqual(
-      expect.arrayContaining(['selector', 'text', 'mode', 'tabId'])
+  it('names every browser field at the top level and every verb in the enum', () => {
+    // These were twenty `oneOf` variants, each repeating
+    // {"type":"object","additionalProperties":false,…,"properties":{"type":{"const":…}}} and each
+    // repeating the selector and tabId definitions - about five kilobytes of scaffolding on every
+    // request for twenty facts. The facts are what matter and they are all still here: one typed
+    // declaration per field, one enum entry per verb, and the required set per verb in the enum's
+    // own description.
+    expect(Object.keys(properties('browser_action'))).toEqual(
+      expect.arrayContaining([
+        'action',
+        'url',
+        'selector',
+        'text',
+        'mode',
+        'values',
+        'paths',
+        'key',
+        'deltaX',
+        'deltaY',
+        'state',
+        'urlIncludes',
+        'timeoutMs',
+        'activate',
+        'x',
+        'y',
+        'response',
+        'promptText',
+        'tabId',
+        'actions',
+        'purpose'
+      ])
     );
-    expect(type?.required).toEqual(['type', 'selector', 'text']);
-    // The approval broker reads action.paths structurally; the model can now see it exists.
-    expect(Object.keys((named('browser_action', 'upload')?.properties ?? {}) as object)).toContain(
-      'paths'
-    );
-    expect(shapes('browser_action').length).toBeGreaterThan(12);
+    expect(verbs('browser_action')).toEqual([
+      'navigate',
+      'click',
+      'double_click',
+      'hover',
+      'type',
+      'select_option',
+      'upload',
+      'text_input',
+      'press',
+      'scroll',
+      'wait_for',
+      'back',
+      'reload',
+      'new_tab',
+      'select_tab',
+      'close_tab',
+      'inspect_tab',
+      'click_at',
+      'dialog',
+      'batch'
+    ]);
+    // The required set is the one thing that moved into prose, so it has to actually be there.
+    for (const [verb, field] of [
+      ['navigate', 'url'],
+      ['click', 'selector'],
+      ['type', 'text'],
+      ['select_option', 'values'],
+      ['upload', 'paths'],
+      ['press', 'key'],
+      ['scroll', 'deltaY'],
+      ['click_at', 'x'],
+      ['dialog', 'response'],
+      ['batch', 'actions']
+    ])
+      expect(
+        new RegExp(`\\b${verb}\\b[^.]*\\b${field}\\b`).test(verbGuide('browser_action')),
+        `the browser action enum never says that ${verb} takes ${field}`
+      ).toBe(true);
   });
 
   it('names the desktop fields the description previously only alluded to', () => {
-    expect(Object.keys((named('desktop_action', 'set_text')?.properties ?? {}) as object)).toEqual(
-      expect.arrayContaining(['nodeId', 'text'])
+    expect(Object.keys(properties('desktop_action'))).toEqual(
+      expect.arrayContaining([
+        'action',
+        'nodeId',
+        'actionIndex',
+        'text',
+        'key',
+        'direction',
+        'amount',
+        'x',
+        'y',
+        'width',
+        'height',
+        'button',
+        'clicks',
+        'fromX',
+        'fromY',
+        'toX',
+        'toY',
+        'durationMs',
+        'milliseconds',
+        'purpose'
+      ])
     );
-    expect(named('desktop_action', 'drag')?.required).toEqual([
-      'type',
-      'fromX',
-      'fromY',
-      'toX',
-      'toY'
+    expect(verbs('desktop_action')).toEqual([
+      'invoke',
+      'focus',
+      'set_text',
+      'text_input',
+      'zoom',
+      'press',
+      'scroll',
+      'click_at',
+      'drag',
+      'wait'
     ]);
+    for (const [verb, field] of [
+      ['invoke', 'nodeId'],
+      ['set_text', 'text'],
+      ['zoom', 'height'],
+      ['drag', 'toY'],
+      ['wait', 'milliseconds']
+    ])
+      expect(
+        new RegExp(`\\b${verb}\\b[^.]*\\b${field}\\b`).test(verbGuide('desktop_action')),
+        `the desktop action enum never says that ${verb} takes ${field}`
+      ).toBe(true);
+  });
+
+  it('hands the runner the nested action its union is discriminated on', () => {
+    // The wire shape is flat and the contract is not. If this remap ever stopped happening the
+    // runner would reject every call, and `purpose` - the model's sentence for the owner's card -
+    // would ride along into the request, which is not what it is for.
+    expect(
+      surfaceActionRequest({ action: 'navigate', url: 'https://example.test', purpose: 'Read it' })
+    ).toEqual({ type: 'navigate', url: 'https://example.test' });
+    expect(
+      surfaceActionRequest({
+        action: 'batch',
+        purpose: 'Fill it in',
+        actions: [
+          { action: 'type', selector: '#a', text: 'Ada' },
+          { action: 'click', selector: '#go' }
+        ]
+      })
+    ).toEqual({
+      type: 'batch',
+      actions: [
+        { type: 'type', selector: '#a', text: 'Ada' },
+        { type: 'click', selector: '#go' }
+      ]
+    });
+    // Nothing descends past one level: the runner's union has no nested batch, so a model that
+    // sends one gets a step the runner refuses rather than a remap that recurses on its input.
+    expect(
+      surfaceActionRequest({
+        action: 'batch',
+        actions: [{ action: 'batch', actions: [{ action: 'click', selector: '#x' }] }]
+      })
+    ).toEqual({ type: 'batch', actions: [{ type: 'batch' }] });
   });
 
   it('declares each schedule kind, including the two fields the daily brief needs', () => {
