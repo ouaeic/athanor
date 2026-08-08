@@ -123,6 +123,7 @@ import {
   surfaceActionRequest,
   untrustedShellOrigin,
   writesOnlyDurableInstructions,
+  writesOnlyProse,
   type ApprovalContext
 } from './tools.js';
 
@@ -155,7 +156,14 @@ interface AgentState {
   mutated?: boolean;
   turnToolResults?: Record<
     string,
-    { name: string; success: boolean; mutating?: boolean; briefOnly?: boolean }
+    {
+      name: string;
+      success: boolean;
+      mutating?: boolean;
+      briefOnly?: boolean;
+      /** A change nothing can execute, so the write is the only observation there is. */
+      proseOnly?: boolean;
+    }
   >;
   /**
    * Consecutive rejected `finish` calls this turn. Persisted rather than kept in the loop frame so a
@@ -1240,24 +1248,50 @@ export const completionVerification = (
     return { ok: false, reason: 'Verification status must be verified or not_applicable.' };
   const status = textValue(input.status) as CompletionVerification['status'];
   const rawEvidence = Array.isArray(input.evidence) ? input.evidence : [];
+  /*
+   * An id on its own is enough, and a full item is still accepted.
+   *
+   * This asked for three levels of nesting at the end of a long turn - a status enum, an array of
+   * objects each needing a claim and an enum of its own, and a second array - while every other
+   * tool in the catalogue takes flat scalars. A small fast model fumbles it: measured on one
+   * research task, the agent wrote a correct answer and then spent about ten more turns being
+   * refused for unparseable arguments and answering in prose instead. Nothing about the guarantee
+   * needed that shape. The id is the part that carries it; the claim is a line for the card, and
+   * defaults to the summary when the model did not write one; the source is inferable from the id.
+   */
   const evidence = rawEvidence.flatMap((item) => {
+    if (typeof item === 'string') {
+      const toolCallId = item.trim();
+      return toolCallId ? [{ claim: '', source: 'tool_result' as const, toolCallId }] : [];
+    }
     if (!item || typeof item !== 'object') return [];
     const record = item as Record<string, unknown>;
     const claim = textValue(record.claim).trim().slice(0, 2_000);
-    const source = textValue(record.source);
-    if (!claim || !['tool_result', 'published_artifact', 'user_visible_result'].includes(source))
-      return [];
     const toolCallId = textValue(record.toolCallId).trim();
-    return [
-      {
-        claim,
-        source: source as CompletionVerification['evidence'][number]['source'],
-        ...(toolCallId ? { toolCallId } : {})
-      }
-    ];
+    // Named when the model named it; otherwise read off what it cited, which is the only thing
+    // these three values were ever distinguishing.
+    const declared = textValue(record.source);
+    /*
+     * Inferred only towards the strict reading. `user_visible_result` is the one source that skips
+     * the ordering check, so it is never guessed at: an item that cites a call is a tool result,
+     * and an item that cites nothing is invalid unless the model said user_visible_result itself.
+     * Guessing it here would have turned `{claim:"I did it"}` into a passing verification, which is
+     * the confident false completion this whole mechanism exists to refuse.
+     */
+    const source = ['tool_result', 'published_artifact', 'user_visible_result'].includes(declared)
+      ? (declared as CompletionVerification['evidence'][number]['source'])
+      : toolCallId
+        ? ('tool_result' as const)
+        : undefined;
+    if (!source) return [];
+    return [{ claim, source, ...(toolCallId ? { toolCallId } : {}) }];
   });
   if (evidence.length !== rawEvidence.length)
-    return { ok: false, reason: 'Every verification item needs a claim and valid source.' };
+    return {
+      ok: false,
+      reason:
+        'Every verification item needs either the id of a tool call from this turn, or a claim saying what the user can see.'
+    };
   const successful = Object.entries(state.turnToolResults ?? {}).filter(
     ([, result]) => result.success && !DECLARATION_TOOLS.has(result.name)
   );
@@ -1340,7 +1374,18 @@ export const completionVerification = (
      * carries only the acknowledgement that a write happened, which is why it still needs
      * something after it.
      */
-    const observedItsOwnChange = state.turnToolResults?.[order[lastMutation] ?? '']?.name === 'shell';
+    /*
+     * A change is its own evidence when observing it separately could show nothing more.
+     *
+     * A shell result carries what the command printed and what it exited with. A write to a file
+     * nothing executes - a report, a note, a CSV - carries the same weight for the same reason: the
+     * only "check" available is reading back a file the agent has just written, which proves that a
+     * file it wrote says what it wrote. Demanding it cost a research task about ten model turns
+     * after its answer was already on screen. Code and commands are unchanged: there the check is
+     * real, and it is still required.
+     */
+    const lastResult = state.turnToolResults?.[order[lastMutation] ?? ''];
+    const observedItsOwnChange = lastResult?.name === 'shell' || lastResult?.proseOnly === true;
     const floor = observedItsOwnChange ? lastMutation : lastMutation + 1;
     const grounded = evidence.some(
       (item) => item.toolCallId && order.indexOf(item.toolCallId) >= floor
@@ -5934,7 +5979,8 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       // Recorded, not subtracted from `mutating`: the approval card, the checkpoint set and
       // `state.mutated` all still treat a brief write as the change it is. Only the completion
       // contract reads this, because only there does "the last change" mean the work being proved.
-      ...(writesOnlyDurableInstructions(call.name, call.arguments) ? { briefOnly: true } : {})
+      ...(writesOnlyDurableInstructions(call.name, call.arguments) ? { briefOnly: true } : {}),
+      ...(writesOnlyProse(call.name, call.arguments) ? { proseOnly: true } : {})
     };
     const modelResult = boundedToolResultForModel(call.name, result, imageSummary);
     state.messages.push({

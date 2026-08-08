@@ -2156,6 +2156,51 @@ export const untrustedShellOrigin = (args: Record<string, unknown>): string | nu
  * already names, and only when every path the call wrote is one of them. A call that touched the
  * brief and a source file is still a change to the source file.
  */
+/**
+ * Files whose correctness nothing can execute: prose, notes, data written to be read.
+ *
+ * The completion rule demands evidence dated after the last change, and the way to produce it is to
+ * observe the change - run the tests, re-read the page, check the exit code. For a research report
+ * or a note there is nothing to run, so the only observation available is reading back a file the
+ * agent has just written, which proves that a file it wrote says what it wrote. Measured on one
+ * research task: a correct answer, a published report, and then about ten more model turns spent
+ * proving prose. A write is its own evidence here, exactly as a shell result is its own evidence
+ * for a command.
+ *
+ * Deliberately by extension and not by guessing at content: a `.ts` file is code whatever is in it,
+ * and a `.md` file is prose even when it contains a code block.
+ */
+const PROSE_EXTENSIONS = new Set([
+  '.md',
+  '.markdown',
+  '.mdx',
+  '.rst',
+  '.txt',
+  '.text',
+  '.adoc',
+  '.asciidoc',
+  '.org',
+  '.csv',
+  '.tsv',
+  '.log'
+]);
+
+export const isProsePath = (path: string): boolean => {
+  const last = path.toLowerCase().split(/[\\/]+/).filter(Boolean).at(-1) ?? '';
+  const dot = last.lastIndexOf('.');
+  return dot > 0 && PROSE_EXTENSIONS.has(last.slice(dot));
+};
+
+/** True when a call writes files and every one of them is prose. */
+export const writesOnlyProse = (name: string, args: Record<string, unknown>): boolean => {
+  // Only the two file tools. A shell command is judged on what it ran, and `writtenPaths` casts a
+  // deliberately wide net over a script - wide enough that one prose-looking token would speak for
+  // the whole command.
+  if (name !== 'file_write' && name !== 'file_patch') return false;
+  const paths = writtenPaths(name, args);
+  return paths.length > 0 && paths.every(isProsePath);
+};
+
 export const writesOnlyDurableInstructions = (
   name: string,
   args: Record<string, unknown>

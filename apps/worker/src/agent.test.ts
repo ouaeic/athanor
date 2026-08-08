@@ -1119,7 +1119,13 @@ describe('completion verification', () => {
   const state = (
     results: Record<
       string,
-      { name: string; success: boolean; mutating?: boolean; briefOnly?: boolean }
+      {
+        name: string;
+        success: boolean;
+        mutating?: boolean;
+        briefOnly?: boolean;
+        proseOnly?: boolean;
+      }
     >
   ) => ({
     messages: [],
@@ -1139,16 +1145,56 @@ describe('completion verification', () => {
     expect(checked.ok).toBe(true);
   });
 
-  it('rejects evidence that omits its source rather than silently dropping the item', () => {
-    // Dropping it would let a finish claim verification while citing nothing at all.
-    const checked = completionVerification(
-      state({ 'call-1': { name: 'file_write', success: true } }),
-      {
+  it('lets a written report stand as its own evidence, but not a code change', () => {
+    /*
+     * The rule wants an observation dated after the last change. For code and commands there is one
+     * to make - run it, read the exit code. For a research report there is not: the only check
+     * available is reading back a file the agent has just written, which proves that a file it
+     * wrote says what it wrote. That ceremony cost one research task about ten model turns after
+     * its answer was already on screen.
+     */
+    const prose = state({
+      'call-1': { name: 'file_write', success: true, mutating: true, proseOnly: true }
+    });
+    expect(
+      completionVerification(prose, { status: 'verified', evidence: ['call-1'] })
+    ).toMatchObject({ ok: true });
+    // Code is unchanged: there the check is real, so something has to come after the change.
+    const code = state({
+      'call-1': { name: 'file_write', success: true, mutating: true }
+    });
+    expect(completionVerification(code, { status: 'verified', evidence: ['call-1'] })).toMatchObject(
+      { ok: false }
+    );
+  });
+
+  it('takes an id as evidence, and still refuses a claim that cites nothing', () => {
+    /*
+     * The shape used to demand three levels of nesting - a status, an array of objects each with a
+     * claim and a source enum, and a second array - at the end of a long turn, while every other
+     * tool takes flat scalars. A small model fumbles it: measured on one research task, a correct
+     * answer was followed by about ten turns of rejected finishes and prose. The id is the part
+     * that carries the guarantee, so the id alone is enough and a full item still works.
+     */
+    const turn = state({ 'call-1': { name: 'file_write', success: true } });
+    expect(completionVerification(turn, { status: 'verified', evidence: ['call-1'] })).toMatchObject(
+      { ok: true }
+    );
+    // A source it did not bother to name is read off what it cited, which can only ever be stricter.
+    expect(
+      completionVerification(turn, {
         status: 'verified',
         evidence: [{ claim: 'Wrote the report', toolCallId: 'call-1' }]
-      }
-    );
-    expect(checked).toMatchObject({ ok: false });
+      })
+    ).toMatchObject({ ok: true });
+    // But `user_visible_result` is the one source that skips the ordering check, so it is never
+    // guessed at. A claim citing nothing is not verification.
+    expect(
+      completionVerification(turn, { status: 'verified', evidence: [{ claim: 'I did it' }] })
+    ).toMatchObject({ ok: false });
+    expect(
+      completionVerification(turn, { status: 'verified', evidence: ['no-such-call'] })
+    ).toMatchObject({ ok: false });
   });
 
   it('does not let writing the running brief invalidate the evidence already gathered', () => {
