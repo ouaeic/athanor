@@ -1003,7 +1003,14 @@ export const agentTools: ModelTool[] = [
   {
     name: 'publish_preview',
     description:
-      'Expose an app already listening on a port of this computer as a private link only the user can open, and place an Open button directly in chat. The link keeps working for as long as they keep using it; it closes on its own after a month with no visits, and they can revoke it at any time. Start the server first and bind it to 0.0.0.0. This is the route for a demo, a working prototype or anything the user alone should see; use publish_site only when they asked for a deployment the public can reach.',
+      /*
+       * The middle clause is here because of what the owner actually received. Asked to build a
+       * page and publish a link, the agent started a plain file server on the workspace and
+       * published its port - so the link opened on an index of every file in the workspace, the
+       * research PDFs included, and not on the page it had just written. The page was one path
+       * away and worked. Nothing in the tool had ever said which address the owner arrives at.
+       */
+      'Expose an app already listening on a port of this computer as a private link only the user can open, and place an Open button directly in chat. It closes after a month with no visits, and they can revoke it whenever they like. Start the server first, bind it to 0.0.0.0, and serve the app itself: the user lands on that port’s root, so a file server aimed at the workspace hands them an index of your files rather than what you built. Use publish_site only when they asked for a deployment the public can reach.',
     parameters: {
       type: 'object',
       additionalProperties: false,
