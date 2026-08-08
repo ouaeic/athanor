@@ -1891,6 +1891,22 @@ export function App() {
               modelName={namedModel}
               onOpenTask={setTaskId}
               onOpenSpendCaps={() => openSettings('ai')}
+              /*
+                A private preview's address is minted on request, not stored: only the hash of its
+                access token is kept, so the URL on the event has no token and answers 401. Asking
+                for one here is what the Preview tab has always done; the card at the end of "build
+                me something and give me a link I can open" handed over the address that does not.
+              */
+              onOpenPreview={(previewId) => {
+                void api
+                  .previewAccess(previewId)
+                  .then((preview) => {
+                    window.open(preview.url, '_blank', 'noreferrer');
+                  })
+                  .catch((cause: unknown) =>
+                    setError(describeFailure(cause, 'That preview could not be opened'))
+                  );
+              }}
               onStarter={(starter) => {
                 setPrompt(starter);
                 window.requestAnimationFrame(() => composer.current?.focus());

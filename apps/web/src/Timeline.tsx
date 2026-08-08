@@ -320,6 +320,7 @@ function AssistantMessage({
 function Event({
   event,
   onOpenSurface,
+  onOpenPreview,
   settled = false,
   compactCompletion = false,
   harness = [],
@@ -327,6 +328,8 @@ function Event({
 }: {
   event: TaskEvent;
   onOpenSurface?: (surface: Surface) => void;
+  /** Asks the server for a fresh, openable address for a private preview. */
+  onOpenPreview?: (previewId: string) => void;
   settled?: boolean;
   compactCompletion?: boolean;
   /** The acceptance checks the harness ran for this completion, where the turn declared any. */
@@ -514,6 +517,7 @@ function Event({
   }
   if (event.kind === 'preview') {
     const url = textValue(data.url);
+    const previewId = textValue(data.previewId);
     return (
       <div className="preview-chat-card">
         <span className="preview-chat-icon">
@@ -531,10 +535,24 @@ function Event({
         </div>
         <span className="artifact-actions">
           {onOpenSurface && <button onClick={() => onOpenSurface('preview')}>Preview</button>}
-          {url && (
+          {/*
+            A private preview is opened by asking for an address, not by holding one.
+            Its access token is minted once and only its hash is kept, so the URL carried on the
+            event has no token on it and answers 401 - which is what this button did, on the card
+            that appears at the end of "build me something and give me a link I can open". The
+            Preview tab always got this right; the card in the conversation did not.
+          */}
+          {textValue(data.visibility) === 'public' && url ? (
             <a href={url} target="_blank" rel="noreferrer">
               <ExternalLink /> Open
             </a>
+          ) : (
+            previewId &&
+            onOpenPreview && (
+              <button onClick={() => onOpenPreview(previewId)}>
+                <ExternalLink /> Open
+              </button>
+            )
           )}
         </span>
       </div>
@@ -984,6 +1002,7 @@ export function Timeline({
   missing = false,
   modelName,
   onOpenSurface,
+  onOpenPreview,
   onOpenTask,
   onOpenSpendCaps,
   onBranch,
@@ -997,6 +1016,7 @@ export function Timeline({
   missing?: boolean;
   modelName?: (id: string) => string;
   onOpenSurface?: (surface: Surface) => void;
+  onOpenPreview?: (previewId: string) => void;
   onOpenTask?: (taskId: string) => void;
   /** Where a run stopped by a spending ceiling sends the owner, since only they can raise it. */
   onOpenSpendCaps?: () => void;
@@ -1188,6 +1208,7 @@ export function Timeline({
               event={node.event}
               {...(node.kind === 'notice' && node.resolution ? { resolution: node.resolution } : {})}
               {...(onOpenSurface ? { onOpenSurface } : {})}
+              {...(onOpenPreview ? { onOpenPreview } : {})}
             />
           );
         })}
