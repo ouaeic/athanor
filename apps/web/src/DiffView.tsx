@@ -29,9 +29,7 @@ function DiffBody({ diff }: { diff: FileDiffModel }) {
                       which left added and removed lines sounding identical - the one distinction a
                       diff exists to make. Said in words instead, for that reader only. */}
                   {line.kind !== 'context' && (
-                    <span className="sr-only">
-                      {line.kind === 'add' ? 'added ' : 'removed '}
-                    </span>
+                    <span className="sr-only">{line.kind === 'add' ? 'added ' : 'removed '}</span>
                   )}
                   {line.text || ' '}
                 </td>

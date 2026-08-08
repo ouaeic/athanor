@@ -400,10 +400,7 @@ export const describeScannedElement = (raw: RawScannedElement): ScannedElement =
  * label whose control was not scanned is kept: sites routinely style a label over an input of zero
  * size, and then the label is the only thing that can be clicked.
  */
-export const foldScannedElements = (
-  raw: RawScannedElement[],
-  limit: number
-): ScannedElement[] => {
+export const foldScannedElements = (raw: RawScannedElement[], limit: number): ScannedElement[] => {
   const scanned = new Set(raw.map((entry) => entry.ref));
   return raw
     .filter(
@@ -1043,7 +1040,9 @@ export const browserLaunchOptions = (attempt: BrowserLaunchAttempt) => ({
     '--no-first-run',
     '--disable-background-networking',
     '--disable-component-update',
-    ...(attempt.headless ? [] : [`--window-size=${BROWSER_VIEWPORT.width},${BROWSER_VIEWPORT.height}`])
+    ...(attempt.headless
+      ? []
+      : [`--window-size=${BROWSER_VIEWPORT.width},${BROWSER_VIEWPORT.height}`])
   ],
   viewport: { ...BROWSER_VIEWPORT }
 });
@@ -1510,10 +1509,7 @@ export class BrowserManager {
    * has nothing to say about a paper on another - and the owner holding the browser to deal with
    * one is no reason for the research half of the task to stop.
    */
-  async readMany(
-    urls: string[],
-    maxCharactersPerPage: number
-  ): Promise<ParallelWebReadResult> {
+  async readMany(urls: string[], maxCharactersPerPage: number): Promise<ParallelWebReadResult> {
     const unique = [...new Set(urls)].slice(0, 12);
     if (unique.some((url) => !isPublicHttpUrl(url)))
       throw new Error('Parallel web reading accepts public HTTP(S) URLs only');
@@ -2285,7 +2281,9 @@ export class BrowserManager {
   ): Promise<string> {
     const timeout = action.timeoutMs;
     if (action.selector) {
-      await (await resolveBrowserTarget(page, action.selector)).waitFor({
+      await (
+        await resolveBrowserTarget(page, action.selector)
+      ).waitFor({
         state: action.state,
         timeout
       });

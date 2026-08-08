@@ -92,7 +92,13 @@ describe('what the pixel path may do without stopping the owner', () => {
   });
 
   it('still stops for a click on nothing this computer can name', () => {
-    const blind = classifyDesktopAction({ type: 'click_at', x: 700, y: 500, button: 'left', clicks: 1 });
+    const blind = classifyDesktopAction({
+      type: 'click_at',
+      x: 700,
+      y: 500,
+      button: 'left',
+      clicks: 1
+    });
     expect(blind.consequential).toBe(true);
     expect(blind.preview).toContain('not on any control');
   });

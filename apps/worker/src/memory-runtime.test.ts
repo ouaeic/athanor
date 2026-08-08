@@ -794,13 +794,17 @@ describe('turn capture write path', () => {
       verifiedClaims: ['called https://deploy:hunter2@example.com/api and got 200'],
       remainingRisks: [],
       // artifacts reconstruct shell command lines, which is exactly where an inline token shows up.
-      artifacts: ['curl -H "Authorization: Bearer ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" https://api'],
+      artifacts: [
+        'curl -H "Authorization: Bearer ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" https://api'
+      ],
       occurredAt: new Date('2026-07-31T09:00:00.000Z')
     });
     expect(result).not.toBeNull();
 
-    const episodeBody = decryptJson<{ body: string }>(probe.items[0]!.documentCiphertext, dataKey)
-      .body;
+    const episodeBody = decryptJson<{ body: string }>(
+      probe.items[0]!.documentCiphertext,
+      dataKey
+    ).body;
     const sourceBodies = probe.sources
       .map((source) => decryptJson<{ body: string }>(source.bodyCiphertext, dataKey).body)
       .join('\n');
@@ -1128,9 +1132,9 @@ describe('against the real store', () => {
     expect(result?.promotedFacts).toBe(0);
     await expect(store.listMemoryItems(realWorkspaceId, { kind: 'fact' })).resolves.toEqual([]);
     // It is corroborated and waiting - the next clean turn settles it, rather than it being lost.
-    await expect(
-      store.listPromotableMemoryFactCandidates(realWorkspaceId)
-    ).resolves.toMatchObject([{ predicate: 'default_shell', episodeCount: 2 }]);
+    await expect(store.listPromotableMemoryFactCandidates(realWorkspaceId)).resolves.toMatchObject([
+      { predicate: 'default_shell', episodeCount: 2 }
+    ]);
   });
 
   it('mints a fact once the owner has said the same thing twice, without asking them', async () => {

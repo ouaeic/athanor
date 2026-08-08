@@ -40,6 +40,7 @@ import {
   hostOf,
   liveActivityId,
   previewLifetime,
+  lastLine,
   reasoningEffortLabel,
   settledToolStarts,
   type ConversationNode,
@@ -438,13 +439,7 @@ function Event({
             : '';
     return (
       <div className={`system-event approval${decision ? ` decision-${decision}` : ''}`}>
-        {decision === 'approved' ? (
-          <CheckCircle2 />
-        ) : decision ? (
-          <XCircle />
-        ) : (
-          <UserRoundCheck />
-        )}
+        {decision === 'approved' ? <CheckCircle2 /> : decision ? <XCircle /> : <UserRoundCheck />}
         <div>
           <strong>{answered || 'Approval requested'}</strong>
           <span>{event.summary}</span>
@@ -586,7 +581,18 @@ function Event({
         <AlertTriangle />
         <div>
           <strong>{event.summary}</strong>
-          {textValue(data.message) && <span>{textValue(data.message)}</span>}
+          {/*
+            Behind a disclosure, because the detail of a failure is for the moment somebody goes
+            looking - and because a producer can always send something longer than a line. The
+            runner now says what was wrong with a request in a sentence, but this is the last place
+            it can be contained, so it is contained here too rather than trusted to be short.
+          */}
+          {textValue(data.message) && (
+            <details className="event-detail">
+              <summary>Details</summary>
+              <span>{textValue(data.message)}</span>
+            </details>
+          )}
         </div>
       </div>
     );
@@ -1146,10 +1152,28 @@ export function Timeline({
             );
           if (node.kind === 'thinking')
             return (
-              <details className="agent-thinking" key={node.id} open={node.streaming}>
+              /*
+                Closed, and left alone once the reader has an opinion about it.
+
+                This was forced open for the whole time it was streaming, so every word a model
+                thought was in the conversation above its answer - and because `open` was a
+                controlled prop, a reader who shut it had it reopened under them on the next frame.
+                It is uncontrolled now. While it runs the summary carries the latest line, which is
+                what a reader actually wants from a block that has not finished: proof it is moving.
+              */
+              <details className="agent-thinking" key={node.id}>
                 <summary>
                   <Brain />
-                  {node.streaming ? 'Thinking' : 'How it got there'}
+                  {node.streaming ? (
+                    <>
+                      Thinking
+                      {lastLine(node.markdown) && (
+                        <span className="thinking-latest"> — {lastLine(node.markdown)}</span>
+                      )}
+                    </>
+                  ) : (
+                    'How it got there'
+                  )}
                 </summary>
                 <Markdown>{node.markdown}</Markdown>
               </details>
@@ -1206,7 +1230,9 @@ export function Timeline({
             <Event
               key={node.id}
               event={node.event}
-              {...(node.kind === 'notice' && node.resolution ? { resolution: node.resolution } : {})}
+              {...(node.kind === 'notice' && node.resolution
+                ? { resolution: node.resolution }
+                : {})}
               {...(onOpenSurface ? { onOpenSurface } : {})}
               {...(onOpenPreview ? { onOpenPreview } : {})}
             />

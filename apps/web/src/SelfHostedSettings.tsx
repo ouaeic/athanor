@@ -167,8 +167,12 @@ export function SelfHostedSettings({
     notificationSettingsDraft(defaultNotificationSettings())
   );
   const [reissuedRecoveryCode, setReissuedRecoveryCode] = useState('');
-  const [enrollment, setEnrollment] =
-    useState<{ id: string; expiresAt: string; uri: string; webUri: string }>();
+  const [enrollment, setEnrollment] = useState<{
+    id: string;
+    expiresAt: string;
+    uri: string;
+    webUri: string;
+  }>();
   const [enrollmentQr, setEnrollmentQr] = useState('');
   const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
   const [deleteAccountConfirmation, setDeleteAccountConfirmation] = useState('');
@@ -1649,10 +1653,9 @@ export function SelfHostedSettings({
             {diagnostics.certificate && (
               <p>
                 Renewing the HTTPS certificate has been failing since{' '}
-                {new Date(diagnostics.certificate.failedAt).toLocaleDateString()}. Until it
-                succeeds this stays reachable, and when the current certificate expires every
-                device will refuse to connect. On the server:{' '}
-                <code>sudo athanor certificate renew</code>.
+                {new Date(diagnostics.certificate.failedAt).toLocaleDateString()}. Until it succeeds
+                this stays reachable, and when the current certificate expires every device will
+                refuse to connect. On the server: <code>sudo athanor certificate renew</code>.
                 {diagnostics.certificate.reason ? ` (${diagnostics.certificate.reason})` : ''}
               </p>
             )}
@@ -1711,7 +1714,9 @@ export function SelfHostedSettings({
                   while showing nothing. */}
               <small>
                 GNU AGPL-3.0-only ·{' '}
-                {legal.sourceUrl ? 'source is always available' : 'the source of this build is in /opt/athanor on this server'}
+                {legal.sourceUrl
+                  ? 'source is always available'
+                  : 'the source of this build is in /opt/athanor on this server'}
               </small>
             </span>
             {legal.sourceUrl && (
@@ -1733,8 +1738,9 @@ export function SelfHostedSettings({
                 Updates install themselves weekly, taking a verified backup first and rolling back
                 if the new release does not serve. To intervene, on the server:{' '}
                 <code>sudo athanor update</code> now, <code>sudo athanor rollback</code> to undo a
-                release that installed cleanly and still went wrong, <code>sudo athanor backup</code>{' '}
-                for a copy on demand, and <code>sudo athanor doctor</code> for the full report.
+                release that installed cleanly and still went wrong,{' '}
+                <code>sudo athanor backup</code> for a copy on demand, and{' '}
+                <code>sudo athanor doctor</code> for the full report.
               </small>
             </span>
           </div>

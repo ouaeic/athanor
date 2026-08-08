@@ -1,9 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  deviceEnrollmentToken,
-  grantInPairingFragment,
-  isPairingFragment
-} from './device-link.js';
+import { deviceEnrollmentToken, grantInPairingFragment, isPairingFragment } from './device-link.js';
 
 const token = 'w6Yl8Qk2nT4vXbR7pL0sZaC3dF5gH9jK';
 

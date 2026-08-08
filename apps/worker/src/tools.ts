@@ -92,7 +92,11 @@ const browserActionProperties: Record<string, unknown> = {
   key: { type: 'string' },
   deltaX: { type: 'number', minimum: -5_000, maximum: 5_000, default: 0 },
   deltaY: { type: 'number', minimum: -5_000, maximum: 5_000 },
-  state: { type: 'string', enum: ['visible', 'hidden', 'attached', 'detached'], default: 'visible' },
+  state: {
+    type: 'string',
+    enum: ['visible', 'hidden', 'attached', 'detached'],
+    default: 'visible'
+  },
   urlIncludes: { type: 'string', maxLength: 2_000 },
   timeoutMs: { type: 'integer', minimum: 100, maximum: 60_000, default: 15_000 },
   activate: { type: 'boolean', default: true },
@@ -2186,7 +2190,12 @@ const PROSE_EXTENSIONS = new Set([
 ]);
 
 export const isProsePath = (path: string): boolean => {
-  const last = path.toLowerCase().split(/[\\/]+/).filter(Boolean).at(-1) ?? '';
+  const last =
+    path
+      .toLowerCase()
+      .split(/[\\/]+/)
+      .filter(Boolean)
+      .at(-1) ?? '';
   const dot = last.lastIndexOf('.');
   return dot > 0 && PROSE_EXTENSIONS.has(last.slice(dot));
 };
@@ -2232,9 +2241,7 @@ export const writtenPaths = (name: string, args: Record<string, unknown>): strin
   if (name === 'shell') {
     if (!isMutatingToolCall(name, args)) return [];
     const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
-    return [...commandArgs, ...commandScript(args).split(/[\s'"`>|;()]+/)].filter(
-      Boolean
-    );
+    return [...commandArgs, ...commandScript(args).split(/[\s'"`>|;()]+/)].filter(Boolean);
   }
   if (name !== 'file_patch') return [];
   return (Array.isArray(args.patches) ? args.patches : [])

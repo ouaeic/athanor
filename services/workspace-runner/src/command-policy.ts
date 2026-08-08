@@ -106,7 +106,9 @@ export const privilegedHelperInvocation = (
   helpers: readonly (string | undefined)[]
 ): string | undefined => {
   const names = new Set(
-    helpers.filter((helper): helper is string => Boolean(helper)).map((helper) => binaryName(helper))
+    helpers
+      .filter((helper): helper is string => Boolean(helper))
+      .map((helper) => binaryName(helper))
   );
   return names.size ? firstMatch(command, names) : undefined;
 };

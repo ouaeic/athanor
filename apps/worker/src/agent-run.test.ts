@@ -3015,6 +3015,17 @@ describe('what would prove the job is done', () => {
     const answer = lastMessage(log, 1);
     expect(answer).toContain('Finish refused (acceptance 1 of 4)');
     expect(answer).toContain('AssertionError: expected 3 rows');
+    /*
+     * And the prose it writes on the way back round is not published as a reply. Five paths refuse
+     * a finish and send the model round again; its natural answer to "finish refused" is to restate
+     * itself, and each restatement used to be another bubble. That is why one answer reached the
+     * owner in pieces. The words still go into the window - the model needs them - they are just
+     * not a new thing said to the owner.
+     */
+    // Exactly one thing reaches the owner. Five paths refuse a finish and send the model round
+    // again, and its natural reply to "finish refused" is to restate itself; each restatement used
+    // to be another bubble, which is why one answer arrived in pieces.
+    expect(probe.events.filter((entry) => entry.kind === 'assistant_message')).toHaveLength(1);
   });
 
   /**

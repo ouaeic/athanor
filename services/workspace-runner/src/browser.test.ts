@@ -183,7 +183,9 @@ describe('browser snapshot shape', () => {
         type: 'button',
         href: null
       })),
-      tabs: [{ tabId: 'tab-1', active: true, url: 'https://shop.example.invalid/cart', title: 'Cart' }],
+      tabs: [
+        { tabId: 'tab-1', active: true, url: 'https://shop.example.invalid/cart', title: 'Cart' }
+      ],
       downloads: [
         {
           path: 'workspace/downloads/2026-01-02T03-04-05/invoice.pdf',
@@ -545,18 +547,30 @@ describe('form field legibility', () => {
   });
 
   it('omits every member that would say nothing, so a wide form still fits the budget', () => {
-    expect(Object.keys(describeScannedElement(rawElement({ tag: 'a', valueBearing: false })))).toEqual(
-      ['ref', 'tag', 'role', 'name', 'type', 'href']
-    );
+    expect(
+      Object.keys(describeScannedElement(rawElement({ tag: 'a', valueBearing: false })))
+    ).toEqual(['ref', 'tag', 'role', 'name', 'type', 'href']);
   });
 
   it('drops a label once its control is listed, and keeps one whose control is hidden', () => {
     const folded = foldScannedElements(
       [
-        rawElement({ ref: 'oc-0-0', tag: 'label', valueBearing: false, text: 'Email', labelFor: 'oc-0-1' }),
+        rawElement({
+          ref: 'oc-0-0',
+          tag: 'label',
+          valueBearing: false,
+          text: 'Email',
+          labelFor: 'oc-0-1'
+        }),
         rawElement({ ref: 'oc-0-1', fieldName: 'email', labelText: 'Email' }),
         // A styled checkbox: the real input has no box, so the label is the only click target.
-        rawElement({ ref: 'oc-0-2', tag: 'label', valueBearing: false, text: 'I agree', labelFor: 'oc-0-9' })
+        rawElement({
+          ref: 'oc-0-2',
+          tag: 'label',
+          valueBearing: false,
+          text: 'I agree',
+          labelFor: 'oc-0-9'
+        })
       ],
       250
     );
@@ -618,7 +632,10 @@ describe('batch approval', () => {
     expect(
       combineBatchPreflight([
         { index: 0, preflight: harmless },
-        { index: 1, preflight: { consequential: false, sensitiveInput: true, preview: 'Fill “Password”' } }
+        {
+          index: 1,
+          preflight: { consequential: false, sensitiveInput: true, preview: 'Fill “Password”' }
+        }
       ])
     ).toMatchObject({ sensitiveInput: true });
   });
@@ -674,9 +691,7 @@ describe('anti-bot wall detection', () => {
   });
 
   it('recognises the interstitial by what it says', () => {
-    expect(
-      detectBotWall({ url: 'https://x.invalid', title: 'Just a moment...' })
-    ).not.toBeNull();
+    expect(detectBotWall({ url: 'https://x.invalid', title: 'Just a moment...' })).not.toBeNull();
     expect(
       detectBotWall({
         url: 'https://x.invalid',
@@ -765,7 +780,10 @@ describe('bot wall scope', () => {
     expect(ledger.hostClosed('https://careers.example.invalid/apply', 2_000)).not.toBeNull();
     // A verdict about a moment is not a verdict about tomorrow.
     expect(
-      ledger.hostClosed('https://careers.example.invalid/apply', 1_000 + BOT_WALL_HOST_COOLDOWN_MS + 1)
+      ledger.hostClosed(
+        'https://careers.example.invalid/apply',
+        1_000 + BOT_WALL_HOST_COOLDOWN_MS + 1
+      )
     ).toBeNull();
   });
 
@@ -1026,9 +1044,7 @@ describe('search route', () => {
     );
     expect(answer.route).toBe('isolated');
     expect(answer.results.map((result) => result.url)).toEqual(['https://example.invalid/rates']);
-    expect(isolated.opened).toEqual([
-      'https://html.duckduckgo.com/html/?q=uk%20corporation%20tax'
-    ]);
+    expect(isolated.opened).toEqual(['https://html.duckduckgo.com/html/?q=uk%20corporation%20tax']);
     expect(isolated.closedCount()).toBe(1);
   });
 
@@ -1140,9 +1156,9 @@ describe('search route', () => {
       maxFileBytes: 1024 * 1024,
       launchIsolatedBrowser: isolated.launch
     });
-    await expect(manager.search('workspace-5', { query: '   ', limit: 10 }, 'agent')).rejects.toThrow(
-      'needs a query'
-    );
+    await expect(
+      manager.search('workspace-5', { query: '   ', limit: 10 }, 'agent')
+    ).rejects.toThrow('needs a query');
     expect(isolated.closedCount()).toBe(0);
   });
 });

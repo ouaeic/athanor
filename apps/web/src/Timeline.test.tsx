@@ -387,4 +387,42 @@ describe('a turn that read something nobody here wrote', () => {
     expect(markup).toContain('system-event warning');
     expect(markup).not.toContain('external-content-mark');
   });
+
+  /**
+   * Live reasoning was rendered open and in full, so every word a model thought sat in the
+   * conversation above its answer - and `open` being a controlled prop meant a reader who collapsed
+   * it had it reopened on the next frame.
+   */
+  it('leaves reasoning collapsed while it is still arriving, with the latest line on the summary', () => {
+    const markup = render(
+      [
+        event(1, 'user_message', 'Look into it', { markdown: 'Look into it' }),
+        event(2, 'assistant_reasoning', 'Agent reasoning', {
+          markdown: 'First I will read the file.\nNow I am checking the second source.'
+        })
+      ],
+      'running'
+    );
+    expect(markup).toContain('agent-thinking');
+    // The whole point: not forced open.
+    expect(markup).not.toContain('<details class="agent-thinking" open');
+    // Proves the block really is mid-stream, so the assertion above is about the streaming case
+    // rather than passing because the node had already settled.
+    expect(markup).toContain('Thinking');
+    expect(markup).not.toContain('How it got there');
+    // Enough to show it is moving, without the body of it.
+    expect(markup).toContain('Now I am checking the second source.');
+  });
+
+  /** A failure's detail is for the moment somebody goes looking, not for the conversation. */
+  it('folds the detail of a failure behind a disclosure', () => {
+    const markup = render([
+      event(2, 'error', 'shell failed', {
+        message: 'Invalid request - args: invalid input: expected array, received string'
+      })
+    ]);
+    expect(markup).toContain('event-detail');
+    expect(markup).toContain('Details');
+    expect(markup).toContain('shell failed');
+  });
 });

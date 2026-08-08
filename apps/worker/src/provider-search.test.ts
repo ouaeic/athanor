@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { WebCitation } from '@athanor/contracts';
 import type { AthanorError } from '@athanor/core';
-import { providerSearchMessages, providerSearchResults, providerWebSearch } from './provider-search.js';
+import {
+  providerSearchMessages,
+  providerSearchResults,
+  providerWebSearch
+} from './provider-search.js';
 
 const cited = (url: string, title = 'Title', excerpt?: string): WebCitation => ({
   url,
@@ -107,7 +111,9 @@ describe('the request that runs one search', () => {
   });
 
   it('tells the search runner not to answer, because a fabricated address is worse than none', () => {
-    expect(providerSearchMessages('anything')[0]?.content).toContain('never list a page you did not');
+    expect(providerSearchMessages('anything')[0]?.content).toContain(
+      'never list a page you did not'
+    );
   });
 });
 

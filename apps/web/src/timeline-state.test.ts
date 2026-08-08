@@ -1121,7 +1121,10 @@ describe('an approval and the answer it got', () => {
   });
 
   it('keeps a request nobody answered on its own', () => {
-    const nodes = buildConversation([event(1, 'approval_requested', { approvalId: 'a1' })], 'running');
+    const nodes = buildConversation(
+      [event(1, 'approval_requested', { approvalId: 'a1' })],
+      'running'
+    );
     const shown = nodes.flatMap((node) => ('event' in node ? [node.event.kind] : []));
     expect(shown).toEqual(['approval_requested']);
   });

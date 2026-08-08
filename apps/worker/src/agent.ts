@@ -160,6 +160,13 @@ interface AgentState {
   mutatedBeyondProse?: boolean;
   /** Whether this turn has said anything to the owner in its own voice. */
   answered?: boolean;
+  /**
+   * Set when the harness has just refused a finish and sent the model round again.
+   *
+   * The step that follows is bookkeeping - cite something newer, declare the checks, close the plan
+   * - and whatever prose it carries is a restatement of an answer the owner already has.
+   */
+  repairStep?: boolean;
   turnToolResults?: Record<
     string,
     {
@@ -1209,6 +1216,7 @@ export const startTurnState = <T extends Record<string, unknown>>(
     mutated: false,
     mutatedBeyondProse: false,
     answered: false,
+    repairStep: false,
     // The effort ladder and the two finish gates are per turn, like the counters above.
     acceptanceFailures: 0,
     acceptanceNagged: false,
@@ -1396,9 +1404,22 @@ export const completionVerification = (
     const lastResult = state.turnToolResults?.[order[lastMutation] ?? ''];
     const observedItsOwnChange = lastResult?.name === 'shell' || lastResult?.proseOnly === true;
     const floor = observedItsOwnChange ? lastMutation : lastMutation + 1;
-    const grounded = evidence.some(
-      (item) => item.toolCallId && order.indexOf(item.toolCallId) >= floor
-    );
+    /*
+     * A written report stays citable wherever it sits in the turn.
+     *
+     * `lastMutation` is the last mutating call in order, so a turn that wrote the report and then
+     * ran one command - `df -h` through a shell, say - moved the floor past the report and refused
+     * every finish that cited it. The owner's turn hit exactly that: "every cited result predates
+     * the last shell call", about the file it had been asked to produce. Prose is its own evidence
+     * by the reasoning just above; that does not stop being true because something read-only ran
+     * afterwards.
+     */
+    const grounded = evidence.some((item) => {
+      if (!item.toolCallId) return false;
+      const index = order.indexOf(item.toolCallId);
+      if (index < 0) return false;
+      return index >= floor || state.turnToolResults?.[item.toolCallId]?.proseOnly === true;
+    });
     if (!grounded) {
       const mutation = order[lastMutation] ?? '';
       const name = state.turnToolResults?.[mutation]?.name ?? 'the last change';
@@ -3319,7 +3340,11 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       content: assistantText,
       ...(response.toolCalls.length ? { toolCalls: response.toolCalls } : {})
     });
-    if (assistantText) {
+    // Same rule as the main loop: a turn that ran out of steps while arguing with the harness is
+    // restating an answer rather than giving a new one. Deliberately without setting `answered` -
+    // these words become the completion summary just below, and the completion publishes that once,
+    // so the owner gets one reply instead of a bubble and a card saying the same thing.
+    if (assistantText && !state.repairStep) {
       state.answered = true;
       await event(this.store, task, key, 'assistant_message', assistantText.slice(0, 500), {
         markdown: assistantText
@@ -7279,12 +7304,27 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
           : {}),
         ...(response.toolCalls.length ? { toolCalls: response.toolCalls } : {})
       });
-      if (assistantText) {
+      /*
+       * A step the harness asked for is not a new answer to the owner.
+       *
+       * Five paths refuse a finish and send the model round again - the finish rejection, the plan
+       * hold, the acceptance hold, an acceptance check that failed, and the completion nag. Its
+       * natural reply to "finish rejected, cite something newer" is to restate the answer with an
+       * apology, and every one of those restatements used to become another bubble. That is why one
+       * answer arrived in pieces, and eleven of those rounds in the worst case is most of where a
+       * small task's tokens went. The prose still goes into the window - the model needs its own
+       * words back - it simply is not published as a fresh reply.
+       */
+      if (assistantText && !state.repairStep) {
         state.answered = true;
         await event(this.store, task, key, 'assistant_message', assistantText.slice(0, 500), {
           markdown: assistantText
         });
       }
+      // Cleared as soon as the model does something other than ask to finish again, so an ordinary
+      // step following a repair speaks normally.
+      if (state.repairStep && response.toolCalls.some((call) => call.name !== 'finish'))
+        state.repairStep = false;
       if (await honorUserControl()) return;
 
       // A reply that stopped at the provider's output ceiling is half a sentence, and it used to be
@@ -7327,6 +7367,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         // budget one nag at a time, then fail with a step-limit error that named nothing.
         const nags = (state.completionNags ?? 0) + 1;
         state.completionNags = nags;
+        state.repairStep = true;
         if (nags >= MAX_COMPLETION_NAGS) {
           /*
            * The answer stands; only the paperwork is missing.
@@ -7492,6 +7533,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
           if (!checked.ok && !unverifiable) {
             const rejections = (state.finishRejections ?? 0) + 1;
             state.finishRejections = rejections;
+            state.repairStep = true;
             state.messages.push({
               role: 'tool',
               toolCallId: call.id,
@@ -7535,6 +7577,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
            */
           if (outstanding.length && !state.planCoverageNagged && !state.planIsFallback) {
             state.planCoverageNagged = true;
+            state.repairStep = true;
             state.messages.push({
               role: 'tool',
               toolCallId: call.id,
@@ -7559,6 +7602,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             !state.acceptanceNagged
           ) {
             state.acceptanceNagged = true;
+            state.repairStep = true;
             state.messages.push({
               role: 'tool',
               toolCallId: call.id,
@@ -7597,6 +7641,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             if (failed.length) {
               const attempt = (state.acceptanceFailures ?? 0) + 1;
               state.acceptanceFailures = attempt;
+              state.repairStep = true;
               if (attempt < MAX_ACCEPTANCE_FAILURES) {
                 state.messages.push({
                   role: 'tool',

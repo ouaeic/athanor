@@ -77,8 +77,7 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
   },
   {
     id: 'pdf-forms',
-    purpose:
-      'Enumerate and fill the fields of a PDF form, which is the one PDF job qpdf cannot do',
+    purpose: 'Enumerate and fill the fields of a PDF form, which is the one PDF job qpdf cannot do',
     binaries: [ATHANOR_PYTHON],
     pythonModules: ['pypdf'],
     fonts: [],
@@ -193,7 +192,9 @@ export const summariseToolchain = (reports: readonly ToolchainCapabilityReport[]
     parts.push(
       `Not installed: ${missing
         .map((report) => `${report.id} (needs ${report.install})`)
-        .join('; ')}. Ask before installing, and do not follow a procedure that depends on one of these until it is there.`
+        .join(
+          '; '
+        )}. Ask before installing, and do not follow a procedure that depends on one of these until it is there.`
     );
   return parts.join(' ');
 };

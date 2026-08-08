@@ -618,9 +618,7 @@ export const classifyDesktopAction = (
    */
   if (action.type === 'click_at' && node)
     return {
-      consequential: consequentialText.test(
-        `${node.name} ${node.description} ${node.role}`.trim()
-      ),
+      consequential: consequentialText.test(`${node.name} ${node.description} ${node.role}`.trim()),
       sensitiveInput: false,
       preview: `Click ${node.role} "${node.name || 'unnamed'}" at ${Math.round(action.x)}, ${Math.round(action.y)}`
     };
@@ -651,7 +649,8 @@ export const classifyDesktopAction = (
    * which is the case the rule was actually protecting.
    */
   if (action.type === 'text_input') {
-    const focusedLabel = `${node?.name ?? ''} ${node?.description ?? ''} ${node?.role ?? ''}`.trim();
+    const focusedLabel =
+      `${node?.name ?? ''} ${node?.description ?? ''} ${node?.role ?? ''}`.trim();
     const knownField = Boolean(node) && !node?.states.includes('read-only');
     const secret = !node || Boolean(node.sensitive) || sensitiveText.test(focusedLabel);
     return {

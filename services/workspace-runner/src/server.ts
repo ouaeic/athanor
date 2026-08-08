@@ -57,6 +57,23 @@ import {
   restoreSnapshot
 } from './snapshots.js';
 
+/**
+ * What was wrong with a request, in a sentence somebody can act on.
+ *
+ * Zod's own `message` is the issue array pretty-printed as JSON, and that string travelled all the
+ * way to the conversation, where the owner read it. This says the same thing in the form the model
+ * needs to correct itself and the owner needs to understand: which field, and what it should have
+ * been. Bounded, because a malformed body can raise a hundred issues and the first few are the ones
+ * that matter.
+ */
+export const sayWhatIsWrong = (error: z.ZodError): string => {
+  const shown = error.issues
+    .slice(0, 3)
+    .map((issue) => `${issue.path.join('.') || 'body'}: ${issue.message.toLowerCase()}`);
+  const rest = error.issues.length - shown.length;
+  return `Invalid request - ${shown.join('; ')}${rest > 0 ? ` (and ${rest} more)` : ''}`;
+};
+
 const WorkspaceRelativePath = z.string().min(1).max(1_024);
 
 const FolderRequest = z.object({ path: WorkspaceRelativePath });
@@ -165,6 +182,21 @@ export const buildServer = async (config: RunnerConfig) => {
       void reply.status(409).send({
         error: { code: 'browser_bot_wall', message, requestId, botWall: error.wall }
       });
+      return;
+    }
+    // A schema failure, said as a sentence.
+    //
+    // `ZodError.message` is a getter that returns `JSON.stringify(issues, null, 2)`. That message
+    // was forwarded verbatim, rebuilt into the worker's error, written to the task event and
+    // rendered in the conversation - so a model that passed `args` as a string put a page of issue
+    // objects in front of the owner. This sits ahead of the generic branch so it covers every
+    // `.parse()` in the runner rather than the one that was noticed.
+    if (error instanceof z.ZodError) {
+      void reply
+        .status(400)
+        .send({
+          error: { code: 'runner_invalid_request', message: sayWhatIsWrong(error), requestId }
+        });
       return;
     }
     void reply
@@ -525,7 +557,9 @@ export const buildServer = async (config: RunnerConfig) => {
           'x-end-line': String(window.endLine),
           'x-file-bytes': String(window.sizeBytes),
           'x-truncated': String(window.truncated),
-          ...(window.totalLines === undefined ? {} : { 'x-total-lines': String(window.totalLines) }),
+          ...(window.totalLines === undefined
+            ? {}
+            : { 'x-total-lines': String(window.totalLines) }),
           ...(window.nextStartLine === undefined
             ? {}
             : { 'x-next-start-line': String(window.nextStartLine) })
@@ -547,30 +581,25 @@ export const buildServer = async (config: RunnerConfig) => {
   app.put<{
     Params: { workspaceId: string };
     Querystring: { path: string; expectSha256?: string };
-  }>(
-    '/v1/workspaces/:workspaceId/file',
-    async (request) => {
-      requireScope(request, 'files.write');
-      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
-      const requestedPath = assertUserDataPath(root, request.query.path);
-      const body = Buffer.isBuffer(request.body)
-        ? request.body
-        : Buffer.from(
-            typeof request.body === 'string' ? request.body : JSON.stringify(request.body)
-          );
-      await assertHostStorageWrite(root, body.length);
-      // The caller's claim about what it is replacing, checked under the write's own descriptor.
-      const expected = (request.query.expectSha256 ?? '').trim();
-      return writeWorkspaceFile(
-        root,
-        requestedPath,
-        body,
-        config.MAX_FILE_BYTES,
-        expected || undefined
-      );
-    }
-  );
+  }>('/v1/workspaces/:workspaceId/file', async (request) => {
+    requireScope(request, 'files.write');
+    const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
+    await ensureRuntimeWorkspace(root);
+    const requestedPath = assertUserDataPath(root, request.query.path);
+    const body = Buffer.isBuffer(request.body)
+      ? request.body
+      : Buffer.from(typeof request.body === 'string' ? request.body : JSON.stringify(request.body));
+    await assertHostStorageWrite(root, body.length);
+    // The caller's claim about what it is replacing, checked under the write's own descriptor.
+    const expected = (request.query.expectSha256 ?? '').trim();
+    return writeWorkspaceFile(
+      root,
+      requestedPath,
+      body,
+      config.MAX_FILE_BYTES,
+      expected || undefined
+    );
+  });
 
   app.delete<{ Params: { workspaceId: string }; Querystring: { path: string } }>(
     '/v1/workspaces/:workspaceId/file',

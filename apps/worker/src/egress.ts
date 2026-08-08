@@ -127,8 +127,7 @@ export const classifyDestination = (
    * this class of check breaks. Publishing something to the internet is still gated, on the tool
    * that does it: `publish_site` raises its own card and this is not a way round it.
    */
-  if (!isPublicHttpUrl(url.toString()))
-    return { sink: false, host, noveltyBytes: 0, reason: '' };
+  if (!isPublicHttpUrl(url.toString())) return { sink: false, host, noveltyBytes: 0, reason: '' };
   if ((context.selfOrigins ?? []).some((origin) => origin && host === origin.toLowerCase()))
     return { sink: false, host, noveltyBytes: 0, reason: '' };
   // Compared case-insensitively and without the separators a URL adds, so a path segment that the
@@ -153,4 +152,3 @@ export const classifyDestination = (
     };
   return { sink: false, host, noveltyBytes, reason: '' };
 };
-

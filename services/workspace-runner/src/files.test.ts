@@ -198,7 +198,13 @@ describe('a whole-file write that claims what it is replacing', () => {
     await writeFile(target, 'a change made by the owner in the file browser\n');
 
     await expect(
-      writeWorkspaceFile(root, 'workspace/notes.md', Buffer.from('agent rewrite\n'), 1_000_000, read.sha256)
+      writeWorkspaceFile(
+        root,
+        'workspace/notes.md',
+        Buffer.from('agent rewrite\n'),
+        1_000_000,
+        read.sha256
+      )
     ).rejects.toThrow(/changed after you read it/);
     // And the other writer's change is still there.
     expect(await readFile(target, 'utf8')).toContain('file browser');
@@ -208,7 +214,13 @@ describe('a whole-file write that claims what it is replacing', () => {
     await writeFile(path.join(root, 'workspace', 'notes.md'), 'original\n');
     const read = await readWorkspaceFile(root, 'workspace/notes.md', 1_000_000);
     await expect(
-      writeWorkspaceFile(root, 'workspace/notes.md', Buffer.from('rewritten\n'), 1_000_000, read.sha256)
+      writeWorkspaceFile(
+        root,
+        'workspace/notes.md',
+        Buffer.from('rewritten\n'),
+        1_000_000,
+        read.sha256
+      )
     ).resolves.toMatchObject({ sizeBytes: 10 });
 
     // No claim: a first write, or a write to something this turn never read. Demanding a hash
@@ -345,9 +357,9 @@ describe('renaming and folders', () => {
 
   it('renames a file and leaves its contents alone', async () => {
     await writeWorkspaceFile(root, 'workspace/draft.md', Buffer.from('# draft'), 100);
-    expect(await renameWorkspaceEntry(root, 'workspace/draft.md', 'workspace/cover-letter.md')).toEqual(
-      { path: path.join('workspace', 'cover-letter.md') }
-    );
+    expect(
+      await renameWorkspaceEntry(root, 'workspace/draft.md', 'workspace/cover-letter.md')
+    ).toEqual({ path: path.join('workspace', 'cover-letter.md') });
     expect(await readFile(path.join(root, 'workspace', 'cover-letter.md'), 'utf8')).toBe('# draft');
   });
 

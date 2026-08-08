@@ -1095,6 +1095,28 @@ export const conversationMarkdown = (title: string, events: TaskEvent[]): string
  * How hard the model was told to think on this step. It varies per step and it is the single
  * biggest lever on what a step costs, so it belongs next to the cost rather than in a payload.
  */
+/**
+ * The newest line of a run of reasoning, for the one-line summary while it is still arriving.
+ *
+ * Live reasoning used to be shown open and in full, so a turn that thought for twenty steps put
+ * every word of it in the conversation above the answer. What a reader wants from a block that is
+ * still running is evidence that it is running and a hint of where it has got to; the rest is there
+ * behind the disclosure when they want it.
+ */
+export const lastLine = (markdown: string, limit = 90): string => {
+  const line = markdown
+    .split('\n')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .at(-1);
+  if (!line) return '';
+  const flat = line
+    .replace(/[#*`_>]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return flat.length > limit ? `${flat.slice(0, limit - 1).trimEnd()}…` : flat;
+};
+
 export const reasoningEffortLabel = (value: unknown): string =>
   value === 'low' || value === 'medium' || value === 'high' ? `${value} reasoning effort` : '';
 

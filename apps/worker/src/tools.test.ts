@@ -355,7 +355,7 @@ describe('agent approval policy', () => {
     ).toBe('Review reusable skill ledger-reconcile');
   });
 
-  it('says when an upsert replaces the owner\'s own saved skill rather than adding one', () => {
+  it("says when an upsert replaces the owner's own saved skill rather than adding one", () => {
     // upsert is a blind full-body overwrite - ON CONFLICT DO UPDATE with no precondition on what
     // the row currently says - and it also forces enabled back to TRUE. The card read identically
     // whether this saved a new procedure or discarded one the owner had written and approved, so
@@ -378,7 +378,9 @@ describe('agent approval policy', () => {
         }
       }
     );
-    expect(replacement?.action).toBe('Review REPLACEMENT of saved skill ledger-reconcile (version 4)');
+    expect(replacement?.action).toBe(
+      'Review REPLACEMENT of saved skill ledger-reconcile (version 4)'
+    );
     expect(replacement?.preview).toContain('REPLACES');
     expect(replacement?.preview).toContain('version 4');
     expect(replacement?.preview).toContain('used 11 times');
@@ -1022,7 +1024,9 @@ describe('which calls count as changing something', () => {
 
     // Closed: a delete through a language runtime went through with no card, whatever the receiver
     // was called, while the same delete spelled `rm` stopped the task.
-    expect(isDestructiveScript(`require('fs').rmSync('/home/athanor',{recursive:true})`)).toBe(true);
+    expect(isDestructiveScript(`require('fs').rmSync('/home/athanor',{recursive:true})`)).toBe(
+      true
+    );
     expect(isDestructiveScript(`const f=require('fs'); f.rmSync('/home/athanor')`)).toBe(true);
     expect(isDestructiveScript(`import pathlib; pathlib.Path('x').unlink()`)).toBe(true);
     // ...without catching the `remove` every list in every language has.
@@ -1116,9 +1120,9 @@ describe('what a shell command brings back from outside', () => {
     expect(untrustedShellOrigin({ executable: '/usr/bin/wget', args: ['-q', 'x'] })).toBe(
       'network command output'
     );
-    expect(
-      untrustedShellOrigin({ executable: 'git', args: ['clone', 'git@host:repo.git'] })
-    ).toBe('network command output');
+    expect(untrustedShellOrigin({ executable: 'git', args: ['clone', 'git@host:repo.git'] })).toBe(
+      'network command output'
+    );
     expect(untrustedShellOrigin({ executable: 'git', args: ['-C', 'sub', 'pull'] })).toBe(
       'network command output'
     );
@@ -1135,9 +1139,9 @@ describe('what a shell command brings back from outside', () => {
   });
 
   it('labels a shell read of the download directory, which the file readers already did', () => {
-    expect(untrustedShellOrigin({ executable: 'cat', args: ['workspace/downloads/terms.txt'] })).toBe(
-      'downloaded file workspace/downloads/terms.txt'
-    );
+    expect(
+      untrustedShellOrigin({ executable: 'cat', args: ['workspace/downloads/terms.txt'] })
+    ).toBe('downloaded file workspace/downloads/terms.txt');
     // Absolute and dot-relative spellings of the same file, and a path reached only from inside an
     // inline script, where the whole command is one argument.
     expect(untrustedShellOrigin({ executable: 'cat', args: ['./downloads/terms.txt'] })).toBe(
@@ -1155,7 +1159,9 @@ describe('what a shell command brings back from outside', () => {
     // A floor that rose on the build and the test run would raise a card on every task and be
     // tapped through, which is the failure it exists to prevent.
     expect(untrustedShellOrigin({ executable: 'git', args: ['status'] })).toBeNull();
-    expect(untrustedShellOrigin({ executable: 'git', args: ['-C', 'sub', 'log', '-1'] })).toBeNull();
+    expect(
+      untrustedShellOrigin({ executable: 'git', args: ['-C', 'sub', 'log', '-1'] })
+    ).toBeNull();
     expect(untrustedShellOrigin({ executable: 'pnpm', args: ['test'] })).toBeNull();
     expect(untrustedShellOrigin({ executable: 'ls', args: ['-la', 'workspace'] })).toBeNull();
     expect(

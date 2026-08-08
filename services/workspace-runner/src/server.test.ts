@@ -57,7 +57,13 @@ describe('a preview whose app is not running', () => {
     await ensureWorkspace(path.join(workspaceRoot, id));
     // A high port nothing binds, which is the case this covers.
     const token = signCapabilityToken(
-      { sub: 'user', workspaceId: id, role: 'user', scopes: ['preview:45999'], nonce: 'preview-test' },
+      {
+        sub: 'user',
+        workspaceId: id,
+        role: 'user',
+        scopes: ['preview:45999'],
+        nonce: 'preview-test'
+      },
       secret
     );
 

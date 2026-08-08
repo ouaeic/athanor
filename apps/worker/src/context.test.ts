@@ -381,7 +381,9 @@ describe('summarising compaction', () => {
     messages.splice(4, 0, {
       role: 'assistant',
       content: 'Opening the deck skill.',
-      toolCalls: [{ id: 'call-skill', name: 'skill', arguments: { action: 'view', id: 'pptx-authoring' } }]
+      toolCalls: [
+        { id: 'call-skill', name: 'skill', arguments: { action: 'view', id: 'pptx-authoring' } }
+      ]
     });
     messages.splice(5, 0, {
       role: 'tool',

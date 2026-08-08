@@ -52,7 +52,10 @@ describe('capturing one rectangle instead of the whole screen', () => {
   };
 
   it('crops rather than scaling when a region is asked for', () => {
-    const args = stillCaptureArguments({ ...base, region: { x: 100, y: 50, width: 320, height: 200 } });
+    const args = stillCaptureArguments({
+      ...base,
+      region: { x: 100, y: 50, width: 320, height: 200 }
+    });
     expect(args.join(' ')).toContain('crop=320:200:100:50');
     // Scaling the whole screen and cropping part of it are alternatives, never both.
     expect(args.join(' ')).not.toContain('scale=');

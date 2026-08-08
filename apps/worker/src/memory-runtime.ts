@@ -345,9 +345,7 @@ export const recallMemory = async (input: MemoryRecallInput): Promise<MemoryReca
     ...(kinds.length > 0 ? { kinds } : {}),
     ...(input.scope ? { scope: input.scope } : {}),
     ...(input.asOf ? { asOf: input.asOf } : {}),
-    ...(input.includeSuperseded === undefined
-      ? {}
-      : { includeSuperseded: input.includeSuperseded }),
+    ...(input.includeSuperseded === undefined ? {} : { includeSuperseded: input.includeSuperseded })
   });
 
   const entries = candidates.flatMap((candidate): MemoryRecallEntry[] => {
@@ -934,7 +932,12 @@ export const recordTurnEpisode = async (input: {
   remainingRisks?: readonly string[];
   artifacts?: readonly string[];
   /** Acceptance checks the harness ran and watched pass, which is what it durably learnt. */
-  verifiedCommands?: readonly { label: string; executable: string; args: readonly string[]; cwd: string }[];
+  verifiedCommands?: readonly {
+    label: string;
+    executable: string;
+    args: readonly string[];
+    cwd: string;
+  }[];
   /**
    * Whether this turn read somebody else's words. A tainted turn still records what happened, but
    * nothing it saw is allowed to settle into a durable fact on the strength of that turn.
@@ -1085,7 +1088,11 @@ export const recordTurnEpisode = async (input: {
           return {
             userId: input.userId,
             trust: 'stated' as const,
-            documentCiphertext: encryptJson(content, input.dataKey, memoryItemAad(input.workspaceId)),
+            documentCiphertext: encryptJson(
+              content,
+              input.dataKey,
+              memoryItemAad(input.workspaceId)
+            ),
             index: buildMemoryItemIndex(content, indexKey)
           };
         }

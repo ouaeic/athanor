@@ -70,6 +70,9 @@ describe('remembering where a turn has already been', () => {
     expect(originOf('https://Docs.Example.com/a')).toBe('docs.example.com');
     expect(originOf('mailto:someone@example.com')).toBe('');
     expect(rememberOrigin(['a.example'], 'https://a.example/x')).toEqual(['a.example']);
-    expect(rememberOrigin(['a.example'], 'https://b.example/x')).toEqual(['a.example', 'b.example']);
+    expect(rememberOrigin(['a.example'], 'https://b.example/x')).toEqual([
+      'a.example',
+      'b.example'
+    ]);
   });
 });

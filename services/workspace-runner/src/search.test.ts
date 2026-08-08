@@ -32,10 +32,12 @@ describe('web search request', () => {
 
 describe('web search results', () => {
   it('hands back the destination rather than the engine redirector', () => {
-    expect(unwrapResultLink('//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.invalid%2Fa%3Fb%3D1')).toBe(
-      'https://example.invalid/a?b=1'
+    expect(
+      unwrapResultLink('//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.invalid%2Fa%3Fb%3D1')
+    ).toBe('https://example.invalid/a?b=1');
+    expect(unwrapResultLink('https://example.invalid/direct')).toBe(
+      'https://example.invalid/direct'
     );
-    expect(unwrapResultLink('https://example.invalid/direct')).toBe('https://example.invalid/direct');
   });
 
   it('drops anything that is not a page the agent could have opened itself', () => {

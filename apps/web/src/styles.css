@@ -1979,6 +1979,31 @@ select:focus-visible {
  * click something. The frame keeps its own aspect - it is centred in whatever is left rather than
  * stretched, because a stretched frame would put the clicks back out of true.
  */
+/* An opened block of reasoning is a reference, not the conversation: it scrolls inside itself
+   rather than pushing the answer off the screen. */
+.agent-thinking > .markdown {
+  max-height: 320px;
+  overflow: auto;
+}
+.thinking-latest {
+  opacity: 0.65;
+  font-weight: 400;
+}
+.event-detail > summary {
+  cursor: pointer;
+  opacity: 0.7;
+  font-size: 0.85em;
+}
+.event-detail > span {
+  display: block;
+  max-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  opacity: 0.8;
+}
 .computer-pane.expanded {
   position: fixed;
   inset: 0;

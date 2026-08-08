@@ -1157,6 +1157,37 @@ describe('completion verification', () => {
     expect(checked.ok).toBe(true);
   });
 
+  /**
+   * The owner's own failure, reproduced. The turn wrote the report it had been asked for, then ran
+   * one command to check the disk. `lastMutation` is the last mutating call in order, so the floor
+   * moved past the report and every finish citing it was refused with "every cited result predates
+   * the last shell call" - about the file that was the whole point of the task.
+   */
+  it('keeps a written report citable after a later command has run', () => {
+    const afterACommand = state({
+      'call-1': { name: 'file_write', success: true, mutating: true, proseOnly: true },
+      'call-2': { name: 'shell', success: true, mutating: true }
+    });
+    const checked = completionVerification(afterACommand, {
+      status: 'verified',
+      evidence: [{ claim: 'Wrote the report', source: 'tool_result', toolCallId: 'call-1' }]
+    });
+    expect(checked.ok).toBe(true);
+
+    // The exemption is for prose alone: a code change behind a later command still owes an
+    // observation dated after it, which is the case the rule exists for.
+    const code = state({
+      'call-1': { name: 'file_write', success: true, mutating: true },
+      'call-2': { name: 'shell', success: true, mutating: true }
+    });
+    expect(
+      completionVerification(code, {
+        status: 'verified',
+        evidence: [{ claim: 'Edited the importer', source: 'tool_result', toolCallId: 'call-1' }]
+      }).ok
+    ).toBe(false);
+  });
+
   it('lets a written report stand as its own evidence, but not a code change', () => {
     /*
      * The rule wants an observation dated after the last change. For code and commands there is one

@@ -154,7 +154,10 @@ export const ensureWorkspace = async (root: string): Promise<void> => {
   await mkdir(path.join(root, 'workspace'), { recursive: true, mode: SHARED_MODE });
   await mkdir(path.join(root, '.athanor', 'browser'), { recursive: true, mode: RUNNER_ONLY_MODE });
   await mkdir(path.join(root, '.athanor', 'desktop'), { recursive: true, mode: RUNNER_ONLY_MODE });
-  await mkdir(path.join(root, '.athanor', 'artifacts'), { recursive: true, mode: RUNNER_ONLY_MODE });
+  await mkdir(path.join(root, '.athanor', 'artifacts'), {
+    recursive: true,
+    mode: RUNNER_ONLY_MODE
+  });
 };
 
 export const listFiles = async (root: string, requested = '.'): Promise<unknown[]> => {

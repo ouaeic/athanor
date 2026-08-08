@@ -31,7 +31,11 @@ const fonts: ToolchainCapability = {
   install: 'apt-get install -y fonts-crosextra-carlito fonts-crosextra-caladea'
 };
 
-const nothing = { binaries: new Set<string>(), pythonModules: new Set<string>(), fonts: new Set<string>() };
+const nothing = {
+  binaries: new Set<string>(),
+  pythonModules: new Set<string>(),
+  fonts: new Set<string>()
+};
 
 describe('document toolchain report', () => {
   it('names what is missing and the command that would provide it', () => {
@@ -96,7 +100,8 @@ describe('document toolchain report', () => {
     expect(ids).toContain('data-analysis');
     expect(ids).toContain('image-work');
     // Every capability has to name a way out of being missing, or the report is only a complaint.
-    for (const capability of DOCUMENT_TOOLCHAIN) expect(capability.install.length).toBeGreaterThan(0);
+    for (const capability of DOCUMENT_TOOLCHAIN)
+      expect(capability.install.length).toBeGreaterThan(0);
   });
 });
 
