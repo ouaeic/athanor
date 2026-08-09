@@ -1989,6 +1989,41 @@ select:focus-visible {
   opacity: 0.65;
   font-weight: 400;
 }
+/* The terminal keeps the height it had; the key row sits under it rather than over the output. */
+.terminal-pane-wrap {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+.terminal-pane-wrap > .terminal-pane {
+  flex: 1;
+  min-height: 0;
+}
+.terminal-keys {
+  display: flex;
+  gap: 6px;
+  padding: 6px 8px;
+  overflow-x: auto;
+  border-top: 1px solid #ffffff14;
+  background: #0e1011;
+}
+.terminal-keys > button {
+  flex: 0 0 auto;
+  min-width: 44px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid #ffffff1f;
+  border-radius: 8px;
+  background: #171a1c;
+  color: #d7dbdd;
+  font-size: 0.82rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  cursor: pointer;
+}
+.terminal-keys > button:active {
+  background: #23282a;
+}
 .event-detail > summary {
   cursor: pointer;
   opacity: 0.7;

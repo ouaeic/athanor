@@ -1411,6 +1411,8 @@ function Computer({
 function TerminalPane({ workspace }: { workspace: Workspace }) {
   const host = useRef<HTMLDivElement>(null);
   const terminal = useRef<Terminal | undefined>(undefined);
+  /** Writes into the same channel the keyboard does, for the on-screen key helpers below. */
+  const send = useRef<((data: string) => void) | undefined>(undefined);
   useEffect(() => {
     if (!host.current) return;
     const term = new Terminal({
@@ -1448,11 +1450,12 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
           if (message.type === 'data') term.write(message.data ?? '');
         };
         socket.onclose = () => term.writeln('\r\n\x1b[33mSession closed\x1b[0m');
-        term.onData(
-          (data) =>
-            socket?.readyState === WebSocket.OPEN &&
-            socket.send(JSON.stringify({ type: 'input', data }))
-        );
+        const write = (data: string): void => {
+          if (socket?.readyState === WebSocket.OPEN)
+            socket.send(JSON.stringify({ type: 'input', data }));
+        };
+        send.current = write;
+        term.onData(write);
         term.onResize(
           ({ cols, rows }) =>
             socket?.readyState === WebSocket.OPEN &&
@@ -1468,11 +1471,53 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
     observer.observe(host.current);
     return () => {
       observer.disconnect();
+      send.current = undefined;
       socket?.close();
       term.dispose();
     };
   }, [workspace.id]);
-  return <div className="terminal-pane" ref={host} />;
+  /*
+   * The keys a phone keyboard does not have.
+   *
+   * The terminal is reachable from any device, and on a touch keyboard there is no Tab, no Escape
+   * and no Control - so a path cannot be completed, an editor cannot be left, and a running command
+   * cannot be interrupted. The computer pane next door has carried exactly these helpers all along;
+   * the terminal, which needs them more, had none.
+   *
+   * Written straight into the same channel `term.onData` feeds, so they are the keystrokes rather
+   * than a special case: ESC, TAB, Ctrl-C, Ctrl-D, and the arrows for shell history.
+   */
+  const keys: Array<[string, string, string]> = [
+    ['Esc', '\x1b', 'Escape'],
+    ['Tab', '\t', 'Tab'],
+    ['Ctrl-C', '\x03', 'Interrupt what is running'],
+    ['Ctrl-D', '\x04', 'End of input'],
+    ['↑', '\x1b[A', 'Previous command'],
+    ['↓', '\x1b[B', 'Next command']
+  ];
+  return (
+    <div className="terminal-pane-wrap">
+      <div className="terminal-pane" ref={host} />
+      <div className="terminal-keys">
+        {keys.map(([label, sequence, title]) => (
+          <button
+            key={label}
+            type="button"
+            title={title}
+            aria-label={title}
+            // The terminal keeps focus, so the on-screen keyboard does not close between presses.
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => {
+              send.current?.(sequence);
+              terminal.current?.focus();
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function PreviewPane({ workspace }: { workspace: Workspace }) {
