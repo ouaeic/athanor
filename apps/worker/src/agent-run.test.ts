@@ -3116,13 +3116,78 @@ describe('what would prove the job is done', () => {
 
     await worker.run(task).catch(() => undefined);
 
+    // Asked once, rather than completed in silence and papered over with the summary. The reply the
+    // owner reads is then the model's own words, which is the thing they asked for.
+    expect(probe.events.some((entry) => entry.summary === 'Asked for the answer itself')).toBe(
+      true
+    );
     const spoken = probe.events.filter((entry) => entry.kind === 'assistant_message');
     expect(spoken).toHaveLength(1);
-    expect(spoken[0]?.summary).toBe('The workspace has three files in it.');
+    expect(spoken[0]?.summary).toBe('Done.');
     // Before the completion, so the owner reads the answer above the card rather than under it.
     expect(probe.events.indexOf(spoken[0]!)).toBeLessThan(
       probe.events.findIndex((entry) => entry.kind === 'completed')
     );
+  });
+
+  /** The other half of the rule: a turn that answered is never asked to answer again. */
+  it('says nothing to a turn that already spoke', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-1', 'shell', { executable: 'ls', args: ['workspace'] }),
+        // Prose and the finish in the same frame, which is how a turn that behaves looks.
+        `data: ${JSON.stringify({
+          choices: [
+            {
+              finish_reason: 'tool_calls',
+              delta: {
+                content: 'There are three files in the workspace.',
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'call-2',
+                    function: {
+                      name: 'finish',
+                      arguments: JSON.stringify({
+                        summary: 'Listed the workspace.',
+                        verification: {
+                          status: 'verified',
+                          evidence: [
+                            { claim: 'Listed it', source: 'tool_result', toolCallId: 'call-1' }
+                          ],
+                          remainingRisks: []
+                        }
+                      })
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        })}\n\ndata: [DONE]\n\n`,
+        textFrame('Done.')
+      ],
+      log,
+      { route: execRoute(0) }
+    );
+    const worker = new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 4 }),
+      masterKey,
+      runnerSecret
+    );
+
+    await worker.run(task).catch(() => undefined);
+
+    expect(probe.events.some((entry) => entry.summary === 'Asked for the answer itself')).toBe(
+      false
+    );
+    const spoken = probe.events.filter((entry) => entry.kind === 'assistant_message');
+    expect(spoken).toHaveLength(1);
+    expect(spoken[0]?.summary).toBe('There are three files in the workspace.');
   });
 
   it('completes when the harness runs the checks and they pass', async () => {

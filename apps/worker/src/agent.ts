@@ -167,6 +167,8 @@ interface AgentState {
    * - and whatever prose it carries is a restatement of an answer the owner already has.
    */
   repairStep?: boolean;
+  /** Whether this turn has already been asked, once, to say something to the owner. */
+  answerNagged?: boolean;
   turnToolResults?: Record<
     string,
     {
@@ -1217,6 +1219,7 @@ export const startTurnState = <T extends Record<string, unknown>>(
     mutatedBeyondProse: false,
     answered: false,
     repairStep: false,
+    answerNagged: false,
     // The effort ladder and the two finish gates are per turn, like the counters above.
     acceptanceFailures: 0,
     acceptanceNagged: false,
@@ -7693,6 +7696,31 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
                 remainingRisks: [...verification.remainingRisks, caveat].slice(0, 20)
               };
             }
+          }
+          /*
+           * A turn that did the work and never said a word.
+           *
+           * The model can do everything through tools and call finish without writing prose once,
+           * and the owner is left with a card describing the work instead of the answer they asked
+           * for - "wrote a note to notes-check.md" in reply to "tell me what it says". The finish
+           * schema already tells it the answer belongs in the reply; nothing ever checked.
+           *
+           * Asked once, and only when literally nothing was said, so a turn that answered normally
+           * never sees it. Deliberately not a `repairStep`: those suppress publishing because they
+           * are bookkeeping, and this is the opposite - it exists to get an answer published, so it
+           * clears the flag a refusal may have left set.
+           */
+          if (!state.answered && !state.answerNagged) {
+            state.answerNagged = true;
+            state.repairStep = false;
+            state.messages.push({
+              role: 'tool',
+              toolCallId: call.id,
+              content:
+                'Finish held: this turn has not said anything to the user. The card carries a description of the work, not the answer - if they asked what a file says, what you found, or what you concluded, that belongs in your reply. Write it, then call finish again.'
+            });
+            await event(this.store, task, key, 'status', 'Asked for the answer itself', {});
+            continue;
           }
           state.messages.push({
             role: 'tool',
