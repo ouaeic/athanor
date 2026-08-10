@@ -1874,6 +1874,16 @@ select:focus-visible {
 .preview-header svg {
   width: 15px;
 }
+/* What the pane is not showing, said where the pane is: under the name, above the contents. */
+.preview-disclosure {
+  margin: 0;
+  padding: 9px 13px;
+  border-bottom: 1px solid #2d3033;
+  background: #151719;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
 .file-preview > pre {
   flex: 1;
   margin: 0;

@@ -34,6 +34,7 @@ import { api } from './api.js';
 import { deletionMessage, newFolderPath, renamedPath } from './file-actions.js';
 import { nextTabIndex } from './focus-trap.js';
 import { describeFailure } from './failure-text.js';
+import { readFilePreview } from './file-preview.js';
 import { botWallClearance, formatBytes, hostOf } from './timeline-state.js';
 import { previewPortProblem, previewSummary } from './preview-rows.js';
 import { advanceFrame, drainFrames, emptyFrameSlots, type FrameSlots } from './remote-frame.js';
@@ -392,11 +393,24 @@ function Files({ workspace }: { workspace: Workspace }) {
     name: string;
     text?: string;
     url?: string;
+    /**
+     * The file itself, as it arrived.
+     *
+     * Download used to rebuild the file out of `text`, which is a decoded, truncated string - so a
+     * PDF, a zip or a photo came back with every byte the decoder could not read replaced by U+FFFD
+     * and everything past two million characters missing, and the copy on the owner's device was
+     * quietly not their file. Kept separately from `url` so a video still gets a typed blob to play
+     * from while the download stays byte-exact.
+     */
+    downloadUrl?: string;
     mime?: string;
     captionsUrl?: string;
     captionsLanguage?: string;
     editable?: boolean;
     path?: string;
+    sizeBytes?: number;
+    /** Why what is on screen is not the whole file, or not editable, when it is not. */
+    reason?: 'binary' | 'truncated' | 'read_only';
   }>();
   const [overwrite, setOverwrite] = useState<{
     file: File;
@@ -478,8 +492,15 @@ function Files({ workspace }: { workspace: Workspace }) {
     () => () => {
       if (preview?.url) URL.revokeObjectURL(preview.url);
       if (preview?.captionsUrl) URL.revokeObjectURL(preview.captionsUrl);
+      /*
+       * Revoked when the preview is replaced or the pane goes, never in the click that started the
+       * download. Some browsers treat a synchronous revoke after `anchor.click()` as the transfer
+       * being withdrawn and drop the file - which is the same complaint as a corrupted copy, from
+       * the other end.
+       */
+      if (preview?.downloadUrl) URL.revokeObjectURL(preview.downloadUrl);
     },
-    [preview?.url, preview?.captionsUrl]
+    [preview?.url, preview?.captionsUrl, preview?.downloadUrl]
   );
   const open = async (entry: FileEntry) => {
     if (entry.type === 'directory') return load(entry.path);
@@ -490,15 +511,16 @@ function Files({ workspace }: { workspace: Workspace }) {
       return undefined;
     });
     if (!bytes) return;
-    const extension = entry.name.split('.').pop()?.toLowerCase();
-    const mime = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(extension ?? '')
-      ? `image/${extension === 'jpg' ? 'jpeg' : extension}`
-      : ['mp4', 'webm'].includes(extension ?? '')
-        ? `video/${extension}`
-        : undefined;
-    if (mime) {
+    // The file as it arrived, before anything decodes or truncates it. Every branch below carries
+    // this through to the download, so what lands on the owner's device is what is on the server.
+    const downloadUrl = URL.createObjectURL(
+      new Blob([bytes], { type: 'application/octet-stream' })
+    );
+    const shown = readFilePreview(entry.name, bytes);
+    const common = { name: entry.name, downloadUrl, sizeBytes: bytes.byteLength };
+    if (shown.kind === 'media') {
       const stem = entry.name.replace(/\.[^.]+$/, '');
-      const captionEntry = mime.startsWith('video/')
+      const captionEntry = shown.mime.startsWith('video/')
         ? entries.find(
             (candidate) =>
               candidate.type === 'file' &&
@@ -511,9 +533,9 @@ function Files({ workspace }: { workspace: Workspace }) {
         : undefined;
       const language = captionEntry?.name.match(/\.([a-z]{2,3}(?:-[A-Z]{2})?)\.vtt$/)?.[1] ?? 'en';
       setPreview({
-        name: entry.name,
-        url: URL.createObjectURL(new Blob([bytes], { type: mime })),
-        mime,
+        ...common,
+        url: URL.createObjectURL(new Blob([bytes], { type: shown.mime })),
+        mime: shown.mime,
         ...(captionBytes
           ? {
               captionsUrl: URL.createObjectURL(new Blob([captionBytes], { type: 'text/vtt' })),
@@ -521,22 +543,24 @@ function Files({ workspace }: { workspace: Workspace }) {
             }
           : {})
       });
-    } else {
-      const text = new TextDecoder().decode(bytes);
-      setPreview({
-        name: entry.name,
-        text: text.slice(0, 2_000_000),
-        // Editable when it is genuinely text and small enough to hold whole: binary bytes and
-        // oversized files stay exactly as they were, read-only.
-        editable: !text.includes('\u0000') && bytes.byteLength <= 1_000_000,
-        path: entry.path
-      });
-      setEdit(
-        !text.includes('\u0000') && bytes.byteLength <= 1_000_000
-          ? { path: entry.path, text }
-          : undefined
-      );
+      setEdit(undefined);
+      return;
     }
+    if (shown.kind === 'binary') {
+      setPreview({ ...common, reason: 'binary' });
+      setEdit(undefined);
+      return;
+    }
+    setPreview({
+      ...common,
+      text: shown.text,
+      editable: shown.editableText !== undefined,
+      path: entry.path,
+      ...(shown.reason ? { reason: shown.reason } : {})
+    });
+    setEdit(
+      shown.editableText === undefined ? undefined : { path: entry.path, text: shown.editableText }
+    );
   };
 
   /** The file goes back through the same diff an overwriting upload already has to pass. */
@@ -820,15 +844,12 @@ function Files({ workspace }: { workspace: Workspace }) {
               className="icon-btn"
               aria-label={`Download ${preview.name}`}
               title="Download to this device"
-              onClick={async () => {
-                const href =
-                  preview.url ??
-                  URL.createObjectURL(new Blob([preview.text ?? ''], { type: 'text/plain' }));
+              onClick={() => {
+                // Always the bytes that arrived, never a rebuild from what is on screen.
                 const anchor = document.createElement('a');
-                anchor.href = href;
+                anchor.href = preview.downloadUrl ?? preview.url ?? '';
                 anchor.download = preview.name;
                 anchor.click();
-                if (!preview.url) URL.revokeObjectURL(href);
               }}
             >
               <Download />
@@ -864,6 +885,16 @@ function Files({ workspace }: { workspace: Workspace }) {
                 </small>
               )}
             </>
+          )}
+          {/* Both facts are known where the decision is made, and neither was ever said. */}
+          {preview.reason && (
+            <p className="preview-disclosure">
+              {preview.reason === 'binary'
+                ? `This file is not text — ${formatBytes(preview.sizeBytes ?? 0)}. Download it to open it on this device.`
+                : preview.reason === 'truncated'
+                  ? `Showing the first 2 MB of ${formatBytes(preview.sizeBytes ?? 0)}. Download it for the whole file.`
+                  : `Too large to edit here — ${formatBytes(preview.sizeBytes ?? 0)}. Use the terminal, or download it.`}
+            </p>
           )}
           {preview.text !== undefined &&
             (preview.editable && edit ? (
