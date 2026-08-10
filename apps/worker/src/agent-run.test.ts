@@ -164,6 +164,12 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
       nextCursor: 0
     }),
     getTask: async () => task(),
+    // The narrow read the stop watch polls while a model request streams. It answers from the same
+    // task the run is built on, so a test that pauses the task stops the request too.
+    taskClaim: async () => {
+      const current = task();
+      return { status: current.status, leaseOwner: current.leaseOwner ?? null };
+    },
     updateTask: async (input: Record<string, unknown>) => {
       checkpoints.push(input);
       return task();
@@ -399,7 +405,10 @@ const checkpointResponse = (pruned: string[] = []): Response =>
 
 /** Serves the provider and the workspace runner from one stub so call ordering stays observable. */
 const installFetch = (
-  providerBodies: Array<BodyInit | (() => BodyInit)>,
+  // A body factory is handed the request init so a stub can behave like a real connection does:
+  // undici errors an in-flight response stream when the request's signal aborts, and a test that
+  // ignores the signal cannot tell a request that was torn down from one that ran to completion.
+  providerBodies: Array<BodyInit | ((init?: RequestInit) => BodyInit)>,
   log: FetchLog,
   runner: {
     checkpoint?: () => Response;
@@ -434,7 +443,7 @@ const installFetch = (
         log.modelRequests.push(JSON.parse(init.body) as Record<string, unknown>);
       const next = providerBodies[Math.min(served, providerBodies.length - 1)];
       served += 1;
-      return new Response(typeof next === 'function' ? next() : (next ?? ''), {
+      return new Response(typeof next === 'function' ? next(init) : (next ?? ''), {
         headers: { 'content-type': 'text/event-stream' }
       });
     }
@@ -503,6 +512,106 @@ describe('the model call and the task lease', () => {
 
     release();
     await running;
+  });
+
+  it('tears down the request in flight when the owner stops the task', async () => {
+    vi.useFakeTimers();
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    let requested = (): void => undefined;
+    const modelRequested = new Promise<void>((resolve) => {
+      requested = resolve;
+    });
+    let torn = false;
+    installFetch(
+      [
+        (init) =>
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              // Part of an answer arrives, and then the provider keeps writing - which is the whole
+              // shape of the complaint: Stop said the task had stopped and the text kept coming.
+              controller.enqueue(encode(textFrame('Half a sen')));
+              requested();
+              init?.signal?.addEventListener('abort', () => {
+                torn = true;
+                controller.error(new Error('aborted'));
+              });
+            }
+          })
+      ],
+      log
+    );
+    const worker = new AgentWorker(probe.store, config(), masterKey, runnerSecret);
+
+    const running = worker.run(task);
+    await modelRequested;
+    task.status = 'cancelled';
+    task.leaseOwner = null;
+
+    // Longer than the stop poll, far shorter than the 15-minute request deadline.
+    await vi.advanceTimersByTimeAsync(4_000);
+    await running;
+
+    expect(torn).toBe(true);
+    // One request. The turn ends here rather than looping into another step on the owner's money.
+    expect(log.modelRequests).toHaveLength(1);
+    // The words the owner watched being written are kept; no reply is published after the stop.
+    expect(probe.events.some((event) => event.kind === 'assistant_delta')).toBe(true);
+    expect(probe.events.some((event) => event.kind === 'assistant_message')).toBe(false);
+    expect(probe.events.at(-1)).toMatchObject({
+      kind: 'status',
+      summary: 'Task cancelled by user'
+    });
+    // ...and the trajectory is saved, unguarded, because the cancel already cleared the lease.
+    const closing = probe.checkpoints.at(-1);
+    expect(closing).toMatchObject({ status: 'cancelled', clearLease: true });
+    expect(closing?.agentStateCiphertext).toBeDefined();
+    expect(closing?.workerId).toBeUndefined();
+  });
+
+  it('stands down in silence when another worker has taken the task', async () => {
+    vi.useFakeTimers();
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    let requested = (): void => undefined;
+    const modelRequested = new Promise<void>((resolve) => {
+      requested = resolve;
+    });
+    installFetch(
+      [
+        (init) =>
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              requested();
+              init?.signal?.addEventListener('abort', () => controller.error(new Error('aborted')));
+            }
+          })
+      ],
+      log
+    );
+    const worker = new AgentWorker(probe.store, config(), masterKey, runnerSecret);
+
+    const running = worker.run(task);
+    await modelRequested;
+    const before = probe.events.length;
+    // A pause that was resumed inside the poll window: the resume cleared the lease and set the
+    // status back to queued, and a second worker took it while this one was still generating. It is
+    // then stopped again, so this worker reads the owner's own stop on a task that is no longer its
+    // to record - the one case where honouring it would write over somebody else's trajectory.
+    task.status = 'cancelled';
+    task.leaseOwner = 'another-worker';
+
+    await vi.advanceTimersByTimeAsync(4_000);
+    await running;
+
+    // Not a word and not a write. Everything this run could say now would land on the trajectory
+    // the other claimant is building, and the closing write is unguarded - it would take their
+    // lease with it and leave them generating into a task nothing they write can reach.
+    expect(probe.events).toHaveLength(before);
+    expect(probe.checkpoints.every((checkpoint) => checkpoint.status !== 'cancelled')).toBe(true);
+    expect(log.modelRequests).toHaveLength(1);
   });
 
   it('closes the streamed thinking with one row carrying the whole of it', async () => {

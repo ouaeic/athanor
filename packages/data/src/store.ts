@@ -4547,6 +4547,28 @@ export class DataStore {
     return result.rows[0] ? mapTask(result.rows[0]) : null;
   }
 
+  /**
+   * Whether the owner has stopped this task, and whose it is to run - the two facts a step already
+   * in flight needs in order to decide whether to keep going.
+   *
+   * Narrow on purpose. `getTask` selects the whole row, and the whole row includes the encrypted
+   * trajectory, which on a long turn is the largest thing in this database; a fifteen-minute model
+   * request polled every three seconds would read it three hundred times to look at two columns.
+   */
+  async taskClaim(id: string): Promise<{ status: string; leaseOwner: string | null } | null> {
+    const result = await this.database.query(
+      'SELECT status, lease_owner FROM tasks WHERE id = $1',
+      [id]
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    const leaseOwner: unknown = row.lease_owner;
+    return {
+      status: String(row.status),
+      leaseOwner: typeof leaseOwner === 'string' ? leaseOwner : null
+    };
+  }
+
   async renewTaskLease(taskId: string, workerId: string, leaseSeconds = 60): Promise<boolean> {
     const result = await this.database.query(
       `UPDATE tasks SET lease_expires_at = NOW() + ($3 * INTERVAL '1 second')

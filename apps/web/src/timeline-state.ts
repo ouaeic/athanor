@@ -1,5 +1,5 @@
 import type { BotWall, Task, TaskEvent } from './types.js';
-import { terminalTaskStatuses } from './task-status.js';
+import { taskIsGenerating, terminalTaskStatuses } from './task-status.js';
 import { harnessRun, type HarnessCheck } from './completion-card.js';
 
 /*
@@ -507,7 +507,9 @@ const streamFragment = (event: TaskEvent): string | undefined =>
  */
 export const buildConversation = (events: TaskEvent[], taskStatus: string): ConversationNode[] => {
   const nodes: ConversationNode[] = [];
-  const terminal = terminalTaskStatuses.has(taskStatus);
+  // Not `terminal`: a paused or waiting conversation is not writing anything either, and the
+  // typing indicator under a half-finished reply is the difference between "stopped" and "stopping".
+  const generating = taskIsGenerating(taskStatus);
   const settled = settledToolStarts(events, taskStatus);
   // Whether the assistant node currently at the tail was built by streamed frames. A settled
   // answer is not extended by the next turn's first frame, and only a streamed node is superseded
@@ -747,13 +749,13 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
         nodes[openThinkingIndex] = {
           ...open,
           markdown: kept + separator + markdown,
-          streaming: !terminal
+          streaming: generating
         };
         return;
       }
       openThinkingIndex = nodes.length;
       thinkingStepStart = 0;
-      nodes.push({ kind: 'thinking', id: event.id, event, markdown, streaming: !terminal });
+      nodes.push({ kind: 'thinking', id: event.id, event, markdown, streaming: generating });
       return;
     }
 
@@ -763,7 +765,7 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
       if (thinking?.streaming) nodes[openThinkingIndex] = { ...thinking, streaming: false };
       const open = openAnswer();
       const fragment = streamFragment(event);
-      const streaming = event.kind === 'assistant_delta' && !terminal;
+      const streaming = event.kind === 'assistant_delta' && generating;
       /*
        * Three shapes reach this branch, and they merge differently.
        *

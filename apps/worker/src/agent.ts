@@ -1758,6 +1758,91 @@ export const withPeriodicRenewal = async <T>(
   }
 };
 
+/** Whether the owner has stopped a task, and whose it is to run. */
+export interface TaskClaim {
+  status: string;
+  leaseOwner: string | null;
+}
+
+/**
+ * Why a step in flight should stop.
+ *
+ * `stopped` is the owner: they pressed Pause or Stop, and what this worker has done so far is worth
+ * recording before it goes. `disowned` is everything else that means this run is no longer the one
+ * in charge - the task was re-queued, or its lease moved - and there the only safe act is silence,
+ * because whoever holds it now is writing the trajectory this worker would otherwise write over.
+ */
+export type StepHalt = 'stopped' | 'disowned';
+
+export const haltReason = (claim: TaskClaim | null, workerId: string): StepHalt | null => {
+  if (!claim) return 'disowned';
+  if (claim.status === 'paused' || claim.status === 'cancelled') return 'stopped';
+  // A resume sets the status back to `queued` and clears the lease in the same statement, which is
+  // what lets a second worker take the task while this one is still generating. Seeing `queued` on
+  // a task this worker is running means exactly that has happened.
+  if (claim.status !== 'running' && claim.status !== 'planning') return 'disowned';
+  if (claim.leaseOwner !== null && claim.leaseOwner !== workerId) return 'disowned';
+  return null;
+};
+
+/** A running request and the reason it was torn down, if it was torn down for this. */
+export interface StopWatch {
+  /** Joined into the request's own signal. */
+  readonly signal: AbortSignal;
+  /** Set before the abort, so the caller can tell this apart from a provider fault. */
+  readonly halt: StepHalt | null;
+  stop(): void;
+}
+
+/**
+ * Delivers Stop to the request that is actually running.
+ *
+ * A model call is the longest thing a turn does - minutes of it, on a high-reasoning step - and it
+ * carried no notion of the owner having changed their mind. Pressing Stop wrote a status in the API
+ * process and the worker read it at the next step boundary, so the answer kept being written across
+ * the screen for as long as the provider felt like writing it, after the interface had already said
+ * the task was stopped. Aborting the request is what makes the two agree, and it is also what stops
+ * the owner paying for the rest of a reply they cancelled.
+ *
+ * The reason is recorded before the abort rather than read off the error afterwards, because the
+ * error is not reliably an abort: a cancel that lands before the response headers is caught inside
+ * the provider adapter and re-thrown as `provider_unavailable`, which would otherwise be handled as
+ * a transient fault and fail the task on a resource it never ran out of.
+ */
+export const startStopWatch = (
+  claim: () => Promise<TaskClaim | null>,
+  workerId: string,
+  intervalMs = CANCELLATION_POLL_INTERVAL_MS
+): StopWatch => {
+  const controller = new AbortController();
+  let halt: StepHalt | null = null;
+  let reading = false;
+  const timer = setInterval(() => {
+    // One read in flight at a time: a database that has become slow must not queue a poll per tick.
+    if (reading || controller.signal.aborted) return;
+    reading = true;
+    void claim()
+      .then((latest) => {
+        const reason = haltReason(latest, workerId);
+        if (!reason || controller.signal.aborted) return;
+        halt = reason;
+        controller.abort();
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        reading = false;
+      });
+  }, intervalMs);
+  timer.unref();
+  return {
+    signal: controller.signal,
+    get halt() {
+      return halt;
+    },
+    stop: () => clearInterval(timer)
+  };
+};
+
 /**
  * How often a streaming reply is written to the timeline, and the smallest frame worth a row.
  *
@@ -6792,6 +6877,17 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
     const honorUserControl = async (): Promise<boolean> => {
       const latest = await this.store.getTask(task.userId, task.id);
       if (!latest || !['paused', 'cancelled'].includes(latest.status)) return false;
+      /*
+       * Stopped, but not by this worker's owner-facing run any more.
+       *
+       * Checked before the notice and before the write, not folded into the guard above, because
+       * everything below this line assumes the trajectory in hand is the one on disk. A worker that
+       * has lost the task to another claimant would otherwise announce a pause on a conversation
+       * somebody else is actively running, save its own stale state over theirs, and - because the
+       * write below is deliberately unguarded - clear their lease on the way out, leaving them
+       * generating into a task every later write of theirs silently misses.
+       */
+      if (latest.leaseOwner !== null && latest.leaseOwner !== this.config.WORKER_ID) return true;
       await event(
         this.store,
         task,
@@ -7182,6 +7278,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       let loopedOn = '';
       const looping = new AbortController();
       let streamed = '';
+      const stopWatch = startStopWatch(() => this.store.taskClaim(task.id), this.config.WORKER_ID);
       const response = await this.#withLeaseRenewal(task, () =>
         withRequestDeadline((signal) =>
           gateway.chat(provider, {
@@ -7197,7 +7294,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             maxTokens: maxOutputTokens,
             reasoningEffort,
             sessionId: sha256(`athanor-task:${task.id}`).slice(0, 64),
-            signal: AbortSignal.any([signal, looping.signal]),
+            signal: AbortSignal.any([signal, looping.signal, stopWatch.signal]),
             onTextDelta: (delta) => {
               const frame = streamFlusher.push(delta);
               if (frame !== null) emitStreamFrame(frame);
@@ -7215,12 +7312,32 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             }
           })
         )
-      ).catch((error: unknown) => {
-        // Only the abort this turn raised itself. Everything else - a real cancel, a deadline, a
-        // provider fault - is still the caller's to handle, and is rethrown untouched.
-        if (!loopedOn) throw error;
-        return null;
-      });
+      )
+        .catch((error: unknown) => {
+          // Only the aborts this turn raised itself. Everything else - a deadline, a provider fault
+          // - is still the caller's to handle, and is rethrown untouched. The stop is recognised by
+          // the watch's own record rather than by the error, because a stop that lands before the
+          // response headers reaches here as `provider_unavailable` and would be failed as one.
+          if (!loopedOn && !stopWatch.halt) throw error;
+          return null;
+        })
+        .finally(() => stopWatch.stop());
+      if (response === null && stopWatch.halt) {
+        // The words that had arrived are the owner's - they watched them being written - so the
+        // partial frames are flushed rather than dropped. Nothing is added to the window: half a
+        // sentence with its tool calls cut off is not a turn a resumed task can carry.
+        const stoppedFrame = streamFlusher.drain();
+        if (stoppedFrame !== null) emitStreamFrame(stoppedFrame);
+        const stoppedReasoning = reasoningFlusher.drain();
+        if (stoppedReasoning !== null) emitReasoningFrame(stoppedReasoning);
+        await streamEvents.catch(() => undefined);
+        // `stopped` is the owner, and honorUserControl is what records the trajectory and says so on
+        // the timeline. `disowned` is another claimant already running this task, and there this run
+        // ends without writing or saying anything at all - every write it could make would land on
+        // somebody else's trajectory, and the unguarded closing write would take their lease with it.
+        if (stopWatch.halt === 'stopped') await honorUserControl();
+        return;
+      }
       if (response === null) {
         const finalLoopFrame = streamFlusher.drain();
         if (finalLoopFrame !== null) emitStreamFrame(finalLoopFrame);

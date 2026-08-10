@@ -39,3 +39,18 @@ export const isPausedTask = (task: Task | undefined): boolean =>
 /** Which way the one pause control points, so its icon, its word and its request never disagree. */
 export const pauseAction = (task: Task | undefined): 'pause' | 'resume' =>
   isPausedTask(task) ? 'resume' : 'pause';
+
+/**
+ * Whether more text can still arrive on this conversation.
+ *
+ * Wider than terminal, and that is the point. The transcript decided "is this answer still being
+ * written" from `terminal` alone, so a turn paused mid-sentence - the one case where the last event
+ * on the timeline is half a reply - kept its typing indicator blinking under it forever, saying the
+ * agent was still writing on a conversation the owner had just stopped. Nothing is being written
+ * while a task waits for an approval or for the computer either.
+ */
+export const taskIsGenerating = (status: string): boolean =>
+  !terminalTaskStatuses.has(status) &&
+  status !== 'paused' &&
+  status !== 'awaiting_user' &&
+  status !== 'awaiting_resource';
