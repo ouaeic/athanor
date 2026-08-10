@@ -16,7 +16,7 @@ import {
   DesktopLaunchRequest,
   WebFetchRequest
 } from '@athanor/contracts';
-import { reservedPreviewPorts } from '@athanor/core';
+import { reservedPreviewPorts, verifyCapabilityToken } from '@athanor/core';
 import { authenticateRunnerRequest, requireScope } from './auth.js';
 import { BotWallError, BrowserManager, type BrowserStreamState } from './browser.js';
 import { WorkspaceCheckpoints } from './checkpoints.js';
@@ -192,11 +192,9 @@ export const buildServer = async (config: RunnerConfig) => {
     // objects in front of the owner. This sits ahead of the generic branch so it covers every
     // `.parse()` in the runner rather than the one that was noticed.
     if (error instanceof z.ZodError) {
-      void reply
-        .status(400)
-        .send({
-          error: { code: 'runner_invalid_request', message: sayWhatIsWrong(error), requestId }
-        });
+      void reply.status(400).send({
+        error: { code: 'runner_invalid_request', message: sayWhatIsWrong(error), requestId }
+      });
       return;
     }
     void reply
@@ -1142,8 +1140,24 @@ export const buildServer = async (config: RunnerConfig) => {
     // browser and desktop streams have always closed on expiry; without the same timer here a
     // sixty-second token bought a session that ran until one side hung up, with nothing able to
     // revoke it in between.
-    const expiresIn = Math.max(1, request.capability.exp * 1000 - Date.now());
-    const expiry = setTimeout(() => socket.close(1008, 'Capability expired'), expiresIn);
+    /*
+     * Re-armable, so a shell is not cut off mid-command.
+     *
+     * The timer stays - a shell on the box must remain revocable - but the capability that opened
+     * it lives fifteen minutes at most, and a terminal is used for longer than that. Without a way
+     * to renew, "may not outlive its capability" meant "dies on a timer while you are typing". The
+     * client refreshes shortly before expiry and this re-arms against the new claim.
+     */
+    const opened = request.capability;
+    let expiry: NodeJS.Timeout;
+    const armExpiry = (exp: number): void => {
+      clearTimeout(expiry);
+      expiry = setTimeout(
+        () => socket.close(1008, 'Capability expired'),
+        Math.max(1, exp * 1000 - Date.now())
+      );
+    };
+    armExpiry(opened.exp);
     void ensureRuntimeWorkspace(root).then(() => {
       const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash';
       const environment = {
@@ -1173,7 +1187,37 @@ export const buildServer = async (config: RunnerConfig) => {
       socket.on('message', (raw: unknown) => {
         const message = JSON.parse(String(raw)) as
           | { type: 'input'; data: string }
-          | { type: 'resize'; cols: number; rows: number };
+          | { type: 'resize'; cols: number; rows: number }
+          | { type: 'renew'; token: string };
+        if (message.type === 'renew') {
+          /*
+           * A fresh capability for the socket that is already open.
+           *
+           * Checked against what opened it rather than merely being well-signed: same owner, same
+           * workspace, same role, same scope, same audience. A renewal cannot widen anything - the
+           * most a replayed one can do is re-arm a deadline on a connection that is already this
+           * owner's - and a bad one is ignored, so the session simply closes on the deadline it
+           * already had.
+           */
+          try {
+            const renewed = verifyCapabilityToken(message.token, config.RUNNER_SHARED_SECRET, {
+              method: request.method,
+              path: request.url
+            });
+            if (
+              renewed.workspaceId !== opened.workspaceId ||
+              renewed.sub !== opened.sub ||
+              renewed.role !== opened.role ||
+              !renewed.scopes.includes('terminal')
+            )
+              throw new Error('Renewal does not match the session it would extend');
+            armExpiry(renewed.exp);
+            socket.send(JSON.stringify({ type: 'renewed', exp: renewed.exp }));
+          } catch {
+            // Ignored on purpose: the deadline already set stands.
+          }
+          return;
+        }
         if (message.type === 'input') terminal.write(message.data);
         else terminal.resize(Math.max(20, message.cols), Math.max(5, message.rows));
       });

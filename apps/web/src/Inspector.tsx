@@ -1483,6 +1483,7 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
     fit.fit();
     terminal.current = term;
     let socket: WebSocket | undefined;
+    let renewal: number | undefined;
     void api
       .terminalToken(workspace.id)
       .then(({ runnerUrl, token }) => {
@@ -1490,10 +1491,43 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
           'athanor-capability',
           token
         ]);
-        socket.onopen = () => term.writeln('\x1b[32mConnected to private agent computer\x1b[0m');
+        /*
+         * Kept alive before its capability runs out.
+         *
+         * The runner closes this socket when the capability that opened it expires - deliberately,
+         * so a shell on the box stays revocable - and capabilities are capped at fifteen minutes.
+         * Without this the terminal died on a timer while the owner was typing and called it
+         * "Session closed". The first renewal is scheduled conservatively; after that the runner
+         * says when the new deadline is and the schedule follows it.
+         */
+        const scheduleRenewal = (expSeconds?: number): void => {
+          window.clearTimeout(renewal);
+          const dueIn = expSeconds
+            ? Math.max(5_000, expSeconds * 1000 - Date.now() - 60_000)
+            : 7 * 60_000;
+          renewal = window.setTimeout(() => {
+            void api
+              .terminalToken(workspace.id)
+              .then((next) => {
+                if (socket?.readyState === WebSocket.OPEN)
+                  socket.send(JSON.stringify({ type: 'renew', token: next.token }));
+              })
+              // Nothing to say: the session keeps the deadline it has and closes on it.
+              .catch(() => undefined);
+          }, dueIn);
+        };
+        socket.onopen = () => {
+          term.writeln('\x1b[32mConnected to private agent computer\x1b[0m');
+          scheduleRenewal();
+        };
         socket.onmessage = (event) => {
-          const message = JSON.parse(String(event.data)) as { type: string; data?: string };
+          const message = JSON.parse(String(event.data)) as {
+            type: string;
+            data?: string;
+            exp?: number;
+          };
           if (message.type === 'data') term.write(message.data ?? '');
+          else if (message.type === 'renewed') scheduleRenewal(message.exp);
         };
         socket.onclose = () => term.writeln('\r\n\x1b[33mSession closed\x1b[0m');
         const write = (data: string): void => {
@@ -1517,6 +1551,7 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
     observer.observe(host.current);
     return () => {
       observer.disconnect();
+      window.clearTimeout(renewal);
       send.current = undefined;
       socket?.close();
       term.dispose();
