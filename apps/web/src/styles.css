@@ -7387,3 +7387,10 @@ a.blocked-resource:hover {
     transform: translate(-50%, -50%);
   }
 }
+
+/* A security list that could not be read is not an empty security list. */
+.settings-unavailable {
+  margin: 0 0 10px;
+  color: #c9a227;
+  font-size: 0.9rem;
+}

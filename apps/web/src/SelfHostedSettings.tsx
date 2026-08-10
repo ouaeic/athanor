@@ -149,6 +149,8 @@ export function SelfHostedSettings({
   const [skillName, setSkillName] = useState('');
   const [skillDescription, setSkillDescription] = useState('');
   const [skillContent, setSkillContent] = useState(skillTemplate);
+  /** Whether the security lists could not be read, as opposed to being genuinely empty. */
+  const [securityUnavailable, setSecurityUnavailable] = useState(false);
   const [sessions, setSessions] = useState<
     Array<{ id: string; deviceLabel: string; lastSeenAt: string; current: boolean }>
   >([]);
@@ -224,8 +226,17 @@ export function SelfHostedSettings({
         setSessions(nextSessions);
         setPasskeys(nextPasskeys);
         setTokens(nextTokens);
+        setSecurityUnavailable(false);
       })
-      .catch(() => undefined);
+      /*
+       * Said out loud, because silence here is a lie with consequences.
+       *
+       * The three lists keep their initial empty value when this fails, and the screen then reads
+       * "no signed-in devices, no passkeys, no API tokens" - which on a security page is not a
+       * blank state, it is an all-clear the owner did not earn. Nothing was revoked; this device
+       * could not ask.
+       */
+      .catch(() => setSecurityUnavailable(true));
   };
   const loadSnapshots = () => {
     if (!workspace) return;
@@ -1117,6 +1128,12 @@ export function SelfHostedSettings({
         >
           <KeyRound /> Add this device
         </button>
+        {securityUnavailable && (
+          <p className="settings-unavailable">
+            Your devices, passkeys and API tokens could not be read just now. Nothing was revoked —
+            this is not a list of what exists.
+          </p>
+        )}
         <div className="settings-list">
           {sessions.map((item) => (
             <div key={item.id}>
