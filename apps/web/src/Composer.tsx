@@ -139,7 +139,15 @@ export function Composer({
         keep in sync.
       */}
       {banners}
-      <div className="composer">
+      {/*
+        The halo burns while the machine does.
+
+        It used to orbit the composer for ever, which made the product's one piece of permanent
+        decoration exactly as informative as wallpaper. Bound to the turn it becomes the largest
+        thing on screen that says the computer is working - visible from across a room, and gone
+        the moment it stops.
+      */}
+      <div className={`composer ${taskLive ? 'working' : ''}`}>
         <AttachmentTray attachments={attachments} onRemove={onRemoveAttachment} />
         <textarea
           {...(textareaRef ? { ref: textareaRef } : {})}

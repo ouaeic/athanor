@@ -641,8 +641,15 @@ select:focus-visible {
   pointer-events: none;
   background: linear-gradient(transparent, var(--panel-soft));
 }
+/*
+  The measure, set for reading rather than for filling the pane.
+ 
+  820px of 13px text is about 115 characters a line; the eye loses its place returning from the end
+  of one line to the start of the next somewhere past 90. This is the column an owner reads the
+  answer in, and the answer is the product.
+*/
 .timeline {
-  max-width: 820px;
+  max-width: 720px;
   padding: 30px 34px 30px;
   margin: 0 auto;
 }
@@ -897,7 +904,13 @@ select:focus-visible {
 }
 .markdown {
   min-width: 0;
-  font-size: 13px;
+  /*
+    13px was the same size as every label, button and caption in the product, so the answer - the
+    one thing on screen the owner is actually here to read - had no more presence than a tab. 227
+    of 251 font sizes in this file sat inside an 11-13px band; this is the declaration that breaks
+    the tie between content and chrome.
+  */
+  font-size: 15px;
   line-height: 1.65;
   color: #29342f;
 }
@@ -914,10 +927,10 @@ select:focus-visible {
   letter-spacing: -0.02em;
 }
 .markdown h2 {
-  font-size: 18px;
+  font-size: 21px;
 }
 .markdown h3 {
-  font-size: 15px;
+  font-size: 17px;
 }
 .markdown code {
   font-family: ui-monospace, monospace;
@@ -3820,7 +3833,16 @@ body,
 .app-shell,
 .workbench,
 .auth-page {
-  background: #0c0d0e;
+  /*
+    True black, because the display can make it and nothing else can.
+   
+    The page, the panes and the cards used to sit within 1.08:1 of each other, so the whole
+    interface was one grey field with hairlines ruled across it - a wireframe of itself. On an OLED
+    panel black is not a colour choice, it is pixels that are off: it costs no light, it has no
+    edge, and everything laid on it reads as an object above nothing. That is the whole elevation
+    system here. There is no third surface and there does not need to be one.
+  */
+  background: #000000;
   color: #e7e9ea;
 }
 
@@ -3828,7 +3850,7 @@ body,
 .inspector,
 .computer-pane,
 .files-pane {
-  background: #101214;
+  background: #0a0b0c;
 }
 
 .workbench-header,
@@ -3862,10 +3884,23 @@ body,
 .browser-capture-card,
 .preview-chat-card,
 .completion-card {
-  background: #151719;
-  border-color: #2d3033;
+  /*
+    A lit object, not a rectangle a shade lighter.
+   
+    This list used to end in `box-shadow: none`, which on near-black is what a flat interface is
+    made of: the only thing separating a card from the page was a 1.35:1 hairline. The load-bearing
+    declaration below is the inset top edge - a black drop shadow on black is nothing, but a single
+    lit pixel along the top of a surface reads unmistakably as something catching the light from
+    above. The drop shadow underneath it is what stops the card and the page being coplanar.
+  */
+  background: #141618;
+  border-color: #26292c;
+  border-radius: 12px;
   color: #e1e4e5;
-  box-shadow: none;
+  box-shadow:
+    inset 0 1px 0 #ffffff0d,
+    0 1px 0 #00000080,
+    0 14px 34px #000000a6;
 }
 
 .workspace-switcher:hover,
@@ -4119,12 +4154,27 @@ select:focus-visible {
   box-shadow: none;
 }
 
+/*
+  Lit while it is working, inert while it is not - which is the difference the sidebar exists to
+  show and could not. `queued` stays grey on purpose: nothing is happening yet, and a colour that
+  means "alive" has to be false when it is not.
+*/
 .status-dot.running,
-.status-dot.planning,
+.status-dot.planning {
+  background: var(--ember);
+  box-shadow: 0 0 0 3px var(--ember-glow);
+}
+
 .status-dot.queued,
 .task-title i {
-  background: var(--accent);
+  background: #6f767a;
   box-shadow: none;
+}
+
+/* The same fact as running, from the other side: the fire is waiting for you. */
+.status-dot.awaiting_user {
+  background: var(--ember);
+  box-shadow: 0 0 0 3px var(--ember-glow);
 }
 
 .status-dot.completed {
@@ -4148,6 +4198,103 @@ select:focus-visible {
 .markdown a,
 .switch-auth button {
   color: #b7bdc1;
+}
+
+/*
+  The elements an agent actually returns.
+ 
+  There were no rules at all for tables, lists, quotes or rules - so a comparison table, which is
+  among the commonest useful things this product produces, rendered as unstyled browser default:
+  a serif-ish grid with no padding and hairlines the browser picked, on a near-black page. The
+  answer is the product, and half of what the answer is made of was never designed.
+*/
+.markdown table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  /* Wide output scrolls inside its own column rather than widening the reading measure. */
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 14px 0;
+  font-size: 13px;
+}
+
+.markdown th,
+.markdown td {
+  padding: 7px 11px;
+  border: 1px solid #26292c;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown th {
+  background: #17191b;
+  color: var(--text);
+  font-weight: 620;
+  white-space: nowrap;
+}
+
+.markdown tbody tr:nth-child(even) td {
+  background: #0f1113;
+}
+
+.markdown blockquote {
+  margin: 14px 0;
+  padding: 2px 0 2px 14px;
+  border-left: 2px solid #2f3336;
+  color: var(--muted);
+}
+
+.markdown hr {
+  border: 0;
+  border-top: 1px solid #24272a;
+  margin: 22px 0;
+}
+
+.markdown ul,
+.markdown ol {
+  margin: 10px 0;
+  padding-left: 22px;
+}
+
+.markdown li {
+  margin: 5px 0;
+}
+
+.markdown li::marker {
+  color: #7d858a;
+}
+
+.markdown li > ul,
+.markdown li > ol {
+  margin: 5px 0;
+}
+
+/* A task list from the agent reads as a list, not as a bullet with a box floating beside it. */
+.markdown li:has(> input[type='checkbox']) {
+  list-style: none;
+  margin-left: -18px;
+}
+
+.markdown li > input[type='checkbox'] {
+  margin-right: 7px;
+  accent-color: var(--ember-deep);
+}
+
+.markdown kbd {
+  padding: 1px 5px;
+  border: 1px solid #34383b;
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: #17191b;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85em;
+}
+
+.markdown img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
 }
 
 .tool-event.success summary > svg:first-child {
@@ -4518,6 +4665,28 @@ select:focus-visible {
   --silver-hot: #edf4f6;
   --silver-glow: #dbe7ec2e;
   --silver-glow-soft: #dbe7ec14;
+
+  /*
+    The fire.
+   
+    An athanor is the furnace that holds one low steady flame for as long as the work takes, which
+    is the whole of what this product is, and until now the interface had no way to say it. Every
+    saturated colour that survived into the dark theme meant something had gone wrong - the one
+    positive state that used to carry colour had it deliberately drained to grey - so the screen
+    only ever lit up to scold, and a working machine, a queued turn and a finished turn were the
+    same grey dot.
+   
+    One warm colour, and one rule an owner learns in ten seconds: heat means the machine is alive,
+    or it is your move. Nothing else is ever ember.
+   
+    The discipline that keeps warmth from colliding with warning: ember is only ever small, bright
+    and moving - dots, carets, hairline edges, a progress fill. Caution stays large, dim and static
+    in the sand and clay already defined below. The two can never be mistaken for each other
+    because they never appear at the same size.
+  */
+  --ember: #f2a13f;
+  --ember-deep: #b4772c;
+  --ember-glow: #f2a13f26;
 }
 
 @property --neon-angle {
@@ -4706,12 +4875,48 @@ select:focus-visible {
 .composer::before {
   inset: -3px;
   padding: 2px;
-  animation-duration: 5.8s, 2.8s;
+  /*
+    At rest the halo is still: a silver edge catching the light, which is what the composer is when
+    nothing is happening. Motion is reserved for the two states that have something to say.
+  */
+  animation: none;
+  opacity: 0.5;
 }
 
 .composer:focus-within::before {
   opacity: 1;
-  animation-duration: 2.8s, 1.45s;
+  animation:
+    neon-edge-orbit 5.8s linear infinite,
+    neon-edge-pulse 2.8s ease-in-out infinite;
+}
+
+/*
+  Working. The one moment the machine gets to be the brightest thing in the room.
+ 
+  Warm rather than silver, because this is the same fact as every ember dot in the sidebar - the
+  furnace is lit - and it is the only ember on screen that is ever this large. It is allowed to be,
+  because it is a 2px edge and it is moving, which is the rule the whole colour rests on.
+*/
+.composer.working::before {
+  background: conic-gradient(
+    from var(--neon-angle),
+    transparent 0deg 118deg,
+    #f2a13f00 132deg,
+    #b4772cc4 152deg,
+    #f2a13f 174deg,
+    #f2a13fc2 194deg,
+    transparent 212deg 276deg,
+    #b4772c00 286deg,
+    #b4772cad 304deg,
+    #f6b767 320deg,
+    #b4772ca1 336deg,
+    transparent 350deg 360deg
+  );
+  opacity: 1;
+  filter: drop-shadow(0 0 7px #f2a13f9e);
+  animation:
+    neon-edge-orbit 3.6s linear infinite,
+    neon-edge-pulse 2.2s ease-in-out infinite;
 }
 
 .empty-canvas .eyebrow {
@@ -5141,12 +5346,16 @@ a:focus-visible {
   box-shadow: none;
 }
 
-.brand-mark img {
+/*
+  The mark is a vector now and carries its own rounded housing, its own light and its own pilot
+  flame. The drop-shadows here were compensating for a raster that was a grey smear at the size it
+  rendered; a shadow cannot add detail that was never in the file.
+*/
+.brand-mark svg,
+.agent-brand-avatar svg {
   display: block;
   width: 100%;
   height: 100%;
-  object-fit: contain;
-  filter: drop-shadow(0 2px 4px #0000008f) drop-shadow(0 0 9px #e4edf01c);
   user-select: none;
 }
 
@@ -5205,13 +5414,12 @@ a:focus-visible {
   color: inherit;
 }
 
-.agent-brand-avatar img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  filter: drop-shadow(0 2px 4px #000000a8) drop-shadow(0 0 8px #e4edf019);
-  transform: scale(1.27);
+/*
+  No `scale(1.27)`. The raster carried its own generous padding, so it had to be blown up past its
+  own frame to fill the avatar; the vector fills it exactly.
+*/
+.agent-brand-avatar {
+  overflow: visible;
 }
 
 .sidebar > .computer-summary strong {
@@ -5286,7 +5494,8 @@ a:focus-visible {
   height: 15px;
   margin-left: 2px;
   border-radius: 1px;
-  background: var(--accent);
+  /* The one place a word is being written this instant. */
+  background: var(--ember);
   vertical-align: text-bottom;
   animation: streaming-caret-blink 1.05s steps(2, start) infinite;
 }
@@ -6595,7 +6804,7 @@ button.spend-bar:hover .spend-bar-name {
 .attachment-progress i {
   display: block;
   height: 100%;
-  background: var(--accent);
+  background: var(--ember-deep);
   transition: width 120ms linear;
 }
 .attachment-remove {
@@ -6710,7 +6919,7 @@ button.spend-bar:hover .spend-bar-name {
 .task-activity-progress i {
   display: block;
   height: 100%;
-  background: var(--accent);
+  background: var(--ember-deep);
   transition: width 200ms ease;
 }
 
@@ -7409,4 +7618,45 @@ a.blocked-resource:hover {
   margin: 0 0 10px;
   color: #c9a227;
   font-size: 0.9rem;
+}
+
+/*
+ * Typing on a phone must not move the page.
+ *
+ * iOS zooms the whole viewport when a text field smaller than 16px takes focus. The composer's
+ * textarea is 13px and the sign-in field is 13px, so the first tap on the first screen magnified
+ * everything by about 1.23 - and because `.app-shell` is `overflow: hidden` at a fixed 100dvh,
+ * there is nothing to scroll back: Send simply sits off the right edge until the owner pinches out
+ * by hand. It is the first thing a new owner does on their phone, and it looks broken.
+ *
+ * 16px is not a style choice here, it is the threshold the platform uses.
+ */
+@media (pointer: coarse) {
+  .composer textarea,
+  input[type='text'],
+  input[type='search'],
+  input[type='url'],
+  input[type='email'],
+  input[type='number'],
+  input[type='password'],
+  textarea,
+  select {
+    font-size: 16px;
+  }
+}
+
+/*
+ * A scroll that reaches its end stops there.
+ *
+ * Without this, flicking to the bottom of the transcript hands the rest of the gesture to the page
+ * behind it - which on an installed phone app is the browser's own pull-to-refresh, so reading to
+ * the end of a long answer can reload the application and lose the scroll position entirely.
+ */
+.timeline-viewport,
+.inspector,
+.modal,
+.file-list,
+.mobile-sidebar .sidebar,
+.terminal-wrap {
+  overscroll-behavior: contain;
 }
