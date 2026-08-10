@@ -44,7 +44,7 @@ import {
 import { composerSubmission, hasSomethingToSend, sendBlock } from './composer-state.js';
 import { removeTask, upsertTask } from './task-list.js';
 import { isLiveTask, isTerminalTask, pauseAction, terminalTaskStatuses } from './task-status.js';
-import { loosensSecurity, securityModeNotice } from './security-mode.js';
+import { securityModeNotice } from './security-mode.js';
 import { Dialog } from './Dialog.js';
 import { UndoProvider, UndoToasts, useUndoQueue } from './Undo.js';
 import { CommandPalette, type Command } from './CommandPalette.js';

@@ -46,15 +46,6 @@ export const securityModeCopy: Record<SecurityMode, SecurityModeCopy> = {
 };
 
 /**
- * How much the agent is trusted, ascending. Loosening asks for the passkey again; tightening does
- * not, because nobody needs to prove who they are to ask for more caution.
- */
-const rank: Record<SecurityMode, number> = { autonomous: 0, balanced: 1, review: 2 };
-
-export const loosensSecurity = (from: SecurityMode, to: SecurityMode): boolean =>
-  rank[to] < rank[from];
-
-/**
  * What to say once the change has landed: a conversation carries its own mode, while changing it
  * with none open sets the default the next conversation on this computer will start under.
  */

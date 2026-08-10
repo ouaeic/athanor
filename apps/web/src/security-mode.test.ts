@@ -1,10 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  loosensSecurity,
-  securityModeCopy,
-  securityModeNotice,
-  securityModes
-} from './security-mode.js';
+import { securityModeCopy, securityModeNotice, securityModes } from './security-mode.js';
 
 describe('how the agent is told to ask', () => {
   it('covers every mode the control can be set to, in the order it offers them', () => {
@@ -37,15 +32,5 @@ describe('how the agent is told to ask', () => {
     expect(securityModeNotice('review', 'workspace')).toBe(
       'New conversations on this computer will ask before every change.'
     );
-  });
-
-  /** Loosening asks for the passkey again; tightening never does. */
-  it('knows which direction needs the owner to prove who they are', () => {
-    expect(loosensSecurity('review', 'autonomous')).toBe(true);
-    expect(loosensSecurity('balanced', 'autonomous')).toBe(true);
-    expect(loosensSecurity('review', 'balanced')).toBe(true);
-    expect(loosensSecurity('autonomous', 'review')).toBe(false);
-    expect(loosensSecurity('balanced', 'review')).toBe(false);
-    expect(loosensSecurity('balanced', 'balanced')).toBe(false);
   });
 });
