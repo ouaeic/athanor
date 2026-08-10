@@ -6802,9 +6802,22 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
           ? 'the user paused the task before this call ran'
           : 'the user cancelled the task before this call ran'
       );
+      /*
+       * Deliberately without `workerId`.
+       *
+       * Every other write from this worker is guarded by `lease_owner = workerId`, which is right:
+       * it stops a worker that lost its lease from writing over whoever holds it now. This one is
+       * different. Pausing and cancelling already cleared the lease in the same statement that set
+       * the status (`setTaskStatusForUser`, `cancelTaskAndReleaseReservations`), so by the time we
+       * get here the guard can never match - and this write is the one that saves the agent state.
+       * It matched zero rows every single time, so a paused task quietly lost the work it had done
+       * and resumed from the beginning, and nothing said so because `updateTask` returns void.
+       *
+       * Unguarded is correct here rather than merely convenient: we are reconciling to a status the
+       * owner has already set, not competing for the task.
+       */
       await this.store.updateTask({
         id: task.id,
-        workerId: this.config.WORKER_ID,
         status: latest.status,
         actualComputeCredits: state.credits,
         agentStateCiphertext: encryptJson(state, key, `task-state:${task.id}`),

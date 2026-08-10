@@ -77,6 +77,7 @@ import {
   inferModelTask,
   rankModels,
   readRoutingMetadata,
+  MAX_CAPABILITY_TTL_SECONDS,
   redactText,
   reservedPreviewPorts,
   sha256,
@@ -218,7 +219,6 @@ const scheduleErrorMessage = (code: string): string =>
     model_unavailable: 'The selected model is not currently available.',
     spend_cap_reached: 'The run would have gone past your spending cap.'
   })[code] ?? 'The scheduled run could not start safely.';
-
 
 const publicPaths = new Set([
   '/healthz',
@@ -1857,28 +1857,27 @@ export const buildServer = async (
    * default rather than becoming unlimited, which is what lets one setting cover follow-ups and
    * scheduled runs as well as tasks started by hand.
    */
-/**
- * The compute allowance a turn starts with, sized so it outlasts the step budget rather than
- * expiring a third of the way into it.
- *
- * A credit is (input + 2x output) per million tokens, times a class multiplier that runs from 0.5
- * to 5. So the same fixed number is eighty steps on a light model and nine on a heavy one, and the
- * five everything asked for was reached around step twenty-two to thirty-nine on a frontier model
- * against a step budget of a hundred and twenty. The ceiling that actually fired was therefore
- * never the one anything was designed around.
- *
- * This is a runaway backstop, not the owner's spending limit - that is `maxSpendUsd`, denominated
- * in real money, which is the number they set and understand. So it is sized to sit just past the
- * step budget for the model actually chosen, and the owner is never asked about it.
- */
-const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): number => {
-  const multiplier =
-    ({ light: 0.5, medium: 1, high: 2.5, extra_high: 5 })[model.usageClass] ?? 1;
-  // A generous step: a large window in, a full reply out. Rounded up so the arithmetic never
-  // lands exactly on the boundary it is meant to sit past.
-  const creditsPerStep = ((200_000 + 2 * 16_384) / 1_000_000) * multiplier;
-  return Math.ceil(creditsPerStep * maxSteps * 1.1);
-};
+  /**
+   * The compute allowance a turn starts with, sized so it outlasts the step budget rather than
+   * expiring a third of the way into it.
+   *
+   * A credit is (input + 2x output) per million tokens, times a class multiplier that runs from 0.5
+   * to 5. So the same fixed number is eighty steps on a light model and nine on a heavy one, and the
+   * five everything asked for was reached around step twenty-two to thirty-nine on a frontier model
+   * against a step budget of a hundred and twenty. The ceiling that actually fired was therefore
+   * never the one anything was designed around.
+   *
+   * This is a runaway backstop, not the owner's spending limit - that is `maxSpendUsd`, denominated
+   * in real money, which is the number they set and understand. So it is sized to sit just past the
+   * step budget for the model actually chosen, and the owner is never asked about it.
+   */
+  const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): number => {
+    const multiplier = { light: 0.5, medium: 1, high: 2.5, extra_high: 5 }[model.usageClass] ?? 1;
+    // A generous step: a large window in, a full reply out. Rounded up so the arithmetic never
+    // lands exactly on the boundary it is meant to sit past.
+    const creditsPerStep = ((200_000 + 2 * 16_384) / 1_000_000) * multiplier;
+    return Math.ceil(creditsPerStep * maxSteps * 1.1);
+  };
 
   const resolveSpendCeiling = async (
     userId: string,
@@ -5753,11 +5752,34 @@ const computeAllowanceFor = (model: { usageClass: string }, maxSteps: number): n
       if (!workspace) throw new AthanorError('workspace_not_found', 'Workspace not found');
       return {
         runnerUrl: config.PUBLIC_RUNNER_URL,
-        // A terminal token opens one socket and nothing else, so it is bound to that one request.
-        token: runner.token(workspace.id, user.id, 'user', ['terminal'], 60, {
-          method: 'GET',
-          path: `/v1/workspaces/${workspace.id}/terminal`
-        })
+        /*
+         * A terminal token opens one socket and nothing else, so it is bound to that one request.
+         *
+         * The lifetime is the session's, not the handshake's. The runner closes the socket when the
+         * capability expires - deliberately, so a shell on the box stays revocable - and at sixty
+         * seconds that meant every terminal died about a minute in, mid-command, reporting "Session
+         * closed" as though that were normal. The token is single-use and bound to this workspace,
+         * this owner, the `terminal` scope and this exact path, so a longer life widens the window
+         * to open one terminal rather than the blast radius of having one.
+         *
+         * `MAX_CAPABILITY_TTL_SECONDS` caps this at fifteen minutes, and that cap is right - it is
+         * what stops a leaked signing secret minting a token that outlives the leak - so this asks
+         * for the most it is allowed rather than the length of a session. Fifteen minutes is not
+         * the answer, it is fifteen times the old one. The answer is a renewal frame: the client
+         * refreshing shortly before expiry and the runner re-arming its timer, which keeps
+         * revocation fine-grained without cutting a shell off mid-command.
+         */
+        token: runner.token(
+          workspace.id,
+          user.id,
+          'user',
+          ['terminal'],
+          MAX_CAPABILITY_TTL_SECONDS,
+          {
+            method: 'GET',
+            path: `/v1/workspaces/${workspace.id}/terminal`
+          }
+        )
       };
     }
   );

@@ -3130,6 +3130,35 @@ describe('what would prove the job is done', () => {
     );
   });
 
+  /**
+   * Pausing cleared the lease in the same statement that set the status, and every write this
+   * worker makes is guarded by `lease_owner = workerId`. So the stand-down write - the one that
+   * saves the agent state - matched zero rows every time, and a paused task quietly lost the work
+   * it had done and resumed from the beginning. `updateTask` returns void, so nothing said so.
+   */
+  it('saves the work when the owner pauses, despite the pause having cleared the lease', async () => {
+    const paused = { ...makeTask(), status: 'paused', leaseOwner: null } as TaskRecord;
+    const probe = probeStore(() => paused);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Working on it.')], log);
+    const worker = new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 2 }),
+      masterKey,
+      runnerSecret
+    );
+
+    await worker.run(paused).catch(() => undefined);
+
+    const standDown = probe.checkpoints.find((write) => write.status === 'paused');
+    expect(standDown).toBeDefined();
+    // The point of the write: the turn's work survives the pause.
+    expect(standDown?.agentStateCiphertext).toBeDefined();
+    // And it is not guarded by an owner the pause already set to NULL, which is what made the
+    // write a no-op. Reconciling to a status the owner set is not competing for the task.
+    expect(standDown?.workerId).toBeUndefined();
+  });
+
   /** The other half of the rule: a turn that answered is never asked to answer again. */
   it('says nothing to a turn that already spoke', async () => {
     const task = makeTask();
