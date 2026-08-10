@@ -1477,16 +1477,6 @@ select:focus-visible {
   align-items: center;
   gap: 8px;
 }
-.composer-tools {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  min-width: 0;
-  flex: 1;
-}
-.mobile-capture {
-  display: none;
-}
 .icon-btn.recording {
   color: white;
   background: var(--danger);
@@ -1496,70 +1486,6 @@ select:focus-visible {
   50% {
     box-shadow: 0 0 0 5px #bd43372b;
   }
-}
-.security-select,
-.model-select {
-  position: relative;
-  display: flex;
-  align-items: center;
-  min-width: 0;
-  border: 1px solid #e1e3de;
-  border-radius: 8px;
-  background: #f8f8f5;
-}
-.security-select svg,
-.model-select svg {
-  width: 12px;
-  position: absolute;
-  left: 7px;
-  color: #65806f;
-  pointer-events: none;
-}
-.security-select svg:last-child,
-.model-select svg:last-child {
-  left: auto;
-  right: 5px;
-  color: #8b948f;
-}
-.security-select select,
-.model-select select {
-  appearance: none;
-  border: 0;
-  outline: 0;
-  background: transparent;
-  padding: 5px 21px 5px 23px;
-  font-size: 12px;
-  color: #59675f;
-  max-width: 145px;
-}
-.model-select {
-  max-width: 230px;
-}
-.model-select select {
-  max-width: 220px;
-}
-.security-select select {
-  max-width: 120px;
-}
-.model-connect-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 27px;
-  border: 1px solid #d8ddd7;
-  border-radius: 8px;
-  padding: 0 9px;
-  background: #f3f6f1;
-  color: #476453;
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 600;
-}
-.model-connect-button:hover {
-  background: #eaf1e8;
-}
-.model-connect-button svg {
-  width: 12px;
 }
 .send-btn {
   display: grid;
@@ -1582,41 +1508,6 @@ select:focus-visible {
 }
 .send-btn svg {
   width: 15px;
-}
-.composer-foot {
-  display: flex;
-  justify-content: center;
-  gap: 16px;
-  max-width: 760px;
-  margin: 7px auto 0;
-  color: #909993;
-  font-size: 11px;
-  pointer-events: auto;
-}
-.composer-foot span {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-}
-.composer-privacy {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  border: 0;
-  padding: 0;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-  font-size: inherit;
-}
-.composer-privacy:hover {
-  color: #d9dee1;
-}
-.composer-privacy.provider-policy {
-  color: #c9a39b;
-}
-.composer-foot svg {
-  width: 10px;
 }
 .inline-error {
   /* Stacked above the composer in flow; see .usage-warning for why none of these are positioned. */
@@ -3591,15 +3482,6 @@ select:focus-visible {
   .inline-notice {
     max-width: 100%;
   }
-  .model-select {
-    max-width: 190px;
-  }
-  .model-select select {
-    max-width: 180px;
-  }
-  .mobile-capture {
-    display: inline-grid;
-  }
   .mobile-tabs {
     position: fixed;
     z-index: 20;
@@ -3736,19 +3618,6 @@ select:focus-visible {
   .artifact-card .artifact-actions {
     grid-column: 1 / -1;
     justify-content: flex-start;
-  }
-  .model-select {
-    max-width: 145px;
-  }
-  .model-select select {
-    max-width: 140px;
-  }
-  .composer > .composer-bottom > .composer-tools > .icon-btn {
-    display: none;
-  }
-  .composer > .composer-bottom > .composer-tools > .mobile-capture,
-  .composer > .composer-bottom > .composer-tools > .composer-attachment {
-    display: inline-grid;
   }
   .composer-wrap {
     padding-bottom: 7px;
@@ -3983,8 +3852,7 @@ select,
 .artifact-actions a,
 .artifact-card a,
 .workspace-tools-button,
-.header-pill,
-.model-select {
+.header-pill {
   background: #131517;
   border-color: #303438;
   color: #e1e4e5;
@@ -4123,28 +3991,10 @@ select:focus-visible {
    light-theme component styles above. These keep every interactive surface
    dark instead of leaving bright islands inside the OLED-first shell. */
 .search,
-.starter-capabilities span,
-.security-select,
-.model-select {
+.starter-capabilities span {
   border-color: #303438;
   background: #151719;
   color: #d9dcde;
-}
-
-.model-connect-button {
-  border-color: #34383b;
-  background: #181a1c;
-  color: #bec3c6;
-}
-
-.model-connect-button:hover {
-  border-color: #51575b;
-  background: #1f2224;
-}
-
-.security-select select,
-.model-select select {
-  color: #d0d4d6;
 }
 
 .search {
@@ -6016,39 +5866,7 @@ a:focus-visible {
   gap: 8px;
   align-items: center;
 }
-
-/*
- * The model picker sits in a flex row with the attachment buttons and had min-width:0, so it was
- * the element that gave way when space ran short - collapsing far below its own max-width and
- * clipping the label mid-word ("Recommende"). It now keeps a floor wide enough to read, and any
- * remaining overflow ends in an ellipsis rather than a severed word.
- */
-.composer-tools .model-select {
-  flex: 0 1 auto;
-  min-width: 150px;
-}
-.composer-tools .model-select select {
-  width: 100%;
-  text-overflow: ellipsis;
-}
 @media (max-width: 680px) {
-  .composer-tools .model-select {
-    min-width: 120px;
-  }
-}
-
-/*
- * The security control was capped at 120px while its labels needed more, so the selected mode was
- * clipped mid-word. The labels are now single words and the cap has room for the longest of them;
- * the full explanation of each mode lives in Settings rather than in a control this size.
- */
-.composer-tools .security-select select {
-  max-width: none;
-  width: 100%;
-}
-.composer-tools .security-select {
-  flex: 0 0 auto;
-  min-width: 132px;
 }
 
 /* ---------------------------------------------------------------------------
@@ -6078,46 +5896,10 @@ body,
   --safe-top: env(safe-area-inset-top, 0px);
   --bottom-bar: 0px;
 }
-
-/*
- * The composer is the primary input of a product used on a phone, so nothing in it may collapse
- * below a tappable size. The row wraps instead: the icons keep their 32px target and the two
- * selects take a second line when 375px cannot hold them, rather than the icons shrinking to
- * their 17px min-content and the model picker landing on top of Send.
- */
-.composer-tools {
-  flex-wrap: wrap;
-  row-gap: 6px;
-  gap: 4px;
-}
 .composer-bottom {
   align-items: flex-end;
 }
-.composer-tools > .icon-btn {
-  flex: 0 0 32px;
-  width: 32px;
-  height: 32px;
-  min-width: 32px;
-}
-.composer-tools .security-select,
-.composer-tools .model-select {
-  flex: 1 1 auto;
-  min-width: 116px;
-  max-width: 100%;
-}
-.composer-tools .security-select select,
-.composer-tools .model-select select {
-  min-width: 0;
-  text-overflow: ellipsis;
-}
 @media (max-width: 430px) {
-  .composer-tools .security-select {
-    min-width: 104px;
-  }
-  .composer-tools .model-select,
-  .composer-tools .model-select select {
-    max-width: none;
-  }
 }
 
 @media (max-width: 800px) {
