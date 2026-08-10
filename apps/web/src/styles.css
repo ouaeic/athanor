@@ -2321,11 +2321,13 @@ select:focus-visible {
 }
 .browser-input {
   display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) auto auto auto;
+  /* Six children - the lock, the field, Send, Tab, Enter, Esc - and there were five tracks, so Esc
+     wrapped onto an implicit second row and the bar stood 76px tall instead of one line. The light
+     fill that used to be here was dead: a later rule has been overriding it with #151719. */
+  grid-template-columns: 16px minmax(0, 1fr) auto auto auto auto;
   gap: 5px;
   align-items: center;
   padding: 7px 8px;
-  background: #f7f6f2;
   border-top: 1px solid #2d3033;
 }
 /* The agent has handed the field back so the owner can type a credential it must never see. That
@@ -2341,7 +2343,6 @@ select:focus-visible {
 .browser-input input {
   min-width: 0;
   height: 28px;
-  border: 1px solid #d8dcd5;
   border-radius: 6px;
   padding: 0 8px;
   font-size: 12px;
@@ -7352,4 +7353,33 @@ a.blocked-resource:hover {
   margin: 0 0 10px;
   color: #c9a227;
   font-size: 0.9rem;
+}
+
+/*
+ * Something a finger can actually hit.
+ *
+ * The icon buttons are 26px and the small controls 32px, which is fine for a cursor and under the
+ * 44px a touch target wants - and this product is meant to be used from a phone. Scoped to coarse
+ * pointers so the desktop keeps its density: the same button is not made clumsy for a mouse to
+ * make it reachable by a thumb. The visual box is unchanged; the hit area grows around it.
+ */
+@media (pointer: coarse) {
+  .icon-btn,
+  .composer-tools button,
+  .message-actions button,
+  .terminal-keys > button {
+    position: relative;
+  }
+  .icon-btn::after,
+  .composer-tools button::after,
+  .message-actions button::after,
+  .terminal-keys > button::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: max(100%, 44px);
+    height: max(100%, 44px);
+    transform: translate(-50%, -50%);
+  }
 }

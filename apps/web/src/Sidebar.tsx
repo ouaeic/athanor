@@ -68,6 +68,8 @@ export function Sidebar(props: {
     return () => window.cancelAnimationFrame(frame);
   }, [renaming]);
   const [contentMatches, setContentMatches] = useState<ConversationSearchResult[]>([]);
+  /** Whether the search could not be run, as opposed to having found nothing. */
+  const [searchFailed, setSearchFailed] = useState(false);
   const [searching, setSearching] = useState(false);
   const [activeResult, setActiveResult] = useState(-1);
   const workspace = props.workspaces.find((item) => item.id === props.selectedWorkspaceId);
@@ -85,10 +87,18 @@ export function Sidebar(props: {
       void props
         .onSearch(searchQuery, thisComputerOnly)
         .then((results) => {
-          if (active) setContentMatches(results);
+          if (active) {
+            setContentMatches(results);
+            setSearchFailed(false);
+          }
         })
+        // "Nothing matched" and "this could not be asked" read identically once the list is empty,
+        // and the owner would conclude their conversation is gone.
         .catch(() => {
-          if (active) setContentMatches([]);
+          if (active) {
+            setContentMatches([]);
+            setSearchFailed(true);
+          }
         })
         .finally(() => {
           if (active) setSearching(false);
@@ -312,7 +322,15 @@ export function Sidebar(props: {
                 {bucket.tasks.map((task) => conversationRow(task, '', undefined))}
               </div>
             ))}
-        {isSearching && !results.length && !searching && (
+        {isSearching && !results.length && !searching && searchFailed && (
+          <div className="empty-mini">
+            <Sparkles size={18} />
+            <span>
+              The search could not be run just now, so this is not an answer about “{searchQuery}”.
+            </span>
+          </div>
+        )}
+        {isSearching && !results.length && !searching && !searchFailed && (
           <div className="empty-mini">
             <Sparkles size={18} />
             <span>

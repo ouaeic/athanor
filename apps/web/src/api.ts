@@ -64,10 +64,24 @@ export interface ProviderSettings {
 
 let nativeGateway = false;
 
+/**
+ * How long any one request may hang before it is treated as a failure.
+ *
+ * Nothing in this client had a deadline, so a connection that opened and then stalled - a phone
+ * moving between networks is the ordinary case - left the promise pending forever. Whatever it was
+ * feeding showed its loading state and never left it, and no error was ever raised because none
+ * ever arrived. Generous, because a slow answer is still an answer; a caller that wants longer
+ * passes its own signal, which wins.
+ */
+const REQUEST_TIMEOUT_MS = 45_000;
+
 const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(path, {
     credentials: 'include',
     ...init,
+    // After the spread, so an `init` carrying an explicit `signal: undefined` cannot silently
+    // remove the deadline. A caller with its own signal still wins.
+    signal: init?.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     headers: {
       ...(init?.body instanceof ArrayBuffer
         ? { 'content-type': 'application/octet-stream' }
