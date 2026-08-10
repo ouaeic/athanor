@@ -1099,7 +1099,15 @@ export function Timeline({
          cannot be reached from the keyboard is a WCAG 2.1.1 failure; the transcript is often the
          only scrollable thing on screen and frequently contains no focusable element at all. */
       tabIndex={0}
-      role="log"
+      /*
+        A region, not a log.
+
+        `log` carries an implicit `aria-live="polite"`, and the answer arrives here as a growing
+        node rewritten on every frame - so a screen reader read the reply aloud a few words at a
+        time, from the top, several times a second, for the whole of a turn. Turn boundaries are
+        already announced through the polite region built for them, once each, in words.
+      */
+      role="region"
       aria-label={`Conversation: ${task?.title ?? 'New conversation'}`}
     >
       <div className="timeline">

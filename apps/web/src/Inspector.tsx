@@ -718,7 +718,11 @@ function Files({ workspace }: { workspace: Workspace }) {
             placeholder={naming.entry ? naming.entry.name : 'March reports'}
             onChange={(event) => setNaming({ ...naming, value: event.target.value })}
             onKeyDown={(event) => {
-              if (event.key === 'Escape') setNaming(undefined);
+              if (event.key !== 'Escape') return;
+              // Consumed, or the same keystroke also reaches the window shortcut that stops the
+              // running agent - backing out of naming a folder would quietly cancel the work.
+              event.stopPropagation();
+              setNaming(undefined);
             }}
           />
           <button type="submit">{naming.entry ? 'Rename' : 'Create'}</button>
@@ -730,6 +734,22 @@ function Files({ workspace }: { workspace: Workspace }) {
       {uploadError && (
         <div className="form-error" role="alert">
           {uploadError}
+        </div>
+      )}
+      {/*
+        A banner rather than a branch of the chain below.
+
+        The failed-listing state was only rendered as one arm of the ternary that also decides
+        between a preview, the loading state and the list - and the preview is tested first. So
+        Refresh, or Up one folder, while a file was open did nothing at all, at every path: the
+        request failed, the message was set, and nothing on screen could show it.
+      */}
+      {listingError && preview && (
+        <div className="form-error" role="alert">
+          {listingError}
+          <button className="link-button" onClick={() => void load()}>
+            Try again
+          </button>
         </div>
       )}
       {overwrite && (
