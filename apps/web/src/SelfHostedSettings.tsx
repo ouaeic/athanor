@@ -151,6 +151,8 @@ export function SelfHostedSettings({
   const [skillContent, setSkillContent] = useState(skillTemplate);
   /** Whether the security lists could not be read, as opposed to being genuinely empty. */
   const [securityUnavailable, setSecurityUnavailable] = useState(false);
+  /** Whether the recovery points could not be read, as opposed to there being none. */
+  const [snapshotsUnavailable, setSnapshotsUnavailable] = useState(false);
   const [sessions, setSessions] = useState<
     Array<{ id: string; deviceLabel: string; lastSeenAt: string; current: boolean }>
   >([]);
@@ -242,8 +244,14 @@ export function SelfHostedSettings({
     if (!workspace) return;
     void api
       .workspaceSnapshots(workspace.id)
-      .then(setSnapshots)
-      .catch(() => setSnapshots([]));
+      .then((next) => {
+        setSnapshots(next);
+        setSnapshotsUnavailable(false);
+      })
+      // "No recovery points" is a claim about the machine; an unread list is a claim about this
+      // device. Told apart, because the first one would send somebody looking for a backup they
+      // actually have.
+      .catch(() => setSnapshotsUnavailable(true));
   };
 
   useEffect(() => {
@@ -1551,7 +1559,15 @@ export function SelfHostedSettings({
           </button>
         </div>
         <div className="settings-list recovery-list">
-          {!snapshots.length && (
+          {snapshotsUnavailable && (
+            <div>
+              <span>
+                <strong>The recovery points could not be read</strong>
+                <small>Nothing was removed — this device could not reach the server.</small>
+              </span>
+            </div>
+          )}
+          {!snapshots.length && !snapshotsUnavailable && (
             <div>
               <span>
                 <strong>No recovery points</strong>
