@@ -13,10 +13,13 @@ describe('deciding when a live session asks for a fresh capability', () => {
   });
 
   /**
-   * The failure this exists for: a fifteen-minute capability renewed once, most of the way to
-   * expiry, by a timer a hidden tab throttles. Measured on the deployed server, the session closed
-   * at 902s with 1008 "Capability expired" - the exact thing renewal prevents. Renewing inside the
-   * last third means a one-minute check gets five attempts, not one.
+   * The property this exists for: one chance is not enough. A fifteen-minute capability renewed by
+   * a single timer most of the way to expiry can miss it entirely, because browsers throttle timers
+   * in a hidden tab and this app is backgrounded constantly on a phone. Renewing anywhere inside
+   * the last third means a one-minute check gets five attempts rather than one.
+   *
+   * Stated as a property rather than an anecdote on purpose: the anecdote this replaced was a
+   * measurement taken through a broken WebSocket stub, and it was wrong.
    */
   it('leaves room for several attempts rather than one', () => {
     const deadline = NOW + 15 * 60_000;

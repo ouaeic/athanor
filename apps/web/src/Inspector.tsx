@@ -1519,18 +1519,20 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
           token
         ]);
         /*
-         * Kept alive before its capability runs out - without trusting a long timer.
+         * Kept alive before its capability runs out, without trusting one long timer.
          *
          * The runner closes this socket when the capability expires, deliberately, so a shell on
-         * the box stays revocable, and capabilities are capped at fifteen minutes. One `setTimeout`
-         * most of the way to expiry looked right and did not work: browsers throttle timers in a
-         * hidden tab. Measured against the deployed server, the socket closed at 902s with 1008
-         * "Capability expired" - exactly the failure this exists to prevent - because the page had
-         * been in the background. On a phone, where the app is backgrounded constantly, that would
-         * be the ordinary case rather than a quirk of how it was tested.
+         * the box stays revocable, and capabilities are capped at fifteen minutes. A single
+         * `setTimeout` most of the way to expiry would be one chance: browsers throttle timers in a
+         * hidden tab, and on a phone this app is backgrounded constantly, so that chance can be
+         * missed and the session dies mid-command. A short interval that throttling cannot push
+         * past the deadline gives several, and the deadline is checked again the moment the page is
+         * shown.
          *
-         * So the deadline is read from the token, checked on a short interval that throttling
-         * cannot push past expiry, and checked again the moment the page is shown.
+         * (An earlier version of this comment claimed a measured failure at 902s. That measurement
+         * was an artifact of the instrumentation used to take it - a WebSocket stub without the
+         * static `OPEN`, which made the app's own send guard false. The throttling risk above is
+         * real; that particular evidence for it was not.)
          */
         let deadline = capabilityDeadline(token);
         let renewing = false;
