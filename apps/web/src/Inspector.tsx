@@ -1055,17 +1055,28 @@ function Computer({
    */
   useEffect(() => {
     if (!expanded) return;
-    // `KeyboardEvent` is React's in this file; this listener is on the window, so it wants the DOM one.
+    /*
+     * Taken in the capture phase, and consumed.
+     *
+     * `windowShortcut` maps Escape to stop-agent while the agent is working (shortcuts.ts), and it
+     * listens on the window in the bubble phase. A bubble listener of our own would fire alongside
+     * it, so leaving full screen also stopped the running task - one keystroke, two meanings, the
+     * destructive one silent. Capture on the document runs before the window's bubble listener, so
+     * stopping propagation here means Escape closes the overlay and does nothing else.
+     */
+    // `KeyboardEvent` is React's in this file; this listener is on the document, so it wants the DOM one.
     const onKey = (event: globalThis.KeyboardEvent) => {
-      if (event.key === 'Escape') setExpanded(false);
+      if (event.key !== 'Escape') return;
+      event.stopPropagation();
+      setExpanded(false);
     };
     const onFullscreenChange = () => {
       if (!document.fullscreenElement) setExpanded(false);
     };
-    window.addEventListener('keydown', onKey);
+    document.addEventListener('keydown', onKey, true);
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => {
-      window.removeEventListener('keydown', onKey);
+      document.removeEventListener('keydown', onKey, true);
       document.removeEventListener('fullscreenchange', onFullscreenChange);
     };
   }, [expanded]);
