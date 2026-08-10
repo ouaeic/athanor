@@ -3907,6 +3907,39 @@ body,
     0 14px 34px #000000a6;
 }
 
+/*
+  One curve, and things that move under a pointer.
+ 
+  Nine of the most-touched surfaces in the product - every sidebar row, every icon button, every
+  settings row, every file row - changed background, border and colour simultaneously with no
+  transition at all, so the whole interface snapped. Fourteen transition declarations in this file
+  and not one easing curve beyond the browser default; the only thing that genuinely animated was
+  the composer's halo, which ran for ever and meant nothing.
+ 
+  The curve is fast out of the gate and settles late, which is what makes a hover feel like the
+  surface responding rather than a value being replaced. It is defined once and used everywhere so
+  the product moves in one voice.
+*/
+:root {
+  --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+
+.workspace-switcher,
+.schedule-task,
+.task-row,
+.account-row,
+.icon-btn,
+.file-list .file-open,
+.ghost,
+.settings-nav button,
+.task-plan-history > button {
+  transition:
+    background-color 140ms var(--ease),
+    border-color 140ms var(--ease),
+    color 140ms var(--ease),
+    box-shadow 140ms var(--ease);
+}
+
 .workspace-switcher:hover,
 .schedule-task:hover,
 .task-row:hover,

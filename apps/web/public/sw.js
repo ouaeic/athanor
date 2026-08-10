@@ -126,8 +126,37 @@ const cachedAsset = async (request) => {
  * image with `index.html` is the failure this replaces. A miss with no cached copy is left to fail
  * as it would with no worker installed, which is the honest outcome.
  */
-const cachedDocument = async (request, isNavigation) => {
+const cachedDocument = async (request, isNavigation, keepAlive) => {
   const url = new URL(request.url);
+  /*
+   * The app's own root answers from cache first, and refreshes behind it.
+   *
+   * Every launch used to block on a full round trip to the box before any HTML existed at all, and
+   * then show the splash while the app made a second one - on a product whose promise is that you
+   * sign in once and never wait for it again. The shell is a hashed-asset bootstrap: the copy on
+   * disk is always a valid app, and the assets it names are immutable, so serving it immediately
+   * and fetching the new one behind it costs nothing but is the whole difference between an icon
+   * that opens and an icon that loads.
+   *
+   * Scoped to `/` for the same reason the write below is: the box serves published previews from
+   * this origin, and answering one of those from the shell would open athanor instead of the
+   * owner's site.
+   */
+  if (isNavigation && url.pathname === '/') {
+    const shell = await caches.match('/index.html');
+    if (shell) {
+      keepAlive(
+        fetch(request)
+          .then(async (fresh) => {
+            if (!fresh.ok) return;
+            const cache = await caches.open(SHELL);
+            await cache.put('/index.html', fresh.clone());
+          })
+          .catch(() => undefined)
+      );
+      return shell;
+    }
+  }
   try {
     const response = await fetch(request);
     // The shell is refreshed on every visit so that offline shows the deployment whose assets this
@@ -182,7 +211,10 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(
     cachedDocument(
       event.request,
-      event.request.mode === 'navigate' || event.request.destination === 'document'
+      event.request.mode === 'navigate' || event.request.destination === 'document',
+      // The revalidation outlives the response it is not part of, so it is held open by the event
+      // rather than left to be killed when the worker goes idle a moment after answering.
+      (work) => event.waitUntil(work)
     )
   );
 });

@@ -143,12 +143,16 @@ const worker = (options: {
     await Promise.all(pending);
   };
 
-  /** What `respondWith` was handed, which is the only thing the page ever sees. */
+  /**
+   * What `respondWith` was handed, which is the only thing the page ever sees - and separately what
+   * the worker asked to keep alive after answering, which is where a revalidation lives.
+   */
+  const settled: Array<Promise<unknown>> = [];
   const respond = async (request: Record<string, unknown>): Promise<Response | Error> => {
     let answered: Promise<Response> | undefined;
     listeners.get('fetch')?.({
       request,
-      waitUntil: () => undefined,
+      waitUntil: (promise: Promise<unknown>) => settled.push(promise),
       respondWith: (value: Promise<Response>) => {
         answered = value;
       }
@@ -157,7 +161,12 @@ const worker = (options: {
     return answered.catch((cause: Error) => cause);
   };
 
-  return { dispatch, respond, storage, shown, opened, navigated, messages, requests };
+  /** Waits for whatever the worker deferred past its own answer. */
+  const drain = async (): Promise<void> => {
+    await Promise.all(settled.splice(0));
+  };
+
+  return { dispatch, respond, drain, storage, shown, opened, navigated, messages, requests };
 };
 
 const payload = (overrides: Record<string, unknown> = {}) => ({
@@ -176,9 +185,11 @@ describe('offline shell', () => {
 
   /** A deployment that answers everything until the test cuts the network. */
   const deployment = () => {
-    const state = { online: true };
+    /** `stalled` is a box that accepted the connection and never answered - the worst real case. */
+    const state = { online: true, stalled: false };
     const sw = worker({
       respond: async (url) => {
+        if (state.stalled) return new Promise<Response>(() => undefined);
         if (!state.online) throw new TypeError('Failed to fetch');
         if (url === '/asset-manifest.json')
           return new Response(JSON.stringify(MANIFEST), {
@@ -245,6 +256,48 @@ describe('offline shell', () => {
     const answer = await sw.respond(navigation);
     expect(answer).toBeInstanceOf(Response);
     expect(await (answer as Response).text()).toContain('<!doctype html>');
+  });
+
+  const launch = () => get('https://box.example/', { mode: 'navigate', destination: 'document' });
+
+  it('opens without waiting for the box, even when the box never answers', async () => {
+    const { sw, state } = deployment();
+    await sw.dispatch('install', {});
+    // A box that accepted the connection and never replied - the worst real case, and the one a
+    // network-first worker cannot survive. Every launch used to block on a full round trip before
+    // any HTML existed at all, on a product whose promise is that you sign in once and never wait
+    // for it again.
+    state.stalled = true;
+
+    const answer = await sw.respond(launch());
+
+    expect(answer).toBeInstanceOf(Response);
+    expect(await (answer as Response).text()).toContain('<!doctype html>');
+  });
+
+  it('replaces the copy on disk behind the answer, so the next launch is the new deployment', async () => {
+    const { sw } = deployment();
+    await sw.dispatch('install', {});
+    const before = sw.requests.length;
+
+    await sw.respond(launch());
+    await sw.drain();
+
+    expect(sw.requests.length).toBeGreaterThan(before);
+    expect(sw.requests.some((request) => request.url === 'https://box.example/')).toBe(true);
+  });
+
+  it('never answers a published preview from the shell, however it is opened', async () => {
+    const { sw } = deployment();
+    await sw.dispatch('install', {});
+    await expect(
+      sw.respond(
+        get('https://box.example/__athanor/preview/abc', {
+          mode: 'navigate',
+          destination: 'document'
+        })
+      )
+    ).rejects.toThrow('did not answer');
   });
 
   it('leaves the API alone: a request to /v1 is never answered from a cache', async () => {
