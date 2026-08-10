@@ -1559,6 +1559,16 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
         document.addEventListener('visibilitychange', onShown);
         socket.onopen = () => {
           term.writeln('\x1b[32mConnected to private agent computer\x1b[0m');
+          /*
+           * Tell it how big the window actually is.
+           *
+           * The runner spawns the pty at a fixed 120x32, and `term.onResize` is registered below -
+           * after this socket exists - so the fit that happened at mount fired into nothing and was
+           * lost. The shell then believed it had 120 columns inside a pane about half that, which
+           * is why anything that draws a full screen, an editor or a pager, came out wrapped and
+           * misaligned. Sent once here, and after that the resize handler keeps it honest.
+           */
+          socket?.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
         };
         socket.onmessage = (event) => {
           const message = JSON.parse(String(event.data)) as {
