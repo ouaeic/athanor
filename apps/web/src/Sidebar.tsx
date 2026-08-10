@@ -148,7 +148,11 @@ export function Sidebar(props: {
              way back, is the one thing an inline rename must never do. */
           onBlur={() => commitRename(task)}
           onKeyDown={(event) => {
-            if (event.key === 'Escape') setRenaming(undefined);
+            if (event.key !== 'Escape') return;
+            // Consumed, or the same keystroke also reaches the window shortcut that stops the
+            // running agent - cancelling a rename would quietly cancel the work.
+            event.stopPropagation();
+            setRenaming(undefined);
           }}
         />
       </form>

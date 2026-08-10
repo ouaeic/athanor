@@ -3008,9 +3008,11 @@ select:focus-visible {
   gap: 10px;
   margin: 13px 0 20px;
   padding: 14px;
-  border: 1px solid var(--line-strong);
+  /* These named a token set that has never existed in this file, so the panel drew with no border
+     and no surface at all - a confirmation before a destructive restore, rendered as bare text. */
+  border: 1px solid var(--line);
   border-radius: 14px;
-  background: var(--surface-raised);
+  background: var(--panel-strong);
 }
 
 .restore-confirmation > span {
@@ -5461,9 +5463,10 @@ a:focus-visible {
 
 /* Distinct from Send without competing with Stop: this one redirects work rather than ending it. */
 .send-btn.correcting {
-  background: var(--surface-3, transparent);
-  border: 1px solid var(--border);
-  color: var(--text-1);
+  /* Same three undefined names: transparent fill, a border colour that dropped, inherited text. */
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  color: var(--text);
 }
 
 /* Command palette (⌘K). */

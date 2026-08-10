@@ -59,7 +59,20 @@ export const createUndoQueue = (options: UndoQueueOptions): UndoQueue => {
     if (!entry) return;
     queue = queue.filter((item) => item.id !== id);
     publish();
-    void entry.request.commit().catch((cause) => options.onError?.(cause, entry.request));
+    /*
+     * A commit that failed has to put the row back.
+     *
+     * The row is removed from the interface the moment the undo window opens, on the promise that
+     * the server call behind it will happen. When that call fails the promise is broken: the file
+     * is still on the computer and gone from the screen, and the only thing that happened was a
+     * message. `restore` existed on the request for exactly this and was never called - so every
+     * failed delete, of a file, an artifact, a preview, a session or a token, left the interface
+     * describing a world that is not there.
+     */
+    void entry.request.commit().catch((cause) => {
+      entry.request.restore?.();
+      options.onError?.(cause, entry.request);
+    });
   };
 
   return {

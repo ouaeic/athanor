@@ -108,6 +108,28 @@ describe('createUndoQueue', () => {
     expect((errors[0] as Error).message).toBe('offline');
   });
 
+  /**
+   * The row leaves the interface the moment the undo window opens, on the promise that the call
+   * behind it will happen. When it fails that promise is broken - the thing is still on the
+   * computer and gone from the screen - and `restore` existed for exactly this and was never run.
+   */
+  it('puts the row back when the commit fails', async () => {
+    const { queue, timers } = harness();
+    const restore = vi.fn();
+    queue.push({
+      message: 'File deleted',
+      commit: async () => {
+        throw new Error('offline');
+      },
+      restore
+    });
+    timers.run(1);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(restore).toHaveBeenCalledTimes(1);
+  });
+
   it('ignores an undo for an entry that already committed', async () => {
     const { queue, timers } = harness();
     const commit = vi.fn(async () => undefined);

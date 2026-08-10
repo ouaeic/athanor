@@ -150,12 +150,20 @@ export function App() {
   const navOpener = useRef<HTMLElement | null>(null);
   useEffect(() => {
     if (!mobileNav) return;
+    /*
+     * Capture, and consumed. Escape is also mapped to stop-agent while the agent is working, on a
+     * window listener in the bubble phase - so closing this drawer stopped the running task too,
+     * silently. Capture on the document runs first, and stopping propagation there means Escape
+     * closes the drawer and does nothing else.
+     */
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setMobileNav(false);
+      if (event.key !== 'Escape') return;
+      event.stopPropagation();
+      setMobileNav(false);
     };
-    window.addEventListener('keydown', onKey);
+    document.addEventListener('keydown', onKey, true);
     return () => {
-      window.removeEventListener('keydown', onKey);
+      document.removeEventListener('keydown', onKey, true);
       navOpener.current?.focus();
     };
   }, [mobileNav]);
