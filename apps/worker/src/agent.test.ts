@@ -39,10 +39,12 @@ import {
   degenerateRepeat,
   previewUrl,
   normalizeAssistantText,
+  ownerFixableCheckpointFailure,
   patchFailure,
   planStepsFromArguments,
   providerWebProvenance,
   LATE_STEP_EFFORT_FLOOR,
+  effortFloorEarned,
   reasoningEffortForStep,
   retryTurnHandoff,
   sealUnansweredToolCalls,
@@ -1763,6 +1765,31 @@ describe('how hard the model thinks about a step', () => {
     expect(step({ step: 0 })).toBe('high');
   });
 
+  it('does not let a call that threw decide the whole turn is hard', () => {
+    const threw = { step: 3, messages: after('shell', 'Tool failed: runner unreachable') };
+    // Worth thinking about on the step that recovers from it...
+    expect(reasoningEffortForStep(threw)).toBe('high');
+    // ...but `Tool failed:` is written when a tool threw, which is a fact about the network. One
+    // such shell call on step 4 of a measured run pinned all sixteen remaining steps to maximum
+    // reasoning on a task whose entire output was two lines of verse.
+    expect(effortFloorEarned(threw)).toBe(false);
+  });
+
+  it('lets evidence about the work itself pin the floor', () => {
+    for (const hard of [
+      { finishRejections: 1 },
+      { acceptanceFailures: 1 },
+      { completionNags: 1 },
+      { step: LATE_STEP_EFFORT_FLOOR },
+      { compactedAtStep: 3 },
+      { estimatedInputTokens: 900, inputBudgetTokens: 1000 }
+    ]) {
+      const state = { step: 3, messages: [], planVersion: 2, ...hard };
+      expect(effortFloorEarned(state)).toBe(true);
+      expect(reasoningEffortForStep(state)).toBe('high');
+    }
+  });
+
   it('spends it again when the last step went wrong', () => {
     expect(step({ messages: after('shell', 'Tool failed: no such file') })).toBe('high');
     expect(step({ messages: after('finish', 'Finish rejected (attempt 1 of 3)') })).toBe('high');
@@ -2105,5 +2132,18 @@ describe('what a long task remembers of its early work', () => {
       reservationKey: 'r'
     });
     expect(next.carriedArtifacts).toEqual([]);
+  });
+});
+
+describe('a turn that lost its undo point', () => {
+  it('tells the owner only when the reason is theirs to clear', () => {
+    // The runner's own refusal, verbatim, is what reaches the worker through the checkpoint call.
+    expect(
+      ownerFixableCheckpointFailure(
+        'Checkpoint failed (507): {"error":{"message":"Host disk is too full to take an automatic checkpoint, so this turn cannot be rewound."}}'
+      )
+    ).toBe(true);
+    expect(ownerFixableCheckpointFailure('EACCES: permission denied, mkdir')).toBe(false);
+    expect(ownerFixableCheckpointFailure('workspace is not its own dataset')).toBe(false);
   });
 });

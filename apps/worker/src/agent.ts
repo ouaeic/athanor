@@ -392,6 +392,19 @@ const CHECKPOINT_EXEMPT_TOOLS = new Set([
 ]);
 
 /**
+ * Whether a turn that lost its undo point lost it for a reason the owner can do something about.
+ *
+ * Measured: writing a two-line haiku produced a transcript whose loudest card was "This turn has no
+ * undo point for the computer", raised because the runner could not take a checkpoint - a fact
+ * about the machine, not about the verse. There is exactly one cause of it the owner can clear, and
+ * the runner says so in as many words when it refuses: the host disk is too full. That one reaches
+ * the conversation; every other cause stays in the work log, where the record still exists for
+ * anyone who goes looking for why a rewind is not on offer.
+ */
+export const ownerFixableCheckpointFailure = (message: string): boolean =>
+  /disk is too full|no space left|ENOSPC|storage is full|quota exceeded/i.test(message);
+
+/**
  * A rejected finish is worth retrying: models usually cite the wrong id or omit `source`, and the
  * corrected call lands on the next attempt. Retrying without bound is not - each attempt is a
  * billed model call against a full context, so an ungroundable completion used to burn the entire
@@ -597,7 +610,7 @@ export const CONTEXT_EFFORT_FLOOR_SHARE = 0.5;
  * instead of flipping ten times in twenty-three steps, each flip discarding the provider's cached
  * trajectory below the system prefix.
  */
-export const reasoningEffortForStep = (state: {
+interface EffortState {
   step: number;
   messages: ModelMessage[];
   planVersion?: number;
@@ -608,20 +621,36 @@ export const reasoningEffortForStep = (state: {
   compactedAtStep?: number;
   estimatedInputTokens?: number;
   inputBudgetTokens?: number;
-}): 'medium' | 'high' => {
-  if (state.step === 0) return 'high';
-  if (state.reasoningFloor === 'high') return 'high';
-  if (state.finishRejections || state.completionNags || state.acceptanceFailures) return 'high';
-  if (state.step >= LATE_STEP_EFFORT_FLOOR) return 'high';
+}
+
+/**
+ * Whether this step's `high` is evidence about the *work* rather than about one call going wrong.
+ *
+ * Only these conditions may pin the floor for the rest of the turn. The distinction was missing and
+ * it is expensive: `Tool failed:` is written when a tool *threw* - the runner briefly unreachable,
+ * a socket closed - and on a measured run one such shell call on step 4 pinned every one of the
+ * sixteen remaining steps to maximum reasoning on a task whose entire output was two lines of
+ * verse. That is a fact about the network. The step after it is still worth thinking about, and it
+ * still gets `high` below; what it no longer does is decide that the turn is hard for ever.
+ *
+ * The conditions kept here are all statements about the turn itself: the harness refused a finish,
+ * an acceptance check failed, the window was just compacted and the model is working from a summary
+ * of its own work, the turn has run long, or the context is over half the input budget.
+ */
+export const effortFloorEarned = (state: EffortState): boolean =>
+  Boolean(state.finishRejections || state.completionNags || state.acceptanceFailures) ||
+  state.step >= LATE_STEP_EFFORT_FLOOR ||
   // The step immediately after a compaction is the one most likely to make a wrong call: the model
   // has just lost the detail it was working from and is holding a summary of its own work instead.
-  if (state.compactedAtStep !== undefined && state.step - state.compactedAtStep <= 1) return 'high';
-  if (
-    state.estimatedInputTokens !== undefined &&
+  (state.compactedAtStep !== undefined && state.step - state.compactedAtStep <= 1) ||
+  (state.estimatedInputTokens !== undefined &&
     state.inputBudgetTokens !== undefined &&
-    state.estimatedInputTokens > state.inputBudgetTokens * CONTEXT_EFFORT_FLOOR_SHARE
-  )
-    return 'high';
+    state.estimatedInputTokens > state.inputBudgetTokens * CONTEXT_EFFORT_FLOOR_SHARE);
+
+export const reasoningEffortForStep = (state: EffortState): 'medium' | 'high' => {
+  if (state.step === 0) return 'high';
+  if (state.reasoningFloor === 'high') return 'high';
+  if (effortFloorEarned(state)) return 'high';
   let lastAssistant = -1;
   for (let index = state.messages.length - 1; index >= 0; index -= 1) {
     if (state.messages[index]?.role === 'assistant') {
@@ -2556,6 +2585,7 @@ export class AgentWorker {
         await this.store.deleteWorkspaceCheckpoints(task.workspaceId, created.pruned);
     } catch (error) {
       state.checkpoint = { turn, id: null };
+      const message = error instanceof Error ? error.message : 'The checkpoint could not be taken';
       await event(
         this.store,
         task,
@@ -2563,8 +2593,9 @@ export class AgentWorker {
         'warning',
         'This turn has no undo point for the computer',
         {
+          ...(ownerFixableCheckpointFailure(message) ? { owner: true } : {}),
           tool,
-          message: error instanceof Error ? error.message : 'The checkpoint could not be taken'
+          message
         }
       );
     }
@@ -3337,6 +3368,9 @@ ${clockLine(new Date(), timeZone)}
         ? 'This turn used its whole compute budget before the work was finished'
         : 'This turn used its whole step budget before the work was finished',
       {
+        // The turn stopped short of the work the owner asked for and only they can start it again,
+        // so this is one of the few warnings that belongs in the transcript rather than the log.
+        owner: true,
         steps: state.step,
         maxSteps: this.config.TASK_MAX_STEPS,
         ...(ranOutOf === 'credits'
@@ -7022,7 +7056,9 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
           key,
           'warning',
           'Refused: this action no longer matches what was approved',
-          { approvalId, tool: call.name }
+          // Addressed to the owner: they answered a question about one action and a different one
+          // was attempted under that answer. Nothing else in the conversation says so.
+          { owner: true, approvalId, tool: call.name }
         );
         state.messages.push({
           role: 'tool',
@@ -7236,8 +7272,10 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       // needs the full budget it does not stop being one, and pinning the field is also what keeps
       // the provider's cached trajectory from being discarded on the next flip. The opening step is
       // deliberately excluded - it is high because it is the opening step, not because the work is
-      // hard, and letting it set the floor would make every task high for its whole length.
-      if (state.step > 0 && reasoningEffort === 'high') state.reasoningFloor = 'high';
+      // hard, and letting it set the floor would make every task high for its whole length. A tool
+      // that threw is excluded for the same reason: it raises this step and not the turn.
+      if (state.step > 0 && reasoningEffort === 'high' && effortFloorEarned(state))
+        state.reasoningFloor = 'high';
       await this.#assertProviderConfigured(task);
       const streamFlusher = createStreamFlusher();
       let streamEvents = Promise.resolve();
@@ -7509,6 +7547,10 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             ? 'The reply reached the model’s output limit again, so it was not continued automatically'
             : 'The reply reached the model’s output limit and is being continued',
           {
+            // Only the cap. A reply being continued is the harness doing its job and the owner
+            // sees the finished answer either way; a reply that will not be continued any further
+            // is an answer they have been handed incomplete.
+            ...(capped ? { owner: true } : {}),
             truncated: true,
             characters: assistantText.length,
             continuation: truncations,
@@ -8243,7 +8285,9 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         key,
         error instanceof AthanorError && error.code.includes('provider') ? 'warning' : 'error',
         message.slice(0, 500),
-        { code: error instanceof AthanorError ? error.code : 'agent_failed' }
+        // The task stopped and did not do what was asked. Whatever else is folded away, the reason
+        // the work is not there has to be in the conversation.
+        { owner: true, code: error instanceof AthanorError ? error.code : 'agent_failed' }
       );
     }
     const waiting =
