@@ -40,13 +40,22 @@ const database = createDatabase({
 await migrateDatabase(database);
 const store = new DataStore(database);
 const masterKey = config.DATA_MASTER_KEY ? decodeMasterKey(config.DATA_MASTER_KEY) : null;
+/*
+ * Shutting down means waking up, not just being told.
+ *
+ * Almost all of this service's life is the hour it spends asleep between refreshes, and a flag set
+ * by the signal handler is not read until that hour is over. So every restart - and every update,
+ * which restarts each service in turn - waited out `TimeoutStopSec` and then killed it: thirty
+ * seconds of the outage the owner is watching, spent on a process that had nothing to finish.
+ */
 let running = true;
-process.once('SIGINT', () => {
+const shutdown = new AbortController();
+const stop = (): void => {
   running = false;
-});
-process.once('SIGTERM', () => {
-  running = false;
-});
+  shutdown.abort();
+};
+process.once('SIGINT', stop);
+process.once('SIGTERM', stop);
 
 let consecutiveFailures = 0;
 
@@ -112,6 +121,8 @@ while (running) {
   });
   if (line) process.stderr.write(line);
   consecutiveFailures = reason === null ? 0 : consecutiveFailures + 1;
-  await delay(config.REGISTRY_REFRESH_SECONDS * 1000);
+  await delay(config.REGISTRY_REFRESH_SECONDS * 1000, undefined, {
+    signal: shutdown.signal
+  }).catch(() => undefined);
 }
 await database.close();
