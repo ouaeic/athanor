@@ -1,7 +1,10 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
+import { ModelRelease } from '@athanor/contracts';
+import { decodeMasterKey } from '@athanor/core';
 import { createDatabase, DataStore, migrateDatabase } from '@athanor/data';
 import { refreshOpenRouterCatalog, seedModels } from '@athanor/model-gateway';
+import { catalogCredential } from './catalog-credential.js';
 import { refreshFailureReason, refreshLogLine } from './refresh-log.js';
 
 const Config = z.object({
@@ -11,6 +14,15 @@ const Config = z.object({
   REGISTRY_REFRESH_SECONDS: z.coerce.number().int().min(60).default(3600),
   OPENROUTER_BASE_URL: z.string().url().default('https://openrouter.ai/api/v1'),
   OPENROUTER_REGISTRY_KEY: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() ? value.trim() : undefined),
+    z.string().min(1).optional()
+  ),
+  /**
+   * Optional here alone. Every other service refuses to start without it because it cannot do its
+   * job at all; this one can still seed an empty catalogue, and a developer running the loop
+   * against a scratch database should not have to hold the owner's key to do it.
+   */
+  DATA_MASTER_KEY: z.preprocess(
     (value) => (typeof value === 'string' && value.trim() ? value.trim() : undefined),
     z.string().min(1).optional()
   ),
@@ -27,6 +39,7 @@ const database = createDatabase({
 });
 await migrateDatabase(database);
 const store = new DataStore(database);
+const masterKey = config.DATA_MASTER_KEY ? decodeMasterKey(config.DATA_MASTER_KEY) : null;
 let running = true;
 process.once('SIGINT', () => {
   running = false;
@@ -44,17 +57,34 @@ while (running) {
   // than weakening privacy requirements or emptying the model picker.
   let reason: string | null = null;
   try {
-    if (config.OPENROUTER_REGISTRY_KEY) {
+    const credential = await catalogCredential({
+      store,
+      masterKey,
+      environmentKey: config.OPENROUTER_REGISTRY_KEY
+    });
+    const existing = await store.listModels();
+    if (credential) {
       // A real refresh, and a replace rather than an upsert: a model the provider has withdrawn
       // should leave the picker rather than sit in it until somebody tries to use it.
       await store.replaceModelCatalog(
         await refreshOpenRouterCatalog(seedModels(), {
-          baseUrl: config.OPENROUTER_BASE_URL,
-          apiKey: config.OPENROUTER_REGISTRY_KEY,
-          scope: config.MODEL_CATALOG_SCOPE
+          baseUrl: credential.baseUrl ?? config.OPENROUTER_BASE_URL,
+          apiKey: credential.apiKey,
+          scope: config.MODEL_CATALOG_SCOPE,
+          /*
+           * What the catalogue said an hour ago, so one failing request cannot withdraw the owner's
+           * private routes. Zero-retention is a fact about live endpoints and it arrives on its own
+           * request; when that request alone fails, the answer carried forward is the last one this
+           * box actually observed rather than "not verified", which the privacy projection would
+           * read as a reason to take every private model out of the picker.
+           */
+          previous: existing.flatMap((model) => {
+            const parsed = ModelRelease.safeParse(model);
+            return parsed.success ? [parsed.data] : [];
+          })
         })
       );
-    } else if (!(await store.listModels()).length) {
+    } else if (!existing.length) {
       /*
        * No key, so there is nothing to refresh from — but an empty catalogue still needs something
        * in it, and this is the only thing that puts it there on a new box.

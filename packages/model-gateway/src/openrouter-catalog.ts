@@ -1,5 +1,6 @@
 import type { ModelRelease } from '@athanor/contracts';
 import {
+  AthanorError,
   RETIREMENT_HORIZON_DAYS,
   type BenchmarkPopulations,
   type ModelPriceTier,
@@ -249,6 +250,22 @@ export const refreshOpenRouterCatalog = async (
   const zdrBody = zdrResult.status === 'fulfilled' ? zdrResult.value : null;
 
   const models = new Map((modelsBody.data ?? []).map((model) => [model.id, model]));
+  /*
+   * An empty list is an outage wearing a 200, and it has to be refused here rather than believed.
+   *
+   * `checkedJson` only asks whether the response was ok, so a proxy interstitial, a shape change, or
+   * an account with nothing enabled all arrive as a body with no models in it - and the answer built
+   * from that is not empty, it is the reviewed allowlist on its own, at availability 'unavailable'
+   * because no live endpoint backed any of it. Believing that flattens the catalogue on the settings
+   * route and, on the registry's replace, deletes every enriched model on the box and leaves four
+   * seeds behind - in both cases without a single failed request to account for it.
+   */
+  if (models.size === 0)
+    throw new AthanorError(
+      'provider_catalog_empty',
+      'The provider answered but listed no models, so the catalogue was left as it was',
+      502
+    );
   const zdr = new Map<string, ZdrEndpoint[]>();
   for (const endpoint of zdrBody?.data ?? []) {
     if (!endpoint.model_id || (endpoint.status !== undefined && endpoint.status !== 0)) continue;

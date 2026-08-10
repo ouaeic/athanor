@@ -246,6 +246,9 @@ importers:
       '@athanor/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@athanor/core':
+        specifier: workspace:*
+        version: link:../../packages/core
       '@athanor/data':
         specifier: workspace:*
         version: link:../../packages/data

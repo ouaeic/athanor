@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@athanor/contracts": "workspace:*",
+    "@athanor/core": "workspace:*",
     "@athanor/data": "workspace:*",
     "@athanor/model-gateway": "workspace:*",
     "zod": "4.4.3"

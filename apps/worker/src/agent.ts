@@ -20,6 +20,7 @@ import {
   decryptJson,
   encryptJson,
   executeConnectorAction,
+  inferenceCredentialAad,
   isMailConnectorKind,
   nextScheduleRun,
   memoryTemporalStatus,
@@ -685,19 +686,6 @@ interface CompletionVerification {
 }
 
 type AgentWorkerConfig = Omit<WorkerConfig, 'WORKER_HEALTH_PORT' | 'WORKER_HEALTH_HOST'>;
-
-/**
- * The context the inference credential was sealed under, which the API writes and this had never
- * checked on the way back in.
- *
- * The GCM tag proves the ciphertext and the AAD beside it were made together; it does not prove the
- * AAD is the one this caller meant, so a row moved from one account to another decrypts perfectly
- * unless somebody compares. That comparison is the only thing between database write access and
- * reading another account's provider key, and the settings endpoint has always made it while the
- * worker - the side that actually spends the key - did not. An envelope written before the binding
- * carries no AAD at all and still opens, so this is safe on every existing installation.
- */
-const inferenceCredentialAad = (userId: string): string => `inference-provider:${userId}`;
 
 interface InferenceCredential {
   provider: 'openrouter' | 'ollama-cloud' | 'openai-compatible';

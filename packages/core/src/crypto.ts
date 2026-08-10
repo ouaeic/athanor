@@ -106,6 +106,22 @@ export const unwrapDataKey = (wrapped: string, masterKey: Uint8Array, keyId: str
   return decryptBytes(envelope, masterKey, `workspace-key:${keyId}`);
 };
 
+/**
+ * The context the owner's inference credential is sealed under.
+ *
+ * The GCM tag proves the ciphertext and the AAD beside it were made together; it does not prove the
+ * AAD is the one this caller meant, so a row moved from one account to another decrypts perfectly
+ * unless somebody compares. That comparison is the only thing between database write access and
+ * reading another account's provider key. An envelope written before the binding carries no AAD at
+ * all and still opens, so insisting on it is safe on every existing installation.
+ *
+ * It lives here because three processes now open that one row - the API writes it, the worker
+ * spends it, and the model registry refreshes the catalogue with it - and a string literal that has
+ * to stay identical across three packages forever, with nothing to notice when it stops being, is
+ * exactly the shape of a bug that presents as "the owner's key stopped working".
+ */
+export const inferenceCredentialAad = (userId: string): string => `inference-provider:${userId}`;
+
 export const sha256 = (value: Uint8Array | string): string =>
   createHash('sha256').update(value).digest('hex');
 

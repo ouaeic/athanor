@@ -311,6 +311,23 @@ describe('OpenRouter live catalog', () => {
     expect(glm?.availability).toBe('available');
   });
 
+  it('refuses a 200 that lists no models rather than answering with the allowlist alone', async () => {
+    // The caller replaces the whole catalogue with this answer, so an answer of "just the seeds"
+    // would delete every enriched model on the box with no failed request to account for it.
+    await expect(
+      refreshOpenRouterCatalog(seedModels(NOW), {
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: 'registry-key',
+        fetch: (async () =>
+          new Response(JSON.stringify({}), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })) as typeof fetch,
+        now: NOW
+      })
+    ).rejects.toMatchObject({ code: 'provider_catalog_empty' });
+  });
+
   it('still fails when the model list itself cannot be read, because there is no catalogue without it', async () => {
     const request = vi.fn(async (input: string | URL | Request) => {
       const url = input instanceof Request ? input.url : input.toString();

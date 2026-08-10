@@ -74,6 +74,7 @@ import {
   assertTimeZone,
   memoryTemporalStatus,
   AthanorError,
+  inferenceCredentialAad,
   inferModelTask,
   rankModels,
   readRoutingMetadata,
@@ -1819,8 +1820,6 @@ export const buildServer = async (
       })
     );
   });
-
-  const inferenceCredentialAad = (userId: string) => `inference-provider:${userId}`;
 
   const PROVIDER_SPEND_WINDOWS = ['daily', 'weekly', 'monthly'] as const;
 

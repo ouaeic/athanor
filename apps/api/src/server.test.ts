@@ -1955,9 +1955,9 @@ describe('conversation management', () => {
     const newer = await create('Today’s question', 'filing-task-2');
 
     const listed = async () =>
-      (
-        await app.inject({ method: 'GET', url: '/v1/tasks', headers: { cookie } })
-      ).json<{ tasks: Array<{ id: string; pinned: boolean; archivedAt: string | null }> }>().tasks;
+      (await app.inject({ method: 'GET', url: '/v1/tasks', headers: { cookie } })).json<{
+        tasks: Array<{ id: string; pinned: boolean; archivedAt: string | null }>;
+      }>().tasks;
     expect((await listed()).map((task) => task.id)).toEqual([newer, older]);
 
     const pinned = await app.inject({
@@ -2046,7 +2046,9 @@ describe('conversation management', () => {
       })
     ).json<{ tasks: Array<{ id: string }>; hasMore: boolean }>();
     // The two pages together are the whole list, in order, with nothing repeated or skipped.
-    expect([...firstPage.tasks, ...nextPage.tasks].map((task) => task.id)).toEqual([...ids].reverse());
+    expect([...firstPage.tasks, ...nextPage.tasks].map((task) => task.id)).toEqual(
+      [...ids].reverse()
+    );
     expect(nextPage.hasMore).toBe(false);
 
     const bootstrap = (
@@ -2957,7 +2959,11 @@ describe('authentication posture', () => {
 
     // Revoking it from the signed-in device is still immediate, which is what stops a photographed
     // screen from being a standing credential once the owner notices.
-    const listed = await app.inject({ method: 'GET', url: '/v1/devices/enrollments', headers: { cookie } });
+    const listed = await app.inject({
+      method: 'GET',
+      url: '/v1/devices/enrollments',
+      headers: { cookie }
+    });
     const enrollmentId = listed.json<Array<{ id: string }>>()[0]?.id;
     expect(enrollmentId).toBeTruthy();
     await app.inject({
@@ -3508,7 +3514,9 @@ describe('rewinding the computer, not only the conversation', () => {
     });
     // A safety point first, then the restore. Every other destructive act in the product takes one;
     // this one asked the owner to choose a past state and then made the present unreachable.
-    expect(runnerCalls.indexOf(`POST /v1/workspaces/${workspaceId}/snapshots`)).toBeGreaterThanOrEqual(0);
+    expect(
+      runnerCalls.indexOf(`POST /v1/workspaces/${workspaceId}/snapshots`)
+    ).toBeGreaterThanOrEqual(0);
     expect(runnerCalls.indexOf(`POST /v1/workspaces/${workspaceId}/snapshots`)).toBeLessThan(
       runnerCalls.indexOf(`POST /v1/workspaces/${workspaceId}/checkpoints/${checkpoint.id}/restore`)
     );
@@ -4007,15 +4015,21 @@ describe('where web searches are answered', () => {
    * go, and it has to reach that verdict through the same function the worker sends the request
    * with, or the two can disagree about a task that has already run.
    */
+  // A provider that lists at least one model, because one that lists none is refused: the answer
+  // built from an empty list is the seed allowlist with nothing live behind it, and believing it
+  // would flatten the owner's catalogue on the way through this very route.
   const stubProviderCalls = () =>
     vi.stubGlobal(
       'fetch',
       vi.fn(
         async () =>
-          new Response(JSON.stringify({ data: [], ok: true }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' }
-          })
+          new Response(
+            JSON.stringify({
+              data: [{ id: 'z-ai/glm-5.2', name: 'GLM-5.2', context_length: 1_000_000 }],
+              ok: true
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          )
       )
     );
 

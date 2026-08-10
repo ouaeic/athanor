@@ -2578,7 +2578,12 @@ export class DataStore {
                WHERE u.task_id=tasks.id AND u.state='settled')) + $4::double precision END,
            updated_at=NOW()
          WHERE id=$1 AND lease_owner=$2`,
-        [input.taskId, input.workerId, input.additionalComputeCredits, input.additionalSpendUsd ?? null]
+        [
+          input.taskId,
+          input.workerId,
+          input.additionalComputeCredits,
+          input.additionalSpendUsd ?? null
+        ]
       );
       await tx.query(
         `INSERT INTO task_events(id,task_id,sequence,kind,summary,payload_ciphertext)
@@ -4943,25 +4948,44 @@ export class DataStore {
    * withdrawn is removed, in one transaction, so a deprecated model stops appearing in the picker
    * instead of failing at the provider the next time a task is routed to it.
    *
-   * Two things bound the blast radius. An empty refresh prunes nothing at all, because a provider
-   * outage that returned no models must never empty the picker. And the delete is scoped to the
+   * Three things bound the blast radius. An empty refresh prunes nothing at all, because a provider
+   * outage that returned no models must never empty the picker. The delete is scoped to the
    * providers this refresh actually covered, which is what keeps a self-hosted `custom/...` entry
    * and any provider it said nothing about.
+   *
+   * And a model something is still pinned to is retired rather than deleted. A weekly schedule is
+   * the one thing here that runs unattended for months, and it names its model by id: deleting that
+   * row turns "the model you chose was withdrawn" into a run that fails every week against a name
+   * nothing on the box can resolve. Retiring it says the same thing where the owner is already
+   * looking - the picker lists it, greyed, as currently unavailable - and it is not a tombstone,
+   * because a provider that brings the model back upserts it live again on the next pass. Only live
+   * pins count: a finished task keeps its model id as history, and history reads perfectly well
+   * from the id alone.
    */
   async replaceModelCatalog(
     models: Array<Record<string, unknown>>
-  ): Promise<{ upserted: number; removed: number }> {
-    if (models.length === 0) return { upserted: 0, removed: 0 };
+  ): Promise<{ upserted: number; removed: number; retired: number }> {
+    if (models.length === 0) return { upserted: 0, removed: 0, retired: 0 };
     const ids = models.map((model) => String(model.id));
     const providers = [...new Set(models.map((model) => String(model.provider)))];
     return this.database.transaction(async (transaction) => {
       for (const model of models) await this.#upsertModel(transaction, model);
-      const removed = await transaction.query(
-        `DELETE FROM model_releases
-         WHERE provider = ANY($1::text[]) AND NOT (id = ANY($2::text[]))`,
+      const withdrawn = `provider = ANY($1::text[]) AND NOT (id = ANY($2::text[]))`;
+      const pinned = `id IN (
+           SELECT model_id FROM task_schedules WHERE enabled
+           UNION SELECT model_id FROM tasks
+             WHERE status NOT IN ('completed','failed','cancelled')
+         )`;
+      const retired = await transaction.query(
+        `UPDATE model_releases SET availability='unavailable', updated_at=NOW()
+         WHERE ${withdrawn} AND ${pinned} AND availability <> 'unavailable'`,
         [providers, ids]
       );
-      return { upserted: models.length, removed: removed.rowCount };
+      const removed = await transaction.query(
+        `DELETE FROM model_releases WHERE ${withdrawn} AND NOT (${pinned})`,
+        [providers, ids]
+      );
+      return { upserted: models.length, removed: removed.rowCount, retired: retired.rowCount };
     });
   }
 

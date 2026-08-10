@@ -223,7 +223,7 @@ describe('DataStore', () => {
     expect(after?.updatedAt).toBe(before?.updatedAt);
   });
 
-  it('takes a conversation\'s memory with it when the conversation is deleted', async () => {
+  it("takes a conversation's memory with it when the conversation is deleted", async () => {
     // "Delete this conversation" used to leave the episode and, worse, the chunks of the owner's
     // own words held verbatim in mem.source. On a computer that offers to keep no logs it has to
     // mean it, and the schema is the only place that cannot be forgotten by a later caller.
@@ -267,7 +267,7 @@ describe('DataStore', () => {
     ).resolves.toMatchObject({ rowCount: 0 });
   });
 
-  it('keeps the owner\'s choices on the box, and merges rather than clobbers them', async () => {
+  it("keeps the owner's choices on the box, and merges rather than clobbers them", async () => {
     // These lived in localStorage, so they were facts about a browser rather than about the person:
     // pick a model on the laptop and the phone still offered the old one. On a computer whose whole
     // point is being the same computer from anywhere, a setting that does not travel is not set.
@@ -1736,15 +1736,91 @@ describe('DataStore', () => {
       release('openrouter/vendor/kept', 'openrouter'),
       release('openrouter/vendor/new', 'openrouter')
     ]);
-    expect(refreshed).toEqual({ upserted: 2, removed: 1 });
+    expect(refreshed).toEqual({ upserted: 2, removed: 1, retired: 0 });
     // The withdrawn model is gone; a provider the refresh said nothing about is untouched.
     await expect(
       store.listModels().then((models) => models.map((model) => model.id))
     ).resolves.toEqual(['custom/local-model', 'openrouter/vendor/kept', 'openrouter/vendor/new']);
 
     // A provider outage returns nothing, and nothing is what it is allowed to remove.
-    await expect(store.replaceModelCatalog([])).resolves.toEqual({ upserted: 0, removed: 0 });
+    await expect(store.replaceModelCatalog([])).resolves.toEqual({
+      upserted: 0,
+      removed: 0,
+      retired: 0
+    });
     await expect(store.listModels()).resolves.toHaveLength(3);
+  });
+
+  it('retires rather than deletes a withdrawn model something is still pinned to', async () => {
+    const user = await store.createUser({ username: 'pinner', displayName: 'Pinner' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Pinned room'));
+    const release = (id: string): Record<string, unknown> => ({
+      id,
+      providerModelId: id.split('/').slice(1).join('/'),
+      displayName: id,
+      provider: 'openrouter',
+      revision: 'r1',
+      availability: 'available',
+      openness: 'remote_proprietary',
+      license: 'Provider-defined',
+      commercialUse: true,
+      privacyRoute: 'external',
+      contextTokens: 128_000,
+      modalities: ['text'],
+      capabilities: ['chat'],
+      usageClass: 'medium',
+      recommendationTags: [],
+      measuredQuality: null,
+      measuredLatencyMs: null
+    });
+    await store.upsertModels([
+      release('openrouter/vendor/scheduled'),
+      release('openrouter/vendor/running'),
+      release('openrouter/vendor/finished'),
+      release('openrouter/vendor/survivor')
+    ]);
+    await store.createTaskSchedule({
+      userId: user.id,
+      workspaceId: workspace.id,
+      titleCiphertext: { v: 1, iv: 'i', tag: 't', ciphertext: 'c' },
+      promptCiphertext: { v: 1, iv: 'i', tag: 't', ciphertext: 'c' },
+      modelId: 'openrouter/vendor/scheduled',
+      privacyRoute: 'external',
+      maxComputeCredits: 10,
+      spec: { kind: 'daily', timeZone: 'UTC', localTime: '09:30' },
+      nextRunAt: new Date(Date.now() + 3_600_000)
+    });
+    const live = await store.createTask({
+      ...taskInput(user.id, workspace.id),
+      modelId: 'openrouter/vendor/running'
+    });
+    const done = await store.createTask({
+      ...taskInput(user.id, workspace.id),
+      modelId: 'openrouter/vendor/finished'
+    });
+    await store.updateTask({ id: done.id, status: 'completed' });
+    expect(live.status).not.toBe('completed');
+
+    // The provider now offers only one of the four.
+    const refreshed = await store.replaceModelCatalog([release('openrouter/vendor/survivor')]);
+    expect(refreshed).toEqual({ upserted: 1, removed: 1, retired: 2 });
+    const after = await store.listModels();
+    expect(after.map((model) => [model.id, model.availability])).toEqual([
+      ['openrouter/vendor/running', 'unavailable'],
+      ['openrouter/vendor/scheduled', 'unavailable'],
+      ['openrouter/vendor/survivor', 'available']
+    ]);
+
+    // And when the provider brings one back it is live again, not a permanent tombstone.
+    await store.replaceModelCatalog([
+      release('openrouter/vendor/survivor'),
+      release('openrouter/vendor/scheduled')
+    ]);
+    await expect(
+      store
+        .listModels()
+        .then((models) => models.find((model) => model.id === 'openrouter/vendor/scheduled'))
+    ).resolves.toMatchObject({ availability: 'available' });
   });
 
   it('drops memories whose expiry passed long ago and keeps the rest', async () => {
