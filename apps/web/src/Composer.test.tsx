@@ -3,9 +3,13 @@
  *
  * It is the control every session starts in, and its worst failures have all been failures of
  * state rather than of wording: a box that goes dead while the agent is working, a Stop that turns
- * back into Send the moment you type a correction, a model picker offering a model that cannot
- * answer. `renderToStaticMarkup` costs no dependency and no DOM, and none of those need one — they
+ * back into Send the moment you type a correction, a row that grows a third line under the owner's
+ * thumb. `renderToStaticMarkup` costs no dependency and no DOM, and none of those need one — they
  * are all visible in the markup of the first paint.
+ *
+ * What is one tap behind the `+` or the context chip is not in this markup, because a closed
+ * portal renders nothing. Those lists are decided by `composerMenuItems`, `modelSheetGroups` and
+ * `privacyLine` and are exercised in composer-state.test.ts instead.
  */
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -94,89 +98,70 @@ describe('the box every session starts in', () => {
     expect(render({ canSend: true })).not.toMatch(/aria-label="Send message"[^>]*disabled/);
   });
 
-  it('leaves the folder import out entirely unless the client can do it', () => {
-    expect(render()).not.toContain('Import a local folder');
-    expect(render({ onImportFolder: () => undefined })).toContain('Import a local folder');
-  });
-
   it('says what the recording control will do next rather than what it is', () => {
     expect(render({ recording: false })).toContain('aria-label="Record a voice note"');
     expect(render({ recording: true })).toContain('aria-label="Stop voice recording"');
   });
 });
 
-describe('choosing what answers', () => {
-  it('offers the way in when no provider is connected, and no model picker', () => {
+describe('two rows at every width', () => {
+  /*
+   * The budget, stated as a test so it cannot drift back. At 375x812 this row was 176px at rest
+   * and 291px with the box full — six icon buttons, two full-width selects that wrapped onto a
+   * second and sometimes a third line, and a permanent disclaimer. Nothing here may be permanent
+   * that is not used every turn.
+   */
+  it('puts no picker and no disclaimer on the row itself', () => {
+    const markup = render();
+    expect(markup).not.toContain('<select');
+    expect(markup).not.toContain('composer-foot');
+    expect(markup.split('composer-row')).toHaveLength(2);
+  });
+
+  it('carries one opener for everything that is not typing, voice or sending', () => {
+    const markup = render();
+    expect(markup).toContain('aria-haspopup="menu"');
+    // Attach, photo and schedule are behind it, so none of them is on the row.
+    expect(markup).not.toContain('aria-label="Attach files"');
+    expect(markup).not.toContain('aria-label="Schedule this work"');
+    // Voice is not: it is the one input a phone is better at than a laptop.
+    expect(markup).toContain('aria-label="Record a voice note"');
+  });
+
+  it('keeps the send cluster beside the tools rather than under them', () => {
+    const markup = render({ taskLive: true, canSend: true });
+    for (const label of ['Stop the agent', 'Correct the running task now', 'Queue follow-up'])
+      expect(markup).toContain(`aria-label="${label}"`);
+  });
+});
+
+describe('the chip that says how this turn is answered', () => {
+  it('says the mode alone while athanor is choosing the model each turn', () => {
+    const markup = render({ securityMode: 'review' }, { automatic: true, preference: 'best' });
+    expect(markup).toContain('Ask first');
+    expect(markup).not.toContain('glm-5.2');
+  });
+
+  it('names the model once the owner has pinned one', () => {
+    const markup = render({}, { automatic: false, modelId: 'openrouter/z-ai/glm-5.2' });
+    expect(markup).toContain('Balanced · glm-5.2');
+  });
+
+  it('names the way in when there is no provider, and marks it as the owner move', () => {
     const markup = render({ providerConfigured: false });
     expect(markup).toContain('Connect AI');
-    expect(markup).not.toContain('aria-label="Model"');
+    expect(markup).toContain('needs-provider');
   });
 
-  it('selects the automatic ranking without pinning a model named after it', () => {
-    const markup = render({}, { automatic: true, preference: 'best' });
-    expect(markup).toContain('value="auto:best" selected');
+  it('opens a sheet rather than a menu, and nothing is open on first paint', () => {
+    const markup = render();
+    expect(markup).toContain('aria-haspopup="dialog"');
+    expect(markup).toContain('aria-expanded="false"');
+    expect(markup).not.toContain('Private AI routes only');
   });
+});
 
-  it('selects a pinned model by its own identifier', () => {
-    const markup = render({}, { automatic: false, modelId: 'openrouter/z-ai/glm-5.2' });
-    expect(markup).toContain('value="openrouter/z-ai/glm-5.2" selected');
-  });
-
-  /* An option that cannot answer is shown disabled with the reason, not silently dropped. */
-  it('says why a model is unavailable, in the terms this box is configured with', () => {
-    const priv = render({
-      enforceZeroDataRetention: true,
-      unavailableModels: [model('openrouter/other/model-x', { availability: 'unavailable' })]
-    });
-    expect(priv).toContain('no verified private route');
-    expect(priv).toContain('private route unavailable');
-
-    const open = render({
-      enforceZeroDataRetention: false,
-      unavailableModels: [model('openrouter/other/model-x', { availability: 'unavailable' })]
-    });
-    expect(open).toContain('Currently unavailable');
-    expect(open).toContain('provider unavailable');
-  });
-
-  it('names a licence review as a licence review either way', () => {
-    expect(
-      render({ unavailableModels: [model('openrouter/other/model-y', { availability: 'review' })] })
-    ).toContain('licence review required');
-  });
-
-  it('refuses the automatic options when the provider is offering nothing', () => {
-    const markup = render({ models: [] });
-    expect(markup).toContain('No model available');
-    expect(markup).toMatch(/value="auto:fast"[^>]*disabled/);
-  });
-
-  /* The one fact in the footer that changes between installs, and the control that changes it. */
-  it('states where inference goes, and states the other answer honestly', () => {
-    expect(render({ enforceZeroDataRetention: true })).toContain('Private AI routes only');
-    expect(render({ enforceZeroDataRetention: false })).toContain('Provider data policy applies');
-  });
-
-  /*
-   * A search query leaving the box is the second half of the same fact, and it belongs on the same
-   * control rather than beside it — one line, one place to change both.
-   */
-  it('says on the same control when a search would leave this computer', () => {
-    const markup = render({
-      enforceZeroDataRetention: false,
-      webSearchNote: 'Web searches go to your provider',
-      webSearchDisclosure: "Web searches are answered by your model provider's search service."
-    });
-    expect(markup).toContain('Provider data policy applies · Web searches go to your provider');
-    expect(markup).toContain('search service');
-    expect(markup.split('composer-privacy')).toHaveLength(2);
-  });
-
-  it('adds nothing to the footer when searches run here, which is the default', () => {
-    const markup = render({ enforceZeroDataRetention: true });
-    expect(markup).toContain('Private AI routes only');
-    expect(markup).not.toContain('Web searches');
-  });
+describe('choosing what answers', () => {
   it('offers correcting a running task as its own control, not a mood of Send', () => {
     // Queueing and correcting are different intentions. A single Send that decided between them
     // from the fact that the agent happened to be busy would be wrong half the time, in whichever

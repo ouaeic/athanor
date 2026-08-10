@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { isPublicHttpUrl, isPublicInternetAddress } from './network-scope.js';
+import {
+  hostMatchesSuffix,
+  isPublicHttpUrl,
+  isPublicInternetAddress,
+  matchingHostSuffix
+} from './network-scope.js';
 
 describe('public internet addresses', () => {
   it('accepts routable addresses and refuses everything reserved', () => {
@@ -92,5 +97,21 @@ describe('public HTTP URLs', () => {
       'not a url'
     ])
       expect({ url, public: isPublicHttpUrl(url) }).toEqual({ url, public: false });
+  });
+});
+
+describe('which suffix a host sits under', () => {
+  it('answers with the longest match, so nothing is charged for a label twice', () => {
+    expect(matchingHostSuffix('docs.example.com', ['example.com', 'docs.example.com'])).toBe(
+      'docs.example.com'
+    );
+    expect(matchingHostSuffix('eu.api.example.com', [' .Example.com ', ''])).toBe('example.com');
+    expect(matchingHostSuffix('example.com.evil.invalid', ['example.com'])).toBeNull();
+    expect(matchingHostSuffix('anything', [''])).toBeNull();
+  });
+
+  it('still answers the yes-or-no question every connector asks', () => {
+    expect(hostMatchesSuffix('mail.example.com', ['example.com'])).toBe(true);
+    expect(hostMatchesSuffix('notexample.com', ['example.com'])).toBe(false);
   });
 });

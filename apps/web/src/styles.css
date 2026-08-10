@@ -7631,13 +7631,13 @@ a.blocked-resource:hover {
  */
 @media (pointer: coarse) {
   .icon-btn,
-  .composer-tools button,
+  .composer-row button,
   .message-actions button,
   .terminal-keys > button {
     position: relative;
   }
   .icon-btn::after,
-  .composer-tools button::after,
+  .composer-row button::after,
   .message-actions button::after,
   .terminal-keys > button::after {
     content: '';
@@ -7696,4 +7696,304 @@ a.blocked-resource:hover {
 .mobile-sidebar .sidebar,
 .terminal-wrap {
   overscroll-behavior: contain;
+}
+
+/* ---------------------------------------------------------------------------
+   The composer's one row, and the two sheets behind it.
+   --------------------------------------------------------------------------- */
+
+/*
+ * One row, and it may never become two.
+ *
+ * This replaces `.composer-tools`, which was allowed to wrap and did at every phone width: 375px
+ * leaves about 293px beside the send cluster, and three icon buttons plus a 104px security select
+ * plus a 116px model select need more than that - so the row took a second and sometimes a third
+ * line and the composer stood 176px tall at rest, 36% of the screen, for three facts an owner
+ * changes a few times a year. The class is new rather than a `flex-wrap: nowrap` on the old one
+ * because `.composer-tools` is what the narrow breakpoint hangs its `display: none` on, and hiding
+ * controls by screen width is the other half of what is being removed.
+ */
+.composer-row {
+  display: flex;
+  flex: 1;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.composer-row > .icon-btn {
+  flex: 0 0 32px;
+}
+
+/* A single row has nothing to bottom-align against; the old rule existed for the wrapped one. */
+.composer-bottom {
+  align-items: center;
+}
+
+/*
+ * How this turn will be answered, in one 32px control.
+ *
+ * It stands where two full-width selects and a permanent footer stood. It is the only elastic thing
+ * on the row, so it is the only thing allowed to lose characters: the mode is the head of the label
+ * and survives a narrow screen, the model name is what an ellipsis takes, and the whole of it is
+ * one tap away in the sheet.
+ */
+.composer-context {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 32px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 #ffffff0d;
+  transition:
+    border-color 150ms var(--ease),
+    color 150ms var(--ease);
+}
+
+.composer-context:hover {
+  border-color: var(--silver-edge);
+  color: var(--text);
+}
+
+.composer-context > svg {
+  flex: none;
+  width: 13px;
+  height: 13px;
+}
+
+.composer-context-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * The one ember mark on this row, and the only state that earns it: with no provider connected the
+ * machine cannot answer at all, so this is not a status - it is the owner's move. Small, bright and
+ * moving, per the rule. A configured composer is a machine at rest and stays silver.
+ */
+.composer-context.needs-provider {
+  border-color: var(--ember-deep);
+  color: var(--text);
+}
+
+.composer-context-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ember);
+  box-shadow: 0 0 0 3px var(--ember-glow);
+  animation: composer-context-ember 2.2s ease-in-out infinite;
+}
+
+@keyframes composer-context-ember {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/*
+ * Both popups rise from the bottom, at every width.
+ *
+ * What they hold used to be permanent furniture on the composer, so they have to read as coming out
+ * of the composer rather than as a dialog that interrupted it. The composer is bottom-pinned
+ * everywhere, so on a wide screen this simply sits lower than a centred modal - which is where the
+ * control that opened it is.
+ */
+.composer-sheet-backdrop {
+  place-items: end center;
+  padding: 22px 11px calc(14px + var(--safe-bottom));
+}
+
+.composer-sheet {
+  /* Narrower than a modal on purpose: it is a control's own list, not a document. */
+  width: min(420px, 100%);
+  max-height: min(62vh, 520px);
+  padding: 14px;
+  border-radius: 16px;
+}
+
+.composer-menu {
+  width: min(320px, 100%);
+}
+
+.composer-sheet-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 9px;
+}
+
+.composer-sheet h3 {
+  margin: 8px 8px 4px;
+  font:
+    600 11px Manrope,
+    sans-serif;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #7d858a;
+}
+
+/*
+ * One row shape for two lists. The menu row is an icon and a label on one line; the sheet row is a
+ * label with its description under it, and `flex: 1 0 100%` on the note is what puts it there
+ * without a second class. That description used to be a `title` on a select wrapper, which on a
+ * phone was not reachable at all.
+ */
+.composer-sheet-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: #dde1e3;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 140ms var(--ease);
+}
+
+.composer-sheet-row > svg {
+  flex: none;
+  width: 16px;
+  color: #8b949a;
+}
+
+.composer-sheet-label {
+  font-size: 13px;
+}
+
+.composer-sheet-note {
+  flex: 1 0 100%;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: #8b9297;
+}
+
+.composer-sheet-row:hover:enabled {
+  background: #1b1e21;
+}
+
+/* Silver, not ember: a mode that is already chosen is neither alive nor the owner's move. */
+.composer-sheet-row.chosen {
+  background: #1f2326;
+  box-shadow: inset 0 1px 0 #ffffff12;
+}
+
+.composer-sheet-row.chosen .composer-sheet-label {
+  color: var(--silver-hot);
+}
+
+.composer-sheet-row:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.composer-sheet-connect {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  width: 100%;
+  height: 40px;
+  margin: 2px 0 9px;
+  border: 1px solid #778187;
+  border-radius: 10px;
+  background: linear-gradient(145deg, #25292c, #17191b);
+  color: #edf1f3;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow:
+    inset 0 1px 0 #ffffff1c,
+    0 0 0 1px #edf4f612;
+}
+
+.composer-sheet-connect:hover {
+  border-color: var(--silver-hot);
+}
+
+.composer-sheet-connect svg {
+  width: 15px;
+}
+
+/*
+ * The one line the old footer carried that changes between installs, on the control that changes
+ * it. Clay for the provider-policy answer: caution stays large, dim and static, and can never be
+ * mistaken for the ember on the chip above.
+ */
+.composer-sheet-privacy {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin-top: 2px;
+  padding: 11px 10px 2px;
+  border: 0;
+  border-top: 1px solid #24282b;
+  border-radius: 0;
+  background: transparent;
+  color: #8b9297;
+  cursor: pointer;
+  font-size: 11.5px;
+  text-align: left;
+}
+
+.composer-sheet-privacy svg {
+  flex: none;
+  width: 12px;
+}
+
+.composer-sheet-privacy:hover {
+  color: #d9dee1;
+}
+
+.composer-sheet-privacy.provider-policy {
+  color: #c9a39b;
+}
+
+/* ---------------------------------------------------------------------------
+   The Inspector keeps all four panes alive.
+   --------------------------------------------------------------------------- */
+
+/*
+ * Required, not cosmetic.
+ *
+ * The panel used to render the selected pane through a ternary, so glancing at Files unmounted the
+ * terminal, closed its socket and made the runner kill the pty - the owner's build died and the
+ * pane said "Session closed" as though the shell had exited. All four are mounted now and the ones
+ * behind are marked `hidden`. `.inspector-panel` carries `display: contents` so a pane lays out as
+ * the inspector's own flex child, and an author declaration beats the browser's own
+ * `[hidden] { display: none }` however specific either one is - without this rule every pane paints
+ * at once, stacked.
+ */
+.inspector-panel[hidden] {
+  display: none;
+}
+
+/*
+ * The picture of the computer does something either way now. Crosshair when the click lands on the
+ * remote screen; zoom when all it can do is make it bigger. It used to be marked `aria-disabled`
+ * with a default cursor - the interface describing a dead spot rather than filling it.
+ */
+.remote-frame-button.zoomable {
+  cursor: zoom-in;
+}
+
+.computer-pane:fullscreen .remote-frame-button.zoomable,
+.computer-pane.expanded .remote-frame-button.zoomable {
+  cursor: zoom-out;
 }

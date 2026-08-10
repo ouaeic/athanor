@@ -56,7 +56,14 @@ import {
   type AcceptanceResult
 } from './acceptance.js';
 import type { WorkerConfig } from './config.js';
-import { classifyDestination, originOf, rememberOrigin } from './egress.js';
+import {
+  chargeNovelty,
+  classifyDestination,
+  originOf,
+  rememberAddress,
+  rememberOrigin,
+  type DestinationContext
+} from './egress.js';
 import {
   BASE_SYSTEM_PROMPT,
   COMPACT_CONTEXT_TOOL,
@@ -117,6 +124,7 @@ import {
 import {
   agentToolsFor,
   approvalRequirement,
+  callDestinations,
   isMutatingToolCall,
   isQuarantinedDownloadPath,
   surfaceActionRequest,
@@ -300,6 +308,14 @@ interface AgentState {
    */
   taint?: { level: 'untrusted'; sources: string[]; sinceStep: number };
   /**
+   * How much material has left for the outside since that happened, counting only what appears
+   * nowhere the owner put it.
+   *
+   * Persisted for the same reason the taint is: the per-address bound is a bound on one request,
+   * and a budget a restart or an approval resets is a budget an attacker gets to reset for free.
+   */
+  turnNoveltyBytes?: number;
+  /**
    * The web route this run has been running under, so the decision cannot move mid-run.
    *
    * The fact behind it is the owner's stored credential, which they can replace from the settings
@@ -311,6 +327,8 @@ interface AgentState {
   webToolMode?: WebToolMode;
   /** Hosts the owner named, a search returned, or this turn already read. Bounded. */
   knownOrigins?: string[];
+  /** The whole addresses behind those hosts, so following a link the turn was handed is not novel. */
+  knownAddresses?: string[];
   /**
    * The reasoning effort this turn has ratcheted up to. Effort only ever rises within a turn: the
    * step that recovers from a failure is not a step to think less about, and a request field that
@@ -1233,6 +1251,19 @@ export const startTurnState = <T extends Record<string, unknown>>(
     // The bound is per turn - the tool says so, the constant is named for it, and the refusal tells
     // the model "this turn". Carrying it through made it per conversation instead.
     notices: 0,
+    /*
+     * The egress budget, for exactly the reason above it.
+     *
+     * `MAX_TURN_NOVEL_BYTES` is named for a turn and its card tells the owner "this turn", but the
+     * taint it is charged under is deliberately never cleared - so carried forward it was a budget
+     * per conversation: a research thread that had spent nine hundred bytes over ten turns would
+     * have raised a card on every web read it made from then on, for ever, and a card that fires on
+     * everything is a card nobody reads. It is safe to clear here and only here, because the one
+     * thing that starts a turn is the owner writing or a schedule they set firing, and neither is
+     * something a hostile page can bring about. The taint itself still carries, so the next turn is
+     * still judged - it just gets its own kilobyte rather than the remains of the last one's.
+     */
+    turnNoveltyBytes: 0,
     // A new turn has changed nothing yet, so its evidence ordering and its plan both start over.
     mutated: false,
     mutatedBeyondProse: false,
@@ -2849,7 +2880,7 @@ export class AgentWorker {
      * host itself, could ask a specialist to "verify this at <url>" and the data left anyway. It has
      * no approval channel of its own, so the answer here is refusal rather than a card.
      */
-    destinations?: { knownOrigins: string[]; ownerText: string; selfOrigins?: string[] }
+    destinations?: DestinationContext
   ): Promise<{
     name: string;
     model: string;
@@ -3120,6 +3151,36 @@ ${clockLine(new Date(), timeZone)}
    */
   #selfOrigins(): string[] {
     return [originOf(this.config.PUBLIC_APP_URL)].filter(Boolean);
+  }
+
+  /**
+   * Where this run is allowed to send data, assembled once for everything that asks.
+   *
+   * The lead's approval floor, a delegated specialist's refusal and the turn's novelty budget are
+   * three questions about the same fact, and three hand-built copies of it are three chances for
+   * one of them to be measuring against a different corpus than the one the owner would recognise.
+   */
+  #destinationContext(state?: AgentState): DestinationContext {
+    return {
+      knownOrigins: [
+        ...(state?.knownOrigins ?? []),
+        ...originsFromOwnerMessages(state?.messages ?? [])
+          .map(originOf)
+          .filter(Boolean)
+      ],
+      // Only what the harness read out of a tool result. An address the owner typed is already in
+      // their own words below, so repeating it here would say nothing.
+      knownAddresses: state?.knownAddresses ?? [],
+      // The owner's own words, and only those: what the agent wrote about the page is not evidence
+      // that the owner asked for the page.
+      ownerText: (state?.messages ?? [])
+        .filter((message) => message.role === 'user')
+        .map((message) => message.content)
+        .join('\n')
+        .slice(0, 40_000),
+      selfOrigins: this.#selfOrigins(),
+      spentNoveltyBytes: state?.turnNoveltyBytes ?? 0
+    };
   }
 
   async #assertProviderConfigured(task: TaskRecord): Promise<void> {
@@ -5013,20 +5074,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
               index,
               missions.length,
               webPlan,
-              {
-                knownOrigins: [
-                  ...(state?.knownOrigins ?? []),
-                  ...originsFromOwnerMessages(state?.messages ?? [])
-                    .map(originOf)
-                    .filter(Boolean)
-                ],
-                ownerText: (state?.messages ?? [])
-                  .filter((message) => message.role === 'user')
-                  .map((message) => message.content)
-                  .join('\n')
-                  .slice(0, 40_000),
-                selfOrigins: this.#selfOrigins()
-              }
+              this.#destinationContext(state)
             )
           )
         );
@@ -5696,20 +5744,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         : {}),
       ...(existingSkill ? { existingSkill } : {}),
       ...(state?.taint ? { taintSources: state.taint.sources } : {}),
-      knownOrigins: [
-        ...(state?.knownOrigins ?? []),
-        ...originsFromOwnerMessages(state?.messages ?? [])
-          .map(originOf)
-          .filter(Boolean)
-      ],
-      // The owner's own words, and only those: what the agent wrote about the page is not evidence
-      // that the owner asked for the page.
-      ownerText: (state?.messages ?? [])
-        .filter((message) => message.role === 'user')
-        .map((message) => message.content)
-        .join('\n')
-        .slice(0, 40_000),
-      selfOrigins: this.#selfOrigins()
+      ...this.#destinationContext(state)
     });
     if (!['browser_action', 'desktop_action'].includes(call.name)) return declared;
     const surface = call.name === 'browser_action' ? 'browser' : 'desktop';
@@ -6072,8 +6107,28 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
     call: ModelToolCall,
     result: unknown
   ): Promise<string | null> {
-    for (const url of originsFromResult(call, result))
+    /*
+     * What this call sent, charged to the turn before the next one is judged against it.
+     *
+     * The novelty count was computed per address, reported on the card and added to nothing, so a
+     * 2,048-byte secret left in twenty-two addresses that were each individually inside the bound.
+     * Charged only while the turn is tainted, and charged after the fact: a clean research pass
+     * pays nothing at all, and the budget describes what has already gone rather than what might.
+     */
+    const reached = state.taint ? callDestinations(call.name, call.arguments) : [];
+    if (reached.length) {
+      // Assembled only when something actually reached the outside: the corpus is up to forty
+      // kilobytes of the owner's own words, and most tool calls in a turn go nowhere near a host.
+      const destinations = this.#destinationContext(state);
+      state.turnNoveltyBytes = chargeNovelty(
+        state.turnNoveltyBytes ?? 0,
+        reached.map((url) => classifyDestination(url, destinations))
+      );
+    }
+    for (const url of originsFromResult(call, result)) {
       state.knownOrigins = rememberOrigin(state.knownOrigins ?? [], url);
+      state.knownAddresses = rememberAddress(state.knownAddresses ?? [], url);
+    }
     return this.#raiseTaint(task, key, state, untrustedOriginOfResult(call, result), call.name);
   }
 

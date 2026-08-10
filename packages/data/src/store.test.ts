@@ -26,6 +26,7 @@ import {
   agentNotificationAad,
   DataStore,
   MEMORY_SOURCE_SEARCH_PER_TASK,
+  TASK_MAX_ATTEMPTS,
   type RecallMemoryInput
 } from './store.js';
 
@@ -669,6 +670,133 @@ describe('DataStore', () => {
     const leased = await store.leaseNextTask('worker-1');
     expect(leased?.status).toBe('planning');
     expect(leased?.leaseOwner).toBe('worker-1');
+  });
+
+  /**
+   * The outage this ordering exists to end: a turn that takes the worker process down with it is
+   * back in the queue the moment systemd restarts, and by age it is ahead of everything the owner
+   * sent while it was crashing. Ordered by attempt first, it drops a place per death and is out of
+   * the queue entirely at the ceiling.
+   */
+  it('puts a task that keeps dying behind a healthy one, and stops leasing it at the ceiling', async () => {
+    const user = await store.createUser({ username: 'queue-order', displayName: 'Queue order' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+    const crasher = await store.createTask(taskInput(user.id, workspace.id));
+    const healthy = await store.createTask(taskInput(user.id, workspace.id));
+    await database.query(
+      `UPDATE tasks SET attempt=$2, created_at=NOW() - INTERVAL '2 minutes' WHERE id=$1`,
+      [crasher.id, TASK_MAX_ATTEMPTS - 1]
+    );
+
+    // Oldest, and still second: the message the owner sent two minutes later goes first.
+    expect(await store.leaseNextTask('worker-1')).toMatchObject({ id: healthy.id, attempt: 1 });
+    expect(await store.leaseNextTask('worker-2')).toMatchObject({
+      id: crasher.id,
+      attempt: TASK_MAX_ATTEMPTS
+    });
+
+    await database.query(`UPDATE tasks SET status='completed' WHERE id=$1`, [healthy.id]);
+    await database.query(
+      `UPDATE tasks SET lease_expires_at=NOW() - INTERVAL '1 second' WHERE id=$1`,
+      [crasher.id]
+    );
+    // The lease has expired and the status is still live, which before the ceiling was all it took
+    // to be handed straight back to a worker.
+    await expect(store.leaseNextTask('worker-3')).resolves.toBeNull();
+  });
+
+  it('fails a task that has used every attempt exactly once, and gives back what it held', async () => {
+    const user = await store.createUser({ username: 'exhausted', displayName: 'Exhausted' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+    const task = await store.createTask(taskInput(user.id, workspace.id));
+    await store.recordUsage({
+      userId: user.id,
+      workspaceId: workspace.id,
+      taskId: task.id,
+      kind: 'compute',
+      resourceClass: 'medium',
+      quantity: 1,
+      unit: 'credit',
+      credits: 4,
+      state: 'reserved',
+      idempotencyKey: `task:${task.id}:reservation`
+    });
+    await database.query(
+      `UPDATE tasks SET status='running', attempt=$2, lease_owner='worker-1',
+         lease_expires_at=NOW() + INTERVAL '2 minutes' WHERE id=$1`,
+      [task.id, TASK_MAX_ATTEMPTS]
+    );
+
+    // A live lease means a worker is in there renewing it, whatever the count says.
+    await expect(store.failTasksAtAttemptLimit()).resolves.toEqual([]);
+
+    await database.query(
+      `UPDATE tasks SET lease_expires_at=NOW() - INTERVAL '1 second' WHERE id=$1`,
+      [task.id]
+    );
+    await expect(store.failTasksAtAttemptLimit()).resolves.toEqual([
+      {
+        id: task.id,
+        userId: user.id,
+        workspaceId: workspace.id,
+        attempt: TASK_MAX_ATTEMPTS
+      }
+    ]);
+    expect((await store.getTask(user.id, task.id))?.status).toBe('failed');
+    await expect(store.reservedUsageForTask(task.id)).resolves.toBe(0);
+    // Exactly once, so the owner is told once: the statement that finds the rows is the statement
+    // that moves them out of the statuses it looks at.
+    await expect(store.failTasksAtAttemptLimit()).resolves.toEqual([]);
+  });
+
+  it('starts the count again whenever a task re-enters the queue, so a long conversation never runs out', async () => {
+    const user = await store.createUser({ username: 'long-run', displayName: 'Long run' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+    const task = await store.createTask(taskInput(user.id, workspace.id));
+    const attemptOf = async (): Promise<number | undefined> =>
+      (await store.getTask(user.id, task.id))?.attempt;
+
+    // Many more turns than the ceiling: an approval answered, a pause resumed, a follow-up sent -
+    // each one is a fresh start, and the ceiling must not be counting them.
+    for (let turn = 0; turn < TASK_MAX_ATTEMPTS + 2; turn += 1) {
+      expect(await store.leaseNextTask('worker-1')).toMatchObject({ id: task.id, attempt: 1 });
+      await store.updateTask({
+        id: task.id,
+        workerId: 'worker-1',
+        status: 'awaiting_user',
+        clearLease: true
+      });
+      // Parked, not queued: the count stands until something puts it back in the queue, which is
+      // what keeps `attempt = 0` meaning "never leased" for the scheduled-run recovery sweep.
+      expect(await attemptOf()).toBe(1);
+      await store.setTaskStatusForUser(user.id, task.id, 'queued');
+      expect(await attemptOf()).toBe(0);
+    }
+
+    // A lease that simply expires - the worker died - is the one that counts.
+    await store.leaseNextTask('worker-1');
+    await database.query(`UPDATE tasks SET lease_expires_at=NOW() - INTERVAL '1 second'`);
+    await store.leaseNextTask('worker-2');
+    expect(await attemptOf()).toBe(2);
+
+    // And the way back in for a task the ceiling stopped: the owner writes again.
+    await database.query(
+      `UPDATE tasks SET status='failed', attempt=$2, lease_owner=NULL WHERE id=$1`,
+      [task.id, TASK_MAX_ATTEMPTS]
+    );
+    const continued = await store.continueTask({
+      id: task.id,
+      userId: user.id,
+      modelId: 'qwen',
+      privacyRoute: 'provider_zdr',
+      additionalComputeCredits: 1,
+      agentStateCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+      reservationKey: `task:${task.id}:turn:1:reservation`,
+      resourceClass: 'medium',
+      userMessageCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' }
+    });
+    expect(continued).toMatchObject({ status: 'queued', attempt: 0 });
+    await expect(store.leaseNextTask('worker-3')).resolves.toMatchObject({ id: task.id });
   });
 
   it('materialises a due schedule exactly once, whichever worker got there first', async () => {

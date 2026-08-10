@@ -1077,9 +1077,19 @@ const PAGE_VIEWPORT = { width: 1440, height: 900 };
  */
 function Computer({
   workspace,
+  visible,
   wall
 }: {
   workspace: Workspace;
+  /**
+   * Whether this pane is the one on screen.
+   *
+   * The panes are all mounted at once now, so that switching tab stops killing what is running in
+   * the one being left. Mounted is not the same as watched: a video stream nobody can see is a
+   * decoder, a socket and a few hundred kilobytes a second of somebody's connection spent painting
+   * a canvas inside `display: none`. This is what stops that.
+   */
+  visible: boolean;
   /** The challenge the browser is sitting behind, from the conversation that hit it. */
   wall?: BotWall | undefined;
 }) {
@@ -1095,9 +1105,19 @@ function Computer({
    * Which view this is, decided once by the box rather than offered as a choice. `available` is
    * false only when the host has no GUI at all — the session itself starts on demand — and that is
    * the one case where the browser is headless and its own page stream is all there is to watch.
+   *
+   * `undefined` is `useRemoteSurface`'s "do not connect": its effect returns before opening
+   * anything, and the cleanup that runs on the way to it closes the socket and the decoder. So
+   * dropping to `undefined` while the pane is off screen is the whole of the teardown, and coming
+   * back re-runs the effect and re-opens the stream.
    */
-  const kind: SurfaceKind | undefined =
-    !probe.done || probe.error ? undefined : desktop?.available ? 'display' : 'page';
+  const kind: SurfaceKind | undefined = !visible
+    ? undefined
+    : !probe.done || probe.error
+      ? undefined
+      : desktop?.available
+        ? 'display'
+        : 'page';
   const surface = useRemoteSurface(workspace.id, kind);
   const holder = surface.state?.holder ?? 'agent';
   /*
@@ -1109,8 +1129,16 @@ function Computer({
   const liveWall = surface.state?.botWall ?? wall;
   const openWall = liveWall && liveWall.url !== handled ? liveWall : undefined;
 
+  /*
+   * Asks; it does not blank first.
+   *
+   * `probe.done` is one of the things `kind` is computed from, and `kind` is what holds the stream
+   * open. Clearing it at the top of every ask meant coming back to this tab opened a socket from
+   * the answer already in hand, closed it one render later when the refresh cleared that answer,
+   * and opened a third when the same answer came back - three connections and two teardowns for a
+   * tab switch. What is on screen stays until there is something truer to put there.
+   */
   const look = () => {
-    setProbe({ done: false, error: '' });
     void api
       .desktopSnapshot(workspace.id)
       .then((snapshot) => {
@@ -1125,12 +1153,21 @@ function Computer({
         });
       });
   };
+  // A different computer is a different question, so everything this pane was part-way through
+  // goes, including the answer about whether there is a screen at all.
   useEffect(() => {
     setHandled('');
     setAddress('');
     setBrowserHeld(false);
-    look();
+    setProbe({ done: false, error: '' });
   }, [workspace.id]);
+  // Asked when the pane is actually being looked at, and again each time it is come back to: the
+  // snapshot decides whether there is a screen, and it goes stale the moment the agent opens or
+  // closes a window, which is most of what happens while this pane is not the one on top.
+  useEffect(() => {
+    if (!visible) return;
+    look();
+  }, [workspace.id, visible]);
 
   const frameSize =
     kind === 'page'
@@ -1195,7 +1232,21 @@ function Computer({
   };
 
   const clickFrame = async (event: MouseEvent<HTMLButtonElement>) => {
-    if (event.detail === 0 || holder !== 'user') return;
+    /*
+     * The picture does something whichever way control is held.
+     *
+     * While the agent has it this was the largest element on screen and pressing it did nothing at
+     * all - a screen-sized dead spot, marked `aria-disabled` and given a default cursor so that the
+     * interface was telling the truth about being inert rather than fixing it. Clicking now does
+     * the one thing that is always safe to do to somebody else's session: makes it bigger. Taking
+     * control is still a deliberate press on the button that says so, because taking the computer
+     * off the agent mid-step is not something a stray click should be able to do.
+     */
+    if (holder !== 'user') {
+      await toggleExpanded();
+      return;
+    }
+    if (event.detail === 0) return;
     // Measured against the picture, not the button around it. The button is a layout box and can be
     // a different shape from what is drawn inside it - it is, in full screen - and mapping a click
     // through the wrong box lands it somewhere the owner did not point.
@@ -1379,7 +1430,7 @@ function Computer({
         (kind === 'display' && desktop?.screenshotBase64) ? (
           <button
             type="button"
-            className={`remote-frame-button ${holder === 'user' ? 'interactive' : ''}`}
+            className={`remote-frame-button ${holder === 'user' ? 'interactive' : 'zoomable'}`}
             // Clicks are mapped proportionally against this element's box, so the box has to be the
             // same shape as the screen inside it. Given here rather than in the stylesheet because
             // only the running stream knows its shape, and it can change mid-session.
@@ -1388,11 +1439,17 @@ function Computer({
                 ? { aspectRatio: `${frameSize.width} / ${frameSize.height}` }
                 : undefined
             }
-            aria-disabled={holder !== 'user'}
+            /*
+              Named for what pressing it does right now. It used to say "Take over below to
+              interact" while carrying `aria-disabled`, which described a control that did nothing
+              instead of giving it something to do.
+            */
             aria-label={
               holder === 'user'
                 ? 'Interactive agent computer. Click a position, or press Enter or Space to activate the focused control.'
-                : 'Live view of the agent computer. Take over below to interact.'
+                : expanded
+                  ? 'Live view of the agent computer. Activate to leave full screen. Take over below to interact.'
+                  : 'Live view of the agent computer. Activate to show it full screen. Take over below to interact.'
             }
             onClick={(event) => void clickFrame(event)}
             onKeyDown={(event) => void keyFrame(event)}
@@ -1435,7 +1492,16 @@ function Computer({
             <span>
               Run <code>sudo athanor doctor</code> on the server. It says which service is down.
             </span>
-            <button onClick={look}>Try again</button>
+            {/* Blanked here rather than inside `look`, which is also the quiet refresh that runs
+                every time this pane comes back. A press has to be answered on the spot. */}
+            <button
+              onClick={() => {
+                setProbe({ done: false, error: '' });
+                look();
+              }}
+            >
+              Try again
+            </button>
           </div>
         ) : (
           <div className="empty-pane">
@@ -1650,8 +1716,21 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
           `\x1b[31m${error instanceof Error ? error.message : 'Connection failed'}\x1b[0m`
         )
       );
-    const observer = new ResizeObserver(() => fit.fit());
-    observer.observe(host.current);
+    /*
+     * A pane with no size is not a pane to fit to.
+     *
+     * This became load-bearing the moment the panes stopped being destroyed on a tab change: the
+     * one behind is `display: none`, ResizeObserver reports that as 0x0, and FitAddon's floor is
+     * two columns by one row - so it resized the terminal to 2x1 and `term.onResize` sent that
+     * straight down the socket as a SIGWINCH. A glance at Files reflowed the owner's running build
+     * or pager to two columns wide and it never came back looking right. Fitting only when there is
+     * something to fit to leaves the pty at the size it had while the tab was away.
+     */
+    const box = host.current;
+    const observer = new ResizeObserver(() => {
+      if (box.clientWidth > 0 && box.clientHeight > 0) fit.fit();
+    });
+    observer.observe(box);
     return () => {
       observer.disconnect();
       if (renewal !== undefined) window.clearInterval(renewal);
@@ -1912,6 +1991,22 @@ export function Inspector({
 }) {
   const [tab, setTab] = useState<Tab>(initialTab);
   useEffect(() => setTab(initialTab), [initialTab]);
+  /*
+   * Which panes exist, as opposed to which one is on top.
+   *
+   * A pane is built the first time it is looked at and is never taken down again. Both halves of
+   * that matter. Taking it down was the bug: the panel rendered one pane through a ternary, so
+   * glancing at Files unmounted the terminal, its cleanup closed the socket, and the runner kills
+   * the pty when that socket closes (services/workspace-runner/src/server.ts) — the owner's build
+   * died and the pane said "Session closed" as though their shell had exited. Not building it until
+   * it is asked for matters too: a shell on the box, a directory listing and a preview poll are all
+   * things nobody should be paying for on a tab they have never opened.
+   *
+   * A Set on a ref rather than state: adding a member that is already there changes nothing, and
+   * the render that reads it is the one the tab change already caused.
+   */
+  const opened = useRef(new Set<Tab>());
+  opened.current.add(tab);
   // The row scrolls on a narrow phone, so the selected tab has to bring itself into view.
   useEffect(() => {
     document
@@ -1941,7 +2036,7 @@ export function Inspector({
             role="tab"
             id={`inspector-tab-${id}`}
             aria-selected={tab === id}
-            aria-controls="inspector-panel"
+            aria-controls={`inspector-panel-${id}`}
             tabIndex={tab === id ? 0 : -1}
             className={tab === id ? 'active' : ''}
             onKeyDown={moveTab}
@@ -1951,13 +2046,15 @@ export function Inspector({
           </button>
         ))}
       </div>
-      <div
-        id="inspector-panel"
-        role="tabpanel"
-        aria-labelledby={`inspector-tab-${tab}`}
-        className="inspector-panel"
-      >
-        {!workspace ? (
+      {!workspace ? (
+        // Nothing to hold four panes open around: the one panel carries the id of the tab that is
+        // selected, so the tab pointing at it still points at something real.
+        <div
+          id={`inspector-panel-${tab}`}
+          role="tabpanel"
+          aria-labelledby={`inspector-tab-${tab}`}
+          className="inspector-panel"
+        >
           <div className="empty-pane grow">
             <HardDrive />
             <strong>The agent computer is not answering</strong>
@@ -1966,16 +2063,36 @@ export function Inspector({
               desktop services and says which one is down.
             </span>
           </div>
-        ) : tab === 'files' ? (
-          <Files workspace={workspace} />
-        ) : tab === 'computer' ? (
-          <Computer workspace={workspace} {...(wall ? { wall } : {})} />
-        ) : tab === 'terminal' ? (
-          <TerminalPane workspace={workspace} />
-        ) : (
-          <PreviewPane workspace={workspace} />
-        )}
-      </div>
+        </div>
+      ) : (
+        // One panel per tab, all present, the ones behind hidden rather than destroyed. `hidden`
+        // needs help here: `.inspector-panel` carries `display: contents` so the pane inside it
+        // lays out as the inspector's own flex child, and that beats the browser's `[hidden]`.
+        inspectorTabs.map(([id]) => (
+          <div
+            key={id}
+            id={`inspector-panel-${id}`}
+            role="tabpanel"
+            aria-labelledby={`inspector-tab-${id}`}
+            className="inspector-panel"
+            hidden={tab !== id}
+          >
+            {!opened.current.has(id) ? null : id === 'files' ? (
+              <Files workspace={workspace} />
+            ) : id === 'computer' ? (
+              <Computer
+                workspace={workspace}
+                visible={tab === 'computer'}
+                {...(wall ? { wall } : {})}
+              />
+            ) : id === 'terminal' ? (
+              <TerminalPane workspace={workspace} />
+            ) : (
+              <PreviewPane workspace={workspace} />
+            )}
+          </div>
+        ))
+      )}
     </aside>
   );
 }

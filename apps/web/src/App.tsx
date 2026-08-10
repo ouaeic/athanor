@@ -70,6 +70,7 @@ import {
   type InspectorTab
 } from './client-state.js';
 import { describeFailure } from './failure-text.js';
+import { followedPane } from './inspector-follow.js';
 import { modelDisplayName } from './model-names.js';
 import type { AgentNotification } from './notice-log.js';
 import { rewindOffer, rewindResultNotice, type TrajectoryDraft } from './rewind.js';
@@ -189,6 +190,16 @@ export function App() {
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>(
     storedInspector.current?.tab ?? 'files'
   );
+  /**
+   * The conversation whose panel the owner has taken charge of.
+   *
+   * The panel follows the running work (see `inspector-follow.ts`), and following stops the instant
+   * the owner names a tab themselves — for that conversation, not forever, because the next one is
+   * a fresh question about where to look. Holding the conversation's id rather than a flag is what
+   * makes it reset on its own when the owner moves. `''` is the conversation that does not exist
+   * yet, so a tab chosen before the first message is sent survives becoming a task.
+   */
+  const [tabHeldFor, setTabHeldFor] = useState<string>();
   const [nativeFolderPicker, setNativeFolderPicker] = useState(false);
   const [recording, setRecording] = useState(false);
   const [palette, setPalette] = useState(false);
@@ -702,10 +713,25 @@ export function App() {
     return () => unlisten?.();
   }, []);
 
-  const openInspector = useCallback((tab: InspectorTab) => {
-    setInspectorOpen(true);
-    setInspectorTab(tab);
-  }, []);
+  /**
+   * A tab the owner asked for by name, from wherever they asked: the strip, the phone bar, the
+   * palette, a banner. Every one of them is the owner overruling the panel's own idea of where to
+   * look, so every one of them stops it following until they move on.
+   */
+  const chooseInspectorTab = useCallback(
+    (tab: InspectorTab) => {
+      setInspectorTab(tab);
+      setTabHeldFor(taskId ?? '');
+    },
+    [taskId]
+  );
+  const openInspector = useCallback(
+    (tab: InspectorTab) => {
+      setInspectorOpen(true);
+      chooseInspectorTab(tab);
+    },
+    [chooseInspectorTab]
+  );
 
   const task = data?.tasks.find((item) => item.id === taskId);
   const privacyRoute =
@@ -780,6 +806,20 @@ export function App() {
    * be able to offer that even after the conversation has moved on.
    */
   const browserWall = useMemo(() => activeBotWall(events), [events]);
+  /*
+   * The panel follows the work, until the owner says otherwise.
+   *
+   * The Inspector is 38% of a 1600px window and its default is a file listing, so an agent driving
+   * the screen or running a build was doing it behind a directory that had not changed since it
+   * loaded. `followedPane` names the pane where that would be visible, and it is only ever a
+   * suggestion: the owner's own choice is what is stored and what comes back on the next device,
+   * and naming a tab by hand ends the following for that conversation. So this is computed for the
+   * render rather than written into `inspectorTab` — a suggestion that overwrote the saved choice
+   * would be a hijack with a longer memory than the hijack.
+   */
+  const suggestedTab = useMemo(() => followedPane(task, events), [task, events]);
+  const shownInspectorTab =
+    tabHeldFor === (taskId ?? '') ? inspectorTab : (suggestedTab ?? inspectorTab);
   useEffect(() => {
     // `withPendingMessage` returns the untouched list once the server echoes the message, which is
     // exactly when the local copy has nothing left to do. Leaving the conversation drops it too.
@@ -1216,6 +1256,10 @@ export function App() {
           current?.id === optimistic.id ? { ...current, taskId: created.id } : current
         );
         setTaskId(created.id);
+        // A tab the owner picked while there was no conversation was picked for this one. Without
+        // this the panel started following the moment the first message landed, over the top of a
+        // choice made seconds earlier.
+        setTabHeldFor((current) => (current === '' ? created.id : current));
         setEvents([]);
       }
       for (const item of ready) if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
@@ -1926,14 +1970,7 @@ export function App() {
             <span>
               {formatBytes(diskFreeBytes)} of disk left — the computer has stopped writing files.
             </span>
-            <button
-              onClick={() => {
-                setInspectorTab('files');
-                setInspectorOpen(true);
-              }}
-            >
-              Files
-            </button>
+            <button onClick={() => openInspector('files')}>Files</button>
           </div>
         );
       case 'error':
@@ -2152,10 +2189,7 @@ export function App() {
                   stopSource: taskIsActive
                 })
               }
-              onOpenSurface={(tab) => {
-                setInspectorTab(tab);
-                setInspectorOpen(true);
-              }}
+              onOpenSurface={(tab) => openInspector(tab)}
             />
           </section>
           <Composer
@@ -2215,7 +2249,10 @@ export function App() {
                 ['preview', 'Preview', Play]
               ] as const
             ).map(([id, label, Icon]) => {
-              const active = id === 'work' ? !inspectorOpen : inspectorOpen && inspectorTab === id;
+              // The tab that is showing, which is not always the tab that was chosen: while the
+              // panel is following the work this bar has to point at the pane actually on screen.
+              const active =
+                id === 'work' ? !inspectorOpen : inspectorOpen && shownInspectorTab === id;
               return (
                 <button
                   key={id}
@@ -2255,9 +2292,9 @@ export function App() {
           >
             <Inspector
               workspace={workspace}
-              initialTab={inspectorTab}
+              initialTab={shownInspectorTab}
               {...(browserWall ? { wall: browserWall } : {})}
-              onTab={setInspectorTab}
+              onTab={chooseInspectorTab}
             />
           </Suspense>
         )}

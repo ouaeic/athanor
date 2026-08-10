@@ -65,10 +65,23 @@ export const isPublicInternetAddress = (raw: string): boolean => {
   if (family !== 6) return false;
   const mapped = address.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
   if (mapped) return isPublicIpv4(mapped);
-  return (
-    GLOBAL_UNICAST.check(address, 'ipv6') && !RESERVED_WITHIN_UNICAST.check(address, 'ipv6')
-  );
+  return GLOBAL_UNICAST.check(address, 'ipv6') && !RESERVED_WITHIN_UNICAST.check(address, 'ipv6');
 };
+
+/**
+ * Which of these suffixes the host actually sits under, or null when none does - the longest one
+ * when several match, because a name under both `example.com` and `docs.example.com` adds nothing
+ * beyond the second and charging it for `docs` would be charging it twice.
+ *
+ * The egress classifier needs the answer rather than a yes or no: it measures what a hostname adds
+ * beyond the part that was already allowed, and a fourth private idea of what `example.com` covers
+ * is exactly the drift this file exists to prevent.
+ */
+export const matchingHostSuffix = (host: string, suffixes: readonly string[]): string | null =>
+  suffixes
+    .map((suffix) => suffix.trim().toLowerCase().replace(/^\./, ''))
+    .filter((suffix) => suffix.length > 0 && (host === suffix || host.endsWith(`.${suffix}`)))
+    .sort((left, right) => right.length - left.length)[0] ?? null;
 
 /**
  * "Is this host one the deployment allows" - the suffix match every connector asks before it lets
@@ -76,10 +89,7 @@ export const isPublicInternetAddress = (raw: string): boolean => {
  * drift into three subtly different ideas of what `example.com` covers.
  */
 export const hostMatchesSuffix = (host: string, suffixes: string[]): boolean =>
-  suffixes.some((suffix) => {
-    const normalized = suffix.trim().toLowerCase().replace(/^\./, '');
-    return normalized.length > 0 && (host === normalized || host.endsWith(`.${normalized}`));
-  });
+  matchingHostSuffix(host, suffixes) !== null;
 
 /** Names that resolve inside the machine or the estate even though they are not IP literals. */
 const isInternalHostname = (host: string): boolean =>

@@ -3,35 +3,54 @@ import {
   ArrowUp,
   CalendarClock,
   Camera,
-  ChevronDown,
   CircleStop,
   Redo2,
   FolderKey,
   Mic,
   Paperclip,
+  Plus,
   ShieldCheck,
   Sparkles
 } from 'lucide-react';
 import { AttachmentTray } from './AttachmentTray.js';
+import { Dialog } from './Dialog.js';
 import {
+  composerContextLabel,
+  composerMenuItems,
   composerPlaceholder,
   modelChoiceFromValue,
   modelSelectValue,
+  modelSheetGroups,
+  privacyLine,
   sendsOnKey,
+  type ComposerMenuItem,
   type ModelChoice
 } from './composer-state.js';
 import { securityModeCopy, securityModes } from './security-mode.js';
 import type { Attachment } from './attachments.js';
 import type { CatalogueModel, SecurityMode } from './types.js';
 
+const menuIcons: Record<ComposerMenuItem['action'], ReactNode> = {
+  attach: <Paperclip />,
+  photo: <Camera />,
+  schedule: <CalendarClock />,
+  folder: <FolderKey />
+};
+
 /**
- * The message box, and everything on its two rails.
+ * The message box, and the one row of controls under it.
  *
  * This is the control used every session and by every route into athanor, and its worst failures
  * are all failures of state: a box that goes dead while the agent is working, a Stop button that
  * turns back into Send the moment you start typing a correction, a model picker that pins a
  * conversation to a model that cannot answer. None of that is visible in a pure function, so it
  * lives in one component that renders from props alone and can be rendered in a test.
+ *
+ * It is two rows at every width, and that is a fixed budget rather than a layout that happens to
+ * fit: measured at 375x812 the old composer was 176px at rest and 291px with the box full - 36% of
+ * the phone - for a text field, six icon buttons, two full-width `<select>`s and a disclaimer
+ * nobody reads twice. Everything that was permanent and rarely touched is now one tap behind the
+ * `+` or the context chip, and nothing was removed.
  *
  * Typing is deliberately never blocked by work already in flight: the message is echoed locally and
  * the server decides when it runs. Disabling this box was the one thing that made a slow reply feel
@@ -87,7 +106,7 @@ export function Composer({
   recording: boolean;
   onToggleRecording: () => void;
   onSchedule: () => void;
-  /** Only the native client can hand over a local folder, so the button only exists there. */
+  /** Only the native client can hand over a local folder, so the item only exists there. */
   onImportFolder?: () => void;
   securityMode: SecurityMode;
   onSecurityMode: (mode: SecurityMode) => void;
@@ -104,9 +123,33 @@ export function Composer({
   onModelChoice: (choice: ModelChoice) => void;
 }) {
   const [dragging, setDragging] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [sheetOpen, setSheetOpen] = useState(false);
   const filePicker = useRef<HTMLInputElement>(null);
   const cameraAttachments = useRef<HTMLInputElement>(null);
-  const noModels = models.length === 0;
+
+  const menuItems = composerMenuItems({
+    workspaceAvailable,
+    busy,
+    canImportFolder: Boolean(onImportFolder)
+  });
+  const runMenuItem = (action: ComposerMenuItem['action']) => {
+    if (action === 'attach') filePicker.current?.click();
+    else if (action === 'photo') cameraAttachments.current?.click();
+    else if (action === 'schedule') onSchedule();
+    else onImportFolder?.();
+    setMenuOpen(false);
+  };
+
+  const selectedModel = modelSelectValue(modelChoice);
+  const contextLabel = composerContextLabel({
+    providerConfigured,
+    securityMode,
+    modelChoice,
+    // A pinned model that has gone unavailable still has to be named on the chip, or the chip stops
+    // describing the conversation at exactly the moment the owner needs to know why it will not run.
+    models: [...models, ...unavailableModels]
+  });
 
   return (
     <section
@@ -142,6 +185,10 @@ export function Composer({
         its own. The tallest thing that can appear here is the approval card, and that already caps
         itself at 40vh and scrolls its own overflow, which is what keeps the message box on a 667px
         phone where `.workbench` clips what does not fit.
+
+        This is also where a send that cannot go anywhere is answered: `sendBlock` names what is
+        wrong and the control that repairs it, and it is drawn here rather than inside the composer
+        so the message never competes with the row that has to stay two lines tall.
       */}
       {banners}
       {/*
@@ -184,26 +231,30 @@ export function Composer({
           }}
         />
         <div className="composer-bottom">
-          <div className="composer-tools">
+          {/*
+            One row, and it may never become two. The class is not `.composer-tools` because that
+            row was allowed to wrap, and wrapping is exactly the behaviour being removed: below
+            430px it took a second and sometimes a third line and the composer grew under the
+            owner's thumb while they were reading it.
+          */}
+          <div className="composer-row">
             <button
-              className="icon-btn composer-attachment"
-              title="Attach files"
-              aria-label="Attach files"
-              onClick={() => filePicker.current?.click()}
+              className="icon-btn composer-add"
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+              title="Add to this message"
+              aria-label="Add to this message"
+              onClick={() => setMenuOpen(true)}
             >
-              <Paperclip />
+              <Plus />
             </button>
+            {/*
+              Voice keeps its own button at every width. It is the one input a phone is better at
+              than a laptop, and putting the best thing about the small screen two taps deep on the
+              small screen is the trade this row exists to avoid.
+            */}
             <button
-              className="icon-btn mobile-capture"
-              title="Take a photo"
-              aria-label="Take a photo"
-              disabled={!workspaceAvailable || busy}
-              onClick={() => cameraAttachments.current?.click()}
-            >
-              <Camera />
-            </button>
-            <button
-              className={`icon-btn mobile-capture ${recording ? 'recording' : ''}`}
+              className={`icon-btn composer-voice ${recording ? 'recording' : ''}`}
               title={recording ? 'Stop voice recording' : 'Record a voice note'}
               aria-label={recording ? 'Stop voice recording' : 'Record a voice note'}
               aria-pressed={recording}
@@ -212,25 +263,11 @@ export function Composer({
             >
               {recording ? <CircleStop /> : <Mic />}
             </button>
-            <button
-              className="icon-btn"
-              title="Schedule this work"
-              aria-label="Schedule this work"
-              disabled={!workspaceAvailable}
-              onClick={onSchedule}
-            >
-              <CalendarClock />
-            </button>
-            {onImportFolder && (
-              <button
-                className="icon-btn"
-                title="Import a local folder"
-                aria-label="Import a local folder"
-                onClick={onImportFolder}
-              >
-                <FolderKey />
-              </button>
-            )}
+            {/*
+              The hidden inputs stay on the row rather than inside the menu: the menu unmounts on
+              the same click that asks one of them to open, and a ref into an unmounted portal is
+              null - the tap would do nothing at all.
+            */}
             <input
               ref={filePicker}
               hidden
@@ -252,76 +289,31 @@ export function Composer({
                 event.target.value = '';
               }}
             />
-            <div className="security-select" title={securityModeCopy[securityMode].description}>
-              <ShieldCheck />
-              <select
-                aria-label="Security mode"
-                value={securityMode}
-                disabled={!workspaceAvailable || busy}
-                onChange={(event) => onSecurityMode(event.target.value as SecurityMode)}
-              >
-                {securityModes.map((mode) => (
-                  <option key={mode} value={mode}>
-                    {securityModeCopy[mode].label}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown />
-            </div>
-            {!providerConfigured ? (
-              <button className="model-connect-button" onClick={onOpenAiSettings}>
-                <Sparkles /> Connect AI
-              </button>
-            ) : (
-              <div className="model-select">
-                <Sparkles />
-                <select
-                  aria-label="Model"
-                  value={modelSelectValue(modelChoice)}
-                  onChange={(event) => onModelChoice(modelChoiceFromValue(event.target.value))}
-                >
-                  <optgroup label="Automatic">
-                    <option value="auto:balanced" disabled={noModels}>
-                      {noModels ? 'No model available' : 'Recommended'}
-                    </option>
-                    <option value="auto:fast" disabled={noModels}>
-                      Faster
-                    </option>
-                    <option value="auto:best" disabled={noModels}>
-                      Higher quality
-                    </option>
-                  </optgroup>
-                  <optgroup label="Choose a specific model">
-                    {models.map((model) => (
-                      <option key={model.id} value={model.id}>
-                        {model.displayName}
-                      </option>
-                    ))}
-                  </optgroup>
-                  {unavailableModels.length > 0 && (
-                    <optgroup
-                      label={
-                        enforceZeroDataRetention
-                          ? 'Unavailable · no verified private route'
-                          : 'Currently unavailable'
-                      }
-                    >
-                      {unavailableModels.map((model) => (
-                        <option key={model.id} value={model.id} disabled>
-                          {model.displayName}
-                          {model.availability === 'review'
-                            ? ' · licence review required'
-                            : enforceZeroDataRetention
-                              ? ' · private route unavailable'
-                              : ' · provider unavailable'}
-                        </option>
-                      ))}
-                    </optgroup>
-                  )}
-                </select>
-                <ChevronDown />
-              </div>
-            )}
+            {/*
+              One chip for how this turn is answered, in place of two selects and a footer.
+
+              Without a provider there is nothing to answer with, so the chip is the owner's move
+              and carries the one ember mark on this row. Ember is never used here for anything
+              else: a configured composer is a machine at rest and says so in silver.
+            */}
+            <button
+              className={`composer-context ${providerConfigured ? '' : 'needs-provider'}`}
+              aria-haspopup="dialog"
+              aria-expanded={sheetOpen}
+              title={
+                providerConfigured
+                  ? securityModeCopy[securityMode].description
+                  : 'Connect an AI provider'
+              }
+              onClick={() => setSheetOpen(true)}
+            >
+              {providerConfigured ? (
+                <ShieldCheck />
+              ) : (
+                <span className="composer-context-dot" aria-hidden="true" />
+              )}
+              <span className="composer-context-label">{contextLabel}</span>
+            </button>
           </div>
           {/*
             Stop and Send are two controls, not one control in two moods. Stop used to appear only
@@ -369,33 +361,122 @@ export function Composer({
           </button>
         </div>
       </div>
-      {/*
-        The footer used to carry five separate statements: no-logs, the privacy route, which model,
-        how images are routed, and "your persistent agent computer". Four of those said something
-        the user already knows or cannot act on. What remains is the one fact that changes between
-        installs and is worth a glance - where inference goes - and it is the control that changes
-        it.
-
-        Where the searches go is the second half of that same fact, and it is added to the same
-        control rather than beside it: one button, one place to change both. It appears only when a
-        query would actually leave this computer, because the in-house answer is the default posture
-        and a badge that is always there is a badge nobody reads on the day it changes.
-      */}
-      <div className="composer-foot">
-        <button
-          className={`composer-privacy ${enforceZeroDataRetention ? 'private' : 'provider-policy'}`}
-          onClick={onOpenAiSettings}
-          title={
-            webSearchNote
-              ? `${webSearchDisclosure} Change this in Settings.`
-              : 'Change model privacy in Settings'
-          }
+      {menuOpen && (
+        <Dialog
+          backdropClassName="modal-backdrop composer-sheet-backdrop"
+          className="modal composer-sheet composer-menu"
+          label="Add to this message"
+          closeOnBackdrop
+          onClose={() => setMenuOpen(false)}
         >
-          <ShieldCheck />
-          {enforceZeroDataRetention ? 'Private AI routes only' : 'Provider data policy applies'}
-          {webSearchNote ? ` · ${webSearchNote}` : ''}
-        </button>
-      </div>
+          <div role="menu" aria-label="Add to this message">
+            {menuItems.map((item) => (
+              <button
+                key={item.action}
+                role="menuitem"
+                className="composer-sheet-row"
+                disabled={item.disabled}
+                onClick={() => runMenuItem(item.action)}
+              >
+                {menuIcons[item.action]}
+                <span className="composer-sheet-label">{item.label}</span>
+              </button>
+            ))}
+          </div>
+        </Dialog>
+      )}
+      {sheetOpen && (
+        <Dialog
+          backdropClassName="modal-backdrop composer-sheet-backdrop"
+          className="modal composer-sheet"
+          label="How this turn is answered"
+          closeOnBackdrop
+          onClose={() => setSheetOpen(false)}
+        >
+          <div className="composer-sheet-group">
+            <h3>How much it asks</h3>
+            {securityModes.map((mode) => (
+              <button
+                key={mode}
+                className={`composer-sheet-row ${mode === securityMode ? 'chosen' : ''}`}
+                aria-pressed={mode === securityMode}
+                disabled={!workspaceAvailable || busy}
+                onClick={() => {
+                  onSecurityMode(mode);
+                  setSheetOpen(false);
+                }}
+              >
+                <span className="composer-sheet-label">{securityModeCopy[mode].label}</span>
+                <span className="composer-sheet-note">{securityModeCopy[mode].description}</span>
+              </button>
+            ))}
+          </div>
+          {providerConfigured ? (
+            modelSheetGroups({ models, unavailableModels, enforceZeroDataRetention }).map(
+              (group) => (
+                <div className="composer-sheet-group" key={group.label}>
+                  <h3>{group.label}</h3>
+                  {group.options.map((option) => (
+                    <button
+                      key={option.value}
+                      className={`composer-sheet-row ${
+                        option.value === selectedModel ? 'chosen' : ''
+                      }`}
+                      aria-pressed={option.value === selectedModel}
+                      disabled={option.disabled}
+                      onClick={() => {
+                        onModelChoice(modelChoiceFromValue(option.value));
+                        setSheetOpen(false);
+                      }}
+                    >
+                      <span className="composer-sheet-label">{option.label}</span>
+                      {option.note ? (
+                        <span className="composer-sheet-note">{option.note}</span>
+                      ) : undefined}
+                    </button>
+                  ))}
+                </div>
+              )
+            )
+          ) : (
+            <button
+              className="composer-sheet-connect"
+              onClick={() => {
+                setSheetOpen(false);
+                onOpenAiSettings();
+              }}
+            >
+              <Sparkles />
+              Connect an AI provider
+            </button>
+          )}
+          {/*
+            The footer used to carry five separate statements: no-logs, the privacy route, which
+            model, how images are routed, and "your persistent agent computer". Four of those said
+            something the owner already knows or cannot act on, and the fifth was printed under
+            every conversation for ever, which is how a fact worth a glance became wallpaper. What
+            remains is the one line that changes between installs - where inference goes, and where
+            a search goes when that is somewhere else - inside the sheet that changes it.
+          */}
+          <button
+            className={`composer-sheet-privacy ${
+              enforceZeroDataRetention ? 'private' : 'provider-policy'
+            }`}
+            title={
+              webSearchDisclosure
+                ? `${webSearchDisclosure} Change this in Settings.`
+                : 'Change model privacy in Settings'
+            }
+            onClick={() => {
+              setSheetOpen(false);
+              onOpenAiSettings();
+            }}
+          >
+            <ShieldCheck />
+            <span>{privacyLine({ enforceZeroDataRetention, webSearchNote })}</span>
+          </button>
+        </Dialog>
+      )}
     </section>
   );
 }

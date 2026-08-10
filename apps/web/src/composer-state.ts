@@ -7,6 +7,9 @@
  * wrong the owner is told about. All of that is decided here so it can be exercised.
  */
 import { withAttachments, type Attachment } from './attachments.js';
+import { modelDisplayName, type NamedModel } from './model-names.js';
+import { securityModeCopy } from './security-mode.js';
+import type { SecurityMode } from './types.js';
 
 export type SendBlockCode =
   | 'workspace_unavailable'
@@ -142,9 +145,9 @@ export const composerSubmission = (input: {
 /**
  * Which model answers: either a ranking athanor keeps up to date, or one the owner pinned.
  *
- * The two live in one `<select>`, so one option list has to carry two different kinds of answer.
- * The `auto:` prefix is the encoding, and it is decided here rather than inside the markup because
- * a mis-parse silently pins a conversation to a model called "auto:best".
+ * The two are offered in one list, so one set of option values has to carry two different kinds of
+ * answer. The `auto:` prefix is the encoding, and it is decided here rather than inside the markup
+ * because a mis-parse silently pins a conversation to a model called "auto:best".
  */
 export type ModelPreference = 'fast' | 'balanced' | 'best';
 
@@ -165,6 +168,161 @@ export const modelChoiceFromValue = (value: string): ModelChoice => {
     preference: modelPreferences.has(preference) ? (preference as ModelPreference) : 'balanced'
   };
 };
+
+/**
+ * What the one chip on the tool row says about how this turn will be answered.
+ *
+ * It stands in for two full-width `<select>`s and a permanent disclaimer footer that between them
+ * took 62px of a 375px phone - a third of the composer - to state three things an owner changes a
+ * few times a year. The label is the shortest true sentence and nothing more: the mode always,
+ * because it governs what happens without asking, and a model name only when the owner pinned one.
+ * Printing a name under automatic routing would be a promise the router does not make - it picks
+ * per turn - and a chip that says "Balanced" and nothing else is the honest answer there.
+ */
+export const composerContextLabel = (input: {
+  providerConfigured: boolean;
+  securityMode: SecurityMode;
+  modelChoice: ModelChoice;
+  models: readonly NamedModel[];
+}): string => {
+  if (!input.providerConfigured) return 'Connect AI';
+  const mode = securityModeCopy[input.securityMode].label;
+  if (input.modelChoice.automatic) return mode;
+  // A pinned id the catalogue has never heard of still resolves to its tail; only a pin with no id
+  // at all leaves nothing to say, and a trailing "Balanced · " would be worse than saying less.
+  const name = modelDisplayName(input.models, input.modelChoice.modelId);
+  return name ? `${mode} · ${name}` : mode;
+};
+
+/** Everything the sheet needs from the catalogue: a name, and whether it can answer. */
+export interface SheetModel {
+  id: string;
+  displayName: string;
+  availability: string;
+}
+
+export interface ModelSheetOption {
+  /** The same encoding `modelChoiceFromValue` reads, so the sheet and the ranking cannot disagree. */
+  value: string;
+  label: string;
+  /** Why this one cannot answer, in the terms this box is configured with. Empty when it can. */
+  note: string;
+  disabled: boolean;
+}
+
+export interface ModelSheetGroup {
+  label: string;
+  options: ModelSheetOption[];
+}
+
+/**
+ * The model list as the sheet draws it, with the reasons attached.
+ *
+ * This was `<optgroup>` markup with the availability wording inlined three times, which is why a
+ * model held back for a licence review and one with no private route read the same in a privacy
+ * build. A model that cannot answer is still listed, disabled, with the reason beside it: dropping
+ * it silently is what makes an owner think athanor has lost their model.
+ */
+export const modelSheetGroups = (input: {
+  models: readonly SheetModel[];
+  unavailableModels: readonly SheetModel[];
+  enforceZeroDataRetention: boolean;
+}): ModelSheetGroup[] => {
+  const empty = input.models.length === 0;
+  const groups: ModelSheetGroup[] = [
+    {
+      label: 'Automatic',
+      options: [
+        {
+          value: 'auto:balanced',
+          label: empty ? 'No model available' : 'Recommended',
+          note: '',
+          disabled: empty
+        },
+        { value: 'auto:fast', label: 'Faster', note: '', disabled: empty },
+        { value: 'auto:best', label: 'Higher quality', note: '', disabled: empty }
+      ]
+    }
+  ];
+  if (!empty)
+    groups.push({
+      label: 'Choose a specific model',
+      options: input.models.map((model) => ({
+        value: model.id,
+        label: model.displayName,
+        note: '',
+        disabled: false
+      }))
+    });
+  if (input.unavailableModels.length)
+    groups.push({
+      label: input.enforceZeroDataRetention
+        ? 'Unavailable · no verified private route'
+        : 'Currently unavailable',
+      options: input.unavailableModels.map((model) => ({
+        value: model.id,
+        label: model.displayName,
+        note:
+          model.availability === 'review'
+            ? 'licence review required'
+            : input.enforceZeroDataRetention
+              ? 'private route unavailable'
+              : 'provider unavailable',
+        disabled: true
+      }))
+    });
+  return groups;
+};
+
+/**
+ * Where inference goes, and where a search goes when that is somewhere else.
+ *
+ * This sentence used to be printed under the composer for ever, which is how a fact worth a glance
+ * on the day it changes became wallpaper. It is one line inside the sheet that changes it, on the
+ * control that changes it.
+ */
+export const privacyLine = (input: {
+  enforceZeroDataRetention: boolean;
+  webSearchNote?: string;
+}): string => {
+  const route = input.enforceZeroDataRetention
+    ? 'Private AI routes only'
+    : 'Provider data policy applies';
+  return input.webSearchNote ? `${route} · ${input.webSearchNote}` : route;
+};
+
+export interface ComposerMenuItem {
+  action: 'attach' | 'photo' | 'schedule' | 'folder';
+  label: string;
+  disabled: boolean;
+}
+
+/**
+ * What the single `+` offers, which is everything that used to be its own permanent icon.
+ *
+ * Four to six buttons sat on the tool row and two of them were already hidden below 430px, so the
+ * phone had a different set of capabilities from the laptop with nothing on screen saying so. One
+ * button, one list, the same list everywhere - except the folder import, which only the native
+ * client can actually perform and so is only offered where it works.
+ *
+ * The microphone is deliberately not in here. It stays on the row because voice is the one input a
+ * phone is better at than a laptop, and burying it two taps deep on the device it suits best would
+ * be the wrong trade.
+ */
+export const composerMenuItems = (input: {
+  workspaceAvailable: boolean;
+  busy: boolean;
+  canImportFolder: boolean;
+}): ComposerMenuItem[] => [
+  // Attaching stays available with the computer down: the upload is this server's business, and a
+  // file put on a draft now is one the owner does not have to find again once the box is back.
+  { action: 'attach', label: 'Attach files', disabled: false },
+  { action: 'photo', label: 'Take a photo', disabled: !input.workspaceAvailable || input.busy },
+  { action: 'schedule', label: 'Schedule this work', disabled: !input.workspaceAvailable },
+  ...(input.canImportFolder
+    ? [{ action: 'folder' as const, label: 'Import a local folder', disabled: false }]
+    : [])
+];
 
 /**
  * What the empty message box invites, which is the only place the state of the conversation is

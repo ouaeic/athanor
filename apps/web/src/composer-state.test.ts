@@ -1,13 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import {
+  composerContextLabel,
+  composerMenuItems,
   composerPlaceholder,
   composerSubmission,
   hasSomethingToSend,
   modelChoiceFromValue,
   modelSelectValue,
+  modelSheetGroups,
+  privacyLine,
   sendBlock,
   sendsOnKey,
-  type SendBlock
+  type SendBlock,
+  type SheetModel
 } from './composer-state.js';
 import type { Attachment } from './attachments.js';
 
@@ -228,5 +233,174 @@ describe('one picker holding two kinds of answer', () => {
       automatic: false,
       modelId: 'openrouter/vendor/automatic-1'
     });
+  });
+});
+
+const catalogueModel = (id: string, availability = 'available'): SheetModel => ({
+  id,
+  displayName: id.split('/').pop() ?? id,
+  availability
+});
+
+describe('the one chip that replaced two selects and a footer', () => {
+  const chip = (patch: Partial<Parameters<typeof composerContextLabel>[0]> = {}) =>
+    composerContextLabel({
+      providerConfigured: true,
+      securityMode: 'balanced',
+      modelChoice: { automatic: true, preference: 'balanced' },
+      models: [{ id: 'openrouter/z-ai/glm-5.2', displayName: 'GLM 5.2' }],
+      ...patch
+    });
+
+  it('names the way in before anything else, because nothing can be answered yet', () => {
+    expect(chip({ providerConfigured: false, securityMode: 'autonomous' })).toBe('Connect AI');
+  });
+
+  /* Naming a model under automatic routing would be a promise the router does not make: it picks
+     per turn, so the chip would be stale the moment it was read. */
+  it('says the mode alone while athanor is choosing the model each turn', () => {
+    expect(chip()).toBe('Balanced');
+    expect(chip({ securityMode: 'review' })).toBe('Ask first');
+    expect(chip({ securityMode: 'autonomous' })).toBe('Autonomous');
+  });
+
+  it('adds the model only once the owner has pinned one', () => {
+    expect(chip({ modelChoice: { automatic: false, modelId: 'openrouter/z-ai/glm-5.2' } })).toBe(
+      'Balanced · GLM 5.2'
+    );
+  });
+
+  /* A pin the catalogue has never heard of still resolves to its tail; only an empty pin leaves
+     nothing to say, and "Balanced · " reads as a bug rather than as less information. */
+  it('falls back to the tail of an unknown id, and to the mode alone when there is no id', () => {
+    expect(chip({ modelChoice: { automatic: false, modelId: 'someone/else/model-q' } })).toBe(
+      'Balanced · model-q'
+    );
+    expect(chip({ modelChoice: { automatic: false, modelId: '' } })).toBe('Balanced');
+  });
+});
+
+describe('the model list inside the sheet', () => {
+  const groups = (patch: Partial<Parameters<typeof modelSheetGroups>[0]> = {}) =>
+    modelSheetGroups({
+      models: [catalogueModel('openrouter/z-ai/glm-5.2')],
+      unavailableModels: [],
+      enforceZeroDataRetention: true,
+      ...patch
+    });
+
+  it('offers the ranking and the specific models as two separate answers', () => {
+    const result = groups();
+    expect(result.map((group) => group.label)).toEqual(['Automatic', 'Choose a specific model']);
+    expect(result[0]?.options.map((option) => option.value)).toEqual([
+      'auto:balanced',
+      'auto:fast',
+      'auto:best'
+    ]);
+    expect(result[1]?.options[0]).toMatchObject({
+      value: 'openrouter/z-ai/glm-5.2',
+      disabled: false
+    });
+  });
+
+  it('refuses the automatic options, and the whole list, when nothing can answer', () => {
+    const result = groups({ models: [] });
+    expect(result).toHaveLength(1);
+    expect(result[0]?.options[0]?.label).toBe('No model available');
+    expect(result[0]?.options.every((option) => option.disabled)).toBe(true);
+  });
+
+  /* A model that cannot answer is listed disabled with the reason, not silently dropped: dropping
+     it is what makes an owner think athanor has lost their model. */
+  it('says why a model is unavailable, in the terms this box is configured with', () => {
+    const priv = groups({
+      unavailableModels: [catalogueModel('openrouter/other/model-x', 'unavailable')],
+      enforceZeroDataRetention: true
+    });
+    expect(priv[2]?.label).toBe('Unavailable · no verified private route');
+    expect(priv[2]?.options[0]).toMatchObject({
+      note: 'private route unavailable',
+      disabled: true
+    });
+
+    const open = groups({
+      unavailableModels: [catalogueModel('openrouter/other/model-x', 'unavailable')],
+      enforceZeroDataRetention: false
+    });
+    expect(open[2]?.label).toBe('Currently unavailable');
+    expect(open[2]?.options[0]?.note).toBe('provider unavailable');
+  });
+
+  it('names a licence review as a licence review either way', () => {
+    for (const enforceZeroDataRetention of [true, false])
+      expect(
+        groups({
+          unavailableModels: [catalogueModel('openrouter/other/model-y', 'review')],
+          enforceZeroDataRetention
+        })[2]?.options[0]?.note
+      ).toBe('licence review required');
+  });
+
+  it('never offers an unavailable model as something that could be picked', () => {
+    const result = groups({
+      unavailableModels: [catalogueModel('openrouter/other/model-x', 'unavailable')]
+    });
+    expect(result[2]?.options.every((option) => option.disabled)).toBe(true);
+  });
+});
+
+describe('where inference goes, said once, inside the sheet that changes it', () => {
+  it('states where it goes, and states the other answer honestly', () => {
+    expect(privacyLine({ enforceZeroDataRetention: true })).toBe('Private AI routes only');
+    expect(privacyLine({ enforceZeroDataRetention: false })).toBe('Provider data policy applies');
+  });
+
+  /* A search leaving the box is the second half of the same fact, so it lands on the same line
+     rather than beside it: one sentence, one place to change both. */
+  it('adds where a search goes only when a query would leave this computer', () => {
+    expect(
+      privacyLine({
+        enforceZeroDataRetention: false,
+        webSearchNote: 'Web searches go to your provider'
+      })
+    ).toBe('Provider data policy applies · Web searches go to your provider');
+    expect(privacyLine({ enforceZeroDataRetention: true, webSearchNote: '' })).toBe(
+      'Private AI routes only'
+    );
+  });
+});
+
+describe('what the one + offers', () => {
+  const items = (patch: Partial<Parameters<typeof composerMenuItems>[0]> = {}) =>
+    composerMenuItems({
+      workspaceAvailable: true,
+      busy: false,
+      canImportFolder: false,
+      ...patch
+    });
+
+  it('holds attach, photo and schedule, and never voice', () => {
+    expect(items().map((item) => item.action)).toEqual(['attach', 'photo', 'schedule']);
+  });
+
+  it('leaves the folder import out entirely unless the client can do it', () => {
+    expect(items().some((item) => item.action === 'folder')).toBe(false);
+    expect(items({ canImportFolder: true }).at(-1)).toMatchObject({
+      action: 'folder',
+      label: 'Import a local folder'
+    });
+  });
+
+  /* Attaching survives the computer being down: the upload is this server's business, and a file
+     put on the draft now is one the owner does not have to find again once the box is back. */
+  it('keeps attaching available with no computer, and holds the rest back', () => {
+    const down = items({ workspaceAvailable: false });
+    expect(down.find((item) => item.action === 'attach')?.disabled).toBe(false);
+    expect(down.find((item) => item.action === 'photo')?.disabled).toBe(true);
+    expect(down.find((item) => item.action === 'schedule')?.disabled).toBe(true);
+  });
+
+  it('holds the camera back while a send is in flight', () => {
+    expect(items({ busy: true }).find((item) => item.action === 'photo')?.disabled).toBe(true);
   });
 });

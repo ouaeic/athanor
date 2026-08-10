@@ -1138,6 +1138,7 @@ describe('what a new turn keeps and what it drops', () => {
     finishRejections: 2,
     completionNags: 4,
     notices: 3,
+    turnNoveltyBytes: 900,
     mutated: true,
     mutatedBeyondProse: true,
     answered: true,
@@ -1184,6 +1185,13 @@ describe('what a new turn keeps and what it drops', () => {
     expect(next).not.toHaveProperty('reasoningFloor');
     expect(next).not.toHaveProperty('compactedAtStep');
     expect(next).not.toHaveProperty('pending');
+    /*
+     * The egress budget goes with them, and it is the one where keeping it would have been the
+     * quieter mistake: the taint it is charged under is never cleared, so a budget that carried
+     * would have been per conversation despite being named, bounded and explained to the owner as
+     * per turn - and once spent, every web read for the rest of the thread raises a card.
+     */
+    expect(next.turnNoveltyBytes).toBe(0);
   });
 
   it('keeps everything that was about the conversation', () => {

@@ -106,6 +106,22 @@ const providerRefModelId = (providerRef: string | undefined): string | null => {
 const OPEN_TASK_STATUSES =
   "('draft','queued','planning','running','awaiting_user','awaiting_resource','paused')";
 
+/**
+ * How many times a task may be leased before the queue stops handing it to anyone.
+ *
+ * The count is cleared at every point where something puts a task back in the queue - a follow-up
+ * message (`continueTask`, `promoteQueuedTaskMessage`) or a resume (`setTaskStatusForUser`) - and
+ * those are the only ways back into a leasable status, so this is six starts since the last time
+ * anything went right, not six turns. A step that merely runs long renews its lease rather than
+ * taking a new one, so it never spends one of these.
+ *
+ * Six because a task that kills its worker was otherwise immortal: systemd restarts the worker,
+ * `ORDER BY created_at` puts the corpse back at the front, and the box spends forever re-running
+ * the one turn it cannot survive while the message the owner sent after it is never reached.
+ * Nothing was logged, because nothing failed - the process was simply gone.
+ */
+export const TASK_MAX_ATTEMPTS = 6;
+
 const encryptedText = (
   value: unknown
 ): { ciphertext: EncryptedEnvelope | null; legacy: string | null } => {
@@ -2400,6 +2416,10 @@ export class DataStore {
              COALESCE(max_spend_usd, (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
                WHERE u.task_id=tasks.id AND u.state='settled')) + $7::double precision END,
            agent_state_ciphertext=$6::jsonb,
+           -- The one way back into the queue for a task the attempt ceiling stopped, so it has to
+           -- clear the count: the owner writing again is a new start, and leaving the old count
+           -- standing would mean their message was accepted and then silently never leased.
+           attempt=0,
            lease_owner=NULL, lease_expires_at=NULL, completed_at=NULL, updated_at=NOW()
          WHERE id=$1 AND user_id=$2
            AND status IN ('completed','failed','awaiting_resource','cancelled')
@@ -2633,6 +2653,9 @@ export class DataStore {
              COALESCE(max_spend_usd, (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
                WHERE u.task_id=tasks.id AND u.state='settled')) + $7::double precision END,
            agent_state_ciphertext=$6::jsonb,lease_owner=NULL,lease_expires_at=NULL,
+           -- Back in the queue, so the attempt count starts again: the turn before this one
+           -- finished, which is the evidence TASK_MAX_ATTEMPTS is asking for.
+           attempt=0,
            completed_at=NULL,updated_at=NOW()
          WHERE id=$1 AND lease_owner=$2
          RETURNING *`,
@@ -4457,6 +4480,11 @@ export class DataStore {
       `UPDATE tasks SET status = $3, lease_owner = NULL, lease_expires_at = NULL, updated_at = NOW(),
        -- Resuming answers the spend pause, so the task stops being one the owner has not heard about.
        spend_paused_at = CASE WHEN $3 = 'queued' THEN NULL ELSE spend_paused_at END,
+       -- And resuming is a new start, so it does not inherit the count of leases that died before
+       -- the owner intervened. Only the 'queued' branch: a task parked in any other status has not
+       -- re-entered the queue, and the scheduled-run recovery sweep in the API reads a zero here
+       -- as a run that was never dispatched at all.
+       attempt = CASE WHEN $3 = 'queued' THEN 0 ELSE attempt END,
        completed_at = CASE WHEN $3 IN ('completed','failed','cancelled') THEN NOW() ELSE completed_at END
        WHERE id=$1 AND EXISTS (
          SELECT 1 FROM workspaces w
@@ -4537,14 +4565,66 @@ export class DataStore {
          SELECT id FROM tasks
          WHERE status IN ('queued','planning','running')
            AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
-         ORDER BY created_at, id
+           AND attempt < $3
+         -- Attempt first, then age. A task that has already died once is behind everything that
+         -- has not, so a turn that kills its worker can no longer starve the message the owner
+         -- sent while it was crashing; it drops a place each time and stops being handed out at
+         -- all once it is at the ceiling. The tie-break on age is the original queue order.
+         ORDER BY attempt, created_at, id
          FOR UPDATE SKIP LOCKED
          LIMIT 1
        )
        RETURNING *`,
-      [workerId, leaseSeconds]
+      [workerId, leaseSeconds, TASK_MAX_ATTEMPTS]
     );
     return result.rows[0] ? mapTask(result.rows[0]) : null;
+  }
+
+  /**
+   * Closes out the tasks the lease will no longer hand to anyone, and gives back the credits they
+   * were holding.
+   *
+   * Without this the ceiling would trade a crash loop for a silence: the task simply stops being
+   * leased, keeps a live-looking status and its reservation, and the owner is left watching a
+   * conversation that is neither running nor finished. The expired-lease condition is what makes it
+   * safe to run while workers are working - a task a worker still holds is renewing its lease, so
+   * only one nobody is holding can be reached from here.
+   *
+   * Exactly once by construction: the same statement that selects the rows moves them out of the
+   * statuses it selects on, so a second sweep, or a second API process, matches nothing.
+   */
+  async failTasksAtAttemptLimit(
+    limit = 20
+  ): Promise<Array<{ id: string; userId: string; workspaceId: string; attempt: number }>> {
+    return this.database.transaction(async (tx) => {
+      const failed = await tx.query(
+        `UPDATE tasks SET status='failed',lease_owner=NULL,lease_expires_at=NULL,
+           completed_at=NOW(),updated_at=NOW()
+         WHERE id IN (
+           SELECT id FROM tasks
+           WHERE status IN ('queued','planning','running')
+             AND attempt >= $1
+             AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+           ORDER BY updated_at, id
+           LIMIT $2
+           FOR UPDATE SKIP LOCKED
+         )
+         RETURNING id, user_id, workspace_id, attempt`,
+        [TASK_MAX_ATTEMPTS, limit]
+      );
+      for (const row of failed.rows) {
+        await tx.query(
+          `UPDATE usage_entries SET state='released' WHERE task_id=$1 AND state='reserved'`,
+          [String(row.id)]
+        );
+      }
+      return failed.rows.map((row) => ({
+        id: String(row.id),
+        userId: String(row.user_id),
+        workspaceId: String(row.workspace_id),
+        attempt: Number(row.attempt)
+      }));
+    });
   }
 
   /**
