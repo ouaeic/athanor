@@ -2572,7 +2572,8 @@ select:focus-visible {
   justify-content: space-between;
   padding: 6px 8px;
   border-bottom: 1px solid #2d3033;
-  color: #748078;
+  /* Was #748078 at 11px, about 4.4:1. */
+  color: var(--muted);
   font-size: 11px;
 }
 .preview-frame-wrap > div button {
@@ -6105,7 +6106,8 @@ body,
 .diff-hunk-header td {
   padding: 4px 10px;
   background: #16191b;
-  color: #7f878b;
+  /* Was #7f878b on #16191b - the worst in the file at ~2.6:1. */
+  color: var(--muted);
 }
 .diff-gutter {
   width: 1%;
@@ -6442,7 +6444,8 @@ button.spend-bar:hover .spend-bar-name {
 .spend-bar small {
   grid-column: 1 / -1;
   font-size: 10.5px;
-  color: #757c80;
+  /* Was #757c80 at 10.5px, about 4.2:1 - the smallest text in the interface needs the most help. */
+  color: var(--muted);
 }
 /* The cost of a conversation, on the conversation, where the decision to continue is made. */
 .task-spend {
