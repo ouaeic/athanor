@@ -617,6 +617,7 @@ function Files({ workspace }: { workspace: Workspace }) {
             const chosen = Array.from(event.target.files ?? []);
             event.target.value = '';
             setUploadError('');
+            const failed: string[] = [];
             for (const file of chosen) {
               // Writing over a file the agent produced used to happen silently. A name that
               // already exists now stops and shows exactly what would be replaced.
@@ -641,12 +642,31 @@ function Files({ workspace }: { workspace: Workspace }) {
                 });
                 continue;
               }
-              await api.writeFile(
-                workspace.id,
-                `${path}/${file.name}`,
-                new Uint8Array(await file.arrayBuffer())
-              );
+              /*
+               * One failure must not take the rest of the selection with it.
+               *
+               * This loop had no catch: a write that threw on the second of five files abandoned
+               * the other three, and skipped the reload below - so the list did not even show what
+               * had landed. The error was cleared when the upload started and nothing set it
+               * again, so the owner was left with a folder that had quietly half-changed.
+               */
+              try {
+                await api.writeFile(
+                  workspace.id,
+                  `${path}/${file.name}`,
+                  new Uint8Array(await file.arrayBuffer())
+                );
+              } catch {
+                failed.push(file.name);
+              }
             }
+            if (failed.length)
+              setUploadError(
+                failed.length === 1
+                  ? `${failed[0]} could not be uploaded. Everything else was.`
+                  : `${failed.length} files could not be uploaded: ${failed.join(', ')}. Everything else was.`
+              );
+            // Always, so the list reflects whatever actually landed rather than the selection.
             await load();
           }}
         />
