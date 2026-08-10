@@ -1489,6 +1489,7 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
     terminal.current = term;
     let socket: WebSocket | undefined;
     let renewal: number | undefined;
+    let onShown: (() => void) | undefined;
     void api
       .terminalToken(workspace.id)
       .then(({ runnerUrl, token }) => {
@@ -1497,33 +1498,54 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
           token
         ]);
         /*
-         * Kept alive before its capability runs out.
+         * Kept alive before its capability runs out - without trusting a long timer.
          *
-         * The runner closes this socket when the capability that opened it expires - deliberately,
-         * so a shell on the box stays revocable - and capabilities are capped at fifteen minutes.
-         * Without this the terminal died on a timer while the owner was typing and called it
-         * "Session closed". The first renewal is scheduled conservatively; after that the runner
-         * says when the new deadline is and the schedule follows it.
+         * The runner closes this socket when the capability expires, deliberately, so a shell on
+         * the box stays revocable, and capabilities are capped at fifteen minutes. One `setTimeout`
+         * most of the way to expiry looked right and did not work: browsers throttle timers in a
+         * hidden tab. Measured against the deployed server, the socket closed at 902s with 1008
+         * "Capability expired" - exactly the failure this exists to prevent - because the page had
+         * been in the background. On a phone, where the app is backgrounded constantly, that would
+         * be the ordinary case rather than a quirk of how it was tested.
+         *
+         * So the deadline is read from the token, checked on a short interval that throttling
+         * cannot push past expiry, and checked again the moment the page is shown.
          */
-        const scheduleRenewal = (expSeconds?: number): void => {
-          window.clearTimeout(renewal);
-          const dueIn = expSeconds
-            ? Math.max(5_000, expSeconds * 1000 - Date.now() - 60_000)
-            : 7 * 60_000;
-          renewal = window.setTimeout(() => {
-            void api
-              .terminalToken(workspace.id)
-              .then((next) => {
-                if (socket?.readyState === WebSocket.OPEN)
-                  socket.send(JSON.stringify({ type: 'renew', token: next.token }));
-              })
-              // Nothing to say: the session keeps the deadline it has and closes on it.
-              .catch(() => undefined);
-          }, dueIn);
+        const expiryOf = (value: string): number => {
+          try {
+            const claims = JSON.parse(atob(value.split('.')[1] ?? '')) as { exp?: number };
+            return typeof claims.exp === 'number' ? claims.exp * 1000 : 0;
+          } catch {
+            return 0;
+          }
         };
+        let deadline = expiryOf(token);
+        let renewing = false;
+        const renewSoon = (): void => {
+          // Renewed once inside the last third of its life, so a throttled tab still has several
+          // chances before the deadline rather than one.
+          if (renewing || !deadline || deadline - Date.now() > 300_000) return;
+          renewing = true;
+          void api
+            .terminalToken(workspace.id)
+            .then((next) => {
+              if (socket?.readyState === WebSocket.OPEN)
+                socket.send(JSON.stringify({ type: 'renew', token: next.token }));
+              deadline = expiryOf(next.token) || deadline;
+            })
+            // Nothing to say: the session keeps the deadline it has and closes on it.
+            .catch(() => undefined)
+            .finally(() => {
+              renewing = false;
+            });
+        };
+        renewal = window.setInterval(renewSoon, 60_000);
+        onShown = () => {
+          if (document.visibilityState === 'visible') renewSoon();
+        };
+        document.addEventListener('visibilitychange', onShown);
         socket.onopen = () => {
           term.writeln('\x1b[32mConnected to private agent computer\x1b[0m');
-          scheduleRenewal();
         };
         socket.onmessage = (event) => {
           const message = JSON.parse(String(event.data)) as {
@@ -1532,7 +1554,7 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
             exp?: number;
           };
           if (message.type === 'data') term.write(message.data ?? '');
-          else if (message.type === 'renewed') scheduleRenewal(message.exp);
+          else if (message.type === 'renewed' && message.exp) deadline = message.exp * 1000;
         };
         socket.onclose = () => term.writeln('\r\n\x1b[33mSession closed\x1b[0m');
         const write = (data: string): void => {
@@ -1556,7 +1578,8 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
     observer.observe(host.current);
     return () => {
       observer.disconnect();
-      window.clearTimeout(renewal);
+      if (renewal !== undefined) window.clearInterval(renewal);
+      if (onShown) document.removeEventListener('visibilitychange', onShown);
       send.current = undefined;
       socket?.close();
       term.dispose();
