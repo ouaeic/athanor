@@ -37,6 +37,7 @@ import { describeFailure } from './failure-text.js';
 import { botWallClearance, formatBytes, hostOf } from './timeline-state.js';
 import { previewPortProblem, previewSummary } from './preview-rows.js';
 import { advanceFrame, drainFrames, emptyFrameSlots, type FrameSlots } from './remote-frame.js';
+import { inertOutside } from './inert-outside.js';
 import {
   canDecodeVideo,
   parseDisplayMessage,
@@ -1098,9 +1099,13 @@ function Computer({
     const onFullscreenChange = () => {
       if (!document.fullscreenElement) setExpanded(false);
     };
+    // Nothing behind the expanded view is reachable while it is up - the same containment `Dialog`
+    // has always had, which this pane was drawn over the whole window without.
+    const releaseInert = paneRef.current ? inertOutside(paneRef.current) : undefined;
     document.addEventListener('keydown', onKey, true);
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => {
+      releaseInert?.();
       document.removeEventListener('keydown', onKey, true);
       document.removeEventListener('fullscreenchange', onFullscreenChange);
     };

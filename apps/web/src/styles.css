@@ -6611,7 +6611,9 @@ button.spend-bar:hover .spend-bar-name {
 .answer-meta {
   display: block;
   margin-top: 4px;
-  color: #6f767a;
+  /* Was #6f767a: measured 4.07:1 and 4.21:1 at 11px on the live page, under the 4.5:1 small text
+     wants. `--muted` is the palette's own secondary grey and clears it comfortably. */
+  color: var(--muted);
   font-size: 11px;
   opacity: 0;
   transition: opacity 120ms ease;
@@ -6752,7 +6754,9 @@ button.spend-bar:hover .spend-bar-name {
 .task-bucket-label {
   margin: 12px 0 2px;
   padding: 0 8px;
-  color: #6f767a;
+  /* Was #6f767a: measured 4.07:1 and 4.21:1 at 11px on the live page, under the 4.5:1 small text
+     wants. `--muted` is the palette's own secondary grey and clears it comfortably. */
+  color: var(--muted);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.06em;
