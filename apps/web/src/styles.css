@@ -7343,3 +7343,10 @@ a.blocked-resource:hover {
 .agent-thinking p:last-child {
   margin-bottom: 0;
 }
+
+/* A load that failed, said plainly, so it is never mistaken for an empty workspace. */
+.connector-unavailable {
+  margin: 0 0 10px;
+  color: #c9a227;
+  font-size: 0.9rem;
+}

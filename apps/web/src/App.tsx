@@ -1465,7 +1465,15 @@ export function App() {
     setBusy(true);
     setError('');
     try {
-      if (loosensSecurity(currentMode, securityMode)) await api.stepUp();
+      /*
+       * No passkey for choosing how much this run asks.
+       *
+       * The server dropped this requirement deliberately - moving a conversation to Autonomous
+       * meant a fingerprint every single time, on the one setting whose entire purpose is to be
+       * interrupted less - but the client kept asking, so the prompt never went away. Step-up still
+       * guards what changing a setting back cannot undo: the provider credential, and raising a
+       * spending ceiling.
+       */
       if (task) {
         const updated = await api.updateTaskSecurityMode(task.id, securityMode);
         setData((current) =>

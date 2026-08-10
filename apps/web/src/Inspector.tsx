@@ -421,6 +421,14 @@ function Files({ workspace }: { workspace: Workspace }) {
    * agent is still working in — and why deleting one is the only way to get its bytes back.
    */
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  /**
+   * Whether the saved results simply could not be read.
+   *
+   * An empty array meant both "you have none" and "this device could not ask", and the section is
+   * only drawn when the array has something in it - so a failed load looked exactly like a clean
+   * workspace. The owner had no way to tell that their finished work was still there.
+   */
+  const [artifactsUnavailable, setArtifactsUnavailable] = useState(false);
   const input = useRef<HTMLInputElement>(null);
   const nameInput = useRef<HTMLInputElement>(null);
   const undo = useUndo();
@@ -452,8 +460,14 @@ function Files({ workspace }: { workspace: Workspace }) {
   const loadArtifacts = () =>
     void api
       .artifacts(workspace.id)
-      .then(setArtifacts)
-      .catch(() => setArtifacts([]));
+      .then((next) => {
+        setArtifacts(next);
+        setArtifactsUnavailable(false);
+      })
+      .catch(() => {
+        setArtifacts([]);
+        setArtifactsUnavailable(true);
+      });
   useEffect(() => {
     void load('workspace');
     loadArtifacts();
@@ -918,6 +932,17 @@ function Files({ workspace }: { workspace: Workspace }) {
               <span>Files you send and files athanor makes both land here.</span>
             </div>
           )}
+          {artifactsUnavailable && (
+            <div className="deliverable-library">
+              <div>
+                <p className="eyebrow">Saved results</p>
+                <small>
+                  This device could not read them just now. Nothing was deleted — they are on the
+                  agent computer.
+                </small>
+              </div>
+            </div>
+          )}
           {artifacts.length > 0 && (
             <div className="deliverable-library">
               <div>
@@ -1346,10 +1371,20 @@ function Computer({
             </span>
           </div>
         )}
-        {surface.error && !probe.error && (
+        {/*
+          Shown when there is an error OR when reconnecting has given up.
+
+          It used to be gated on the error alone, and the reconnect budget sets `stalled` without
+          setting one - so the moment the pane stopped trying was the moment its only recovery
+          control disappeared, leaving a dead view with nothing to press.
+        */}
+        {(surface.error || surface.stalled) && !probe.error && (
           <div className="browser-error">
             <strong>The computer needs attention</strong>
-            <span>{surface.error}</span>
+            <span>
+              {surface.error ||
+                'This device stopped trying to reach the agent computer after several attempts.'}
+            </span>
             {surface.stalled && <button onClick={surface.reconnect}>Try again</button>}
           </div>
         )}

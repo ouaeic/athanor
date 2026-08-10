@@ -5605,6 +5605,21 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           preview: `${declared?.preview ?? policy.preview}\nThe ${surface} broker identified the actual control as consequential.`
         };
       }
+      /*
+       * The broker looked and said it is harmless, so that is the answer.
+       *
+       * `desktop_action` declares every `click_at` and `drag` as consequential because a bare
+       * coordinate is ambiguous - which is right when nothing can resolve it. Here something did:
+       * the preflight identified the actual control under that coordinate and found it benign. The
+       * verdict used to fall through to `return declared` below, so the authoritative answer could
+       * only ever make a decision stricter and never lighter, and the owner was asked to confirm
+       * clicks on things the runner had already recognised as ordinary.
+       */
+      return {
+        sideEffect: 'external_reversible',
+        action: declared?.action ?? `Use the ${surface}`,
+        preview: declared?.preview ?? policy.preview
+      };
     } catch {
       // The execution call will return the browser's authoritative error if preflight is unavailable.
     }

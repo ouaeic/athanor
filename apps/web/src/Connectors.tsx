@@ -64,6 +64,8 @@ export function Connectors({
   setError: (message: string) => void;
 }) {
   const [connectors, setConnectors] = useState<Connector[]>([]);
+  /** Whether the list could not be read, as opposed to being genuinely empty. */
+  const [unavailable, setUnavailable] = useState(false);
   const [audit, setAudit] = useState<ConnectorAuditEvent[]>([]);
   const [catalog, setCatalog] = useState<ConnectorDefinition[]>([]);
   const [kind, setKind] = useState<ConnectorKind>('imap');
@@ -87,8 +89,12 @@ export function Connectors({
       .then(([nextConnectors, nextAudit]) => {
         setConnectors(nextConnectors);
         setAudit(nextAudit);
+        setUnavailable(false);
       })
+      // Distinguished from "you have none": an empty list after a failed read told the owner
+      // their connections were gone when they were only unreachable.
       .catch(() => {
+        setUnavailable(true);
         setConnectors([]);
         setAudit([]);
       });
@@ -624,6 +630,12 @@ export function Connectors({
           </div>
         ))}
       </div>
+      {unavailable && (
+        <p className="connector-unavailable">
+          Your connections could not be read just now. Nothing was removed — this device could not
+          reach the server.
+        </p>
+      )}
       {connectors.length > 0 && (
         <>
           <hr />
