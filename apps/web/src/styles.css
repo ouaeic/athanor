@@ -6003,7 +6003,10 @@ body,
   position: fixed;
   z-index: 60;
   left: 50%;
-  bottom: calc(18px + var(--safe-bottom, 0px) + var(--bottom-bar, 0px));
+  /* `--bottom-bar` already carries the safe-area inset (see its definition), so adding it again
+     here counted the home indicator twice and floated the undo bar above where it belongs on a
+     phone - on the one control that is time-limited and has to be easy to hit. */
+  bottom: calc(18px + var(--bottom-bar, 0px));
   transform: translateX(-50%);
   display: grid;
   gap: 8px;
