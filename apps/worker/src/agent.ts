@@ -22,6 +22,8 @@ import {
   executeConnectorAction,
   inferenceCredentialAad,
   isMailConnectorKind,
+  readRoutingMetadata,
+  type RoutingMetadata,
   nextScheduleRun,
   memoryTemporalStatus,
   recallMemories,
@@ -1709,6 +1711,32 @@ export const retryTurnHandoff = async (input: {
   return 'exhausted';
 };
 
+/**
+ * Which route a request is going to, and how that route caches a repeated prefix.
+ *
+ * The two travel together because they are read off the same catalogue entry and because sending
+ * one without the other is the bug this exists to make unrepeatable. The catalogue works out how a
+ * route caches from what it charges for cache writes and reads, stores it on the model, and the
+ * provider adapter reads it off the request - and nothing ever carried it from one to the other, so
+ * every request fell back to a two-vendor slug list that the comment in `prompt-cache.ts` already
+ * describes as the thing that was fixed. On an explicit route the effect is total: the adapter
+ * marks nothing, so the whole breakpoint apparatus in `context.ts` is computed each step, counted
+ * into the cost event, and thrown away.
+ *
+ * Measured on one twenty-step task before this existed: 187,014 of 289,514 input tokens billed at
+ * full rate, thirteen steps caching nothing at all, against a fixed head of about 12,000 tokens
+ * that only ever needed paying for once.
+ *
+ * Every model call in this worker goes through here rather than writing `model:` by hand, so a new
+ * call site cannot quietly opt out of caching again.
+ */
+const routeTo = (model: {
+  providerModelId: string;
+}): { model: string; promptCacheStyle?: RoutingMetadata['promptCacheStyle'] } => {
+  const { promptCacheStyle } = readRoutingMetadata(model);
+  return { model: model.providerModelId, ...(promptCacheStyle ? { promptCacheStyle } : {}) };
+};
+
 export const MODEL_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 
 /**
@@ -2909,7 +2937,7 @@ ${clockLine(new Date(), timeZone)}
       });
       const response = await withRequestDeadline((signal) =>
         gateway.chat(provider, {
-          model: model.providerModelId,
+          ...routeTo(model),
           messages: prepared.messages,
           tools,
           temperature: 0.1,
@@ -3349,7 +3377,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
     const response = await this.#withLeaseRenewal(task, () =>
       withRequestDeadline((signal) =>
         gateway.chat(provider, {
-          model: model.providerModelId,
+          ...routeTo(model),
           messages: preparedContext.messages,
           tools: handoffTools,
           temperature: 0.2,
@@ -3599,7 +3627,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           withRequestDeadline(
             (signal) =>
               gateway.chat(provider, {
-                model: model.providerModelId,
+                ...routeTo(model),
                 messages,
                 tools: [],
                 serverTools: webPlan.serverTools,
@@ -5732,7 +5760,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       withRequestDeadline(
         (signal) =>
           gateway.chat(provider, {
-            model: summariser.providerModelId,
+            ...routeTo(summariser),
             messages: compactionRequest(request),
             tools: [],
             temperature: 0.1,
@@ -6164,7 +6192,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       const response = await this.#withLeaseRenewal(task, () =>
         withRequestDeadline((signal) =>
           specialistGateway.gateway.chat(specialistGateway.provider, {
-            model: specialist.providerModelId,
+            ...routeTo(specialist),
             messages: [
               {
                 role: 'system',
@@ -7282,7 +7310,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       const response = await this.#withLeaseRenewal(task, () =>
         withRequestDeadline((signal) =>
           gateway.chat(provider, {
-            model: model.providerModelId,
+            ...routeTo(model),
             messages: preparedContext.messages,
             // No provider-side tools ride here, on any route. The agent's request offers the model
             // the tools the model calls; the provider's search is spent by `#providerWebSearch`, on

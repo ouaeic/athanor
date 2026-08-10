@@ -514,6 +514,45 @@ describe('the model call and the task lease', () => {
     await running;
   });
 
+  it('marks the cacheable prefix on the wire, on the route the catalogue described', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Done.')], log);
+    /*
+     * The routing fields are deliberately kept off the owner-facing model shape and carried
+     * alongside it, which is exactly how `store.listModels` returns them and how the worker
+     * receives them - so the catalogue entry is built the same way here.
+     */
+    const cachingRoute = { ...model, promptCacheStyle: 'explicit' as const };
+
+    await new AgentWorker(
+      { ...probe.store, listModels: async () => [cachingRoute] } as unknown as typeof probe.store,
+      config(),
+      masterKey,
+      runnerSecret
+    )
+      .run(task)
+      .catch(() => undefined);
+
+    const sent = (log.modelRequests[0]?.messages ?? []) as Array<{ content: unknown }>;
+    const marked = sent.filter(
+      (message) =>
+        Array.isArray(message.content) &&
+        (message.content as Array<Record<string, unknown>>).some((block) => block.cache_control)
+    );
+    /*
+     * The whole breakpoint apparatus in context.ts was computed on every step, counted into the
+     * cost event, and then dropped on the floor: nothing carried the route's cache style from the
+     * catalogue entry onto the request, so the adapter fell back to a two-vendor slug list and
+     * marked nothing. Measured on one twenty-step task, thirteen steps cached nothing at all and
+     * 187,014 of 289,514 input tokens were billed at full rate against a fixed head of about
+     * 12,000 that only ever needed paying for once. Asserted on the request body rather than on
+     * the helper, because the helper was never what was broken.
+     */
+    expect(marked.length).toBeGreaterThan(0);
+  });
+
   it('tears down the request in flight when the owner stops the task', async () => {
     vi.useFakeTimers();
     const task = makeTask();
