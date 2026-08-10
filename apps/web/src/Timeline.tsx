@@ -29,6 +29,7 @@ import { CopyButton, Markdown } from './Markdown.js';
 import { DiffView } from './DiffView.js';
 import { fileChangesFromTool } from './diff.js';
 import {
+  activityLine,
   activityOverview,
   botWallClearance,
   buildConversation,
@@ -36,7 +37,6 @@ import {
   conversationCost,
   formatBytes,
   forkFamily,
-  formatTokens,
   hostOf,
   liveActivityId,
   previewLifetime,
@@ -728,6 +728,12 @@ function ActivityLog({
   // the `live ?` below except the last.
   const plan = useTaskPlan(live ? task.id : '', planSequence);
   const progress = live ? planProgress(plan?.steps ?? []) : null;
+  const line = activityLine({
+    progress: progress && !terminal ? progress : null,
+    overview,
+    steps: events.length,
+    live
+  });
   return (
     <details
       className={`task-activity ${terminal ? 'finished' : 'active'}`}
@@ -744,15 +750,10 @@ function ActivityLog({
             "Step 2 of 5 · Writing a file" rather than "Thinking": the count is the answer to the
             question a waiting owner is actually asking, and it used to cost a click to reach. It
             belongs only to the group being worked in — every earlier group repeating the live
-            progress made the transcript claim the agent was in four places at once.
+            progress made the transcript claim the agent was in four places at once. What it says
+            when there is nothing to count, and when the count has run out, is `activityLine`.
           */}
-          <small>
-            {progress && !terminal
-              ? `Step ${Math.min(progress.completed + 1, progress.total)} of ${progress.total} · ${progress.current || overview}`
-              : live
-                ? overview
-                : `${events.length} ${events.length === 1 ? 'step' : 'steps'}`}
-          </small>
+          {line && <small>{line}</small>}
           {progress && !terminal && (
             <span
               className="task-activity-progress"
@@ -840,20 +841,22 @@ const useStickyScroll = (dependency: number) => {
   return { container, pinned, onScroll, jump };
 };
 
+/**
+ * What the conversation cost, and nothing else about how it was billed.
+ *
+ * This line used to read "$0.02 · 163k in · 1.6k out · 54% cached" at the foot of a transcript
+ * whose answer was two lines of verse. Three of those four figures are the provider's telemetry:
+ * they say nothing about the work and they cannot be acted on from here. The money is the one an
+ * owner reads in passing, so the money is what stays; the split and the cache share are in the
+ * usage pane, which is where somebody who wants them is already looking.
+ */
 function CostSummary({ events }: { events: TaskEvent[] }) {
   const total = conversationCost(events);
-  if (!total.inputTokens && !total.outputTokens) return null;
-  const cacheShare = total.inputTokens
-    ? Math.round((total.cachedInputTokens / total.inputTokens) * 100)
-    : 0;
+  if (!(total.costUsd > 0)) return null;
   return (
     <div className="cost-event conversation-cost">
       <CircleDollarSign />
-      <span>
-        {total.costUsd > 0 ? `${formatUsd(total.costUsd)} · ` : ''}
-        {formatTokens(total.inputTokens)} in · {formatTokens(total.outputTokens)} out
-        {cacheShare > 0 ? ` · ${cacheShare}% cached` : ''}
-      </span>
+      <span>{formatUsd(total.costUsd)}</span>
     </div>
   );
 }
@@ -1071,10 +1074,14 @@ export function Timeline({
       // Five stacked elements used to stand between opening athanor and typing: an eyebrow that
       // repeated the heading, the heading, a paragraph, the examples, and a note explaining that
       // panes open when needed - which the interface demonstrates the first time it happens.
-      // What is left is the question and three concrete examples, because examples teach what
-      // this can do better than a sentence claiming it - and each one writes the first message.
+      // What is left is one sentence and three concrete examples, because examples teach what this
+      // can do better than a sentence claiming it - and each one writes the first message.
+      //
+      // The sentence replaced the question “What should we get done?”, which the composer under it
+      // already asks in its placeholder, and which taught an owner arriving from the installer
+      // nothing about what they had just been handed.
       <div className="empty-canvas">
-        <h1>What should we get done?</h1>
+        <h1>A whole computer that keeps working while you are away.</h1>
         <div className="starter-capabilities">
           {starters.map((starter) => (
             <button key={starter.label} type="button" onClick={() => onStarter?.(starter.prompt)}>

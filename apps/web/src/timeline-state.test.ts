@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Task, TaskEvent } from './types.js';
 import {
   activeBotWall,
+  activityLine,
   activityOverview,
   agentNotice,
   asBotWall,
@@ -209,6 +210,46 @@ describe('timeline presentation', () => {
       event(3, 'cost')
     ];
     expect(activityOverview('completed', events)).toBe('1 action · 2 AI turns · finished');
+  });
+
+  it('says nothing about a turn that is only thinking, because the thinking node says it', () => {
+    // "Thinking" rendered one line above a thinking block whose heading is the same word.
+    expect(activityOverview('running', [event(1, 'assistant_reasoning')])).toBe('');
+    expect(activityOverview('planning', [])).toBe('Preparing the task');
+  });
+
+  it('counts the steps that are done once there are none left to start', () => {
+    // "Step 2 of 2" beside a bar already at 100%: the counter was written as the step being worked
+    // on, and at the end of a plan there is no such step.
+    expect(
+      activityLine({
+        progress: { completed: 2, total: 2, current: '' },
+        overview: '',
+        steps: 4,
+        live: true
+      })
+    ).toBe('2 steps done');
+    expect(
+      activityLine({
+        progress: { completed: 1, total: 3, current: 'Draft the note' },
+        overview: 'Writing a file',
+        steps: 4,
+        live: true
+      })
+    ).toBe('Step 2 of 3 · Draft the note');
+  });
+
+  it('renders no line at all rather than an empty one', () => {
+    expect(activityLine({ progress: null, overview: '', steps: 4, live: true })).toBe('');
+    expect(
+      activityLine({
+        progress: { completed: 1, total: 2, current: '' },
+        overview: '',
+        steps: 4,
+        live: true
+      })
+    ).toBe('Step 2 of 2');
+    expect(activityLine({ progress: null, overview: '', steps: 1, live: false })).toBe('1 step');
   });
 
   it('creates a short plain-language result while preserving the full source separately', () => {
@@ -561,6 +602,43 @@ describe('conversation transcript', () => {
     expect(activity.events[0]?.event.kind).toBe('tool_result');
   });
 
+  it('files a warning the agent recovered from with the rest of the machinery', () => {
+    // Measured: writing a haiku put an amber "no undo point" card and a red "file_write failed"
+    // above the verse, and the agent had already worked around both by the time anyone read them.
+    const nodes = buildConversation(
+      [
+        event(1, 'user_message', { markdown: 'Write me a haiku' }),
+        event(2, 'warning', { message: 'This turn has no undo point for the computer' }),
+        event(3, 'error', { message: 'file_write failed' }),
+        event(4, 'assistant_message', { markdown: 'An old silent pond' })
+      ],
+      'completed'
+    );
+
+    expect(nodes.map((node) => node.kind)).toEqual(['user', 'activity', 'assistant']);
+    const activity = nodes[1];
+    if (activity?.kind !== 'activity') throw new Error('expected an activity group');
+    expect(activity.events.map((entry) => entry.event.kind)).toEqual(['warning', 'error']);
+  });
+
+  it('keeps the one the owner has to act on in the conversation', () => {
+    const nodes = buildConversation(
+      [
+        event(1, 'user_message', { markdown: 'Write me a haiku' }),
+        event(2, 'warning', { message: 'A cache was cleared' }),
+        event(3, 'warning', {
+          owner: true,
+          message: 'This turn used its whole step budget before the work was finished'
+        })
+      ],
+      'completed'
+    );
+
+    expect(nodes.map((node) => node.kind)).toEqual(['user', 'activity', 'notice']);
+    const raised = nodes[2];
+    expect(raised?.kind === 'notice' && raised.event.sequence).toBe(3);
+  });
+
   it('retires a queued notice once the message has actually run', () => {
     const promoted = buildConversation(
       [
@@ -582,7 +660,9 @@ describe('conversation transcript', () => {
     const nodes = buildConversation(
       [
         event(1, 'artifact', { artifactId: 'a1', name: 'report.pdf' }),
-        event(2, 'error'),
+        // The failure that ends a task is written with `owner`, which is what keeps it out on the
+        // page; an error the run went on to recover from is not, and belongs in the work log.
+        event(2, 'error', { owner: true }),
         event(3, 'completed', { summary: 'All done' })
       ],
       'failed'

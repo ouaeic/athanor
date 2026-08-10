@@ -2199,10 +2199,16 @@ describe('unattended recovery', () => {
       headers: { cookie }
     });
     const expiry = events
-      .json<Array<{ kind: string; summary: string; payload?: { code?: string } }>>()
+      .json<
+        Array<{ kind: string; summary: string; payload?: { code?: string; owner?: boolean } }>
+      >()
       .find((event) => event.payload?.code === 'approval_expired');
     expect(expiry?.kind).toBe('warning');
     expect(expiry?.summary).toContain('expired');
+    // And says it out on the page. Warnings without `owner` are folded into the collapsed work log
+    // with the machinery the agent recovered from; a task that stopped and needs a reply is not
+    // that, and this one carries no other evidence of why it stopped.
+    expect(expiry?.payload?.owner).toBe(true);
 
     // The card is gone from the pending list but is still reachable, so the owner can read what
     // was being asked before deciding whether to resume.
@@ -3072,6 +3078,140 @@ describe('authentication posture', () => {
     const verifyLimited = await verify(20);
     expect(verifyLimited.statusCode).toBe(429);
     expect(verifyLimited.json<{ error: { code: string } }>().error.code).toBe('auth_rate_limited');
+  }, 30_000);
+
+  /**
+   * One biometric for the whole first run.
+   *
+   * Signing in, registering, recovering and enrolling a device each complete a WebAuthn ceremony
+   * with `userVerification: 'required'` and each opens the five-minute step-up window. Every route
+   * that guards a sensitive action honours that window - but the route that hands out the step-up
+   * challenge never read it, so the client ran a second ceremony against the same authenticator
+   * moments later, and again for the action after that. The owner met a fingerprint prompt per
+   * sensitive action for the first five minutes of owning the machine.
+   *
+   * What this pins down is that removing the duplicate removed only the duplicate: freshness is
+   * still the server's, still anchored to a real ceremony, still per session, and the floor that
+   * must always ask still refuses a session that cannot show one.
+   */
+  test('answers a sensitive action with the ceremony the owner just completed, once', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-stepup-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const owner = await store.getUserByUsername('owner');
+    expect(owner).toBeTruthy();
+    // A registered passkey, because without one the route takes the developer shortcut and none of
+    // what follows would be about the window.
+    await store.addPasskey({
+      userId: owner!.id,
+      credentialId: 'step-up-window-credential',
+      publicKey: Buffer.alloc(32, 7).toString('base64url'),
+      counter: 0,
+      transports: ['internal'],
+      deviceType: 'multiDevice',
+      backedUp: true
+    });
+
+    const stepUpOptions = (as: string) =>
+      app.inject({
+        method: 'POST',
+        url: '/v1/auth/step-up/options',
+        headers: { cookie: as },
+        payload: {}
+      });
+    const reissueRecoveryCode = (as: string) =>
+      app.inject({
+        method: 'POST',
+        url: '/v1/auth/recovery-code',
+        headers: { cookie: as },
+        payload: {}
+      });
+    const idHash = (value: string) => sha256(value.slice(value.indexOf('=') + 1));
+    const stepUpAge = async (value: string) =>
+      Number(
+        (
+          await database.query(
+            'SELECT EXTRACT(EPOCH FROM (NOW()-step_up_at)) AS age FROM sessions WHERE id_hash=$1',
+            [idHash(value)]
+          )
+        ).rows[0]!.age
+      );
+
+    // Signing in was the ceremony, so there is nothing left to prove: no challenge is minted at all.
+    const fresh = await stepUpOptions(cookie);
+    expect(fresh.statusCode, fresh.body).toBe(200);
+    expect(fresh.json()).toEqual({ verified: true });
+    expect(
+      Number(
+        (await database.query("SELECT COUNT(*) AS count FROM auth_challenges WHERE kind='step_up'"))
+          .rows[0]!.count
+      )
+    ).toBe(0);
+    const reissued = await reissueRecoveryCode(cookie);
+    expect(reissued.statusCode, reissued.body).toBe(200);
+
+    // Answering `verified` is a reading of the window, not a grant of one. If it wrote `step_up_at`
+    // the way the developer shortcut does, whoever held the cookie could hold the window open
+    // forever by polling this route, and the five minutes would never expire for anybody.
+    await database.query(
+      "UPDATE sessions SET step_up_at=NOW()-INTERVAL '4 minutes' WHERE id_hash=$1",
+      [idHash(cookie)]
+    );
+    expect((await stepUpOptions(cookie)).json()).toEqual({ verified: true });
+    expect(await stepUpAge(cookie)).toBeGreaterThan(200);
+
+    // Past the window the ceremony comes back, with presence still required of the authenticator.
+    await database.query(
+      "UPDATE sessions SET step_up_at=NOW()-INTERVAL '10 minutes' WHERE id_hash=$1",
+      [idHash(cookie)]
+    );
+    const challenged = await stepUpOptions(cookie);
+    expect(challenged.statusCode, challenged.body).toBe(200);
+    const offered = challenged.json<{
+      verified?: boolean;
+      challengeId?: string;
+      options?: { userVerification?: string };
+    }>();
+    expect(offered.verified).toBeUndefined();
+    expect(offered.challengeId).toMatch(/[0-9a-f-]{36}/);
+    expect(offered.options?.userVerification).toBe('required');
+
+    // The floor that must always ask. A recovery code is a permanent way back into the account from
+    // any device, and being handed a challenge is not the same as answering one: asking for options
+    // over and over, and failing the ceremony outright, both leave the credential route refused.
+    for (let attempt = 0; attempt < 3; attempt += 1) await stepUpOptions(cookie);
+    const failedCeremony = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/step-up/verify',
+      headers: { cookie },
+      payload: {
+        challengeId: offered.challengeId,
+        response: { id: 'step-up-window-credential', rawId: 'step-up-window-credential' }
+      }
+    });
+    expect(failedCeremony.statusCode).toBeGreaterThanOrEqual(400);
+    const refused = await reissueRecoveryCode(cookie);
+    expect(refused.statusCode, refused.body).toBe(403);
+    expect(refused.json<{ error: { code: string } }>().error.code).toBe('step_up_required');
+
+    // And freshness belongs to one session, not to the account. A second device that has gone stale
+    // cannot ride on the ceremony the first device completed a moment ago.
+    const second = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    await database.query(
+      "UPDATE sessions SET step_up_at=NOW()-INTERVAL '10 minutes' WHERE id_hash=$1",
+      [idHash(second)]
+    );
+    await database.query('UPDATE sessions SET step_up_at=NOW() WHERE id_hash=$1', [idHash(cookie)]);
+    expect((await stepUpOptions(cookie)).json()).toEqual({ verified: true });
+    expect((await stepUpOptions(second)).json<{ verified?: boolean }>().verified).toBeUndefined();
+    expect((await reissueRecoveryCode(second)).statusCode).toBe(403);
   }, 30_000);
 });
 

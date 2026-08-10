@@ -2,7 +2,13 @@ import { useEffect, useState } from 'react';
 import { startAuthentication, startRegistration } from '@simplewebauthn/browser';
 import { ArrowRight, Copy, Download, KeyRound, ShieldCheck } from 'lucide-react';
 import { api } from './api.js';
-import { authActionLabel, authHeading, canSubmitAuth, type AuthMode } from './auth-form.js';
+import {
+  authActionLabel,
+  authHeading,
+  canSubmitAuth,
+  initialAuthMode,
+  type AuthMode
+} from './auth-form.js';
 import { deviceEnrollmentToken, grantInPairingFragment, isPairingFragment } from './device-link.js';
 import { recoveryFile } from './account-recovery.js';
 import { BrandMark } from './BrandMark.js';
@@ -59,8 +65,13 @@ export function Auth({ onReady }: { onReady: () => void }) {
         }
       }
       setLegal(server);
-      if (server?.registrationAvailable && !scanned) setMode('register');
-      else if (server && (scanned || native?.pairingCode)) setMode('enroll');
+      const opening =
+        server &&
+        initialAuthMode({
+          registrationAvailable: server.registrationAvailable,
+          grantInHand: Boolean(scanned || native?.pairingCode)
+        });
+      if (opening) setMode(opening);
     });
     return () => {
       active = false;

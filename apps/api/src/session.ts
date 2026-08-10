@@ -25,6 +25,17 @@ export const sessionCookieName = (secure: boolean): string =>
 export const SESSION_LIFETIME_SECONDS = 400 * 24 * 60 * 60;
 
 /**
+ * How long a completed passkey ceremony keeps counting as proof that the owner is at the keyboard.
+ *
+ * It lived as a bare `5 * 60` in two separate `requireRecentStepUp` helpers, and the route that
+ * *starts* a ceremony consulted neither — so the server enforced one window while the client asked
+ * for a fingerprint on a schedule of its own. One exported number means "recent" has exactly one
+ * definition, and the route that decides whether to challenge reads the same one the routes that
+ * accept the answer read.
+ */
+export const STEP_UP_WINDOW_SECONDS = 5 * 60;
+
+/**
  * `lax` rather than `strict`. Under `strict` the browser withholds the cookie on any inbound
  * top-level navigation, so following a push notification, a shared task link, or the PWA's own
  * launch URL lands on a signed-out page even though the session is perfectly valid — the exact

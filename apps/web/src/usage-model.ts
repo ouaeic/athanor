@@ -69,6 +69,36 @@ export const formatUsd = (value: number): string => {
   return `$${value.toFixed(2)}`;
 };
 
+export interface TokenSplit {
+  inputTokens: number;
+  outputTokens: number;
+  /** How much of the input the provider served from its cache, 0-100. */
+  cacheSharePercent: number;
+}
+
+/**
+ * The provider's own account of a conversation: how many tokens went each way, and how much of the
+ * input it did not have to re-read.
+ *
+ * It used to be printed under the last answer, where it competed with the answer. Nothing here can
+ * be acted on in the transcript - it is diagnostic, and it belongs with the other diagnostics. The
+ * cached count is clamped to the input it is a share of, because a provider that reports the two
+ * from different counters has been observed to make the share exceed 100%.
+ */
+export const tokenSplit = (totals: {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+}): TokenSplit | null => {
+  if (!totals.inputTokens && !totals.outputTokens) return null;
+  const cached = Math.min(Math.max(totals.cachedInputTokens, 0), totals.inputTokens);
+  return {
+    inputTokens: totals.inputTokens,
+    outputTokens: totals.outputTokens,
+    cacheSharePercent: totals.inputTokens ? Math.round((cached / totals.inputTokens) * 100) : 0
+  };
+};
+
 /**
  * How full the box's disk is, or nothing when it has not said.
  *
@@ -83,6 +113,39 @@ export const hostStoragePercent = (workspace: {
   const available = workspace.hostStorageAvailableBytes;
   if (!total || total <= 0 || available === undefined) return undefined;
   return Math.min(100, Math.max(0, ((total - available) / total) * 100));
+};
+
+const GIB = 1024 ** 3;
+
+/**
+ * The free space the box keeps for itself, below which it refuses the agent's writes.
+ *
+ * Mirrors `hostStorageFloorBytes` in services/workspace-runner/src/host-storage.ts, which is the
+ * code that actually throws: PostgreSQL's data directory, the journal and the workspace share one
+ * filesystem, so an agent that fills the disk stops the database and takes the interface with it.
+ * Copied rather than imported for the same reason the spend ceilings above are - the runner is a
+ * server package and every other use of shared code here is `import type`.
+ */
+export const hostStorageFloorBytes = (hostStorageTotalBytes: number): number =>
+  Math.min(20 * GIB, Math.max(2 * GIB, hostStorageTotalBytes * 0.02));
+
+/**
+ * Whether the disk is full enough that work is already failing.
+ *
+ * The strip above the composer used to speak at ninety percent, which is a percentage of a number
+ * the owner did not choose: ninety percent of a 4 TB disk is 400 GB free and nothing is wrong,
+ * while ninety percent of a 32 GB box is already past the floor. What decides whether the agent's
+ * next file write throws is the free bytes against that floor and nothing else, so that is what is
+ * asked here - the banner and the runner now agree about the same disk.
+ */
+export const hostStorageBlocksWork = (workspace: {
+  hostStorageTotalBytes?: number | undefined;
+  hostStorageAvailableBytes?: number | undefined;
+}): boolean => {
+  const total = workspace.hostStorageTotalBytes;
+  const available = workspace.hostStorageAvailableBytes;
+  if (!total || total <= 0 || available === undefined) return false;
+  return available < hostStorageFloorBytes(total);
 };
 
 /** A provider-qualified model id is unreadable in a table; the tail is the part people know. */

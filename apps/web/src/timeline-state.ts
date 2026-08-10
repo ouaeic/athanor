@@ -1,6 +1,7 @@
 import type { BotWall, Task, TaskEvent } from './types.js';
 import { taskIsGenerating, terminalTaskStatuses } from './task-status.js';
 import { harnessRun, type HarnessCheck } from './completion-card.js';
+import { externalRead } from './provenance.js';
 
 /*
  * What the agent is doing, in the owner's words.
@@ -119,7 +120,42 @@ export const activityOverview = (taskStatus: string, events: TaskEvent[]): strin
     const tool = typeof rawTool === 'string' ? rawTool : '';
     return activityLabels[tool] ?? current.summary.replace(/^Running\s+/i, '');
   }
-  return taskStatus === 'queued' || taskStatus === 'planning' ? 'Preparing the task' : 'Thinking';
+  /*
+   * Nothing, rather than "Thinking".
+   *
+   * A turn with no tool call in flight is thinking, and the transcript already says so: the word
+   * rendered on the work log's own line, in a different typeface, directly above the thinking node
+   * carrying the actual reasoning. Two printings of one fact, and the smaller of them was the one
+   * with nothing in it.
+   */
+  return taskStatus === 'queued' || taskStatus === 'planning' ? 'Preparing the task' : '';
+};
+
+/**
+ * The one line under the work log's heading, or nothing at all.
+ *
+ * Assembled here rather than in the component so the empty cases are a thing a test can reach.
+ * Measured: a two-step plan whose steps were both done rendered "Step 2 of 2" beside a bar already
+ * at 100%, because the counter was written as "the step being worked on" and there was none. When
+ * every part of the line is empty the line itself does not render - an empty row is furniture.
+ */
+export const activityLine = (input: {
+  /** The live plan's progress, or null when this group is not the one being worked in. */
+  progress: { completed: number; total: number; current: string } | null;
+  overview: string;
+  /** How many entries a finished group holds. */
+  steps: number;
+  /** Whether this is the group the agent is working in right now. */
+  live: boolean;
+}): string => {
+  const plural = (count: number): string => `${count} ${count === 1 ? 'step' : 'steps'}`;
+  if (input.progress) {
+    const { completed, total, current } = input.progress;
+    const counter =
+      completed >= total ? `${plural(total)} done` : `Step ${completed + 1} of ${total}`;
+    return [counter, current || input.overview].filter(Boolean).join(' · ');
+  }
+  return input.live ? input.overview : plural(input.steps);
 };
 
 export const compactResultSummary = (markdown: string, maxLength = 320): string => {
@@ -158,10 +194,32 @@ const conversationalKinds = new Set([
   // answered it was filed inside a collapsed activity group - so the one thing the owner might scroll
   // back to check, whether they said yes, was the one thing the transcript would not say.
   'approval_resolved',
-  'warning',
-  'error',
   'completed'
 ]);
+
+/**
+ * The warnings and errors that are the owner's business rather than the machine's.
+ *
+ * Measured on a live run: writing a two-line haiku produced a transcript whose visible content was
+ * an amber "This turn has no undo point for the computer", a red "file_write failed" the agent had
+ * already recovered from, and a cost line. The verse was the third thing on the page. Almost every
+ * warning athanor writes is a note to itself about something it went on to handle, and those belong
+ * in the work log with the rest of the machinery; the few that need the owner to act, or that they
+ * would want to know happened, are marked at the site that raises them.
+ */
+const ownerFacing = (event: TaskEvent): boolean =>
+  (event.kind === 'warning' || event.kind === 'error') && eventPayload(event).owner === true;
+
+/**
+ * And the crossing, which is a warning by kind and a divider by nature.
+ *
+ * The event that records outside content entering a turn is published as a `warning`, but it is not
+ * one: it is drawn as a change of character in the conversation, and it is the single fact that
+ * changes how everything below it should be read. Folding it away with the recovered machinery
+ * would take out the one piece of evidence this overhaul exists to promote.
+ */
+const staysInTranscript = (event: TaskEvent): boolean =>
+  ownerFacing(event) || externalRead(event) !== undefined;
 
 /**
  * The conversational events that close the work log where they stand.
@@ -680,7 +738,7 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
       return;
     }
     if (standingWallSite && clearsBotWall(event)) standingWallSite = '';
-    if (!conversationalKinds.has(event.kind)) {
+    if (!staysInTranscript(event) && !conversationalKinds.has(event.kind)) {
       if (event.kind === 'cost') {
         const metadata = record(eventPayload(event).metadata);
         const model = typeof metadata?.model === 'string' ? metadata.model.trim() : '';

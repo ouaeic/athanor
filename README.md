@@ -43,17 +43,18 @@ The installer gathers the computer’s usable addresses, installs its dependenci
 packages — plus the three pinned pieces apt does not carry: the `typst` typesetter against a
 recorded SHA-256, a hash-locked document Python environment, and Chromium at the revision the
 lockfile’s Playwright carries — builds athanor, creates isolated service accounts and keys, starts
-systemd services, opens the existing HTTPS gateway on ports 80/443, and prints a QR connection
-ticket plus an expiring, single-use owner code. It does not ask for a domain, unpack a machine
-image, start a container, create a VM, or install a VPN.
+systemd services, opens the existing HTTPS gateway on ports 80/443, and prints the address of the
+computer, a QR code that opens it on a phone, and an expiring, single-use owner code. It does not
+ask for a domain, unpack a machine image, start a container, create a VM, or install a VPN.
 
 SSH is needed only to run the install command and for recovery. Normal clients connect directly to
 athanor over HTTPS.
 
 ## Connect
 
-Open the athanor client and paste the installer connection ticket. A QR representation is also
-printed for clients that support scanning. The ticket contains:
+Open the address the installer printed in a browser, or scan its QR code with a phone — the code is
+an ordinary `https://` link to the computer, so any camera opens it and the owner code travels in
+the fragment. The installer also prints a connection ticket for the native client, containing:
 
 - every useful endpoint detected at install time;
 - the server’s stable cryptographic identity;

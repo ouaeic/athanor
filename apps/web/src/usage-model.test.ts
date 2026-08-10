@@ -3,6 +3,8 @@ import type { SpendSummary } from './types.js';
 import {
   bucketShare,
   formatUsd,
+  hostStorageBlocksWork,
+  hostStorageFloorBytes,
   hostStoragePercent,
   modelLabel,
   modelsBySpend,
@@ -11,6 +13,7 @@ import {
   spendLimitsPatch,
   spendMeters,
   tasksBySpend,
+  tokenSplit,
   type UsageEntry,
   type UsageResponse
 } from './usage-model.js';
@@ -259,5 +262,76 @@ describe('how full the disk is', () => {
     expect(hostStoragePercent({ hostStorageTotalBytes: 100, hostStorageAvailableBytes: 140 })).toBe(
       0
     );
+  });
+});
+
+const GIB = 1024 ** 3;
+
+describe('when a full disk is worth a banner', () => {
+  /* The same floor the runner throws against - services/workspace-runner/src/host-storage.ts. */
+  it('keeps two per cent, between a 2 GiB floor and a 20 GiB ceiling', () => {
+    expect(hostStorageFloorBytes(50 * GIB)).toBe(2 * GIB);
+    expect(hostStorageFloorBytes(500 * GIB)).toBe(10 * GIB);
+    expect(hostStorageFloorBytes(4000 * GIB)).toBe(20 * GIB);
+  });
+
+  /* The old strip shouted at ninety per cent of any disk. Ninety-five per cent of a 4 TB disk is
+     200 GB free and there is nothing to do about it; the banner is the most expensive place in the
+     interface and it may not be spent on that. */
+  it('says nothing about a large disk that is merely full', () => {
+    expect(
+      hostStorageBlocksWork({
+        hostStorageTotalBytes: 4000 * GIB,
+        hostStorageAvailableBytes: 480 * GIB
+      })
+    ).toBe(false);
+    expect(
+      hostStorageBlocksWork({
+        hostStorageTotalBytes: 100 * GIB,
+        hostStorageAvailableBytes: 12 * GIB
+      })
+    ).toBe(false);
+  });
+
+  it('speaks only once the box is refusing the writes', () => {
+    expect(
+      hostStorageBlocksWork({
+        hostStorageTotalBytes: 100 * GIB,
+        hostStorageAvailableBytes: 1.5 * GIB
+      })
+    ).toBe(true);
+    expect(
+      hostStorageBlocksWork({
+        hostStorageTotalBytes: 4000 * GIB,
+        hostStorageAvailableBytes: 19 * GIB
+      })
+    ).toBe(true);
+  });
+
+  it('says nothing when the box has not reported a disk at all', () => {
+    expect(hostStorageBlocksWork({})).toBe(false);
+    expect(hostStorageBlocksWork({ hostStorageTotalBytes: 100 * GIB })).toBe(false);
+    expect(hostStorageBlocksWork({ hostStorageAvailableBytes: 0 })).toBe(false);
+  });
+});
+
+describe('the provider’s own account of a conversation', () => {
+  it('reports the split and what the cache covered of the input', () => {
+    expect(
+      tokenSplit({ inputTokens: 163_000, outputTokens: 1_600, cachedInputTokens: 88_020 })
+    ).toEqual({ inputTokens: 163_000, outputTokens: 1_600, cacheSharePercent: 54 });
+  });
+
+  it('cannot report more of the input as cached than there was input', () => {
+    // Two counters from one provider have been seen to disagree, and "112% cached" is not a fact
+    // about anything.
+    expect(
+      tokenSplit({ inputTokens: 1_000, outputTokens: 10, cachedInputTokens: 1_200 })
+        ?.cacheSharePercent
+    ).toBe(100);
+  });
+
+  it('says nothing about a conversation the provider never billed', () => {
+    expect(tokenSplit({ inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 })).toBeNull();
   });
 });

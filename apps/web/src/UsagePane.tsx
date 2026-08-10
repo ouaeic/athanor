@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { CircleDollarSign, HardDrive, LoaderCircle, MessageSquare } from 'lucide-react';
+import { CircleDollarSign, HardDrive, Hash, LoaderCircle, MessageSquare } from 'lucide-react';
 import { api } from './api.js';
 import {
   bucketShare,
@@ -8,12 +8,13 @@ import {
   modelLabel,
   spendBreakdown,
   spendMeters,
+  tokenSplit,
   type UsageResponse
 } from './usage-model.js';
-import type { SpendSummary, Task, Workspace } from './types.js';
+import type { SpendSummary, Task, TaskEvent, Workspace } from './types.js';
 // One formatter for one quantity: the sidebar, the composer banner and this pane used to disagree
 // about how many gigabytes the same files were.
-import { formatBytes } from './timeline-state.js';
+import { conversationCost, formatBytes, formatTokens } from './timeline-state.js';
 
 const resetLabel = (iso: string | null): string => {
   if (!iso) return '';
@@ -109,10 +110,17 @@ function BucketList({
 export function UsagePane({
   workspace,
   tasks,
+  conversationEvents,
   onOpenTask
 }: {
   workspace: Workspace;
   tasks: Task[];
+  /**
+   * The open conversation's events, when there is one. The provider's token figures are written
+   * into those events and nowhere the server can aggregate them from, so this is the only place
+   * they can be read - which is why they are handed down rather than fetched.
+   */
+  conversationEvents?: TaskEvent[];
   onOpenTask?: (taskId: string) => void;
 }) {
   const [usage, setUsage] = useState<UsageResponse>();
@@ -145,6 +153,10 @@ export function UsagePane({
     [usage, spend]
   );
   const taskTitles = useMemo(() => new Map(tasks.map((task) => [task.id, task.title])), [tasks]);
+  const tokens = useMemo(
+    () => (conversationEvents?.length ? tokenSplit(conversationCost(conversationEvents)) : null),
+    [conversationEvents]
+  );
 
   const storage = hostStoragePercent(workspace);
 
@@ -228,6 +240,33 @@ export function UsagePane({
               <small>No conversation has been billed yet.</small>
             )}
           </div>
+
+          {/*
+            Where the transcript's token line went. It draws nothing when no conversation is open,
+            for the same reason the provenance panel does: a report nobody asked for, shown always,
+            stops being read at all.
+          */}
+          {tokens && (
+            <div className="meter-card">
+              <div>
+                <span>
+                  <Hash size={14} /> Tokens
+                </span>
+                {/* The figure in the strong, the subject in the small: the same shape as the
+                    storage card two below, which is the card people read most. */}
+                <strong>
+                  {formatTokens(tokens.inputTokens)} in · {formatTokens(tokens.outputTokens)} out
+                </strong>
+              </div>
+              <small>
+                The conversation you have open
+                {tokens.cacheSharePercent > 0
+                  ? `, ${tokens.cacheSharePercent}% of its input from cache`
+                  : ''}
+                .
+              </small>
+            </div>
+          )}
 
           <div className="meter-card">
             <div>

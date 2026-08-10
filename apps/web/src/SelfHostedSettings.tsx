@@ -68,6 +68,7 @@ import type {
   ApiToken,
   Bootstrap,
   Task,
+  TaskEvent,
   User,
   RelayReport,
   Workspace,
@@ -93,6 +94,7 @@ export function SelfHostedSettings({
   user,
   workspace,
   tasks,
+  conversationEvents,
   legal,
   initialPage = 'ai',
   onOpenTerminal,
@@ -104,6 +106,8 @@ export function SelfHostedSettings({
   workspace: Workspace | undefined;
   /** Only the spend report needs these, to name and open the conversations that cost the most. */
   tasks: Task[];
+  /** Also only the spend report: the token figures live in the open conversation's own events. */
+  conversationEvents?: TaskEvent[];
   legal: Bootstrap['legal'];
   initialPage?: SettingsPage;
   onOpenTerminal: () => void;
@@ -632,7 +636,14 @@ export function SelfHostedSettings({
           next to Files and the screen — a report standing where a place should be, and half a
           window away from the only numbers that give it meaning.
         */}
-        {workspace && <UsagePane workspace={workspace} tasks={tasks} onOpenTask={onOpenTask} />}
+        {workspace && (
+          <UsagePane
+            workspace={workspace}
+            tasks={tasks}
+            {...(conversationEvents ? { conversationEvents } : {})}
+            onOpenTask={onOpenTask}
+          />
+        )}
         <hr />
         <div className="section-heading compact">
           <Code2 />

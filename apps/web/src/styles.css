@@ -1389,6 +1389,10 @@ select:focus-visible {
   letter-spacing: -0.04em;
   color: var(--text);
   margin: 3px 0 10px;
+  /* It opens with a sentence now rather than a four-word question, and at 28px an unbounded line
+     ran the whole width of a desktop pane. */
+  max-width: 460px;
+  text-wrap: balance;
 }
 .empty-canvas > p:not(.eyebrow) {
   max-width: 540px;
@@ -1430,10 +1434,35 @@ select:focus-visible {
  * be scrolled to. A flex row cannot be wrong about its own height, so all seven are gone and
  * none of them was replaced by a measurement.
  */
+/*
+ * The strip above the composer gives way; the composer never does.
+ *
+ * This was `flex: none` in a fixed-height column, so its content grew straight past the bottom of
+ * `.workbench`, which clips. On a 375px phone the header, the tab bar, a strip at the approval
+ * card's 40vh ceiling and a composer at its 160px textarea maximum come to more than the screen -
+ * and what goes off the bottom is the message box with the owner's draft in it. Letting the wrap
+ * shrink puts the whole shortfall on the strip: `.chat-canvas` is `flex: 1` on a zero basis, so it
+ * has no shrink share of its own to give up.
+ */
 .composer-wrap {
-  flex: none;
+  display: flex;
+  flex-direction: column;
+  flex: 0 1 auto;
+  min-height: 0;
   padding: 10px 24px 14px;
   pointer-events: none;
+}
+.composer-wrap > .composer {
+  flex: none;
+}
+.composer-strip {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* The wrap is click-through so the transcript keeps the pointer; the strip is real content and
+     has to catch a touch in order to scroll. */
+  pointer-events: auto;
 }
 .composer {
   max-width: 820px;

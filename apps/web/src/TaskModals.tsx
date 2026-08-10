@@ -498,6 +498,7 @@ export function Approvals({
   openTaskEvents,
   onOpenTask,
   onOpenComputer,
+  failure,
   onResolve
 }: {
   approvals: Approval[];
@@ -513,6 +514,15 @@ export function Approvals({
   onOpenTask?: (taskId: string) => void;
   /** The browser is part of the computer's screen, so a handoff of either lands in one place. */
   onOpenComputer?: () => void;
+  /**
+   * Why the last answer did not land, and which request it was about.
+   *
+   * Said here rather than in the strip above the composer because this card is what occupies that
+   * strip while a decision is pending: sent there it would never be drawn, and Approve would once
+   * again do nothing visible at all. Carried with its request's id because the pending list is
+   * refetched every few seconds and the next card up must not inherit the last one's failure.
+   */
+  failure?: { approvalId: string; message: string };
   onResolve: (id: string, decision: 'approve' | 'deny') => Promise<void>;
 }) {
   const item = nextApproval(approvals, openTaskId);
@@ -600,6 +610,11 @@ export function Approvals({
             How far the request reaches is the card's headline, above; repeating it here said the
             same sentence twice on a card already fighting to keep its buttons on screen. */}
         <small>{expiryPhrase(item.expiresAt)}</small>
+        {failure?.approvalId === item.id && (
+          <p className="approval-failure" role="alert">
+            {failure.message}
+          </p>
+        )}
       </div>
       <div className="approval-actions">
         {elsewhere && onOpenTask && (

@@ -137,6 +137,11 @@ export function Composer({
         first line of the sentence being written: the one moment the wording matters most. Stacked
         here they move with the composer at every width and every height, and there is no number to
         keep in sync.
+
+        Exactly one of them at a time - `composerStrip` decides which - so this needs no bound of
+        its own. The tallest thing that can appear here is the approval card, and that already caps
+        itself at 40vh and scrolls its own overflow, which is what keeps the message box on a 667px
+        phone where `.workbench` clips what does not fit.
       */}
       {banners}
       {/*

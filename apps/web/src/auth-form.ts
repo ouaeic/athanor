@@ -32,6 +32,25 @@ export interface AuthFormState {
 }
 
 /**
+ * Which of the four things this screen is doing, decided the moment the box says what it is.
+ *
+ * Whether the box has an owner decides it, not how the grant arrived. Enrolment used to win
+ * whenever anything had been scanned, which was written when the only QR code in existence came
+ * from the settings screen of a box that already had an owner. The installer now prints one too,
+ * and on an unclaimed box enrolling is the single thing that cannot work — the grant it wants is
+ * minted by a signed-in device, and there is none. So a scan that was meant to be the first five
+ * minutes ended on a screen asking for something that does not exist yet.
+ *
+ * Nothing back means leave the screen where it opens, signing in.
+ */
+export const initialAuthMode = (input: {
+  registrationAvailable: boolean;
+  /** A grant already in hand, from a scanned code or from the native client's bootstrap. */
+  grantInHand: boolean;
+}): AuthMode | undefined =>
+  input.registrationAvailable ? 'register' : input.grantInHand ? 'enroll' : undefined;
+
+/**
  * Whether the form is ready to be sent. Enter and the button ask the same question.
  *
  * Adding a device asks for the grant and nothing else. The account already exists and is already

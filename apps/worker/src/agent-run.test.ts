@@ -923,6 +923,35 @@ describe('the undo point a turn leaves behind', () => {
     );
     expect(warning?.kind).toBe('warning');
     expect(String((warning?.payload as { message?: string })?.message)).toContain('507');
+    // A full disk is the one cause of this the owner can clear, so it is raised to them.
+    expect((warning?.payload as { owner?: boolean })?.owner).toBe(true);
+  });
+
+  it('files the same loss quietly when the reason is not the owner’s to fix', async () => {
+    // Measured: writing a two-line haiku put this card at the top of the transcript, above the
+    // verse, because the runner could not take a checkpoint. Nothing about that is the owner's
+    // business unless they are the one who can clear it.
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([toolFrame('call-f', 'shell', { executable: 'ls' })], log, {
+      checkpoint: () =>
+        new Response(JSON.stringify({ error: { message: 'workspace is not its own dataset' } }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' }
+        })
+    });
+
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const warning = probe.events.find(
+      (entry) => entry.summary === 'This turn has no undo point for the computer'
+    );
+    // Still recorded - the work log holds it, and a rewind that is not on offer still has a reason.
+    expect(warning?.kind).toBe('warning');
+    expect((warning?.payload as { owner?: boolean })?.owner).toBeUndefined();
   });
 });
 
@@ -1894,11 +1923,12 @@ describe('a turn that runs out of steps', () => {
     expect(payload.interrupted).toBe(true);
     expect(String(payload.summary)).toContain('Two of five sections');
     expect(payload.deliverables).toEqual(['workspace/report.md']);
-    expect(
-      probe.events.some(
-        (entry) => entry.kind === 'warning' && entry.summary.includes('whole step budget')
-      )
-    ).toBe(true);
+    const ceiling = probe.events.find(
+      (entry) => entry.kind === 'warning' && entry.summary.includes('whole step budget')
+    );
+    // Raised to the owner rather than filed: the turn stopped short of what they asked for and
+    // only their reply starts it again.
+    expect((ceiling?.payload as { owner?: boolean })?.owner).toBe(true);
     const saved = decryptCheckpoints(probe.checkpoints).at(-1);
     expect(saved?.messages.at(-1)?.content).toContain('PREVIOUS TURN STOPPED AT ITS STEP LIMIT');
     expect(saved?.messages.at(-1)?.content).toContain('do not restart finished work');
@@ -3946,5 +3976,99 @@ describe('the prompt prefix a follow-up turn re-sends', () => {
     expect(knowledge(first)).toContain('workspace/notes');
     expect(knowledge(first)).toContain('workspace/archive');
     expect(knowledge(second)).toBe(knowledge(first));
+  });
+});
+
+/*
+ * Measured on a live run: writing a two-line haiku produced a transcript whose visible content was
+ * an amber "no undo point" card, a red "file_write failed" the agent had already recovered from,
+ * and a cost line. The verse was third. Almost every warning the worker writes is a note to itself,
+ * and the transcript now folds those into the work log - so the few that are genuinely the owner's
+ * business have to say so at the site that raises them.
+ */
+describe('the warnings that are the owner’s business', () => {
+  const ownerFlag = (entry: { payload: unknown } | undefined): unknown =>
+    (entry?.payload as { owner?: unknown } | undefined)?.owner;
+
+  it('raises an action that no longer matches what the owner approved', async () => {
+    const approved = { executable: 'rm', args: ['-rf', 'workspace/old'] };
+    const attempted = { executable: 'rm', args: ['-rf', 'workspace'] };
+    const task = makeTask({
+      messages: [
+        { role: 'user', content: 'Clear the old folder' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call-s', name: 'shell', arguments: attempted }]
+        }
+      ],
+      step: 1,
+      credits: 0,
+      pending: {
+        approvalId: 'approval-1',
+        toolCall: { id: 'call-s', name: 'shell', arguments: attempted }
+      }
+    });
+    const probe = probeStore(() => task);
+    Object.assign(probe.store, {
+      getApproval: async () => ({
+        id: 'approval-1',
+        status: 'approved',
+        previewHash: approvalPreviewHash(dataKey, approved),
+        expiresAt: '2099-01-01T00:00:00.000Z'
+      })
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('I will not run that.')], log);
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const refusal = probe.events.find((entry) =>
+      entry.summary.startsWith('Refused: this action no longer matches')
+    );
+    expect(refusal?.kind).toBe('warning');
+    expect(ownerFlag(refusal)).toBe(true);
+    expect(log.calls.some((call) => call.includes('/exec'))).toBe(false);
+  });
+
+  it('raises the answer it will not continue, and not the ones it will', async () => {
+    const cutOff = `data: ${JSON.stringify({
+      choices: [{ finish_reason: 'length', delta: { content: 'and then, ' } }]
+    })}\n\ndata: [DONE]\n\n`;
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([cutOff], log);
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 5 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const continuing = probe.events.find((entry) => entry.summary.includes('is being continued'));
+    const capped = probe.events.find((entry) =>
+      entry.summary.includes('was not continued automatically')
+    );
+    // Continuing is the harness doing its job and the owner reads the finished answer either way.
+    expect(continuing?.kind).toBe('warning');
+    expect(ownerFlag(continuing)).toBeUndefined();
+    // Stopping is an answer handed over incomplete, which nothing else in the transcript says.
+    expect(capped?.kind).toBe('warning');
+    expect(ownerFlag(capped)).toBe(true);
+  });
+
+  it('raises the reason a task stopped without doing what was asked', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret).fail(
+      task,
+      new Error('The workspace could not be reached')
+    );
+
+    const failure = probe.events.find((entry) => entry.kind === 'error');
+    expect(failure?.summary).toBe('The workspace could not be reached');
+    expect(ownerFlag(failure)).toBe(true);
   });
 });

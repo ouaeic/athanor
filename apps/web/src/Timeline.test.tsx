@@ -87,6 +87,18 @@ describe('a streamed turn on screen', () => {
     expect(render(streamedTurn)).toContain('$0.02');
   });
 
+  /*
+   * The foot of the transcript read "$0.02 · 163k in · 1.6k out · 54% cached" under an answer that
+   * was two lines of verse. Three of those four numbers are the provider's telemetry and none of
+   * them can be acted on from a transcript; they are in the usage pane now.
+   */
+  it('closes the conversation with the money and nothing else', () => {
+    const markup = render(streamedTurn);
+    expect(markup).toContain('conversation-cost');
+    expect(markup).not.toContain('900 in');
+    expect(markup).not.toContain('cached');
+  });
+
   it('keeps the tool traffic in one collapsed group and does not open one for the cost alone', () => {
     const markup = render(streamedTurn);
     expect(occurrences(markup, '<details class="task-activity')).toBe(1);
@@ -99,6 +111,7 @@ describe('a turn the harness stopped at its step limit', () => {
     [
       event(1, 'user_message', 'Build the deck', { markdown: 'Build the deck' }),
       event(2, 'warning', 'This turn used its whole step budget before the work was finished', {
+        owner: true,
         steps: 120,
         maxSteps: 120
       }),
@@ -326,9 +339,10 @@ describe('a conversation that is a fork of another', () => {
 });
 
 describe('an empty conversation', () => {
-  it('asks the question and offers three concrete starts, and nothing else', () => {
+  it('says what the computer is for and offers three concrete starts, and nothing else', () => {
     const markup = renderToStaticMarkup(<Timeline task={undefined} events={[]} />);
-    expect(markup).toContain('What should we get done?');
+    expect(markup).toContain('A whole computer that keeps working while you are away.');
+    expect(markup).not.toContain('What should we get done?');
     expect(occurrences(markup, '<button')).toBe(3);
   });
 
@@ -382,10 +396,20 @@ describe('a turn that read something nobody here wrote', () => {
     expect(markup).not.toContain('external-content-mark');
   });
 
-  it('still draws an ordinary warning as a warning', () => {
-    const markup = render([event(2, 'warning', 'A page would not load', { message: 'Timed out' })]);
-    expect(markup).toContain('system-event warning');
-    expect(markup).not.toContain('external-content-mark');
+  it('draws a warning the owner has to act on as a warning, and files the rest', () => {
+    const raised = render([
+      event(2, 'warning', 'This turn used its whole step budget before the work was finished', {
+        owner: true
+      })
+    ]);
+    expect(raised).toContain('system-event warning');
+    expect(raised).not.toContain('external-content-mark');
+
+    // A page that would not load is a thing the turn went on to handle. It is still recorded - the
+    // work log holds it - but it is not what the conversation is about.
+    const filed = render([event(2, 'warning', 'A page would not load', { message: 'Timed out' })]);
+    expect(filed).not.toContain('system-event warning');
+    expect(filed).toContain('task-activity');
   });
 
   /**
@@ -418,6 +442,7 @@ describe('a turn that read something nobody here wrote', () => {
   it('folds the detail of a failure behind a disclosure', () => {
     const markup = render([
       event(2, 'error', 'shell failed', {
+        owner: true,
         message: 'Invalid request - args: invalid input: expected array, received string'
       })
     ]);

@@ -119,7 +119,7 @@ import { RunnerClient } from './runner-client.js';
 import { advanceScheduleRun } from './schedule-advance.js';
 import { startTaskTitler, TITLE_SYSTEM_PROMPT, type TitleCompletion } from './task-titles.js';
 import { recordSecurityEvent } from './security-events.js';
-import { sessionCookieName, sessionUser } from './session.js';
+import { sessionCookieName, sessionUser, STEP_UP_WINDOW_SECONDS } from './session.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -916,7 +916,10 @@ export const buildServer = async (
 
   const requireRecentStepUp = async (request: FastifyRequest, user: UserRecord): Promise<void> => {
     const token = request.cookies[sessionCookieName(secure)];
-    if (!token || !(await store.hasRecentSessionStepUp(user.id, sha256(token), 5 * 60))) {
+    if (
+      !token ||
+      !(await store.hasRecentSessionStepUp(user.id, sha256(token), STEP_UP_WINDOW_SECONDS))
+    ) {
       throw new AthanorError(
         'step_up_required',
         'Confirm this sensitive action with your passkey',
@@ -1143,7 +1146,11 @@ export const buildServer = async (
           {
             __athanorEventVersion: 1,
             summary: scheduleErrorMessage('workspace_unavailable'),
-            payload: { code: 'workspace_unavailable', scheduleId }
+            // `owner` is what keeps a warning or an error out on the page rather than folded into
+            // the collapsed work log with the machinery the agent recovered from. A scheduled run
+            // that never started has no other evidence in its transcript at all: without this the
+            // whole conversation is a closed disclosure reading "2 steps".
+            payload: { owner: true, code: 'workspace_unavailable', scheduleId }
           },
           key,
           `task-event:${taskId}`
@@ -1208,7 +1215,12 @@ export const buildServer = async (
               __athanorEventVersion: 1,
               summary:
                 'The approval this task was waiting for expired unanswered, so the task is paused and its reserved credits are back. Resume it to ask again.',
-              payload: { code: 'approval_expired', approvalId: String(row.approval_id) }
+              // Owner-facing by construction: the task is stopped and only their reply starts it.
+              payload: {
+                owner: true,
+                code: 'approval_expired',
+                approvalId: String(row.approval_id)
+              }
             },
             key,
             `task-event:${taskId}`
@@ -2044,7 +2056,7 @@ export const buildServer = async (
         {
           __athanorEventVersion: 1,
           summary: 'Scheduled run could not start',
-          payload: { scheduleId: schedule.id }
+          payload: { owner: true, scheduleId: schedule.id }
         },
         key,
         `task-event:${taskId}`
@@ -2069,7 +2081,7 @@ export const buildServer = async (
             {
               __athanorEventVersion: 1,
               summary: scheduleErrorMessage(materialized.errorCode ?? 'schedule_failed'),
-              payload: { code: materialized.errorCode, scheduleId: schedule.id }
+              payload: { owner: true, code: materialized.errorCode, scheduleId: schedule.id }
             },
             key,
             `task-event:${taskId}`

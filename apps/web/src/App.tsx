@@ -1,4 +1,13 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode
+} from 'react';
 import {
   Archive,
   HardDrive,
@@ -66,7 +75,8 @@ import type { AgentNotification } from './notice-log.js';
 import { rewindOffer, rewindResultNotice, type TrajectoryDraft } from './rewind.js';
 import { RewindDialog } from './RewindDialog.js';
 import { shortcutRows, windowShortcut } from './shortcuts.js';
-import { hostStoragePercent } from './usage-model.js';
+import { hostStorageBlocksWork } from './usage-model.js';
+import { composerStrip } from './composer-strip.js';
 import {
   attachmentPath,
   attachmentsFromDraft,
@@ -106,6 +116,14 @@ export function App() {
   );
   const [events, setEvents] = useState<TaskEvent[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  // Kept apart from `error` because only one thing may sit above the composer and the approval card
+  // is what sits there while a decision is pending - an answer that would not send has to be said
+  // on the card, and a failure from anywhere else must not be. Carried with the request's id: the
+  // pending list is refetched every few seconds, and the next card must not inherit this one's.
+  const [approvalFailure, setApprovalFailure] = useState<{
+    approvalId: string;
+    message: string;
+  }>();
   // The device's own copy, kept only so the first paint has something and so a box that cannot be
   // reached still offers the last choice. The server's copy is the real one and replaces it below.
   const storedModel = useRef(readModelChoice());
@@ -1783,7 +1801,169 @@ export function App() {
       </div>
     );
   if (auth === 'required' || !data) return <Auth onReady={() => void load()} />;
-  const storagePercent = hostStoragePercent(workspace ?? {}) ?? 0;
+  /*
+   * The one thing allowed above the composer, decided once.
+   *
+   * Seven conditions used to render there independently and the only exclusion between them was
+   * whichever guard the change that added a strip happened to write, so a box near its disk ceiling
+   * that also lost its connection showed storage, offline and an error stacked in three alarm
+   * colours above a 176px composer. `composerStrip` holds the whole order; the guards it replaced
+   * (`!error && !notice && !showBlock` on storage, `!offline` on the degraded stream) are gone
+   * rather than joined by more of them.
+   */
+  const diskFreeBytes = workspace?.hostStorageAvailableBytes;
+  const stripKind = composerStrip({
+    approval: approvals.length > 0,
+    block: showBlock,
+    offline,
+    storage: hostStorageBlocksWork(workspace ?? {}),
+    error: Boolean(error),
+    streamDegraded,
+    notice: Boolean(notice)
+  });
+  const strip = ((): ReactNode => {
+    switch (stripKind) {
+      case 'approval':
+        return (
+          /*
+            The approval card is a banner like the others, so it lives where they live: in flow,
+            inside the composer, above the box. It used to be absolutely positioned at
+            `bottom: 150px` against a composer that is 190px tall, so it overlapped the thing it sat
+            above and carried two more composer-height guesses of its own.
+          */
+          <Approvals
+            approvals={approvals}
+            {...(workspace ? { workspaceId: workspace.id } : {})}
+            onOpenTask={setTaskId}
+            openTaskId={taskId}
+            /* So the card can say whether the agent asking had anybody else's text in its context.
+               These are the events of the conversation on screen; the card reads them only for an
+               approval that belongs to it. */
+            openTaskEvents={events}
+            onOpenComputer={() => openInspector('computer')}
+            /*
+              A decision that failed is reported on the card that asked for it, not through the
+              shared error strip. The strip cannot say it while this card is up - the card outranks
+              it, and the approval is still pending - so routing the failure there put athanor back
+              where it was before any of this: Approve pressed, nothing on screen, no way to tell a
+              refusal from a dropped packet. The card is also where the owner is looking.
+            */
+            {...(approvalFailure ? { failure: approvalFailure } : {})}
+            /*
+              The card only goes when the decision actually landed. It used to be an unguarded
+              `async` called as `void onResolve(...)`, so an expired approval or a dropped
+              connection produced an unhandled rejection and a button that did nothing at all — on
+              the one control where doing nothing silently is least acceptable. The wording matches
+              what the lock-screen path already says for the same three outcomes.
+            */
+            onResolve={async (id, decision) => {
+              setApprovalFailure(undefined);
+              try {
+                await api.resolveApproval(id, decision);
+                setApprovals((items) => items.filter((item) => item.id !== id));
+                setError('');
+              } catch (cause) {
+                if (cause instanceof ApiFailure && cause.status === 404) {
+                  // The request is gone, so its card goes with it and there is nothing left to
+                  // write on. The strip below says why, which it can once no other request is
+                  // waiting - and when one is, the card being replaced is itself the answer.
+                  setApprovals((items) => items.filter((item) => item.id !== id));
+                  setError('That request was already answered, or it expired.');
+                  return;
+                }
+                setApprovalFailure({
+                  approvalId: id,
+                  message: describeFailure(cause, 'That decision could not be sent')
+                });
+              }
+            }}
+          />
+        );
+      case 'block':
+        return blocked ? (
+          <div className="composer-block" role="status">
+            <Sparkles />
+            <span>{blocked.message}</span>
+            <button
+              onClick={() =>
+                blocked.code === 'private_route_unavailable' || blocked.code === 'provider_missing'
+                  ? openSettings('ai')
+                  : openSettings('server')
+              }
+            >
+              {blocked.actionLabel}
+            </button>
+          </div>
+        ) : undefined;
+      case 'offline':
+        return (
+          /*
+            The last-known state stays on screen behind this. A dropped connection is a strip, not a
+            sign-out: the box is still working and this device reconnects on its own. What the owner
+            actually needs to know is what it means for the work — the turn on screen carries on
+            there, and nothing on this device moves until the connection is back.
+          */
+          <div className="inline-error offline-strip" role="status">
+            <WifiOff />
+            <span>
+              Can’t reach your athanor. It keeps working; nothing here updates or sends until it
+              reconnects.
+            </span>
+            <button onClick={() => void load()}>Retry now</button>
+          </div>
+        );
+      case 'storage':
+        /*
+          A banner above the composer is the most expensive place in the interface, so storage only
+          earns it once the box is refusing writes — which is a floor in free bytes, not a
+          percentage: see `hostStorageBlocksWork`. It used to shout at ninety percent, which on a
+          large disk is hundreds of gigabytes free and nothing to do about it. The free space is the
+          only number here because it is the one that decides how much has to go.
+        */
+        return diskFreeBytes === undefined ? undefined : (
+          <div className="usage-warning critical">
+            <HardDrive />
+            <span>
+              {formatBytes(diskFreeBytes)} of disk left — the computer has stopped writing files.
+            </span>
+            <button
+              onClick={() => {
+                setInspectorTab('files');
+                setInspectorOpen(true);
+              }}
+            >
+              Files
+            </button>
+          </div>
+        );
+      case 'error':
+        return (
+          <div className="inline-error" role="alert">
+            <span>{error}</span>
+            <button onClick={() => setError('')} aria-label="Dismiss error">
+              <X />
+            </button>
+          </div>
+        );
+      case 'degraded':
+        return (
+          <div className="inline-notice" role="status">
+            <span>Reconnecting to this conversation — new activity may arrive a little late.</span>
+          </div>
+        );
+      case 'notice':
+        return (
+          <div className="inline-notice" role="status">
+            <span>{notice}</span>
+            <button onClick={() => setNotice('')} aria-label="Dismiss status">
+              <X />
+            </button>
+          </div>
+        );
+      default:
+        return undefined;
+    }
+  })();
 
   return (
     <UndoProvider value={undo.queue}>
@@ -1979,127 +2159,7 @@ export function App() {
             />
           </section>
           <Composer
-            banners={
-              <>
-                {/*
-                The approval card is a banner like the others, so it lives where they live: in
-                flow, inside the composer, above the box. It used to be absolutely positioned at
-                `bottom: 150px` against a composer that is 190px tall, so it overlapped the thing
-                it sat above and carried two more composer-height guesses of its own.
-              */}
-                <Approvals
-                  approvals={approvals}
-                  {...(workspace ? { workspaceId: workspace.id } : {})}
-                  onOpenTask={setTaskId}
-                  openTaskId={taskId}
-                  /* So the card can say whether the agent asking had anybody else's text in its context.
-                   These are the events of the conversation on screen; the card reads them only for an
-                   approval that belongs to it. */
-                  openTaskEvents={events}
-                  onOpenComputer={() => openInspector('computer')}
-                  /*
-                  The card only goes when the decision actually landed. It used to be an unguarded
-                  `async` called as `void onResolve(...)`, so an expired approval or a dropped
-                  connection produced an unhandled rejection and a button that did nothing at all — on
-                  the one control where doing nothing silently is least acceptable. The wording matches
-                  what the lock-screen path already says for the same three outcomes.
-                */
-                  onResolve={async (id, decision) => {
-                    try {
-                      await api.resolveApproval(id, decision);
-                      setApprovals((items) => items.filter((item) => item.id !== id));
-                      setError('');
-                    } catch (cause) {
-                      if (cause instanceof ApiFailure && cause.status === 404) {
-                        setApprovals((items) => items.filter((item) => item.id !== id));
-                        setError('That request was already answered, or it expired.');
-                        return;
-                      }
-                      setError(describeFailure(cause, 'That decision could not be sent'));
-                    }
-                  }}
-                />
-                {/*
-              A banner above the composer is the most expensive place in the interface, so storage only
-              earns it once the situation is actually actionable. Seventy percent full on a large disk
-              is normal and warning about it teaches people to ignore banners; ninety-five percent is
-              about to block their work. The wording carries the one number that decides what to do.
-            */}
-                {storagePercent >= 90 && !error && !notice && !showBlock && (
-                  <div
-                    className={`usage-warning ${storagePercent >= 95 ? 'critical' : 'elevated'}`}
-                  >
-                    <HardDrive />
-                    <span>
-                      {workspace?.hostStorageAvailableBytes !== undefined
-                        ? `${formatBytes(workspace.hostStorageAvailableBytes)} of disk left`
-                        : `${storagePercent.toFixed(0)}% of the disk is used`}
-                      {storagePercent >= 95 ? ' — new work will start failing.' : '.'}
-                    </span>
-                    <button
-                      onClick={() => {
-                        setInspectorTab('files');
-                        setInspectorOpen(true);
-                      }}
-                    >
-                      Files
-                    </button>
-                  </div>
-                )}
-                {blocked && showBlock && (
-                  <div className="composer-block" role="status">
-                    <Sparkles />
-                    <span>{blocked.message}</span>
-                    <button
-                      onClick={() =>
-                        blocked.code === 'private_route_unavailable' ||
-                        blocked.code === 'provider_missing'
-                          ? openSettings('ai')
-                          : openSettings('server')
-                      }
-                    >
-                      {blocked.actionLabel}
-                    </button>
-                  </div>
-                )}
-                {/*
-              The last-known state stays on screen behind this. A dropped connection is a strip, not a
-              sign-out: the box is still working and this device reconnects on its own.
-            */}
-                {offline && (
-                  <div className="inline-error offline-strip" role="status">
-                    <WifiOff />
-                    <span>
-                      Can’t reach your athanor — retrying. It keeps working while you wait.
-                    </span>
-                    <button onClick={() => void load()}>Retry now</button>
-                  </div>
-                )}
-                {streamDegraded && !offline && (
-                  <div className="inline-notice" role="status">
-                    <span>
-                      Reconnecting to this conversation — new activity may arrive a little late.
-                    </span>
-                  </div>
-                )}
-                {error && (
-                  <div className="inline-error" role="alert">
-                    <span>{error}</span>
-                    <button onClick={() => setError('')} aria-label="Dismiss error">
-                      <X />
-                    </button>
-                  </div>
-                )}
-                {notice && (
-                  <div className="inline-notice" role="status">
-                    <span>{notice}</span>
-                    <button onClick={() => setNotice('')} aria-label="Dismiss status">
-                      <X />
-                    </button>
-                  </div>
-                )}
-              </>
-            }
+            banners={strip}
             prompt={prompt}
             onPrompt={setPrompt}
             textareaRef={composer}
@@ -2271,6 +2331,7 @@ export function App() {
               user={data.user}
               workspace={workspace}
               tasks={data.tasks}
+              conversationEvents={events}
               legal={data.legal}
               initialPage={settingsPage}
               onOpenTerminal={() => {

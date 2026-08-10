@@ -1149,6 +1149,12 @@ ticket=$(
   ' "$endpoints_json" "$server_identity" "$pairing_code" "$pairing_expires"
 )
 pairing_uri="athanor://pair/$ticket"
+# The same grant as an address a camera can open, which is the only form worth putting in a code
+# printed at install time: the device being paired is by definition one with nothing installed yet,
+# so a phone pointed at an `athanor://` code did nothing at all. The API mints exactly this shape
+# for the settings screen (apps/api/src/server.ts, the enrollment `webUri`), and the ticket rides in
+# the fragment, where it never appears in a request line or an access log.
+web_pairing_uri="$public_url/#pair=$ticket"
 
 # A self-signed certificate is not merely an ugly warning: browsers refuse to register a service
 # worker on a certificate error, so the installable app, push notifications and the share target
@@ -1172,17 +1178,24 @@ if [ -n "$install_warnings" ]; then
 else
   printf 'athanor is ready.\n\n'
 fi
-printf 'Open the athanor client and choose “Add existing athanor”.\n'
-printf 'Scan this code or paste the connection ticket below:\n\n'
-qrencode -t ANSIUTF8 "$pairing_uri" || true
-printf '\n%s\n\n' "$pairing_uri"
-printf 'One-time pairing code: %s\n' "$pairing_code"
-printf 'Server identity: sha256/%s\n' "$server_identity"
-printf 'Detected endpoints:\n'
-printf '%s' "$endpoints_json" | jq -r '.[] | "  " + .'
+printf 'Open your computer at: %s\n' "$public_url"
+printf '\nOr scan this from a phone:\n\n'
+# qrencode is one of the host packages this installer places (scripts/athanor-host.sh lists it for
+# every family), so the code is normally drawn. If a package manager left it out, the address it
+# encodes is printed instead: an empty gap under “scan this” is exactly the pointing-at-nothing this
+# block exists to remove.
+qrencode -t ANSIUTF8 "$web_pairing_uri" 2>/dev/null || printf '  %s\n' "$web_pairing_uri"
+printf '\nOne-time pairing code, if you opened the address by hand: %s\n' "$pairing_code"
+printf 'Connection ticket, for the native client:\n%s\n' "$pairing_uri"
 printf '\nThe pairing code expires in 24 hours and stops working after the owner is created.\n'
 printf 'To show a fresh code later: sudo athanor pairing-code\n'
 printf 'To check the installation: sudo athanor doctor\n'
+# Everything below the rule is for diagnosing a connection, not for making the first one. It was
+# printed above the address, so the one line a new owner needed arrived after two they did not.
+printf '\n%s\n' '────────────────────────────────────────────────────────────'
+printf 'Detected endpoints:\n'
+printf '%s' "$endpoints_json" | jq -r '.[] | "  " + .'
+printf 'Server identity: sha256/%s\n' "$server_identity"
 if [ -z "$server_has_hostname" ]; then
   printf '\nThis computer has no hostname, so it is reachable only by address. Signing in from a\n'
   printf 'browser needs a hostname: a passkey is bound to a domain name and the WebAuthn standard\n'

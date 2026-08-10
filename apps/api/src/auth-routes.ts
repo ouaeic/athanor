@@ -11,7 +11,12 @@ import { hashRecoveryCode, AthanorError, sha256, verifyRecoveryCode } from '@ath
 import type { DataStore } from '@athanor/data';
 import type { ApiConfig } from './config.js';
 import { recordSecurityEvent } from './security-events.js';
-import { createSession, destroySession, sessionCookieName } from './session.js';
+import {
+  createSession,
+  destroySession,
+  sessionCookieName,
+  STEP_UP_WINDOW_SECONDS
+} from './session.js';
 
 const b64 = (value: Uint8Array): string => Buffer.from(value).toString('base64url');
 
@@ -176,7 +181,10 @@ export const registerAuthRoutes = (
     const user = request.user;
     if (!user) throw new AthanorError('authentication_required', 'Sign in to continue', 401);
     const token = request.cookies[sessionCookieName(secure)];
-    if (!token || !(await store.hasRecentSessionStepUp(user.id, sha256(token), 5 * 60))) {
+    if (
+      !token ||
+      !(await store.hasRecentSessionStepUp(user.id, sha256(token), STEP_UP_WINDOW_SECONDS))
+    ) {
       throw new AthanorError(
         'step_up_required',
         'Confirm this sensitive action with your passkey',
@@ -371,7 +379,9 @@ export const registerAuthRoutes = (
        */
       const sole = await store.soleUser();
       const user = sole ?? (await store.getUserByUsername(internalUsername(request.body.username)));
-      checkRecoveryRate(`${request.ip}:${user?.username ?? internalUsername(request.body.username)}`);
+      checkRecoveryRate(
+        `${request.ip}:${user?.username ?? internalUsername(request.body.username)}`
+      );
       const verified = await verifyRecoveryCode(
         request.body.recoveryCode,
         user?.recoveryHash ?? (await dummyRecoveryHash)
@@ -708,6 +718,30 @@ export const registerAuthRoutes = (
   app.post<{ Body: { nativeOrigin?: string } }>('/v1/auth/step-up/options', async (request) => {
     const user = request.user;
     if (!user) throw new AthanorError('authentication_required', 'Sign in to continue', 401);
+    /*
+     * A ceremony that already happened, inside the window, is the answer.
+     *
+     * Registration, sign-in, recovery and device enrolment each complete a WebAuthn ceremony with
+     * `userVerification: 'required'` against the very authenticator this route would challenge, and
+     * each opens the step-up window (`createSession(..., steppedUp)`). Every route behind
+     * `requireRecentStepUp` already accepts that proof for the next five minutes without asking
+     * again — but this route never consulted it, so it minted a challenge regardless and the client
+     * ran it. The result was a fingerprint per sensitive action for the first five minutes after
+     * first run, each one re-proving a fact the server was about to accept anyway. Nothing is
+     * granted here that the window did not already grant; the floor that must always ask still
+     * asks, because that floor is enforced where the action happens, on the same window.
+     *
+     * `step_up_at` is deliberately not touched. The window is anchored to the last real ceremony,
+     * and refreshing it from a route that proves nothing would let whoever holds the cookie hold
+     * the window open indefinitely by polling.
+     */
+    const sessionToken = request.cookies[sessionCookieName(secure)];
+    if (
+      sessionToken &&
+      (await store.hasRecentSessionStepUp(user.id, sha256(sessionToken), STEP_UP_WINDOW_SECONDS))
+    ) {
+      return { verified: true };
+    }
     const passkeys = await store.listPasskeys(user.id);
     if (!passkeys.length) {
       // Step-up exists to prove a person is present. On a real deployment there is nothing to fall

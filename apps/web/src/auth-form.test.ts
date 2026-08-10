@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { authActionLabel, authHeading, canSubmitAuth, type AuthFormState } from './auth-form.js';
+import {
+  authActionLabel,
+  authHeading,
+  canSubmitAuth,
+  initialAuthMode,
+  type AuthFormState
+} from './auth-form.js';
 
 const code = 'x'.repeat(24);
 
@@ -86,6 +92,26 @@ describe('adding a second device', () => {
     expect(canSubmitAuth(state({ mode: 'enroll', pairingCode: code, serverKnown: false }))).toBe(
       false
     );
+  });
+});
+
+describe('what the screen opens on once the box has answered', () => {
+  /*
+   * The installer prints a QR code that opens this page with a grant in the fragment, and it prints
+   * it on a box that by definition has no owner yet. Enrolling there cannot work — the grant it
+   * wants comes from a signed-in device — so the scan has to land on claiming the box.
+   */
+  it('claims an unclaimed box whether or not a grant came with the address', () => {
+    expect(initialAuthMode({ registrationAvailable: true, grantInHand: true })).toBe('register');
+    expect(initialAuthMode({ registrationAvailable: true, grantInHand: false })).toBe('register');
+  });
+
+  it('adds a device only once the box refuses registration', () => {
+    expect(initialAuthMode({ registrationAvailable: false, grantInHand: true })).toBe('enroll');
+  });
+
+  it('leaves a claimed box with no grant where it opens, signing in', () => {
+    expect(initialAuthMode({ registrationAvailable: false, grantInHand: false })).toBeUndefined();
   });
 });
 

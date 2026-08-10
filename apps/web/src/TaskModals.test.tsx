@@ -212,4 +212,39 @@ describe('the card that asks before something irreversible', () => {
     // "Approve once" implied a persistent approval that does not exist.
     expect(markup).not.toContain('Approve once');
   });
+
+  /*
+   * Only one thing is allowed above the composer and this card is it, so a decision that would not
+   * send cannot be reported by the strip underneath - it would never be drawn. Said here, Approve
+   * can no longer look identical whether the box accepted it or never heard it.
+   */
+  it('says on the card when the decision would not send', () => {
+    const markup = renderToStaticMarkup(
+      <Approvals
+        approvals={[approval()]}
+        openTaskId={undefined}
+        failure={{ approvalId: approval().id, message: 'That decision could not be sent' }}
+        onResolve={async () => undefined}
+      />
+    );
+    expect(markup).toContain('That decision could not be sent');
+    expect(markup).toContain('role="alert"');
+  });
+
+  /* The pending list is refetched every few seconds, so a failure has to name the request it was
+     about or the next card up inherits it. */
+  it('does not carry one request’s failure onto the next', () => {
+    const markup = renderToStaticMarkup(
+      <Approvals
+        approvals={[approval()]}
+        openTaskId={undefined}
+        failure={{
+          approvalId: 'a-request-that-is-gone',
+          message: 'That decision could not be sent'
+        }}
+        onResolve={async () => undefined}
+      />
+    );
+    expect(markup).not.toContain('That decision could not be sent');
+  });
 });
