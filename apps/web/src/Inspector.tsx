@@ -38,6 +38,7 @@ import { botWallClearance, formatBytes, hostOf } from './timeline-state.js';
 import { previewPortProblem, previewSummary } from './preview-rows.js';
 import { advanceFrame, drainFrames, emptyFrameSlots, type FrameSlots } from './remote-frame.js';
 import { inertOutside } from './inert-outside.js';
+import { capabilityDeadline, shouldRenew } from './session-renewal.js';
 import {
   canDecodeVideo,
   parseDisplayMessage,
@@ -1531,27 +1532,19 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
          * So the deadline is read from the token, checked on a short interval that throttling
          * cannot push past expiry, and checked again the moment the page is shown.
          */
-        const expiryOf = (value: string): number => {
-          try {
-            const claims = JSON.parse(atob(value.split('.')[1] ?? '')) as { exp?: number };
-            return typeof claims.exp === 'number' ? claims.exp * 1000 : 0;
-          } catch {
-            return 0;
-          }
-        };
-        let deadline = expiryOf(token);
+        let deadline = capabilityDeadline(token);
         let renewing = false;
         const renewSoon = (): void => {
-          // Renewed once inside the last third of its life, so a throttled tab still has several
-          // chances before the deadline rather than one.
-          if (renewing || !deadline || deadline - Date.now() > 300_000) return;
+          // The decision lives in `session-renewal.ts` and is tested there. It was a condition
+          // inside this closure, which is how it went wrong twice with every test still passing.
+          if (!shouldRenew({ deadline, now: Date.now(), inFlight: renewing })) return;
           renewing = true;
           void api
             .terminalToken(workspace.id)
             .then((next) => {
               if (socket?.readyState === WebSocket.OPEN)
                 socket.send(JSON.stringify({ type: 'renew', token: next.token }));
-              deadline = expiryOf(next.token) || deadline;
+              deadline = capabilityDeadline(next.token) || deadline;
             })
             // Nothing to say: the session keeps the deadline it has and closes on it.
             .catch(() => undefined)
