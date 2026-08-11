@@ -23,6 +23,9 @@ import {
   ContinueTaskRequest,
   CreateWorkspacePreviewRequest,
   CreateWorkspaceRequest,
+  MEDIA_APPROVAL_USD,
+  MEDIA_VIDEO_UNAVAILABLE_REASON,
+  MediaModelSelection,
   ModelRelease,
   resolveWebToolPlan,
   PublishWorkspacePreviewRequest,
@@ -33,6 +36,9 @@ import {
   UpdateSecurityModeRequest,
   UpdateSpendLimitsRequest,
   type AgentNotification,
+  type MediaModalityState,
+  type MediaModelOption,
+  type MediaSettings,
   type Connector,
   type ConnectorTestResult,
   type StartMcpOAuthResponse,
@@ -72,12 +78,17 @@ import {
   generateDataKey,
   hashRecoveryCode,
   assertTimeZone,
+  memoryExcerpt,
   memoryTemporalStatus,
   AthanorError,
   inferenceCredentialAad,
   inferModelTask,
+  modelFit,
+  modelTaskKinds,
   rankModels,
   readRoutingMetadata,
+  type ModelTaskKind,
+  type RoutableModel,
   MAX_CAPABILITY_TTL_SECONDS,
   redactText,
   reservedPreviewPorts,
@@ -96,6 +107,7 @@ import {
   migrateDatabase,
   type ConnectorRecord,
   type ApiTokenRecord,
+  type MemoryItemRecord,
   type UserRecord,
   type TaskScheduleRecord,
   type WorkspaceCheckpointRecord,
@@ -104,8 +116,12 @@ import {
 } from '@athanor/data';
 import {
   applyOpenRouterPrivacyPolicy,
+  configuredModelCatalog,
   OpenAICompatibleAdapter,
   refreshOpenRouterCatalog,
+  refreshOpenRouterMediaCatalog,
+  resolveMediaModel,
+  seedMediaModels,
   seedModels,
   verifyOpenRouterKey
 } from '@athanor/model-gateway';
@@ -146,6 +162,10 @@ const resumableTaskStatuses = ['paused', 'awaiting_resource'] as const;
  */
 export const UNREADABLE_AGENT_MESSAGE =
   'This notice cannot be read: the workspace key that sealed it no longer opens on this server.';
+
+/** The same fact about a row of the agent's own memory, which is listed rather than skipped. */
+export const UNREADABLE_MEMORY_ITEM =
+  'This cannot be read: the workspace key that sealed it no longer opens on this server.';
 
 const taskResponse = (
   task: Awaited<ReturnType<DataStore['getTask']>> extends infer T ? NonNullable<T> : never,
@@ -478,6 +498,29 @@ interface InferenceSecret {
   apiKey?: string;
   modelId?: string;
   enforceZeroDataRetention: boolean;
+  /**
+   * Which model makes an image and which speaks, when the owner has said.
+   *
+   * Kept in the credential rather than in `OwnerPreferences` because it is a fact about the
+   * provider account: the ids only mean anything against the endpoint that lists them, and moving
+   * providers should not leave a picker pointing at a model the new account has never heard of.
+   * The credential is already re-verified on every provider save, which is the moment that
+   * mismatch is caught.
+   */
+  mediaModels?: MediaModelSelection;
+  /**
+   * The choice above, already resolved into the concrete route it names, with its price and voice.
+   *
+   * The worker has no media catalogue and no way to build one: it never talks to a provider except
+   * to run the request in front of it, and adding a catalogue fetch to a tool call would put two
+   * provider round trips in front of every generated image. So the resolution happens here, where
+   * the catalogue already exists, at the moment the owner chooses - and the worker reads a model
+   * id, a price and a voice rather than a preference it would have to interpret.
+   *
+   * It also means an automatic mode settles when it is chosen rather than drifting under the owner
+   * between one generation and the next.
+   */
+  mediaRoutes?: { image?: MediaModelOption; audio?: MediaModelOption };
 }
 
 const CONNECTION_TICKET_VERSION = 2;
@@ -2028,12 +2071,36 @@ export const buildServer = async (
 
   const modelsForUser = async (user: UserRecord) => {
     const requireZdr = await requiresZeroDataRetention(user.id);
+    /*
+     * Which provider the key on this box actually belongs to.
+     *
+     * A catalogue row outlives the credential that wrote it: the only pruning this software does
+     * is the registry's replace, which runs on the OpenRouter path alone. So an owner who moved
+     * from OpenRouter to their own account kept a picker full of models their key cannot reach,
+     * every one of them offered as available, and the first thing that noticed was the worker
+     * refusing the turn with `provider_model_mismatch` - after the conversation had started.
+     *
+     * They are withdrawn rather than hidden, for the same reason a model held back for a licence
+     * review is still listed: an owner whose model vanished concludes athanor lost it. A box with
+     * no provider connected withdraws nothing, because on that box no row is wrong yet.
+     */
+    const connected = await inferenceCredential(user.id)
+      .then(({ secret, configured }) =>
+        configured ? (secret.provider === 'openrouter' ? 'openrouter' : 'custom') : null
+      )
+      .catch(() => null);
     return (await store.listModels()).map((record) => {
       // The contract's parse strips what it does not declare, and the fields the router reads -
       // where the numbers came from, when the route retires, how it bills a cached prefix - are
       // deliberately not part of the owner-facing model shape. Carried alongside rather than
       // widened into it, so the API keeps answering with exactly what it promises.
-      const model = applyOpenRouterPrivacyPolicy(ModelRelease.parse(record), requireZdr);
+      const parsed = ModelRelease.parse(record);
+      const model = applyOpenRouterPrivacyPolicy(
+        connected && parsed.provider !== connected
+          ? { ...parsed, availability: 'unavailable' as const }
+          : parsed,
+        requireZdr
+      );
       return { ...model, ...readRoutingMetadata(record) };
     });
   };
@@ -2588,6 +2655,124 @@ export const buildServer = async (
     }
   );
 
+  /**
+   * One line of what a stored row actually says.
+   *
+   * A row this key will not open is still listed, and says so, exactly as the standing notice log
+   * does with a sentence it cannot read. The point of the list is that nothing this computer holds
+   * about its owner is invisible to them, and a row dropped for being unreadable would be the one
+   * row they would most want to reach.
+   */
+  const memoryItemExcerpt = (
+    record: MemoryItemRecord,
+    key: Buffer,
+    workspaceId: string
+  ): string => {
+    try {
+      const document = decryptJson<{ title?: string | null; body: string }>(
+        record.documentCiphertext,
+        key,
+        `memory-item:${workspaceId}`
+      );
+      return memoryExcerpt(document.body, '', { maxChars: 200 }) || (document.title ?? '');
+    } catch {
+      return UNREADABLE_MEMORY_ITEM;
+    }
+  };
+
+  /**
+   * Removal, not retirement.
+   *
+   * The store's own verb for an item is `retract`, which sets a status: the row stops being
+   * recalled and every word of it stays on disk. That is the right answer when the agent decides
+   * something has stopped being true, and the wrong one here, because an owner told a line is gone
+   * has to be right. The verbatim chunks go with it - `mem.source` holds the request as typed, and
+   * reaches its episode by a link that is set to null rather than followed on delete, so removing
+   * the episode alone would leave those words on disk with nothing left pointing at them.
+   *
+   * The last statement is the one that decides whether any of this is true from where the agent is
+   * standing. A task assembles its memory once, seals the rendered text into `mem.pack`, and re-uses
+   * those exact bytes on every later turn without reading the rows again - that is what keeps the
+   * cached prompt prefix alive. Deleting the rows and leaving the bundle would mean a conversation
+   * that is merely parked, and can be parked for weeks, goes on reciting the line the owner just
+   * deleted. So every bundle that quoted this row or its chunks goes too, and those tasks pay one
+   * rebuild on their next turn.
+   */
+  const forgetMemoryItem = (workspaceId: string, itemId: string): Promise<boolean> =>
+    database.transaction(async (transaction) => {
+      const chunks = await transaction.query<{ id: string }>(
+        'DELETE FROM mem.source WHERE workspace_id=$1 AND episode_id=$2 RETURNING id',
+        [workspaceId, itemId]
+      );
+      await transaction.query('DELETE FROM mem.link WHERE src_id=$1 OR dst_id=$1', [itemId]);
+      // A bundle cites verbatim chunks by their own id alongside the items, so both go into the
+      // overlap test: matching on the item alone would leave the owner's own words quoted.
+      await transaction.query(
+        'DELETE FROM mem.pack WHERE workspace_id=$1 AND item_ids && $2::uuid[]',
+        [workspaceId, [itemId, ...chunks.rows.map((chunk) => chunk.id)]]
+      );
+      /*
+       * And the turn stops vouching for anything it was about to prove. A drafted fact waits in
+       * `mem.fact_candidate` until two separate turns have observed it, holding a sealed draft and
+       * the ids of the turns that vouched for it. Nothing reads that table on recall, so it is not
+       * the lie the bundle above was - but leaving this turn's vote in it means a line the owner
+       * deleted can still be half of what makes athanor believe something later, from a record they
+       * were told was gone. A draft with no turn left behind it is not a draft.
+       */
+      await transaction.query(
+        `UPDATE mem.fact_candidate
+            SET episode_ids = array_remove(episode_ids, $2::uuid),
+                n_episodes = GREATEST(n_episodes - 1, 1)
+          WHERE workspace_id=$1 AND $2::uuid = ANY(episode_ids)`,
+        [workspaceId, itemId]
+      );
+      await transaction.query(
+        'DELETE FROM mem.fact_candidate WHERE workspace_id=$1 AND cardinality(episode_ids)=0',
+        [workspaceId]
+      );
+      const removed = await transaction.query(
+        'DELETE FROM mem.item WHERE workspace_id=$1 AND id=$2',
+        [workspaceId, itemId]
+      );
+      return removed.rowCount === 1;
+    });
+
+  /**
+   * What the agent has written down for itself, which until now had no route at all.
+   *
+   * Every turn that finishes files what was asked and what came of it, so this grows on its own and
+   * has no natural end: newest first and capped, with the owner asking for more when they want it.
+   * Every status is served, including the retired ones - a line the agent has stopped believing is
+   * still a line about the owner, still on their disk, and hiding it here is the defect this route
+   * exists to fix.
+   */
+  app.get<{ Params: { workspaceId: string }; Querystring: { limit?: string } }>(
+    '/v1/workspaces/:workspaceId/memory-items',
+    async (request) => {
+      const user = requireUser(request.user);
+      const { key } = await workspaceKnowledgeKey(user.id, request.params.workspaceId);
+      const limit = z.coerce.number().int().min(1).max(200).default(20).parse(request.query.limit);
+      return (await store.listMemoryItems(request.params.workspaceId, { limit })).map((record) => ({
+        id: record.id,
+        kind: record.kind,
+        status: record.status,
+        excerpt: memoryItemExcerpt(record, key, request.params.workspaceId),
+        observedAt: record.observedAt
+      }));
+    }
+  );
+
+  app.delete<{ Params: { workspaceId: string; itemId: string } }>(
+    '/v1/workspaces/:workspaceId/memory-items/:itemId',
+    async (request) => {
+      const user = requireUser(request.user);
+      await workspaceKnowledgeKey(user.id, request.params.workspaceId);
+      return {
+        deleted: await forgetMemoryItem(request.params.workspaceId, request.params.itemId)
+      };
+    }
+  );
+
   app.get<{ Params: { workspaceId: string } }>(
     '/v1/workspaces/:workspaceId/skills',
     async (request) => {
@@ -2948,6 +3133,61 @@ export const buildServer = async (
     }
   );
 
+  /** Extensions the router treats as pictures, which is the one attachment kind that changes it. */
+  const IMAGE_ATTACHMENT = /\.(?:png|jpe?g|gif|webp|bmp|tiff?|heic|heif|avif)$/i;
+
+  /**
+   * Says once, at the top of a conversation, that the model about to answer is behind for the work
+   * being asked of it.
+   *
+   * The web client picks a model before a word is typed - it ranks the catalogue on sign-in for
+   * generic work in a 16K window and pins the winner - so by the time the request exists the route
+   * has already been decided against something that is not this request. Every automatic pick then
+   * arrives here as an explicit `modelId`, which `rankModels` honours without comparison. This is
+   * the one place the two facts are in the same scope, and it costs a ranking over a catalogue
+   * already in memory: no model call, no tokens, no round trip.
+   *
+   * At the top of the conversation and nowhere else. The same line on every follow-up would be the
+   * narration this interface exists to be losing, and a model the owner kept after reading it once
+   * is a decision, not an oversight.
+   */
+  const noteModelFit = async (input: {
+    taskId: string;
+    dataKey: Uint8Array;
+    catalog: RoutableModel[];
+    chosen: RoutableModel;
+    privacyRoute: 'provider_zdr' | 'external';
+    prompt: string;
+    attachments: string[];
+  }): Promise<void> => {
+    const fit = modelFit({
+      models: input.catalog,
+      chosen: input.chosen,
+      request: {
+        privacyRoute: input.privacyRoute,
+        requiredCapabilities: ['chat', 'tools'],
+        requiredModalities: ['text'],
+        minContextTokens: 16_000,
+        preference: 'balanced'
+      },
+      signals: {
+        prompt: input.prompt,
+        hasImages: input.attachments.some((path) => IMAGE_ATTACHMENT.test(path))
+      }
+    });
+    if (!fit.headline) return;
+    await store.appendTaskEvent({
+      taskId: input.taskId,
+      kind: 'notice',
+      summary: fit.headline.slice(0, 500),
+      payloadCiphertext: encryptJson(
+        { headline: fit.headline, detail: fit.detail },
+        input.dataKey,
+        `task-event:${input.taskId}`
+      )
+    });
+  };
+
   app.post('/v1/tasks', async (request, reply) => {
     const user = requireUser(request.user);
     return idempotent(request, reply, user, async () => {
@@ -3033,6 +3273,19 @@ export const buildServer = async (
         summary: 'User message',
         payloadCiphertext: encryptJson({ markdown: input.prompt }, dataKey, `task-event:${task.id}`)
       });
+      // After the request it is about, so the owner reads what they asked for and then what will be
+      // answering it. Caught rather than awaited into the response: the task exists and is queued by
+      // this point, and a remark about the ranking is not worth failing a send the owner has already
+      // watched succeed.
+      await noteModelFit({
+        taskId: task.id,
+        dataKey,
+        catalog,
+        chosen: selected,
+        privacyRoute: input.privacyRoute,
+        prompt: input.prompt,
+        attachments: input.attachments ?? []
+      }).catch((error: unknown) => log.warn('models.fit_note_failed', errorFields(error)));
       return taskResponse(task, title);
     });
   });
@@ -4435,6 +4688,7 @@ export const buildServer = async (
         modelId: secret.modelId ?? null,
         hasApiKey: Boolean(secret.apiKey),
         enforceZeroDataRetention: secret.enforceZeroDataRetention,
+        mediaModels: secret.mediaModels ?? null,
         webSearch: webSearchRoute(secret)
       };
     }
@@ -4446,11 +4700,157 @@ export const buildServer = async (
       modelId: config.AI_DEFAULT_MODEL ?? null,
       hasApiKey: Boolean(config.AI_API_KEY ?? config.OPENROUTER_API_KEY),
       enforceZeroDataRetention: config.AI_REQUIRE_ZDR,
+      mediaModels: null,
       webSearch: webSearchRoute({ provider: config.AI_PROVIDER })
     };
   };
 
   app.get('/v1/providers', async (request) => providerSettings(requireUser(request.user).id));
+
+  /**
+   * What the owner's provider will make an image and a voice with, and what each will cost.
+   *
+   * Cached in this process for a few minutes because the settings screen asks for it on open and
+   * the answer is two provider requests. A media catalogue changes when a provider ships a model,
+   * which is not on the timescale of a settings dialog being opened twice, and the alternative -
+   * two live requests every time the page mounts - is what the owner meant when they said this
+   * software takes a while.
+   */
+  const MEDIA_CATALOG_TTL_MS = 5 * 60_000;
+  let mediaCatalogCache:
+    | { key: string; expiresAt: number; options: MediaModelOption[] }
+    | undefined;
+
+  const mediaCatalogFor = async (secret: InferenceSecret): Promise<MediaModelOption[]> => {
+    // Only OpenRouter publishes a feed this can be built from. Ollama Cloud and a directly
+    // configured endpoint list model ids and nothing about modality or price, so there is no honest
+    // way to tell a generator from a chat model in their answer - the reviewed routes are what is
+    // offered there, and Settings says why rather than showing an empty list.
+    if (secret.provider !== 'openrouter' || !secret.apiKey) return seedMediaModels();
+    const key = `${secret.baseUrl}|${sha256(secret.apiKey)}|${secret.enforceZeroDataRetention}`;
+    const now = Date.now();
+    if (mediaCatalogCache?.key === key && mediaCatalogCache.expiresAt > now)
+      return mediaCatalogCache.options;
+    try {
+      const options = await refreshOpenRouterMediaCatalog({
+        baseUrl: secret.baseUrl,
+        apiKey: secret.apiKey,
+        requireZeroDataRetention: secret.enforceZeroDataRetention,
+        ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
+      });
+      mediaCatalogCache = { key, expiresAt: now + MEDIA_CATALOG_TTL_MS, options };
+      return options;
+    } catch {
+      // A provider that cannot be reached must not empty the picker: the reviewed routes are still
+      // what this box would generate with, and saying so is better than an empty select and no
+      // reason. The failure is not cached, so the next open tries again.
+      return mediaCatalogCache?.options ?? seedMediaModels();
+    }
+  };
+
+  /**
+   * The media section of Settings, resolved here so the price beside the control and the price on
+   * the approval card are produced by one resolver rather than two.
+   */
+  const mediaSettings = async (userId: string): Promise<MediaSettings> => {
+    const { secret } = await inferenceCredential(userId);
+    const options = await mediaCatalogFor(secret);
+    const selection = secret.mediaModels ?? {};
+    const modality = (kind: 'image' | 'audio'): MediaModalityState => {
+      const forKind = options.filter((option) => option.modality === kind);
+      const choice = selection[kind] ?? { automatic: true, preference: 'balanced', modelId: '' };
+      return {
+        modality: kind,
+        available: forKind.some((option) => !option.unavailableReason),
+        reason: forKind.some((option) => !option.unavailableReason)
+          ? null
+          : secret.enforceZeroDataRetention
+            ? 'No route your provider offers for this has a verified private endpoint. Allowing providers that may retain data would offer more.'
+            : 'This provider account lists nothing that generates this.',
+        options: forKind,
+        choice,
+        effective: resolveMediaModel(options, choice, kind)
+      };
+    };
+    return {
+      modalities: [
+        modality('image'),
+        modality('audio'),
+        {
+          modality: 'video',
+          available: false,
+          // One string in contracts, read by the worker that refuses the call and by the screen
+          // that explains the absence. A second copy of a policy is how the stale one ends up
+          // winning, which is the audit's own finding about approvals.
+          reason: MEDIA_VIDEO_UNAVAILABLE_REASON,
+          options: [],
+          choice: { automatic: true, preference: 'balanced', modelId: '' },
+          effective: null
+        }
+      ],
+      approvalThresholdUsd: MEDIA_APPROVAL_USD
+    };
+  };
+
+  /**
+   * The owner's choice turned into the concrete routes the worker will run, ready to be sealed
+   * into the credential beside it. Resolution failure is not fatal here: a provider that could not
+   * be reached leaves the previously stored routes alone rather than replacing them with the seeds.
+   */
+  const mediaRoutesFor = async (
+    secret: InferenceSecret,
+    selection: MediaModelSelection | undefined
+  ): Promise<InferenceSecret['mediaRoutes']> => {
+    const options = await mediaCatalogFor(secret);
+    const image = resolveMediaModel(options, selection?.image, 'image');
+    const audio = resolveMediaModel(options, selection?.audio, 'audio');
+    return { ...(image ? { image } : {}), ...(audio ? { audio } : {}) };
+  };
+
+  app.get('/v1/media/models', async (request) => mediaSettings(requireUser(request.user).id));
+
+  /**
+   * Changes which model makes an image and which one speaks. Deliberately not behind step-up.
+   *
+   * The approval floor asks for a passkey when a credential moves, and nothing here moves one: the
+   * key is untouched, the endpoint is untouched, and choosing a model authorises no spend on its
+   * own - every generation still meets the cumulative media card, and picking a route whose price
+   * the provider does not publish makes that card appear more often rather than less. Putting a
+   * fingerprint in front of a dropdown is the heavy-handedness the owner has already objected to
+   * elsewhere, and it would buy nothing an attacker could not do by asking for a picture.
+   */
+  app.put('/v1/media/models', async (request, reply) => {
+    const user = requireUser(request.user);
+    return idempotent(request, reply, user, async () => {
+      const input = MediaModelSelection.parse(request.body);
+      const credential = await store.getManagedProviderCredential(user.id, 'inference');
+      if (credential?.status !== 'active')
+        throw new AthanorError(
+          'provider_setup_required',
+          'Connect a model provider before choosing what it generates with',
+          409
+        );
+      const secret = decryptJson<InferenceSecret>(
+        credential.secretCiphertext,
+        masterKey,
+        inferenceCredentialAad(user.id)
+      );
+      const routes = await mediaRoutesFor(secret, input);
+      await store.upsertManagedProviderCredential({
+        userId: user.id,
+        provider: 'inference',
+        secretCiphertext: encryptJson(
+          { ...secret, mediaModels: input, ...(routes ? { mediaRoutes: routes } : {}) },
+          masterKey,
+          inferenceCredentialAad(user.id)
+        ),
+        externalRef: credential.externalRef ?? 'self-hosted',
+        monthlyLimitUsd: 0,
+        status: 'active'
+      });
+      return mediaSettings(user.id);
+    });
+  });
 
   /**
    * One naming call, on the model the conversation itself ran on.
@@ -4609,10 +5009,11 @@ export const buildServer = async (
       const existingCredential = await store.getManagedProviderCredential(user.id, 'inference');
       const existingSecret =
         existingCredential?.status === 'active'
-          ? decryptJson<{
-              provider: 'openrouter' | 'ollama-cloud' | 'openai-compatible';
-              apiKey?: string;
-            }>(existingCredential.secretCiphertext, masterKey, inferenceCredentialAad(user.id))
+          ? decryptJson<InferenceSecret>(
+              existingCredential.secretCiphertext,
+              masterKey,
+              inferenceCredentialAad(user.id)
+            )
           : undefined;
       const input = z
         .object({
@@ -4629,10 +5030,19 @@ export const buildServer = async (
           modalities: z
             .array(z.enum(['text', 'image', 'audio', 'video']))
             .min(1)
-            .default(['text'])
+            .default(['text']),
+          /**
+           * Which model generates an image and which speaks. Absent leaves whatever was saved
+           * before, so the screen can save a key without also having to restate a media choice it
+           * did not touch.
+           */
+          mediaModels: MediaModelSelection.optional()
         })
         .superRefine((value, context) => {
-          if (value.provider !== 'openrouter' && !value.modelId)
+          // Ollama Cloud is exempt because it no longer needs one: the catalogue below lists every
+          // model that account can reach, the same way OpenRouter's does, so naming a single model
+          // by hand went from a requirement to an optional pin.
+          if (value.provider === 'openai-compatible' && !value.modelId)
             context.addIssue({
               code: 'custom',
               path: ['modelId'],
@@ -4702,39 +5112,10 @@ export const buildServer = async (
         appTitle: 'athanor',
         enforceZeroDataRetention: input.provider === 'openrouter' && input.enforceZeroDataRetention
       });
-      const listed = await adapter.list(AbortSignal.timeout(15_000));
-      if (input.provider !== 'openrouter') {
-        if (!listed.some((model) => model.id === input.modelId))
-          throw new AthanorError(
-            'provider_model_not_found',
-            `The endpoint did not list model ${input.modelId}`,
-            422
-          );
-        await store.upsertModels([
-          {
-            id: `custom/${input.modelId}`,
-            providerModelId: input.modelId!,
-            displayName: input.modelId!,
-            provider: 'custom',
-            revision: 'provider-managed',
-            availability: 'available',
-            openness: 'remote_proprietary',
-            license: 'Provider-defined',
-            commercialUse: true,
-            privacyRoute: input.enforceZeroDataRetention ? 'provider_zdr' : 'external',
-            contextTokens: input.contextTokens,
-            modalities: input.modalities,
-            capabilities: input.capabilities,
-            usageClass: 'medium',
-            recommendationTags: [
-              input.provider === 'ollama-cloud' ? 'Ollama Cloud' : 'Configured endpoint'
-            ],
-            measuredQuality: null,
-            measuredLatencyMs: null,
-            updatedAt: new Date().toISOString()
-          }
-        ]);
-      } else {
+      if (input.provider === 'openrouter') {
+        // The `adapter.list()` that used to run here for every provider is gone from this arm: its
+        // answer was only ever read by the branch below, so an OpenRouter save spent a whole extra
+        // round trip on a list it discarded before asking for the catalogue it actually wanted.
         const liveModels = await refreshOpenRouterCatalog(seedModels(), {
           baseUrl,
           apiKey: apiKey!,
@@ -4742,18 +5123,98 @@ export const buildServer = async (
           ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
         });
         await store.upsertModels(liveModels);
+      } else {
+        /*
+         * One request, read twice as hard.
+         *
+         * `describe` asks the same `/models` route `list` did and keeps the context windows,
+         * output limits, prices and supported parameters the endpoint published, instead of
+         * throwing them away and having the owner type a context window in a form. It is also the
+         * only credential check available here: OpenRouter has `/key`, a route it gates and this
+         * server calls above, and no equivalent is confirmed anywhere in this repository for
+         * Ollama Cloud - so a 401 or 403 from the models route is treated as a rejected key, and
+         * anything else that fails is reported as unreachable rather than as verified.
+         */
+        const described = await adapter.describe(AbortSignal.timeout(15_000)).catch((error) => {
+          const status = error instanceof AthanorError ? /\b(\d{3})$/.exec(error.message)?.[1] : '';
+          if (status === '401' || status === '403')
+            throw new AthanorError(
+              'provider_key_rejected',
+              'The provider did not accept this key. Paste it again whole — a trailing space or a missing character is enough — and check it has not been revoked.',
+              422
+            );
+          throw error;
+        });
+        if (input.modelId && !described.some((model) => model.id === input.modelId))
+          throw new AthanorError(
+            'provider_model_not_found',
+            `The endpoint did not list model ${input.modelId}`,
+            422
+          );
+        /*
+         * A subscription is a catalogue, not a model.
+         *
+         * An Ollama Cloud account reaches every cloud model on the plan, so all of them are written
+         * and the owner picks in the composer like any other provider. A directly configured
+         * endpoint keeps the single named row: those are usually one served model, the owner has
+         * told this screen its context window and capabilities, and writing that description across
+         * every id a gateway happens to front would attach one model's facts to all of them.
+         */
+        const catalogue =
+          input.provider === 'ollama-cloud'
+            ? described
+            : described.filter((model) => model.id === input.modelId);
+        if (!catalogue.length)
+          throw new AthanorError(
+            'provider_model_not_found',
+            'The endpoint listed no models for this key',
+            422
+          );
+        await store.upsertModels(
+          configuredModelCatalog(catalogue, {
+            privacyRoute: input.enforceZeroDataRetention ? 'provider_zdr' : 'external',
+            contextTokens: input.contextTokens,
+            capabilities: input.capabilities,
+            modalities: input.modalities,
+            tag: input.provider === 'ollama-cloud' ? 'Ollama Cloud' : 'Configured endpoint'
+          })
+        );
       }
+      /*
+       * Carried forward when this save did not mention it, and dropped when the provider changes.
+       * A media id only means something against the account that listed it, so keeping an image
+       * model pinned across a move to another provider would leave the choice pointing at a route
+       * the new key cannot reach - and the first anyone would hear of it is a failed generation
+       * mid-task.
+       */
+      const mediaModels =
+        input.mediaModels ??
+        (existingSecret?.provider === input.provider ? existingSecret.mediaModels : undefined);
+      const saved: InferenceSecret = {
+        provider: input.provider,
+        baseUrl,
+        ...(apiKey ? { apiKey } : {}),
+        ...(input.modelId ? { modelId: input.modelId } : {}),
+        enforceZeroDataRetention: input.enforceZeroDataRetention,
+        ...(mediaModels ? { mediaModels } : {})
+      };
+      /*
+       * Resolved against the credential as it is about to be stored, not as it was: a save that
+       * switches on private routes only, or moves to another account, changes which media routes
+       * exist, and the worker reads the answer rather than working it out again.
+       *
+       * Only when there is a choice to resolve. Resolving costs the same two provider requests the
+       * chat catalogue above just made, and an owner who has never opened the media section has
+       * nothing to resolve - they get the reviewed routes, which is what they had before any of
+       * this existed. Connecting a provider is already the slowest thing this screen does; it does
+       * not also get to pay for a question nobody asked.
+       */
+      const mediaRoutes = mediaModels ? await mediaRoutesFor(saved, mediaModels) : undefined;
       await store.upsertManagedProviderCredential({
         userId: user.id,
         provider: 'inference',
         secretCiphertext: encryptJson(
-          {
-            provider: input.provider,
-            baseUrl,
-            ...(apiKey ? { apiKey } : {}),
-            ...(input.modelId ? { modelId: input.modelId } : {}),
-            enforceZeroDataRetention: input.enforceZeroDataRetention
-          },
+          { ...saved, ...(mediaRoutes ? { mediaRoutes } : {}) },
           masterKey,
           inferenceCredentialAad(user.id)
         ),
@@ -4784,7 +5245,12 @@ export const buildServer = async (
     Querystring: {
       privacyRoute?: 'provider_zdr' | 'external';
       preference?: 'fast' | 'balanced' | 'best';
-      taskKind?: 'general' | 'coding' | 'agentic';
+      /**
+       * The full router vocabulary, not the three coarse kinds this used to admit. Five profiles -
+       * vision, long context, reasoning, bulk summarisation, conversation - were written, weighted
+       * and tested, and were unreachable from the only HTTP entry point that ranks anything.
+       */
+      taskKind?: ModelTaskKind;
     };
   }>('/v1/models/recommend', async (request) => {
     /*
@@ -4801,7 +5267,11 @@ export const buildServer = async (
       requiredModalities: ['text'],
       minContextTokens: 16_000,
       preference: request.query.preference ?? 'balanced',
-      taskKind: request.query.taskKind ?? 'general'
+      // A kind this server does not know is a client from another version, not a bad request: rank
+      // it as general work rather than refusing to answer with the whole catalogue.
+      taskKind: modelTaskKinds.includes(request.query.taskKind as ModelTaskKind)
+        ? (request.query.taskKind as ModelTaskKind)
+        : 'general'
     });
     // Reasoning for the head, an order for the tail. Every entry carried seven sentences explaining
     // a placement no interface will ever show for the three-hundredth-best model; what the caller

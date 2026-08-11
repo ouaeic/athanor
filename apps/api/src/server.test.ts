@@ -6,8 +6,10 @@ import { Duplex } from 'node:stream';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { PREVIEW_IDLE_EXPIRY_DAYS } from '@athanor/contracts';
 import {
+  buildMemoryItemIndex,
   encryptJson,
   generateDataKey,
+  memoryIndexKey,
   sha256,
   unwrapDataKey,
   wrapDataKey,
@@ -4669,5 +4671,186 @@ describe('what the computer is running', () => {
     });
     expect(stopped.statusCode, stopped.body).toBe(200);
     expect(runnerCalls).toContain(`POST /v1/workspaces/${workspaceId}/processes/proc_1`);
+  });
+});
+
+/*
+ * The tiered store the agent writes to itself had no route at all, so the one record on this
+ * computer the owner could neither read nor remove was the one made out of their own requests.
+ */
+describe('what the computer wrote down about its owner', () => {
+  test('lists the agent’s own memory, and a delete takes the verbatim words with it', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-memory-items-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'memory-items',
+      'Prepare the quarterly numbers'
+    );
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspaceId);
+    const indexKey = memoryIndexKey(key);
+    const write = async (title: string, body: string, observedAt: string) => {
+      const content = { title, tags: [], body };
+      return store.createMemoryItem({
+        userId: workspace.userId,
+        workspaceId,
+        kind: 'episode',
+        trust: 'derived',
+        documentCiphertext: encryptJson(content, key, `memory-item:${workspaceId}`),
+        index: buildMemoryItemIndex(content, indexKey),
+        observedAt,
+        taskId
+      });
+    };
+    const older = await write(
+      'Book the flights',
+      'Goal: Book the flights\nOutcome: ok',
+      '2026-01-01T09:00:00.000Z'
+    );
+    const episode = await write(
+      'Prepare the quarterly numbers',
+      'Goal: Prepare the quarterly numbers\nOutcome: ok\nResult: The workbook is written.',
+      '2026-02-01T09:00:00.000Z'
+    );
+    const source = await store.createMemorySource({
+      userId: workspace.userId,
+      workspaceId,
+      channel: 'chat',
+      role: 'owner',
+      taskId,
+      episodeId: episode.id,
+      bodyCiphertext: encryptJson(
+        { body: 'Prepare the quarterly numbers' },
+        key,
+        `memory-source:${workspaceId}`
+      ),
+      bodyTokens: 'quarterly numbers',
+      tokensEst: 6
+    });
+    /*
+     * The bundle a task carries for its whole life. It is assembled once from these rows, sealed,
+     * and re-sent on every later turn without the rows being read again - so a task still open when
+     * the owner deletes one of them is where a deleted line would go on being recalled.
+     */
+    await store.saveMemoryPack({
+      taskId,
+      workspaceId,
+      bodyCiphertext: encryptJson(
+        { body: '# MEMORY PACK\nGoal: Prepare the quarterly numbers\n' },
+        key,
+        `memory-pack:${taskId}`
+      ),
+      sha256: 'a'.repeat(64),
+      itemIds: [episode.id, source.id],
+      tokensEst: 12
+    });
+    /*
+     * A drafted fact this turn voted for, and one the turn before it voted for. Two votes are what
+     * makes a draft into something athanor believes, so the deleted turn has to stop casting one -
+     * and the draft it was the whole of has nothing left behind it at all.
+     */
+    await store.observeMemoryFactCandidate({
+      workspaceId,
+      subjectKey: 'owner',
+      predicate: 'prefers',
+      objectKey: 'quarterly-workbook',
+      episodeId: episode.id
+    });
+    await store.observeMemoryFactCandidate({
+      workspaceId,
+      subjectKey: 'owner',
+      predicate: 'prefers',
+      objectKey: 'flights-early',
+      episodeId: older.id
+    });
+    await store.observeMemoryFactCandidate({
+      workspaceId,
+      subjectKey: 'owner',
+      predicate: 'prefers',
+      objectKey: 'flights-early',
+      episodeId: episode.id
+    });
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memory-items`,
+      headers: { cookie }
+    });
+    expect(listed.statusCode, listed.body).toBe(200);
+    expect(listed.json()).toMatchObject([
+      {
+        id: episode.id,
+        kind: 'episode',
+        status: 'active',
+        excerpt:
+          'Goal: Prepare the quarterly numbers\nOutcome: ok\nResult: The workbook is written.'
+      },
+      { id: older.id, excerpt: 'Goal: Book the flights\nOutcome: ok' }
+    ]);
+
+    /* Newest first, and the page the owner asked for is the page they get. */
+    const firstPage = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memory-items?limit=1`,
+      headers: { cookie }
+    });
+    expect(firstPage.json()).toHaveLength(1);
+    expect(firstPage.json<Array<{ id: string }>>()[0]!.id).toBe(episode.id);
+
+    const stranger = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'stranger' } })
+    );
+    const refusedRead = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memory-items`,
+      headers: { cookie: stranger }
+    });
+    expect(refusedRead.statusCode).toBe(404);
+    const refusedDelete = await app.inject({
+      method: 'DELETE',
+      url: `/v1/workspaces/${workspaceId}/memory-items/${episode.id}`,
+      headers: { cookie: stranger, 'idempotency-key': 'memory-items-refused' },
+      payload: {}
+    });
+    expect(refusedDelete.statusCode).toBe(404);
+
+    const removed = await app.inject({
+      method: 'DELETE',
+      url: `/v1/workspaces/${workspaceId}/memory-items/${episode.id}`,
+      headers: { cookie, 'idempotency-key': 'memory-items-delete' },
+      payload: {}
+    });
+    expect(removed.json()).toEqual({ deleted: true });
+    /*
+     * Removed rather than retired. The item is off the disk and so is the verbatim chunk of the
+     * owner's own words that cited it - a status flip would have left both exactly where they were.
+     */
+    expect((await database.query('SELECT id FROM mem.item')).rows).toEqual([{ id: older.id }]);
+    expect((await database.query('SELECT id FROM mem.source')).rows).toEqual([]);
+    /*
+     * And out of the sealed bundle, which is the only copy that would still have reached the model.
+     * The task rebuilds it on its next turn, one prompt-cache miss, which is the right price for
+     * the owner having said forget this.
+     */
+    expect(await store.getMemoryPack(taskId)).toBeNull();
+    /* The draft this turn was the whole of is gone; the one it merely seconded is back to one vote
+       and can no longer be promoted on the strength of a turn the owner deleted. */
+    expect(
+      (
+        await database.query<{ object_key: string; n_episodes: number; episode_ids: string[] }>(
+          'SELECT object_key,n_episodes,episode_ids FROM mem.fact_candidate ORDER BY object_key'
+        )
+      ).rows
+    ).toEqual([{ object_key: 'flights-early', n_episodes: 1, episode_ids: [older.id] }]);
+    const after = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memory-items`,
+      headers: { cookie }
+    });
+    expect(after.json<Array<{ id: string }>>().map((row) => row.id)).toEqual([older.id]);
   });
 });

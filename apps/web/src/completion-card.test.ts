@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { completionCard, harnessRun, verificationReceiptLabel } from './completion-card.js';
-import type { TaskEvent } from './types.js';
+import {
+  completionCard,
+  computerChangeLine,
+  harnessRun,
+  turnComputerQuery,
+  verificationReceiptLabel
+} from './completion-card.js';
+import type { TaskEvent, TaskRewindPreview } from './types.js';
 
 const completed = (summary: string, payload: unknown): TaskEvent => ({
   id: '00000000-0000-4000-8000-000000000001',
@@ -205,13 +211,13 @@ describe('what the harness ran', () => {
   });
 
   /*
-   * The caveat is the harness's sentence about the worth of its own tick, and the worker writes it
-   * into both fields. Printing it under "caveats" alongside the agent's own risks buries the one
-   * line that says this tick proves less than the last one.
+   * Two fields, two places. A caveat the worker sends both ways is its own correction to its own
+   * tick and belongs beside it; printing it under "caveats" alongside the agent's own risks buries
+   * the one line that says this tick proves less than the last one.
    */
   it('lifts the harness caveat out of the agent’s caveats and shows it once', () => {
     const caveat =
-      'These acceptance checks were declared by an earlier turn and were already passing before this one started.';
+      'These checks were already passing before this job started, so passing them says nothing about it.';
     const card = completionCard(
       completed('Task completed', {
         summary: 'Tidied the folder.',
@@ -229,6 +235,30 @@ describe('what the harness ran', () => {
     expect(verificationReceiptLabel(card)).toBe('The harness ran 2 checks · all passed · 1 caveat');
   });
 
+  /*
+   * The other half of that protocol. Everything the worker sends only as a risk - how the checks
+   * were made, where they came from - is detail behind the disclosure, and the summary line says
+   * there is something in there to read rather than printing it over the tick.
+   */
+  it('leaves a caveat sent only as a risk behind the disclosure', () => {
+    const caveat = 'These checks were written after the work, not before it.';
+    const card = completionCard(
+      completed('Task completed', {
+        summary: 'Built it.',
+        acceptance: ['check-1: The suite passes — exit 0'],
+        verification: {
+          status: 'verified',
+          evidence: [{ claim: 'Ran the suite', source: 'tool_result' }],
+          remainingRisks: [caveat]
+        }
+      }),
+      ranTwoChecks
+    );
+    expect(card.harnessCaveats).toEqual([]);
+    expect(card.caveats).toEqual([caveat]);
+    expect(verificationReceiptLabel(card)).toBe('The harness ran 2 checks · all passed · 1 caveat');
+  });
+
   it('opens a receipt for a turn whose only evidence is the harness run', () => {
     const card = completionCard(
       completed('Task completed', {
@@ -239,5 +269,150 @@ describe('what the harness ran', () => {
     );
     expect(verificationReceiptLabel(card)).toBe('The harness ran 2 checks · all passed');
     expect(completionCard(completed('Task completed', { summary: 'Done' })).harness).toEqual([]);
+  });
+});
+
+/*
+ * The turn's effect on the computer, which the card could never say.
+ *
+ * Everything here is about not asking, and not answering, when the answer would belong to another
+ * turn: the box measures the restore point against the tree as it stands, so the only completion
+ * whose difference is its own is the newest one on a conversation that has stopped moving.
+ */
+const timeline = (entries: Array<[number, TaskEvent['kind']]>): TaskEvent[] =>
+  entries.map(([sequence, kind]) => ({
+    id: `00000000-0000-4000-8000-${String(sequence).padStart(12, '0')}`,
+    taskId: '00000000-0000-4000-8000-000000000099',
+    sequence,
+    kind,
+    summary: kind,
+    createdAt: '2026-08-01T09:00:00.000Z'
+  }));
+
+const wroteFiles = timeline([
+  [1, 'user_message'],
+  [2, 'tool_started'],
+  [3, 'tool_result'],
+  [4, 'completed']
+]);
+
+const rewindPreview = (
+  eventSequence: number | null,
+  computer: Partial<TaskRewindPreview['computer'] & object> | null
+): TaskRewindPreview =>
+  ({
+    taskId: '00000000-0000-4000-8000-000000000099',
+    eventId: '00000000-0000-4000-8000-000000000004',
+    droppedEventCount: 0,
+    checkpoint: { id: '00000000-0000-4000-8000-000000000500', eventSequence },
+    computer: computer && {
+      addedCount: 0,
+      modifiedCount: 0,
+      deletedCount: 0,
+      added: [],
+      modified: [],
+      deleted: [],
+      packagesInstalled: [],
+      packagesRemoved: [],
+      uncovered: [],
+      truncated: false,
+      ...computer
+    }
+  }) as TaskRewindPreview;
+
+describe('what the finished turn did to the computer', () => {
+  it('asks about the newest completion, from the message that opened its turn', () => {
+    expect(turnComputerQuery(wroteFiles, 'completed')).toEqual({
+      eventId: '00000000-0000-4000-8000-000000000004',
+      fromSequence: 1
+    });
+  });
+
+  it('never asks while the conversation is still moving', () => {
+    for (const status of ['running', 'queued', 'planning'])
+      expect(turnComputerQuery(wroteFiles, status)).toBeUndefined();
+    // Parked is not moving: an approval, a question and a wait on the box all leave the tree alone.
+    expect(turnComputerQuery(wroteFiles, 'awaiting_user')).toBeDefined();
+  });
+
+  it('never asks for a turn that made no call, because it took no restore point', () => {
+    /*
+     * The restore point is taken in front of the first call that could change anything, so a turn
+     * that only talked has none - and the box would answer with the previous turn's, putting an
+     * earlier turn's file changes under a conversational reply.
+     */
+    const talked = timeline([
+      [1, 'user_message'],
+      [2, 'assistant_message'],
+      [3, 'completed']
+    ]);
+    expect(turnComputerQuery(talked, 'completed')).toBeUndefined();
+  });
+
+  it('never asks once something has run since that completion', () => {
+    const thenFailed = [
+      ...wroteFiles,
+      ...timeline([
+        [5, 'user_message'],
+        [6, 'tool_started']
+      ])
+    ];
+    expect(turnComputerQuery(thenFailed, 'failed')).toBeUndefined();
+  });
+
+  it('never asks when the message that opened the turn is older than this device holds', () => {
+    // The transcript is paged. Without the turn's own starting point there is no way to tell
+    // whether the restore point that comes back belongs to this turn or to one before it.
+    expect(
+      turnComputerQuery(
+        timeline([
+          [8, 'tool_started'],
+          [9, 'completed']
+        ]),
+        'completed'
+      )
+    ).toBeUndefined();
+    expect(turnComputerQuery(timeline([[1, 'user_message']]), 'completed')).toBeUndefined();
+  });
+
+  it('puts the counts in one line, with the noun said once', () => {
+    expect(
+      computerChangeLine(rewindPreview(1, { addedCount: 2, modifiedCount: 3, deletedCount: 1 }), 1)
+    ).toBe('On the computer — 2 files added, 3 changed, 1 deleted');
+    expect(computerChangeLine(rewindPreview(1, { modifiedCount: 1 }), 1)).toBe(
+      'On the computer — 1 file changed'
+    );
+    /* A turn that only removed things is the one a reader most wants counted, and the noun still
+       goes on the first clause that has anything in it. */
+    expect(computerChangeLine(rewindPreview(1, { deletedCount: 3 }), 1)).toBe(
+      'On the computer — 3 files deleted'
+    );
+  });
+
+  /*
+   * The counts are the box's own totals, not the length of the lists beside them: the preview caps
+   * its paths at 200 and says so, and a turn that touched more than that must not be reported as
+   * having touched exactly 200.
+   */
+  it('reports the whole total on a turn whose file list came back truncated', () => {
+    expect(
+      computerChangeLine(
+        rewindPreview(1, { addedCount: 412, modifiedCount: 88, truncated: true }),
+        1
+      )
+    ).toBe('On the computer — 412 files added, 88 changed');
+  });
+
+  it('says nothing at all when the turn changed nothing', () => {
+    // "No files changed" under every conversational reply is the interface talking about itself.
+    expect(computerChangeLine(rewindPreview(1, {}), 1)).toBe('');
+    expect(computerChangeLine(undefined, 1)).toBe('');
+    expect(computerChangeLine(rewindPreview(1, null), 1)).toBe('');
+  });
+
+  it('says nothing when the restore point that came back predates this turn', () => {
+    // It is the previous turn's, and the difference it measures is the previous turn's work.
+    expect(computerChangeLine(rewindPreview(1, { addedCount: 9 }), 5)).toBe('');
+    expect(computerChangeLine(rewindPreview(null, { addedCount: 9 }), 5)).toBe('');
   });
 });

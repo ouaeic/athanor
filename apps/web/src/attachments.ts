@@ -91,6 +91,48 @@ export const isImageAttachment = (path: string): boolean => imageExtensions.has(
 export const imageMimeType = (path: string): string =>
   imageMimeTypes[extensionOf(path)] ?? 'application/octet-stream';
 
+/**
+ * The types `/v1/artifacts/:id/content` will hand back as something to render, rather than as bytes
+ * to save.
+ *
+ * This is the client half of one decision the server already makes (`apps/api/src/server.ts`,
+ * `inlineSafe`): anything outside that list is answered as `application/octet-stream` with
+ * `content-disposition: attachment` and `nosniff`, because the MIME type on an artifact is a
+ * free-form string the agent supplied and a page it read may have chosen for it. So a `<img>`,
+ * `<audio>` or `<video>` pointed at anything else is a broken element by construction — which is
+ * what the card did for `image/svg+xml` and for a photo published as `image/heic`: it drew an image
+ * frame around a response the browser had already been told to download.
+ *
+ * Duplicated deliberately rather than fetched: the alternative is rendering the element first and
+ * discovering from the response headers that it was never going to work.
+ */
+const INLINE_ARTIFACT_MIME = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+  'image/avif',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/ogg',
+  'audio/wav',
+  'video/mp4',
+  'video/webm'
+]);
+
+/**
+ * Which element a produced file gets in the transcript, or nothing when it gets a card instead.
+ *
+ * Only the three families the owner watches or listens to. A PDF is inline-safe too and already has
+ * its own review frame on the card, and `text/plain` is a file to open rather than a thing to play.
+ */
+export const inlineMediaKind = (mimeType: string): 'image' | 'audio' | 'video' | undefined => {
+  const declared = mimeType.split(';')[0]?.trim().toLowerCase() ?? '';
+  if (!INLINE_ARTIFACT_MIME.has(declared)) return undefined;
+  const family = declared.split('/')[0];
+  return family === 'image' || family === 'audio' || family === 'video' ? family : undefined;
+};
+
 const fileKinds: Record<string, string> = {
   'application/pdf': 'PDF',
   'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'Presentation',

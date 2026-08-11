@@ -28,6 +28,25 @@ import type { WebSearchRoute } from './web-search-route.js';
 
 export type { Artifact } from '@athanor/contracts';
 
+/**
+ * One file the transcript is pointing at, in the two forms a file here can take.
+ *
+ * A path is a thing in the tree the agent is still working in; an artifact is a fixed copy in the
+ * saved-results library, which has no path at all — its bytes live under a storage key nobody
+ * should be shown. Both are opened the same way by the owner, so both travel in one type rather
+ * than in two callbacks that the Files pane would then have to reconcile.
+ */
+export type FileRequest = { path: string } | { artifactId: string };
+
+/**
+ * The same request, stamped so it can be asked for twice.
+ *
+ * The pane is pointed at a file by a prop, and a prop that is deep-equal to the last one is not a
+ * new instruction to React. Clicking the same artifact's "Files" button after wandering off to
+ * another folder has to move the pane again, so the count is what the pane watches.
+ */
+export type FileTarget = FileRequest & { nonce: number };
+
 export interface User {
   id: string;
   username: string;

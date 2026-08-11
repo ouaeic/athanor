@@ -63,6 +63,20 @@ export interface ProviderSettings {
   webSearch?: WebSearchRoute;
 }
 
+/**
+ * A row the agent wrote into its own memory as work finished, rather than one the owner typed.
+ *
+ * `excerpt` is the opening of the stored text, decrypted on the server with the workspace key: the
+ * client is shown what is actually held, not a description of it.
+ */
+export interface MemoryItem {
+  id: string;
+  kind: 'source' | 'episode' | 'fact' | 'procedure';
+  status: 'active' | 'superseded' | 'disputed' | 'archived' | 'retracted';
+  excerpt: string;
+  observedAt: string;
+}
+
 let nativeGateway = false;
 
 /**
@@ -614,6 +628,13 @@ export const api = {
   deleteMemory: (workspaceId: string, memoryId: string) =>
     request<{ deleted: boolean }>(
       `/v1/workspaces/${workspaceId}/memories/${memoryId}`,
+      mutation('DELETE', {})
+    ),
+  memoryItems: (workspaceId: string, limit: number) =>
+    request<MemoryItem[]>(`/v1/workspaces/${workspaceId}/memory-items?limit=${limit}`),
+  deleteMemoryItem: (workspaceId: string, itemId: string) =>
+    request<{ deleted: boolean }>(
+      `/v1/workspaces/${workspaceId}/memory-items/${itemId}`,
       mutation('DELETE', {})
     ),
   skills: (workspaceId: string) =>

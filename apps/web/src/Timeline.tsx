@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  Archive,
   ArrowDown,
   BellRing,
   BookOpen,
@@ -10,6 +11,7 @@ import {
   ChevronRight,
   CircleDollarSign,
   Clock3,
+  Download,
   ExternalLink,
   FileOutput,
   Globe2,
@@ -24,7 +26,7 @@ import {
   UserRoundCheck,
   XCircle
 } from 'lucide-react';
-import type { BotWall, Task, TaskEvent } from './types.js';
+import type { BotWall, FileRequest, Task, TaskEvent } from './types.js';
 import { TaskPlanPanel, planProgress, useTaskPlan } from './TaskPlanPanel.js';
 import { CopyButton, Markdown } from './Markdown.js';
 import { DiffView } from './DiffView.js';
@@ -55,9 +57,9 @@ import {
 } from './timeline-state.js';
 import { externalRead, provenanceReport, sourcesPhrase } from './provenance.js';
 import { completionCard, verificationReceiptLabel, type HarnessCheck } from './completion-card.js';
-import { terminalTaskStatuses } from './task-status.js';
+import { taskIsGenerating, terminalTaskStatuses } from './task-status.js';
 import { formatUsd } from './usage-model.js';
-import { fileKindLabel, splitAttachments } from './attachments.js';
+import { fileKindLabel, inlineMediaKind, splitAttachments } from './attachments.js';
 import { AttachmentStrip } from './AttachmentTray.js';
 
 type Surface = 'files' | 'computer' | 'terminal' | 'preview';
@@ -259,7 +261,8 @@ export const ToolEvidence = memo(function ToolEvidence({
   args,
   before,
   result,
-  stage
+  stage,
+  onOpenFile
 }: {
   tool: string;
   args: unknown;
@@ -267,6 +270,8 @@ export const ToolEvidence = memo(function ToolEvidence({
   result?: unknown;
   /** Which half of the call this row is, which decides what the raw disclosure holds. */
   stage: 'started' | 'result';
+  /** Where a file the agent just wrote can be looked at whole, rather than as a diff. */
+  onOpenFile?: (request: FileRequest) => void;
 }) {
   const call: ToolCall = { tool, arguments: args, ...(before === undefined ? {} : { before }) };
   const evidence = workEvidence(call, result);
@@ -284,6 +289,25 @@ export const ToolEvidence = memo(function ToolEvidence({
             defaultOpen={evidence.changes.length === 1}
           />
         ))}
+      {/*
+        A diff says what changed; it does not say what the file now is, and for anything the agent
+        renders rather than writes - a chart, a page, an image it composed - the diff is the least
+        useful view of it there is. One control per path, going to the pane that can show the whole
+        thing, with the conversation still on screen beside it.
+      */}
+      {evidence.kind === 'files' && onOpenFile && (
+        <span className="artifact-actions">
+          {evidence.changes.map((change) => (
+            <button
+              key={change.path}
+              title={`Show ${change.path} in Files`}
+              onClick={() => onOpenFile({ path: change.path })}
+            >
+              <Archive /> {change.path.split('/').pop()}
+            </button>
+          ))}
+        </span>
+      )}
       {evidence.kind === 'command' && (
         <CommandEvidence evidence={evidence} finished={stage === 'result'} />
       )}
@@ -453,22 +477,28 @@ function Event({
   event,
   call,
   onOpenSurface,
+  onOpenFile,
   onOpenPreview,
   settled = false,
   compactCompletion = false,
   harness = [],
+  computerChanges = '',
   resolution
 }: {
   event: TaskEvent;
   /** The call a `tool_result` answers, joined to its start in the transcript pass. */
   call?: ToolCall;
   onOpenSurface?: (surface: Surface) => void;
+  /** Points the Files pane at one named file, without taking the conversation off screen. */
+  onOpenFile?: (request: FileRequest) => void;
   /** Asks the server for a fresh, openable address for a private preview. */
   onOpenPreview?: (previewId: string) => void;
   settled?: boolean;
   compactCompletion?: boolean;
   /** The acceptance checks the harness ran for this completion, where the turn declared any. */
   harness?: HarnessCheck[];
+  /** What this turn did to the files, in the box's counts. Empty whenever it did nothing. */
+  computerChanges?: string;
   /** The decision, when this is an approval that has since been answered. */
   resolution?: TaskEvent;
 }) {
@@ -485,6 +515,41 @@ function Event({
         <Clock3 />
         <span>{event.summary}</span>
       </div>
+    );
+  /*
+   * The model working out loud, filed where the machinery is.
+   *
+   * The transcript pass diverts a run of streamed frames here when the turn never consolidated it
+   * into a reply and reached for a tool instead - prose written between two tool calls, which is
+   * not an answer to anybody. Nothing is deleted: the words are one click away, next to the calls
+   * they were written between. The type is deliberately the same disclosure every other row in this
+   * log wears, and the copy is quiet, because that is what it is now.
+   */
+  if (event.kind === 'assistant_delta')
+    return (
+      <details className="tool-event">
+        <summary>
+          <Brain />
+          <span>{event.summary}</span>
+          <ChevronRight />
+        </summary>
+        {/* One paragraph per paragraph, in the padded grid every other body in this log uses, so
+            this needs no rule of its own: the grid's gap is the spacing, and `.tool-quiet` is the
+            size and colour of prose that is not being promoted. */}
+        <div className="tool-evidence">
+          {textValue(data.markdown)
+            .split(/\n{2,}/)
+            .map((paragraph) => paragraph.trim())
+            .filter(Boolean)
+            .map((paragraph, position) => (
+              // By position, because a model that has started repeating itself is one of the
+              // things this log is read to find out, and two identical paragraphs are two rows.
+              <p className="tool-quiet" key={position}>
+                {paragraph}
+              </p>
+            ))}
+        </div>
+      </details>
     );
   if (event.kind === 'tool_started') {
     const tool = textValue(data.tool);
@@ -508,7 +573,12 @@ function Event({
           </span>
           <ChevronRight />
         </summary>
-        <ToolEvidence tool={tool} args={data.arguments} stage="started" />
+        <ToolEvidence
+          tool={tool}
+          args={data.arguments}
+          stage="started"
+          {...(onOpenFile ? { onOpenFile } : {})}
+        />
       </details>
     );
   }
@@ -557,6 +627,7 @@ function Event({
             {...(call?.before === undefined ? {} : { before: call.before })}
             result={data.result}
             stage="result"
+            {...(onOpenFile ? { onOpenFile } : {})}
           />
         </details>
       </>
@@ -649,21 +720,64 @@ function Event({
     const name = textValue(data.name, event.summary);
     const size = formatBytes(Number(data.sizeBytes));
     const url = artifactId ? `/v1/artifacts/${encodeURIComponent(artifactId)}/content` : '';
+    /*
+     * What the turn made, shown as the thing it is.
+     *
+     * A generated picture arrived as a 62×48 thumbnail beside its own file name, and a generated
+     * track or clip arrived as no preview at all — the owner had to leave for a browser tab to find
+     * out what athanor had produced for them. The element is chosen from the type the *server* will
+     * agree to serve inline, not from the type the agent wrote down, so nothing here can draw a
+     * frame around a response the browser was told to download.
+     */
+    const media = url ? inlineMediaKind(mimeType) : undefined;
     return (
       <>
+        {media === 'image' && (
+          // Bounded by `.artifact-media` so a portrait render cannot take the whole scrollport, and
+          // the bound is what makes the link worth having: full size is one click, in a tab, with
+          // no viewer of our own to maintain.
+          <a
+            className="artifact-media"
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            title={`Open ${name} at full size`}
+          >
+            <img src={url} alt={name} loading="lazy" />
+          </a>
+        )}
+        {media === 'video' && (
+          /* eslint-disable-next-line jsx-a11y/media-has-caption -- A published artifact is one file
+             and the route that serves it has no way to name a companion, so there is no track to
+             attach; the Files pane, which can see the folder, loads a sidecar WebVTT when the owner
+             has put one beside the video. `preload="metadata"` because a turn that produced ten
+             clips must not pull ten files down as the transcript scrolls past them. */
+          <video
+            className="artifact-media"
+            controls
+            preload="metadata"
+            src={url}
+            aria-label={name}
+          />
+        )}
+        {media === 'audio' && (
+          /* eslint-disable-next-line jsx-a11y/media-has-caption -- Same file, same route, same
+             absence of anywhere to carry a transcript of it. */
+          <audio
+            className="artifact-media"
+            controls
+            preload="metadata"
+            src={url}
+            aria-label={name}
+          />
+        )}
         {url && mimeType === 'application/pdf' && (
           <div className="pdf-review-card">
             <iframe src={`${url}#toolbar=0&navpanes=0`} title={event.summary} />
           </div>
         )}
-        <div className={`artifact-card ${mimeType.startsWith('image/') ? 'with-preview' : ''}`}>
-          {url && mimeType.startsWith('image/') ? (
-            <a className="artifact-thumb" href={url} target="_blank" rel="noreferrer">
-              <img src={url} alt={name} loading="lazy" />
-            </a>
-          ) : (
-            <FileOutput />
-          )}
+        <div className="artifact-card">
+          <FileOutput />
           <div>
             <strong>{name}</strong>
             <span>
@@ -671,16 +785,30 @@ function Event({
               {size ? ` · ${size}` : ''}
             </span>
           </div>
+          {/*
+            The same three verbs, in the same order and wearing the same icons, as the file preview
+            in the Files pane: show it where the files are, open it full size, take a copy. The card
+            used to offer "Files", which opened the pane at whatever folder it happened to be
+            showing, and "Open", which for anything the route will not render inline downloads the
+            file — so two of the three controls did the same thing and the first did not do its job.
+          */}
           <span className="artifact-actions">
-            {onOpenSurface && <button onClick={() => onOpenSurface('files')}>Files</button>}
-            {url && (
-              <a href={url} target="_blank" rel="noreferrer">
-                Open
+            {artifactId && onOpenFile && (
+              <button title={`Show ${name} in Files`} onClick={() => onOpenFile({ artifactId })}>
+                <Archive /> Files
+              </button>
+            )}
+            {/* Only where the route answers `content-disposition: inline`. Everywhere else a new
+                tab is a download with extra steps, which is the button beside it. Audio is left
+                out because the player above is already the whole of it. */}
+            {url && (media === 'image' || media === 'video' || mimeType === 'application/pdf') && (
+              <a href={url} target="_blank" rel="noreferrer" title={`Open ${name} at full size`}>
+                <ExternalLink /> Open
               </a>
             )}
             {url && (
               <a href={url} download={name}>
-                Download
+                <Download /> Download
               </a>
             )}
           </span>
@@ -808,6 +936,11 @@ function Event({
               </div>
             </details>
           )}
+          {/* What the turn left behind on the machine, which the card could never say. It was
+              computed for the rewind dialog and reachable only by opening the control that offers
+              to destroy the turn, so the one place it was never shown was the one place a reader
+              is deciding whether to trust the work. */}
+          {computerChanges && <span className="completion-computer">{computerChanges}</span>}
           {/* The one thing a step-limited turn needs to hand over: what it did not get to. It is
               open rather than folded away, because it is the reason this card is not a result. */}
           {card.outstanding.length > 0 && (
@@ -879,6 +1012,22 @@ function Event({
 }
 
 /**
+ * Whether anything is moving, and how it stopped when it is not.
+ *
+ * One spinner for "not terminal" and one tick for everything else, which meant a run that failed
+ * wore the same mark as a verified one, directly above the word that said so. Only the live group
+ * answers for the conversation; every earlier group is finished by construction.
+ */
+function ActivityIcon({ status, live }: { status: string; live: boolean }) {
+  if (!live) return <CheckCircle2 />;
+  if (taskIsGenerating(status)) return <LoaderCircle className="spin" />;
+  if (status === 'failed') return <AlertTriangle />;
+  if (status === 'completed') return <CheckCircle2 />;
+  // Stopped, or parked on the owner or on the box: work outstanding either way.
+  return <Hourglass />;
+}
+
+/**
  * `overview`, `settled` and `planSequence` are derived from the whole event log, which is why they
  * are passed in rather than computed here: every group would otherwise re-derive them from the
  * full array on every frame of a streaming answer.
@@ -890,7 +1039,8 @@ function ActivityLog({
   settled,
   planSequence,
   live,
-  onOpenSurface
+  onOpenSurface,
+  onOpenFile
 }: {
   task: Task;
   events: ActivityEntry[];
@@ -900,6 +1050,7 @@ function ActivityLog({
   /** Whether this is the group the agent is working in right now. */
   live: boolean;
   onOpenSurface?: (surface: Surface) => void;
+  onOpenFile?: (request: FileRequest) => void;
 }) {
   const terminal = terminalTaskStatuses.has(task.status);
   const [open, setOpen] = useState(false);
@@ -911,7 +1062,9 @@ function ActivityLog({
   const line = activityLine({
     progress: progress && !terminal ? progress : null,
     overview,
-    steps: events.length,
+    // Entries, minus the ones that are not steps: a folded run of narration is a block of the
+    // model's prose filed here, and counting it would make a finished log claim work it never did.
+    steps: events.filter(({ event }) => event.kind !== 'assistant_delta').length,
     live
   });
   return (
@@ -922,7 +1075,7 @@ function ActivityLog({
     >
       <summary>
         <span className="task-activity-icon">
-          {live && !terminal ? <LoaderCircle className="spin" /> : <CheckCircle2 />}
+          <ActivityIcon status={task.status} live={live} />
         </span>
         <span className="task-activity-copy">
           <strong>{live && !terminal ? 'Agent activity' : 'Work log'}</strong>
@@ -965,6 +1118,7 @@ function ActivityLog({
               settled={settled(event)}
               {...(call ? { call } : {})}
               {...(onOpenSurface ? { onOpenSurface } : {})}
+              {...(onOpenFile ? { onOpenFile } : {})}
             />
           ))}
         </div>
@@ -1234,13 +1388,15 @@ export function Timeline({
   earlierLoading = false,
   onLoadEarlier,
   onOpenSurface,
+  onOpenFile,
   onOpenPreview,
   onOpenTask,
   onOpenSpendCaps,
   onBranch,
   onEdit,
   onRetry,
-  onStarter
+  onStarter,
+  turnChanges
 }: {
   task: Task | undefined;
   tasks?: Task[];
@@ -1252,6 +1408,12 @@ export function Timeline({
   earlierLoading?: boolean;
   onLoadEarlier?: () => void;
   onOpenSurface?: (surface: Surface) => void;
+  /**
+   * Points the Files pane at one file the transcript named, without the conversation leaving the
+   * screen. The panel keeps all four panes alive, so this is a change of what one of them is
+   * showing rather than a navigation.
+   */
+  onOpenFile?: (request: FileRequest) => void;
   onOpenPreview?: (previewId: string) => void;
   onOpenTask?: (taskId: string) => void;
   /** Where a run stopped by a spending ceiling sends the owner, since only they can raise it. */
@@ -1260,6 +1422,12 @@ export function Timeline({
   onEdit?: (event: TaskEvent) => void;
   onRetry?: (event: TaskEvent) => void;
   onStarter?: (prompt: string) => void;
+  /**
+   * What one finished turn did to the files, named by the completion it belongs to. Asked for
+   * above, where the client's requests are made, and only ever for the newest completion — the
+   * box measures the tree as it stands now, so an older turn's answer would be somebody else's.
+   */
+  turnChanges?: { eventId: string; line: string };
 }) {
   const status = task?.status ?? 'queued';
   const [revealed, setRevealed] = useState(VISIBLE_NODE_WINDOW);
@@ -1504,6 +1672,7 @@ export function Timeline({
                 planSequence={transcript.planSequence}
                 live={node.id === lastActivityId}
                 {...(onOpenSurface ? { onOpenSurface } : {})}
+                {...(onOpenFile ? { onOpenFile } : {})}
               />
             ) : null;
           if (node.kind === 'handoff')
@@ -1539,6 +1708,7 @@ export function Timeline({
                 event={node.event}
                 compactCompletion
                 {...(node.harness ? { harness: node.harness } : {})}
+                {...(turnChanges?.eventId === node.id ? { computerChanges: turnChanges.line } : {})}
               />
             );
           return (
@@ -1549,6 +1719,7 @@ export function Timeline({
                 ? { resolution: node.resolution }
                 : {})}
               {...(onOpenSurface ? { onOpenSurface } : {})}
+              {...(onOpenFile ? { onOpenFile } : {})}
               {...(onOpenPreview ? { onOpenPreview } : {})}
             />
           );

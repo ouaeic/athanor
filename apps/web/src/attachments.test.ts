@@ -5,6 +5,7 @@ import {
   attachmentTrailer,
   fileKindLabel,
   imageMimeType,
+  inlineMediaKind,
   isImageAttachment,
   MAX_ATTACHMENT_BYTES,
   MAX_ATTACHMENT_COUNT,
@@ -208,5 +209,38 @@ describe('sending a voice note for transcription', () => {
 
   it('does not care how the browser cased it', () => {
     expect(voiceNoteExtension('AUDIO/MP4')).toBe('m4a');
+  });
+});
+
+/*
+ * The card in the transcript drew an `<img>` around anything whose type began `image/`, and the
+ * route it pointed at answers `application/octet-stream` with `content-disposition: attachment` for
+ * everything outside its own allowlist - because the type on an artifact is a free-form string the
+ * agent supplied, and a page it read may have chosen that string. A photo published from a phone as
+ * `image/heic`, or a chart saved as SVG, arrived as a broken image frame in the conversation.
+ */
+describe('which produced files the transcript can show inline', () => {
+  it('gives each family the element it plays in', () => {
+    expect(inlineMediaKind('image/png')).toBe('image');
+    expect(inlineMediaKind('audio/mpeg')).toBe('audio');
+    expect(inlineMediaKind('video/mp4')).toBe('video');
+  });
+
+  it('does not draw a frame around bytes the route will hand back as a download', () => {
+    // Both are `image/*`; neither is on the serving route's inline allowlist.
+    expect(inlineMediaKind('image/svg+xml')).toBeUndefined();
+    expect(inlineMediaKind('image/heic')).toBeUndefined();
+  });
+
+  it('leaves the files that are opened rather than played to the card', () => {
+    expect(inlineMediaKind('application/pdf')).toBeUndefined();
+    expect(inlineMediaKind('text/plain')).toBeUndefined();
+    expect(inlineMediaKind('application/octet-stream')).toBeUndefined();
+  });
+
+  it('reads the type the way the server does, parameters and casing included', () => {
+    expect(inlineMediaKind('IMAGE/PNG')).toBe('image');
+    expect(inlineMediaKind('audio/mp4; codecs="mp4a.40.2"')).toBe('audio');
+    expect(inlineMediaKind('')).toBeUndefined();
   });
 });

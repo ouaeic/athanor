@@ -63,6 +63,7 @@ import type {
   BotWall,
   DesktopSnapshot,
   FileEntry,
+  FileTarget,
   Workspace,
   WorkspacePreview
 } from './types.js';
@@ -406,7 +407,16 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
   };
 }
 
-function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive: boolean }) {
+function Files({
+  workspace,
+  taskIsActive,
+  target
+}: {
+  workspace: Workspace;
+  taskIsActive: boolean;
+  /** One file the transcript asked to be shown here, stamped so the same one can be asked twice. */
+  target?: FileTarget;
+}) {
   const [path, setPath] = useState('workspace');
   const [entries, setEntries] = useState<FileEntry[]>([]);
   /*
@@ -478,6 +488,16 @@ function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive
    * workspace. The owner had no way to tell that their finished work was still there.
    */
   const [artifactsUnavailable, setArtifactsUnavailable] = useState(false);
+  /**
+   * The saved result the transcript sent the owner here to see.
+   *
+   * A fixed copy has no path in the tree — its bytes live under a storage key — so "open it at that
+   * file" can only mean the row in the library below. Held rather than scrolled-to-and-forgotten
+   * because thirty rows all look alike and the owner arrived looking for one of them.
+   */
+  const [markedArtifact, setMarkedArtifact] = useState('');
+  /** A file the transcript pointed at that the agent has since moved or deleted. */
+  const [missingFile, setMissingFile] = useState('');
   const input = useRef<HTMLInputElement>(null);
   const nameInput = useRef<HTMLInputElement>(null);
   const undo = useUndo();
@@ -507,7 +527,7 @@ function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive
     }
   };
   const loadArtifacts = () =>
-    void api
+    api
       .artifacts(workspace.id)
       .then((next) => {
         setArtifacts(next);
@@ -519,7 +539,7 @@ function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive
       });
   useEffect(() => {
     void load('workspace');
-    loadArtifacts();
+    void loadArtifacts();
   }, [workspace.id]);
   useEffect(
     () => () => {
@@ -535,7 +555,14 @@ function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive
     },
     [preview?.url, preview?.captionsUrl, preview?.downloadUrl]
   );
-  const open = async (entry: FileEntry) => {
+  /*
+   * `listing` is the folder this file was found in, and it defaults to what is on screen because
+   * that is where a click comes from. It is passed explicitly when the pane was pointed at a file
+   * by the transcript: the listing was fetched moments earlier and React has not committed it yet,
+   * so reading `entries` there would search the folder the owner was looking at before, and a video
+   * opened that way would silently lose its companion captions.
+   */
+  const open = async (entry: FileEntry, listing: FileEntry[] = entries) => {
     if (entry.type === 'directory') return load(entry.path);
     setListingError('');
     const bytes = await api.file(workspace.id, entry.path).catch((cause: unknown) => {
@@ -554,7 +581,7 @@ function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive
     if (shown.kind === 'media') {
       const stem = entry.name.replace(/\.[^.]+$/, '');
       const captionEntry = shown.mime.startsWith('video/')
-        ? entries.find(
+        ? listing.find(
             (candidate) =>
               candidate.type === 'file' &&
               (candidate.name === `${stem}.vtt` ||
@@ -596,6 +623,95 @@ function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive
     );
   };
 
+  /**
+   * The pane, pointed at one file the owner clicked on in the conversation.
+   *
+   * Its folder first, then the file, because a preview with no listing behind it leaves the owner
+   * nowhere to go when they close it. A file the agent has since moved or deleted says so on the
+   * pane's own error line rather than opening the wrong thing or nothing at all.
+   */
+  const openAt = async (asked: string) => {
+    /*
+     * Where the file actually landed, which is not always where the model said to put it.
+     *
+     * The runner resolves a bare or relative name under `workspace/`
+     * (`assertUserDataPath`, services/workspace-runner/src/files.ts), and the transcript carries
+     * the argument the model wrote rather than the path the write resolved to. `file_write` with
+     * `notes.md` - which the tool's own schema invites - therefore arrives here as `notes.md` and
+     * would be looked for in a listing where every entry is `workspace/notes.md`, sending the
+     * owner to "not on the agent computer any more" about a file sitting in the folder that was
+     * just listed. Same rule as the worker applies before it spends anything on a generation.
+     */
+    const wanted =
+      asked.startsWith('workspace/') || asked.startsWith('.athanor/')
+        ? asked
+        : `workspace/${asked}`;
+    const folder = wanted.slice(0, wanted.lastIndexOf('/')) || 'workspace';
+    setLoading(true);
+    setNaming(undefined);
+    setMissingFile('');
+    try {
+      const listing = (await api.files(workspace.id, folder)).entries;
+      setEntries(listing);
+      setPath(folder);
+      setPreview(undefined);
+      setEdit(undefined);
+      setListingError('');
+      const entry = listing.find((item) => item.path === wanted);
+      if (!entry) {
+        /*
+         * A banner over the folder, not the pane's listing-failure state.
+         *
+         * That state replaces the whole listing with "this device could not read the listing",
+         * which here would be a false statement about a listing that was just read successfully -
+         * and it would take away the folder the file used to be in, which is the one useful thing
+         * left to show someone whose file the agent has since moved or deleted.
+         */
+        setMissingFile(`${wanted} is not on the agent computer any more.`);
+        return;
+      }
+      await open(entry, listing);
+    } catch (cause) {
+      setEntries([]);
+      setListingError(describeFailure(cause, `Couldn’t open ${wanted}`));
+    } finally {
+      setLoading(false);
+    }
+  };
+  /*
+   * The transcript asking for a file, obeyed once per ask.
+   *
+   * Keyed on the stamp rather than on the request, so clicking the same file twice - after the
+   * owner has wandered off into another folder in between - moves the pane both times.
+   */
+  const askedFor = target?.nonce;
+  useEffect(() => {
+    if (!target) return;
+    if ('artifactId' in target) {
+      // A fixed copy lives in the library under the listing, so the listing has to be what is on
+      // screen for it to be reachable at all.
+      setPreview(undefined);
+      setMissingFile('');
+      setMarkedArtifact(target.artifactId);
+      // Refetched because the artifact the owner just clicked was published seconds ago, after this
+      // pane last asked - the commonest case for this button is the card at the end of a turn.
+      void loadArtifacts();
+      return;
+    }
+    setMarkedArtifact('');
+    void openAt(target.path);
+  }, [askedFor]);
+  /*
+   * Brought into view once the row exists, which is a render later than the request when the
+   * library had to be refetched to find it.
+   */
+  useEffect(() => {
+    if (markedArtifact)
+      document
+        .getElementById(`artifact-row-${markedArtifact}`)
+        ?.scrollIntoView({ block: 'nearest' });
+  }, [markedArtifact, artifacts]);
+
   /** The file goes back through the same diff an overwriting upload already has to pass. */
   const saveEdit = async (next: string) => {
     if (!edit) return;
@@ -612,6 +728,19 @@ function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive
       setSaving(false);
     }
   };
+  /*
+   * The thirty most recent, and the one that was asked for.
+   *
+   * The list has always been capped, which is fine for browsing and wrong for arriving: a card from
+   * a conversation a fortnight old sends the owner to a library where its own row was cut off, and
+   * the pane would have said nothing about why. The asked-for row goes first, where they are looking.
+   */
+  const recentArtifacts = artifacts.slice(0, 30);
+  const askedArtifact =
+    markedArtifact && !recentArtifacts.some((item) => item.id === markedArtifact)
+      ? artifacts.find((item) => item.id === markedArtifact)
+      : undefined;
+  const listedArtifacts = askedArtifact ? [askedArtifact, ...recentArtifacts] : recentArtifacts;
   const parent = path.split('/').slice(0, -1).join('/') || 'workspace';
   const submitName = async () => {
     if (!naming) return;
@@ -764,9 +893,9 @@ function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive
           </button>
         </form>
       )}
-      {uploadError && (
+      {(uploadError || missingFile) && (
         <div className="form-error" role="alert">
-          {uploadError}
+          {uploadError || missingFile}
         </div>
       )}
       {/*
@@ -920,6 +1049,24 @@ function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive
                   <Save />
                 </button>
               </>
+            )}
+            {/*
+              The same verb, the same icon and the same place in the row as the card in the
+              conversation: show it, open it full size, take a copy. The pane bounds a picture or a
+              clip to the space it has, exactly as the transcript does, and until now it was the one
+              of the two with no way out of that bound.
+            */}
+            {preview.url && (
+              <a
+                className="icon-btn"
+                href={preview.url}
+                target="_blank"
+                rel="noreferrer"
+                aria-label={`Open ${preview.name} at full size`}
+                title="Open at full size"
+              >
+                <ExternalLink />
+              </a>
             )}
             <button
               className="icon-btn"
@@ -1079,8 +1226,12 @@ function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive
                 <p className="eyebrow">Saved results</p>
                 <small>Fixed copies of finished work. The editable originals are above.</small>
               </div>
-              {artifacts.slice(0, 30).map((artifact) => (
-                <div className="deliverable-row" key={artifact.id}>
+              {listedArtifacts.map((artifact) => (
+                <div
+                  className={`deliverable-row${artifact.id === markedArtifact ? ' marked' : ''}`}
+                  id={`artifact-row-${artifact.id}`}
+                  key={artifact.id}
+                >
                   <File />
                   <span>
                     <strong>{artifact.name}</strong>
@@ -2244,7 +2395,8 @@ export function Inspector({
   wall,
   hidden: away = false,
   onTab,
-  taskIsActive = false
+  taskIsActive = false,
+  openFile
 }: {
   workspace: Workspace | undefined;
   initialTab: Tab;
@@ -2262,6 +2414,13 @@ export function Inspector({
   onTab?: (tab: Tab) => void;
   /** Whether the agent is working right now, which is what makes Files open on Recent. */
   taskIsActive?: boolean;
+  /**
+   * A file the conversation asked to be shown here.
+   *
+   * The window chooses the Files tab in the same click, so this never has to reach a pane that has
+   * not been built: the tab change is what builds it.
+   */
+  openFile?: FileTarget;
 }) {
   const [tab, setTab] = useState<Tab>(initialTab);
   useEffect(() => setTab(initialTab), [initialTab]);
@@ -2360,7 +2519,11 @@ export function Inspector({
             hidden={tab !== id}
           >
             {!opened.current.has(id) ? null : id === 'files' ? (
-              <Files workspace={workspace} taskIsActive={taskIsActive} />
+              <Files
+                workspace={workspace}
+                taskIsActive={taskIsActive}
+                {...(openFile ? { target: openFile } : {})}
+              />
             ) : id === 'computer' ? (
               <Computer
                 workspace={workspace}

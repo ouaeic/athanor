@@ -23,7 +23,6 @@ import {
   WifiOff,
   X
 } from 'lucide-react';
-import { Auth } from './Auth.js';
 import { api, ApiFailure } from './api.js';
 import { BrandMark } from './BrandMark.js';
 import { Approvals, NoticeLog, ScheduleModal } from './TaskModals.js';
@@ -34,12 +33,15 @@ import type {
   Approval,
   Bootstrap,
   CatalogueModel,
+  FileRequest,
+  FileTarget,
   SecurityMode,
   Task,
   TaskEvent,
   TaskRewindPreview
 } from './types.js';
 import { nativeBridge, nativeTarget } from './native.js';
+import { computerChangeLine, turnComputerQuery } from './completion-card.js';
 import { consumeSharedPayload } from './share-target.js';
 import {
   activeBotWall,
@@ -80,7 +82,6 @@ import { followedPane } from './inspector-follow.js';
 import { modelDisplayName } from './model-names.js';
 import type { AgentNotification } from './notice-log.js';
 import { rewindOffer, rewindResultNotice, type TrajectoryDraft } from './rewind.js';
-import { RewindDialog } from './RewindDialog.js';
 import { paneId, panes, shortcutRows, stepPane, windowShortcut, type Pane } from './shortcuts.js';
 import { hostStorageBlocksWork } from './usage-model.js';
 import { composerStrip } from './composer-strip.js';
@@ -110,6 +111,26 @@ const SelfHostedSettings = lazy(() =>
   import('./SelfHostedSettings.js').then(({ SelfHostedSettings: Settings }) => ({
     default: Settings
   }))
+);
+
+/**
+ * Rewind is reached by an explicit click on a control that is itself behind a menu, and it is the
+ * one dialog in the product nobody opens by accident. Behind `lazy` it costs the first paint
+ * nothing, and the fetch it does cost lands while the owner is still reading a dialog that asks
+ * them to confirm undoing a turn.
+ */
+const RewindDialog = lazy(() =>
+  import('./RewindDialog.js').then(({ RewindDialog: Dialog }) => ({ default: Dialog }))
+);
+
+/**
+ * Signing in carries the whole passkey dance - enrolment, the recovery path, the QR hand-off to a
+ * second device - and an owner who is already signed in never needs a byte of it. Behind `lazy` it
+ * leaves the first paint entirely, and the owner who does need it is looking at the splash while it
+ * arrives, which is where they were already waiting for the bootstrap request.
+ */
+const Auth = lazy(() =>
+  import('./Auth.js').then(({ Auth: AuthScreen }) => ({ default: AuthScreen }))
 );
 
 export function App() {
@@ -832,6 +853,21 @@ export function App() {
     },
     [chooseInspectorTab]
   );
+  /**
+   * A file named in the conversation, opened where the owner is already looking.
+   *
+   * One state, not a call into the panel, because the panel is a sibling: the Files pane watches
+   * this the way it watches the workspace it belongs to. The stamp is a count rather than a clock -
+   * two clicks inside the same millisecond are two requests, and the pane has to obey both.
+   */
+  const [fileTarget, setFileTarget] = useState<FileTarget>();
+  const openFileInPane = useCallback(
+    (request: FileRequest) => {
+      setFileTarget((current) => ({ ...request, nonce: (current?.nonce ?? 0) + 1 }));
+      openInspector('files');
+    },
+    [openInspector]
+  );
 
   const task = data?.tasks.find((item) => item.id === taskId);
   const privacyRoute =
@@ -908,6 +944,38 @@ export function App() {
     () => withPendingMessage(events, visiblePending),
     [events, visiblePending]
   );
+  /*
+   * What the finished turn changed on the computer, which is the answer to the question the card
+   * at the end of a turn was never able to answer.
+   *
+   * The box already computes it - a turn takes a restore point before its first call that could
+   * change anything, and the same preview that the rewind dialog reads carries the added, changed
+   * and deleted paths. Until now the only way to that answer was to open the control offering to
+   * destroy the turn. `turnComputerQuery` decides whether asking would be honest at all; a turn
+   * that took no restore point never reaches the network.
+   */
+  const changeQuery = useMemo(
+    () => turnComputerQuery(timelineEvents, task?.status ?? ''),
+    [timelineEvents, task?.status]
+  );
+  const [turnChanges, setTurnChanges] = useState<{ eventId: string; line: string }>();
+  useEffect(() => {
+    setTurnChanges(undefined);
+    if (!taskId || !changeQuery) return;
+    let active = true;
+    void api
+      .taskRewindPreview(taskId, changeQuery.eventId)
+      .then((preview) => {
+        const line = computerChangeLine(preview, changeQuery.fromSequence);
+        // Nothing changed, or the restore point that came back belongs to an earlier turn. Both
+        // are answered with silence rather than a sentence saying so.
+        if (active && line) setTurnChanges({ eventId: changeQuery.eventId, line });
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [taskId, changeQuery?.eventId, changeQuery?.fromSequence]);
   /* What each conversation is called, for the approval card: a request raised in one the owner is
      not looking at has to say which one, and the list is already here. */
   const taskTitles = useMemo(
@@ -2116,7 +2184,12 @@ export function App() {
         )}
       </div>
     );
-  if (auth === 'required' || !data) return <Auth onReady={() => void load()} />;
+  if (auth === 'required' || !data)
+    return (
+      <Suspense fallback={<div className="splash" />}>
+        <Auth onReady={() => void load()} />
+      </Suspense>
+    );
   /*
    * The one thing allowed above the composer, decided once.
    *
@@ -2455,6 +2528,7 @@ export function App() {
               task={task}
               tasks={data.tasks}
               events={timelineEvents}
+              {...(turnChanges ? { turnChanges } : {})}
               missing={missingTask}
               modelName={namedModel}
               earlierAvailable={eventWindow.more}
@@ -2505,6 +2579,7 @@ export function App() {
                 })
               }
               onOpenSurface={(tab) => openInspector(tab)}
+              onOpenFile={openFileInPane}
             />
           </section>
           <Composer
@@ -2589,17 +2664,19 @@ export function App() {
           </nav>
         </main>
         {trajectory && task && (
-          <RewindDialog
-            trajectory={trajectory}
-            onChange={setTrajectory}
-            preview={rewindPreview}
-            promptRef={trajectoryPrompt}
-            taskIsActive={taskIsActive}
-            busy={busy}
-            onConfirm={() => void runTrajectory()}
-            onCancel={() => setTrajectory(undefined)}
-            onOpenRecoveryPoints={() => openSettings('server')}
-          />
+          <Suspense fallback={null}>
+            <RewindDialog
+              trajectory={trajectory}
+              onChange={setTrajectory}
+              preview={rewindPreview}
+              promptRef={trajectoryPrompt}
+              taskIsActive={taskIsActive}
+              busy={busy}
+              onConfirm={() => void runTrajectory()}
+              onCancel={() => setTrajectory(undefined)}
+              onOpenRecoveryPoints={() => openSettings('server')}
+            />
+          </Suspense>
         )}
         {/*
           Built the first time it is asked for and never taken down again.
@@ -2621,6 +2698,7 @@ export function App() {
               hidden={!inspectorOpen}
               onTab={chooseInspectorTab}
               taskIsActive={taskIsActive}
+              {...(fileTarget ? { openFile: fileTarget } : {})}
             />
           </Suspense>
         )}

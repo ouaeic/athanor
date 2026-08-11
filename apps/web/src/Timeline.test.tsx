@@ -106,6 +106,55 @@ describe('a streamed turn on screen', () => {
   });
 });
 
+/*
+ * Fourteen minutes of one live task published 1,015 streamed frames and five consolidated replies,
+ * and the reading column filled with the model talking itself through the job. The frames it never
+ * consolidated are machinery, and this product already has a place for machinery.
+ */
+describe('the model working out loud', () => {
+  const turn = [
+    event(1, 'user_message', 'Cut the background out', { markdown: 'Cut the background out' }),
+    event(2, 'assistant_delta', 'Agent response', {
+      markdown: 'Let me think about what gives the cleanest true result.',
+      append: true
+    }),
+    event(3, 'tool_started', 'Running shell', { tool: 'shell', toolCallId: 'c1' }),
+    event(4, 'tool_result', 'shell finished', { toolCallId: 'c1', result: { exitCode: 0 } }),
+    event(5, 'assistant_delta', 'Agent response', {
+      markdown: 'Background cut, four sizes and a contact sheet.',
+      append: true
+    }),
+    event(6, 'assistant_message', 'Background cut', {
+      markdown: 'Background cut, four sizes and a contact sheet.'
+    })
+  ];
+
+  it('promotes the reply and nothing else', () => {
+    const markup = render(turn);
+    expect(occurrences(markup, '<article class="assistant-message">')).toBe(1);
+    expect(markup).toContain('Background cut, four sizes and a contact sheet.');
+    // Filed in the work log, which is a disclosure that stays shut until somebody opens it.
+    expect(markup).not.toContain('Let me think about');
+    expect(markup).toContain('task-activity');
+  });
+
+  /*
+   * A block of the model's prose is not a step, and a log that counts it claims work it never did.
+   * Read off an earlier group, because the live one shows what the agent is doing instead.
+   */
+  it('does not count itself as a step in a finished group', () => {
+    const markup = render([
+      ...turn,
+      event(7, 'user_message', 'And the favicon', { markdown: 'And the favicon' }),
+      event(8, 'tool_started', 'Running shell', { tool: 'shell', toolCallId: 'c2' }),
+      event(9, 'tool_result', 'shell finished', { toolCallId: 'c2', result: { exitCode: 0 } }),
+      event(10, 'assistant_message', 'Done', { markdown: 'Done.' })
+    ]);
+    expect(markup).toContain('>1 step<');
+    expect(markup).not.toContain('>2 steps<');
+  });
+});
+
 describe('a turn the harness stopped at its step limit', () => {
   const markup = render(
     [
@@ -619,5 +668,185 @@ describe('a question on the transcript', () => {
     expect(markup).toContain('You answered');
     // The dot means "your move", so it cannot still be burning over a question they have answered.
     expect(markup).not.toContain('question-live');
+  });
+});
+
+/*
+ * What the turn made, shown as the thing it is.
+ *
+ * A generated picture used to arrive as a 62x48 thumbnail beside its own file name, and a generated
+ * track or clip as no preview at all, so the only way to find out what athanor had produced was to
+ * leave for a browser tab. The element is chosen from the type the serving route will agree to
+ * render inline rather than from the type the agent wrote down - `image/*` alone put an image frame
+ * around a response the browser had already been told to download.
+ */
+describe('media the turn produced', () => {
+  const artifact = (mimeType: string, name: string): string =>
+    renderToStaticMarkup(
+      <Timeline
+        task={task}
+        events={[
+          event(1, 'artifact', `${name} · version 1`, {
+            artifactId: '00000000-0000-4000-8000-0000000000a1',
+            name,
+            mimeType,
+            sizeBytes: 4096,
+            version: 1
+          })
+        ]}
+        onOpenFile={() => {}}
+      />
+    );
+
+  it('plays a picture, a track and a clip where they were made', () => {
+    expect(artifact('image/png', 'chart.png')).toContain('<img src="/v1/artifacts/');
+    expect(artifact('audio/mpeg', 'read.mp3')).toContain('<audio class="artifact-media"');
+    expect(artifact('video/mp4', 'clip.mp4')).toContain('<video class="artifact-media"');
+  });
+
+  it('bounds the picture and makes the bound worth having', () => {
+    const markup = artifact('image/png', 'chart.png');
+    // The class the stylesheet caps, and the link out of the cap: full size is a tab, not a viewer
+    // of our own.
+    expect(markup).toContain('class="artifact-media"');
+    expect(markup).toContain('Open chart.png at full size');
+  });
+
+  it('does not draw a player around bytes the route hands back as a download', () => {
+    const markup = artifact('image/svg+xml', 'diagram.svg');
+    expect(markup).not.toContain('artifact-media');
+    // The card is still there, with the two things that do work on it.
+    expect(markup).toContain('diagram.svg');
+    expect(markup).toContain('Download</a>');
+    expect(markup).not.toContain('Open</a>');
+  });
+
+  /*
+   * "Files" opened the pane at whatever folder it happened to be showing, and "Open" downloaded
+   * anything the route would not render - so two of three controls did the same thing and the first
+   * did not do its job. The three verbs now match the file preview in the pane, in the same order.
+   */
+  it('offers the same three verbs the Files pane offers', () => {
+    const markup = artifact('image/png', 'chart.png');
+    expect(markup).toContain('Show chart.png in Files');
+    expect(markup.indexOf('Show chart.png in Files')).toBeLessThan(markup.indexOf('Open</a>'));
+    expect(markup.indexOf('Open</a>')).toBeLessThan(markup.indexOf('Download</a>'));
+  });
+
+  it('says nothing about the pane when there is no pane to point at', () => {
+    const markup = renderToStaticMarkup(
+      <Timeline
+        task={task}
+        events={[
+          event(1, 'artifact', 'chart.png · version 1', {
+            artifactId: '00000000-0000-4000-8000-0000000000a1',
+            name: 'chart.png',
+            mimeType: 'image/png',
+            sizeBytes: 10
+          })
+        ]}
+      />
+    );
+    expect(markup).not.toContain('in Files');
+  });
+});
+
+/*
+ * A diff says what changed; it does not say what the file now is, and for anything the agent
+ * renders rather than writes the diff is the least useful view of it there is.
+ */
+describe('a file the agent wrote, reachable in the pane', () => {
+  const written = (onOpenFile?: () => void): string =>
+    renderToStaticMarkup(
+      <ToolEvidence
+        tool="file_write"
+        args={{ path: 'workspace/report.md', content: 'one\ntwo' }}
+        before="one"
+        result={{ sha256: 'abc', sizeBytes: 7 }}
+        stage="result"
+        {...(onOpenFile ? { onOpenFile } : {})}
+      />
+    );
+
+  it('offers the file itself beside the change to it', () => {
+    const markup = written(() => {});
+    expect(markup).toContain('Show workspace/report.md in Files');
+    // Named by the file, not by the path, because the path is already the diff's own heading.
+    expect(markup).toContain('report.md</button>');
+  });
+
+  it('offers nothing when there is nowhere to open it', () => {
+    expect(written()).not.toContain('in Files');
+  });
+});
+
+/*
+ * The two things a finished turn now says out loud: what it left behind on the machine, and how it
+ * actually ended.
+ */
+describe('a finished turn, on the record', () => {
+  const turn = [
+    event(1, 'user_message', 'Rebuild the site', { markdown: 'Rebuild the site' }),
+    event(2, 'tool_started', 'Running file_write', { tool: 'file_write', toolCallId: 'c1' }),
+    event(3, 'completed', 'Task completed', { summary: 'The site is rebuilt.' })
+  ];
+  const completion = turn[2]!.id;
+
+  const withChanges = (
+    turnChanges: { eventId: string; line: string } | undefined,
+    status: Task['status'] = 'completed'
+  ): string =>
+    renderToStaticMarkup(
+      <Timeline
+        task={{ ...task, status }}
+        tasks={[{ ...task, status }]}
+        events={turn}
+        modelName={modelName}
+        {...(turnChanges ? { turnChanges } : {})}
+      />
+    );
+
+  it('puts what changed on disk on the card, in one line', () => {
+    const markup = withChanges({
+      eventId: completion,
+      line: 'On the computer — 2 files added, 1 changed'
+    });
+    expect(markup).toContain('On the computer — 2 files added, 1 changed');
+    // One line, never a file tree: nothing here opens.
+    expect(markup).toContain('completion-computer');
+  });
+
+  it('says nothing about the computer when there is nothing to say', () => {
+    expect(withChanges(undefined)).not.toContain('completion-computer');
+  });
+
+  it('puts it on the completion it belongs to and nowhere else', () => {
+    expect(
+      withChanges({ eventId: turn[0]!.id, line: 'On the computer — 4 files added' })
+    ).not.toContain('On the computer');
+  });
+
+  it('does not call a failed conversation finished in its own work log', () => {
+    // The row in the list said failed while this line said finished, with the provider timeout
+    // that ended it sitting between them.
+    expect(withChanges(undefined, 'failed')).toContain('<small>1 action · failed</small>');
+    expect(withChanges(undefined, 'cancelled')).toContain('<small>1 action · stopped</small>');
+    expect(withChanges(undefined, 'completed')).toContain('<small>1 action · finished</small>');
+  });
+
+  /** The mark on the work log itself, which is the one place a whole run is summed up in a glyph. */
+  const logIcon = (status: Task['status']): string =>
+    withChanges(undefined, status).match(/task-activity-icon"><svg[^>]*class="([^"]*)"/)?.[1] ?? '';
+
+  it('does not put a tick on a run that failed, over the word that says it failed', () => {
+    expect(logIcon('failed')).toContain('triangle-alert');
+    expect(logIcon('completed')).toContain('circle-check');
+    expect(logIcon('cancelled')).toContain('hourglass');
+  });
+
+  it('stops the work log spinning over a conversation that is waiting for its owner', () => {
+    expect(logIcon('running')).toContain('spin');
+    expect(logIcon('awaiting_user')).not.toContain('spin');
+    expect(logIcon('paused')).not.toContain('spin');
   });
 });

@@ -163,3 +163,30 @@ describe('the panel with no workspace to show', () => {
     expect(offline).toContain('The agent computer is not answering');
   });
 });
+
+/*
+ * A file named in the conversation, opened where the owner is already looking.
+ *
+ * The pane is pointed at a file by a prop rather than by a call into the panel, because the panel
+ * is a sibling of the transcript rather than something it owns. What can be checked without a DOM
+ * is that arriving with a file already asked for changes nothing about the panel that holds it:
+ * four panes, the ones behind still hidden rather than destroyed, and the conversation untouched.
+ */
+describe('the panel arriving with a file already asked for', () => {
+  const asked = renderToStaticMarkup(
+    <UndoProvider value={createUndoQueue({ onChange: () => undefined, onError: () => undefined })}>
+      <Inspector
+        workspace={workspace}
+        initialTab="files"
+        openFile={{ path: 'workspace/report.md', nonce: 1 }}
+      />
+    </UndoProvider>
+  );
+
+  it('still holds all four panes, and still builds only the one being looked at', () => {
+    for (const id of ['files', 'computer', 'terminal', 'preview'])
+      expect(asked).toContain(`id="inspector-panel-${id}"`);
+    expect(asked).toContain('files-pane');
+    expect(asked).not.toContain('terminal-pane');
+  });
+});

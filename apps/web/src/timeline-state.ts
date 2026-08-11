@@ -116,6 +116,21 @@ const waitingOn = (events: TaskEvent[]): string => {
   return 'Waiting for you';
 };
 
+/**
+ * How a conversation ended, in the word for the ending it actually had.
+ *
+ * Every one of these used to read "finished", because the line asked whether anything was still
+ * running rather than how it stopped. Observed: "18 actions · 12 AI turns · finished" over a
+ * provider timeout, on a conversation whose own row in the list said failed - two answers to one
+ * question on one screen, and the confident one was wrong. Nothing is running is true of all three
+ * and is not what a reader is asking.
+ */
+const endingWords: Record<string, string> = {
+  completed: 'finished',
+  failed: 'failed',
+  cancelled: 'stopped'
+};
+
 export const activityOverview = (taskStatus: string, events: TaskEvent[]): string => {
   let actionCount = 0;
   let turnCount = 0;
@@ -124,11 +139,15 @@ export const activityOverview = (taskStatus: string, events: TaskEvent[]): strin
     else if (event.kind === 'cost') turnCount += 1;
   }
   if (terminalTaskStatuses.has(taskStatus)) {
+    // A terminal status with no word of its own gets the one thing that is certainly true of it.
+    const ending = endingWords[taskStatus] ?? 'ended';
     const parts = [
       actionCount ? `${actionCount} ${actionCount === 1 ? 'action' : 'actions'}` : '',
       turnCount ? `${turnCount} AI ${turnCount === 1 ? 'turn' : 'turns'}` : ''
     ].filter(Boolean);
-    return parts.length ? `${parts.join(' · ')} · finished` : 'Finished';
+    return parts.length
+      ? `${parts.join(' · ')} · ${ending}`
+      : `${ending[0]!.toUpperCase()}${ending.slice(1)}`;
   }
   // `awaiting_user` covers two different waits now, and reading "Waiting for your approval" over a
   // question with three options offered is worse than saying nothing: it sends the owner looking for
@@ -231,6 +250,73 @@ const conversationalKinds = new Set([
   'question_asked',
   'completed'
 ]);
+
+/**
+ * What a folded run of narration is called in the work log, in the register of the rows beside it.
+ */
+export const NARRATION_SUMMARY = 'Thinking out loud';
+
+/** A run of streamed frames ends here, unclassified, and whatever it holds stays an answer. */
+const closesStream = new Set([
+  // The consolidated reply. Its arrival is the whole test: the worker publishes one for every step
+  // whose content the owner is meant to read, so a run it closes is an answer by construction.
+  'assistant_message',
+  'user_message',
+  'queued_message',
+  'question_asked',
+  'completed'
+]);
+
+/**
+ * The streamed frames that are the model working out loud rather than answering.
+ *
+ * Measured on one live task: 1,015 `assistant_delta` frames against 29 `assistant_reasoning`, for
+ * five consolidated replies. The model was putting its deliberation in the content channel - "let
+ * me think about what gives the cleanest true result", and worse - and this client promotes content
+ * as the answer, so the owner's reading column filled with it and the five real replies were buried.
+ * The contract now says where thinking goes; a model will narrate anyway, and this is what stops
+ * the narration being promoted.
+ *
+ * The rule is the one the client can actually apply, from evidence it already holds. A run of
+ * frames that the worker went on to consolidate into an `assistant_message` is an answer - that is
+ * exactly what the worker publishes that message for. A run it never consolidated, that ends
+ * because the turn reached for a tool, is prose written between two tool calls, which is narration.
+ * Everything else - a run still arriving, a run the turn ended on - is left alone and reads as an
+ * answer, because the cost of folding a genuine reply away is far higher than the cost of promoting
+ * one paragraph of narration.
+ *
+ * Note what this deliberately does *not* fold: an answer that streams, is consolidated, and is then
+ * followed by more tool calls. That is the ordinary shape of a turn that says something and carries
+ * on working, and it stays an answer.
+ *
+ * What makes that safe is one fact about the other side, and it is worth writing down here because
+ * nothing else joins the two: the worker publishes a step's `assistant_message` *before* it starts
+ * any of that step's tools. So a run this rule folds is never a reply the worker meant to publish
+ * and this client happened to miss - it is a run the worker itself declined to consolidate, which
+ * it does in exactly one case, a step the harness asked for rather than the owner (a rejected
+ * finish, a held plan, an acceptance hold, a failed check, the completion nag). The client is
+ * agreeing with a decision already taken, not taking one. If that emit ever moves after the tool
+ * loop, every answer in the product folds into the work log at once - so if this rule starts
+ * swallowing replies, look there first and not here.
+ */
+export const narratedDeltas = (events: TaskEvent[]): Set<string> => {
+  const narrated = new Set<string>();
+  let run: string[] = [];
+  for (const event of events) {
+    if (event.kind === 'assistant_delta') {
+      run.push(event.id);
+      continue;
+    }
+    if (!run.length) continue;
+    if (event.kind === 'tool_started') {
+      for (const id of run) narrated.add(id);
+      run = [];
+      continue;
+    }
+    if (closesStream.has(event.kind)) run = [];
+  }
+  return narrated;
+};
 
 /**
  * The warnings and errors that are the owner's business rather than the machine's.
@@ -838,6 +924,8 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
    * appear in the transcript nowhere at all. Collected in the pass that is already walking the log.
    */
   const resolvedCalls = new Set<string>();
+  /** Which streamed frames the turn never consolidated into a reply. One pass, read below. */
+  const narrated = narratedDeltas(events);
   for (const event of events) {
     if (event.kind === 'user_message') ranMessages.add(payloadText(event, 'markdown'));
     else if (event.kind === 'tool_result') {
@@ -933,8 +1021,18 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
    * reasoning frame closed the open group and started another.
    */
   let activityAnchor = -1;
+  /**
+   * Where the run of narration being folded is accumulating inside `activity`, or -1.
+   *
+   * One entry for a whole run, not one per frame. A run is hundreds of `assistant_delta` events -
+   * the measured task published 1,015 of them - and filed individually they would be hundreds of
+   * identical rows reading "Agent response", which is the same failure moved one screen across.
+   */
+  let narrationEntry = -1;
   const openActivity = (event: TaskEvent, index: number): void => {
     if (activityAnchor < 0) activityAnchor = nodes.length;
+    // Anything else entering the log ends the run being folded, so the next one is its own block.
+    narrationEntry = -1;
     // The join, done here so that every path into the log gets it - including the repeated browser
     // wall below, which files its result in the group rather than raising a second card.
     const call =
@@ -954,6 +1052,7 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
   };
 
   const flushActivity = (): void => {
+    narrationEntry = -1;
     if (!activity.length) {
       activityAnchor = -1;
       return;
@@ -969,6 +1068,42 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
     if (openThinkingIndex >= at) openThinkingIndex += 1;
     activity = [];
     activityAnchor = -1;
+  };
+
+  /**
+   * Files one frame of narration in the work log rather than in the reading column.
+   *
+   * The text is not dropped - it is the same words, one disclosure away, beside the calls they were
+   * written between. What changes is that they are no longer promoted as the answer to a question
+   * nobody asked here.
+   */
+  const foldNarration = (event: TaskEvent, index: number): void => {
+    const fragment = streamFragment(event);
+    const arriving = fragment === undefined ? assistantMarkdown(event) : fragment;
+    const open = narrationEntry >= 0 ? activity[narrationEntry] : undefined;
+    if (!open) {
+      const opening = arriving.trimStart();
+      if (!opening) return;
+      openActivity({ ...event, summary: NARRATION_SUMMARY, payload: { markdown: opening } }, index);
+      narrationEntry = activity.length - 1;
+      return;
+    }
+    const held = payloadText(open.event, 'markdown');
+    /*
+     * A fragment carries only what arrived since the last frame, so it concatenates. A cumulative
+     * snapshot - what a box predating fragment frames publishes - carries everything so far, so it
+     * supersedes the text it is a longer version of. The same two shapes the answer path merges,
+     * for the same reason: this log is a persistent stream replayed by one client across vintages.
+     */
+    const merged =
+      fragment !== undefined
+        ? `${held}${fragment}`
+        : arriving.startsWith(held) || held.startsWith(arriving)
+          ? arriving.length >= held.length
+            ? arriving
+            : held
+          : `${held}\n\n${arriving}`;
+    activity[narrationEntry] = { ...open, event: { ...open.event, payload: { markdown: merged } } };
   };
 
   /**
@@ -1102,6 +1237,10 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
          * is what left the file diffs unreachable: `DiffView` was rendered from this branch only,
          * and this branch was removed from every finished conversation.
          */
+        // This one path leaves the log untouched, so it has to end the run being folded itself;
+        // everywhere else `openActivity` does it. A start dropped in favour of its own result is
+        // still the turn reaching for a tool, and prose after it is a new block, not a longer one.
+        narrationEntry = -1;
         if (toolCallId && resolvedCalls.has(toolCallId)) return;
         openActivity(event, index);
         return;
@@ -1120,6 +1259,16 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
      * agent's own reasoning and prose are not among them, and no test protected that.
      */
     if (activityBoundary.has(event.kind)) flushActivity();
+
+    /*
+     * Narration is machinery, and the product already has a place for machinery. It is diverted
+     * before the answer branch below, so it never opens or extends an assistant node - which is
+     * what keeps a genuine reply arriving later in the same turn from being welded onto it.
+     */
+    if (event.kind === 'assistant_delta' && narrated.has(event.id)) {
+      foldNarration(event, index);
+      return;
+    }
 
     if (event.kind === 'assistant_reasoning') {
       // Frames append onto the open thinking node, and a new turn opens a new one - the same rule

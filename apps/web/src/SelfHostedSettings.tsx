@@ -43,7 +43,14 @@ import {
   withStepUp,
   type PasskeySummary
 } from './account-security.js';
-import { api, type ProviderSettings } from './api.js';
+import { api, type MemoryItem, type ProviderSettings } from './api.js';
+import type {
+  MediaModalityState,
+  MediaModelChoice,
+  MediaModelOption,
+  MediaModelSelection,
+  MediaSettings
+} from '@athanor/contracts';
 import { webSearchSummary } from './web-search-route.js';
 import { spendLimitsDraft, spendLimitsPatch, type SpendLimitsDraft } from './usage-model.js';
 import { securityModeCopy, securityModeNotice, securityModes } from './security-mode.js';
@@ -100,6 +107,241 @@ export type SettingsPage = 'ai' | 'agent' | 'devices' | 'server';
 const skillTemplate =
   '## When to use\n\nDescribe the trigger.\n\n## Procedure\n\n1. Describe the reliable steps.\n\n## Pitfalls\n\n- Describe common failures.\n\n## Verification\n\n- Describe how to prove the result.\n';
 
+/**
+ * The media catalogue, asked for only when this screen is open on the page that shows it.
+ *
+ * It is not on the bootstrap and not on the provider read, because building it costs the owner's
+ * provider two requests and nothing outside this section has ever needed it. The server holds the
+ * answer for five minutes, so opening Settings twice in a row is one round trip, not two.
+ */
+const mediaSettingsRequest = async (selection?: MediaModelSelection): Promise<MediaSettings> => {
+  const response = await fetch('/v1/media/models', {
+    credentials: 'include',
+    signal: AbortSignal.timeout(45_000),
+    ...(selection
+      ? {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() },
+          body: JSON.stringify(selection)
+        }
+      : {})
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as { error?: { message?: string } };
+    throw new Error(body.error?.message ?? `The media catalogue answered ${response.status}`);
+  }
+  return (await response.json()) as MediaSettings;
+};
+
+const loadMediaSettings = (): Promise<MediaSettings> => mediaSettingsRequest();
+
+/**
+ * Money, to as many places as it actually has and never fewer than two.
+ *
+ * Rounding to cents is wrong on this screen specifically: the reviewed image route is $0.014, and
+ * an owner comparing it against a route ten times the price would read both of them as "$0.01" and
+ * "$0.14" - a difference of one character, for a decision about their own bill.
+ */
+const usd = (value: number): string => `$${value.toFixed(4).replace(/(\.\d{2}\d*?)0+$/, '$1')}`;
+
+/**
+ * What one media route costs, in the unit its provider bills it in.
+ *
+ * A price athanor could not read is said as that and never as zero. This is the sentence the owner
+ * reads before they pick, and the same fact - `priceSource: 'unknown'` - is what makes the agent
+ * raise an approval card on every single generation from that route, so the warning here and the
+ * behaviour there are the same fact rather than two.
+ */
+const mediaPriceLabel = (option: MediaModelOption): string => {
+  if (option.modality === 'audio')
+    return option.usdPerMillionCharacters === null
+      ? 'price not published'
+      : `${usd(option.usdPerMillionCharacters)} per million characters`;
+  return option.usdPerImage === null
+    ? 'price not published'
+    : `${usd(option.usdPerImage)} an image`;
+};
+
+/**
+ * The same three automatic modes, the same encoding and the same words as the composer's model
+ * sheet, because an owner should not have to learn a second vocabulary for the same decision.
+ */
+const mediaSelectValue = (choice: MediaModelChoice): string =>
+  choice.automatic ? `auto:${choice.preference}` : choice.modelId;
+
+const mediaChoiceFromValue = (value: string): MediaModelChoice =>
+  value.startsWith('auto:')
+    ? {
+        automatic: true,
+        preference:
+          (['fast', 'balanced', 'best'] as const).find(
+            (candidate) => candidate === value.slice('auto:'.length)
+          ) ?? 'balanced',
+        modelId: ''
+      }
+    : { automatic: false, preference: 'balanced', modelId: value };
+
+const mediaModalityLabel: Record<string, string> = {
+  image: 'Images',
+  audio: 'Speech',
+  video: 'Video'
+};
+
+/**
+ * One modality's control, or the sentence that says why there is not one.
+ *
+ * A modality with nothing behind it renders its reason where the select would be, rather than an
+ * empty dropdown. Video is always that case and always will be until there is a request shape to
+ * point it at; an image or speech list can also be empty, when the owner's provider offers no
+ * generator with a verified private endpoint and they have asked for private routes only.
+ */
+function MediaModalityRow({
+  entry,
+  choice,
+  onChoose
+}: {
+  entry: MediaModalityState;
+  choice: MediaModelChoice;
+  onChoose: (choice: MediaModelChoice) => void;
+}) {
+  if (!entry.available)
+    return (
+      <p className="web-search-route">
+        <span>{mediaModalityLabel[entry.modality] ?? entry.modality}: not available</span>
+        {entry.reason ? <small>{entry.reason}</small> : null}
+      </p>
+    );
+  return (
+    <label>
+      {mediaModalityLabel[entry.modality] ?? entry.modality}
+      <select
+        value={mediaSelectValue(choice)}
+        onChange={(event) => onChoose(mediaChoiceFromValue(event.target.value))}
+      >
+        <optgroup label="Automatic">
+          <option value="auto:balanced">Recommended</option>
+          <option value="auto:fast">Faster</option>
+          <option value="auto:best">Higher quality</option>
+        </optgroup>
+        <optgroup label="Choose a specific model">
+          {entry.options.map((option) => (
+            // A model that cannot be chosen is still listed with the reason beside it, the way the
+            // composer lists one held back for a licence review: dropping it silently is what makes
+            // an owner think athanor has lost their model.
+            <option key={option.id} value={option.id} disabled={Boolean(option.unavailableReason)}>
+              {option.displayName} · {mediaPriceLabel(option)}
+              {option.unavailableReason ? ` · ${option.unavailableReason}` : ''}
+            </option>
+          ))}
+        </optgroup>
+      </select>
+      {entry.effective ? (
+        <small>
+          Uses {entry.effective.displayName}, {mediaPriceLabel(entry.effective)}
+          {entry.effective.priceSource === 'measured'
+            ? ' — a price athanor measured on this route.'
+            : entry.effective.priceSource === 'unknown'
+              ? ' — so every generation on it asks you first.'
+              : '.'}
+        </small>
+      ) : null}
+    </label>
+  );
+}
+
+/** How many of the agent's own memory rows are fetched at a time. */
+const REMEMBERED_PAGE = 20;
+
+/**
+ * The most the route will put in one answer.
+ *
+ * It has no cursor, so a page is the whole list from the top and the ceiling is real: asking past
+ * it is a rejected request, not a longer list. Offering "Show older" here anyway would be a control
+ * that does nothing, which is worse than the ceiling itself.
+ */
+const REMEMBERED_MAX = 200;
+
+/** The store's tiers are named for how a row was written; these are what the owner reads. */
+const rememberedKindLabel: Record<MemoryItem['kind'], string> = {
+  source: 'Your words',
+  episode: 'Conversation',
+  fact: 'Fact',
+  procedure: 'Procedure'
+};
+
+/**
+ * What the computer wrote down for itself as work finished, and the way to take any of it back.
+ *
+ * The second press lives in the row. Deleting this is the owner acting on their own record on their
+ * own machine - it is not the approval floor and must not wear its clothes, so there is no dialog
+ * and nothing to read twice; the first press only arms the second so a stray tap costs nothing.
+ */
+export function RememberedList({
+  items,
+  more,
+  onShowOlder,
+  onForget
+}: {
+  items: MemoryItem[];
+  /** True while the server may still be holding older rows than the ones asked for. */
+  more: boolean;
+  onShowOlder: () => void;
+  onForget: (item: MemoryItem) => void;
+}) {
+  const [armed, setArmed] = useState<string | null>(null);
+  if (items.length === 0) return null;
+  return (
+    <>
+      <p className="memory-observed-note">
+        Written down on its own as work finished, newest first.{' '}
+        {more ? (
+          <button type="button" className="memory-observed-more" onClick={onShowOlder}>
+            Show older
+          </button>
+        ) : null}
+      </p>
+      <div className="settings-list">
+        {items.map((item) => (
+          <div key={item.id}>
+            <span>
+              <strong>
+                {rememberedKindLabel[item.kind]}
+                {item.status === 'active' ? '' : ` · ${item.status}`}
+              </strong>
+              <small>{item.excerpt}</small>
+              <small>{new Date(item.observedAt).toLocaleString()}</small>
+            </span>
+            {armed === item.id ? (
+              <div className="settings-row-actions">
+                <button
+                  className="danger"
+                  onClick={() => {
+                    setArmed(null);
+                    onForget(item);
+                  }}
+                >
+                  Delete for good
+                </button>
+                <button className="icon-btn" aria-label="Keep it" onClick={() => setArmed(null)}>
+                  <X />
+                </button>
+              </div>
+            ) : (
+              <button
+                className="icon-btn"
+                aria-label="Delete what was remembered"
+                onClick={() => setArmed(item.id)}
+              >
+                <Trash2 />
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
 export function SelfHostedSettings({
   user,
   workspace,
@@ -149,6 +391,14 @@ export function SelfHostedSettings({
   const [memories, setMemories] = useState<WorkspaceMemory[]>([]);
   const [memory, setMemory] = useState('');
   const [memoryTarget, setMemoryTarget] = useState<'workspace' | 'user'>('workspace');
+  const [remembered, setRemembered] = useState<MemoryItem[]>([]);
+  /* This list has no end - a row lands every time a turn finishes - so it is asked for a page at a
+     time and grows only when the owner asks it to. */
+  const [rememberedLimit, setRememberedLimit] = useState(REMEMBERED_PAGE);
+  /* Whether the last answer filled the page it asked for, which is the only sign this server has
+     more. Deriving it from the length on screen instead made deleting one row - which is what this
+     list is for - look like reaching the end of the list. */
+  const [rememberedMore, setRememberedMore] = useState(false);
   const [spendLimitsForm, setSpendLimitsForm] = useState<SpendLimitsDraft>({
     dailyCapUsd: '',
     monthlyCapUsd: '',
@@ -206,6 +456,8 @@ export function SelfHostedSettings({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [media, setMedia] = useState<MediaSettings | null>();
+  const [mediaSelection, setMediaSelection] = useState<MediaModelSelection>({});
 
   const loadProvider = () =>
     void api
@@ -218,6 +470,36 @@ export function SelfHostedSettings({
         setZdr(value.enforceZeroDataRetention);
       })
       .catch(() => setProvider(undefined));
+  /**
+   * Undefined until asked, null when the catalogue could not be read - which is a different thing
+   * from a provider that offers nothing, and is said differently.
+   */
+  const loadMedia = () =>
+    void loadMediaSettings()
+      .then((value) => {
+        setMedia(value);
+        setMediaSelection(
+          Object.fromEntries(
+            value.modalities
+              .filter((entry) => entry.modality !== 'video')
+              .map((entry) => [entry.modality, entry.choice])
+          ) as MediaModelSelection
+        );
+      })
+      .catch(() => setMedia(null));
+  const loadRemembered = (limit: number) => {
+    if (!workspace) return;
+    const asked = Math.min(limit, REMEMBERED_MAX);
+    setRememberedLimit(asked);
+    void api
+      .memoryItems(workspace.id, asked)
+      // A server from before this route existed answers 404, and the list is simply absent.
+      .then((items) => {
+        setRemembered(items);
+        setRememberedMore(items.length >= asked && asked < REMEMBERED_MAX);
+      })
+      .catch(() => undefined);
+  };
   const loadKnowledge = () => {
     if (!workspace) return;
     void Promise.all([api.memories(workspace.id), api.skills(workspace.id)])
@@ -226,6 +508,7 @@ export function SelfHostedSettings({
         setSkills(nextSkills);
       })
       .catch(() => undefined);
+    loadRemembered(rememberedLimit);
   };
   const loadSpendLimits = () =>
     void api
@@ -279,6 +562,7 @@ export function SelfHostedSettings({
 
   useEffect(() => {
     loadProvider();
+    loadMedia();
     loadSpendLimits();
     loadKnowledge();
     loadBrief();
@@ -337,12 +621,30 @@ export function SelfHostedSettings({
     }
   };
 
+  /**
+   * No passkey on this one, matching the route.
+   *
+   * Choosing which model draws a picture moves no credential and authorises no spend: every
+   * generation still meets the cumulative media approval, and a route whose price the provider does
+   * not publish raises that card every single time rather than once in a while. A fingerprint in
+   * front of a dropdown would cost the owner something and buy them nothing.
+   */
+  const saveMedia = () =>
+    act(async () => {
+      const saved = await mediaSettingsRequest(mediaSelection);
+      setMedia(saved);
+      setNotice('Saved. New generations use these models.');
+    });
+
   const saveProvider = () =>
     act(async () => {
       await api.stepUp();
       const saved = await api.saveProvider({
         provider: providerKind,
-        ...(providerKind !== 'openrouter' ? { modelId } : {}),
+        // Sent only when there is one to send. A blank model id used to be impossible - the field
+        // was required for every provider but OpenRouter - and Ollama Cloud no longer requires it,
+        // so an empty string would now reach a route that rejects empty strings.
+        ...(providerKind !== 'openrouter' && modelId.trim() ? { modelId: modelId.trim() } : {}),
         ...(providerKind === 'openai-compatible' ? { baseUrl: providerUrl } : {}),
         ...(providerKey ? { apiKey: providerKey } : {}),
         enforceZeroDataRetention: zdr,
@@ -364,8 +666,15 @@ export function SelfHostedSettings({
       setNotice(
         providerKind === 'openrouter'
           ? 'Key checked with the provider and saved. It is encrypted and will not be shown again.'
-          : `Saved and encrypted. The endpoint listed ${modelId} for this key. Nothing was run against it, so cost and quota are unchecked.`
+          : providerKind === 'ollama-cloud'
+            ? // The endpoint answered the models route with this key attached, and a rejected key
+              // is refused there before anything is written, so "accepted" is what happened. What
+              // did not happen is a completion, which is the only thing that proves quota.
+              'Saved and encrypted. Every model this subscription lists is now in the model picker. Nothing was run against it, so cost and quota are unchecked.'
+            : `Saved and encrypted. The endpoint listed ${modelId} for this key. Nothing was run against it, so cost and quota are unchecked.`
       );
+      // The catalogue this screen offers below belongs to the credential that just changed.
+      loadMedia();
     });
 
   /*
@@ -516,7 +825,7 @@ export function SelfHostedSettings({
               }
             />
           </label>
-          {providerKind !== 'openrouter' && (
+          {providerKind === 'openai-compatible' && (
             <>
               <label>
                 Model ID
@@ -533,6 +842,28 @@ export function SelfHostedSettings({
                 />
               </label>
             </>
+          )}
+          {/*
+            Ollama Cloud asks for nothing but the key now.
+
+            It used to require a model ID and a context window typed by hand, which made a
+            subscription that reaches a whole catalogue behave like a single endpoint serving one
+            model: reaching a second one meant coming back here and retyping. The save route reads
+            the account's own model list and writes all of them, taking each context window from
+            what the endpoint published, so both fields were asking the owner for something the
+            provider already knew.
+          */}
+          {providerKind === 'ollama-cloud' && (
+            <label>
+              Context window <small>only for models that do not publish one</small>
+              <input
+                type="number"
+                min={4096}
+                max={10_000_000}
+                value={contextTokens}
+                onChange={(event) => setContextTokens(Number(event.target.value))}
+              />
+            </label>
           )}
         </div>
         <label className="toggle-line">
@@ -605,14 +936,77 @@ export function SelfHostedSettings({
               (['openrouter', 'ollama-cloud'].includes(providerKind) &&
                 !providerKey &&
                 !(provider?.hasApiKey && provider.provider === providerKind)) ||
-              (providerKind !== 'openrouter' && !modelId) ||
-              (providerKind === 'openai-compatible' && !providerUrl)
+              (providerKind === 'openai-compatible' && (!modelId || !providerUrl))
             }
             onClick={() => void saveProvider()}
           >
             <ShieldCheck /> {busy ? 'Verifying…' : 'Verify and save'}
           </button>
         </div>
+        <hr />
+        {/*
+          Which model makes a picture, and which one speaks.
+
+          Both were constants compiled into the worker until now, so an owner paying a provider for
+          a catalogue of generators had a choice of one of each and no way to see either. The
+          vocabulary is the composer's, deliberately: Recommended, Faster and Higher quality mean
+          here what they mean there. What is different, and is said out loud below rather than
+          implied, is what those words stand on. The chat modes rank on measured benchmarks; no
+          benchmark measures an image model anywhere in the provider feed, so these three read the
+          only column that exists, which is price.
+        */}
+        <div className="section-heading compact">
+          <CloudCog />
+          <div>
+            <strong>Image and speech models</strong>
+            <span>
+              What generate_media uses, and what each one costs. Your provider bills these apart
+              from chat, per image and per character rather than per token.
+            </span>
+          </div>
+        </div>
+        {media === null ? (
+          <p className="web-search-route">
+            <span>The media catalogue could not be read from your provider just now.</span>
+            <small>
+              Generation still works and uses the reviewed routes. Reopen this page to try again.
+            </small>
+          </p>
+        ) : media === undefined ? (
+          <p className="web-search-route">
+            <span>Asking your provider what it can generate…</span>
+          </p>
+        ) : (
+          <>
+            {media.modalities.map((entry) => (
+              <MediaModalityRow
+                key={entry.modality}
+                entry={entry}
+                choice={mediaSelection[entry.modality as 'image' | 'audio'] ?? entry.choice}
+                onChoose={(choice) =>
+                  setMediaSelection({ ...mediaSelection, [entry.modality]: choice })
+                }
+              />
+            ))}
+            <p className="web-search-route">
+              <span>
+                Recommended, Faster and Higher quality order these by price and nothing else.
+              </span>
+              <small>
+                Nothing in your provider’s catalogue measures how good a generated image or voice
+                is, so athanor does not pretend to rank them on it. Above{' '}
+                {usd(media.approvalThresholdUsd)} of generated media in one conversation, every
+                further generation asks you first — and a model whose price your provider does not
+                publish asks every time, because there is no figure to weigh against that.
+              </small>
+            </p>
+            <div className="modal-actions">
+              <button disabled={busy || !provider?.configured} onClick={() => void saveMedia()}>
+                <Save /> Save media models
+              </button>
+            </div>
+          </>
+        )}
         <hr />
         <div className="section-heading compact">
           <CircleDollarSign />
@@ -928,6 +1322,18 @@ export function SelfHostedSettings({
             </div>
           ))}
         </div>
+        <RememberedList
+          items={remembered}
+          more={rememberedMore}
+          onShowOlder={() => loadRemembered(rememberedLimit + REMEMBERED_PAGE)}
+          onForget={(item) =>
+            void act(async () => {
+              if (!workspace) return;
+              await api.deleteMemoryItem(workspace.id, item.id);
+              setRemembered((current) => current.filter((entry) => entry.id !== item.id));
+            })
+          }
+        />
         <hr />
         <div className="section-heading compact">
           <Code2 />

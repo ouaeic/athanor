@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Task, TaskEvent } from './types.js';
+import { terminalTaskStatuses } from './task-status.js';
 import {
   activeBotWall,
   activityLine,
@@ -19,6 +20,8 @@ import {
   liveActivityId,
   mergeTaskEvent,
   mergeTaskEvents,
+  narratedDeltas,
+  NARRATION_SUMMARY,
   previewLifetime,
   reasoningEffortLabel,
   settledToolStarts,
@@ -214,6 +217,39 @@ describe('timeline presentation', () => {
       event(3, 'cost')
     ];
     expect(activityOverview('completed', events)).toBe('1 action · 2 AI turns · finished');
+  });
+
+  it('names the ending it had, rather than calling every ending finished', () => {
+    /*
+     * Observed on a real conversation: "18 actions · 12 AI turns · finished" over a provider
+     * timeout, on a task whose own row said failed. The line was asking whether anything was still
+     * running, which is true of all three of these and is not what anybody reads it for.
+     */
+    const events = [
+      event(1, 'tool_started', { tool: 'shell', toolCallId: 'call-1' }),
+      event(2, 'cost')
+    ];
+    expect(activityOverview('failed', events)).toBe('1 action · 1 AI turn · failed');
+    expect(activityOverview('cancelled', events)).toBe('1 action · 1 AI turn · stopped');
+    expect(activityOverview('completed', events)).toBe('1 action · 1 AI turn · finished');
+    // And with nothing to count, which is the whole line rather than its last word.
+    expect(activityOverview('failed', [])).toBe('Failed');
+    expect(activityOverview('cancelled', [])).toBe('Stopped');
+    expect(activityOverview('completed', [])).toBe('Finished');
+  });
+
+  it('gives every ending the interface knows a word of its own', () => {
+    // The word is chosen per status and the gate is the shared set, so a status added to one and
+    // not the other would quietly go back to describing itself as something it is not.
+    for (const status of terminalTaskStatuses)
+      expect(activityOverview(status, [])).not.toBe('Ended');
+  });
+
+  it('does not call a conversation waiting for its owner finished, or working', () => {
+    const events = [event(1, 'tool_started', { tool: 'shell', toolCallId: 'call-1' })];
+    expect(activityOverview('awaiting_user', events)).toBe('Waiting for you');
+    expect(activityOverview('awaiting_resource', events)).toBe('Waiting for the computer');
+    expect(activityOverview('paused', events)).toBe('Paused');
   });
 
   it('says nothing about a turn that is only thinking, because the thinking node says it', () => {
@@ -971,6 +1007,194 @@ describe('conversation transcript', () => {
     expect(taskStateAnnouncement('Quarterly report', 'completed')).toBe(
       'Quarterly report: Work finished.'
     );
+  });
+});
+
+/*
+ * Measured on the owner's box, on one fourteen-minute task: 1,015 `assistant_delta` frames against
+ * 29 `assistant_reasoning`, twelve model calls, five consolidated replies. The model was writing
+ * its deliberation into the content channel and this client promotes content as the answer, so the
+ * reading column filled with "let me think about what gives the cleanest true result" and the five
+ * real replies were buried in a thousand frames of it.
+ *
+ * The contract now tells the model where thinking goes. These tests are the other half: a model
+ * will narrate anyway, and narration must not be promoted when it does.
+ */
+describe('deliberation the model published as an answer', () => {
+  const narrationOpening = 'Let me think about what gives the cleanest true result. ';
+  const narrationRest = 'A hard cut is arguably cleaner, but might look jaggy at 32px.';
+
+  const midTurnProse = [
+    event(1, 'user_message', { markdown: 'Cut the background out cleanly' }),
+    event(2, 'assistant_delta', { markdown: narrationOpening, append: true }),
+    event(3, 'assistant_delta', { markdown: narrationRest, append: true }),
+    event(4, 'tool_started', { tool: 'shell', toolCallId: 'c1' }),
+    event(5, 'tool_result', { toolCallId: 'c1', result: { exitCode: 0 } }),
+    event(6, 'assistant_delta', { markdown: 'Cut, feathered and decontaminated.', append: true }),
+    event(7, 'assistant_message', { markdown: 'Cut, feathered and decontaminated.' })
+  ];
+
+  it('folds prose written between two tool calls into the work log', () => {
+    const nodes = buildConversation(midTurnProse, 'completed');
+    expect(nodes.map((node) => node.kind)).toEqual(['user', 'activity', 'assistant']);
+    // One answer on screen, and it is the one the turn actually consolidated.
+    expect(nodes.filter((node) => node.kind === 'assistant').map((node) => node.markdown)).toEqual([
+      'Cut, feathered and decontaminated.'
+    ]);
+  });
+
+  it('keeps the words, in the log, beside the calls they were written between', () => {
+    const log = buildConversation(midTurnProse, 'completed').find(
+      (node) => node.kind === 'activity'
+    );
+    const entries = log?.kind === 'activity' ? log.events : [];
+    expect(entries.map((entry) => entry.event.kind)).toEqual(['assistant_delta', 'tool_result']);
+    expect(entries[0]?.event.payload).toEqual({
+      markdown: `${narrationOpening}${narrationRest}`
+    });
+    // Named in the register of the rows beside it, rather than left as the worker's own summary.
+    expect(entries[0]?.event.summary).toBe(NARRATION_SUMMARY);
+  });
+
+  /*
+   * The boundary case, and the one that decides whether this is worth having: an answer that
+   * streams, is consolidated, and is followed by more work is an answer. Folding that away would
+   * cost the owner a genuine reply, which is far worse than promoting a paragraph of narration.
+   */
+  it('leaves a real answer alone when the turn carries on working after it', () => {
+    const nodes = buildConversation(
+      [
+        event(1, 'user_message', { markdown: 'Do it' }),
+        event(2, 'assistant_delta', { markdown: 'Here is the plan, ', append: true }),
+        event(3, 'assistant_delta', { markdown: 'then I will run it.', append: true }),
+        event(4, 'assistant_message', { markdown: 'Here is the plan, then I will run it.' }),
+        event(5, 'tool_started', { tool: 'shell', toolCallId: 'c1' }),
+        event(6, 'tool_result', { toolCallId: 'c1' }),
+        event(7, 'assistant_delta', { markdown: 'It ran clean.', append: true }),
+        event(8, 'assistant_message', { markdown: 'It ran clean.' })
+      ],
+      'completed'
+    );
+
+    expect(nodes.map((node) => node.kind)).toEqual(['user', 'assistant', 'activity', 'assistant']);
+    expect(nodes.filter((node) => node.kind === 'assistant').map((node) => node.markdown)).toEqual([
+      'Here is the plan, then I will run it.',
+      'It ran clean.'
+    ]);
+  });
+
+  it('shows a reply that is still arriving, because nothing yet says it is not one', () => {
+    const nodes = buildConversation(
+      [
+        event(1, 'user_message', { markdown: 'Go' }),
+        event(2, 'assistant_delta', { markdown: 'The contact sheet is ', append: true })
+      ],
+      'running'
+    );
+    expect(nodes.map((node) => node.kind)).toEqual(['user', 'assistant']);
+    expect(nodes[1]).toMatchObject({ markdown: 'The contact sheet is ', streaming: true });
+  });
+
+  it('leaves prose the turn ended on alone, tool call or no tool call', () => {
+    const nodes = buildConversation(
+      [
+        event(1, 'tool_started', { tool: 'shell', toolCallId: 'c1' }),
+        event(2, 'tool_result', { toolCallId: 'c1' }),
+        event(3, 'assistant_delta', { markdown: 'That is as far as I got.', append: true }),
+        event(4, 'completed', { summary: 'Stopped' })
+      ],
+      'cancelled'
+    );
+    expect(nodes.map((node) => node.kind)).toEqual(['activity', 'assistant', 'completion']);
+  });
+
+  /*
+   * A run is hundreds of frames - the measured task published 1,015 of them - so filing one row per
+   * frame would be the same failure moved one screen across: hundreds of identical disclosures
+   * reading "Agent response" in a log nobody could then use.
+   */
+  it('files one entry for a whole run rather than one row per frame', () => {
+    const prose = 'Working out what to try next, at length. '.repeat(30);
+    const frames: TaskEvent[] = [];
+    for (let offset = 0; offset < prose.length; offset += 12)
+      frames.push(
+        event(frames.length + 1, 'assistant_delta', {
+          markdown: prose.slice(offset, offset + 12),
+          append: true
+        })
+      );
+    frames.push(event(frames.length + 1, 'tool_started', { tool: 'shell', toolCallId: 'c1' }));
+    frames.push(event(frames.length + 1, 'tool_result', { toolCallId: 'c1' }));
+
+    const nodes = buildConversation(frames, 'completed');
+    expect(frames.length).toBeGreaterThan(100);
+    expect(nodes.map((node) => node.kind)).toEqual(['activity']);
+    const entries = nodes[0]?.kind === 'activity' ? nodes[0].events : [];
+    expect(entries).toHaveLength(2);
+    // Byte for byte, trailing space and all: a frame boundary routinely lands between two words,
+    // and trimming each fragment on the way in welds the words either side of it together.
+    expect(entries[0]?.event.payload).toEqual({ markdown: prose });
+  });
+
+  /* Two runs, two blocks: the tool call between them is what separates one thought from the next. */
+  it('starts a new block after each tool call rather than one running commentary', () => {
+    const nodes = buildConversation(
+      [
+        event(1, 'assistant_delta', { markdown: 'First, the mask.', append: true }),
+        event(2, 'tool_started', { tool: 'shell', toolCallId: 'c1' }),
+        event(3, 'tool_result', { toolCallId: 'c1' }),
+        event(4, 'assistant_delta', { markdown: 'Now the sizes.', append: true }),
+        event(5, 'tool_started', { tool: 'shell', toolCallId: 'c2' }),
+        event(6, 'tool_result', { toolCallId: 'c2' })
+      ],
+      'completed'
+    );
+    const entries = nodes[0]?.kind === 'activity' ? nodes[0].events : [];
+    expect(entries.map((entry) => entry.event.kind)).toEqual([
+      'assistant_delta',
+      'tool_result',
+      'assistant_delta',
+      'tool_result'
+    ]);
+    expect(entries[2]?.event.payload).toEqual({ markdown: 'Now the sizes.' });
+  });
+
+  /* The event log is persistent, and a box predating fragment frames sends the whole answer each
+     time; concatenating those would file the same sentence a dozen times over. */
+  it('collapses cumulative snapshots the same way the answer path does', () => {
+    const nodes = buildConversation(
+      [
+        event(1, 'assistant_delta', { markdown: 'I will ', replace: true }),
+        event(2, 'assistant_delta', { markdown: 'I will check the size.', replace: true }),
+        event(3, 'tool_started', { tool: 'shell', toolCallId: 'c1' }),
+        event(4, 'tool_result', { toolCallId: 'c1' })
+      ],
+      'completed'
+    );
+    const entries = nodes[0]?.kind === 'activity' ? nodes[0].events : [];
+    expect(entries[0]?.event.payload).toEqual({ markdown: 'I will check the size.' });
+  });
+
+  it('keeps narration out of the conversation somebody copies elsewhere', () => {
+    const copied = conversationMarkdown('Logo', midTurnProse);
+    expect(copied).toContain('Cut, feathered and decontaminated.');
+    expect(copied).not.toContain('Let me think');
+  });
+
+  it('classifies a run by whether the turn consolidated it, and by what ended it', () => {
+    const frame = event(2, 'assistant_delta', { markdown: 'Hmm.', append: true });
+    const started = event(3, 'tool_started', { tool: 'shell', toolCallId: 'c1' });
+    const said = event(3, 'assistant_message', { markdown: 'Hmm.' });
+    // Never consolidated, and the turn reached for a tool: narration.
+    expect([...narratedDeltas([frame, started])]).toEqual([frame.id]);
+    // Consolidated first: an answer, whatever happens afterwards.
+    expect(narratedDeltas([frame, said, started]).size).toBe(0);
+    // Nothing has decided yet, so nothing is folded.
+    expect(narratedDeltas([frame]).size).toBe(0);
+    // A turn boundary decides it too - the next turn's tool call cannot reach back over it.
+    expect(
+      narratedDeltas([frame, event(4, 'user_message', { markdown: 'go on' }), started]).size
+    ).toBe(0);
   });
 });
 
