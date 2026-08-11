@@ -75,7 +75,26 @@ const Config = z.object({
    * the owner's own numbers - this one is a runaway guard, and it was set tight enough to cut off
    * ordinary work instead.
    */
-  TASK_MAX_STEPS: z.coerce.number().int().min(1).max(400).default(120)
+  TASK_MAX_STEPS: z.coerce.number().int().min(1).max(400).default(120),
+  /**
+   * How many times one turn may hand itself another step budget rather than stopping for a reply.
+   *
+   * The ceiling above bounds the work a turn does before the harness takes the last word, and the
+   * handoff it writes says outright that the same task continues on the same computer the moment the
+   * user replies. On a scheduled run at three in the morning there is nobody to send that reply, so
+   * a box with a plan, a saved window and a machine-checkable definition of done stopped because the
+   * interaction model says a turn is a reply - not because anything about the job was finished.
+   *
+   * A renewal is granted only when the harness itself has just run the acceptance record and found
+   * it unsatisfied, and only while the turn is still changing things. It buys steps and nothing else:
+   * `maxComputeCredits` and the owner's spend caps are untouched, so three budgets cost no more than
+   * one - they simply spend the allowance the turn would otherwise have left on the table.
+   *
+   * Two, because the value is in finishing the job that was one budget short, and an agent that will
+   * not stop is far worse than one that stops early. Zero switches it off and restores the old
+   * behaviour exactly; the ceiling of three is a hard bound on how far this can ever be turned up.
+   */
+  TASK_MAX_SELF_CONTINUATIONS: z.coerce.number().int().min(0).max(3).default(2)
 });
 
 export type WorkerConfig = z.infer<typeof Config>;

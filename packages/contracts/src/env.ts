@@ -110,5 +110,19 @@ export const sharedEnv = {
    * budget and the spend caps as well, both of which are the owner's own numbers - this one is a
    * runaway guard, and it was set tight enough to cut off ordinary work instead.
    */
-  TASK_MAX_STEPS: z.coerce.number().int().min(1).max(400).default(120)
+  TASK_MAX_STEPS: z.coerce.number().int().min(1).max(400).default(120),
+  /**
+   * How many times one turn may hand itself another step budget rather than stopping for a reply.
+   *
+   * Shared for the same reason as the ceiling above it: the API embeds a worker on the development
+   * shape and builds it from its own parse of the same control.env, so a key only one of them
+   * declares is a box where the embedded worker and the packaged one behave differently on the
+   * identical file - and here that difference is whether an unattended run stops overnight.
+   *
+   * A renewal is granted only when the harness itself has just run the turn's acceptance record and
+   * found it unsatisfied, and only while the turn is still changing things. It buys steps and
+   * nothing else, so three budgets cost no more than one. Zero restores the old behaviour exactly,
+   * and three is a hard bound on how far it can ever be turned up.
+   */
+  TASK_MAX_SELF_CONTINUATIONS: z.coerce.number().int().min(0).max(3).default(2)
 };

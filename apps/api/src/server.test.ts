@@ -165,6 +165,8 @@ describe('API production boundaries', () => {
       WORKER_POLL_MS: 60_000,
       SCHEDULER_POLL_MS: 1_000,
       TASK_MAX_STEPS: 3,
+      // Off: every expectation in this file describes a turn that stops at its step ceiling.
+      TASK_MAX_SELF_CONTINUATIONS: 0,
       SECURITY_EVENT_RETENTION_DAYS: 30,
       LOG_LEVEL: 'silent',
       OPENROUTER_BASE_URL: 'https://openrouter.ai/api/v1',
@@ -1485,6 +1487,8 @@ const isolatedConfig = (directory: string): ApiConfig => ({
   WORKER_POLL_MS: 60_000,
   SCHEDULER_POLL_MS: 60_000,
   TASK_MAX_STEPS: 3,
+  // Off: every expectation in this file describes a turn that stops at its step ceiling.
+  TASK_MAX_SELF_CONTINUATIONS: 0,
   SECURITY_EVENT_RETENTION_DAYS: 30,
   LOG_LEVEL: 'silent',
   OPENROUTER_BASE_URL: 'https://openrouter.ai/api/v1',

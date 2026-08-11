@@ -198,6 +198,39 @@ export const buildServer = async (config: RunnerConfig) => {
     );
   }
 
+  /*
+   * The services this computer was keeping running, put back before it answers anything.
+   *
+   * Every other thing the runner holds is per-turn state a restart is allowed to lose. A service is
+   * the one thing whose whole promise is that it does not - the unit is `Restart=always`, so a
+   * crash used to take every server the agent had started with it and leave the link it handed the
+   * owner answering nothing. Awaited rather than fired off: a crashed runner has to stop its own
+   * orphans before it starts their replacements, or two copies end up fighting over one port.
+   * Services are only ever started by an agent capability, so they resume under the agent's own
+   * network isolation setting.
+   */
+  const resumed = await processes.resume(
+    config.WORKSPACE_ROOT,
+    config.ISOLATE_AGENT_NETWORK,
+    guards
+  );
+  if (resumed > 0)
+    console.info(
+      `athanor runner: resumed ${resumed} service(s) this computer was keeping running.`
+    );
+
+  /*
+   * Snapshots and checkpoints stop long-running commands so nothing writes into the tree while it
+   * is being rewritten, and services are commands. Without putting them back, "make a recovery
+   * point" would silently take the owner's dashboard down for good - which is the same broken
+   * promise as the hour-long timeout, arriving by a different route. The record survives a rewind
+   * on purpose: it lives in `.athanor/services.json`, outside both `CHECKPOINT_CONTENT` and the
+   * snapshot archive, so restoring yesterday's files cannot un-declare today's service.
+   */
+  const restoreServices = async (root: string, workspaceId: string): Promise<void> => {
+    await processes.resumeWorkspace(root, workspaceId, config.ISOLATE_AGENT_NETWORK, guards);
+  };
+
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(websocket);
   app.addContentTypeParser(
@@ -317,7 +350,9 @@ export const buildServer = async (config: RunnerConfig) => {
       requireScope(request, 'workspace.manage');
       await browser.close(request.params.workspaceId);
       await desktop.close(request.params.workspaceId);
-      processes.stopWorkspace(request.params.workspaceId);
+      // `forget` because the workspace is going: a service must not be restarted into a tree that
+      // no longer exists, and the record itself goes with the `.athanor` directory below.
+      processes.stopWorkspace(request.params.workspaceId, { forget: true });
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await clearAgentOwnedFiles(root);
       await rm(root, { recursive: true, force: true });
@@ -336,13 +371,17 @@ export const buildServer = async (config: RunnerConfig) => {
       processes.stopWorkspace(request.params.workspaceId);
       await browser.close(request.params.workspaceId);
       await desktop.close(request.params.workspaceId);
-      return createSnapshot({
-        snapshotExecutable: config.SNAPSHOT_EXECUTABLE,
-        workspaceRoot: config.WORKSPACE_ROOT,
-        root,
-        workspaceId: request.params.workspaceId,
-        snapshotId: request.body.snapshotId
-      });
+      try {
+        return await createSnapshot({
+          snapshotExecutable: config.SNAPSHOT_EXECUTABLE,
+          workspaceRoot: config.WORKSPACE_ROOT,
+          root,
+          workspaceId: request.params.workspaceId,
+          snapshotId: request.body.snapshotId
+        });
+      } finally {
+        await restoreServices(root, request.params.workspaceId);
+      }
     }
   );
 
@@ -368,13 +407,21 @@ export const buildServer = async (config: RunnerConfig) => {
       processes.stopWorkspace(request.params.workspaceId);
       await browser.close(request.params.workspaceId);
       await desktop.close(request.params.workspaceId);
-      await restoreSnapshot({
-        snapshotExecutable: config.SNAPSHOT_EXECUTABLE,
-        workspaceRoot: config.WORKSPACE_ROOT,
-        root,
-        workspaceId: request.params.workspaceId,
-        snapshotId: request.params.snapshotId
-      });
+      // In a `finally`, like the snapshot and checkpoint routes above and below: a restore that
+      // throws has still stopped the services, and leaving them down is the worse half of the
+      // failure - the owner loses their dashboard as well as their rewind, and nothing brings it
+      // back until the runner next restarts.
+      try {
+        await restoreSnapshot({
+          snapshotExecutable: config.SNAPSHOT_EXECUTABLE,
+          workspaceRoot: config.WORKSPACE_ROOT,
+          root,
+          workspaceId: request.params.workspaceId,
+          snapshotId: request.params.snapshotId
+        });
+      } finally {
+        await restoreServices(root, request.params.workspaceId);
+      }
       return { restored: true };
     }
   );
@@ -426,7 +473,15 @@ export const buildServer = async (config: RunnerConfig) => {
       // leave a mixture of both states. The browser and the desktop are deliberately left running:
       // their profiles are outside what a checkpoint covers, so a rewind cannot disturb them.
       processes.stopWorkspace(request.params.workspaceId);
-      return checkpoints.restore(request.params.workspaceId, root, request.params.checkpointId);
+      try {
+        return await checkpoints.restore(
+          request.params.workspaceId,
+          root,
+          request.params.checkpointId
+        );
+      } finally {
+        await restoreServices(root, request.params.workspaceId);
+      }
     }
   );
 
@@ -509,7 +564,10 @@ export const buildServer = async (config: RunnerConfig) => {
       requireScope(request, 'exec');
       return processes.action(
         request.params.workspaceId,
-        request.capability.sub,
+        // The same split the list above makes, for the same reason - and it matters more here.
+        // A service outlives the task that started it, so a subject-scoped kill meant the owner
+        // could see a service in their panel with no way on this computer to stop it.
+        request.capability.role === 'agent' ? request.capability.sub : null,
         request.params.sessionId,
         request.body
       );

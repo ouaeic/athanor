@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  arrivalLine,
   conversationMatches,
   groupConversations,
   removeTask,
   renameCommit,
   upsertTask
 } from './task-list.js';
+import type { ConversationBucket, ConversationEntry } from './task-list.js';
 import type { Task } from './types.js';
 
 const task = (id: string, createdAt: string, title = id, updatedAt = createdAt): Task =>
@@ -16,9 +18,16 @@ const task = (id: string, createdAt: string, title = id, updatedAt = createdAt):
     title,
     status: 'completed',
     modelId: 'openai/gpt-5',
+    scheduleId: null,
     createdAt,
     updatedAt
   }) as unknown as Task;
+
+/** What a bucket used to hold, so the assertions about ordering read the way they always did. */
+const ids = (bucket: ConversationBucket | undefined): string[] =>
+  (bucket?.entries ?? []).map((entry: ConversationEntry) =>
+    entry.kind === 'conversation' ? entry.task.id : `schedule:${entry.group.scheduleId}`
+  );
 
 describe('groupConversations', () => {
   const now = Date.parse('2026-07-31T15:00:00.000Z');
@@ -28,7 +37,7 @@ describe('groupConversations', () => {
     const fresh = task('fresh', '2026-07-31T08:00:00.000Z');
     const buckets = groupConversations([fresh, old], now);
     expect(buckets[0]?.label).toBe('Today');
-    expect(buckets[0]?.tasks.map((item) => item.id)).toEqual(['old', 'fresh']);
+    expect(ids(buckets[0])).toEqual(['old', 'fresh']);
   });
 
   it('buckets by how recently each was touched and drops empty buckets', () => {
@@ -41,11 +50,7 @@ describe('groupConversations', () => {
       now
     );
     expect(buckets.map((bucket) => bucket.label)).toEqual(['Today', 'Yesterday', 'Earlier']);
-    expect(buckets.map((bucket) => bucket.tasks.map((item) => item.id))).toEqual([
-      ['today'],
-      ['yesterday'],
-      ['ancient']
-    ]);
+    expect(buckets.map(ids)).toEqual([['today'], ['yesterday'], ['ancient']]);
   });
 
   it('does not mutate the list it was given', () => {
@@ -73,7 +78,7 @@ describe('groupConversations', () => {
       now
     );
     expect(buckets.map((bucket) => bucket.label)).toEqual(['Pinned', 'Today']);
-    expect(buckets[0]?.tasks.map((item) => item.id)).toEqual(['kept-later', 'kept']);
+    expect(ids(buckets[0])).toEqual(['kept-later', 'kept']);
   });
 
   it('takes a filed conversation out of the list without touching the rest', () => {
@@ -85,7 +90,136 @@ describe('groupConversations', () => {
       now
     );
     expect(buckets.map((bucket) => bucket.label)).toEqual(['Today']);
-    expect(buckets[0]?.tasks.map((item) => item.id)).toEqual(['today']);
+    expect(ids(buckets[0])).toEqual(['today']);
+  });
+});
+
+/*
+ * A schedule mints a fresh conversation every time it fires. A watcher on a fifteen-minute interval
+ * is ninety-six of them a day, in the same recency order as the owner's own work, which is what put
+ * their work off the bottom of the list by mid-morning.
+ */
+describe('runs of one schedule', () => {
+  const now = Date.parse('2026-07-31T15:00:00.000Z');
+  const run = (id: string, at: string, scheduleId = 'rent-watcher', status = 'completed'): Task =>
+    ({ ...task(id, at, 'Rent watcher'), scheduleId, status }) as Task;
+
+  it('collapses every run into one entry, filed and named by the newest', () => {
+    const buckets = groupConversations(
+      [
+        run('run-1', '2026-07-31T09:00:00.000Z'),
+        run('run-2', '2026-07-30T09:00:00.000Z'),
+        run('run-3', '2026-05-30T09:00:00.000Z'),
+        task('mine', '2026-07-31T10:00:00.000Z')
+      ],
+      now
+    );
+    expect(buckets.map((bucket) => bucket.label)).toEqual(['Today']);
+    expect(ids(buckets[0])).toEqual(['mine', 'schedule:rent-watcher']);
+    const entry = buckets[0]?.entries[1];
+    expect(entry?.kind).toBe('schedule');
+    if (entry?.kind !== 'schedule') throw new Error('expected the collapsed schedule');
+    expect(entry.group.runs.map((item) => item.id)).toEqual(['run-1', 'run-2', 'run-3']);
+    expect(entry.group.latest.id).toBe('run-1');
+    expect(entry.group.title).toBe('Rent watcher');
+  });
+
+  it('keeps two different schedules apart', () => {
+    const buckets = groupConversations(
+      [
+        run('a-1', '2026-07-31T09:00:00.000Z', 'watcher-a'),
+        run('a-2', '2026-07-31T08:00:00.000Z', 'watcher-a'),
+        run('b-1', '2026-07-31T07:00:00.000Z', 'watcher-b'),
+        run('b-2', '2026-07-31T06:00:00.000Z', 'watcher-b')
+      ],
+      now
+    );
+    expect(ids(buckets[0])).toEqual(['schedule:watcher-a', 'schedule:watcher-b']);
+  });
+
+  /* A group of one is a control that hides nothing, so a schedule that has fired once is a row. */
+  it('leaves a schedule that has only run once as an ordinary conversation', () => {
+    const buckets = groupConversations([run('only', '2026-07-31T09:00:00.000Z')], now);
+    expect(ids(buckets[0])).toEqual(['only']);
+  });
+
+  /* Pinning is the owner singling out one conversation, and it still wins over the collapse. */
+  it('holds a pinned run above the dates and leaves it out of the count', () => {
+    const buckets = groupConversations(
+      [
+        { ...run('run-1', '2026-07-31T09:00:00.000Z'), pinned: true },
+        run('run-2', '2026-07-31T08:00:00.000Z'),
+        run('run-3', '2026-07-31T07:00:00.000Z')
+      ],
+      now
+    );
+    expect(buckets.map((bucket) => bucket.label)).toEqual(['Pinned', 'Today']);
+    expect(ids(buckets[0])).toEqual(['run-1']);
+    const entry = buckets[1]?.entries[0];
+    if (entry?.kind !== 'schedule') throw new Error('expected the collapsed schedule');
+    expect(entry.group.runs.map((item) => item.id)).toEqual(['run-2', 'run-3']);
+  });
+
+  it('does not count a filed run, and collapses nothing once only one is left', () => {
+    const buckets = groupConversations(
+      [
+        run('run-1', '2026-07-31T09:00:00.000Z'),
+        { ...run('run-2', '2026-07-31T08:00:00.000Z'), archivedAt: '2026-07-31T09:30:00.000Z' }
+      ],
+      now
+    );
+    expect(ids(buckets[0])).toEqual(['run-1']);
+  });
+});
+
+/*
+ * The owner arrives to a machine that has been working all night. The screen that greets them should
+ * carry the evidence of that rather than ask them what to do — but only when there is evidence.
+ */
+describe('what happened while the owner was away', () => {
+  const run = (id: string, at: string, status = 'completed'): Task =>
+    ({ ...task(id, at, 'Rent watcher'), scheduleId: 'rent-watcher', status }) as Task;
+
+  it('says nothing when nothing ran', () => {
+    expect(arrivalLine([])).toBeUndefined();
+    expect(arrivalLine([task('mine', '2026-07-31T09:00:00.000Z')])).toBeUndefined();
+  });
+
+  it('counts only the runs since the owner last touched their own work', () => {
+    expect(
+      arrivalLine([
+        task('mine', '2026-07-30T22:00:00.000Z'),
+        run('before', '2026-07-30T21:00:00.000Z'),
+        run('after-1', '2026-07-31T02:00:00.000Z'),
+        run('after-2', '2026-07-31T03:00:00.000Z')
+      ])
+    ).toBe('2 scheduled runs finished while you were away.');
+  });
+
+  it('reads as one run rather than as 1 runs', () => {
+    expect(arrivalLine([run('one', '2026-07-31T02:00:00.000Z')])).toBe(
+      '1 scheduled run finished while you were away.'
+    );
+  });
+
+  /* A run holding an approval is the owner's move, so it is the thing worth saying. */
+  it('leads with the runs waiting on the owner, ahead of the ones that failed', () => {
+    expect(
+      arrivalLine([
+        run('waiting', '2026-07-31T02:00:00.000Z', 'awaiting_user'),
+        run('broken', '2026-07-31T03:00:00.000Z', 'failed'),
+        run('fine', '2026-07-31T04:00:00.000Z')
+      ])
+    ).toBe('1 scheduled run needs you.');
+  });
+
+  it('says a run failed when none is waiting on the owner', () => {
+    expect(
+      arrivalLine([
+        run('broken', '2026-07-31T03:00:00.000Z', 'failed'),
+        run('fine', '2026-07-31T04:00:00.000Z')
+      ])
+    ).toBe('1 scheduled run failed while you were away.');
   });
 });
 

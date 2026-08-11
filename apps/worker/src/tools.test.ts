@@ -785,7 +785,17 @@ describe('the size of the catalogue the model is sent', () => {
     // The number moves for a capability and not for prose, which is the distinction this ceiling
     // exists to enforce - and it moves down for an encoding, which is the other half of the same
     // rule.
-    expect(bytes).toBeLessThan(51_900);
+    //
+    // Then raised from 51,900 to 52,200 for services: one `service` field on shell, 174 bytes net
+    // after `background` and `timeoutSeconds` gave back the sentences that are no longer true. It
+    // is a capability by the test above's own definition - a background process was capped at an
+    // hour and lived in a Map, so a link the agent handed the user stopped answering by dinner, and
+    // no wording anywhere could have said otherwise. The field is the only way to reach a process
+    // the computer keeps running (services/workspace-runner/src/services.ts); everything the model
+    // needs to know about the backoff, the crash-loop give-up and the restart record is read back
+    // through `process`, not declared here, which is why it costs a sentence and not a tool.
+    // Measured at 52,055 against it, so the room this leaves is 145 bytes and not a licence.
+    expect(bytes).toBeLessThan(52_200);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
     // union of what twenty-four actions across mail, calendar and repositories accept. Those are

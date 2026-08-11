@@ -259,7 +259,7 @@ export const agentTools: ModelTool[] = [
   {
     name: 'shell',
     description:
-      'Run one executable directly on the user’s persistent Linux computer. Use background=true for servers and long analyses, then use process to inspect or stop them. There is no shell here, so nothing expands: put every argument in args, and when you genuinely need a pipe, a glob or a redirect run `bash -lc` or `python3 -c` and pass the script as one argument.',
+      'Run one executable directly on the user’s persistent Linux computer. Use background=true for long analyses, service as well for a server, then process to inspect or stop them. There is no shell here, so nothing expands: put every argument in args, and when you genuinely need a pipe, a glob or a redirect run `bash -lc` or `python3 -c` and pass the script as one argument.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -273,13 +273,18 @@ export const agentTools: ModelTool[] = [
           minimum: 1,
           maximum: 3600,
           description:
-            'How long the command may run before it is stopped: five minutes by default in the foreground, an hour in the background, and an hour is the ceiling either way.'
+            'How long the command may run before it is stopped: five minutes by default in the foreground, an hour in the background. A service ignores this.'
         },
         background: {
           type: 'boolean',
           default: false,
           description:
-            'Return immediately with a session ID while the process keeps running. It lasts until its timeout, until process(action=kill), or until this computer’s workspace runtime restarts - nothing brings it back after that, so tell the user how long a server you started will answer for.'
+            'Return immediately with a session ID while the process keeps running. It lasts until its timeout or until process(action=kill).'
+        },
+        service: {
+          type: 'string',
+          description:
+            'Name it and the computer keeps it running: no timeout, restarted if it dies, still there after a restart. For anything you hand the user a link to. Needs background=true; process(action=kill) stops it for good.'
         },
         stdin: { type: 'string' },
         maxOutputBytes: {
@@ -307,7 +312,7 @@ export const agentTools: ModelTool[] = [
   {
     name: 'process',
     description:
-      'List, inspect, read logs from, write to, or stop background processes created by shell(background=true). poll and log return the current status and output and come back immediately, so check on a long build or a running server with one of them rather than sleeping or starting the work over.',
+      'List, inspect, read logs from, write to, or stop background processes and services created by shell(background=true). poll and log return the current status and output and come back immediately, so check on a long build or a running server with one of them rather than sleeping or starting the work over. list carries each service’s name, restarts and last exit.',
     parameters: {
       type: 'object',
       additionalProperties: false,

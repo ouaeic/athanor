@@ -26,9 +26,24 @@ export const removeTask = (tasks: Task[], id: string): Task[] =>
 export const lastActivityAt = (task: Task): number =>
   Math.max(Date.parse(task.updatedAt) || 0, Date.parse(task.createdAt) || 0);
 
+/** Every run of one schedule that is currently in the list, folded into a single line. */
+export interface ScheduleGroup {
+  scheduleId: string;
+  /** The name the runs carry, taken from the newest of them. */
+  title: string;
+  /** The runs, newest first. Always more than one: a lone run is just a conversation. */
+  runs: Task[];
+  /** The newest run, whose status and time the collapsed line reports. */
+  latest: Task;
+}
+
+export type ConversationEntry =
+  | { kind: 'conversation'; task: Task }
+  | { kind: 'schedule'; group: ScheduleGroup };
+
 export interface ConversationBucket {
   label: string;
-  tasks: Task[];
+  entries: ConversationEntry[];
 }
 
 /**
@@ -44,6 +59,16 @@ export interface ConversationBucket {
  * that way and said so in the contract, and the client sorted by recency alone, so pinning a
  * conversation moved nothing on the screen the owner was looking at. A filed one leaves the list
  * entirely: it is still open if it is open, still reachable from search, and no longer in the way.
+ *
+ * The third decision is not the owner's, it is the machine's. A schedule mints a fresh conversation
+ * every time it fires, so a watcher on a fifteen-minute interval put ninety-six rows a day into this
+ * order and pushed the owner's own work off the end of the list by mid-morning. Runs of one schedule
+ * collapse into a single entry, filed by the newest of them, so a watcher costs one line whether it
+ * has fired twice or four hundred times. A schedule with exactly one run so far stays an ordinary
+ * conversation: a group of one is a control that hides nothing.
+ *
+ * Pinning still wins. A run the owner pinned is a conversation they singled out, so it is held above
+ * the dates on its own and the count beside its schedule no longer includes it.
  */
 export const groupConversations = (tasks: Task[], now = Date.now()): ConversationBucket[] => {
   const startOfToday = new Date(now);
@@ -52,20 +77,64 @@ export const groupConversations = (tasks: Task[], now = Date.now()): Conversatio
   const yesterday = today - 86_400_000;
   const week = today - 6 * 86_400_000;
   const buckets: ConversationBucket[] = [
-    { label: 'Pinned', tasks: [] },
-    { label: 'Today', tasks: [] },
-    { label: 'Yesterday', tasks: [] },
-    { label: 'This week', tasks: [] },
-    { label: 'Earlier', tasks: [] }
+    { label: 'Pinned', entries: [] },
+    { label: 'Today', entries: [] },
+    { label: 'Yesterday', entries: [] },
+    { label: 'This week', entries: [] },
+    { label: 'Earlier', entries: [] }
   ];
-  for (const task of [...tasks]
+  const ordered = [...tasks]
     .filter((task) => !task.archivedAt)
-    .sort((left, right) => lastActivityAt(right) - lastActivityAt(left))) {
+    .sort((left, right) => lastActivityAt(right) - lastActivityAt(left));
+  const runs = new Map<string, Task[]>();
+  for (const task of ordered) {
+    if (task.pinned || !task.scheduleId) continue;
+    const existing = runs.get(task.scheduleId);
+    if (existing) existing.push(task);
+    else runs.set(task.scheduleId, [task]);
+  }
+  const placed = new Set<string>();
+  for (const task of ordered) {
+    const scheduleId = task.pinned ? null : (task.scheduleId ?? null);
+    const group = scheduleId ? runs.get(scheduleId) : undefined;
+    const collapsed = scheduleId && group && group.length > 1 ? { scheduleId, runs: group } : null;
+    if (collapsed && placed.has(collapsed.scheduleId)) continue;
     const at = lastActivityAt(task);
     const bucket = task.pinned ? 0 : at >= today ? 1 : at >= yesterday ? 2 : at >= week ? 3 : 4;
-    buckets[bucket]!.tasks.push(task);
+    if (collapsed) {
+      placed.add(collapsed.scheduleId);
+      // The first run reached is the newest, because the list is already sorted, so the group is
+      // filed and named by it without a second pass.
+      buckets[bucket]!.entries.push({
+        kind: 'schedule',
+        group: { ...collapsed, title: task.title, latest: task }
+      });
+    } else buckets[bucket]!.entries.push({ kind: 'conversation', task });
   }
-  return buckets.filter((bucket) => bucket.tasks.length > 0);
+  return buckets.filter((bucket) => bucket.entries.length > 0);
+};
+
+/**
+ * What the computer did while nobody was watching, in one sentence, or nothing worth saying.
+ *
+ * The owner arrives to a machine that has been working all night, so the screen that greets them
+ * should carry the evidence of that rather than ask them what to do. "While you were away" is read
+ * from the work itself: anything a schedule ran since the owner last touched a conversation of their
+ * own happened without them. No dashboard, no digest — one line, and only when there is one to say.
+ */
+export const arrivalLine = (tasks: Task[]): string | undefined => {
+  const lastOwnTouch = tasks.reduce(
+    (latest, task) => (task.scheduleId ? latest : Math.max(latest, lastActivityAt(task))),
+    0
+  );
+  const away = tasks.filter((task) => task.scheduleId && lastActivityAt(task) > lastOwnTouch);
+  if (!away.length) return undefined;
+  const runs = (count: number) => `${count} scheduled run${count === 1 ? '' : 's'}`;
+  const waiting = away.filter((task) => task.status === 'awaiting_user').length;
+  if (waiting) return `${runs(waiting)} ${waiting === 1 ? 'needs' : 'need'} you.`;
+  const failed = away.filter((task) => task.status === 'failed').length;
+  if (failed) return `${runs(failed)} failed while you were away.`;
+  return `${runs(away.length)} finished while you were away.`;
 };
 
 export interface ConversationMatch {

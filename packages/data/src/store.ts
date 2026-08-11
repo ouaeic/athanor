@@ -180,6 +180,7 @@ const mapTask = (row: Record<string, unknown>): TaskRecord => {
     parentTaskId: optionalText(row.parent_task_id),
     branchedFromEventId: optionalText(row.branched_from_event_id),
     forkKind: optionalText(row.fork_kind) as TaskRecord['forkKind'],
+    scheduleId: optionalText(row.schedule_id),
     rewindScope: optionalText(row.rewind_scope) as TaskRecord['rewindScope'],
     restoredCheckpointId: optionalText(row.restored_checkpoint_id),
     titleCiphertext: title.ciphertext,
@@ -4321,12 +4322,15 @@ export class DataStore {
         ? input.failureEventCiphertext
         : input.preparingEventCiphertext;
       const taskResult = await tx.query(
+        // The run says where it came from in the same statement that creates it. Anything later -
+        // a second UPDATE, a join through task_schedule_runs at read time - leaves a window where a
+        // run exists without its provenance, and the sidebar reads tasks, not runs.
         `INSERT INTO tasks(
           id,user_id,workspace_id,title,status,model_id,privacy_route,max_compute_credits,
-          prompt_ciphertext,security_mode,completed_at,max_spend_usd
+          prompt_ciphertext,security_mode,completed_at,max_spend_usd,schedule_id
          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,
            (SELECT security_mode FROM workspaces WHERE id=$3),
-           CASE WHEN $5='failed' THEN NOW() ELSE NULL END,$10) RETURNING *`,
+           CASE WHEN $5='failed' THEN NOW() ELSE NULL END,$10,$11) RETURNING *`,
         [
           input.taskId,
           schedule.user_id,
@@ -4337,7 +4341,8 @@ export class DataStore {
           schedule.privacy_route,
           schedule.max_compute_credits,
           JSON.stringify(json(schedule.prompt_ciphertext)),
-          numericOrNull(schedule.max_spend_usd)
+          numericOrNull(schedule.max_spend_usd),
+          input.scheduleId
         ]
       );
       await tx.query(

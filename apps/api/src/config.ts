@@ -85,6 +85,10 @@ const Config = z.object({
   WORKER_POLL_MS: sharedEnv.WORKER_POLL_MS,
   SCHEDULER_POLL_MS: z.coerce.number().int().min(1000).default(15_000),
   TASK_MAX_STEPS: sharedEnv.TASK_MAX_STEPS,
+  // Read here only because the embedded worker is built from this parse of control.env. Without it
+  // the development shape ran a worker that could not be configured at all, and the packaged one
+  // could - on the same file, from the same key.
+  TASK_MAX_SELF_CONTINUATIONS: sharedEnv.TASK_MAX_SELF_CONTINUATIONS,
   SECURITY_EVENT_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(30),
   /**
    * `info` is what an owner reading `athanor logs` wants: lifecycle, scheduled work, and every

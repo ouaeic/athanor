@@ -51,7 +51,10 @@ import {
   acceptanceFailureMessage,
   acceptancePassedEvidence,
   describeAcceptanceCheck,
+  mayRenewStepBudget,
   parseAcceptanceChecks,
+  stepBudgetRenewedNote,
+  turnWriteCount,
   type AcceptanceRecord,
   type AcceptanceResult
 } from './acceptance.js';
@@ -295,6 +298,18 @@ interface AgentState {
    * record rather than with the turn - a record carried into the next turn carries how it was made.
    */
   acceptanceCaveat?: string;
+  /**
+   * How many times this turn has handed itself another step budget rather than stopping for a reply,
+   * and what the harness had counted the last time it did.
+   *
+   * Both are persisted with the rest of the state because they are bounds: a count a worker restart
+   * or an approval pause resets is not a bound, and the mark is what "still making progress" is
+   * measured against. Per turn, like every other ceiling in this file - a reply from the owner is a
+   * new turn and starts again from zero, which is the only reading that matches what the model is
+   * told when a budget is renewed.
+   */
+  selfContinuations?: number;
+  continuationMark?: { atStep: number; writes: number };
   /** Whether this turn has already been sent back once for a plan whose steps were left open. */
   planCoverageNagged?: boolean;
   /** True while the only plan on record is the boilerplate one the harness wrote for itself. */
@@ -1349,6 +1364,10 @@ export const startTurnState = <T extends Record<string, unknown>>(
     acceptanceFailures: 0,
     acceptanceNagged: false,
     acceptanceBaselineRefusals: 0,
+    // The self-continuation bound, per turn like the rest. The owner replying is the thing that
+    // starts a turn, so a conversation where they keep replying is a conversation they are watching
+    // - it is the turn nobody replied to that is allowed to renew itself.
+    selfContinuations: 0,
     planCoverageNagged: false,
     planIsFallback: false,
     // Per turn, like the counters above: the workspace may well have changed between turns, so a
@@ -1358,10 +1377,18 @@ export const startTurnState = <T extends Record<string, unknown>>(
     // step that touched it; carrying it into the next turn would put work in the `Touched:` list of
     // a turn that predates it, which is worse than the absence it exists to fix.
     carriedArtifacts: []
-  } as unknown as T & { reasoningFloor?: unknown; compactedAtStep?: unknown; pending?: unknown };
+  } as unknown as T & {
+    reasoningFloor?: unknown;
+    compactedAtStep?: unknown;
+    pending?: unknown;
+    continuationMark?: unknown;
+  };
   delete next.reasoningFloor;
   delete next.compactedAtStep;
   delete next.pending;
+  // What the last turn had changed by its last ceiling says nothing about this one, and left behind
+  // it would be the bar a fresh turn has to clear before it may renew its own budget.
+  delete next.continuationMark;
   return next;
 };
 
@@ -3275,9 +3302,21 @@ ${clockLine(new Date(), timeZone)}
       );
   }
 
-  /** Appends the step-budget notice this step crosses, if the window is not already carrying it. */
-  async #noteStepBudget(task: TaskRecord, key: Uint8Array, state: AgentState): Promise<void> {
-    const notice = stepBudgetNotice(state.step, this.config.TASK_MAX_STEPS);
+  /**
+   * Appends the step-budget notice this step crosses, if the window is not already carrying it.
+   *
+   * Against the ceiling in force rather than the configured one: a turn that has renewed its budget
+   * is genuinely working to a later ceiling, and warning it at the old one would tell it to wrap up
+   * a hundred and twenty steps before anything ends. A renewal clears these notices back out of the
+   * window for the same reason, so each budget gets its own wind-down.
+   */
+  async #noteStepBudget(
+    task: TaskRecord,
+    key: Uint8Array,
+    state: AgentState,
+    maxSteps: number
+  ): Promise<void> {
+    const notice = stepBudgetNotice(state.step, maxSteps);
     if (!notice) return;
     const marker = notice.split(':')[0] ?? '';
     if (
@@ -3295,7 +3334,7 @@ ${clockLine(new Date(), timeZone)}
       marker === STEP_HANDOFF_MARKER
         ? 'Wrapping up: this turn is nearly out of steps'
         : 'Most of this turn’s step budget is used',
-      { step: state.step, maxSteps: this.config.TASK_MAX_STEPS }
+      { step: state.step, maxSteps }
     ).catch(() => undefined);
   }
 
@@ -3560,6 +3599,179 @@ ${clockLine(new Date(), timeZone)}
       .map((step) => step.title);
   }
 
+  /** The step ceiling in force, which a turn that has renewed its own budget has moved. */
+  #stepCeiling(state: AgentState): number {
+    return this.config.TASK_MAX_STEPS * (1 + (state.selfContinuations ?? 0));
+  }
+
+  /**
+   * A turn that has used its step budget, has not finished the job, and is still working.
+   *
+   * Everything this box does is meant to survive the owner not being there, and this was the one
+   * place where it did not: the ceiling ended the turn, the handoff wrote "the user can reply and
+   * you continue on this same computer with a fresh budget", and on a run started by a schedule at
+   * three in the morning there is nobody to send that reply for eight hours. Nothing about the job
+   * was finished; the interaction model had simply run out.
+   *
+   * What makes continuing safe is that the model does not get a vote. The acceptance record was
+   * written before the work and is executed by the harness, so the answer to "is this done?" is a
+   * fact rather than a self-assessment - and it is the same run, with the same timeouts, that the
+   * finish gate is held to. Every other condition is checked in front of it, in the order they cost:
+   * the free reads first, then one indexed row for the task's status and one for the spend guard,
+   * and only then the checks themselves, which can be a full build.
+   *
+   * The bounds, all of them:
+   *
+   * - the record must exist, and the harness must have just watched it fail;
+   * - the turn must have changed something since the last ceiling it was let past;
+   * - the harness must not already have spent its refusals arguing with this turn;
+   * - the task must still be running, still leased here, and not parked on an approval;
+   * - the compute allowance and the owner's spend caps must both still allow it;
+   * - and it may happen at most `TASK_MAX_SELF_CONTINUATIONS` times.
+   *
+   * What bounds the money is not on that list, because a continuation does not touch it. It buys
+   * steps and only steps: `maxComputeCredits` is unchanged, the per-step spend guard runs before
+   * every step of a renewed budget exactly as it does now, and a turn that reaches either ceiling
+   * hands off in the ordinary way. Three budgets therefore cannot cost more than one - they spend
+   * the allowance a stopped turn would have left behind.
+   */
+  async #renewStepBudget(task: TaskRecord, key: Uint8Array, state: AgentState): Promise<boolean> {
+    const ceiling = this.config.TASK_MAX_SELF_CONTINUATIONS;
+    const used = state.selfContinuations ?? 0;
+    const writes = turnWriteCount(state.turnToolResults);
+    const record = state.acceptance;
+    const refused = async (reason: string): Promise<boolean> => {
+      // The work log, not the conversation: a turn that stopped at its ceiling already raises the
+      // owner-facing warning immediately below this, and saying twice over that it stopped would
+      // bury the sentence that tells them where the work got to. This line is for the reader who
+      // goes looking for why it did not carry on.
+      await event(this.store, task, key, 'status', `Stopping at the step limit: ${reason}`, {
+        step: state.step,
+        continuations: used,
+        writes
+      }).catch(() => undefined);
+      return false;
+    };
+    const verdict = mayRenewStepBudget({
+      hasAcceptance: Boolean(record),
+      // The same test the finish gate makes at agent.ts:8321, for the same stated reason: a record
+      // an earlier turn declared was passing before this turn began, so it is not evidence about
+      // anything this turn did.
+      acceptanceIsThisTurn: (state.acceptanceTurn ?? 0) === (state.turn ?? 0),
+      continuationsUsed: used,
+      continuationCeiling: ceiling,
+      writes,
+      mark: state.continuationMark,
+      credits: state.credits,
+      maxCredits: task.maxComputeCredits,
+      // The two ceilings that mean the harness has already given up on this turn. A model that
+      // cannot ground a finish, or cannot pass its own checks, four times running is not one budget
+      // short of passing them - it is stuck, and another budget is the runaway rather than the fix.
+      refusalsExhausted:
+        (state.acceptanceFailures ?? 0) >= MAX_ACCEPTANCE_FAILURES ||
+        (state.finishRejections ?? 0) >= MAX_FINISH_REJECTIONS,
+      awaitingApproval: Boolean(state.pending)
+    });
+    // Silent when the feature is off: an operator who set the ceiling to zero does not want a line
+    // about it on every task that reaches its step limit.
+    if (ceiling <= 0) return false;
+    if (!verdict.ok) return refused(verdict.reason);
+    if (!record) return false;
+    /*
+     * The owner's word, read fresh, immediately before the decision.
+     *
+     * Read rather than reconciled: `honorUserControl` writes the paused state and clears the lease,
+     * and it is already called on the far side of this loop before the closing handoff is billed, so
+     * doing it here as well would write the same state twice. What matters is that a Stop pressed at
+     * any point during the last budget is seen here, and that a task some other worker has taken is
+     * never continued by this one.
+     */
+    const latest = await this.store.getTask(task.userId, task.id).catch(() => null);
+    if (!latest || latest.status !== 'running')
+      return refused(`the task is ${latest?.status ?? 'no longer readable'}`);
+    if (latest.leaseOwner !== this.config.WORKER_ID)
+      return refused('another worker holds the task');
+    /*
+     * The spend caps, asked without acting on the answer.
+     *
+     * `#haltIfOutOfMoney` pauses the task when a cap is reached, which is the right thing to do at a
+     * step boundary and the wrong thing here - the turn is ending either way, and the handoff below
+     * is what leaves the owner something to act on. So the guard is consulted read-only: a cap that
+     * is already blocking is a reason not to start another budget, and nothing more.
+     */
+    const decision = await this.store
+      .spendGuard({
+        userId: task.userId,
+        taskId: task.id,
+        estimateUsd: Math.max(0.01, state.lastStepUsd ?? 0.01),
+        includeOpenCommitments: true
+      })
+      .catch(() => null);
+    if (!decision) return refused('the spending guard did not answer');
+    if (decision.outcome === 'deny')
+      return refused(spendHalt(decision) || 'a spending cap has been reached');
+
+    const results = await this.#runAcceptanceChecks(task, key, record, {
+      purpose: 'continuation'
+    });
+    const failed = results.filter((result) => !result.passed);
+    if (!failed.length)
+      // Every check the model wrote before the work now passes. That is the strongest evidence this
+      // box has that the job is done, so the turn ends and spends its closing call saying so.
+      return refused('every acceptance check now passes');
+
+    const continuation = used + 1;
+    state.selfContinuations = continuation;
+    state.continuationMark = { atStep: state.step, writes };
+    /*
+     * The wind-down notice, taken back out of the window.
+     *
+     * `stepBudgetNotice` is pushed once and recognised by its marker, so without this the renewed
+     * budget would get no warning of its own end while carrying a standing instruction to stop
+     * starting work - which is now false, and which the model would read as the most recent thing
+     * the harness said about the budget. It costs the cached prefix from that point on, twice a turn
+     * at most, which is the same price a compaction pays for the same kind of correction.
+     */
+    state.messages = state.messages.filter(
+      (message) =>
+        !(
+          message.role === 'system' &&
+          (message.content.startsWith(STEP_BUDGET_MARKER) ||
+            message.content.startsWith(STEP_HANDOFF_MARKER))
+        )
+    );
+    state.messages.push({
+      role: 'system',
+      content: stepBudgetRenewedNote({
+        results,
+        continuation,
+        ceiling,
+        steps: state.step
+      })
+    });
+    await event(
+      this.store,
+      task,
+      key,
+      'status',
+      `Continuing on its own (${continuation} of ${ceiling}): ${failed.length} of ${results.length} acceptance ${results.length === 1 ? 'check' : 'checks'} still ${failed.length === 1 ? 'fails' : 'fail'} after ${state.step} steps`,
+      {
+        continuation,
+        maxContinuations: ceiling,
+        step: state.step,
+        maxSteps: this.config.TASK_MAX_STEPS * (1 + continuation),
+        writes,
+        acceptance: results
+      }
+    ).catch(() => undefined);
+    // Durable before the next step runs. A worker that dies here must resume into the renewed budget
+    // it already announced rather than into a turn that reaches its ceiling and announces it again.
+    // Swallowed, because this runs inside the loop's own condition: a store hiccup here must cost the
+    // durability of one renewal, not the whole turn and the handoff it has not written yet.
+    await this.#checkpoint(task, key, state).catch(() => undefined);
+    return true;
+  }
+
   /**
    * The end of a turn that ran out of steps rather than out of work.
    *
@@ -3621,7 +3833,11 @@ ${clockLine(new Date(), timeZone)}
         // so this is one of the few warnings that belongs in the transcript rather than the log.
         owner: true,
         steps: state.step,
-        maxSteps: this.config.TASK_MAX_STEPS,
+        // The ceiling this turn actually worked to, and how it got there. A turn that renewed its
+        // own budget twice and still ran out is a different thing to be told about than one that
+        // stopped at the first ceiling, and the number in the payload has to say which happened.
+        maxSteps: this.#stepCeiling(state),
+        ...(state.selfContinuations ? { continuations: state.selfContinuations } : {}),
         ...(ranOutOf === 'credits'
           ? { credits: state.credits, maxCredits: task.maxComputeCredits }
           : {}),
@@ -6196,7 +6412,12 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
     task: TaskRecord,
     key: Uint8Array,
     record: AcceptanceRecord,
-    options: { purpose: 'finish' | 'baseline' } = { purpose: 'finish' }
+    /**
+     * `continuation` asks the finish-time question at the step ceiling - is this job done? - so it
+     * gets the finish-time timeouts. Only the sentence the owner reads differs, because a check run
+     * to decide whether to keep working is not the same event as one run to decide whether to stop.
+     */
+    options: { purpose: 'finish' | 'baseline' | 'continuation' } = { purpose: 'finish' }
   ): Promise<AcceptanceResult[]> {
     const root = `/v1/workspaces/${task.workspaceId}`;
     const results: AcceptanceResult[] = [];
@@ -6273,7 +6494,9 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       'status',
       options.purpose === 'baseline'
         ? `Acceptance baseline: ${passed} of ${results.length} already pass before the work`
-        : `Acceptance checks: ${passed} of ${results.length} passed`,
+        : options.purpose === 'continuation'
+          ? `Acceptance checks at the step ceiling: ${passed} of ${results.length} passed`
+          : `Acceptance checks: ${passed} of ${results.length} passed`,
       { acceptance: results, ...(options.purpose === 'baseline' ? { baseline: true } : {}) }
     ).catch(() => undefined);
     return results;
@@ -7395,13 +7618,27 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         contextWindowTokens: model.contextTokens
       });
 
-    for (; state.step < this.config.TASK_MAX_STEPS; state.step += 1) {
+    /*
+     * The step ceiling, asked rather than fixed.
+     *
+     * The first clause is the budget as it has always been. The second is the only thing that can
+     * move it: at the ceiling, and nowhere else, the harness runs the acceptance record the model
+     * declared before the work and grants another budget when the job is demonstrably unfinished and
+     * demonstrably still moving. It raises `selfContinuations`, which raises the first clause, so the
+     * loop cannot spin here - each renewal is one whole budget of progress and there are at most
+     * `TASK_MAX_SELF_CONTINUATIONS` of them.
+     */
+    for (
+      ;
+      state.step < this.#stepCeiling(state) || (await this.#renewStepBudget(task, key, state));
+      state.step += 1
+    ) {
       if (await honorUserControl()) return;
       // Before the plan is refreshed, so a correction that changes the goal is in the window when
       // the plan is read rather than one step behind it.
       await drainCorrection();
       await refreshActivePlan(state.mutated === true || state.step >= 2);
-      await this.#noteStepBudget(task, key, state);
+      await this.#noteStepBudget(task, key, state, this.#stepCeiling(state));
       // Last of the tail blocks, and re-pushed on every step rather than once per turn: a block
       // left where the next step's tool results bury it stops being free to change. At a step
       // boundary every tool call has been answered, so nothing here can split a call from its
@@ -8551,7 +8788,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         .catch(() => undefined);
       throw new AthanorError(
         'step_limit_reached',
-        `This turn used all ${this.config.TASK_MAX_STEPS} of its steps, and the closing handoff could not be written either (${error instanceof Error ? error.message : 'unknown error'}).${
+        `This turn used all ${this.#stepCeiling(state)} of its steps, and the closing handoff could not be written either (${error instanceof Error ? error.message : 'unknown error'}).${
           outstanding.length ? ` Still open: ${outstanding.slice(0, 3).join('; ')}.` : ''
         } Everything it produced is saved - reply to carry on from where it stopped.`
       );

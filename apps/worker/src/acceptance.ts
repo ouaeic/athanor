@@ -286,3 +286,162 @@ export const acceptanceFailureMessage = (
 
 export const acceptancePassedEvidence = (results: readonly AcceptanceResult[]): string[] =>
   results.map((result) => `${result.id}: ${result.label} — ${result.detail}`);
+
+/**
+ * Whether a turn that has used its step budget may give itself another one instead of stopping.
+ *
+ * A turn ends at the step ceiling and hands back to the owner, and the handoff it writes says in as
+ * many words that "the user can reply and you continue on this same computer with a fresh budget".
+ * So a box with electricity, a saved window, an open plan and a machine-checkable definition of done
+ * stops for no reason other than the interaction model saying a turn is a reply. On unattended work
+ * - the kind the ceiling actually bites on - there is nobody to send that reply for hours.
+ *
+ * What makes continuing safe rather than runaway is that the harness, not the model, decides. The
+ * acceptance record was written before the work and is executed by the harness, so "not done yet" is
+ * a fact this function can be handed rather than the model's opinion of itself. Everything here is a
+ * refusal; the caller supplies the facts and gets one sentence back saying which one stopped it, so
+ * a turn that did not continue can always say why.
+ *
+ * The checks are ordered by what they cost the caller to establish, cheapest first, because the
+ * expensive one - running the acceptance record again - is worth paying for only if everything free
+ * has already said yes.
+ */
+export interface ContinuationInput {
+  /** Whether the model ever declared what would prove this job done. No record, no continuation. */
+  readonly hasAcceptance: boolean;
+  /**
+   * Whether that record was declared by this turn rather than carried in from an earlier one.
+   *
+   * The finish gate already refuses an inherited record, in as many words: it was passing before
+   * this turn began, so whatever this turn just did, it is not evidence of it. The same is true
+   * here and the consequence is worse - the renewal fires on the record *failing*, and an inherited
+   * check that has started failing says this turn broke something an earlier one guaranteed, which
+   * is a reason to stop and tell the owner rather than to hand the model another whole budget.
+   */
+  readonly acceptanceIsThisTurn: boolean;
+  readonly continuationsUsed: number;
+  readonly continuationCeiling: number;
+  /** Successful tool calls this turn that changed something, counted with `turnWriteCount`. */
+  readonly writes: number;
+  /** What was true at the last ceiling this turn was let past; absent before the first one. */
+  readonly mark?: { readonly atStep: number; readonly writes: number } | undefined;
+  readonly credits: number;
+  readonly maxCredits: number;
+  /**
+   * Whether the harness has already spent its refusals on this turn - the finish it could not
+   * ground, or the acceptance checks it could not pass. Computed by the caller because the ceilings
+   * live with the loop that enforces them.
+   */
+  readonly refusalsExhausted: boolean;
+  /** A turn parked on an approval card is the owner's move, not the machine's. */
+  readonly awaitingApproval: boolean;
+}
+
+export type ContinuationVerdict =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * How much of the task's compute allowance must remain before a turn renews its own step budget.
+ *
+ * A continuation buys steps, not money. Nothing about it raises `maxComputeCredits`, which the API
+ * sizes at one step budget's worth of credits for the model actually chosen, so a self-continuing
+ * turn is bounded by exactly the same allowance as one that stopped - it simply gets to spend the
+ * remainder rather than leaving it. Renewing with almost none of that left would announce a
+ * continuation and then hand off two steps later on the credit ceiling, which is worse for the owner
+ * to read than stopping cleanly, so the renewal has to be worth having before it is taken.
+ */
+export const CONTINUATION_CREDIT_HEADROOM = 0.1;
+
+export const turnWriteCount = (
+  results: Readonly<Record<string, { success: boolean; mutating?: boolean }>> | undefined
+): number =>
+  Object.values(results ?? {}).filter((result) => result.success && result.mutating).length;
+
+export const mayRenewStepBudget = (input: ContinuationInput): ContinuationVerdict => {
+  if (input.continuationCeiling <= 0) return { ok: false, reason: 'continuing is switched off' };
+  if (input.continuationsUsed >= input.continuationCeiling)
+    return {
+      ok: false,
+      reason: `it has already renewed its own budget ${input.continuationsUsed} times`
+    };
+  if (!input.hasAcceptance)
+    return {
+      ok: false,
+      reason:
+        'this turn never declared what would prove the job done, so nothing but the model could say it is unfinished'
+    };
+  if (!input.acceptanceIsThisTurn)
+    return {
+      ok: false,
+      reason:
+        'the only acceptance checks on record were declared by an earlier turn, so a failing one says this turn broke something rather than that it has not finished'
+    };
+  if (input.awaitingApproval)
+    return { ok: false, reason: 'it is waiting on a decision only the user can make' };
+  if (input.refusalsExhausted)
+    return {
+      ok: false,
+      reason: 'the harness has already refused this turn as many times as it refuses anything'
+    };
+  /*
+   * Progress, from the one thing the harness counts rather than the model claims.
+   *
+   * A budget spent without a single successful change is a turn that is reading, re-planning or
+   * arguing with itself, and another hundred and twenty steps of that is exactly the runaway this
+   * whole mechanism exists not to be. Before the first renewal the bar is that the turn changed
+   * something at all; after it, that it changed something *since* the last renewal - so a turn that
+   * downs tools halfway through its second budget does not get a third.
+   *
+   * Deliberately not "the acceptance checks pass more than they did". A real job has one check that
+   * flips at the very end - the build compiles, the suite is green - so measuring progress by it
+   * would refuse continuation to precisely the work that needs it. The checks answer whether the job
+   * is done; this answers whether it is still moving.
+   */
+  if (input.writes <= (input.mark?.writes ?? 0))
+    return {
+      ok: false,
+      reason: input.mark
+        ? `nothing has changed on this computer since step ${input.mark.atStep}`
+        : 'this turn has not changed anything yet'
+    };
+  if (input.credits >= input.maxCredits * (1 - CONTINUATION_CREDIT_HEADROOM))
+    return {
+      ok: false,
+      reason: 'too little of the task’s compute allowance is left to be worth it'
+    };
+  return { ok: true };
+};
+
+/**
+ * What the window is told when the harness renews the budget rather than ending the turn.
+ *
+ * It carries the failing checks because that is the whole justification for spending more of the
+ * owner's money: the model gets the harness's own observation of what is still not done, which is
+ * the same feedback a refused finish gets and the only thing that makes the next budget different
+ * from a repeat of the last one. The closing line is what stops a renewed turn treating the budget
+ * as endless - the last one says so.
+ */
+export const stepBudgetRenewedNote = (input: {
+  results: readonly AcceptanceResult[];
+  continuation: number;
+  ceiling: number;
+  steps: number;
+}): string => {
+  const failed = input.results.filter((result) => !result.passed);
+  const last = input.continuation >= input.ceiling;
+  return [
+    // Deliberately not "STEP BUDGET ...". The budget notices are recognised in the window by their
+    // opening words so a step is never billed for a notice it already carries, and a renewal that
+    // began with the same two words would be mistaken for one - which would silently cost the
+    // renewed budget the wind-down warning of its own ending.
+    `BUDGET RENEWED (${input.continuation} of ${input.ceiling}) after ${input.steps} steps. You did not stop, because the harness has just run your own acceptance checks and ${failed.length} of ${input.results.length} still ${failed.length === 1 ? 'fails' : 'fail'}:`,
+    ...failed.map((result) => `- ${result.id} (${result.label}): ${result.detail}`),
+    'This is the same turn on the same computer under the same spending caps, and the user has not been asked anything - carry straight on from the first thing that is not done. Do not restart finished work and do not re-plan from the beginning.',
+    last
+      ? 'This is the last renewal there is. If the job will not fit in it, spend the end of it finishing one thing properly, saving anything unfinished to a workspace file, and saying plainly what is left.'
+      : ''
+  ]
+    .filter(Boolean)
+    .join('\n');
+};

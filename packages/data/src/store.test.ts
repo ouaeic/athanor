@@ -851,6 +851,13 @@ describe('DataStore', () => {
     });
     expect(materialized).toMatchObject({ outcome: 'queued', errorCode: null });
     expect(materialized?.task.status).toBe('awaiting_resource');
+    // Where the run came from is written by the statement that creates it, and survives the read
+    // path: it is the only thing that lets the sidebar fold a watcher's runs into one line rather
+    // than interleaving ninety-six of them a day with the owner's own conversations.
+    expect(materialized?.task.scheduleId).toBe(schedule.id);
+    await expect(store.getTask(user.id, taskId)).resolves.toMatchObject({
+      scheduleId: schedule.id
+    });
     await expect(
       store.materializeTaskSchedule({
         scheduleId: schedule.id,
@@ -3544,6 +3551,51 @@ describe('schema migrations against a populated database', () => {
         await database.transaction(async (transaction) => transaction.exec(migration.sql));
 
     expect(await snapshot()).toEqual(before);
+  });
+
+  /*
+   * The box this update lands on already has the runs. A watcher that has been firing every fifteen
+   * minutes for a month is thousands of conversations that would stay uncollapsed if the column only
+   * ever filled for runs made after the update, so the migration reads the pairing out of
+   * task_schedule_runs, which has carried it since version 11.
+   */
+  it('gives a run that already exists the schedule it came from', async () => {
+    // The state of a live box before this version: no column, and the pairing only in the run row.
+    await database.exec('ALTER TABLE tasks DROP COLUMN schedule_id');
+    const owner = await database.query<{ id: string; user_id: string; workspace_id: string }>(
+      'SELECT id,user_id,workspace_id FROM tasks LIMIT 1'
+    );
+    const existing = owner.rows[0]!;
+    const scheduleId = '00000000-0000-4000-8000-0000000000f1';
+    await database.query(
+      `INSERT INTO task_schedules(id,user_id,workspace_id,title_ciphertext,prompt_ciphertext,
+         model_id,privacy_route,max_compute_credits,spec)
+       VALUES ($1,$2,$3,$4::jsonb,$4::jsonb,'qwen','provider_zdr',1,$5::jsonb)`,
+      [
+        scheduleId,
+        existing.user_id,
+        existing.workspace_id,
+        JSON.stringify(envelope),
+        JSON.stringify({ kind: 'interval', everyMinutes: 15 })
+      ]
+    );
+    await database.query(
+      `INSERT INTO task_schedule_runs(schedule_id,scheduled_for,task_id,outcome)
+       VALUES ($1,NOW(),$2,'queued')`,
+      [scheduleId, existing.id]
+    );
+
+    const arrival = migrations.find((migration) => migration.version === 62)!;
+    await database.transaction(async (transaction) => transaction.exec(arrival.sql));
+
+    const filed = await database.query<{ id: string; schedule_id: string | null }>(
+      'SELECT id,schedule_id FROM tasks ORDER BY id'
+    );
+    expect(filed.rows.find((row) => row.id === existing.id)?.schedule_id).toBe(scheduleId);
+    // Nothing the owner started is claimed by a schedule it never came from.
+    expect(
+      filed.rows.filter((row) => row.id !== existing.id).every((row) => row.schedule_id === null)
+    ).toBe(true);
   });
 
   it('is a no-op when a second start migrates the same populated database', async () => {

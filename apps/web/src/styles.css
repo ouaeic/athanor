@@ -8374,3 +8374,69 @@ a.blocked-resource:hover {
   font-size: 11px;
   line-height: 1.5;
 }
+
+/* ---------------------------------------------------------------------------
+   A schedule's runs, folded into one row; and paging back through a long one.
+   --------------------------------------------------------------------------- */
+
+/*
+ * A watcher on a fifteen-minute interval mints ninety-six conversations a day, and every one of
+ * them took a row in this list in the same recency order as the owner's own work - so their work
+ * was off the bottom of it by mid-morning. The collapsed row reuses the ordinary task row on
+ * purpose: it is a count of conversations, not a new kind of object, and giving it a shape of its
+ * own would make the sidebar read as two lists. No ember anywhere on it - a watcher that has been
+ * running all night is the machine working, not the owner's move.
+ */
+.schedule-run-group .task-copy {
+  /*
+   * Takes the slack so the chevron sits at the row's trailing edge rather than against the title,
+   * which would move it every time a run is renamed. `.task-copy` already carries `min-width: 0`,
+   * so a long name still ellipsizes instead of pushing the arrow out.
+   */
+  flex: 1;
+}
+
+.schedule-run-chevron {
+  flex: none;
+  color: var(--muted);
+  transition: transform 160ms var(--ease);
+}
+
+.schedule-run-chevron.open {
+  transform: rotate(90deg);
+}
+
+/* Indented and hung off a rule, so an expanded group reads as the runs of the row above it rather
+   than as more conversations in the same date bucket. */
+.schedule-run-list {
+  margin: 0 0 4px 15px;
+  padding-left: 8px;
+  border-left: 1px solid var(--line);
+}
+
+/*
+ * "Earlier in this conversation" is a request to the box now, not just a reveal.
+ *
+ * The transcript opens at its newest page, so this control reveals what is already here and then
+ * fetches the page before it - which means it carries a spinner and is disabled while one is in
+ * flight. It was laid out for a single run of text, and a bare icon lands on its own line.
+ */
+.earlier-in-conversation {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.earlier-in-conversation svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* Dim and static while it waits. The spinner is what says something is happening; a border
+   brightening under a cursor that cannot click is the interface claiming otherwise. */
+.earlier-in-conversation:disabled,
+.earlier-in-conversation:disabled:hover {
+  border-color: var(--line);
+  color: var(--muted);
+  cursor: default;
+}

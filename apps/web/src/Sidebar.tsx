@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BellRing,
   CalendarClock,
+  ChevronRight,
   Monitor,
   Pencil,
   Plus,
@@ -11,7 +12,13 @@ import {
   Trash2
 } from 'lucide-react';
 import { BrandMark } from './BrandMark.js';
-import { conversationMatches, groupConversations, renameCommit } from './task-list.js';
+import {
+  arrivalLine,
+  conversationMatches,
+  groupConversations,
+  renameCommit,
+  type ScheduleGroup
+} from './task-list.js';
 import { formatUsd } from './usage-model.js';
 import { workspaceStatusLabel } from './workspace-status.js';
 import type { ConversationSearchResult, Task, TaskSchedule, User, Workspace } from './types.js';
@@ -59,6 +66,12 @@ export function Sidebar(props: {
   const [thisComputerOnly, setThisComputerOnly] = useState(false);
   const [renaming, setRenaming] = useState<string>();
   const [draft, setDraft] = useState('');
+  /**
+   * Which schedules are showing their runs. Collapsed is the default and stays the default across
+   * a reload: the whole point of the row is that ninety-six runs cost one line until the owner
+   * asks for them.
+   */
+  const [openSchedules, setOpenSchedules] = useState<ReadonlySet<string>>(new Set());
   const renameField = useRef<HTMLInputElement>(null);
   // Focus is moved after the field mounts rather than with autoFocus, which steals focus on
   // first paint and is flagged as an accessibility hazard.
@@ -131,6 +144,12 @@ export function Sidebar(props: {
           ),
     [isSearching, props.tasks, workspace]
   );
+  /**
+   * Read across every computer, not the one in view: this line only ever replaces the invitation
+   * below, which is drawn when the list in view has nothing in it, and the runs that happened
+   * overnight are exactly the ones that are somewhere else or already filed.
+   */
+  const arrival = useMemo(() => arrivalLine(props.tasks), [props.tasks]);
 
   const commitRename = (task: Task) => {
     setRenaming(undefined);
@@ -227,6 +246,59 @@ export function Sidebar(props: {
       </div>
     );
 
+  /**
+   * One schedule, one line.
+   *
+   * A watcher on a fifteen-minute interval minted ninety-six conversations a day and every one of
+   * them took a row in the same list as the owner's own work, in the same recency order, so by
+   * mid-morning their work was off the bottom of it. What is left on screen is the schedule's name,
+   * how its last run ended and how long ago, and how many runs there have been — the same three
+   * facts an ordinary row carries, plus the count that makes the collapse honest. The runs are one
+   * click away and none of them has been hidden.
+   *
+   * The name comes from the schedule when this device has it, because a run can be renamed — by the
+   * owner, or by the titler once it has said something — and forty renamed runs should still answer
+   * to the schedule they came from. The newest run's name is the fallback, so a group survives the
+   * schedule being deleted.
+   */
+  const scheduleGroupRows = (group: ScheduleGroup) => {
+    const open = openSchedules.has(group.scheduleId);
+    const name = props.schedules.find((item) => item.id === group.scheduleId)?.title ?? group.title;
+    const outcome = group.latest.status.replace('_', ' ');
+    return (
+      <Fragment key={`schedule-${group.scheduleId}`}>
+        <div className="task-row schedule-run-group">
+          <button
+            className="task-open"
+            aria-expanded={open}
+            aria-label={`${name}, ${group.runs.length} scheduled runs, last ${outcome}`}
+            onClick={() =>
+              setOpenSchedules((current) => {
+                const next = new Set(current);
+                if (!next.delete(group.scheduleId)) next.add(group.scheduleId);
+                return next;
+              })
+            }
+          >
+            <span className={`status-dot ${group.latest.status}`} />
+            <span className="task-copy">
+              <strong>{name}</strong>
+              <small>
+                {outcome} · {relative(group.latest.updatedAt)} · {group.runs.length} runs
+              </small>
+            </span>
+            <ChevronRight size={13} className={`schedule-run-chevron ${open ? 'open' : ''}`} />
+          </button>
+        </div>
+        {open && (
+          <div className="schedule-run-list">
+            {group.runs.map((run) => conversationRow(run, '', undefined))}
+          </div>
+        )}
+      </Fragment>
+    );
+  };
+
   return (
     <aside className="sidebar">
       <button className="workspace-switcher computer-summary" onClick={props.onComputerSettings}>
@@ -319,7 +391,11 @@ export function Sidebar(props: {
           : buckets.map((bucket) => (
               <div key={bucket.label} className="task-bucket">
                 <p className="task-bucket-label">{bucket.label}</p>
-                {bucket.tasks.map((task) => conversationRow(task, '', undefined))}
+                {bucket.entries.map((entry) =>
+                  entry.kind === 'conversation'
+                    ? conversationRow(entry.task, '', undefined)
+                    : scheduleGroupRows(entry.group)
+                )}
               </div>
             ))}
         {isSearching && !results.length && !searching && searchFailed && (
@@ -341,10 +417,14 @@ export function Sidebar(props: {
             </span>
           </div>
         )}
+        {/* Nothing in view is not the same as nothing having happened. A computer that has been
+            working all night should say so in the place where it would otherwise ask the owner what
+            to do — one sentence, and only when there is one; the invitation stands when there is
+            not. */}
         {!isSearching && !buckets.length && (
           <div className="empty-mini">
             <Sparkles size={18} />
-            <span>No conversations yet. Start one above.</span>
+            <span>{arrival ?? 'No conversations yet. Start one above.'}</span>
           </div>
         )}
         {!isSearching && props.onEarlier && (

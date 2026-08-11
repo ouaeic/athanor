@@ -2119,5 +2119,39 @@ export const migrations = [
       ALTER TABLE workspace_previews
         ADD COLUMN IF NOT EXISTS entry_path TEXT;
     `
+  },
+  {
+    version: 62,
+    name: 'a_scheduled_run_says_where_it_came_from',
+    // A materialised run was indistinguishable from a conversation the owner started. The only
+    // record that a task came from a schedule was a row in task_schedule_runs, which the task read
+    // never joins - so the sidebar, which orders by recency alone, interleaved a fifteen-minute
+    // watcher's ninety-six runs a day with the owner's own work and buried it. The column is what
+    // lets the list collapse a run of them into one line.
+    //
+    // Deliberately not a foreign key. Neither action Postgres offers is right here: CASCADE would
+    // delete the owner's conversations when they turn a watcher off, and SET NULL would spill every
+    // past run back into the sidebar as a separate line at exactly that moment - the burying this
+    // column exists to stop, triggered by tidying up. What is recorded is provenance: this
+    // conversation was minted by that schedule, which does not stop being true when the schedule is
+    // deleted. Clients name the group from the runs themselves, so nothing downstream needs the
+    // schedule row to still exist.
+    //
+    // Safe on a live box: a nullable column with no default is a catalogue change in Postgres 11
+    // and later, so no table rewrite and no long lock. The backfill reads task_schedule_runs, which
+    // has carried the pairing since version 11, so every run already on the box groups on the first
+    // load after the update rather than only new ones. The index is partial because the owner's own
+    // conversations are the overwhelming majority of the table and none of them are in it.
+    sql: `
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS schedule_id UUID;
+
+      UPDATE tasks t SET schedule_id = r.schedule_id
+      FROM task_schedule_runs r
+      WHERE r.task_id = t.id AND t.schedule_id IS NULL;
+
+      CREATE INDEX IF NOT EXISTS tasks_schedule_idx
+        ON tasks(schedule_id, created_at DESC)
+        WHERE schedule_id IS NOT NULL;
+    `
   }
 ] as const;

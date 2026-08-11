@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowDown,
@@ -939,8 +939,11 @@ function ActivityLog({
  * Sticks the view to the newest content only while the reader is already at the bottom. Streaming
  * appends an event every ~160 characters, so an unconditional scroll makes it impossible to read
  * anything earlier while the agent is still working.
+ *
+ * `dependency` is what arrives at the bottom; `head` is how much is mounted above, which changes
+ * when earlier material is revealed or fetched and would otherwise throw the reader down the page.
  */
-const useStickyScroll = (dependency: number) => {
+const useStickyScroll = (dependency: number, head: number) => {
   const container = useRef<HTMLDivElement>(null);
   const [pinned, setPinned] = useState(true);
   /*
@@ -963,12 +966,17 @@ const useStickyScroll = (dependency: number) => {
     node?.scrollTo({ top: node.scrollHeight, behavior: 'smooth' });
   }, []);
 
+  const anchor = useRef<number | null>(null);
+
   const onScroll = useCallback(() => {
     const node = container.current;
     if (!node) return;
     const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
     pinnedNow.current = distance < 120;
     setPinned(pinnedNow.current);
+    // A page of history is a round trip to the box, and the reader is free to keep scrolling while
+    // it is in flight; the anchor has to describe where they are now, not where they clicked.
+    if (anchor.current !== null) anchor.current = node.scrollHeight - node.scrollTop;
   }, []);
 
   useEffect(() => {
@@ -981,7 +989,30 @@ const useStickyScroll = (dependency: number) => {
     scrollToEnd(container.current);
   }, [scrollToEnd]);
 
-  return { container, pinned, onScroll, jump };
+  /*
+   * Growing the transcript upwards moves everything the reader is looking at down the page by
+   * exactly the height of what was added, because a scrollport measures from the top. Recording the
+   * distance to the bottom before the growth and restoring it afterwards keeps the line they were
+   * reading under the same pixel - the same quantity `onScroll` already uses, so the two agree by
+   * construction.
+   */
+  const hold = useCallback(() => {
+    const node = container.current;
+    if (node) anchor.current = node.scrollHeight - node.scrollTop;
+  }, []);
+  /** Dropped when the growth it was recorded for is never going to arrive - a failed page. */
+  const release = useCallback(() => {
+    anchor.current = null;
+  }, []);
+  useLayoutEffect(() => {
+    const node = container.current;
+    if (!node || anchor.current === null) return;
+    // Before paint: a restore after it is a visible jump and back.
+    node.scrollTop = node.scrollHeight - anchor.current;
+    anchor.current = null;
+  }, [head]);
+
+  return { container, pinned, onScroll, jump, hold, release };
 };
 
 /**
@@ -993,13 +1024,21 @@ const useStickyScroll = (dependency: number) => {
  * owner reads in passing, so the money is what stays; the split and the cache share are in the
  * usage pane, which is where somebody who wants them is already looking.
  */
-function CostSummary({ events }: { events: TaskEvent[] }) {
-  const total = conversationCost(events);
-  if (!(total.costUsd > 0)) return null;
+function CostSummary({ task, events }: { task: Task | undefined; events: TaskEvent[] }) {
+  /*
+   * The transcript on screen is a window onto the conversation, not the whole of it, so adding up
+   * the cost events in it understates a long conversation whose earlier pages have not been
+   * fetched. The task carries its own settled total for the whole conversation, which is the
+   * figure this line has always claimed to be. The window is still the fresher of the two mid-turn:
+   * a cost event is on screen the moment it is written, seconds before the poll that settles the
+   * task catches up, so whichever is larger is the honest one.
+   */
+  const total = Math.max(conversationCost(events).costUsd, task?.spentUsd ?? 0);
+  if (!(total > 0)) return null;
   return (
     <div className="cost-event conversation-cost">
       <CircleDollarSign />
-      <span>{formatUsd(total.costUsd)}</span>
+      <span>{formatUsd(total)}</span>
     </div>
   );
 }
@@ -1153,6 +1192,9 @@ export function Timeline({
   events,
   missing = false,
   modelName,
+  earlierAvailable = false,
+  earlierLoading = false,
+  onLoadEarlier,
   onOpenSurface,
   onOpenPreview,
   onOpenTask,
@@ -1167,6 +1209,10 @@ export function Timeline({
   events: TaskEvent[];
   missing?: boolean;
   modelName?: (id: string) => string;
+  /** Whether the box holds any of this conversation older than what was sent to this device. */
+  earlierAvailable?: boolean;
+  earlierLoading?: boolean;
+  onLoadEarlier?: () => void;
   onOpenSurface?: (surface: Surface) => void;
   onOpenPreview?: (previewId: string) => void;
   onOpenTask?: (taskId: string) => void;
@@ -1177,7 +1223,6 @@ export function Timeline({
   onRetry?: (event: TaskEvent) => void;
   onStarter?: (prompt: string) => void;
 }) {
-  const scroll = useStickyScroll(events.length);
   const status = task?.status ?? 'queued';
   const [revealed, setRevealed] = useState(VISIBLE_NODE_WINDOW);
   useEffect(() => setRevealed(VISIBLE_NODE_WINDOW), [task?.id]);
@@ -1211,6 +1256,51 @@ export function Timeline({
       planSequence
     };
   }, [events, status]);
+  /*
+   * What is actually mounted, which is what the scrollport's height is made of. `events.length`
+   * follows the newest content and `mounted` follows the oldest, and the two grow for different
+   * reasons: an arriving answer at the bottom, a page of history at the top.
+   */
+  const nodeCount = transcript.nodes.length;
+  const mounted = Math.min(nodeCount, revealed);
+  const scroll = useStickyScroll(events.length, mounted);
+  /*
+   * A fetched page arrives above everything already held, so without this it would land entirely
+   * inside the hidden part of the window and the click would appear to do nothing. Revealing
+   * exactly what grew - measured, not assumed, because the node count is not the event count -
+   * shows the reader what they asked for and nothing else.
+   *
+   * In a passive effect rather than at merge time so the growth is measured after the transcript
+   * has been rebuilt, and so the layout effect that holds the scroll position runs on the commit
+   * that actually mounts the nodes.
+   */
+  const awaitingEarlier = useRef(false);
+  const knownNodeCount = useRef(nodeCount);
+  const headNodeId = useRef(transcript.nodes[0]?.id);
+  useEffect(() => {
+    const grown = nodeCount - knownNodeCount.current;
+    const head = transcript.nodes[0]?.id;
+    const grewAtHead = grown > 0 && head !== headNodeId.current;
+    knownNodeCount.current = nodeCount;
+    headNodeId.current = head;
+    if (!awaitingEarlier.current) return;
+    // The head test separates the page that was asked for from an answer still streaming in at the
+    // bottom, which also grows the node count and must not be mistaken for it.
+    if (grewAtHead) {
+      awaitingEarlier.current = false;
+      setRevealed((current) => current + grown);
+      return;
+    }
+    /*
+     * The request ended and nothing was added above - it failed, or the box had nothing left. The
+     * held scroll position is waiting for growth that is not coming, and the next thing to arrive
+     * at the bottom would otherwise be restored against it and move the view.
+     */
+    if (!earlierLoading) {
+      awaitingEarlier.current = false;
+      scroll.release();
+    }
+  }, [nodeCount, earlierLoading, transcript.nodes, scroll.release]);
   if (missing)
     return (
       <div className="empty-canvas">
@@ -1273,12 +1363,31 @@ export function Timeline({
     >
       <div className="timeline">
         {task && onOpenTask && <ForkBar task={task} tasks={tasks} onOpenTask={onOpenTask} />}
-        {hidden > 0 && (
+        {/*
+          One control for one question, whichever side of the wire the answer is on.
+
+          It used to reveal transcript nodes this device already held and nothing else, so on a
+          conversation opened at its newest page it would have run out at the top of that page with
+          the rest of the conversation still on the box. Revealing what is here is instant and comes
+          first; when there is nothing left to reveal, the same click asks for the page before it.
+        */}
+        {(hidden > 0 || earlierAvailable) && (
           <button
             className="earlier-in-conversation"
-            onClick={() => setRevealed((current) => current + VISIBLE_NODE_WINDOW)}
+            disabled={earlierLoading}
+            onClick={() => {
+              scroll.hold();
+              if (hidden > 0) {
+                setRevealed((current) => current + VISIBLE_NODE_WINDOW);
+                return;
+              }
+              awaitingEarlier.current = true;
+              onLoadEarlier?.();
+            }}
           >
-            Earlier in this conversation · {hidden} more
+            {earlierLoading && <LoaderCircle className="spin" />}
+            Earlier in this conversation
+            {hidden > 0 ? ` · ${hidden} more` : ''}
           </button>
         )}
         {task && nodes.length === 0 && (
@@ -1410,7 +1519,7 @@ export function Timeline({
         {/* Shown while the money is being spent, not only once it has been: the cost events are
             already in the stream and waiting for the task to finish is waiting too long. */}
         <ProvenanceSummary events={events} />
-        <CostSummary events={events} />
+        <CostSummary task={task} events={events} />
       </div>
       {!scroll.pinned && (
         <button className="jump-to-latest" onClick={scroll.jump} title="Jump to the newest message">

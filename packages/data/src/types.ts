@@ -83,6 +83,12 @@ export interface TaskRecord {
   parentTaskId: string | null;
   branchedFromEventId: string | null;
   forkKind: 'branch' | 'edit' | 'retry' | null;
+  /**
+   * The schedule that minted this task, or null for one the owner started. Provenance rather than a
+   * live reference: it outlives the schedule row, because the runs it names are conversations the
+   * owner keeps after they turn the schedule off.
+   */
+  scheduleId: string | null;
   /** How far the fork that created this task reached back. Null for a task nobody rewound into. */
   rewindScope: 'conversation' | 'computer' | 'both' | null;
   restoredCheckpointId: string | null;

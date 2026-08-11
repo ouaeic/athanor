@@ -462,7 +462,28 @@ export const api = {
       steps: TaskPlanStep[];
     }
   ) => request<TaskPlan>(`/v1/tasks/${id}/plan`, mutation('POST', body)),
-  events: (id: string, after = 0) => request<TaskEvent[]>(`/v1/tasks/${id}/events?after=${after}`),
+  /**
+   * A window onto one conversation's trajectory, always oldest first.
+   *
+   * This took `after` and nothing else, so the only window this client could ask for was "the whole
+   * of it from here" - and opening a conversation asked from zero. The route has answered `limit`
+   * and `before` all along, backed by two store methods nothing called: `limit` alone is the newest
+   * page, which is what opening wants, and `before` is the page immediately preceding a sequence,
+   * which is how a reader walks back into history. Naming none of the three still returns
+   * everything, which is what the catch-up poll wants once it already holds a cursor.
+   */
+  events: (
+    id: string,
+    window: { after?: number; before?: number; limit?: number } = {}
+  ): Promise<TaskEvent[]> => {
+    const query = new URLSearchParams();
+    if (window.after !== undefined) query.set('after', String(window.after));
+    if (window.before !== undefined) query.set('before', String(window.before));
+    if (window.limit !== undefined) query.set('limit', String(window.limit));
+    return request<TaskEvent[]>(
+      `/v1/tasks/${encodeURIComponent(id)}/events${query.size ? `?${query}` : ''}`
+    );
+  },
   taskAction: (id: string, action: 'pause' | 'resume' | 'cancel') =>
     request<Task>(`/v1/tasks/${id}/${action}`, mutation('POST', {})),
   createEnrollment: (label: string) =>

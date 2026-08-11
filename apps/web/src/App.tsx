@@ -50,6 +50,12 @@ import {
   withPendingMessage,
   type PendingUserMessage
 } from './timeline-state.js';
+import {
+  EMPTY_EVENT_WINDOW,
+  EVENT_PAGE_SIZE,
+  windowAfterPage,
+  type EventWindow
+} from './event-window.js';
 import { composerSubmission, hasSomethingToSend, sendBlock } from './composer-state.js';
 import { removeTask, upsertTask } from './task-list.js';
 import { isLiveTask, isTerminalTask, pauseAction, terminalTaskStatuses } from './task-status.js';
@@ -153,6 +159,21 @@ export function App() {
   const [offline, setOffline] = useState(false);
   const [streamDegraded, setStreamDegraded] = useState(false);
   const lastSequence = useRef(0);
+  /**
+   * How much of the open conversation is on this device, and whether the box holds more before it.
+   *
+   * Paired with `lastSequence`, which is the other end of the same window: that one is where the
+   * stream resumes, this one is where reading backwards continues.
+   */
+  const [eventWindow, setEventWindow] = useState<EventWindow>(EMPTY_EVENT_WINDOW);
+  /**
+   * The conversation whose newest page has already been asked for.
+   *
+   * The transcript effect is keyed on liveness as well as on the conversation, so a turn starting
+   * or finishing tears it down and builds it again - and the opening page must not be re-fetched
+   * for a conversation this device is already holding.
+   */
+  const openedTask = useRef<string | undefined>(undefined);
   const [trajectory, setTrajectory] = useState<TrajectoryDraft>();
   const [rewindPreview, setRewindPreview] = useState<TaskRewindPreview>();
   const [pendingSend, setPendingSend] = useState<PendingUserMessage>();
@@ -994,6 +1015,10 @@ export function App() {
   useEffect(() => {
     setEvents([]);
     lastSequence.current = 0;
+    // Both ends of the window go with the transcript: a fork, a branch or a plain switch starts
+    // again from the newest page, and the offer to read backwards belongs to the conversation it
+    // was measured on.
+    setEventWindow(EMPTY_EVENT_WINDOW);
   }, [taskId]);
   /*
    * The transcript, and what keeps it alive.
@@ -1051,7 +1076,7 @@ export function App() {
     /** The non-streaming route, used to catch up after a stream that could not be re-established. */
     const catchUp = () => {
       void api
-        .events(taskId, lastSequence.current)
+        .events(taskId, { after: lastSequence.current })
         .then((batch) => {
           if (!active) return;
           for (const incoming of batch) absorb(incoming);
@@ -1099,7 +1124,37 @@ export function App() {
         reopenTimer = window.setTimeout(open, Math.min(30_000, 1_000 * 2 ** failures));
       };
     };
-    open();
+
+    /**
+     * The newest page first, then the stream from where that page ends.
+     *
+     * Opening used to be one act: point an `EventSource` at cursor zero and let the box replay the
+     * conversation from its first frame. On a 2,000-event conversation that is 43.2 ms of decrypt
+     * and re-serialise on the box and 1.09 MB on the wire before the newest message can be drawn,
+     * against 3.7 ms and 110 kB for the newest page alone - and 24.6 ms against 5.2 ms of parsing
+     * and building on this side. The page is one request; the stream then resumes at its last
+     * sequence, so nothing arrives twice and nothing older is ever sent.
+     *
+     * If the page cannot be fetched the stream still opens, at cursor zero, which is exactly what
+     * this did before - a degraded open is a whole conversation, not an empty one.
+     */
+    const start = async () => {
+      if (openedTask.current !== taskId) {
+        openedTask.current = taskId;
+        try {
+          const page = await api.events(taskId, { limit: EVENT_PAGE_SIZE });
+          if (!active) return;
+          for (const incoming of page) absorb(incoming);
+          setEventWindow(windowAfterPage(page));
+        } catch {
+          // Left at the empty window: no offer to read backwards, and the stream below opens at
+          // zero and replays everything, which is the behaviour this replaced.
+        }
+        if (!active) return;
+      }
+      open();
+    };
+    void start();
 
     const poll = async () => {
       try {
@@ -1379,6 +1434,36 @@ export function App() {
       setError(describeFailure(cause, 'Could not load earlier conversations'));
     } finally {
       setLoadingEarlier(false);
+    }
+  };
+
+  /**
+   * The part of this conversation that opening it deliberately did not send.
+   *
+   * "Earlier in this conversation" only ever revealed transcript nodes this device already held,
+   * so it stopped at the top of whatever had been loaded and the rest of a long conversation was
+   * unreachable. It now walks the same window backwards a page at a time: `before` the oldest
+   * sequence held, oldest-first, merged rather than prepended because a page can overlap what is
+   * here after a reconnect replayed part of it.
+   *
+   * The merge is the per-event path rather than a concat - the batch is older than everything held,
+   * which is the one order `mergeTaskEvents` cannot fast-path - and that is fine at this size: it
+   * happens on a click, once per page, not on every frame of a streaming answer.
+   */
+  const loadEarlierEvents = async () => {
+    const id = taskId;
+    if (!id || !eventWindow.more || eventWindow.loading || eventWindow.oldest <= 1) return;
+    setEventWindow((current) => ({ ...current, loading: true }));
+    try {
+      const page = await api.events(id, { before: eventWindow.oldest, limit: EVENT_PAGE_SIZE });
+      // The conversation may have been switched while this was in flight; its events belong to a
+      // transcript that is no longer on screen.
+      if (openedTask.current !== id) return;
+      setEvents((current) => mergeTaskEvents(current, page));
+      setEventWindow((current) => windowAfterPage(page, current));
+    } catch (cause) {
+      setEventWindow((current) => ({ ...current, loading: false }));
+      setError(describeFailure(cause, 'Could not load the earlier part of this conversation'));
     }
   };
 
@@ -1738,22 +1823,43 @@ export function App() {
    */
   const exportConversation = (mode: 'copy' | 'download') => {
     if (!task) return;
-    const markdown = conversationMarkdown(task.title, events);
+    const id = task.id;
+    const title = task.title;
+    /*
+     * The transcript on screen is a window onto the conversation now, and an export that quietly
+     * stopped at the newest page would be the wrong document - this is the one place that promises
+     * the whole of it. The route with no window is the whole trajectory; only a conversation that
+     * is genuinely longer than what is loaded pays for the request, and if the box cannot be
+     * reached the window is still better than nothing.
+     */
+    const wholeMarkdown = (
+      eventWindow.more ? api.events(id, {}).catch(() => events) : Promise.resolve(events)
+    ).then((all) => conversationMarkdown(title, all));
     if (mode === 'copy') {
-      void navigator.clipboard
-        .writeText(markdown)
+      /*
+       * A promise handed to the clipboard rather than awaited before writing to it. Safari ends the
+       * user gesture at the first await and refuses the write, which would have turned "copy a long
+       * conversation" into a permissions error; `ClipboardItem` exists to carry exactly this.
+       */
+      const written =
+        typeof ClipboardItem === 'function'
+          ? navigator.clipboard.write([new ClipboardItem({ 'text/plain': wholeMarkdown })])
+          : wholeMarkdown.then((markdown) => navigator.clipboard.writeText(markdown));
+      void written
         .then(() => setNotice('Conversation copied as Markdown.'))
         .catch(() => setError('This browser would not let athanor write to the clipboard.'));
       return;
     }
-    const name = `${task.title.replace(/[^a-zA-Z0-9 _-]+/g, ' ').trim() || 'conversation'}.md`;
-    const url = URL.createObjectURL(new Blob([markdown], { type: 'text/markdown' }));
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = name;
-    anchor.rel = 'noopener';
-    anchor.click();
-    URL.revokeObjectURL(url);
+    void wholeMarkdown.then((markdown) => {
+      const name = `${title.replace(/[^a-zA-Z0-9 _-]+/g, ' ').trim() || 'conversation'}.md`;
+      const url = URL.createObjectURL(new Blob([markdown], { type: 'text/markdown' }));
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = name;
+      anchor.rel = 'noopener';
+      anchor.click();
+      URL.revokeObjectURL(url);
+    });
   };
 
   /*
@@ -2229,6 +2335,9 @@ export function App() {
               events={timelineEvents}
               missing={missingTask}
               modelName={namedModel}
+              earlierAvailable={eventWindow.more}
+              earlierLoading={eventWindow.loading}
+              onLoadEarlier={() => void loadEarlierEvents()}
               onOpenTask={setTaskId}
               onOpenSpendCaps={() => openSettings('ai')}
               /*

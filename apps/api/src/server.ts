@@ -156,6 +156,9 @@ const taskResponse = (
   parentTaskId: task.parentTaskId,
   branchedFromEventId: task.branchedFromEventId,
   forkKind: task.forkKind,
+  // What lets a client fold ninety-six watcher runs into one line instead of listing them beside
+  // the owner's own conversations in the same recency order.
+  scheduleId: task.scheduleId,
   title,
   // The store keeps these as text so a migration can add a value without a type change; the API is
   // the boundary where they become the contract's unions, and every value written comes from one.

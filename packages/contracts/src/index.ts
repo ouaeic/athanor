@@ -444,6 +444,15 @@ export const Task = z.object({
   parentTaskId: Id.nullable().optional(),
   branchedFromEventId: Id.nullable().optional(),
   forkKind: z.enum(['branch', 'edit', 'retry']).nullable().optional(),
+  /**
+   * The schedule that minted this conversation, or null for one the owner started.
+   *
+   * Nothing on a materialised run recorded where it came from, so a watcher firing every fifteen
+   * minutes put ninety-six conversations a day into the same recency order as the owner's own work
+   * and buried it. This is the fact that lets a client collapse them: it is provenance, not a live
+   * reference, and it stays true after the schedule itself is deleted.
+   */
+  scheduleId: Id.nullable().default(null),
   title: z.string().min(1).max(160),
   status: TaskStatus,
   modelId: z.string(),

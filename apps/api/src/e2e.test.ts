@@ -243,6 +243,8 @@ const start = async (
     WORKER_POLL_MS: 25,
     SCHEDULER_POLL_MS: 60_000,
     TASK_MAX_STEPS: options.maxSteps ?? 24,
+    // Off: every expectation in this file describes a turn that stops at its step ceiling.
+    TASK_MAX_SELF_CONTINUATIONS: 0,
     SECURITY_EVENT_RETENTION_DAYS: 30,
     OPENROUTER_BASE_URL: 'https://openrouter.ai/api/v1',
     AI_PROVIDER: 'openrouter',
@@ -359,7 +361,9 @@ describe('a task from prompt to completion', () => {
         // the harness refuses a finish that leaves steps open rather than marking them done itself,
         // so the plan the owner watched stays true.
         toolCalls: [
-          toolCall('call-3', 'set_plan', { steps: [{ title: 'Do the work', status: 'completed' }] }),
+          toolCall('call-3', 'set_plan', {
+            steps: [{ title: 'Do the work', status: 'completed' }]
+          }),
           groundedFinish('Ran the command and read its output.', 'call-2')
         ]
       }

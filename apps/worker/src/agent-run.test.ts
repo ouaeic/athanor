@@ -87,6 +87,9 @@ const config = (
   WORKER_CONCURRENCY: 2,
   WORKER_POLL_MS: 1_000,
   TASK_MAX_STEPS: 1,
+  // Off unless a test asks for it, so every existing expectation about what happens at the step
+  // ceiling still describes a turn that stops there.
+  TASK_MAX_SELF_CONTINUATIONS: 0,
   ...overrides
 });
 
@@ -350,6 +353,10 @@ const makeTask = (agentState?: unknown): TaskRecord => ({
   parentTaskId: null,
   branchedFromEventId: null,
   forkKind: null,
+  // A conversation the owner started, which is what every test in this file is about. The worker
+  // never reads this - it is provenance the sidebar folds runs of one schedule by - but the record
+  // declares it, so the fixture has to say which kind of conversation it is standing in for.
+  scheduleId: null,
   rewindScope: null,
   restoredCheckpointId: null,
   titleCiphertext: null,
@@ -4336,5 +4343,318 @@ describe('reads proposed together', () => {
     for (const message of answered) expect(message.content).toContain('Tool failed');
     expect(probe.checkpoints.at(-1)).toMatchObject({ status: 'paused', clearLease: true });
     expect(probe.events.some((entry) => entry.summary === 'Task paused by user')).toBe(true);
+  }, 15_000);
+});
+
+/**
+ * A turn that runs out of steps while the job is demonstrably unfinished and demonstrably moving.
+ *
+ * The ceiling used to end the turn and write a handoff saying the work continues "the moment the
+ * user replies" - which on a scheduled run at three in the morning is eight hours away. These are
+ * about the harness taking that decision itself, and about how much harder it is to get a yes than
+ * a no: the acceptance record must exist, the harness itself must have just watched it fail, the
+ * turn must still be changing things, and the owner must not have stopped it.
+ */
+describe('a turn that finishes the job rather than the budget', () => {
+  const failingCheck = {
+    checks: [
+      {
+        id: 'check-1',
+        kind: 'command',
+        label: 'the importer test passes',
+        executable: 'pytest',
+        args: ['-q'],
+        cwd: 'workspace',
+        expectExit: 0,
+        timeoutSeconds: 300
+      }
+    ],
+    revisions: 1,
+    declaredAtStep: 0
+  };
+
+  /** A turn mid-job: it declared its checks, and it has already changed something. */
+  const workingState = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    messages: [
+      { role: 'user', content: 'Fix the importer' },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'call-0', name: 'file_write', arguments: {} }]
+      },
+      { role: 'tool', toolCallId: 'call-0', content: 'ok' }
+    ],
+    step: 0,
+    credits: 0,
+    mutated: true,
+    mutatedBeyondProse: true,
+    turnToolResults: { 'call-0': { name: 'file_write', success: true, mutating: true } },
+    acceptance: failingCheck,
+    acceptanceTurn: 0,
+    ...over
+  });
+
+  const exec = (exitCode: number) => (url: string) =>
+    url.includes('/exec')
+      ? new Response(
+          JSON.stringify({
+            exitCode,
+            stdout: '',
+            stderr: exitCode === 0 ? '' : 'AssertionError: expected 3 rows, found 0',
+            durationMs: 5,
+            timedOut: false
+          }),
+          { headers: { 'content-type': 'application/json' } }
+        )
+      : undefined;
+
+  it('renews its own budget when the harness watches its checks fail, and says so', async () => {
+    const task = makeTask(workingState());
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        textFrame('Working.'),
+        textFrame('Still working.'),
+        textFrame('Carrying on.'),
+        textFrame('Nearly there.'),
+        toolFrame('call-hand', 'finish', {
+          summary: 'The importer reads two of three columns; the third is still failing.',
+          verification: { status: 'not_applicable', evidence: [] }
+        })
+      ],
+      log,
+      { route: exec(1) }
+    );
+
+    await new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 2, TASK_MAX_SELF_CONTINUATIONS: 1 }),
+      masterKey,
+      runnerSecret
+    )
+      .run(task)
+      .catch(() => undefined);
+
+    // Two budgets of two steps, and then the one closing call - which the budget has never counted.
+    expect(log.modelRequests).toHaveLength(5);
+    const continued = probe.events.find((entry) =>
+      entry.summary.startsWith('Continuing on its own')
+    );
+    expect(continued?.summary).toContain('(1 of 1)');
+    expect(continued?.summary).toContain('1 of 1 acceptance check still fails after 2 steps');
+    expect(continued?.payload).toMatchObject({ continuation: 1, step: 2, maxSteps: 4 });
+    // The model is told what the harness saw, not that it was given more rope.
+    const renewed = ((log.modelRequests[2]?.messages ?? []) as Array<{ content: string }>)
+      .map((message) => message.content)
+      .join('\n');
+    expect(renewed).toContain('BUDGET RENEWED (1 of 1) after 2 steps');
+    expect(renewed).toContain('AssertionError: expected 3 rows, found 0');
+    expect(renewed).toContain('This is the last renewal there is');
+    // ...and the wind-down it was given for the first budget is gone, replaced by one counting down
+    // to the ceiling that is actually in force. Carrying the old one would leave the model holding a
+    // standing instruction to stop starting work, which is exactly what it has just been told not to
+    // do - and would cost the renewed budget any warning of its own ending.
+    expect(renewed.split('FINAL STEPS').length - 1).toBe(1);
+    expect(renewed).toContain("2 of this turn's 4 steps remain");
+    // It still ends where the owner can act on it, with the ceiling it actually worked to.
+    const ceiling = probe.events.find(
+      (entry) => entry.kind === 'warning' && entry.summary.includes('whole step budget')
+    );
+    expect(ceiling?.payload).toMatchObject({ owner: true, maxSteps: 4, continuations: 1 });
+  }, 15_000);
+
+  it('stops the moment its own definition of done is satisfied', async () => {
+    const task = makeTask(workingState());
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        textFrame('Working.'),
+        textFrame('Still working.'),
+        toolFrame('call-hand', 'finish', {
+          summary: 'The importer reads all three columns.',
+          verification: { status: 'not_applicable', evidence: [] }
+        })
+      ],
+      log,
+      { route: exec(0) }
+    );
+
+    await new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 2, TASK_MAX_SELF_CONTINUATIONS: 2 }),
+      masterKey,
+      runnerSecret
+    )
+      .run(task)
+      .catch(() => undefined);
+
+    // The checks the model wrote before the work all pass, which is the strongest evidence this box
+    // has that the job is done - so the budget is not renewed and the turn spends its closing call.
+    expect(
+      probe.events.some(
+        (entry) => entry.summary === 'Stopping at the step limit: every acceptance check now passes'
+      )
+    ).toBe(true);
+    expect(log.modelRequests).toHaveLength(3);
+  }, 15_000);
+
+  it('is stopped by the same Stop, on the last step of the budget it would have renewed', async () => {
+    const task = makeTask(workingState());
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        textFrame('Working.'),
+        () => {
+          // Stop, pressed while the last step of the budget was still streaming. Nothing about a
+          // turn that can renew itself may make it harder to stop than one that cannot: the same
+          // button, at the same moment, has to end it.
+          task.status = 'paused';
+          task.leaseOwner = null;
+          return textFrame('Still working.');
+        },
+        textFrame('This call must never be made.')
+      ],
+      log,
+      { route: exec(1) }
+    );
+
+    await new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 2, TASK_MAX_SELF_CONTINUATIONS: 2 }),
+      masterKey,
+      runnerSecret
+    )
+      .run(task)
+      .catch(() => undefined);
+
+    expect(probe.events.some((entry) => entry.summary.startsWith('Continuing on its own'))).toBe(
+      false
+    );
+    // No renewal, and no closing call billed after the stop either.
+    expect(log.modelRequests).toHaveLength(2);
+    expect(probe.events.some((entry) => entry.summary === 'Task paused by user')).toBe(true);
+    expect(probe.checkpoints.at(-1)).toMatchObject({ status: 'paused', clearLease: true });
+  }, 15_000);
+
+  it('never renews a turn this worker no longer holds', async () => {
+    // The lease moved while the budget was being spent. Renewing here would have this worker
+    // announce a continuation on a conversation another one is running, and then save its own stale
+    // trajectory over theirs - so the ceiling asks who holds the task before it asks anything about
+    // the work.
+    const task = makeTask(workingState());
+    task.leaseOwner = 'worker-other';
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [textFrame('Working.'), textFrame('Still working.'), textFrame('Handing off.')],
+      log,
+      {
+        route: exec(1)
+      }
+    );
+
+    await new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 2, TASK_MAX_SELF_CONTINUATIONS: 2 }),
+      masterKey,
+      runnerSecret
+    )
+      .run(task)
+      .catch(() => undefined);
+
+    expect(
+      probe.events.some(
+        (entry) => entry.summary === 'Stopping at the step limit: another worker holds the task'
+      )
+    ).toBe(true);
+    expect(probe.events.some((entry) => entry.summary.startsWith('Continuing on its own'))).toBe(
+      false
+    );
+    // Nothing was run to work that out, either: who holds the task is a free read and it comes
+    // before the checks, which can be a full build.
+    expect(log.calls.some((call) => call.includes('/exec'))).toBe(false);
+  }, 15_000);
+
+  it('does not spend a check run establishing what the free reads already refused', async () => {
+    const task = makeTask(
+      // Nothing this turn changed: the acceptance record is inherited and the only successful call
+      // was a read. Running the checks could only tell it what it is not allowed to act on anyway.
+      workingState({
+        turnToolResults: { 'call-0': { name: 'file_read', success: true } }
+      })
+    );
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        textFrame('Reading.'),
+        textFrame('Still reading.'),
+        toolFrame('call-hand', 'finish', {
+          summary: 'I could not work out what was wrong.',
+          verification: { status: 'not_applicable', evidence: [] }
+        })
+      ],
+      log,
+      { route: exec(1) }
+    );
+
+    await new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 2, TASK_MAX_SELF_CONTINUATIONS: 2 }),
+      masterKey,
+      runnerSecret
+    )
+      .run(task)
+      .catch(() => undefined);
+
+    expect(
+      probe.events.some(
+        (entry) =>
+          entry.summary === 'Stopping at the step limit: this turn has not changed anything yet'
+      )
+    ).toBe(true);
+    expect(log.calls.some((call) => call.includes('/exec'))).toBe(false);
+  }, 15_000);
+
+  it('will not renew itself on the checks an earlier turn declared', async () => {
+    /*
+     * The finish gate already refuses this record and says why: it was passing before this turn
+     * began, so whatever this turn just did, that record is not evidence of it. The renewal has to
+     * hold to the same rule, and the case for it is sharper - the renewal fires on a check
+     * *failing*, and an inherited check that has started failing says this turn broke something an
+     * earlier turn guaranteed. That is the owner's business, not another budget's.
+     */
+    const task = makeTask(workingState({ turn: 1 }));
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [textFrame('Working.'), textFrame('Still working.'), textFrame('Handing off.')],
+      log,
+      { route: exec(1) }
+    );
+
+    await new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 2, TASK_MAX_SELF_CONTINUATIONS: 2 }),
+      masterKey,
+      runnerSecret
+    )
+      .run(task)
+      .catch(() => undefined);
+
+    expect(
+      probe.events.some((entry) =>
+        entry.summary.startsWith('Stopping at the step limit: the only acceptance checks on record')
+      )
+    ).toBe(true);
+    expect(probe.events.some((entry) => entry.summary.startsWith('Continuing on its own'))).toBe(
+      false
+    );
+    // Nothing was run to establish it: the turn a record belongs to is a free read, and it comes in
+    // front of the checks, which can be a whole build.
+    expect(log.calls.some((call) => call.includes('/exec'))).toBe(false);
   }, 15_000);
 });
