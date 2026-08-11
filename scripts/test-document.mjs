@@ -43,6 +43,17 @@ try {
   assert.match(searchPayload.method, /BM25/);
   assert.equal(searchPayload.filesConsidered, 4);
 
+  // A folder of real documents will always contain something no parser can open, and the
+  // extractors reach into third-party libraries that raise their own exception types. One such
+  // file must cost the owner that file and nothing else - never the whole search.
+  await writeFile(path.join(root, 'broken.xlsx'), 'this is not a workbook');
+  const withBroken = run('search', '--path', '.', '--query', 'bioinformatics server');
+  assert.equal(withBroken.status, 0, withBroken.stderr);
+  const brokenPayload = JSON.parse(withBroken.stdout);
+  assert.equal(brokenPayload.results[0].path, 'notes.txt');
+  assert.equal(brokenPayload.filesConsidered, 5);
+  assert.equal(brokenPayload.filesSkipped, 1);
+
   const empty = run('search', '--path', '.', '--query', '!!!');
   assert.notEqual(empty.status, 0);
   assert.match(empty.stderr, /at least one word/);

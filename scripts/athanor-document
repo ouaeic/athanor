@@ -620,7 +620,12 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
     for target in files:
         try:
             extraction = extract_text(target, 1, args.max_pages)
-        except (OSError, ValueError, ET.ParseError, zipfile.BadZipFile, subprocess.TimeoutExpired):
+        except Exception:
+            # Deliberately every exception rather than the named five. A search runs over whatever
+            # the owner happens to have on disk, and the extractors reach into third-party parsers
+            # that raise their own types - openpyxl alone raises several outside that tuple. One
+            # unreadable file among four hundred must be counted and skipped, never the reason the
+            # owner's search returns nothing at all. The count is reported as `filesSkipped`.
             failures += 1
             continue
         for chunk, page in located_chunks(extraction.text, target.suffix.lower()):
@@ -724,7 +729,10 @@ def main() -> int:
         json.dump(payload, sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
         return 0
-    except (OSError, ValueError, ET.ParseError, zipfile.BadZipFile, subprocess.TimeoutExpired) as error:
+    except Exception as error:
+        # Same reasoning as the per-file guard above, for the same reason: the caller is the agent,
+        # and a JSON error it can read and report is worth more than a traceback on stderr that it
+        # cannot. KeyboardInterrupt and SystemExit are not Exceptions and still pass straight out.
         json.dump({"error": str(error)}, sys.stderr, ensure_ascii=False)
         sys.stderr.write("\n")
         return 2
