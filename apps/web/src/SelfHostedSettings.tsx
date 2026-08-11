@@ -249,6 +249,71 @@ function MediaModalityRow({
   );
 }
 
+/**
+ * The number already in the box when the ceiling is asked for.
+ *
+ * A prefilled figure is the difference between a question and a chore: it can be accepted without
+ * thinking about it, changed by anyone who has a figure of their own, and cleared by anyone who
+ * wants no ceiling. Fifty dollars a month is more than a personal computer that thinks costs most
+ * months and far less than an unattended loop can spend in one night.
+ */
+export const SUGGESTED_MONTHLY_CEILING_USD = 50;
+
+/**
+ * What the connect form sends about money, from what is in the field.
+ *
+ * An empty field is not an absent answer: it is the owner declining a ceiling, which is theirs to
+ * decline on their own computer, and it is sent as an explicit null so the server records that the
+ * question was asked and never puts it in front of them again. Only a value that is not a number at
+ * all is withheld, because a saved key is worth more than a refused form.
+ */
+export const spendCeilingRequest = (
+  draft: string,
+  timeZone: string
+): { monthlyCapUsd: number | null; timeZone?: string } | undefined => {
+  const trimmed = draft.trim();
+  const zone = timeZone.trim() ? { timeZone: timeZone.trim() } : {};
+  if (!trimmed) return { monthlyCapUsd: null, ...zone };
+  const amount = Number(trimmed);
+  if (!Number.isFinite(amount) || amount <= 0) return undefined;
+  return { monthlyCapUsd: amount, ...zone };
+};
+
+/**
+ * The one question about money worth asking while a key is being pasted.
+ *
+ * Every cap ships unset, and a cap that is unset refuses nothing - so on a box nobody has been
+ * through the settings of, the whole spending guard is inert. This is the moment to fix that: it is
+ * the first moment spending is possible at all, and the owner is already thinking about a bill.
+ * It is one field in the form they are in, not a wizard and not a page they have to find.
+ */
+export function SpendCeilingField({
+  value,
+  onChange
+}: {
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  return (
+    <div className="form-grid">
+      <label>
+        Stop at, per month (USD)
+        <small>
+          A quarter of it is the most any one day may spend, which is what stops a run that goes
+          wrong overnight. Leave it blank for no ceiling. Both are yours to change under Spending
+          caps.
+        </small>
+        <input
+          inputMode="decimal"
+          placeholder="No ceiling"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      </label>
+    </div>
+  );
+}
+
 /** How many of the agent's own memory rows are fetched at a time. */
 const REMEMBERED_PAGE = 20;
 
@@ -407,6 +472,14 @@ export function SelfHostedSettings({
     // The owner's own zone is the only sensible default for "today"; the server accepts any IANA id.
     timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
   });
+  const [ceilingDraft, setCeilingDraft] = useState(String(SUGGESTED_MONTHLY_CEILING_USD));
+  /*
+   * Whether this box has ever had an answer about money, which is what decides whether the question
+   * is asked at all. It starts as answered so the field cannot flash up on a box that settled this
+   * years ago, and the server's own timestamp is what settles it: limits nobody has saved come back
+   * stamped at the epoch, which is how a default is told from a choice that happens to match one.
+   */
+  const [capsAnswered, setCapsAnswered] = useState(true);
   const [relay, setRelay] = useState<RelayReport | null>();
   const [diagnostics, setDiagnostics] = useState<{
     certificate: { failedAt: string; reason: string } | null;
@@ -513,7 +586,10 @@ export function SelfHostedSettings({
   const loadSpendLimits = () =>
     void api
       .spendLimits()
-      .then((limits) => setSpendLimitsForm(spendLimitsDraft(limits)))
+      .then((limits) => {
+        setSpendLimitsForm(spendLimitsDraft(limits));
+        setCapsAnswered(Date.parse(limits.updatedAt) > 0);
+      })
       // A server without the caps route keeps the local defaults, which are what it enforces.
       .catch(() => undefined);
   const loadBrief = () => {
@@ -639,7 +715,22 @@ export function SelfHostedSettings({
   const saveProvider = () =>
     act(async () => {
       await api.stepUp();
-      const saved = await api.saveProvider({
+      // The ceiling rides with the key rather than following it: one request, so a box can never
+      // end up holding a working credential and no answer about what it may spend.
+      const ceiling = capsAnswered
+        ? undefined
+        : spendCeilingRequest(ceilingDraft, spendLimitsForm.timeZone);
+      const capabilities: Array<'chat' | 'vision' | 'tools' | 'reasoning' | 'embedding'> = [
+        'chat',
+        'tools',
+        'reasoning',
+        ...(vision ? (['vision'] as const) : [])
+      ];
+      const modalities: Array<'text' | 'image' | 'audio' | 'video'> = [
+        'text',
+        ...(vision ? (['image'] as const) : [])
+      ];
+      const body = {
         provider: providerKind,
         // Sent only when there is one to send. A blank model id used to be impossible - the field
         // was required for every provider but OpenRouter - and Ollama Cloud no longer requires it,
@@ -649,11 +740,16 @@ export function SelfHostedSettings({
         ...(providerKey ? { apiKey: providerKey } : {}),
         enforceZeroDataRetention: zdr,
         contextTokens,
-        capabilities: ['chat', 'tools', 'reasoning', ...(vision ? (['vision'] as const) : [])],
-        modalities: ['text', ...(vision ? (['image'] as const) : [])]
-      });
+        capabilities,
+        modalities,
+        ...(ceiling ? { spendCeiling: ceiling } : {})
+      };
+      const saved = await api.saveProvider(body);
       setProvider(saved);
       setProviderKey('');
+      // Whatever was just seeded is what the caps below have to show, and the question is answered
+      // from here on.
+      if (ceiling) loadSpendLimits();
       /*
        * Two sentences because two different things were checked.
        *
@@ -663,7 +759,7 @@ export function SelfHostedSettings({
        * an unusable key. The OpenRouter path now calls a route the provider gates, so there the
        * word verified is earned; here it is replaced by what actually happened.
        */
-      setNotice(
+      const stored =
         providerKind === 'openrouter'
           ? 'Key checked with the provider and saved. It is encrypted and will not be shown again.'
           : providerKind === 'ollama-cloud'
@@ -671,7 +767,11 @@ export function SelfHostedSettings({
               // is refused there before anything is written, so "accepted" is what happened. What
               // did not happen is a completion, which is the only thing that proves quota.
               'Saved and encrypted. Every model this subscription lists is now in the model picker. Nothing was run against it, so cost and quota are unchecked.'
-            : `Saved and encrypted. The endpoint listed ${modelId} for this key. Nothing was run against it, so cost and quota are unchecked.`
+            : `Saved and encrypted. The endpoint listed ${modelId} for this key. Nothing was run against it, so cost and quota are unchecked.`;
+      setNotice(
+        ceiling?.monthlyCapUsd
+          ? `${stored} Spending stops at $${ceiling.monthlyCapUsd} a month.`
+          : stored
       );
       // The catalogue this screen offers below belongs to the credential that just changed.
       loadMedia();
@@ -866,6 +966,9 @@ export function SelfHostedSettings({
             </label>
           )}
         </div>
+        {capsAnswered ? null : (
+          <SpendCeilingField value={ceilingDraft} onChange={setCeilingDraft} />
+        )}
         <label className="toggle-line">
           <input
             aria-label="Block providers that may retain or train on my data"

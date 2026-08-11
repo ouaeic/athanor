@@ -79,7 +79,9 @@ import {
   hashRecoveryCode,
   assertTimeZone,
   memoryExcerpt,
+  memoryIndexKey,
   memoryTemporalStatus,
+  planMemoryQuery,
   AthanorError,
   inferenceCredentialAad,
   inferModelTask,
@@ -101,6 +103,7 @@ import {
   wrapDataKey
 } from '@athanor/core';
 import {
+  agentNotificationAad,
   assertMasterKeyOpensDatabase,
   createDatabase,
   DataStore,
@@ -108,6 +111,7 @@ import {
   type ConnectorRecord,
   type ApiTokenRecord,
   type MemoryItemRecord,
+  type TaskRecord,
   type UserRecord,
   type TaskScheduleRecord,
   type WorkspaceCheckpointRecord,
@@ -155,6 +159,94 @@ declare module 'fastify' {
 const resumableTaskStatuses = ['paused', 'awaiting_resource'] as const;
 
 /**
+ * The three ways a provider turns work away, and whether waiting is any use.
+ *
+ * A quota and an outage come down on the provider's own clock - a rate window closing, a credit
+ * month rolling over, a machine coming back - so the only sensible answer is to wait and ask
+ * again. A provider that is not connected is not a wall anything will take down: there is no
+ * account on this box to ask, so asking it again at any interval is noise, and what actually
+ * clears it is the owner saving a key, which wakes the work from the save route itself.
+ *
+ * The sentence is what reaches the phone, so it says what is stopped and what it depends on
+ * rather than naming an error code the owner never chose.
+ */
+const providerWalls: Record<string, { clearsOnItsOwn: boolean; notice: string }> = {
+  provider_quota_exhausted: {
+    clearsOnItsOwn: true,
+    notice: 'Your provider has been refusing this work for the last hour: the quota is used up.'
+  },
+  provider_unavailable: {
+    clearsOnItsOwn: true,
+    notice: 'Your provider has been unreachable for the last hour, so this work is stopped.'
+  },
+  provider_not_connected: {
+    clearsOnItsOwn: false,
+    notice:
+      'No model provider is connected, so this work cannot run. Save a key in Settings and it starts again on its own.'
+  }
+};
+
+/**
+ * How long to leave a wall standing before asking again: a minute, then five, fifteen, half an
+ * hour, and hourly after that.
+ *
+ * A blip is over before the owner would have noticed it, and a quota that has lasted an hour will
+ * not be talked round by asking every few seconds - each ask is a real request to someone else's
+ * server, and the point of an unattended box is to be a good citizen of one. Twenty-four asks
+ * spans about a day, which is long enough to sit through a daily quota resetting.
+ */
+const providerWallRetryMinutes = [1, 5, 15, 30, 60];
+const PROVIDER_WALL_MAX_RETRIES = 24;
+
+/**
+ * How many refusals stand between the wall going up and the owner's phone.
+ *
+ * At the intervals above this is the ask made about fifty minutes in, which is the first moment
+ * "the provider is refusing" has stopped being a blip and become a fact about the owner's account.
+ * Waking someone at two in the morning for something that fixed itself by four past two is the
+ * failure this number exists to avoid.
+ */
+const PROVIDER_WALL_NOTIFY_AFTER_RETRIES = 3;
+
+/**
+ * The public label on every line this leaves in a conversation.
+ *
+ * Event payloads are encrypted, so the summary column is the only part of a work-log line SQL can
+ * read - which makes counting these rows the whole of the retry's memory. No column, no lock and
+ * nothing to reconcile after a restart: what has been tried is what is written in the log.
+ */
+const PROVIDER_WALL_EVENT_SUMMARY = 'Encrypted provider wall event';
+
+/** Kept apart from the count above: a key being saved is the owner acting, not a retry. */
+const PROVIDER_RECONNECTED_EVENT_SUMMARY = 'Encrypted provider reconnected event';
+
+/**
+ * The two ceilings a first connection puts in place, from the one number the owner was asked for.
+ *
+ * A month is the unit a provider bill arrives in and the only one worth asking for at a keyboard.
+ * The day is what makes a monthly ceiling mean anything overnight: a loop that has gone wrong can
+ * spend a month's allowance between two and six in the morning without ever crossing a monthly cap.
+ * A quarter of the month in a single day is far above ordinary use and far below a runaway, and the
+ * agent asks the guard again at every step, against money that has actually changed hands - so a
+ * run that goes wrong at 2am is stopped by the day's ceiling within a step of reaching it.
+ *
+ * A per-conversation ceiling is deliberately NOT seeded, and it is the one number here that cannot
+ * be chosen well without knowing what the owner does. Unlike the other two it is enforced by
+ * reservation: a conversation that is queued or running holds its whole ceiling against the day
+ * whether or not it spends a penny of it. Seed a tenth of the month and the third conversation of
+ * the morning is refused for money nobody has spent, which reads as the product being broken rather
+ * than as a setting. It remains under Spending caps for an owner who wants one, sized to the way
+ * they work.
+ */
+const seededSpendCaps = (
+  monthlyCapUsd: number
+): { monthlyCapUsd: number; dailyCapUsd: number; defaultTaskCapUsd: null } => ({
+  monthlyCapUsd,
+  dailyCapUsd: Math.round(monthlyCapUsd * 25) / 100,
+  defaultTaskCapUsd: null
+});
+
+/**
  * What the standing notice log says in place of a sentence it cannot decrypt.
  *
  * Only reachable when a workspace key will not unwrap - a master key that has been replaced, or a
@@ -166,6 +258,19 @@ export const UNREADABLE_AGENT_MESSAGE =
 /** The same fact about a row of the agent's own memory, which is listed rather than skipped. */
 export const UNREADABLE_MEMORY_ITEM =
   'This cannot be read: the workspace key that sealed it no longer opens on this server.';
+
+/**
+ * How many conversations a search reads the names of.
+ *
+ * The names are the one part of a conversation the blind index does not hold, so they are matched
+ * by reading them - two small decrypts a row, no events. Bounding it is what keeps the cost of a
+ * search set by the query rather than by the age of the box, and what it gives up is small: the
+ * opening request beyond this window is still reachable, because the verbatim layer recorded it.
+ */
+const SEARCH_NAMED_CONVERSATIONS = 200;
+
+/** Long enough to show the sentence around the match, short enough that twenty are a list. */
+const SEARCH_EXCERPT_CHARS = 280;
 
 const taskResponse = (
   task: Awaited<ReturnType<DataStore['getTask']>> extends infer T ? NonNullable<T> : never,
@@ -1367,6 +1472,235 @@ export const buildServer = async (
   };
 
   /**
+   * One line in a conversation's work log about the wall it is behind.
+   *
+   * A retry is a `status` event with no `owner`, which is what folds it into the collapsed log:
+   * twenty-four asks over a day are evidence, not twenty-four things to read. The two lines that
+   * are the owner's business - nothing is connected, or athanor has stopped asking - say so, and
+   * surface.
+   */
+  const sayWallInLog = async (input: {
+    taskId: string;
+    key: Uint8Array;
+    kind: 'status' | 'warning';
+    summary: string;
+    code: string;
+    owner?: boolean;
+  }): Promise<void> => {
+    await store.appendTaskEvent({
+      taskId: input.taskId,
+      kind: input.kind,
+      summary: PROVIDER_WALL_EVENT_SUMMARY,
+      payloadCiphertext: encryptJson(
+        {
+          __athanorEventVersion: 1,
+          summary: input.summary,
+          payload: { ...(input.owner ? { owner: true } : {}), code: input.code }
+        },
+        input.key,
+        `task-event:${input.taskId}`
+      )
+    });
+  };
+
+  /**
+   * Tells the owner their computer is stopped at their provider.
+   *
+   * `takeover_needed` because that is exactly what this is - work halted until a person does
+   * something - and it is raised here rather than by the agent for the plain reason that by the
+   * time it matters there is no agent left: the turn ended, the worker moved on, and the only
+   * thing that still knows the conversation is parked is this sweep. A conversation that has
+   * already spent its allowance of notifications is not a reason to abandon the pass.
+   */
+  const tellOwnerAboutWall = async (input: {
+    userId: string;
+    taskId: string;
+    key: Uint8Array;
+    notice: string;
+  }): Promise<void> => {
+    await store
+      .createAgentNotification({
+        userId: input.userId,
+        taskId: input.taskId,
+        kind: 'takeover_needed',
+        messageCiphertext: encryptJson(
+          { message: input.notice },
+          input.key,
+          agentNotificationAad(input.taskId)
+        )
+      })
+      .catch((error: unknown) => {
+        log.warn('provider_wall.notify_failed', { taskId: input.taskId, ...errorFields(error) });
+      });
+  };
+
+  /**
+   * The code the provider was last refused with, or null when the last thing that went wrong was
+   * not a refusal this understands. Reading it is what keeps this sweep off work that is parked for
+   * some other reason: nothing is retried unless the conversation says, in its own log, what wall
+   * it is behind.
+   */
+  const providerWallCode = async (taskId: string, key: Uint8Array): Promise<string | null> => {
+    const page = await store.listRecentTaskEvents(taskId, 50);
+    const failure = page.events
+      .filter((item) => item.kind === 'error' || item.kind === 'warning')
+      .at(-1);
+    if (!failure?.payloadCiphertext) return null;
+    try {
+      const decoded = decryptJson<{ payload?: { code?: unknown } }>(
+        failure.payloadCiphertext,
+        key,
+        `task-event:${taskId}`
+      );
+      return typeof decoded.payload?.code === 'string' ? decoded.payload.code : null;
+    } catch {
+      // A conversation whose key no longer opens keeps its status; there is nothing to read and
+      // guessing at a wall would restart work nobody can see the reason for.
+      return null;
+    }
+  };
+
+  /**
+   * Work the provider turned away, picked back up.
+   *
+   * A quota wall at two in the morning used to be the end of the night: `awaiting_resource` is in
+   * none of the notification branches and in none of the other sweeps, so the run stopped, said
+   * nothing, and waited for the owner to open the box. This is both halves of that - the wall is
+   * tried again on a widening interval, and if it is still standing an hour later the owner is
+   * told on whatever device they have.
+   *
+   * How many times a wall has been tried is counted from the log lines the retries themselves
+   * write, over the last day. That is why the line saying athanor has given up is written with the
+   * same label as a retry: writing it is what carries the count past the ceiling, so it is written
+   * exactly once. A wall still standing tomorrow starts the count again, which is right - a day is
+   * long enough that it has become news for a second time.
+   */
+  const retryProviderWalls = async (): Promise<number> => {
+    const parked = await database.query<{
+      task_id: string;
+      user_id: string;
+      workspace_id: string;
+      updated_at: string;
+      retries: string;
+    }>(
+      // `attempt > 0` is the same discriminator the schedule recovery above reads the other way:
+      // only a task a worker has actually leased can have been refused by a provider.
+      `SELECT t.id AS task_id, t.user_id, t.workspace_id, t.updated_at,
+         (SELECT COUNT(*) FROM task_events e
+           WHERE e.task_id = t.id AND e.summary = $1
+             AND e.created_at > NOW() - INTERVAL '24 hours') AS retries
+       FROM tasks t
+       WHERE t.status = 'awaiting_resource' AND t.attempt > 0
+       ORDER BY t.updated_at
+       LIMIT 20`,
+      [PROVIDER_WALL_EVENT_SUMMARY]
+    );
+    let retried = 0;
+    for (const row of parked.rows) {
+      const taskId = String(row.task_id);
+      const userId = String(row.user_id);
+      const workspace = await store.getWorkspaceById(String(row.workspace_id));
+      if (!workspace?.wrappedKey) continue;
+      const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
+      const code = await providerWallCode(taskId, key);
+      if (!code) continue;
+      const wall = providerWalls[code];
+      if (!wall) continue;
+      const retries = Number(row.retries);
+      if (!wall.clearsOnItsOwn) {
+        // Nothing here will change by being asked again, so this is said once and then not again
+        // for a day - which is as often as a box with nothing connected is worth mentioning.
+        if (retries > 0) continue;
+        await sayWallInLog({
+          taskId,
+          key,
+          kind: 'warning',
+          code,
+          summary: wall.notice,
+          owner: true
+        });
+        await tellOwnerAboutWall({ userId, taskId, key, notice: wall.notice });
+        log.info('provider_wall.owner_needed', { taskId, code });
+        continue;
+      }
+      if (retries > PROVIDER_WALL_MAX_RETRIES) continue;
+      if (retries === PROVIDER_WALL_MAX_RETRIES) {
+        await sayWallInLog({
+          taskId,
+          key,
+          kind: 'warning',
+          code,
+          owner: true,
+          summary: `Asked your provider ${PROVIDER_WALL_MAX_RETRIES} times over the last day and it is still refusing, so athanor has stopped asking. Reply here to try again.`
+        });
+        log.warn('provider_wall.gave_up', { taskId, code });
+        continue;
+      }
+      const waitMs =
+        60_000 *
+        (providerWallRetryMinutes[Math.min(retries, providerWallRetryMinutes.length - 1)] ?? 60);
+      if (Date.now() - new Date(String(row.updated_at)).getTime() < waitMs) continue;
+      if (retries === PROVIDER_WALL_NOTIFY_AFTER_RETRIES)
+        await tellOwnerAboutWall({ userId, taskId, key, notice: wall.notice });
+      // The line goes in before the status changes, so the timeline reads in the order things
+      // happened and the record of the attempt exists even if the requeue loses a race.
+      await sayWallInLog({
+        taskId,
+        key,
+        kind: 'status',
+        code,
+        summary: `Asking your provider again after it refused this work: attempt ${retries + 1} of ${PROVIDER_WALL_MAX_RETRIES}.`
+      });
+      if (!(await store.setTaskStatusForUser(userId, taskId, 'queued'))) continue;
+      log.info('provider_wall.retried', { taskId, code, attempt: retries + 1 });
+      retried += 1;
+    }
+    return retried;
+  };
+
+  /**
+   * The wall a person takes down: a key is saved, so everything parked behind the provider goes
+   * back in the queue at once rather than waiting out a backoff that was measuring the wrong thing.
+   *
+   * No wall code is read here. A conversation a worker leased and parked in `awaiting_resource` was
+   * turned away by the provider, whichever of the three ways it was, and a new credential is a
+   * plausible answer to all of them - a different account has its own quota and its own endpoint.
+   * The one thing this must not touch is a scheduled run stranded mid-dispatch, which has never
+   * been leased and needs its workspace woken first; `attempt > 0` is what separates them.
+   */
+  const resumeTasksWaitingOnAProvider = async (userId: string): Promise<number> => {
+    const parked = await database.query<{ task_id: string; workspace_id: string }>(
+      `SELECT id AS task_id, workspace_id FROM tasks
+       WHERE user_id = $1 AND status = 'awaiting_resource' AND attempt > 0
+       ORDER BY updated_at LIMIT 50`,
+      [userId]
+    );
+    let resumed = 0;
+    for (const row of parked.rows) {
+      const taskId = String(row.task_id);
+      const workspace = await store.getWorkspaceById(String(row.workspace_id));
+      if (workspace?.wrappedKey)
+        await store.appendTaskEvent({
+          taskId,
+          kind: 'status',
+          summary: PROVIDER_RECONNECTED_EVENT_SUMMARY,
+          payloadCiphertext: encryptJson(
+            {
+              __athanorEventVersion: 1,
+              summary: 'A provider key was saved, so this work is going again.',
+              payload: { code: 'provider_reconnected' }
+            },
+            unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id),
+            `task-event:${taskId}`
+          )
+        });
+      if (await store.setTaskStatusForUser(userId, taskId, 'queued')) resumed += 1;
+    }
+    if (resumed) log.info('provider_wall.resumed_on_connect', { userId, count: resumed });
+    return resumed;
+  };
+
+  /**
    * Each step is contained on its own: an unhandled rejection here used to reach Node's default
    * handler and take the whole API down, and a database blip during cleanup should not cost the
    * metering pass or the two sweeps that release held credits. Nothing in here throws, which is
@@ -1387,6 +1721,7 @@ export const buildServer = async (
     await step('maintenance.approval_sweep_failed', sweepExpiredApprovals);
     await step('maintenance.attempt_limit_sweep_failed', failTasksAtAttemptLimit);
     await step('maintenance.schedule_recovery_failed', recoverStrandedScheduledTasks);
+    await step('maintenance.provider_wall_retry_failed', retryProviderWalls);
     await step('maintenance.metering_failed', async () => {
       const running = await store.listRunningWorkspaces();
       await Promise.all(running.map(meterWorkspace));
@@ -2366,6 +2701,29 @@ export const buildServer = async (
     };
   });
 
+  /**
+   * Search over the owner's own history.
+   *
+   * This used to read all of it. Every conversation in every workspace, every event in every
+   * conversation, decrypted and stringified in this process to be matched with `includes` - and
+   * tool results are stored whole, so one browser tree or one megabyte of shell output was in that
+   * total verbatim. It was instant in week one and seconds of blocked event loop by month three,
+   * which on a single-threaded API also stalls the stream feeding the live conversation. Nothing
+   * announced the change: it degraded exactly in step with using the computer.
+   *
+   * The bodies are already indexed. Every captured turn is chunked, sealed and blind-indexed on the
+   * write path, and `searchMemorySources` is a bounded BM25 probe over that index - stemming, so
+   * "restarted" finds "restart"; document frequency, so the rare word in the question decides;
+   * length normalisation, so the longest transcript stops winning everything. The agent has
+   * searched this way since the memory runtime landed. Now the owner does.
+   *
+   * The names are not in that index, so they keep a scan of their own: a conversation is findable
+   * by what the owner called it from the moment it is created, before any turn has finished and
+   * therefore before anything has been captured. That scan is two small decrypts per row over the
+   * newest `SEARCH_NAMED_CONVERSATIONS`, so its cost is fixed rather than proportional to how long
+   * the box has been owned - and what it cannot reach it barely loses, because the opening request
+   * of a conversation is the first thing the verbatim layer records.
+   */
   app.get<{
     Querystring: { q?: string; workspaceId?: string; limit?: string };
   }>('/v1/search', async (request) => {
@@ -2382,6 +2740,12 @@ export const buildServer = async (
           (workspace): workspace is WorkspaceRecord => Boolean(workspace?.wrappedKey)
         )
       : (await store.listWorkspaces(user.id)).filter((workspace) => Boolean(workspace.wrappedKey));
+    const keys = new Map(
+      workspaces.map((workspace) => [
+        workspace.id,
+        unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id)
+      ])
+    );
     const query = input.q.toLowerCase();
     const terms = [...new Set(query.split(/\s+/).filter((term) => term.length > 1))];
     const score = (content: string): number => {
@@ -2391,69 +2755,138 @@ export const buildServer = async (
         terms.reduce((total, term) => total + (lower.includes(term) ? 1 : 0), 0)
       );
     };
-    const excerpt = (content: string): string => {
-      const flat = content.replace(/\s+/g, ' ').trim();
-      const lower = flat.toLowerCase();
-      const at =
-        [lower.indexOf(query), ...terms.map((term) => lower.indexOf(term))]
-          .filter((index) => index >= 0)
-          .sort((left, right) => left - right)[0] ?? 0;
-      const start = Math.max(0, at - 100);
-      return `${start ? '…' : ''}${flat.slice(start, start + 280)}${
-        start + 280 < flat.length ? '…' : ''
-      }`;
-    };
-    const results: Array<{
-      taskId: string;
+
+    type Found = {
       workspaceId: string;
       title: string;
-      excerpt: string;
-      score: number;
       updatedAt: string;
-    }> = [];
-    for (const workspace of workspaces) {
-      const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id);
-      for (const task of await store.listTasks(user.id, workspace.id)) {
-        let title = task.legacyTitle ?? 'Private task';
-        if (task.titleCiphertext?.aad === `task-title:${workspace.id}`)
-          title = decryptJson<{ title: string }>(task.titleCiphertext, key).title;
-        const candidates: string[] = [title];
-        if (task.promptCiphertext.aad === `task-prompt:${workspace.id}`)
-          candidates.push(decryptJson<{ prompt: string }>(task.promptCiphertext, key).prompt);
-        for (const event of await store.listTaskEvents(task.id)) {
-          if (event.payloadCiphertext?.aad !== `task-event:${task.id}`) continue;
-          try {
-            candidates.push(JSON.stringify(decryptJson<unknown>(event.payloadCiphertext, key)));
-          } catch {
-            // A malformed legacy event is skipped rather than weakening the query boundary.
-          }
-        }
-        const ranked = candidates
-          .map((content) => ({ content, score: score(content) }))
-          .sort((left, right) => right.score - left.score)[0];
-        if (!ranked?.score) continue;
-        results.push({
-          taskId: task.id,
-          workspaceId: workspace.id,
-          title,
-          excerpt: excerpt(ranked.content),
-          score: ranked.score,
-          updatedAt: task.updatedAt
-        });
-      }
+      /** Lexical score of the conversation's own name or opening request; zero when neither hit. */
+      named: number;
+      /** The best passage the index found inside the conversation. */
+      said: { excerpt: string; score: number } | null;
+      /** Shown when nothing inside the conversation matched, so a hit is never excerptless. */
+      opening: string | null;
+    };
+    const found = new Map<string, Found>();
+
+    const openTask = (task: TaskRecord, key: Uint8Array) => {
+      let title = task.legacyTitle ?? 'Private task';
+      if (task.titleCiphertext?.aad === `task-title:${task.workspaceId}`)
+        title = decryptJson<{ title: string }>(task.titleCiphertext, key).title;
+      const prompt =
+        task.promptCiphertext.aad === `task-prompt:${task.workspaceId}`
+          ? decryptJson<{ prompt: string }>(task.promptCiphertext, key).prompt
+          : '';
+      return { title, prompt };
+    };
+
+    const named = await store.listTaskPage(user.id, {
+      ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
+      include: 'all',
+      limit: SEARCH_NAMED_CONVERSATIONS
+    });
+    for (const task of named.tasks) {
+      const key = keys.get(task.workspaceId);
+      if (!key) continue;
+      const { title, prompt } = openTask(task, key);
+      const rank = Math.max(score(title), score(prompt));
+      if (!rank) continue;
+      found.set(task.id, {
+        workspaceId: task.workspaceId,
+        title,
+        updatedAt: task.updatedAt,
+        named: rank,
+        said: null,
+        opening: memoryExcerpt(prompt || title, input.q, { maxChars: SEARCH_EXCERPT_CHARS })
+      });
     }
-    return results
+
+    /*
+     * One passage per conversation, ranked across workspaces before any of them is opened.
+     *
+     * The number of conversations this route reads is therefore the number of results asked for
+     * rather than the number of boxes owned. `perTask` is the other half of that: the index returns
+     * several passages from one thread by default, which is right for an agent reading around a
+     * subject and wrong here, where every row past the first is a duplicate of a result the owner
+     * can already see. Asking for one apiece is what keeps a request for twenty conversations from
+     * being answered with seven.
+     */
+    const hits = (
+      await Promise.all(
+        workspaces.map(async (workspace) =>
+          (
+            await store.searchMemorySources({
+              workspaceId: workspace.id,
+              plan: planMemoryQuery(input.q, memoryIndexKey(keys.get(workspace.id)!)),
+              limit: input.limit,
+              perTask: 1
+            })
+          ).map((hit) => ({ hit, workspaceId: workspace.id }))
+        )
+      )
+    )
+      .flat()
+      // A capture that belongs to no conversation has nothing to open, and this route's whole
+      // answer is a conversation to open, so it is dropped before it can take up a place.
+      .filter(({ hit }) => Boolean(hit.taskId))
+      .sort((left, right) => right.hit.score - left.hit.score)
+      .slice(0, input.limit);
+
+    for (const { hit, workspaceId } of hits) {
+      const taskId = hit.taskId!;
+      const key = keys.get(workspaceId)!;
+      if (hit.bodyCiphertext.aad !== `memory-source:${workspaceId}`) continue;
+      let body: string;
+      try {
+        body = decryptJson<{ body: string }>(hit.bodyCiphertext, key).body;
+      } catch {
+        // A row sealed under a key this server no longer holds is skipped rather than reported.
+        continue;
+      }
+      const said = {
+        excerpt: memoryExcerpt(body, input.q, { maxChars: SEARCH_EXCERPT_CHARS }),
+        score: hit.score
+      };
+      const held = found.get(taskId);
+      if (held) {
+        // Held rows keep their name ordering; this only ever gives them a better excerpt, which the
+        // name match does not have. Best-scoring rather than last-seen: one row per conversation
+        // makes that the same thing today, and it stops being the same thing the moment anyone
+        // widens `perTask` above.
+        if (!held.said || held.said.score < said.score) held.said = said;
+        continue;
+      }
+      const task = await store.getTask(user.id, taskId);
+      if (!task) continue;
+      found.set(taskId, {
+        workspaceId,
+        title: openTask(task, key).title,
+        updatedAt: task.updatedAt,
+        named: 0,
+        said,
+        opening: null
+      });
+    }
+
+    /*
+     * Two passes, two questions, and their scores do not share a scale, so they are ordered rather
+     * than added. A conversation whose name or opening request carries the query is what the owner
+     * was looking for often enough that it goes first; everything found inside a conversation
+     * follows in the order the index ranked it.
+     */
+    return [...found]
       .sort(
-        (left, right) =>
-          right.score - left.score ||
+        ([, left], [, right]) =>
+          right.named - left.named ||
+          (right.said?.score ?? 0) - (left.said?.score ?? 0) ||
           new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()
       )
       .slice(0, input.limit)
-      .map((result) => ({
-        taskId: result.taskId,
+      .map(([taskId, result]) => ({
+        taskId,
         workspaceId: result.workspaceId,
         title: result.title,
-        excerpt: result.excerpt,
+        excerpt: result.said?.excerpt ?? result.opening ?? result.title,
         updatedAt: result.updatedAt
       }));
   });
@@ -5036,7 +5469,20 @@ export const buildServer = async (
            * before, so the screen can save a key without also having to restate a media choice it
            * did not touch.
            */
-          mediaModels: MediaModelSelection.optional()
+          mediaModels: MediaModelSelection.optional(),
+          /**
+           * The answer to the one question about money worth asking at this moment, and the only
+           * moment it is worth asking: saving a key is when spending becomes possible at all, and
+           * the owner is already thinking about a bill. Absent means this save was not about money;
+           * an explicit null is the owner declining a ceiling, which is theirs to decline on their
+           * own computer - what is not acceptable is a cap system that is off because nobody asked.
+           */
+          spendCeiling: z
+            .object({
+              monthlyCapUsd: z.number().positive().max(1_000_000).nullable(),
+              timeZone: z.string().min(1).max(100).optional()
+            })
+            .optional()
         })
         .superRefine((value, context) => {
           // Ollama Cloud is exempt because it no longer needs one: the catalogue below lists every
@@ -5048,6 +5494,20 @@ export const buildServer = async (
               path: ['modelId'],
               message: 'Choose the model ID exposed by this endpoint'
             });
+          // Checked here rather than where the caps are written, which is after the credential has
+          // been stored: a zone this server cannot resolve should cost the owner a corrected form,
+          // not a saved key reported as a failure.
+          if (value.spendCeiling?.timeZone !== undefined) {
+            try {
+              assertTimeZone(value.spendCeiling.timeZone);
+            } catch {
+              context.addIssue({
+                code: 'custom',
+                path: ['spendCeiling', 'timeZone'],
+                message: 'Choose a valid IANA time zone'
+              });
+            }
+          }
         })
         .parse(request.body);
       const apiKey =
@@ -5228,6 +5688,29 @@ export const buildServer = async (
         outcome: 'completed',
         metadata: { provider: input.provider }
       });
+      /*
+       * A ceiling only ever gets put in place here, never moved.
+       *
+       * Without this every cap ships null, the guard builds no window for a null cap, and the whole
+       * DST-correct, commitment-aware machinery refuses nothing until the owner goes looking for a
+       * setting they do not know exists. The answer given at the keyboard is written once, and only
+       * onto a box that has never had spending limits of any kind - so re-saving a key years later
+       * cannot quietly undo caps the owner has since chosen, and declining is a decision this
+       * records rather than a question it asks again.
+       */
+      if (input.spendCeiling && !(await store.getSpendLimits(user.id))) {
+        const { monthlyCapUsd, timeZone } = input.spendCeiling;
+        await store.setSpendLimits({
+          userId: user.id,
+          ...(monthlyCapUsd === null
+            ? { dailyCapUsd: null, monthlyCapUsd: null, defaultTaskCapUsd: null }
+            : seededSpendCaps(monthlyCapUsd)),
+          ...(timeZone ? { timeZone } : {})
+        });
+      }
+      // A key is the one wall a person takes down by hand, so the work behind it goes now rather
+      // than on the retry sweep's clock.
+      await resumeTasksWaitingOnAProvider(user.id);
       return providerSettings(user.id);
     });
   });

@@ -133,6 +133,30 @@ const Auth = lazy(() =>
   import('./Auth.js').then(({ Auth: AuthScreen }) => ({ default: AuthScreen }))
 );
 
+/**
+ * The conversation that has this one's computer, or undefined when nothing has it.
+ *
+ * A computer is one filesystem, one browser and one desktop, so it is handed to one conversation at
+ * a time: a second one asked while the first is working waits, and `planning` is written by the
+ * hand-over itself. A queued conversation with a `planning` or `running` neighbour on the same
+ * computer is therefore not slow to start — it is behind that neighbour, which is the difference
+ * the screen had no way of showing.
+ *
+ * How long the holder may keep the computer is not on the wire, so there is one case this reads
+ * wrong: a turn whose worker died keeps a working-looking status until its hold runs out, and this
+ * names it while the computer is in fact free. It rights itself as soon as this conversation is
+ * picked up, which is the same few seconds either way.
+ */
+export const computerHeldBy = (task: Task | undefined, tasks: Task[]): Task | undefined =>
+  task?.status === 'queued'
+    ? tasks.find(
+        (other) =>
+          other.id !== task.id &&
+          other.workspaceId === task.workspaceId &&
+          (other.status === 'planning' || other.status === 'running')
+      )
+    : undefined;
+
 export function App() {
   const [auth, setAuth] = useState<'loading' | 'required' | 'ready'>('loading');
   const [data, setData] = useState<Bootstrap>();
@@ -870,6 +894,7 @@ export function App() {
   );
 
   const task = data?.tasks.find((item) => item.id === taskId);
+  const computerHolder = computerHeldBy(task, data?.tasks ?? []);
   const privacyRoute =
     data?.models.find((model) => model.id === modelId)?.privacyRoute ??
     data?.models.find((model) => model.availability === 'available')?.privacyRoute ??
@@ -2477,6 +2502,26 @@ export function App() {
                 <span>
                   <i />
                   Computer unavailable
+                </span>
+              )}
+              {/*
+                A conversation waiting for the computer looked exactly like one about to start, and
+                the wait can be a whole turn long. This is the second question saying which
+                conversation has the computer, and offering the way to it — the only two moves here
+                are to wait or to stop that one, and Stop lives on that conversation. A fact about
+                the machine, so it is chrome: no fire, no caution, nothing to press but the name.
+              */}
+              {workspace && computerHolder && (
+                <span className="computer-held">
+                  Waiting for the computer.{' '}
+                  <button
+                    className="computer-held-open"
+                    aria-label={`Open ${computerHolder.title}`}
+                    onClick={() => setTaskId(computerHolder.id)}
+                  >
+                    {computerHolder.title}
+                  </button>{' '}
+                  has it.
                 </span>
               )}
             </div>

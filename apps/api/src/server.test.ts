@@ -7,6 +7,8 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import { PREVIEW_IDLE_EXPIRY_DAYS } from '@athanor/contracts';
 import {
   buildMemoryItemIndex,
+  buildMemorySourceIndex,
+  decryptJson,
   encryptJson,
   generateDataKey,
   memoryIndexKey,
@@ -2396,7 +2398,12 @@ describe('unattended recovery', () => {
     expect(resumed).toHaveLength(1);
   }, 30_000);
 
-  test('does not re-queue a task that ran and then hit a resource wall', async () => {
+  /*
+   * The schedule recovery must not touch a run that reached a worker, and neither must the provider
+   * retry below it: this conversation says nothing in its own log about what turned it away, and
+   * nothing is put back in the queue on a guess about a wall nobody can name.
+   */
+  test('leaves a task that ran and then hit an unnamed wall where the worker put it', async () => {
     stubProviderFetch();
     const directory = await mkdtemp(join(tmpdir(), 'athanor-api-schedule-wall-'));
     disposers.push(() => rm(directory, { recursive: true, force: true }));
@@ -2457,6 +2464,166 @@ describe('unattended recovery', () => {
       status: 'queued',
       resumable: false
     });
+  }, 30_000);
+
+  /*
+   * The overnight failure this exists for: a run hits a quota wall at two in the morning, and
+   * nothing notices. `awaiting_resource` appears in no notification branch and in no other sweep,
+   * so the box went quiet until someone opened it. Both halves are asserted here - the wall is
+   * tried again on a widening interval, and once it has stood the better part of an hour the owner
+   * is told on whatever device they carry.
+   */
+  test('retries a provider quota wall on a widening interval and wakes the owner if it stands', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-quota-wall-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database, runMaintenance } = await buildServer(isolatedConfig(directory), {
+      masterKey
+    });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'quota-wall',
+      'Watch the deployment overnight'
+    );
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id);
+    // Exactly what the worker leaves behind when the provider turns it away: the refusal in the
+    // log, and the conversation parked with a lease already spent on it.
+    await store.appendTaskEvent({
+      taskId,
+      kind: 'warning',
+      summary: 'Encrypted warning event',
+      payloadCiphertext: encryptJson(
+        {
+          __athanorEventVersion: 1,
+          summary: 'The provider refused the request: no quota left',
+          payload: { owner: true, code: 'provider_quota_exhausted' }
+        },
+        key,
+        `task-event:${taskId}`
+      )
+    });
+    const park = (ago: string) =>
+      database.query(
+        `UPDATE tasks SET status='awaiting_resource', attempt=1,
+         updated_at=NOW() - $2::interval WHERE id=$1`,
+        [taskId, ago]
+      );
+    const status = async () =>
+      (await app.inject({ method: 'GET', url: `/v1/tasks/${taskId}`, headers: { cookie } })).json<{
+        status: string;
+      }>().status;
+    const notices = async () =>
+      (await store.listAgentNotifications(workspace.userId, 50, masterKey)).map(
+        (notice) => notice.message
+      );
+
+    // A wall seconds old is not retried: the whole point of the interval is that a provider is
+    // someone else's server and this box does not hammer it.
+    await park('5 seconds');
+    await runMaintenance();
+    expect(await status()).toBe('awaiting_resource');
+    expect(await notices()).toEqual([]);
+
+    // The first three refusals are the box's own business; nobody is woken for a blip.
+    for (const attempt of [1, 2, 3]) {
+      await park('2 hours');
+      await runMaintenance();
+      expect(await status(), `attempt ${attempt}`).toBe('queued');
+      expect(await notices()).toEqual([]);
+    }
+
+    // The fourth is about fifty minutes in, which is where a refusal has stopped being weather and
+    // become a fact about the account.
+    await park('2 hours');
+    await runMaintenance();
+    expect(await status()).toBe('queued');
+    expect(await notices()).toEqual([
+      'Your provider has been refusing this work for the last hour: the quota is used up.'
+    ]);
+
+    // And every ask is in the conversation rather than in a log nobody reads.
+    const events = await store.listRecentTaskEvents(taskId, 200);
+    const retries = events.events
+      .filter((event) => event.summary === 'Encrypted provider wall event')
+      .map(
+        (event) =>
+          decryptJson<{ summary: string }>(event.payloadCiphertext!, key, `task-event:${taskId}`)
+            .summary
+      );
+    expect(retries).toHaveLength(4);
+    expect(retries[0]).toBe(
+      'Asking your provider again after it refused this work: attempt 1 of 24.'
+    );
+  }, 30_000);
+
+  /*
+   * The third cause is not like the other two. A quota and an outage end on the provider's clock;
+   * a box with no provider connected has nothing to ask, so asking it on any interval is noise.
+   */
+  test('never probes a wall only the owner can take down, and puts the work back when they do', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-no-provider-wall-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database, runMaintenance } = await buildServer(isolatedConfig(directory), {
+      masterKey
+    });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'no-provider-wall',
+      'File the receipts'
+    );
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id);
+    await store.appendTaskEvent({
+      taskId,
+      kind: 'warning',
+      summary: 'Encrypted warning event',
+      payloadCiphertext: encryptJson(
+        {
+          __athanorEventVersion: 1,
+          summary: 'There is no model provider connected',
+          payload: { owner: true, code: 'provider_not_connected' }
+        },
+        key,
+        `task-event:${taskId}`
+      )
+    });
+    await database.query(
+      `UPDATE tasks SET status='awaiting_resource', attempt=1,
+       updated_at=NOW() - INTERVAL '6 hours' WHERE id=$1`,
+      [taskId]
+    );
+    const status = async () =>
+      (await app.inject({ method: 'GET', url: `/v1/tasks/${taskId}`, headers: { cookie } })).json<{
+        status: string;
+      }>().status;
+
+    await runMaintenance();
+    await runMaintenance();
+
+    expect(await status()).toBe('awaiting_resource');
+    // Told once, not once per sweep.
+    expect(
+      (await store.listAgentNotifications(workspace.userId, 50, masterKey)).map(
+        (notice) => notice.message
+      )
+    ).toEqual([
+      'No model provider is connected, so this work cannot run. Save a key in Settings and it starts again on its own.'
+    ]);
+
+    // The sentence promises the work starts again on its own, and saving a key is what makes that
+    // true: the credential is the one wall a person takes down by hand.
+    const saved = await app.inject({
+      method: 'PUT',
+      url: '/v1/providers',
+      headers: { cookie, 'idempotency-key': 'no-provider-wall-reconnect' },
+      payload: { provider: 'openrouter', apiKey: 'another-key', enforceZeroDataRetention: true }
+    });
+    expect(saved.statusCode, saved.body).toBe(200);
+    expect(await status()).toBe('queued');
   }, 30_000);
 
   test('dispatches a due schedule and moves it past the run it just served', async () => {
@@ -2844,6 +3011,168 @@ describe('spending caps', () => {
     });
     expect(spend.windows.find((window) => window.name === 'monthly')?.capUsd).toBeNull();
     expect(Array.isArray(spend.byDay) && Array.isArray(spend.byModel)).toBe(true);
+  }, 40_000);
+
+  /*
+   * Every cap shipped null, and the guard builds no window for a null cap - so the machinery that
+   * refuses work could refuse nothing at all until the owner went looking for a setting they did
+   * not know existed. The answer is asked for where the owner is already thinking about money and
+   * where spending first becomes possible, which is the moment the key is saved.
+   */
+  test('puts a ceiling in place when the key is saved, and lets the owner decline one', async () => {
+    stubProviderAndRunner();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-seeded-caps-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const connect = async (
+      username: string,
+      key: string,
+      spendCeiling?: { monthlyCapUsd: number | null; timeZone?: string }
+    ) => {
+      const cookie = sessionCookie(
+        await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username } })
+      );
+      const saved = await app.inject({
+        method: 'PUT',
+        url: '/v1/providers',
+        headers: { cookie, 'idempotency-key': key },
+        payload: {
+          provider: 'openrouter',
+          apiKey: 'test-key',
+          enforceZeroDataRetention: true,
+          ...(spendCeiling ? { spendCeiling } : {})
+        }
+      });
+      expect(saved.statusCode, saved.body).toBe(200);
+      return cookie;
+    };
+    const limits = async (cookie: string) =>
+      (await app.inject({ method: 'GET', url: '/v1/spend-limits', headers: { cookie } })).json<{
+        dailyCapUsd: number | null;
+        monthlyCapUsd: number | null;
+        defaultTaskCapUsd: number | null;
+        timeZone: string;
+        updatedAt: string;
+      }>();
+
+    // One number at the keyboard becomes the two ceilings that actually stop a runaway: a month is
+    // what a bill arrives in, and a quarter of it in a day is what makes the month mean anything
+    // overnight. The per-conversation ceiling stays unset on purpose - it is the only one enforced
+    // by reserving its whole value up front, so seeding one refuses ordinary work over money that
+    // has not been spent.
+    const accepted = await connect('accepter', 'caps-accept', {
+      monthlyCapUsd: 50,
+      timeZone: 'Europe/Lisbon'
+    });
+    expect(await limits(accepted)).toMatchObject({
+      monthlyCapUsd: 50,
+      dailyCapUsd: 12.5,
+      defaultTaskCapUsd: null,
+      timeZone: 'Europe/Lisbon'
+    });
+
+    // Declining is a decision, and it is recorded as one: the caps stay off, and the timestamp
+    // stops being the epoch, which is how the screen knows never to ask again.
+    const declined = await connect('decliner', 'caps-decline', { monthlyCapUsd: null });
+    expect(await limits(declined)).toMatchObject({
+      monthlyCapUsd: null,
+      dailyCapUsd: null,
+      defaultTaskCapUsd: null
+    });
+    expect(Date.parse((await limits(declined)).updatedAt)).toBeGreaterThan(0);
+    expect(Date.parse((await limits(await connect('unasked', 'caps-unasked'))).updatedAt)).toBe(0);
+
+    // And a ceiling is only ever put in place, never moved: re-saving a key cannot quietly undo
+    // caps the owner has chosen since.
+    await connect('accepter', 'caps-accept-again', { monthlyCapUsd: null });
+    expect(await limits(accepted)).toMatchObject({ monthlyCapUsd: 50, dailyCapUsd: 12.5 });
+  }, 40_000);
+
+  /*
+   * The failure a seeded ceiling can cause, which is worse than shipping none at all.
+   *
+   * The per-conversation cap is enforced by reserving its whole value the moment work is queued, so
+   * seeding one at a tenth of the month against a day at a quarter of it meant three conversations
+   * used up the day before any of them had spent a penny. The owner queues a morning's work, the
+   * third one is refused for money, and the number in the refusal is money that does not exist.
+   * Queueing work and walking away is the entire product, so this is pinned rather than reasoned
+   * about.
+   */
+  test('lets an owner who accepted the suggested ceiling queue a morning of work', async () => {
+    stubProviderAndRunner();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-seeded-caps-queue-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'seeded-caps-queue-workspace' },
+        payload: { name: 'Computer', storageLimitBytes: 10_000_000_000, region: 'auto' }
+      })
+    ).json<{ id: string }>().id;
+    const saved = await app.inject({
+      method: 'PUT',
+      url: '/v1/providers',
+      headers: { cookie, 'idempotency-key': 'seeded-caps-queue-provider' },
+      payload: {
+        provider: 'openrouter',
+        apiKey: 'test-key',
+        enforceZeroDataRetention: true,
+        // Exactly what the field sends when the owner accepts the figure already in it.
+        spendCeiling: { monthlyCapUsd: 50, timeZone: 'Europe/Lisbon' }
+      }
+    });
+    expect(saved.statusCode, saved.body).toBe(200);
+
+    for (let index = 1; index <= 8; index += 1) {
+      const started = await app.inject({
+        method: 'POST',
+        url: '/v1/tasks',
+        headers: { cookie, 'idempotency-key': `seeded-caps-queue-task-${index}` },
+        payload: {
+          workspaceId,
+          prompt: `Ordinary piece of work number ${index}`,
+          modelId: 'openrouter/openai/gpt-oss-120b',
+          privacyRoute: 'provider_zdr',
+          maxComputeCredits: 5
+        }
+      });
+      expect(started.statusCode, `conversation ${index}: ${started.body}`).toBe(200);
+    }
+
+    // The ceiling is still a ceiling: it refuses against money that has actually been spent.
+    const user = (await store.getWorkspaceById(workspaceId))!.userId;
+    await store.recordUsage({
+      userId: user,
+      idempotencyKey: 'seeded-caps-queue-overspend',
+      kind: 'model_call',
+      resourceClass: 'inference',
+      quantity: 1,
+      unit: 'call',
+      credits: 0,
+      state: 'settled',
+      costUsd: 13
+    });
+    const refused = await app.inject({
+      method: 'POST',
+      url: '/v1/tasks',
+      headers: { cookie, 'idempotency-key': 'seeded-caps-queue-task-over' },
+      payload: {
+        workspaceId,
+        prompt: 'One more after the day is spent',
+        modelId: 'openrouter/openai/gpt-oss-120b',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 5
+      }
+    });
+    expect(refused.statusCode).toBe(402);
+    expect(refused.json<{ error: { code: string } }>().error.code).toBe('spend_cap_reached');
   }, 40_000);
 });
 
@@ -4671,6 +5000,162 @@ describe('what the computer is running', () => {
     });
     expect(stopped.statusCode, stopped.body).toBe(200);
     expect(runnerCalls).toContain(`POST /v1/workspaces/${workspaceId}/processes/proc_1`);
+  });
+});
+
+/*
+ * Search used to read the owner's whole history on every keystroke - every conversation, every
+ * event, decrypted and matched with `includes`, in the API's own event loop. It answered instantly
+ * on a new box and in seconds on a used one, and nothing said so.
+ */
+describe('searching the owner’s own history', () => {
+  test('answers from the index the agent uses, one conversation per result', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-search-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'history-search',
+      'Prepare a concise report'
+    );
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspaceId);
+    const indexKey = memoryIndexKey(key);
+
+    // A second conversation whose name says nothing about what was discussed in it, which is the
+    // case the index exists for.
+    const mailTaskId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/tasks',
+        headers: { cookie, 'idempotency-key': 'history-search-mail-task' },
+        payload: {
+          workspaceId,
+          prompt: 'Look at the mail server',
+          modelId: 'openrouter/openai/gpt-oss-120b',
+          privacyRoute: 'provider_zdr',
+          maxComputeCredits: 5
+        }
+      })
+    ).json<{ id: string }>().id;
+
+    const capture = async (task: string, body: string, occurredAt: string) => {
+      const index = buildMemorySourceIndex(body, indexKey);
+      return store.createMemorySource({
+        userId: workspace.userId,
+        workspaceId,
+        channel: 'chat',
+        role: 'owner',
+        taskId: task,
+        bodyCiphertext: encryptJson({ body }, key, `memory-source:${workspaceId}`),
+        bodyTokens: index.bodyTokens,
+        tokensEst: index.tokensEst,
+        indexed: index.indexed,
+        occurredAt
+      });
+    };
+    await capture(
+      mailTaskId,
+      'The box would not accept mail so I had to restart dovecot by hand before it came back.',
+      '2026-03-04T11:00:00.000Z'
+    );
+    // A second matching turn in the same conversation, so the one-row-per-conversation rule below
+    // is asserted against a thread that really did match twice.
+    await capture(
+      mailTaskId,
+      'Then the backlog drained on its own once dovecot was up.',
+      '2026-03-04T11:05:00.000Z'
+    );
+
+    /*
+     * The old scan's own corpus, in the shape that made it expensive: one tool result carrying a
+     * megabyte of output. It is written here so the assertion below is about a route that does not
+     * read it rather than about a fixture that is not there.
+     */
+    await store.appendTaskEvent({
+      taskId,
+      kind: 'tool_result',
+      summary: 'Read the mail log',
+      payloadCiphertext: encryptJson(
+        { output: `dovecot ${'log line '.repeat(100_000)}` },
+        key,
+        `task-event:${taskId}`
+      )
+    });
+    const events = vi.spyOn(store, 'listTaskEvents');
+
+    const search = async (q: string, limit?: number) =>
+      app.inject({
+        method: 'GET',
+        url: `/v1/search?q=${encodeURIComponent(q)}&workspaceId=${workspaceId}${
+          limit ? `&limit=${limit}` : ''
+        }`,
+        headers: { cookie }
+      });
+
+    // "restarted" against a body that says "restart": the same stemmer indexed both, which is the
+    // match the substring scan could not make at all.
+    const restarted = await search('restarted dovecot');
+    expect(restarted.statusCode, restarted.body).toBe(200);
+    const hits = restarted.json<{ taskId: string; excerpt: string; title: string }[]>();
+    expect(hits[0]).toMatchObject({ taskId: mailTaskId, title: 'Look at the mail server' });
+    // One row per conversation, so a thread that matched twice takes one place in the list rather
+    // than two, and asking for twenty conversations is answered with twenty.
+    expect(hits.filter((hit) => hit.taskId === mailTaskId)).toHaveLength(1);
+    expect(hits[0]!.excerpt).toContain('restart dovecot');
+    // The whole point: no conversation's trajectory was read to answer this.
+    expect(events).not.toHaveBeenCalled();
+
+    /*
+     * A conversation is findable by what the owner called it from the moment it exists, before any
+     * turn has finished and so before anything of it has been captured.
+     */
+    const named = await search('concise report');
+    expect(named.statusCode, named.body).toBe(200);
+    expect(named.json()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ taskId, title: 'Prepare a concise report' })
+      ])
+    );
+    expect(events).not.toHaveBeenCalled();
+
+    /*
+     * Four conversations that each said the same thing several times, and room asked for exactly
+     * four.
+     *
+     * The index answers a question about passages and this route answers a question about
+     * conversations, and the gap between them is silent: several passages out of one busy thread
+     * fill the places the other threads were meant to occupy, so a search for a word four
+     * conversations discussed comes back naming two of them. Nothing says any were left out.
+     */
+    for (const subject of ['orchard', 'harbour', 'granary', 'foundry']) {
+      const busy = (
+        await app.inject({
+          method: 'POST',
+          url: '/v1/tasks',
+          headers: { cookie, 'idempotency-key': `history-search-${subject}` },
+          payload: {
+            workspaceId,
+            prompt: `Work on the ${subject}`,
+            modelId: 'openrouter/openai/gpt-oss-120b',
+            privacyRoute: 'provider_zdr',
+            maxComputeCredits: 5
+          }
+        })
+      ).json<{ id: string }>().id;
+      for (const turn of [1, 2, 3])
+        await capture(
+          busy,
+          `Turn ${turn}: the barometer at the ${subject} was read and logged.`,
+          `2026-04-0${turn}T09:00:00.000Z`
+        );
+    }
+    const barometer = await search('barometer', 4);
+    expect(barometer.statusCode, barometer.body).toBe(200);
+    const spread = barometer.json<{ taskId: string }[]>();
+    expect(new Set(spread.map((hit) => hit.taskId)).size).toBe(4);
   });
 });
 
