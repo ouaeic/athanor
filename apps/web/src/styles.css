@@ -3466,12 +3466,28 @@ select:focus-visible {
     border: 0;
     background: #17211d77;
   }
+  /*
+    A sheet the conversation stays behind, not a screen that replaces it.
+   
+    This used to be `inset: 58px 0 52px` - everything between the header and the tab bar, which is
+    exactly where the composer lives. So opening Files, Computer, Terminal or Running covered the
+    message box completely, and the realistic phone gesture - glance at what it made, then say "no,
+    the second one" - cost two taps and the loss of everything you were about to refer to.
+   
+    Anchored to the bottom at a little over half the screen instead, with the transcript and the
+    composer still visible above it. `svh` rather than `dvh` so the sheet does not resize under the
+    owner's thumb as the browser chrome comes and goes mid-scroll.
+  */
   .inspector {
     position: fixed;
     z-index: 12;
-    inset: 58px 0 52px;
+    inset: auto 0 var(--bottom-bar) 0;
+    height: var(--sheet);
     border-left: 0;
-    background: #131517;
+    border-top: 1px solid #2f3336;
+    border-radius: 16px 16px 0 0;
+    background: #0d0f10;
+    box-shadow: 0 -18px 44px #000000a8;
   }
   .composer-wrap {
     padding-left: 11px;
@@ -5924,8 +5940,13 @@ body,
   .mobile-sidebar {
     padding-top: var(--safe-top);
   }
+  /*
+    The sheet's own bottom, once the tab bar and the home indicator are known. Height rather than a
+    top inset: the point of the sheet is that the conversation and the message box stay on screen
+    above it.
+  */
   .inspector {
-    inset: calc(58px + var(--safe-top)) 0 var(--bottom-bar);
+    inset: auto 0 var(--bottom-bar) 0;
   }
   .composer-wrap {
     bottom: var(--bottom-bar);
@@ -5937,6 +5958,16 @@ body,
    */
   .workbench {
     padding-bottom: var(--bottom-bar);
+  }
+
+  /*
+   * And the sheet is part of that distance while it is open, which is what makes it a sheet rather
+   * than a second screen: the message box sits directly above it, so the whole point of opening
+   * Files on a phone - look at what it made, then say which one - is one gesture instead of two
+   * taps and the loss of everything you were about to refer to.
+   */
+  .app-shell:not(.inspector-closed) .workbench {
+    padding-bottom: calc(var(--bottom-bar) + var(--sheet));
   }
 }
 
@@ -7799,6 +7830,8 @@ a.blocked-resource:hover {
  */
 :root {
   --keyboard: 0px;
+  /* How much of a phone screen the Inspector takes when it is open. */
+  --sheet: 52svh;
 }
 
 @media (max-width: 800px) {
