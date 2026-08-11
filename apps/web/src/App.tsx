@@ -205,6 +205,17 @@ export function App() {
   const [palette, setPalette] = useState(false);
   const composer = useRef<HTMLTextAreaElement>(null);
   const uploads = useRef(new Map<string, () => void>());
+  const approvalCard = useRef<HTMLDivElement | null>(null);
+  /**
+   * The way back to a request that is waiting, from the palette.
+   *
+   * Deferred a frame on purpose. The palette is a Dialog, and a Dialog returns focus to whatever
+   * opened it as it closes — so running this on the same tick focuses the card and then has it
+   * taken away again, which is precisely the "Shift+Tab and hope" this exists to end.
+   */
+  const focusApproval = useCallback(() => {
+    window.requestAnimationFrame(() => approvalCard.current?.focus());
+  }, []);
   // Window-level shortcuts are registered once and must not capture the first render's closures.
   const live = useRef<{ stop: () => void; editLast: () => void; active: boolean }>({
     stop: () => undefined,
@@ -827,8 +838,18 @@ export function App() {
     if (!visiblePending || timelineEvents === events) setPendingSend(undefined);
   }, [timelineEvents, events, pendingSend, visiblePending]);
   const [announcement, setAnnouncement] = useState('');
+  /*
+   * One sentence per state change, and `awaiting_user` is not one of them.
+   *
+   * That state means a request card is up, and the card announces itself through this same region
+   * with the thing it is about to do named — "Runs a command on your computer" against this one's
+   * "The agent needs your approval". Two sentences for one event is the narration this interface is
+   * meant to be losing, and worse, they raced: effects run child-first, so whenever the approval
+   * poll and the status change landed in one commit this line silently overwrote the better one.
+   */
   useEffect(() => {
-    if (task) setAnnouncement(taskStateAnnouncement(task.title, task.status));
+    if (task && task.status !== 'awaiting_user')
+      setAnnouncement(taskStateAnnouncement(task.title, task.status));
   }, [task?.id, task?.status, task?.title]);
   useEffect(() => {
     if (auth !== 'ready') return;
@@ -1748,9 +1769,25 @@ export function App() {
       ['files', 'Files'],
       ['computer', 'Computer'],
       ['terminal', 'Terminal'],
-      ['preview', 'Preview']
+      // The identifier is the owner's stored preference and cannot move; the name follows the tab,
+      // which now shows what the computer is running rather than a form asking for a port number.
+      ['preview', 'Running']
     ];
     const commands: Command[] = [
+      // First, and only while something is waiting. The palette is where the owner looks for a
+      // thing they cannot find, and the one control they could not reach from here was the one
+      // where the agent is stopped waiting on them. No key of its own: every chord built on Enter
+      // is already a send in the message box (`sendsOnKey`), which is where it would be pressed.
+      ...(approvals.length
+        ? [
+            {
+              id: 'approval',
+              label: 'Go to the request waiting for you',
+              group: 'Actions',
+              run: focusApproval
+            }
+          ]
+        : []),
       {
         id: 'new-chat',
         label: 'New conversation',
@@ -1920,6 +1957,13 @@ export function App() {
                approval that belongs to it. */
             openTaskEvents={events}
             onOpenComputer={() => openInspector('computer')}
+            /* The card takes focus itself when it appears; this is how the window gets the owner
+               back to it, from ⌘⇧↩ and from the palette. */
+            cardRef={approvalCard}
+            /* One arrival, said once, through the region the window already has. The card used to
+               announce itself by being assertive, which meant announcing again every time its
+               countdown moved. */
+            onAnnounce={setAnnouncement}
             /*
               A decision that failed is reported on the card that asked for it, not through the
               shared error strip. The strip cannot say it while this card is up - the card outranks
@@ -1941,6 +1985,11 @@ export function App() {
                 await api.resolveApproval(id, decision);
                 setApprovals((items) => items.filter((item) => item.id !== id));
                 setError('');
+                // The card took focus when it appeared, so it owes it back: the control just
+                // pressed is about to unmount, and focus left on a dead node drops a keyboard onto
+                // the top of the document. Not when another request is queued — that card focuses
+                // itself a commit later, and it is still the owner's turn.
+                if (approvals.length <= 1) composer.current?.focus();
               } catch (cause) {
                 if (cause instanceof ApiFailure && cause.status === 404) {
                   // The request is gone, so its card goes with it and there is nothing left to
@@ -2281,7 +2330,7 @@ export function App() {
                 ['files', 'Files', Archive],
                 ['computer', 'Computer', Monitor],
                 ['terminal', 'Terminal', TerminalSquare],
-                ['preview', 'Preview', Play]
+                ['preview', 'Running', Play]
               ] as const
             ).map(([id, label, Icon]) => {
               // The tab that is showing, which is not always the tab that was chosen: while the

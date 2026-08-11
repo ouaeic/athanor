@@ -2,6 +2,7 @@ import type { BotWall, Task, TaskEvent } from './types.js';
 import { taskIsGenerating, terminalTaskStatuses } from './task-status.js';
 import { harnessRun, type HarnessCheck } from './completion-card.js';
 import { externalRead } from './provenance.js';
+import { fileChangesFromTool, type FileChange } from './diff.js';
 
 /*
  * What the agent is doing, in the owner's words.
@@ -48,6 +49,17 @@ const activityLabels: Record<string, string> = {
   tool_search: 'Looking for the right tool',
   web_search: 'Searching the web'
 };
+
+/**
+ * What one call is, in the owner's words, wherever it is printed.
+ *
+ * The table above was read only by the one line under the work log's heading. Inside the log, every
+ * row printed the worker's own sentence — "shell", "file_write completed" — so a single screen
+ * described the same action in two registers, the machine's underneath the owner's. The table
+ * already covers all thirty tools; nothing here needed writing except the export.
+ */
+export const toolLabel = (tool: string, fallback: string): string =>
+  activityLabels[tool] ?? fallback.replace(/^Running\s+/i, '');
 
 const eventPayload = (event: TaskEvent): Record<string, unknown> =>
   event.payload && typeof event.payload === 'object'
@@ -451,7 +463,7 @@ export type ConversationNode =
    * it is often much longer, and nobody wants it glued to the top of what they asked for.
    */
   | { kind: 'thinking'; id: string; event: TaskEvent; markdown: string; streaming: boolean }
-  | { kind: 'activity'; id: string; events: Array<{ event: TaskEvent; index: number }> }
+  | { kind: 'activity'; id: string; events: ActivityEntry[] }
   | { kind: 'output'; id: string; event: TaskEvent }
   /** `resolution` is present on an approval that has since been answered; the two render as one. */
   | { kind: 'notice'; id: string; event: TaskEvent; resolution?: TaskEvent }
@@ -486,47 +498,228 @@ export const liveActivityId = (nodes: ConversationNode[]): string | undefined =>
 };
 
 /**
+ * Every address anywhere inside one tool result, depth-bounded because a browser result can carry
+ * a whole accessibility tree. Lifted out of `sourcesFromEvents` so it stays one walk with one set
+ * of rules about what counts.
+ */
+const collectSources = (
+  value: unknown,
+  found: Map<string, ConversationSource>,
+  depth: number,
+  inheritedTitle: string
+): void => {
+  if (found.size >= 12 || depth > 4 || !value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectSources(item, found, depth + 1, inheritedTitle);
+    return;
+  }
+  const record = value as Record<string, unknown>;
+  const title = typeof record.title === 'string' ? record.title : inheritedTitle;
+  const url = record.url;
+  /*
+   * A ranked snippet is a link the agent was offered, not a page it read. Search results carry
+   * both of these and nothing the agent actually opens does, so without this a single search
+   * would put ten uncited addresses under "Sources for this answer".
+   */
+  const offered = typeof record.rank === 'number' && typeof record.snippet === 'string';
+  if (!offered && typeof url === 'string' && /^https?:\/\//i.test(url)) {
+    try {
+      const parsed = new URL(url);
+      const host = parsed.host.replace(/^www\./, '');
+      // Same page reached twice in one turn is one source; the query string is part of identity.
+      const key = `${host}${parsed.pathname}${parsed.search}`;
+      if (!found.has(key)) found.set(key, { url, host, title: title.trim() || host });
+    } catch {
+      // A malformed URL is not a source.
+    }
+  }
+  for (const nested of Object.values(record)) collectSources(nested, found, depth + 1, title);
+};
+
+/**
  * The pages a turn actually visited, pulled out of the tool results that visited them.
  *
  * One of the three starter prompts promises a briefing with links, and the only record of what a
- * research answer was based on was `JSON.stringify` inside a disclosure that starts closed. The
- * walk is depth-bounded because a browser result can carry a whole accessibility tree.
+ * research answer was based on was `JSON.stringify` inside a disclosure that starts closed.
  */
 export const sourcesFromEvents = (events: TaskEvent[]): ConversationSource[] => {
   const found = new Map<string, ConversationSource>();
-  const visit = (value: unknown, depth: number, inheritedTitle: string): void => {
-    if (found.size >= 12 || depth > 4 || !value || typeof value !== 'object') return;
-    if (Array.isArray(value)) {
-      for (const item of value) visit(item, depth + 1, inheritedTitle);
-      return;
-    }
-    const record = value as Record<string, unknown>;
-    const title = typeof record.title === 'string' ? record.title : inheritedTitle;
-    const url = record.url;
-    /*
-     * A ranked snippet is a link the agent was offered, not a page it read. Search results carry
-     * both of these and nothing the agent actually opens does, so without this a single search
-     * would put ten uncited addresses under "Sources for this answer".
-     */
-    const offered = typeof record.rank === 'number' && typeof record.snippet === 'string';
-    if (!offered && typeof url === 'string' && /^https?:\/\//i.test(url)) {
-      try {
-        const parsed = new URL(url);
-        const host = parsed.host.replace(/^www\./, '');
-        // Same page reached twice in one turn is one source; the query string is part of identity.
-        const key = `${host}${parsed.pathname}${parsed.search}`;
-        if (!found.has(key)) found.set(key, { url, host, title: title.trim() || host });
-      } catch {
-        // A malformed URL is not a source.
-      }
-    }
-    for (const nested of Object.values(record)) visit(nested, depth + 1, title);
-  };
   for (const event of events) {
     if (event.kind !== 'tool_result') continue;
-    visit(eventPayload(event).result, 0, '');
+    collectSources(eventPayload(event).result, found, 0, '');
   }
   return [...found.values()];
+};
+
+/**
+ * A tool call, joined back together from the two events that record it.
+ *
+ * The worker publishes the arguments on `tool_started` and the outcome on `tool_result`, keyed to
+ * each other by `toolCallId`. Nothing in this client ever joined them, so every finished call in
+ * every finished conversation rendered as its result alone — and a result on its own cannot say
+ * which file it wrote or which command it ran, because those facts are in the arguments.
+ */
+export interface ToolCall {
+  /** The tool as the worker named it: `file_patch`, `shell`, `browser_snapshot`. */
+  tool: string;
+  /** What the call was made with, from the start that opened it. */
+  arguments: unknown;
+  /** What the file held before a `file_write`, when this conversation read it whole first. */
+  before?: string;
+}
+
+/** One row of a work log: an event, and the call it belongs to where there is one. */
+export interface ActivityEntry {
+  event: TaskEvent;
+  index: number;
+  call?: ToolCall;
+}
+
+/**
+ * What a finished call actually did, in the shape a person should read it in.
+ *
+ * The alternative — and what shipped — is `JSON.stringify(result)` at 9px, which for a file write
+ * is a hash and a byte count, for a command is its own output re-escaped, and for a page read is a
+ * whole accessibility tree. All three of those are the same evidence in a form nobody reads.
+ */
+export type WorkEvidence =
+  | { kind: 'files'; changes: FileChange[] }
+  /** `status` is empty for a command that succeeded: an exit code of zero is not news. */
+  | { kind: 'command'; command: string; status: string; output: string }
+  | { kind: 'pages'; pages: ConversationSource[] };
+
+/** Shell metacharacters. A word holding any of them is quoted so the line can be pasted as read. */
+const NEEDS_QUOTING = /[^\w@%+=:,./-]/;
+
+const shellWord = (word: string): string =>
+  word === '' || NEEDS_QUOTING.test(word) ? `'${word.replace(/'/g, `'\\''`)}'` : word;
+
+/**
+ * The command as it would be typed.
+ *
+ * `shell` takes an executable and an argument vector rather than a line, precisely so that nothing
+ * expands — but an owner checking what ran wants the line, not a JSON array of eleven strings.
+ */
+const commandLine = (args: Record<string, unknown>): string => {
+  const executable = typeof args.executable === 'string' ? args.executable : '';
+  if (!executable) return '';
+  const rest = Array.isArray(args.args) ? args.args : [];
+  return [executable, ...rest.map((word) => String(word))].map(shellWord).join(' ');
+};
+
+/**
+ * How much of a command's output is promoted, and which end of it.
+ *
+ * The tail, because a command is being looked at for how it ended: the failing assertion, the last
+ * line of a build. Everything above it is still one disclosure away in the raw result, so this
+ * bounds what is drawn without hiding anything.
+ */
+const OUTPUT_LINES = 40;
+const OUTPUT_CHARS = 8_000;
+
+const boundedOutput = (text: string): string => {
+  const lines = text.replace(/\s+$/, '').split('\n');
+  const kept =
+    lines.length > OUTPUT_LINES
+      ? `[${lines.length - OUTPUT_LINES} earlier lines not shown]\n${lines
+          .slice(-OUTPUT_LINES)
+          .join('\n')}`
+      : lines.join('\n');
+  // A single line can be a megabyte of minified output, which the line count alone would let past.
+  return kept.length > OUTPUT_CHARS ? `…${kept.slice(-OUTPUT_CHARS)}` : kept;
+};
+
+const commandStatus = (result: Record<string, unknown>): string => {
+  if (typeof result.sessionId === 'string' && result.sessionId) return 'still running';
+  if (result.timedOut === true) return 'timed out';
+  if (typeof result.signal === 'string' && result.signal) return `stopped by ${result.signal}`;
+  const exitCode = result.exitCode;
+  return typeof exitCode === 'number' && exitCode !== 0 ? `exit ${exitCode}` : '';
+};
+
+/** The tools whose result is a page the browser actually loaded, rather than links it was offered. */
+const pageReads = new Set([
+  'browser_action',
+  'browser_snapshot',
+  'parallel_web_read',
+  'read_elements'
+]);
+
+/**
+ * The page or pages one read loaded, and nothing else that happens to carry an address.
+ *
+ * Deliberately not the deep walk `sourcesFromEvents` uses. A browser result carries the page's own
+ * `url` and `title` at the top and a whole accessibility tree underneath it, so walking it listed
+ * every link on the page as a page that had been read - measured on one snapshot of a pricing page:
+ * two identical-looking rows, because a nested link inherits the title of the page it sits on.
+ * A read went to its own address, and `parallel_web_read` reports each of its own in `sources`.
+ */
+const pagesRead = (result: unknown): ConversationSource[] => {
+  const found = new Map<string, ConversationSource>();
+  const add = (value: unknown): void => {
+    const page = record(value);
+    if (!page) return;
+    // `requestedUrl` is where the read meant to go, which is the honest address when a redirect or
+    // a failure means the final one is missing.
+    const url = firstString(page, ['url', 'requestedUrl']);
+    if (!/^https?:\/\//i.test(url)) return;
+    try {
+      const parsed = new URL(url);
+      const host = parsed.host.replace(/^www\./, '');
+      const key = `${host}${parsed.pathname}${parsed.search}`;
+      if (!found.has(key))
+        found.set(key, { url, host, title: firstString(page, ['title']) || host });
+    } catch {
+      // A malformed URL is not a page.
+    }
+  };
+  const outcome = record(result);
+  if (!outcome) return [];
+  add(outcome);
+  for (const entry of Array.isArray(outcome.sources) ? outcome.sources.slice(0, 12) : [])
+    add(entry);
+  return [...found.values()];
+};
+
+/**
+ * The evidence one call produced, or nothing when the raw result is all there is.
+ *
+ * Pure, and taking the joined call rather than the events, so the three shapes this promotes are
+ * decided in a module a test can reach rather than inside a React branch.
+ */
+export const workEvidence = (
+  call: ToolCall | undefined,
+  result: unknown
+): WorkEvidence | undefined => {
+  if (!call) return undefined;
+  if (call.tool === 'file_write' || call.tool === 'file_patch') {
+    const changes = fileChangesFromTool(call.tool, call.arguments).map((change) =>
+      change.before === undefined && call.before !== undefined
+        ? { ...change, before: call.before }
+        : change
+    );
+    return changes.length ? { kind: 'files', changes } : undefined;
+  }
+  if (call.tool === 'shell') {
+    const command = commandLine(record(call.arguments) ?? {});
+    if (!command) return undefined;
+    const outcome = record(result) ?? {};
+    const streams = [outcome.stdout, outcome.stderr]
+      .map((stream) => (typeof stream === 'string' ? stream.replace(/\s+$/, '') : ''))
+      .filter(Boolean)
+      .join('\n');
+    return {
+      kind: 'command',
+      command,
+      status: commandStatus(outcome),
+      output: boundedOutput(streams)
+    };
+  }
+  if (pageReads.has(call.tool)) {
+    const pages = pagesRead(result);
+    return pages.length ? { kind: 'pages', pages } : undefined;
+  }
+  return undefined;
 };
 
 const payloadText = (event: TaskEvent, key: string): string => {
@@ -568,7 +761,6 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
   // Not `terminal`: a paused or waiting conversation is not writing anything either, and the
   // typing indicator under a half-finished reply is the difference between "stopped" and "stopping".
   const generating = taskIsGenerating(taskStatus);
-  const settled = settledToolStarts(events, taskStatus);
   // Whether the assistant node currently at the tail was built by streamed frames. A settled
   // answer is not extended by the next turn's first frame, and only a streamed node is superseded
   // by the message that closes it.
@@ -576,9 +768,36 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
   // Queued notices are retired by matching text, which was an O(n) rescan of the whole log per
   // notice. The set of texts that actually ran is the same answer for one pass.
   const ranMessages = new Set<string>();
-  for (const event of events)
+  /*
+   * Which calls this log holds a result for.
+   *
+   * A start is dropped because its result carries the same call, not because the task moved on:
+   * `settledToolStarts` answers `true` for every start in a finished conversation, so a call that
+   * was cut off mid-flight - the interesting one - used to be dropped along with the rest and
+   * appear in the transcript nowhere at all. Collected in the pass that is already walking the log.
+   */
+  const resolvedCalls = new Set<string>();
+  for (const event of events) {
     if (event.kind === 'user_message') ranMessages.add(payloadText(event, 'markdown'));
-  let activity: Array<{ event: TaskEvent; index: number }> = [];
+    else if (event.kind === 'tool_result') {
+      const toolCallId = payloadText(event, 'toolCallId');
+      if (toolCallId) resolvedCalls.add(toolCallId);
+    }
+  }
+  /** Every call opened so far, so its result can be joined back to what it was asked to do. */
+  const openCalls = new Map<string, ToolCall>();
+  /*
+   * What each file held the last time this conversation saw it.
+   *
+   * `file_write` carries only the new contents, so a diff built from its arguments alone calls
+   * every write a new file: a one-line edit to an 800-line module rendered as "new file · +800",
+   * which is this log's own evidence thrown away a second way. A whole-file `file_read` is exactly
+   * the text a later write overwrites - the worker refuses a write whose file changed under it
+   * (`agent.ts:5283`), so the read it claims is the read that stands - and a write is itself what
+   * the next write to the same path starts from.
+   */
+  const fileContents = new Map<string, string>();
+  let activity: ActivityEntry[] = [];
   /*
    * The site whose challenge is currently standing.
    *
@@ -655,7 +874,11 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
   let activityAnchor = -1;
   const openActivity = (event: TaskEvent, index: number): void => {
     if (activityAnchor < 0) activityAnchor = nodes.length;
-    activity.push({ event, index });
+    // The join, done here so that every path into the log gets it - including the repeated browser
+    // wall below, which files its result in the group rather than raising a second card.
+    const call =
+      event.kind === 'tool_result' ? openCalls.get(payloadText(event, 'toolCallId')) : undefined;
+    activity.push({ event, index, ...(call ? { call } : {}) });
     /*
      * Sources are collected as the pages are read, not when the group is closed. The group now
      * stays open until the end of the turn, and the answer it feeds is written before that - so
@@ -685,6 +908,45 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
     if (openThinkingIndex >= at) openThinkingIndex += 1;
     activity = [];
     activityAnchor = -1;
+  };
+
+  /**
+   * Keeps `fileContents` current, and stamps a write with what it overwrote.
+   *
+   * Runs on results rather than on starts because a write's outcome is the moment the file changed,
+   * and because a read only counts once it has come back. Two map operations per file call.
+   */
+  const rememberWrittenFile = (event: TaskEvent): void => {
+    const toolCallId = payloadText(event, 'toolCallId');
+    const call = toolCallId ? openCalls.get(toolCallId) : undefined;
+    if (!call || (call.tool !== 'file_read' && call.tool !== 'file_write')) return;
+    const args = record(call.arguments) ?? {};
+    // `./notes.md` and `notes.md` are one file; the worker normalises the same prefix for the same
+    // reason. Nothing further is normalised, because collapsing two distinct paths onto one key
+    // would diff a file against something that is not it.
+    const path = (typeof args.path === 'string' ? args.path : '').replace(/^\.\//, '');
+    if (!path) return;
+    if (call.tool === 'file_read') {
+      /*
+       * Only a whole-file read is the file. `file_read` answers a windowed request with the window
+       * it was asked for, and diffing a write against twenty lines out of nine hundred would invent
+       * every other line as a deletion the write never made.
+       */
+      const result = record(eventPayload(event).result) ?? {};
+      if (
+        result.startLine === 1 &&
+        result.truncated === false &&
+        result.endLine === result.totalLines &&
+        typeof result.content === 'string'
+      )
+        fileContents.set(path, result.content);
+      return;
+    }
+    const before = fileContents.get(path);
+    if (before !== undefined) openCalls.set(toolCallId, { ...call, before });
+    // What is on disk now is what this write just put there, so a second write to the same path in
+    // the same conversation is shown against the first rather than against the original.
+    if (typeof args.content === 'string') fileContents.set(path, args.content);
   };
 
   events.forEach((event, index) => {
@@ -765,9 +1027,25 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
          */
         return;
       }
-      // A tool start that already has its result is noise while running and redundant once the
-      // task is finished; the matching tool_result carries the same label plus the outcome.
-      if (event.kind === 'tool_started' && settled(event)) return;
+      if (event.kind === 'tool_started') {
+        const data = eventPayload(event);
+        const toolCallId = payloadText(event, 'toolCallId');
+        if (toolCallId)
+          openCalls.set(toolCallId, {
+            tool: typeof data.tool === 'string' ? data.tool : '',
+            arguments: data.arguments
+          });
+        /*
+         * A start whose result is in this log is dropped because the result now carries the same
+         * call, arguments and all - not because the task has moved on. Dropping it for the latter
+         * is what left the file diffs unreachable: `DiffView` was rendered from this branch only,
+         * and this branch was removed from every finished conversation.
+         */
+        if (toolCallId && resolvedCalls.has(toolCallId)) return;
+        openActivity(event, index);
+        return;
+      }
+      if (event.kind === 'tool_result') rememberWrittenFile(event);
       openActivity(event, index);
       return;
     }

@@ -4449,3 +4449,107 @@ describe('a half-typed message', () => {
     expect(cleared.json<{ drafts: unknown[] }>().drafts).toEqual([]);
   });
 });
+
+describe('what the computer is running', () => {
+  /*
+   * The runner has always kept a table of the background processes an agent started, and has always
+   * served it. Nothing on this side ever asked, so the panel that is supposed to show the owner
+   * their own machine could only offer a port field defaulted to 3000. This pins both halves of the
+   * proxy: what comes back, and the case where nothing is asked at all.
+   */
+  test('reports the background processes, and does not wake a sleeping box to say none', async () => {
+    const runnerCalls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const requestUrl = input instanceof Request ? input.url : input.toString();
+        const json = (body: unknown) =>
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          });
+        if (requestUrl.includes('workspace-manager.test')) {
+          const url = new URL(requestUrl);
+          runnerCalls.push(`${init?.method ?? 'GET'} ${url.pathname}`);
+          if (url.pathname.endsWith('/processes'))
+            return json({
+              processes: [
+                {
+                  sessionId: 'proc_1',
+                  status: 'running',
+                  command: ['/usr/local/bin/node', 'server.js'],
+                  startedAt: '2026-08-10T09:00:00.000Z'
+                },
+                {
+                  sessionId: 'proc_2',
+                  status: 'failed',
+                  command: ['pnpm', 'test'],
+                  startedAt: '2026-08-10T08:00:00.000Z',
+                  finishedAt: '2026-08-10T08:02:00.000Z',
+                  exitCode: 1
+                }
+              ]
+            });
+        }
+        return json({ storageBytes: 4_096, ok: true });
+      })
+    );
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-processes-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'processes-workspace' },
+        payload: { name: 'Running', storageLimitBytes: 10_000_000_000, region: 'auto' }
+      })
+    ).json<{ id: string }>().id;
+
+    const running = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/processes`,
+      headers: { cookie }
+    });
+    expect(running.statusCode, running.body).toBe(200);
+    expect(running.json<{ processes: Array<{ sessionId: string; exitCode?: number }> }>()).toEqual({
+      processes: [
+        {
+          sessionId: 'proc_1',
+          status: 'running',
+          command: ['/usr/local/bin/node', 'server.js'],
+          startedAt: '2026-08-10T09:00:00.000Z'
+        },
+        {
+          sessionId: 'proc_2',
+          status: 'failed',
+          command: ['pnpm', 'test'],
+          startedAt: '2026-08-10T08:00:00.000Z',
+          finishedAt: '2026-08-10T08:02:00.000Z',
+          exitCode: 1
+        }
+      ]
+    });
+    expect(runnerCalls).toContain(`GET /v1/workspaces/${workspaceId}/processes`);
+
+    await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/hibernate`,
+      headers: { cookie, 'idempotency-key': 'processes-hibernate' }
+    });
+    runnerCalls.length = 0;
+    const asleep = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/processes`,
+      headers: { cookie }
+    });
+    expect(asleep.json()).toEqual({ processes: [] });
+    // Hibernating clears the runner's session table, so an asleep computer has nothing to report -
+    // and reading a panel must never be the thing that starts a machine back up.
+    expect(runnerCalls).toEqual([]);
+  });
+});

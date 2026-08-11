@@ -5974,6 +5974,39 @@ export const buildServer = async (
     }
   );
 
+  /**
+   * What this computer is running right now.
+   *
+   * The runner has always kept this list and has always served it; nothing on this side ever asked
+   * for it, so the only account the owner had of their own machine's background work was whatever
+   * the transcript happened to mention. The token is audience-bound to this one GET, so the `exec`
+   * scope it carries cannot be turned round and used to start a process.
+   *
+   * A computer that is not running reports nothing rather than being woken to say so: stopping,
+   * hibernating, snapshotting and restoring all clear the runner's session table
+   * (services/workspace-runner/src/server.ts), so an asleep box has no background processes by
+   * construction, and reading a panel must never be the thing that starts the machine.
+   */
+  app.get<{ Params: { workspaceId: string } }>(
+    '/v1/workspaces/:workspaceId/processes',
+    async (request) => {
+      const user = requireUser(request.user);
+      const workspace = await store.getWorkspace(user.id, request.params.workspaceId);
+      if (!workspace) throw new AthanorError('workspace_not_found', 'Workspace not found');
+      if (workspace.status !== 'running') return { processes: [] };
+      return runner.request<{ processes: unknown[] }>({
+        workspaceId: workspace.id,
+        userId: user.id,
+        role: 'user',
+        scopes: ['exec'],
+        path: `/v1/workspaces/${workspace.id}/processes`,
+        // Someone is watching this pane refresh, so a wedged runner has to fail in seconds rather
+        // than hold the request for undici's five-minute header timeout.
+        timeoutMs: 5_000
+      });
+    }
+  );
+
   app.get<{ Params: { workspaceId: string } }>(
     '/v1/workspaces/:workspaceId/previews',
     async (request) => {

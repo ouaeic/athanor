@@ -16,6 +16,7 @@ import {
   Radio,
   RotateCcw,
   Save,
+  Scale,
   ScrollText,
   Server,
   ShieldCheck,
@@ -45,7 +46,8 @@ import {
 import { api, type ProviderSettings } from './api.js';
 import { webSearchSummary } from './web-search-route.js';
 import { spendLimitsDraft, spendLimitsPatch, type SpendLimitsDraft } from './usage-model.js';
-import { securityModeCopy, securityModes } from './security-mode.js';
+import { securityModeCopy, securityModeNotice, securityModes } from './security-mode.js';
+import { alwaysAsks, balancedVsAutonomous } from './asking-rules.js';
 import {
   apiTokenRequest,
   apiTokenScopeCopy,
@@ -68,6 +70,7 @@ import {
 import type {
   ApiToken,
   Bootstrap,
+  SecurityMode,
   Task,
   TaskEvent,
   User,
@@ -85,6 +88,12 @@ import { relayAddress, relayHostProblem, relayQuotaNote, relayStatusLine } from 
   Four pages, each named after something the owner already wants to do. The previous six spent a
   whole navigation slot on one token field, filed "tell me when this finishes" under Security, and
   put the only filesystem undo below the licence line.
+
+  The ids are the stored names the rest of the app opens a page by; the words in `pages` below are
+  what the owner reads, and they are not the same thing. "AI" and "Agent" named the technology
+  rather than the errand, so the two most-visited destinations on this screen — the spending caps
+  and the question of what the machine may do unattended — were both behind a label that did not
+  mention them.
 */
 export type SettingsPage = 'ai' | 'agent' | 'devices' | 'server';
 
@@ -117,6 +126,15 @@ export function SelfHostedSettings({
   onLogout: () => void;
 }) {
   const [page, setPage] = useState<SettingsPage>(initialPage);
+  /*
+   * The mode new conversations start in, held here so the radio group reflects the server's answer
+   * rather than the press. The prop is a bootstrap snapshot the parent only re-reads when this
+   * dialog closes, so a value written back optimistically would survive a refusal and read as
+   * saved.
+   */
+  const [defaultMode, setDefaultMode] = useState<SecurityMode>(
+    workspace?.securityMode ?? 'balanced'
+  );
   const undo = useUndo();
   const [provider, setProvider] = useState<ProviderSettings>();
   const [providerKind, setProviderKind] = useState<
@@ -268,6 +286,9 @@ export function SelfHostedSettings({
     loadSnapshots();
   }, [workspace?.id]);
   useEffect(() => {
+    if (workspace) setDefaultMode(workspace.securityMode);
+  }, [workspace?.securityMode]);
+  useEffect(() => {
     // Null means this server has no relay route at all, which is a different thing from "off" and
     // is why the whole block is absent rather than showing controls that could not work.
     void api
@@ -347,6 +368,21 @@ export function SelfHostedSettings({
       );
     });
 
+  /*
+   * No passkey on this one, matching the route: the server dropped step-up from
+   * `PATCH /v1/workspaces/:id/security-mode` because a fingerprint on the setting whose entire
+   * purpose is to be interrupted less made Autonomous unreachable in practice. Step-up still guards
+   * what changing a setting back cannot undo — the provider credential above, and raising a
+   * spending ceiling.
+   */
+  const chooseDefaultMode = (mode: SecurityMode) =>
+    act(async () => {
+      if (!workspace || mode === defaultMode) return;
+      const saved = await api.updateWorkspaceSecurityMode(workspace.id, mode);
+      setDefaultMode(saved.securityMode);
+      setNotice(securityModeNotice(saved.securityMode, 'workspace'));
+    });
+
   const exportData = () =>
     act(async () => {
       await api.stepUp();
@@ -364,10 +400,10 @@ export function SelfHostedSettings({
   const webSearch = webSearchSummary(provider?.webSearch);
 
   const pages: Array<{ id: SettingsPage; label: string }> = [
-    { id: 'ai', label: 'AI' },
-    { id: 'agent', label: 'Agent' },
-    { id: 'devices', label: 'Devices & security' },
-    { id: 'server', label: 'Server' }
+    { id: 'ai', label: 'Model & spending' },
+    { id: 'agent', label: 'What it may do' },
+    { id: 'devices', label: 'Devices & sign-in' },
+    { id: 'server', label: 'This server' }
   ];
 
   return (
@@ -729,18 +765,67 @@ export function SelfHostedSettings({
         <div className="section-heading">
           <ShieldCheck />
           <div>
-            <strong>How the agent asks</strong>
-            {/* The words come from the table the control itself reads, so this page and the shield
-                in the composer cannot describe the same three settings differently. */}
-            <span>Set per conversation from the shield in the composer.</span>
+            <strong>How much it asks</strong>
+            {/*
+              A control, not a description of one. These three were printed here as read-only rows
+              ending in "set per conversation from the shield in the composer" — and that shield
+              sets the open conversation's mode, so the workspace default this page was describing
+              could not be changed from anywhere at all once a conversation existed. The words are
+              still the composer's own table, so the two places cannot describe the same three
+              settings differently.
+            */}
+            <span>Each conversation can be moved from its shield; this is where they start.</span>
+          </div>
+        </div>
+        <fieldset className="security-modes">
+          <legend>New conversations start in</legend>
+          {securityModes.map((mode) => (
+            <label key={mode} className={mode === defaultMode ? 'chosen' : ''}>
+              <input
+                type="radio"
+                name="workspace-default-security-mode"
+                value={mode}
+                checked={mode === defaultMode}
+                disabled={!workspace || busy}
+                onChange={() => void chooseDefaultMode(mode)}
+              />
+              <strong>{securityModeCopy[mode].label}</strong>
+              <small>{securityModeCopy[mode].description}</small>
+            </label>
+          ))}
+        </fieldset>
+        <div className="section-heading compact">
+          <LockKeyhole />
+          <div>
+            <strong>Always asks, whatever the mode</strong>
+            <span>Nothing on this page switches these off.</span>
           </div>
         </div>
         <div className="settings-list">
-          {securityModes.map((mode) => (
-            <div key={mode}>
+          {alwaysAsks.map((rule) => (
+            <div key={rule.what}>
               <span>
-                <strong>{securityModeCopy[mode].label}</strong>
-                <small>{securityModeCopy[mode].description}</small>
+                <strong>{rule.what}</strong>
+                <small>{rule.detail}</small>
+              </span>
+            </div>
+          ))}
+        </div>
+        <div className="section-heading compact">
+          <Scale />
+          <div>
+            <strong>Where Balanced and Autonomous differ</strong>
+            {/* Two rules, and this is all of them: nothing else in the classifier reads the choice
+                between those two modes. Said out loud so the list can be finished. */}
+            <span>Everything else is decided the same way in both.</span>
+          </div>
+        </div>
+        <div className="settings-list">
+          {balancedVsAutonomous.map((rule) => (
+            <div key={rule.what}>
+              <span>
+                <strong>{rule.what}</strong>
+                <small>{rule.detail}</small>
               </span>
             </div>
           ))}
@@ -1023,135 +1108,6 @@ export function SelfHostedSettings({
         )}
 
         <div className="section-heading">
-          <BellRing />
-          <div>
-            <strong>Notifications on this device</strong>
-            <span>
-              {pushState === 'unsupported'
-                ? 'This browser cannot receive push notifications.'
-                : pushState === 'unavailable'
-                  ? 'The server has no push key configured, so notifications are off.'
-                  : pushState === 'denied'
-                    ? 'This browser blocked notifications. Allow them in site settings first.'
-                    : 'Tell me when a long task finishes or needs approval, even with athanor closed.'}
-            </span>
-          </div>
-        </div>
-        <button
-          disabled={
-            busy || ['checking', 'unsupported', 'unavailable', 'denied'].includes(pushState)
-          }
-          onClick={() =>
-            void act(async () => {
-              setPushState(
-                pushState === 'enabled' ? await disableNotifications() : await enableNotifications()
-              );
-            })
-          }
-        >
-          <BellRing />
-          {pushState === 'enabled' ? 'Turn off notifications' : 'Turn on notifications'}
-        </button>
-        {pushSettings && (
-          <>
-            {/* Only the kinds this box stores: see notificationSettingsFromResponse. */}
-            <div className="notification-kinds">
-              {pushDraft.supported.map((kind) => (
-                <label key={kind} className="toggle-row">
-                  <input
-                    type="checkbox"
-                    checked={pushDraft.kinds[kind]}
-                    onChange={(event) =>
-                      setPushDraft({
-                        ...pushDraft,
-                        kinds: { ...pushDraft.kinds, [kind]: event.target.checked }
-                      })
-                    }
-                  />
-                  <strong>{notificationKindCopy[kind].label}</strong>
-                  <small>{notificationKindCopy[kind].detail}</small>
-                </label>
-              ))}
-            </div>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={pushDraft.quietHoursEnabled}
-                onChange={(event) =>
-                  setPushDraft({ ...pushDraft, quietHoursEnabled: event.target.checked })
-                }
-              />
-              <strong>Quiet hours</strong>
-              <small>
-                Held on the server, not just silenced on this device, and read in the same time zone
-                your spending day rolls over in ({pushSettings.timeZone}).
-              </small>
-            </label>
-            {pushDraft.quietHoursEnabled && (
-              <>
-                <div className="form-grid two">
-                  <label>
-                    From
-                    <input
-                      type="time"
-                      value={pushDraft.quietHoursStart}
-                      onChange={(event) =>
-                        setPushDraft({ ...pushDraft, quietHoursStart: event.target.value })
-                      }
-                    />
-                  </label>
-                  <label>
-                    Until
-                    <input
-                      type="time"
-                      value={pushDraft.quietHoursEnd}
-                      onChange={(event) =>
-                        setPushDraft({ ...pushDraft, quietHoursEnd: event.target.value })
-                      }
-                    />
-                  </label>
-                </div>
-                <label className="toggle-row">
-                  <input
-                    type="checkbox"
-                    checked={pushDraft.quietHoursAllowApprovals}
-                    onChange={(event) =>
-                      setPushDraft({
-                        ...pushDraft,
-                        quietHoursAllowApprovals: event.target.checked
-                      })
-                    }
-                  />
-                  <strong>Let approvals through anyway</strong>
-                  <small>
-                    An approval is the one message where silence has a cost: the work waits until
-                    you answer it.
-                  </small>
-                </label>
-              </>
-            )}
-            <p className="settings-summary">
-              {notificationSettingsSummary(pushDraft, pushSettings.timeZone)}
-            </p>
-            <button
-              disabled={busy}
-              onClick={() =>
-                void act(async () => {
-                  const patch = notificationSettingsPatch(pushDraft);
-                  if (!patch.ok) throw new Error(patch.message);
-                  const saved = await api.updateNotificationSettings(patch.body);
-                  setPushSettings(saved);
-                  setPushDraft(notificationSettingsDraft(saved));
-                  setNotice('Saved. The server decides what to send before your device sees it.');
-                })
-              }
-            >
-              <Save /> Save notification rules
-            </button>
-          </>
-        )}
-
-        <div className="section-heading">
           <LockKeyhole />
           <div>
             <strong>Passkeys and devices</strong>
@@ -1302,6 +1258,140 @@ export function SelfHostedSettings({
           </button>
         )}
 
+        {/*
+          Last on the page, under the three sign-in blocks it is named for. Quiet hours sat second
+          here, above passkeys and above the recovery code, so somebody arriving to revoke a browser
+          or reissue their code scrolled past a form about when to be woken up to reach either.
+        */}
+        <div className="section-heading">
+          <BellRing />
+          <div>
+            <strong>Notifications on this device</strong>
+            <span>
+              {pushState === 'unsupported'
+                ? 'This browser cannot receive push notifications.'
+                : pushState === 'unavailable'
+                  ? 'The server has no push key configured, so notifications are off.'
+                  : pushState === 'denied'
+                    ? 'This browser blocked notifications. Allow them in site settings first.'
+                    : 'Tell me when a long task finishes or needs approval, even with athanor closed.'}
+            </span>
+          </div>
+        </div>
+        <button
+          disabled={
+            busy || ['checking', 'unsupported', 'unavailable', 'denied'].includes(pushState)
+          }
+          onClick={() =>
+            void act(async () => {
+              setPushState(
+                pushState === 'enabled' ? await disableNotifications() : await enableNotifications()
+              );
+            })
+          }
+        >
+          <BellRing />
+          {pushState === 'enabled' ? 'Turn off notifications' : 'Turn on notifications'}
+        </button>
+        {pushSettings && (
+          <>
+            {/* Only the kinds this box stores: see notificationSettingsFromResponse. */}
+            <div className="notification-kinds">
+              {pushDraft.supported.map((kind) => (
+                <label key={kind} className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={pushDraft.kinds[kind]}
+                    onChange={(event) =>
+                      setPushDraft({
+                        ...pushDraft,
+                        kinds: { ...pushDraft.kinds, [kind]: event.target.checked }
+                      })
+                    }
+                  />
+                  <strong>{notificationKindCopy[kind].label}</strong>
+                  <small>{notificationKindCopy[kind].detail}</small>
+                </label>
+              ))}
+            </div>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={pushDraft.quietHoursEnabled}
+                onChange={(event) =>
+                  setPushDraft({ ...pushDraft, quietHoursEnabled: event.target.checked })
+                }
+              />
+              <strong>Quiet hours</strong>
+              <small>
+                Held on the server, not just silenced on this device, and read in the same time zone
+                your spending day rolls over in ({pushSettings.timeZone}).
+              </small>
+            </label>
+            {pushDraft.quietHoursEnabled && (
+              <>
+                <div className="form-grid two">
+                  <label>
+                    From
+                    <input
+                      type="time"
+                      value={pushDraft.quietHoursStart}
+                      onChange={(event) =>
+                        setPushDraft({ ...pushDraft, quietHoursStart: event.target.value })
+                      }
+                    />
+                  </label>
+                  <label>
+                    Until
+                    <input
+                      type="time"
+                      value={pushDraft.quietHoursEnd}
+                      onChange={(event) =>
+                        setPushDraft({ ...pushDraft, quietHoursEnd: event.target.value })
+                      }
+                    />
+                  </label>
+                </div>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={pushDraft.quietHoursAllowApprovals}
+                    onChange={(event) =>
+                      setPushDraft({
+                        ...pushDraft,
+                        quietHoursAllowApprovals: event.target.checked
+                      })
+                    }
+                  />
+                  <strong>Let approvals through anyway</strong>
+                  <small>
+                    An approval is the one message where silence has a cost: the work waits until
+                    you answer it.
+                  </small>
+                </label>
+              </>
+            )}
+            <p className="settings-summary">
+              {notificationSettingsSummary(pushDraft, pushSettings.timeZone)}
+            </p>
+            <button
+              disabled={busy}
+              onClick={() =>
+                void act(async () => {
+                  const patch = notificationSettingsPatch(pushDraft);
+                  if (!patch.ok) throw new Error(patch.message);
+                  const saved = await api.updateNotificationSettings(patch.body);
+                  setPushSettings(saved);
+                  setPushDraft(notificationSettingsDraft(saved));
+                  setNotice('Saved. The server decides what to send before your device sees it.');
+                })
+              }
+            >
+              <Save /> Save notification rules
+            </button>
+          </>
+        )}
+
         <div className="modal-actions">
           <button onClick={() => void exportData()} disabled={busy}>
             <Download /> Export my data
@@ -1425,6 +1515,155 @@ export function SelfHostedSettings({
       </div>
 
       <div className="settings-section" hidden={page !== 'server'}>
+        {/*
+          First, because it is the only thing on this page somebody arrives in a hurry to reach.
+          Recovery points used to sit between the relay and the licence line: the relay is off for
+          almost every owner and its own copy opens "you probably do not need this", so the one
+          undo for the whole filesystem was behind a block written to be skipped.
+        */}
+        <div className="section-heading recovery-heading">
+          <Save />
+          <div>
+            <strong>Recovery points</strong>
+            <span>
+              A local copy of working files, published results, and the browser profile. Linked or
+              mounted bulk storage and account history are not copied. Large local datasets need
+              enough free disk space for another copy.
+            </span>
+          </div>
+        </div>
+        <div className="recovery-create">
+          <input
+            value={snapshotName}
+            maxLength={80}
+            placeholder="Before the next major change"
+            onChange={(event) => setSnapshotName(event.target.value)}
+          />
+          <button
+            disabled={!workspace || !snapshotName.trim() || busy}
+            onClick={() =>
+              void act(async () => {
+                if (!workspace) return;
+                await api.stepUp();
+                await api.createWorkspaceSnapshot(workspace.id, snapshotName.trim());
+                setSnapshotName('');
+                setNotice('Recovery point created and verified.');
+                loadSnapshots();
+              })
+            }
+          >
+            <Save /> Create
+          </button>
+        </div>
+        <div className="settings-list recovery-list">
+          {snapshotsUnavailable && (
+            <div>
+              <span>
+                <strong>The recovery points could not be read</strong>
+                <small>Nothing was removed — this device could not reach the server.</small>
+              </span>
+            </div>
+          )}
+          {!snapshots.length && !snapshotsUnavailable && (
+            <div>
+              <span>
+                <strong>No recovery points</strong>
+                <small>Use an off-host athanor backup for disaster recovery.</small>
+              </span>
+            </div>
+          )}
+          {snapshots.map((snapshot) => (
+            <div key={snapshot.id}>
+              <span>
+                <strong>{snapshot.name}</strong>
+                <small>
+                  {snapshot.status} · {formatBytes(snapshot.sizeBytes)} ·{' '}
+                  {new Date(snapshot.createdAt).toLocaleString()}
+                </small>
+              </span>
+              <span className="settings-row-actions">
+                {snapshot.status === 'ready' && (
+                  <button
+                    className="icon-btn"
+                    aria-label={`Restore ${snapshot.name}`}
+                    title="Restore"
+                    onClick={() => {
+                      setRestoreSnapshotId(snapshot.id);
+                      setRestoreConfirmation('');
+                    }}
+                  >
+                    <RotateCcw />
+                  </button>
+                )}
+                <button
+                  className="icon-btn"
+                  aria-label={`Delete ${snapshot.name}`}
+                  title="Delete"
+                  disabled={busy}
+                  onClick={() => {
+                    if (!workspace) return;
+                    void act(async () => {
+                      await api.stepUp();
+                      setSnapshots((current) =>
+                        current.filter((entry) => entry.id !== snapshot.id)
+                      );
+                      undo({
+                        message: `Deleted “${snapshot.name}”`,
+                        commit: () => api.deleteWorkspaceSnapshot(workspace.id, snapshot.id),
+                        restore: loadSnapshots
+                      });
+                    });
+                  }}
+                >
+                  <Trash2 />
+                </button>
+              </span>
+            </div>
+          ))}
+        </div>
+        {restoreSnapshotId && workspace && (
+          <div className="restore-confirmation">
+            <strong>Restore this recovery point?</strong>
+            <span>
+              Current files and browser state will first be saved as a new safety point. Enter{' '}
+              <code>{workspace.name}</code> to continue.
+            </span>
+            <input
+              value={restoreConfirmation}
+              onChange={(event) => setRestoreConfirmation(event.target.value)}
+            />
+            <span className="modal-actions">
+              <button
+                className="secondary"
+                onClick={() => {
+                  setRestoreSnapshotId('');
+                  setRestoreConfirmation('');
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                disabled={busy || restoreConfirmation !== workspace.name}
+                onClick={() =>
+                  void act(async () => {
+                    await api.stepUp();
+                    await api.restoreWorkspaceSnapshot(
+                      workspace.id,
+                      restoreSnapshotId,
+                      restoreConfirmation
+                    );
+                    setRestoreSnapshotId('');
+                    setRestoreConfirmation('');
+                    setNotice('Files and browser state restored. A safety point was retained.');
+                    loadSnapshots();
+                  })
+                }
+              >
+                <RotateCcw /> Restore
+              </button>
+            </span>
+          </div>
+        )}
         {/*
           The relay is off, and for most owners that is the right answer. A box on a public address,
           or one with a dynamic-DNS name, is reached directly; this exists for a box behind
@@ -1570,149 +1809,6 @@ export function SelfHostedSettings({
               </div>
             )}
           </>
-        )}
-        <div className="section-heading recovery-heading">
-          <Save />
-          <div>
-            <strong>Recovery points</strong>
-            <span>
-              A local copy of working files, published results, and the browser profile. Linked or
-              mounted bulk storage and account history are not copied. Large local datasets need
-              enough free disk space for another copy.
-            </span>
-          </div>
-        </div>
-        <div className="recovery-create">
-          <input
-            value={snapshotName}
-            maxLength={80}
-            placeholder="Before the next major change"
-            onChange={(event) => setSnapshotName(event.target.value)}
-          />
-          <button
-            disabled={!workspace || !snapshotName.trim() || busy}
-            onClick={() =>
-              void act(async () => {
-                if (!workspace) return;
-                await api.stepUp();
-                await api.createWorkspaceSnapshot(workspace.id, snapshotName.trim());
-                setSnapshotName('');
-                setNotice('Recovery point created and verified.');
-                loadSnapshots();
-              })
-            }
-          >
-            <Save /> Create
-          </button>
-        </div>
-        <div className="settings-list recovery-list">
-          {snapshotsUnavailable && (
-            <div>
-              <span>
-                <strong>The recovery points could not be read</strong>
-                <small>Nothing was removed — this device could not reach the server.</small>
-              </span>
-            </div>
-          )}
-          {!snapshots.length && !snapshotsUnavailable && (
-            <div>
-              <span>
-                <strong>No recovery points</strong>
-                <small>Use an off-host athanor backup for disaster recovery.</small>
-              </span>
-            </div>
-          )}
-          {snapshots.map((snapshot) => (
-            <div key={snapshot.id}>
-              <span>
-                <strong>{snapshot.name}</strong>
-                <small>
-                  {snapshot.status} · {formatBytes(snapshot.sizeBytes)} ·{' '}
-                  {new Date(snapshot.createdAt).toLocaleString()}
-                </small>
-              </span>
-              <span className="settings-row-actions">
-                {snapshot.status === 'ready' && (
-                  <button
-                    className="icon-btn"
-                    aria-label={`Restore ${snapshot.name}`}
-                    title="Restore"
-                    onClick={() => {
-                      setRestoreSnapshotId(snapshot.id);
-                      setRestoreConfirmation('');
-                    }}
-                  >
-                    <RotateCcw />
-                  </button>
-                )}
-                <button
-                  className="icon-btn"
-                  aria-label={`Delete ${snapshot.name}`}
-                  title="Delete"
-                  disabled={busy}
-                  onClick={() => {
-                    if (!workspace) return;
-                    void act(async () => {
-                      await api.stepUp();
-                      setSnapshots((current) =>
-                        current.filter((entry) => entry.id !== snapshot.id)
-                      );
-                      undo({
-                        message: `Deleted “${snapshot.name}”`,
-                        commit: () => api.deleteWorkspaceSnapshot(workspace.id, snapshot.id),
-                        restore: loadSnapshots
-                      });
-                    });
-                  }}
-                >
-                  <Trash2 />
-                </button>
-              </span>
-            </div>
-          ))}
-        </div>
-        {restoreSnapshotId && workspace && (
-          <div className="restore-confirmation">
-            <strong>Restore this recovery point?</strong>
-            <span>
-              Current files and browser state will first be saved as a new safety point. Enter{' '}
-              <code>{workspace.name}</code> to continue.
-            </span>
-            <input
-              value={restoreConfirmation}
-              onChange={(event) => setRestoreConfirmation(event.target.value)}
-            />
-            <span className="modal-actions">
-              <button
-                className="secondary"
-                onClick={() => {
-                  setRestoreSnapshotId('');
-                  setRestoreConfirmation('');
-                }}
-              >
-                Cancel
-              </button>
-              <button
-                disabled={busy || restoreConfirmation !== workspace.name}
-                onClick={() =>
-                  void act(async () => {
-                    await api.stepUp();
-                    await api.restoreWorkspaceSnapshot(
-                      workspace.id,
-                      restoreSnapshotId,
-                      restoreConfirmation
-                    );
-                    setRestoreSnapshotId('');
-                    setRestoreConfirmation('');
-                    setNotice('Files and browser state restored. A safety point was retained.');
-                    loadSnapshots();
-                  })
-                }
-              >
-                <RotateCcw /> Restore
-              </button>
-            </span>
-          </div>
         )}
         <div className="section-heading">
           <Server />

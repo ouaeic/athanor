@@ -186,6 +186,26 @@ export interface ConnectorDefinition {
   scopes: Array<{ id: string; label: string; sideEffect: 'read' | 'write' | 'delete' }>;
 }
 
+/**
+ * One background process on the agent computer, exactly as the runner reports it in
+ * `GET /v1/workspaces/:id/processes` (services/workspace-runner/src/processes.ts).
+ *
+ * Declared here rather than imported because this is a runner observation the client only ever
+ * reads. The optional fields are optional on the wire too: a session that is still running has no
+ * `finishedAt`, and one that never started - a missing executable - has an `exitCode` of null,
+ * which is why the type says `null` rather than leaving it out.
+ */
+export interface BackgroundProcess {
+  sessionId: string;
+  status: 'running' | 'completed' | 'failed' | 'timed_out' | 'stopped';
+  /** The executable and its arguments, as the process was started. */
+  command: string[];
+  startedAt: string;
+  finishedAt?: string;
+  exitCode?: number | null;
+  signal?: string | null;
+}
+
 export interface FileEntry {
   name: string;
   path: string;

@@ -9,7 +9,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { Timeline } from './Timeline.js';
+import { Timeline, ToolEvidence } from './Timeline.js';
 import type { Task, TaskEvent } from './types.js';
 
 const task: Task = {
@@ -449,5 +449,121 @@ describe('a turn that read something nobody here wrote', () => {
     expect(markup).toContain('event-detail');
     expect(markup).toContain('Details');
     expect(markup).toContain('shell failed');
+  });
+});
+
+/*
+ * What the agent changed in your files, reachable at last.
+ *
+ * Every diff this product produced was unreachable in every finished conversation: the diff was
+ * rendered from the `tool_started` branch, and the transcript dropped every start that had a
+ * result. What survived was `JSON.stringify(result)` at 9px - for a write, a hash and a byte count.
+ */
+describe('the evidence a call left behind', () => {
+  const evidence = (props: Parameters<typeof ToolEvidence>[0]): string =>
+    renderToStaticMarkup(<ToolEvidence {...props} />);
+
+  it('shows a write as the change it made to the file', () => {
+    const markup = evidence({
+      tool: 'file_write',
+      args: { path: 'notes.md', content: 'one\ntwo\nfour' },
+      before: 'one\ntwo\nthree',
+      result: { sha256: 'abc', sizeBytes: 12 },
+      stage: 'result'
+    });
+    expect(markup).toContain('notes.md');
+    expect(markup).toContain('diff-line add');
+    expect(markup).toContain('diff-line remove');
+    expect(markup).toContain('four');
+    // Not "new file", which is what a write diffed against nothing claims to be.
+    expect(markup).not.toContain('new file');
+  });
+
+  it('shows a command as the line that ran and the end of what it printed', () => {
+    const markup = evidence({
+      tool: 'shell',
+      args: { executable: 'pnpm', args: ['--filter', '@athanor/web', 'test'] },
+      result: { exitCode: 1, stdout: '3 failed', stderr: '' },
+      stage: 'result'
+    });
+    expect(markup).toContain('pnpm --filter @athanor/web test');
+    expect(markup).toContain('3 failed');
+    expect(markup).toContain('exit 1');
+  });
+
+  /*
+   * A start is drawn on its own only while the call is still in flight, and there is no result to
+   * read yet. Saying "It printed nothing" over a build that is still building is the same class of
+   * confident falsehood as "new file · +800" over a one-line edit — the thing this panel exists to
+   * stop. The line that is running is still shown, because that is the part that is true.
+   */
+  it('does not tell you a running command printed nothing', () => {
+    const markup = evidence({
+      tool: 'shell',
+      args: { executable: '/usr/bin/make', args: ['build'] },
+      stage: 'started'
+    });
+    expect(markup).toContain('make build');
+    expect(markup).not.toContain('printed nothing');
+  });
+
+  /*
+   * `<details>` hides its children; it does not stop React building them. With one write the diff
+   * opens and is drawn, with several it stays shut and costs nothing until it is asked for — which
+   * is what keeps a turn that created three large files from putting a thousand rows in the
+   * document the moment the work log is expanded.
+   */
+  it('builds the rows of a diff only for the one it opens', () => {
+    const both = {
+      tool: 'file_patch',
+      stage: 'result',
+      result: {}
+    } as const;
+    const one = evidence({
+      ...both,
+      args: { patches: [{ path: 'a.ts', oldText: 'one', newText: 'two' }] }
+    });
+    expect(one).toContain('diff-line');
+    const many = evidence({
+      ...both,
+      args: {
+        patches: [
+          { path: 'a.ts', oldText: 'one', newText: 'two' },
+          { path: 'b.ts', oldText: 'three', newText: 'four' }
+        ]
+      }
+    });
+    expect(many).toContain('b.ts');
+    expect(many).not.toContain('diff-line');
+  });
+
+  it('shows a page read as the page and whose it was', () => {
+    const markup = evidence({
+      tool: 'browser_snapshot',
+      args: { url: 'https://www.example.com/pricing' },
+      result: { holder: 'agent', url: 'https://www.example.com/pricing', title: 'Pricing' },
+      stage: 'result'
+    });
+    expect(markup).toContain('Pricing');
+    expect(markup).toContain('example.com');
+  });
+
+  /* Promoted, not hidden: whatever the reader came for is still one disclosure further down. */
+  it('keeps the raw payload behind one more disclosure', () => {
+    const markup = evidence({
+      tool: 'shell',
+      args: { executable: 'ls' },
+      result: { exitCode: 0, stdout: 'notes.md' },
+      stage: 'result'
+    });
+    expect(markup).toContain('tool-raw');
+    expect(markup).toContain('Raw result');
+    expect(markup).toContain('&quot;exitCode&quot;: 0');
+  });
+
+  it('falls back to the payload for a tool with no shape worth promoting', () => {
+    const markup = evidence({ tool: 'memory', args: {}, result: { saved: true }, stage: 'result' });
+    expect(markup).not.toContain('tool-evidence');
+    expect(markup).toContain('&quot;saved&quot;: true');
   });
 });

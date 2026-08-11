@@ -71,6 +71,31 @@ describe('the panel behind the tabs', () => {
   });
 });
 
+/*
+ * The fourth place answers "what is this computer doing", and it used to open on a form asking the
+ * owner to guess which port their own machine was listening on. The order of the pane is the whole
+ * of that change, so it is the thing worth pinning: processes first, the port form last.
+ */
+describe('the fourth pane', () => {
+  const running = render(workspace, 'preview');
+
+  it('is called Running', () => {
+    expect(markup).toContain('>Running</button>');
+    expect(markup).not.toContain('>Preview</button>');
+  });
+
+  it('leads with what is running and demotes the port form to the bottom', () => {
+    expect(running.indexOf('running-list')).toBeGreaterThan(-1);
+    expect(running.indexOf('running-list')).toBeLessThan(running.indexOf('preview-create'));
+  });
+
+  // Quiet when there is nothing: one line, no illustration, on the pane and on the frame both.
+  it('says nothing is running in one line', () => {
+    expect(running).toContain('Nothing is running in the background.');
+    expect(running).not.toContain('empty-pane');
+  });
+});
+
 describe('the panel with no workspace to show', () => {
   const offline = render(undefined, 'terminal');
 

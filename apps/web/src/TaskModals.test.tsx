@@ -214,6 +214,32 @@ describe('the card that asks before something irreversible', () => {
   });
 
   /*
+   * It claimed to be a modal and behaved as a banner: `role="alertdialog"` with nothing inert
+   * behind it, no focus moved to it, no Tab held inside it and no Escape — a promise to a screen
+   * reader that the page underneath had been taken away, when it had not. And `aria-live` over a
+   * countdown that re-renders four times a minute meant "expires in 43s" was read over the top of
+   * whoever was reading the command. It is a part of the workbench that is asking a question.
+   */
+  it('is a focusable group named by its own two lines, not an alert dialog that shouts', () => {
+    const markup = render([approval()]);
+    expect(markup).not.toContain('alertdialog');
+    expect(markup).not.toContain('aria-live');
+    expect(markup).toContain('role="group"');
+    expect(markup).toContain('tabindex="-1"');
+    expect(markup).toContain('aria-labelledby="approval-eyebrow approval-headline"');
+    expect(markup).toContain('id="approval-eyebrow"');
+    expect(markup).toContain('id="approval-headline"');
+  });
+
+  /* The keys ride on the controls, so a screen reader reads them out with the button and the card
+     does not grow a legend. Answering is bound inside the card only — see `decisionKey`. */
+  it('says on each control which keys answer it', () => {
+    const markup = render([approval()]);
+    expect(markup).toContain('aria-keyshortcuts="Meta+Enter"');
+    expect(markup).toContain('aria-keyshortcuts="Meta+Backspace"');
+  });
+
+  /*
    * Only one thing is allowed above the composer and this card is it, so a decision that would not
    * send cannot be reported by the strip underneath - it would never be drawn. Said here, Approve
    * can no longer look identical whether the box accepted it or never heard it.

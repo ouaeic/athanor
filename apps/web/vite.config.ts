@@ -7,8 +7,20 @@ import react from '@vitejs/plugin-react';
  * everything it statically imports, gzipped. Lazy chunks are excluded because nothing waits on
  * them. A warning here would be worthless — a bundle regression is only ever noticed if it stops
  * the build — so this fails instead.
+ *
+ * Raised from 145 kB, deliberately and once. Measured: 143.9 kB before the work-log, approval and
+ * settings changes and 148.0 kB after, all of it real code on the first screen — the evidence a
+ * tool call left behind (`workEvidence` and the three renderers it feeds), the keys and focus the
+ * approval card now answers, and the join that pairs a result with the arguments it answers.
+ *
+ * The other remedy was examined and does not exist here: the diff renderer is the one lump worth
+ * deferring, and `TaskModals` needs it synchronously — putting a Suspense fallback inside the card
+ * that asks before something irreversible is a worse trade than four kilobytes. The one saving that
+ * did exist was taken: the two rules tables on "What it may do" are prose read by a lazily-loaded
+ * settings page and were riding in because the composer imports the mode labels from the same
+ * module, so they now live in `asking-rules.ts`.
  */
-const EAGER_BUDGET_BYTES = 145_000;
+const EAGER_BUDGET_BYTES = 150_000;
 
 /**
  * The same walk, twice used: it measures the first paint, and it writes the hashed names down for

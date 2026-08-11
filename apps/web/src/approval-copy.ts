@@ -73,6 +73,33 @@ export const expiryPhrase = (expiresAt: string, now = Date.now()): string => {
 };
 
 /**
+ * What the polite region says when a request arrives, and — mostly — that it says nothing.
+ *
+ * The card used to be `role="alertdialog" aria-live="assertive"`, and it re-renders every twenty
+ * seconds to move its countdown. An assertive region re-reads whatever changed inside it, so a
+ * screen reader interrupted the owner with "expires in 43s", then "expires in 23s", over the top of
+ * the command they were trying to read — loudest in the last minute, when reading it matters most.
+ *
+ * So: once per request, and the sentence carries no number. Returning `undefined` for a request
+ * already announced is the whole policy, and it is why the countdown can go on moving on screen.
+ */
+export const approvalAnnouncement = (input: {
+  approval: Approval | undefined;
+  /** How many are queued behind this one, which is worth hearing once and never again. */
+  waiting: number;
+  announcedId: string | undefined;
+}): { id: string; message: string } | undefined => {
+  const approval = input.approval;
+  if (!approval || approval.id === input.announcedId) return undefined;
+  return {
+    id: approval.id,
+    message: `Your confirmation is required. ${approvalReach(approval)}.${
+      input.waiting > 1 ? ` ${input.waiting} waiting.` : ''
+    }`
+  };
+};
+
+/**
  * Which request the card is showing.
  *
  * The queue is never filtered to the open conversation — an agent that keeps working after you

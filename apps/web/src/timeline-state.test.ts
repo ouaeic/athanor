@@ -23,7 +23,9 @@ import {
   settledToolStarts,
   spendPause,
   taskStateAnnouncement,
-  withPendingMessage
+  toolLabel,
+  withPendingMessage,
+  workEvidence
 } from './timeline-state.js';
 
 const event = (sequence: number, kind: TaskEvent['kind'], payload?: unknown): TaskEvent =>
@@ -1261,5 +1263,240 @@ describe('an approval and the answer it got', () => {
     );
     const shown = nodes.flatMap((node) => ('event' in node ? [node.event.kind] : []));
     expect(shown).toEqual(['approval_requested']);
+  });
+});
+
+describe('a finished call, joined back to what it was asked to do', () => {
+  /*
+   * The worker publishes the arguments on `tool_started` and the outcome on `tool_result`, keyed to
+   * each other by `toolCallId`, and this client never joined them. So the one row that survived
+   * into a finished conversation was the result - which for a write is a hash and a byte count.
+   */
+  const call = (sequence: number, toolCallId: string, tool: string, args: unknown): TaskEvent =>
+    event(sequence, 'tool_started', { toolCallId, tool, arguments: args });
+
+  const answered = (sequence: number, toolCallId: string, result: unknown): TaskEvent =>
+    event(sequence, 'tool_result', { toolCallId, result });
+
+  const workLog = (events: TaskEvent[], status = 'completed') => {
+    const group = buildConversation(events, status).find((node) => node.kind === 'activity');
+    if (group?.kind !== 'activity') throw new Error('expected a work log');
+    return group.events;
+  };
+
+  it('carries the tool and the arguments onto the result', () => {
+    const entries = workLog([
+      call(1, 'c1', 'file_patch', {
+        patches: [{ path: 'notes.md', oldText: 'one', newText: 'two' }]
+      }),
+      answered(2, 'c1', { applied: 1 })
+    ]);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.event.kind).toBe('tool_result');
+    expect(entries[0]?.call?.tool).toBe('file_patch');
+    expect(workEvidence(entries[0]?.call, entries[0]?.event.payload)).toEqual({
+      kind: 'files',
+      changes: [{ path: 'notes.md', before: 'one', after: 'two' }]
+    });
+  });
+
+  /*
+   * A start used to be dropped for being "settled", and `settledToolStarts` answers true for every
+   * start in a finished conversation - so a call the owner stopped halfway, the one they are most
+   * likely to go looking for, was in the transcript nowhere at all. It is dropped for being
+   * superseded by its own result now, which is a fact about this log rather than about the clock.
+   */
+  it('keeps a call that never came back', () => {
+    const entries = workLog([
+      call(1, 'c1', 'shell', { executable: 'sleep', args: ['600'] }),
+      event(2, 'completed', { summary: 'Stopped' })
+    ]);
+    expect(entries.map((entry) => entry.event.kind)).toEqual(['tool_started']);
+  });
+
+  it('says what a call is in the owner’s words, wherever it is printed', () => {
+    expect(toolLabel('file_write', 'file_write completed')).toBe('Writing a file');
+    expect(toolLabel('shell', 'Running shell')).toBe('Running a command');
+    // A tool this build has never heard of falls back to the worker's sentence, minus the prefix
+    // that only made sense while it was still running.
+    expect(toolLabel('quantum_read', 'Running quantum_read')).toBe('quantum_read');
+  });
+});
+
+describe('what a call actually did', () => {
+  const started = (sequence: number, toolCallId: string, tool: string, args: unknown): TaskEvent =>
+    event(sequence, 'tool_started', { toolCallId, tool, arguments: args });
+  const finished = (sequence: number, toolCallId: string, result: unknown): TaskEvent =>
+    event(sequence, 'tool_result', { toolCallId, result });
+  const wholeRead = (path: string, content: string) => ({
+    path,
+    startLine: 1,
+    endLine: content.split('\n').length,
+    totalLines: content.split('\n').length,
+    truncated: false,
+    content
+  });
+
+  /*
+   * `file_write` carries only the new contents, so a diff from its arguments alone calls every
+   * write a new file - a one-line edit to a long module reading "new file · +800". The whole-file
+   * read this turn already did is exactly the text the write overwrote.
+   */
+  it('shows a write against what the turn read, not as a new file', () => {
+    const events = [
+      started(1, 'r1', 'file_read', { path: './notes.md' }),
+      finished(2, 'r1', wholeRead('notes.md', 'one\ntwo\nthree')),
+      started(3, 'w1', 'file_write', { path: 'notes.md', content: 'one\ntwo\nfour' }),
+      finished(4, 'w1', { sha256: 'abc', sizeBytes: 12 })
+    ];
+    const group = buildConversation(events, 'completed').find((node) => node.kind === 'activity');
+    if (group?.kind !== 'activity') throw new Error('expected a work log');
+    const write = group.events.find((entry) => entry.call?.tool === 'file_write');
+    expect(write?.call?.before).toBe('one\ntwo\nthree');
+    const evidence = workEvidence(write?.call, { sha256: 'abc' });
+    expect(evidence).toEqual({
+      kind: 'files',
+      changes: [{ path: 'notes.md', before: 'one\ntwo\nthree', after: 'one\ntwo\nfour' }]
+    });
+  });
+
+  it('diffs a second write to the same file against the first', () => {
+    const events = [
+      started(1, 'w1', 'file_write', { path: 'notes.md', content: 'one' }),
+      finished(2, 'w1', { sha256: 'a' }),
+      started(3, 'w2', 'file_write', { path: 'notes.md', content: 'two' }),
+      finished(4, 'w2', { sha256: 'b' })
+    ];
+    const group = buildConversation(events, 'completed').find((node) => node.kind === 'activity');
+    if (group?.kind !== 'activity') throw new Error('expected a work log');
+    const writes = group.events.filter((entry) => entry.call?.tool === 'file_write');
+    expect(writes[0]?.call?.before).toBeUndefined();
+    expect(writes[1]?.call?.before).toBe('one');
+  });
+
+  /*
+   * A windowed read is a window. Diffing a write against twenty lines out of nine hundred would
+   * invent every other line as a deletion the write never made.
+   */
+  it('refuses to diff against a windowed read', () => {
+    const events = [
+      started(1, 'r1', 'file_read', { path: 'big.log', startLine: 400, endLine: 420 }),
+      finished(2, 'r1', {
+        path: 'big.log',
+        startLine: 400,
+        endLine: 420,
+        totalLines: 9000,
+        truncated: false,
+        content: 'a\nb'
+      }),
+      started(3, 'w1', 'file_write', { path: 'big.log', content: 'a\nb\nc' }),
+      finished(4, 'w1', { sha256: 'a' })
+    ];
+    const group = buildConversation(events, 'completed').find((node) => node.kind === 'activity');
+    if (group?.kind !== 'activity') throw new Error('expected a work log');
+    expect(
+      group.events.find((entry) => entry.call?.tool === 'file_write')?.call?.before
+    ).toBeUndefined();
+  });
+
+  it('shows a command as it would be typed, with how it ended and what it said', () => {
+    const evidence = workEvidence(
+      {
+        tool: 'shell',
+        arguments: { executable: 'bash', args: ['-lc', 'pnpm test && echo ok'] }
+      },
+      { exitCode: 1, stdout: 'first\nsecond\n', stderr: 'boom\n' }
+    );
+    expect(evidence).toEqual({
+      kind: 'command',
+      // The vector is quoted back into a line, so what ran can be read and pasted.
+      command: "bash -lc 'pnpm test && echo ok'",
+      status: 'exit 1',
+      output: 'first\nsecond\nboom'
+    });
+  });
+
+  it('says nothing about a command that simply worked', () => {
+    const evidence = workEvidence(
+      { tool: 'shell', arguments: { executable: 'ls' } },
+      { exitCode: 0, stdout: '', stderr: '' }
+    );
+    // An exit code of zero is not news, and an empty log line is furniture.
+    expect(evidence).toEqual({ kind: 'command', command: 'ls', status: '', output: '' });
+  });
+
+  it('keeps the end of a long output rather than the start', () => {
+    const lines = Array.from({ length: 120 }, (_, index) => `line ${index}`).join('\n');
+    const evidence = workEvidence(
+      { tool: 'shell', arguments: { executable: 'make' } },
+      { exitCode: 2, stdout: lines }
+    );
+    const output = evidence?.kind === 'command' ? evidence.output : '';
+    // A command is being looked at for how it ended: the failing assertion is at the bottom.
+    expect(output.endsWith('line 119')).toBe(true);
+    expect(output.startsWith('[80 earlier lines not shown]')).toBe(true);
+    expect(output).not.toContain('line 79\n');
+  });
+
+  it('reports a background command as still running rather than as an exit', () => {
+    const evidence = workEvidence(
+      { tool: 'shell', arguments: { executable: 'node', args: ['server.js'] } },
+      { sessionId: 's1' }
+    );
+    expect(evidence?.kind === 'command' && evidence.status).toBe('still running');
+  });
+
+  /*
+   * A read went to one address. The links on the page it landed on are not pages it read, and a
+   * deep walk for anything carrying a `url` listed all of them - each one wearing the title of the
+   * page it sits on, because a nested entry inherits it. Measured on one pricing-page snapshot:
+   * three rows reading "Pricing — Example · example.com", for one page.
+   */
+  it('shows a page read as the page, not as every link on it', () => {
+    const evidence = workEvidence(
+      { tool: 'browser_snapshot', arguments: { url: 'https://www.example.com/pricing' } },
+      {
+        holder: 'agent',
+        url: 'https://www.example.com/pricing',
+        title: 'Pricing',
+        nodes: [
+          { role: 'link', name: 'Home', url: 'https://www.example.com/' },
+          { role: 'link', name: 'Docs', url: 'https://www.example.com/docs' }
+        ]
+      }
+    );
+    expect(evidence).toEqual({
+      kind: 'pages',
+      pages: [{ url: 'https://www.example.com/pricing', host: 'example.com', title: 'Pricing' }]
+    });
+  });
+
+  it('lists each page a parallel read went to, by the address it meant to reach', () => {
+    const evidence = workEvidence(
+      { tool: 'parallel_web_read', arguments: { urls: ['https://a.test/x', 'https://b.test/y'] } },
+      {
+        sources: [
+          { url: 'https://a.test/x', title: 'A' },
+          // A read that failed reports where it was going and no final address.
+          { requestedUrl: 'https://b.test/y', error: 'timed out' }
+        ]
+      }
+    );
+    expect(evidence).toEqual({
+      kind: 'pages',
+      pages: [
+        { url: 'https://a.test/x', host: 'a.test', title: 'A' },
+        { url: 'https://b.test/y', host: 'b.test', title: 'b.test' }
+      ]
+    });
+  });
+
+  it('leaves everything else to the raw payload rather than inventing a shape for it', () => {
+    expect(workEvidence(undefined, { ok: true })).toBeUndefined();
+    expect(
+      workEvidence({ tool: 'memory', arguments: { note: 'x' } }, { ok: true })
+    ).toBeUndefined();
+    // A write whose arguments never arrived has nothing to draw.
+    expect(workEvidence({ tool: 'file_write', arguments: {} }, { ok: true })).toBeUndefined();
   });
 });

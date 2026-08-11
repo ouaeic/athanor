@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { FileDiff } from 'lucide-react';
 import { buildFileDiff, diffStat, type FileDiff as FileDiffModel } from './diff.js';
 
@@ -58,8 +58,23 @@ export function DiffView({
   defaultOpen?: boolean;
 }) {
   const diff = useMemo(() => buildFileDiff(path, before, after), [path, before, after]);
+  /*
+   * The rows are built when the disclosure is opened, not when it is drawn closed.
+   *
+   * `<details>` hides its children, it does not stop them being rendered, and this component is now
+   * reached from every file write in a work log rather than from one approval card at a time. A
+   * turn that created three 500-line files put fifteen hundred table rows into the document the
+   * instant the log was expanded, all of them behind a triangle nobody had clicked. The summary
+   * line still needs the diff itself, which is cheap — the alignment is trimmed and capped in
+   * `diffLines` — so only the body waits.
+   */
+  const [open, setOpen] = useState(defaultOpen);
   return (
-    <details className="file-diff" open={defaultOpen}>
+    <details
+      className="file-diff"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
       <summary>
         <FileDiff />
         <span className="file-diff-path">{path}</span>
@@ -68,7 +83,7 @@ export function DiffView({
           {diffStat(diff)}
         </span>
       </summary>
-      <DiffBody diff={diff} />
+      {open && <DiffBody diff={diff} />}
     </details>
   );
 }

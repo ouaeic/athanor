@@ -7908,3 +7908,436 @@ a.blocked-resource:hover {
   border-color: var(--silver-edge);
   background: #22272a;
 }
+
+/* ---------------------------------------------------------------------------
+   The work log, the approval, Running, and the workspace default.
+   --------------------------------------------------------------------------- */
+
+/* ==========================================================================
+   1 — THE APPROVAL CARD TAKES FOCUS, SO IT HAS TO SHOW IT
+   ========================================================================== */
+
+/*
+  FUNCTIONAL. The card is a `div` with `tabIndex={-1}` that now moves focus to itself when a
+  request arrives. The global focus ring (styles.css:132) covers button/input/textarea/select
+  only, so a sighted keyboard owner had focus moved for them with nothing on screen saying where
+  it went. `:focus` rather than `:focus-visible`: this focus is programmatic, and browsers do not
+  reliably match `:focus-visible` for a scripted focus on a non-input element — which is exactly
+  the case that needs the ring most.
+*/
+.approval-drawer:focus,
+.approval-drawer:focus-visible {
+  outline: 2px solid var(--silver-edge);
+  outline-offset: 3px;
+}
+
+/* ==========================================================================
+   2 — WHAT A TOOL CALL LEFT BEHIND, IN THE WORK LOG
+   ========================================================================== */
+
+/*
+  The evidence sits inside `.tool-event`, which has no padding of its own (styles.css:1030) because
+  everything it used to hold was a full-bleed `<pre>`.
+*/
+.tool-evidence {
+  display: grid;
+  gap: 8px;
+  padding: 0 11px 11px;
+}
+
+/* The diff carries its own 8px block margin (styles.css:6094); the grid gap is doing that job. */
+.tool-evidence .file-diff {
+  margin: 0;
+}
+
+/* --- a command ----------------------------------------------------------- */
+
+.tool-command {
+  display: grid;
+  gap: 7px;
+}
+
+.tool-command-line {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin: 0;
+}
+
+.tool-command-line > svg {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  color: #6f767a;
+  transform: translateY(2px);
+}
+
+/*
+  FUNCTIONAL. A command line is untrusted text of any length with no spaces guaranteed in it, and
+  this pane lives in a 330px-minimum column. Without the wrap an argv of one long path pushed the
+  whole workbench sideways.
+*/
+.tool-command-line code {
+  min-width: 0;
+  color: #dce0e2;
+  font:
+    11px/1.5 ui-monospace,
+    monospace;
+  overflow-wrap: anywhere;
+}
+
+/* Drawn only when there is something to say: an exit code of zero is not news. Sand, not ember —
+   a command that failed is caution, and caution is dim and static. */
+.tool-command-status {
+  flex: none;
+  border: 1px solid #4a4231;
+  border-radius: 5px;
+  padding: 1px 6px;
+  color: #d5b46a;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/*
+  FUNCTIONAL (the scroll containment). `.tool-event pre` (styles.css:1063) already gives the mono
+  face and the dark ground; this reclaims it from the full-bleed shape that rule assumes, because
+  the output now sits inside a padded box. Specificity 0,2,0 beats that rule's 0,1,1.
+
+  `max-height` plus `overflow: auto` is what keeps 40 lines of build output scrolling inside its
+  own box instead of making the page scroll horizontally.
+*/
+.tool-event .tool-output {
+  margin: 0;
+  border: 1px solid #2d3033;
+  border-radius: 8px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.tool-quiet {
+  margin: 0;
+  color: #6f767a;
+  font-size: 11px;
+}
+
+/* --- the pages a read loaded --------------------------------------------- */
+
+.tool-pages {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tool-pages a {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #2d3033;
+  border-radius: 8px;
+  padding: 7px 9px;
+  background: #131517;
+  color: inherit;
+  text-decoration: none;
+  transition: border-color 160ms var(--ease);
+}
+
+/* Silver: an interactive edge. */
+.tool-pages a:hover {
+  border-color: var(--silver-edge);
+}
+
+/* FUNCTIONAL. These are anchors, which the global focus rule does not cover. */
+.tool-pages a:focus-visible {
+  outline: 2px solid var(--silver-edge);
+  outline-offset: 2px;
+}
+
+.tool-pages svg {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  color: #6f767a;
+}
+
+.tool-pages a > span {
+  display: grid;
+  min-width: 0;
+}
+
+/* FUNCTIONAL. A page title is arbitrary text from a site the agent visited; it truncates rather
+   than setting the width of the column it is in. */
+.tool-pages strong,
+.tool-pages small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-pages strong {
+  color: #dce0e2;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tool-pages small {
+  color: #959a9e;
+  font-size: 11px;
+}
+
+/* --- the payload, one disclosure further down ---------------------------- */
+
+.tool-raw {
+  border: 1px solid #2d3033;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+/*
+  `.tool-event summary` (styles.css:1037) is a three-column grid for the row's own header and it
+  matches every nested summary too. Specificity 0,2,1 beats it; the `list-style` it sets is kept.
+*/
+.tool-event .tool-raw > summary {
+  display: block;
+  padding: 6px 9px;
+  color: #6f767a;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.tool-event .tool-raw > summary:hover {
+  color: #959a9e;
+}
+
+/* The dump already scrolls and wraps from `.tool-event pre`; only its edges change in here. */
+.tool-event .tool-raw pre {
+  border-top: 1px solid #2d3033;
+  border-radius: 0;
+}
+
+/* --- a call that never came back ----------------------------------------- */
+
+/*
+  Not a failure and not a success: the task stopped while this was still out. Grey, because the
+  sand and clay mean caution and there is nothing to be careful about here — something is simply
+  missing. This is the row a reader goes looking for after a bad run, so it is not dimmed away.
+*/
+.tool-event.unfinished summary > svg:first-child {
+  color: #858d92;
+}
+
+/* ==========================================================================
+   3 — THE RUNNING PANE
+   ========================================================================== */
+
+/*
+  `.inspector-content` is already a column flex with a gap (styles.css:1601), and `.preview-pane`
+  sets the padding, so the pane itself needs nothing. `flex: none` on the list stops it stretching
+  when it is the only thing on a pane with a frame underneath.
+*/
+.running-list {
+  display: grid;
+  gap: 6px;
+  flex: none;
+}
+
+.running-row {
+  display: grid;
+  grid-template-columns: 6px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid #2d3033;
+  border-radius: 9px;
+  padding: 9px 11px;
+  background: #131517;
+  /* Everything finished is quiet; the live rows below take their opacity back. */
+  opacity: 0.62;
+}
+
+.running-row.live {
+  opacity: 1;
+  border-color: #3a4044;
+}
+
+/*
+  The one ember on this pane, and the whole reason the pane exists: this dot is on exactly the rows
+  where the machine is working this second. Small, bright and moving — the discipline that keeps
+  warmth from ever being mistaken for the large, dim, static caution colours.
+
+  Drawn grey for a finished row so the column does not jump.
+*/
+.running-mark {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #6b7276;
+}
+
+.running-row.live .running-mark {
+  background: var(--ember);
+  box-shadow: 0 0 0 3px var(--ember-glow);
+  animation: running-mark-pulse 2.2s var(--ease) infinite;
+}
+
+/* The global reduced-motion block (styles.css:5802) already stops this; it needs nothing here. */
+@keyframes running-mark-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 3px var(--ember-glow);
+  }
+  50% {
+    box-shadow: 0 0 0 5px var(--ember-glow);
+  }
+}
+
+.running-row > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+/*
+  FUNCTIONAL. `processCommand` bounds the line to 96 characters, which is still wider than this
+  column on a phone. It truncates rather than wrapping to three lines or widening the pane.
+*/
+.running-row strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #dce0e2;
+  font:
+    12px/1.4 ui-monospace,
+    monospace;
+  font-weight: 500;
+}
+
+.running-row small {
+  color: #959a9e;
+  font-size: 11px;
+}
+
+.running-elapsed {
+  flex: none;
+  color: #6f767a;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* An empty computer is the ordinary state. One line, no illustration. Also carries the sentence
+   for a box that has stopped answering, which is a fact about the machine rather than an error. */
+.running-idle {
+  margin: 0;
+  color: #6f767a;
+  font-size: 12px;
+}
+
+/*
+  The bottom of the pane: the owner knows something is listening that athanor did not start. It is
+  the uncommon case, so it is set apart and quiet rather than led with.
+*/
+.running-publish {
+  display: grid;
+  gap: 7px;
+  margin-top: 4px;
+  border-top: 1px solid #24282b;
+  padding-top: 12px;
+}
+
+.running-publish > span {
+  color: #959a9e;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* ==========================================================================
+   4 — THE WORKSPACE DEFAULT, ON "WHAT IT MAY DO"
+   ========================================================================== */
+
+/*
+  A real radio group where three read-only rows used to be. Deliberately the same shape as
+  `.token-scopes` (styles.css:7114) — same fieldset reset, same legend, same row — because these
+  are the same thing to an owner: a short list of what something is permitted to do, chosen from.
+*/
+.security-modes {
+  display: grid;
+  gap: 6px;
+  margin-top: 13px;
+  padding: 0;
+  border: 0;
+}
+
+.security-modes legend {
+  padding: 0 0 6px;
+  color: #969ca0;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* The `.self-hosted-settings` prefix matches `.token-scopes`: the dialog has its own `label` rule
+   that this has to win over. */
+.self-hosted-settings .security-modes label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  margin: 0;
+  padding: 9px 11px;
+  border: 1px solid #2f3336;
+  border-radius: 10px;
+  background: #131517;
+  cursor: pointer;
+  transition:
+    border-color 160ms var(--ease),
+    background-color 160ms var(--ease);
+}
+
+.self-hosted-settings .security-modes label:hover {
+  border-color: var(--silver-edge);
+}
+
+/*
+  The chosen row, which is the one fact this control exists to state. Silver, not ember: this is a
+  setting that is already true, not the machine working and not the owner's move.
+*/
+.self-hosted-settings .security-modes label.chosen {
+  border-color: var(--silver-edge);
+  background: #191d1f;
+}
+
+/* FUNCTIONAL. The whole label is the hit area, so the disabled state has to read on all of it —
+   the radios are disabled while a write is in flight and while there is no workspace. */
+.self-hosted-settings .security-modes label:has(input:disabled) {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* FUNCTIONAL. The input is real and focusable; without this the ring lands on a 13px dot with no
+   relation to the row it selects. */
+.self-hosted-settings .security-modes label:has(input:focus-visible) {
+  outline: 2px solid var(--silver-edge);
+  outline-offset: 2px;
+}
+
+.security-modes input {
+  margin: 2px 0 0;
+  accent-color: var(--ember-deep);
+}
+
+.security-modes strong {
+  display: block;
+  color: #dce0e2;
+  font-size: 12px;
+}
+
+.security-modes small {
+  display: block;
+  grid-column: 2;
+  margin-top: 3px;
+  color: #969ca0;
+  font-size: 11px;
+  line-height: 1.5;
+}

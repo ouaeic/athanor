@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  approvalAnnouncement,
   approvalDiffState,
   approvalReach,
   expiryPhrase,
@@ -146,5 +147,60 @@ describe('the diff the card shows before a write is allowed', () => {
         'workspace/other.md': null
       }).ready
     ).toBe(true);
+  });
+});
+
+describe('what the card is allowed to say out loud', () => {
+  /*
+   * The card was `aria-live="assertive"` over a countdown that re-renders every twenty seconds, so
+   * a screen reader read "expires in 43s", then "expires in 23s", over whatever the owner was
+   * reading — loudest in the last minute, when what they are reading is the command itself.
+   */
+  it('says what arrived, once, and never says how long is left', () => {
+    const first = approvalAnnouncement({
+      approval: approval(),
+      waiting: 1,
+      announcedId: undefined
+    });
+    expect(first?.id).toBe('ap-1');
+    expect(first?.message).toContain('Your confirmation is required');
+    expect(first?.message).toContain('Runs a command on your computer');
+    expect(first?.message).not.toMatch(/expires|\ds\b|minute/);
+  });
+
+  it('says nothing at all on the next tick of the same request', () => {
+    expect(
+      approvalAnnouncement({ approval: approval(), waiting: 1, announcedId: 'ap-1' })
+    ).toBeUndefined();
+    // Nor when the queue behind it changes: only a different request in front is news.
+    expect(
+      approvalAnnouncement({ approval: approval(), waiting: 3, announcedId: 'ap-1' })
+    ).toBeUndefined();
+  });
+
+  /* The buttons are reused across requests, so the owner has to hear that this is a new one. */
+  it('speaks again when a different request takes its place', () => {
+    const next = approvalAnnouncement({
+      approval: approval({ id: 'ap-2', preview: { tool: 'publish_site' } }),
+      waiting: 1,
+      announcedId: 'ap-1'
+    });
+    expect(next?.id).toBe('ap-2');
+    expect(next?.message).toContain('Puts something on the public internet');
+  });
+
+  it('counts the queue only when there is one', () => {
+    expect(
+      approvalAnnouncement({ approval: approval(), waiting: 1, announcedId: undefined })?.message
+    ).not.toContain('waiting');
+    expect(
+      approvalAnnouncement({ approval: approval(), waiting: 3, announcedId: undefined })?.message
+    ).toContain('3 waiting');
+  });
+
+  it('has nothing to say when nothing is waiting', () => {
+    expect(
+      approvalAnnouncement({ approval: undefined, waiting: 0, announcedId: undefined })
+    ).toBeUndefined();
   });
 });

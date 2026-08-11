@@ -11,7 +11,6 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
-  Globe2,
   HardDrive,
   LoaderCircle,
   LockKeyhole,
@@ -37,6 +36,13 @@ import { describeFailure } from './failure-text.js';
 import { readFilePreview } from './file-preview.js';
 import { botWallClearance, formatBytes, hostOf } from './timeline-state.js';
 import { previewPortProblem, previewSummary } from './preview-rows.js';
+import {
+  isLive,
+  processCommand,
+  processElapsed,
+  processState,
+  runningOrder
+} from './running-rows.js';
 import { advanceFrame, drainFrames, emptyFrameSlots, type FrameSlots } from './remote-frame.js';
 import { inertOutside } from './inert-outside.js';
 import { capabilityDeadline, shouldRenew } from './session-renewal.js';
@@ -50,6 +56,7 @@ import { DiffView } from './DiffView.js';
 import { useUndo } from './Undo.js';
 import type {
   Artifact,
+  BackgroundProcess,
   BotWall,
   DesktopSnapshot,
   FileEntry,
@@ -67,11 +74,21 @@ import type {
  * picture the agent can already make by being asked, and Usage was a report rather than a place,
  * so it sits with the spending caps it is measured against.
  */
+/*
+ * The fourth place is called Running, because that is what it now shows: the background processes
+ * this computer has going, with the published addresses under them. It was called Preview and led
+ * with a form asking the owner to guess a port.
+ *
+ * The identifier stays `preview`. It is not a private label - it is the stored value of the owner's
+ * inspector preference, sent to the box and validated there (packages/contracts/src/index.ts), so
+ * renaming it would refuse every device that has ever had this tab open until the owner clicked
+ * something else. What the owner reads is the second element.
+ */
 const inspectorTabs = [
   ['files', 'Files'],
   ['computer', 'Computer'],
   ['terminal', 'Terminal'],
-  ['preview', 'Preview']
+  ['preview', 'Running']
 ] as const;
 type Tab = (typeof inspectorTabs)[number][0];
 const tabIds = inspectorTabs.map(([id]) => id);
@@ -1849,7 +1866,21 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
   );
 }
 
-function PreviewPane({ workspace }: { workspace: Workspace }) {
+/**
+ * How often the pane re-reads what the computer is running.
+ *
+ * The clock moves every second so a live row counts up rather than jumping; the machine is asked
+ * every fifth of those, which is often enough that a server started in the conversation appears
+ * while the owner is still looking at it, and rare enough that watching this pane is not itself a
+ * load on the box. Both stop dead when the pane is behind another tab.
+ */
+const RUNNING_TICK_MS = 1_000;
+const RUNNING_TICKS_PER_POLL = 5;
+
+function RunningPane({ workspace, visible }: { workspace: Workspace; visible: boolean }) {
+  const [processes, setProcesses] = useState<BackgroundProcess[]>([]);
+  const [processFailure, setProcessFailure] = useState('');
+  const [now, setNow] = useState(() => Date.now());
   const [previews, setPreviews] = useState<WorkspacePreview[]>([]);
   const undo = useUndo();
   const [port, setPort] = useState(3000);
@@ -1864,10 +1895,43 @@ function PreviewPane({ workspace }: { workspace: Workspace }) {
       .catch((cause) =>
         setError(cause instanceof Error ? cause.message : 'Could not load previews')
       );
+  const loadProcesses = () =>
+    void api
+      .workspaceProcesses(workspace.id)
+      .then((current) => {
+        setProcesses(current);
+        setProcessFailure('');
+      })
+      // Said once, in the row's own place, rather than in the alert the form below uses: a computer
+      // that has stopped answering is a fact about the machine, not a failed thing the owner did.
+      .catch(() => setProcessFailure('The computer is not saying what it is running.'));
   useEffect(() => {
     setActiveUrl('');
     load();
   }, [workspace.id]);
+  /*
+   * The clock is only read by a row that is counting up, so it is only advanced while one exists.
+   * A machine with nothing running - the ordinary state - otherwise re-rendered this pane once a
+   * second for a number that had already stopped, for as long as the tab was on screen.
+   */
+  const counting = processes.some(isLive);
+  useEffect(() => {
+    if (!visible) return;
+    setNow(Date.now());
+    loadProcesses();
+    let ticks = 0;
+    const timer = window.setInterval(() => {
+      // Behind another window as well as behind another tab: everything else that polls this box
+      // checks `visibilityState` first (App.tsx), and a browser left open overnight on this pane
+      // would otherwise ask the machine what it is running twelve times a minute until morning.
+      if (document.visibilityState !== 'visible') return;
+      if (counting) setNow(Date.now());
+      ticks += 1;
+      if (ticks % RUNNING_TICKS_PER_POLL === 0) loadProcesses();
+    }, RUNNING_TICK_MS);
+    return () => window.clearInterval(timer);
+  }, [visible, workspace.id, counting]);
+  const rows = runningOrder(processes);
   const openPreview = async (preview: WorkspacePreview) => {
     setBusy(true);
     setError('');
@@ -1883,57 +1947,50 @@ function PreviewPane({ workspace }: { workspace: Workspace }) {
   };
   // A dead button with no reason on it is the worst of both: this says which port to use instead.
   const portProblem = previewPortProblem(port);
-  // No title card: the tab is called Preview and the form under it says what it does.
+  /*
+   * The order of this pane is the answer to one question: what is this computer doing right now.
+   *
+   * It used to open on a form asking the owner to name a port, defaulted to 3000, which answered a
+   * wrong guess with "Nothing is listening on port N" - the machine knew exactly what it was
+   * running and made the person guess anyway. So the background processes lead, the addresses that
+   * are already published come next, and the form sinks to the bottom where it belongs: the case
+   * where the owner knows something is listening that athanor did not start.
+   */
   return (
-    <div className="inspector-content preview-pane">
-      <div className="preview-create">
-        <label>
-          Name
-          <input value={label} maxLength={80} onChange={(event) => setLabel(event.target.value)} />
-        </label>
-        {/* The port decides whether this works at all, so it is not hidden behind "Advanced". */}
-        <label className="preview-port">
-          Port
-          <input
-            type="number"
-            min={1024}
-            max={65535}
-            value={port}
-            onChange={(event) => setPort(Number(event.target.value))}
-          />
-        </label>
-        <button
-          className="primary"
-          disabled={busy || !label.trim() || portProblem !== ''}
-          onClick={async () => {
-            setBusy(true);
-            setError('');
-            try {
-              // No lifetime is named here on purpose: a private preview lasts as long as the box
-              // says it does, and the row below reports whatever that turns out to be.
-              const created = await api.createPreview(workspace.id, { label, port });
-              setPreviews((current) => [created, ...current]);
-              setActiveUrl(created.url);
-            } catch (cause) {
-              setError(cause instanceof Error ? cause.message : 'Could not expose this port');
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          <Play /> {busy ? 'Opening…' : 'Open preview'}
-        </button>
+    <div className="inspector-content preview-pane running-pane">
+      <div className="running-list">
+        {rows.length === 0 ? (
+          // One line. An empty computer is the ordinary state and does not deserve an illustration.
+          <p className="running-idle">
+            {processFailure || 'Nothing is running in the background.'}
+          </p>
+        ) : (
+          rows.map((row) => {
+            const live = isLive(row);
+            return (
+              <div className={`running-row${live ? ' live' : ''}`} key={row.sessionId}>
+                {/* The ember mark, and the only thing on this pane that gets it: it is on exactly
+                    the rows where the machine is working this second. A finished row is grey. */}
+                <span className="running-mark" aria-hidden="true" />
+                <div>
+                  <strong>{processCommand(row.command)}</strong>
+                  <small>{processState(row)}</small>
+                </div>
+                <span className="running-elapsed">{processElapsed(row, now)}</span>
+              </div>
+            );
+          })
+        )}
       </div>
-      {portProblem && <p className="subtle">{portProblem}</p>}
-      {error && (
-        <div className="form-error" role="alert">
-          {error}
+      {processFailure && rows.length > 0 && <p className="running-idle">{processFailure}</p>}
+      {/* Only where there is something for it to be true of. Said over an empty list it was the
+          software describing itself, which is the one thing this pane is not for. */}
+      {previews.length > 0 && (
+        <div className="preview-boundary">
+          <LockKeyhole />
+          <span>A preview cannot read your athanor session, even if its code tries.</span>
         </div>
       )}
-      <div className="preview-boundary">
-        <LockKeyhole />
-        <span>A preview cannot read your athanor session, even if its code tries.</span>
-      </div>
       <div className="preview-list">
         {previews.map((preview) => (
           <div className={`preview-row ${preview.status}`} key={preview.id}>
@@ -2031,13 +2088,64 @@ function PreviewPane({ workspace }: { workspace: Workspace }) {
             sandbox="allow-downloads allow-forms allow-modals allow-popups allow-scripts"
           />
         </div>
-      ) : (
-        <div className="empty-pane compact">
-          <Globe2 />
-          <strong>Nothing open</strong>
-          <span>Pick a preview above, or ask athanor to start the app and open it for you.</span>
+      ) : null}
+      {error && (
+        <div className="form-error" role="alert">
+          {error}
         </div>
       )}
+      {/*
+        The bottom of the pane, because it is the uncommon case: the owner knows something is
+        listening that athanor did not start, and wants an address for it. Anything athanor started
+        is already a row at the top of this pane, which is why this is no longer the first thing
+        anyone sees.
+      */}
+      <div className="running-publish">
+        <span>Publish a port athanor did not start</span>
+        <div className="preview-create">
+          <label>
+            Name
+            <input
+              value={label}
+              maxLength={80}
+              onChange={(event) => setLabel(event.target.value)}
+            />
+          </label>
+          {/* The port decides whether this works at all, so it is not hidden behind "Advanced". */}
+          <label className="preview-port">
+            Port
+            <input
+              type="number"
+              min={1024}
+              max={65535}
+              value={port}
+              onChange={(event) => setPort(Number(event.target.value))}
+            />
+          </label>
+          <button
+            className="primary"
+            disabled={busy || !label.trim() || portProblem !== ''}
+            onClick={async () => {
+              setBusy(true);
+              setError('');
+              try {
+                // No lifetime is named here on purpose: a private preview lasts as long as the box
+                // says it does, and the row above reports whatever that turns out to be.
+                const created = await api.createPreview(workspace.id, { label, port });
+                setPreviews((current) => [created, ...current]);
+                setActiveUrl(created.url);
+              } catch (cause) {
+                setError(cause instanceof Error ? cause.message : 'Could not expose this port');
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            <Play /> {busy ? 'Opening…' : 'Open preview'}
+          </button>
+        </div>
+        {portProblem && <p className="subtle">{portProblem}</p>}
+      </div>
     </div>
   );
 }
@@ -2153,7 +2261,9 @@ export function Inspector({
             ) : id === 'terminal' ? (
               <TerminalPane workspace={workspace} />
             ) : (
-              <PreviewPane workspace={workspace} />
+              // `visible` because this pane polls the machine: a pane that stays mounted behind
+              // another tab must not keep asking what is running where nobody is looking.
+              <RunningPane workspace={workspace} visible={tab === 'preview'} />
             )}
           </div>
         ))

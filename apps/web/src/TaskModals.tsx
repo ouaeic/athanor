@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import {
   BellRing,
   BookOpen,
@@ -15,12 +15,14 @@ import {
 } from 'lucide-react';
 import { api } from './api.js';
 import {
+  approvalAnnouncement,
   approvalDiffState,
   approvalReach,
   expiryPhrase,
   needsComputer,
   nextApproval
 } from './approval-copy.js';
+import { decisionKey } from './shortcuts.js';
 import {
   agentSentence,
   approvalDestinations,
@@ -498,6 +500,8 @@ export function Approvals({
   openTaskEvents,
   onOpenTask,
   onOpenComputer,
+  onAnnounce,
+  cardRef,
   failure,
   onResolve
 }: {
@@ -515,6 +519,20 @@ export function Approvals({
   /** The browser is part of the computer's screen, so a handoff of either lands in one place. */
   onOpenComputer?: () => void;
   /**
+   * Said once, through the one polite region the window already has.
+   *
+   * The card announced itself by being an assertive live region, which meant it announced itself
+   * again on every countdown tick. See `approvalAnnouncement`: arrival is news, 43 seconds becoming
+   * 23 seconds is not.
+   */
+  onAnnounce?: (message: string) => void;
+  /**
+   * The card itself, so the window can send the owner back to it — ⌘⇧↩ and the palette entry. A
+   * request answered from the keyboard is otherwise reachable only by Shift+Tabbing out of the
+   * composer and hoping.
+   */
+  cardRef?: RefObject<HTMLDivElement | null>;
+  /**
    * Why the last answer did not land, and which request it was about.
    *
    * Said here rather than in the strip above the composer because this card is what occupies that
@@ -527,12 +545,85 @@ export function Approvals({
 }) {
   const item = nextApproval(approvals, openTaskId);
   // The countdown has to move on its own; the approval list is refetched far less often than the
-  // last minute of an expiry window is worth watching.
+  // last minute of an expiry window is worth watching. It moves on screen only — nothing here is a
+  // live region any more, so this tick no longer talks over whoever is reading the command.
   const [, tick] = useState(0);
   useEffect(() => {
     const timer = window.setInterval(() => tick((current) => current + 1), 20_000);
     return () => window.clearInterval(timer);
   }, []);
+  const ownCard = useRef<HTMLDivElement | null>(null);
+  const card = cardRef ?? ownCard;
+  /*
+   * Focus goes to the request the moment there is one, and again when a different one takes its
+   * place. Both halves matter. The first is simply that it is the owner's turn: this is not a
+   * banner reporting something, it is a question with the agent stopped in front of it. The second
+   * is the safety half — the buttons are reused across requests, so leaving focus on Approve while
+   * the card underneath it becomes a *different* decision is one stray Enter from answering a
+   * question nobody read.
+   *
+   * Keyed on the id rather than on the render: the countdown re-renders this four times a minute,
+   * and a card that grabbed focus back on every tick would be unusable.
+   *
+   * Never out of a field somebody is typing in, though. A request arrives on a poll, at a moment
+   * the owner did not choose, and pulling the caret out of the message box mid-sentence sends the
+   * next few keystrokes to a div that does nothing with them — they are simply gone. The card is
+   * on screen, the polite region has said so, and the palette carries the labelled way to it, so
+   * nothing is lost by letting a typist finish their word.
+   */
+  useEffect(() => {
+    if (!item) return;
+    const focused = document.activeElement;
+    const typing =
+      focused instanceof HTMLElement &&
+      (focused.isContentEditable || ['INPUT', 'TEXTAREA'].includes(focused.tagName));
+    if (!typing) card.current?.focus();
+  }, [item?.id]);
+  /*
+   * Announced once per request, through the window's polite region. Deliberately after the focus
+   * move above, which is what a screen reader reads first; this adds the fact that something is now
+   * waiting, for the case where the owner's attention was somewhere else entirely.
+   */
+  const announced = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const next = approvalAnnouncement({
+      approval: item,
+      waiting: approvals.length,
+      announcedId: announced.current
+    });
+    if (!next) return;
+    announced.current = next.id;
+    onAnnounce?.(next.message);
+  }, [item?.id]);
+  /*
+   * The two answers, bound on the card rather than on the window, so they exist exactly while the
+   * owner is inside the decision and nowhere else. Listened for on the element instead of through
+   * JSX because the keystroke has to stop here: Escape carries on to the window and still stops the
+   * agent, but an answer must not also be read as something else on its way past.
+   *
+   * The handler is re-read from a ref so that re-binding is keyed on which request is on screen —
+   * `onResolve` is an inline closure in App and changes on every render, and a listener that
+   * detached and reattached four times a minute would eventually do it between keydown and the
+   * decision landing.
+   */
+  const resolve = useRef(onResolve);
+  useEffect(() => {
+    resolve.current = onResolve;
+  });
+  useEffect(() => {
+    const node = card.current;
+    const id = item?.id;
+    if (!node || !id) return;
+    const answer = (event: KeyboardEvent) => {
+      const decision = decisionKey(event);
+      if (!decision) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void resolve.current(id, decision);
+    };
+    node.addEventListener('keydown', answer);
+    return () => node.removeEventListener('keydown', answer);
+  }, [item?.id]);
   /*
    * Stated only when this card belongs to the conversation on screen and that conversation has
    * actually loaded. An empty array is a trajectory nobody has fetched yet, and reading it as "this
@@ -560,19 +651,37 @@ export function Approvals({
   const wording = agentSentence(item);
   const elsewhere = Boolean(openTaskId) && item.taskId !== openTaskId;
   return (
-    <div className="approval-drawer" role="alertdialog" aria-live="assertive" aria-label="Approval">
+    /*
+      A group, not an alert dialog. It was `role="alertdialog"` and it is not one: nothing was made
+      inert behind it, nothing trapped Tab inside it, Escape did not close it and nothing moved
+      focus to it — a dialog by assertion only, which is worse than no role at all, because a screen
+      reader promises the owner a modal and then hands them the page behind it. It is a region of
+      the workbench that is asking a question, so it says so, names itself from the two lines that
+      are its heading, and takes focus by being focusable.
+
+      `tabIndex={-1}` rather than 0: its buttons are already in the tab order, and adding an empty
+      stop in front of them would tax every Tab through the composer for the benefit of the moments
+      when a request is up. The focus that matters here is the one this card moves itself.
+    */
+    <div
+      className="approval-drawer"
+      ref={card}
+      role="group"
+      aria-labelledby="approval-eyebrow approval-headline"
+      tabIndex={-1}
+    >
       <div className="approval-symbol">
         <LockKeyhole />
       </div>
       <div className="approval-copy">
-        <p className="eyebrow">
+        <p className="eyebrow" id="approval-eyebrow">
           Your confirmation is required
           {approvals.length > 1 ? ` · ${approvals.length} waiting` : ''}
         </p>
         {/* What the box will do, said by the box. `item.action` is the model's own sentence for
             every tool that takes a `purpose`, so it is no longer the headline: the headline is the
             reversibility class and the tool, both of which the harness recorded itself. */}
-        <strong>{approvalReach(item)}</strong>
+        <strong id="approval-headline">{approvalReach(item)}</strong>
         <RequestFacts approval={item} />
         {/* Where the request came from, as against what it does. Both answers are drawn, because a
             line that only appears when something is wrong teaches its own absence to mean safety. */}
@@ -627,11 +736,21 @@ export function Approvals({
             Open computer
           </button>
         )}
-        <button className="ghost" onClick={() => void onResolve(item.id, 'deny')}>
+        {/* The keys are stated on the controls themselves rather than printed beside them: a
+            screen reader reads them out with the button, and the card stays two words wide. */}
+        <button
+          className="ghost"
+          aria-keyshortcuts="Meta+Backspace"
+          onClick={() => void onResolve(item.id, 'deny')}
+        >
           Deny
         </button>
         {/* "Approve once" implied a persistent approve that does not exist. */}
-        <button className="primary" onClick={() => void onResolve(item.id, 'approve')}>
+        <button
+          className="primary"
+          aria-keyshortcuts="Meta+Enter"
+          onClick={() => void onResolve(item.id, 'approve')}
+        >
           Approve
         </button>
       </div>

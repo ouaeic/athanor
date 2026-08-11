@@ -179,6 +179,23 @@ export class ProcessManager {
       .map((session) => this.#view(session, false));
   }
 
+  /**
+   * Every background process on this computer, whoever started it.
+   *
+   * `list` above is narrowed to one owner because an agent's capability is subject to its own task:
+   * it must not poll, write to or kill a session belonging to a turn it is not running. The person
+   * who owns the computer is in the opposite position, and the owner filter silently denied them
+   * everything - the agent starts these sessions under its task id as the subject, so an
+   * owner-scoped list handed the panel an empty array for a box with three servers running on it,
+   * and "what is my computer doing" had no answer anywhere in the product. The workspace is the
+   * boundary that matters here, and the capability token already carries it.
+   */
+  listWorkspace(workspaceId: string) {
+    return [...this.#sessions.values()]
+      .filter((session) => session.workspaceId === workspaceId)
+      .map((session) => this.#view(session, false));
+  }
+
   action(workspaceId: string, owner: string, id: string, value: unknown) {
     const request = z
       .object({

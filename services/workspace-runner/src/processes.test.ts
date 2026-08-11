@@ -261,6 +261,63 @@ describe('background process manager', () => {
     manager.close();
   });
 
+  /*
+   * The list the owner's panel reads, as opposed to the list a turn reads.
+   *
+   * Every background session is started by an agent, whose capability subject is the task it is
+   * running - never the person. So the owner-scoped list, asked on the owner's behalf, matched
+   * nothing at all: a computer with two servers on it reported an empty table, which is why the
+   * panel could never say what the machine was doing. The workspace filter still holds.
+   */
+  it('shows the whole workspace to the person who owns it, whichever task started it', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
+    roots.push(root);
+    await mkdir(path.join(root, 'workspace'));
+    const manager = new ProcessManager();
+    const args = ['-e', 'setTimeout(() => undefined, 400)'];
+    const first = await manager.start(
+      root,
+      'workspace-1',
+      'task-1',
+      { executable: process.execPath, args, timeoutSeconds: 5 },
+      5,
+      false
+    );
+    const second = await manager.start(
+      root,
+      'workspace-1',
+      'task-2',
+      { executable: process.execPath, args, timeoutSeconds: 5 },
+      5,
+      false
+    );
+    const elsewhere = await manager.start(
+      root,
+      'workspace-2',
+      'task-3',
+      { executable: process.execPath, args, timeoutSeconds: 5 },
+      5,
+      false
+    );
+    expect(manager.list('workspace-1', 'task-1').map((view) => view.sessionId)).toEqual([
+      first.sessionId
+    ]);
+    expect(manager.listWorkspace('workspace-1').map((view) => view.sessionId)).toEqual([
+      first.sessionId,
+      second.sessionId
+    ]);
+    expect(manager.listWorkspace('workspace-2').map((view) => view.sessionId)).toEqual([
+      elsewhere.sessionId
+    ]);
+    // What the row is drawn from: the command as started, when it started, and how it is going.
+    expect(manager.listWorkspace('workspace-1')[0]).toMatchObject({
+      status: 'running',
+      command: [process.execPath, ...args]
+    });
+    expect(manager.listWorkspace('workspace-1')[0]?.startedAt).toEqual(expect.any(String));
+    manager.close();
+  });
+
   it('does not allow background privilege or package operations in host-native mode', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
     roots.push(root);

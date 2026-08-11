@@ -3,6 +3,7 @@ import type {
   Artifact,
   ApiToken,
   ApiTokenScope,
+  BackgroundProcess,
   Bootstrap,
   ConnectorDefinition,
   ConversationSearchResult,
@@ -759,6 +760,10 @@ export const api = {
     );
     return { ...result, runnerUrl: runnerUrlForClient(result.runnerUrl) };
   },
+  /** What the computer is running in the background, as the machine itself reports it. */
+  workspaceProcesses: async (workspaceId: string) =>
+    (await request<{ processes: BackgroundProcess[] }>(`/v1/workspaces/${workspaceId}/processes`))
+      .processes,
   previews: async (workspaceId: string) =>
     (await request<WorkspacePreview[]>(`/v1/workspaces/${workspaceId}/previews`)).map(
       previewForClient

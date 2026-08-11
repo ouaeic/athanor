@@ -20,6 +20,7 @@ import {
   Pencil,
   RotateCcw,
   ShieldAlert,
+  Terminal,
   UserRoundCheck,
   XCircle
 } from 'lucide-react';
@@ -27,7 +28,6 @@ import type { BotWall, Task, TaskEvent } from './types.js';
 import { TaskPlanPanel, planProgress, useTaskPlan } from './TaskPlanPanel.js';
 import { CopyButton, Markdown } from './Markdown.js';
 import { DiffView } from './DiffView.js';
-import { fileChangesFromTool } from './diff.js';
 import {
   activityLine,
   activityOverview,
@@ -43,9 +43,14 @@ import {
   lastLine,
   reasoningEffortLabel,
   settledToolStarts,
+  toolLabel,
+  workEvidence,
+  type ActivityEntry,
   type ConversationNode,
   type ConversationSource,
-  type SpendPause
+  type SpendPause,
+  type ToolCall,
+  type WorkEvidence
 } from './timeline-state.js';
 import { externalRead, provenanceReport, sourcesPhrase } from './provenance.js';
 import { completionCard, verificationReceiptLabel, type HarnessCheck } from './completion-card.js';
@@ -184,6 +189,110 @@ const PayloadDump = memo(function PayloadDump({
   replacer?: (key: string, value: unknown) => unknown;
 }) {
   return <pre>{JSON.stringify(value ?? {}, replacer, 2)}</pre>;
+});
+
+/**
+ * The line that ran, what it ended as, and what it said.
+ *
+ * `finished` is the difference between a command that printed nothing and one that has not printed
+ * anything *yet*. A row drawn from the start alone has no result to read, so an empty output there
+ * is the absence of a record rather than a fact about the command — and "It printed nothing", over
+ * a build still running, is exactly the confident falsehood this whole panel exists to remove.
+ */
+function CommandEvidence({
+  evidence,
+  finished
+}: {
+  evidence: Extract<WorkEvidence, { kind: 'command' }>;
+  finished: boolean;
+}) {
+  return (
+    <div className="tool-command">
+      <p className="tool-command-line">
+        <Terminal />
+        <code>{evidence.command}</code>
+        {evidence.status && <span className="tool-command-status">{evidence.status}</span>}
+      </p>
+      {evidence.output ? <pre className="tool-output">{evidence.output}</pre> : null}
+      {finished && !evidence.output && <p className="tool-quiet">It printed nothing.</p>}
+    </div>
+  );
+}
+
+/** The pages a read actually loaded: what the answer above was built out of, and whose they were. */
+function PageEvidence({ evidence }: { evidence: Extract<WorkEvidence, { kind: 'pages' }> }) {
+  return (
+    <ul className="tool-pages">
+      {evidence.pages.map((page) => (
+        <li key={page.url}>
+          <a href={page.url} target="_blank" rel="noreferrer noopener">
+            <Globe2 />
+            <span>
+              <strong>{page.title}</strong>
+              <small>{page.host}</small>
+            </span>
+          </a>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * What a call did, promoted above the payload that records it.
+ *
+ * Memoised on the four values rather than on the joined call, because the join rebuilds its objects
+ * on every rebuild of the transcript and a streaming turn rebuilds the transcript once per frame -
+ * so a component keyed on the call itself would re-derive every open work log's evidence sixty
+ * times a second. `arguments` and `result` are the payload objects the event carries, which are the
+ * same references for the life of the event, so the shallow comparison holds.
+ *
+ * The raw payload is one more disclosure down rather than gone. This is about what is promoted.
+ *
+ * Exported for the test that guards the bug this replaced: a work log's body is mounted only once
+ * the reader opens the group, so nothing rendered from the transcript's own root can reach it, and
+ * the shipped defect was exactly a row rendered from the wrong branch.
+ */
+export const ToolEvidence = memo(function ToolEvidence({
+  tool,
+  args,
+  before,
+  result,
+  stage
+}: {
+  tool: string;
+  args: unknown;
+  before?: string;
+  result?: unknown;
+  /** Which half of the call this row is, which decides what the raw disclosure holds. */
+  stage: 'started' | 'result';
+}) {
+  const call: ToolCall = { tool, arguments: args, ...(before === undefined ? {} : { before }) };
+  const evidence = workEvidence(call, result);
+  const raw = stage === 'result' ? result : args;
+  if (!evidence) return <PayloadDump value={raw} replacer={truncateLongStrings} />;
+  return (
+    <div className="tool-evidence">
+      {evidence.kind === 'files' &&
+        evidence.changes.map((change) => (
+          <DiffView
+            key={change.path}
+            path={change.path}
+            before={change.before}
+            after={change.after}
+            defaultOpen={evidence.changes.length === 1}
+          />
+        ))}
+      {evidence.kind === 'command' && (
+        <CommandEvidence evidence={evidence} finished={stage === 'result'} />
+      )}
+      {evidence.kind === 'pages' && <PageEvidence evidence={evidence} />}
+      <details className="tool-raw">
+        <summary>Raw {stage === 'result' ? 'result' : 'arguments'}</summary>
+        <PayloadDump value={raw} replacer={truncateLongStrings} />
+      </details>
+    </div>
+  );
 });
 
 function MessageActions({
@@ -341,6 +450,7 @@ function AssistantMessage({
 
 function Event({
   event,
+  call,
   onOpenSurface,
   onOpenPreview,
   settled = false,
@@ -349,6 +459,8 @@ function Event({
   resolution
 }: {
   event: TaskEvent;
+  /** The call a `tool_result` answers, joined to its start in the transcript pass. */
+  call?: ToolCall;
   onOpenSurface?: (surface: Surface) => void;
   /** Asks the server for a fresh, openable address for a private preview. */
   onOpenPreview?: (previewId: string) => void;
@@ -374,27 +486,28 @@ function Event({
       </div>
     );
   if (event.kind === 'tool_started') {
-    const changes = fileChangesFromTool(textValue(data.tool), data.arguments);
+    const tool = textValue(data.tool);
+    /*
+     * A start only survives into the transcript when this log holds no result for it — see the
+     * join in `buildConversation`. So while the task is live it is a call in flight, and once the
+     * task has stopped it is a call that never came back: the interesting one, the one a reader
+     * goes looking for after a conversation ends badly.
+     *
+     * `settled` is exactly that second case now, and it used to draw a green tick and the success
+     * class over it. The tick was honest when this branch also drew calls that had returned; it
+     * cannot stay, because the only rows left here are the ones that did not.
+     */
     return (
-      <details className={`tool-event ${settled ? 'success' : ''}`}>
+      <details className={`tool-event ${settled ? 'unfinished' : ''}`}>
         <summary>
-          {settled ? <Check /> : <LoaderCircle className="spin" />}
-          <span>{settled ? event.summary.replace(/^Running\s+/i, '') : event.summary}</span>
+          {settled ? <Hourglass /> : <LoaderCircle className="spin" />}
+          <span>
+            {toolLabel(tool, event.summary)}
+            {settled && ' · never finished'}
+          </span>
           <ChevronRight />
         </summary>
-        {changes.length > 0 ? (
-          changes.map((change) => (
-            <DiffView
-              key={`${event.id}-${change.path}`}
-              path={change.path}
-              before={change.before}
-              after={change.after}
-              defaultOpen={changes.length === 1}
-            />
-          ))
-        ) : (
-          <PayloadDump value={data.arguments} />
-        )}
+        <ToolEvidence tool={tool} args={data.arguments} stage="started" />
       </details>
     );
   }
@@ -432,10 +545,18 @@ function Event({
         <details className="tool-event success">
           <summary>
             <Check />
-            <span>{event.summary}</span>
+            {/* The call's own tool, not the summary's: the worker writes "file_write completed",
+                and the owner has been reading "Writing a file" for the whole run. */}
+            <span>{toolLabel(call?.tool ?? '', event.summary)}</span>
             <ChevronRight />
           </summary>
-          <PayloadDump value={data.result} replacer={truncateLongStrings} />
+          <ToolEvidence
+            tool={call?.tool ?? ''}
+            args={call?.arguments}
+            {...(call?.before === undefined ? {} : { before: call.before })}
+            result={data.result}
+            stage="result"
+          />
         </details>
       </>
     );
@@ -734,7 +855,7 @@ function ActivityLog({
   onOpenSurface
 }: {
   task: Task;
-  events: Array<{ event: TaskEvent; index: number }>;
+  events: ActivityEntry[];
   overview: string;
   settled: (event: TaskEvent) => boolean;
   planSequence: number;
@@ -799,11 +920,12 @@ function ActivityLog({
             groups put two editors for one record on the screen at once.
           */}
           {live && <TaskPlanPanel task={task} refreshKey={planSequence} />}
-          {events.map(({ event }) => (
+          {events.map(({ event, call }) => (
             <Event
               key={event.id}
               event={event}
               settled={settled(event)}
+              {...(call ? { call } : {})}
               {...(onOpenSurface ? { onOpenSurface } : {})}
             />
           ))}

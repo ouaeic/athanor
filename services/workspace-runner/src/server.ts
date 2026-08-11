@@ -490,7 +490,16 @@ export const buildServer = async (config: RunnerConfig) => {
     '/v1/workspaces/:workspaceId/processes',
     async (request) => {
       requireScope(request, 'exec');
-      return { processes: processes.list(request.params.workspaceId, request.capability.sub) };
+      // Who is asking decides how wide the answer is. An agent is subject to its own task and sees
+      // only the sessions that task started, which is what keeps one turn out of another's. A
+      // person driving their own computer - or the API asking on their behalf - is asking what the
+      // machine is doing, and every background process on it is part of that answer.
+      return {
+        processes:
+          request.capability.role === 'agent'
+            ? processes.list(request.params.workspaceId, request.capability.sub)
+            : processes.listWorkspace(request.params.workspaceId)
+      };
     }
   );
 

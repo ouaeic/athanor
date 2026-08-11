@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { shortcutRows, windowShortcut, type ShortcutEvent } from './shortcuts.js';
+import { decisionKey, shortcutRows, windowShortcut, type ShortcutEvent } from './shortcuts.js';
 
 const press = (patch: Partial<ShortcutEvent>): ShortcutEvent => ({
   key: 'a',
@@ -26,6 +26,23 @@ describe('the keystrokes the workbench answers', () => {
     expect(windowShortcut(press({ key: '?' }), idle)).toBe('shortcut-sheet');
   });
 
+  /*
+   * The window claims no chord built on Enter, and this is the guard on that.
+   *
+   * ⌘⇧↩ was briefly the way to a waiting request. It cannot be: `sendsOnKey` treats every Enter
+   * held with a modifier as a send, deliberately and with its own test, so from the message box —
+   * the only place the owner would reach for it — that chord sent a half-written message and moved
+   * focus away in the same keystroke. The two answers belong to the card; the way to the card is
+   * the palette.
+   */
+  it('claims no chord the message box already sends on', () => {
+    expect(
+      windowShortcut(press({ key: 'Enter', metaKey: true, shiftKey: true }), idle)
+    ).toBeUndefined();
+    expect(windowShortcut(press({ key: 'Enter', metaKey: true }), idle)).toBeUndefined();
+    expect(windowShortcut(press({ key: 'Enter' }), working)).toBeUndefined();
+  });
+
   /* The sheet is the only place any of these are discoverable, so it must not name one that does
      not exist. Enter and Shift+Enter are answered by the message box rather than by the window. */
   it('leaves nothing in the sheet that the window cannot do', () => {
@@ -41,7 +58,15 @@ describe('the keystrokes the workbench answers', () => {
       ].filter(Boolean)
     );
     for (const row of shortcutRows) if (row.id) expect(reachable.has(row.id)).toBe(true);
-    expect(shortcutRows.filter((row) => !row.id).map((row) => row.keys)).toEqual([
+    // And nothing the card cannot do either: the sheet is the one place these are written down.
+    for (const row of shortcutRows)
+      if (row.decision)
+        expect(
+          decisionKey(
+            press({ key: row.decision === 'approve' ? 'Enter' : 'Backspace', metaKey: true })
+          )
+        ).toBe(row.decision);
+    expect(shortcutRows.filter((row) => !row.id && !row.decision).map((row) => row.keys)).toEqual([
       'Enter',
       '⇧Enter'
     ]);
@@ -67,5 +92,40 @@ describe('the keystrokes the workbench answers', () => {
     expect(windowShortcut(press({ key: 'Enter' }), working)).toBeUndefined();
     expect(windowShortcut(press({ key: 'o', metaKey: true }), working)).toBeUndefined();
     expect(windowShortcut(press({ key: 'ArrowUp' }), working)).toBeUndefined();
+  });
+});
+
+describe('the keys the pending request answers', () => {
+  it('takes both decisions, and takes Ctrl for ⌘', () => {
+    expect(decisionKey(press({ key: 'Enter', metaKey: true }))).toBe('approve');
+    expect(decisionKey(press({ key: 'Backspace', metaKey: true }))).toBe('deny');
+    expect(decisionKey(press({ key: 'Enter', ctrlKey: true }))).toBe('approve');
+    expect(decisionKey(press({ key: 'Backspace', ctrlKey: true }))).toBe('deny');
+  });
+
+  /*
+   * The one this file exists for. The card takes focus the moment it appears, so the owner is
+   * inside it without having gone there, and Escape is the reflex for "get this off my screen".
+   * Mapping that onto Deny would make a decision out of a dismissal — and Deny is a real answer,
+   * not a way of closing something. Escape falls through to the window, where it stops the agent.
+   */
+  it('never reads Escape as an answer', () => {
+    expect(decisionKey(press({ key: 'Escape' }))).toBeUndefined();
+    expect(decisionKey(press({ key: 'Escape', metaKey: true }))).toBeUndefined();
+    expect(decisionKey(press({ key: 'Escape', ctrlKey: true, shiftKey: true }))).toBeUndefined();
+  });
+
+  /* For the same reason: focus arriving unbidden must not put an answer one keystroke away. */
+  it('does not answer a bare Enter, a bare Backspace or a space', () => {
+    expect(decisionKey(press({ key: 'Enter' }))).toBeUndefined();
+    expect(decisionKey(press({ key: 'Backspace' }))).toBeUndefined();
+    expect(decisionKey(press({ key: ' ' }))).toBeUndefined();
+  });
+
+  /* ⌘⇧↩ is a send in the message box. A chord the owner's fingers already own somewhere else must
+     not become an approval the moment focus lands here. */
+  it('does not approve on a chord that means something else elsewhere', () => {
+    expect(decisionKey(press({ key: 'Enter', metaKey: true, shiftKey: true }))).toBeUndefined();
+    expect(decisionKey(press({ key: 'Backspace', metaKey: true, shiftKey: true }))).toBeUndefined();
   });
 });
