@@ -19,6 +19,13 @@
       http-equiv="Content-Security-Policy"
       content="img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; base-uri 'none'"
     />
+    <!--
+      `interactive-widget=resizes-content` is Chromium-only. There the software keyboard shrinks the
+      layout viewport and `dvh` follows it, which is the whole fix on Android. WebKit ignores the
+      attribute: an iPhone 15 keeps reporting 852px with about 336px of it behind the keyboard. That
+      gap is measured from `visualViewport` in src/main.tsx and published as `--keyboard`. The two
+      cannot double-count, because wherever this attribute is honoured the gap it measures is zero.
+    -->
     <meta
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
@@ -31,14 +38,23 @@
     />
     <meta property="og:type" content="website" />
     <meta property="og:title" content="athanor" />
-    <meta property="og:description" content="One private AI computer, available from every device." />
+    <meta
+      property="og:description"
+      content="One private AI computer, available from every device."
+    />
     <meta property="og:image" content="/og-athanor.png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="athanor: a chat beside the files, terminal and browser of one private computer." />
+    <meta
+      property="og:image:alt"
+      content="athanor: a chat beside the files, terminal and browser of one private computer."
+    />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="athanor" />
-    <meta name="twitter:description" content="One private AI computer, available from every device." />
+    <meta
+      name="twitter:description"
+      content="One private AI computer, available from every device."
+    />
     <meta name="twitter:image" content="/og-athanor.png" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/brand/athanor-icon-192.png" type="image/png" />

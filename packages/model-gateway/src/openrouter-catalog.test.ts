@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { AthanorError } from '@athanor/core';
 import type { ModelRelease } from '@athanor/contracts';
 import { seedModels } from './catalog.js';
-import { applyOpenRouterPrivacyPolicy, refreshOpenRouterCatalog } from './openrouter-catalog.js';
+import {
+  applyOpenRouterPrivacyPolicy,
+  refreshOpenRouterCatalog,
+  verifyOpenRouterKey
+} from './openrouter-catalog.js';
 
 const NOW = new Date('2026-08-03T01:00:00.000Z');
 
@@ -450,6 +455,82 @@ describe('OpenRouter live catalog', () => {
       privacyRoute: 'external',
       availability: 'available'
     });
+  });
+});
+
+/*
+ * "Verify and save" verified nothing about the key. Both routes the refresh reads are public - they
+ * answer 200 to a request carrying no credential at all - so a mistyped key, a revoked key and a
+ * spent-out account each produced a green success message on the settings screen and a raw 401 in
+ * the middle of the owner's next task.
+ */
+describe('checking the key before it is saved', () => {
+  /** The last credential the stub was handed, so the request can be shown to carry it. */
+  let sent: string | undefined;
+  const keyFetch = (status: number, body: unknown = {}) =>
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (!url.endsWith('/key')) throw new Error(`unexpected request to ${url}`);
+      sent = (init?.headers as Record<string, string> | undefined)?.authorization;
+      return new Response(JSON.stringify(body), { status });
+    });
+
+  it('asks the one route the provider gates, carrying the key', async () => {
+    const request = keyFetch(200, { data: { label: 'athanor', limit_remaining: 12.5 } });
+    await expect(
+      verifyOpenRouterKey({
+        baseUrl: 'https://openrouter.ai/api/v1/',
+        apiKey: 'sk-or-real',
+        fetch: request as typeof fetch
+      })
+    ).resolves.toBeUndefined();
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(sent).toBe('Bearer sk-or-real');
+  });
+
+  /** The refusal itself, so the copy an owner reads can be asserted rather than only its code. */
+  const refusal = async (status: number, body?: unknown): Promise<AthanorError> => {
+    try {
+      await verifyOpenRouterKey({
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: 'sk-or-doubtful',
+        fetch: keyFetch(status, body) as typeof fetch
+      });
+    } catch (cause) {
+      return cause as AthanorError;
+    }
+    throw new Error('the key was accepted');
+  };
+
+  it('refuses a key the provider rejects, and names what causes it', async () => {
+    const error = await refusal(401);
+    expect(error.code).toBe('provider_key_rejected');
+    expect(error.message).toContain('trailing space');
+    expect(error.statusCode).toBe(422);
+  });
+
+  it('refuses a working key with nothing left to spend, rather than saving a 401 for later', async () => {
+    const error = await refusal(200, { data: { limit_remaining: 0 } });
+    expect(error.code).toBe('provider_credit_exhausted');
+    expect(error.message).toContain('Add credit');
+  });
+
+  // A key with no spend limit set reports null here. Unknown is not empty, and refusing on it would
+  // lock the owner out of their own settings screen over a field the provider never filled in.
+  it('accepts a key whose remaining balance the provider does not state', async () => {
+    await expect(
+      verifyOpenRouterKey({
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: 'sk-or-real',
+        fetch: keyFetch(200, { data: { limit_remaining: null } }) as typeof fetch
+      })
+    ).resolves.toBeUndefined();
+  });
+
+  it('saves nothing when the provider could not be asked at all', async () => {
+    const error = await refusal(503);
+    expect(error.code).toBe('provider_key_uncheckable');
+    expect(error.statusCode).toBe(502);
   });
 });
 

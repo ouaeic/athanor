@@ -19,6 +19,40 @@ export const passkeyLabel = (passkey: PasskeySummary): string => {
   return `${kind} passkey · added ${new Date(passkey.createdAt).toLocaleDateString()}`;
 };
 
+/** The server's own word for "this session's passkey confirmation is older than five minutes". */
+const stepUpRequired = (cause: unknown): boolean =>
+  typeof cause === 'object' &&
+  cause !== null &&
+  'code' in cause &&
+  String(cause.code) === 'step_up_required';
+
+/**
+ * A settings write, with the passkey confirmation the server may ask for folded in.
+ *
+ * Which routes sit behind step-up is the server's decision, and it is not one the client can read:
+ * `PUT /v1/spend-limits` asks only when a cap is being raised or cleared, and `DELETE
+ * /v1/sessions/:id` asks always. Neither client path asked, so more than five minutes after signing
+ * in, raising a spending cap and signing a lost device out both failed - and the only thing on
+ * screen was the server's instruction to confirm with a passkey, with no control that would.
+ *
+ * Asking the server first and confirming only when it refuses is what keeps this from becoming a
+ * prompt on every save: no route is asked more than it asks for, and each new sensitive route is
+ * covered without having to remember. Once, because a second refusal is the confirmation failing
+ * rather than a stale window.
+ */
+export const withStepUp = async (
+  operation: () => Promise<void>,
+  stepUp: () => Promise<void>
+): Promise<void> => {
+  try {
+    await operation();
+  } catch (cause) {
+    if (!stepUpRequired(cause)) throw cause;
+    await stepUp();
+    await operation();
+  }
+};
+
 /**
  * Turns a failed security action into something the owner can act on. `last_passkey` and
  * `confirmation_failed` are both ordinary outcomes with an obvious next step, and a generic
@@ -36,6 +70,11 @@ export const securityActionMessage = (cause: unknown): string => {
     return 'This is the only way left to sign in. Add another passkey first, then remove this one.';
   if (code === 'confirmation_failed') return 'That did not match. Type the exact username.';
   if (code === 'step_up_failed') return 'Passkey verification did not complete. Try again.';
+  // Reached only when the ceremony ran and the server still refused, so the server's own sentence -
+  // "Confirm this sensitive action with your passkey" - is an instruction with no control attached
+  // and no way to follow it. Say what happened and what the owner does next.
+  if (code === 'step_up_required')
+    return 'Your passkey confirmation did not land. Try again and approve the prompt.';
   return cause instanceof Error && cause.message ? cause.message : 'The change could not be saved';
 };
 

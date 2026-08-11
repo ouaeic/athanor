@@ -412,7 +412,10 @@ const installFetch = (
   log: FetchLog,
   runner: {
     checkpoint?: () => Response;
-    route?: (url: string) => Response | undefined;
+    // Handed the request init for the same reason the provider bodies are: a runner call that is
+    // torn down mid-flight - by a Stop, by a cancel - errors its response stream, and a stub that
+    // never sees the signal cannot tell that apart from a call that ran to completion.
+    route?: (url: string, init?: RequestInit) => Response | undefined;
     media?: () => Response;
   } = {}
 ): void => {
@@ -449,7 +452,7 @@ const installFetch = (
     }
     if (log.runnerRequests && typeof init?.body === 'string')
       log.runnerRequests.push({ url, body: JSON.parse(init.body) as unknown });
-    const routed = runner.route?.(url);
+    const routed = runner.route?.(url, init);
     if (routed) return routed;
     if (url.includes('/checkpoints')) return (runner.checkpoint ?? checkpointResponse)();
     if (url.includes('/file'))
@@ -4071,4 +4074,267 @@ describe('the warnings that are the owner’s business', () => {
     expect(failure?.summary).toBe('The workspace could not be reached');
     expect(ownerFlag(failure)).toBe(true);
   });
+});
+
+/**
+ * The batch of reads a frontier model opens a task with.
+ *
+ * Every call in it used to wait for the one in front of it to cross to the runner and come back,
+ * which is three round trips of nothing on a four-read batch. What must not change is anything the
+ * loop decides: the stop check, the floor's verdict on each call, and above all the order the
+ * results land in the window - a turn whose window depends on which read finished first is a turn
+ * that cannot be reproduced.
+ */
+describe('reads proposed together', () => {
+  const batchFrame = (
+    calls: Array<{ id: string; name: string; args: Record<string, unknown> }>
+  ): string =>
+    `data: ${JSON.stringify({
+      choices: [
+        {
+          finish_reason: 'tool_calls',
+          delta: {
+            tool_calls: calls.map((call, index) => ({
+              index,
+              id: call.id,
+              function: { name: call.name, arguments: JSON.stringify(call.args) }
+            }))
+          }
+        }
+      ]
+    })}\n\ndata: [DONE]\n\n`;
+
+  const reads = (
+    ...names: string[]
+  ): Array<{ id: string; name: string; args: Record<string, unknown> }> =>
+    names.map((name, index) => ({
+      id: `call-${index + 1}`,
+      name: 'file_read',
+      args: { path: `workspace/${name}.txt` }
+    }));
+
+  const readPath = (url: string): string =>
+    decodeURIComponent(new URL(url).searchParams.get('path') ?? '');
+
+  /** A runner response whose body arrives only when `until` settles, and dies if torn down first. */
+  const heldBody = (body: string, until: Promise<void>, signal?: AbortSignal | null): Response =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          let settled = false;
+          const tearDown = (): void => {
+            if (settled) return;
+            settled = true;
+            controller.error(new Error('the connection was torn down'));
+          };
+          if (signal?.aborted) {
+            tearDown();
+            return;
+          }
+          signal?.addEventListener('abort', tearDown, { once: true });
+          void until.then(() => {
+            if (settled) return;
+            settled = true;
+            controller.enqueue(encode(body));
+            controller.close();
+          });
+        }
+      }),
+      { headers: { 'content-type': 'application/json' } }
+    );
+
+  const toolMessages = (probe: StoreProbe): Array<{ toolCallId?: string; content: string }> => {
+    const state = decryptCheckpoints(probe.checkpoints).at(-1);
+    return (state?.messages ?? []).filter((message) => message.role === 'tool');
+  };
+
+  it('holds all four open at once and still answers them in the declared order', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    const openers: Array<() => void> = [];
+    let inFlight = 0;
+    installFetch(
+      [batchFrame(reads('alpha', 'bravo', 'charlie', 'delta')), textFrame('Read them.')],
+      log,
+      {
+        route: (url) => {
+          // Only the batch's own reads. The turn opens by looking for the workspace's durable
+          // instructions, and holding that one would hang the run before the model is even asked.
+          if (!url.includes('/file?') || !readPath(url).endsWith('.txt')) return undefined;
+          const path = readPath(url);
+          let open = (): void => undefined;
+          const body = heldBody(
+            JSON.stringify({ marker: path }),
+            new Promise<void>((resolve) => {
+              open = resolve;
+            })
+          );
+          openers.push(open);
+          inFlight += 1;
+          // Nothing is answered until every read in the run has been dispatched, so this test can
+          // only finish if they really were in flight together - and they are then answered
+          // backwards, so a window that came out in the declared order cannot have got there by
+          // following the order the runner happened to reply in.
+          if (inFlight === 4) for (const release of [...openers].reverse()) release();
+          return body;
+        }
+      }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(inFlight).toBe(4);
+    const answered = toolMessages(probe);
+    expect(answered.map((message) => message.toolCallId)).toEqual([
+      'call-1',
+      'call-2',
+      'call-3',
+      'call-4'
+    ]);
+    for (const [index, name] of ['alpha', 'bravo', 'charlie', 'delta'].entries())
+      expect(answered[index]?.content).toContain(`workspace/${name}.txt`);
+    // And the timeline reads in the same order, because that is the record the owner scrolls.
+    expect(
+      probe.events
+        .filter((entry) => entry.kind === 'tool_result')
+        .map((entry) => (entry.payload as { toolCallId?: string }).toolCallId)
+    ).toEqual(['call-1', 'call-2', 'call-3', 'call-4']);
+    // Three state writes for the whole turn: one for the run, then the step's own and the closing
+    // one. Four reads that would each have written twice had they been anything but reads now cost
+    // a single point at which everything already fetched is durable.
+    expect(probe.checkpoints.filter((input) => input.agentStateCiphertext).length).toBe(3);
+  });
+
+  it('keeps the answers that came back when one of the run throws', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [batchFrame(reads('alpha', 'missing', 'charlie')), textFrame('Two of three.')],
+      log,
+      {
+        route: (url) => {
+          if (!url.includes('/file?')) return undefined;
+          const path = readPath(url);
+          if (path.includes('missing'))
+            return new Response(
+              JSON.stringify({ error: { code: 'file_not_found', message: 'no such file' } }),
+              { status: 404, headers: { 'content-type': 'application/json' } }
+            );
+          return new Response(JSON.stringify({ marker: path }), {
+            headers: { 'content-type': 'application/json' }
+          });
+        }
+      }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const answered = toolMessages(probe);
+    expect(answered.map((message) => message.toolCallId)).toEqual(['call-1', 'call-2', 'call-3']);
+    // The one that failed says so, in its own place, and the two that came back are still here -
+    // a run that threw away three good reads because the second one was a typo would be a worse
+    // loop than the one that ran them one at a time.
+    expect(answered[0]?.content).toContain('workspace/alpha.txt');
+    expect(answered[1]?.content).toContain('Tool failed');
+    expect(answered[2]?.content).toContain('workspace/charlie.txt');
+    expect(probe.events.filter((entry) => entry.kind === 'error')).toHaveLength(1);
+  });
+
+  it('runs the reads, then stops at the call the floor wants a card for', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const approvals: Array<Record<string, unknown>> = [];
+    const store = {
+      ...probe.store,
+      createApproval: async (input: Record<string, unknown>) => {
+        approvals.push(input);
+        return 'approval-1';
+      }
+    } as unknown as DataStore;
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        batchFrame([
+          ...reads('alpha', 'bravo'),
+          {
+            id: 'call-3',
+            name: 'schedule',
+            args: { action: 'create', title: 'Nightly', prompt: 'Check the feed', spec: {} }
+          },
+          { id: 'call-4', name: 'file_read', args: { path: 'workspace/delta.txt' } }
+        ]),
+        textFrame('Waiting on you.')
+      ],
+      log,
+      {
+        route: (url) =>
+          url.includes('/file?')
+            ? new Response(JSON.stringify({ marker: readPath(url) }), {
+                headers: { 'content-type': 'application/json' }
+              })
+            : undefined
+      }
+    );
+
+    await new AgentWorker(store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(approvals).toHaveLength(1);
+    expect(probe.checkpoints.at(-1)).toMatchObject({ status: 'awaiting_user' });
+    const answered = toolMessages(probe);
+    // The two reads in front of the card are answered and kept: the turn parks on the approval
+    // with its reading already done, not with it thrown away.
+    expect(answered[0]?.content).toContain('workspace/alpha.txt');
+    expect(answered[1]?.content).toContain('workspace/bravo.txt');
+    // And the read behind the card is deferred in writing rather than run, exactly as it was when
+    // every call went one at a time.
+    expect(answered.find((message) => message.toolCallId === 'call-4')?.content).toContain(
+      'Deferred because an earlier action requires user approval'
+    );
+    expect(log.calls.filter((entry) => entry.includes('delta.txt'))).toHaveLength(0);
+  });
+
+  it('loses nothing when the owner presses Stop with the run in flight', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    let inFlight = 0;
+    const never = new Promise<void>(() => undefined);
+    installFetch([batchFrame(reads('alpha', 'bravo', 'charlie')), textFrame('Stopped.')], log, {
+      route: (url, init) => {
+        if (!url.includes('/file?') || !readPath(url).endsWith('.txt')) return undefined;
+        inFlight += 1;
+        // Stopped once the whole run is out on the wire, which is the moment this is about: three
+        // requests the owner has already paid for, none of them answered yet.
+        if (inFlight === 3) {
+          task.status = 'paused';
+          // A pause clears the lease in the same statement that sets the status, and the closing
+          // write is the one that saves the trajectory - a probe that left the lease on would test
+          // the disowned path instead.
+          task.leaseOwner = null;
+        }
+        return heldBody('never arrives', never, init?.signal);
+      }
+    });
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(inFlight).toBe(3);
+    // One poll of the cancellation watch reaches every request in the run, because they all
+    // inherit its signal.
+    const answered = toolMessages(probe);
+    expect(answered.map((message) => message.toolCallId)).toEqual(['call-1', 'call-2', 'call-3']);
+    for (const message of answered) expect(message.content).toContain('Tool failed');
+    expect(probe.checkpoints.at(-1)).toMatchObject({ status: 'paused', clearLease: true });
+    expect(probe.events.some((entry) => entry.summary === 'Task paused by user')).toBe(true);
+  }, 15_000);
 });

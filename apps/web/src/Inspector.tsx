@@ -40,6 +40,7 @@ import { previewPortProblem, previewSummary } from './preview-rows.js';
 import { advanceFrame, drainFrames, emptyFrameSlots, type FrameSlots } from './remote-frame.js';
 import { inertOutside } from './inert-outside.js';
 import { capabilityDeadline, shouldRenew } from './session-renewal.js';
+import { sessionEnd, type SessionClose } from './terminal-session.js';
 import {
   canDecodeVideo,
   parseDisplayMessage,
@@ -1602,8 +1603,18 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
   const terminal = useRef<Terminal | undefined>(undefined);
   /** Writes into the same channel the keyboard does, for the on-screen key helpers below. */
   const send = useRef<((data: string) => void) | undefined>(undefined);
+  /*
+   * How this session ended, and the count that starts another.
+   *
+   * Both live outside the effect because the effect is what has to be re-run: bumping `attempt`
+   * tears down the dead socket and its terminal and builds a fresh pair, which is exactly what a
+   * new session is. `undefined` means the session is live.
+   */
+  const [closed, setClosed] = useState<SessionClose | undefined>(undefined);
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     if (!host.current) return;
+    setClosed(undefined);
     const term = new Terminal({
       cursorBlink: true,
       convertEol: true,
@@ -1628,6 +1639,12 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
     let socket: WebSocket | undefined;
     let renewal: number | undefined;
     let onShown: (() => void) | undefined;
+    /*
+     * Closing this socket ourselves - on unmount, or on the way to a new session - fires `onclose`
+     * too. Without this the teardown of the old session would report itself as the new session
+     * having ended, and the bar would be up over a terminal that had just connected.
+     */
+    let live = true;
     void api
       .terminalToken(workspace.id)
       .then(({ runnerUrl, token }) => {
@@ -1698,7 +1715,26 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
           if (message.type === 'data') term.write(message.data ?? '');
           else if (message.type === 'renewed' && message.exp) deadline = message.exp * 1000;
         };
-        socket.onclose = () => term.writeln('\r\n\x1b[33mSession closed\x1b[0m');
+        /*
+         * The end of a session is a state, not a line of scrollback.
+         *
+         * It used to write one yellow line and stop: no reconnect, no button, and the key helpers
+         * below still lit and still doing nothing, because a dead socket swallows them silently.
+         * The scrollback line stays - it belongs with the output it follows - and the bar carries
+         * the reason and the way back.
+         */
+        socket.onclose = (event) => {
+          // Nothing left to keep alive. A session that closed on its deadline has one in the past,
+          // so the renewal check would say yes on every tick and mint a capability a minute, for
+          // as long as the pane stayed open, for a socket that is gone. The visibility hook is the
+          // same check by another route - it is what asks again the moment a backgrounded phone is
+          // picked up - so both go together or the leak simply moves.
+          if (renewal !== undefined) window.clearInterval(renewal);
+          if (onShown) document.removeEventListener('visibilitychange', onShown);
+          if (!live) return;
+          term.writeln('\r\n\x1b[33mSession closed\x1b[0m');
+          setClosed({ kind: 'socket', code: event.code, reason: event.reason });
+        };
         const write = (data: string): void => {
           if (socket?.readyState === WebSocket.OPEN)
             socket.send(JSON.stringify({ type: 'input', data }));
@@ -1711,11 +1747,13 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
             socket.send(JSON.stringify({ type: 'resize', cols, rows }))
         );
       })
-      .catch((error) =>
-        term.writeln(
-          `\x1b[31m${error instanceof Error ? error.message : 'Connection failed'}\x1b[0m`
-        )
-      );
+      .catch((cause: unknown) => {
+        if (!live) return;
+        // No socket was ever opened, so there is no close code to read: the same bar, with what the
+        // failed request said. Written into the scrollback too, so the reason survives the reload.
+        term.writeln(`\x1b[31m${describeFailure(cause, 'Could not reach this computer')}\x1b[0m`);
+        setClosed({ kind: 'token', cause });
+      });
     /*
      * A pane with no size is not a pane to fit to.
      *
@@ -1732,6 +1770,7 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
     });
     observer.observe(box);
     return () => {
+      live = false;
       observer.disconnect();
       if (renewal !== undefined) window.clearInterval(renewal);
       if (onShown) document.removeEventListener('visibilitychange', onShown);
@@ -1739,7 +1778,8 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
       socket?.close();
       term.dispose();
     };
-  }, [workspace.id]);
+    // `attempt` is the New session button: re-running this effect is what starts one.
+  }, [workspace.id, attempt]);
   /*
    * The keys a phone keyboard does not have.
    *
@@ -1759,9 +1799,31 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
     ['↑', '\x1b[A', 'Previous command'],
     ['↓', '\x1b[B', 'Next command']
   ];
+  const ended = closed && sessionEnd(closed);
   return (
     <div className="terminal-pane-wrap">
       <div className="terminal-pane" ref={host} />
+      {ended && (
+        <div className={`terminal-closed ${ended.clean ? '' : 'faulted'}`} role="status">
+          <div>
+            <strong>{ended.message}</strong>
+            {/*
+              Said plainly because it is what happens: reconnecting spawns a fresh shell in the
+              workspace folder, so a `cd`, an environment and anything that was running are gone.
+              A button labelled "Reconnect" over a new shell would be the pane lying about the
+              state of the computer.
+            */}
+            <span>A new shell, starting in workspace.</span>
+          </div>
+          <button
+            type="button"
+            className="terminal-new-session"
+            onClick={() => setAttempt((count) => count + 1)}
+          >
+            New session
+          </button>
+        </div>
+      )}
       <div className="terminal-keys">
         {keys.map(([label, sequence, title]) => (
           <button
@@ -1769,6 +1831,9 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
             type="button"
             title={title}
             aria-label={title}
+            // Lit and dead was the old behaviour: with the socket gone these still looked pressable
+            // and every press went nowhere.
+            disabled={Boolean(closed)}
             // The terminal keeps focus, so the on-screen keyboard does not close between presses.
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => {

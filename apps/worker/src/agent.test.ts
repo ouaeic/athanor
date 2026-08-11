@@ -1,7 +1,7 @@
 import { acceptanceCommandRefusal } from './acceptance.js';
 import { describe, expect, it } from 'vitest';
 import type { ModelRelease } from '@athanor/contracts';
-import type { ModelMessage } from '@athanor/model-gateway';
+import type { ModelMessage, ModelToolCall } from '@athanor/model-gateway';
 import { markCacheBreakpoints } from './context.js';
 import { injectMemoryPack, MEMORY_PACK_MARKER } from './memory-runtime.js';
 import { AthanorError } from '@athanor/core';
@@ -40,6 +40,9 @@ import {
   previewUrl,
   normalizeAssistantText,
   ownerFixableCheckpointFailure,
+  MAX_PARALLEL_TOOL_CALLS,
+  parallelToolRun,
+  PARALLEL_SAFE_TOOLS,
   patchFailure,
   planStepsFromArguments,
   providerWebProvenance,
@@ -2153,5 +2156,72 @@ describe('a turn that lost its undo point', () => {
     ).toBe(true);
     expect(ownerFixableCheckpointFailure('EACCES: permission denied, mkdir')).toBe(false);
     expect(ownerFixableCheckpointFailure('workspace is not its own dataset')).toBe(false);
+  });
+});
+
+describe('the reads a batch may run at the same time', () => {
+  const read = (id: string, path: string): ModelToolCall => ({
+    id,
+    name: 'file_read',
+    arguments: { path }
+  });
+
+  it('leaves out the members that write, and the one whose approval verdict moves', () => {
+    for (const name of ['file_read', 'code_search', 'repo_overview', 'web_search'])
+      expect(PARALLEL_SAFE_TOOLS.has(name)).toBe(true);
+    // The two writers. A plan published beside the read that decides its next step is a plan
+    // nobody chose.
+    expect(PARALLEL_SAFE_TOOLS.has('set_plan')).toBe(false);
+    expect(PARALLEL_SAFE_TOOLS.has('set_acceptance')).toBe(false);
+    // The exfiltration floor's per-turn novelty budget is charged when a result is recorded, so two
+    // web reads judged against the same spent total can jointly pass a bound that would have
+    // carded the second. Replay safety does not imply that, which is why this set is not simply
+    // inherited from the replay-safety one.
+    expect(PARALLEL_SAFE_TOOLS.has('parallel_web_read')).toBe(false);
+    // And nothing that changes the computer ever gets in.
+    for (const name of ['shell', 'file_write', 'browser_action', 'publish_artifact', 'finish'])
+      expect(PARALLEL_SAFE_TOOLS.has(name)).toBe(false);
+  });
+
+  it('takes the maximal run and stops at the first call that is not one of them', () => {
+    const calls = [
+      read('a', 'workspace/a.txt'),
+      { id: 'b', name: 'code_search', arguments: { query: 'handler' } },
+      { id: 'c', name: 'file_write', arguments: { path: 'workspace/c.txt', content: 'x' } },
+      read('d', 'workspace/d.txt')
+    ];
+    expect(parallelToolRun(calls, 0)).toBe(2);
+    // The writer itself is never a run, so the caller falls through to the ordinary path.
+    expect(parallelToolRun(calls, 2)).toBe(0);
+    expect(parallelToolRun(calls, 3)).toBe(1);
+  });
+
+  it('never runs more than the cap at once, and runs the rest behind them', () => {
+    const calls = Array.from({ length: MAX_PARALLEL_TOOL_CALLS + 3 }, (_, index) =>
+      read(`call-${index}`, `workspace/${index}.txt`)
+    );
+    expect(parallelToolRun(calls, 0)).toBe(MAX_PARALLEL_TOOL_CALLS);
+    expect(parallelToolRun(calls, MAX_PARALLEL_TOOL_CALLS)).toBe(3);
+  });
+
+  it('ends in front of a call the loop answers instead of running', () => {
+    // Cut off mid-JSON at the output cap: it is answered with the message that says so, and that
+    // message has to keep its place in the declared order.
+    expect(
+      parallelToolRun([read('a', 'workspace/a.txt'), { ...read('b', ''), parseFailed: true }], 0)
+    ).toBe(1);
+    // An exact repeat of a read this turn already answered, whether the earlier one was in a
+    // previous batch or in this one.
+    expect(
+      parallelToolRun([read('a', 'workspace/a.txt'), read('b', 'workspace/b.txt')], 0, {
+        'file_read:{"path":"workspace/b.txt"}': 'call-earlier'
+      })
+    ).toBe(1);
+    expect(
+      parallelToolRun(
+        [read('a', 'workspace/a.txt'), read('b', 'workspace/a.txt'), read('c', 'workspace/c.txt')],
+        0
+      )
+    ).toBe(1);
   });
 });

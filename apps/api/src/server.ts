@@ -106,7 +106,8 @@ import {
   applyOpenRouterPrivacyPolicy,
   OpenAICompatibleAdapter,
   refreshOpenRouterCatalog,
-  seedModels
+  seedModels,
+  verifyOpenRouterKey
 } from '@athanor/model-gateway';
 import { AgentWorker, connectorHostAllowance, startTurnState } from '@athanor/worker';
 import { registerAuthRoutes } from './auth-routes.js';
@@ -4646,6 +4647,22 @@ export const buildServer = async (
           'provider_url_insecure',
           'Use HTTPS, or explicitly allow private HTTP provider URLs on this server'
         );
+      /*
+       * The key is proven before any of the work below reports success.
+       *
+       * Everything this route did for an OpenRouter key - `adapter.list()`, then the catalogue
+       * refresh's `/models` and `/endpoints/zdr` - is a public route that answers 200 anonymously.
+       * So the screen's "Verify and save" verified the provider was reachable and nothing about the
+       * credential, and a mistyped or revoked key was stored, encrypted, under a green success
+       * message. `/key` is the one call the provider gates, and it is made first so a refusal costs
+       * one request and leaves the previously saved credential untouched.
+       */
+      if (input.provider === 'openrouter')
+        await verifyOpenRouterKey({
+          baseUrl,
+          apiKey: apiKey!,
+          ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
+        });
       const adapter = new OpenAICompatibleAdapter({
         baseUrl,
         ...(apiKey ? { apiKey } : {}),

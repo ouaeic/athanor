@@ -214,6 +214,57 @@ const priceTiersOf = (pricing: OpenRouterPricing | undefined): ModelPriceTier[] 
     .sort((left, right) => left.minPromptTokens - right.minPromptTokens);
 
 /**
+ * Asks the provider about the credential itself, before anything is saved under it.
+ *
+ * Neither request below is a check of the key. `/models` and `/endpoints/zdr` are public catalogue
+ * routes: both answer 200 to a request carrying no credential at all, so a key with a trailing
+ * character, a revoked key, and an account with nothing left to spend all completed the settings
+ * screen's "Verify and save" and were written to the database. The first thing that ever read the
+ * credential was the owner's next conversation, which failed as a raw 401 in the middle of a task.
+ *
+ * `/key` is the one route that reads it, it costs nothing, and its answer carries what the key may
+ * still spend - so the two failures that are not "wrong key" can be told apart and named.
+ */
+export const verifyOpenRouterKey = async (options: {
+  baseUrl: string;
+  apiKey: string;
+  fetch?: typeof fetch;
+}): Promise<void> => {
+  const request = options.fetch ?? globalThis.fetch;
+  const response = await request(`${options.baseUrl.replace(/\/$/, '')}/key`, {
+    headers: { authorization: `Bearer ${options.apiKey}` },
+    signal: AbortSignal.timeout(15_000)
+  });
+  if (response.status === 401 || response.status === 403)
+    throw new AthanorError(
+      'provider_key_rejected',
+      'The provider did not accept this key. Paste it again whole — a trailing space or a missing character is enough — and check it has not been revoked.',
+      422
+    );
+  if (!response.ok)
+    throw new AthanorError(
+      'provider_key_uncheckable',
+      `The provider answered ${response.status} when asked about this key, so nothing was saved. Try again in a moment.`,
+      502
+    );
+  const body = (await response.json().catch(() => null)) as {
+    data?: { limit_remaining?: number | null };
+  } | null;
+  /*
+   * Stated as a number, or not stated at all. A key with no spend limit set reports null here, and
+   * an unknown balance must not be reported as an empty one - the point of this call is to stop
+   * claiming knowledge it does not have.
+   */
+  const remaining = body?.data?.limit_remaining;
+  if (typeof remaining === 'number' && remaining <= 0)
+    throw new AthanorError(
+      'provider_credit_exhausted',
+      'This key works but has nothing left to spend. Add credit to the provider account, or raise this key’s limit, then verify again.',
+      422
+    );
+};
+
+/**
  * Builds the owner's selectable model catalogue from live OpenRouter metadata.
  *
  * In `reviewed_open_weight` scope this enriches, but can never expand, the independently reviewed

@@ -991,6 +991,35 @@ export const mergeTaskEvent = (events: TaskEvent[], incoming: TaskEvent): TaskEv
   return [...events.slice(0, low), incoming, ...events.slice(low)];
 };
 
+/**
+ * Folds a whole frame's worth of arrivals in one go.
+ *
+ * `mergeTaskEvent` copies the array per event, which is the right trade when events arrive one at a
+ * time and wrong when they arrive in a run: reopening a conversation replays its entire log through
+ * this path, so an 800-event catch-up did 800 copies of an array averaging 400 entries. The batch a
+ * stream hands over is already in ascending `sequence` and already past the tail, so the common case
+ * is a single concat; anything that is not — a replayed frame after a reconnect, an out-of-order
+ * arrival — falls back to the per-event merge and gets exactly the same answer.
+ */
+export const mergeTaskEvents = (events: TaskEvent[], incoming: TaskEvent[]): TaskEvent[] => {
+  if (incoming.length === 0) return events;
+  if (incoming.length === 1) return mergeTaskEvent(events, incoming[0]!);
+  // Sequences are positive, so zero is the floor an empty list appends onto.
+  let previous = events[events.length - 1]?.sequence ?? 0;
+  let ascending = true;
+  for (const event of incoming) {
+    if (event.sequence <= previous) {
+      ascending = false;
+      break;
+    }
+    previous = event.sequence;
+  }
+  if (ascending) return [...events, ...incoming];
+  let merged = events;
+  for (const event of incoming) merged = mergeTaskEvent(merged, event);
+  return merged;
+};
+
 export interface PendingUserMessage {
   id: string;
   taskId: string | undefined;

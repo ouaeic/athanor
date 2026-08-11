@@ -391,6 +391,81 @@ const IDEMPOTENT_WITHIN_TURN = new Set([
   'session_search'
 ]);
 
+/** How a repeat is recognised: the tool and the exact arguments, which is what makes it a repeat. */
+const idempotentCallKey = (call: ModelToolCall): string =>
+  `${call.name}:${JSON.stringify(call.arguments)}`;
+
+/**
+ * Tools whose calls may be in flight at the same time as each other.
+ *
+ * `REPEATABLE_TOOLS` minus its two writers is the obvious basis and it is very nearly right, but it
+ * is not the property being asked for, and it should not be inherited without saying so: its own
+ * comment defines it as a replay-safety set - a tool whose second run after a restart cannot
+ * surprise anyone - and surviving a replay says nothing about two calls overlapping. Three things
+ * have to hold, and the third costs the set a third member:
+ *
+ * - The call cannot change the computer, so no order between it and a sibling is observable at all.
+ *   `set_plan` and `set_acceptance` are the two members that write, and both are out: a plan
+ *   published while the read that decides its next step is still running is a plan nobody chose.
+ * - Its answer does not depend on when a sibling's answer lands. Everything left reads the
+ *   workspace, the memory store, or a search index.
+ * - The approval floor's verdict on it cannot move while the run is in flight. This is what puts
+ *   `parallel_web_read` out, and it is not a technicality. While the turn is tainted, a web read is
+ *   judged against `turnNoveltyBytes` - a per-turn budget of bytes that appear nowhere in the
+ *   owner's request - and that budget is only charged when a result is recorded. Two reads judged
+ *   concurrently are both judged against the same spent total, so a pair that run one after the
+ *   other would card on the second can both go out with no card at all. That is the exfiltration
+ *   floor, and it is not being traded for a round trip. `parallel_web_read` is also the member that
+ *   wants this least: it already fetches up to twelve pages at once inside itself.
+ */
+export const PARALLEL_SAFE_TOOLS: ReadonlySet<string> = new Set(
+  [...REPEATABLE_TOOLS].filter(
+    (name) => !['set_plan', 'set_acceptance', 'parallel_web_read'].includes(name)
+  )
+);
+
+/**
+ * How many of them run together.
+ *
+ * Four. It is the shape the batches actually have - a task opens with three or four `file_read`s,
+ * or a `code_search` beside a `repo_overview` - so a higher cap would buy almost nothing real, and
+ * every one of these calls crosses to a single workspace runner serving one container and holds a
+ * whole file body in this process while it does. Four whole files is the most of the owner's memory
+ * this loop is willing to hold to save a round trip. A longer batch is not refused: it runs as
+ * consecutive runs of four, which is still four times fewer waits than before.
+ */
+export const MAX_PARALLEL_TOOL_CALLS = 4;
+
+/**
+ * How many calls from `from` may run as one concurrent run: the maximal run of consecutive
+ * parallel-safe calls, capped, and stopped in front of anything the loop answers instead of running.
+ *
+ * A run of one is not a run - the caller reads anything below two as "take the ordinary path" - so
+ * the guards that end a run early cost nothing but the parallelism they were going to save. A call
+ * whose arguments were cut off mid-JSON is one of those, and so is an exact repeat of a read this
+ * turn has already answered: both are answered with a message rather than executed, and that
+ * message has to keep its place in the declared order, so the run ends in front of it.
+ */
+export const parallelToolRun = (
+  calls: readonly ModelToolCall[],
+  from: number,
+  seenCalls: Readonly<Record<string, string>> = {}
+): number => {
+  const seen = new Set(Object.keys(seenCalls));
+  let length = 0;
+  while (from + length < calls.length && length < MAX_PARALLEL_TOOL_CALLS) {
+    const call = calls[from + length];
+    if (!call || !PARALLEL_SAFE_TOOLS.has(call.name) || call.parseFailed) break;
+    if (IDEMPOTENT_WITHIN_TURN.has(call.name)) {
+      const repeat = idempotentCallKey(call);
+      if (seen.has(repeat)) break;
+      seen.add(repeat);
+    }
+    length += 1;
+  }
+  return length;
+};
+
 /**
  * Tools that cannot change the computer, so a turn made only of these needs no undo point.
  *
@@ -3361,6 +3436,119 @@ ${clockLine(new Date(), timeZone)}
     state.turnToolResults ??= {};
     state.turnToolResults[call.id] = { name: call.name, success: false };
     if (wall) await this.#raiseTakeover(task, key, state, wall);
+  }
+
+  /**
+   * Runs one run of read-only calls at the same time and answers them in the order they were asked.
+   *
+   * `calls` is a maximal run of `PARALLEL_SAFE_TOOLS` chosen by `parallelToolRun` and already past
+   * the approval floor, and every one of them is answered here - the caller walks past all of them.
+   *
+   * Everything that is not the waiting stays sequential, deliberately. The results are recorded one
+   * after another in the declared order rather than as they land, because the window is the turn's
+   * memory and a window whose order depends on which read finished first is a turn that cannot be
+   * reproduced, replayed or compared with itself. Recording is also where provenance, taint and the
+   * novelty budget are moved forward, and those are cumulative: running them in order means they
+   * see exactly what they saw before this existed.
+   */
+  async #runToolCallsTogether(
+    task: TaskRecord,
+    key: Uint8Array,
+    state: AgentState,
+    calls: readonly ModelToolCall[],
+    context: {
+      model: ModelRelease;
+      catalog: ModelRelease[];
+      webPlan?: WebToolPlan;
+      /** Whether the owner has published a newer plan since this batch was proposed. */
+      refreshActivePlan: () => Promise<boolean>;
+    }
+  ): Promise<void> {
+    const { model, catalog, webPlan } = context;
+    // Registered before the plan is re-read, matching the order the sequential path applies these
+    // in: a repeat later in the turn is answered from the first call whatever became of it.
+    for (const call of calls)
+      if (IDEMPOTENT_WITHIN_TURN.has(call.name))
+        state.seenCalls = { ...(state.seenCalls ?? {}), [idempotentCallKey(call)]: call.id };
+    // Once for the run rather than once per call, which is the whole saving: it is a read of the
+    // owner's plan, and the run holds nothing that could act on a change to it.
+    if (await context.refreshActivePlan()) {
+      for (const call of calls)
+        await this.#recordToolResult(
+          task,
+          key,
+          state,
+          call,
+          {
+            skipped: true,
+            reason:
+              'The user changed the active plan after this tool call was proposed. Replan before acting.'
+          },
+          model,
+          catalog
+        );
+      return;
+    }
+    for (const call of calls) {
+      // Both of these are no-ops for everything in this set - it is read-only by construction - and
+      // both are called anyway, so that the set gaining a member can never quietly cost the owner
+      // their undo point or leave a change out of the plan the interface draws.
+      await this.#ensureTurnUndoPoint(task, key, state, call.name);
+      if (isMutatingToolCall(call.name, call.arguments)) {
+        state.mutated = true;
+        if (!writesOnlyProse(call.name, call.arguments)) state.mutatedBeyondProse = true;
+      }
+      await event(this.store, task, key, 'tool_started', `Running ${call.name}`, {
+        toolCallId: call.id,
+        tool: call.name,
+        arguments: call.arguments
+      });
+    }
+    /*
+     * One lease renewal and one cancellation watch around the whole run, not one of each per call.
+     * The lease is two minutes and the run is as long as its slowest member, so the renewal has to
+     * span it; the watch is what a Stop pressed mid-run reaches, and it aborts every request in the
+     * run at once because they all inherit its signal.
+     *
+     * Nothing here rejects. Each call is settled into its own outcome, so a runner that drops one
+     * read cannot throw away three that already came back - the model is told which one failed and
+     * keeps the rest, where before an exception left the whole run unanswered.
+     */
+    const settled = await this.#withLeaseRenewal(task, () =>
+      this.#withCancellationWatch(task, () =>
+        Promise.all(
+          calls.map(async (call) => {
+            try {
+              return {
+                ok: true as const,
+                result: await this.#execute(task, call, key, false, webPlan, state)
+              };
+            } catch (error) {
+              return { ok: false as const, error };
+            }
+          })
+        )
+      )
+    );
+    for (const [index, call] of calls.entries()) {
+      const outcome = settled[index];
+      if (!outcome) continue;
+      if (outcome.ok)
+        await this.#recordToolResult(task, key, state, call, outcome.result, model, catalog);
+      else await this.#recordToolFailure(task, key, state, call, outcome.error);
+    }
+    /*
+     * One state write for the run, where the sequential path writes twice around every call that
+     * needs replay protection and nothing at all around a read.
+     *
+     * It is not an in-flight marker - a read that ran twice costs a round trip and tells the owner
+     * nothing, which is the whole reason these tools are the ones allowed to overlap. It is the
+     * point at which reads already paid for become durable, so a worker that dies between this run
+     * and the next model call resumes with four answers in the window instead of fetching them
+     * again. Guarded by the worker id like every other write from here, so a run whose task was
+     * paused underneath it matches no rows and leaves the owner's own closing write in charge.
+     */
+    await this.#checkpoint(task, key, state);
   }
 
   /** The plan steps this task has not finished, newest plan version, in order. */
@@ -7674,13 +7862,54 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       }
       state.completionNags = 0;
 
+      // The last index a concurrent run has already answered. Those calls have their results in the
+      // window and their events on the timeline; walking into them again would run them twice.
+      let answeredByRun = -1;
       for (const [callIndex, call] of response.toolCalls.entries()) {
+        if (callIndex <= answeredByRun) continue;
         // Re-checked before every call in the batch, not once before it. A model routinely proposes
         // several actions at a time, and the earlier single check meant a cancel landing after the
         // first one still sent the email, published the artifact and fired the POST - minutes after
         // the interface said the task had stopped. honorUserControl seals the calls that never ran,
         // so the transcript stays answerable if the task is later resumed.
         if (await honorUserControl()) return;
+        /*
+         * Reads that were proposed together stop queueing behind each other.
+         *
+         * A frontier model opens a task with four `file_read`s, or a `code_search` beside a
+         * `repo_overview`, and each of those is an HTTP round trip to the runner that the next one
+         * waited on for no reason - the product had already paid for this parallelism three times
+         * over as per-tool workarounds (`parallel_web_read`, the browser_action batch, `delegate`),
+         * which is the strongest argument that the loop itself should have it.
+         *
+         * Only the run's execution overlaps. Every decision around it stays exactly where it was:
+         * the stop check above has already run, the floor is asked about each call separately just
+         * below, and the results are recorded strictly in the order the model declared them, so the
+         * window this produces is the same window the sequential path produced.
+         */
+        const runLength = parallelToolRun(response.toolCalls, callIndex, state.seenCalls ?? {});
+        if (runLength > 1) {
+          const run: ModelToolCall[] = [];
+          for (const candidate of response.toolCalls.slice(callIndex, callIndex + runLength)) {
+            // Per call, never once for the run. A call the floor wants a card for ends the run in
+            // front of itself and is left to the sequential path below, which raises the card and
+            // defers everything behind it in writing - so the approval order the owner sees is the
+            // order the model declared. Every tool in the run is one whose verdict is a pure
+            // function of arguments and turn state, so asking early cannot change the answer.
+            if (await this.#approvalForCall(task, candidate, state)) break;
+            run.push(candidate);
+          }
+          if (run.length > 1) {
+            await this.#runToolCallsTogether(task, key, state, run, {
+              model,
+              catalog,
+              refreshActivePlan,
+              ...(webPlan ? { webPlan } : {})
+            });
+            answeredByRun = callIndex + run.length - 1;
+            continue;
+          }
+        }
         // Arguments that did not parse mean the response was cut off mid-JSON at the output cap.
         // Running the call anyway sent an empty object into a tool that then failed on a validation
         // error naming neither the truncation nor the way out of it, and the turn spent its
@@ -7692,7 +7921,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         // call still gets a tool result, because a call without one is a malformed window, and the
         // result names the earlier id so the model can cite or re-read that instead.
         if (IDEMPOTENT_WITHIN_TURN.has(call.name)) {
-          const callKey = `${call.name}:${JSON.stringify(call.arguments)}`;
+          const callKey = idempotentCallKey(call);
           const earlier = state.seenCalls?.[callKey];
           if (earlier) {
             await this.#recordToolResult(

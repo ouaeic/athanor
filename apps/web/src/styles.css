@@ -7779,3 +7779,132 @@ a.blocked-resource:hover {
 .computer-pane.expanded .remote-frame-button.zoomable {
   cursor: zoom-out;
 }
+
+/* ---------------------------------------------------------------------------
+   The software keyboard, and the terminal session that ended.
+   --------------------------------------------------------------------------- */
+
+/*
+ * The strip at the bottom of the window the owner cannot see, in whole CSS pixels.
+ *
+ * `interactive-widget=resizes-content` in index.html is Chromium-only. There the layout viewport
+ * shrinks for the keyboard, `dvh` follows it, and the measurement comes out 0px because there is
+ * nothing left to measure - so the two mechanisms cannot double-count. WebKit ignores the
+ * attribute: an iPhone keeps reporting its full layout viewport with about 336px of it behind the
+ * keyboard. `main.tsx` measures that gap from `visualViewport` and writes it as an inline style on
+ * <html>, which beats this declaration.
+ *
+ * This is the floor. A browser with no `visualViewport` writes nothing, so every rule below reads
+ * 0px and the phone behaves exactly as it did before any of this existed.
+ */
+:root {
+  --keyboard: 0px;
+}
+
+@media (max-width: 800px) {
+  /*
+   * The bottom edge the phone layout is already measured from.
+   *
+   * `--bottom-bar` is what the tab bar's height, the workbench's bottom padding, the inspector's
+   * inset and the undo bar's offset all derive from, so the keyboard is one substitution rather
+   * than five rules that could drift apart: while the keyboard is up, the distance to clear at the
+   * bottom of the window is the keyboard instead of the tab bar.
+   *
+   * `var(--keyboard)` and not `0px`. Fixed and bottom-anchored elements lay out against the layout
+   * viewport, which WebKit does not shrink - so telling them to sit at the bottom of the window
+   * puts them behind the keyboard, which is the bug being fixed. The measured strip is exactly what
+   * they have to clear, and it is deliberately smaller than the keyboard's own height because the
+   * part overlapping ground already scrolled off the top does not need clearing twice.
+   */
+  [data-keyboard='open'] {
+    --bottom-bar: var(--keyboard);
+  }
+
+  /*
+   * Five destinations are meaningless mid-sentence, and on a 375px screen they are the space the
+   * composer needs. Removed rather than shortened, and that is functional: the bar is fixed to the
+   * bottom at `height: var(--bottom-bar)`, so leaving it under the override above would draw a
+   * keyboard-tall opaque block over the composer the override exists to make room for.
+   */
+  [data-keyboard='open'] .mobile-tabs {
+    display: none;
+  }
+}
+
+/*
+ * A session that ended, in the pane's own column between the output and the key helpers.
+ *
+ * Not an overlay like the browser error next door, and that is the one real decision here: that one
+ * is a transient over a live surface, this one stands for as long as the session is dead, and an
+ * overlay would cover the last lines of scrollback - including the marker saying where the shell
+ * stopped. A flex row pushes the terminal up instead of hiding the evidence.
+ *
+ * Large, dim and static: this is caution, and it never competes with the ember that means alive.
+ */
+.terminal-closed {
+  flex: none;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 11px;
+  border-top: 1px solid #ffffff14;
+  background: #101314;
+}
+
+.terminal-closed > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.terminal-closed strong {
+  font-size: 12px;
+  font-weight: 600;
+  color: #c8cdd0;
+}
+
+.terminal-closed span {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/*
+ * Sand and clay, the pair the browser error already uses, so a fault reads the same wherever in the
+ * inspector it appears. Only reached when the session ended by fault: a shell the owner exited
+ * needs no explanation.
+ */
+.terminal-closed.faulted {
+  border-top-color: #5f4844;
+  background: #151719;
+}
+
+.terminal-closed.faulted strong {
+  color: #d2aaa5;
+}
+
+.terminal-closed.faulted span {
+  color: #8b6f68;
+}
+
+/* Silver: an interactive edge, not a live machine. */
+.terminal-new-session {
+  flex: none;
+  border: 1px solid #4a5155;
+  border-radius: 7px;
+  padding: 6px 11px;
+  background: #171a1c;
+  color: #dfe4e6;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    border-color 160ms var(--ease),
+    background-color 160ms var(--ease);
+}
+
+.terminal-new-session:hover {
+  border-color: var(--silver-edge);
+  background: #22272a;
+}

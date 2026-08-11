@@ -3437,6 +3437,69 @@ describe('the settings and file surfaces the client already calls', () => {
     });
     expect(again.json<{ recoveryCode: string }>().recoveryCode).not.toBe(first);
   }, 30_000);
+
+  /*
+   * "Verify and save" now has to have verified something.
+   *
+   * Everything this route called for an OpenRouter key - the adapter's model list, then the
+   * catalogue refresh's `/models` and `/endpoints/zdr` - is a public route that answers 200 with no
+   * credential at all. So a key with a trailing character was stored, encrypted, under a green
+   * success message, and the first thing that ever read it was the owner's next conversation,
+   * failing as a raw 401 mid-task. `/key` is the call the provider gates.
+   */
+  test('refuses a key the provider does not accept, and stores nothing', async () => {
+    const asked: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const requestUrl = input instanceof Request ? input.url : input.toString();
+        const json = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), {
+            status,
+            headers: { 'content-type': 'application/json' }
+          });
+        if (requestUrl.endsWith('/key')) {
+          asked.push(requestUrl);
+          return json({ error: { message: 'No auth credentials found' } }, 401);
+        }
+        // Both catalogue routes answer, exactly as they do for a request carrying no key at all.
+        if (requestUrl.endsWith('/models')) return json({ data: [{ id: 'z-ai/glm-5.2' }] });
+        if (requestUrl.endsWith('/endpoints/zdr')) return json({ data: [] });
+        return json({
+          storageBytes: 0,
+          hostStorageTotalBytes: 1_000_000_000,
+          hostStorageAvailableBytes: 900_000_000,
+          ok: true
+        });
+      })
+    );
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-provider-key-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+
+    const refused = await app.inject({
+      method: 'PUT',
+      url: '/v1/providers',
+      headers: { cookie, 'idempotency-key': 'provider-bad-key' },
+      payload: { provider: 'openrouter', apiKey: 'sk-or-typo ', enforceZeroDataRetention: true }
+    });
+    expect(refused.statusCode, refused.body).toBe(422);
+    expect(refused.json<{ error: { code: string; message: string } }>().error).toMatchObject({
+      code: 'provider_key_rejected'
+    });
+    expect(asked.length).toBe(1);
+    // Nothing was written, so the screen still offers to connect rather than claiming it is ready.
+    expect(
+      (await app.inject({ method: 'GET', url: '/v1/providers', headers: { cookie } })).json<{
+        configured: boolean;
+        hasApiKey: boolean;
+      }>()
+    ).toMatchObject({ configured: false, hasApiKey: false });
+  }, 30_000);
 });
 
 describe('rewinding the computer, not only the conversation', () => {

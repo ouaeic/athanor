@@ -39,6 +39,7 @@ import {
   passkeyLabel,
   passkeyRemovable,
   securityActionMessage,
+  withStepUp,
   type PasskeySummary
 } from './account-security.js';
 import { api, type ProviderSettings } from './api.js';
@@ -293,12 +294,21 @@ export function SelfHostedSettings({
       .catch(() => setPushSettings(null));
   }, []);
 
+  /*
+   * Every write on this screen goes through here, which is why the step-up confirmation lives here
+   * too rather than being remembered at each control - it was missed at two of them, and the two
+   * that were missed both passed their tests because dev sign-in stamps `step_up_at` at session
+   * creation, the one condition that never holds while the screen is in use.
+   *
+   * Bodies are re-run whole on the retry, so each one is a single request plus the local state that
+   * follows it.
+   */
   const act = async (operation: () => Promise<void>) => {
     setBusy(true);
     setError('');
     setNotice('');
     try {
-      await operation();
+      await withStepUp(operation, api.stepUp);
     } catch (cause) {
       setError(securityActionMessage(cause));
     } finally {
@@ -321,7 +331,20 @@ export function SelfHostedSettings({
       });
       setProvider(saved);
       setProviderKey('');
-      setNotice('Provider verified and saved. The key is encrypted and will not be shown again.');
+      /*
+       * Two sentences because two different things were checked.
+       *
+       * "Provider verified and saved" was said either way, and for a directly configured endpoint
+       * it was a claim nobody made: the server asks that endpoint for its model list with the key
+       * and requires the chosen model to be in it, which a public catalogue route will answer for
+       * an unusable key. The OpenRouter path now calls a route the provider gates, so there the
+       * word verified is earned; here it is replaced by what actually happened.
+       */
+      setNotice(
+        providerKind === 'openrouter'
+          ? 'Key checked with the provider and saved. It is encrypted and will not be shown again.'
+          : `Saved and encrypted. The endpoint listed ${modelId} for this key. Nothing was run against it, so cost and quota are unchecked.`
+      );
     });
 
   const exportData = () =>
@@ -1167,14 +1190,27 @@ export function SelfHostedSettings({
                 <button
                   className="icon-btn"
                   aria-label={`Sign out ${item.deviceLabel}`}
-                  onClick={() => {
-                    setSessions((current) => current.filter((entry) => entry.id !== item.id));
-                    undo({
-                      message: `Signed out ${item.deviceLabel}`,
-                      commit: () => api.revokeSession(item.id),
-                      restore: loadSecurity
-                    });
-                  }}
+                  disabled={busy}
+                  /*
+                   * Confirmed here rather than in the commit below, which is the whole reason this
+                   * row could not be relied on: the revoke runs when the undo window closes, so a
+                   * refusal arrived seconds after the row had already gone from the list, and a
+                   * passkey sheet raised then would appear with nothing on screen asking for it.
+                   * Prompting on the press keeps the ceremony attached to the gesture that wanted
+                   * it, and the row is only removed once the server will accept the removal. The
+                   * token revoke beside this one (`Revoke the … token`) already works this way.
+                   */
+                  onClick={() =>
+                    void act(async () => {
+                      await api.stepUp();
+                      setSessions((current) => current.filter((entry) => entry.id !== item.id));
+                      undo({
+                        message: `Signed out ${item.deviceLabel}`,
+                        commit: () => api.revokeSession(item.id),
+                        restore: loadSecurity
+                      });
+                    })
+                  }
                 >
                   <Trash2 />
                 </button>

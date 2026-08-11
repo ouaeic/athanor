@@ -17,6 +17,7 @@ import {
   formatTokens,
   liveActivityId,
   mergeTaskEvent,
+  mergeTaskEvents,
   previewLifetime,
   reasoningEffortLabel,
   settledToolStarts,
@@ -810,6 +811,59 @@ describe('conversation transcript', () => {
 
   it('starts an empty log from the first frame', () => {
     expect(mergeTaskEvent([], event(7, 'task_created')).map((item) => item.sequence)).toEqual([7]);
+  });
+
+  // A frame's worth of arrivals, and the whole log of a reopened conversation, both come through
+  // here as a run. The batch has to reach exactly the state the same events would have reached one
+  // at a time - that equivalence is what lets the transcript effect buffer them at all.
+  it('folds a whole batch of in-order frames in one pass', () => {
+    const events = [event(1, 'task_created')];
+    const batch = [event(2, 'user_message'), event(3, 'assistant_delta'), event(4, 'cost')];
+    expect(mergeTaskEvents(events, batch).map((item) => item.sequence)).toEqual([1, 2, 3, 4]);
+    expect(events.map((item) => item.sequence)).toEqual([1]);
+  });
+
+  it('starts an empty log from a batch', () => {
+    const batch = [event(1, 'task_created'), event(2, 'user_message')];
+    expect(mergeTaskEvents([], batch).map((item) => item.sequence)).toEqual([1, 2]);
+  });
+
+  it('leaves the log alone when the batch is empty', () => {
+    const events = [event(1, 'task_created')];
+    expect(mergeTaskEvents(events, [])).toBe(events);
+  });
+
+  it('reaches the same log as one-at-a-time merging when the batch is out of order', () => {
+    const events = [event(1, 'task_created'), event(5, 'cost')];
+    const batch = [event(4, 'assistant_delta'), event(2, 'user_message'), event(6, 'completed')];
+    const batched = mergeTaskEvents(events, batch);
+    const single = batch.reduce(mergeTaskEvent, events);
+    expect(batched.map((item) => item.sequence)).toEqual([1, 2, 4, 5, 6]);
+    expect(batched).toEqual(single);
+  });
+
+  it('drops frames the log already holds, however they are grouped', () => {
+    const events = [event(1, 'task_created'), event(2, 'cost'), event(3, 'completed')];
+    const batch = [event(2, 'cost'), event(3, 'completed'), event(4, 'artifact')];
+    expect(mergeTaskEvents(events, batch).map((item) => item.sequence)).toEqual([1, 2, 3, 4]);
+  });
+
+  /*
+   * The Timeline memo is keyed on this array's identity, so a render that brought no new events has
+   * to be handed the very same array back. `withPendingMessage` sits between the two and is the
+   * only thing that could break that.
+   */
+  it('hands the same log back untouched when there is no pending message to add', () => {
+    const events = [event(1, 'task_created'), event(2, 'user_message', { markdown: 'Go' })];
+    expect(withPendingMessage(events, undefined)).toBe(events);
+    expect(
+      withPendingMessage(events, {
+        id: 'p1',
+        taskId: 't',
+        markdown: 'Go',
+        createdAt: '2026-07-23T00:00:00.000Z'
+      })
+    ).toBe(events);
   });
 
   it('names the reasoning effort of a step, and says nothing when the step carried none', () => {

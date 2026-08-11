@@ -74,6 +74,41 @@ export const sayWhatIsWrong = (error: z.ZodError): string => {
   return `Invalid request - ${shown.join('; ')}${rest > 0 ? ` (and ${rest} more)` : ''}`;
 };
 
+export interface TerminalSize {
+  readonly cols: number;
+  readonly rows: number;
+}
+
+/**
+ * The size a shell starts at when the client has not said one.
+ *
+ * It used to be 120x32, chosen for nothing and wrong everywhere: the pane it renders into measures
+ * about 70 columns on a desktop and fewer on a phone, so every full-screen program drew past the
+ * edge. 80x24 is the size every terminal has defaulted to for forty years, so a client that says
+ * nothing at least gets the size programs assume when they cannot ask.
+ */
+export const TERMINAL_DEFAULT_SIZE: TerminalSize = { cols: 80, rows: 24 };
+
+/**
+ * What a `resize` frame means, clamped.
+ *
+ * The floor is the old one: a pane briefly reporting 2x1 - which a hidden tab really does report -
+ * must not reflow a running pager to two columns. The ceiling is new and is about this being an
+ * allocation: the numbers come off a socket, and a pty is real memory, so a frame asking for
+ * 100000 columns is answered with the largest honest screen instead. A value that is not a finite
+ * number keeps the size the session already had rather than resetting it.
+ */
+export const terminalSize = (cols: unknown, rows: unknown, current: TerminalSize): TerminalSize => {
+  const clamp = (value: unknown, low: number, high: number, fallback: number): number =>
+    typeof value === 'number' && Number.isFinite(value)
+      ? Math.min(high, Math.max(low, Math.trunc(value)))
+      : fallback;
+  return {
+    cols: clamp(cols, 20, 500, current.cols),
+    rows: clamp(rows, 5, 200, current.rows)
+  };
+};
+
 const WorkspaceRelativePath = z.string().min(1).max(1_024);
 
 const FolderRequest = z.object({ path: WorkspaceRelativePath });
@@ -1158,74 +1193,130 @@ export const buildServer = async (config: RunnerConfig) => {
       );
     };
     armExpiry(opened.exp);
-    void ensureRuntimeWorkspace(root).then(() => {
-      const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash';
-      const environment = {
-        PATH: `${agentSearchPath(root)}${path.delimiter}${process.env.PATH ?? ''}`,
-        HOME: root,
-        TERM: 'xterm-256color',
-        LANG: 'C.UTF-8'
-      };
-      // The same account and the same one-way privilege drop as every other agent command: a
-      // shell here would otherwise be the way around the whole sandbox. Interactive use keeps
-      // the network, which is what an owner opening a terminal expects.
-      const invocation = sandbox
-        ? sandboxedShell({ executable: shell, args: [] }, environment, sandbox)
-        : { executable: shell, args: [] };
-      const terminal = pty.spawn(invocation.executable, invocation.args, {
-        name: 'xterm-256color',
-        cols: 120,
-        rows: 32,
-        cwd: path.join(root, 'workspace'),
-        env: sandbox ? {} : environment
-      });
-      terminal.onData((data) => socket.send(JSON.stringify({ type: 'data', data })));
-      terminal.onExit(({ exitCode, signal }) => {
-        socket.send(JSON.stringify({ type: 'exit', exitCode, signal }));
-        socket.close();
-      });
-      socket.on('message', (raw: unknown) => {
-        const message = JSON.parse(String(raw)) as
-          | { type: 'input'; data: string }
-          | { type: 'resize'; cols: number; rows: number }
-          | { type: 'renew'; token: string };
-        if (message.type === 'renew') {
-          /*
-           * A fresh capability for the socket that is already open.
-           *
-           * Checked against what opened it rather than merely being well-signed: same owner, same
-           * workspace, same role, same scope, same audience. A renewal cannot widen anything - the
-           * most a replayed one can do is re-arm a deadline on a connection that is already this
-           * owner's - and a bad one is ignored, so the session simply closes on the deadline it
-           * already had.
-           */
-          try {
-            const renewed = verifyCapabilityToken(message.token, config.RUNNER_SHARED_SECRET, {
-              method: request.method,
-              path: request.url
-            });
-            if (
-              renewed.workspaceId !== opened.workspaceId ||
-              renewed.sub !== opened.sub ||
-              renewed.role !== opened.role ||
-              !renewed.scopes.includes('terminal')
-            )
-              throw new Error('Renewal does not match the session it would extend');
-            armExpiry(renewed.exp);
-            socket.send(JSON.stringify({ type: 'renewed', exp: renewed.exp }));
-          } catch {
-            // Ignored on purpose: the deadline already set stands.
-          }
-          return;
+    /*
+     * The shell is born the size the client says its pane is, and nothing sent before it exists is
+     * lost.
+     *
+     * `ensureRuntimeWorkspace` is a filesystem round trip, and the message handler used to be
+     * registered inside its `.then`, so every frame that arrived first was dropped on the floor -
+     * including the opening `resize` the client now sends. The pty was therefore always born the
+     * hardcoded 120x32 whatever the pane measured; against the ~70 columns a desktop pane actually
+     * has, `less`, `vim` and readline redrew in the wrong place for the whole session. Handling
+     * messages from here closes that window on the server side: the size is known before the spawn
+     * rather than corrected after it, and a keystroke typed into a terminal that has just appeared
+     * reaches the shell instead of vanishing.
+     */
+    let terminal: ReturnType<typeof pty.spawn> | undefined;
+    let size = TERMINAL_DEFAULT_SIZE;
+    let hungUp = false;
+    /*
+     * Bounded, because this buffer exists before any shell does. A workspace that is slow to
+     * become ready must not let a connected owner - or a stuck client retrying its keystrokes -
+     * grow an unbounded string in the runner. Past the cap the oldest input is dropped; a shell
+     * that has not started yet has nothing to be mid-command about.
+     */
+    let typedEarly = '';
+    const EARLY_INPUT_LIMIT = 8 * 1024;
+    socket.on('message', (raw: unknown) => {
+      let message:
+        | { type: 'input'; data: string }
+        | { type: 'resize'; cols: number; rows: number }
+        | { type: 'renew'; token: string };
+      try {
+        message = JSON.parse(String(raw)) as typeof message;
+      } catch {
+        // A frame that is not JSON is not a session-ending event; the shell carries on.
+        return;
+      }
+      if (message.type === 'renew') {
+        /*
+         * A fresh capability for the socket that is already open.
+         *
+         * Checked against what opened it rather than merely being well-signed: same owner, same
+         * workspace, same role, same scope, same audience. A renewal cannot widen anything - the
+         * most a replayed one can do is re-arm a deadline on a connection that is already this
+         * owner's - and a bad one is ignored, so the session simply closes on the deadline it
+         * already had.
+         */
+        try {
+          const renewed = verifyCapabilityToken(message.token, config.RUNNER_SHARED_SECRET, {
+            method: request.method,
+            path: request.url
+          });
+          if (
+            renewed.workspaceId !== opened.workspaceId ||
+            renewed.sub !== opened.sub ||
+            renewed.role !== opened.role ||
+            !renewed.scopes.includes('terminal')
+          )
+            throw new Error('Renewal does not match the session it would extend');
+          armExpiry(renewed.exp);
+          socket.send(JSON.stringify({ type: 'renewed', exp: renewed.exp }));
+        } catch {
+          // Ignored on purpose: the deadline already set stands.
         }
-        if (message.type === 'input') terminal.write(message.data);
-        else terminal.resize(Math.max(20, message.cols), Math.max(5, message.rows));
-      });
-      socket.on('close', () => {
-        clearTimeout(expiry);
-        terminal.kill();
-      });
+        return;
+      }
+      if (message.type === 'resize') {
+        size = terminalSize(message.cols, message.rows, size);
+        terminal?.resize(size.cols, size.rows);
+        return;
+      }
+      // Named rather than assumed: this used to be the `else` of the resize branch, so a frame of
+      // any other type reached `resize` with two undefined numbers. Falling through to `write`
+      // instead would be worse - a frame the protocol does not define would become keystrokes in
+      // the owner's shell - so only a frame that says it is input is ever typed.
+      if (message.type !== 'input' || typeof message.data !== 'string') return;
+      if (terminal) terminal.write(message.data);
+      else typedEarly = (typedEarly + message.data).slice(-EARLY_INPUT_LIMIT);
     });
+    // Registered here for the same reason: a socket that hangs up while the workspace is still
+    // being prepared used to leave its expiry timer armed and then spawn a shell that nothing held
+    // a handle to, so the pty outlived the connection with no way to reach it.
+    socket.on('close', () => {
+      hungUp = true;
+      clearTimeout(expiry);
+      terminal?.kill();
+    });
+    void ensureRuntimeWorkspace(root)
+      .then(() => {
+        if (hungUp) return;
+        const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash';
+        const environment = {
+          PATH: `${agentSearchPath(root)}${path.delimiter}${process.env.PATH ?? ''}`,
+          HOME: root,
+          TERM: 'xterm-256color',
+          LANG: 'C.UTF-8'
+        };
+        // The same account and the same one-way privilege drop as every other agent command: a
+        // shell here would otherwise be the way around the whole sandbox. Interactive use keeps
+        // the network, which is what an owner opening a terminal expects.
+        const invocation = sandbox
+          ? sandboxedShell({ executable: shell, args: [] }, environment, sandbox)
+          : { executable: shell, args: [] };
+        terminal = pty.spawn(invocation.executable, invocation.args, {
+          name: 'xterm-256color',
+          cols: size.cols,
+          rows: size.rows,
+          cwd: path.join(root, 'workspace'),
+          env: sandbox ? {} : environment
+        });
+        terminal.onData((data) => socket.send(JSON.stringify({ type: 'data', data })));
+        terminal.onExit(({ exitCode, signal }) => {
+          socket.send(JSON.stringify({ type: 'exit', exitCode, signal }));
+          socket.close();
+        });
+        if (typedEarly) {
+          terminal.write(typedEarly);
+          typedEarly = '';
+        }
+      })
+      .catch(() => {
+        // The workspace could not be prepared, so there will be no shell. Said out loud rather
+        // than left as a socket that is open, accepting keystrokes and answering nothing: the
+        // pane turns this into its closed state with a way back.
+        socket.close(1011, 'Workspace unavailable');
+      });
   });
 
   app.addHook('onClose', () => {
