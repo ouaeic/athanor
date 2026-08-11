@@ -4741,18 +4741,23 @@ select:focus-visible {
   inset: -3px;
   padding: 2px;
   /*
-    At rest the halo is still: a silver edge catching the light, which is what the composer is when
-    nothing is happening. Motion is reserved for the two states that have something to say.
+    The halo turns at rest as well, slowly.
+   
+    It was frozen here for a while on the argument that motion should be reserved for states that
+    mean something. That was wrong about what this particular edge is: it is the one place on a
+    black screen that says the machine is powered and listening, and a still ring reads as a dead
+    one. It quickens under focus and turns to ember while a turn runs, so it still carries the two
+    states - it simply is not off in between.
   */
-  animation: none;
-  opacity: 0.5;
+  animation:
+    neon-edge-orbit 7.5s linear infinite,
+    neon-edge-pulse 3.6s ease-in-out infinite;
+  opacity: 0.62;
 }
 
 .composer:focus-within::before {
   opacity: 1;
-  animation:
-    neon-edge-orbit 5.8s linear infinite,
-    neon-edge-pulse 2.8s ease-in-out infinite;
+  animation-duration: 2.8s, 1.45s;
 }
 
 /*
