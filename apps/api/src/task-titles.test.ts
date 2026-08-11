@@ -5,7 +5,13 @@
  */
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import { decryptJson, encryptJson, wrapDataKey } from '@athanor/core';
+import {
+  buildConversationNameIndex,
+  decryptJson,
+  encryptJson,
+  memoryIndexKey,
+  wrapDataKey
+} from '@athanor/core';
 import { createDatabase, DataStore, migrateDatabase, type Database } from '@athanor/data';
 import { createLogger } from './log.js';
 import {
@@ -55,6 +61,11 @@ const boxWithAnsweredTask = async () => {
       { title: 'Have a look at the build log and tell me' },
       dataKey,
       `task-title:${workspace.id}`
+    ),
+    nameIndex: buildConversationNameIndex(
+      'Have a look at the build log and tell me',
+      'Have a look at the build log and tell me why the release job is red',
+      memoryIndexKey(dataKey)
     ),
     modelId: 'openrouter/z-ai/glm-5.2',
     privacyRoute: 'provider_zdr',
@@ -144,7 +155,8 @@ describe('the titler', () => {
       await store.renameTask(
         user.id,
         task.id,
-        encryptJson({ title: 'Red release' }, dataKey, `task-title:${workspace.id}`)
+        encryptJson({ title: 'Red release' }, dataKey, `task-title:${workspace.id}`),
+        buildConversationNameIndex('Red release', '', memoryIndexKey(dataKey))
       );
       const complete = vi.fn<TaskTitlerDeps['complete']>(async () =>
         completion('Release job failure')

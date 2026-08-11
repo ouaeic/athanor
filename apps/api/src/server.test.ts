@@ -6,6 +6,7 @@ import { Duplex } from 'node:stream';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { PREVIEW_IDLE_EXPIRY_DAYS } from '@athanor/contracts';
 import {
+  buildConversationNameIndex,
   buildMemoryItemIndex,
   buildMemorySourceIndex,
   decryptJson,
@@ -4161,6 +4162,11 @@ describe('the standing record of what athanor said', () => {
       userId: user.id,
       workspaceId,
       titleCiphertext: encryptJson({ title: 'Permit watch' }, dataKey, `task-title:${workspaceId}`),
+      nameIndex: buildConversationNameIndex(
+        'Permit watch',
+        'Watch the permits',
+        memoryIndexKey(dataKey)
+      ),
       modelId: 'qwen',
       privacyRoute: 'provider_zdr',
       maxComputeCredits: 1,
@@ -5156,6 +5162,246 @@ describe('searching the owner’s own history', () => {
     expect(barometer.statusCode, barometer.body).toBe(200);
     const spread = barometer.json<{ taskId: string }[]>();
     expect(new Set(spread.map((hit) => hit.taskId)).size).toBe(4);
+  });
+
+  test('finds a conversation the owner renamed in March by that name in December', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-search-renamed-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'renamed-search',
+      'Have a look at the invoice and tell me what changed'
+    );
+
+    const renamed = await app.inject({
+      method: 'PATCH',
+      url: `/v1/tasks/${taskId}`,
+      headers: { cookie, 'idempotency-key': 'renamed-search-rename' },
+      payload: { title: 'Kitchen rewire' }
+    });
+    expect(renamed.statusCode, renamed.body).toBe(200);
+
+    // March, and then nine months of using the computer on top of it. The name shares no word with
+    // the request the conversation opened with, so the verbatim corpus has nothing of it either.
+    await database.query(
+      `UPDATE tasks SET created_at='2026-03-11T09:00:00Z', updated_at='2026-03-11T09:00:00Z'
+       WHERE id=$1`,
+      [taskId]
+    );
+    for (const subject of ['orchard', 'harbour', 'granary', 'foundry', 'quarry']) {
+      const later = await app.inject({
+        method: 'POST',
+        url: '/v1/tasks',
+        headers: { cookie, 'idempotency-key': `renamed-search-${subject}` },
+        payload: {
+          workspaceId,
+          prompt: `Work on the ${subject}`,
+          modelId: 'openrouter/openai/gpt-oss-120b',
+          privacyRoute: 'provider_zdr',
+          maxComputeCredits: 5
+        }
+      });
+      expect(later.statusCode, later.body).toBe(200);
+    }
+
+    // The list is what the old pass read, and reading it is what made the answer depend on how
+    // recently the conversation was touched. Nothing about this route consults it now.
+    const listed = vi.spyOn(store, 'listTaskPage');
+    const found = await app.inject({
+      method: 'GET',
+      url: `/v1/search?q=${encodeURIComponent('kitchen rewire')}&workspaceId=${workspaceId}`,
+      headers: { cookie }
+    });
+    expect(found.statusCode, found.body).toBe(200);
+    expect(found.json()).toEqual([expect.objectContaining({ taskId, title: 'Kitchen rewire' })]);
+    expect(listed).not.toHaveBeenCalled();
+  });
+
+  /*
+   * The boot pass that gives the older half of the history its name index reads oldest first, and
+   * every conversation it reads it decrypts. One that will not open therefore sits in front of
+   * everything newer than it, and if it ends the pass rather than costing only itself, the far end
+   * of the history stays unfindable - which is the hole the index was added to close, back again
+   * with a different cause and no sign of it on the screen.
+   */
+  test('one conversation this server cannot read costs itself and nothing behind it', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-search-unreadable-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const config = isolatedConfig(directory);
+
+    const { app, store, database } = await buildServer(config, { masterKey });
+    const {
+      cookie,
+      workspaceId,
+      taskId: legacyTaskId
+    } = await seedOwnerWithTask(app, 'unreadable-search', 'Sort out the pemberwick invoices');
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const dataKey = unwrapDataKey(workspace.wrappedKey!, masterKey, workspaceId);
+    const conversation = async (key: string, prompt: string) =>
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/v1/tasks',
+          headers: { cookie, 'idempotency-key': key },
+          payload: {
+            workspaceId,
+            prompt,
+            modelId: 'openrouter/openai/gpt-oss-120b',
+            privacyRoute: 'provider_zdr',
+            maxComputeCredits: 5
+          }
+        })
+      ).json<{ id: string }>().id;
+    const lostPromptId = await conversation(
+      'unreadable-search-b',
+      'Sort out the durnsley invoices'
+    );
+    const lostNameId = await conversation(
+      'unreadable-search-c',
+      'Sort out the wintermoor invoices'
+    );
+    const behindId = await conversation('unreadable-search-d', 'Sort out the vantrell invoices');
+
+    // A sealed envelope whose context still matches and whose contents no longer open, which is
+    // what a row restored from a backup taken under another key looks like.
+    const sealedElsewhere = (aad: string) =>
+      JSON.stringify({
+        ...encryptJson({ prompt: 'unreadable', title: 'unreadable' }, dataKey, aad),
+        tag: Buffer.alloc(16, 7).toString('base64')
+      });
+    // The oldest of the four also predates encrypted titles, so the sweep that re-seals those runs
+    // over it before the server listens - and it now reads the request as well as the name.
+    await database.query(
+      `UPDATE tasks SET title=to_jsonb('Pemberwick invoices'::text), prompt_ciphertext=$2::jsonb
+       WHERE id=$1`,
+      [legacyTaskId, sealedElsewhere(`task-prompt:${workspaceId}`)]
+    );
+    await database.query('UPDATE tasks SET prompt_ciphertext=$2::jsonb WHERE id=$1', [
+      lostPromptId,
+      sealedElsewhere(`task-prompt:${workspaceId}`)
+    ]);
+    await database.query('UPDATE tasks SET title=$2::jsonb WHERE id=$1', [
+      lostNameId,
+      sealedElsewhere(`task-title:${workspaceId}`)
+    ]);
+    // Every row as it looks on the boot that first has the column.
+    await database.query('UPDATE tasks SET name_tsv = NULL');
+    await app.close();
+
+    const restarted = await buildServer(config, { masterKey });
+    disposers.push(() => restarted.app.close());
+    await vi.waitFor(
+      async () => {
+        const waiting = await restarted.database.query<{ count: string }>(
+          'SELECT count(*)::text AS count FROM tasks WHERE name_tsv IS NULL'
+        );
+        expect(waiting.rows[0]!.count).toBe('0');
+      },
+      { timeout: 10_000, interval: 50 }
+    );
+
+    const findable = async (word: string) => {
+      const response = await restarted.app.inject({
+        method: 'GET',
+        url: `/v1/search?q=${word}&workspaceId=${workspaceId}`,
+        headers: { cookie }
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      return response.json<{ taskId: string }[]>().map((hit) => hit.taskId);
+    };
+    // The one whose request will not open keeps its name; the one whose name will not open keeps
+    // its request, and is drawn with the placeholder an unreadable row carries anywhere else.
+    await expect(findable('durnsley')).resolves.toEqual([lostPromptId]);
+    const lostName = await restarted.app.inject({
+      method: 'GET',
+      url: `/v1/search?q=wintermoor&workspaceId=${workspaceId}`,
+      headers: { cookie }
+    });
+    expect(lostName.statusCode, lostName.body).toBe(200);
+    expect(lostName.json()).toEqual([
+      expect.objectContaining({ taskId: lostNameId, title: 'Private task' })
+    ]);
+    // Everything the pass had not reached when it met those rows is indexed all the same.
+    await expect(findable('vantrell')).resolves.toEqual([behindId]);
+    await expect(findable('pemberwick')).resolves.toEqual([legacyTaskId]);
+  });
+
+  /*
+   * The database a single box runs by default answers inside this process, so awaiting a query
+   * settles a promise rather than waiting on a socket and the continuation runs as a microtask -
+   * ahead of every timer and every connection. A loop that only awaits queries therefore never
+   * hands the process back at all, however many times it is written to look like it does, and the
+   * boot it runs on has no server on it until its last row is written. That is a longer outage
+   * than the slow search this whole index replaced.
+   */
+  test('comes up while the older half of the history is still being indexed', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-search-backfill-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const config = isolatedConfig(directory);
+
+    const { app, store, database } = await buildServer(config, { masterKey });
+    const { cookie, workspaceId } = await seedOwnerWithTask(app, 'backfill-boot', 'Sort the post');
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const dataKey = unwrapDataKey(workspace.wrappedKey!, masterKey, workspaceId);
+    const rows: string[] = [];
+    const values: unknown[] = [];
+    for (let index = 0; index < 400; index += 1) {
+      const at = values.length;
+      rows.push(
+        `($${at + 1},$${at + 2},$${at + 3},$${at + 4}::jsonb,'completed','qwen','provider_zdr',` +
+          `1,$${at + 5}::jsonb,NULL)`
+      );
+      values.push(
+        randomUUID(),
+        workspace.userId,
+        workspaceId,
+        JSON.stringify(
+          encryptJson({ title: `Ledger ${index}` }, dataKey, `task-title:${workspaceId}`)
+        ),
+        JSON.stringify(
+          encryptJson({ prompt: `Read ledger ${index}` }, dataKey, `task-prompt:${workspaceId}`)
+        )
+      );
+    }
+    await database.query(
+      `INSERT INTO tasks(id,user_id,workspace_id,title,status,model_id,privacy_route,
+        max_compute_credits,prompt_ciphertext,name_tsv) VALUES ${rows.join(',')}`,
+      values
+    );
+    await database.query('UPDATE tasks SET name_tsv = NULL');
+    await app.close();
+
+    const restarted = await buildServer(config, { masterKey });
+    disposers.push(() => restarted.app.close());
+    // What the caller does next is listen, and this is the assertion that it can: the drain is
+    // still going, so the process was handed back rather than held until the last row.
+    const waiting = await restarted.database.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM tasks WHERE name_tsv IS NULL'
+    );
+    expect(Number(waiting.rows[0]!.count)).toBeGreaterThan(0);
+
+    // And it still drains to empty, rather than trading the outage for a hole.
+    await vi.waitFor(
+      async () => {
+        const left = await restarted.database.query<{ count: string }>(
+          'SELECT count(*)::text AS count FROM tasks WHERE name_tsv IS NULL'
+        );
+        expect(left.rows[0]!.count).toBe('0');
+      },
+      { timeout: 20_000, interval: 50 }
+    );
+    const found = await restarted.app.inject({
+      method: 'GET',
+      url: `/v1/search?q=${encodeURIComponent('ledger 399')}&workspaceId=${workspaceId}`,
+      headers: { cookie }
+    });
+    expect(found.statusCode, found.body).toBe(200);
+    expect(found.json<{ title: string }[]>()[0]).toMatchObject({ title: 'Ledger 399' });
   });
 });
 

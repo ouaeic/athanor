@@ -7,6 +7,7 @@ import {
   MEMORY_RECALL_QUOTAS,
   assertMemoryValidity,
   buildMemoryItemIndex,
+  buildConversationNameIndex,
   buildMemorySourceIndex,
   MEMORY_KINDS,
   MEMORY_PACK_BUDGET_TOKENS,
@@ -179,6 +180,29 @@ describe('keyed blind index', () => {
     const prose = buildMemorySourceIndex('systemctl restart athanor.target succeeded', indexKey);
     expect(prose.indexed).toBe(true);
     expect(prose.bodyTokens).not.toBe('');
+  });
+
+  it('keeps a conversation findable by its name when its request is a pasted blob', () => {
+    const blob = Buffer.from('x'.repeat(80_000)).toString('base64');
+    const index = buildConversationNameIndex('Kitchen rewire', blob, indexKey);
+    // The two surfaces go through the tokenizer separately, so the guard that refuses the blob
+    // does not take the name down with it.
+    expect(index.nameTokens).not.toBe('');
+    expect(index.openingTokens).toBe('');
+
+    // A name is matched with exactly the tokens a query is planned with, which is the whole reason
+    // the corpus indexer is reused here rather than a second one written beside it: the stemmer
+    // that makes "restarted" find "restart" in a transcript now does it in a name too.
+    const named = buildConversationNameIndex('Relay restart', '', indexKey);
+    const planned = planMemoryQuery('restarted the relays', indexKey).lexemes;
+    for (const token of named.nameTokens.split(' ')) expect(planned).toContain(token);
+
+    // A request longer than the bound contributes its opening and stops there.
+    const long = buildConversationNameIndex('', `${'relay '.repeat(400)}gooseberry`, indexKey);
+    expect(long.openingTokens).not.toBe('');
+    expect(long.openingTokens.split(' ')).not.toContain(
+      buildConversationNameIndex('gooseberry', '', indexKey).nameTokens
+    );
   });
 });
 

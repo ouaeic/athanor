@@ -480,8 +480,13 @@ const openSourceBody = (
 };
 
 /**
- * Searches the verbatim layer: what the owner and the agent actually said, and what the tools
- * actually printed.
+ * Searches the verbatim layer: the request the owner made, and the answer the agent finished with.
+ *
+ * Those two are the whole corpus. Nothing writes a row for a tool result, an intermediate reply or
+ * a command's output. `recordTurnEpisode` is the only writer of `mem.source` on this box and those
+ * two parts, in chunks, are everything it writes - so a search for a string that appeared only in
+ * a directory listing finds nothing, and finding nothing here means "not in what was said", never
+ * "it did not happen".
  *
  * Every turn is chunked, sealed and blind-indexed when it is captured, so this is one bounded GIN
  * probe with BM25 over it. What that buys over reading and matching substrings across the whole

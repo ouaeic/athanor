@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   MEMORY_KINDS,
   MEMORY_PREDICATES,
+  buildConversationNameIndex,
   buildMemoryItemIndex,
   buildMemorySourceIndex,
   memoryIndexKey,
@@ -30,6 +31,9 @@ import {
   type RecallMemoryInput
 } from './store.js';
 
+/** For the conversations in this file that are never searched by name. */
+const UNINDEXED_NAME = { nameTokens: '', openingTokens: '' };
+
 const workspaceInput = (
   userId: string,
   name: string
@@ -49,6 +53,7 @@ const taskInput = (
   userId,
   workspaceId,
   titleCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+  nameIndex: UNINDEXED_NAME,
   modelId: 'qwen',
   privacyRoute: 'provider_zdr',
   maxComputeCredits: 1,
@@ -244,6 +249,7 @@ describe('DataStore', () => {
       privacyRoute: 'provider_zdr',
       maxComputeCredits: 1,
       titleCiphertext: { v: 1, iv: 'iv', tag: 'tag', ciphertext: 'title' },
+      nameIndex: UNINDEXED_NAME,
       promptCiphertext: { v: 1, iv: 'iv', tag: 'tag', ciphertext: 'prompt' }
     });
     const item = await store.createMemoryItem({
@@ -351,6 +357,7 @@ describe('DataStore', () => {
       userId: owner.id,
       workspaceId: workspace.id,
       titleCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+      nameIndex: UNINDEXED_NAME,
       modelId: 'qwen',
       privacyRoute: 'provider_zdr',
       maxComputeCredits: 1,
@@ -387,6 +394,7 @@ describe('DataStore', () => {
       userId: user.id,
       workspaceId: workspace.id,
       titleCiphertext: { v: 1, iv: 'title', tag: 'tag', ciphertext: 'cipher' },
+      nameIndex: UNINDEXED_NAME,
       modelId: 'qwen',
       privacyRoute: 'provider_zdr',
       maxComputeCredits: 1,
@@ -437,6 +445,7 @@ describe('DataStore', () => {
       userId: user.id,
       workspaceId: workspace.id,
       titleCiphertext: { v: 1, iv: 'title', tag: 'tag', ciphertext: 'cipher' },
+      nameIndex: UNINDEXED_NAME,
       modelId: 'lead-model',
       privacyRoute: 'provider_zdr',
       maxComputeCredits: 1,
@@ -500,6 +509,7 @@ describe('DataStore', () => {
       userId: user.id,
       workspaceId: workspace.id,
       titleCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+      nameIndex: UNINDEXED_NAME,
       modelId: 'qwen',
       privacyRoute: 'provider_zdr',
       maxComputeCredits: 1,
@@ -662,6 +672,7 @@ describe('DataStore', () => {
       userId: user.id,
       workspaceId: workspace.id,
       titleCiphertext: { v: 1, iv: 'title-a', tag: 'title-b', ciphertext: 'title-c' },
+      nameIndex: UNINDEXED_NAME,
       modelId: 'qwen',
       privacyRoute: 'provider_zdr',
       maxComputeCredits: 1,
@@ -1172,6 +1183,7 @@ describe('DataStore', () => {
       userId: user.id,
       workspaceId: workspace.id,
       titleCiphertext: { v: 1, iv: 'private-title', tag: 'title-tag', ciphertext: 'title-data' },
+      nameIndex: UNINDEXED_NAME,
       modelId: 'qwen',
       privacyRoute: 'provider_zdr',
       maxComputeCredits: 1,
@@ -3010,6 +3022,7 @@ describe('tiered agent memory', () => {
         privacyRoute: 'provider_zdr',
         maxComputeCredits: 1,
         titleCiphertext: sealed(`thread ${suffix}`),
+        nameIndex: UNINDEXED_NAME,
         promptCiphertext: sealed(`thread ${suffix}`)
       });
       conversations.push(conversation.id);
@@ -3080,6 +3093,7 @@ describe('tiered agent memory', () => {
       privacyRoute: 'provider_zdr',
       maxComputeCredits: 1,
       titleCiphertext: sealed('reach'),
+      nameIndex: UNINDEXED_NAME,
       promptCiphertext: sealed('reach')
     });
     const taskId = conversation.id;
@@ -3808,6 +3822,90 @@ describe('task spend on the owner-facing reads', () => {
     expect(second.hasMore).toBe(false);
   });
 
+  it('finds a conversation by a name the owner gave it, however old the conversation is', async () => {
+    const user = await store.createUser({ username: 'namer', displayName: 'Namer' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Naming'));
+    const key = memoryIndexKey(generateDataKey());
+    const named = (title: string, prompt: string) => buildConversationNameIndex(title, prompt, key);
+
+    // Renamed by the owner, and then buried under two thousand conversations. Its new name shares
+    // no word with the request it started from, so nothing about it is in the verbatim corpus.
+    const renamed = await store.createTask({
+      ...taskInput(user.id, workspace.id),
+      nameIndex: named('Check the thing', 'Check the thing')
+    });
+    await store.renameTask(
+      user.id,
+      renamed.id,
+      { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+      named('Kitchen rewire', 'Check the thing')
+    );
+    // Only mentions the words in its opening request, so it must lose to the one called that.
+    const mentioned = await store.createTask({
+      ...taskInput(user.id, workspace.id),
+      nameIndex: named('Weekend jobs', 'Get a quote for the kitchen rewire before the holiday')
+    });
+    for (let index = 0; index < 20; index += 1)
+      await store.createTask({
+        ...taskInput(user.id, workspace.id),
+        nameIndex: named(`Unrelated ${index}`, 'Something else entirely')
+      });
+    await database.query(
+      `UPDATE tasks SET created_at='2026-03-02T09:00:00Z', updated_at='2026-03-02T09:00:00Z'
+       WHERE id = ANY($1::uuid[])`,
+      [[renamed.id, mentioned.id]]
+    );
+
+    const hits = await store.searchTaskNames(user.id, {
+      lexemes: planMemoryQuery('kitchen rewire', key).lexemes,
+      limit: 10
+    });
+    expect(hits.map((hit) => hit.id)).toEqual([renamed.id, mentioned.id]);
+    expect(hits[0]).toMatchObject({ wholeName: true, inName: true });
+    // Nothing of the query is in this one's name, so it is carried entirely by the opening.
+    expect(hits[1]).toMatchObject({ wholeName: false, inName: false });
+
+    // Stemming reaches a name because the name went through the corpus tokenizer, not because
+    // anything here reimplemented it.
+    const restarted = await store.createTask({
+      ...taskInput(user.id, workspace.id),
+      nameIndex: named('Relay restart', 'Look at the relay')
+    });
+    const stemmed = await store.searchTaskNames(user.id, {
+      lexemes: planMemoryQuery('restarted the relays', key).lexemes,
+      limit: 10
+    });
+    expect(stemmed.map((hit) => hit.id)).toEqual([restarted.id]);
+    expect(stemmed[0]).toMatchObject({ wholeName: true });
+
+    const other = await store.createUser({ username: 'stranger', displayName: 'Stranger' });
+    await expect(
+      store.searchTaskNames(other.id, { lexemes: planMemoryQuery('kitchen rewire', key).lexemes })
+    ).resolves.toEqual([]);
+  });
+
+  it('leaves a conversation written before the index existed for the boot pass to pick up', async () => {
+    const user = await store.createUser({ username: 'backfill', displayName: 'Backfill' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Backfill'));
+    const key = memoryIndexKey(generateDataKey());
+    const task = await store.createTask(taskInput(user.id, workspace.id));
+    // What every row on a box that predates the column looks like.
+    await database.query('UPDATE tasks SET name_tsv = NULL WHERE id=$1', [task.id]);
+
+    const waiting = await store.listTasksMissingNameIndex();
+    expect(waiting.map((row) => row.id)).toEqual([task.id]);
+    await store.setTaskNameIndex(
+      task.id,
+      buildConversationNameIndex('Sailing trip', 'Plan the crossing', key)
+    );
+
+    await expect(store.listTasksMissingNameIndex()).resolves.toEqual([]);
+    const hits = await store.searchTaskNames(user.id, {
+      lexemes: planMemoryQuery('sailing trip', key).lexemes
+    });
+    expect(hits.map((hit) => hit.id)).toEqual([task.id]);
+  });
+
   it('anchors a turn checkpoint to the point in the transcript it was taken at', async () => {
     const user = await store.createUser({ username: 'rewind', displayName: 'Rewind' });
     const workspace = await store.createWorkspace(workspaceInput(user.id, 'Rewind'));
@@ -4032,6 +4130,7 @@ describe('task spend on the owner-facing reads', () => {
       branchedFromEventId: anchor.id,
       forkKind: 'branch',
       titleCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+      nameIndex: UNINDEXED_NAME,
       modelId: 'qwen',
       privacyRoute: 'provider_zdr',
       promptCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
@@ -4049,6 +4148,7 @@ describe('task spend on the owner-facing reads', () => {
       branchedFromEventId: anchor.id,
       forkKind: 'edit',
       titleCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+      nameIndex: UNINDEXED_NAME,
       modelId: 'qwen',
       privacyRoute: 'provider_zdr',
       promptCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },

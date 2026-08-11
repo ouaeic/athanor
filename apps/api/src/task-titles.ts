@@ -1,4 +1,10 @@
-import { decryptJson, encryptJson, unwrapDataKey } from '@athanor/core';
+import {
+  buildConversationNameIndex,
+  decryptJson,
+  encryptJson,
+  memoryIndexKey,
+  unwrapDataKey
+} from '@athanor/core';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import { errorFields, type Logger } from './log.js';
 
@@ -198,7 +204,10 @@ const titleOneTask = async (
   if (!title) return 'unusable';
   const written = await deps.store.setGeneratedTaskTitle(
     task.id,
-    encryptJson({ title }, key, `task-title:${workspace.id}`)
+    encryptJson({ title }, key, `task-title:${workspace.id}`),
+    // The name the box worked out is the one the owner will search by, so it is indexed with the
+    // same call the placeholder was - a name nobody can find is not much better than no name.
+    buildConversationNameIndex(title, prompt, memoryIndexKey(key))
   );
   // Not written means the owner renamed it while this call was in flight, and their name stands.
   return written ? 'named' : 'unusable';

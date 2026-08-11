@@ -73,6 +73,7 @@ import {
   type ConnectorTransport,
   type MailSocketFactory,
   resolveDataMasterKey,
+  buildConversationNameIndex,
   decryptJson,
   encryptJson,
   generateDataKey,
@@ -258,16 +259,6 @@ export const UNREADABLE_AGENT_MESSAGE =
 /** The same fact about a row of the agent's own memory, which is listed rather than skipped. */
 export const UNREADABLE_MEMORY_ITEM =
   'This cannot be read: the workspace key that sealed it no longer opens on this server.';
-
-/**
- * How many conversations a search reads the names of.
- *
- * The names are the one part of a conversation the blind index does not hold, so they are matched
- * by reading them - two small decrypts a row, no events. Bounding it is what keeps the cost of a
- * search set by the query rather than by the age of the box, and what it gives up is small: the
- * opening request beyond this window is still reachable, because the verbatim layer recorded it.
- */
-const SEARCH_NAMED_CONVERSATIONS = 200;
 
 /** Long enough to show the sentence around the match, short enough that twenty are a list. */
 const SEARCH_EXCERPT_CHARS = 280;
@@ -1055,15 +1046,121 @@ export const buildServer = async (
     };
   };
 
+  /**
+   * The keyed tokens a conversation is findable by. Derived from the workspace data key rather
+   * than being it, so the search surface and the stored ciphertext are separate secrets - which is
+   * the same derivation every other blind index on this box goes through.
+   */
+  const nameIndexFor = (name: string, opening: string, dataKey: Uint8Array) =>
+    buildConversationNameIndex(name, opening, memoryIndexKey(dataKey));
+
+  /**
+   * What a conversation was asked to do, or an empty string when this server cannot read it.
+   *
+   * A stored envelope that will not open is a state this box already models rather than an
+   * accident - the passage pass of the search route skips such a row instead of reporting it - so
+   * it costs this one conversation its opening surface and costs nothing else. Letting it throw
+   * instead would take down whatever pass is walking the history: the rename it is called from,
+   * the legacy-title sweep this file runs before the server listens, or the boot drain, which
+   * reads oldest first and would stop at the first unreadable row with every conversation newer
+   * than it still unindexed.
+   */
+  const openPrompt = (
+    task: Pick<TaskRecord, 'workspaceId' | 'promptCiphertext'>,
+    dataKey: Uint8Array
+  ): string => {
+    if (task.promptCiphertext.aad !== `task-prompt:${task.workspaceId}`) return '';
+    try {
+      return decryptJson<{ prompt: string }>(task.promptCiphertext, dataKey).prompt;
+    } catch {
+      return '';
+    }
+  };
+
+  /** What a conversation is called, on the same terms. */
+  const openName = (
+    task: Pick<TaskRecord, 'workspaceId' | 'titleCiphertext' | 'legacyTitle'>,
+    dataKey: Uint8Array
+  ): string => {
+    if (task.titleCiphertext?.aad !== `task-title:${task.workspaceId}`)
+      return task.legacyTitle ?? '';
+    try {
+      return decryptJson<{ title: string }>(task.titleCiphertext, dataKey).title;
+    } catch {
+      return '';
+    }
+  };
+
   for (const task of await store.listLegacyTaskTitles()) {
     const workspace = await store.getWorkspaceById(task.workspaceId);
     if (!workspace?.wrappedKey || !task.legacyTitle) continue;
     const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
     await store.setTaskTitleCiphertext(
       task.id,
-      encryptJson({ title: task.legacyTitle }, key, `task-title:${workspace.id}`)
+      encryptJson({ title: task.legacyTitle }, key, `task-title:${workspace.id}`),
+      nameIndexFor(task.legacyTitle, openPrompt(task, key), key)
     );
   }
+
+  /**
+   * Gives every conversation that predates the name index one.
+   *
+   * It has to happen in this process rather than in the migration: the tokens are keyed with a key
+   * derived from the workspace's own, and SQL has neither the key nor the tokenizer. It drains to
+   * empty instead of taking a batch a boot, because the far end of the history is what the index
+   * exists to reach and a batch a boot would leave it unfindable for weeks.
+   *
+   * Measured on this machine, one conversation costs about 0.7ms to read and tokenize, so a box
+   * with fifty thousand of them spends the better part of a minute here. That is why the caller
+   * does not wait for it, and why every row hands the loop back before the next one starts: the
+   * default database on a single box answers in this process, so awaiting a query is not a yield -
+   * it settles a promise and the continuation runs as a microtask, ahead of every timer and every
+   * socket. Without a real yield the whole drain runs as one uninterrupted cascade, and the boot it
+   * runs on has no server on it until the last row is written. `setImmediate` is the yield: it
+   * costs a loop turn a row and it bounds how long the box is busy at one row rather than at all
+   * of them. The rows arrive oldest first, which is the half a bounded decrypt window could never
+   * see.
+   *
+   * A conversation this server cannot read is written as an empty vector rather than skipped -
+   * whether the workspace key is gone or that one row's envelope will not open. It is unreadable
+   * either way, and the alternative is a row that stays NULL and is read again on every boot for
+   * the life of the box. What must not happen is the third thing: one such row ending the drain,
+   * which on an oldest-first pass leaves every conversation newer than it unindexed for good.
+   */
+  const backfillConversationNames = async (): Promise<number> => {
+    const dataKeys = new Map<string, Buffer | null>();
+    const handBack = () => new Promise<void>((resolve) => setImmediate(resolve));
+    let written = 0;
+    for (;;) {
+      await handBack();
+      const batch = await store.listTasksMissingNameIndex();
+      if (batch.length === 0) return written;
+      for (const task of batch) {
+        await handBack();
+        if (!dataKeys.has(task.workspaceId)) {
+          const workspace = await store.getWorkspaceById(task.workspaceId);
+          dataKeys.set(
+            task.workspaceId,
+            workspace?.wrappedKey
+              ? unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id)
+              : null
+          );
+        }
+        const key = dataKeys.get(task.workspaceId) ?? null;
+        const index = key
+          ? nameIndexFor(openName(task, key), openPrompt(task, key), key)
+          : { nameTokens: '', openingTokens: '' };
+        await store.setTaskNameIndex(task.id, index);
+        written += 1;
+      }
+    }
+  };
+  void backfillConversationNames().then(
+    (written) => {
+      if (written) log.info('search.names_backfilled', { conversations: written });
+    },
+    (error: unknown) => log.error('search.names_backfill_failed', errorFields(error))
+  );
   await store.scrubLegacyContentSummaries();
 
   const requireRecentStepUp = async (request: FastifyRequest, user: UserRecord): Promise<void> => {
@@ -2717,12 +2814,13 @@ export const buildServer = async (
    * length normalisation, so the longest transcript stops winning everything. The agent has
    * searched this way since the memory runtime landed. Now the owner does.
    *
-   * The names are not in that index, so they keep a scan of their own: a conversation is findable
-   * by what the owner called it from the moment it is created, before any turn has finished and
-   * therefore before anything has been captured. That scan is two small decrypts per row over the
-   * newest `SEARCH_NAMED_CONVERSATIONS`, so its cost is fixed rather than proportional to how long
-   * the box has been owned - and what it cannot reach it barely loses, because the opening request
-   * of a conversation is the first thing the verbatim layer records.
+   * The names are indexed the same way and searched separately, because they answer a different
+   * question: a conversation is findable by what the owner called it from the moment it is created,
+   * before any turn has finished and therefore before anything has been captured. That used to be
+   * a decrypt of the newest few hundred names, which was bounded but wrong at the far end - the
+   * owner's own words for a conversation are in no transcript, so a thread renamed in March was
+   * findable by that name in April and gone by December. `name_tsv` carries those words as keyed
+   * tokens now, so the age of the conversation stops being a factor in either pass.
    */
   app.get<{
     Querystring: { q?: string; workspaceId?: string; limit?: string };
@@ -2746,21 +2844,20 @@ export const buildServer = async (
         unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id)
       ])
     );
-    const query = input.q.toLowerCase();
-    const terms = [...new Set(query.split(/\s+/).filter((term) => term.length > 1))];
-    const score = (content: string): number => {
-      const lower = content.toLowerCase();
-      return (
-        (lower.includes(query) ? 10 : 0) +
-        terms.reduce((total, term) => total + (lower.includes(term) ? 1 : 0), 0)
-      );
-    };
+    // One plan per workspace, because the tokens are keyed to the workspace: the same word is a
+    // different token in each one, and both passes have to ask with the token the writer used.
+    const plans = new Map(
+      workspaces.map((workspace) => [
+        workspace.id,
+        planMemoryQuery(input.q, memoryIndexKey(keys.get(workspace.id)!))
+      ])
+    );
 
     type Found = {
       workspaceId: string;
       title: string;
       updatedAt: string;
-      /** Lexical score of the conversation's own name or opening request; zero when neither hit. */
+      /** How much of the request the conversation's own name and opening account for. */
       named: number;
       /** The best passage the index found inside the conversation. */
       said: { excerpt: string; score: number } | null;
@@ -2769,33 +2866,59 @@ export const buildServer = async (
     };
     const found = new Map<string, Found>();
 
-    const openTask = (task: TaskRecord, key: Uint8Array) => {
-      let title = task.legacyTitle ?? 'Private task';
-      if (task.titleCiphertext?.aad === `task-title:${task.workspaceId}`)
-        title = decryptJson<{ title: string }>(task.titleCiphertext, key).title;
-      const prompt =
-        task.promptCiphertext.aad === `task-prompt:${task.workspaceId}`
-          ? decryptJson<{ prompt: string }>(task.promptCiphertext, key).prompt
-          : '';
-      return { title, prompt };
-    };
+    /*
+     * A conversation whose name will not open takes the placeholder an unreadable row carries
+     * everywhere else on this box, rather than failing the search that found it. The passage pass
+     * below already skips a row it cannot decrypt; a name matched by the index and then refused
+     * here would be the same state answered with a 500, and the conversation is a real one the
+     * owner can still open.
+     */
+    const openTask = (
+      task: Pick<
+        TaskRecord,
+        'workspaceId' | 'titleCiphertext' | 'legacyTitle' | 'promptCiphertext'
+      >,
+      key: Uint8Array
+    ) => ({ title: openName(task, key) || 'Private task', prompt: openPrompt(task, key) });
 
-    const named = await store.listTaskPage(user.id, {
-      ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
-      include: 'all',
-      limit: SEARCH_NAMED_CONVERSATIONS
-    });
-    for (const task of named.tasks) {
-      const key = keys.get(task.workspaceId);
+    /*
+     * Only the page that is going to be shown is decrypted, which is what makes this affordable at
+     * any age. Ranking by name before opening request happens in the database, so a thread the
+     * owner called "Berlin flights" is chosen over one that mentions the words in a paragraph
+     * before either of them is opened here.
+     */
+    const namedHits = (
+      await Promise.all(
+        workspaces.map(async (workspace) =>
+          store.searchTaskNames(user.id, {
+            lexemes: plans.get(workspace.id)!.lexemes,
+            workspaceId: workspace.id,
+            limit: input.limit
+          })
+        )
+      )
+    )
+      .flat()
+      // The database ranked each workspace; this only interleaves them, on the same three keys.
+      .sort(
+        (left, right) =>
+          Number(right.wholeName) - Number(left.wholeName) ||
+          Number(right.inName) - Number(left.inName) ||
+          new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()
+      )
+      .slice(0, input.limit);
+    for (const hit of namedHits) {
+      const key = keys.get(hit.workspaceId);
       if (!key) continue;
-      const { title, prompt } = openTask(task, key);
-      const rank = Math.max(score(title), score(prompt));
-      if (!rank) continue;
-      found.set(task.id, {
-        workspaceId: task.workspaceId,
+      const { title, prompt } = openTask(hit, key);
+      found.set(hit.id, {
+        workspaceId: hit.workspaceId,
         title,
-        updatedAt: task.updatedAt,
-        named: rank,
+        updatedAt: hit.updatedAt,
+        // One rather than zero for the weakest of the three, because the two passes are ordered
+        // rather than added: a conversation that opened by asking this still goes above one that
+        // only mentioned it somewhere in the middle.
+        named: (hit.wholeName ? 2 : 0) + (hit.inName ? 1 : 0) + 1,
         said: null,
         opening: memoryExcerpt(prompt || title, input.q, { maxChars: SEARCH_EXCERPT_CHARS })
       });
@@ -2817,7 +2940,7 @@ export const buildServer = async (
           (
             await store.searchMemorySources({
               workspaceId: workspace.id,
-              plan: planMemoryQuery(input.q, memoryIndexKey(keys.get(workspace.id)!)),
+              plan: plans.get(workspace.id)!,
               limit: input.limit,
               perTask: 1
             })
@@ -3660,6 +3783,7 @@ export const buildServer = async (
         userId: user.id,
         workspaceId: workspace.id,
         titleCiphertext: encryptJson({ title }, dataKey, `task-title:${workspace.id}`),
+        nameIndex: nameIndexFor(title, input.prompt, dataKey),
         modelId: selected.id,
         privacyRoute: input.privacyRoute,
         maxComputeCredits: Math.max(
@@ -4169,6 +4293,7 @@ export const buildServer = async (
       branchedFromEventId: target.id,
       forkKind: input.operation,
       titleCiphertext: encryptJson({ title }, dataKey, `task-title:${workspace.id}`),
+      nameIndex: nameIndexFor(title, prompt, dataKey),
       modelId: selected?.id ?? parent.modelId,
       privacyRoute: parent.privacyRoute,
       securityMode: parent.securityMode,
@@ -4378,7 +4503,10 @@ export const buildServer = async (
       const renamed = await store.renameTask(
         user.id,
         task.id,
-        encryptJson({ title: input.title }, key, `task-title:${workspace.id}`)
+        encryptJson({ title: input.title }, key, `task-title:${workspace.id}`),
+        // The request has not changed, but the vector holds both surfaces and a tsvector cannot be
+        // half-rewritten, so the opening is re-tokenized from the task's own ciphertext.
+        nameIndexFor(input.title, openPrompt(task, key), key)
       );
       if (!renamed) throw new AthanorError('task_not_found', 'Task not found');
       return taskResponse(renamed, input.title);

@@ -6,12 +6,7 @@ import {
   buildMemorySourceIndex,
   planMemoryQuery
 } from '@athanor/core';
-import type {
-  EncryptedEnvelope,
-  MemoryKind,
-  MemoryPackQuota,
-  MemoryTrust
-} from '@athanor/core';
+import type { EncryptedEnvelope, MemoryKind, MemoryPackQuota, MemoryTrust } from '@athanor/core';
 import type { DataStore, RecallMemoryInput } from './store.js';
 
 /* ------------------------------------------------------------------------ *
@@ -1179,8 +1174,7 @@ export const MEMORY_EVAL_UNBOUNDED_QUOTAS: readonly MemoryPackQuota[] = MEMORY_P
   (quota) => ({ ...quota, share: 1, cap: 1_000, perSubject: 1_000 })
 );
 
-const daysBefore = (now: Date, days: number): Date =>
-  new Date(now.getTime() - days * 86_400_000);
+const daysBefore = (now: Date, days: number): Date => new Date(now.getTime() - days * 86_400_000);
 
 /**
  * Writes the corpus into a real store. Nothing here is a fixture of the query's own making: rows go
@@ -1213,7 +1207,9 @@ export const seedMemoryEvalCorpus = async (input: {
       input.key
     );
     indexedBytes +=
-      index.titleTokens.length + index.tagTokens.length + index.aliasTokens.length +
+      index.titleTokens.length +
+      index.tagTokens.length +
+      index.aliasTokens.length +
       index.bodyTokens.length;
     const observedAt = daysBefore(input.now, item.daysAgo);
     const common = {
@@ -1255,7 +1251,11 @@ export const seedMemoryEvalCorpus = async (input: {
         privacyRoute: 'provider_zdr',
         maxComputeCredits: 0,
         titleCiphertext: { v: 1, iv: 'eval', tag: 'eval', ciphertext: source.conversation },
-        promptCiphertext: { v: 1, iv: 'eval', tag: 'eval', ciphertext: source.conversation }
+        promptCiphertext: { v: 1, iv: 'eval', tag: 'eval', ciphertext: source.conversation },
+        // This corpus measures recall over the verbatim layer. Names are a separate index with its
+        // own probes, and giving these placeholder rows one would put tokens nobody is asking about
+        // into the numbers.
+        nameIndex: { nameTokens: '', openingTokens: '' }
       });
       taskId = conversationTask.id;
       conversations.set(source.conversation, taskId);
@@ -1367,7 +1367,8 @@ export const runMemoryRecallEval = async (input: {
    */
   const shuffled = <T>(values: readonly T[], seedText: string): T[] => {
     let state = 2_463_534_242;
-    for (const character of seedText) state = (state ^ character.charCodeAt(0)) * 16_777_619 >>> 0;
+    for (const character of seedText)
+      state = ((state ^ character.charCodeAt(0)) * 16_777_619) >>> 0;
     const copy = [...values];
     for (let index = copy.length - 1; index > 0; index -= 1) {
       state ^= state << 13;

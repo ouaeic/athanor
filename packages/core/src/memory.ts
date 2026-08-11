@@ -226,12 +226,7 @@ export type MemoryTrust = 'stated' | 'derived';
 
 export type MemoryStatus = 'active' | 'superseded' | 'disputed' | 'archived' | 'retracted';
 
-export const MEMORY_KINDS: readonly MemoryKind[] = [
-  'source',
-  'episode',
-  'fact',
-  'procedure'
-];
+export const MEMORY_KINDS: readonly MemoryKind[] = ['source', 'episode', 'fact', 'procedure'];
 
 /**
  * Vetted in-repo predicate registry. `cardinality: 'one'` is the whole deterministic contradiction
@@ -669,6 +664,49 @@ export const buildMemorySourceIndex = (body: string, key: Uint8Array): MemorySou
     indexed
   };
 };
+
+/**
+ * How much of a conversation's opening request is indexed beside its name.
+ *
+ * The name has no bound worth applying - it is a line. The request has none at all: a conversation
+ * can open with a pasted document, and a tsvector of every lexeme of one, on every conversation
+ * ever started, is a second copy of the corpus attached to a table that is read on every page load.
+ *
+ * This is the only surface the whole request would have bought, and it is a narrow one. From the
+ * moment the first answer lands the request is in the verbatim corpus in full, chunked and indexed,
+ * and reachable there at any age. What this covers is the gap before that - a conversation the
+ * owner started, went to make coffee, and came back to search for. Two thousand characters is more
+ * than anyone types into that gap, and for a pasted document it is the opening they would search by
+ * rather than page eleven of it.
+ */
+export const MAX_INDEXED_OPENING_CHARS = 2_000;
+
+/**
+ * The two keyed surfaces a conversation is findable by before anything it said was captured: what
+ * it is called, and what it was asked to do.
+ *
+ * Both go through `buildMemorySourceIndex`, which is the same tokenizer, the same stemmer, the same
+ * alias expansion and the same keyed token space the verbatim corpus uses - so a query planned by
+ * `planMemoryQuery` matches a conversation's name exactly as it matches its transcript, and there
+ * is no second indexer to drift away from the first. Running it twice rather than over one joined
+ * string is what keeps a pasted-blob request from taking the name down with it: the blob guard
+ * fires on the request alone and the name is still indexed.
+ */
+export interface ConversationNameIndex {
+  /** Keyed lexemes of the conversation's own name; indexed above the request. */
+  readonly nameTokens: string;
+  /** Keyed lexemes of the opening of the request, bounded by `MAX_INDEXED_OPENING_CHARS`. */
+  readonly openingTokens: string;
+}
+
+export const buildConversationNameIndex = (
+  name: string,
+  opening: string,
+  key: Uint8Array
+): ConversationNameIndex => ({
+  nameTokens: buildMemorySourceIndex(name, key).bodyTokens,
+  openingTokens: buildMemorySourceIndex(opening.slice(0, MAX_INDEXED_OPENING_CHARS), key).bodyTokens
+});
 
 /* ------------------------------------------------------------------------ *
  * Excerpting

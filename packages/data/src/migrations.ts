@@ -2153,5 +2153,33 @@ export const migrations = [
         ON tasks(schedule_id, created_at DESC)
         WHERE schedule_id IS NOT NULL;
     `
+  },
+  {
+    version: 63,
+    name: 'a_conversation_is_findable_by_its_name_at_any_age',
+    // A conversation's name is encrypted, so there was no predicate that could match it and search
+    // matched it by decrypting the newest few hundred instead. That is fine for a conversation
+    // named after its opening request, because the request itself is in the blind-indexed corpus
+    // and reachable however old it is. It is not fine for one the owner renamed: their words were
+    // never in the request, so past the decrypt window the name existed nowhere a query could
+    // reach, and the share of the box that was past the window grew every month it was owned.
+    //
+    // The corpus already solves this and the solution is reused rather than rebuilt: the tokenizer
+    // runs in the application, every lexeme becomes a keyed HMAC, and PostgreSQL matches a token
+    // space it cannot read back. `name_tsv` is that vector for the conversation's own name at A
+    // weight and the opening of its request at D, so "named that" outranks "asked about that" and
+    // both are one GIN probe.
+    //
+    // NULL rather than an empty vector for a row nobody has indexed yet, because the two need to be
+    // told apart: a conversation whose name is entirely stop words indexes to nothing and is done,
+    // while one written before this column existed has to be read and sealed again. The API does
+    // that on the boot after the update, beside the other backfills, and NULL is what it looks for
+    // - so a backfill interrupted half way resumes rather than starting over.
+    sql: `
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS name_tsv TSVECTOR;
+
+      CREATE INDEX IF NOT EXISTS tasks_name_tsv_gin ON tasks USING gin (name_tsv)
+        WITH (fastupdate = off) WHERE name_tsv IS NOT NULL;
+    `
   }
 ] as const;

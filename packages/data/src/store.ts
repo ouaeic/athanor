@@ -21,6 +21,7 @@ import {
   unwrapDataKey
 } from '@athanor/core';
 import type {
+  ConversationNameIndex,
   EncryptedEnvelope,
   MemoryItemIndex,
   MemoryKind,
@@ -373,6 +374,21 @@ export interface TaskEventPage {
 /** How much of the sidebar a page is allowed to be, whatever the caller asks for. */
 const MAX_TASK_PAGE = 500;
 
+/**
+ * The searchable form of a conversation's name, written by every statement that writes the name.
+ *
+ * Two weights, because the two questions are not the same question: A is what the conversation is
+ * called, D is what it was asked to do. A search for "berlin flights" should reach the thread
+ * called that before the one that merely mentioned it in passing, and this is where that ordering
+ * comes from - `searchTaskNames` counts matches at A before it counts matches anywhere.
+ *
+ * It takes the parameter positions rather than being a constant because these statements are
+ * insert, update and backfill and no two of them number their placeholders alike.
+ */
+const taskNameTsv = (name: number, opening: number): string =>
+  `setweight(to_tsvector('simple', $${name}::text), 'A')` +
+  ` || setweight(to_tsvector('simple', $${opening}::text), 'D')`;
+
 export type TaskListFilter = 'active' | 'archived' | 'all';
 
 export interface TaskPage {
@@ -381,6 +397,54 @@ export interface TaskPage {
   nextCursor: string | null;
   hasMore: boolean;
 }
+
+/** Just enough of a conversation to rank it, name it and open it. Never its agent state. */
+export interface TaskNameHit {
+  id: string;
+  workspaceId: string;
+  titleCiphertext: EncryptedEnvelope | null;
+  legacyTitle: string | null;
+  promptCiphertext: EncryptedEnvelope;
+  updatedAt: string;
+  /** The conversation's own name carries every term of the request. */
+  wholeName: boolean;
+  /** Its name carries at least one of them; false means only its opening request does. */
+  inName: boolean;
+}
+
+/**
+ * Three tiers and a clock, and nothing per row that grows.
+ *
+ * Ranking by how many of the request's terms each candidate carries reads better on paper and cost
+ * seven times as much to run: counting means `unnest` and an aggregate per row, and on the query
+ * that matches the whole history - a word the owner puts in every conversation - the whole history
+ * is what it runs over. Two extra `@@` probes against a vector already in hand answer the question
+ * that actually decides the order: is this the conversation called that, is it one whose name
+ * mentions it, or is it one that merely opened by asking about it. Measured over ten thousand
+ * conversations every one of which matched, that is 15ms where counting was 101ms, and there is no
+ * candidate cap anywhere in it - nothing is dropped to make the number, so nothing has to be
+ * confessed to the owner either.
+ *
+ * The lexemes are keyed HMAC tokens over a sixteen-letter alphabet with no digits and no
+ * punctuation (`isMemoryToken` is asserted before they get here), which is what lets them be
+ * assembled into a tsquery by string concatenation without a lexeme ever being read as an
+ * operator.
+ *
+ * The columns are named rather than `t.*`: a task row carries its agent state, which is the whole
+ * conversation, and pulling fifty of those back to read fifty titles would rebuild here the cost
+ * the index was added to remove.
+ */
+const TASK_NAME_SEARCH_SQL = `
+SELECT t.id, t.workspace_id, t.title, t.prompt_ciphertext, t.updated_at,
+       (t.name_tsv @@ (array_to_string($2::text[], ':A & ') || ':A')::tsquery) AS whole_name,
+       (t.name_tsv @@ (array_to_string($2::text[], ':A | ') || ':A')::tsquery) AS in_name
+FROM tasks t JOIN workspaces w ON w.id = t.workspace_id
+WHERE w.user_id = $1
+  AND ($3::uuid IS NULL OR t.workspace_id = $3)
+  AND t.name_tsv @@ array_to_string($2::text[], ' | ')::tsquery
+ORDER BY whole_name DESC, in_name DESC,
+         GREATEST(t.updated_at, t.created_at) DESC, t.id DESC
+LIMIT $4`;
 
 /**
  * The sidebar's position, as the three values its ordering is built from.
@@ -2314,6 +2378,8 @@ export class DataStore {
     userId: string;
     workspaceId: string;
     titleCiphertext: EncryptedEnvelope;
+    /** Built by `buildConversationNameIndex`; the only way this conversation's name is findable. */
+    nameIndex: ConversationNameIndex;
     modelId: string;
     privacyRoute: string;
     maxComputeCredits: number;
@@ -2325,8 +2391,9 @@ export class DataStore {
     const result = await this.database.query(
       `INSERT INTO tasks(
         id,user_id,workspace_id,title,status,model_id,privacy_route,max_compute_credits,
-        prompt_ciphertext,security_mode,max_spend_usd
-       ) VALUES ($1,$2,$3,$4,'queued',$5,$6,$7,$8::jsonb,$9,$10) RETURNING *`,
+        prompt_ciphertext,security_mode,max_spend_usd,name_tsv
+       ) VALUES ($1,$2,$3,$4,'queued',$5,$6,$7,$8::jsonb,$9,$10,${taskNameTsv(11, 12)})
+       RETURNING *`,
       [
         id,
         input.userId,
@@ -2337,7 +2404,9 @@ export class DataStore {
         input.maxComputeCredits,
         JSON.stringify(input.promptCiphertext),
         input.securityMode ?? 'balanced',
-        input.maxSpendUsd ?? null
+        input.maxSpendUsd ?? null,
+        input.nameIndex.nameTokens,
+        input.nameIndex.openingTokens
       ]
     );
     const task = mapTask(result.rows[0]!);
@@ -2353,6 +2422,7 @@ export class DataStore {
     branchedFromEventId?: string;
     forkKind?: NonNullable<TaskRecord['forkKind']>;
     titleCiphertext: EncryptedEnvelope;
+    nameIndex: ConversationNameIndex;
     modelId: string;
     privacyRoute: string;
     promptCiphertext: EncryptedEnvelope;
@@ -2371,9 +2441,10 @@ export class DataStore {
       `INSERT INTO tasks(
         id,user_id,workspace_id,parent_task_id,branched_from_event_id,title,status,model_id,
         privacy_route,max_compute_credits,prompt_ciphertext,agent_state_ciphertext,completed_at,
-        fork_kind,security_mode,max_spend_usd,rewind_scope,restored_checkpoint_id
+        fork_kind,security_mode,max_spend_usd,rewind_scope,restored_checkpoint_id,name_tsv
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,
-        CASE WHEN $7='completed' THEN NOW() ELSE NULL END,$13,$14,$15,$16,$17)
+        CASE WHEN $7='completed' THEN NOW() ELSE NULL END,$13,$14,$15,$16,$17,
+        ${taskNameTsv(18, 19)})
        RETURNING *`,
       [
         id,
@@ -2392,7 +2463,9 @@ export class DataStore {
         input.securityMode ?? 'balanced',
         input.maxSpendUsd ?? null,
         input.rewindScope ?? 'conversation',
-        input.restoredCheckpointId ?? null
+        input.restoredCheckpointId ?? null,
+        input.nameIndex.nameTokens,
+        input.nameIndex.openingTokens
       ]
     );
     const fork = mapTask(result.rows[0]!);
@@ -2869,21 +2942,24 @@ export class DataStore {
 
   /**
    * Renames a conversation. The title is encrypted like every other task field, so the caller
-   * supplies the envelope rather than plaintext.
+   * supplies the envelope rather than plaintext - and the search vector for the same reason, since
+   * this layer cannot read either one.
    *
    * The name becomes the owner's, which is what stops the titler from ever touching it again.
    */
   async renameTask(
     userId: string,
     id: string,
-    titleCiphertext: EncryptedEnvelope
+    titleCiphertext: EncryptedEnvelope,
+    nameIndex: ConversationNameIndex
   ): Promise<TaskRecord | null> {
     const result = await this.database.query(
-      `UPDATE tasks t SET title=$3::jsonb, title_source='owner', updated_at=NOW()
+      `UPDATE tasks t SET title=$3::jsonb, title_source='owner', updated_at=NOW(),
+         name_tsv = ${taskNameTsv(4, 5)}
        FROM workspaces w
        WHERE t.id=$1 AND w.id=t.workspace_id AND w.user_id=$2
        RETURNING t.*, 0 AS queued_message_count`,
-      [id, userId, JSON.stringify(titleCiphertext)]
+      [id, userId, JSON.stringify(titleCiphertext), nameIndex.nameTokens, nameIndex.openingTokens]
     );
     return result.rows[0] ? mapTask(result.rows[0]) : null;
   }
@@ -2916,11 +2992,16 @@ export class DataStore {
    * rather than allowed to overwrite it. `updated_at` is left alone so naming a conversation does
    * not reorder the sidebar.
    */
-  async setGeneratedTaskTitle(id: string, titleCiphertext: EncryptedEnvelope): Promise<boolean> {
+  async setGeneratedTaskTitle(
+    id: string,
+    titleCiphertext: EncryptedEnvelope,
+    nameIndex: ConversationNameIndex
+  ): Promise<boolean> {
     const result = await this.database.query(
-      `UPDATE tasks SET title=$2::jsonb, title_source='generated'
+      `UPDATE tasks SET title=$2::jsonb, title_source='generated',
+         name_tsv = ${taskNameTsv(3, 4)}
        WHERE id=$1 AND title_source='prompt'`,
-      [id, JSON.stringify(titleCiphertext)]
+      [id, JSON.stringify(titleCiphertext), nameIndex.nameTokens, nameIndex.openingTokens]
     );
     return result.rowCount === 1;
   }
@@ -4441,11 +4522,102 @@ export class DataStore {
     return result.rows.map(mapTask).filter((task) => task.legacyTitle !== null);
   }
 
-  async setTaskTitleCiphertext(id: string, titleCiphertext: EncryptedEnvelope): Promise<void> {
-    await this.database.query('UPDATE tasks SET title=$2,updated_at=NOW() WHERE id=$1', [
+  async setTaskTitleCiphertext(
+    id: string,
+    titleCiphertext: EncryptedEnvelope,
+    nameIndex: ConversationNameIndex
+  ): Promise<void> {
+    await this.database.query(
+      `UPDATE tasks SET title=$2,updated_at=NOW(), name_tsv = ${taskNameTsv(3, 4)} WHERE id=$1`,
+      [id, JSON.stringify(titleCiphertext), nameIndex.nameTokens, nameIndex.openingTokens]
+    );
+  }
+
+  /**
+   * One batch of conversations whose name has never been through the tokenizer - everything that
+   * existed before `name_tsv` did, and anything a half-finished backfill did not reach. The API
+   * drains this on the boot after the update for the same reason it drains the legacy titles: the
+   * tokens are keyed, so only a process holding the workspace key can produce them.
+   *
+   * Oldest first, because the old end of the history is precisely the part a bounded decrypt window
+   * could never see and the part this exists to recover.
+   *
+   * Four columns and not the row: a task carries its agent state, which is the entire conversation
+   * it has had, and five hundred of those at once is a boot that runs the box out of memory to
+   * write five hundred short vectors.
+   */
+  async listTasksMissingNameIndex(
+    limit = 500
+  ): Promise<
+    Pick<
+      TaskRecord,
+      'id' | 'workspaceId' | 'titleCiphertext' | 'legacyTitle' | 'promptCiphertext'
+    >[]
+  > {
+    const result = await this.database.query(
+      `SELECT id, workspace_id, title, prompt_ciphertext FROM tasks
+       WHERE name_tsv IS NULL ORDER BY created_at, id LIMIT $1`,
+      [Math.max(1, Math.min(Math.trunc(limit), MAX_TASK_PAGE))]
+    );
+    return result.rows.map((row) => {
+      const title = encryptedText(row.title);
+      return {
+        id: String(row.id),
+        workspaceId: String(row.workspace_id),
+        titleCiphertext: title.ciphertext,
+        legacyTitle: title.legacy,
+        promptCiphertext: json<EncryptedEnvelope>(row.prompt_ciphertext)
+      };
+    });
+  }
+
+  /** Writes the search vector without touching the name it was built from, or `updated_at`. */
+  async setTaskNameIndex(id: string, nameIndex: ConversationNameIndex): Promise<void> {
+    await this.database.query(`UPDATE tasks SET name_tsv = ${taskNameTsv(2, 3)} WHERE id=$1`, [
       id,
-      JSON.stringify(titleCiphertext)
+      nameIndex.nameTokens,
+      nameIndex.openingTokens
     ]);
+  }
+
+  /**
+   * Conversations whose name or opening request carries the request's words.
+   *
+   * The work here is set by what was asked for and by nothing else. The GIN index answers which
+   * conversations match, the ordering happens in the database over the keyed tokens, and only the
+   * page that is going to be shown comes back to be decrypted - so a box with fifty thousand
+   * conversations pays what a box with fifty pays, and a conversation renamed years ago is as
+   * reachable as one renamed this morning.
+   *
+   * The order is what the conversation is called first and when it was last touched second: the
+   * one named exactly what was asked for, then the one whose name says part of it, then the one
+   * that only opened by asking about it.
+   */
+  async searchTaskNames(
+    userId: string,
+    input: { lexemes: readonly string[]; workspaceId?: string | null; limit?: number }
+  ): Promise<TaskNameHit[]> {
+    const lexemes = [...new Set(input.lexemes.filter(isMemoryToken))];
+    if (lexemes.length === 0) return [];
+    const result = await this.database.query(TASK_NAME_SEARCH_SQL, [
+      userId,
+      lexemes,
+      input.workspaceId ?? null,
+      Math.max(1, Math.min(Math.trunc(input.limit ?? 20), MAX_TASK_PAGE))
+    ]);
+    return result.rows.map((row) => {
+      const title = encryptedText(row.title);
+      return {
+        id: String(row.id),
+        workspaceId: String(row.workspace_id),
+        titleCiphertext: title.ciphertext,
+        legacyTitle: title.legacy,
+        promptCiphertext: json<EncryptedEnvelope>(row.prompt_ciphertext),
+        updatedAt: iso(row.updated_at),
+        wholeName: Boolean(row.whole_name),
+        inName: Boolean(row.in_name)
+      };
+    });
   }
 
   /**
