@@ -313,8 +313,11 @@ describe('a turn the harness checked', () => {
   });
 
   it('shows a caveat about the tick beside the tick, not folded into the disclosure', () => {
-    const caveat =
-      'The acceptance checks were declared after this turn had already changed things.';
+    // Any caveat that arrives in both the acceptance record and the remaining risks, which is what
+    // this rule is about. It used to be a specific one the worker emitted; that sentence was the
+    // harness describing its own mechanics in the owner's completion and has been deleted, but the
+    // render-it-once rule outlives it.
+    const caveat = 'One check could not be run on this machine.';
     const markup = render([
       event(1, 'status', 'Acceptance checks: 1 of 1 passed', {
         acceptance: [{ id: 'check-1', label: 'It builds', passed: true, detail: 'exit 0' }]
