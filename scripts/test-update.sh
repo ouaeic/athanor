@@ -17,6 +17,7 @@ state="$test_root/state"
 home="$test_root/home"
 backups="$test_root/backups"
 command_log="$test_root/commands.log"
+worker_busy="$test_root/worker-busy"
 mkdir -p "$seed/scripts" "$seed/infra/native" "$seed/packages/data/src" \
   "$fake_bin" "$config" "$state" "$home" "$backups"
 
@@ -48,6 +49,11 @@ for argument in "$@"; do
 done
 if [ -f "$ATHANOR_TEST_CHECKOUT/FAIL_HEALTH" ]; then exit 22; fi
 case "$requested" in
+  # The worker metrics the backup reads to decide whether anybody is using the computer. Silence
+  # means idle, which is what an unattended box normally is.
+  */metrics)
+    if [ -f "$ATHANOR_TEST_WORKER_BUSY" ]; then printf "athanor_worker_active 1\n"; fi
+    ;;
   */v1/legal) printf "{\"applicationLicense\":\"AGPL-3.0-only\",\"accepted\":false}\n" ;;
 esac
 exit 0'
@@ -132,6 +138,9 @@ cp "$repository_root/infra/native/start-desktop-session.sh" \
   "$repository_root/infra/native/athanor-certificate-renew.service" \
   "$repository_root/infra/native/athanor-certificate-renew.timer" \
   "$repository_root/infra/native/athanor-certificate-alert.service" \
+  "$repository_root/infra/native/athanor-backup.service" \
+  "$repository_root/infra/native/athanor-backup.timer" \
+  "$repository_root/infra/native/athanor-backup-alert.service" \
   "$repository_root/infra/native/athanor-motd" \
   "$repository_root/infra/native/nginx.conf" \
   "$seed/infra/native/"
@@ -171,6 +180,8 @@ run_athanor() {
     ATHANOR_HOME="$home" \
     ATHANOR_BACKUP_ROOT="$backups" \
     ATHANOR_BACKUP_KEEP="${ATHANOR_TEST_BACKUP_KEEP:-5}" \
+    ATHANOR_BACKUP_IDLE_WAIT_SECONDS="${ATHANOR_TEST_BACKUP_IDLE_WAIT:-0}" \
+    ATHANOR_TEST_WORKER_BUSY="$worker_busy" \
     ATHANOR_READY_TIMEOUT_SECONDS=3 \
     ATHANOR_RUNTIME_PREFIX="$runtime" \
     "$checkout/scripts/athanor" "$@"
@@ -326,3 +337,75 @@ grep -q 'Update complete after' <<EOF
 $outage_output
 EOF
 printf 'ok  the outage is announced beforehand and measured afterwards\n'
+
+# The daily backup, and whether the box can say anything true about it.
+#
+# Settings asserted "A backup is taken daily, at a randomised hour, when nothing is running". Two
+# ordinary paths made that false without leaving a mark anywhere: a run that stands down because
+# the worker is busy exits zero and speaks only to the journal, and a run that fails leaves no
+# directory at all, because a copy with no checksum manifest cannot restore anything and is pruned
+# as wreckage. Both of them ended with the sentence still on the screen.
+backup_status_file="$state/backup.status"
+status_field() {
+  sed -n "s/^$1=//p" "$backup_status_file" | sed -n '1p'
+}
+
+# Every route to a verified copy records itself, so the update just above already left one.
+test "$(status_field outcome)" = ok
+test -n "$(status_field copy_at)"
+test "$(status_field copy_bytes)" -gt 0
+test -d "$backups/$(status_field copy_at | tr -d ':-')"
+printf 'ok  a completed backup records when it happened and how big it is\n'
+
+# The first silent path. The run stands down for a task that is still going, which is the design,
+# and the exit status says nothing happened wrong - so a box that is busy every time the window
+# comes round stands down every night behind an unchanged promise.
+: >"$worker_busy"
+skipped_output=$(run_athanor backup auto run 2>&1)
+grep -q 'the next window will take the backup' <<EOF
+$skipped_output
+EOF
+test "$(status_field outcome)" = skipped
+test "$(status_field reason)" = "a task was still running when the window came round"
+# And the copy it did not take is still described, because how far back the owner can restore to is
+# a different question from what last night's run did.
+test -n "$(status_field copy_at)"
+printf 'ok  a run that stands down for a busy worker says so and says why\n'
+rm -f "$worker_busy"
+
+# The second. A full disk is the ordinary way a backup fails, and it is exactly when every retained
+# copy is already there - so nothing new is written, nothing is left behind, and the box carries on
+# serving perfectly.
+make_fake df '
+printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+printf "/dev/synthetic 1024 1000 24 98%% /\n"'
+if failed_backup_output=$(run_athanor backup auto run 2>&1); then
+  printf 'a backup that could not fit reported success\n' >&2
+  exit 1
+fi
+rm -f "$fake_bin/df"
+grep -q 'not enough room for a backup' <<EOF
+$failed_backup_output
+EOF
+test "$(status_field outcome)" = failed
+case "$(status_field reason)" in
+  'not enough room for a backup'*) ;;
+  *)
+    printf 'the failure was not written down in words the owner can read: %s\n' \
+      "$(status_field reason)" >&2
+    exit 1
+    ;;
+esac
+printf 'ok  a backup that could not be taken is written down with its reason\n'
+
+# What OnFailure= is for: a run stopped by its own ninety-minute limit never reaches a line that
+# could write anything, so the pessimistic record it left on the way in is the one that stands.
+printf 'at=2026-08-10T03:00:00Z\noutcome=running\nreason=\n' >"$backup_status_file"
+run_athanor backup auto alert >/dev/null 2>&1
+test "$(status_field outcome)" = failed
+test "$(status_field reason)" = "the run was stopped before it finished"
+# And it leaves a finished run alone, because it fires after those too.
+printf 'at=2026-08-10T03:00:00Z\noutcome=ok\nreason=\n' >"$backup_status_file"
+run_athanor backup auto alert >/dev/null 2>&1
+test "$(status_field outcome)" = ok
+printf 'ok  a run killed before it finished is recorded, and a finished one is left alone\n'

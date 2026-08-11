@@ -4661,11 +4661,58 @@ export const buildServer = async (
         return null;
       }
     };
-    const [certificate, dynamicDns] = await Promise.all([
+    /**
+     * The last backup, which unlike the two files above is reported whatever it says.
+     *
+     * Settings asserted that a backup is taken daily. Two paths made that false without a word
+     * anywhere: a run that stands down because the worker is busy exits zero, and a run that fails
+     * leaves no directory behind, because a copy with no checksum manifest cannot restore anything.
+     * `at` and `outcome` describe the last run, `copyAt` and `copyBytes` the newest copy that
+     * actually exists, and the case worth showing is the one where they disagree.
+     */
+    const readBackup = async (): Promise<{
+      at: string;
+      outcome: 'ok' | 'skipped' | 'failed' | 'running';
+      reason: string;
+      copyAt: string | null;
+      copyBytes: number | null;
+    } | null> => {
+      try {
+        const fields = new Map<string, string>();
+        for (const line of (
+          await readFile(join(config.ATHANOR_STATE_PATH, 'backup.status'), 'utf8')
+        ).split('\n')) {
+          const separator = line.indexOf('=');
+          if (separator > 0) fields.set(line.slice(0, separator), line.slice(separator + 1).trim());
+        }
+        const parsed = z
+          .object({
+            at: z.string().min(1),
+            outcome: z.enum(['ok', 'skipped', 'failed', 'running']),
+            reason: z.string().max(500).default(''),
+            copy_at: z.string().min(1).optional(),
+            copy_bytes: z.coerce.number().int().nonnegative().optional()
+          })
+          .safeParse(Object.fromEntries(fields));
+        if (!parsed.success) return null;
+        return {
+          at: parsed.data.at,
+          outcome: parsed.data.outcome,
+          reason: parsed.data.reason,
+          copyAt: parsed.data.copy_at ?? null,
+          copyBytes: parsed.data.copy_bytes ?? null
+        };
+      } catch {
+        // Nothing written is a box that has not reached its first window, not a box in trouble.
+        return null;
+      }
+    };
+    const [certificate, dynamicDns, backup] = await Promise.all([
       read('certificate.error'),
-      read('ddns.error')
+      read('ddns.error'),
+      readBackup()
     ]);
-    return { certificate, dynamicDns };
+    return { certificate, dynamicDns, backup };
   });
 
   app.get('/v1/relay', async (request) => {

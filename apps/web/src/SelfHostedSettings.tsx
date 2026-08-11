@@ -88,6 +88,7 @@ import type {
   WorkspaceSkill
 } from './types.js';
 import { formatBytes } from './timeline-state.js';
+import { backupLine, type BackupStatus } from './backup-evidence.js';
 import { UsagePane } from './UsagePane.js';
 import { relayAddress, relayHostProblem, relayQuotaNote, relayStatusLine } from './relay-state.js';
 
@@ -491,6 +492,7 @@ export function SelfHostedSettings({
   const [diagnostics, setDiagnostics] = useState<{
     certificate: { failedAt: string; reason: string } | null;
     dynamicDns: { failedAt: string; reason: string } | null;
+    backup?: BackupStatus | null;
   }>();
   const [relayHost, setRelayHost] = useState('');
   const [relayToken, setRelayToken] = useState('');
@@ -814,6 +816,14 @@ export function SelfHostedSettings({
     });
 
   const webSearch = webSearchSummary(provider?.webSearch);
+  // Read at render rather than ticked: the panel is opened, read and closed, and a backup taken
+  // yesterday is still yesterday's a minute later.
+  //
+  // Nothing at all until the box has answered, which is a different fact from the box answering
+  // that it has nothing. The row says "no backup yet" on the second, and a request still in flight
+  // - or one that failed, which leaves this undefined for as long as the panel is open - would
+  // otherwise tell a server with a year of good copies that it has never taken one.
+  const backupEvidence = diagnostics ? backupLine(diagnostics.backup ?? null, Date.now()) : null;
 
   const pages: Array<{ id: SettingsPage; label: string }> = [
     { id: 'ai', label: 'Model & spending' },
@@ -2427,21 +2437,42 @@ export function SelfHostedSettings({
               </a>
             )}
           </div>
+          {/*
+            What the machine did, not what it intends to do.
+
+            This row used to open "A backup is taken daily, at a randomised hour, when nothing is
+            running" — an assertion about a timer standing in for evidence from the box, on the one
+            subject where being wrong cannot be repaired afterwards. Two ordinary paths made it
+            false in silence: the daily run stands down when the worker is busy and exits cleanly,
+            and a run that fails leaves nothing behind at all, because a copy with no checksum
+            manifest cannot restore anything and is pruned as wreckage. Either way the sentence
+            stayed on the screen. It now says when the last copy was actually taken and how big it
+            is, and when the last run did not produce one it says that instead, with the reason.
+          */}
+          {backupEvidence && (
+            <div>
+              <span>
+                <strong>Backups</strong>
+                <small className={backupEvidence.attention ? 'settings-attention' : undefined}>
+                  {backupEvidence.text}
+                </small>
+              </span>
+            </div>
+          )}
           <div>
             <span>
-              <strong>Backups and updates</strong>
+              <strong>Updates</strong>
               {/*
                 What the box does on its own, then what to type if you want to intervene — and it
                 has to be the box this installer actually ships. This said updates install
-                themselves weekly and said nothing about backups, which is the exact inverse of
-                both: the installer enables the backup timer and leaves the update timer off. An
-                owner read it, stopped thinking about updates, and had nothing install itself.
+                themselves weekly, which is the inverse of what the installer does: it enables the
+                backup timer and leaves the update timer off. An owner read it, stopped thinking
+                about updates, and had nothing install itself.
               */}
               <small>
-                A backup is taken daily, at a randomised hour, when nothing is running. Updates are
-                yours to run: <code>sudo athanor update</code>. To have them install themselves
-                weekly, backing up first and rolling back if the new release does not serve:{' '}
-                <code>sudo athanor auto-update on</code>. Also on the server:{' '}
+                Updates are yours to run: <code>sudo athanor update</code>. To have them install
+                themselves weekly, backing up first and rolling back if the new release does not
+                serve: <code>sudo athanor auto-update on</code>. Also on the server:{' '}
                 <code>sudo athanor rollback</code> to undo a release that installed cleanly and
                 still went wrong, <code>sudo athanor backup</code> for a copy on demand, and{' '}
                 <code>sudo athanor doctor</code> for the full report.

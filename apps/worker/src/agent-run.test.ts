@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { decryptJson, encryptJson, generateDataKey, wrapDataKey } from '@athanor/core';
+import {
+  AthanorError,
+  decryptJson,
+  encryptJson,
+  generateDataKey,
+  wrapDataKey
+} from '@athanor/core';
 import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import type { ModelRelease } from '@athanor/contracts';
 import {
@@ -4696,6 +4702,7 @@ describe('the warnings that are the owner’s business', () => {
   it('raises the reason a task stopped without doing what was asked', async () => {
     const task = makeTask();
     const probe = probeStore(() => task);
+    const journal = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
 
     await new AgentWorker(probe.store, config(), masterKey, runnerSecret).fail(
       task,
@@ -4705,6 +4712,50 @@ describe('the warnings that are the owner’s business', () => {
     const failure = probe.events.find((entry) => entry.kind === 'error');
     expect(failure?.summary).toBe('The workspace could not be reached');
     expect(ownerFlag(failure)).toBe(true);
+    journal.mockRestore();
+  });
+
+  /**
+   * The other half of the same failure, and the half the owner can actually read. The event above
+   * is encrypted for good reasons; this box's owner is also its operator, and an error that needs
+   * the master key to read is one they cannot diagnose.
+   */
+  it('writes the failure to the journal, where the owner can read it without a key', async () => {
+    const task = makeTask({ messages: [], step: 12, credits: 0, turn: 2 });
+    const probe = probeStore(() => task);
+    const journal = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret).fail(
+      task,
+      new AthanorError('model_timeout', 'The model provider did not respond within 900 seconds'),
+      903_000
+    );
+
+    const line = String(journal.mock.calls.at(0)?.[0]);
+    journal.mockRestore();
+    expect(line).toContain(`task ${taskId} failed at turn 2 step 12 after 903.0s`);
+    expect(line).toContain('model_timeout');
+    // The sentence the model provider wrote is in the encrypted event and nowhere else.
+    expect(line).not.toContain('did not respond');
+  });
+
+  it('leaves that line behind even when the store is what failed', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    Object.assign(probe.store, {
+      appendTaskEvent: async () => {
+        throw new Error('database is not accepting connections');
+      }
+    });
+    const journal = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret)
+      .fail(task, new AthanorError('workspace_unreachable', 'The workspace could not be reached'))
+      .catch(() => undefined);
+
+    const line = String(journal.mock.calls.at(0)?.[0]);
+    journal.mockRestore();
+    expect(line).toContain('workspace_unreachable');
   });
 });
 

@@ -1,4 +1,3 @@
-import { setTimeout as delay } from 'node:timers/promises';
 import { createServer } from 'node:http';
 import {
   assertMasterKeyOpensDatabase,
@@ -7,7 +6,7 @@ import {
   migrateDatabase
 } from '@athanor/data';
 import { deriveServiceSecret, resolveDataMasterKey } from '@athanor/core';
-import { AgentWorker } from './agent.js';
+import { AgentWorker, journalLevelPrefix } from './agent.js';
 import { loadConfig } from './config.js';
 import { runLeaseLoops, type WorkerCounters } from './lease.js';
 
@@ -58,12 +57,28 @@ const reportLeaseHealth = (healthy: boolean, error?: unknown): void => {
   leaseHealthy = healthy;
   process.stderr.write(
     healthy
-      ? '[athanor] leasing recovered; the worker is accepting tasks again\n'
-      : `[athanor] leasing the next task failed, so this worker is accepting nothing: ${
+      ? `${journalLevelPrefix('info')}[athanor] leasing recovered; the worker is accepting tasks again\n`
+      : `${journalLevelPrefix('error')}[athanor] leasing the next task failed, so this worker is accepting nothing: ${
           error instanceof Error ? error.message : String(error)
         }\n`
   );
 };
+
+// When each in-flight attempt was handed out, so the line a failure writes can say how long it ran.
+// Kept here because the lease is what starts that clock: this is the only place that sees both the
+// moment a task was taken and the moment it came back. An attempt that finishes clears its own
+// entry and a failed one is cleared by the reporter below, so nothing accumulates across a run.
+const startedAt = new Map<string, number>();
+
+// Proof that starting up finished. Everything above this line can hang rather than fail - the
+// master key, the migration, the health socket - and a worker that never reached the queue looks
+// exactly like one whose queue is empty: both say nothing at all. One line, and then silence until
+// something happens.
+process.stderr.write(
+  `${journalLevelPrefix('info')}[athanor] worker ${config.WORKER_ID} is taking tasks: ${
+    config.WORKER_CONCURRENCY
+  } at once, ${config.DATABASE_DRIVER} database\n`
+);
 
 await runLeaseLoops({
   concurrency: config.WORKER_CONCURRENCY,
@@ -72,9 +87,30 @@ await runLeaseLoops({
   onLeaseHealth: reportLeaseHealth,
   running: () => running,
   lease: () => store.leaseNextTask(config.WORKER_ID, 120),
-  run: (task) => worker.run(task),
-  fail: (task, error) => worker.fail(task, error),
-  idle: (milliseconds) => delay(milliseconds)
+  run: async (task) => {
+    startedAt.set(task.id, Date.now());
+    await worker.run(task);
+    startedAt.delete(task.id);
+  },
+  fail: async (task, error) => {
+    const began = startedAt.get(task.id);
+    startedAt.delete(task.id);
+    await worker.fail(task, error, began === undefined ? undefined : Date.now() - began);
+  },
+  /*
+   * Waits on the write rather than on the clock, which is what every announcement into the queue
+   * has been for.
+   *
+   * The API's embedded worker has waited this way for a while; this loop - the one a box with a
+   * postgres database actually runs, as athanor@worker.service - slept a flat interval and heard
+   * none of it. So a conversation queued behind a running turn became leasable the instant that
+   * turn let go and then sat out the rest of a poll before anyone looked, at exactly the moment
+   * the owner is watching one answer finish and the next begin. `waitForQueuedTask` returns on the
+   * signal or on the interval, whichever comes first, and a subscription that could not be set up
+   * leaves the interval doing precisely what it does today - so the worst case here is the
+   * behaviour this replaces.
+   */
+  idle: (milliseconds) => store.waitForQueuedTask(milliseconds)
 });
 
 await new Promise<void>((resolve) => health.close(() => resolve()));

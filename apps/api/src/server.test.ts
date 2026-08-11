@@ -3410,7 +3410,7 @@ describe('authentication posture', () => {
       headers: { cookie }
     });
     expect(healthy.statusCode, healthy.body).toBe(200);
-    expect(healthy.json()).toEqual({ certificate: null, dynamicDns: null });
+    expect(healthy.json()).toEqual({ certificate: null, dynamicDns: null, backup: null });
 
     await writeFile(
       join(directory, 'certificate.error'),
@@ -3428,6 +3428,46 @@ describe('authentication posture', () => {
       },
       dynamicDns: null
     });
+
+    /*
+     * The backup record, which unlike the two above is reported whatever it says. Settings
+     * asserted that a backup is taken daily; a run that stands down for a busy worker exits zero,
+     * and a run that fails leaves no directory behind, so the assertion outlived both without a
+     * word anywhere. The last run and the newest copy are separate fields because the case worth
+     * showing is exactly the one where they disagree.
+     */
+    await writeFile(
+      join(directory, 'backup.status'),
+      [
+        'at=2026-08-09T04:11:00Z',
+        'outcome=skipped',
+        'reason=a task was still running when the window came round',
+        'copy_at=2026-08-01T03:02:00Z',
+        'copy_bytes=2260123648',
+        ''
+      ].join('\n')
+    );
+    expect(
+      (
+        await app.inject({ method: 'GET', url: '/v1/instance/diagnostics', headers: { cookie } })
+      ).json()
+    ).toMatchObject({
+      backup: {
+        at: '2026-08-09T04:11:00Z',
+        outcome: 'skipped',
+        reason: 'a task was still running when the window came round',
+        copyAt: '2026-08-01T03:02:00Z',
+        copyBytes: 2_260_123_648
+      }
+    });
+
+    // A half-written or hand-edited file reports nothing rather than an outcome nobody defined.
+    await writeFile(join(directory, 'backup.status'), 'at=2026-08-09T04:11:00Z\noutcome=maybe\n');
+    expect(
+      (
+        await app.inject({ method: 'GET', url: '/v1/instance/diagnostics', headers: { cookie } })
+      ).json()
+    ).toMatchObject({ backup: null });
 
     // Signed out, it says nothing: this names what is wrong with somebody's server.
     expect((await app.inject({ method: 'GET', url: '/v1/instance/diagnostics' })).statusCode).toBe(

@@ -503,6 +503,10 @@ install_asset 0644 "$athanor_root/infra/native/athanor-backup.service" \
   /etc/systemd/system/athanor-backup.service
 install_asset 0644 "$athanor_root/infra/native/athanor-backup.timer" \
   /etc/systemd/system/athanor-backup.timer
+# Never enabled: started only by OnFailure= when a backup run is stopped before it can write down
+# why, so the settings screen says what happened instead of standing by its daily promise.
+install_asset 0644 "$athanor_root/infra/native/athanor-backup-alert.service" \
+  /etc/systemd/system/athanor-backup-alert.service
 install_asset 0755 "$athanor_root/scripts/athanor-certificate" \
   /usr/local/lib/athanor/athanor-certificate
 # The network refresh runs this on every netlink address event, by absolute path.

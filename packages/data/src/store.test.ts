@@ -802,6 +802,97 @@ describe('DataStore', () => {
     expect(await store.leaseNextTask('worker-2')).toMatchObject({ id: waiting.id, attempt: 1 });
   });
 
+  /**
+   * The owner is watching at exactly this moment - one answer has just finished and the question
+   * they asked while it ran is next. Every door out of a turn has to say so, or the conversation
+   * that was waiting for the computer sits out a whole worker poll after it became leasable.
+   */
+  it('wakes the queue on every door a turn leaves the workspace by', async () => {
+    const user = await store.createUser({ username: 'handover', displayName: 'Handover' });
+    const state: EncryptedEnvelope = { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' };
+    const doors: Array<[string, (holderId: string) => Promise<unknown>]> = [
+      [
+        'end of turn',
+        (id) => store.updateTask({ id, workerId: 'worker-1', status: 'paused', clearLease: true })
+      ],
+      [
+        'finished',
+        (id) =>
+          store.completeTaskIfNoQueued({
+            id,
+            workerId: 'worker-1',
+            actualComputeCredits: 1,
+            agentStateCiphertext: state
+          })
+      ],
+      ['stopped from the screen', (id) => store.setTaskStatusForUser(user.id, id, 'paused')],
+      ['cancelled', (id) => store.cancelTaskAndReleaseReservations(user.id, id)],
+      ['deleted', (id) => store.deleteTask(user.id, id)]
+    ];
+    for (const [door, release] of doors) {
+      const workspace = await store.createWorkspace(workspaceInput(user.id, door));
+      const holder = await store.createTask(taskInput(user.id, workspace.id));
+      const waiting = await store.createTask(taskInput(user.id, workspace.id));
+      // The queue hands out the older conversation first, and two writes can land in the same
+      // instant here, so which of these is the holder is said rather than assumed.
+      await database.query(`UPDATE tasks SET created_at=NOW() + INTERVAL '1 second' WHERE id=$1`, [
+        waiting.id
+      ]);
+      expect(await store.leaseNextTask('worker-1')).toMatchObject({ id: holder.id });
+
+      const startedAt = Date.now();
+      const woken = store.waitForQueuedTask(4_000);
+      await release(holder.id);
+      await woken;
+      expect(Date.now() - startedAt, door).toBeLessThan(1_000);
+      expect(await store.leaseNextTask('worker-2')).toMatchObject({ id: waiting.id });
+
+      // Left held by nobody, so the next door in this list is the only thing the queue can offer.
+      await store.updateTask({
+        id: waiting.id,
+        workerId: 'worker-2',
+        status: 'completed',
+        clearLease: true
+      });
+    }
+  });
+
+  /**
+   * A wake-up is every worker slot in the install stopping to poll, so the price of announcing one
+   * that freed nothing is paid by every turn that is running at the time.
+   */
+  it('says nothing on a write that let go of no workspace', async () => {
+    const user = await store.createUser({ username: 'quiet', displayName: 'Quiet' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Quiet'));
+    const holder = await store.createTask(taskInput(user.id, workspace.id));
+    expect(await store.leaseNextTask('worker-1')).toMatchObject({ id: holder.id });
+
+    let woke = false;
+    const woken = store.waitForQueuedTask(500).then(() => {
+      woke = true;
+    });
+    // The ordinary mid-turn write: the worker is still in there and still holding the computer.
+    await store.updateTask({ id: holder.id, workerId: 'worker-1', status: 'running' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(woke).toBe(false);
+
+    // And a lease that ran out was already excluding nobody: whatever was behind it became
+    // leasable when it expired, which is what the poll interval is the floor for.
+    await database.query(
+      `UPDATE tasks SET lease_expires_at=NOW() - INTERVAL '1 second' WHERE id=$1`,
+      [holder.id]
+    );
+    await store.updateTask({
+      id: holder.id,
+      workerId: 'worker-1',
+      status: 'paused',
+      clearLease: true
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(woke).toBe(false);
+    await woken;
+  });
+
   it('fails a task that has used every attempt exactly once, and gives back what it held', async () => {
     const user = await store.createUser({ username: 'exhausted', displayName: 'Exhausted' });
     const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
@@ -3820,6 +3911,133 @@ describe('task spend on the owner-facing reads', () => {
     const second = await store.listTaskPage(user.id, { cursor: first.nextCursor! });
     expect(second.tasks.map((task) => task.id)).toEqual([ids[2]]);
     expect(second.hasMore).toBe(false);
+  });
+
+  /**
+   * A fifteen-minute watcher is ninety-six conversations a day, and the list is ordered by
+   * activity, so the schedule the owner set up once used to take the whole first page inside two
+   * days. What fell off the end was the only thing on it they had done themselves.
+   */
+  it('keeps one schedule from taking the list the owner finds their own work in', async () => {
+    const user = await store.createUser({ username: 'watched', displayName: 'Watched' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Watched'));
+    const scheduleId = '018f3dd3-8a2a-7d8b-8d3c-a2f4c8316bf2';
+    const mine = await store.createTask(taskInput(user.id, workspace.id));
+    await database.query(
+      'UPDATE tasks SET created_at=$2::timestamptz, updated_at=$2::timestamptz WHERE id=$1',
+      [mine.id, '2026-08-01T09:00:00+00']
+    );
+    const runs: string[] = [];
+    for (let fired = 0; fired < 12; fired += 1) {
+      const run = await store.createTask(taskInput(user.id, workspace.id));
+      await database.query(
+        `UPDATE tasks SET schedule_id=$2, created_at=$3::timestamptz, updated_at=$3::timestamptz
+         WHERE id=$1`,
+        [run.id, scheduleId, new Date(Date.UTC(2026, 7, 2, fired)).toISOString()]
+      );
+      runs.push(run.id);
+    }
+    const newest = [...runs].reverse();
+
+    const page = await store.listTaskPage(user.id, { limit: 10 });
+    expect(page.tasks.filter((task) => task.scheduleId).map((task) => task.id)).toEqual(
+      newest.slice(0, 5)
+    );
+    // The whole point: the owner's own conversation is still on the page they read.
+    expect(page.tasks.map((task) => task.id)).toContain(mine.id);
+    // And the folded line can say how many runs there are rather than how many it is holding.
+    expect(page.scheduleRunCounts).toEqual({ [scheduleId]: 12 });
+
+    // Nothing is hidden by this, only kept out of the way: the schedule's own list is all of them.
+    const history = await store.listTaskPage(user.id, { scheduleId });
+    expect(history.tasks.map((task) => task.id)).toEqual(newest);
+
+    // A run the owner pinned is theirs now, so it is neither capped away nor counted as the
+    // schedule's - which is exactly what the client does with a pinned run.
+    await store.updateTaskFiling(user.id, runs[0]!, { pinned: true });
+    const pinned = await store.listTaskPage(user.id, { limit: 10 });
+    expect(pinned.tasks.map((task) => task.id)).toContain(runs[0]);
+    expect(pinned.scheduleRunCounts).toEqual({ [scheduleId]: 11 });
+  });
+
+  /**
+   * The ceiling has to rank over the rows the page is drawn from and not over every run there has
+   * ever been, or filing a run away hides the ones behind it.
+   *
+   * An owner who archives the newest few runs of a noisy watcher - the most ordinary thing anyone
+   * does with one - was setting the boundary with rows that were then not on the page to occupy it,
+   * and the schedule disappeared from the list while the count beside it still said hundreds.
+   * Pinning the newest few did the same thing, and the client leaves pinned runs out of the fold,
+   * so the folded line was left with nothing behind it at all.
+   */
+  it('does not hide a schedule behind the runs of it the owner has filed or pinned', async () => {
+    const user = await store.createUser({ username: 'filed', displayName: 'Filed' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Filed'));
+    const scheduleId = '018f3dd3-8a2a-7d8b-8d3c-a2f4c8316bf4';
+    const runs: string[] = [];
+    for (let fired = 0; fired < 20; fired += 1) {
+      const run = await store.createTask(taskInput(user.id, workspace.id));
+      await database.query(
+        `UPDATE tasks SET schedule_id=$2, created_at=$3::timestamptz, updated_at=$3::timestamptz
+         WHERE id=$1`,
+        [run.id, scheduleId, new Date(Date.UTC(2026, 7, 4, fired)).toISOString()]
+      );
+      runs.push(run.id);
+    }
+    const newest = [...runs].reverse();
+
+    for (const id of newest.slice(0, 5))
+      await store.updateTaskFiling(user.id, id, { pinned: true });
+    const withPinned = await store.listTaskPage(user.id, { limit: 50 });
+    expect(
+      withPinned.tasks.filter((task) => task.scheduleId === scheduleId && !task.pinned)
+    ).toHaveLength(5);
+    expect(withPinned.scheduleRunCounts).toEqual({ [scheduleId]: 15 });
+
+    for (const id of newest.slice(0, 5))
+      await store.updateTaskFiling(user.id, id, { pinned: false });
+    for (const id of newest.slice(0, 5))
+      await store.updateTaskFiling(user.id, id, { archived: true });
+    const active = await store.listTaskPage(user.id, { limit: 50, include: 'active' });
+    expect(active.tasks.filter((task) => task.scheduleId === scheduleId)).toHaveLength(5);
+    expect(active.scheduleRunCounts).toEqual({ [scheduleId]: 15 });
+  });
+
+  /**
+   * The ceiling is a fact about each run rather than about the page, which is the only way it can
+   * live alongside a cursor: a page boundary that fell inside a schedule's runs would otherwise
+   * show one twice or step over one.
+   */
+  it('pages a capped list without showing a run twice or stepping over one', async () => {
+    const user = await store.createUser({ username: 'capped', displayName: 'Capped' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Capped'));
+    const scheduleId = '018f3dd3-8a2a-7d8b-8d3c-a2f4c8316bf3';
+    for (let fired = 0; fired < 8; fired += 1) {
+      const run = await store.createTask(taskInput(user.id, workspace.id));
+      await database.query(
+        `UPDATE tasks SET schedule_id=$2, created_at=$3::timestamptz, updated_at=$3::timestamptz
+         WHERE id=$1`,
+        [run.id, scheduleId, new Date(Date.UTC(2026, 7, 3, fired)).toISOString()]
+      );
+      const mine = await store.createTask(taskInput(user.id, workspace.id));
+      await database.query(
+        'UPDATE tasks SET created_at=$2::timestamptz, updated_at=$2::timestamptz WHERE id=$1',
+        [mine.id, new Date(Date.UTC(2026, 7, 3, fired, 30)).toISOString()]
+      );
+    }
+    const whole = await store.listTaskPage(user.id, { limit: 100 });
+    const walked: string[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 10 && (page === 0 || cursor); page += 1) {
+      const next: Awaited<ReturnType<typeof store.listTaskPage>> = await store.listTaskPage(
+        user.id,
+        { limit: 2, ...(cursor ? { cursor } : {}) }
+      );
+      walked.push(...next.tasks.map((task) => task.id));
+      cursor = next.nextCursor;
+    }
+    expect(walked).toEqual(whole.tasks.map((task) => task.id));
+    expect(whole.tasks.filter((task) => task.scheduleId)).toHaveLength(5);
   });
 
   it('finds a conversation by a name the owner gave it, however old the conversation is', async () => {

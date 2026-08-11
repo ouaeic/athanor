@@ -131,6 +131,24 @@ const COMMITTED_TASK_STATUSES = "('queued','planning','running')";
  */
 export const TASK_MAX_ATTEMPTS = 6;
 
+/**
+ * Joins a task to the lease it was holding just before the write clears it, as `held_until`.
+ *
+ * `RETURNING` reports what a write left behind, and every write that lets go of a workspace leaves
+ * the same NULL in those columns whether it freed the workspace or found it already free. Reading
+ * the row alongside itself is how one statement can also report what was there before, which is
+ * what decides whether there is a release worth waking the queue for.
+ *
+ * The row is locked on the way in, so a worker cannot renew the lease between that read and the
+ * update and have the release announced against a workspace it is still inside. Both statements
+ * take the same row in the same order, so there is nothing here to deadlock against.
+ *
+ * Every statement that uses this takes the task id as `$1`.
+ */
+const HELD_LEASE_JOIN =
+  'FROM (SELECT id AS held_id, lease_expires_at AS held_until FROM tasks' +
+  ' WHERE id = $1 FOR UPDATE) held';
+
 const encryptedText = (
   value: unknown
 ): { ciphertext: EncryptedEnvelope | null; legacy: string | null } => {
@@ -375,6 +393,25 @@ export interface TaskEventPage {
 const MAX_TASK_PAGE = 500;
 
 /**
+ * How many runs of any one schedule a page of the conversation list may carry.
+ *
+ * A watcher on a fifteen-minute interval mints ninety-six conversations a day. The list is ordered
+ * by activity and every run is a conversation, so without a ceiling one schedule the owner set up
+ * once takes the whole first page in about two days, and everything they did by hand is off the end
+ * of the list they use to find their own work. The client folds runs of a schedule into a single
+ * line, but it can only fold what it was handed, so the crowding has to be answered here.
+ *
+ * Five, because the line is a control the owner opens rather than a place work is read: it wants
+ * enough behind it to be worth opening, not the whole history. The rest of the runs are not lost -
+ * `scheduleId` pages them, and the true number of them travels with the page so the folded line can
+ * say how many there really are rather than how many it happens to be holding.
+ *
+ * A run the owner pinned is theirs now, not the schedule's, and is never counted or capped: the
+ * client leaves pinned runs out of the fold for the same reason.
+ */
+const SCHEDULE_RUNS_PER_PAGE = 5;
+
+/**
  * The searchable form of a conversation's name, written by every statement that writes the name.
  *
  * Two weights, because the two questions are not the same question: A is what the conversation is
@@ -396,6 +433,12 @@ export interface TaskPage {
   /** Pass back as `cursor` for the next page. Null when this page is the end of the list. */
   nextCursor: string | null;
   hasMore: boolean;
+  /**
+   * For every schedule with a run on this page, how many runs it has in the list being read - not
+   * how many of them the page is carrying, which the ceiling above keeps small on purpose. This is
+   * what lets one folded line report four hundred runs while holding five of them.
+   */
+  scheduleRunCounts?: Record<string, number>;
 }
 
 /** Just enough of a conversation to rank it, name it and open it. Never its agent state. */
@@ -1346,6 +1389,25 @@ export class DataStore {
     this.#signals.emit(channel === TASK_EVENT_CHANNEL ? `${channel}:${payload}` : channel);
     // A failed wake-up is not a failed write: the reader polls anyway, one second later.
     void this.database.notify(channel, payload).catch(() => undefined);
+  }
+
+  /**
+   * Says that this task has just let go of its workspace, so whatever was queued behind it can run.
+   *
+   * One computer is one writer: while a conversation holds an unexpired lease, every other
+   * conversation in that workspace is passed over rather than leased. Arrivals into the queue have
+   * always been announced; letting go was not, so the conversation that had been waiting became
+   * leasable on that write and then sat out the whole worker poll before anyone looked - at exactly
+   * the moment the owner is watching one thing finish and the next begin.
+   *
+   * Two conditions on every caller, and both matter. It signals after its transaction has
+   * committed, so nothing wakes to find the row it was told about unchanged. And it signals only
+   * where the row it wrote was holding the workspace a moment earlier: a lease that had already
+   * run out was excluding nobody, and waking every worker slot on every task update would trade
+   * this delay for a stampede.
+   */
+  #signalWorkspaceRelease(taskId: string): void {
+    this.#signal(TASK_QUEUE_CHANNEL, taskId);
   }
 
   /**
@@ -2781,7 +2843,12 @@ export class DataStore {
         queued_message_count: Number(remaining.rows[0]?.count ?? 0)
       });
     });
-    if (promoted) this.#signal(TASK_EVENT_CHANNEL, input.taskId);
+    if (promoted) {
+      // Both halves of this write are news for the queue: the turn that was holding the workspace
+      // has ended, and the follow-up it was holding it against is now itself queued behind nothing.
+      this.#signal(TASK_QUEUE_CHANNEL, input.taskId);
+      this.#signal(TASK_EVENT_CHANNEL, input.taskId);
+    }
     return promoted;
   }
 
@@ -2791,18 +2858,21 @@ export class DataStore {
     actualComputeCredits: number;
     agentStateCiphertext: EncryptedEnvelope;
   }): Promise<boolean> {
-    return this.database.transaction(async (tx) => {
+    const completed = await this.database.transaction(async (tx) => {
+      // The row is held for the rest of this transaction from here, so what its lease says now is
+      // what the update below is about to clear.
       const locked = await tx.query(
-        `SELECT id FROM tasks WHERE id=$1 AND lease_owner=$2 FOR UPDATE`,
+        `SELECT lease_expires_at > NOW() AS was_held FROM tasks
+         WHERE id=$1 AND lease_owner=$2 FOR UPDATE`,
         [input.id, input.workerId]
       );
-      if (!locked.rows[0]) return false;
+      if (!locked.rows[0]) return null;
       const queued = await tx.query(
         `SELECT id FROM task_message_queue
          WHERE task_id=$1 AND status='queued' ORDER BY created_at,id LIMIT 1`,
         [input.id]
       );
-      if (queued.rows[0]) return false;
+      if (queued.rows[0]) return null;
       const result = await tx.query(
         `UPDATE tasks SET status='completed',actual_compute_credits=$3,
            agent_state_ciphertext=$4::jsonb,lease_owner=NULL,lease_expires_at=NULL,
@@ -2815,8 +2885,11 @@ export class DataStore {
           JSON.stringify(input.agentStateCiphertext)
         ]
       );
-      return result.rowCount === 1;
+      if (result.rowCount !== 1) return null;
+      return { wasHeld: locked.rows[0].was_held === true };
     });
+    if (completed?.wasHeld) this.#signalWorkspaceRelease(input.id);
+    return completed !== null;
   }
 
   /**
@@ -2846,6 +2919,19 @@ export class DataStore {
    * this morning belongs at the top however old it is; pinned conversations sit above all of it.
    * The row comparison is exactly the ORDER BY read backwards, which is what makes the cursor a
    * position in this list rather than a count of rows already seen.
+   *
+   * No schedule may take more than `SCHEDULE_RUNS_PER_PAGE` of it. A conversation the owner started
+   * is one they went looking for; a run is one the box made on its own, and a schedule makes them
+   * faster than a person can. Left uncapped, the list the owner uses to find their own work fills
+   * with work they are not doing, and the only thing that ever falls off the end of it is theirs.
+   *
+   * The ceiling is a fact about each row - is this among the newest few runs of its schedule - and
+   * not about the page, which is what keeps it compatible with the cursor: a position still means
+   * the same thing on the next page, and no run is shown twice or skipped by paging past it.
+   *
+   * Runs beyond it stay reachable rather than hidden: `scheduleId` asks for one schedule and lifts
+   * the ceiling for it, so the whole run history of a watcher is the same paged list, read from a
+   * different door.
    */
   async listTaskPage(
     userId: string,
@@ -2854,11 +2940,14 @@ export class DataStore {
       limit?: number;
       cursor?: string | null;
       include?: TaskListFilter;
+      /** One schedule's runs, all of them. The sidebar's ceiling on runs does not apply. */
+      scheduleId?: string;
     } = {}
   ): Promise<TaskPage> {
     const limit = Math.max(1, Math.min(Math.trunc(options.limit ?? 200), MAX_TASK_PAGE));
     const position = options.cursor ? decodeTaskCursor(options.cursor) : null;
     const include = options.include ?? 'active';
+    const scheduleId = options.scheduleId ?? null;
     const result = await this.database.query(
       // The ordering key is selected as the database's own text as well as being ordered on, so the
       // cursor for the last row of this page is the exact value the next page compares against.
@@ -2874,6 +2963,27 @@ export class DataStore {
          AND ($3::text = 'all'
               OR ($3::text = 'active' AND t.archived_at IS NULL)
               OR ($3::text = 'archived' AND t.archived_at IS NOT NULL))
+         AND ($8::uuid IS NULL OR t.schedule_id=$8)
+         -- The ceiling, asked of the row rather than of the page: is this run one of the newest few
+         -- its schedule has made. The subquery walks the schedule index in the order it is already
+         -- stored in and stops as soon as it has counted that far, so it costs the same on a
+         -- watcher that has fired four hundred times as on one that has fired twice; COALESCE is
+         -- what admits every run of a schedule that has not fired that many times yet.
+         --
+         -- It ranks over exactly the rows this page is drawn from, which it has to: ranked over all
+         -- of them, five runs the owner had archived or pinned would set the boundary and then not
+         -- be on the page to occupy it, and a schedule whose newest five had been filed away
+         -- vanished from the list entirely while the count beside it still said three hundred.
+         AND ($9::int IS NULL OR t.schedule_id IS NULL OR t.pinned
+              OR t.created_at >= COALESCE((
+                   SELECT run.created_at FROM tasks run
+                   WHERE run.schedule_id = t.schedule_id AND NOT run.pinned
+                     AND ($3::text = 'all'
+                          OR ($3::text = 'active' AND run.archived_at IS NULL)
+                          OR ($3::text = 'archived' AND run.archived_at IS NOT NULL))
+                   ORDER BY run.created_at DESC
+                   OFFSET $9 - 1 LIMIT 1
+                 ), t.created_at))
          AND ($4::boolean IS NULL OR
               (t.pinned, GREATEST(t.updated_at, t.created_at), t.id)
                 < ($4::boolean, $5::timestamptz, $6::uuid))
@@ -2886,18 +2996,56 @@ export class DataStore {
         position?.pinned ?? null,
         position?.activityAt ?? null,
         position?.id ?? null,
-        limit + 1
+        limit + 1,
+        scheduleId,
+        // Asking for one schedule is asking for its runs, so the thing that keeps runs out of the
+        // owner's list is exactly what that caller wants lifted.
+        scheduleId ? null : SCHEDULE_RUNS_PER_PAGE
       ]
     );
     // One row past the page is what proves there is more without a second count query.
     const hasMore = result.rows.length > limit;
     const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
     const last = rows.at(-1);
+    const tasks = rows.map(mapTask);
     return {
-      tasks: rows.map(mapTask),
+      tasks,
       hasMore,
-      nextCursor: hasMore && last ? encodeTaskCursor(last) : null
+      nextCursor: hasMore && last ? encodeTaskCursor(last) : null,
+      scheduleRunCounts: await this.#scheduleRunCounts(userId, tasks, include)
     };
+  }
+
+  /**
+   * How many runs each schedule on a page has, for the schedules that page carries.
+   *
+   * Counted rather than inferred, because the page is capped and the number the owner is shown
+   * beside a folded schedule should be the number of runs there are, not the number that fitted.
+   * Only the schedules already on the page are counted, so a box with no scheduled work never pays
+   * for this at all, and the count is taken over the same filter the page was read with - a folded
+   * line in the active list should not be counting the runs the owner filed away.
+   */
+  async #scheduleRunCounts(
+    userId: string,
+    tasks: readonly TaskRecord[],
+    include: TaskListFilter
+  ): Promise<Record<string, number>> {
+    const scheduleIds = [
+      ...new Set(tasks.map((task) => task.scheduleId).filter((id): id is string => id !== null))
+    ];
+    if (!scheduleIds.length) return {};
+    const counted = await this.database.query(
+      `SELECT t.schedule_id, COUNT(*)::int AS runs FROM tasks t
+       WHERE t.user_id=$1 AND t.schedule_id = ANY($2::uuid[]) AND NOT t.pinned
+         AND ($3::text = 'all'
+              OR ($3::text = 'active' AND t.archived_at IS NULL)
+              OR ($3::text = 'archived' AND t.archived_at IS NOT NULL))
+       GROUP BY t.schedule_id`,
+      [userId, scheduleIds, include]
+    );
+    return Object.fromEntries(
+      counted.rows.map((row) => [String(row.schedule_id), Number(row.runs)])
+    );
   }
 
   /**
@@ -3011,21 +3159,27 @@ export class DataStore {
    * deleted, so removing an experiment never silently takes the branches taken from it.
    */
   async deleteTask(userId: string, id: string): Promise<boolean> {
-    return this.database.transaction(async (tx) => {
+    const deleted = await this.database.transaction(async (tx) => {
       const owned = await tx.query(
-        `SELECT t.id FROM tasks t JOIN workspaces w ON w.id=t.workspace_id
+        `SELECT t.lease_expires_at > NOW() AS was_held FROM tasks t
+         JOIN workspaces w ON w.id=t.workspace_id
          WHERE t.id=$1 AND w.user_id=$2 FOR UPDATE OF t`,
         [id, userId]
       );
-      if (!owned.rows[0]) return false;
+      if (!owned.rows[0]) return null;
       await tx.query('UPDATE tasks SET parent_task_id=NULL WHERE parent_task_id=$1', [id]);
       await tx.query('DELETE FROM task_events WHERE task_id=$1', [id]);
       await tx.query('DELETE FROM task_message_queue WHERE task_id=$1', [id]);
       await tx.query('DELETE FROM task_plans WHERE task_id=$1', [id]);
       await tx.query('DELETE FROM approvals WHERE task_id=$1', [id]);
       await tx.query('DELETE FROM tasks WHERE id=$1', [id]);
-      return true;
+      return { wasHeld: owned.rows[0].was_held === true };
     });
+    if (!deleted) return false;
+    // Deleting the conversation a worker is inside is still a release: the row that was excluding
+    // everything else in that workspace is simply gone rather than parked.
+    if (deleted.wasHeld) this.#signalWorkspaceRelease(id);
+    return true;
   }
 
   async createTaskPlan(input: {
@@ -4664,35 +4818,45 @@ export class DataStore {
     const result = await this.database.query(
       `UPDATE tasks SET status = $3, lease_owner = NULL, lease_expires_at = NULL, updated_at = NOW(),
        -- Resuming answers the spend pause, so the task stops being one the owner has not heard about.
-       spend_paused_at = CASE WHEN $3 = 'queued' THEN NULL ELSE spend_paused_at END,
+       spend_paused_at = CASE WHEN $3 = 'queued' THEN NULL ELSE tasks.spend_paused_at END,
        -- And resuming is a new start, so it does not inherit the count of leases that died before
        -- the owner intervened. Only the 'queued' branch: a task parked in any other status has not
        -- re-entered the queue, and the scheduled-run recovery sweep in the API reads a zero here
        -- as a run that was never dispatched at all.
-       attempt = CASE WHEN $3 = 'queued' THEN 0 ELSE attempt END,
-       completed_at = CASE WHEN $3 IN ('completed','failed','cancelled') THEN NOW() ELSE completed_at END
-       WHERE id=$1 AND EXISTS (
+       attempt = CASE WHEN $3 = 'queued' THEN 0 ELSE tasks.attempt END,
+       completed_at = CASE WHEN $3 IN ('completed','failed','cancelled') THEN NOW() ELSE tasks.completed_at END
+       ${HELD_LEASE_JOIN}
+       WHERE tasks.id=held.held_id AND EXISTS (
          SELECT 1 FROM workspaces w
          WHERE w.id=tasks.workspace_id AND w.user_id=$2
-       )`,
+       )
+       RETURNING held.held_until > NOW() AS was_held`,
       [id, userId, status]
     );
-    if (result.rowCount === 1 && status === 'queued') this.#signal(TASK_QUEUE_CHANNEL, id);
-    return result.rowCount === 1;
+    const row = result.rows[0];
+    if (!row) return false;
+    // Queued is an arrival and is announced as one; anything else the owner sets from the screen -
+    // pausing a turn that is running, stopping it - is only ever a release.
+    if (status === 'queued') this.#signal(TASK_QUEUE_CHANNEL, id);
+    else if (row.was_held === true) this.#signalWorkspaceRelease(id);
+    return true;
   }
 
   async cancelTaskAndReleaseReservations(userId: string, id: string): Promise<boolean> {
-    return this.database.transaction(async (tx) => {
+    const cancelled = await this.database.transaction(async (tx) => {
       const changed = await tx.query(
         `UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_expires_at=NULL,
            completed_at=NOW(),updated_at=NOW()
-         WHERE id=$1 AND status NOT IN ('completed','failed','cancelled') AND EXISTS (
-           SELECT 1 FROM workspaces w
-           WHERE w.id=tasks.workspace_id AND w.user_id=$2
-         )`,
+         ${HELD_LEASE_JOIN}
+         WHERE tasks.id=held.held_id AND tasks.status NOT IN ('completed','failed','cancelled')
+           AND EXISTS (
+             SELECT 1 FROM workspaces w
+             WHERE w.id=tasks.workspace_id AND w.user_id=$2
+           )
+         RETURNING held.held_until > NOW() AS was_held`,
         [id, userId]
       );
-      if (changed.rowCount !== 1) return false;
+      if (changed.rowCount !== 1) return null;
       await tx.query(
         `UPDATE task_message_queue SET status='cancelled'
          WHERE task_id=$1 AND status='queued'`,
@@ -4708,8 +4872,13 @@ export class DataStore {
          WHERE task_id=$1 AND state='reserved'`,
         [id]
       );
-      return true;
+      return { wasHeld: changed.rows[0]?.was_held === true };
     });
+    if (!cancelled) return false;
+    // Stopping a turn is the fastest a workspace ever comes free, and the owner is by definition
+    // watching: they pressed the button.
+    if (cancelled.wasHeld) this.#signalWorkspaceRelease(id);
+    return true;
   }
 
   async updateTaskSecurityMode(
@@ -4814,6 +4983,12 @@ export class DataStore {
    *
    * Exactly once by construction: the same statement that selects the rows moves them out of the
    * statuses it selects on, so a second sweep, or a second API process, matches nothing.
+   *
+   * The one release path that deliberately does not wake the queue, for the same reason it is safe
+   * to run beside working workers: it can only reach a task whose lease has already run out, and a
+   * lease that has run out was excluding nothing. Whatever was waiting behind these tasks became
+   * leasable when the lease expired, not now, and the poll interval has always been the floor for
+   * that. Waking here would be announcing a release that happened minutes ago.
    */
   async failTasksAtAttemptLimit(
     limit = 20
@@ -4904,19 +5079,26 @@ export class DataStore {
       input.spendPausedAt === undefined ? null : input.spendPausedAt,
       input.spendPausedAt !== undefined
     ];
-    await this.database.query(
+    const result = await this.database.query(
       `UPDATE tasks SET
          status = $2,
-         agent_state_ciphertext = COALESCE($3::jsonb, agent_state_ciphertext),
-         actual_compute_credits = COALESCE($4, actual_compute_credits),
-         lease_owner = CASE WHEN $5 THEN NULL ELSE lease_owner END,
-         lease_expires_at = CASE WHEN $5 THEN NULL ELSE lease_expires_at END,
-         spend_paused_at = CASE WHEN $8 THEN $7::timestamptz ELSE spend_paused_at END,
-         completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN NOW() ELSE completed_at END,
+         agent_state_ciphertext = COALESCE($3::jsonb, tasks.agent_state_ciphertext),
+         actual_compute_credits = COALESCE($4, tasks.actual_compute_credits),
+         lease_owner = CASE WHEN $5 THEN NULL ELSE tasks.lease_owner END,
+         lease_expires_at = CASE WHEN $5 THEN NULL ELSE tasks.lease_expires_at END,
+         spend_paused_at = CASE WHEN $8 THEN $7::timestamptz ELSE tasks.spend_paused_at END,
+         completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN NOW() ELSE tasks.completed_at END,
          updated_at = NOW()
-       WHERE id = $1 AND ($6::text IS NULL OR lease_owner = $6)`,
+       ${HELD_LEASE_JOIN}
+       WHERE tasks.id = held.held_id AND ($6::text IS NULL OR tasks.lease_owner = $6)
+       RETURNING held.held_until > NOW() AS was_held`,
       params
     );
+    // The end of a turn is the ordinary way a workspace comes free, and it is the one the owner is
+    // most often watching: they have just read the last line of one answer and the next question is
+    // already queued behind it.
+    if (input.clearLease && result.rows[0]?.was_held === true)
+      this.#signalWorkspaceRelease(input.id);
   }
 
   /**

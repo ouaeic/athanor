@@ -21,6 +21,11 @@ athanor_runtime_prefix="${ATHANOR_RUNTIME_PREFIX:-}"
 service_units="athanor-runner.service athanor@api.service athanor@worker.service athanor@registry.service athanor@notifications.service athanor-network-watch.service"
 auto_update_timer="athanor-auto-update.timer"
 backup_timer="athanor-backup.timer"
+# What the last backup run did, beside the certificate and dynamic DNS files the same way: the
+# interface has no other way to know whether the thing it promises daily has ever happened.
+athanor_backup_status="$athanor_state/backup.status"
+# How long the unattended backup waits for the worker to go idle before standing down for the day.
+athanor_backup_idle_wait_seconds="${ATHANOR_BACKUP_IDLE_WAIT_SECONDS:-300}"
 last_backup_destination=""
 
 runtime_path() {
@@ -569,17 +574,37 @@ doctor() {
   # is that it keeps running while nobody is watching. A copy that does not exist is the one fault
   # here that cannot be repaired after the fact.
   backup_age=$(latest_backup_age)
+  # What the last run did, which is a different question from how old the newest copy is. "No
+  # backup yet; the daily window will take the first one" was the friendliest thing this check
+  # could say and, on a box whose every window had stood down for a busy worker, the least true.
+  backup_outcome=$(backup_status_field outcome)
+  backup_reason=$(backup_status_field reason)
   case "$backup_age" in
     '')
-      if systemctl is-enabled --quiet "$backup_timer" 2>/dev/null; then
-        check_note "no backup yet; the daily window will take the first one"
+      case "$backup_outcome" in
+        skipped|failed)
+          check_fail "no backup exists; the last run $backup_outcome - $backup_reason. Run sudo athanor backup to take one now"
+          ;;
+        *)
+          if systemctl is-enabled --quiet "$backup_timer" 2>/dev/null; then
+            check_note "no backup yet; the daily window will take the first one"
+          else
+            check_warn "no backup exists: sudo athanor backup auto on takes one daily"
+          fi
+          ;;
+      esac
+      ;;
+    0|1|2)
+      if [ "$backup_outcome" = failed ]; then
+        check_warn "newest backup ${backup_age} days old, but the last run failed - $backup_reason"
       else
-        check_warn "no backup exists: sudo athanor backup auto on takes one daily"
+        check_ok "newest backup ${backup_age} days old"
       fi
       ;;
-    0|1|2) check_ok "newest backup ${backup_age} days old" ;;
     *)
-      if systemctl is-enabled --quiet "$backup_timer" 2>/dev/null; then
+      if [ "$backup_outcome" = failed ] || [ "$backup_outcome" = skipped ]; then
+        check_warn "newest backup is $backup_age days old; the last run $backup_outcome - $backup_reason"
+      elif systemctl is-enabled --quiet "$backup_timer" 2>/dev/null; then
         check_warn "newest backup is $backup_age days old; check athanor logs for why the daily run stopped"
       else
         check_warn "newest backup is $backup_age days old: sudo athanor backup auto on keeps it daily"
@@ -879,7 +904,17 @@ backup_athanor() {
   trap - EXIT INT TERM
   # Only after the new backup is complete and checksummed, so a failed run never costs the
   # operator the copy they still had.
-  [ -n "${1:-}" ] || prune_backups
+  #
+  # The record is written here rather than in the timer's own path, so every route to a verified
+  # copy answers the same question the same way: the daily run, the operator's own command, and the
+  # copy an update takes before it touches anything. "When did this box last copy itself" has one
+  # answer, not one per caller. Under the same condition as the prune, and for the same reason -
+  # a destination the operator named is theirs to keep track of, and reporting it here would let a
+  # copy onto a USB stick paper over a daily run that has been failing for a fortnight.
+  [ -n "${1:-}" ] || {
+    prune_backups
+    record_backup_status ok ''
+  }
   printf 'Checksum-verified backup created at %s\n' "$destination"
   printf 'Dependency trees and package caches were skipped; the agent reinstalls those.\n'
   printf 'It contains server keys and must be stored as securely as the server.\n'
@@ -1071,6 +1106,16 @@ install_runtime_files() {
   # Started only by OnFailure= on the renewal unit, so it is installed but never enabled.
   install -D -m 0644 infra/native/athanor-certificate-alert.service \
     "$(runtime_path /etc/systemd/system/athanor-certificate-alert.service)"
+  # The backup units were installed by the installer and never by an update, which meant a change
+  # to them only ever reached a box somebody reinstalled. The enablement symlink is the installer's
+  # and survives being overwritten, so a server whose owner turned automatic backups off keeps them
+  # off. Its alert companion is installed and never enabled: OnFailure= starts it.
+  install -D -m 0644 infra/native/athanor-backup.service \
+    "$(runtime_path /etc/systemd/system/athanor-backup.service)"
+  install -D -m 0644 infra/native/athanor-backup.timer \
+    "$(runtime_path /etc/systemd/system/athanor-backup.timer)"
+  install -D -m 0644 infra/native/athanor-backup-alert.service \
+    "$(runtime_path /etc/systemd/system/athanor-backup-alert.service)"
   # An owner locked out by an expired certificate reaches for ssh; this is what greets them there.
   install -D -m 0755 infra/native/athanor-motd \
     "$(runtime_path /etc/update-motd.d/99-athanor)"
@@ -1313,14 +1358,18 @@ wait_for_idle_worker() {
 # Waits a short while for the worker to go idle. The unattended backup is not worth an outage in
 # the middle of somebody's work, and unlike the update it has no reason to insist: another window
 # comes round tomorrow, and a backup a day late is a backup.
+#
+# What happens at the end of the five minutes is the whole point - it is the path that quietly made
+# the interface's daily promise false - so the length is overridable. A policy that can only be
+# exercised by waiting five real minutes is one nobody ever exercises.
 wait_briefly_for_idle_worker() {
   waited_seconds=0
-  while [ "$waited_seconds" -lt 300 ]; do
+  while :; do
     worker_is_idle && return 0
+    [ "$waited_seconds" -lt "$athanor_backup_idle_wait_seconds" ] || return 1
     sleep 30
     waited_seconds=$((waited_seconds + 30))
   done
-  return 1
 }
 
 # The unattended daily backup.
@@ -1339,10 +1388,39 @@ auto_backup_run() {
   systemctl is-enabled --quiet "$backup_timer" 2>/dev/null ||
     fail "automatic backups are off; run sudo athanor backup auto on"
   if ! wait_briefly_for_idle_worker; then
+    # Written down, not merely printed. This is the path that made the promise false while nothing
+    # went wrong anywhere: the unit exits zero, the timer schedules tomorrow, and a box that is
+    # working every time the window comes round stands down every day in silence. Standing down
+    # once is the design; standing down for a month is the owner's to know about.
+    record_backup_status skipped 'a task was still running when the window came round'
     printf 'athanor: a task is running; the next window will take the backup.\n'
     return 0
   fi
-  backup_athanor
+  # Pessimistic first and corrected on the way out, because a run killed by its own start timeout
+  # never reaches another line of this function. Without it the newest thing on record after a
+  # ninety-minute kill would be yesterday's success.
+  record_backup_status running ''
+  # In a subshell so `fail` inside the backup ends the backup rather than this script, which is how
+  # `update_athanor` already calls `restore_athanor`. Its output is held back so the reason can be
+  # taken from it, then put out again so the journal has the whole of it either way.
+  if backup_output=$( (backup_athanor) 2>&1 ); then
+    printf '%s\n' "$backup_output"
+    return 0
+  fi
+  printf '%s\n' "$backup_output" >&2
+  record_backup_status failed "$(backup_failure_reason "$backup_output")"
+  # Non-zero, so systemd marks the unit failed and the journal keeps the run at error level.
+  return 1
+}
+
+# Started by OnFailure= on the backup unit. Covers the one ending `auto_backup_run` cannot write
+# down itself: a run stopped by its own start timeout, or by the power going off, which gets no
+# further line to run.
+auto_backup_alert() {
+  [ "$(backup_status_field outcome)" = running ] || return 0
+  record_backup_status failed 'the run was stopped before it finished'
+  printf 'athanor: the daily backup did not finish. The last complete copy in %s is untouched.\n' \
+    "$athanor_backup_root" >&2
 }
 
 auto_backup() {
@@ -1369,22 +1447,107 @@ auto_backup() {
         '') printf 'Newest backup: none\n' ;;
         *) printf 'Newest backup: %s days old\n' "$newest_backup" ;;
       esac
+      report_backup_status
       ;;
     run) auto_backup_run ;;
+    alert) auto_backup_alert ;;
     *) fail 'usage: sudo athanor backup auto {on|off|status}' ;;
   esac
 }
 
-# How old the newest checksum-verified backup is, in whole days, or nothing when there is none.
-# A directory without SHA256SUMS is wreckage from a failed run and does not count as a copy.
-latest_backup_age() {
+# The newest checksum-verified backup this script manages, or nothing when there is none.
+#
+# Same two rules as `prune_backups`, for the same reasons: a directory without a SHA256SUMS is
+# wreckage from a run that died partway and is not a copy of anything, and a destination the
+# operator named themselves is theirs rather than ours. Ordered by name because the name is a UTC
+# timestamp, so it sorts chronologically without asking the filesystem anything.
+latest_backup_path() {
   [ -d "$athanor_backup_root" ] || return 0
-  newest=$(
-    find "$athanor_backup_root" -mindepth 2 -maxdepth 2 -name SHA256SUMS -type f \
-      -exec stat -c '%Y' {} + 2>/dev/null | sort -rn | sed -n '1p'
-  )
+  find "$athanor_backup_root" -mindepth 1 -maxdepth 1 -type d \
+    -name '????????T??????Z' 2>/dev/null |
+    while IFS= read -r candidate; do
+      [ -f "$candidate/SHA256SUMS" ] && printf '%s\n' "$candidate"
+    done |
+    sort -r |
+    sed -n '1p'
+}
+
+# When a backup directory was taken, read off its own name rather than off its mtime: the name is
+# the second the run started, which is what the copy is a copy of.
+backup_taken_at() {
+  basename -- "$1" |
+    sed -n 's/^\(....\)\(..\)\(..\)T\(..\)\(..\)\(..\)Z$/\1-\2-\3T\4:\5:\6Z/p'
+}
+
+# How old the newest checksum-verified backup is, in whole days, or nothing when there is none.
+latest_backup_age() {
+  newest=$(latest_backup_path)
   [ -n "$newest" ] || return 0
-  printf '%s' "$((($(date +%s) - newest) / 86400))"
+  newest_epoch=$(stat -c '%Y' "$newest/SHA256SUMS" 2>/dev/null) || return 0
+  [ -n "$newest_epoch" ] || return 0
+  printf '%s' "$((($(date +%s) - newest_epoch) / 86400))"
+}
+
+# What the box actually did about backups, written where the interface can read it.
+#
+# Settings asserted that a backup is taken daily, and an assertion was all it was. Two paths made
+# it false without anything on the box saying so: a run that stood down because the worker was
+# still busy exited zero and spoke only to the journal, and a run that failed left nothing behind
+# at all - `prune_backups` removes a directory with no checksum manifest, because such a directory
+# cannot restore anything. An owner could read that sentence every day for a year on a box that had
+# never once copied itself.
+#
+# `at` and `outcome` are about the last run; `copy_at` and `copy_bytes` are about the newest copy
+# that actually exists, which is the question underneath. They are separate because the interesting
+# case is exactly the one where they disagree.
+record_backup_status() {
+  install -d -m 0755 "$athanor_state" 2>/dev/null || true
+  status_copy=$(latest_backup_path)
+  {
+    printf 'at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'outcome=%s\n' "$1"
+    printf 'reason=%s\n' "${2:-}"
+    if [ -n "$status_copy" ]; then
+      printf 'copy_at=%s\n' "$(backup_taken_at "$status_copy")"
+      printf 'copy_bytes=%s\n' \
+        "$(du -sk "$status_copy" 2>/dev/null | awk '{printf "%.0f", $1 * 1024}')"
+    fi
+  } >"$athanor_backup_status" 2>/dev/null || return 0
+  # World-readable on purpose, like the certificate and dynamic DNS files beside it: the API reads
+  # it as an unprivileged service so the settings screen can show it. Nothing secret goes in - see
+  # backup_failure_reason for the rule that keeps it that way.
+  chmod 0644 "$athanor_backup_status" 2>/dev/null || true
+}
+
+backup_status_field() {
+  sed -n "s/^$1=//p" "$athanor_backup_status" 2>/dev/null | sed -n '1p'
+}
+
+# Why a run failed, in this program's own words and nobody else's.
+#
+# Everything a failing run printed is in the journal for whoever is at a shell. What lands in a
+# world-readable file, and from there in a browser, is restricted to lines this script wrote:
+# `tar` and `pg_dump` name the file they choked on, and a path inside somebody's workspace has no
+# business sitting outside the encrypted store.
+backup_failure_reason() {
+  own_words=$(printf '%s\n' "$1" | sed -n 's/^athanor: //p' | awk 'NF { last = $0 } END { print last }')
+  if [ -n "$own_words" ]; then
+    printf '%s' "$own_words"
+  else
+    printf 'the run did not finish; journalctl -u athanor-backup.service has the detail'
+  fi
+}
+
+# The last run, in the words the interface uses for it.
+report_backup_status() {
+  last_outcome=$(backup_status_field outcome)
+  case "$last_outcome" in
+    '') printf 'Last run: nothing recorded yet\n' ;;
+    ok) printf 'Last run: %s, complete\n' "$(backup_status_field at)" ;;
+    running) printf 'Last run: started %s and has not reported back\n' "$(backup_status_field at)" ;;
+    skipped) printf 'Last run: %s, stood down - %s\n' "$(backup_status_field at)" "$(backup_status_field reason)" ;;
+    *) printf 'Last run: %s, failed - %s\n' "$(backup_status_field at)" "$(backup_status_field reason)" ;;
+  esac
 }
 
 auto_update_run() {

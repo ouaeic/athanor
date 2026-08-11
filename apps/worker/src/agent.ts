@@ -29,6 +29,7 @@ import {
   recallMemories,
   untrustedFromOutside,
   AthanorError,
+  redactText,
   sha256,
   unwrapDataKey,
   type AnyConnectorKind,
@@ -36,7 +37,7 @@ import {
   type MemoryDocument,
   type MemoryKind
 } from '@athanor/core';
-import { agentNotificationAad } from '@athanor/data';
+import { agentNotificationAad, TASK_MAX_ATTEMPTS } from '@athanor/data';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import {
   MediaClient,
@@ -2850,6 +2851,135 @@ const event = async (
     ...(options?.replacesEarlierFrames ? { replacesEarlierFrames: true } : {})
   });
 
+/**
+ * systemd reads a leading `<N>` off a line and files it at that priority, which is the difference
+ * between a failed task appearing in `journalctl -p err` and sitting at info among everything else
+ * the box says. JOURNAL_STREAM is set by systemd itself, and only when this process's output goes
+ * to the journal, so a worker started in a terminal prints the plain sentence instead.
+ */
+export const journalLevelPrefix = (level: 'error' | 'warning' | 'info'): string =>
+  process.env.JOURNAL_STREAM ? { error: '<3>', warning: '<4>', info: '<6>' }[level] : '';
+
+/** How many stacks are remembered before the set is emptied and one of them may repeat. */
+const REMEMBERED_FAILURE_STACKS = 64;
+
+/**
+ * The shape of everything this line is allowed to name: a code, an errno, a class. Anything that
+ * does not fit was not chosen by the machine, and this line prints only what the machine chose.
+ */
+const MACHINE_WORD = /^[A-Za-z0-9_.-]{1,64}$/;
+
+/**
+ * The identity of a failure without its wording: a driver's SQLSTATE or a system errno where the
+ * thrown value carries one, otherwise the class that was thrown. Null for an AthanorError, whose
+ * code already says what it is.
+ */
+const failureClass = (error: unknown): string | null => {
+  if (error instanceof AthanorError) return null;
+  const carried = (error as { code?: unknown } | null)?.code;
+  if (typeof carried === 'string' && MACHINE_WORD.test(carried)) return carried;
+  // `name` is a class name in every error anyone writes, but it is an ordinary writable property
+  // and a library is free to put a sentence in it, so it is held to the same shape as the rest.
+  if (error instanceof Error) return MACHINE_WORD.test(error.name) ? error.name : 'Error';
+  return error === null || error === undefined ? String(error) : typeof error;
+};
+
+/**
+ * The code, if it is one.
+ *
+ * An AthanorError's code is athanor's own vocabulary everywhere it is written by hand - but not
+ * everywhere it is constructed. `runnerFailure` in runner-client.ts mints one from the `code` field
+ * of whatever JSON the workspace runner answered with, and that is a value off a wire rather than
+ * out of this repository: unbounded, free to carry a newline that would split this record in two,
+ * and free to carry whatever the failing call was about. Held to the same shape as everything else
+ * on the line, and where it does not fit the line still says a task failed and how far it got.
+ */
+const failureCode = (error: unknown): string => {
+  if (!(error instanceof AthanorError)) return 'agent_failed';
+  return MACHINE_WORD.test(error.code) ? error.code : 'agent_failed';
+};
+
+const failureStack = (error: unknown): string => {
+  if (!(error instanceof Error) || !error.stack) return '';
+  /*
+   * The frames, taken by cutting the whole message off the front rather than by recognising what a
+   * frame looks like.
+   *
+   * A stack begins with the message, the message can be several lines long, and one of those lines
+   * can be shaped exactly like a frame - which is not a contrivance: an error that wraps a failed
+   * subprocess carries that program's own trace in its message, and that trace names the owner's
+   * files. Recognising frames by shape printed those, so this recognises the header instead, which
+   * is the one part of a stack whose exact text is known here. A stack that does not begin with the
+   * header it should - anything that rewrote it - gets no frames at all, because silence is the
+   * only safe answer to a string this cannot account for.
+   */
+  const header = error.message === '' ? error.name : `${error.name}: ${error.message}`;
+  if (!error.stack.startsWith(header)) return '';
+  return redactText(
+    error.stack
+      .slice(header.length)
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => /^at\s\S.*:\d+:\d+\)?$/.test(line))
+      .slice(0, 3)
+      .join(' | ')
+  );
+};
+
+export interface TaskFailureLog {
+  taskId: string;
+  attempt: number;
+  turn: number;
+  step: number;
+  modelId: string;
+  /** Omitted when the caller did not see this attempt start; a guess would be worse than silence. */
+  durationMs?: number;
+  error: unknown;
+  /** The turn is parked on something outside this box rather than broken. */
+  waiting: boolean;
+}
+
+/**
+ * A journal line an operator can act on, for a turn that has just died.
+ *
+ * The encrypted `error` event is the owner's record and stays exactly as it is - it can quote a
+ * path, a command, a fragment of the work - which means reading it needs the master key and a
+ * script. This is the other record, describing the same failure in nothing but facts the machine
+ * chose for itself: which task, how far it got, how long it ran, which model, and the code. Never
+ * the message, because the message is where the owner's content ends up - a driver quotes the
+ * offending value back, a filesystem error names the file, a provider echoes the prompt.
+ *
+ * The stack is the exception, and it is the same exception the API's logger already makes: frames
+ * name code locations and never the data that flowed through them. They are printed only where the
+ * failure came from the machine rather than from athanor's own judgement - an AthanorError says
+ * what it is in one word and needs no frames - and only the first time this process prints that
+ * particular stack, so a task handed out six times leaves six one-line records and one trace.
+ */
+export const taskFailureLogLine = (
+  input: TaskFailureLog,
+  loggedStacks: Set<string> = new Set()
+): string => {
+  const code = failureCode(input.error);
+  const kind = failureClass(input.error);
+  const stack = kind ? failureStack(input.error) : '';
+  const fingerprint = `${code}|${kind ?? ''}|${stack}`;
+  const repeated = stack !== '' && loggedStacks.has(fingerprint);
+  if (stack && !repeated) {
+    // Bounded by emptying rather than by evicting the oldest: forgetting costs one repeated trace,
+    // which is not worth the code an eviction order would take to avoid.
+    if (loggedStacks.size >= REMEMBERED_FAILURE_STACKS) loggedStacks.clear();
+    loggedStacks.add(fingerprint);
+  }
+  const detail = kind
+    ? ` (${kind}${repeated ? ', stack already logged above' : ''})${repeated || !stack ? '' : ` ${stack}`}`
+    : '';
+  const ran =
+    input.durationMs === undefined ? '' : ` after ${(input.durationMs / 1000).toFixed(1)}s`;
+  return `${journalLevelPrefix(input.waiting ? 'warning' : 'error')}[athanor] task ${input.taskId} ${
+    input.waiting ? 'is waiting on a provider' : 'failed'
+  } at turn ${input.turn} step ${input.step}${ran} (attempt ${input.attempt} of ${TASK_MAX_ATTEMPTS}, model ${input.modelId}): ${code}${detail}\n`;
+};
+
 export class AgentWorker {
   readonly #masterKey: Buffer;
   readonly #runner: AgentRunnerClient;
@@ -2868,6 +2998,12 @@ export class AgentWorker {
    * only case where the answer can have changed.
    */
   readonly #presentBinaries = new Map<string, Set<string>>();
+  /**
+   * Stacks this process has already written to the journal. Held per worker rather than per task
+   * because the failure that repeats is rarely one task's: a provider that is refusing everything
+   * fails every task in the queue with the same trace, and a restart is what clears the memory.
+   */
+  readonly #loggedFailureStacks = new Set<string>();
 
   constructor(
     private readonly store: DataStore,
@@ -9726,9 +9862,47 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
     }
   }
 
-  async fail(task: TaskRecord, error: unknown): Promise<void> {
+  async fail(task: TaskRecord, error: unknown, durationMs?: number): Promise<void> {
     const workspace = await this.store.getWorkspaceById(task.workspaceId).catch(() => null);
     const message = error instanceof Error ? error.message : 'Task failed';
+    const waiting =
+      error instanceof AthanorError &&
+      ['provider_quota_exhausted', 'provider_not_connected', 'provider_unavailable'].includes(
+        error.code
+      );
+    let turn = 0;
+    let step = 0;
+    if (workspace?.wrappedKey && task.agentStateCiphertext) {
+      try {
+        const key = unwrapDataKey(workspace.wrappedKey, this.#masterKey, workspace.id);
+        const saved = decryptJson<Pick<AgentState, 'turn' | 'step'>>(
+          task.agentStateCiphertext,
+          key
+        );
+        turn = saved.turn ?? 0;
+        step = saved.step ?? 0;
+      } catch {
+        turn = 0;
+        step = 0;
+      }
+    }
+    // Before the writes below, all of which need the database - which is one of the things that
+    // fails here. The journal line is the record that survives the store being the problem.
+    process.stderr.write(
+      taskFailureLogLine(
+        {
+          taskId: task.id,
+          attempt: task.attempt,
+          turn,
+          step,
+          modelId: task.modelId,
+          ...(durationMs === undefined ? {} : { durationMs }),
+          error,
+          waiting
+        },
+        this.#loggedFailureStacks
+      )
+    );
     if (workspace?.wrappedKey) {
       const key = unwrapDataKey(workspace.wrappedKey, this.#masterKey, workspace.id);
       await event(
@@ -9741,20 +9915,6 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         // the work is not there has to be in the conversation.
         { owner: true, code: error instanceof AthanorError ? error.code : 'agent_failed' }
       );
-    }
-    const waiting =
-      error instanceof AthanorError &&
-      ['provider_quota_exhausted', 'provider_not_connected', 'provider_unavailable'].includes(
-        error.code
-      );
-    let turn = 0;
-    if (workspace?.wrappedKey && task.agentStateCiphertext) {
-      try {
-        const key = unwrapDataKey(workspace.wrappedKey, this.#masterKey, workspace.id);
-        turn = decryptJson<Pick<AgentState, 'turn'>>(task.agentStateCiphertext, key).turn ?? 0;
-      } catch {
-        turn = 0;
-      }
     }
     if (!waiting)
       await this.store.transitionUsage(reservationUsageKey(task.id, turn), 'reserved', 'released');

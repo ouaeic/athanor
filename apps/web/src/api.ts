@@ -23,6 +23,7 @@ import type {
   WorkspaceSkill,
   WorkspaceSnapshot
 } from './types.js';
+import type { BackupStatus } from './backup-evidence.js';
 import type {
   Connector,
   ConnectorAuditEvent,
@@ -845,6 +846,8 @@ export const api = {
     request<{
       certificate: { failedAt: string; reason: string } | null;
       dynamicDns: { failedAt: string; reason: string } | null;
+      /** The last backup run and the newest copy it left. Absent from a box older than this field. */
+      backup?: BackupStatus | null;
     }>('/v1/instance/diagnostics'),
   revokePreview: (id: string) =>
     request<{ revoked: boolean }>(`/v1/previews/${id}`, mutation('DELETE', {})),

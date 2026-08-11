@@ -5347,6 +5347,21 @@ a:focus-visible {
   line-height: 1.55;
 }
 
+/*
+  The one line in this list that can ever ask for something.
+
+  A backup that has not run for days is the owner's move - but caution, not ember. Ember is small,
+  bright and moving and means the machine is working this second; a backup that stopped a month ago
+  is not alive. It is a static condition, which is what the large, dim, still caution colour is for.
+  9.04:1 on --panel-soft, which is this row's fill.
+
+  Type only: no fill, no border, no icon. A row that grows a box the moment something goes stale
+  makes the panel rearrange itself around a fact, and this list is furniture.
+*/
+.settings-list small.settings-attention {
+  color: var(--caution);
+}
+
 .settings-list code {
   color: #e4d7cc;
   font-size: 0.96em;
