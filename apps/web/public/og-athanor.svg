@@ -1,31 +1,56 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <!--
+    The social card. It carries the same furnace as apps/web/src/BrandMark.tsx and the same warm
+    ramp as the interface, with ember written out rather than taken from a custom property: this
+    file is fetched by link previewers with no document around it.
+  -->
   <defs>
     <radialGradient id="background" cx="22%" cy="13%" r="100%">
-      <stop stop-color="#242628"/>
-      <stop offset=".48" stop-color="#111315"/>
-      <stop offset="1" stop-color="#08090a"/>
+      <stop stop-color="#2b2724"/>
+      <stop offset=".48" stop-color="#171412"/>
+      <stop offset="1" stop-color="#0a0908"/>
     </radialGradient>
-    <linearGradient id="metal" x1="96" y1="83" x2="318" y2="365">
-      <stop stop-color="#fbfbfb"/>
-      <stop offset=".34" stop-color="#9fa4a8"/>
-      <stop offset=".64" stop-color="#eff0f0"/>
-      <stop offset="1" stop-color="#686e72"/>
+    <linearGradient id="brick" x1="34" y1="52" x2="96" y2="106" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6b503e"/>
+      <stop offset=".55" stop-color="#48362a"/>
+      <stop offset="1" stop-color="#2c211a"/>
     </linearGradient>
-    <linearGradient id="word" x1="365" y1="218" x2="855" y2="354">
-      <stop stop-color="#f4f5f5"/>
-      <stop offset=".43" stop-color="#b7bbbe"/>
-      <stop offset=".7" stop-color="#eeeeee"/>
-      <stop offset="1" stop-color="#8b9094"/>
+    <linearGradient id="iron" x1="30" y1="28" x2="98" y2="108" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#9aa0a3"/>
+      <stop offset=".45" stop-color="#6e7477"/>
+      <stop offset="1" stop-color="#4a4f52"/>
+    </linearGradient>
+    <linearGradient id="metal" x1="44" y1="84" x2="84" y2="108" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f7f8f8"/>
+      <stop offset=".5" stop-color="#b6babd"/>
+      <stop offset="1" stop-color="#7d8285"/>
+    </linearGradient>
+    <radialGradient id="glow" cx=".5" cy=".5" r=".5">
+      <stop stop-color="#f2a13f" stop-opacity=".55"/>
+      <stop offset=".6" stop-color="#f2a13f" stop-opacity=".16"/>
+      <stop offset="1" stop-color="#f2a13f" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="word" x1="365" y1="218" x2="855" y2="354" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#faf1e8"/>
+      <stop offset=".43" stop-color="#d8c4b2"/>
+      <stop offset=".7" stop-color="#f6ebe0"/>
+      <stop offset="1" stop-color="#b09884"/>
     </linearGradient>
   </defs>
   <rect width="1200" height="630" fill="url(#background)"/>
   <circle cx="166" cy="123" r="290" fill="#fff" opacity=".018"/>
   <rect x="72" y="76" width="1056" height="478" rx="38" fill="#fff" opacity=".018" stroke="#fff" stroke-opacity=".09"/>
   <g transform="translate(102 140) scale(2.4)">
-    <path d="M48 24h32M52 24v20L33 85.5A14 14 0 0 0 45.8 104h36.4A14 14 0 0 0 95 85.5L76 44V24" fill="none" stroke="url(#metal)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M41 80h46M54 80c1.5-8.7 4.9-16.2 10-23 5.1 6.8 8.5 14.3 10 23" fill="none" stroke="url(#metal)" stroke-width="5.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M54 29h20v7H54z" fill="url(#iron)"/>
+    <path d="M57 34h14v24H57z" fill="url(#iron)"/>
+    <path d="M26 104 L31 70 C31 50 97 50 97 70 L102 104 Z" fill="url(#brick)"/>
+    <path d="M30.6 74.5h66.8" fill="none" stroke="url(#iron)" stroke-width="5"/>
+    <ellipse cx="64" cy="93" rx="34" ry="28" fill="url(#glow)"/>
+    <path d="M48 104V90c0-16 32-16 32 0v14Z" fill="#0b0908" stroke="url(#metal)" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M64 82c6 8.5 9.5 14.5 9.5 19 0 5.4-4.2 9-9.5 9s-9.5-3.6-9.5-9c0-4.5 3.5-10.5 9.5-19Z" fill="#f2a13f"/>
+    <path d="M26 107.5h76" fill="none" stroke="url(#iron)" stroke-width="6" stroke-linecap="round"/>
   </g>
   <text x="390" y="305" fill="url(#word)" font-family="Inter, Arial, sans-serif" font-size="110" font-weight="590" letter-spacing="-5">athanor</text>
-  <text x="397" y="376" fill="#b2b5b7" font-family="Inter, Arial, sans-serif" font-size="29" font-weight="420" letter-spacing="-.4">your private cloud computer, through chat</text>
-  <text x="397" y="436" fill="#777c7f" font-family="Inter, Arial, sans-serif" font-size="17" font-weight="430" letter-spacing="1.2">OPEN SOURCE · MANAGED OPEN-WEIGHT AI · ZERO CONTENT LOGGING</text>
+  <text x="397" y="376" fill="#a2988e" font-family="Inter, Arial, sans-serif" font-size="29" font-weight="420" letter-spacing="-.4">your private cloud computer, through chat</text>
+  <text x="397" y="436" fill="#7a706a" font-family="Inter, Arial, sans-serif" font-size="17" font-weight="430" letter-spacing="1.2">OPEN SOURCE · MANAGED OPEN-WEIGHT AI · ZERO CONTENT LOGGING</text>
 </svg>
