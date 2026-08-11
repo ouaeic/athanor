@@ -1,4 +1,5 @@
 export * from './protocol.js';
+export * from './generation-budget.js';
 export * from './prompt-cache.js';
 export * from './openai-compatible.js';
 export * from './catalog.js';

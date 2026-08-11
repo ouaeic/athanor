@@ -14,6 +14,15 @@ import {
   readCacheUsage,
   type CacheUsageFields
 } from './prompt-cache.js';
+import {
+  DEFAULT_GENERATION_TIMEOUT_MS,
+  describeCutoff,
+  estimatedOutputTokens,
+  generationCharCeiling,
+  startGenerationBudget,
+  worthContinuing,
+  type GenerationCutoff
+} from './generation-budget.js';
 
 /**
  * How long a streamed response may go without a single byte before the provider counts as stalled.
@@ -35,6 +44,10 @@ interface Options {
   enforceZeroDataRetention?: boolean;
   /** Zero disables the idle deadline; only tests that drive the reader by hand should do that. */
   streamIdleTimeoutMs?: number;
+  /** Zero disables the generation deadline. An escape hatch for an unusual route, not a setting. */
+  generationTimeoutMs?: number;
+  /** Overrides the ceiling derived from the request's own output cap. Zero disables it. */
+  generationMaxChars?: number;
 }
 
 interface CompletionBody {
@@ -102,6 +115,12 @@ interface StreamChunk {
     };
   }>;
   usage?: CompletionBody['usage'];
+}
+
+/** A completion assembled from a stream, plus what the stream itself cost and how it ended. */
+interface StreamedBody extends CompletionBody {
+  generatedChars: number;
+  cutoff?: { reason: GenerationCutoff; detail: string };
 }
 
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
@@ -212,7 +231,13 @@ export interface ConfiguredModelDescription {
  * agent turn actually carries. Tools outrank everything - a route that cannot call them cannot run
  * the task at all - and the rest are counted.
  */
-const PREFERRED_PARAMETERS = ['tools', 'temperature', 'reasoning', 'max_tokens', 'max_completion_tokens'] as const;
+const PREFERRED_PARAMETERS = [
+  'tools',
+  'temperature',
+  'reasoning',
+  'max_tokens',
+  'max_completion_tokens'
+] as const;
 const routeScore = (declared: ReadonlySet<string>): number =>
   (declared.has('tools') ? 100 : 0) +
   PREFERRED_PARAMETERS.filter((parameter) => declared.has(parameter)).length;
@@ -301,6 +326,8 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
   readonly #appTitle: string | undefined;
   readonly #enforceZeroDataRetention: boolean;
   readonly #streamIdleTimeoutMs: number;
+  readonly #generationTimeoutMs: number;
+  readonly #generationMaxChars: number | undefined;
   #parameterCache: Promise<Map<string, ReadonlySet<string>>> | undefined;
 
   constructor(options: Options) {
@@ -313,6 +340,8 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     this.#appTitle = options.appTitle;
     this.#enforceZeroDataRetention = options.enforceZeroDataRetention ?? false;
     this.#streamIdleTimeoutMs = options.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+    this.#generationTimeoutMs = options.generationTimeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS;
+    this.#generationMaxChars = options.generationMaxChars;
   }
 
   /** Turns a payload's own `error` object into the throw the caller's retry logic can reason about. */
@@ -537,60 +566,56 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     })();
     const payload = (withReasoningDetails: boolean): string =>
       JSON.stringify({
-          model: input.model,
-          messages: input.messages.map((message, index) => ({
-            role: message.role,
-            content: ((): string | ContentBlock[] => {
-              if (message.images?.length)
-                return [
-                  { type: 'text', text: message.content },
-                  ...message.images.map(
-                    (url): ContentBlock => ({ type: 'image_url', image_url: { url } })
-                  )
-                ];
-              if (!cacheBreakpoints.has(index)) return message.content;
+        model: input.model,
+        messages: input.messages.map((message, index) => ({
+          role: message.role,
+          content: ((): string | ContentBlock[] => {
+            if (message.images?.length)
               return [
-                { type: 'text', text: message.content, cache_control: { type: 'ephemeral' } }
+                { type: 'text', text: message.content },
+                ...message.images.map(
+                  (url): ContentBlock => ({ type: 'image_url', image_url: { url } })
+                )
               ];
-            })(),
-            ...(message.toolCallId ? { tool_call_id: message.toolCallId } : {}),
-            ...(message.reasoning ? { reasoning: message.reasoning } : {}),
-            ...(withReasoningDetails && message.reasoningDetails?.length
-              ? { reasoning_details: message.reasoningDetails }
-              : {}),
-            ...(message.toolCalls?.length
-              ? {
-                  tool_calls: message.toolCalls.map((call) => ({
-                    id: call.id,
-                    type: 'function',
-                    function: { name: call.name, arguments: JSON.stringify(call.arguments) }
-                  }))
-                }
-              : {})
-          })),
-          tools: [
-            ...input.tools.map((tool) => ({ type: 'function', function: tool })),
-            ...serverTools
-          ],
-          ...(sends('temperature') ? { temperature: input.temperature } : {}),
-          ...(input.reasoningEffort &&
-          input.supportsReasoningEffort !== false &&
-          sends('reasoning')
-            ? { reasoning: { effort: input.reasoningEffort } }
+            if (!cacheBreakpoints.has(index)) return message.content;
+            return [{ type: 'text', text: message.content, cache_control: { type: 'ephemeral' } }];
+          })(),
+          ...(message.toolCallId ? { tool_call_id: message.toolCallId } : {}),
+          ...(message.reasoning ? { reasoning: message.reasoning } : {}),
+          ...(withReasoningDetails && message.reasoningDetails?.length
+            ? { reasoning_details: message.reasoningDetails }
             : {}),
-          ...(input.sessionId ? { session_id: input.sessionId } : {}),
-          ...outputCap,
-          ...(input.onTextDelta ? { stream: true, stream_options: { include_usage: true } } : {}),
-          ...(this.#enforceZeroDataRetention
+          ...(message.toolCalls?.length
             ? {
-                provider: {
-                  zdr: true,
-                  data_collection: 'deny',
-                  require_parameters: true,
-                  allow_fallbacks: true
-                }
+                tool_calls: message.toolCalls.map((call) => ({
+                  id: call.id,
+                  type: 'function',
+                  function: { name: call.name, arguments: JSON.stringify(call.arguments) }
+                }))
               }
             : {})
+        })),
+        tools: [
+          ...input.tools.map((tool) => ({ type: 'function', function: tool })),
+          ...serverTools
+        ],
+        ...(sends('temperature') ? { temperature: input.temperature } : {}),
+        ...(input.reasoningEffort && input.supportsReasoningEffort !== false && sends('reasoning')
+          ? { reasoning: { effort: input.reasoningEffort } }
+          : {}),
+        ...(input.sessionId ? { session_id: input.sessionId } : {}),
+        ...outputCap,
+        ...(input.onTextDelta ? { stream: true, stream_options: { include_usage: true } } : {}),
+        ...(this.#enforceZeroDataRetention
+          ? {
+              provider: {
+                zdr: true,
+                data_collection: 'deny',
+                require_parameters: true,
+                allow_fallbacks: true
+              }
+            }
+          : {})
       });
     const send = async (withReasoningDetails: boolean): Promise<Response> => {
       try {
@@ -601,7 +626,11 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
           body: payload(withReasoningDetails)
         });
       } catch {
-        throw new AthanorError('provider_unavailable', `${this.provider} could not be reached`, 503);
+        throw new AthanorError(
+          'provider_unavailable',
+          `${this.provider} could not be reached`,
+          503
+        );
       }
     };
     let response = await send(true);
@@ -641,9 +670,16 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     // Nothing publishes a usable latency for these routes, so the only honest number is the one
     // measured here: on this owner's network, from this box, on this owner's prompts.
     const firstToken: { at?: number } = {};
-    const body = input.onTextDelta
-      ? await this.#streamCompletion(response, input.onTextDelta, firstToken, input.onReasoningDelta)
-      : ((await response.json()) as CompletionBody);
+    const streamed = input.onTextDelta
+      ? await this.#streamCompletion(
+          response,
+          this.#generationMaxChars ?? generationCharCeiling(maxTokensFor(input)),
+          input.onTextDelta,
+          firstToken,
+          input.onReasoningDelta
+        )
+      : undefined;
+    const body: CompletionBody = streamed ?? ((await response.json()) as CompletionBody);
     if (!body.choices?.length) {
       const fault = this.#fault(body.error, 'in its response');
       if (fault) throw fault;
@@ -678,8 +714,27 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         };
       }
     });
+    /*
+     * A streamed request asks for usage and the route sends it in one frame at the end, so a stream
+     * that was cut off - or one from a route that simply never sends the frame - leaves this side
+     * with nothing to bill. It used to record zero, which is how a quarter of an hour of generation
+     * came to sit on the timeline under a price that never moved while the owner watched it. The
+     * characters were counted on the way past; four to the token is the same rough conversion the
+     * window is estimated with, and it travels marked as an estimate so nothing downstream mistakes
+     * it for the provider's own number. The prompt is not estimated: this side never saw it.
+     */
+    const reportedOutputTokens = body.usage?.completion_tokens;
+    const countedOutputTokens = streamed ? estimatedOutputTokens(streamed.generatedChars) : 0;
+    // A route that reports usage on every chunk rather than only at the end reports a count that
+    // stops where the cut did, so on a cutoff the provider's own number is not final either and the
+    // larger of the two stands. A stream that ran to its end keeps whatever the provider said,
+    // however the estimate compares: nothing here estimates over the top of a finished count.
+    const estimated =
+      countedOutputTokens > 0 &&
+      (reportedOutputTokens === undefined ||
+        (streamed?.cutoff !== undefined && countedOutputTokens > reportedOutputTokens));
     const inputTokens = body.usage?.prompt_tokens ?? 0;
-    const outputTokens = body.usage?.completion_tokens ?? 0;
+    const outputTokens = estimated ? countedOutputTokens : (reportedOutputTokens ?? 0);
     const citations = webCitationsFrom(choice?.message?.annotations);
     const serverToolUse = serverToolUseFrom(body.usage?.server_tool_use);
     return {
@@ -695,10 +750,14 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         : choice?.finish_reason === 'length'
           ? 'length'
           : 'stop',
+      ...(streamed?.cutoff ? { truncated: streamed.cutoff } : {}),
       usage: {
         inputTokens,
         outputTokens,
-        totalTokens: body.usage?.total_tokens ?? inputTokens + outputTokens,
+        totalTokens: estimated
+          ? inputTokens + outputTokens
+          : (body.usage?.total_tokens ?? inputTokens + outputTokens),
+        ...(estimated ? { estimated: true as const } : {}),
         ...(typeof body.usage?.cost === 'number' ? { costUsd: body.usage.cost } : {}),
         ...(serverToolUse ? { serverToolUse } : {}),
         ...readCacheUsage(body.usage)
@@ -717,14 +776,28 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
   }
 
   /**
-   * One read, bounded by the idle deadline rather than by the request's total budget. The clock
-   * restarts on every read, so a turn that keeps producing runs as long as it needs to and only a
-   * genuinely silent provider trips it.
+   * One read, bounded by two clocks that measure different things.
+   *
+   * The idle clock restarts on every read, so a turn that keeps producing runs as long as it needs
+   * to and only a genuinely silent provider trips it. The generation clock does not restart, and it
+   * is here for the read that is still outstanding when the whole generation runs out of time -
+   * the caller's loop reads the same clock for itself between chunks, because a read that resolves
+   * from bytes already buffered wins this race every time and a race alone is not a bound.
+   *
+   * Neither throws. Which clock ran out is returned, because both leave text on the floor and the
+   * decision about what that partial answer is worth is not made in here.
    */
-  async #readWithIdleDeadline(
-    reader: ReadableStreamDefaultReader<Uint8Array>
-  ): Promise<ReadableStreamReadResult<Uint8Array>> {
-    if (this.#streamIdleTimeoutMs <= 0) return reader.read();
+  async #readWithin(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    remainingMs: number
+  ): Promise<
+    { outcome: 'chunk'; read: ReadableStreamReadResult<Uint8Array> } | { outcome: GenerationCutoff }
+  > {
+    const idleMs =
+      this.#streamIdleTimeoutMs > 0 ? this.#streamIdleTimeoutMs : Number.POSITIVE_INFINITY;
+    const deadlineMs = Math.min(idleMs, Math.max(0, remainingMs));
+    const cutoff: GenerationCutoff = remainingMs <= idleMs ? 'timeout' : 'stalled';
+    if (!Number.isFinite(deadlineMs)) return { outcome: 'chunk', read: await reader.read() };
     const pending = reader.read();
     // The deadline can win the race and leave this read outstanding; the caller cancels the reader
     // straight after, but a socket that errors in the same tick would otherwise reject with nobody
@@ -733,19 +806,9 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
-        pending,
-        new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(
-            () =>
-              reject(
-                new AthanorError(
-                  'provider_stream_stalled',
-                  `${this.provider} sent nothing for ${Math.round(this.#streamIdleTimeoutMs / 1000)} seconds and the response was abandoned`,
-                  504
-                )
-              ),
-            this.#streamIdleTimeoutMs
-          );
+        pending.then((read) => ({ outcome: 'chunk', read }) as const),
+        new Promise<{ outcome: GenerationCutoff }>((resolve) => {
+          timer = setTimeout(() => resolve({ outcome: cutoff }), deadlineMs);
           timer.unref();
         })
       ]);
@@ -756,12 +819,15 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
 
   async #streamCompletion(
     response: Response,
+    maxChars: number,
     onTextDelta: (delta: string) => void | Promise<void>,
     firstToken: { at?: number } = {},
     onReasoningDelta?: (delta: string) => void | Promise<void>
-  ): Promise<CompletionBody> {
+  ): Promise<StreamedBody> {
     if (!response.body)
       throw new AthanorError('provider_request_failed', `${this.provider} returned no stream`);
+    const budget = startGenerationBudget({ timeoutMs: this.#generationTimeoutMs, maxChars });
+    let cutoff: GenerationCutoff | undefined;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const toolCalls = new Map<
@@ -804,10 +870,16 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       if (delta?.content) {
         content += delta.content;
         await onTextDelta(delta.content);
+        // Handed over first, then counted. The characters are already on the owner's screen, and a
+        // ceiling that swallowed the fragment that crossed it would be hiding its own evidence.
+        if (budget.produced(delta.content.length)) cutoff ??= 'overrun';
       }
       if (delta?.reasoning) {
         reasoning += delta.reasoning;
         if (onReasoningDelta) await onReasoningDelta(delta.reasoning);
+        // Thinking counts against the ceiling as well: it is generated, it is billed as output, and
+        // a route that loops inside its own reasoning produces no content at all to measure.
+        if (budget.produced(delta.reasoning.length)) cutoff ??= 'overrun';
       }
       if (delta?.reasoning_details?.length) reasoningDetails.push(...delta.reasoning_details);
       if (delta?.annotations?.length) annotations.push(...delta.annotations);
@@ -822,18 +894,48 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         if (fragment.function?.name) current.function.name += fragment.function.name;
         if (fragment.function?.arguments) current.function.arguments += fragment.function.arguments;
         toolCalls.set(index, current);
+        // A call's arguments are generated output like any other, and on this product they are
+        // where the volume is: a file_write carries the whole file inside them. Uncounted, a route
+        // writing a runaway file passed the ceiling without touching it, and the call that spent
+        // twenty-four thousand characters on it was handed back billed as nothing at all.
+        const generated =
+          (fragment.function?.name?.length ?? 0) + (fragment.function?.arguments?.length ?? 0);
+        if (generated && budget.produced(generated)) cutoff ??= 'overrun';
       }
     };
     try {
       for (;;) {
-        const { done, value } = await this.#readWithIdleDeadline(reader);
+        const step = await this.#readWithin(reader, budget.remainingMs());
+        if (step.outcome !== 'chunk') {
+          cutoff = step.outcome;
+          break;
+        }
+        const { done, value } = step.read;
         buffer += decoder.decode(value, { stream: !done });
         const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() ?? '';
         for (const line of lines) await consume(line);
-        if (done) break;
+        if (done || cutoff) break;
+        /*
+         * The clock is read again here, and not only raced against the read above, because a race
+         * is not a bound.
+         *
+         * A read that finds bytes already buffered - which is most reads on a route that is keeping
+         * the socket busy - resolves as a settled promise, and a settled promise runs ahead of any
+         * timer however short. So the deadline lost every race it was entered into and a stream
+         * that never had to wait for the network ran forty-three times past it under test, stopped
+         * in the end by the character ceiling and reported as an overrun. Read here, the deadline
+         * holds whoever wins: the frame in hand is kept, and the next one is not asked for.
+         */
+        if (budget.remainingMs() <= 0) {
+          cutoff = 'timeout';
+          break;
+        }
       }
-      if (buffer.trim()) await consume(buffer);
+      if (!cutoff && buffer.trim()) await consume(buffer);
+      // Every cutoff leaves the socket open and the provider still writing into it, so the read side
+      // is torn down here rather than left to garbage collection.
+      if (cutoff) await reader.cancel().catch(() => undefined);
     } catch (cause) {
       await reader.cancel().catch(() => undefined);
       // A connection that dies a few bytes into the body is the same fault as one that dies before
@@ -847,12 +949,50 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         503
       );
     }
+    /*
+     * A cutoff with nothing to show for it is a different fault from a cutoff with an answer in it,
+     * and only one of them is this side's to keep.
+     *
+     * Nothing generated means nothing was lost and nothing was billed, so it is reported as the
+     * provider fault it is - retryable, and the gateway's retry actually engages, because no text
+     * reached the caller to be duplicated by a second attempt. Once a single character has been
+     * generated the opposite holds on both counts: replaying costs the owner the same quarter of an
+     * hour for a request that has already shown how it behaves, and the words are the owner's. So it
+     * returns, cut off and labelled, and the caller decides.
+     */
+    if (cutoff && !content && !reasoning && toolCalls.size === 0)
+      throw new AthanorError(
+        'provider_stream_stalled',
+        `${this.provider} accepted the request and then wrote nothing for ${Math.round(budget.elapsedMs() / 1000)} seconds, so the response was abandoned`,
+        504
+      );
     return {
       ...(model ? { model } : {}),
       ...(upstreamProvider ? { provider: upstreamProvider } : {}),
+      generatedChars: budget.characters(),
+      ...(cutoff
+        ? { cutoff: { reason: cutoff, detail: describeCutoff(this.provider, cutoff, budget) } }
+        : {}),
       choices: [
         {
-          ...(finishReason ? { finish_reason: finishReason } : {}),
+          /*
+           * `length` is what a cut-off answer is called, and two callers read it for two different
+           * reasons. One marks a tool call whose JSON stopped mid-object, which is true of every
+           * cutoff that assembled one. The other asks the model to carry straight on from where it
+           * stopped, and repeats that up to three times - which is the right answer for a long
+           * reply that ran out of room and precisely the wrong one for a route that has stopped
+           * being productive, where it buys the same ten minutes over again and ends up cut off
+           * anyway. So the second reading is only claimed when the rate says continuing can finish
+           * the answer; otherwise this is an ordinary stop and what was written stands where it is.
+           */
+          ...(cutoff
+            ? {
+                finish_reason:
+                  toolCalls.size > 0 || worthContinuing(cutoff, budget) ? 'length' : 'stop'
+              }
+            : finishReason
+              ? { finish_reason: finishReason }
+              : {}),
           message: {
             content,
             ...(reasoning ? { reasoning } : {}),

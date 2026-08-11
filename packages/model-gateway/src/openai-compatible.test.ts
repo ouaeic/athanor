@@ -286,7 +286,11 @@ describe('OpenAICompatibleAdapter', () => {
 
   const streamingAdapter = (
     body: BodyInit,
-    options: { streamIdleTimeoutMs?: number } = {}
+    options: {
+      streamIdleTimeoutMs?: number;
+      generationTimeoutMs?: number;
+      generationMaxChars?: number;
+    } = {}
   ): OpenAICompatibleAdapter =>
     new OpenAICompatibleAdapter({
       baseUrl: 'https://openrouter.ai/api/v1',
@@ -387,11 +391,33 @@ describe('OpenAICompatibleAdapter', () => {
     expect(deltas).toEqual(['Half an ']);
   });
 
-  it('abandons a stream that goes silent rather than holding the worker for the whole budget', async () => {
+  it('keeps what a stream had written when it goes silent, rather than losing it with the error', async () => {
     const deltas: string[] = [];
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(encode('data: {"choices":[{"delta":{"content":"Thinking"}}]}\n\n'));
+      }
+    });
+
+    const result = await streamRequest(streamingAdapter(body, { streamIdleTimeoutMs: 25 }), deltas);
+
+    expect(result).toMatchObject({
+      text: 'Thinking',
+      finishReason: 'length',
+      truncated: { reason: 'stalled' },
+      // The provider's usage frame never arrived, so it is estimated from what was generated rather
+      // than recorded as the zero the owner watched for a quarter of an hour.
+      usage: { outputTokens: 2, estimated: true }
+    });
+    expect(deltas).toEqual(['Thinking']);
+  });
+
+  it('reports a stream that goes silent before it says anything as the retryable provider fault it is', async () => {
+    const deltas: string[] = [];
+    const body = new ReadableStream<Uint8Array>({
+      start() {
+        // Headers, then nothing at all: no text reached the caller, so a second attempt costs the
+        // owner nothing they have already paid for and may well land on a working instance.
       }
     });
 
@@ -403,7 +429,239 @@ describe('OpenAICompatibleAdapter', () => {
     expect((failure as AthanorError).code).toBe('provider_stream_stalled');
     expect((failure as AthanorError).statusCode).toBe(504);
     expect(isRetryableError(failure)).toBe(true);
-    expect(deltas).toEqual(['Thinking']);
+    expect(deltas).toEqual([]);
+  });
+
+  /*
+   * The measured failure. A stream that never goes quiet for long enough to look stalled, produces
+   * a trickle, and would keep producing it until the caller's fifteen-minute deadline. The idle
+   * clock cannot see this - every read returns - so the generation clock is what ends it, and it
+   * ends it with the answer in hand.
+   */
+  it('cuts a generation that streams forever without finishing, and hands back what it wrote', async () => {
+    const deltas: string[] = [];
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        controller.enqueue(encode('data: {"choices":[{"delta":{"content":"and on "}}]}\n\n'));
+      }
+    });
+
+    const result = (await streamRequest(
+      streamingAdapter(body, { streamIdleTimeoutMs: 500, generationTimeoutMs: 60 }),
+      deltas
+    )) as { text: string; truncated?: { reason: string; detail: string } };
+
+    expect(result.truncated?.reason).toBe('timeout');
+    expect(result.truncated?.detail).toContain('still writing');
+    expect(result.text.startsWith('and on ')).toBe(true);
+    expect(deltas.length).toBeGreaterThan(1);
+  });
+
+  it('stops a route that writes past the output ceiling the request asked for', async () => {
+    const deltas: string[] = [];
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        controller.enqueue(encode('data: {"choices":[{"delta":{"content":"0123456789"}}]}\n\n'));
+      }
+    });
+
+    // The clock is set as well, and deliberately much later: a route with no ceiling on it would be
+    // cut by the deadline eventually, and this has to show the ceiling doing the cutting.
+    const result = (await streamRequest(
+      streamingAdapter(body, { generationMaxChars: 25, generationTimeoutMs: 300 }),
+      deltas
+    )) as { text: string; truncated?: { reason: string } };
+
+    expect(result.truncated?.reason).toBe('overrun');
+    expect(result.text.length).toBeGreaterThan(25);
+    expect(result.text.length).toBeLessThan(60);
+  });
+
+  it('leaves an answer that finishes inside its budget completely alone', async () => {
+    const deltas: string[] = [];
+    const paragraph = 'The importer reads all three columns. '.repeat(40);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const sentence of paragraph.split('. ').filter(Boolean))
+          controller.enqueue(
+            encode(`data: {"choices":[{"delta":{"content":"${sentence}. "}}]}\n\n`)
+          );
+        controller.enqueue(
+          encode(
+            'data: {"choices":[{"finish_reason":"stop","delta":{}}],"usage":{"prompt_tokens":900,"completion_tokens":380}}\n\n'
+          )
+        );
+        controller.close();
+      }
+    });
+
+    const result = (await streamRequest(streamingAdapter(body), deltas)) as {
+      finishReason: string;
+      truncated?: unknown;
+      usage: { outputTokens: number; estimated?: true };
+    };
+
+    expect(result.finishReason).toBe('stop');
+    expect(result.truncated).toBeUndefined();
+    // The provider's own count stands; nothing here estimates over the top of it.
+    expect(result.usage).toEqual({ inputTokens: 900, outputTokens: 380, totalTokens: 1280 });
+  });
+
+  /*
+   * The largest thing this product generates is not prose - it is the content of a file, and that
+   * travels inside a tool call's arguments. Those characters were once counted by nothing: the
+   * ceiling could not see them, so a route writing a runaway file ran to the clock, and the answer
+   * came back billed at zero for twenty-four thousand characters of generation.
+   */
+  it('counts what a runaway tool call writes, and bills for it', async () => {
+    const deltas: string[] = [];
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        controller.enqueue(
+          encode(
+            `data: ${JSON.stringify({
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: 'call-1',
+                        function: { name: 'file_write', arguments: 'x'.repeat(200) }
+                      }
+                    ]
+                  }
+                }
+              ]
+            })}\n\n`
+          )
+        );
+      }
+    });
+
+    // The clock is set as well, and deliberately later than the ceiling, so that a run which stops
+    // counting these characters fails on the reason rather than by hanging until vitest gives up.
+    const result = (await streamRequest(
+      streamingAdapter(body, { generationMaxChars: 400, generationTimeoutMs: 300 }),
+      deltas
+    )) as {
+      finishReason: string;
+      truncated?: { reason: string };
+      usage: { outputTokens: number; estimated?: true };
+      toolCalls: { rawArguments?: string }[];
+    };
+
+    expect(result.truncated?.reason).toBe('overrun');
+    // A cut-off call is still a call the loop has to refuse rather than run, and `length` is how it
+    // is told the arguments were cut rather than malformed.
+    expect(result.finishReason).toBe('tool_calls');
+    expect(result.usage.estimated).toBe(true);
+    expect(result.usage.outputTokens).toBeGreaterThan(100);
+    expect(result.toolCalls[0]?.rawArguments?.length).toBeGreaterThanOrEqual(400);
+  });
+
+  /*
+   * A cut-off answer is only worth continuing if continuing it can finish it, and the loop upstream
+   * continues one three times before giving up. At the rate the measured failure produced - ten
+   * characters a second - those three continuations buy half an hour and end up cut off anyway, so
+   * this is reported as the end of an answer rather than as one to carry on from.
+   */
+  it('does not ask a route that has stopped being productive to carry on', async () => {
+    const deltas: string[] = [];
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        // Ten characters a second, which is the rate the incident was measured at.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        controller.enqueue(encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'));
+      }
+    });
+
+    const result = (await streamRequest(
+      streamingAdapter(body, { streamIdleTimeoutMs: 500, generationTimeoutMs: 250 }),
+      deltas
+    )) as { text: string; finishReason: string; truncated?: { reason: string } };
+
+    expect(result.truncated?.reason).toBe('timeout');
+    expect(result.finishReason).toBe('stop');
+    expect(result.text.length).toBeGreaterThan(0);
+  });
+
+  it('asks a long answer that was still being written to carry on', async () => {
+    const deltas: string[] = [];
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        controller.enqueue(
+          encode(`data: {"choices":[{"delta":{"content":"${'a'.repeat(200)}"}}]}\n\n`)
+        );
+      }
+    });
+
+    const result = (await streamRequest(
+      streamingAdapter(body, { streamIdleTimeoutMs: 500, generationTimeoutMs: 200 }),
+      deltas
+    )) as { finishReason: string; truncated?: { reason: string } };
+
+    expect(result.truncated?.reason).toBe('timeout');
+    expect(result.finishReason).toBe('length');
+  });
+
+  /*
+   * The deadline has to hold against a route that keeps the socket busy, and racing it against the
+   * read is not enough to make it: a read that finds bytes already buffered resolves as a settled
+   * promise, and a settled promise runs ahead of any timer. Measured before the loop read the clock
+   * for itself, a stream like this one ran forty-three times past its deadline and was stopped in
+   * the end by the character ceiling - the wrong bound, under the wrong name.
+   */
+  it('holds the deadline against a stream that never makes it wait', async () => {
+    const deltas: string[] = [];
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(
+          encode(`data: {"choices":[{"delta":{"content":"${'c'.repeat(100)}"}}]}\n\n`)
+        );
+      }
+    });
+
+    const result = (await streamRequest(
+      streamingAdapter(body, { generationTimeoutMs: 5, generationMaxChars: 60_000 }),
+      deltas
+    )) as { truncated?: { reason: string } };
+
+    expect(result.truncated?.reason).toBe('timeout');
+    expect(deltas.join('').length).toBeLessThan(60_000);
+  });
+
+  /*
+   * A route that reports usage on every chunk rather than only at the end reports a count that
+   * stops where the cut did. Trusting it is the same zero the owner was shown, one decimal place
+   * along, so the larger of the two numbers stands.
+   */
+  it('will not bill a cut-off answer at the count a half-finished usage frame carried', async () => {
+    const deltas: string[] = [];
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        controller.enqueue(
+          encode(
+            `data: {"choices":[{"delta":{"content":"${'b'.repeat(100)}"}}],"usage":{"prompt_tokens":900,"completion_tokens":1}}\n\n`
+          )
+        );
+      }
+    });
+
+    const result = (await streamRequest(
+      streamingAdapter(body, { generationTimeoutMs: 120 }),
+      deltas
+    )) as { usage: { inputTokens: number; outputTokens: number; estimated?: true } };
+
+    expect(result.usage.estimated).toBe(true);
+    expect(result.usage.outputTokens).toBeGreaterThan(50);
+    // The prompt was reported by the provider and is not estimated over.
+    expect(result.usage.inputTokens).toBe(900);
   });
 
   it('lets a slow but productive stream run past the idle window', async () => {
@@ -506,7 +764,8 @@ describe('OpenAICompatibleAdapter', () => {
       privacyRoute: 'provider_zdr',
       enforceZeroDataRetention: true,
       fetch: (async (input: string | URL | Request, init?: RequestInit) => {
-        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
         requested.push(url);
         if (url.endsWith('/endpoints/zdr'))
           return new Response(
@@ -878,94 +1137,105 @@ describe('OpenAICompatibleAdapter', () => {
   it.each([
     ['whole', false],
     ['streamed', true]
-  ])('marks a %s tool call whose arguments were cut off, rather than emptying them', async (
-    _name,
-    streaming
-  ) => {
-    const truncated = '{"path":"report.md","content":"lorem ipsum dolor';
-    const request = vi.fn(async (input: string | URL | Request) => {
-      const url = input instanceof Request ? input.url : input.toString();
-      if (url.endsWith('/models'))
-        return new Response(JSON.stringify({ data: [{ id: 'z-ai/glm-5.2', owned_by: 'z-ai' }] }), {
-          status: 200
-        });
-      if (streaming) {
-        const frames = [
-          `data: ${JSON.stringify({
+  ])(
+    'marks a %s tool call whose arguments were cut off, rather than emptying them',
+    async (_name, streaming) => {
+      const truncated = '{"path":"report.md","content":"lorem ipsum dolor';
+      const request = vi.fn(async (input: string | URL | Request) => {
+        const url = input instanceof Request ? input.url : input.toString();
+        if (url.endsWith('/models'))
+          return new Response(
+            JSON.stringify({ data: [{ id: 'z-ai/glm-5.2', owned_by: 'z-ai' }] }),
+            {
+              status: 200
+            }
+          );
+        if (streaming) {
+          const frames = [
+            `data: ${JSON.stringify({
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: 'call-1',
+                        function: { name: 'file_write', arguments: truncated }
+                      }
+                    ]
+                  }
+                }
+              ]
+            })}\n\n`,
+            `data: ${JSON.stringify({ choices: [{ finish_reason: 'length', delta: {} }] })}\n\n`,
+            'data: [DONE]\n\n'
+          ].join('');
+          return new Response(frames, {
+            status: 200,
+            headers: { 'content-type': 'text/event-stream' }
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            model: 'z-ai/glm-5.2',
             choices: [
               {
-                delta: {
+                finish_reason: 'length',
+                message: {
+                  content: '',
                   tool_calls: [
-                    { index: 0, id: 'call-1', function: { name: 'file_write', arguments: truncated } }
+                    {
+                      id: 'call-1',
+                      type: 'function',
+                      function: { name: 'file_write', arguments: truncated }
+                    }
                   ]
                 }
               }
-            ]
-          })}\n\n`,
-          `data: ${JSON.stringify({ choices: [{ finish_reason: 'length', delta: {} }] })}\n\n`,
-          'data: [DONE]\n\n'
-        ].join('');
-        return new Response(frames, {
-          status: 200,
-          headers: { 'content-type': 'text/event-stream' }
-        });
-      }
-      return new Response(
-        JSON.stringify({
-          model: 'z-ai/glm-5.2',
-          choices: [
-            {
-              finish_reason: 'length',
-              message: {
-                content: '',
-                tool_calls: [
-                  { id: 'call-1', type: 'function', function: { name: 'file_write', arguments: truncated } }
-                ]
-              }
-            }
-          ],
-          usage: { prompt_tokens: 10, completion_tokens: 4 }
-        }),
-        { status: 200, headers: { 'content-type': 'application/json' } }
-      );
-    });
-    const adapter = new OpenAICompatibleAdapter({
-      baseUrl: 'https://openrouter.ai/api/v1',
-      apiKey: 'managed-key',
-      provider: 'openrouter',
-      privacyRoute: 'provider_zdr',
-      enforceZeroDataRetention: true,
-      fetch: request as typeof fetch
-    });
-    const result = streaming
-      ? await adapter.chat({
-          model: 'z-ai/glm-5.2',
-          messages: [{ role: 'user', content: 'Write the report' }],
-          tools: [{ name: 'file_write', description: 'Write a file', parameters: {} }],
-          temperature: 0.2,
-          onTextDelta: (): void => undefined
-        })
-      : await adapter.chat({
-          model: 'z-ai/glm-5.2',
-          messages: [{ role: 'user', content: 'Write the report' }],
-          tools: [{ name: 'file_write', description: 'Write a file', parameters: {} }],
-          temperature: 0.2
-        });
-    const call = result.toolCalls[0];
-    expect(call?.name).toBe('file_write');
-    expect(call?.parseFailed).toBe(true);
-    // The raw text is kept so the refusal can say how much was cut off.
-    expect(call?.rawArguments).toBe(truncated);
-    // And crucially it is NOT a plausible-looking empty call.
-    expect(call?.arguments).toEqual({});
-  });
+            ],
+            usage: { prompt_tokens: 10, completion_tokens: 4 }
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+      });
+      const adapter = new OpenAICompatibleAdapter({
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: 'managed-key',
+        provider: 'openrouter',
+        privacyRoute: 'provider_zdr',
+        enforceZeroDataRetention: true,
+        fetch: request as typeof fetch
+      });
+      const result = streaming
+        ? await adapter.chat({
+            model: 'z-ai/glm-5.2',
+            messages: [{ role: 'user', content: 'Write the report' }],
+            tools: [{ name: 'file_write', description: 'Write a file', parameters: {} }],
+            temperature: 0.2,
+            onTextDelta: (): void => undefined
+          })
+        : await adapter.chat({
+            model: 'z-ai/glm-5.2',
+            messages: [{ role: 'user', content: 'Write the report' }],
+            tools: [{ name: 'file_write', description: 'Write a file', parameters: {} }],
+            temperature: 0.2
+          });
+      const call = result.toolCalls[0];
+      expect(call?.name).toBe('file_write');
+      expect(call?.parseFailed).toBe(true);
+      // The raw text is kept so the refusal can say how much was cut off.
+      expect(call?.rawArguments).toBe(truncated);
+      // And crucially it is NOT a plausible-looking empty call.
+      expect(call?.arguments).toEqual({});
+    }
+  );
   /*
    * A thinking block is signed against the whole turn that produced it, so compaction or truncation
    * invalidates it and the replay is refused with a 400. Nothing about that is retryable - the same
    * bytes fail forever - and since a refusal appends nothing, a resumed task would die at the same
    * step for good. The one repair is to stop replaying the signed material.
    */
-  it('drops replayed reasoning once when the provider refuses its signature, and keeps the caller\'s messages intact', async () => {
+  it("drops replayed reasoning once when the provider refuses its signature, and keeps the caller's messages intact", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const request = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : input.toString();

@@ -1,5 +1,6 @@
 import type { ServerToolUse, WebCitation } from '@athanor/contracts';
 import { z } from 'zod';
+import type { GenerationCutoff } from './generation-budget.js';
 
 export const ModelMessage = z.object({
   role: z.enum(['system', 'user', 'assistant', 'tool']),
@@ -123,12 +124,39 @@ export interface ModelResponse {
    */
   citations?: WebCitation[];
   finishReason: 'stop' | 'tool_calls' | 'length' | 'cancelled' | 'error';
+  /**
+   * Present when this side ended the generation rather than the model finishing it: the stream went
+   * quiet, ran past its deadline, or wrote past the ceiling the request asked for.
+   *
+   * The text, the reasoning and any tool call fragments are still in the response. That is the whole
+   * point of the field. The tokens were spent whether or not anyone ever saw them, and a turn that
+   * generated for a quarter of an hour and handed back an exception is the owner paying for work
+   * and receiving an error.
+   *
+   * `finishReason` beside it is `length` only where carrying the answer on can actually finish it -
+   * where the route was writing at a rate that says it had more to say rather than that it had
+   * stopped saying anything. Where it was not, the reason is `stop`: what was written stands, and
+   * the caller treats it as the end of an answer rather than asking a route that has run out of
+   * momentum for the rest of it three more times at ten minutes a go. Either way this field is the
+   * one that says the generation was ended here rather than by the model, and what ended it.
+   */
+  truncated?: { reason: GenerationCutoff; detail: string };
   usage: {
     inputTokens: number;
     outputTokens: number;
     totalTokens: number;
     computeSeconds?: number;
     costUsd?: number;
+    /**
+     * Set when the counts here were worked out from the text rather than reported by the provider.
+     *
+     * A streamed request asks for usage and the route sends it in a final frame, which a stream that
+     * was cut off never reaches - so a generation that ran for fifteen minutes recorded zero tokens
+     * and zero cost, which is precisely what the owner saw and asked about. An estimate from the
+     * characters actually generated is wrong by some percentage; zero is wrong by all of it.
+     * `inputTokens` is not estimated here and stays zero: this side never saw the prompt.
+     */
+    estimated?: true;
     /** Input tokens the provider served from its prompt cache, billed at a reduced read rate. */
     cachedInputTokens?: number;
     /** Input tokens the provider charged to populate a new cache entry. */
