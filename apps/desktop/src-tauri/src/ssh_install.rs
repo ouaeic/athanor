@@ -13,8 +13,15 @@ use zeroize::{Zeroize, Zeroizing};
 
 const RELEASE_REF: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const SOURCE_COMMIT: &str = env!("ATHANOR_SOURCE_COMMIT");
+/// The hash of `install.sh` as this build ships it, checked on the server before the script runs.
+///
+/// It is a release gate rather than a comment: `scripts/check-release.mjs` recomputes it, so a
+/// change to the installer that forgets this line cannot be released. It was forgotten once - the
+/// commit that tagged v0.1.1 rewrote the installer's checkout so a pinned box could receive updates
+/// and left this pointing at the previous script, which meant the desktop app's own `sha256sum -c`
+/// refused the installer it had just fetched. That is the first thing a new owner does.
 const INSTALL_BOOTSTRAP_SHA256: &str =
-    "bd4a6cc99fef23dabf52b4439c3549187a9b5cec873eb5b8dfd0acb7b6312e07";
+    "fa7b03a38f6b1fb63f868120b69d531a6d7b888411ea114162e562fd86b18a03";
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const INSTALLER_PAGE: &str = include_str!("installer.html");
 

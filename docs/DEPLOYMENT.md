@@ -24,7 +24,7 @@ The host needs:
 Published release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.0/install.sh | sudo env ATHANOR_REF=v0.1.0 sh
+curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.1/install.sh | sudo env ATHANOR_REF=v0.1.1 sh
 ```
 
 Checked-out source:

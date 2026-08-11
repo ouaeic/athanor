@@ -1,6 +1,6 @@
 [package]
 name = "athanor-desktop"
-version = "0.1.0"
+version = "0.1.1"
 description = "Native shell and permission broker for athanor"
 authors = ["athanor contributors"]
 license = "AGPL-3.0-only"
