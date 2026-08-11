@@ -1,0 +1,15 @@
+[Unit]
+Description=athanor backup
+After=network-online.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+# `athanor backup auto run` waits a few minutes for the worker to go idle and stands down if it does
+# not, because the archive stops the services for its duration and that is not worth doing over
+# somebody's work. It runs without the sandboxing the long-lived services use: it stops and starts
+# units, reads the whole workspace and writes outside its own tree.
+ExecStart=/usr/local/bin/athanor backup auto run
+# Bounded, because this runs unattended. A large workspace on a slow disk is the long case; past
+# this the run is abandoned and the partial copy is removed by its own trap, leaving yesterday's.
+TimeoutStartSec=90m

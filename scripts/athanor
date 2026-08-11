@@ -20,6 +20,7 @@ athanor_ready_timeout_seconds="${ATHANOR_READY_TIMEOUT_SECONDS:-180}"
 athanor_runtime_prefix="${ATHANOR_RUNTIME_PREFIX:-}"
 service_units="athanor-runner.service athanor@api.service athanor@worker.service athanor@registry.service athanor@notifications.service athanor-network-watch.service"
 auto_update_timer="athanor-auto-update.timer"
+backup_timer="athanor-backup.timer"
 last_backup_destination=""
 
 runtime_path() {
@@ -564,6 +565,27 @@ doctor() {
   else
     check_note "unattended updates are off; run sudo athanor auto-update on to enable them"
   fi
+  # Twenty-five checks and not one of them used to mention backups, on a product whose whole promise
+  # is that it keeps running while nobody is watching. A copy that does not exist is the one fault
+  # here that cannot be repaired after the fact.
+  backup_age=$(latest_backup_age)
+  case "$backup_age" in
+    '')
+      if systemctl is-enabled --quiet "$backup_timer" 2>/dev/null; then
+        check_note "no backup yet; the daily window will take the first one"
+      else
+        check_warn "no backup exists: sudo athanor backup auto on takes one daily"
+      fi
+      ;;
+    0|1|2) check_ok "newest backup ${backup_age} days old" ;;
+    *)
+      if systemctl is-enabled --quiet "$backup_timer" 2>/dev/null; then
+        check_warn "newest backup is $backup_age days old; check athanor logs for why the daily run stopped"
+      else
+        check_warn "newest backup is $backup_age days old: sudo athanor backup auto on keeps it daily"
+      fi
+      ;;
+  esac
   available_kb=$(df -Pk "$athanor_home" | awk 'NR == 2 {print $4}')
   if [ "$available_kb" -ge 10485760 ]; then
     check_ok "disk headroom $((available_kb / 1048576)) GiB"
@@ -1288,6 +1310,83 @@ wait_for_idle_worker() {
   return 1
 }
 
+# Waits a short while for the worker to go idle. The unattended backup is not worth an outage in
+# the middle of somebody's work, and unlike the update it has no reason to insist: another window
+# comes round tomorrow, and a backup a day late is a backup.
+wait_briefly_for_idle_worker() {
+  waited_seconds=0
+  while [ "$waited_seconds" -lt 300 ]; do
+    worker_is_idle && return 0
+    sleep 30
+    waited_seconds=$((waited_seconds + 30))
+  done
+  return 1
+}
+
+# The unattended daily backup.
+#
+# `backup_athanor` stops athanor.target for the length of the archive, because a tar of a workspace
+# the agent is writing into is a tar of half-written files. That is the right trade for a copy taken
+# once and trusted later, and it is why this waits for an idle worker instead of running regardless:
+# on an unattended box at a randomised hour, idle is the normal state, and a run that finds work in
+# progress simply leaves it alone.
+#
+# Without this, backup cadence equalled release cadence - `backup_athanor` was reachable only from
+# the sub-command, from `update_athanor` (which returns before the backup when HEAD already matches
+# upstream), and from rollback. A server left alone for a year had no copy of its conversations, its
+# files, its connector credentials or its keys, and `athanor doctor` never mentioned it.
+auto_backup_run() {
+  systemctl is-enabled --quiet "$backup_timer" 2>/dev/null ||
+    fail "automatic backups are off; run sudo athanor backup auto on"
+  if ! wait_briefly_for_idle_worker; then
+    printf 'athanor: a task is running; the next window will take the backup.\n'
+    return 0
+  fi
+  backup_athanor
+}
+
+auto_backup() {
+  need_root backup "auto" "${1:-status}"
+  case "${1:-status}" in
+    on)
+      systemctl enable --now "$backup_timer"
+      printf 'Automatic backups are on: daily, at a randomised hour, when nothing is running.\n'
+      printf 'They are kept in %s and contain server keys.\n' "$athanor_backup_root"
+      ;;
+    off)
+      systemctl disable --now "$backup_timer" >/dev/null 2>&1 || true
+      printf 'Automatic backups are off. Run “sudo athanor backup” to take one by hand.\n'
+      ;;
+    status)
+      if systemctl is-enabled --quiet "$backup_timer" 2>/dev/null; then
+        printf 'Automatic backups: on\n'
+        systemctl list-timers --no-pager --no-legend "$backup_timer" || true
+      else
+        printf 'Automatic backups: off\n'
+      fi
+      newest_backup=$(latest_backup_age)
+      case "$newest_backup" in
+        '') printf 'Newest backup: none\n' ;;
+        *) printf 'Newest backup: %s days old\n' "$newest_backup" ;;
+      esac
+      ;;
+    run) auto_backup_run ;;
+    *) fail 'usage: sudo athanor backup auto {on|off|status}' ;;
+  esac
+}
+
+# How old the newest checksum-verified backup is, in whole days, or nothing when there is none.
+# A directory without SHA256SUMS is wreckage from a failed run and does not count as a copy.
+latest_backup_age() {
+  [ -d "$athanor_backup_root" ] || return 0
+  newest=$(
+    find "$athanor_backup_root" -mindepth 2 -maxdepth 2 -name SHA256SUMS -type f \
+      -exec stat -c '%Y' {} + 2>/dev/null | sort -rn | sed -n '1p'
+  )
+  [ -n "$newest" ] || return 0
+  printf '%s' "$((($(date +%s) - newest) / 86400))"
+}
+
 auto_update_run() {
   systemctl is-enabled --quiet "$auto_update_timer" 2>/dev/null ||
     fail "unattended updates are off; run sudo athanor auto-update on"
@@ -1395,7 +1494,12 @@ case "$command_name" in
     ;;
   pairing-code) pairing_code ;;
   set-hostname) set_hostname "${1:-}" ;;
-  backup) backup_athanor "${1:-}" ;;
+  backup)
+    case "${1:-}" in
+      auto) shift; auto_backup "${1:-status}" ;;
+      *) backup_athanor "${1:-}" ;;
+    esac
+    ;;
   restore) restore_athanor "${1:-}" "${2:-}" ;;
   update) update_athanor ;;
   rollback) rollback_athanor "${1:-}" ;;

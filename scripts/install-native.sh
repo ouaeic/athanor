@@ -494,6 +494,15 @@ install_asset 0644 "$athanor_root/infra/native/athanor-auto-update.service" \
   /etc/systemd/system/athanor-auto-update.service
 install_asset 0644 "$athanor_root/infra/native/athanor-auto-update.timer" \
   /etc/systemd/system/athanor-auto-update.timer
+# Installed and enabled, unlike the update timer above: an unattended update is a change the owner
+# should opt into, and a backup is the thing that makes every other risk survivable. A server left
+# alone for a year previously had no copy of its conversations, files, connector credentials or
+# keys, because the only paths that ever called the backup were the operator's own command and the
+# update.
+install_asset 0644 "$athanor_root/infra/native/athanor-backup.service" \
+  /etc/systemd/system/athanor-backup.service
+install_asset 0644 "$athanor_root/infra/native/athanor-backup.timer" \
+  /etc/systemd/system/athanor-backup.timer
 install_asset 0755 "$athanor_root/scripts/athanor-certificate" \
   /usr/local/lib/athanor/athanor-certificate
 # The network refresh runs this on every netlink address event, by absolute path.
@@ -999,7 +1008,7 @@ systemctl enable avahi-daemon nginx athanor.target
 systemctl enable athanor-runner.service athanor@api.service athanor@worker.service \
   athanor@registry.service athanor@notifications.service
 systemctl enable --now athanor-network-watch.service athanor-network-refresh.timer \
-  athanor-network-refresh.path
+  athanor-network-refresh.path athanor-backup.timer
 systemctl restart avahi-daemon
 systemctl restart athanor-runner.service
 athanor_services="api worker registry notifications"

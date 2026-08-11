@@ -47,7 +47,8 @@ single-use token and happens in Settings, because only the running server can re
 `doctor` also reports whether unattended updates are on; that line is informational and never fails
 the run.
 
-Monitor host disk/RAM, systemd restarts, PostgreSQL health, backup age, and failed scheduled tasks.
+Monitor host disk/RAM, systemd restarts, PostgreSQL health, and failed scheduled tasks; `doctor`
+reports backup age itself.
 Do not put prompt or file bodies into observability.
 
 ## Install preflight
@@ -169,6 +170,19 @@ Address handling follows what each provider actually does:
 whether the answer already includes this computer's address or is still cached.
 
 ## Backup
+
+A daily backup is enabled by the installer and needs no attention:
+
+```bash
+sudo athanor backup auto status
+sudo athanor backup auto off
+```
+
+It runs at a randomised hour and waits a few minutes for the worker to go idle before starting,
+because the archive stops the services for its duration. A run that finds work in progress stands
+down and leaves the next window to take the copy. `doctor` reports the age of the newest one.
+
+To take one immediately, or to write it somewhere specific:
 
 ```bash
 sudo athanor backup
