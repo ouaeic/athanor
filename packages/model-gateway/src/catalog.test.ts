@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { seedModels } from './catalog.js';
+import type { MediaModelOption } from '@athanor/contracts';
+import {
+  configuredModelCatalog,
+  rankMediaModels,
+  resolveMediaModel,
+  seedMediaModels,
+  seedModels
+} from './catalog.js';
+import type { ConfiguredModelDescription } from './openai-compatible.js';
 
 describe('cloud-only model catalog', () => {
   it('contains only independently reviewed OpenRouter open-weight routes', () => {
@@ -47,5 +55,143 @@ describe('cloud-only model catalog', () => {
         })
       ])
     );
+  });
+});
+
+describe('media model catalogue', () => {
+  const option = (
+    overrides: Partial<MediaModelOption> & Pick<MediaModelOption, 'id'>
+  ): MediaModelOption => ({
+    providerModelId: overrides.id,
+    displayName: overrides.id,
+    provider: 'openrouter',
+    modality: 'image',
+    usdPerImage: null,
+    usdPerMillionCharacters: null,
+    priceSource: 'provider',
+    recommendationTags: [],
+    updatedAt: '2026-08-10T00:00:00.000Z',
+    ...overrides
+  });
+
+  it('offers a reviewed route for each modality athanor can actually generate', () => {
+    const offered = seedMediaModels().map((entry) => entry.modality);
+    // Video is absent by construction: there is no request shape behind it, and a catalogue entry
+    // would be an offer athanor cannot keep.
+    expect(offered.sort()).toEqual(['audio', 'image']);
+    expect(seedMediaModels().every((entry) => entry.priceSource === 'measured')).toBe(true);
+  });
+
+  it('never lets an automatic mode reach for a model whose price nobody published', () => {
+    const models = [
+      option({ id: 'cheap', usdPerImage: 0.01 }),
+      option({ id: 'dear', usdPerImage: 0.5 }),
+      option({ id: 'silent', priceSource: 'unknown' })
+    ];
+    // An unknown price is neither the cheap end nor the premium end. It is a number the owner first
+    // sees on an invoice, so it sorts last in every mode rather than winning the one it looks like.
+    for (const preference of ['fast', 'balanced', 'best'] as const)
+      expect(rankMediaModels(models, preference).at(-1)?.id).toBe('silent');
+    expect(rankMediaModels(models, 'fast')[0]?.id).toBe('cheap');
+    expect(rankMediaModels(models, 'best')[0]?.id).toBe('dear');
+  });
+
+  it('leads Recommended with the route athanor has itself measured', () => {
+    const models = [
+      option({ id: 'cheaper', usdPerImage: 0.001 }),
+      option({ id: 'reviewed', usdPerImage: 0.014, priceSource: 'measured' })
+    ];
+    expect(rankMediaModels(models, 'balanced')[0]?.id).toBe('reviewed');
+    expect(rankMediaModels(models, 'fast')[0]?.id).toBe('cheaper');
+  });
+
+  it('falls back to the automatic answer when a pinned model has left the catalogue', () => {
+    const models = [option({ id: 'still-here', usdPerImage: 0.02 })];
+    const resolved = resolveMediaModel(
+      models,
+      { automatic: false, preference: 'balanced', modelId: 'withdrawn-last-month' },
+      'image'
+    );
+    // The alternative is a conversation that cannot generate anything because a provider retired a
+    // route months ago on an unattended box and nobody was watching.
+    expect(resolved?.id).toBe('still-here');
+  });
+
+  it('will not resolve to a model that cannot be chosen', () => {
+    const models = [
+      option({ id: 'blocked', usdPerImage: 0.001, unavailableReason: 'no verified private route' }),
+      option({ id: 'private', usdPerImage: 0.09 })
+    ];
+    expect(resolveMediaModel(models, undefined, 'image')?.id).toBe('private');
+  });
+
+  it('answers null for a modality the provider offers nothing for', () => {
+    expect(resolveMediaModel([option({ id: 'an-image-model' })], undefined, 'audio')).toBeNull();
+  });
+});
+
+describe('a catalogue built from what a configured endpoint says about itself', () => {
+  const described = (
+    overrides: Partial<ConfiguredModelDescription> & Pick<ConfiguredModelDescription, 'id'>
+  ): ConfiguredModelDescription => ({
+    displayName: overrides.id,
+    contextTokens: null,
+    maxOutputTokens: null,
+    inputUsdPerMillionTokens: null,
+    outputUsdPerMillionTokens: null,
+    supportsTools: null,
+    supportsReasoningEffort: null,
+    unknownFields: [],
+    metadataSource: 'unknown',
+    ...overrides
+  });
+
+  const options = {
+    privacyRoute: 'provider_zdr' as const,
+    contextTokens: 128_000,
+    capabilities: ['chat', 'tools', 'reasoning'] as const,
+    modalities: ['text'] as const,
+    tag: 'Ollama Cloud'
+  };
+
+  it('writes every model the account reaches, not the one the owner typed', () => {
+    const catalogue = configuredModelCatalog(
+      [described({ id: 'a' }), described({ id: 'b' }), described({ id: 'c' })],
+      { ...options, capabilities: [...options.capabilities], modalities: [...options.modalities] }
+    );
+    expect(catalogue.map((model) => model.id)).toEqual(['custom/a', 'custom/b', 'custom/c']);
+    expect(catalogue.every((model) => model.provider === 'custom')).toBe(true);
+  });
+
+  it('prefers the endpoint’s own numbers and falls back to the owner’s only where it was silent', () => {
+    const [declared, silent] = configuredModelCatalog(
+      [
+        described({
+          id: 'declared',
+          contextTokens: 262_144,
+          inputUsdPerMillionTokens: 5,
+          metadataSource: 'declared'
+        }),
+        described({ id: 'silent' })
+      ],
+      { ...options, capabilities: [...options.capabilities], modalities: [...options.modalities] }
+    );
+    expect(declared?.contextTokens).toBe(262_144);
+    expect(declared?.usageClass).toBe('high');
+    expect(silent?.contextTokens).toBe(128_000);
+    // Never invented as measured: an unmeasured route is selectable by name and never by ranking.
+    expect(silent?.metadataSource).toBe('unknown');
+    expect(silent?.measuredQuality).toBeNull();
+  });
+
+  it('only takes tools away from a model that said it has none', () => {
+    const [quiet, refusing] = configuredModelCatalog(
+      [described({ id: 'quiet' }), described({ id: 'refusing', supportsTools: false })],
+      { ...options, capabilities: [...options.capabilities], modalities: [...options.modalities] }
+    );
+    // Silence is not a denial. Reading it as one would take every model on a quiet endpoint out of
+    // agent work, which is all of them on most endpoints.
+    expect(quiet?.capabilities).toContain('tools');
+    expect(refusing?.capabilities).not.toContain('tools');
   });
 });

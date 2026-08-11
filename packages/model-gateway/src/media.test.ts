@@ -62,9 +62,59 @@ describe('managed media generation', () => {
         prompt: 'Private speech',
         width: 0,
         height: 0,
-        seed: 3
+        seed: 3,
+        voice: 'af_heart'
       })
     ).resolves.toMatchObject({ outputs: [{ filename: 'gen-3.mp3' }] });
+  });
+
+  it('sends no voice to a speech route whose voices athanor does not know', async () => {
+    const request = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = typeof init?.body === 'string' ? (JSON.parse(init.body) as object) : {};
+      expect(body).not.toHaveProperty('voice');
+      return new Response(Buffer.from('audio'), {
+        status: 200,
+        headers: { 'content-type': 'audio/mpeg' }
+      });
+    });
+    vi.stubGlobal('fetch', request);
+    await expect(
+      client().generate({
+        id: 'gen-6',
+        kind: 'audio',
+        model: 'some-other/speech-model',
+        prompt: 'Private speech',
+        width: 0,
+        height: 0,
+        seed: 6,
+        usdPerMillionCharacters: 2
+      })
+    ).resolves.toMatchObject({ costUsd: (14 * 2) / 1_000_000 });
+  });
+
+  it('prices an image from the chosen route rather than from the compiled-in default', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({ data: [{ b64_json: Buffer.from('image').toString('base64') }] }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          )
+      )
+    );
+    await expect(
+      client().generate({
+        id: 'gen-7',
+        kind: 'image',
+        model: 'some-other/image-model',
+        prompt: 'A private image',
+        width: 1000,
+        height: 1000,
+        seed: 7,
+        usdPerImage: 0.09
+      })
+    ).resolves.toMatchObject({ costUsd: 0.09 });
   });
 
   it('refuses to fetch an output the provider offered over plain HTTP', async () => {

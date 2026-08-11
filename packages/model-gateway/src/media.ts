@@ -32,6 +32,26 @@ export interface MediaRequest {
   width: number;
   height: number;
   seed: number;
+  /**
+   * The voice to speak in, when the chosen route names its voices.
+   *
+   * Sent only when the caller supplies one. This used to be a constant, and the constant belonged
+   * to one specific speech model - so the moment the model became the owner's choice, every other
+   * speech route would have been asked for a voice from a different model's list. A route whose
+   * voices athanor does not know is asked without one, and the provider's own answer says what it
+   * needs, which is better than this side inventing a name for it.
+   */
+  voice?: string;
+  /**
+   * What the caller believes this route costs, used only when the provider does not say.
+   *
+   * Both are per the unit the modality is billed in and both may be absent. Every response path
+   * below prefers the provider's own figure; these exist so that a route athanor has measured
+   * still prices its own generations rather than borrowing the price of whatever model happened to
+   * be compiled in.
+   */
+  usdPerImage?: number | null;
+  usdPerMillionCharacters?: number | null;
 }
 
 /** Only over TLS, and only what the provider pointed at. */
@@ -119,11 +139,10 @@ export class MediaClient {
     }
     if (!outputs.length) throw new Error('The provider returned no generated images');
     const megapixels = (input.width * input.height) / 1_000_000;
+    const base = input.usdPerImage ?? managedMediaModels.image.baseUsdPerImage;
     return {
       outputs,
-      costUsd:
-        body.usage?.cost ??
-        managedMediaModels.image.baseUsdPerImage + Math.max(0, megapixels - 1) * 0.001
+      costUsd: body.usage?.cost ?? base + Math.max(0, megapixels - 1) * 0.001
     };
   }
 
@@ -135,7 +154,7 @@ export class MediaClient {
       body: JSON.stringify({
         model: input.model,
         input: input.prompt,
-        voice: managedMediaModels.audio.defaultVoice,
+        ...(input.voice ? { voice: input.voice } : {}),
         response_format: 'mp3',
         ...this.#routing()
       })
@@ -151,7 +170,9 @@ export class MediaClient {
         }
       ],
       costUsd:
-        (input.prompt.length * managedMediaModels.audio.usdPerMillionCharacters) / 1_000_000
+        (input.prompt.length *
+          (input.usdPerMillionCharacters ?? managedMediaModels.audio.usdPerMillionCharacters)) /
+        1_000_000
     };
   }
 }

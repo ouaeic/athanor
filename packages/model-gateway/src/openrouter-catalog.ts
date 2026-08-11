@@ -1,4 +1,4 @@
-import type { ModelRelease } from '@athanor/contracts';
+import type { MediaModelOption, ModelRelease } from '@athanor/contracts';
 import {
   AthanorError,
   RETIREMENT_HORIZON_DAYS,
@@ -6,6 +6,7 @@ import {
   type ModelPriceTier,
   type RoutableModel
 } from '@athanor/core';
+import { seedMediaModels } from './catalog.js';
 import { currentCommercialLicenseReview } from './license-manifest.js';
 import { promptCacheStyleFor, type PromptCacheStyle } from './prompt-cache.js';
 
@@ -645,6 +646,107 @@ export const refreshOpenRouterCatalog = async (
   }
 
   return [...reviewedEntries, ...liveEntries];
+};
+
+/**
+ * The generators the owner's provider account can reach, which the chat refresh above throws away.
+ *
+ * `refreshOpenRouterCatalog` skips every model whose output is not text - correctly, they cannot
+ * answer a turn - and until now that was the end of them. So the image and speech models the owner
+ * is paying for existed nowhere in this software except as two ids compiled into a manifest, which
+ * is exactly the complaint: there was no control because there was no catalogue to control.
+ *
+ * What this cannot do is price them. The chat side reads `pricing.prompt` and `pricing.completion`
+ * off the same feed and those are the only price fields this repository has ever confirmed; there
+ * is no field here that is known to state dollars per generated image, and guessing at one would
+ * put a number under a control the owner is about to trust. So a live entry's price is reported as
+ * `unknown`, the reviewed seeds keep their measured figures, and the worker's approval card asks
+ * every single time for a model whose cost nobody has stated. A live account is what it would take
+ * to confirm whether a per-image price is published here and under what key.
+ */
+export const refreshOpenRouterMediaCatalog = async (options: {
+  baseUrl: string;
+  apiKey: string;
+  fetch?: typeof fetch;
+  now?: Date;
+  /** When true, a model with no zero-retention endpoint is listed but cannot be chosen. */
+  requireZeroDataRetention?: boolean;
+}): Promise<MediaModelOption[]> => {
+  const request = options.fetch ?? globalThis.fetch;
+  const baseUrl = options.baseUrl.replace(/\/$/, '');
+  const headers = { authorization: `Bearer ${options.apiKey}` };
+  const now = options.now ?? new Date();
+  const updatedAt = now.toISOString();
+  const [modelsResult, zdrResult] = await Promise.allSettled([
+    request(`${baseUrl}/models`, { headers, signal: AbortSignal.timeout(15_000) }).then(
+      (response) => checkedJson<{ data?: OpenRouterModel[] }>(response, 'OpenRouter models')
+    ),
+    request(`${baseUrl}/endpoints/zdr`, { headers, signal: AbortSignal.timeout(15_000) }).then(
+      (response) => checkedJson<{ data?: ZdrEndpoint[] }>(response, 'OpenRouter ZDR endpoints')
+    )
+  ]);
+  if (modelsResult.status === 'rejected') throw modelsResult.reason;
+  const listed = modelsResult.value.data ?? [];
+  if (listed.length === 0)
+    throw new AthanorError(
+      'provider_catalog_empty',
+      'The provider answered but listed no models, so the media catalogue was left as it was',
+      502
+    );
+  const zdrBody = zdrResult.status === 'fulfilled' ? zdrResult.value : null;
+  const zdrModelIds = new Set(
+    (zdrBody?.data ?? [])
+      .filter((endpoint) => endpoint.status === undefined || endpoint.status === 0)
+      .flatMap((endpoint) => (endpoint.model_id ? [endpoint.model_id] : []))
+  );
+  const listedIds = new Set(listed.map((model) => model.id));
+  const seeds = seedMediaModels(now).map((seed) => ({
+    ...seed,
+    ...(zdrBody ? { zeroDataRetentionAvailable: zdrModelIds.has(seed.providerModelId) } : {}),
+    // The reviewed route is always offered, but it is not always there: an account that cannot
+    // reach it says so here rather than at the moment a generation fails.
+    ...(listedIds.has(seed.providerModelId)
+      ? {}
+      : { unavailableReason: 'this provider account does not list it' })
+  }));
+  const seeded = new Set(seeds.map((seed) => seed.providerModelId));
+  const live: MediaModelOption[] = [];
+  for (const model of listed) {
+    if (seeded.has(model.id)) continue;
+    const outputs = model.architecture?.output_modalities ?? [];
+    // A model that can answer with text is a chat model, whatever else it can also emit; it belongs
+    // in the picker the composer reads and not in a list of things that make files.
+    if (!outputs.length || outputs.includes('text')) continue;
+    const modality = outputs.includes('image')
+      ? ('image' as const)
+      : outputs.includes('audio')
+        ? ('audio' as const)
+        : null;
+    if (!modality) continue;
+    live.push({
+      id: `openrouter/${model.id}`,
+      providerModelId: model.id,
+      displayName: displayNameFor(model),
+      provider: 'openrouter',
+      modality,
+      usdPerImage: null,
+      usdPerMillionCharacters: null,
+      priceSource: 'unknown' as const,
+      defaultVoice: null,
+      recommendationTags: ['Price not published'],
+      updatedAt,
+      // Undefined rather than false when the endpoint feed could not be read, so an outage on one
+      // of two requests cannot silently withdraw every private media route the owner has.
+      ...(zdrBody ? { zeroDataRetentionAvailable: zdrModelIds.has(model.id) } : {})
+    });
+  }
+  const all = [...seeds, ...live];
+  if (!options.requireZeroDataRetention) return all;
+  return all.map((option) =>
+    option.unavailableReason || option.zeroDataRetentionAvailable !== false
+      ? option
+      : { ...option, unavailableReason: 'no verified private route' }
+  );
 };
 
 /** Projects shared live endpoint metadata into one owner's current privacy policy. */

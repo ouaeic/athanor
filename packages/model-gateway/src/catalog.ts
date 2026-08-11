@@ -1,4 +1,13 @@
-import type { ModelRelease } from '@athanor/contracts';
+import type {
+  MediaModality,
+  MediaModelChoice,
+  MediaModelOption,
+  ModelRelease,
+  PrivacyRoute
+} from '@athanor/contracts';
+import type { RoutableModel } from '@athanor/core';
+import { managedMediaModels } from './license-manifest.js';
+import type { ConfiguredModelDescription } from './openai-compatible.js';
 
 type Seed = Omit<ModelRelease, 'updatedAt'>;
 
@@ -111,4 +120,194 @@ export const seedModels = (now = new Date()): ModelRelease[] => {
     }
   ];
   return seeds.map((model) => ({ ...model, updatedAt }));
+};
+
+/**
+ * Every model a directly configured account can reach, turned into a catalogue.
+ *
+ * This is what `'ollama-cloud'` was missing. The provider had been in the enum and in the settings
+ * form since before this file, and the whole of its support was: the owner types one model id, the
+ * save route checks that id appears in `/models`, and exactly one row is written with a context
+ * window and a capability list the owner had to guess. A subscription that reaches thirty cloud
+ * models produced a catalogue of one, and reaching a second one meant going back to Settings and
+ * retyping. The refresh loop never touched it either - it is OpenRouter-shaped throughout - so the
+ * one row also never changed again.
+ *
+ * The endpoint's own answer is the source. `describe` reads context windows, output limits, prices
+ * and supported parameters where they are published and reports what was not, which is the whole
+ * difference between this and the invented metadata it replaces: a field nobody stated stays at the
+ * owner's declared fallback and the entry says its metadata was never measured, so it is selectable
+ * by name and never by automatic ranking.
+ */
+export const configuredModelCatalog = (
+  described: readonly ConfiguredModelDescription[],
+  options: {
+    privacyRoute: PrivacyRoute;
+    /** What the owner said when the endpoint would not say. */
+    contextTokens: number;
+    capabilities: ModelRelease['capabilities'];
+    modalities: ModelRelease['modalities'];
+    /** The badge on every row, naming where these came from. */
+    tag: string;
+    now?: Date;
+  }
+): RoutableModel[] => {
+  const updatedAt = (options.now ?? new Date()).toISOString();
+  return described
+    .filter((model) => model.id.trim().length > 0)
+    .map((model) => ({
+      id: `custom/${model.id}`,
+      providerModelId: model.id,
+      displayName: model.displayName,
+      provider: 'custom',
+      revision: 'provider-managed',
+      availability: 'available' as const,
+      openness: 'remote_proprietary' as const,
+      license: 'Provider-defined',
+      commercialUse: true,
+      privacyRoute: options.privacyRoute,
+      contextTokens: model.contextTokens ?? options.contextTokens,
+      modalities: options.modalities,
+      // Only ever narrowed on an explicit denial. `supportsTools` is null when the endpoint listed
+      // no parameters at all, and reading silence as "cannot call tools" would take every model on
+      // a quiet endpoint out of agent work, which is all of them on most.
+      capabilities:
+        model.supportsTools === false
+          ? options.capabilities.filter((capability) => capability !== 'tools')
+          : options.capabilities,
+      usageClass: usageClassForPrice(model.inputUsdPerMillionTokens),
+      recommendationTags: [
+        options.tag,
+        ...(model.metadataSource === 'unknown' ? [] : ['Declared'])
+      ],
+      measuredQuality: null,
+      measuredLatencyMs: null,
+      inputUsdPerMillionTokens: model.inputUsdPerMillionTokens,
+      outputUsdPerMillionTokens: model.outputUsdPerMillionTokens,
+      maxOutputTokens: model.maxOutputTokens,
+      ...(model.supportsReasoningEffort === null
+        ? {}
+        : { supportsReasoningEffort: model.supportsReasoningEffort }),
+      metadataSource: model.metadataSource,
+      updatedAt
+    }));
+};
+
+/** Price per million input tokens decides how a run is weighed against the owner's usage windows. */
+const usageClassForPrice = (inputUsdPerMillion: number | null): ModelRelease['usageClass'] => {
+  if (inputUsdPerMillion === null || !Number.isFinite(inputUsdPerMillion)) return 'medium';
+  if (inputUsdPerMillion <= 1) return 'light';
+  if (inputUsdPerMillion <= 3) return 'medium';
+  if (inputUsdPerMillion <= 10) return 'high';
+  return 'extra_high';
+};
+
+/**
+ * The two media routes athanor has actually run, offered as catalogue entries like any other.
+ *
+ * These are the models that were hard-coded until now - the same ids, the same prices - but they
+ * are no longer the answer, only the entry that is always present. Their prices are marked
+ * `measured` rather than `provider`: they are figures this software recorded from real generations
+ * on these routes, not something read back off a feed, and an owner comparing them with a live
+ * catalogue entry deserves to know which kind of number they are looking at.
+ */
+export const seedMediaModels = (now = new Date()): MediaModelOption[] => {
+  const updatedAt = now.toISOString();
+  return [
+    {
+      id: `openrouter/${managedMediaModels.image.modelId}`,
+      providerModelId: managedMediaModels.image.modelId,
+      displayName: managedMediaModels.image.displayName,
+      provider: 'openrouter',
+      modality: 'image' as const,
+      usdPerImage: managedMediaModels.image.baseUsdPerImage,
+      usdPerMillionCharacters: null,
+      priceSource: 'measured' as const,
+      defaultVoice: null,
+      recommendationTags: ['Reviewed', managedMediaModels.image.license],
+      updatedAt
+    },
+    {
+      id: `openrouter/${managedMediaModels.audio.modelId}`,
+      providerModelId: managedMediaModels.audio.modelId,
+      displayName: managedMediaModels.audio.displayName,
+      provider: 'openrouter',
+      modality: 'audio' as const,
+      usdPerImage: null,
+      usdPerMillionCharacters: managedMediaModels.audio.usdPerMillionCharacters,
+      priceSource: 'measured' as const,
+      defaultVoice: managedMediaModels.audio.defaultVoice,
+      recommendationTags: ['Reviewed', managedMediaModels.audio.license],
+      updatedAt
+    }
+  ];
+};
+
+/** The unit a modality is billed in, so one comparison can order a mixed catalogue. */
+const comparablePrice = (option: MediaModelOption): number | null =>
+  option.modality === 'audio' ? option.usdPerMillionCharacters : option.usdPerImage;
+
+/**
+ * The order the three automatic modes read the catalogue in, and the whole of the evidence behind
+ * them.
+ *
+ * The chat picker's modes stand on measured benchmarks. Nothing measures a media model: the
+ * provider feed that carries an intelligence index for chat routes carries no quality column for
+ * image or speech generation at all, and inventing one would be the same mistake that once let an
+ * unmeasured local route outrank every benchmarked model in the catalogue. So price is the only
+ * ordering there is, it is used as an ordering and not dressed up as a quality score, and the
+ * Settings copy says exactly that beside the control.
+ *
+ * A model whose price nobody published always sorts last, in every mode. An unknown price is not a
+ * cheap one, and it is not a premium one either - it is a number the owner will first see on an
+ * invoice, so it is never what an automatic mode reaches for on their behalf.
+ */
+export const rankMediaModels = (
+  options: readonly MediaModelOption[],
+  preference: MediaModelChoice['preference']
+): MediaModelOption[] => {
+  const selectable = options.filter((option) => !option.unavailableReason);
+  const priced = selectable.filter((option) => comparablePrice(option) !== null);
+  const unpriced = selectable.filter((option) => comparablePrice(option) === null);
+  const byPrice = [...priced].sort(
+    (left, right) =>
+      (comparablePrice(left) ?? 0) - (comparablePrice(right) ?? 0) ||
+      left.id.localeCompare(right.id)
+  );
+  const ordered =
+    preference === 'fast'
+      ? byPrice
+      : preference === 'best'
+        ? [...byPrice].reverse()
+        : // Recommended leads with the route athanor has itself run and priced, because that is the
+          // one entry whose cost figure came from generations rather than from a feed. Everything
+          // else follows cheapest-first, which is the safest thing to fall to when it is absent.
+          [
+            ...byPrice.filter((option) => option.priceSource === 'measured'),
+            ...byPrice.filter((option) => option.priceSource !== 'measured')
+          ];
+  return [...ordered, ...unpriced.sort((left, right) => left.id.localeCompare(right.id))];
+};
+
+/**
+ * Which model a modality will actually use, from the owner's choice and what their provider offers.
+ *
+ * A pinned model that has left the catalogue falls back to the automatic answer rather than
+ * failing: the alternative is a conversation that cannot generate an image because a provider
+ * withdrew a route months ago and nobody was watching. Null means the provider offers nothing for
+ * this modality at all, which is a real state and is reported as one.
+ */
+export const resolveMediaModel = (
+  options: readonly MediaModelOption[],
+  choice: MediaModelChoice | undefined,
+  modality: MediaModality
+): MediaModelOption | null => {
+  const forModality = options.filter((option) => option.modality === modality);
+  if (!choice?.automatic && choice?.modelId) {
+    const pinned = forModality.find(
+      (option) => option.id === choice.modelId || option.providerModelId === choice.modelId
+    );
+    if (pinned && !pinned.unavailableReason) return pinned;
+  }
+  return rankMediaModels(forModality, choice?.preference ?? 'balanced')[0] ?? null;
 };

@@ -5,6 +5,7 @@ import { seedModels } from './catalog.js';
 import {
   applyOpenRouterPrivacyPolicy,
   refreshOpenRouterCatalog,
+  refreshOpenRouterMediaCatalog,
   verifyOpenRouterKey
 } from './openrouter-catalog.js';
 
@@ -606,5 +607,84 @@ describe('benchmark populations', () => {
     expect(
       result.find((model) => model.providerModelId === 'unreviewed/new-model')?.benchmarkPopulations
     ).toBeNull();
+  });
+});
+
+describe('the media catalogue the chat refresh throws away', () => {
+  it('offers the generators the owner is paying for, which had existed nowhere before', async () => {
+    const options = await refreshOpenRouterMediaCatalog({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'owner-key',
+      fetch: liveFetch() as typeof fetch,
+      now: NOW
+    });
+    const live = options.find((entry) => entry.providerModelId === 'black-forest-labs/flux-2');
+    expect(live?.modality).toBe('image');
+    // No chat model gets in: a model that can answer with text belongs in the composer's picker,
+    // whatever else it can also emit.
+    expect(options.some((entry) => entry.providerModelId === 'z-ai/glm-5.2')).toBe(false);
+  });
+
+  it('says a live model’s price is unpublished rather than borrowing the default’s', async () => {
+    const options = await refreshOpenRouterMediaCatalog({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'owner-key',
+      fetch: liveFetch() as typeof fetch,
+      now: NOW
+    });
+    const live = options.find((entry) => entry.providerModelId === 'black-forest-labs/flux-2');
+    // There is no field in this feed that this repository can point at for dollars per image, and a
+    // number under a control the owner is about to trust must not be a guess. The worker turns this
+    // admission into an approval card on every generation from that route.
+    expect(live).toMatchObject({ priceSource: 'unknown', usdPerImage: null });
+    const reviewed = options.find((entry) => entry.priceSource === 'measured');
+    expect(reviewed?.usdPerImage).toBeGreaterThan(0);
+  });
+
+  it('says when the reviewed route is one this account cannot reach', async () => {
+    const options = await refreshOpenRouterMediaCatalog({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'owner-key',
+      fetch: liveFetch() as typeof fetch,
+      now: NOW
+    });
+    // Said here rather than at the moment a generation fails mid-task.
+    expect(options.filter((entry) => entry.priceSource === 'measured')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ unavailableReason: 'this provider account does not list it' })
+      ])
+    );
+  });
+
+  it('withholds a model with no private endpoint only when private routes were demanded', async () => {
+    const request = { baseUrl: 'https://openrouter.ai/api/v1', apiKey: 'owner-key', now: NOW };
+    const relaxed = await refreshOpenRouterMediaCatalog({
+      ...request,
+      fetch: liveFetch() as typeof fetch
+    });
+    const strict = await refreshOpenRouterMediaCatalog({
+      ...request,
+      fetch: liveFetch() as typeof fetch,
+      requireZeroDataRetention: true
+    });
+    const of = (all: typeof relaxed) =>
+      all.find((entry) => entry.providerModelId === 'black-forest-labs/flux-2');
+    expect(of(relaxed)?.unavailableReason).toBeUndefined();
+    expect(of(strict)?.unavailableReason).toBe('no verified private route');
+  });
+
+  it('does not withdraw private media routes on the strength of one failed request', async () => {
+    const options = await refreshOpenRouterMediaCatalog({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'owner-key',
+      fetch: liveFetch({ zdrStatus: 500 }) as typeof fetch,
+      requireZeroDataRetention: true,
+      now: NOW
+    });
+    // Unknown is not false. With the endpoint feed unread, nothing is claimed either way, and the
+    // owner keeps a picker rather than losing every media route to an outage.
+    const live = options.find((entry) => entry.providerModelId === 'black-forest-labs/flux-2');
+    expect(live?.zeroDataRetentionAvailable).toBeUndefined();
+    expect(live?.unavailableReason).toBeUndefined();
   });
 });
