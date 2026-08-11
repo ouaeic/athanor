@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import html
 import json
 import math
@@ -17,7 +18,7 @@ import zipfile
 from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 
 SUPPORTED = {
@@ -44,6 +45,17 @@ SUPPORTED = {
 MAX_SOURCE_BYTES = 250 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024
 TOKEN = re.compile(r"[\w-]{2,}", re.UNICODE)
+
+# The one interpreter this computer guarantees has the document libraries. The distribution's
+# python3 usually has openpyxl as well, so this is the second thing tried and not the first.
+ATHANOR_PYTHON = "/usr/local/lib/athanor/python/bin/python3"
+
+# Naming every populated cell is what makes a figure citable, and it is also what makes a large
+# sheet unreadable, so a reading stops at a bounded number of cells and says where it stopped.
+# The workbook total is set against the 200,000-character ceiling a read is clipped to anyway.
+MAX_SHEET_CELLS = 4_000
+MAX_WORKBOOK_CELLS = 12_000
+CURRENCY_SIGNS = "$£€¥₹₽"
 
 
 class TextHTMLParser(HTMLParser):
@@ -143,7 +155,226 @@ def extract_pptx(target: Path) -> str:
         )
 
 
-def extract_xlsx(target: Path) -> str:
+def openpyxl_module():
+    """The workbook reader, or None when the running interpreter does not have it."""
+    try:
+        import openpyxl
+    except ImportError:
+        return None
+    return openpyxl
+
+
+def number_text(value: float, number_format: str) -> str:
+    """Render a number the way its format renders it: percentage, currency, decimal places.
+
+    Only the first section of the format is read. The sections after it describe negative, zero
+    and text values, and reading them would buy a minus sign the number already carries.
+    """
+    code = (number_format or "General").split(";")[0]
+    marks = "".join(
+        part for group in re.findall(r'"([^"]*)"|\[\$([^\]]*)\]', code) for part in group
+    )
+    symbol = "".join(mark for mark in marks if mark in CURRENCY_SIGNS)
+    skeleton = re.sub(r'"[^"]*"|\[[^\]]*\]|\\.|_.|\*.', "", code)
+    if "%" in skeleton:
+        value *= 100
+    places = re.search(r"\.([0#?]+)", skeleton)
+    grouping = "," if re.search(r"[#0],[#0]", skeleton) else ""
+    whole = int(value) if isinstance(value, int) or float(value).is_integer() else None
+    if places:
+        text = format(float(value), f"{grouping}.{len(places.group(1))}f")
+    elif whole is not None and abs(whole) < 2**53:
+        # An invoice number, an account number or an order reference is a whole number the sheet
+        # holds exactly, and eleven significant figures would round it into 4.4770090012e+11 and
+        # lose the digits that make it citable. Past 2**53 the workbook itself no longer holds
+        # every digit, so there is nothing left to preserve and the general form is the honest one.
+        text = format(whole, f"{grouping}d")
+    else:
+        text = format(value, f"{grouping}.11g")
+    sign = ""
+    if text.startswith("-"):
+        sign, text = "-", text[1:]
+    return f"{sign}{symbol}{text}%" if "%" in skeleton else f"{sign}{symbol}{text}"
+
+
+def moment_text(value: object, number_format: str) -> str:
+    """ISO 8601, rather than the sheet's own date mask.
+
+    The defect being fixed is a date arriving as 45292. Reproducing the mask would trade it for
+    01/02/2024, which is two different days depending on who is reading.
+    """
+    code = re.sub(r'"[^"]*"|\[[^\]]*\]|\\.', "", number_format or "").lower()
+    if isinstance(value, datetime.time):
+        return value.strftime("%H:%M:%S" if value.second else "%H:%M")
+    timed = "h" in code or "s" in code
+    if isinstance(value, datetime.datetime) and (timed or value.time() != datetime.time()):
+        return value.strftime("%Y-%m-%d %H:%M")
+    return value.strftime("%Y-%m-%d")
+
+
+def cell_text(value: object, number_format: str) -> str:
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return moment_text(value, number_format)
+    if isinstance(value, datetime.timedelta):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return number_text(value, number_format)
+    # A cell's own line breaks and tabs would read as new rows and new cells further along.
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def plural(count: int, noun: str) -> str:
+    return f"{count:,} {noun}" if count == 1 else f"{count:,} {noun}s"
+
+
+def formula_string(value: object) -> str | None:
+    if not isinstance(value, str):
+        value = getattr(value, "text", None)  # an array formula carries its source here
+    if isinstance(value, str) and value.startswith("="):
+        return re.sub(r"\s+", " ", value).strip()
+    return None
+
+
+def sheet_lines(value_sheet, formula_sheet, limit: int) -> tuple[list[str], int, int, str]:
+    """One line per row, one `B14: value` per populated cell, until the cell limit is spent.
+
+    The two sheets are the same XML read twice, once for cached values and once for formulas, so
+    their rows arrive in step. A formula is only ever attached to a value cell of the same
+    coordinate, which means a misalignment would lose a formula rather than misreport one.
+    """
+    lines: list[str] = []
+    written = 0
+    uncached = 0
+    stopped = ""
+    for value_row, formula_row in zip(value_sheet.iter_rows(), formula_sheet.iter_rows()):
+        formula_at: dict[str, str] = {}
+        for cell in formula_row:
+            # A gap in a row arrives as a cell with no coordinate at all, and holds nothing.
+            coordinate = getattr(cell, "coordinate", None)
+            source = formula_string(cell.value)
+            if coordinate and source is not None:
+                formula_at[coordinate] = source
+        cells: list[str] = []
+        for cell in value_row:
+            coordinate = getattr(cell, "coordinate", None)
+            if not coordinate:
+                continue
+            formula = formula_at.get(coordinate)
+            if cell.value is None and formula is None:
+                continue
+            if written >= limit:
+                stopped = coordinate
+                break
+            if cell.value is None:
+                uncached += 1
+                text = formula
+            else:
+                text = cell_text(cell.value, cell.number_format)
+            if not text:
+                continue
+            cells.append(f"{coordinate}: {text}")
+            written += 1
+        if cells:
+            lines.append("\t".join(cells))
+        if stopped:
+            break
+    return lines or ["(no populated cells)"], written, uncached, stopped
+
+
+def workbook_lines(values, formulas, name: str) -> list[str]:
+    body: list[str] = []
+    budget = MAX_WORKBOOK_CELLS
+    uncached = 0
+    sheets = values.worksheets
+    for index, sheet in enumerate(sheets, 1):
+        if budget <= 0:
+            skipped = sheets[index - 1 :]
+            titles = ", ".join(later.title for later in skipped)
+            body.append(
+                f"[Not read: {plural(len(skipped), 'further sheet')} ({titles}). "
+                f"The {MAX_WORKBOOK_CELLS:,} cell limit for one workbook was reached.]"
+            )
+            break
+        lines, written, missing, stopped = sheet_lines(
+            sheet, formulas[sheet.title], min(MAX_SHEET_CELLS, budget)
+        )
+        body.append(f"[Sheet {index}: {sheet.title}]")
+        body.extend(lines)
+        if stopped:
+            body.append(
+                f"[Truncated: {plural(written, 'cell')} read from {sheet.title}, stopping at "
+                f"{stopped}. The rest of the sheet was not read.]"
+            )
+        budget -= written
+        uncached += missing
+    if uncached:
+        stem = Path(name).stem
+        body.insert(
+            0,
+            "[This workbook has not been recalculated since it was written. Where a formula has "
+            f"no cached result the formula itself appears below, in {plural(uncached, 'cell')}: "
+            f"`athanor-office-convert {name} {stem}.recalc.xlsx` computes the values.]",
+        )
+    return body
+
+
+def workbook_text(target: Path, openpyxl) -> str:
+    """Read-only twice over: one workbook for cached values, one for the formulas behind them."""
+    values = openpyxl.load_workbook(target, read_only=True, data_only=True)
+    formulas = openpyxl.load_workbook(target, read_only=True, data_only=False)
+    try:
+        return normalized("\n".join(workbook_lines(values, formulas, target.name)))
+    finally:
+        values.close()
+        formulas.close()
+
+
+def delegated_workbook_text(target: Path) -> str | None:
+    """Ask the pinned interpreter to read the workbook when this one cannot."""
+    if not os.access(ATHANOR_PYTHON, os.X_OK):
+        return None
+    try:
+        result = subprocess.run(
+            [ATHANOR_PYTHON, str(Path(__file__).resolve()), "workbook", "--path", str(target)],
+            check=False,
+            capture_output=True,
+            timeout=90,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    text = payload.get("text")
+    return text if isinstance(text, str) else None
+
+
+# What the reader below cannot do, said once in the text it produces. A workbook that quietly
+# came back as serial numbers and blank totals is worse than one that says why it did.
+SHEET_XML_NOTE = (
+    "[Read from the sheet XML because openpyxl is not installed here: the sheets below are "
+    "unnamed and in file order rather than tab order, dates and percentages appear as the raw "
+    "numbers underneath them, and a formula cell with no cached value is blank.]"
+)
+
+
+def extract_xlsx(target: Path) -> tuple[str, str]:
+    """A workbook read as a spreadsheet, plus the name of the reader that managed it."""
+    openpyxl = openpyxl_module()
+    if openpyxl is not None:
+        return workbook_text(target, openpyxl), "openpyxl"
+    delegated = delegated_workbook_text(target)
+    if delegated is not None:
+        return delegated, "openpyxl"
+    return f"{SHEET_XML_NOTE}\n{sheet_xml_text(target)}", "sheet XML"
+
+
+def sheet_xml_text(target: Path) -> str:
     with zipfile.ZipFile(target) as archive:
         shared: list[str] = []
         if "xl/sharedStrings.xml" in archive.namelist():
@@ -225,38 +456,46 @@ def extract_pdf(target: Path, start_page: int, end_page: int) -> tuple[str, int 
     return normalized(result.stdout.decode("utf-8", "replace")), pages
 
 
-def extract_text(target: Path, start_page: int = 1, end_page: int = 20) -> tuple[str, int | None]:
+class Extraction(NamedTuple):
+    text: str
+    pages: int | None = None
+    extractor: str | None = None
+
+
+def extract_text(target: Path, start_page: int = 1, end_page: int = 20) -> Extraction:
     suffix = target.suffix.lower()
     if suffix == ".pdf":
-        return extract_pdf(target, start_page, end_page)
+        text, pages = extract_pdf(target, start_page, end_page)
+        return Extraction(text, pages)
     if suffix == ".docx":
-        return extract_docx(target), None
+        return Extraction(extract_docx(target))
     if suffix == ".pptx":
-        return extract_pptx(target), None
+        return Extraction(extract_pptx(target))
     if suffix == ".xlsx":
-        return extract_xlsx(target), None
+        text, extractor = extract_xlsx(target)
+        return Extraction(text, None, extractor)
     if suffix in {".odt", ".ods", ".odp"}:
-        return extract_open_document(target), None
+        return Extraction(extract_open_document(target))
     data = target.read_bytes()
     text = data.decode("utf-8", "replace")
     if suffix in {".html", ".htm"}:
         parser = TextHTMLParser()
         parser.feed(text)
-        return normalized(html.unescape(" ".join(parser.parts))), None
+        return Extraction(normalized(html.unescape(" ".join(parser.parts))))
     if suffix in {".xml", ".svg"}:
         try:
-            return xml_text(data, {"p", "text", "g"}), None
+            return Extraction(xml_text(data, {"p", "text", "g"}))
         except ET.ParseError:
             pass
     if suffix in {".csv", ".tsv"}:
         dialect = "excel-tab" if suffix == ".tsv" else "excel"
         rows = csv.reader(text.splitlines(), dialect=dialect)
-        return normalized("\n".join("\t".join(row) for row in rows)), None
+        return Extraction(normalized("\n".join("\t".join(row) for row in rows)))
     if suffix == ".rtf":
         text = re.sub(r"\\'[0-9a-fA-F]{2}", " ", text)
         text = re.sub(r"\\[a-zA-Z]+-?\d* ?", " ", text)
         text = text.replace("{", " ").replace("}", " ")
-    return normalized(text), None
+    return Extraction(normalized(text))
 
 
 def chunks(text: str, size: int = 2_400) -> Iterable[str]:
@@ -326,16 +565,17 @@ def bm25_score(
 
 def read_command(args: argparse.Namespace) -> dict[str, object]:
     target = safe_target(args.path)
-    text, pages = extract_text(target, args.start_page, args.end_page)
-    total = len(text)
-    clipped = text[: args.max_chars]
+    extraction = extract_text(target, args.start_page, args.end_page)
+    total = len(extraction.text)
+    clipped = extraction.text[: args.max_chars]
     return {
         "path": os.path.relpath(target, Path.cwd()),
         "format": target.suffix.lower().lstrip(".") or "text",
         "text": clipped,
         "characters": total,
         "truncated": total > len(clipped),
-        "pages": pages,
+        "extractor": extraction.extractor,
+        "pages": extraction.pages,
         "pageRange": (
             {"start": args.start_page, "end": args.end_page}
             if target.suffix.lower() == ".pdf"
@@ -379,11 +619,11 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
     failures = 0
     for target in files:
         try:
-            text, _pages = extract_text(target, 1, args.max_pages)
+            extraction = extract_text(target, 1, args.max_pages)
         except (OSError, ValueError, ET.ParseError, zipfile.BadZipFile, subprocess.TimeoutExpired):
             failures += 1
             continue
-        for chunk, page in located_chunks(text, target.suffix.lower()):
+        for chunk, page in located_chunks(extraction.text, target.suffix.lower()):
             counts = Counter(term.lower() for term in TOKEN.findall(chunk))
             token_count = sum(counts.values())
             corpus_size += 1
@@ -454,6 +694,11 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("--max-results", type=int, default=12)
     search.add_argument("--max-pages", type=int, default=500)
     search.add_argument("--excerpt-chars", type=int, default=2_400)
+    workbook = subparsers.add_parser(
+        "workbook",
+        help="Read one .xlsx with openpyxl. `read` calls this on the pinned interpreter when its own lacks the library.",
+    )
+    workbook.add_argument("--path", required=True)
     return result
 
 
@@ -465,6 +710,11 @@ def main() -> int:
                 raise ValueError("Invalid page range")
             args.max_chars = min(200_000, max(1_000, args.max_chars))
             payload = read_command(args)
+        elif args.command == "workbook":
+            openpyxl = openpyxl_module()
+            if openpyxl is None:
+                raise ValueError("openpyxl is not available to this interpreter")
+            payload = {"text": workbook_text(safe_target(args.path), openpyxl)}
         else:
             args.max_files = min(2_000, max(1, args.max_files))
             args.max_results = min(50, max(1, args.max_results))

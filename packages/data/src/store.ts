@@ -102,9 +102,17 @@ const providerRefModelId = (providerRef: string | undefined): string | null => {
   return providerRef && separator > 0 ? providerRef.slice(separator + 1) : null;
 };
 
-/** Statuses in which a task can still spend, which is what a start-time cap has to price in. */
-const OPEN_TASK_STATUSES =
-  "('draft','queued','planning','running','awaiting_user','awaiting_resource','paused')";
+/**
+ * Statuses in which a task is about to spend the rest of its ceiling, which is what a start-time
+ * cap has to price in.
+ *
+ * Only the three a worker is in or reaching for. A task that is parked - waiting on the owner, on a
+ * resource, or paused - has no worker and will spend nothing until something puts it back in the
+ * queue, and the ceiling is priced again at that point. Reserving against it protects nothing and
+ * costs everything: a question asked at five o'clock would hold that conversation's whole unspent
+ * ceiling overnight, and the owner would sit down to a daily limit reached by work that never ran.
+ */
+const COMMITTED_TASK_STATUSES = "('queued','planning','running')";
 
 /**
  * How many times a task may be leased before the queue stops handing it to anyone.
@@ -4558,6 +4566,35 @@ export class DataStore {
     return result.rows[0] ? mapWorkspace(result.rows[0]) : null;
   }
 
+  /**
+   * Hands out one task, and never a second one for a workspace another worker is already inside.
+   *
+   * A workspace is one filesystem, one browser with one active page, one desktop. Two agents in
+   * there at once do not fail, they interfere: one runs a build while the other rewrites the file
+   * being built, and a navigation from one moves the page the other is reading. The owner sees
+   * damaged work with nothing to attribute it to. So the second conversation waits its turn rather
+   * than running beside the first - the concurrency the worker is configured for still applies, it
+   * just spreads across workspaces instead of stacking up inside one.
+   *
+   * Held, not parked or dead: the exclusion looks only at an unexpired lease, and every path that
+   * parks or finishes a task clears the lease as it goes. A worker that died holds the workspace
+   * for the remainder of its lease and no longer, which is the same window after which its own task
+   * becomes leasable again - so nothing can be wedged by a process that is gone. A task never
+   * excludes itself, so a retry of the one that died is still the next thing to run.
+   *
+   * A task that is passed over is left exactly as it was. It is filtered out of the candidates
+   * rather than leased and rejected, so waiting for the workspace costs it no attempt and the queue
+   * cannot spend a conversation's whole allowance on it before its turn ever comes.
+   *
+   * The workspace row is locked while the choice is made, which narrows the one case this cannot
+   * decide alone: two workers polling within a millisecond of each other. The second is passed over
+   * while the first holds the row, but a poll that began before the first committed and reaches the
+   * lock after it still reads a snapshot from before that lease existed, and would take a second
+   * task in the same workspace. Closing that needs the hold written on the workspace row itself,
+   * where the lock and the fact being read are the same row; until then this is a narrow race in
+   * place of a certainty. `SKIP LOCKED` means the statement waits on nothing, so it can neither
+   * block nor take part in a deadlock.
+   */
   async leaseNextTask(workerId: string, leaseSeconds = 60): Promise<TaskRecord | null> {
     const result = await this.database.query(
       `UPDATE tasks SET
@@ -4567,16 +4604,24 @@ export class DataStore {
          attempt = attempt + 1,
          updated_at = NOW()
        WHERE id = (
-         SELECT id FROM tasks
-         WHERE status IN ('queued','planning','running')
-           AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
-           AND attempt < $3
+         SELECT candidate.id FROM tasks candidate
+         JOIN workspaces workspace ON workspace.id = candidate.workspace_id
+         WHERE candidate.status IN ('queued','planning','running')
+           AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at < NOW())
+           AND candidate.attempt < $3
+           AND NOT EXISTS (
+             SELECT 1 FROM tasks holder
+             WHERE holder.workspace_id = candidate.workspace_id
+               AND holder.id <> candidate.id
+               AND holder.status IN ('queued','planning','running')
+               AND holder.lease_expires_at > NOW()
+           )
          -- Attempt first, then age. A task that has already died once is behind everything that
          -- has not, so a turn that kills its worker can no longer starve the message the owner
          -- sent while it was crashing; it drops a place each time and stops being handed out at
          -- all once it is at the ceiling. The tie-break on age is the original queue order.
-         ORDER BY attempt, created_at, id
-         FOR UPDATE SKIP LOCKED
+         ORDER BY candidate.attempt, candidate.created_at, candidate.id
+         FOR UPDATE OF candidate, workspace SKIP LOCKED
          LIMIT 1
        )
        RETURNING *`,
@@ -5507,8 +5552,8 @@ export class DataStore {
   }
 
   /**
-   * The unspent headroom of work that is already open. Without it two tasks started in the same
-   * second each see the same settled total, each fit under the cap, and together sail past it.
+   * The unspent headroom of work that is queued or under way. Without it two tasks started in the
+   * same second each see the same settled total, each fit under the cap, and together sail past it.
    */
   async openSpendCommitment(userId: string, excludeTaskId?: string): Promise<number> {
     return this.openSpendCommitmentIn(this.database, userId, excludeTaskId);
@@ -5527,7 +5572,7 @@ export class DataStore {
          WHERE u.task_id=t.id AND u.state='settled' AND u.cost_usd>0
        ) s ON TRUE
        WHERE t.user_id=$1 AND t.max_spend_usd IS NOT NULL
-         AND t.status IN ${OPEN_TASK_STATUSES}
+         AND t.status IN ${COMMITTED_TASK_STATUSES}
          AND ($2::uuid IS NULL OR t.id<>$2::uuid)`,
       [userId, excludeTaskId ?? null]
     );

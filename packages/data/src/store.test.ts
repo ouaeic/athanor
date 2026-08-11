@@ -690,12 +690,18 @@ describe('DataStore', () => {
 
     // Oldest, and still second: the message the owner sent two minutes later goes first.
     expect(await store.leaseNextTask('worker-1')).toMatchObject({ id: healthy.id, attempt: 1 });
+    // Second means after it, not beside it: both of these are the same computer.
+    await expect(store.leaseNextTask('worker-2')).resolves.toBeNull();
+
+    await database.query(
+      `UPDATE tasks SET status='completed',lease_owner=NULL,lease_expires_at=NULL WHERE id=$1`,
+      [healthy.id]
+    );
     expect(await store.leaseNextTask('worker-2')).toMatchObject({
       id: crasher.id,
       attempt: TASK_MAX_ATTEMPTS
     });
 
-    await database.query(`UPDATE tasks SET status='completed' WHERE id=$1`, [healthy.id]);
     await database.query(
       `UPDATE tasks SET lease_expires_at=NOW() - INTERVAL '1 second' WHERE id=$1`,
       [crasher.id]
@@ -703,6 +709,86 @@ describe('DataStore', () => {
     // The lease has expired and the status is still live, which before the ceiling was all it took
     // to be handed straight back to a worker.
     await expect(store.leaseNextTask('worker-3')).resolves.toBeNull();
+  });
+
+  /**
+   * The most ordinary thing an owner does is ask about a second thing while the first is still
+   * running. That must not put two agents in one filesystem, one browser and one desktop.
+   */
+  it('hands a workspace to one worker at a time, and leaves other workspaces alone', async () => {
+    const user = await store.createUser({ username: 'one-writer', displayName: 'One writer' });
+    const main = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+    const spare = await store.createWorkspace(workspaceInput(user.id, 'Spare'));
+    const running = await store.createTask(taskInput(user.id, main.id));
+    const waiting = await store.createTask(taskInput(user.id, main.id));
+    const elsewhere = await store.createTask(taskInput(user.id, spare.id));
+
+    expect(await store.leaseNextTask('worker-1')).toMatchObject({ id: running.id });
+    // The second question waits; a workspace of its own is a different computer and runs at once.
+    expect(await store.leaseNextTask('worker-2')).toMatchObject({ id: elsewhere.id });
+    await expect(store.leaseNextTask('worker-3')).resolves.toBeNull();
+
+    // Parking the first turn hands the computer over, without waiting for any lease to run out.
+    await store.updateTask({
+      id: running.id,
+      workerId: 'worker-1',
+      status: 'awaiting_user',
+      clearLease: true
+    });
+    expect(await store.leaseNextTask('worker-3')).toMatchObject({ id: waiting.id });
+  });
+
+  it('takes the workspace back when the worker holding it dies, and still retries its task', async () => {
+    const user = await store.createUser({ username: 'dead-worker', displayName: 'Dead worker' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+    const first = await store.createTask(taskInput(user.id, workspace.id));
+    const second = await store.createTask(taskInput(user.id, workspace.id));
+
+    expect(await store.leaseNextTask('worker-1')).toMatchObject({ id: first.id, attempt: 1 });
+    await expect(store.leaseNextTask('worker-2')).resolves.toBeNull();
+
+    // Nothing is renewing the lease any more, so the process that is gone stops holding the box.
+    await database.query(
+      `UPDATE tasks SET lease_expires_at=NOW() - INTERVAL '1 second' WHERE id=$1`,
+      [first.id]
+    );
+    expect(await store.leaseNextTask('worker-2')).toMatchObject({ id: second.id, attempt: 1 });
+
+    // And the turn that died is still the same task, so it comes back rather than being lost.
+    await database.query(
+      `UPDATE tasks SET lease_expires_at=NOW() - INTERVAL '1 second' WHERE id=$1`,
+      [second.id]
+    );
+    expect(await store.leaseNextTask('worker-3')).toMatchObject({ id: first.id, attempt: 2 });
+  });
+
+  /**
+   * Waiting for the workspace is not an attempt at anything. If a poll that finds the workspace
+   * held were to spend one, an idle worker would count a patient conversation to death in a few
+   * seconds and the sweep would fail it as a task that keeps dying, having never once run.
+   */
+  it('spends no attempt on a conversation that is only waiting for the workspace', async () => {
+    const user = await store.createUser({ username: 'patient', displayName: 'Patient' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+    const holder = await store.createTask(taskInput(user.id, workspace.id));
+    const waiting = await store.createTask(taskInput(user.id, workspace.id));
+
+    expect(await store.leaseNextTask('worker-1')).toMatchObject({ id: holder.id, attempt: 1 });
+    for (let poll = 0; poll < TASK_MAX_ATTEMPTS + 3; poll += 1)
+      await expect(store.leaseNextTask('worker-2')).resolves.toBeNull();
+
+    const untouched = await store.getTask(user.id, waiting.id);
+    expect(untouched).toMatchObject({ attempt: 0, status: 'queued', leaseOwner: null });
+    // And nothing swept it up as a task that has run out of tries while it stood in line.
+    await expect(store.failTasksAtAttemptLimit()).resolves.toEqual([]);
+
+    await store.updateTask({
+      id: holder.id,
+      workerId: 'worker-1',
+      status: 'completed',
+      clearLease: true
+    });
+    expect(await store.leaseNextTask('worker-2')).toMatchObject({ id: waiting.id, attempt: 1 });
   });
 
   it('fails a task that has used every attempt exactly once, and gives back what it held', async () => {
@@ -3197,6 +3283,35 @@ describe('spending caps in real currency', () => {
     await expect(
       store.spendGuard({ userId, estimateUsd: 2, includeOpenCommitments: true, now })
     ).resolves.toMatchObject({ outcome: 'allow' });
+  });
+
+  /**
+   * A conversation the owner left open overnight has no worker and will spend nothing until they
+   * come back to it, at which point the ceiling is priced again. Holding its whole ceiling against
+   * the day would have them sitting down to a limit reached by work that never ran.
+   */
+  it('reserves only what a worker is about to spend, not what a parked conversation might', async () => {
+    await store.setSpendLimits({ userId, dailyCapUsd: 5 });
+    const task = await store.createTask({ ...taskInput(userId, workspaceId), maxSpendUsd: 4 });
+    await bill({ key: 'partial', costUsd: 1, taskId: task.id });
+
+    for (const status of ['awaiting_user', 'awaiting_resource', 'paused']) {
+      await database.query('UPDATE tasks SET status=$2 WHERE id=$1', [task.id, status]);
+      await expect(store.openSpendCommitment(userId)).resolves.toBe(0);
+      await expect(
+        store.spendGuard({ userId, estimateUsd: 2, includeOpenCommitments: true, now })
+      ).resolves.toMatchObject({ outcome: 'allow' });
+    }
+
+    // Back in the queue, and the rest of the ceiling is committed again: a worker is about to
+    // spend it, and two starts in the same second must not both fit under the same cap.
+    for (const status of ['queued', 'planning', 'running']) {
+      await database.query('UPDATE tasks SET status=$2 WHERE id=$1', [task.id, status]);
+      await expect(store.openSpendCommitment(userId)).resolves.toBeCloseTo(3, 6);
+      await expect(
+        store.spendGuard({ userId, estimateUsd: 2, includeOpenCommitments: true, now })
+      ).resolves.toMatchObject({ outcome: 'deny', blockedBy: 'daily' });
+    }
   });
 
   it('will not materialise a scheduled run that would breach the cap', async () => {
