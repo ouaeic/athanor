@@ -497,6 +497,7 @@ export function Approvals({
   approvals,
   workspaceId,
   openTaskId,
+  taskTitles,
   openTaskEvents,
   onOpenTask,
   onOpenComputer,
@@ -508,6 +509,13 @@ export function Approvals({
   approvals: Approval[];
   workspaceId?: string;
   openTaskId: string | undefined;
+  /**
+   * What each conversation is called, so a request raised in one the owner is not looking at can say
+   * which one. `nextApproval` deliberately surfaces requests from any conversation, so the common
+   * case is a card asking about a shell command that belongs somewhere else - and the card said
+   * nothing about that at all, offering only an unnamed "Open conversation".
+   */
+  taskTitles?: Record<string, string>;
   /**
    * The trajectory of the conversation on screen, when there is one, so the card can say whether
    * the agent asking had anybody else's text in its context. Only ever read for an approval that
@@ -527,9 +535,9 @@ export function Approvals({
    */
   onAnnounce?: (message: string) => void;
   /**
-   * The card itself, so the window can send the owner back to it — ⌘⇧↩ and the palette entry. A
-   * request answered from the keyboard is otherwise reachable only by Shift+Tabbing out of the
-   * composer and hoping.
+   * The card itself, so the window can send the owner back to it from the palette entry — the only
+   * route, deliberately: see `windowShortcut`. A request answered from the keyboard is otherwise
+   * reachable only by Shift+Tabbing out of the composer and hoping.
    */
   cardRef?: RefObject<HTMLDivElement | null>;
   /**
@@ -650,6 +658,7 @@ export function Approvals({
   // top line, the body, and the last word.
   const wording = agentSentence(item);
   const elsewhere = Boolean(openTaskId) && item.taskId !== openTaskId;
+  const elsewhereTitle = elsewhere ? (taskTitles?.[item.taskId] ?? '') : '';
   return (
     /*
       A group, not an alert dialog. It was `role="alertdialog"` and it is not one: nothing was made
@@ -676,6 +685,7 @@ export function Approvals({
       <div className="approval-copy">
         <p className="eyebrow" id="approval-eyebrow">
           Your confirmation is required
+          {elsewhereTitle ? ` · in ${elsewhereTitle}` : ''}
           {approvals.length > 1 ? ` · ${approvals.length} waiting` : ''}
         </p>
         {/* What the box will do, said by the box. `item.action` is the model's own sentence for
@@ -728,7 +738,7 @@ export function Approvals({
       <div className="approval-actions">
         {elsewhere && onOpenTask && (
           <button className="ghost" onClick={() => onOpenTask(item.taskId)}>
-            <MessageSquare /> Open conversation
+            <MessageSquare /> {elsewhereTitle ? `Open ${elsewhereTitle}` : 'Open conversation'}
           </button>
         )}
         {needsComputer(item) && onOpenComputer && (

@@ -44,15 +44,20 @@ export const sendBlock = (input: {
       // failed, on load and every five minutes. Saying "check the server" while that is happening
       // sent the owner off to look at something being handled, and there was nothing on the other
       // screen to do anyway - which is how a computer that failed to start once became permanent.
-      message:
-        'Starting the agent computer. This cannot run until it is up; if it stays this way, Settings has a button to start it again.',
+      //
+      // It used to promise a button on the other screen. That button is drawn only for a computer
+      // that has failed or is hibernating, and the state this fires in most often - a first sign-in,
+      // no workspace at all yet - is neither, so the destination was empty. Settings says what the
+      // computer is doing, which is true in every case this can fire in.
+      message: 'Starting the agent computer. Nothing can run until it is up.',
       actionLabel: 'Open Settings'
     };
   if (!input.providerConfigured)
     return {
       code: 'provider_missing',
-      message:
-        'Connect an AI provider to send this. Your key goes straight from this server to the provider you choose.',
+      // Where the key goes is said where the key is entered. Here it was a second sentence
+      // explaining a reassurance nobody had asked for yet, next to a button that says the rest.
+      message: 'No AI provider is connected yet.',
       actionLabel: 'Connect a provider'
     };
   if (input.availableModelCount === 0)

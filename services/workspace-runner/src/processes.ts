@@ -524,6 +524,11 @@ export class ProcessManager {
    * same split `listWorkspace` makes above, for the same reason. Without the null case the owner
    * could see a service in their panel and had no way to stop it, because every service on the
    * machine is subject to whichever task happened to start it.
+   *
+   * The null case is narrowed to reading and stopping. `write` puts chosen bytes on the stdin of a
+   * process belonging to some other task, which is the one thing here that could be turned into
+   * cross-task influence; stopping and reading are what the owner's panel was widened for, and
+   * neither can be aimed at another turn's reasoning.
    */
   action(workspaceId: string, owner: string | null, id: string, value: unknown) {
     const request = z
@@ -536,7 +541,8 @@ export class ProcessManager {
     if (
       !session ||
       session.workspaceId !== workspaceId ||
-      (owner !== null && session.owner !== owner)
+      (owner !== null && session.owner !== owner) ||
+      (owner === null && request.action === 'write')
     )
       throw new Error('Background process not found');
     if (request.action === 'kill') {

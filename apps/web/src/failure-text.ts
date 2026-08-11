@@ -20,9 +20,18 @@ export const isTransportFailure = (cause: unknown): boolean => {
   return typeof error.message === 'string';
 };
 
+/**
+ * The offline sentence, owned here.
+ *
+ * It was written out character-for-character in two modules and said a third way in a third, which
+ * is three places for one fact to drift apart. Everything that has to say the box is unreachable
+ * imports this.
+ */
+export const UNREACHABLE =
+  'Your athanor is not reachable right now. It keeps working; this device will reconnect.';
+
 export const describeFailure = (cause: unknown, fallback: string): string => {
-  if (isTransportFailure(cause))
-    return 'Your athanor is not reachable right now. It keeps working; this device will reconnect.';
+  if (isTransportFailure(cause)) return UNREACHABLE;
   if (cause instanceof Error && cause.message.trim()) return cause.message;
   return fallback;
 };

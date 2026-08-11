@@ -114,6 +114,10 @@ export const groupConversations = (tasks: Task[], now = Date.now()): Conversatio
   return buckets.filter((bucket) => bucket.entries.length > 0);
 };
 
+/** A day, which is as far back as "while you were away" can honestly reach with nothing to measure
+    from. */
+const AWAY_WINDOW_MS = 24 * 60 * 60 * 1_000;
+
 /**
  * What the computer did while nobody was watching, in one sentence, or nothing worth saying.
  *
@@ -121,11 +125,15 @@ export const groupConversations = (tasks: Task[], now = Date.now()): Conversatio
  * should carry the evidence of that rather than ask them what to do. "While you were away" is read
  * from the work itself: anything a schedule ran since the owner last touched a conversation of their
  * own happened without them. No dashboard, no digest — one line, and only when there is one to say.
+ *
+ * Floored at a day. With no conversation of the owner's own in view - every one archived, or a box
+ * that has only ever run schedules - "since they last looked" reduced to the beginning of time, and
+ * the line reported every run the schedule had ever made as having happened overnight.
  */
-export const arrivalLine = (tasks: Task[]): string | undefined => {
+export const arrivalLine = (tasks: Task[], now = Date.now()): string | undefined => {
   const lastOwnTouch = tasks.reduce(
     (latest, task) => (task.scheduleId ? latest : Math.max(latest, lastActivityAt(task))),
-    0
+    now - AWAY_WINDOW_MS
   );
   const away = tasks.filter((task) => task.scheduleId && lastActivityAt(task) > lastOwnTouch);
   if (!away.length) return undefined;

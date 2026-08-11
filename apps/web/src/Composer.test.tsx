@@ -71,9 +71,17 @@ describe('the box every session starts in', () => {
     expect(markup).toContain('Add a follow-up');
   });
 
-  it('goes inert only when there is no computer to send to, and says which it is', () => {
+  /*
+   * And typeable while the computer is still coming up, which is the state a new owner arrives in.
+   *
+   * This box used to be disabled whenever the workspace was missing — so the first screen of the
+   * product could not be typed into, and the block that explains that state is only drawn once
+   * there is something to send, which meant it could never be drawn from the state it was written
+   * for. Waiting is a fine thing to ask of somebody; being stuck is not.
+   */
+  it('stays typeable while there is no computer yet, and says so', () => {
     const markup = render({ workspaceAvailable: false });
-    expect(markup).toMatch(/<textarea[^>]*disabled/);
+    expect(markup).not.toMatch(/<textarea[^>]*disabled/);
     expect(markup).toContain('The agent computer is unavailable');
   });
 

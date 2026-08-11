@@ -201,6 +201,16 @@ export function Composer({
       */}
       <div className={`composer ${taskLive ? 'working' : ''}`}>
         <AttachmentTray attachments={attachments} onRemove={onRemoveAttachment} />
+        {/*
+          Writable while the box is still coming up.
+
+          This carried `disabled={!workspaceAvailable}`, which is the state a new owner arrives in
+          while their computer is being provisioned — so the first screen of the product was a grey
+          box that could not be typed into, and the one sentence written to explain that state was
+          gated behind having typed something. The draft is kept on this device and on the server,
+          the strip above says what is happening, and Enter answers with the block rather than
+          swallowing the keystroke; waiting is a fine thing to ask of someone, being stuck is not.
+        */}
         <textarea
           {...(textareaRef ? { ref: textareaRef } : {})}
           rows={1}
@@ -223,7 +233,6 @@ export function Composer({
           }}
           onChange={(event) => onPrompt(event.target.value)}
           placeholder={composerPlaceholder({ workspaceAvailable, taskOpen, taskLive })}
-          disabled={!workspaceAvailable}
           onKeyDown={(event) => {
             if (!sendsOnKey(event)) return;
             event.preventDefault();
@@ -232,14 +241,14 @@ export function Composer({
         />
         <div className="composer-bottom">
           {/*
-            One row, and it may never become two. The class is not `.composer-tools` because that
-            row was allowed to wrap, and wrapping is exactly the behaviour being removed: below
-            430px it took a second and sometimes a third line and the composer grew under the
+            One row, and it may never become two. It carries a new class rather than the one the
+            wrapping row had, because wrapping is exactly the behaviour being removed: below 430px
+            that row took a second and sometimes a third line and the composer grew under the
             owner's thumb while they were reading it.
           */}
           <div className="composer-row">
             <button
-              className="icon-btn composer-add"
+              className="icon-btn"
               aria-haspopup="menu"
               aria-expanded={menuOpen}
               title="Add to this message"
@@ -254,7 +263,7 @@ export function Composer({
               small screen is the trade this row exists to avoid.
             */}
             <button
-              className={`icon-btn composer-voice ${recording ? 'recording' : ''}`}
+              className={`icon-btn ${recording ? 'recording' : ''}`}
               title={recording ? 'Stop voice recording' : 'Record a voice note'}
               aria-label={recording ? 'Stop voice recording' : 'Record a voice note'}
               aria-pressed={recording}
@@ -348,7 +357,11 @@ export function Composer({
               disabled={!canSend || busy}
               onClick={() => onSend({ interrupt: true })}
             >
+              {/* One word, because there is no hover on a phone: three round buttons appear together
+                  the moment work starts, two of them are arrows, and the only thing telling this one
+                  from Send was a `title` a touchscreen never shows. */}
               <Redo2 />
+              <span>Now</span>
             </button>
           )}
           <button

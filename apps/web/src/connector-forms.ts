@@ -8,7 +8,7 @@
  * they give up.
  */
 import type { ConnectorScope, CreateConnectorRequest } from '@athanor/contracts';
-import { isTransportFailure } from './failure-text.js';
+import { isTransportFailure, UNREACHABLE } from './failure-text.js';
 
 type MailAccess = 'read' | 'send';
 type CalendarAccess = 'read' | 'write';
@@ -283,9 +283,6 @@ const failure = (cause: unknown): { code: string; message: string } => {
     message: typeof error?.message === 'string' ? error.message : ''
   };
 };
-
-const UNREACHABLE =
-  'Your athanor is not reachable right now. It keeps working; this device will reconnect.';
 
 /**
  * A box that predates mail and calendar connectors refuses the request as malformed, because its

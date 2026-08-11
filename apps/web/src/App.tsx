@@ -208,6 +208,16 @@ export function App() {
     };
   }, [mobileNav]);
   const [inspectorOpen, setInspectorOpen] = useState(storedInspector.current?.open ?? false);
+  /*
+   * Whether the panel has ever been opened, which is the only thing that decides whether it exists.
+   *
+   * A ref, not state: it only ever goes from false to true, and the render that has to notice is the
+   * one `setInspectorOpen(true)` already causes. Nothing is built until it is asked for - a shell on
+   * the box, a directory listing and a preview poll are all things nobody should pay for on a panel
+   * they have never opened - and nothing is taken down once it is.
+   */
+  const inspectorMounted = useRef(false);
+  if (inspectorOpen) inspectorMounted.current = true;
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>(
     storedInspector.current?.tab ?? 'files'
   );
@@ -821,9 +831,17 @@ export function App() {
   // A conversation carries its own mode; with none open the computer's default is what is shown.
   const currentSecurityMode: SecurityMode =
     task?.securityMode ?? workspace?.securityMode ?? 'balanced';
-  // The block is the only thing that matters while it is on screen, so nothing else competes for
-  // the strip above the composer.
-  const showBlock = Boolean(blocked) && canSend;
+  /*
+   * The block is the only thing that matters while it is on screen, so nothing else competes for
+   * the strip above the composer.
+   *
+   * A missing computer is the exception, and it was the one state this got wrong. The box being
+   * absent is a fact about the machine rather than an answer to a keystroke, and it was gated on
+   * there being something to send — which on a first sign-in, while the box is still being
+   * provisioned, there never is. So the sentence written for exactly this state could not be
+   * reached from it, and a new owner got a grey message box and a pill.
+   */
+  const showBlock = Boolean(blocked) && (canSend || blocked?.code === 'workspace_unavailable');
   const visiblePending =
     pendingSend && (pendingSend.taskId === undefined || pendingSend.taskId === taskId)
       ? pendingSend
@@ -831,6 +849,12 @@ export function App() {
   const timelineEvents = useMemo(
     () => withPendingMessage(events, visiblePending),
     [events, visiblePending]
+  );
+  /* What each conversation is called, for the approval card: a request raised in one the owner is
+     not looking at has to say which one, and the list is already here. */
+  const taskTitles = useMemo(
+    () => Object.fromEntries((data?.tasks ?? []).map((item) => [item.id, item.title])),
+    [data?.tasks]
   );
   /*
    * A challenge takes the browser away from the agent for the whole computer, not just for the
@@ -1541,7 +1565,7 @@ export function App() {
             }
           : current
       );
-      setNotice('Stopped. The work so far is kept — send a message to continue from here.');
+      setNotice('Stopped. The work so far is kept.');
     } catch (cause) {
       setError(describeFailure(cause, 'Could not stop the agent'));
     } finally {
@@ -1588,9 +1612,7 @@ export function App() {
       setData((current) => (current ? { ...current, tasks: [branch, ...current.tasks] } : current));
       setWorkspaceId(branch.workspaceId);
       setTaskId(branch.id);
-      setNotice(
-        'Branch created. The original conversation stays untouched; send a message to take this one somewhere new.'
-      );
+      setNotice('Branched. The original conversation is untouched.');
     } catch (cause) {
       setError(describeFailure(cause, 'Could not branch this conversation'));
     } finally {
@@ -2058,13 +2080,15 @@ export function App() {
             {...(workspace ? { workspaceId: workspace.id } : {})}
             onOpenTask={setTaskId}
             openTaskId={taskId}
+            /* So a request raised somewhere the owner is not looking can say where. */
+            taskTitles={taskTitles}
             /* So the card can say whether the agent asking had anybody else's text in its context.
                These are the events of the conversation on screen; the card reads them only for an
                approval that belongs to it. */
             openTaskEvents={events}
             onOpenComputer={() => openInspector('computer')}
             /* The card takes focus itself when it appears; this is how the window gets the owner
-               back to it, from ⌘⇧↩ and from the palette. */
+               back to it from the palette, which is the only route — see `windowShortcut`. */
             cardRef={approvalCard}
             /* One arrival, said once, through the region the window already has. The card used to
                announce itself by being assertive, which meant announcing again every time its
@@ -2139,10 +2163,7 @@ export function App() {
           */
           <div className="inline-error offline-strip" role="status">
             <WifiOff />
-            <span>
-              Can’t reach your athanor. It keeps working; nothing here updates or sends until it
-              reconnects.
-            </span>
+            <span>Can’t reach your athanor. It keeps working; this screen doesn’t.</span>
             <button onClick={() => void load()}>Retry now</button>
           </div>
         );
@@ -2175,7 +2196,7 @@ export function App() {
       case 'degraded':
         return (
           <div className="inline-notice" role="status">
-            <span>Reconnecting to this conversation — new activity may arrive a little late.</span>
+            <span>Reconnecting. New activity may lag.</span>
           </div>
         );
       case 'notice':
@@ -2479,7 +2500,16 @@ export function App() {
             onOpenRecoveryPoints={() => openSettings('server')}
           />
         )}
-        {inspectorOpen && (
+        {/*
+          Built the first time it is asked for and never taken down again.
+
+          The Inspector mounts all four panes and hides the ones behind, so that a glance at Files no
+          longer closes the socket the runner kills the pty on. Rendering it behind `inspectorOpen`
+          undid the whole of that on a phone, where "Work" is the primary destination: tapping it -
+          or ⌘B, or the header toggle - unmounted the panel, and with it the terminal, so the owner's
+          build died on the way to reading the answer. Same principle one level up, same `hidden`.
+        */}
+        {inspectorMounted.current && (
           <Suspense
             fallback={<aside className="inspector inspector-loading">Opening tools…</aside>}
           >
@@ -2487,6 +2517,7 @@ export function App() {
               workspace={workspace}
               initialTab={shownInspectorTab}
               {...(browserWall ? { wall: browserWall } : {})}
+              hidden={!inspectorOpen}
               onTab={chooseInspectorTab}
             />
           </Suspense>

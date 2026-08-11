@@ -785,6 +785,13 @@ export const api = {
   workspaceProcesses: async (workspaceId: string) =>
     (await request<{ processes: BackgroundProcess[] }>(`/v1/workspaces/${workspaceId}/processes`))
       .processes,
+  /** Stop one of them. A service stopped here is forgotten, so it does not come back on restart. */
+  stopWorkspaceProcess: async (workspaceId: string, sessionId: string) => {
+    await request(
+      `/v1/workspaces/${workspaceId}/processes/${encodeURIComponent(sessionId)}`,
+      mutation('POST', { action: 'kill' })
+    );
+  },
   previews: async (workspaceId: string) =>
     (await request<WorkspacePreview[]>(`/v1/workspaces/${workspaceId}/previews`)).map(
       previewForClient

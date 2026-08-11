@@ -840,6 +840,18 @@ const textValue = (value: unknown, fallback = ''): string => {
   return fallback;
 };
 
+/**
+ * Whether this tool result is the harness's own answer rather than the tool's.
+ *
+ * Every one of them carries `skipped: true` and a reason the model reads instead of a result: the
+ * call was an exact repeat of one already answered this turn, the owner republished the plan while
+ * it was in flight, or the arguments were cut off mid-JSON. Nothing was run and nothing was sent.
+ */
+const isHarnessAnswer = (result: unknown): boolean =>
+  typeof result === 'object' &&
+  result !== null &&
+  (result as { skipped?: unknown }).skipped === true;
+
 /** The wall as the runner sends it, in the fields everything downstream actually reads. */
 export interface BotWall {
   vendor: string;
@@ -3474,6 +3486,10 @@ ${clockLine(new Date(), timeZone)}
     state.messages.push({ role: 'tool', toolCallId: call.id, content: `Tool failed: ${message}` });
     state.turnToolResults ??= {};
     state.turnToolResults[call.id] = { name: call.name, success: false };
+    // A call that threw still reached for its addresses, so the turn is charged for them here as
+    // well as on the success path. Left out, a server that simply never answered made the whole
+    // budget optional - see `#chargeCallNovelty`.
+    this.#chargeCallNovelty(state, call);
     if (wall) await this.#raiseTakeover(task, key, state, wall);
   }
 
@@ -3613,10 +3629,16 @@ ${clockLine(new Date(), timeZone)}
    * three in the morning there is nobody to send that reply for eight hours. Nothing about the job
    * was finished; the interaction model had simply run out.
    *
-   * What makes continuing safe is that the model does not get a vote. The acceptance record was
-   * written before the work and is executed by the harness, so the answer to "is this done?" is a
-   * fact rather than a self-assessment - and it is the same run, with the same timeouts, that the
-   * finish gate is held to. Every other condition is checked in front of it, in the order they cost:
+   * What makes continuing safe is not that the model has no say - it chooses which check to declare
+   * and it makes the changes that count as progress - but that it cannot mark its own homework and
+   * cannot outspend the owner. The acceptance record is executed by the harness, so "is this done?"
+   * is answered by running it rather than by a self-assessment, on the same run and the same
+   * timeouts the finish gate is held to; and the ceiling that actually bounds a determined turn is
+   * money, checked every step against the task's own allowance with a tenth of it kept back. What
+   * remains gameable is wall clock: a turn willing to declare a check it will not satisfy and write
+   * one file per budget can reach the configured continuation ceiling.
+   *
+   * Every other condition is checked in front of it, in the order they cost:
    * the free reads first, then one indexed row for the task's status and one for the spend guard,
    * and only then the checks themselves, which can be a full build.
    *
@@ -3654,9 +3676,9 @@ ${clockLine(new Date(), timeZone)}
     };
     const verdict = mayRenewStepBudget({
       hasAcceptance: Boolean(record),
-      // The same test the finish gate makes at agent.ts:8321, for the same stated reason: a record
-      // an earlier turn declared was passing before this turn began, so it is not evidence about
-      // anything this turn did.
+      // The same test the finish gate makes on `inheritedAcceptance`, for the same stated reason:
+      // a record an earlier turn declared was passing before this turn began, so it is not evidence
+      // about anything this turn did.
       acceptanceIsThisTurn: (state.acceptanceTurn ?? 0) === (state.turn ?? 0),
       continuationsUsed: used,
       continuationCeiling: ceiling,
@@ -6503,6 +6525,31 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
   }
 
   /**
+   * What one call sent, charged to the turn before the next one is judged against it.
+   *
+   * The novelty count was computed per address, reported on the card and added to nothing, so a
+   * 2,048-byte secret left in twenty-two addresses that were each individually inside the bound.
+   * Charged only while the turn is tainted: a clean research pass pays nothing at all.
+   *
+   * Charged on the attempt rather than on the answer. A request that throws still went out - the
+   * hostname was resolved and the payload was in the path - and the only party who decides whether a
+   * request is answered is the server being talked to, so charging on success alone made stalling a
+   * free channel: a collector that accepts and never replies produced `TOOL_REQUEST_TIMEOUT_MS`,
+   * left the total where it was, and the next chunk was judged against the same figure again.
+   */
+  #chargeCallNovelty(state: AgentState, call: ModelToolCall): void {
+    const reached = state.taint ? callDestinations(call.name, call.arguments) : [];
+    if (!reached.length) return;
+    // Assembled only when something actually reached the outside: the corpus is up to forty
+    // kilobytes of the owner's own words, and most tool calls in a turn go nowhere near a host.
+    const destinations = this.#destinationContext(state);
+    state.turnNoveltyBytes = chargeNovelty(
+      state.turnNoveltyBytes ?? 0,
+      reached.map((url) => classifyDestination(url, destinations))
+    );
+  }
+
+  /**
    * Moves the turn's provenance forward from one tool result.
    *
    * Two things are recorded and they pull in opposite directions on purpose. A read of something
@@ -6518,24 +6565,10 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
     call: ModelToolCall,
     result: unknown
   ): Promise<string | null> {
-    /*
-     * What this call sent, charged to the turn before the next one is judged against it.
-     *
-     * The novelty count was computed per address, reported on the card and added to nothing, so a
-     * 2,048-byte secret left in twenty-two addresses that were each individually inside the bound.
-     * Charged only while the turn is tainted, and charged after the fact: a clean research pass
-     * pays nothing at all, and the budget describes what has already gone rather than what might.
-     */
-    const reached = state.taint ? callDestinations(call.name, call.arguments) : [];
-    if (reached.length) {
-      // Assembled only when something actually reached the outside: the corpus is up to forty
-      // kilobytes of the owner's own words, and most tool calls in a turn go nowhere near a host.
-      const destinations = this.#destinationContext(state);
-      state.turnNoveltyBytes = chargeNovelty(
-        state.turnNoveltyBytes ?? 0,
-        reached.map((url) => classifyDestination(url, destinations))
-      );
-    }
+    // A result the harness wrote rather than the runner - an idempotent repeat, a plan that changed
+    // underneath the call, arguments that would not parse - is a request that was never made, and a
+    // budget that spends itself on those raises cards on turns where nothing left the machine.
+    if (!isHarnessAnswer(result)) this.#chargeCallNovelty(state, call);
     for (const url of originsFromResult(call, result)) {
       state.knownOrigins = rememberOrigin(state.knownOrigins ?? [], url);
       state.knownAddresses = rememberAddress(state.knownAddresses ?? [], url);

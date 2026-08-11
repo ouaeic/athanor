@@ -671,7 +671,9 @@ function Event({
           </span>
         </div>
         <span className="artifact-actions">
-          {onOpenSurface && <button onClick={() => onOpenSurface('preview')}>Preview</button>}
+          {/* Named for where it goes. The pane was renamed and this one control was left pointing
+              at a tab that no longer exists by that name. */}
+          {onOpenSurface && <button onClick={() => onOpenSurface('preview')}>Running</button>}
           {/*
             A private preview is opened by asking for an address, not by holding one.
             Its access token is minted once and only its hash is kept, so the URL carried on the
@@ -1318,14 +1320,13 @@ export function Timeline({
       // Five stacked elements used to stand between opening athanor and typing: an eyebrow that
       // repeated the heading, the heading, a paragraph, the examples, and a note explaining that
       // panes open when needed - which the interface demonstrates the first time it happens.
-      // What is left is one sentence and three concrete examples, because examples teach what this
-      // can do better than a sentence claiming it - and each one writes the first message.
       //
-      // The sentence replaced the question “What should we get done?”, which the composer under it
-      // already asks in its placeholder, and which taught an owner arriving from the installer
-      // nothing about what they had just been handed.
+      // The heading went too, and it was the last of them. "A whole computer that keeps working
+      // while you are away" is a claim about a machine that has, at that moment, done nothing: the
+      // software talking about itself, on the one screen that should be showing the computer. The
+      // three examples teach what this can do better than any sentence claiming it, and each one
+      // writes the first message.
       <div className="empty-canvas">
-        <h1>A whole computer that keeps working while you are away.</h1>
         <div className="starter-capabilities">
           {starters.map((starter) => (
             <button key={starter.label} type="button" onClick={() => onStarter?.(starter.prompt)}>

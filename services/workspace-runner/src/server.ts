@@ -1205,6 +1205,12 @@ export const buildServer = async (config: RunnerConfig) => {
     '/v1/workspaces/:workspaceId/hibernate',
     async (request) => {
       requireScope(request, 'workspace.manage');
+      // Including the background work, which this used to leave running. A hibernated computer that
+      // still holds a build and three servers is not asleep in any sense the owner would recognise,
+      // and the panel that reports what is running was reading the control plane's word for it - so
+      // the box carried on serving while every screen said nothing was there. Without `forget`: the
+      // records stay on disk, and `/resume` below puts them back.
+      processes.stopWorkspace(request.params.workspaceId);
       await browser.close(request.params.workspaceId);
       await desktop.close(request.params.workspaceId);
       return { id: request.params.workspaceId, state: 'hibernated' };
@@ -1217,6 +1223,9 @@ export const buildServer = async (config: RunnerConfig) => {
       requireScope(request, 'workspace.manage');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await ensureRuntimeWorkspace(root);
+      // The other half of hibernate, and the same call a snapshot or a checkpoint restore makes:
+      // waking the computer has to bring back the services the owner left running on it.
+      await restoreServices(root, request.params.workspaceId);
       return { id: request.params.workspaceId, state: 'running' };
     }
   );

@@ -5985,10 +5985,13 @@ export const buildServer = async (
    * the transcript happened to mention. The token is audience-bound to this one GET, so the `exec`
    * scope it carries cannot be turned round and used to start a process.
    *
-   * A computer that is not running reports nothing rather than being woken to say so: stopping,
-   * hibernating, snapshotting and restoring all clear the runner's session table
-   * (services/workspace-runner/src/server.ts), so an asleep box has no background processes by
-   * construction, and reading a panel must never be the thing that starts the machine.
+   * The runner answers whatever the workspace's status here says, because the status is not evidence
+   * about what is running. Services are built to outlive a snapshot, a checkpoint restore and a
+   * runner restart, and the runner brings every one it finds on disk back up when it boots - so a box
+   * this side calls hibernated can be serving, and a panel that short-circuited on the status told
+   * the owner their machine was idle while it was not. Reading this cannot start anything: the
+   * runner's route reads an in-memory table and returns an empty list for a workspace it holds
+   * nothing for.
    */
   app.get<{ Params: { workspaceId: string } }>(
     '/v1/workspaces/:workspaceId/processes',
@@ -5996,7 +5999,6 @@ export const buildServer = async (
       const user = requireUser(request.user);
       const workspace = await store.getWorkspace(user.id, request.params.workspaceId);
       if (!workspace) throw new AthanorError('workspace_not_found', 'Workspace not found');
-      if (workspace.status !== 'running') return { processes: [] };
       return runner.request<{ processes: unknown[] }>({
         workspaceId: workspace.id,
         userId: user.id,
@@ -6005,6 +6007,40 @@ export const buildServer = async (
         path: `/v1/workspaces/${workspace.id}/processes`,
         // Someone is watching this pane refresh, so a wedged runner has to fail in seconds rather
         // than hold the request for undici's five-minute header timeout.
+        timeoutMs: 5_000
+      });
+    }
+  );
+
+  /**
+   * Stop one of them.
+   *
+   * The runner was widened for exactly this - `ProcessManager.action` takes a null owner so the
+   * person who owns the box is not held to the task subject an agent capability carries - and
+   * nothing on this side ever called it, so a service, which outlives the task that declared it and
+   * comes back after every restart, could be seen in the panel and stopped from nowhere. The
+   * capability is audience-bound to this one path, so the `exec` scope it carries cannot be turned
+   * round and used to start something.
+   *
+   * `:session` rather than `:sessionId`: the runner names a session `proc_<uuid>`, which is not a
+   * column here, and the UUID guard above would answer 404 for every real one. Re-encoded on the way
+   * out so a segment carrying `%2F` cannot walk out of this route and into another of the runner's.
+   */
+  app.post<{ Params: { workspaceId: string; session: string } }>(
+    '/v1/workspaces/:workspaceId/processes/:session',
+    async (request) => {
+      const user = requireUser(request.user);
+      const workspace = await store.getWorkspace(user.id, request.params.workspaceId);
+      if (!workspace) throw new AthanorError('workspace_not_found', 'Workspace not found');
+      return runner.request({
+        workspaceId: workspace.id,
+        userId: user.id,
+        role: 'user',
+        scopes: ['exec'],
+        method: 'POST',
+        path: `/v1/workspaces/${workspace.id}/processes/${encodeURIComponent(request.params.session)}`,
+        contentType: 'application/json',
+        body: JSON.stringify({ action: 'kill' }),
         timeoutMs: 5_000
       });
     }

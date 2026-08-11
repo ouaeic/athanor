@@ -27,22 +27,45 @@ export interface ShortcutRow {
   decision?: Decision;
 }
 
+/**
+ * The modifier this keyboard actually has.
+ *
+ * `windowShortcut` has always taken Ctrl as well as Command, and every one of these was written in
+ * Mac notation anyway - so an owner who installed their own server on Windows or Linux was shown
+ * seven bindings in glyphs their keyboard does not carry, for keys it had all along. Read once, at
+ * module load, because the keyboard does not change under the owner mid-session.
+ */
+export const keyNotation = (
+  identity: string
+): { cmd: string; shift: string; enter: string; del: string } =>
+  /mac|iphone|ipad|ipod/i.test(identity)
+    ? { cmd: '⌘', shift: '⇧', enter: '↩', del: '⌫' }
+    : { cmd: 'Ctrl+', shift: 'Shift+', enter: 'Enter', del: 'Backspace' };
+
+const { cmd, shift, enter, del } = keyNotation(
+  typeof navigator === 'undefined' ? '' : navigator.platform || navigator.userAgent || ''
+);
+
 export const shortcutRows: ShortcutRow[] = [
-  { keys: '⌘K', meaning: 'Search and run anything', id: 'palette' },
-  { keys: '⌘⇧O', meaning: 'New conversation', id: 'new-conversation' },
-  { keys: '⌘B', meaning: 'Show or hide the computer tools', id: 'toggle-tools' },
-  { keys: '⌘/', meaning: 'Jump to the message box', id: 'focus-composer' },
-  { keys: '⌘↑', meaning: 'Edit your last message', id: 'edit-last' },
+  { keys: `${cmd}K`, meaning: 'Search and run anything', id: 'palette' },
+  { keys: `${cmd}${shift}O`, meaning: 'New conversation', id: 'new-conversation' },
+  { keys: `${cmd}B`, meaning: 'Show or hide the computer tools', id: 'toggle-tools' },
+  { keys: `${cmd}/`, meaning: 'Jump to the message box', id: 'focus-composer' },
+  { keys: `${cmd}↑`, meaning: 'Edit your last message', id: 'edit-last' },
   { keys: 'Enter', meaning: 'Send' },
-  { keys: '⇧Enter', meaning: 'New line' },
+  { keys: `${shift}Enter`, meaning: 'New line' },
   { keys: 'Esc', meaning: 'Stop the agent', id: 'stop-agent' },
   // The safety floor, which until now was the only control in athanor with no keys at all. Both
   // are deliberately live only inside the card; the way to the card is the palette, for the reason
   // in `windowShortcut`.
-  { keys: '⌘↩', meaning: 'Approve it, from inside the request', decision: 'approve' },
-  { keys: '⌘⌫', meaning: 'Deny it, from inside the request', decision: 'deny' },
+  { keys: `${cmd}${enter}`, meaning: 'Approve it, from inside the request', decision: 'approve' },
+  { keys: `${cmd}${del}`, meaning: 'Deny it, from inside the request', decision: 'deny' },
   { keys: '?', meaning: 'This list', id: 'shortcut-sheet' }
 ];
+
+/** The one row the sidebar repeats on its own button, read from the table rather than retyped. */
+export const shortcutKeys = (id: Shortcut): string =>
+  shortcutRows.find((row) => row.id === id)?.keys ?? '';
 
 export interface ShortcutEvent {
   key: string;

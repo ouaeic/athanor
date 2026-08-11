@@ -1188,6 +1188,18 @@ else
   printf 'athanor is ready.\n\n'
 fi
 printf 'Open your computer at: %s\n' "$public_url"
+# Directly under the address, because it is what happens when the address is opened. With no ACME
+# email this is the ordinary install and nothing above collects a warning about it - so the script
+# said "athanor is ready", the owner opened the link, and met a full-page "Your connection is not
+# private" with the explanation thirty lines further down, below a rule this script's own comment
+# describes as being for diagnosing a connection rather than making the first one.
+if [ -z "${ATHANOR_ACME_EMAIL:-}" ]; then
+  printf '\nYour browser will warn you the first time and ask you to accept the certificate -\n'
+  printf 'this server signed its own. Until TLS is publicly trusted athanor cannot be installed\n'
+  printf 'as an app and cannot send notifications. To fix that now (no domain needed - a bare IP\n'
+  printf 'address works):\n'
+  printf '  sudo athanor certificate enable --agree-tos --email you@example.com\n'
+fi
 printf '\nOr scan this from a phone:\n\n'
 # qrencode is one of the host packages this installer places (scripts/athanor-host.sh lists it for
 # every family), so the code is normally drawn. If a package manager left it out, the address it
@@ -1199,6 +1211,14 @@ printf 'Connection ticket, for the native client:\n%s\n' "$pairing_uri"
 printf '\nThe pairing code expires in 24 hours and stops working after the owner is created.\n'
 printf 'To show a fresh code later: sudo athanor pairing-code\n'
 printf 'To check the installation: sudo athanor doctor\n'
+# The one thing this box now does on its own without ever being told to. It pauses the services, it
+# writes an archive containing this server's keys, and it was enabled here silently: the owner was
+# told about updates, the doctor, the pairing code and the certificate, and not about the job that
+# touches their data every day.
+printf '\nA backup is taken daily, at a randomised hour, when nothing is running. It pauses the\n'
+printf 'computer for the length of the copy. Copies are kept in /var/backups/athanor (the newest\n'
+printf '5) and contain this server%s keys - treat them as you would the server itself.\n' "'s"
+printf 'To turn it off: sudo athanor backup auto off\n'
 # Everything below the rule is for diagnosing a connection, not for making the first one. It was
 # printed above the address, so the one line a new owner needed arrived after two they did not.
 printf '\n%s\n' '────────────────────────────────────────────────────────────'
@@ -1221,11 +1241,5 @@ if [ -z "$server_has_hostname" ]; then
   printf '  2. sudo athanor ddns configure\n'
   printf 'Either way the name becomes the public origin and goes into the TLS certificate.\n'
 fi
-if [ -z "${ATHANOR_ACME_EMAIL:-}" ]; then
-  printf '\nThis server is using a self-signed certificate, so browsers will warn and cannot\n'
-  printf 'install athanor as an app or deliver notifications. For trusted HTTPS (no domain\n'
-  printf 'needed - a bare IP address works):\n'
-  printf '  sudo athanor certificate enable --agree-tos --email you@example.com\n'
-fi
-printf 'Updates are manual (sudo athanor update). For weekly unattended updates with\n'
+printf '\nUpdates are manual (sudo athanor update). For weekly unattended updates with\n'
 printf 'automatic rollback: sudo athanor auto-update on\n'

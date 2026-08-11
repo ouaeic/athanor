@@ -793,8 +793,8 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
    * every write a new file: a one-line edit to an 800-line module rendered as "new file · +800",
    * which is this log's own evidence thrown away a second way. A whole-file `file_read` is exactly
    * the text a later write overwrites - the worker refuses a write whose file changed under it
-   * (`agent.ts:5283`), so the read it claims is the read that stands - and a write is itself what
-   * the next write to the same path starts from.
+   * (`file_write`'s `readFileHashes` check), so the read it claims is the read that stands - and a
+   * write is itself what the next write to the same path starts from.
    */
   const fileContents = new Map<string, string>();
   let activity: ActivityEntry[] = [];

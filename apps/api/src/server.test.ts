@@ -4540,6 +4540,15 @@ describe('what the computer is running', () => {
     });
     expect(runnerCalls).toContain(`GET /v1/workspaces/${workspaceId}/processes`);
 
+    /*
+     * And it keeps asking after the box is hibernated, because the status is not evidence about what
+     * is running. This used to short-circuit on `status !== 'running'`, justified by the claim that
+     * hibernating clears the runner's session table — which it did not do, and which services are
+     * specifically built to survive in the cases where it does: the runner starts every one it finds
+     * on disk when it boots. So a box the control plane called asleep could be serving three ports
+     * while this panel reported an empty machine. Reading it still cannot start anything; the
+     * runner's route reads an in-memory table and answers `[]` for a workspace it holds nothing for.
+     */
     await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${workspaceId}/hibernate`,
@@ -4551,9 +4560,54 @@ describe('what the computer is running', () => {
       url: `/v1/workspaces/${workspaceId}/processes`,
       headers: { cookie }
     });
-    expect(asleep.json()).toEqual({ processes: [] });
-    // Hibernating clears the runner's session table, so an asleep computer has nothing to report -
-    // and reading a panel must never be the thing that starts a machine back up.
-    expect(runnerCalls).toEqual([]);
+    expect(asleep.statusCode, asleep.body).toBe(200);
+    expect(runnerCalls).toContain(`GET /v1/workspaces/${workspaceId}/processes`);
+  });
+
+  /*
+   * The other half of the panel. A service outlives the task that declared it and comes back after
+   * every restart, and the runner was widened so the owner is not held to the task subject an agent
+   * capability carries — but nothing on this side called it, so a service could be seen and stopped
+   * from nowhere.
+   */
+  test('stops one of them on the owner’s say-so', async () => {
+    const runnerCalls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const requestUrl = input instanceof Request ? input.url : input.toString();
+        if (requestUrl.includes('workspace-manager.test')) {
+          const url = new URL(requestUrl);
+          runnerCalls.push(`${init?.method ?? 'GET'} ${url.pathname}`);
+        }
+        return new Response(JSON.stringify({ storageBytes: 4_096, ok: true, status: 'stopped' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      })
+    );
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-process-stop-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'process-stop-workspace' },
+        payload: { name: 'Running', storageLimitBytes: 10_000_000_000, region: 'auto' }
+      })
+    ).json<{ id: string }>().id;
+
+    const stopped = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/processes/proc_1`,
+      headers: { cookie, 'idempotency-key': 'process-stop' }
+    });
+    expect(stopped.statusCode, stopped.body).toBe(200);
+    expect(runnerCalls).toContain(`POST /v1/workspaces/${workspaceId}/processes/proc_1`);
   });
 });

@@ -279,7 +279,7 @@ export const agentTools: ModelTool[] = [
           type: 'boolean',
           default: false,
           description:
-            'Return immediately with a session ID while the process keeps running. It lasts until its timeout or until process(action=kill).'
+            'Return immediately with a session ID while the process keeps running. It lasts until its timeout, until process(action=kill), or until this computer restarts - unless you name it as a service.'
         },
         service: {
           type: 'string',
@@ -2391,10 +2391,28 @@ const taintedRequirement = (
     selfOrigins: context.selfOrigins ?? [],
     spentNoveltyBytes: context.spentNoveltyBytes ?? 0
   };
+  /*
+   * Every address in this call, each judged against what the ones before it have already sent.
+   *
+   * The turn's budget used to be read once, before the call, and every address in the call measured
+   * against that same figure - so the batch was the hole. One `browser_action` of twenty-four
+   * navigations, or one `parallel_web_read` of twelve URLs, each individually inside the per-address
+   * bound, sent more than the whole turn is allowed and raised nothing at all. This is the failure
+   * `PARALLEL_SAFE_TOOLS` names as the reason two web reads may not overlap; it was already inside
+   * one call.
+   */
+  const sinkVerdicts = (): DestinationVerdict[] => {
+    let spent = destinations.spentNoveltyBytes;
+    const verdicts: DestinationVerdict[] = [];
+    for (const url of callDestinations(name, args)) {
+      const verdict = classifyDestination(url, { ...destinations, spentNoveltyBytes: spent });
+      spent += verdict.noveltyBytes;
+      verdicts.push(verdict);
+    }
+    return verdicts.filter((verdict) => verdict.sink);
+  };
   if (name === 'parallel_web_read' || name === 'browser_action') {
-    const verdicts = callDestinations(name, args)
-      .map((url) => classifyDestination(url, destinations))
-      .filter((verdict) => verdict.sink);
+    const verdicts = sinkVerdicts();
     if (verdicts.length)
       return destinationCard(
         verdicts,
@@ -2425,9 +2443,7 @@ const taintedRequirement = (
    * so it was the better of the two to be handed.
    */
   if (name === 'shell' || name === 'desktop_launch') {
-    const verdicts = callDestinations(name, args)
-      .map((url) => classifyDestination(url, destinations))
-      .filter((verdict) => verdict.sink);
+    const verdicts = sinkVerdicts();
     if (verdicts.length) return destinationCard(verdicts, taintSources, 'this command');
     if (name === 'desktop_launch')
       return {
@@ -2445,6 +2461,43 @@ const taintedRequirement = (
   return null;
 };
 
+/**
+ * Declaring a service is not the same act as running the command inside it.
+ *
+ * `shell` with `service` set asks the computer to keep a process: no timeout, started again every
+ * time it stops, started again after the box restarts, and outliving the task that declared it.
+ * Nothing in `ordinaryRequirement` describes that - it judges what a command does while it runs, and
+ * `npm start` on its own is as ordinary as a command gets - so a named, network-capable process that
+ * survives every reboot could be planted with no card at all, and on a tainted turn that is a
+ * foothold rather than a build step. Asked once, on the declaration; what the service then does is
+ * still judged by the rules the bare command faces.
+ *
+ * Asked in every mode, including autonomous. Autonomous is about not interrupting ordinary work, and
+ * this is the one background call whose effect the owner cannot otherwise learn about.
+ */
+const serviceRequirement = (
+  name: string,
+  args: Record<string, unknown>,
+  taintSources: readonly string[]
+): ApprovalRequirement | null => {
+  if (name !== 'shell' || args.background !== true) return null;
+  const service = textValue(args.service);
+  if (!service) return null;
+  const command = [
+    textValue(args.executable, 'command'),
+    ...(Array.isArray(args.args) ? args.args.map(String) : [])
+  ].join(' ');
+  return {
+    sideEffect: taintSources.length ? 'external_consequential' : 'external_reversible',
+    action: `Keep ${service} running on this computer`,
+    preview: `Run ${command} as a service called ${service}. It has no time limit, is started again whenever it stops, and comes back after this computer restarts, so it outlives this task.${
+      taintSources.length
+        ? ` This turn has read untrusted content (${taintSources.slice(0, 3).join(', ')}).`
+        : ''
+    }`
+  };
+};
+
 export const approvalRequirement = (
   name: string,
   args: Record<string, unknown>,
@@ -2454,7 +2507,10 @@ export const approvalRequirement = (
   const taintSources = context.taintSources ?? [];
   return strongestRequirement(
     taintSources.length ? taintedRequirement(name, args, context, taintSources) : null,
-    ordinaryRequirement(name, args, securityMode, context)
+    strongestRequirement(
+      serviceRequirement(name, args, taintSources),
+      ordinaryRequirement(name, args, securityMode, context)
+    )
   );
 };
 

@@ -19,6 +19,7 @@ import {
   renameCommit,
   type ScheduleGroup
 } from './task-list.js';
+import { shortcutKeys } from './shortcuts.js';
 import { formatUsd } from './usage-model.js';
 import { workspaceStatusLabel } from './workspace-status.js';
 import type { ConversationSearchResult, Task, TaskSchedule, User, Workspace } from './types.js';
@@ -311,7 +312,7 @@ export function Sidebar(props: {
         </span>
       </button>
       <button className="new-task" onClick={props.onNewTask}>
-        <Plus size={18} /> New conversation <kbd>⌘ ⇧ O</kbd>
+        <Plus size={18} /> New conversation <kbd>{shortcutKeys('new-conversation')}</kbd>
       </button>
       <button className="schedule-task" onClick={props.onSchedules}>
         <CalendarClock size={17} /> Scheduled work
@@ -363,6 +364,15 @@ export function Sidebar(props: {
       {/* No "Conversations" heading: the date buckets below name themselves, and a search field
           directly above a list of results does not need the list captioned. */}
       <nav className="task-list" aria-label="Conversations">
+        {/*
+          What the computer did while nobody was watching, above the list rather than instead of it.
+
+          This used to be drawn only when the list was empty — and a scheduled run is itself a
+          conversation, so on the computer where the schedule fired the list is never empty and the
+          line never appeared. One sentence, only when there is one to say, above the work it is
+          about.
+        */}
+        {!isSearching && arrival && <p className="arrival-line">{arrival}</p>}
         {isSearching
           ? results.map((result, index) => {
               const elsewhere =
@@ -417,14 +427,10 @@ export function Sidebar(props: {
             </span>
           </div>
         )}
-        {/* Nothing in view is not the same as nothing having happened. A computer that has been
-            working all night should say so in the place where it would otherwise ask the owner what
-            to do — one sentence, and only when there is one; the invitation stands when there is
-            not. */}
         {!isSearching && !buckets.length && (
           <div className="empty-mini">
             <Sparkles size={18} />
-            <span>{arrival ?? 'No conversations yet. Start one above.'}</span>
+            <span>No conversations yet. Start one above.</span>
           </div>
         )}
         {!isSearching && props.onEarlier && (

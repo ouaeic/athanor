@@ -5,7 +5,11 @@ import { keyboardInset } from './keyboard-inset.js';
 import './styles.css';
 import '@xterm/xterm/css/xterm.css';
 
-if ('serviceWorker' in navigator) void navigator.serviceWorker.register('/sw.js');
+// Caught, not because there is anything to do about it, but because on the certificate this product
+// ships by default registration always fails - and an uncaught rejection on the first line of the
+// application is noise in the one console a new owner is most likely to have open.
+if ('serviceWorker' in navigator)
+  void navigator.serviceWorker.register('/sw.js').catch(() => undefined);
 
 /**
  * Publish the height of the software keyboard so the stylesheet can stop guessing at it.

@@ -8,6 +8,7 @@
  * checked is the shape that makes the unmount impossible: a panel per tab, present together, with
  * the ones behind marked hidden rather than absent.
  */
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { Inspector } from './Inspector.js';
@@ -84,14 +85,31 @@ describe('the fourth pane', () => {
     expect(markup).not.toContain('>Preview</button>');
   });
 
+  /*
+   * The rename is a fact about the product, not about this component, and the one control it missed
+   * was the one this file cannot see: the artifact card in the transcript still said "Preview". A
+   * guard narrower than the thing it guards is how that survived.
+   */
+  it('is called Running everywhere a control names it', () => {
+    for (const file of ['App.tsx', 'Timeline.tsx', 'Inspector.tsx'])
+      expect(readFileSync(new URL(file, import.meta.url), 'utf8')).not.toContain(
+        '>Preview</button>'
+      );
+  });
+
   it('leads with what is running and demotes the port form to the bottom', () => {
     expect(running.indexOf('running-list')).toBeGreaterThan(-1);
     expect(running.indexOf('running-list')).toBeLessThan(running.indexOf('preview-create'));
   });
 
-  // Quiet when there is nothing: one line, no illustration, on the pane and on the frame both.
-  it('says nothing is running in one line', () => {
-    expect(running).toContain('Nothing is running in the background.');
+  /*
+   * Quiet either way: one line, no illustration. Which line it is matters — the pane used to state
+   * "Nothing is running" on first paint, before it had asked, so a box with three servers up opened
+   * on a falsehood. An empty list is only news once it is an answer.
+   */
+  it('does not claim the computer is idle before it has asked', () => {
+    expect(running).toContain('Asking the computer what it is running');
+    expect(running).not.toContain('Nothing is running in the background.');
     expect(running).not.toContain('empty-pane');
   });
 });

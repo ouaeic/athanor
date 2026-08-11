@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { decisionKey, shortcutRows, windowShortcut, type ShortcutEvent } from './shortcuts.js';
+import {
+  decisionKey,
+  keyNotation,
+  shortcutRows,
+  windowShortcut,
+  type ShortcutEvent
+} from './shortcuts.js';
 
 const press = (patch: Partial<ShortcutEvent>): ShortcutEvent => ({
   key: 'a',
@@ -66,10 +72,22 @@ describe('the keystrokes the workbench answers', () => {
             press({ key: row.decision === 'approve' ? 'Enter' : 'Backspace', metaKey: true })
           )
         ).toBe(row.decision);
-    expect(shortcutRows.filter((row) => !row.id && !row.decision).map((row) => row.keys)).toEqual([
-      'Enter',
-      '⇧Enter'
-    ]);
+    expect(
+      shortcutRows.filter((row) => !row.id && !row.decision).map((row) => row.meaning)
+    ).toEqual(['Send', 'New line']);
+  });
+
+  /*
+   * The sheet is written in the notation of the keyboard reading it. `windowShortcut` has always
+   * taken Ctrl as well as Command, and the sheet was hard-coded to Mac glyphs — so the owner of a
+   * server they installed themselves on Windows or Linux was shown seven bindings in symbols their
+   * keyboard does not have, for keys it accepted all along.
+   */
+  it('writes the keys in the notation of the keyboard reading it', () => {
+    expect(keyNotation('MacIntel')).toMatchObject({ cmd: '⌘', shift: '⇧', del: '⌫' });
+    expect(keyNotation('Win32')).toMatchObject({ cmd: 'Ctrl+', shift: 'Shift+', del: 'Backspace' });
+    expect(keyNotation('Linux x86_64').cmd).toBe('Ctrl+');
+    expect(keyNotation('iPhone').cmd).toBe('⌘');
   });
 
   it('takes Ctrl for ⌘, so the same keys work on a keyboard without one', () => {

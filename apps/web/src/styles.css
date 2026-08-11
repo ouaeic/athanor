@@ -125,15 +125,27 @@ button:not([class]):hover:enabled {
   border-color: var(--accent);
   background: var(--panel-strong);
 }
-button:not([class]):disabled {
-  opacity: 0.5;
+/*
+  One disabled treatment, for everything.
+
+  There were six dims - 0.35, 0.38, 0.4, 0.45, 0.5 and a colour-only one - and two cursors, so
+  "you cannot press this" was said six different ways depending on which control it happened to be.
+  Local rules that only set an opacity are gone; the ones that also recolour or that hang the state
+  on a wrapper are still local, because they are doing something this cannot.
+*/
+[disabled],
+[aria-disabled='true'] {
+  opacity: 0.4;
   cursor: default;
 }
+/* Silver for interactive edges and focus, which is the rule — and this rule is the focus treatment
+   for effectively the whole product, so a desaturated green here made every other silver ring in the
+   file a local correction of the global one. */
 button:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 select:focus-visible {
-  outline: 2px solid #52705f;
+  outline: 2px solid var(--silver-edge);
   outline-offset: 2px;
 }
 .app-shell {
@@ -162,7 +174,6 @@ select:focus-visible {
   height: 38px;
   gap: 10px;
   padding: 0 6px;
-  font-family: Manrope, system-ui, sans-serif;
   font-size: 16px;
   font-weight: 650;
   letter-spacing: -0.45px;
@@ -515,9 +526,8 @@ select:focus-visible {
   text-overflow: ellipsis;
 }
 .task-title strong {
-  font:
-    600 13px Manrope,
-    sans-serif;
+  font-weight: 600;
+  font-size: 13px;
   max-width: 420px;
 }
 .task-title span {
@@ -550,7 +560,7 @@ select:focus-visible {
   font-size: 11px;
   cursor: pointer;
   opacity: 0;
-  transition: opacity 120ms ease;
+  transition: opacity 120ms var(--ease);
 }
 .user-message:hover .message-meta button,
 .message-meta button:focus-visible {
@@ -596,9 +606,8 @@ select:focus-visible {
   border-radius: 9px;
   padding: 6px 9px;
   color: #536159;
-  font:
-    600 10px Manrope,
-    sans-serif;
+  font-weight: 600;
+  font-size: 10px;
   cursor: pointer;
 }
 .workspace-tools-button:hover,
@@ -744,11 +753,6 @@ select:focus-visible {
   border-color: var(--text);
   color: #fff;
 }
-.task-plan-actions button:disabled,
-.task-plan-row-actions button:disabled {
-  cursor: default;
-  opacity: 0.35;
-}
 .task-plan-progress {
   height: 3px;
   margin: 12px 0;
@@ -761,7 +765,7 @@ select:focus-visible {
   height: 100%;
   border-radius: inherit;
   background: #78a58a;
-  transition: width 180ms ease;
+  transition: width 180ms var(--ease);
 }
 
 .task-plan-steps input,
@@ -923,7 +927,6 @@ select:focus-visible {
 .markdown h1,
 .markdown h2,
 .markdown h3 {
-  font-family: Manrope, sans-serif;
   letter-spacing: -0.02em;
 }
 .markdown h2 {
@@ -933,7 +936,7 @@ select:focus-visible {
   font-size: 17px;
 }
 .markdown code {
-  font-family: ui-monospace, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   background: #edf0eb;
   padding: 2px 4px;
   border-radius: 4px;
@@ -1052,7 +1055,9 @@ select:focus-visible {
   width: 13px;
 }
 .tool-event summary svg:last-child {
-  transition: 0.2s;
+  /* The chevron, and only the chevron. This was a bare `transition: 0.2s` - every animatable
+     property, on the browser's own curve, which is the one thing the file says it does not do. */
+  transition: transform 200ms var(--ease);
 }
 .tool-event[open] summary svg:last-child {
   transform: rotate(90deg);
@@ -1070,6 +1075,8 @@ select:focus-visible {
   color: #959a9e;
   font:
     9px/1.5 ui-monospace,
+    SFMono-Regular,
+    Menlo,
     monospace;
   white-space: pre-wrap;
 }
@@ -1383,9 +1390,8 @@ select:focus-visible {
   color: #959a9e;
 }
 .empty-canvas h1 {
-  font:
-    600 28px Manrope,
-    sans-serif;
+  font-weight: 600;
+  font-size: 28px;
   letter-spacing: -0.04em;
   color: var(--text);
   margin: 3px 0 10px;
@@ -1501,10 +1507,6 @@ select:focus-visible {
 }
 .send-btn:hover {
   background: #2c4035;
-}
-.send-btn:disabled {
-  opacity: 0.35;
-  cursor: default;
 }
 .send-btn svg {
   width: 15px;
@@ -1801,6 +1803,8 @@ select:focus-visible {
   color: #e1e4e5;
   font:
     10px/1.6 ui-monospace,
+    SFMono-Regular,
+    Menlo,
     monospace;
   white-space: pre-wrap;
 }
@@ -2047,7 +2051,9 @@ select:focus-visible {
   cursor: crosshair;
 }
 .remote-frame-button:focus-visible {
-  outline: 3px solid #2d3033;
+  /* Inset, because the ring has to sit inside the picture of the remote screen; silver, because a
+     hairline against the panel behind it is not a focus ring. */
+  outline: 3px solid var(--silver-edge);
   outline-offset: -3px;
 }
 .browser-status {
@@ -2369,59 +2375,6 @@ select:focus-visible {
   width: 13px;
   flex: none;
 }
-.custom-domain-panel {
-  display: grid;
-  gap: 6px;
-  border: 1px solid #2d3033;
-  border-radius: 9px;
-  background: #151719;
-  padding: 9px;
-}
-.custom-domain-panel > span {
-  color: #718078;
-  font-size: 11px;
-  line-height: 1.45;
-}
-.custom-domain-panel > div:first-child {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.domain-connect-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  gap: 6px;
-}
-.domain-connect-row input {
-  min-width: 0;
-  height: 31px;
-  border: 1px solid #2d3033;
-  border-radius: 7px;
-  padding: 0 7px;
-  font-size: 12px;
-}
-.domain-dns-records {
-  display: grid;
-  gap: 6px;
-  border-top: 1px solid #2d3033;
-  padding-top: 7px;
-  color: #959a9e;
-  font-size: 11px;
-  line-height: 1.5;
-}
-.domain-dns-records p {
-  margin: 0;
-}
-.domain-dns-records code {
-  overflow-wrap: anywhere;
-  color: #314f40;
-  background: #e8eee9;
-  border-radius: 3px;
-  padding: 1px 3px;
-}
-.domain-dns-records button {
-  justify-self: start;
-}
 .preview-list {
   display: grid;
   gap: 6px;
@@ -2660,7 +2613,7 @@ select:focus-visible {
   white-space: pre-wrap;
 }
 .approval-facts .approval-destination dd strong {
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
 }
 .approval-facts .approval-destination dd span {
@@ -2671,7 +2624,7 @@ select:focus-visible {
   overflow: auto;
   margin: 5px 0 0;
   color: #4b4437;
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   line-height: 1.5;
 }
@@ -2758,10 +2711,6 @@ select:focus-visible {
 .primary:hover {
   background: #293c32;
 }
-.primary:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
 .primary svg,
 .ghost svg {
   width: 14px;
@@ -2790,10 +2739,6 @@ select:focus-visible {
 }
 .secondary:hover {
   border-color: #858f94;
-}
-.secondary:disabled {
-  opacity: 0.4;
-  cursor: default;
 }
 .secondary svg {
   width: 14px;
@@ -2825,9 +2770,8 @@ select:focus-visible {
 }
 
 .modal h2 {
-  font:
-    600 23px Manrope,
-    sans-serif;
+  font-weight: 600;
+  font-size: 23px;
   letter-spacing: -0.04em;
   margin: 4px 0 5px;
 }
@@ -3077,7 +3021,6 @@ select:focus-visible {
 }
 .schedule-existing > strong,
 .schedule-form > strong {
-  font-family: Manrope, sans-serif;
   font-size: 13px;
 }
 .schedule-existing > small {
@@ -3219,16 +3162,6 @@ select:focus-visible {
   flex: none;
 }
 
-.danger-button {
-  border: 1px solid #e2c5c1;
-  background: #fff5f3;
-  color: #9b4038;
-  border-radius: 8px;
-  padding: 8px 12px;
-  font-size: 12px;
-  cursor: pointer;
-}
-
 .auth-legal-links {
   display: flex;
   justify-content: center;
@@ -3275,9 +3208,9 @@ select:focus-visible {
 }
 /* Sized for a sentence, not for a slogan: this panel used to carry a marketing headline. */
 .auth-hero-copy h1 {
-  font:
-    600 clamp(26px, 2.6vw, 38px)/1.1 Manrope,
-    sans-serif;
+  font-weight: 600;
+  font-size: clamp(26px, 2.6vw, 38px);
+  line-height: 1.1;
   letter-spacing: -0.04em;
   color: white;
   margin: 10px 0 12px;
@@ -3299,9 +3232,8 @@ select:focus-visible {
 }
 .auth-form h2,
 .recovery-card h1 {
-  font:
-    600 28px Manrope,
-    sans-serif;
+  font-weight: 600;
+  font-size: 28px;
   letter-spacing: -0.05em;
   margin: 4px 0 7px;
 }
@@ -3370,6 +3302,8 @@ select:focus-visible {
   border-radius: 10px;
   font:
     12px ui-monospace,
+    SFMono-Regular,
+    Menlo,
     monospace;
   word-break: break-all;
 }
@@ -3449,7 +3383,7 @@ select:focus-visible {
     bottom: 0;
     width: 280px;
     transform: translateX(-102%);
-    transition: transform 0.24s ease;
+    transition: transform 0.24s var(--ease);
   }
   .mobile-sidebar.open {
     transform: none;
@@ -3690,15 +3624,23 @@ select:focus-visible {
   }
 }
 
-/* Dark-only product surface. System fonts avoid a third-party font request and
-   the near-black canvas keeps OLED pixels genuinely quiet. */
+/*
+  Dark-only product surface. One family name, declared once and inherited everywhere.
+
+  There were two, and neither existed: `Inter` here and `Manrope` on ten rules, with no `@font-face`
+  and no link, behind a `font-src 'self' data:` policy that would have refused one anyway. So both
+  fell through to their fallbacks - and the fallbacks were different chains, `ui-sans-serif` against
+  `system-ui`, which pick different faces off macOS. Ten headings in one typeface and the text under
+  them in another, on Windows and Linux, for a font neither of them was ever going to load. The rules
+  that named `Manrope` set weight, size and tracking now, which is all they were ever doing.
+*/
 :root {
   color-scheme: dark;
   color: #e7e9ea;
   background: #0c0d0e;
   font-family:
-    Inter,
     ui-sans-serif,
+    system-ui,
     -apple-system,
     BlinkMacSystemFont,
     'Segoe UI',
@@ -3708,7 +3650,6 @@ select:focus-visible {
   --muted: #959a9e;
   --line: #2a2d30;
   --accent: #aeb5b9;
-  --accent-hover: #c8cdd0;
   --accent-soft: #24272a;
   --accent-muted: #969da1;
   --danger: #bd7770;
@@ -3790,6 +3731,28 @@ body,
     inset 0 1px 0 #ffffff0d,
     0 1px 0 #00000080,
     0 14px 34px #000000a6;
+}
+
+/*
+  The second tier, and the last one: a row that sits inside a panel rather than floating above the
+  page. It takes the same lit top edge and drops the shadow, because a list of eight of these
+  floating over one another is not elevation, it is soup.
+
+  This exists because there were seven of them, each with its own fill and its own radius, and each
+  defended by its own comment. On the Settings safety page a `.security-modes label` sat directly
+  above a `.settings-list > div`: same fill, same border, radii one pixel apart - close enough to
+  read as a rendering fault rather than as a distinction. One fill, one radius, one lit edge; every
+  local `background`, `border-radius` and border colour on these five is gone.
+*/
+.settings-list > div,
+.self-hosted-settings .security-modes label,
+.running-row,
+.notice-row,
+.enrollment-card {
+  background: var(--panel-soft);
+  border: 1px solid #2f3336;
+  border-radius: 11px;
+  box-shadow: inset 0 1px 0 #ffffff0d;
 }
 
 /*
@@ -3941,8 +3904,7 @@ textarea::placeholder {
 .system-event.error,
 .inline-error,
 .form-error,
-.usage-warning.critical,
-.danger-button {
+.usage-warning.critical {
   background: #231b1a;
   border-color: #5f4844;
   color: #d2aaa5;
@@ -3970,7 +3932,6 @@ textarea::placeholder {
 
 .eyebrow,
 small,
-.composer-foot,
 .message-meta,
 .section-heading span {
   color: #959a9e;
@@ -4058,14 +4019,16 @@ select:focus-visible {
 }
 
 /*
-  Lit while it is working, inert while it is not - which is the difference the sidebar exists to
-  show and could not. `queued` stays grey on purpose: nothing is happening yet, and a colour that
-  means "alive" has to be false when it is not.
+  Working and waiting-for-you are the one distinction a computer that works while you are away
+  exists to make, and these two were byte-identical declarations twelve lines apart under a comment
+  calling them "the same fact from the other side". They are not. A machine being busy is a fact and
+  is stated in steady ember with no ring; the machine needing the owner is their move, and the rule
+  says a move is small, bright and moving. `queued` stays grey on purpose: nothing is happening yet,
+  and a colour that means "alive" has to be false when it is not.
 */
 .status-dot.running,
 .status-dot.planning {
   background: var(--ember);
-  box-shadow: 0 0 0 3px var(--ember-glow);
 }
 
 .status-dot.queued,
@@ -4074,10 +4037,10 @@ select:focus-visible {
   box-shadow: none;
 }
 
-/* The same fact as running, from the other side: the fire is waiting for you. */
 .status-dot.awaiting_user {
   background: var(--ember);
   box-shadow: 0 0 0 3px var(--ember-glow);
+  animation: running-mark-pulse 2.2s var(--ease) infinite;
 }
 
 .status-dot.completed {
@@ -4179,9 +4142,11 @@ select:focus-visible {
   margin-left: -18px;
 }
 
+/* Agent-authored checklist content: neither alive nor the owner's move, and there can be dozens of
+   them on one page. Ember is small, bright and moving, and none of that is a static tick box. */
 .markdown li > input[type='checkbox'] {
   margin-right: 7px;
-  accent-color: var(--ember-deep);
+  accent-color: var(--silver-edge);
 }
 
 .markdown kbd {
@@ -4190,7 +4155,7 @@ select:focus-visible {
   border-bottom-width: 2px;
   border-radius: 5px;
   background: #17191b;
-  font-family: ui-monospace, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.85em;
 }
 
@@ -4286,7 +4251,7 @@ select:focus-visible {
 
 .task-activity-chevron {
   color: #686f73;
-  transition: transform 160ms ease;
+  transition: transform 160ms var(--ease);
 }
 
 .task-activity[open] .task-activity-chevron {
@@ -4432,6 +4397,8 @@ select:focus-visible {
   color: #8f979b;
   font:
     11px/1.5 ui-monospace,
+    SFMono-Regular,
+    Menlo,
     monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -4517,11 +4484,6 @@ select:focus-visible {
 .modal input[type='radio'],
 .modal input[type='range'] {
   accent-color: var(--accent);
-}
-
-.domain-dns-records code {
-  background: #222527;
-  color: #ced2d4;
 }
 
 .auth-story:after {
@@ -4615,9 +4577,9 @@ select:focus-visible {
     0 0 0 1px #dbe7ec08,
     0 0 20px #dbe7ec09;
   transition:
-    border-color 180ms ease,
-    box-shadow 180ms ease,
-    transform 180ms ease;
+    border-color 180ms var(--ease),
+    box-shadow 180ms var(--ease),
+    transform 180ms var(--ease);
 }
 
 .composer:focus-within {
@@ -4657,9 +4619,9 @@ select:focus-visible {
     0 0 0 1px #edf4f61c,
     0 0 16px #dbe7ec20;
   transition:
-    border-color 160ms ease,
-    box-shadow 160ms ease,
-    filter 160ms ease;
+    border-color 160ms var(--ease),
+    box-shadow 160ms var(--ease),
+    filter 160ms var(--ease);
 }
 
 .primary:hover,
@@ -4686,11 +4648,11 @@ select:focus-visible {
 .artifact-card button,
 .artifact-card a {
   transition:
-    border-color 150ms ease,
-    background 150ms ease,
-    color 150ms ease,
-    box-shadow 150ms ease,
-    transform 150ms ease;
+    border-color 150ms var(--ease),
+    background 150ms var(--ease),
+    color 150ms var(--ease),
+    box-shadow 150ms var(--ease),
+    transform 150ms var(--ease);
 }
 
 .workspace-switcher:hover,
@@ -5068,9 +5030,6 @@ a:focus-visible {
   gap: 14px;
   align-items: center;
   min-width: 0;
-  border: 1px solid #2f3336;
-  border-radius: 11px;
-  background: #131517;
   padding: 12px;
 }
 
@@ -5146,10 +5105,10 @@ a:focus-visible {
   font-size: 12px;
   font-weight: 680;
   transition:
-    border-color 150ms ease,
-    box-shadow 150ms ease,
-    color 150ms ease,
-    background 150ms ease;
+    border-color 150ms var(--ease),
+    box-shadow 150ms var(--ease),
+    color 150ms var(--ease),
+    background 150ms var(--ease);
 }
 
 .self-hosted-settings .modal-actions > button:hover,
@@ -5225,9 +5184,9 @@ a:focus-visible {
   color: #d6aba3;
 }
 
+/* `not-allowed` was the one cursor in the product that said it; the shadow still has to go, because
+   a lit edge on a control that cannot be pressed is the elevation lying. */
 .self-hosted-settings button:disabled {
-  cursor: not-allowed;
-  opacity: 0.38;
   box-shadow: none;
 }
 
@@ -5434,9 +5393,9 @@ a:focus-visible {
   cursor: pointer;
   opacity: 0;
   transition:
-    opacity 120ms ease,
-    color 120ms ease,
-    background 120ms ease;
+    opacity 120ms var(--ease),
+    color 120ms var(--ease),
+    background 120ms var(--ease);
 }
 .user-message:hover .message-actions button,
 .assistant-message:hover .message-actions button,
@@ -5501,7 +5460,7 @@ a:focus-visible {
   padding: 13px;
   overflow-x: auto;
   background: transparent;
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 1.6;
 }
 .code-block.wrapped pre {
@@ -5585,12 +5544,20 @@ a:focus-visible {
   color: #fff;
 }
 
-/* Distinct from Send without competing with Stop: this one redirects work rather than ending it. */
+/* Distinct from Send without competing with Stop: this one redirects work rather than ending it.
+   It carries its word as well as its glyph — a phone has no hover, so the `title` that told this
+   curved arrow from the straight one next to it was invisible exactly where it was needed. */
 .send-btn.correcting {
   /* Same three undefined names: transparent fill, a border colour that dropped, inherited text. */
   background: var(--panel-soft);
   border: 1px solid var(--line);
   color: var(--text);
+  width: auto;
+  padding: 0 9px;
+  grid-auto-flow: column;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 /* Command palette (⌘K). */
@@ -5772,7 +5739,7 @@ a:focus-visible {
   gap: 1px;
   flex: none;
   opacity: 0;
-  transition: opacity 120ms ease;
+  transition: opacity 120ms var(--ease);
 }
 .task-row:hover .task-row-actions,
 .task-row:focus-within .task-row-actions {
@@ -5857,9 +5824,6 @@ a:focus-visible {
   gap: 10px;
   justify-items: center;
   padding: 16px;
-  border: 1px solid var(--line);
-  border-radius: 13px;
-  background: var(--panel-soft);
   text-align: center;
 }
 .enrollment-card img {
@@ -6028,18 +5992,22 @@ body,
 }
 
 /* The one thing standing between a typed message and a running agent, with its repair action. */
+/*
+  A send that cannot go anywhere is caution, not a fifth colour.
+
+  This was #3c4a3f on #171b18 - green, which is neither ember nor sand nor clay nor silver - in the
+  one slot above the composer that already had three other registers in it, at a fourth width. It is
+  the same fact `.usage-warning` states and it is stated the same way.
+*/
 .composer-block {
-  width: min(760px, 100%);
-  margin: 0 auto 8px;
   pointer-events: auto;
   display: flex;
   gap: 10px;
   align-items: center;
   padding: 10px 12px;
-  border: 1px solid #3c4a3f;
-  border-radius: 12px;
-  background: #171b18;
-  color: #dfe4e0;
+  border: 1px solid #5e5647;
+  background: #22201c;
+  color: #c4b69a;
   font-size: 12px;
   line-height: 1.5;
 }
@@ -6055,16 +6023,57 @@ body,
 }
 .composer-block button {
   flex: none;
-  border: 1px solid #4b5750;
+  border: 1px solid #6b6252;
   border-radius: 8px;
   padding: 6px 10px;
-  background: #212724;
-  color: #e7ece8;
+  background: #2b2823;
+  color: #ded4c1;
   font-size: 12px;
   cursor: pointer;
 }
 .composer-block button:hover {
-  background: #2a312d;
+  border-color: var(--silver-edge);
+  color: var(--text);
+}
+
+/*
+  The one slot above the composer, at one width and one radius.
+
+  `composerStrip` returns exactly one of these four and they disagreed about every measurement:
+  760px, 820px and twice `fit-content`; radius 12 once and 9 three times. Four registers in one slot
+  is four systems, and the owner meets them one after another in the same place. What they keep is
+  their colour family - sand for caution, clay for a problem, grey for a status - because that is the
+  distinction the slot is actually making.
+*/
+.composer-block,
+.usage-warning,
+.inline-error,
+.inline-notice {
+  width: min(820px, 100%);
+  margin: 0 auto 8px;
+  border-radius: 12px;
+}
+
+/*
+  Every disclosure in this product opens the same way, and three of them did not.
+
+  Four summaries hide the browser's own triangle and draw a chevron; three set neither `display` nor
+  `list-style`, so they rendered `display: list-item` with the native marker - including
+  `.result-details`, which is the completion card's full summary and verification receipt, wearing an
+  OS triangle next to chevroned twins. `.file-diff` sets `display: flex`, which suppresses the marker
+  in every engine but Safari, where a `<summary>` keeps it; naming it here costs nothing and closes
+  that gap too.
+*/
+.event-detail > summary,
+.result-details > summary,
+.file-diff > summary {
+  list-style: none;
+}
+
+.event-detail > summary::-webkit-details-marker,
+.result-details > summary::-webkit-details-marker,
+.file-diff > summary::-webkit-details-marker {
+  display: none;
 }
 
 /* Above the modal scrim: a delete made from inside Settings must still be undoable. */
@@ -6172,7 +6181,7 @@ body,
   width: 100%;
   border-collapse: collapse;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.55;
 }
 .diff-hunk-header td {
@@ -6437,7 +6446,7 @@ body,
 .spend-card small {
   display: block;
   margin-top: 6px;
-  font-size: 10.5px;
+  font-size: 11px;
   line-height: 1.45;
   color: #7c8387;
 }
@@ -6515,8 +6524,8 @@ button.spend-bar:hover .spend-bar-name {
 }
 .spend-bar small {
   grid-column: 1 / -1;
-  font-size: 10.5px;
-  /* Was #757c80 at 10.5px, about 4.2:1 - the smallest text in the interface needs the most help. */
+  font-size: 11px;
+  /* Was #757c80 at 11px, about 4.2:1 - the smallest text in the interface needs the most help. */
   color: var(--muted);
 }
 /* The cost of a conversation, on the conversation, where the decision to continue is made. */
@@ -6691,7 +6700,7 @@ button.spend-bar:hover .spend-bar-name {
   color: var(--muted);
   font-size: 11px;
   opacity: 0;
-  transition: opacity 120ms ease;
+  transition: opacity 120ms var(--ease);
 }
 .assistant-message:hover .answer-meta,
 .assistant-message:focus-within .answer-meta {
@@ -6770,7 +6779,7 @@ button.spend-bar:hover .spend-bar-name {
   display: block;
   height: 100%;
   background: var(--ember-deep);
-  transition: width 200ms ease;
+  transition: width 200ms var(--ease);
 }
 
 /* A long agentic task mounts a window of the transcript; this reaches the rest of it. */
@@ -6826,6 +6835,18 @@ button.spend-bar:hover .spend-bar-name {
 }
 
 /* Conversations grouped by when they were last touched. */
+/*
+  The one line the sidebar says in its own voice, and only when the machine has something to report
+  from while the owner was gone. Set like a bucket label because that is what it is - a heading over
+  the work below it - but in the product's sentence case rather than shouted.
+*/
+.arrival-line {
+  margin: 4px 0 2px;
+  padding: 0 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .task-bucket-label {
   margin: 12px 0 2px;
   padding: 0 8px;
@@ -7100,9 +7121,6 @@ button.spend-bar:hover .spend-bar-name {
   align-items: start;
   width: 100%;
   padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: 11px;
-  background: var(--panel-soft);
   text-align: left;
   cursor: pointer;
 }
@@ -7518,13 +7536,13 @@ a.blocked-resource:hover {
 /*
  * One row, and it may never become two.
  *
- * This replaces `.composer-tools`, which was allowed to wrap and did at every phone width: 375px
- * leaves about 293px beside the send cluster, and three icon buttons plus a 104px security select
- * plus a 116px model select need more than that - so the row took a second and sometimes a third
- * line and the composer stood 176px tall at rest, 36% of the screen, for three facts an owner
- * changes a few times a year. The class is new rather than a `flex-wrap: nowrap` on the old one
- * because `.composer-tools` is what the narrow breakpoint hangs its `display: none` on, and hiding
- * controls by screen width is the other half of what is being removed.
+ * The row this replaces was allowed to wrap and did at every phone width: 375px leaves about 293px
+ * beside the send cluster, and three icon buttons plus a 104px security select plus a 116px model
+ * select need more than that - so it took a second and sometimes a third line and the composer stood
+ * 176px tall at rest, 36% of the screen, for three facts an owner changes a few times a year. It is
+ * a new class rather than `flex-wrap: nowrap` on the old one because the old one was what the narrow
+ * breakpoint hung its `display: none` on, and hiding controls by screen width is the other half of
+ * what is being removed. Its rules went with it; nothing in this file answers to that name now.
  */
 .composer-row {
   display: flex;
@@ -7606,7 +7624,7 @@ a.blocked-resource:hover {
   border-radius: 50%;
   background: var(--ember);
   box-shadow: 0 0 0 3px var(--ember-glow);
-  animation: composer-context-ember 2.2s ease-in-out infinite;
+  animation: composer-context-ember 2.2s var(--ease) infinite;
 }
 
 @keyframes composer-context-ember {
@@ -7649,9 +7667,8 @@ a.blocked-resource:hover {
 
 .composer-sheet h3 {
   margin: 8px 8px 4px;
-  font:
-    600 11px Manrope,
-    sans-serif;
+  font-weight: 600;
+  font-size: 11px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: #7d858a;
@@ -7691,7 +7708,7 @@ a.blocked-resource:hover {
 
 .composer-sheet-note {
   flex: 1 0 100%;
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.45;
   color: #8b9297;
 }
@@ -7708,11 +7725,6 @@ a.blocked-resource:hover {
 
 .composer-sheet-row.chosen .composer-sheet-label {
   color: var(--silver-hot);
-}
-
-.composer-sheet-row:disabled {
-  opacity: 0.45;
-  cursor: default;
 }
 
 .composer-sheet-connect {
@@ -7761,7 +7773,7 @@ a.blocked-resource:hover {
   background: transparent;
   color: #8b9297;
   cursor: pointer;
-  font-size: 11.5px;
+  font-size: 12px;
   text-align: left;
 }
 
@@ -7794,6 +7806,13 @@ a.blocked-resource:hover {
  * at once, stacked.
  */
 .inspector-panel[hidden] {
+  display: none;
+}
+
+/* The same, one level up: the whole panel is put away rather than unmounted, so closing the tools -
+   which on a phone is what tapping "Work" does - no longer kills the shell either. `.inspector` sets
+   `display: flex`, which would otherwise beat `[hidden]`. */
+.inspector[hidden] {
   display: none;
 }
 
@@ -8015,6 +8034,8 @@ a.blocked-resource:hover {
   color: #dce0e2;
   font:
     11px/1.5 ui-monospace,
+    SFMono-Regular,
+    Menlo,
     monospace;
   overflow-wrap: anywhere;
 }
@@ -8177,13 +8198,10 @@ a.blocked-resource:hover {
 
 .running-row {
   display: grid;
-  grid-template-columns: 6px minmax(0, 1fr) auto;
+  grid-template-columns: 6px minmax(0, 1fr) auto minmax(0, auto);
   gap: 10px;
   align-items: center;
-  border: 1px solid #2d3033;
-  border-radius: 9px;
   padding: 9px 11px;
-  background: #131517;
   /* Everything finished is quiet; the live rows below take their opacity back. */
   opacity: 0.62;
 }
@@ -8241,6 +8259,8 @@ a.blocked-resource:hover {
   color: #dce0e2;
   font:
     12px/1.4 ui-monospace,
+    SFMono-Regular,
+    Menlo,
     monospace;
   font-weight: 500;
 }
@@ -8264,6 +8284,48 @@ a.blocked-resource:hover {
   margin: 0;
   color: #6f767a;
   font-size: 12px;
+}
+
+/* The way back, in the register of the line it sits on: every other pane in this panel offers one
+   and this pane printed its failure and stopped. */
+.running-idle button {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--silver-edge);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/*
+  Stopping it, which is the half the panel was missing: a service outlives the conversation that
+  declared it and comes back after every restart, so a list with no control on it was the owner
+  watching their own machine through glass. Only on the rows where there is something to stop.
+*/
+.running-stop {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  transition:
+    border-color 140ms var(--ease),
+    color 140ms var(--ease);
+}
+
+.running-stop:hover {
+  border-color: var(--silver-edge);
+  color: var(--text);
+}
+
+.running-stop svg {
+  width: 14px;
+  height: 14px;
 }
 
 /*
@@ -8319,9 +8381,6 @@ a.blocked-resource:hover {
   gap: 10px;
   margin: 0;
   padding: 9px 11px;
-  border: 1px solid #2f3336;
-  border-radius: 10px;
-  background: #131517;
   cursor: pointer;
   transition:
     border-color 160ms var(--ease),
@@ -8355,9 +8414,11 @@ a.blocked-resource:hover {
   outline-offset: 2px;
 }
 
+/* The chosen mode is permanently on and permanently still, and `--ember-deep` is within a few
+   percent of the sand caution family - so the safety setting the owner picked read as a warning. */
 .security-modes input {
   margin: 2px 0 0;
-  accent-color: var(--ember-deep);
+  accent-color: var(--silver-edge);
 }
 
 .security-modes strong {

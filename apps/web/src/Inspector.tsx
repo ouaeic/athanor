@@ -4,6 +4,7 @@ import { Terminal } from '@xterm/xterm';
 import {
   ArrowLeft,
   Bot,
+  CircleStop,
   Download,
   File,
   FileCode2,
@@ -1880,6 +1881,14 @@ const RUNNING_TICKS_PER_POLL = 5;
 function RunningPane({ workspace, visible }: { workspace: Workspace; visible: boolean }) {
   const [processes, setProcesses] = useState<BackgroundProcess[]>([]);
   const [processFailure, setProcessFailure] = useState('');
+  /*
+   * Whether the machine has been asked yet.
+   *
+   * Without this the pane opened on "Nothing is running in the background." — stated before the
+   * first request had been made, and therefore stated on every box including the ones with three
+   * servers up. An empty list is only news once it is an answer.
+   */
+  const [asked, setAsked] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const [previews, setPreviews] = useState<WorkspacePreview[]>([]);
   const undo = useUndo();
@@ -1904,7 +1913,8 @@ function RunningPane({ workspace, visible }: { workspace: Workspace; visible: bo
       })
       // Said once, in the row's own place, rather than in the alert the form below uses: a computer
       // that has stopped answering is a fact about the machine, not a failed thing the owner did.
-      .catch(() => setProcessFailure('The computer is not saying what it is running.'));
+      .catch(() => setProcessFailure('The computer is not saying what it is running.'))
+      .finally(() => setAsked(true));
   useEffect(() => {
     setActiveUrl('');
     load();
@@ -1957,12 +1967,14 @@ function RunningPane({ workspace, visible }: { workspace: Workspace; visible: bo
    * where the owner knows something is listening that athanor did not start.
    */
   return (
-    <div className="inspector-content preview-pane running-pane">
+    <div className="inspector-content preview-pane">
       <div className="running-list">
         {rows.length === 0 ? (
           // One line. An empty computer is the ordinary state and does not deserve an illustration.
           <p className="running-idle">
-            {processFailure || 'Nothing is running in the background.'}
+            {!asked
+              ? 'Asking the computer what it is running…'
+              : processFailure || 'Nothing is running in the background.'}
           </p>
         ) : (
           rows.map((row) => {
@@ -1977,12 +1989,36 @@ function RunningPane({ workspace, visible }: { workspace: Workspace; visible: bo
                   <small>{processState(row)}</small>
                 </div>
                 <span className="running-elapsed">{processElapsed(row, now)}</span>
+                {/* The half the panel was missing. A service outlives the conversation that started
+                    it and comes back after every restart, so seeing one with no way to stop it was
+                    the owner watching their own machine through glass. */}
+                {live && (
+                  <button
+                    className="running-stop"
+                    title="Stop this"
+                    aria-label={`Stop ${processCommand(row.command)}`}
+                    onClick={() =>
+                      void api
+                        .stopWorkspaceProcess(workspace.id, row.sessionId)
+                        .then(loadProcesses)
+                        .catch(() => setProcessFailure('That could not be stopped.'))
+                    }
+                  >
+                    <CircleStop />
+                  </button>
+                )}
               </div>
             );
           })
         )}
       </div>
-      {processFailure && rows.length > 0 && <p className="running-idle">{processFailure}</p>}
+      {/* Every other pane offers the way back; this one printed the failure and stopped. */}
+      {processFailure && (
+        <p className="running-idle">
+          {rows.length > 0 ? `${processFailure} ` : ''}
+          <button onClick={loadProcesses}>Try again</button>
+        </p>
+      )}
       {/* Only where there is something for it to be true of. Said over an empty list it was the
           software describing itself, which is the one thing this pane is not for. */}
       {previews.length > 0 && (
@@ -2154,12 +2190,22 @@ export function Inspector({
   workspace,
   initialTab,
   wall,
+  hidden: away = false,
   onTab
 }: {
   workspace: Workspace | undefined;
   initialTab: Tab;
   /** The challenge the open conversation stopped at, so the screen can offer the way out of it. */
   wall?: BotWall | undefined;
+  /**
+   * Put away rather than taken down.
+   *
+   * The panes stopped being destroyed on a tab change, which fixed the terminal for a laptop and
+   * left the phone exactly as it was: there "Work" is the primary destination and reaching it closed
+   * the whole panel, so the shell died on the way to reading the answer. The window hides the panel
+   * with this instead of unmounting it, on the same principle and with the same `hidden`.
+   */
+  hidden?: boolean;
   onTab?: (tab: Tab) => void;
 }) {
   const [tab, setTab] = useState<Tab>(initialTab);
@@ -2201,7 +2247,7 @@ export function Inspector({
     document.getElementById(`inspector-tab-${target}`)?.focus();
   };
   return (
-    <aside className="inspector">
+    <aside className="inspector" hidden={away}>
       <div className="inspector-tabs" role="tablist" aria-label="Computer tools">
         {inspectorTabs.map(([id, label]) => (
           <button
@@ -2232,8 +2278,7 @@ export function Inspector({
             <HardDrive />
             <strong>The agent computer is not answering</strong>
             <span>
-              Run <code>sudo athanor doctor</code> on the server. It checks the file, browser and
-              desktop services and says which one is down.
+              Run <code>sudo athanor doctor</code> on the server. It says which service is down.
             </span>
           </div>
         </div>
@@ -2255,15 +2300,16 @@ export function Inspector({
             ) : id === 'computer' ? (
               <Computer
                 workspace={workspace}
-                visible={tab === 'computer'}
+                visible={!away && tab === 'computer'}
                 {...(wall ? { wall } : {})}
               />
             ) : id === 'terminal' ? (
               <TerminalPane workspace={workspace} />
             ) : (
               // `visible` because this pane polls the machine: a pane that stays mounted behind
-              // another tab must not keep asking what is running where nobody is looking.
-              <RunningPane workspace={workspace} visible={tab === 'preview'} />
+              // another tab - or behind the whole panel being put away - must not keep asking what
+              // is running where nobody is looking.
+              <RunningPane workspace={workspace} visible={!away && tab === 'preview'} />
             )}
           </div>
         ))

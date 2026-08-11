@@ -339,9 +339,15 @@ describe('a conversation that is a fork of another', () => {
 });
 
 describe('an empty conversation', () => {
-  it('says what the computer is for and offers three concrete starts, and nothing else', () => {
+  /*
+   * Three concrete starts and nothing else. Not a headline: everything on screen is meant to be
+   * evidence of the computer, and a tagline on the one screen where the machine has done nothing yet
+   * is the software talking about itself. The examples teach what it can do and each one writes the
+   * first message, which no sentence claiming the same thing does.
+   */
+  it('offers three concrete starts and says nothing about itself', () => {
     const markup = renderToStaticMarkup(<Timeline task={undefined} events={[]} />);
-    expect(markup).toContain('A whole computer that keeps working while you are away.');
+    expect(markup).not.toContain('<h1');
     expect(markup).not.toContain('What should we get done?');
     expect(occurrences(markup, '<button')).toBe(3);
   });

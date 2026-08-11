@@ -402,7 +402,10 @@ export function SelfHostedSettings({
   const pages: Array<{ id: SettingsPage; label: string }> = [
     { id: 'ai', label: 'Model & spending' },
     { id: 'agent', label: 'What it may do' },
-    { id: 'devices', label: 'Devices & sign-in' },
+    // "Alerts" rather than "sign-in" alone: the passkey rows plainly are sign-in, and the one
+    // errand an owner of an unattended computer is most likely to come looking for on this page is
+    // "tell me when this finishes", which no nav label contained.
+    { id: 'devices', label: 'Devices & alerts' },
     { id: 'server', label: 'This server' }
   ];
 
@@ -708,57 +711,21 @@ export function SelfHostedSettings({
           <Code2 />
           <div>
             <strong>Coding agents you already pay for</strong>
+            {/*
+              One sentence and one button. This was three two-sentence rows above the same button,
+              each naming a product by brand and repeating "ask athanor to install it, then run its
+              login command" - which is the same instruction three times, and is the terminal's job
+              to know rather than this page's. Which CLIs exist changes faster than this screen does.
+            */}
             <span>
-              Sign in to Codex, Claude Code or OpenCode with their own CLI and athanor hands
-              repository work to them. Your subscription tokens never enter a conversation.
-            </span>
-          </div>
-        </div>
-        {/* One button, not three: every row sent the owner to the same terminal, and the three
-            copies of it read as three different destinations. */}
-        <div className="settings-list coding-agent-list">
-          <div>
-            <span>
-              <strong>OpenAI Codex</strong>
-              <small>
-                Ask athanor to install Codex, then run <code>codex login</code>. Codex sessions,
-                sandbox output, and repository changes stay on this computer.
-              </small>
-            </span>
-          </div>
-          <div>
-            <span>
-              <strong>Anthropic Claude Code</strong>
-              <small>
-                Ask athanor to install Claude Code, then run <code>claude</code> and choose Claude
-                Pro or Max. The official CLI owns its authentication.
-              </small>
-            </span>
-          </div>
-          <div>
-            <span>
-              <strong>OpenCode</strong>
-              <small>
-                Ask athanor to install OpenCode, then run <code>opencode auth login</code>. OpenCode
-                supports ChatGPT Plus, GitHub Copilot, GitLab Duo, and provider keys. Claude Pro/Max
-                stays on the official Claude Code path above.
-              </small>
+              Sign a coding CLI in on this computer and athanor hands repository work to it. Its
+              tokens never enter a conversation, and its sessions and output stay on this machine.
             </span>
           </div>
         </div>
         <button className="secondary" onClick={onOpenTerminal}>
           Open Terminal
         </button>
-        <div className="privacy-boundary">
-          <LockKeyhole />
-          <span>
-            <strong>One safety policy</strong>
-            {' · '}athanor shows the specialist mission for approval, bounds its runtime, keeps it
-            in the workspace, and returns one compact result to the main conversation. Strict
-            zero-retention tasks never route through subscription CLIs because their publisher
-            policies are separate.
-          </span>
-        </div>
       </div>
 
       <div className="settings-section knowledge-settings" hidden={page !== 'agent'}>
@@ -774,7 +741,12 @@ export function SelfHostedSettings({
               still the composer's own table, so the two places cannot describe the same three
               settings differently.
             */}
-            <span>Each conversation can be moved from its shield; this is where they start.</span>
+            {/* "Its shield" was the developer's name for the chip. What the owner sees on it is the
+                mode word, or "Connect AI" and a dot when there is no provider - never a shield. */}
+            <span>
+              This is where new conversations start. To change the one you are in, tap the mode next
+              to the message box.
+            </span>
           </div>
         </div>
         <fieldset className="security-modes">
@@ -829,6 +801,19 @@ export function SelfHostedSettings({
               </span>
             </div>
           ))}
+        </div>
+        {/* Moved here from the page about models and spending, where four statements about
+            approvals, sandboxing and confinement sat under a heading naming neither. This is the
+            page called "What it may do", and the two lists above are the rest of the answer. */}
+        <div className="privacy-boundary">
+          <LockKeyhole />
+          <span>
+            <strong>Handed-off work follows the same rules</strong>
+            {' · '}athanor shows the specialist mission for approval, bounds its runtime, keeps it
+            in the workspace, and returns one compact result to the main conversation. Strict
+            zero-retention tasks never route through subscription CLIs because their publisher
+            policies are separate.
+          </span>
         </div>
         <hr />
         <div className="section-heading">
@@ -1056,15 +1041,18 @@ export function SelfHostedSettings({
           <QrCode />
           <div>
             <strong>Add another device</strong>
+            {/* What the button makes, not how to use a thing that does not exist yet: the
+                instruction to scan lives on the card that holds the code. */}
             <span>
-              Scan this from the new device. The link works once, expires in ten minutes, and never
-              carries the installer&rsquo;s pairing code.
+              A one-time link for a second phone or laptop. It works once and expires ten minutes
+              after you make it.
             </span>
           </div>
         </div>
         {enrollment ? (
           <div className="enrollment-card">
             {enrollmentQr && <img src={enrollmentQr} alt="Device enrollment code" />}
+            <span>Scan this from the new device, or paste the link into its sign-in screen.</span>
             <code>{enrollment.webUri}</code>
             <span>Expires {new Date(enrollment.expiresAt).toLocaleTimeString()} · single use</span>
             <div className="enrollment-actions">
@@ -1211,9 +1199,7 @@ export function SelfHostedSettings({
           <div>
             <strong>Recovery code</strong>
             <span>
-              The one way back in if every passkey is gone. Issuing a new one retires the old
-              immediately, so do it if the file you saved is lost, shared, or somewhere you no
-              longer trust.
+              The one way back in if every passkey is gone. A new one retires the old immediately.
             </span>
           </div>
         </div>
@@ -1268,19 +1254,28 @@ export function SelfHostedSettings({
           <div>
             <strong>Notifications on this device</strong>
             <span>
-              {pushState === 'unsupported'
-                ? 'This browser cannot receive push notifications.'
-                : pushState === 'unavailable'
-                  ? 'The server has no push key configured, so notifications are off.'
-                  : pushState === 'denied'
-                    ? 'This browser blocked notifications. Allow them in site settings first.'
-                    : 'Tell me when a long task finishes or needs approval, even with athanor closed.'}
+              {pushState === 'checking'
+                ? 'Checking whether this device can be told.'
+                : pushState === 'unsupported'
+                  ? 'This browser cannot receive push notifications.'
+                  : pushState === 'unregistered'
+                    ? // The default install: no browser will run a service worker for an origin
+                      // whose certificate it does not trust, and without one there is nothing to
+                      // deliver a notification to. This used to wait on a promise that never
+                      // settles, so the section sat on "checking" for ever with a dead button.
+                      'No browser accepts notifications from a server using a self-signed certificate. On the server: sudo athanor certificate enable --agree-tos --email you@example.com'
+                    : pushState === 'unavailable'
+                      ? 'The server has no push key configured, so notifications are off.'
+                      : pushState === 'denied'
+                        ? 'This browser blocked notifications. Allow them in site settings first.'
+                        : 'Tell me when a long task finishes or needs approval, even with athanor closed.'}
             </span>
           </div>
         </div>
         <button
           disabled={
-            busy || ['checking', 'unsupported', 'unavailable', 'denied'].includes(pushState)
+            busy ||
+            ['checking', 'unsupported', 'unregistered', 'unavailable', 'denied'].includes(pushState)
           }
           onClick={() =>
             void act(async () => {
@@ -1866,19 +1861,31 @@ export function SelfHostedSettings({
               call is the same one a sleeping computer is woken with — it was simply never offered
               for this state.
             */}
-            {workspace && ['failed', 'hibernated'].includes(workspace.status) && (
-              <button
-                className="secondary"
-                disabled={busy}
-                onClick={() =>
-                  void act(async () => {
-                    await api.workspaceAction(workspace.id, 'resume');
-                    setNotice('Starting the agent computer. It is usable again in a few seconds.');
-                  })
-                }
-              >
-                <RotateCcw /> Start it again
-              </button>
+            {!workspace ? (
+              // No workspace at all is the state the composer's block sends people here from, and
+              // this row answered it with a status word and nothing else. One instruction, the same
+              // one the empty panel gives, so the two screens do not disagree.
+              <small>
+                This device cannot see the agent computer. On the server:{' '}
+                <code>sudo athanor doctor</code>.
+              </small>
+            ) : (
+              ['failed', 'hibernated'].includes(workspace.status) && (
+                <button
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() =>
+                    void act(async () => {
+                      await api.workspaceAction(workspace.id, 'resume');
+                      setNotice(
+                        'Starting the agent computer. It is usable again in a few seconds.'
+                      );
+                    })
+                  }
+                >
+                  <RotateCcw /> Start it again
+                </button>
+              )
             )}
           </div>
           <div>
@@ -1905,17 +1912,19 @@ export function SelfHostedSettings({
             <span>
               <strong>Backups and updates</strong>
               {/*
-                What the box does on its own, then what to type if you want to intervene. This read
-                as three commands and nothing else, which told an owner that keeping their server
-                current was their job and their shell's - when unattended updates back up first,
-                verify the new release is serving, and roll themselves back if it is not.
+                What the box does on its own, then what to type if you want to intervene — and it
+                has to be the box this installer actually ships. This said updates install
+                themselves weekly and said nothing about backups, which is the exact inverse of
+                both: the installer enables the backup timer and leaves the update timer off. An
+                owner read it, stopped thinking about updates, and had nothing install itself.
               */}
               <small>
-                Updates install themselves weekly, taking a verified backup first and rolling back
-                if the new release does not serve. To intervene, on the server:{' '}
-                <code>sudo athanor update</code> now, <code>sudo athanor rollback</code> to undo a
-                release that installed cleanly and still went wrong,{' '}
-                <code>sudo athanor backup</code> for a copy on demand, and{' '}
+                A backup is taken daily, at a randomised hour, when nothing is running. Updates are
+                yours to run: <code>sudo athanor update</code>. To have them install themselves
+                weekly, backing up first and rolling back if the new release does not serve:{' '}
+                <code>sudo athanor auto-update on</code>. Also on the server:{' '}
+                <code>sudo athanor rollback</code> to undo a release that installed cleanly and
+                still went wrong, <code>sudo athanor backup</code> for a copy on demand, and{' '}
                 <code>sudo athanor doctor</code> for the full report.
               </small>
             </span>

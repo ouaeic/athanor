@@ -177,48 +177,76 @@ describe('runs of one schedule', () => {
  * carry the evidence of that rather than ask them what to do — but only when there is evidence.
  */
 describe('what happened while the owner was away', () => {
+  const now = Date.parse('2026-07-31T09:00:00.000Z');
   const run = (id: string, at: string, status = 'completed'): Task =>
     ({ ...task(id, at, 'Rent watcher'), scheduleId: 'rent-watcher', status }) as Task;
 
   it('says nothing when nothing ran', () => {
-    expect(arrivalLine([])).toBeUndefined();
-    expect(arrivalLine([task('mine', '2026-07-31T09:00:00.000Z')])).toBeUndefined();
+    expect(arrivalLine([], now)).toBeUndefined();
+    expect(arrivalLine([task('mine', '2026-07-31T09:00:00.000Z')], now)).toBeUndefined();
   });
 
   it('counts only the runs since the owner last touched their own work', () => {
     expect(
-      arrivalLine([
-        task('mine', '2026-07-30T22:00:00.000Z'),
-        run('before', '2026-07-30T21:00:00.000Z'),
-        run('after-1', '2026-07-31T02:00:00.000Z'),
-        run('after-2', '2026-07-31T03:00:00.000Z')
-      ])
+      arrivalLine(
+        [
+          task('mine', '2026-07-30T22:00:00.000Z'),
+          run('before', '2026-07-30T21:00:00.000Z'),
+          run('after-1', '2026-07-31T02:00:00.000Z'),
+          run('after-2', '2026-07-31T03:00:00.000Z')
+        ],
+        now
+      )
     ).toBe('2 scheduled runs finished while you were away.');
   });
 
   it('reads as one run rather than as 1 runs', () => {
-    expect(arrivalLine([run('one', '2026-07-31T02:00:00.000Z')])).toBe(
+    expect(arrivalLine([run('one', '2026-07-31T02:00:00.000Z')], now)).toBe(
       '1 scheduled run finished while you were away.'
     );
+  });
+
+  /*
+   * With no conversation of the owner's own to measure from - every one archived, or a box that has
+   * only ever run schedules - "since they last looked" reduced to the beginning of time, so a
+   * schedule that has been running for a year reported the whole year as having happened overnight.
+   */
+  it('reaches back a day and no further when there is nothing of the owner’s to measure from', () => {
+    expect(
+      arrivalLine(
+        [
+          run('a-year-ago', '2025-08-01T02:00:00.000Z'),
+          run('last-week', '2026-07-24T02:00:00.000Z'),
+          run('overnight', '2026-07-31T02:00:00.000Z')
+        ],
+        now
+      )
+    ).toBe('1 scheduled run finished while you were away.');
   });
 
   /* A run holding an approval is the owner's move, so it is the thing worth saying. */
   it('leads with the runs waiting on the owner, ahead of the ones that failed', () => {
     expect(
-      arrivalLine([
-        run('waiting', '2026-07-31T02:00:00.000Z', 'awaiting_user'),
-        run('broken', '2026-07-31T03:00:00.000Z', 'failed'),
-        run('fine', '2026-07-31T04:00:00.000Z')
-      ])
+      arrivalLine(
+        [
+          run('waiting', '2026-07-31T02:00:00.000Z', 'awaiting_user'),
+          run('broken', '2026-07-31T03:00:00.000Z', 'failed'),
+          run('fine', '2026-07-31T04:00:00.000Z')
+        ],
+        now
+      )
     ).toBe('1 scheduled run needs you.');
   });
 
   it('says a run failed when none is waiting on the owner', () => {
     expect(
-      arrivalLine([
-        run('broken', '2026-07-31T03:00:00.000Z', 'failed'),
-        run('fine', '2026-07-31T04:00:00.000Z')
-      ])
+      arrivalLine(
+        [
+          run('broken', '2026-07-31T03:00:00.000Z', 'failed'),
+          run('fine', '2026-07-31T04:00:00.000Z')
+        ],
+        now
+      )
     ).toBe('1 scheduled run failed while you were away.');
   });
 });

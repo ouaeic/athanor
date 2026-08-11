@@ -787,7 +787,10 @@ describe('the size of the catalogue the model is sent', () => {
     // rule.
     //
     // Then raised from 51,900 to 52,200 for services: one `service` field on shell, 174 bytes net
-    // after `background` and `timeoutSeconds` gave back the sentences that are no longer true. It
+    // after `timeoutSeconds` gave back the sentence a service makes untrue. `background` keeps its
+    // restart caveat, scoped: a plain background process still lives in a Map and still dies with
+    // the workspace runtime, which is the difference between a link the model hands the owner that
+    // answers in the morning and one that does not. It
     // is a capability by the test above's own definition - a background process was capped at an
     // hour and lived in a Map, so a link the agent handed the user stopped answering by dinner, and
     // no wording anywhere could have said otherwise. The field is the only way to reach a process
@@ -1492,6 +1495,82 @@ describe('what a tainted turn may still do through shell', () => {
         executable: 'bash',
         args: ['-lc', 'echo "- a note" >> workspace/ATHANOR.md']
       })
+    ).toBeNull();
+  });
+
+  /*
+   * The budget is a turn's, and a call is not smaller than a turn.
+   *
+   * Every address in one call used to be measured against the same frozen figure - what the turn had
+   * spent before the call began - so one batch of navigations, each individually inside the
+   * per-address bound, carried more than the whole turn is allowed and raised nothing at all.
+   */
+  it('measures the tenth address in a batch against what the first nine spent', () => {
+    const chunks = Array.from({ length: 22 }, (_, index) => `${'z'.repeat(90)}${index}`);
+    const batch = approvalRequirement(
+      'parallel_web_read',
+      { urls: chunks.map((chunk) => `https://vendor.example/${chunk}`) },
+      'balanced',
+      tainted
+    );
+    expect(batch?.preview).toContain('this turn has already sent');
+
+    // And the same batch one at a time is still the same fact, so nothing was gained by splitting.
+    const single = approvalRequirement(
+      'parallel_web_read',
+      { urls: [`https://vendor.example/${chunks[0]}`] },
+      'balanced',
+      tainted
+    );
+    expect(single).toBeNull();
+  });
+});
+
+/*
+ * A service is durable persistence, and the floor had no rule about it: `ordinaryRequirement` judges
+ * what a command does while it runs, and `npm start` is as ordinary as a command gets. So a named,
+ * network-capable process that survives every reboot and outlives the task that made it could be
+ * planted with no card.
+ */
+describe('declaring a service the computer keeps running', () => {
+  it('asks before the computer takes something on permanently', () => {
+    const card = approvalRequirement('shell', {
+      executable: 'node',
+      args: ['server.js'],
+      background: true,
+      service: 'dashboard'
+    });
+    expect(card?.sideEffect).toBe('external_reversible');
+    expect(card?.action).toContain('dashboard');
+    expect(card?.preview).toContain('restarts');
+  });
+
+  it('asks in every mode, because autonomous is about ordinary work', () => {
+    for (const mode of ['balanced', 'autonomous', 'review'] as const)
+      expect(
+        approvalRequirement(
+          'shell',
+          { executable: 'node', args: ['server.js'], background: true, service: 'dashboard' },
+          mode
+        ),
+        mode
+      ).not.toBeNull();
+  });
+
+  it('raises it further while untrusted content is in the turn', () => {
+    expect(
+      approvalRequirement(
+        'shell',
+        { executable: 'node', args: ['x.js'], background: true, service: 'beacon' },
+        'balanced',
+        { taintSources: ['web page vendor.example'] }
+      )?.sideEffect
+    ).toBe('external_consequential');
+  });
+
+  it('leaves an ordinary background command alone', () => {
+    expect(
+      approvalRequirement('shell', { executable: 'npm', args: ['test'], background: true })
     ).toBeNull();
   });
 });
