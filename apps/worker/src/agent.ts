@@ -100,6 +100,8 @@ import {
   mediaDimension,
   mediaEstimateUsd,
   resolvedMediaModel,
+  resolvedTranscriptionRoute,
+  transcriptionEstimateUsd,
   type ResolvedMediaModel,
   type StoredMediaRoutes
 } from './media.js';
@@ -437,6 +439,9 @@ const REPEATABLE_TOOLS = new Set([
  * documented way to use them, not a symptom.
  */
 const IDEMPOTENT_WITHIN_TURN = new Set([
+  // The only member that costs money to repeat. Transcription is billed by the minute, so a second
+  // identical reading of the same window of the same recording buys the same text twice.
+  'audio_read',
   'code_search',
   'document_read',
   'document_search',
@@ -1250,6 +1255,7 @@ export const untrustedOriginOfResult = (call: ModelToolCall, result: unknown): s
     }
     case 'shell':
       return untrustedShellOrigin(call.arguments);
+    case 'audio_read':
     case 'document_read':
     case 'image_read':
     case 'file_read': {
@@ -4806,6 +4812,127 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           );
         return JSON.parse(result.stdout) as unknown;
       }
+      case 'audio_read': {
+        // Resolved before anything else, so a computer with no provider connected says so rather
+        // than encoding ninety minutes of audio first and then discovering it cannot send it.
+        const secret = await this.#inferenceCredential(task);
+        const path = textValue(call.arguments.path);
+        const startSeconds = Math.min(
+          86_400,
+          Math.max(0, Math.floor(Number(call.arguments.startSeconds ?? 0)) || 0)
+        );
+        const endValue = Number(call.arguments.endSeconds);
+        const maxCharacters = Math.min(
+          200_000,
+          Math.max(1_000, Number(call.arguments.maxCharacters ?? 40_000))
+        );
+        const client = new MediaClient({
+          baseUrl: secret.baseUrl,
+          ...(secret.apiKey ? { apiKey: secret.apiKey } : {}),
+          appUrl: this.config.PUBLIC_APP_URL,
+          openRouter: secret.provider === 'openrouter'
+        });
+        // The owner's own choice first. Asking the provider what it has is the fallback for an owner
+        // who has never opened the media section, and it is one request rather than a compiled-in
+        // model id: nothing in this repository has run a transcription route, so an id written here
+        // would be a claim about a model nobody checked.
+        const chosen = resolvedTranscriptionRoute(secret.mediaRoutes);
+        const modelId =
+          chosen?.modelId ??
+          (await client.transcriptionModels().catch(() => [] as string[]))[0] ??
+          '';
+        if (!modelId)
+          throw new AthanorError(
+            'transcription_route_unavailable',
+            'The connected provider offers no model that reads recordings, so this file cannot be transcribed. Choosing a transcription model in Settings, or connecting a provider that has one, is what opens this route.',
+            503
+          );
+        const prepared = await this.#runner.prepareAudio(task.workspaceId, task.id, {
+          path,
+          startSeconds,
+          ...(Number.isFinite(endValue) && endValue > startSeconds
+            ? { endSeconds: Math.min(86_400, Math.floor(endValue)) }
+            : {})
+        });
+        // Priced on what was actually cut rather than on what was asked for, and checked before the
+        // recording leaves this computer. Duration billing means the money is spent the moment the
+        // request is accepted, so a guard that ran afterwards would be a report rather than a brake.
+        const decision = await this.store.spendGuard({
+          userId: task.userId,
+          taskId: task.id,
+          estimateUsd: transcriptionEstimateUsd(prepared.preparedSeconds, chosen),
+          includeOpenCommitments: true
+        });
+        if (decision.outcome === 'deny')
+          throw new AthanorError(
+            'spend_cap_reached',
+            `${spendHalt(decision)} Nothing was transcribed and nothing was charged; say so and carry on with the work that costs nothing.`
+          );
+        const reading = await client
+          .transcribe({
+            model: modelId,
+            audio: prepared.bytes,
+            format: prepared.format,
+            seconds: prepared.preparedSeconds,
+            usdPerMinute: chosen?.usdPerMinute ?? null
+          })
+          .catch((error: unknown) => {
+            throw new AthanorError(
+              'audio_read_failed',
+              error instanceof Error ? error.message : 'The recording could not be read'
+            );
+          });
+        // Recorded between the charge and everything that could still fail, exactly as a generation
+        // is. The provider has billed by this line, and media spend was the least visible line on a
+        // task's bill precisely because a path existed that spent money without writing one of these.
+        await this.store.recordUsage({
+          userId: task.userId,
+          workspaceId: task.workspaceId,
+          taskId: task.id,
+          kind: 'model_inference',
+          resourceClass: 'media:transcription',
+          quantity: Math.max(1, Math.round(reading.billedSeconds ?? prepared.preparedSeconds)),
+          unit: 'second',
+          credits: 0,
+          costUsd: reading.costUsd,
+          state: 'settled',
+          idempotencyKey: `transcription:${task.id}:${sha256(`${path}:${prepared.startSeconds}:${prepared.preparedSeconds}`)}`,
+          providerRef: `${secret.provider}:${modelId}`
+        });
+        // The whole transcript goes to a file before any of it is cut for the window. What was paid
+        // for is not thrown away because the model asked for forty thousand characters, and reading
+        // the rest of it is a free file_read rather than a second minute-billed request.
+        const transcriptPath = `${path}${prepared.startSeconds > 0 ? `.from-${prepared.startSeconds}s` : ''}.transcript.txt`;
+        await this.#runner
+          .writeFile(task.workspaceId, task.id, transcriptPath, reading.text)
+          .catch(() => undefined);
+        const text = reading.text.slice(0, maxCharacters);
+        return {
+          path,
+          transcriptPath,
+          startSeconds: prepared.startSeconds,
+          secondsRead: Math.round(prepared.preparedSeconds),
+          ...(prepared.durationSeconds === null
+            ? {}
+            : { durationSeconds: Math.round(prepared.durationSeconds) }),
+          // Where the next reading starts, when the recording carries on past this window. Without
+          // it a bounded read of a long recording is a dead end the model cannot get past.
+          ...(prepared.more
+            ? { nextStartSeconds: prepared.startSeconds + Math.round(prepared.preparedSeconds) }
+            : {}),
+          characters: reading.text.length,
+          truncated: reading.text.length > text.length,
+          modelId,
+          costUsd: reading.costUsd,
+          billedBy: 'connected provider',
+          text,
+          ...(reading.text.length > text.length
+            ? {
+                instruction: `This is the first ${text.length} of ${reading.text.length} characters. The whole transcript of this stretch is at ${transcriptPath}; read the rest of it there rather than transcribing again.`
+              }
+            : {})
+        };
+      }
       case 'document_search': {
         const query = textValue(call.arguments.query).trim();
         if (!query) throw new AthanorError('document_query_empty', 'Document search needs a query');
@@ -6592,6 +6719,16 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
             ...(await this.#mediaModelForCall(task, textValue(call.arguments.kind)))
           }
         : {}),
+      // Reading a recording lands on the same bill as making one, so it meets the same cumulative
+      // card. The duration is what it is priced on, and the only honest number available before the
+      // encode is what the model asked for - which is why the card says "up to" and the ledger is
+      // settled afterwards from what the provider actually billed.
+      ...(call.name === 'audio_read'
+        ? {
+            mediaCommittedUsd: await this.#mediaCommittedUsd(task),
+            ...(await this.#transcriptionModelForCall(task))
+          }
+        : {}),
       ...(existingSkill ? { existingSkill } : {}),
       ...(state?.taint ? { taintSources: state.taint.sources } : {}),
       ...this.#destinationContext(state)
@@ -6672,6 +6809,21 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
     if (kind !== 'image' && kind !== 'audio') return {};
     const secret = await this.#inferenceCredential(task).catch(() => undefined);
     return { mediaModel: resolvedMediaModel(kind, secret?.mediaRoutes) };
+  }
+
+  /**
+   * The route a reading will take, for the card that asks about it.
+   *
+   * Absent where the owner has pinned nothing: the model is then whatever their provider offers,
+   * discovered a moment later in the dispatch arm, and a card that named one before it was chosen
+   * would be naming a guess. Absent also prices nothing, which is what makes the card ask on every
+   * reading until a route with a published per-minute price is chosen - the same treatment an
+   * unpriced image route already gets, for the same reason.
+   */
+  async #transcriptionModelForCall(task: TaskRecord): Promise<{ mediaModel?: ResolvedMediaModel }> {
+    const secret = await this.#inferenceCredential(task).catch(() => undefined);
+    const route = resolvedTranscriptionRoute(secret?.mediaRoutes);
+    return route ? { mediaModel: route } : {};
   }
 
   /**
@@ -8505,9 +8657,25 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       // no usage leaves the estimate in charge rather than claiming an empty window.
       if (response.usage.inputTokens > 0)
         state.preparedInputTokens = Math.max(0, response.usage.inputTokens - reservedTokens);
+      /*
+       * What a call that was cut off owes for its prompt.
+       *
+       * The gateway can count the output it watched go past, and does. It cannot count the input:
+       * usage arrives in the last frame of the stream and a stream that was cut never reaches it,
+       * and the prompt is not something the reading side ever saw. This side did see it - it
+       * assembled the request a few lines above and priced it there - so the one number missing
+       * from a cut-off call is the one number here is certain of. The catalogue is added back
+       * because the estimate covers the messages alone while what a provider bills is the whole
+       * request. Left at zero, a quarter of an hour of generation settled at a few tenths of a
+       * cent, which is the spinner-and-a-price-that-never-moves the owner asked about, one layer up.
+       */
+      const billedInputTokens =
+        response.usage.estimated && response.usage.inputTokens === 0
+          ? preparedContext.estimatedInputTokens + reservedTokens
+          : response.usage.inputTokens;
       const credit = usageCredit(
         model,
-        response.usage.inputTokens,
+        billedInputTokens,
         response.usage.outputTokens,
         response.usage.computeSeconds
       );
@@ -8515,7 +8683,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         response.usage.costUsd ??
         estimatedInferenceCostUsd(
           model,
-          response.usage.inputTokens,
+          billedInputTokens,
           response.usage.outputTokens,
           response.usage
         );
@@ -8527,7 +8695,14 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         taskId: task.id,
         kind: 'model_inference',
         resourceClass: model.usageClass,
-        quantity: response.usage.computeSeconds ?? response.usage.totalTokens,
+        // The total is the provider's own, except where there is no provider total: a stream that
+        // was cut carries a sum of a reported output and an input nobody reported, and billing the
+        // ledger from it would file the same zero the credit line has just stopped charging.
+        quantity:
+          response.usage.computeSeconds ??
+          (response.usage.estimated
+            ? billedInputTokens + response.usage.outputTokens
+            : response.usage.totalTokens),
         unit: response.usage.computeSeconds ? 'gpu_seconds' : 'tokens',
         credits: credit,
         costUsd,
@@ -8599,6 +8774,38 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         state.repairStep = false;
       if (await honorUserControl()) return;
 
+      /*
+       * Why the answer stops where it does, when it was this side that stopped it.
+       *
+       * A generation that went quiet, ran past its deadline or wrote past its ceiling is ended
+       * here rather than by the model, and what had arrived is kept. The owner is reading half an
+       * answer either way; without this they are reading half an answer that presents itself as a
+       * whole one, and the only clue is that it ends mid-sentence.
+       *
+       * It deliberately does not continue. The gateway has already asked whether carrying on could
+       * finish this answer - it watched the rate the words arrived at - and written the verdict
+       * into the finish reason: worth continuing arrives as `length` and is continued by the branch
+       * below, and everything else arrives as `stop` and falls through to the completion check,
+       * which is bounded and ends the turn by completing it. Asking again from here would buy back
+       * the ten-minutes-at-a-time this was all built to stop.
+       *
+       * Only where the step ended in prose. A cut-off step that still assembled a tool call has to
+       * be followed immediately by that call's result, so a system message wedged in between would
+       * make the next request malformed; that shape is answered by the truncated-arguments path.
+       */
+      if (response.truncated && response.finishReason !== 'length' && !response.toolCalls.length) {
+        await event(this.store, task, key, 'warning', 'The answer was cut off before it finished', {
+          owner: true,
+          reason: response.truncated.reason,
+          detail: response.truncated.detail,
+          characters: assistantText.length
+        });
+        state.messages.push({
+          role: 'system',
+          content: `YOUR REPLY WAS CUT OFF: ${response.truncated.detail}. The user has already read what you wrote, so do not repeat or summarise it. Either do one concrete thing that moves the work on, or close in a sentence and call finish.`
+        });
+      }
+
       // A reply that stopped at the provider's output ceiling is half a sentence, and it used to be
       // committed as if it were the whole answer: the task completed, the Result card said the work
       // was ready, and the owner's only recourse was to type "continue" and pay for the whole
@@ -8633,9 +8840,24 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             ? `OUTPUT LIMIT REACHED ${truncations} times in a row. Stop expanding the answer in chat: write what remains to a workspace file, publish it, and reply with a short complete closing message that points at it.`
             : `CONTINUE THE ANSWER (${truncations} of ${MAX_TRUNCATED_CONTINUATIONS}): your previous reply stopped at the model's output limit, mid-sentence, and the user is looking at it. Carry straight on from where it stopped - do not repeat, restart or summarise what you already wrote. Call finish once the answer is complete.`
         });
-        continue;
-      }
-      state.truncatedReplies = 0;
+        /*
+         * Past the cap this deliberately does not continue, and the counter deliberately does not
+         * reset.
+         *
+         * The cap used to change only the wording. Both branches continued, and the reset below was
+         * skipped by that continue, so a model that hit the output limit on every reply was told to
+         * stop expanding the answer and then asked again, and again, until the step budget ran out:
+         * measured at 41 model calls against a ceiling of 40. It bounded nothing.
+         *
+         * Falling through instead puts the step under the completion nag, which is bounded and ends
+         * the turn by *completing* rather than by exhausting it - so the answer the owner has
+         * already read stands, with the closing instruction in front of the model. That matters
+         * more than it used to: a generation this computer cut short now reports the same finish
+         * reason whenever carrying on could still finish it, and each of those costs up to the full
+         * generation deadline.
+         */
+        if (!capped) continue;
+      } else state.truncatedReplies = 0;
 
       if (!response.toolCalls.length) {
         /*

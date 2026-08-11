@@ -68,6 +68,7 @@ describe('media model catalogue', () => {
     modality: 'image',
     usdPerImage: null,
     usdPerMillionCharacters: null,
+    usdPerMinute: null,
     priceSource: 'provider',
     recommendationTags: [],
     updatedAt: '2026-08-10T00:00:00.000Z',

@@ -616,7 +616,11 @@ interface InferenceSecret {
    * It also means an automatic mode settles when it is chosen rather than drifting under the owner
    * between one generation and the next.
    */
-  mediaRoutes?: { image?: MediaModelOption; audio?: MediaModelOption };
+  mediaRoutes?: {
+    image?: MediaModelOption;
+    audio?: MediaModelOption;
+    transcription?: MediaModelOption;
+  };
 }
 
 const CONNECTION_TICKET_VERSION = 2;
@@ -5317,7 +5321,7 @@ export const buildServer = async (
     const { secret } = await inferenceCredential(userId);
     const options = await mediaCatalogFor(secret);
     const selection = secret.mediaModels ?? {};
-    const modality = (kind: 'image' | 'audio'): MediaModalityState => {
+    const modality = (kind: 'image' | 'audio' | 'transcription'): MediaModalityState => {
       const forKind = options.filter((option) => option.modality === kind);
       const choice = selection[kind] ?? { automatic: true, preference: 'balanced', modelId: '' };
       return {
@@ -5327,7 +5331,7 @@ export const buildServer = async (
           ? null
           : secret.enforceZeroDataRetention
             ? 'No route your provider offers for this has a verified private endpoint. Allowing providers that may retain data would offer more.'
-            : 'This provider account lists nothing that generates this.',
+            : 'This provider account lists nothing that does this.',
         options: forKind,
         choice,
         effective: resolveMediaModel(options, choice, kind)
@@ -5337,6 +5341,7 @@ export const buildServer = async (
       modalities: [
         modality('image'),
         modality('audio'),
+        modality('transcription'),
         {
           modality: 'video',
           available: false,
@@ -5365,7 +5370,12 @@ export const buildServer = async (
     const options = await mediaCatalogFor(secret);
     const image = resolveMediaModel(options, selection?.image, 'image');
     const audio = resolveMediaModel(options, selection?.audio, 'audio');
-    return { ...(image ? { image } : {}), ...(audio ? { audio } : {}) };
+    const transcription = resolveMediaModel(options, selection?.transcription, 'transcription');
+    return {
+      ...(image ? { image } : {}),
+      ...(audio ? { audio } : {}),
+      ...(transcription ? { transcription } : {})
+    };
   };
 
   app.get('/v1/media/models', async (request) => mediaSettings(requireUser(request.user).id));
@@ -5494,21 +5504,31 @@ export const buildServer = async (
       'http-referer': config.PUBLIC_APP_URL,
       'x-title': 'athanor'
     };
-    const catalogUrl = new URL(`${baseUrl}/models`);
-    catalogUrl.searchParams.set('output_modalities', 'transcription');
-    catalogUrl.searchParams.set('sort', 'top-weekly');
-    const catalogResponse = await fetch(catalogUrl, {
-      headers,
-      signal: AbortSignal.timeout(15_000)
-    }).catch(() => undefined);
-    if (!catalogResponse?.ok)
-      throw new AthanorError(
-        'transcription_catalog_unavailable',
-        'OpenRouter’s transcription catalog could not be reached',
-        503
-      );
-    const catalog = (await catalogResponse.json()) as { data?: Array<{ id?: string }> };
-    const model = catalog.data?.find((entry) => typeof entry.id === 'string')?.id;
+    // The owner's own choice, where they have made one. This route used to take whatever stood at
+    // the top of the provider's weekly list, which meant the model that reads a voice note into the
+    // composer could change under them between one dictation and the next, and could never be the
+    // one they picked in Settings. The catalogue is now the fallback rather than the answer, and it
+    // is the same sealed choice the agent's audio_read reads.
+    const model = await (async (): Promise<string | undefined> => {
+      const pinned = secret.mediaRoutes?.transcription;
+      if (pinned?.modality === 'transcription' && pinned.providerModelId)
+        return pinned.providerModelId;
+      const catalogUrl = new URL(`${baseUrl}/models`);
+      catalogUrl.searchParams.set('output_modalities', 'transcription');
+      catalogUrl.searchParams.set('sort', 'top-weekly');
+      const catalogResponse = await fetch(catalogUrl, {
+        headers,
+        signal: AbortSignal.timeout(15_000)
+      }).catch(() => undefined);
+      if (!catalogResponse?.ok)
+        throw new AthanorError(
+          'transcription_catalog_unavailable',
+          'The transcription catalogue could not be reached',
+          503
+        );
+      const catalog = (await catalogResponse.json()) as { data?: Array<{ id?: string }> };
+      return catalog.data?.find((entry) => typeof entry.id === 'string')?.id;
+    })();
     if (!model)
       throw new AthanorError(
         'transcription_model_unavailable',

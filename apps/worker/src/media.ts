@@ -55,6 +55,7 @@ export const managedMediaCatalog = {
 export interface StoredMediaRoutes {
   image?: MediaModelOption;
   audio?: MediaModelOption;
+  transcription?: MediaModelOption;
 }
 
 /**
@@ -71,6 +72,7 @@ export interface ResolvedMediaModel {
   displayName: string;
   usdPerImage: number | null;
   usdPerMillionCharacters: number | null;
+  usdPerMinute: number | null;
   voice: string | undefined;
   /**
    * Whether the price above came from anywhere at all. False means the provider published no cost
@@ -100,6 +102,7 @@ export const resolvedMediaModel = (
           displayName: managedMediaModels.image.displayName,
           usdPerImage: managedMediaModels.image.baseUsdPerImage,
           usdPerMillionCharacters: null,
+          usdPerMinute: null,
           voice: undefined,
           priceKnown: true
         }
@@ -108,6 +111,7 @@ export const resolvedMediaModel = (
           displayName: managedMediaModels.audio.displayName,
           usdPerImage: null,
           usdPerMillionCharacters: managedMediaModels.audio.usdPerMillionCharacters,
+          usdPerMinute: null,
           voice: managedMediaModels.audio.defaultVoice,
           priceKnown: true
         };
@@ -116,12 +120,69 @@ export const resolvedMediaModel = (
     displayName: option.displayName,
     usdPerImage: option.usdPerImage,
     usdPerMillionCharacters: option.usdPerMillionCharacters,
+    usdPerMinute: option.usdPerMinute,
     voice: option.defaultVoice ?? undefined,
     priceKnown:
       option.priceSource !== 'unknown' &&
       (kind === 'image' ? option.usdPerImage !== null : option.usdPerMillionCharacters !== null)
   };
 };
+
+/**
+ * The route that reads a recording, or nothing.
+ *
+ * Deliberately not folded into the resolver above, because it cannot keep that function's promise:
+ * image and speech fall back to a reviewed model athanor has itself run and priced, and no such
+ * model exists on this side for transcription. Inventing one would be a licence claim about
+ * something nobody reviewed and a price about something nobody billed. Null means the owner has
+ * chosen nothing yet, which the caller answers by asking the provider what it has - one request,
+ * and only when there is no choice to honour.
+ */
+export const resolvedTranscriptionRoute = (
+  routes?: StoredMediaRoutes
+): ResolvedMediaModel | null => {
+  const option = routes?.transcription;
+  if (!option || option.modality !== 'transcription' || !option.providerModelId) return null;
+  return {
+    modelId: option.providerModelId,
+    displayName: option.displayName,
+    usdPerImage: null,
+    usdPerMillionCharacters: null,
+    usdPerMinute: option.usdPerMinute,
+    voice: undefined,
+    priceKnown: option.priceSource !== 'unknown' && option.usdPerMinute !== null
+  };
+};
+
+/**
+ * What a reading of this length will cost, before a second of it is sent.
+ *
+ * Rounded up to the minute, because that is how duration billing is quoted and rounding down would
+ * make the card understate every job. A route whose price nobody published prices at zero here and
+ * is caught by `priceKnown` instead, exactly as an unpriced image route is: an unknown price is a
+ * card every time, never a small number.
+ */
+/**
+ * What a reading is expected to cost, from its duration alone.
+ *
+ * No transcription route publishes a per-minute figure this side can read, so today every one of
+ * them lands here with `usdPerMinute` null and prices at zero. That is deliberate and it is not the
+ * same thing as free: the image path can fall back to a compiled-in constant because athanor has
+ * run and priced that model, and nothing here has ever transcribed anything, so a number in this
+ * file would be a price claim about a model nobody has measured. Inventing one is worse than
+ * admitting there is none.
+ *
+ * What actually protects the owner is therefore not this estimate. A route with no published price
+ * has `priceKnown` false, so the approval card asks before every single reading and states the
+ * minutes; the ledger settles from the provider's own figure once the work is done; and the spend
+ * guard is asked again at the next step boundary against money that has really been spent. The
+ * exposure is one reading's worth of overshoot on a cap, on a reading the owner was asked about
+ * first. Seed a real figure here the moment one can be measured, and this stops being true.
+ */
+export const transcriptionEstimateUsd = (
+  seconds: number,
+  model: ResolvedMediaModel | null
+): number => Math.ceil(Math.max(0, seconds) / 60) * (model?.usdPerMinute ?? 0);
 
 const clamp = (value: unknown, minimum: number, maximum: number, fallback: number): number => {
   const parsed = Number(value ?? fallback);

@@ -1,5 +1,6 @@
+import { spawnSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -8,6 +9,16 @@ import { capabilityAudience, signCapabilityToken } from '@athanor/core';
 import type { RunnerConfig } from './config.js';
 import { ensureWorkspace } from './files.js';
 import { buildServer } from './server.js';
+
+/**
+ * The host's own copy of a binary, or nothing. The runner resolves executables on the search path a
+ * server would have, which is not this machine's, so a test that needs a real encoder has to put one
+ * where that path already looks rather than assume the host layout.
+ */
+const binaryOnPath = async (name: string): Promise<string | null> => {
+  const found = spawnSync('sh', ['-c', `command -v ${name}`], { encoding: 'utf8' });
+  return found.status === 0 ? found.stdout.trim() : null;
+};
 
 describe('a preview whose app is not running', () => {
   const disposers: Array<() => Promise<void>> = [];
@@ -36,6 +47,7 @@ describe('a preview whose app is not running', () => {
       BROWSER_USE_DESKTOP_DISPLAY: false,
       MAX_EXECUTION_SECONDS: 30,
       RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
+      IMAGE_CONVERT_EXECUTABLE: 'magick',
       COMMAND_FILE_LIMIT_BYTES: 4 * 1024 ** 3,
       COMMAND_PROCESS_LIMIT: 1024,
       COMMAND_OPEN_FILE_LIMIT: 4096,
@@ -100,6 +112,7 @@ describe('workspace export', () => {
       BROWSER_USE_DESKTOP_DISPLAY: false,
       MAX_EXECUTION_SECONDS: 30,
       RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
+      IMAGE_CONVERT_EXECUTABLE: 'magick',
       COMMAND_FILE_LIMIT_BYTES: 4 * 1024 ** 3,
       COMMAND_PROCESS_LIMIT: 1024,
       COMMAND_OPEN_FILE_LIMIT: 4096,
@@ -193,6 +206,7 @@ describe('workspace export', () => {
       BROWSER_USE_DESKTOP_DISPLAY: false,
       MAX_EXECUTION_SECONDS: 30,
       RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
+      IMAGE_CONVERT_EXECUTABLE: 'magick',
       COMMAND_FILE_LIMIT_BYTES: 4 * 1024 ** 3,
       COMMAND_PROCESS_LIMIT: 1024,
       COMMAND_OPEN_FILE_LIMIT: 4096,
@@ -259,6 +273,7 @@ describe('turn checkpoints over the runner API', () => {
       BROWSER_USE_DESKTOP_DISPLAY: false,
       MAX_EXECUTION_SECONDS: 30,
       RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
+      IMAGE_CONVERT_EXECUTABLE: 'magick',
       COMMAND_FILE_LIMIT_BYTES: 4 * 1024 ** 3,
       COMMAND_PROCESS_LIMIT: 1024,
       COMMAND_OPEN_FILE_LIMIT: 4096,
@@ -383,6 +398,7 @@ describe('file organisation and toolchain routes', () => {
     BROWSER_USE_DESKTOP_DISPLAY: false,
     MAX_EXECUTION_SECONDS: 30,
     RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
+    IMAGE_CONVERT_EXECUTABLE: 'magick',
     COMMAND_FILE_LIMIT_BYTES: 4 * 1024 ** 3,
     COMMAND_PROCESS_LIMIT: 1024,
     COMMAND_OPEN_FILE_LIMIT: 4096,
@@ -555,4 +571,66 @@ describe('file organisation and toolchain routes', () => {
       missing: ['athanor-definitely-absent']
     });
   });
+
+  it('will not prepare a recording for a token that may only read files elsewhere', async () => {
+    const { app, id, token } = await harness();
+    // The route only ever reads a file the owner already has, so `files.read` is the whole of what
+    // it may ask for - and a token without it gets nothing, including the file's length.
+    const refused = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${id}/audio/prepare`,
+      headers: { authorization: `Bearer ${token(['exec'])}` },
+      payload: { path: 'workspace/memo.m4a' }
+    });
+    expect(refused.statusCode).toBe(403);
+  });
+
+  it('will not read a recording outside the workspace, whatever the path says', async () => {
+    const { app, id, token } = await harness();
+    const escaped = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${id}/audio/prepare`,
+      headers: { authorization: `Bearer ${token(['files.read'])}` },
+      payload: { path: '../../etc/passwd' }
+    });
+    expect(escaped.statusCode).toBe(400);
+    expect(escaped.json<{ error: { message: string } }>().error.message).toMatch(
+      /escapes workspace/i
+    );
+  });
+
+  it('says which second range it prepared, on the response that carries the bytes', async () => {
+    const { app, id, root, token } = await harness();
+    const ffmpeg = await binaryOnPath('ffmpeg');
+    const ffprobe = await binaryOnPath('ffprobe');
+    if (!ffmpeg || !ffprobe) return;
+    const bin = path.join(root, 'workspace', '.athanor', 'tools', 'node_modules', '.bin');
+    await mkdir(bin, { recursive: true });
+    await symlink(ffmpeg, path.join(bin, 'ffmpeg'));
+    await symlink(ffprobe, path.join(bin, 'ffprobe'));
+    spawnSync(ffmpeg, [
+      '-v',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=440:duration=8',
+      path.join(root, 'workspace', 'memo.m4a')
+    ]);
+
+    const prepared = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${id}/audio/prepare`,
+      headers: { authorization: `Bearer ${token(['files.read'])}` },
+      payload: { path: 'workspace/memo.m4a', endSeconds: 3 }
+    });
+    expect(prepared.statusCode).toBe(200);
+    expect(prepared.headers['content-type']).toContain('audio/ogg');
+    expect(prepared.headers['x-audio-prepared-seconds']).toBe('3');
+    // The file runs past the window, and the header is what lets the caller say where to resume
+    // rather than leaving a bounded reading of a long recording as a dead end.
+    expect(prepared.headers['x-audio-more']).toBe('true');
+    expect(prepared.headers['x-audio-duration-seconds']).toBe('8');
+    expect(prepared.rawPayload.length).toBeGreaterThan(0);
+  }, 60_000);
 });

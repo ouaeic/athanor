@@ -54,6 +54,33 @@ export interface MediaRequest {
   usdPerMillionCharacters?: number | null;
 }
 
+/**
+ * A recording to be read back as text, already cut and re-encoded by the computer that holds it.
+ *
+ * The bytes arrive prepared rather than raw on purpose: transcription is billed by duration, so the
+ * length of what is sent is the size of the bill, and the only place that can be decided honestly
+ * is before the request rather than inside it.
+ */
+export interface TranscriptionRequest {
+  model: string;
+  audio: Buffer;
+  /** The container the bytes are in, as the endpoint names containers. */
+  format: 'ogg' | 'wav' | 'mp3' | 'flac' | 'm4a' | 'webm' | 'aac';
+  /** What the caller believes the route costs per minute, used only when the provider is silent. */
+  usdPerMinute?: number | null;
+  /** How long the prepared audio runs, for pricing a provider that reports no duration of its own. */
+  seconds: number;
+}
+
+export interface TranscriptionResult {
+  text: string;
+  /** The duration the provider says it billed, where it says one. */
+  billedSeconds: number | null;
+  costUsd: number;
+  /** True when the figure above is the provider's own rather than this side's arithmetic. */
+  costFromProvider: boolean;
+}
+
 /** Only over TLS, and only what the provider pointed at. */
 const download = async (rawUrl: string): Promise<{ bytes: Buffer; mimeType: string }> => {
   const url = new URL(rawUrl);
@@ -104,6 +131,74 @@ export class MediaClient {
 
   async generate(input: MediaRequest): Promise<GeneratedMediaResult> {
     return input.kind === 'image' ? this.#image(input) : this.#speech(input);
+  }
+
+  /**
+   * The route that turns a recording into text, when the owner has not pinned one.
+   *
+   * Asked of the provider rather than compiled in. The two generating modalities can fall back to a
+   * reviewed constant because athanor has run and priced those exact models; nothing here has ever
+   * transcribed anything, so an id written into this repository would be a claim about a model
+   * nobody checked. The catalogue is only consulted when the owner's own choice is absent - a
+   * pinned route never pays for this request.
+   */
+  async transcriptionModels(): Promise<string[]> {
+    const url = new URL(this.#endpoint('models'));
+    url.searchParams.set('output_modalities', 'transcription');
+    url.searchParams.set('sort', 'top-weekly');
+    const response = await fetch(url, { headers: this.#headers(), signal: this.#signal() });
+    if (!response.ok)
+      throw new Error(`The transcription catalogue could not be read (${response.status})`);
+    const body = (await response.json()) as { data?: Array<{ id?: unknown }> };
+    return (body.data ?? [])
+      .map((entry) => entry.id)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+  }
+
+  /**
+   * Speech to text, over the same account, the same headers and the same zero-retention routing
+   * block as everything else this client sends.
+   *
+   * The cost is the provider's own figure wherever it gives one, exactly as a generated image
+   * settles on the provider's number rather than on the estimate: duration billing is quoted per
+   * minute and rounded in ways this side cannot see, so guessing at it would put a wrong number in
+   * the ledger the owner reads. `costFromProvider` says which of the two happened, because a
+   * derived figure and a billed one should not look alike on an invoice.
+   */
+  async transcribe(input: TranscriptionRequest): Promise<TranscriptionResult> {
+    const response = await fetch(this.#endpoint('audio/transcriptions'), {
+      method: 'POST',
+      headers: this.#headers(),
+      signal: this.#signal(),
+      body: JSON.stringify({
+        model: input.model,
+        input_audio: { data: input.audio.toString('base64'), format: input.format },
+        temperature: 0,
+        ...this.#routing()
+      })
+    });
+    if (!response.ok)
+      throw new Error(`Transcription failed (${response.status}): ${await response.text()}`);
+    const body = (await response.json()) as {
+      text?: string;
+      usage?: { seconds?: number; cost?: number };
+    };
+    const text = (body.text ?? '').trim();
+    if (!text) throw new Error('The provider returned no speech from that recording');
+    const billedSeconds =
+      typeof body.usage?.seconds === 'number' && Number.isFinite(body.usage.seconds)
+        ? body.usage.seconds
+        : null;
+    const providerCost =
+      typeof body.usage?.cost === 'number' && Number.isFinite(body.usage.cost)
+        ? body.usage.cost
+        : null;
+    return {
+      text,
+      billedSeconds,
+      costUsd: providerCost ?? ((billedSeconds ?? input.seconds) / 60) * (input.usdPerMinute ?? 0),
+      costFromProvider: providerCost !== null
+    };
   }
 
   async #image(input: MediaRequest): Promise<GeneratedMediaResult> {

@@ -121,7 +121,10 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
   },
   {
     id: 'media',
-    purpose: 'Inspect and transcode audio and video',
+    // Reading a recording depends on this one and on nothing else installed here: audio_read cuts
+    // and re-encodes the window locally before anything leaves the computer, so a box without
+    // ffmpeg cannot listen to a voice memo at all, however the transcription itself is reached.
+    purpose: 'Inspect and transcode audio and video, and prepare a recording to be read',
     binaries: ['ffmpeg', 'ffprobe'],
     pythonModules: [],
     fonts: [],

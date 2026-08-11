@@ -28,6 +28,8 @@ const requestSignal = (timeoutMs: number): AbortSignal => {
  */
 const TOOL_REQUEST_TIMEOUT_MS = 3_900_000;
 const FILE_REQUEST_TIMEOUT_MS = 300_000;
+/** Cutting and re-encoding ninety minutes of audio is minutes of work, not seconds. */
+const AUDIO_REQUEST_TIMEOUT_MS = 960_000;
 /**
  * A turn checkpoint is a walk of the workspace, not a copy of it, and it stands between the model
  * and the work it is about to do. Ten minutes is far beyond anything measured and still short
@@ -352,18 +354,28 @@ export class AgentRunnerClient {
     };
   }
 
+  /**
+   * A picture from the workspace, already in a form the gateway can put in a request.
+   *
+   * This used to read the plain file endpoint and then refuse anything that was not one of four
+   * types. That refusal was the whole of athanor's answer to a phone photograph: HEIC arrived as
+   * bytes of no stated kind, and the owner was told their computer could not open a file sitting in
+   * front of them in the Files pane. The runner now converts what no model accepts, so the check
+   * below is no longer a policy - it is this side making sure the other side kept its promise
+   * before a data URL is built out of it.
+   */
   async readImage(
     workspaceId: string,
     taskId: string,
     requestedPath: string
-  ): Promise<{ mimeType: string; base64: string }> {
+  ): Promise<{ mimeType: string; base64: string; convertedFrom?: string }> {
     const token = signCapabilityToken(
       { sub: taskId, workspaceId, role: 'agent', scopes: ['files.read'], nonce: randomUUID() },
       this.secret,
       90
     );
     const response = await runnerFetch(
-      `${this.baseUrl}/v1/workspaces/${workspaceId}/file?path=${encodeURIComponent(requestedPath)}`,
+      `${this.baseUrl}/v1/workspaces/${workspaceId}/image?path=${encodeURIComponent(requestedPath)}`,
       {
         headers: { authorization: `Bearer ${token}` },
         signal: requestSignal(FILE_REQUEST_TIMEOUT_MS)
@@ -373,12 +385,21 @@ export class AgentRunnerClient {
     if (!response.ok) throw await runnerFailure(response);
     const mimeType =
       response.headers.get('content-type')?.split(';', 1)[0] ?? 'application/octet-stream';
-    if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mimeType)) {
-      throw new Error('image_read accepts PNG, JPEG, WebP, or GIF files only');
-    }
+    if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mimeType))
+      throw new Error(`The workspace returned ${mimeType}, which no model accepts as a picture`);
     const bytes = Buffer.from(await response.arrayBuffer());
     if (bytes.length > 20 * 1024 * 1024) throw new Error('Image exceeds the 20 MB vision limit');
-    return { mimeType, base64: bytes.toString('base64') };
+    // Only when it happened, and named by what the file actually was: a turn that reads a
+    // photograph is entitled to know it is looking at a re-encoding rather than at the pixels on
+    // disk, and a turn that reads a PNG should not be told anything at all.
+    const sourceType = response.headers.get('x-image-source-type');
+    return {
+      mimeType,
+      base64: bytes.toString('base64'),
+      ...(response.headers.get('x-image-converted') === 'true' && sourceType
+        ? { convertedFrom: sourceType }
+        : {})
+    };
   }
 
   async readBytes(
@@ -404,6 +425,60 @@ export class AgentRunnerClient {
       mimeType:
         response.headers.get('content-type')?.split(';', 1)[0] ?? 'application/octet-stream',
       bytes: Buffer.from(await response.arrayBuffer())
+    };
+  }
+
+  /**
+   * One window of a recording, measured and re-encoded for upload by the computer that holds it.
+   *
+   * Given its own timeout rather than the file one: an hour of audio is a real encode, and the whole
+   * point of the bound is that the caller learns the file's true length from the same answer that
+   * carries the bytes, so failing at five minutes would leave a long recording unreadable rather
+   * than partly read.
+   */
+  async prepareAudio(
+    workspaceId: string,
+    taskId: string,
+    request: { path: string; startSeconds?: number; endSeconds?: number }
+  ): Promise<{
+    bytes: Buffer;
+    format: 'ogg';
+    startSeconds: number;
+    preparedSeconds: number;
+    durationSeconds: number | null;
+    container: string | null;
+    codec: string | null;
+    more: boolean;
+  }> {
+    const token = signCapabilityToken(
+      { sub: taskId, workspaceId, role: 'agent', scopes: ['files.read'], nonce: randomUUID() },
+      this.secret,
+      90
+    );
+    const response = await runnerFetch(
+      `${this.baseUrl}/v1/workspaces/${workspaceId}/audio/prepare`,
+      {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        signal: requestSignal(AUDIO_REQUEST_TIMEOUT_MS),
+        body: JSON.stringify(request)
+      },
+      AUDIO_REQUEST_TIMEOUT_MS
+    );
+    if (!response.ok) throw await runnerFailure(response);
+    const header = (name: string): number | null => {
+      const parsed = Number(response.headers.get(name));
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+    return {
+      bytes: Buffer.from(await response.arrayBuffer()),
+      format: 'ogg',
+      startSeconds: header('x-audio-start-seconds') ?? 0,
+      preparedSeconds: header('x-audio-prepared-seconds') ?? 0,
+      durationSeconds: header('x-audio-duration-seconds'),
+      container: response.headers.get('x-audio-container'),
+      codec: response.headers.get('x-audio-codec'),
+      more: response.headers.get('x-audio-more') === 'true'
     };
   }
 

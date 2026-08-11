@@ -27,6 +27,12 @@ const Config = z.object({
   // prlimit is part of util-linux, an essential package, so it is present on every stock
   // Debian and Ubuntu host without anything being installed for athanor's benefit.
   RESOURCE_LIMIT_EXECUTABLE: z.string().default('/usr/bin/prlimit'),
+  // A bare name rather than a path, which is the one spelling everything else in athanor uses for
+  // this: the installer puts a compatibility command on PATH where the release only packages the
+  // older ImageMagick, and the toolchain probe and the skills both name it this way. The package
+  // table already installs it for image work, so a photograph the owner wants looked at is
+  // converted by the toolchain that is on the box rather than by a dependency added for one format.
+  IMAGE_CONVERT_EXECUTABLE: z.string().default('magick'),
   // Left unset the ceiling is derived from the host's own memory, because a number that suits a
   // 32 GiB server would be larger than the whole of a 2 GiB one.
   COMMAND_MEMORY_LIMIT_BYTES: z.coerce.number().int().positive().optional(),

@@ -1,8 +1,13 @@
 import type { ModelTool } from '@athanor/model-gateway';
-import type { SecurityMode } from '@athanor/contracts';
+import { AUDIO_READ_MAX_SECONDS, type SecurityMode } from '@athanor/contracts';
 import { connectorActions } from '@athanor/core';
 import { classifyDestination, type DestinationVerdict } from './egress.js';
-import { mediaEstimateUsd, MEDIA_APPROVAL_USD, type ResolvedMediaModel } from './media.js';
+import {
+  mediaEstimateUsd,
+  transcriptionEstimateUsd,
+  MEDIA_APPROVAL_USD,
+  type ResolvedMediaModel
+} from './media.js';
 import {
   estimateSkillTokens,
   isBuiltinSkillName,
@@ -871,12 +876,34 @@ export const agentTools: ModelTool[] = [
   {
     name: 'image_read',
     description:
-      'Look at a PNG, JPEG, WebP, or GIF already in the workspace with the selected vision model, and get back what is in it. Use it for screenshots, photographs, scans, diagrams, and any picture the user refers to - including the page images you render to prove a document before publishing it. It only looks at pictures that already exist: use document_read for a PDF or an office file, and use generate_media to make a new image.',
+      'Look at a picture already in the workspace with the selected vision model, and get back what is in it. PNG, JPEG, GIF, WebP, HEIC, HEIF, AVIF, TIFF, BMP and SVG all work; anything a model cannot take is converted first. Use it for screenshots, phone photographs, scans, diagrams, and the page images you render to prove a document before publishing it. It only looks at pictures that already exist: use document_read for a PDF or an office file, and use generate_media to make a new image.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['path'],
       properties: { path: { type: 'string' } }
+    }
+  },
+  {
+    name: 'audio_read',
+    /**
+     * The counterpart to `image_read`, and deliberately shaped like it rather than like
+     * `generate_media`: it points at a file the owner already has and returns what is in it. The
+     * description spends most of its bytes on formats and on the length bound, because those are the
+     * two things a model cannot discover without spending the owner's money to find out.
+     */
+    description:
+      'Listen to a recording already on this computer and get back what was said, as text. This is how you handle a voice memo, a meeting or call recording, a voicemail, a lecture, an interview, or the audio track of a video or screen recording - anything the user asks you to summarise, quote from or act on. Whatever their phone or app recorded is converted here first, so m4a, mp3, wav, aac, opus, ogg, flac, amr, wma, mp4, mov, mkv and webm all work. Reading is billed by the minute of recording, so one call covers at most 90 minutes: the result gives the full length of the file, how much of it was read and where the rest starts, and the whole transcript of that stretch is written beside the recording so re-reading any part of it with file_read costs nothing more. Use startSeconds to carry on where a previous call stopped, or to read one stretch of a long recording. It reads recordings that already exist; use generate_media to make speech.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['path'],
+      properties: {
+        path: { type: 'string' },
+        startSeconds: { type: 'integer', minimum: 0, maximum: 86_400, default: 0 },
+        endSeconds: { type: 'integer', minimum: 1, maximum: 86_400 },
+        maxCharacters: { type: 'integer', minimum: 1_000, maximum: 200_000, default: 40_000 }
+      }
     }
   },
   {
@@ -2646,6 +2673,29 @@ const ordinaryRequirement = (
         sideEffect: 'external_reversible',
         action: 'Approve continued provider spend on generated media',
         preview: `Generate ${textValue(args.kind, 'media')}${model ? ` with ${model.displayName}` : ''} ${unpriced ? 'from the connected provider account. This model publishes no price athanor can read, so the cost is only known once the provider bills it.' : `for about $${estimateUsd.toFixed(3)} from the connected provider account.`}${committedUsd > 0 ? ` This task has already spent about $${committedUsd.toFixed(2)} generating media.` : ''}\n\nEvery further generation in this task asks again.`
+      };
+  }
+  if (name === 'audio_read') {
+    // Priced on duration, because that is the unit transcription is billed in. The window is what
+    // the call asks for rather than what the file turns out to hold, so this can only ever overstate
+    // - which is the right direction for a card, and is why it says "up to".
+    const model = context.mediaModel;
+    const start = Math.max(0, Number(args.startSeconds) || 0);
+    const end = Number(args.endSeconds);
+    const seconds = Math.min(
+      AUDIO_READ_MAX_SECONDS,
+      Number.isFinite(end) && end > start ? end - start : AUDIO_READ_MAX_SECONDS
+    );
+    const estimateUsd = transcriptionEstimateUsd(seconds, model ?? null);
+    const committedUsd = Math.max(0, Number(context.mediaCommittedUsd) || 0);
+    // No route resolved is the same case as a route nobody priced: the owner has not chosen one, so
+    // the model is whatever the provider offers and its price is not a number athanor can state.
+    const unpriced = model === undefined || !model.priceKnown;
+    if (unpriced || committedUsd + estimateUsd >= MEDIA_APPROVAL_USD)
+      return {
+        sideEffect: 'external_reversible',
+        action: 'Approve continued provider spend on reading recordings',
+        preview: `Read up to ${Math.ceil(seconds / 60)} minutes of ${textValue(args.path, 'a recording')}${model ? ` with ${model.displayName}` : ''}. ${unpriced ? 'Transcription is billed by the minute and no price athanor can read is published for this route, so the cost is only known once the provider bills it.' : `That is about $${estimateUsd.toFixed(3)} from the connected provider account.`}${committedUsd > 0 ? ` This task has already spent about $${committedUsd.toFixed(2)} on media.` : ''}\n\nEvery further reading in this task asks again.`
       };
   }
   if (name === 'coding_agent' && textValue(args.action) === 'setup')

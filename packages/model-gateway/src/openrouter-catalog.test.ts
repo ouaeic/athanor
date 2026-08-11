@@ -426,6 +426,47 @@ describe('OpenRouter live catalog', () => {
     });
   });
 
+  /*
+   * The provider describes what a model can be fed. Athanor describes what it can send it, and
+   * those are not the same list: the only non-text part any request carries is one image part. A
+   * model recorded here as taking video put a modality in front of the owner that nothing on this
+   * computer could ever construct - an offer the product could not keep, on a screen whose whole
+   * job is to show what the computer is actually doing.
+   */
+  it('records only the modalities it can actually put in front of a model', async () => {
+    const omniFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.endsWith('/endpoints/zdr')) return respondWith(zdrPayload);
+      return respondWith({
+        data: [
+          {
+            id: 'qwen/qwen3.6-omni',
+            name: 'Qwen: Qwen 3.6 Omni',
+            context_length: 131_072,
+            architecture: {
+              input_modalities: ['text', 'image', 'audio', 'video'],
+              output_modalities: ['text']
+            },
+            pricing: { prompt: '0.0000005', completion: '0.000002' },
+            supported_parameters: ['tools']
+          }
+        ]
+      });
+    });
+
+    const result = await refreshOpenRouterCatalog(seedModels(NOW), {
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'registry-key',
+      fetch: omniFetch as typeof fetch,
+      now: NOW
+    });
+
+    const omni = result.find((model) => model.providerModelId === 'qwen/qwen3.6-omni');
+    expect(omni?.modalities).toEqual(['text', 'image']);
+    // The picture half is not collateral damage: a model that takes images still says so.
+    expect(omni?.capabilities).toContain('vision');
+  });
+
   it('keeps a model selectable after its weight-licence review lapses, without the open-weight claim', async () => {
     const result = await refreshOpenRouterCatalog(seedModels(), {
       baseUrl: 'https://openrouter.ai/api/v1',

@@ -14,7 +14,12 @@ import {
 } from './tools.js';
 import { MAX_NOTICES_PER_TURN } from './agent.js';
 import { COMPACT_CONTEXT_TOOL } from './context.js';
-import { managedMediaCatalog, resolvedMediaModel } from './media.js';
+import {
+  managedMediaCatalog,
+  resolvedMediaModel,
+  resolvedTranscriptionRoute,
+  transcriptionEstimateUsd
+} from './media.js';
 import type { MediaModelOption } from '@athanor/contracts';
 
 /** A stored media route, as the API seals one into the credential this worker decrypts. */
@@ -27,6 +32,7 @@ const mediaOption = (
   modality: 'image',
   usdPerImage: null,
   usdPerMillionCharacters: null,
+  usdPerMinute: null,
   priceSource: 'provider',
   recommendationTags: [],
   updatedAt: '2026-08-10T00:00:00.000Z',
@@ -826,7 +832,17 @@ describe('the size of the catalogue the model is sent', () => {
     // agent that asks instead of working, and every clause telling it when not to ask is cheaper
     // than one parked conversation the owner did not need to be interrupted by.
     // Measured at 53,722 against it.
-    expect(bytes).toBeLessThan(53_870);
+    //
+    // Then raised from 53,870 to 55,300 for `audio_read`: 1,385 bytes, nearly all of it the
+    // description. It is a capability by this test's own definition and there was no wording that
+    // could have substituted for it - thirty-nine tools could open a recording and not one could
+    // hear it, so a voice memo, a meeting recording or a voicemail sat in Files as bytes the
+    // computer could copy, rename and publish and could not read a word of. The bytes are in the
+    // description because two of the things a model cannot discover without spending the owner's
+    // money to find out are declared there: which containers arrive from a phone and are converted
+    // rather than refused, and that a reading is bounded at ninety minutes and resumes by second
+    // rather than failing on a long file. Measured at 55,107 against it.
+    expect(bytes).toBeLessThan(55_300);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
     // union of what twenty-four actions across mail, calendar and repositories accept. Those are
@@ -1985,5 +2001,68 @@ describe('the contract each answer is written to', () => {
     const memory = agentTools.find((tool) => tool.name === 'memory');
     expect(memory?.description).toMatch(/validUntil/);
     expect(memory?.description).toMatch(/never transient task state/);
+  });
+});
+
+describe('what a reading of a recording costs before it happens', () => {
+  const route = (overrides: Partial<MediaModelOption> = {}) =>
+    resolvedTranscriptionRoute({
+      transcription: mediaOption({
+        id: 'openrouter/a-transcription-route',
+        modality: 'transcription',
+        usdPerMinute: 0.006,
+        ...overrides
+      })
+    });
+
+  it('prices by the minute, rounded up, because that is how duration is billed', () => {
+    // Rounding down would make every card understate the job, and a card that understates is worse
+    // than no card: the owner reads a number and is billed a different one.
+    expect(transcriptionEstimateUsd(61, route())).toBeCloseTo(0.012, 6);
+    expect(transcriptionEstimateUsd(0, route())).toBe(0);
+  });
+
+  it('takes the owner’s own route rather than a route for another modality', () => {
+    // A speech route sealed under the transcription key would otherwise be sent to an endpoint that
+    // reads recordings, and the owner would find out from the invoice.
+    expect(resolvedTranscriptionRoute({ transcription: mediaOption({ id: 'x' }) })).toBeNull();
+    expect(route()?.modelId).toBe('openrouter/a-transcription-route');
+  });
+
+  it('asks every time while nobody has said what a minute costs', () => {
+    // No stored route at all: the model is whatever the provider offers and its price is not a
+    // number this side can state, so the cumulative threshold has nothing to compare against.
+    const unchosen = approvalRequirement('audio_read', { path: 'workspace/memo.m4a' });
+    expect(unchosen?.sideEffect).toBe('external_reversible');
+    expect(unchosen?.preview).toMatch(/no price athanor can read/i);
+    // The same is true of a chosen route the provider publishes no price for.
+    const unpriced = approvalRequirement('audio_read', { path: 'workspace/memo.m4a' }, 'balanced', {
+      mediaModel: route({ priceSource: 'unknown', usdPerMinute: null })!
+    });
+    expect(unpriced?.preview).toMatch(/no price athanor can read/i);
+  });
+
+  it('states the minutes and the money when the route publishes a price', () => {
+    // No range asked for is a request for the whole ninety-minute window, which at six tenths of a
+    // cent a minute is fifty-four cents - over the threshold on one call. The card says the length
+    // rather than only the money, because the length is the thing the model can change.
+    const card = approvalRequirement('audio_read', { path: 'workspace/meeting.m4a' }, 'balanced', {
+      mediaModel: route()!,
+      mediaCommittedUsd: 0
+    });
+    expect(card?.preview).toContain('90 minutes');
+    expect(card?.preview).toContain('workspace/meeting.m4a');
+    expect(card?.preview).toContain('$0.540');
+  });
+
+  it('is quiet about a short recording on a route whose price is known', () => {
+    expect(
+      approvalRequirement(
+        'audio_read',
+        { path: 'workspace/memo.m4a', startSeconds: 0, endSeconds: 30 },
+        'balanced',
+        { mediaModel: route()!, mediaCommittedUsd: 0 }
+      )
+    ).toBeNull();
   });
 });

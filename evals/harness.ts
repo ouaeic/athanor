@@ -58,6 +58,15 @@ export interface ModelTurn {
   readonly calls?: readonly ScriptedCall[];
   /** Ends the reply at the provider's output ceiling rather than at a real stop. */
   readonly truncated?: boolean;
+  /**
+   * Ends the stream where the text stops: no finish reason, and no usage frame ever sent.
+   *
+   * This is the route that keeps writing rather than the one that finishes, and it is cut on this
+   * side once it passes the ceiling the request asked for. That is the one cutoff a fixture can
+   * provoke without spending the wall clock the other two are measured in - and the text has to be
+   * long enough to reach the ceiling, which is why the fixture that uses it generates its answer.
+   */
+  readonly cut?: boolean;
 }
 
 export interface ScriptContext {
@@ -150,6 +159,13 @@ const promptBytes = (body: Record<string, unknown>): string =>
 const framesFor = (turn: ModelTurn): string[] => {
   const parts: string[] = [];
   const pieces = turn.chunks ?? (turn.text ? [turn.text] : []);
+  // A cut stream stops mid-answer: every piece arrives as an ordinary delta and then nothing does.
+  // No closing frame, because the closing frame is exactly what a cut call never sends - which is
+  // why the usage it carries has to be worked out on the other side.
+  if (turn.cut) {
+    for (const piece of pieces) parts.push(sse({ choices: [{ delta: { content: piece } }] }));
+    return parts;
+  }
   // Everything but the last piece goes out with no finish reason, which is what a real stream looks
   // like and what the degenerate-repeat watch reads.
   for (const piece of pieces.slice(0, turn.calls?.length ? pieces.length : -1))
@@ -214,7 +230,14 @@ const streamOf = (
         await new Promise((resolve) => setTimeout(resolve, 0));
         if (closed) return;
         closed = true;
-        controller.close();
+        // A reader that has already been cancelled has closed this end for us, which is what a
+        // generation cut on this side does to the socket it was reading. Closing it a second time
+        // throws out of the queue nobody is awaiting and takes the process down with it.
+        try {
+          controller.close();
+        } catch {
+          // Already closed by the cancel, which is the only way this happens.
+        }
       })();
     }
   });

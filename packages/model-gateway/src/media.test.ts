@@ -159,3 +159,96 @@ describe('managed media generation', () => {
     ).rejects.toThrow('no such model');
   });
 });
+
+describe('reading a recording back as text', () => {
+  it('sends the prepared audio over the same private route as everything else', async () => {
+    const request = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body: unknown = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+      expect(body).toMatchObject({
+        model: 'a-transcription-route',
+        input_audio: { data: Buffer.from('ogg-bytes').toString('base64'), format: 'ogg' },
+        temperature: 0,
+        provider: { zdr: true, data_collection: 'deny', allow_fallbacks: true }
+      });
+      return new Response(
+        JSON.stringify({ text: '  the meeting starts now  ', usage: { seconds: 61, cost: 0.007 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', request);
+    await expect(
+      client().transcribe({
+        model: 'a-transcription-route',
+        audio: Buffer.from('ogg-bytes'),
+        format: 'ogg',
+        seconds: 60,
+        usdPerMinute: 0.02
+      })
+    ).resolves.toEqual({
+      text: 'the meeting starts now',
+      billedSeconds: 61,
+      // The provider's own figure, not the per-minute arithmetic: a duration price is quoted per
+      // minute and rounded in ways this side cannot see, so a derived number in the ledger would be
+      // a guess sitting where a billed amount belongs.
+      costUsd: 0.007,
+      costFromProvider: true
+    });
+  });
+
+  it('prices from the route when the provider says nothing, and says which it was', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ text: 'two minutes of talking' }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+      )
+    );
+    await expect(
+      client().transcribe({
+        model: 'a-transcription-route',
+        audio: Buffer.from('ogg-bytes'),
+        format: 'ogg',
+        seconds: 120,
+        usdPerMinute: 0.006
+      })
+    ).resolves.toMatchObject({ billedSeconds: null, costUsd: 0.012, costFromProvider: false });
+  });
+
+  it('refuses an answer with no speech in it rather than reporting an empty reading', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ text: '   ' }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+      )
+    );
+    await expect(
+      client().transcribe({
+        model: 'a-transcription-route',
+        audio: Buffer.from('ogg-bytes'),
+        format: 'ogg',
+        seconds: 30
+      })
+    ).rejects.toThrow(/no speech/i);
+  });
+
+  it('asks the provider which models read recordings, and only for those', async () => {
+    const request = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      expect(url.pathname).toBe('/api/v1/models');
+      expect(url.searchParams.get('output_modalities')).toBe('transcription');
+      return new Response(JSON.stringify({ data: [{ id: 'one' }, {}, { id: 'two' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    });
+    vi.stubGlobal('fetch', request);
+    await expect(client().transcriptionModels()).resolves.toEqual(['one', 'two']);
+  });
+});

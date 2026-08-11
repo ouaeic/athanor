@@ -50,6 +50,21 @@ export const MAX_TASK_SPEND_USD = 10_000;
  */
 export const MEDIA_APPROVAL_USD = 0.25;
 
+/**
+ * The most of a recording one reading will take in, and the reason the tool has a resume parameter.
+ *
+ * Ninety minutes is a meeting, a lecture or a long interview - the shapes an owner actually points
+ * at - and it is about eleven megabytes once it is cut down to mono speech, which crosses a wire
+ * comfortably. Beyond it the transcript alone would fill a large part of the model's window, so the
+ * useful answer to a three-hour recording is the first stretch of it plus the offset the next
+ * reading starts at, not a refusal and not a silent truncation.
+ *
+ * Here because three layers need the same number: the runner cuts to it, the approval card prices
+ * against it, and the tool tells the model about it. It has been two numbers in two files before
+ * elsewhere in this project, and it was the stale one that won.
+ */
+export const AUDIO_READ_MAX_SECONDS = 5_400;
+
 const CapUsd = z.number().nonnegative().max(MAX_SPEND_CAP_USD);
 const TaskSpendUsd = z.number().positive().max(MAX_TASK_SPEND_USD);
 
@@ -768,14 +783,20 @@ export const ModelRelease = z.object({
 export type ModelRelease = z.infer<typeof ModelRelease>;
 
 /**
- * The kinds of media the owner's provider can be asked to make.
+ * The kinds of media the owner's provider can be asked to make, and the one it can be asked to
+ * read.
+ *
+ * Transcription runs the other way round from the rest - a file goes out and text comes back - but
+ * it is the same account, the same private routing and the same question for the owner: which model
+ * does this, and what does it cost. Giving it its own picker rather than its own mechanism is what
+ * keeps that one question in one place.
  *
  * Video is in the enum because the owner asks about it and the answer has to be addressable, not
  * because anything generates one. There is no video route on this computer: the only video code
  * that has ever existed here is the sentence that refuses, and a modality with a picker and no
  * endpoint behind it would be an offer athanor cannot keep.
  */
-export const MediaModality = z.enum(['image', 'audio', 'video']);
+export const MediaModality = z.enum(['image', 'audio', 'transcription', 'video']);
 export type MediaModality = z.infer<typeof MediaModality>;
 
 /**
@@ -809,6 +830,8 @@ export const MediaModelOption = z.object({
   usdPerImage: z.number().nonnegative().nullable(),
   /** Charged per million characters of input text, which is how speech is billed. */
   usdPerMillionCharacters: z.number().nonnegative().nullable(),
+  /** Charged per minute of recording, which is how transcription is billed. */
+  usdPerMinute: z.number().nonnegative().nullable().default(null),
   /**
    * `provider` when the figure came off the provider's own feed, `measured` when it is a price
    * athanor recorded from real generations on this route, `unknown` when nobody has said.
@@ -842,7 +865,8 @@ export type MediaModelChoice = z.infer<typeof MediaModelChoice>;
 /** What the owner chose per modality. An absent modality is one they have never touched. */
 export const MediaModelSelection = z.object({
   image: MediaModelChoice.optional(),
-  audio: MediaModelChoice.optional()
+  audio: MediaModelChoice.optional(),
+  transcription: MediaModelChoice.optional()
 });
 export type MediaModelSelection = z.infer<typeof MediaModelSelection>;
 

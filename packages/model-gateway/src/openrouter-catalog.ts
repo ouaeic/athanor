@@ -494,11 +494,13 @@ export const refreshOpenRouterCatalog = async (
       zeroDataRetentionAvailable,
       expiresAt,
       shared: {
+        // Text and pictures, whatever else the provider says the model can be fed. The gateway
+        // builds one kind of non-text part and it is an image, so a model listed here as taking
+        // video was an offer the owner could see in the picker and nothing on this computer could
+        // keep. The seed catalogue already held this line; the live feed was overwriting it.
         modalities: [
           'text' as const,
-          ...(inputModalities.has('image') ? (['image'] as const) : []),
-          ...(inputModalities.has('video') ? (['video'] as const) : []),
-          ...(inputModalities.has('audio') ? (['audio'] as const) : [])
+          ...(inputModalities.has('image') ? (['image'] as const) : [])
         ],
         capabilities: [
           'chat' as const,
@@ -715,13 +717,18 @@ export const refreshOpenRouterMediaCatalog = async (options: {
     if (seeded.has(model.id)) continue;
     const outputs = model.architecture?.output_modalities ?? [];
     // A model that can answer with text is a chat model, whatever else it can also emit; it belongs
-    // in the picker the composer reads and not in a list of things that make files.
+    // in the picker the composer reads and not in a list of things that make files. A transcription
+    // route is the exception the feed itself draws: it declares `transcription` rather than `text`,
+    // which is what separates a model that reads a recording from one that merely accepts audio in
+    // a conversation.
     if (!outputs.length || outputs.includes('text')) continue;
     const modality = outputs.includes('image')
       ? ('image' as const)
       : outputs.includes('audio')
         ? ('audio' as const)
-        : null;
+        : outputs.includes('transcription')
+          ? ('transcription' as const)
+          : null;
     if (!modality) continue;
     live.push({
       id: `openrouter/${model.id}`,
@@ -731,6 +738,7 @@ export const refreshOpenRouterMediaCatalog = async (options: {
       modality,
       usdPerImage: null,
       usdPerMillionCharacters: null,
+      usdPerMinute: null,
       priceSource: 'unknown' as const,
       defaultVoice: null,
       recommendationTags: ['Price not published'],

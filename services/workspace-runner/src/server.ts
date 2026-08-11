@@ -17,6 +17,7 @@ import {
   WebFetchRequest
 } from '@athanor/contracts';
 import { reservedPreviewPorts, verifyCapabilityToken } from '@athanor/core';
+import { prepareAudio } from './audio.js';
 import { authenticateRunnerRequest, requireScope } from './auth.js';
 import { BotWallError, BrowserManager, type BrowserStreamState } from './browser.js';
 import { WorkspaceCheckpoints } from './checkpoints.js';
@@ -24,6 +25,13 @@ import type { RunnerConfig } from './config.js';
 import { DesktopManager, type DesktopStreamState } from './desktop.js';
 import { agentSearchPath, execute } from './execution.js';
 import { assertHostStorageWrite, hostStorage } from './host-storage.js';
+import {
+  conversionTargetFor,
+  convertImageForModel,
+  IMAGE_CONTENT_TYPES,
+  IMAGE_SOURCE_MAX_BYTES,
+  MODEL_IMAGE_TYPES
+} from './images.js';
 import { commandLimits, resolveCommandLimiter } from './limits.js';
 import { ProcessManager } from './processes.js';
 import { resolveAgentSandbox, sandboxedInvocation, sandboxedShell } from './sandbox.js';
@@ -116,6 +124,16 @@ const RenameRequest = z.object({ from: WorkspaceRelativePath, to: WorkspaceRelat
 const BinaryProbeRequest = z.object({
   binaries: z.array(z.string().min(1).max(120)).min(1).max(64)
 });
+/**
+ * A window of a recording, in seconds from its start. The ceiling is a day, which no owner's voice
+ * memo reaches and which stops a nonsense offset from becoming a nonsense encode; how much is
+ * actually prepared is decided against the file's own length and the window limit in `audio.ts`.
+ */
+const PrepareAudioRequest = z.object({
+  path: WorkspaceRelativePath,
+  startSeconds: z.number().min(0).max(86_400).optional(),
+  endSeconds: z.number().min(0).max(86_400).optional()
+});
 const ReadElementsRequest = z.object({
   /** Scopes the read to one form or panel; omitted, it reads the whole page as a snapshot would. */
   selector: z.string().min(1).max(1_024).optional(),
@@ -141,12 +159,7 @@ const positiveQueryInteger = (value: string | undefined): number | undefined => 
 
 const contentTypeFor = (requestedPath: string): string =>
   ({
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.webp': 'image/webp',
-    '.gif': 'image/gif',
-    '.svg': 'image/svg+xml',
+    ...IMAGE_CONTENT_TYPES,
     '.pdf': 'application/pdf',
     '.json': 'application/json',
     '.md': 'text/markdown; charset=utf-8',
@@ -678,6 +691,57 @@ export const buildServer = async (config: RunnerConfig) => {
     }
   });
 
+  /**
+   * One picture, in a form a model will take.
+   *
+   * This is not the file endpoint with a filter on it. The file endpoint answers with what is on
+   * disk, which is the right answer for a download and the wrong one for a request that is about to
+   * be built: a phone photograph is HEIC, and every route the gateway can reach refuses HEIC. The
+   * conversion belongs here because this is the process with the image toolchain and the file, and
+   * because doing it anywhere else means sending a picture in order to learn it was not accepted -
+   * a failure that arrives from a provider, minutes later, naming a coder rather than the photo the
+   * owner attached.
+   */
+  app.get<{ Params: { workspaceId: string }; Querystring: { path: string } }>(
+    '/v1/workspaces/:workspaceId/image',
+    async (request, reply) => {
+      requireScope(request, 'files.read');
+      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
+      const requestedPath = assertUserDataPath(root, request.query.path);
+      const declared = contentTypeFor(requestedPath);
+      if (!MODEL_IMAGE_TYPES.has(declared) && conversionTargetFor(declared) === undefined)
+        throw new WorkspaceFileError(
+          `${path.basename(requestedPath)} is not a picture. Read it with file_read or document_read instead.`,
+          415
+        );
+      let source;
+      try {
+        source = await readWorkspaceFile(
+          root,
+          requestedPath,
+          Math.min(config.MAX_FILE_BYTES, IMAGE_SOURCE_MAX_BYTES)
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+          return reply
+            .status(404)
+            .send({ error: { code: 'file_not_found', message: 'Workspace file not found' } });
+        throw error;
+      }
+      const picture = MODEL_IMAGE_TYPES.has(declared)
+        ? { mimeType: declared, content: source.content }
+        : await convertImageForModel(config.IMAGE_CONVERT_EXECUTABLE, declared, source.content);
+      // Said on the wire rather than inferred from the type, because the two facts differ: a JPEG
+      // converted from HEIC is still a JPEG, and the turn that looks at it is entitled to know it
+      // is not seeing the pixels the file holds.
+      return reply
+        .type(picture.mimeType)
+        .header('x-image-source-type', declared)
+        .header('x-image-converted', String(picture.mimeType !== declared))
+        .send(picture.content);
+    }
+  );
+
   app.put<{
     Params: { workspaceId: string };
     Querystring: { path: string; expectSha256?: string };
@@ -734,6 +798,37 @@ export const buildServer = async (config: RunnerConfig) => {
         assertUserDataPath(root, requested.from),
         assertUserDataPath(root, requested.to)
       );
+    }
+  );
+
+  /**
+   * One window of a recording, measured and re-encoded small enough to be transcribed.
+   *
+   * The bytes come back as the body and everything the caller needs to price and describe the job
+   * comes back as headers, for the same reason the windowed file read above answers that way: the
+   * audio is the payload and the measurements are about it. `files.read` is the right scope because
+   * that is all this does - it reads a file the owner already has and writes nothing.
+   */
+  app.post<{ Params: { workspaceId: string } }>(
+    '/v1/workspaces/:workspaceId/audio/prepare',
+    async (request, reply) => {
+      requireScope(request, 'files.read');
+      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
+      await ensureRuntimeWorkspace(root);
+      const asked = PrepareAudioRequest.parse(request.body);
+      const prepared = await prepareAudio(root, assertUserDataPath(root, asked.path), asked);
+      reply.headers({
+        'x-audio-format': prepared.format,
+        'x-audio-start-seconds': String(prepared.startSeconds),
+        'x-audio-prepared-seconds': String(Math.round(prepared.preparedSeconds)),
+        'x-audio-more': String(prepared.more),
+        ...(prepared.source.durationSeconds === null
+          ? {}
+          : { 'x-audio-duration-seconds': String(Math.round(prepared.source.durationSeconds)) }),
+        ...(prepared.source.container ? { 'x-audio-container': prepared.source.container } : {}),
+        ...(prepared.source.codec ? { 'x-audio-codec': prepared.source.codec } : {})
+      });
+      return reply.type('audio/ogg').send(prepared.bytes);
     }
   );
 

@@ -222,6 +222,7 @@ export const seedMediaModels = (now = new Date()): MediaModelOption[] => {
       modality: 'image' as const,
       usdPerImage: managedMediaModels.image.baseUsdPerImage,
       usdPerMillionCharacters: null,
+      usdPerMinute: null,
       priceSource: 'measured' as const,
       defaultVoice: null,
       recommendationTags: ['Reviewed', managedMediaModels.image.license],
@@ -235,6 +236,7 @@ export const seedMediaModels = (now = new Date()): MediaModelOption[] => {
       modality: 'audio' as const,
       usdPerImage: null,
       usdPerMillionCharacters: managedMediaModels.audio.usdPerMillionCharacters,
+      usdPerMinute: null,
       priceSource: 'measured' as const,
       defaultVoice: managedMediaModels.audio.defaultVoice,
       recommendationTags: ['Reviewed', managedMediaModels.audio.license],
@@ -245,7 +247,11 @@ export const seedMediaModels = (now = new Date()): MediaModelOption[] => {
 
 /** The unit a modality is billed in, so one comparison can order a mixed catalogue. */
 const comparablePrice = (option: MediaModelOption): number | null =>
-  option.modality === 'audio' ? option.usdPerMillionCharacters : option.usdPerImage;
+  option.modality === 'audio'
+    ? option.usdPerMillionCharacters
+    : option.modality === 'transcription'
+      ? option.usdPerMinute
+      : option.usdPerImage;
 
 /**
  * The order the three automatic modes read the catalogue in, and the whole of the evidence behind

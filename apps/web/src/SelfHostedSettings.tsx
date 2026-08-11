@@ -157,6 +157,10 @@ const mediaPriceLabel = (option: MediaModelOption): string => {
     return option.usdPerMillionCharacters === null
       ? 'price not published'
       : `${usd(option.usdPerMillionCharacters)} per million characters`;
+  if (option.modality === 'transcription')
+    return option.usdPerMinute === null
+      ? 'price not published'
+      : `${usd(option.usdPerMinute)} a minute`;
   return option.usdPerImage === null
     ? 'price not published'
     : `${usd(option.usdPerImage)} an image`;
@@ -184,6 +188,9 @@ const mediaChoiceFromValue = (value: string): MediaModelChoice =>
 const mediaModalityLabel: Record<string, string> = {
   image: 'Images',
   audio: 'Speech',
+  // The one that reads rather than makes: it is what turns a voice note into a message and a
+  // meeting recording into something the computer can work on.
+  transcription: 'Reading recordings',
   video: 'Video'
 };
 
@@ -1085,7 +1092,10 @@ export function SelfHostedSettings({
               <MediaModalityRow
                 key={entry.modality}
                 entry={entry}
-                choice={mediaSelection[entry.modality as 'image' | 'audio'] ?? entry.choice}
+                choice={
+                  mediaSelection[entry.modality as 'image' | 'audio' | 'transcription'] ??
+                  entry.choice
+                }
                 onChoose={(choice) =>
                   setMediaSelection({ ...mediaSelection, [entry.modality]: choice })
                 }

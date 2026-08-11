@@ -1002,12 +1002,15 @@ describe('what actually reaches the provider', () => {
     // is gone, because a generation now returns its file rather than a receipt; and code_symbols is
     // gone, folded into code_search's wholeWord. Thirty-nine since `ask`, which is the first way
     // the model has had to put a question to the owner and stop - before it, a blocker came back as
-    // a finish nobody could tell from finished work.
-    expect(names).toHaveLength(39);
+    // a finish nobody could tell from finished work. Forty since `audio_read`: thirty-nine of them
+    // could open a recording, none could hear it, so a voice memo or a meeting recording sat in the
+    // workspace as bytes nothing on this computer could act on.
+    expect(names).toHaveLength(40);
     expect(names).toEqual(
       expect.arrayContaining([
         'document_read',
         'image_read',
+        'audio_read',
         'browser_snapshot',
         'generate_media',
         'compact_context',
@@ -3876,11 +3879,22 @@ describe('how full the window is believed to be', () => {
      *
      * A small window is the case that shows it because the catalogue is a larger share of it; the
      * fault is the same on every window.
+     *
+     * The bulk is the helper's own, and has to be: this ran on six thousand characters a step,
+     * which is not enough to keep the window under pressure once the tool-output squeeze reaches
+     * its two-thousand-character floor. Measured on that figure, the prepared request collapses
+     * from 19,393 tokens to 10,808 at the step the floor bottoms out and then climbs about sixty a
+     * step, so it never reaches the 20,719 trigger again and nothing is condensed for the rest of
+     * the run - which is compaction correctly declining to spend a model call on a request sitting
+     * at 46% of its budget, not the fault this test is about. It survived only while the catalogue
+     * was a particular size, and a test that a fortieth tool can turn red is measuring the
+     * catalogue. On the helper's default the prepared request stays pinned above the budget itself
+     * for the whole run, which is the pressure the arithmetic below is meant to be read under.
      */
     const task = makeTask();
     const probe = probeStore(() => task);
     const log: FetchLog = { calls: [], modelRequests: [] };
-    installFetch([usageFrame(0, 6_000)], log);
+    installFetch([usageFrame(0)], log);
     await new AgentWorker(
       {
         ...(probe.store as unknown as Record<string, unknown>),
@@ -5433,4 +5447,111 @@ describe('what a tainted turn is charged for sending', () => {
     // Nothing was ever added, so the running total is still untouched rather than merely small.
     expect(noveltySpent(probe) ?? 0).toBe(0);
   }, 15_000);
+});
+
+/**
+ * A call this side ended rather than one the model finished.
+ *
+ * The gateway keeps what was written, says what ended it, and marks the usage it had to work out
+ * for itself because the frame carrying the real numbers is the one a cut stream never reaches.
+ * Two things have to happen here: the prompt is billed from what this side sent, and the owner is
+ * told why the answer they are looking at stops where it does.
+ */
+describe('a generation the box cut short', () => {
+  /**
+   * An answer that runs past the ceiling `maxTokens` implies - eight characters a token against a
+   * 16,384-token cap - which is the one cutoff a test can provoke without spending the wall time
+   * the other two are measured in.
+   *
+   * Every line differs, so what is measured is the ceiling rather than the repetition watch: a
+   * hundred thousand characters of the same sentence is a degenerate repeat and would be stopped
+   * long before the generation budget noticed anything.
+   */
+  const overrunningAnswer = ((): string => {
+    const lines: string[] = [];
+    for (let index = 0, length = 0; length < 140_000; index += 1) {
+      const line = `Point ${index}: workspace/notes/${index}.md still wants a heading and a date.`;
+      lines.push(line);
+      length += line.length + 1;
+    }
+    return lines.join('\n');
+  })();
+
+  /** The stream as a cut one arrives: text, then nothing. No finish reason, and no usage frame. */
+  const cutOffStream = `data: ${JSON.stringify({
+    choices: [{ delta: { content: overrunningAnswer } }]
+  })}\n\n`;
+
+  /** Four characters to the token, which is what the gateway counts a cut-off answer at. */
+  const estimatedOutput = Math.ceil(overrunningAnswer.length / 4);
+
+  const finishFrame = toolFrame('call-1', 'finish', {
+    summary: 'The answer was cut off, and what stands is in the reply above.',
+    verification: { status: 'not_applicable', evidence: [] }
+  });
+
+  const run = async (
+    bodies: string[]
+  ): Promise<{ probe: StoreProbe; log: FetchLog; billed: Array<Record<string, unknown>> }> => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const billed: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      recordUsage: async (input: Record<string, unknown>) => {
+        if (input.kind === 'model_inference') billed.push(input);
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(bodies, log);
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 4 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+    return { probe, log, billed };
+  };
+
+  it('bills the prompt it sent for a call whose usage never came back', async () => {
+    const { probe, log, billed } = await run([cutOffStream, finishFrame]);
+
+    // What the loop said it was sending, read back off its own cost event and off the catalogue on
+    // the wire - the two halves of a request, and between them the whole of what a provider bills
+    // as input. Nothing in the response carries either number: the usage frame never arrived.
+    const cost = probe.events.find((entry) => entry.kind === 'cost');
+    const messageTokens = (
+      cost?.payload as { context: { estimatedInputTokens: number } } | undefined
+    )?.context.estimatedInputTokens;
+    const catalogue = (log.modelRequests[0]?.tools ?? []) as Array<{ function: unknown }>;
+    const catalogueTokens = Math.ceil(
+      JSON.stringify(catalogue.map((tool) => tool.function)).length / 4
+    );
+
+    expect(messageTokens).toBeGreaterThan(0);
+    expect(billed[0]?.quantity).toBe(messageTokens! + catalogueTokens + estimatedOutput);
+    // The ledger row is the one the owner's spend is added up from, so the failure this replaces is
+    // not a rounding error: it filed the prompt at nothing and the output at the provider's silence.
+    expect(billed[0]?.unit).toBe('tokens');
+    expect(Number(billed[0]?.credits)).toBeGreaterThan(0);
+  }, 20_000);
+
+  it('says why the answer stops there, and does not ask for the rest of it', async () => {
+    const { probe, log } = await run([cutOffStream, finishFrame]);
+
+    const cut = probe.events.find((entry) =>
+      entry.summary.startsWith('The answer was cut off before it finished')
+    );
+    expect(cut?.kind).toBe('warning');
+    // An answer handed over incomplete is the owner's business, in the way a continuation is not.
+    expect((cut?.payload as { owner?: unknown } | undefined)?.owner).toBe(true);
+    expect((cut?.payload as { reason?: unknown } | undefined)?.reason).toBe('overrun');
+
+    const windows = log.modelRequests.map((body) => JSON.stringify(body.messages));
+    // The model is told, and told once. What it must not be told is to carry on: the gateway had
+    // already decided this generation had stopped being productive, and continuing it buys the
+    // same cut-off answer again at the same price.
+    expect(windows.at(-1)).toContain('YOUR REPLY WAS CUT OFF');
+    expect(windows.some((window) => window.includes('CONTINUE THE ANSWER'))).toBe(false);
+    // Bounded: it fell through to the completion check, which ends the turn by completing it.
+    expect(windows.at(-1)).toContain('COMPLETION CHECK');
+    expect(log.modelRequests).toHaveLength(2);
+    expect(probe.events.some((entry) => entry.kind === 'completed')).toBe(true);
+  }, 20_000);
 });

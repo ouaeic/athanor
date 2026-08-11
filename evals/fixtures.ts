@@ -82,6 +82,26 @@ const scanPlan: ReadonlyArray<number | 'phase-done'> = Array.from(
   batch % 8 === 7 && batch !== BATCHES - 1 ? [batch, 'phase-done' as const] : [batch]
 );
 
+/**
+ * More than a route is allowed to write in one answer: eight characters to the token against the
+ * 16,384-token ceiling every request here declares, which is the ceiling this side cuts a runaway
+ * generation at.
+ *
+ * No two lines are alike, for the same reason the log batches differ from each other: a hundred
+ * thousand characters of one sentence is a degenerate repeat, and the watch would stop it several
+ * steps before the generation budget noticed anything, which would make this fixture green for the
+ * wrong reason.
+ */
+const overrunningAnswer = (characters = 140_000): string => {
+  const lines: string[] = [];
+  for (let index = 0, length = 0; length < characters; index += 1) {
+    const line = `${index}. workspace/notes/${index}.md still wants a heading, a date and an owner.`;
+    lines.push(line);
+    length += line.length + 1;
+  }
+  return lines.join('\n');
+};
+
 /** A workspace with a couple of ordinary things in it, which most fixtures can share. */
 const workspaceFiles = {
   'workspace/notes.txt': 'Renewal is due on 14 March 2027 at the standard rate.\n',
@@ -739,6 +759,31 @@ export const fixtures: readonly Fixture[] = [
       status: 'completed',
       verification: 'not_applicable',
       holds: ['output_limit_continued']
+    }
+  },
+  {
+    id: 'verify-output-limit-forever-still-ends',
+    shape: 'verify',
+    request: 'Explain, at length, how the importer handles malformed rows.',
+    why: 'The cap on continuations used to change only the wording: both arms continued, so a model that hit the output ceiling on every reply was told to stop expanding the answer and then asked again until the step budget ran out - 41 calls against a ceiling of 40. Past the cap the step now falls to the completion nag, which ends the turn by completing, so the answer the owner has already read stands.',
+    model: sequence({ text: 'The importer first checks the header, and then it', truncated: true }),
+    expect: {
+      // Three continuations to the cap, then four nags, then the turn completes. Well inside the
+      // ceiling is the whole claim, and it is pinned exactly because the number moving is how a
+      // future change to either bound announces itself.
+      modelCalls: 8,
+      tools: [],
+      status: 'completed',
+      verification: 'not_applicable',
+      holds: [
+        'output_limit_continued',
+        'output_limit_continued',
+        'output_limit_continued',
+        'completion_nag',
+        'completion_nag',
+        'completion_nag',
+        'completion_nag'
+      ]
     }
   },
 
@@ -1631,6 +1676,31 @@ export const fixtures: readonly Fixture[] = [
       tools: [],
       status: 'completed',
       holds: ['repetition_stopped']
+    }
+  },
+  {
+    id: 'small-a-cut-off-answer-is-not-asked-for-again',
+    shape: 'small',
+    request: 'Go through the notes and tell me everything in them that still needs doing.',
+    why: 'A route that keeps writing past the ceiling is cut here, and what it wrote is kept. The turn then has to end: the gateway has already judged that carrying on could not finish this answer, so continuing buys the same cut-off reply again at the same price. Two calls - the answer, and the completion check that ends it. If this ever grows a third, the ten-minutes-at-a-time is back.',
+    model: ({ index }) =>
+      index === 0
+        ? { text: overrunningAnswer(), cut: true }
+        : {
+            calls: finishCall('call-1', {
+              summary: 'The list was cut off part way; what arrived stands in the reply above.',
+              verification: conversational()
+            })
+          },
+    expect: {
+      modelCalls: 2,
+      tools: [],
+      status: 'completed',
+      verification: 'not_applicable',
+      // The completion check and nothing else. `output_limit_continued` here would mean the loop
+      // read a cutoff nobody could finish as an answer worth paying for the rest of.
+      holds: ['completion_nag'],
+      replies: 1
     }
   },
   {

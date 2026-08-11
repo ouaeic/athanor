@@ -144,6 +144,11 @@
     "promptTokens": 8229,
     "cachePrefix": 96
   },
+  "small-a-cut-off-answer-is-not-asked-for-again": {
+    "modelCalls": 2,
+    "promptTokens": 23100,
+    "cachePrefix": 51
+  },
   "small-deliberation-that-ignores-the-break-is-stopped": {
     "modelCalls": 7,
     "promptTokens": 31788,
@@ -208,5 +213,9 @@
     "modelCalls": 3,
     "promptTokens": 8344,
     "cachePrefix": 98
+  },
+  "verify-output-limit-forever-still-ends": {
+    "modelCalls": 8,
+    "promptTokens": 36050
   }
 }
