@@ -2,7 +2,7 @@ import type { ModelTool } from '@athanor/model-gateway';
 import type { SecurityMode } from '@athanor/contracts';
 import { connectorActions } from '@athanor/core';
 import { classifyDestination, type DestinationVerdict } from './egress.js';
-import { mediaEstimateUsd, MEDIA_APPROVAL_USD } from './media.js';
+import { mediaEstimateUsd, MEDIA_APPROVAL_USD, type ResolvedMediaModel } from './media.js';
 import {
   estimateSkillTokens,
   isBuiltinSkillName,
@@ -2338,6 +2338,17 @@ export const writtenPaths = (name: string, args: Record<string, unknown>): strin
 export interface ApprovalContext {
   mediaCommittedUsd?: number;
   /**
+   * The media route this generation will take, once the owner's choice has been resolved.
+   *
+   * Absent means the caller has not resolved one and the card prices against the reviewed default,
+   * which is what it always did when the default was the only model. Present, it does two things:
+   * the card names the model the owner picked, and `priceKnown: false` turns the cumulative
+   * threshold below into "ask every time" - because a route whose price nobody published cannot be
+   * compared with a threshold, and a comparison against an invented number is how spend approval
+   * stops meaning anything.
+   */
+  mediaModel?: ResolvedMediaModel;
+  /**
    * The saved skill this upsert would land on, when the proposed name already resolves to one.
    * Without it the card read the same for a new procedure and for a replacement of the owner's
    * own text, so approving one could silently destroy the other.
@@ -2617,18 +2628,24 @@ const ordinaryRequirement = (
     // Priced here rather than read out of the call. The estimate used to be a tool parameter, so a
     // model that wrote 0 - or omitted it, which arrived as NaN and failed every comparison - spent
     // the owner's provider money with no card in front of it.
+    const model = context.mediaModel;
     const estimateUsd = mediaEstimateUsd({
       kind: textValue(args.kind),
       width: args.width,
       height: args.height,
-      characterCount: textValue(args.prompt).trim().length
+      characterCount: textValue(args.prompt).trim().length,
+      ...(model ? { model } : {})
     });
     const committedUsd = Math.max(0, Number(context.mediaCommittedUsd) || 0);
-    if (committedUsd + estimateUsd >= MEDIA_APPROVAL_USD)
+    // An unpublished price is not a small one. The owner is free to choose a route their provider
+    // prices nowhere athanor can read, and the honest consequence of that choice is a card in front
+    // of every generation on it rather than a threshold applied to a number nobody stated.
+    const unpriced = model !== undefined && !model.priceKnown;
+    if (unpriced || committedUsd + estimateUsd >= MEDIA_APPROVAL_USD)
       return {
         sideEffect: 'external_reversible',
         action: 'Approve continued provider spend on generated media',
-        preview: `Generate ${textValue(args.kind, 'media')} for about $${estimateUsd.toFixed(3)} from the connected provider account.${committedUsd > 0 ? ` This task has already spent about $${committedUsd.toFixed(2)} generating media.` : ''}\n\nEvery further generation in this task asks again.`
+        preview: `Generate ${textValue(args.kind, 'media')}${model ? ` with ${model.displayName}` : ''} ${unpriced ? 'from the connected provider account. This model publishes no price athanor can read, so the cost is only known once the provider bills it.' : `for about $${estimateUsd.toFixed(3)} from the connected provider account.`}${committedUsd > 0 ? ` This task has already spent about $${committedUsd.toFixed(2)} generating media.` : ''}\n\nEvery further generation in this task asks again.`
       };
   }
   if (name === 'coding_agent' && textValue(args.action) === 'setup')

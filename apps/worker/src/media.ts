@@ -1,3 +1,4 @@
+import { MEDIA_VIDEO_UNAVAILABLE_REASON, type MediaModelOption } from '@athanor/contracts';
 import { managedMediaModels } from '@athanor/model-gateway';
 
 /**
@@ -24,19 +25,103 @@ export const managedMediaCatalog = {
       (input.characterCount * managedMediaModels.audio.usdPerMillionCharacters) / 1_000_000
   },
   /**
-   * Kept as an answer rather than an offer. `media_catalog` still explains why video is refused
-   * when a user asks for one, and no tool schema lists it: OpenRouter states that asynchronous
-   * video generation is not eligible for zero-data-retention, so there is no route to make one.
+   * Kept as an answer rather than an offer, and the one modality the owner cannot be given a
+   * picker for.
+   *
+   * Image and speech became the owner's choice because there is a request shape behind each of
+   * them - `/images` and `/audio/speech`, both exercised - so a catalogue of routes is a catalogue
+   * of things that would actually run. There is no video request shape here at all: no endpoint,
+   * no response parser, no pricing unit. A modality select listing video models would be a control
+   * with nothing on the other side of it, which is worse than the refusal, so Settings states this
+   * sentence where the picker would be instead.
    */
   video: {
     modelId: '',
-    displayName: 'Private video generation',
+    displayName: 'Video generation',
     license: 'not available',
     available: false,
-    reason:
-      'OpenRouter currently states that asynchronous video generation is not eligible for zero-data-retention, so athanor fails closed.'
+    reason: MEDIA_VIDEO_UNAVAILABLE_REASON
   }
 } as const;
+
+/**
+ * The routes the owner chose, as the API sealed them into the credential this worker decrypts.
+ *
+ * A resolved option rather than a preference, because this process has no media catalogue and no
+ * business fetching one: it talks to a provider to run the request in front of it and for nothing
+ * else, and a catalogue fetch per tool call would put two round trips in front of every generated
+ * image. The screen that has the catalogue does the resolving, at the moment the owner chooses.
+ */
+export interface StoredMediaRoutes {
+  image?: MediaModelOption;
+  audio?: MediaModelOption;
+}
+
+/**
+ * The model a generation will actually use, and what this side believes it costs.
+ *
+ * Until now the two ids in the manifest above were the whole of the answer, in both the pricer and
+ * the dispatch arm, which is what the owner meant by having no control over the media models:
+ * there was nothing to control, because the choice was a constant. An owner who has never opened
+ * the media section still falls back to those reviewed routes, so a box that has never resolved a
+ * catalogue generates exactly as it did before.
+ */
+export interface ResolvedMediaModel {
+  modelId: string;
+  displayName: string;
+  usdPerImage: number | null;
+  usdPerMillionCharacters: number | null;
+  voice: string | undefined;
+  /**
+   * Whether the price above came from anywhere at all. False means the provider published no cost
+   * for this route and athanor has never measured it, which is the state the approval floor below
+   * treats as "always ask" - see `mediaEstimateUsd`'s callers.
+   */
+  priceKnown: boolean;
+}
+
+export const resolvedMediaModel = (
+  kind: 'image' | 'audio',
+  routes?: StoredMediaRoutes
+): ResolvedMediaModel => {
+  const option = routes?.[kind];
+  // A stored route for the wrong modality is not usable as this one's answer, and silently pricing
+  // an image against a speech route is the kind of mix-up an owner would only see on the invoice.
+  //
+  // Nor is one that names no model. Nothing this worker can see validates the sealed blob - it is
+  // decrypted and cast, because the screen that wrote it is the thing that parsed it - so a route
+  // left empty by a catalogue that answered with a blank id would go out as a request with no model
+  // on it, and what the provider does with that is its own business and the owner's bill. The
+  // reviewed default is the honest answer to a choice that resolved to nothing.
+  if (!option || option.modality !== kind || !option.providerModelId)
+    return kind === 'image'
+      ? {
+          modelId: managedMediaModels.image.modelId,
+          displayName: managedMediaModels.image.displayName,
+          usdPerImage: managedMediaModels.image.baseUsdPerImage,
+          usdPerMillionCharacters: null,
+          voice: undefined,
+          priceKnown: true
+        }
+      : {
+          modelId: managedMediaModels.audio.modelId,
+          displayName: managedMediaModels.audio.displayName,
+          usdPerImage: null,
+          usdPerMillionCharacters: managedMediaModels.audio.usdPerMillionCharacters,
+          voice: managedMediaModels.audio.defaultVoice,
+          priceKnown: true
+        };
+  return {
+    modelId: option.providerModelId,
+    displayName: option.displayName,
+    usdPerImage: option.usdPerImage,
+    usdPerMillionCharacters: option.usdPerMillionCharacters,
+    voice: option.defaultVoice ?? undefined,
+    priceKnown:
+      option.priceSource !== 'unknown' &&
+      (kind === 'image' ? option.usdPerImage !== null : option.usdPerMillionCharacters !== null)
+  };
+};
 
 const clamp = (value: unknown, minimum: number, maximum: number, fallback: number): number => {
   const parsed = Number(value ?? fallback);
@@ -61,26 +146,30 @@ export const mediaEstimateUsd = (input: {
   width?: unknown;
   height?: unknown;
   characterCount?: unknown;
+  /**
+   * The route this generation will take, when the caller has resolved the owner's choice. Omitting
+   * it prices against the reviewed default, which is what every caller did when the default was the
+   * only model there was.
+   */
+  model?: ResolvedMediaModel;
 }): number => {
-  if (input.kind === 'image')
-    return managedMediaCatalog.image.estimate({
-      width: mediaDimension(input.width),
-      height: mediaDimension(input.height)
-    });
-  if (input.kind === 'audio')
-    return managedMediaCatalog.audio.estimate({
-      characterCount: mediaCharacterCount(input.characterCount)
-    });
+  if (input.kind === 'image') {
+    const width = mediaDimension(input.width);
+    const height = mediaDimension(input.height);
+    const base = input.model?.usdPerImage ?? managedMediaCatalog.image.baseUsdPerImage;
+    return base + Math.max(0, (width * height) / 1_000_000 - 1) * 0.001;
+  }
+  if (input.kind === 'audio') {
+    const characters = mediaCharacterCount(input.characterCount);
+    const perMillion =
+      input.model?.usdPerMillionCharacters ?? managedMediaCatalog.audio.usdPerMillionCharacters;
+    return (characters * perMillion) / 1_000_000;
+  }
   return 0;
 };
 
 /**
- * How much one task may spend generating media before every further generation asks.
- *
- * The owner's spend caps are the ceiling on a runaway, and they are optional - an owner who has set
- * none has nothing between the agent and the provider's bill. This is the second brake, and it is
- * cumulative deliberately: a reviewed image is one and a half cents, so a per-call threshold at any
- * amount worth reading could never fire, while the run that re-rolls a logo forty times is exactly
- * what the owner would have stopped. A quarter of a dollar is roughly eighteen images.
+ * The cumulative media-spend threshold, which now lives in the contracts package because the
+ * Settings screen that chooses the model has to state the same number this card enforces.
  */
-export const MEDIA_APPROVAL_USD = 0.25;
+export { MEDIA_APPROVAL_USD } from '@athanor/contracts';

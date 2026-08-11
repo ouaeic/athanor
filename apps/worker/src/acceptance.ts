@@ -248,6 +248,57 @@ export const parseAcceptanceChecks = (
   return { ok: true, checks };
 };
 
+/**
+ * The identity of a command, so "has athanor already run exactly this?" is a lookup.
+ *
+ * Executable, arguments and working directory and nothing else: two calls that differ in any of
+ * them are different commands, and the whole value of this is that a match means a match.
+ */
+export const commandFingerprint = (input: {
+  executable: string;
+  args: readonly string[];
+  cwd: string;
+}): string =>
+  JSON.stringify([
+    input.executable.trim(),
+    input.args.map((argument) => String(argument)),
+    input.cwd.trim() || 'workspace'
+  ]);
+
+/**
+ * A check the harness has already run itself, after the last change, and watched pass.
+ *
+ * The acceptance record exists because a model asserting its own correctness proves nothing and an
+ * external check does. That argument is about who ran the command, not about how many times: when
+ * the model checks its own work through `shell` - which is how most of them check anything - the
+ * process athanor started is the same process, with the same arguments, in the same directory, on a
+ * computer nothing has changed since. Running it a second time at finish observes the identical
+ * fact and charges the owner a second build or a second test suite for it.
+ *
+ * Deliberately narrow, in three ways. Only an exact command match counts, so a check that differs
+ * from what ran by one flag is run. Only a run at or after the evidence floor counts - the same
+ * floor the completion contract uses, which is what "nothing has changed since" means here. And
+ * only a pass is reused: a check that failed after the last change is worth one more look before it
+ * refuses the turn, because a wrong refusal costs a whole further loop and a flake costs one
+ * command. A check with an expected output is always run, because the output was not kept.
+ */
+export const acceptanceAlreadyObserved = (
+  check: AcceptanceCheck,
+  observed: ReadonlyMap<string, number>
+): AcceptanceResult | null => {
+  if (check.kind !== 'command' || check.expectStdoutContains) return null;
+  const exitCode = observed.get(
+    commandFingerprint({ executable: check.executable, args: check.args, cwd: check.cwd })
+  );
+  if (exitCode === undefined || exitCode !== check.expectExit) return null;
+  return {
+    id: check.id,
+    label: check.label,
+    passed: true,
+    detail: `exit ${exitCode}, from athanor running this same command after the last change`
+  };
+};
+
 export const describeAcceptanceCheck = (check: AcceptanceCheck): string =>
   check.kind === 'command'
     ? `${check.id} (${check.label}): ${[check.executable, ...check.args].join(' ')}${

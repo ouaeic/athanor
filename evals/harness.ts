@@ -64,12 +64,28 @@ export interface ScriptContext {
   /** Which model call this is, counting from zero. */
   readonly index: number;
   /**
+   * Which step of the turn this is, counting from zero and not counting the calls a compaction
+   * made. A script that works from `index` alone starts answering the wrong step the moment the
+   * window is condensed once.
+   */
+  readonly step: number;
+  /**
    * The last thing athanor said to the model, which is how every hold in the loop talks back. The
    * runtime block is stepped over: it sits at the end of every window and its clock changes.
    */
   readonly lastMessage: string;
   /** Every message content in this request, for a script that has to look further back. */
   readonly messages: readonly string[];
+  /**
+   * Whether this is the tool-free call a compaction makes to write the next part of the brief,
+   * rather than a step of the turn.
+   *
+   * Recognised by the absent catalogue rather than by the wording of the request, because the
+   * wording is the summariser's prompt and a fixture that matched it would be asserting on prose.
+   * A script that ignores this and answers with a tool call gets a brief that says nothing, which
+   * is a green run measuring the deterministic fallback.
+   */
+  readonly summarising: boolean;
 }
 
 /** A model, as a function of what athanor just said to it. */
@@ -79,6 +95,57 @@ const sse = (payload: unknown): string => `data: ${JSON.stringify(payload)}\n\n`
 
 /** A value read off an untyped payload, as text. Anything that is not a string reads as absent. */
 const asText = (value: unknown): string => (typeof value === 'string' ? value : '');
+
+/**
+ * A request body as an object, whatever was actually sent.
+ *
+ * A file write carries the file's own bytes rather than a JSON envelope, so this has to survive a
+ * body that is not JSON at all: parsing it unguarded turned every file_write into a failed tool
+ * call.
+ */
+const bodyOf = (init?: RequestInit): Record<string, unknown> => {
+  if (typeof init?.body !== 'string') return {};
+  try {
+    return JSON.parse(init.body) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+};
+
+/**
+ * The text of one message in a request, however the adapter chose to wrap it.
+ *
+ * A message the context layer marked as a cache breakpoint is sent as a content array carrying a
+ * `cache_control` block rather than as a bare string, so reading `content` as a string alone makes
+ * exactly the messages athanor considers most important read as empty.
+ */
+const contentOf = (message: { content?: unknown }): string => {
+  if (typeof message.content === 'string') return message.content;
+  if (!Array.isArray(message.content)) return '';
+  return message.content
+    .map((block) => asText((block as { text?: unknown } | null)?.text))
+    .join('');
+};
+
+/** How many leading bytes two requests share, which is the most a prefix cache could read back. */
+const commonPrefix = (left: string, right: string): number => {
+  const limit = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < limit && left.charCodeAt(index) === right.charCodeAt(index)) index += 1;
+  return index;
+};
+
+/**
+ * One request as the provider reads it, which is not the order the JSON body happens to be in.
+ *
+ * A prefix cache is over tokens, and the tool definitions are tokenised ahead of the conversation
+ * whatever position the request object puts them in - so comparing the raw bodies scores athanor
+ * against the one part of the prompt that never changes, and reports about 23% for a turn whose
+ * real repeated run is nearer 90%. The catalogue goes first here for the same reason it goes first
+ * there: it is the head of what any provider could hand back.
+ */
+const promptBytes = (body: Record<string, unknown>): string =>
+  `${JSON.stringify(body.tools ?? [])}${JSON.stringify(body.messages ?? [])}`;
 
 const framesFor = (turn: ModelTurn): string[] => {
   const parts: string[] = [];
@@ -160,6 +227,13 @@ export interface RunnerStub {
    * acceptance check fail on the unfinished job and pass on the finished one.
    */
   readonly exec?: readonly number[];
+  /**
+   * The bytes a media generation comes back with, base64, and what the provider says it cost.
+   *
+   * Absent means a generation still succeeds, with a small image and a plausible price: the media
+   * fixtures are about what the loop does around a generation, not about the provider.
+   */
+  readonly media?: { readonly base64?: string; readonly costUsd?: number };
   /** What those commands printed, positionally, defaulting to a plausible line. */
   readonly stdout?: readonly string[];
   /** What the workspace holds, by path, for the reads. A path that is absent reads as missing. */
@@ -173,24 +247,62 @@ export interface RunnerStub {
 const json = (body: unknown): Response =>
   new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } });
 
+/** A one-pixel PNG, so a generation comes back with real bytes to write and price. */
+const ONE_PIXEL_PNG =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+/**
+ * The provider's media routes, which live on the same host as inference and are not inference.
+ *
+ * Generation is an ordinary request to `/images` or `/audio/speech` on the configured provider, so
+ * without this the media fixtures would have every logo counted as a model call and answered with a
+ * chat frame. It is separated here for the same reason the document binary is separated from the
+ * exec codes: a fixture's numbers have to mean what they say.
+ */
+const mediaResponse = (
+  stub: RunnerStub,
+  state: RunnerState,
+  url: string,
+  init?: RequestInit
+): Response | null => {
+  const image = url.endsWith('/images');
+  if (!image && !url.endsWith('/audio/speech')) return null;
+  state.media += 1;
+  // The route the provider was actually asked for, read off the wire rather than off the tool call.
+  // Everything before this line - the picker in Settings, the stored credential, the argument the
+  // model passed - is a claim about what will be generated. This is the request that gets billed,
+  // and it is the only place a seam between the owner's choice and the generation is visible.
+  state.mediaModels.push(asText(bodyOf(init).model));
+  const base64 = stub.media?.base64 ?? ONE_PIXEL_PNG;
+  const costUsd = stub.media?.costUsd ?? 0.01;
+  return image
+    ? json({ data: [{ b64_json: base64 }], usage: { cost: costUsd } })
+    : new Response(Buffer.from(base64, 'base64'), {
+        headers: { 'content-type': 'audio/mpeg', 'x-cost-usd': String(costUsd) }
+      });
+};
+
 /** What the document tools shell out to, whose stdout has to be JSON rather than a console line. */
 const DOCUMENT_BINARY = '/usr/local/lib/athanor/athanor-document';
 
+/** What the workspace has been made to do so far, which is the only state the stub carries. */
+interface RunnerState {
+  execs: number;
+  /** What the turn has written, so a listing sees the work happen and a read gets it back. */
+  written: Map<string, { bytes: number; text: string }>;
+  /** Media generations the provider was actually asked for. */
+  media: number;
+  /** The model id each of those named on the wire, in order. */
+  mediaModels: string[];
+}
+
 const runnerResponse = (
   stub: RunnerStub,
-  state: { execs: number },
+  state: RunnerState,
   url: string,
   init?: RequestInit
 ): Response => {
-  // A write carries the file's own bytes rather than a JSON envelope, so this has to survive a body
-  // that is not JSON at all: parsing it unguarded turned every file_write into a failed tool call.
-  let body: Record<string, unknown> = {};
-  if (typeof init?.body === 'string')
-    try {
-      body = JSON.parse(init.body) as Record<string, unknown>;
-    } catch {
-      body = {};
-    }
+  const body = bodyOf(init);
   if (url.includes('/exec') || url.includes('/processes/start')) {
     // document_read and document_search are shell calls too, and they parse their own stdout as
     // JSON. They are answered off to one side so they do not consume the exit codes a fixture wrote
@@ -247,19 +359,61 @@ const runnerResponse = (
     });
   if (url.includes('/files?')) {
     const path = decodeURIComponent(new URL(url).searchParams.get('path') ?? '');
+    // The runner's own field names, not an approximation of them. An artifact acceptance check
+    // reads `name`, `type` and `sizeBytes` off these rows, so a listing shaped any other way makes
+    // every artifact check report the file missing - a green fixture measuring nothing.
+    //
+    // What the turn has written counts as being there, which is what makes an artifact check fail
+    // on the unfinished job and pass on the finished one without a fixture having to say when the
+    // file appears.
+    const listed: Record<string, number> = {
+      ...Object.fromEntries(
+        Object.entries(stub.files ?? {}).map(([file, content]) => [file, content.length])
+      ),
+      ...Object.fromEntries([...state.written].map(([file, entry]) => [file, entry.bytes]))
+    };
     return json({
       path,
-      entries: Object.keys(stub.files ?? {})
-        .filter((file) => file.startsWith(path))
-        .map((file) => ({ path: file, kind: 'file', bytes: (stub.files?.[file] ?? '').length }))
+      entries: Object.entries(listed)
+        .filter(([file]) => file.startsWith(path))
+        .map(([file, sizeBytes]) => ({
+          name: file.split('/').filter(Boolean).pop() ?? file,
+          path: file,
+          type: 'file',
+          sizeBytes,
+          modifiedAt: '2026-07-01T00:00:00.000Z'
+        }))
     });
   }
   if (url.includes('/file')) {
     // A write is acknowledged; a read of a path the fixture never put in the workspace is a miss,
     // which is how a fixture makes a read fail without inventing an error shape.
-    if (init?.method === 'PUT') return json({ ok: true, storageBytes: 2_048 });
+    if (init?.method === 'PUT') {
+      const path = decodeURIComponent(new URL(url).searchParams.get('path') ?? '');
+      const text = typeof init.body === 'string' ? init.body : '';
+      const bytes =
+        typeof init.body === 'string'
+          ? init.body.length
+          : init.body instanceof ArrayBuffer
+            ? init.body.byteLength
+            : ArrayBuffer.isView(init.body)
+              ? init.body.byteLength
+              : 1;
+      if (path) state.written.set(path, { bytes, text });
+      return json({ ok: true, storageBytes: 2_048 });
+    }
     const path = decodeURIComponent(new URL(url).searchParams.get('path') ?? '');
-    const content = stub.files?.[path];
+    const known = state.written.has(path) || stub.files?.[path] !== undefined;
+    // A picture comes back as bytes with a picture's content type, because that is the only thing
+    // `image_read` accepts - and looking at what it just generated is the first thing the media tool
+    // tells the model to do, so a media fixture that could not do it would measure the wrong loop.
+    if (known && /\.(png|jpe?g|webp|gif)$/i.test(path))
+      return new Response(Buffer.from(ONE_PIXEL_PNG, 'base64'), {
+        headers: { 'content-type': 'image/png' }
+      });
+    // What the turn wrote reads back as what it wrote. Without this a fixture could not measure the
+    // one thing worth measuring about a re-read - that the window already held the answer.
+    const content = state.written.get(path)?.text ?? stub.files?.[path];
     return content === undefined
       ? new Response('', { status: 404 })
       : json({ path, content, bytes: content.length });
@@ -290,7 +444,10 @@ export type FixtureShape =
   | 'research'
   | 'ambiguous'
   | 'refusal'
-  | 'small';
+  | 'small'
+  | 'media'
+  /** A job long enough that what it costs is decided by how the window is held down, not by holds. */
+  | 'long';
 
 export interface Expectation {
   /** Exactly how many model calls the turn cost, including the closing handoff when one happens. */
@@ -304,6 +461,17 @@ export interface Expectation {
   readonly proposed?: readonly string[];
   /** The catalogue offered on the last request, for the turns where the loop narrows it. */
   readonly finalCatalogue?: readonly string[];
+  /**
+   * Whether the closing request offered the same catalogue as the step before it.
+   *
+   * The property, rather than the list. A turn that swaps its catalogue on the way out rewrites the
+   * head of the prompt on its own largest request, and every provider that bills a cached prefix
+   * bills that as a fresh write - so the restriction such a swap is meant to buy has to be worth
+   * the whole window, and a restriction the loop already enforces by refusing the call is not.
+   * Naming the tools instead would make this fail every time a tool is added, which is how an
+   * assertion about caching turns into an assertion about the catalogue's length.
+   */
+  readonly finalCatalogueUnchanged?: boolean;
   /** Tools that must appear somewhere in the run. */
   readonly toolsInclude?: readonly string[];
   /** Tools that must never run - the check that a floor or a gate actually stopped something. */
@@ -321,6 +489,38 @@ export interface Expectation {
    * and the finish is the only run there ever was.
    */
   readonly commandsRun?: number;
+  /** How many times the provider was asked to generate something, and therefore charged for it. */
+  readonly mediaGenerated?: number;
+  /**
+   * The model id every generation named on the wire, in order.
+   *
+   * The unit tests around media hand a chosen route in by hand and assert on the value they handed
+   * in, which is green whether or not anything carries it to the provider. This is the request the
+   * provider answers, so it is the one thing that cannot be green over a wire that does not exist.
+   */
+  readonly mediaModels?: readonly string[];
+  /**
+   * The least share of a request that may be a byte-for-byte repeat of the one before it.
+   *
+   * The floor, not the value: the exact share moves by a point when anything in the window changes
+   * size, and a fixture that pinned it would fail on every unrelated edit. What is worth asserting
+   * is that a turn which only appends to its window did not rewrite the front of it.
+   */
+  readonly minCachePrefix?: number;
+  /** The fewest compactions this turn must have performed. */
+  readonly minCompactions?: number;
+  /** The fewest sections the running brief must have ended up carrying. */
+  readonly minBriefSections?: number;
+  /** Whether the owner's own words were still in the last window, byte for byte. */
+  readonly ownerMessageIntact?: boolean;
+  /**
+   * The shortest a squeezed tool result may be left in the last window.
+   *
+   * Nothing squeezed at all satisfies this: the assertion is that no result was cut all the way to
+   * the hard floor, which is what a turn looks like when the cheap mechanism has been made to do
+   * the work the expensive one exists for.
+   */
+  readonly minToolResultFloor?: number;
   /** Every hold the harness fired, in the order it fired them. */
   readonly holds?: readonly HoldName[];
   /** Whether the boilerplate fallback plan was written for a task that never asked for one. */
@@ -342,6 +542,16 @@ export interface Fixture {
   readonly runner?: RunnerStub;
   /** The step ceiling in force, when the fixture is about what happens at one. */
   readonly maxSteps?: number;
+  /**
+   * The window of the model this fixture runs on, when the size of the window is the subject.
+   *
+   * Both shipped defaults declare a million tokens, and every mechanism that decides when to
+   * condense is a function of that number, so a fixture about the window has to be able to state
+   * it. Everything else runs on the ordinary release below.
+   */
+  readonly contextTokens?: number;
+  /** The compute ceiling in force, raised only by the fixtures long enough to reach the default. */
+  readonly maxCredits?: number;
   readonly expect: Expectation;
 }
 
@@ -366,7 +576,8 @@ const HOLD_MARKERS: ReadonlyArray<readonly [HoldName, string]> = [
   ['baseline_refused', 'every one of them already passes'],
   ['repetition_stopped', 'began repeating'],
   ['output_limit_continued', 'CONTINUE THE ANSWER ('],
-  ['step_budget', 'STEP BUDGET EXHAUSTED']
+  ['step_budget', 'STEP BUDGET EXHAUSTED'],
+  ['idle_break', 'NOTHING HAS RUN FOR']
 ];
 
 export type HoldName =
@@ -379,7 +590,8 @@ export type HoldName =
   | 'baseline_refused'
   | 'repetition_stopped'
   | 'output_limit_continued'
-  | 'step_budget';
+  | 'step_budget'
+  | 'idle_break';
 
 // The acceptance hold and the plan hold share an opening, so the longer marker is tried first.
 const ORDERED_MARKERS = [...HOLD_MARKERS].sort((left, right) => right[1].length - left[1].length);
@@ -406,7 +618,49 @@ export interface RunOutcome {
   readonly tools: readonly string[];
   readonly proposed: readonly string[];
   readonly finalCatalogue: readonly string[];
+  /**
+   * Whether the closing request's catalogue was byte-identical to the one before it. True for a
+   * turn of a single step, which never swapped anything.
+   */
+  readonly finalCatalogueUnchanged: boolean;
   readonly commandsRun: number;
+  /** Generations the provider was actually billed for, which is the only real money a turn spends. */
+  readonly mediaGenerated: number;
+  /** The model id each of those generations named on the wire, in order. */
+  readonly mediaModels: readonly string[];
+  /**
+   * The mean share of a request that repeated the previous request byte for byte, 0 to 100.
+   *
+   * Every provider that bills a cached prefix bills it as a prefix: the read stops at the first
+   * byte that differs from what it cached. So the common leading run between one request and the
+   * next is the ceiling on what any of them could have read back, and the mean of that over a turn
+   * is what a long task's bill actually turns on. A turn of one call has no previous request and
+   * reads as zero.
+   *
+   * It is a mean of per-request shares rather than a share of the whole turn's bytes, so a turn is
+   * not scored mostly by its largest step.
+   *
+   * What it cannot see, so that nobody sets a floor against it in the belief that it can: the tool
+   * catalogue is the head of every comparison and it does not move, so on a short turn it is most
+   * of the bytes and the share has a floor no message-side defect can push it under. Measured by
+   * making the first message of the window differ on every step - every message byte destroyed - on
+   * `files-helper-script-then-run`: 97% became 91%, not 0%. A floor worth setting on a five-step
+   * fixture is in the mid-nineties; a defect costing less than a point or two is only visible on a
+   * turn long enough for the conversation to outweigh the catalogue.
+   */
+  readonly cachePrefix: number;
+  /** Compactions the loop performed, each of which is a model call and a rewritten prefix. */
+  readonly compactions: number;
+  /** Sections the running brief ended up carrying, which is how much history survived condensing. */
+  readonly briefSections: number;
+  /** Whether the owner's own words were still in the last window, byte for byte. */
+  readonly ownerMessageIntact: boolean;
+  /**
+   * The shortest squeezed tool result left in the last window, or 0 when none was squeezed. Read
+   * against the hard floor: a window full of results cut to it is one the cheap mechanism has been
+   * left to hold down on its own.
+   */
+  readonly toolResultFloor: number;
   readonly holds: readonly HoldName[];
   /** What the loop actually said back, in full, for the runs that need explaining. */
   readonly pushback: readonly string[];
@@ -440,7 +694,7 @@ const workspace: WorkspaceRecord = {
   updatedAt: '2026-07-01T00:00:00.000Z'
 };
 
-const model: ModelRelease = {
+const release: ModelRelease = {
   id: 'model-1',
   providerModelId: 'vendor/model-1',
   displayName: 'Model One',
@@ -461,7 +715,10 @@ const model: ModelRelease = {
   updatedAt: '2026-07-01T00:00:00.000Z'
 };
 
-const taskFor = (prompt: string): TaskRecord => ({
+const modelFor = (contextTokens?: number): ModelRelease =>
+  contextTokens === undefined ? release : { ...release, contextTokens };
+
+const taskFor = (prompt: string, maxComputeCredits: number): TaskRecord => ({
   id: taskId,
   userId,
   workspaceId,
@@ -477,10 +734,10 @@ const taskFor = (prompt: string): TaskRecord => ({
   pinned: false,
   archivedAt: null,
   status: 'running',
-  modelId: model.id,
+  modelId: release.id,
   privacyRoute: 'provider_zdr',
   securityMode: 'balanced',
-  maxComputeCredits: 50,
+  maxComputeCredits,
   actualComputeCredits: 0,
   maxSpendUsd: null,
   spentUsd: 0,
@@ -495,7 +752,8 @@ const taskFor = (prompt: string): TaskRecord => ({
 });
 
 export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
-  const task = taskFor(fixture.request);
+  const model = modelFor(fixture.contextTokens);
+  const task = taskFor(fixture.request, fixture.maxCredits ?? 50);
   const events: Array<{ kind: string; summary: string; payload: unknown }> = [];
   const approvals: string[] = [];
   let finalStatus = 'running';
@@ -565,6 +823,12 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       return `approval-${approvals.length}`;
     },
     recordUsage: async () => undefined,
+    // A delivered file, so a job that makes something can be measured all the way to the owner
+    // rather than stopping at the workspace.
+    createArtifact: async (input: Record<string, unknown>) => ({
+      id: `artifact-${asText(input.storageKey)}`,
+      version: 1
+    }),
     mediaSpendForTask: async () => 0,
     spendGuard: async () => ({
       outcome: 'allow' as const,
@@ -594,27 +858,58 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     consolidateMemory: async () => undefined
   } as unknown as DataStore;
 
-  const modelRequests: Array<Record<string, unknown>> = [];
+  let modelCalls = 0;
+  // Only the last request is kept, and the previous one only as the bytes the next is compared
+  // against. A forty-step fixture sends forty windows of up to a megabyte each, and holding them
+  // all measures this process's heap rather than the loop.
+  let steps = 0;
+  let lastRequest: Record<string, unknown> = {};
+  let lastAgentRequest: Record<string, unknown> = {};
+  let previousBytes = '';
+  // The catalogue of the last two steps, as sent. Only the two, for the same reason the bytes above
+  // are only the previous request's: what a swap costs is paid on the step it happens.
+  let lastCatalogue = '';
+  let previousCatalogue = '';
+  const prefixShares: number[] = [];
+  const everyMessage = new Set<string>();
   const proposed: string[] = [];
-  const execState = { execs: 0 };
+  const execState: RunnerState = { execs: 0, written: new Map(), media: 0, mediaModels: [] };
   const original = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = input instanceof Request ? input.url : input.toString();
     if (url.startsWith(PROVIDER_URL)) {
-      const body =
-        typeof init?.body === 'string'
-          ? (JSON.parse(init.body) as Record<string, unknown>)
-          : ({} as Record<string, unknown>);
-      modelRequests.push(body);
-      const messages = ((body.messages ?? []) as Array<{ content?: unknown }>).map((message) =>
-        typeof message.content === 'string' ? message.content : ''
-      );
+      const media = mediaResponse(fixture.runner ?? {}, execState, url, init);
+      if (media) return media;
+      const body = bodyOf(init);
+      modelCalls += 1;
+      lastRequest = body;
+      // The summarising call a compaction makes carries no catalogue, and it is a fresh prompt with
+      // no predecessor rather than the next step of one - so it is neither the window the turn was
+      // working in nor a link in the chain a cache reads back along. What it costs is already in the
+      // step count and the token total, which is where a one-off call belongs.
+      const summarising = !((body.tools ?? []) as unknown[]).length;
+      if (!summarising) {
+        steps += 1;
+        lastAgentRequest = body;
+        const bytes = promptBytes(body);
+        if (previousBytes) prefixShares.push(commonPrefix(previousBytes, bytes) / bytes.length);
+        previousBytes = bytes;
+        previousCatalogue = lastCatalogue;
+        lastCatalogue = JSON.stringify(body.tools ?? []);
+      }
+      const messages = ((body.messages ?? []) as Array<{ content?: unknown }>).map(contentOf);
+      // Collected as the requests arrive, deduplicated in order: a hold pushes one message that
+      // then travels in every later request, so a raw scan would count the same hold once per
+      // remaining step.
+      for (const content of messages) everyMessage.add(content);
       const turn = fixture.model({
-        index: modelRequests.length - 1,
+        index: modelCalls - 1,
+        step: Math.max(0, steps - 1),
         lastMessage:
           [...messages].reverse().find((content) => !content.startsWith(RUNTIME_CONTEXT_MARKER)) ??
           '',
-        messages
+        messages,
+        summarising
       });
       for (const call of turn.calls ?? []) proposed.push(call.name);
       return new Response(streamOf(framesFor(turn), init?.signal), {
@@ -675,15 +970,29 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
             ?.estimatedInputTokens
         ) || 0
     );
-  const everyMessage = modelRequests.flatMap((request) =>
-    ((request.messages ?? []) as Array<{ content?: unknown }>).map((message) =>
-      typeof message.content === 'string' ? message.content : ''
-    )
-  );
   const completion = [...events].reverse().find((entry) => entry.kind === 'completed');
+  // Only a compaction writes a brief, so the field it carries is what tells its status event from
+  // every other one. Read structurally rather than off the sentence, which the interface owns.
+  const compactions = events
+    .map(
+      (entry) =>
+        ((entry.payload ?? {}) as { compaction?: { briefParts?: unknown } }).compaction ?? {}
+    )
+    .filter((compaction) => typeof compaction.briefParts === 'number');
+  const lastWindow = (
+    (lastAgentRequest.messages ?? []) as Array<{ role?: unknown; content?: unknown }>
+  ).map((message) => ({ role: asText(message.role), content: contentOf(message) }));
+  // Squeezed, not merely short: a result the window never had to cut says nothing about the floor,
+  // and counting it would make every fixture that reads a small file look like an overrun window.
+  const squeezed = lastWindow
+    .filter(
+      (message) =>
+        message.role === 'tool' && message.content.includes('omitted from earlier tool output')
+    )
+    .map((message) => message.content.length);
 
   return {
-    modelCalls: modelRequests.length,
+    modelCalls,
     promptTokens: costs.reduce((total, value) => total + value, 0),
     peakPromptTokens: costs.reduce((peak, value) => Math.max(peak, value), 0),
     tools: events
@@ -691,12 +1000,28 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       .map((entry) => asText((entry.payload as { tool?: unknown }).tool)),
     proposed,
     commandsRun: execState.execs,
-    finalCatalogue: (
-      (modelRequests.at(-1)?.tools ?? []) as Array<{ function?: { name?: unknown } }>
-    ).map((tool) => asText(tool.function?.name)),
-    // Deduplicated in order: a hold pushes one message that then travels in every later request, so
-    // the raw scan would count the same hold once per remaining step.
-    ...holdsIn([...new Set(everyMessage)]),
+    mediaGenerated: execState.media,
+    mediaModels: execState.mediaModels,
+    // Rounded to a whole point, which is all this number can honestly carry: the runtime block at
+    // the end of the window rebuilds its clock on every step, so the last few bytes of a request
+    // differ from the last one's whatever else the loop did.
+    cachePrefix: prefixShares.length
+      ? Math.round(
+          (prefixShares.reduce((total, share) => total + share, 0) / prefixShares.length) * 100
+        )
+      : 0,
+    compactions: compactions.length,
+    briefSections: compactions.reduce(
+      (most, payload) => Math.max(most, Number(payload.briefParts) || 0),
+      0
+    ),
+    ownerMessageIntact: lastWindow.some((message) => message.content.includes(fixture.request)),
+    toolResultFloor: squeezed.length ? Math.min(...squeezed) : 0,
+    finalCatalogue: ((lastRequest.tools ?? []) as Array<{ function?: { name?: unknown } }>).map(
+      (tool) => asText(tool.function?.name)
+    ),
+    finalCatalogueUnchanged: previousCatalogue === '' || previousCatalogue === lastCatalogue,
+    ...holdsIn([...everyMessage]),
     status: finalStatus,
     verification:
       asText(

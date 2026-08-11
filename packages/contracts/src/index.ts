@@ -35,6 +35,21 @@ export const DEFAULT_SPEND_WARN_PERCENT = 80;
 export const MAX_SPEND_CAP_USD = 1_000_000;
 export const MAX_TASK_SPEND_USD = 10_000;
 
+/**
+ * How much one task may spend generating media before every further generation asks.
+ *
+ * The owner's spend caps are the ceiling on a runaway, and they are optional - an owner who has set
+ * none has nothing between the agent and the provider's bill. This is the second brake, and it is
+ * cumulative deliberately: a reviewed image is one and a half cents, so a per-call threshold at any
+ * amount worth reading could never fire, while the run that re-rolls a logo forty times is exactly
+ * what the owner would have stopped. A quarter of a dollar is roughly eighteen images.
+ *
+ * Here rather than beside the approval card because Settings has to print it. The media model is
+ * the owner's to choose now, and a choice whose cost is stated next to a threshold the same screen
+ * cannot see is how the two numbers drift apart.
+ */
+export const MEDIA_APPROVAL_USD = 0.25;
+
 const CapUsd = z.number().nonnegative().max(MAX_SPEND_CAP_USD);
 const TaskSpendUsd = z.number().positive().max(MAX_TASK_SPEND_USD);
 
@@ -751,6 +766,110 @@ export const ModelRelease = z.object({
   updatedAt: IsoDate
 });
 export type ModelRelease = z.infer<typeof ModelRelease>;
+
+/**
+ * The kinds of media the owner's provider can be asked to make.
+ *
+ * Video is in the enum because the owner asks about it and the answer has to be addressable, not
+ * because anything generates one. There is no video route on this computer: the only video code
+ * that has ever existed here is the sentence that refuses, and a modality with a picker and no
+ * endpoint behind it would be an offer athanor cannot keep.
+ */
+export const MediaModality = z.enum(['image', 'audio', 'video']);
+export type MediaModality = z.infer<typeof MediaModality>;
+
+/**
+ * Why video is not on offer, said once.
+ *
+ * The worker refuses the tool call with it and Settings prints it where the picker would be. It is
+ * one string in one place because the alternative is two copies of a policy, and the audit's own
+ * finding on approvals is that when policy is duplicated across layers it is the stale copy that
+ * wins.
+ */
+export const MEDIA_VIDEO_UNAVAILABLE_REASON =
+  'athanor has no video generation route. The provider it builds a media catalogue from states that asynchronous video generation is not eligible for zero-data-retention, so one was never built and there is nothing yet to point a choice at.';
+
+/**
+ * One media model the owner may choose, with what it costs stated in the unit its provider bills.
+ *
+ * Every price is nullable and paired with `priceSource`, because a media price is the one number
+ * this software genuinely may not know. The chat catalogue reads per-token prices straight out of
+ * the provider feed; the media feed carries no field this repository can point at for "dollars per
+ * image", so a model whose price was not published says so rather than borrowing the default's.
+ * `mediaPriceKnown` in the worker turns that admission into an approval that always asks.
+ */
+export const MediaModelOption = z.object({
+  /** Catalogue id, the same `provider/slug` shape the chat catalogue uses. */
+  id: z.string(),
+  providerModelId: z.string(),
+  displayName: z.string(),
+  provider: z.string(),
+  modality: MediaModality,
+  /** Charged per generated image, where the provider prices by the image. */
+  usdPerImage: z.number().nonnegative().nullable(),
+  /** Charged per million characters of input text, which is how speech is billed. */
+  usdPerMillionCharacters: z.number().nonnegative().nullable(),
+  /**
+   * `provider` when the figure came off the provider's own feed, `measured` when it is a price
+   * athanor recorded from real generations on this route, `unknown` when nobody has said.
+   */
+  priceSource: z.enum(['provider', 'measured', 'unknown']),
+  /** The voice name to send for speech, when this route names its voices and one was chosen. */
+  defaultVoice: z.string().nullable().optional(),
+  /** Whether a zero-retention endpoint serves this model, on the providers that publish that. */
+  zeroDataRetentionAvailable: z.boolean().optional(),
+  /** Why this one cannot be chosen right now, in the owner's terms. Empty when it can. */
+  unavailableReason: z.string().nullable().optional(),
+  recommendationTags: z.array(z.string()),
+  updatedAt: IsoDate
+});
+export type MediaModelOption = z.infer<typeof MediaModelOption>;
+
+/**
+ * The owner's choice for one modality, in the vocabulary the chat model picker already uses.
+ *
+ * Deliberately the same three automatic modes and the same `automatic`/`modelId` pair as
+ * `OwnerPreferences.model`: an owner who has learned that Recommended, Faster and Higher quality
+ * mean something in the composer should not have to learn a second set of words in Settings.
+ */
+export const MediaModelChoice = z.object({
+  automatic: z.boolean(),
+  preference: z.enum(['fast', 'balanced', 'best']),
+  modelId: z.string().max(300).default('')
+});
+export type MediaModelChoice = z.infer<typeof MediaModelChoice>;
+
+/** What the owner chose per modality. An absent modality is one they have never touched. */
+export const MediaModelSelection = z.object({
+  image: MediaModelChoice.optional(),
+  audio: MediaModelChoice.optional()
+});
+export type MediaModelSelection = z.infer<typeof MediaModelSelection>;
+
+/**
+ * One modality as Settings draws it: what is on offer, what is chosen, and what that will cost.
+ *
+ * `effective` is resolved on the server rather than in the browser, so the price the owner reads
+ * beside the control is produced by the same resolver the worker prices the approval card with.
+ * Two answers to "which model does this use" is exactly the state this whole change exists to end.
+ */
+export const MediaModalityState = z.object({
+  modality: MediaModality,
+  available: z.boolean(),
+  /** Present when `available` is false: the reason there is nothing to choose. */
+  reason: z.string().nullable(),
+  options: z.array(MediaModelOption),
+  choice: MediaModelChoice,
+  effective: MediaModelOption.nullable()
+});
+export type MediaModalityState = z.infer<typeof MediaModalityState>;
+
+export const MediaSettings = z.object({
+  modalities: z.array(MediaModalityState),
+  /** The running total, per conversation, above which every further generation asks. */
+  approvalThresholdUsd: z.number().nonnegative()
+});
+export type MediaSettings = z.infer<typeof MediaSettings>;
 
 export const Approval = z.object({
   id: Id,

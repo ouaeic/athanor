@@ -3,6 +3,7 @@ import { decryptJson, encryptJson, generateDataKey, wrapDataKey } from '@athanor
 import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import type { ModelRelease } from '@athanor/contracts';
 import {
+  ACCEPTANCE_EARLIER_TURN_CAVEAT,
   AgentWorker,
   approvalPreviewHash,
   DELEGATE_MAX_STEPS,
@@ -12,6 +13,7 @@ import {
 } from './agent.js';
 import { RUNTIME_CONTEXT_MARKER } from './context.js';
 import { managedMediaCatalog } from './media.js';
+import { memoryItemAad, MEMORY_PACK_MARKER } from './memory-runtime.js';
 import { agentTools } from './tools.js';
 import type { WorkerConfig } from './config.js';
 
@@ -1903,24 +1905,42 @@ describe('a turn that runs out of steps', () => {
     verification: { status: 'not_applicable', evidence: [] }
   });
 
-  it('spends its last call on a handoff, with nothing but set_plan and finish to spend it on', async () => {
+  it('spends its last call on a handoff, on the catalogue every other step sent', async () => {
     const { log } = await runToTheCeiling(handoffFinish);
 
     // Three provider calls for a two-step budget: the budget bounds the work, and the harness
     // closing the turn is not one of the steps it bounds.
     expect(log.modelRequests).toHaveLength(3);
     const handoff = log.modelRequests[2] ?? {};
+    /*
+     * The catalogue is the head of the cached prefix, and this is the largest request the turn
+     * makes. It used to be sent a two-tool list where the step before it sent forty, so the front
+     * of the prompt moved and every byte behind it was re-billed at the write price - to buy
+     * nothing, because what stops the model starting new work here is the denial the next test
+     * exercises, not the shape of the list.
+     */
+    expect(JSON.stringify(handoff.tools)).toBe(JSON.stringify(log.modelRequests[1]?.tools));
     expect(
       ((handoff.tools ?? []) as Array<{ function?: { name?: string } }>).map(
         (tool) => tool.function?.name
       )
-    ).toEqual(['set_plan', 'finish']);
+    ).toEqual(expect.arrayContaining(['set_plan', 'finish', 'shell', 'file_write']));
     const systemText = ((handoff.messages ?? []) as Array<{ role: string; content: string }>)
       .filter((message) => message.role === 'system')
       .map((message) => message.content)
       .join('\n');
     expect(systemText).toContain('STEP BUDGET EXHAUSTED after 2 steps');
     expect(systemText).toContain('the exact words they can send back to carry on');
+  });
+
+  it('runs nothing but set_plan and finish on the handoff turn, whatever it is asked for', async () => {
+    // The restriction the catalogue used to carry, where it has always actually lived: a call that
+    // is neither of the two is answered with a denial and never reaches the runner.
+    const { log } = await runToTheCeiling(
+      toolFrame('call-hand', 'shell', { command: 'echo late', cwd: 'workspace' })
+    );
+
+    expect(log.calls.some((call) => call.includes('/exec'))).toBe(false);
   });
 
   it('lands somewhere the owner can act on instead of a red failure', async () => {
@@ -2751,12 +2771,42 @@ describe('spending the owner’s money on generated media', () => {
     failWrite?: boolean;
     spentUsd?: number;
     arguments?: Record<string, unknown>;
+    /** A route the owner chose in Settings, sealed the way the API seals it. */
+    imageRoute?: Record<string, unknown>;
+    /** The same for speech, which is dispatched through its own arm and priced in its own unit. */
+    audioRoute?: Record<string, unknown>;
+    /** A provider that will not serve the sealed route, which is what a withdrawn model looks like. */
+    providerRefusesTheRoute?: boolean;
   }): Promise<MediaProbe> => {
     const task = makeTask();
     const probe = probeStore(() => task);
     const guarded: Array<Record<string, unknown>> = [];
     const billed: Array<Record<string, unknown>> = [];
     Object.assign(probe.store, {
+      ...(options.imageRoute || options.audioRoute
+        ? {
+            getManagedProviderCredential: async (_userId: string, provider: string) =>
+              provider === 'inference'
+                ? ({
+                    provider: 'inference',
+                    secretCiphertext: encryptJson(
+                      {
+                        provider: 'openai-compatible',
+                        baseUrl: PROVIDER_URL,
+                        apiKey: 'stored-key',
+                        enforceZeroDataRetention: false,
+                        mediaRoutes: {
+                          ...(options.imageRoute ? { image: options.imageRoute } : {}),
+                          ...(options.audioRoute ? { audio: options.audioRoute } : {})
+                        }
+                      },
+                      masterKey,
+                      `inference-provider:${userId}`
+                    )
+                  } as unknown as Awaited<ReturnType<DataStore['getManagedProviderCredential']>>)
+                : null
+          }
+        : {}),
       mediaSpendForTask: async () => options.spentUsd ?? 0,
       recordUsage: async (input: Record<string, unknown>) => {
         if (String(input.resourceClass).startsWith('media:')) billed.push(input);
@@ -2813,6 +2863,15 @@ describe('spending the owner’s money on generated media', () => {
       ],
       log,
       {
+        ...(options.providerRefusesTheRoute
+          ? {
+              media: () =>
+                new Response(
+                  JSON.stringify({ error: { message: 'No endpoints found for that model' } }),
+                  { status: 404 }
+                )
+            }
+          : {}),
         route: (url) => {
           if (!url.includes('/file?path=')) return undefined;
           const path = decodeURIComponent(url.split('path=')[1] ?? '');
@@ -2866,6 +2925,135 @@ describe('spending the owner’s money on generated media', () => {
     expect(probe.written[0]).toMatch(/^workspace\/generated\/.*\.png$/);
     const answer = probe.messages.find((message) => message.toolCallId === 'call-m')?.content ?? '';
     expect(answer).toContain(probe.written[0]!);
+  });
+
+  it('generates with the model the owner chose, and prices the request against it', async () => {
+    /*
+     * The whole of "we have no control over the image model" in one assertion.
+     *
+     * Settings resolves the choice and the API seals it beside the key; this is the only place
+     * that reads it back. Before it was wired the picker stored a route, displayed it, and the
+     * worker generated with the compiled-in constant anyway - so an owner could pick a model, be
+     * shown it, and never once use it. The price travels with it because the cap and the approval
+     * card are checked against this number, and quoting the default's figure for a route ten times
+     * the price is how a spend ceiling stops meaning anything.
+     */
+    const probe = await generate({
+      imageRoute: {
+        id: 'someone/painter-xl',
+        providerModelId: 'someone/painter-xl',
+        displayName: 'Painter XL',
+        provider: 'openai-compatible',
+        modality: 'image',
+        usdPerImage: 0.14,
+        usdPerMillionCharacters: null,
+        priceSource: 'provider',
+        recommendationTags: [],
+        updatedAt: new Date().toISOString()
+      }
+    });
+    expect(probe.generated[0]).toMatchObject({ model: 'someone/painter-xl' });
+    // The chosen route's own base, and the same megapixel surcharge every image carries: 1024x1024
+    // is 0.048576 of a megapixel over the flat rate, at $0.001 each.
+    expect(probe.guarded[0]).toMatchObject({ estimateUsd: 0.14 + 0.000_048_576 });
+    expect(probe.billed[0]).toMatchObject({
+      providerRef: 'openai-compatible:someone/painter-xl'
+    });
+    // Not the reviewed default, which is the thing this used to do no matter what was chosen.
+    expect(probe.generated[0]?.model).not.toBe(managedMediaCatalog.image.modelId);
+  });
+
+  it('falls back to the reviewed route when the sealed choice names no model at all', async () => {
+    // Nothing on this side validates the sealed blob: it is decrypted and cast, because the screen
+    // that wrote it is the thing that parsed it. A route that resolved to a blank id would go to
+    // the provider as a request with no model on it, and what happens then is the owner's bill.
+    const probe = await generate({
+      imageRoute: {
+        id: '',
+        providerModelId: '',
+        displayName: 'Whatever the catalogue said',
+        provider: 'openai-compatible',
+        modality: 'image',
+        // Deliberately under the approval threshold and deliberately not the default's figure, so
+        // the generation runs without a card in front of it and the price still says which route
+        // was used.
+        usdPerImage: 0.02,
+        usdPerMillionCharacters: null,
+        priceSource: 'provider',
+        recommendationTags: [],
+        updatedAt: new Date().toISOString()
+      }
+    });
+    expect(probe.generated[0]).toMatchObject({ model: managedMediaCatalog.image.modelId });
+    expect(probe.guarded[0]).toMatchObject({
+      estimateUsd: managedMediaCatalog.image.estimate({ width: 1024, height: 1024 })
+    });
+  });
+
+  it('spends nothing and says so when the provider will not serve the chosen route', async () => {
+    /*
+     * The failure the picker makes possible.
+     *
+     * A route is resolved once, when the owner chooses it, and sealed beside the key - so a model
+     * their provider later withdraws stays sealed until they open Settings again. The turn has to
+     * survive that: the ledger is the only account of media spend there is, and a generation that
+     * never happened must not appear in it, must not leave a half-written file, and must reach the
+     * model as a tool result it can act on rather than as a dead turn.
+     */
+    const probe = await generate({
+      providerRefusesTheRoute: true,
+      imageRoute: {
+        id: 'someone/withdrawn',
+        providerModelId: 'someone/withdrawn',
+        displayName: 'Withdrawn',
+        provider: 'openai-compatible',
+        modality: 'image',
+        usdPerImage: 0.14,
+        usdPerMillionCharacters: null,
+        priceSource: 'provider',
+        recommendationTags: [],
+        updatedAt: new Date().toISOString()
+      }
+    });
+    expect(probe.generated[0]).toMatchObject({ model: 'someone/withdrawn' });
+    expect(probe.billed).toHaveLength(0);
+    expect(probe.written).toHaveLength(0);
+    const answer = probe.messages.find((message) => message.toolCallId === 'call-m')?.content ?? '';
+    expect(answer).toContain('No endpoints found for that model');
+  });
+
+  it('speaks in the voice of the speech model the owner chose, and prices it by the character', async () => {
+    /*
+     * The other arm, which shares the resolver and nothing else.
+     *
+     * Speech is dispatched to a different endpoint, billed in a different unit, and is the only
+     * modality that carries a voice - and a voice belongs to one model's own list, so the moment
+     * the model became the owner's choice, sending the reviewed default's voice name to whatever
+     * they picked became a request their provider has no way to honour. The image assertion above
+     * cannot see any of that: it never sends a voice and its price is per image.
+     */
+    const probe = await generate({
+      arguments: { kind: 'audio', prompt: 'Read the quarterly note aloud.' },
+      audioRoute: {
+        id: 'someone/reader-1',
+        providerModelId: 'someone/reader-1',
+        displayName: 'Reader One',
+        provider: 'openai-compatible',
+        modality: 'audio',
+        usdPerImage: null,
+        usdPerMillionCharacters: 40,
+        priceSource: 'provider',
+        defaultVoice: 'quiet',
+        recommendationTags: [],
+        updatedAt: new Date().toISOString()
+      }
+    });
+    expect(probe.generated[0]).toMatchObject({ model: 'someone/reader-1', voice: 'quiet' });
+    expect(probe.generated[0]?.model).not.toBe(managedMediaCatalog.audio.modelId);
+    // The chosen route's own per-million rate over the thirty characters it was asked to speak.
+    expect(probe.guarded[0]).toMatchObject({ estimateUsd: (30 * 40) / 1_000_000 });
+    expect(probe.billed[0]).toMatchObject({ providerRef: 'openai-compatible:someone/reader-1' });
+    expect(probe.written[0]).toMatch(/\.mp3$/);
   });
 
   it('honours a path the agent chose, so the file lands where the work expects it', async () => {
@@ -3451,7 +3639,7 @@ describe('what would prove the job is done', () => {
     ]);
   });
 
-  it('says in the completion when the checks were written after the work', async () => {
+  it('keeps the order athanor did its own steps in out of the completion', async () => {
     const task = makeTask(acceptanceState());
     const probe = probeStore(() => task);
     const log: FetchLog = { calls: [], modelRequests: [] };
@@ -3482,8 +3670,7 @@ describe('what would prove the job is done', () => {
     await worker.run(task).catch(() => undefined);
 
     // No baseline was possible: the turn had already changed things, so what passes now may be the
-    // work or may always have been true. The checks still run - and the owner is told which kind of
-    // green tick this is.
+    // work or may always have been true. The checks still run and the tick is still earned.
     expect(probe.events.some((entry) => entry.summary.startsWith('Acceptance baseline:'))).toBe(
       false
     );
@@ -3492,10 +3679,20 @@ describe('what would prove the job is done', () => {
       acceptance?: string[];
       verification?: { remainingRisks: string[] };
     };
-    expect(payload.verification?.remainingRisks.join(' ')).toContain(
-      'declared after this turn had already changed things'
+    expect(payload.acceptance).toEqual(['check-1: the importer test passes — exit 0']);
+    /*
+     * What the owner is not told is when the checks were written relative to the work, because that
+     * is a fact about how this box sequences its own steps and not about the job it just finished.
+     * The hold on finish is the only thing that asks for a record and it fires because something has
+     * already changed, so the sentence appeared on very nearly every completed task; the owner read
+     * it and asked what it meant. Matched on the words rather than on a constant, because the fix is
+     * that no wording of it belongs here.
+     */
+    for (const risk of payload.verification?.remainingRisks ?? [])
+      expect(risk).not.toMatch(/written after the work|before it/i);
+    expect(payload.acceptance ?? []).not.toContainEqual(
+      expect.stringMatching(/written after the work/i)
     );
-    expect(payload.acceptance?.[0]).toContain('never saw them fail');
   });
 
   it('will not let a later turn be proven by the checks an earlier one declared', async () => {
@@ -3538,7 +3735,7 @@ describe('what would prove the job is done', () => {
     expect(lastMessage(log, 1)).toContain('an earlier turn declared');
     const completed = probe.events.find((entry) => entry.kind === 'completed');
     const payload = completed?.payload as { verification?: { remainingRisks: string[] } };
-    expect(payload.verification?.remainingRisks.join(' ')).toContain('declared by an earlier turn');
+    expect(payload.verification?.remainingRisks).toContain(ACCEPTANCE_EARLIER_TURN_CAVEAT);
   });
 
   it('will not let a turn cite the promise it made as the proof it kept it', async () => {
@@ -3602,7 +3799,7 @@ describe('how full the window is believed to be', () => {
    * `stream_options.include_usage` is what puts it on the stream, and it is the number the
    * compaction trigger should be reading.
    */
-  const usageFrame = (promptTokens: number): string =>
+  const usageFrame = (promptTokens: number, chars = 120_000): string =>
     [
       `data: ${JSON.stringify({
         choices: [
@@ -3615,7 +3812,7 @@ describe('how full the window is believed to be', () => {
               // thousand tokens raised the threshold and the estimate stopped reaching it. That is
               // the right behaviour and the wrong calibration for a test about which *number* is
               // believed, so the fixture now clears the trigger with room rather than by a hair.
-              content: 'x'.repeat(120_000),
+              content: 'x'.repeat(chars),
               tool_calls: [
                 {
                   index: 0,
@@ -3664,6 +3861,56 @@ describe('how full the window is believed to be', () => {
     // measurement would switch compaction off entirely for every route that omits usage, which is
     // the failure that matters, because it ends in a refused request rather than a wasted one.
     expect(compacted(await run(0))).toBe(true);
+  });
+
+  it('condenses to a share of the same budget the trigger measured', async () => {
+    /*
+     * The two ends were reading different numbers. The check that decides to compact subtracts the
+     * tool catalogue from the window; the target it then aims for did not, so it asked for a
+     * verbatim tail that was a share of a budget nobody was working to. On a 64k model that made
+     * the intended half into 0.725, and the run below shows what that costs: measured here, the old
+     * arithmetic condensed once, freed a fifth of the window, and then never managed to condense
+     * anything again for the rest of the task - each later attempt asking to keep a tail larger
+     * than the conversation and returning nothing, while the trigger went on firing every step. The
+     * same figure at both ends condenses four times and frees nearly twice as much the first time.
+     *
+     * A small window is the case that shows it because the catalogue is a larger share of it; the
+     * fault is the same on every window.
+     */
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([usageFrame(0, 6_000)], log);
+    await new AgentWorker(
+      {
+        ...(probe.store as unknown as Record<string, unknown>),
+        listModels: async () => [{ ...model, contextTokens: 64_000 }]
+      } as unknown as DataStore,
+      config({ TASK_MAX_STEPS: 60 }),
+      masterKey,
+      runnerSecret
+    )
+      .run(task)
+      .catch(() => undefined);
+
+    const compactions = probe.events
+      .filter((entry) => entry.summary.includes('Condensed earlier work'))
+      .map(
+        (entry) =>
+          (
+            entry.payload as {
+              compaction: { estimatedTokensBefore: number; estimatedTokensAfter: number };
+            }
+          ).compaction
+      );
+
+    // It keeps being able to help. One compaction in sixty steps is the shape of the fault, not of
+    // a task that had nothing more to condense.
+    expect(compactions.length).toBeGreaterThanOrEqual(3);
+    const first = compactions[0];
+    expect(first).toBeDefined();
+    // And the first one frees a third of the window rather than a fifth.
+    expect(first!.estimatedTokensAfter).toBeLessThan(first!.estimatedTokensBefore * 0.7);
   });
 });
 
@@ -4160,6 +4407,147 @@ describe('the prompt prefix a follow-up turn re-sends', () => {
       messages.slice(0, goal).some((message) => message.content.startsWith(RUNTIME_CONTEXT_MARKER))
     ).toBe(false);
     expect(messages.at(-1)?.content.startsWith(RUNTIME_CONTEXT_MARKER)).toBe(true);
+  });
+
+  it('renders the skill index in an order that opening a skill cannot change', async () => {
+    /*
+     * The store returns saved skills most-recently-updated first, and viewing one stamps that
+     * column - so the owner opening a skill reordered this block and rewrote the front of the
+     * prompt on their next turn, their own browsing paying the write premium on the whole window
+     * behind it. What is rendered is an index rather than a ranking, and ids are written once and
+     * never rewritten, so ordering by id costs the model nothing it was being told.
+     */
+    const skill = (id: string, name: string): Record<string, unknown> => ({
+      id,
+      enabled: true,
+      status: 'active',
+      pinned: false,
+      documentCiphertext: encryptJson(
+        { name, description: `How to ${name}` },
+        dataKey,
+        `workspace-skill:${workspaceId}`
+      )
+    });
+    const rendered = async (order: Array<Record<string, unknown>>): Promise<string> => {
+      const task = makeTask();
+      const probe = probeStore(() => task);
+      const store = {
+        ...(probe.store as unknown as Record<string, unknown>),
+        listWorkspaceSkills: async () => order
+      } as unknown as DataStore;
+      const log: FetchLog = { calls: [], modelRequests: [] };
+      installFetch([textFrame('Tidied.')], log);
+      await new AgentWorker(store, config(), masterKey, runnerSecret)
+        .run(task)
+        .catch(() => undefined);
+      return (
+        requestMessages(log, 0).find((message) =>
+          message.content.startsWith('CURATED ENCRYPTED KNOWLEDGE')
+        )?.content ?? ''
+      );
+    };
+
+    const drafting = skill('skill-a', 'draft the weekly note');
+    const filing = skill('skill-b', 'file the receipts');
+    const before = await rendered([drafting, filing]);
+    // The owner opens the second one, so the store hands it back first from here on.
+    const after = await rendered([filing, drafting]);
+
+    expect(before).toContain('draft the weekly note');
+    expect(before.indexOf('skill-a')).toBeLessThan(before.indexOf('skill-b'));
+    expect(after).toBe(before);
+  });
+
+  it('leaves the reviewed block where it is when a resume cannot rebuild the memory pack', async () => {
+    /*
+     * The two recalled blocks have a fixed order - what the owner approved, then what recall found -
+     * and the pack's own comment says so. The knowledge block used to be spliced out of the window
+     * and re-inserted at the end of the leading system run, which puts it *after* the pack; the
+     * pack's injector happened to do the same dance a few lines later and put it back, so the two
+     * moves cancelled and nothing showed. They stop cancelling the moment the pack cannot be
+     * rebuilt - a store that is briefly unavailable on a follow-up, which is the one case that path
+     * exists for - and then the two blocks swap for the rest of the task and every cached byte
+     * behind them is written again. Replacing the block where it already sits removes the
+     * dependence on one bug undoing another.
+     */
+    const item = {
+      id: 'memory-item-1',
+      layer: 'item' as const,
+      kind: 'fact' as const,
+      trust: 'stated' as const,
+      status: 'active' as const,
+      observedAt: '2026-06-01T00:00:00.000Z',
+      validFrom: '2026-06-01T00:00:00.000Z',
+      validTo: null,
+      subjectKey: null,
+      predicate: null,
+      tokensEst: 20,
+      score: 1,
+      documentCiphertext: encryptJson(
+        { title: 'Where notes live', body: 'Notes live under workspace/notes' },
+        dataKey,
+        memoryItemAad(workspaceId)
+      )
+    };
+    let packRecord: Record<string, unknown> | null = null;
+    let packReadable = true;
+    let task = makeTask();
+    const probe = probeStore(() => task);
+    const store = {
+      ...(probe.store as unknown as Record<string, unknown>),
+      getMemoryPack: async () => {
+        if (!packReadable) throw new Error('memory store unavailable');
+        return packRecord;
+      },
+      recallMemoryCandidates: async () => [item],
+      saveMemoryPack: async (input: Record<string, unknown>) => {
+        packRecord = {
+          ...input,
+          itemIds: [...(input.itemIds as string[])],
+          createdAt: '2026-07-01T00:00:00.000Z'
+        };
+        return packRecord;
+      }
+    } as unknown as DataStore;
+
+    const first: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Tidied.')], first);
+    await new AgentWorker(store, config(), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const opening = requestMessages(first, 0);
+    const knowledgeAt = opening.findIndex((message) =>
+      message.content.startsWith('CURATED ENCRYPTED KNOWLEDGE')
+    );
+    const packAt = opening.findIndex((message) => message.content.startsWith(MEMORY_PACK_MARKER));
+    // Vacuous unless both blocks are actually there and in that order.
+    expect(knowledgeAt).toBeGreaterThan(0);
+    expect(packAt).toBe(knowledgeAt + 1);
+
+    packReadable = false;
+    const saved = decryptCheckpoints(probe.checkpoints).at(-1);
+    task = makeTask(
+      startTurnState(saved as unknown as Record<string, unknown>, {
+        prompt: 'Now archive last year’s notes too',
+        turn: 1,
+        reservationKey: 'reservation-2'
+      })
+    );
+    const second: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Archived.')], second);
+    await new AgentWorker(store, config(), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const resumed = requestMessages(second, 0);
+    expect(
+      resumed.findIndex((message) => message.content.startsWith('CURATED ENCRYPTED KNOWLEDGE'))
+    ).toBe(knowledgeAt);
+    expect(resumed.findIndex((message) => message.content.startsWith(MEMORY_PACK_MARKER))).toBe(
+      packAt
+    );
+    expect(sharedPrefix(opening, resumed)).toBeGreaterThan(packAt);
   });
 
   it('ranks the curated knowledge block once, so a follow-up does not reshuffle it', async () => {

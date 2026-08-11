@@ -1,7 +1,7 @@
 import { acceptanceAcceptedResult } from './acceptance.js';
 import { ACCEPTANCE_MARKER } from './agent.js';
 import { describe, expect, it } from 'vitest';
-import type { ModelMessage } from '@athanor/model-gateway';
+import { seedModels, type ModelMessage } from '@athanor/model-gateway';
 import {
   appendBriefSection,
   BASE_PROMPT_MARKER,
@@ -18,6 +18,9 @@ import {
   estimatedContextTokens,
   markCacheBreakpoints,
   COMPACTION_TRIGGER_SHARE,
+  COMPACTION_TRIGGER_TOKENS,
+  compactionTargetTail,
+  compactionTrigger,
   contextShortfall,
   MINIMUM_WORKING_TOKENS,
   modelInputBudget,
@@ -1373,5 +1376,180 @@ describe('what a truncated tool result tells the model', () => {
     expect(cut).toContain('run the tool again for just the part you need');
     // And no longer points at somewhere the model cannot look.
     expect(cut).not.toContain('encrypted task event');
+  });
+});
+
+describe('what it costs to move the tool-output floor', () => {
+  const step = (index: number, size: number): ModelMessage[] => [
+    {
+      role: 'assistant',
+      content: `step ${index}`,
+      toolCalls: [{ id: `c${index}`, name: 'parallel_web_read', arguments: { urls: ['x'] } }]
+    },
+    {
+      role: 'tool',
+      toolCallId: `c${index}`,
+      content: `HEAD${index} ${'z'.repeat(size)}MIDDLE${'y'.repeat(size)} TAIL${index}`
+    }
+  ];
+  /**
+   * The shape that shows the fault: ten large reads that put the window past the squeeze's start
+   * line and stay near the front of it, then a run of ordinary steps. The large results are what
+   * every floor change re-cuts, and they sit inside the prefix the provider has already cached.
+   */
+  const growing = (steps: number): ModelMessage[] => [
+    { role: 'system', content: `contract ${filler(3_000)}` },
+    { role: 'user', content: 'Read every page on this list and tell me where they disagree.' },
+    ...Array.from({ length: 10 }, (_, index) => step(index, 20_000)).flat(),
+    ...Array.from({ length: steps }, (_, index) => step(10 + index, 6_000)).flat()
+  ];
+  /** Everything the provider hashes, minus the advisory hint, which moves without moving bytes. */
+  const bytes = (messages: ModelMessage[]): string =>
+    JSON.stringify(messages.map(({ cacheBreakpoint: _ignored, ...rest }) => rest));
+  const deepestBreakpoint = (messages: ModelMessage[]): number =>
+    messages.reduce((found, message, index) => (message.cacheBreakpoint ? index : found), -1);
+
+  it('holds a floor the curve has barely moved away from', () => {
+    // The curve is read at a 1,000-character resolution, so one arriving tool result was enough to
+    // pick a new floor - and a new floor re-cuts every older result at once, ahead of every
+    // breakpoint. A quarter is what a move has to be worth before it is taken.
+    const budget = modelInputBudget(1_000_000, 16_384);
+    const applied = olderToolOutputChars(budget * 0.1, budget);
+    expect(applied).toBe(24_000);
+    // 1,000 characters of curve below the applied floor: the old rule stepped, this one does not.
+    expect(olderToolOutputChars(85_000, budget, applied)).toBe(24_000);
+    expect(olderToolOutputChars(105_000, budget, applied)).toBe(24_000);
+    // A quarter off, and it follows the curve down to wherever the curve actually is.
+    const moved = olderToolOutputChars(112_000, budget, applied);
+    expect(moved).toBeLessThanOrEqual(18_000);
+    expect(moved).toBeGreaterThan(2_000);
+  });
+
+  it('still reaches the hard floor on a window that genuinely fills', () => {
+    // Lagging must not become never arriving: walk the whole ramp the way the agent loop does.
+    const budget = modelInputBudget(1_000_000, 16_384);
+    let floor = 24_000;
+    for (let tokens = 80_000; tokens <= 200_000; tokens += 1_000)
+      floor = olderToolOutputChars(tokens, budget, floor);
+    expect(floor).toBe(2_000);
+  });
+
+  it('reaches the hard floor from every floor a task could resume carrying', () => {
+    /*
+     * The rule is one-way and the floor is persisted per task, so a task resumed after any change
+     * to how the curve is read arrives here carrying a number this run did not choose. Reaching the
+     * hard floor from a round number is the ordinary case and is covered above; reaching it from an
+     * unround one is the case that has no reason to work. It does not by arithmetic - a quarter off
+     * 2,500 is 1,875, which is under the hard floor, so the band alone refuses the only move left
+     * and the task keeps that floor for the rest of its life.
+     */
+    const budget = modelInputBudget(1_000_000, 16_384);
+    for (const carried of [24_000, 9_000, 3_000, 2_667, 2_666, 2_500, 2_100, 2_001]) {
+      let floor = carried;
+      for (let step = 0; step < 8; step += 1) floor = olderToolOutputChars(500_000, budget, floor);
+      expect(floor).toBe(2_000);
+    }
+  });
+
+  it('leaves the cached prefix alone across the steps of a growing window', () => {
+    // Everything in this run is an append except the floor, so the floor is the only thing that can
+    // move a byte the previous request had already cached. Measured over these thirty-two steps: the
+    // 1,000-character step-down rewrote the prefix on 16 of them and held a mean floor of 9,250
+    // characters; holding until the curve asks for a quarter off rewrites 6 and holds 10,281. Fewer
+    // rewrites and more of each result kept are the same effect - the rewrites were what the extra
+    // truncation was buying.
+    let floor: number | undefined;
+    let previous: { bytes: string; through: number } | null = null;
+    let rewrites = 0;
+    const floors: number[] = [];
+    for (let steps = 0; steps <= 31; steps += 1) {
+      const prepared = prepareModelContext(growing(steps), 1_000_000, 16_384, {
+        precedingTokens: 5_500,
+        ...(floor === undefined ? {} : { toolOutputFloor: floor })
+      });
+      floor = prepared.olderToolOutputChars;
+      floors.push(floor);
+      const through = deepestBreakpoint(prepared.messages);
+      expect(through).toBeGreaterThan(0);
+      if (previous && bytes(prepared.messages.slice(0, previous.through + 1)) !== previous.bytes)
+        rewrites += 1;
+      previous = { bytes: bytes(prepared.messages.slice(0, through + 1)), through };
+    }
+    expect(rewrites).toBeLessThanOrEqual(8);
+    // A real descent, not a run that simply never squeezed: it starts high and ends on the floor.
+    expect(floors[0]).toBeGreaterThan(9_000);
+    expect(floors.at(-1)).toBe(2_000);
+    // And it kept more than the smooth curve did on the way down, which is the point of lagging.
+    expect(floors.reduce((sum, value) => sum + value, 0) / floors.length).toBeGreaterThan(9_250);
+  });
+
+  it('prepares the same window into the same bytes twice', () => {
+    // The prefix comparison above is only evidence if preparation is deterministic to begin with.
+    const first = prepareModelContext(growing(20), 1_000_000, 16_384, {
+      precedingTokens: 5_500,
+      toolOutputFloor: 9_000
+    });
+    const second = prepareModelContext(growing(20), 1_000_000, 16_384, {
+      precedingTokens: 5_500,
+      toolOutputFloor: 9_000
+    });
+    expect(bytes(second.messages)).toBe(bytes(first.messages));
+    expect(deepestBreakpoint(second.messages)).toBe(deepestBreakpoint(first.messages));
+  });
+});
+
+describe('when the window is condensed instead of truncated', () => {
+  it('always aims at a tail worth half the size that set the compaction off', () => {
+    // The gap between trigger and target is what buys byte-identical steps between rewrites, and it
+    // was being measured against two different budgets - the trigger counted the tool catalogue, the
+    // target did not. That turned the intended halving into 0.716 on a 64,000-token window, and on a
+    // 32,000-token one into 1.900: a target ABOVE its own trigger, asking a compaction to free the
+    // window down to a size larger than the one that set it off. The ratio is the property; the
+    // shares either side of it are free to be retuned.
+    const windows = [
+      ...new Set([...seedModels().map((model) => model.contextTokens), 32_000, 64_000, 200_000])
+    ];
+    expect(windows.length).toBeGreaterThan(3);
+    for (const contextTokens of windows) {
+      const maxOutputTokens = Math.min(16_384, Math.max(2_048, Math.floor(contextTokens * 0.2)));
+      for (const reservedTokens of [0, 13_423, 24_000]) {
+        const budget = modelInputBudget(contextTokens, maxOutputTokens, reservedTokens);
+        expect(compactionTargetTail(budget) * 2).toBeLessThanOrEqual(compactionTrigger(budget));
+        expect(compactionTargetTail(budget)).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('condenses on a window large enough that a share of it never would', () => {
+    // A pure share says a million-token model may carry 673,535 tokens before anything is condensed,
+    // which no task reaches inside the 120 steps a turn is allowed - so on both shipped defaults the
+    // window was held down entirely by cutting the middle out of tool results, and the mechanism
+    // built for it never ran. The anchor sits above the tool-output squeeze's own start line, so the
+    // cheap mechanism still goes first.
+    const budget = modelInputBudget(1_000_000, 16_384);
+    expect(compactionTrigger(budget)).toBe(COMPACTION_TRIGGER_TOKENS);
+    expect(compactionTrigger(budget)).toBeGreaterThan(80_000);
+    // A small window is still governed by its share, not by the anchor.
+    const small = modelInputBudget(131_072, 16_384);
+    expect(compactionTrigger(small)).toBe(small * COMPACTION_TRIGGER_SHARE);
+    // And the vision release between them is not small: the anchor binds wherever the budget is
+    // over 171,429 tokens, which is three of the four shipped windows rather than the two everyone
+    // reaches for. Pinned so that a change to the anchor has to state which models it moves.
+    const vision = modelInputBudget(262_144, 16_384, 13_423);
+    expect(vision * COMPACTION_TRIGGER_SHARE).toBeGreaterThan(COMPACTION_TRIGGER_TOKENS);
+    expect(compactionTrigger(vision)).toBe(COMPACTION_TRIGGER_TOKENS);
+    expect(compactionTargetTail(vision)).toBe(60_000);
+  });
+});
+
+describe('what the running brief has to carry forward', () => {
+  it('asks for the answers the owner already gave', () => {
+    // The signed grant survives a compaction; the model's memory that the owner already said yes or
+    // no to publishing to a given host does not, so it asked again for something already settled.
+    const prompt = compactionRequest({ brief: 'so far', transcript: 'turns' })
+      .map((message) => message.content)
+      .join('\n');
+    expect(prompt).toContain('approved or refused');
+    expect(prompt).toContain('never ask twice');
   });
 });

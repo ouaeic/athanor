@@ -10,7 +10,20 @@
 import type { Expectation, Fixture, HoldName, RunOutcome } from './harness.js';
 
 export interface Baseline {
-  readonly [id: string]: { readonly modelCalls: number; readonly promptTokens: number };
+  readonly [id: string]: {
+    readonly modelCalls: number;
+    readonly promptTokens: number;
+    /**
+     * The mean share of a request that repeated the one before it, byte for byte.
+     *
+     * Committed alongside the step count because it is the other half of what a long task costs,
+     * and the half nothing here could previously see. A cached prefix is billed at a fraction of a
+     * written one, so a change that leaves the step count alone and drops this number twenty points
+     * has made every long turn dearer - which is exactly what a floor that re-cut the middle out of
+     * every older tool result on an ordinary step did, unnoticed, for the whole life of the product.
+     */
+    readonly cachePrefix?: number;
+  };
 }
 
 export interface Result {
@@ -38,6 +51,39 @@ export const check = (expect: Expectation, outcome: RunOutcome): string[] => {
   compare('untrusted content recorded', expect.untrusted, outcome.untrusted);
   compare('replies to the owner', expect.replies, outcome.replies);
   compare('commands run in the workspace', expect.commandsRun, outcome.commandsRun);
+  compare('media generations charged for', expect.mediaGenerated, outcome.mediaGenerated);
+  compare(
+    'the closing request offered the same catalogue as the step before it',
+    expect.finalCatalogueUnchanged,
+    outcome.finalCatalogueUnchanged
+  );
+  compare('the owner’s own words survived', expect.ownerMessageIntact, outcome.ownerMessageIntact);
+  if (expect.mediaModels && !same(expect.mediaModels, outcome.mediaModels))
+    failures.push(
+      `media models asked of the provider: expected [${expect.mediaModels.join(', ')}], got [${outcome.mediaModels.join(', ')}]`
+    );
+  if (expect.minCachePrefix !== undefined && outcome.cachePrefix < expect.minCachePrefix)
+    failures.push(
+      `cached prefix: expected at least ${expect.minCachePrefix}% of each request to repeat the one before it, got ${outcome.cachePrefix}%`
+    );
+  if (expect.minCompactions !== undefined && outcome.compactions < expect.minCompactions)
+    failures.push(
+      `compactions: expected at least ${expect.minCompactions}, got ${outcome.compactions}`
+    );
+  if (expect.minBriefSections !== undefined && outcome.briefSections < expect.minBriefSections)
+    failures.push(
+      `sections in the running brief: expected at least ${expect.minBriefSections}, got ${outcome.briefSections}`
+    );
+  // Nothing squeezed is not a failure: the claim is that no result was cut all the way down, and a
+  // window that never had to cut one has not cut one down.
+  if (
+    expect.minToolResultFloor !== undefined &&
+    outcome.toolResultFloor > 0 &&
+    outcome.toolResultFloor < expect.minToolResultFloor
+  )
+    failures.push(
+      `the smallest squeezed tool result: expected at least ${expect.minToolResultFloor} characters, got ${outcome.toolResultFloor}`
+    );
   if (expect.tools && !same(expect.tools, outcome.tools))
     failures.push(
       `tools: expected [${expect.tools.join(', ')}], got [${outcome.tools.join(', ')}]`
@@ -76,6 +122,7 @@ const row = (result: Result, baseline: Baseline, width: number): string => {
   const before = baseline[result.fixture.id];
   const steps = drift(result.outcome.modelCalls, before?.modelCalls);
   const tokens = drift(result.outcome.promptTokens, before?.promptTokens);
+  const cached = drift(result.outcome.cachePrefix, before?.cachePrefix);
   return [
     result.failures.length ? 'FAIL' : ' ok ',
     pad(result.fixture.id, width),
@@ -84,6 +131,10 @@ const row = (result: Result, baseline: Baseline, width: number): string => {
     padStart(steps, 5),
     padStart(String(result.outcome.promptTokens), 8),
     padStart(tokens, 8),
+    // A single-call turn has no previous request, so there is nothing a cache could have read back
+    // and no share to report - which is not the same statement as nought per cent.
+    padStart(result.outcome.modelCalls > 1 ? `${result.outcome.cachePrefix}%` : '-', 6),
+    padStart(result.outcome.modelCalls > 1 ? cached : '', 5),
     result.outcome.holds.join(' ')
   ].join(' ');
 };
@@ -98,7 +149,8 @@ const HOLD_ORDER: readonly HoldName[] = [
   'baseline_refused',
   'repetition_stopped',
   'output_limit_continued',
-  'step_budget'
+  'step_budget',
+  'idle_break'
 ];
 
 export const render = (results: readonly Result[], baseline: Baseline): string => {
@@ -117,10 +169,10 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
 
   lines.push('');
   lines.push(
-    `     ${pad('fixture', width)} ${pad('shape', 10)} ${padStart('steps', 5)} ${padStart('Δ', 5)} ${padStart('tokens', 8)} ${padStart('Δ', 8)} holds`
+    `     ${pad('fixture', width)} ${pad('shape', 10)} ${padStart('steps', 5)} ${padStart('Δ', 5)} ${padStart('tokens', 8)} ${padStart('Δ', 8)} ${padStart('cached', 6)} ${padStart('Δ', 5)} holds`
   );
   lines.push(
-    `     ${'-'.repeat(width)} ${'-'.repeat(10)} ${'-'.repeat(5)} ${'-'.repeat(5)} ${'-'.repeat(8)} ${'-'.repeat(8)} -----`
+    `     ${'-'.repeat(width)} ${'-'.repeat(10)} ${'-'.repeat(5)} ${'-'.repeat(5)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(6)} ${'-'.repeat(5)} -----`
   );
   for (const result of results) lines.push(row(result, baseline, width));
 
@@ -164,6 +216,17 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
       beforeSteps ? ` (baseline ${beforeSteps})` : ''
     }, ${tokens} estimated prompt tokens, the largest single prompt ${peak}.`
   );
+  // Averaged over the turns that had a previous request to repeat, because a one-call turn has no
+  // opinion about caching and averaging its nought in would make the suite look worse the more
+  // cheap fixtures it grew.
+  const repeatable = results.filter((result) => result.outcome.modelCalls > 1);
+  if (repeatable.length)
+    lines.push(
+      `Across the ${repeatable.length} turns of more than one call, a mean ${Math.round(
+        repeatable.reduce((total, result) => total + result.outcome.cachePrefix, 0) /
+          repeatable.length
+      )}% of each request repeated the one before it byte for byte, which is the ceiling on what a prefix cache could read back.`
+    );
   if (failed.length)
     lines.push(`${failed.length} fixture${failed.length === 1 ? '' : 's'} failed.`);
   lines.push('');
@@ -176,6 +239,10 @@ export const baselineFrom = (results: readonly Result[]): Baseline =>
       .sort((left, right) => left.fixture.id.localeCompare(right.fixture.id))
       .map((result) => [
         result.fixture.id,
-        { modelCalls: result.outcome.modelCalls, promptTokens: result.outcome.promptTokens }
+        {
+          modelCalls: result.outcome.modelCalls,
+          promptTokens: result.outcome.promptTokens,
+          cachePrefix: result.outcome.cachePrefix
+        }
       ])
   );

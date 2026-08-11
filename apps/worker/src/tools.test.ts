@@ -14,7 +14,24 @@ import {
 } from './tools.js';
 import { MAX_NOTICES_PER_TURN } from './agent.js';
 import { COMPACT_CONTEXT_TOOL } from './context.js';
-import { managedMediaCatalog } from './media.js';
+import { managedMediaCatalog, resolvedMediaModel } from './media.js';
+import type { MediaModelOption } from '@athanor/contracts';
+
+/** A stored media route, as the API seals one into the credential this worker decrypts. */
+const mediaOption = (
+  overrides: Partial<MediaModelOption> & Pick<MediaModelOption, 'id'>
+): MediaModelOption => ({
+  providerModelId: overrides.id,
+  displayName: overrides.id,
+  provider: 'openrouter',
+  modality: 'image',
+  usdPerImage: null,
+  usdPerMillionCharacters: null,
+  priceSource: 'provider',
+  recommendationTags: [],
+  updatedAt: '2026-08-10T00:00:00.000Z',
+  ...overrides
+});
 import { SKILL_BUDGET } from './skills.js';
 
 describe('agent approval policy', () => {
@@ -950,6 +967,68 @@ describe('the catalogue as the model reads it', () => {
         mediaCommittedUsd: 0.3
       })?.sideEffect
     ).toBe('external_reversible');
+  });
+
+  it('prices the generation against the model the owner actually chose', () => {
+    // The two ids in the manifest used to be the whole of the answer in both the pricer and the
+    // dispatch arm, so an owner who picked a route ten times the price still read the default's
+    // figure on the card they were about to approve.
+    const image = { kind: 'image', prompt: 'A logo', width: 1000, height: 1000 };
+    const expensive = resolvedMediaModel('image', {
+      image: mediaOption({
+        id: 'openrouter/studio/canvas-1',
+        displayName: 'Canvas 1',
+        usdPerImage: 0.4
+      })
+    });
+    const card = approvalRequirement('generate_media', image, 'balanced', {
+      mediaModel: expensive
+    });
+    expect(card?.preview).toContain('Canvas 1');
+    expect(card?.preview).toContain('$0.400');
+  });
+
+  it('asks every time for a route whose price the provider never published', () => {
+    const unpriced = resolvedMediaModel('image', {
+      image: mediaOption({ id: 'openrouter/studio/quiet-1', priceSource: 'unknown' })
+    });
+    expect(unpriced.priceKnown).toBe(false);
+    // A cumulative threshold cannot govern a number nobody stated, and comparing it against an
+    // invented one is how spend approval stops meaning anything. So the card is raised on the first
+    // generation rather than on the eighteenth.
+    const card = approvalRequirement(
+      'generate_media',
+      { kind: 'image', prompt: 'A logo', width: 1000, height: 1000 },
+      'balanced',
+      { mediaModel: unpriced, mediaCommittedUsd: 0 }
+    );
+    expect(card?.sideEffect).toBe('external_reversible');
+    expect(card?.preview).toContain('publishes no price');
+  });
+
+  it('speaks with the chosen route’s own voice, and with none when it names none', () => {
+    // The voice was a constant belonging to one specific speech model. The moment the model became
+    // the owner's choice, sending it to any other route would have asked for a voice from a
+    // different model's list.
+    expect(resolvedMediaModel('audio').voice).toBe('af_heart');
+    expect(
+      resolvedMediaModel('audio', {
+        audio: mediaOption({
+          id: 'openrouter/studio/speaker-1',
+          modality: 'audio',
+          usdPerMillionCharacters: 1
+        })
+      }).voice
+    ).toBeUndefined();
+  });
+
+  it('will not price one modality against a route stored for the other', () => {
+    // A speech route standing in for an image would be priced per million characters against a
+    // request measured in pixels, and the owner would first see it on an invoice.
+    const crossed = resolvedMediaModel('image', {
+      image: mediaOption({ id: 'openrouter/studio/speaker-1', modality: 'audio' })
+    });
+    expect(crossed.modelId).toBe(managedMediaCatalog.image.modelId);
   });
 
   it('never describes the computer as somebody else’s', () => {

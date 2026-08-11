@@ -29,6 +29,13 @@ export const BASE_PROMPT_MARKER = '# athanor operating contract';
  * web-form-filling procedure, which is opened when a form is actually in front of the model; the
  * one thing in it that was a safety property rather than a sequence - never fill a gap in the
  * user's own record with something plausible - is now stated once, generally, in the safety floor.
+ *
+ * Where deliberation goes qualifies under the same rule, and it is not choreography: no tool result
+ * tells the model that this harness publishes the content channel to the user and folds the
+ * reasoning channel away. Without the line it wrote its working-out into content, which the owner's
+ * transcript promotes as the answer - measured on one live task at 1,015 streamed content frames
+ * against 29 reasoning frames, for five actual replies. 279 characters, paid once per step behind
+ * the cache anchor.
  */
 export const BASE_SYSTEM_PROMPT = `${BASE_PROMPT_MARKER}
 
@@ -67,6 +74,7 @@ You operate the user's persistent, private Linux server computer. Their current 
 
 ## Your response
 - Your streamed reply is the answer the user reads, and the only place the substance belongs. Write it to their standard: lead with the answer, do not restate the request, do not narrate what you are about to do, and never re-print the plan.
+- Working out - options weighed, what to try next, talking yourself through it - goes in the reasoning channel, or nowhere. Everything in the content channel is published to the user as that reply, so between tool calls write there only when you have something for them to read.
 - Publish finished files, screenshots, and media so they arrive beside that answer. Use a private preview for a working demo unless the user explicitly asks for public deployment.
 
 ## How to finish
@@ -314,6 +322,38 @@ const OLDER_TOOL_OUTPUT_CHARS = 2_000;
 const TOOL_OUTPUT_SQUEEZE_START_TOKENS = 80_000;
 const TOOL_OUTPUT_SQUEEZE_FLOOR_TOKENS = 192_000;
 const TOOL_OUTPUT_SQUEEZE_SHARE = 0.5;
+/**
+ * How far the curve above must fall below the floor already in force before that floor is allowed
+ * to follow it down.
+ *
+ * Everything the paragraphs above say about where the squeeze starts and where it lands is still
+ * true; what was wrong was how often it moved on the way between them. The curve was followed at a
+ * 1,000-character resolution, so an ordinary step - one tool result arriving - was enough to pick a
+ * new floor, and a new floor re-cuts the middle out of every older tool result at once. Those bytes
+ * sit near the front of the window, ahead of every cache breakpoint, so each move re-bills the
+ * whole prompt at the write premium instead of reading it back.
+ *
+ * Measured on a sixty-step task against this function and prepareModelContext: the floor took 17
+ * distinct values on a 1,000,000-token model and 18 on a 200,000-token one, and the byte-common
+ * prefix with the previous request came to 62.9% of input where 93.0% was reachable, with 18 of 59
+ * steps sharing under half their bytes with the step before. Holding the floor until the curve asks
+ * for a quarter off leaves 6 moves and 77.2% on the million-token model, and 7 moves and 74.1% on
+ * the 200,000-token one - more than half of the gap recovered, and sub-half-prefix steps down from
+ * 18 to 7.
+ *
+ * What it costs is that the floor now lags the curve rather than tracking it, so between moves each
+ * older result is kept LONGER than the smooth answer would keep it: the mean floor across the same
+ * sixty steps rises from 14,017 to 14,633 characters. More content retained and roughly a third as
+ * many rewrites are the same effect, not a trade - the rewrites were what the extra truncation was
+ * buying, and it was buying them at the price of the whole prompt.
+ *
+ * Lagging cannot overrun the budget, because the pass at the end of prepareModelContext still cuts
+ * every non-newest tool result to OLDER_TOOL_OUTPUT_CHARS unconditionally whenever the prepared
+ * window is over. A band held too high degrades into that pass; it does not produce a refused
+ * request. Bands from 0.85 to 0.6 were swept and all of them still reached the 2,000-3,000
+ * character floor on every window size.
+ */
+const TOOL_OUTPUT_FLOOR_STEP = 0.75;
 
 export const olderToolOutputChars = (
   estimatedTokens: number,
@@ -327,10 +367,17 @@ export const olderToolOutputChars = (
   const scaled =
     RECENT_TOOL_OUTPUT_CHARS -
     (RECENT_TOOL_OUTPUT_CHARS - OLDER_TOOL_OUTPUT_CHARS) * Math.min(1, Math.max(0, pressure));
-  return Math.max(
-    OLDER_TOOL_OUTPUT_CHARS,
-    Math.min(appliedFloor, Math.round(scaled / 1_000) * 1_000)
-  );
+  const wanted = Math.max(OLDER_TOOL_OUTPUT_CHARS, Math.round(scaled / 1_000) * 1_000);
+  if (wanted >= appliedFloor) return appliedFloor;
+  // The hard floor is never worth holding out against: it is where every descent ends, so a band
+  // that refuses the last rung is a band that never arrives. Without this the rule is only total
+  // because of an accident of arithmetic - the curve is read in thousands, so an applied floor is
+  // always a multiple of a thousand, and 2,000 is the only one from which a quarter off is not a
+  // move worth taking. Any floor a task carried in between 2,000 and 2,667 would hold there
+  // forever, which is a trap laid for whoever next changes that resolution.
+  if (wanted > OLDER_TOOL_OUTPUT_CHARS && wanted > appliedFloor * TOOL_OUTPUT_FLOOR_STEP)
+    return appliedFloor;
+  return wanted;
 };
 /** The same for tool-call arguments once a call is no longer recent. */
 const COMPACTED_TOOL_ARGUMENT_CHARS = 4_000;
@@ -436,6 +483,40 @@ const trajectorySummary = (messages: ModelMessage[], indexes: number[]): string 
  */
 export const COMPACTION_TRIGGER_SHARE = 0.7;
 export const COMPACTION_TARGET_SHARE = 0.35;
+/**
+ * The ceiling the trigger is held under however large the window is.
+ *
+ * A share on its own says a million-token model may carry 673,535 tokens of live conversation
+ * before anything is condensed, and no task reaches that inside the 120 steps a turn is allowed -
+ * so on both shipped default models compaction never fires at all, and the window is held down
+ * entirely by cutting the middle out of tool results. Worse, the target computed from the same
+ * share asks for a verbatim tail of 341,465 tokens, which is larger than the whole conversation,
+ * so planCompaction finds nothing to condense even when it is called: the mechanism is not merely
+ * unused on those models, it cannot run.
+ *
+ * 120,000 rather than something smaller because it sits above TOOL_OUTPUT_SQUEEZE_START_TOKENS.
+ * The cheap mechanism gets to run first on every task, and compaction - which costs a model call
+ * and rewrites the prompt - stays the rare second resort rather than firing every few steps.
+ *
+ * Which models this actually moves, since "the two big defaults" is the wrong answer and reading it
+ * as the right one is how the next change to this number gets mis-sized: the anchor binds wherever
+ * the input budget is over 171,429 tokens, because that is where a 0.7 share first reaches 120,000.
+ * Of the shipped catalogue that is the two million-token releases AND the 262,144-token vision
+ * model, whose trigger moves from 157,036 to 120,000 and whose target moves from 78,517 to 60,000.
+ * The 131,072-token release and everything under it are untouched, to the token, in both numbers.
+ *
+ * Both numbers are read through the two helpers below so that they cannot drift apart again. The
+ * trigger was measured against a budget that subtracted the tool catalogue and the target against
+ * one that did not, which turned the deliberate halving into 0.716 on a 64,000-token window and
+ * into 1.900 on a 32,000-token one - a target ABOVE its own trigger, asking a compaction to free
+ * the window down to a size larger than the one that set it off. Deriving the target from the
+ * trigger makes the ratio hold whatever budget either is handed.
+ */
+export const COMPACTION_TRIGGER_TOKENS = 120_000;
+export const compactionTrigger = (inputBudget: number): number =>
+  Math.min(COMPACTION_TRIGGER_TOKENS, inputBudget * COMPACTION_TRIGGER_SHARE);
+export const compactionTargetTail = (inputBudget: number): number =>
+  Math.floor(compactionTrigger(inputBudget) * (COMPACTION_TARGET_SHARE / COMPACTION_TRIGGER_SHARE));
 /** Never condense so far forward that the model loses the turns it is actively working through. */
 export const MIN_PROTECTED_TAIL_MESSAGES = 8;
 /** Below this a compaction costs a model call and a cache rewrite without freeing useful room. */
@@ -885,6 +966,7 @@ Preserve, in compact prose or short bullets:
 - decisions taken and the reason for them, including approaches that were tried and rejected;
 - exact identifiers worth reusing: file paths, commands, URLs, ports, process and session ids, error text;
 - what was actually verified against a tool result, kept separate from what was only assumed;
+- what the user approved or refused, and exactly what the answer covered, so you never ask twice;
 - unresolved failures and known-wrong state.
 
 Drop routine narration, superseded intermediate output and anything reconstructible from the workspace.

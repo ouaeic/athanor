@@ -926,6 +926,19 @@ export interface TaskSignals {
   /** Tokens of transcript, files or tool output the model has to read alongside the prompt. */
   readonly attachedContextTokens?: number;
   readonly interactive?: boolean;
+  /**
+   * Whether the turn is being handed a tool catalogue and a computer.
+   *
+   * It gates the conversation profile, and it has to, because `interactive` on its own measures the
+   * length of the request rather than the size of the work. Measured: "Generate a cartoon logo, cut
+   * the background out cleanly, produce several sizes and a contact sheet" is ninety-eight
+   * characters, and on the short-prompt rule alone it classified as `conversation` - the profile
+   * that weights latency at 0.45 and quality at 0.25 against a 16K reference window. What that
+   * sentence actually asked for was image maths, a script, several runs of it and a montage, on a
+   * window that reached 37,000 tokens. A short imperative typed at a machine that can act is not a
+   * chat, and no reading of the words was ever going to say so.
+   */
+  readonly usesTools?: boolean;
   /** Set when the caller is the system talking to itself rather than the owner. */
   readonly internalPurpose?: 'summarisation' | 'classification' | 'extraction';
 }
@@ -999,9 +1012,155 @@ export const classifyModelTask = (signals: TaskSignals): TaskClassification => {
     return { kind: 'reasoning', signals: ['The prompt asks for a derivation or a judgement'] };
   if (agenticPattern.test(prompt))
     return { kind: 'agentic', signals: ['The prompt asks for multi-step work with tools'] };
-  if (signals.interactive === true && prompt.trim().length <= CONVERSATION_PROMPT_CHARS)
-    return { kind: 'conversation', signals: ['Short prompt in a live conversation'] };
+  if (
+    signals.interactive === true &&
+    signals.usesTools !== true &&
+    prompt.trim().length <= CONVERSATION_PROMPT_CHARS
+  )
+    return {
+      kind: 'conversation',
+      signals: ['Short prompt in a live conversation, with no tools']
+    };
   return { kind: 'general', signals: ['No specialised signal; treated as general work'] };
+};
+
+/**
+ * Why this model cannot do this work, in the terms the request was made in. Empty means it can.
+ *
+ * `meetsRequirements` answers the same question with a boolean, which is all a filter needs and
+ * nothing an owner can act on. The sentences are the same clauses, in the same order, said once.
+ */
+export const unmetRequirements = (model: RoutableModel, request: ModelRequest): string[] => {
+  const missing: string[] = [];
+  if (model.availability !== 'available')
+    missing.push(`the provider lists it as ${model.availability}`);
+  if (model.providerAvailable === false) missing.push('its provider is not answering');
+  if (!model.commercialUse) missing.push('its licence has not been cleared');
+  if (model.metadataSource === 'unknown') missing.push('nothing is known about this endpoint');
+  if (!isPrivacyRouteEligible(model, request.privacyRoute))
+    missing.push(
+      request.privacyRoute === 'provider_zdr'
+        ? 'it has no verified zero-retention route'
+        : 'it is not on this privacy route'
+    );
+  if (model.contextTokens < request.minContextTokens)
+    missing.push(
+      `${formatTokens(model.contextTokens)} context for ${formatTokens(request.minContextTokens)} of work`
+    );
+  for (const capability of request.requiredCapabilities)
+    if (!model.capabilities.includes(capability)) missing.push(`no ${capability}`);
+  for (const modality of request.requiredModalities)
+    if (!model.modalities.includes(modality)) missing.push(`it cannot read ${modality}`);
+  return missing;
+};
+
+/**
+ * How far down the ranking the model in use has to sit before the gap is worth a line. Third place
+ * on a catalogue of hundreds is the router disagreeing with itself, not a bad choice.
+ */
+const FIT_RANK_FLOOR = 4;
+
+/**
+ * And how much blended score has to separate it from the leader. Both have to be true: a wide gap
+ * between first and second is a strong leader, not a poor pick, and rank alone is noise.
+ */
+const FIT_SCORE_GAP = 0.12;
+
+export interface ModelFit {
+  /** The shape of work the request was read as, and the observations that produced it. */
+  readonly classification: TaskClassification;
+  /** Where the model in use placed, 1-based. Null when it was not rankable for this work at all. */
+  readonly rank: number | null;
+  readonly ranked: number;
+  /** What it cannot do for this work. Empty when it can, and the whole answer when it cannot. */
+  readonly missing: readonly string[];
+  /** What leads instead, or null when the model in use already does. */
+  readonly leader: RoutableModel | null;
+  /** One line for the transcript, or null when the fit is fine and nothing needs saying. */
+  readonly headline: string | null;
+  /** The benchmark behind the line, which is the part worth reading twice. Empty when silent. */
+  readonly detail: string;
+}
+
+/**
+ * Whether the model about to answer suits the work in front of it.
+ *
+ * `rankModels` short-circuits a named model to a score of 1 and the reason "Explicitly selected by
+ * the user" - correct, because the owner's pick is not athanor's to overrule, and the reason
+ * nothing anywhere compares the model in use against the one the router would have reached for. A
+ * fast route pointed at precise multi-step work degenerates quietly: it costs almost nothing per
+ * call, so no ceiling fires, and the only signal reaching the owner is a spinner.
+ *
+ * It is judged on `fast`, whatever the owner asked for. That dial weights latency and price hardest
+ * and quality least, so it is the most forgiving reading a cheap route can get; a model that still
+ * places near the bottom under it is behind on terms nobody chose. This says so once and stops -
+ * changing the route mid-task is a decision with its own failure modes, and the owner has a model
+ * control two inches from where this line lands.
+ */
+export const modelFit = (input: {
+  models: RoutableModel[];
+  /** The model that will actually answer. */
+  chosen: RoutableModel;
+  /** The request as the router would have received it, without the owner's pick short-circuiting it. */
+  request: ModelRequest;
+  signals: TaskSignals;
+}): ModelFit => {
+  // Whether the turn can act is a fact about the request, not something a caller should be able to
+  // get wrong: a ranking that requires the tools capability is by definition ranking for tool work.
+  const classification = classifyModelTask({
+    ...input.signals,
+    usesTools: input.request.requiredCapabilities.includes('tools')
+  });
+  const profile = taskProfile(classification.kind);
+  const { requestedId: _pinned, ...open } = input.request;
+  const request: ModelRequest = {
+    ...open,
+    preference: 'fast',
+    taskKind: classification.kind,
+    requiredCapabilities: [
+      ...new Set([...input.request.requiredCapabilities, ...profile.requiredCapabilities])
+    ],
+    requiredModalities: [
+      ...new Set([...input.request.requiredModalities, ...profile.requiredModalities])
+    ]
+  };
+  const ranked = rankModels(input.models, request);
+  const leader = ranked[0] ?? null;
+  const index = ranked.findIndex((entry) => entry.model.id === input.chosen.id);
+  const chosen = index >= 0 ? ranked[index]! : null;
+  const silent: ModelFit = {
+    classification,
+    rank: chosen ? index + 1 : null,
+    ranked: ranked.length,
+    missing: [],
+    leader: null,
+    headline: null,
+    detail: ''
+  };
+  // Nothing to compare against, or the model in use is already the answer.
+  if (!leader || leader.model.id === input.chosen.id) return silent;
+  const benchmarkOf = (model: RoutableModel): string =>
+    `${model.displayName}: ${describeBenchmark(model, profile, qualityScore(model, profile.benchmark)).toLowerCase()}`;
+  if (!chosen) {
+    const missing = unmetRequirements(input.chosen, request);
+    // Ranked out for something this function does not model - a retirement date, a bad day on the
+    // provider's endpoints. Both are already reported where they are decided; neither is a fit.
+    if (missing.length === 0) return silent;
+    return {
+      ...silent,
+      missing,
+      leader: leader.model,
+      headline: `${input.chosen.displayName} cannot do ${taskLabel[classification.kind]} here: ${missing.join(', ')}. ${leader.model.displayName} can.`,
+      detail: benchmarkOf(leader.model)
+    };
+  }
+  if (index + 1 < FIT_RANK_FLOOR || leader.score - chosen.score < FIT_SCORE_GAP) return silent;
+  return {
+    ...silent,
+    leader: leader.model,
+    headline: `${input.chosen.displayName} ranks ${index + 1} of ${ranked.length} for ${taskLabel[classification.kind]}; ${leader.model.displayName} leads.`,
+    detail: `${benchmarkOf(input.chosen)}. ${benchmarkOf(leader.model)}.`
+  };
 };
 
 /** Collapses the full task vocabulary onto the three kinds older callers understand. */

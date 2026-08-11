@@ -75,9 +75,11 @@ export const catalogCredential = async (input: {
     input.masterKey,
     inferenceCredentialAad(owner.id)
   );
-  // An owner on Ollama Cloud or their own endpoint has a catalogue of exactly one model, written by
-  // the API when they saved it and under a provider this service never prunes. Sending their key to
-  // OpenRouter to ask what OpenRouter is offering would be wrong twice over.
+  // An owner on Ollama Cloud or their own endpoint has a catalogue written by the API when they
+  // saved the provider - every model the endpoint described, since that save now asks - under a
+  // provider this service never prunes. Sending their key to OpenRouter to ask what OpenRouter is
+  // offering would be wrong twice over. It does mean their catalogue is written once and then
+  // frozen: a model their provider withdraws sits in the picker until something tries it.
   if (secret.provider !== 'openrouter' || !secret.apiKey) return null;
   return {
     apiKey: secret.apiKey,

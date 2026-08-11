@@ -6,11 +6,13 @@ import {
   blendedPricePerMillionTokens,
   classifyModelTask,
   coarsenTaskKind,
+  CONVERSATION_PROMPT_CHARS,
   contextHeadroomScore,
   effectivePricePerMillionTokens,
   inferModelTask,
   isModelEligible,
   isPrivacyRouteEligible,
+  modelFit,
   modelTaskKinds,
   priceCeilingBreach,
   qualityScore,
@@ -678,6 +680,20 @@ describe('task classification', () => {
     expect(classifyModelTask({ prompt: 'Deploy the staging build' }).kind).toBe('agentic');
   });
 
+  it('does not read a short request to a machine that can act as a chat', () => {
+    // Measured on the owner's box. Ninety-eight characters, and every one of them about pictures:
+    // on prompt length alone this is the latency-first profile with a 16K reference window. What it
+    // asked for was a script, several runs of it and a montage, on a 37,000-token window.
+    const prompt =
+      'Generate a cartoon logo, cut the background out cleanly, produce several sizes and a contact sheet';
+    expect(prompt.length).toBeLessThan(CONVERSATION_PROMPT_CHARS);
+    expect(classifyModelTask({ prompt, interactive: true, usesTools: true }).kind).toBe('general');
+    // The profile is still reachable for a turn that genuinely has nothing to act with.
+    expect(classifyModelTask({ prompt, interactive: true, usesTools: false }).kind).toBe(
+      'conversation'
+    );
+  });
+
   it('reaches every profile from the only entry point callers use', () => {
     // inferModelTask used to coarsen its answer to three kinds, which left five carefully written
     // profiles unreachable from the API.
@@ -687,5 +703,166 @@ describe('task classification', () => {
     expect(inferModelTask('Prove that this schedule is optimal')).toBe('reasoning');
     expect(inferModelTask('Refactor this TypeScript repository and run tests')).toBe('coding');
     expect(inferModelTask('Explain partial pooling')).toBe('general');
+  });
+});
+
+describe('model fit', () => {
+  /**
+   * A catalogue with a clear best answer and a clear worst one, so what the fit reports is the
+   * ranking rather than an accident of the fixture. Latency is measured on both, which keeps the
+   * `fast` dial the fit judges on honest instead of collapsing into price.
+   */
+  const strong: RoutableModel = {
+    ...base,
+    id: 'strong',
+    displayName: 'Strong',
+    contextTokens: 400_000,
+    codingQuality: 0.98,
+    agenticQuality: 0.98,
+    intelligenceQuality: 0.98,
+    measuredQuality: 0.98,
+    measuredLatencyMs: 900,
+    inputUsdPerMillionTokens: 3,
+    outputUsdPerMillionTokens: 15
+  };
+  const middling: RoutableModel = {
+    ...base,
+    id: 'middling',
+    displayName: 'Middling',
+    codingQuality: 0.6,
+    agenticQuality: 0.6,
+    intelligenceQuality: 0.6,
+    measuredQuality: 0.6,
+    inputUsdPerMillionTokens: 0.5,
+    outputUsdPerMillionTokens: 1.5
+  };
+  const cheap: RoutableModel = {
+    ...base,
+    id: 'cheap',
+    displayName: 'Cheap',
+    contextTokens: 32_000,
+    codingQuality: 0.05,
+    agenticQuality: 0.05,
+    intelligenceQuality: 0.05,
+    measuredQuality: 0.05,
+    measuredLatencyMs: 120,
+    inputUsdPerMillionTokens: 0.05,
+    outputUsdPerMillionTokens: 0.2
+  };
+  const second: RoutableModel = {
+    ...strong,
+    id: 'second',
+    displayName: 'Second',
+    codingQuality: 0.93,
+    agenticQuality: 0.93,
+    intelligenceQuality: 0.93
+  };
+  const third: RoutableModel = {
+    ...strong,
+    id: 'third',
+    displayName: 'Third',
+    codingQuality: 0.88,
+    agenticQuality: 0.88,
+    intelligenceQuality: 0.88
+  };
+  const open: ModelRequest = {
+    privacyRoute: 'provider_zdr',
+    requiredCapabilities: ['chat', 'tools'],
+    requiredModalities: ['text'],
+    minContextTokens: 16_000,
+    preference: 'balanced'
+  };
+
+  it('says nothing when the model in use is the one that leads', () => {
+    const fit = modelFit({
+      models: [strong, cheap],
+      chosen: strong,
+      request: open,
+      signals: { prompt: 'Refactor this TypeScript repository and run the tests' }
+    });
+    expect(fit.headline).toBeNull();
+    expect(fit.rank).toBe(1);
+  });
+
+  it('says nothing about a near miss, because a ranking disagreeing with itself is not news', () => {
+    const fit = modelFit({
+      models: [strong, second, middling],
+      chosen: second,
+      request: open,
+      signals: { prompt: 'Refactor this TypeScript repository and run the tests' }
+    });
+    expect(fit.headline).toBeNull();
+    expect(fit.rank).toBe(2);
+  });
+
+  it('names the leader when the model in use is far down the ranking', () => {
+    const fit = modelFit({
+      models: [strong, second, third, cheap],
+      chosen: cheap,
+      request: open,
+      signals: { prompt: 'Refactor this TypeScript repository and run the tests' }
+    });
+    expect(fit.rank).toBe(4);
+    expect(fit.leader?.id).toBe('strong');
+    expect(fit.headline).toContain('Cheap ranks 4 of 4 for coding');
+    expect(fit.headline).toContain('Strong leads');
+    // The benchmark is the evidence; the sentence above it is only the index into it.
+    expect(fit.detail).toContain('Cheap:');
+    expect(fit.detail).toContain('Strong:');
+  });
+
+  it('reports work the model cannot do at all rather than a placement', () => {
+    const blind: RoutableModel = {
+      ...cheap,
+      modalities: ['text'],
+      capabilities: ['chat', 'tools']
+    };
+    const seeing: RoutableModel = {
+      ...strong,
+      modalities: ['text', 'image'],
+      capabilities: ['chat', 'tools', 'vision']
+    };
+    const fit = modelFit({
+      models: [seeing, blind],
+      chosen: blind,
+      request: open,
+      signals: { prompt: 'What is wrong with this?', hasImages: true }
+    });
+    expect(fit.classification.kind).toBe('vision');
+    expect(fit.rank).toBeNull();
+    expect(fit.missing).toEqual(['no vision', 'it cannot read image']);
+    expect(fit.headline).toBe(
+      'Cheap cannot do vision work here: no vision, it cannot read image. Strong can.'
+    );
+  });
+
+  it('judges the pick on the dial most forgiving to it, whatever the owner asked for', () => {
+    // `best` would condemn a cheap route on quality alone. The fit ranks on `fast` - latency and
+    // price weighted hardest, quality least - so a model that still places last has lost on terms
+    // nobody chose for it.
+    const forgiving = modelFit({
+      models: [strong, second, third, cheap],
+      chosen: cheap,
+      request: { ...open, preference: 'best' },
+      signals: { prompt: 'Refactor this TypeScript repository and run the tests' }
+    });
+    const asked = modelFit({
+      models: [strong, second, third, cheap],
+      chosen: cheap,
+      request: { ...open, preference: 'fast' },
+      signals: { prompt: 'Refactor this TypeScript repository and run the tests' }
+    });
+    expect(forgiving.headline).toEqual(asked.headline);
+  });
+
+  it('is silent when nothing else could have answered either', () => {
+    expect(
+      modelFit({
+        models: [cheap],
+        chosen: cheap,
+        request: open,
+        signals: { prompt: 'Refactor this TypeScript repository' }
+      }).headline
+    ).toBeNull();
   });
 });

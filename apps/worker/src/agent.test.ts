@@ -36,9 +36,11 @@ import {
   createStreamFlusher,
   delegateBudget,
   MAX_PLAN_STEPS,
-  ACCEPTANCE_RETROFIT_CAVEAT,
-  acceptanceRetrofitCaveat,
   degenerateRepeat,
+  idleStepBreak,
+  idleStepsAfter,
+  IDLE_STEPS_BEFORE_STOP,
+  MAX_IDLE_STEPS,
   previewUrl,
   normalizeAssistantText,
   ownerFixableCheckpointFailure,
@@ -78,27 +80,6 @@ describe('agent chat output', () => {
     expect(normalizeAssistantText(' into chatLet me inspect the workspace.')).toBe(
       'Let me inspect the workspace.'
     );
-  });
-
-  it('does not caveat a completion for lateness athanor asked for', () => {
-    /*
-     * The only thing that asks for an acceptance record is the hold on finish, and that hold fires
-     * because the turn has already changed something. So a model that complies declares its checks
-     * after the work by construction, and this sentence was on every completed task in the product.
-     * A caveat that is always there says nothing and teaches the owner to skim the line where a
-     * real one will one day be.
-     */
-    expect(
-      acceptanceRetrofitCaveat({ mutatedBeyondProse: true, acceptanceNagged: true })
-    ).toBeUndefined();
-    // Late on its own account, with nobody having asked: that is worth saying.
-    expect(acceptanceRetrofitCaveat({ mutatedBeyondProse: true, acceptanceNagged: false })).toBe(
-      ACCEPTANCE_RETROFIT_CAVEAT
-    );
-    // Declared before anything changed, which is the case the whole mechanism is built around.
-    expect(
-      acceptanceRetrofitCaveat({ mutatedBeyondProse: false, acceptanceNagged: false })
-    ).toBeUndefined();
   });
 
   it('points a preview link at the page rather than at a file index', () => {
@@ -148,6 +129,59 @@ describe('agent chat output', () => {
     expect(degenerateRepeat(code)).toBe('');
     // Short repeats are somebody writing, not a model looping.
     expect(degenerateRepeat('ha '.repeat(30))).toBe('');
+  });
+
+  it('counts steps that started no tool, and only those', () => {
+    // The measured shape: the same read asked for again and again, answered from the first one, so
+    // nothing runs and nothing is learned. Three steps of it and no more.
+    const asked = { proposed: ['file_read'], started: 0 };
+    expect(idleStepsAfter(0, asked)).toBe(1);
+    expect(idleStepsAfter(1, asked)).toBe(2);
+    expect(idleStepsAfter(MAX_IDLE_STEPS - 1, asked)).toBe(MAX_IDLE_STEPS);
+    // One tool starting anywhere in the step is the whole reset. This is what makes a turn that
+    // thinks for ten steps while still moving invisible to the guard.
+    expect(idleStepsAfter(2, { proposed: ['file_read', 'shell'], started: 1 })).toBe(0);
+    expect(idleStepsAfter(2, { proposed: ['file_read', 'finish'], started: 1 })).toBe(0);
+  });
+
+  it('leaves the count alone for the tools the loop answers itself', () => {
+    // Each of these has its own bound, and two bounds counting the same step race each other: a
+    // third rejected finish would otherwise trip this as well as MAX_FINISH_REJECTIONS.
+    for (const name of ['finish', 'compact_context', 'notify', 'ask', 'set_acceptance'])
+      expect(idleStepsAfter(2, { proposed: [name], started: 0 })).toBeUndefined();
+    /*
+     * A reply with no tool call at all is the completion nag's, which ends the turn by completing
+     * it rather than by pushing back - and the loop must agree with this function about that. It
+     * did not: the no-tool-call branch raised the count itself, so two steps of ordinary reasoning
+     * plus one read answered from an earlier one reached the break, and the turn was told "NOTHING
+     * HAS RUN FOR 3 STEPS" when one step had. Pinned end to end by
+     * `small-reasoning-between-commands-is-not-called-a-stall`.
+     */
+    expect(idleStepsAfter(2, { proposed: [], started: 0 })).toBeUndefined();
+    // Mixed: the dispatchable call is what is being judged, and it started nothing.
+    expect(idleStepsAfter(2, { proposed: ['finish', 'file_read'], started: 0 })).toBe(3);
+  });
+
+  it('tells the model the number and the two ways out of it', () => {
+    const said = idleStepBreak(MAX_IDLE_STEPS);
+    expect(said).toContain(`${MAX_IDLE_STEPS} STEPS`);
+    // Both exits, named: act differently, or stop and say what is in the way.
+    expect(said).toContain('take the next concrete action');
+    expect(said).toContain('finish');
+  });
+
+  it('says it three times before it ends anything', () => {
+    // The stop is the half that costs the owner a turn, so it may never be the first thing the
+    // model hears. Every step from MAX_IDLE_STEPS up to the stop pushes back with the count risen.
+    expect(IDLE_STEPS_BEFORE_STOP).toBeGreaterThan(MAX_IDLE_STEPS);
+    const told: number[] = [];
+    for (let steps = MAX_IDLE_STEPS; steps < IDLE_STEPS_BEFORE_STOP; steps += 1) told.push(steps);
+    expect(told).toHaveLength(3);
+    expect(told.map((steps) => idleStepBreak(steps).includes(`${steps} STEPS`))).toEqual([
+      true,
+      true,
+      true
+    ]);
   });
 
   it('drops the control tokens a model opens its own turn with', () => {
