@@ -210,8 +210,17 @@ export interface FileEntry {
   name: string;
   path: string;
   type: 'file' | 'directory' | 'symlink';
+  /**
+   * For a directory this is the size of the directory record, not of what is in it - the runner
+   * reads it from `lstat`. Nothing on screen may present it as a folder's weight on disk.
+   */
   sizeBytes: number;
   modifiedAt: string;
+  /**
+   * How many things are in a folder, where the runner could count them. Absent on files, and
+   * absent for every folder when the server is older than the client talking to it.
+   */
+  itemCount?: number;
 }
 
 /**

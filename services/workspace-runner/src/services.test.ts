@@ -501,6 +501,139 @@ describe('a service the computer keeps running', () => {
     TEST_TIMEOUT_MS
   );
 
+  it(
+    'has no deadline, whatever deadline the call that declared it asked for',
+    async () => {
+      /*
+       * The hour was the bug. Every other thing this manager starts is scoped to a turn, and a
+       * background session was capped - so "build me a dashboard and give me a link" produced a
+       * link that stopped answering by dinner while the Running row still called it alive. A
+       * service ignores `timeoutSeconds` entirely, and nothing exercised that: the ceiling is
+       * applied in the same `#launch` both paths share, one ternary away from covering services
+       * too.
+       */
+      const root = await workspace();
+      const manager = new ProcessManager(50, HEALTHY_POLICY);
+      const started = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        {
+          executable: '/bin/sh',
+          // A deadline the test can outlive, against a process that lives well past it.
+          args: ['-c', 'sleep 30'],
+          timeoutSeconds: 1,
+          service: 'patient server',
+          maxOutputBytes: 4_096
+        },
+        // The route's own ceiling, which is the other bound that used to reach a service.
+        1,
+        false
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      const view = manager.action('workspace-1', 'task-1', started.sessionId, { action: 'poll' });
+      expect(view.status).toBe('running');
+      expect(view.service).toMatchObject({ state: 'running', restarts: 0 });
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
+    'lets the owner read and stop a service without letting anyone write to it',
+    async () => {
+      /*
+       * `owner` is the task a capability is subject to, or null for the person who owns the box.
+       * The null case was widened so the owner could stop a service some task started - without it
+       * a service was visible in their panel and unstoppable from this computer - and it is
+       * deliberately narrowed to reading and stopping. `write` puts chosen bytes on the stdin of a
+       * process belonging to another turn, which is the one thing here that could be turned into
+       * cross-task influence, and nothing held that line.
+       */
+      const root = await workspace();
+      const manager = new ProcessManager(50, FAST_POLICY);
+      const started = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        {
+          executable: '/bin/sh',
+          args: ['-c', 'cat > /dev/null'],
+          service: 'reads its stdin',
+          maxOutputBytes: 4_096
+        },
+        5,
+        false
+      );
+      // Reading is the whole reason the null case exists, and it still answers.
+      expect(
+        manager.action('workspace-1', null, started.sessionId, { action: 'poll' }).sessionId
+      ).toBe(started.sessionId);
+      expect(() =>
+        manager.action('workspace-1', null, started.sessionId, { action: 'write', data: 'x' })
+      ).toThrow('not found');
+      // The task that started it may still write: this is a narrowing of the owner's capability,
+      // not a change to what a turn can do with its own session.
+      expect(() =>
+        manager.action('workspace-1', 'task-1', started.sessionId, { action: 'write', data: 'x' })
+      ).not.toThrow();
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
+    'gives a service that had been given up on five more attempts when the runner comes back',
+    async () => {
+      /*
+       * A give-up is not permanent across a restart. The runner coming back is a different machine
+       * state - a package installed, a disk mounted, a port released - and five more attempts over
+       * a minute is a cheap way to be wrong about it. The alternative is a box that reboots and
+       * silently never brings back a service whose dependency happened to be missing at the moment
+       * supervision gave up, which is precisely the failure the record on disk exists to prevent.
+       */
+      const root = await workspace();
+      const manager = new ProcessManager(50, FAST_POLICY);
+      await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        {
+          executable: '/bin/sh',
+          args: ['-c', 'exit 3'],
+          service: 'broken service',
+          maxOutputBytes: 4_096
+        },
+        5,
+        false
+      );
+      await expect
+        .poll(() => manager.list('workspace-1', 'task-1')[0]?.service?.state, {
+          interval: 20,
+          timeout: 10_000
+        })
+        .toBe('crash_looped');
+      const abandoned = manager.list('workspace-1', 'task-1')[0]?.service?.restarts ?? 0;
+      expect(abandoned).toBe(FAST_POLICY.maxRapidFailures - 1);
+      manager.close();
+
+      const booted = new ProcessManager(50, FAST_POLICY);
+      // Counted as taken back under supervision, which is not the same as up: it goes round its
+      // own backoff from a clean streak and this one is genuinely broken, so it ends where it was.
+      expect(await booted.resumeWorkspace(root, 'workspace-1', false)).toBe(1);
+      await expect
+        .poll(() => booted.listWorkspace('workspace-1')[0]?.service?.state, {
+          interval: 20,
+          timeout: 10_000
+        })
+        .toBe('crash_looped');
+      // The point: it was actually tried again rather than left where the last runner abandoned it.
+      expect(booted.listWorkspace('workspace-1')[0]?.service?.restarts).toBeGreaterThan(abandoned);
+      booted.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
   it('renders the owner-facing record from what is on disk', () => {
     const record = newServiceRecord({
       workspaceId: 'workspace-1',

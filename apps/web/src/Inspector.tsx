@@ -46,6 +46,8 @@ import {
 } from './running-rows.js';
 import { advanceFrame, drainFrames, emptyFrameSlots, type FrameSlots } from './remote-frame.js';
 import { inertOutside } from './inert-outside.js';
+import { paneId } from './shortcuts.js';
+import { fileLine, sortEntries, type FileOrder } from './file-rows.js';
 import { capabilityDeadline, shouldRenew } from './session-renewal.js';
 import { sessionEnd, type SessionClose } from './terminal-session.js';
 import {
@@ -404,9 +406,21 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
   };
 }
 
-function Files({ workspace }: { workspace: Workspace }) {
+function Files({ workspace, taskIsActive }: { workspace: Workspace; taskIsActive: boolean }) {
   const [path, setPath] = useState('workspace');
   const [entries, setEntries] = useState<FileEntry[]>([]);
+  /*
+   * The order follows the work until the owner says otherwise - the same bargain the panel itself
+   * makes with the tab it is showing (App.tsx `shownInspectorTab`).
+   *
+   * While the agent is working, the question this pane is open to answer is "what did it just
+   * make", and alphabetical order buries that among everything that was already there. Once the
+   * owner picks an order it is theirs and nothing takes it back.
+   */
+  const [chosenOrder, setChosenOrder] = useState<FileOrder>();
+  const order = chosenOrder ?? (taskIsActive ? 'recent' : 'name');
+  /* Read once for the whole list, so forty rows cannot disagree about what "now" is. */
+  const nowMs = Date.now();
   const [loading, setLoading] = useState(true);
   const [preview, setPreview] = useState<{
     name: string;
@@ -850,6 +864,34 @@ function Files({ workspace }: { workspace: Workspace }) {
           </div>
         </div>
       )}
+      {/*
+        Three orders, and no control at all until there is something to reorder.
+
+        Name is the listing; Size answers the storage banner that sends the owner here and has no
+        other way to say what is eating the disk; Recent answers what the agent has just done. They
+        are three buttons rather than a select because there are three of them and the current one
+        has to be readable without opening anything.
+      */}
+      {!preview && !loading && !listingError && entries.length > 1 && (
+        <div className="file-sort" role="group" aria-label="Order">
+          {(
+            [
+              ['name', 'Name'],
+              ['size', 'Size'],
+              ['recent', 'Recent']
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              className={order === id ? 'active' : ''}
+              aria-pressed={order === id}
+              onClick={() => setChosenOrder(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
       {preview ? (
         <div className="file-preview">
           <div className="preview-header">
@@ -971,52 +1013,48 @@ function Files({ workspace }: { workspace: Workspace }) {
         </div>
       ) : (
         <div className="file-list">
-          {entries
-            .sort((a, b) =>
-              a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'directory' ? -1 : 1
-            )
-            .map((entry) => (
-              <div className="file-row" key={entry.path}>
-                <button className="file-open" onClick={() => void open(entry)}>
-                  {entry.type === 'directory' ? <Folder /> : <File />}
-                  <span>
-                    <strong>{entry.name}</strong>
-                    <small>
-                      {entry.type === 'directory' ? 'Folder' : formatBytes(entry.sizeBytes)}
-                    </small>
-                  </span>
-                </button>
-                <button
-                  className="icon-btn"
-                  title="Rename"
-                  aria-label={`Rename ${entry.name}`}
-                  onClick={() => {
-                    setUploadError('');
-                    setNaming({ entry, value: entry.name });
-                  }}
-                >
-                  <PencilLine />
-                </button>
-                <button
-                  className="icon-btn"
-                  title={entry.type === 'directory' ? 'Delete folder and contents' : 'Delete'}
-                  aria-label={`Delete ${entry.name}`}
-                  onClick={() => {
-                    // Removed from the list at once and from the disk a few seconds later, so the
-                    // mistake costs one click rather than a restore from a recovery point.
-                    setEntries((current) => current.filter((item) => item.path !== entry.path));
-                    setNaming(undefined);
-                    undo({
-                      message: deletionMessage(entry),
-                      commit: () => api.deleteFile(workspace.id, entry.path),
-                      restore: () => void load()
-                    });
-                  }}
-                >
-                  <Trash2 />
-                </button>
-              </div>
-            ))}
+          {sortEntries(entries, order).map((entry) => (
+            <div className="file-row" key={entry.path}>
+              <button className="file-open" onClick={() => void open(entry)}>
+                {entry.type === 'directory' ? <Folder /> : <File />}
+                <span>
+                  <strong>{entry.name}</strong>
+                  {/* This used to read "Folder" beside a folder icon, or a size with nothing to
+                      say whether the file was written a minute ago or last March. */}
+                  <small>{fileLine(entry, nowMs)}</small>
+                </span>
+              </button>
+              <button
+                className="icon-btn"
+                title="Rename"
+                aria-label={`Rename ${entry.name}`}
+                onClick={() => {
+                  setUploadError('');
+                  setNaming({ entry, value: entry.name });
+                }}
+              >
+                <PencilLine />
+              </button>
+              <button
+                className="icon-btn"
+                title={entry.type === 'directory' ? 'Delete folder and contents' : 'Delete'}
+                aria-label={`Delete ${entry.name}`}
+                onClick={() => {
+                  // Removed from the list at once and from the disk a few seconds later, so the
+                  // mistake costs one click rather than a restore from a recovery point.
+                  setEntries((current) => current.filter((item) => item.path !== entry.path));
+                  setNaming(undefined);
+                  undo({
+                    message: deletionMessage(entry),
+                    commit: () => api.deleteFile(workspace.id, entry.path),
+                    restore: () => void load()
+                  });
+                }}
+              >
+                <Trash2 />
+              </button>
+            </div>
+          ))}
           {!entries.length && !listingError && (
             <div className="empty-pane">
               <FolderOpen />
@@ -1649,6 +1687,20 @@ function TerminalPane({ workspace }: { workspace: Workspace }) {
         selectionBackground: '#34383b'
       }
     });
+    /*
+     * F6 is the one key the shell does not get to keep.
+     *
+     * xterm turns every function key into an escape sequence and then cancels the event -
+     * `evaluateKeyboardEvent` maps keyCode 117 to ESC[17~ and `_keyDown` finishes with
+     * `preventDefault` and `stopPropagation` - so the keydown never bubbled to the window handler
+     * and the pane walk did nothing in here. It takes Tab and Shift+Tab the same way (keyCode 9
+     * sends HT with `cancel` set), which is correct for a terminal and is also the whole problem:
+     * between them, this pane was the one place in the workbench a keyboard could get into and not
+     * get back out of, and the browser's own ⌘1-4 escape is exactly the chord Chrome and Safari
+     * keep for tab switching. Returning false hands the event back untouched before xterm reads
+     * it, so it reaches the window and the shell never sees an F6. Nothing else is intercepted.
+     */
+    term.attachCustomKeyEventHandler((event) => event.key !== 'F6');
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host.current);
@@ -2191,7 +2243,8 @@ export function Inspector({
   initialTab,
   wall,
   hidden: away = false,
-  onTab
+  onTab,
+  taskIsActive = false
 }: {
   workspace: Workspace | undefined;
   initialTab: Tab;
@@ -2207,6 +2260,8 @@ export function Inspector({
    */
   hidden?: boolean;
   onTab?: (tab: Tab) => void;
+  /** Whether the agent is working right now, which is what makes Files open on Recent. */
+  taskIsActive?: boolean;
 }) {
   const [tab, setTab] = useState<Tab>(initialTab);
   useEffect(() => setTab(initialTab), [initialTab]);
@@ -2247,7 +2302,16 @@ export function Inspector({
     document.getElementById(`inspector-tab-${target}`)?.focus();
   };
   return (
-    <aside className="inspector" hidden={away}>
+    // A named region with `tabIndex={-1}`, so ⌘4, ⌘⌥1–4 and F6 have somewhere to land. Without it
+    // the panel was only reachable by tabbing past every conversation in the sidebar and the whole
+    // transcript, which on a well-used athanor is dozens of stops.
+    <aside
+      className="inspector"
+      id={paneId('tools')}
+      tabIndex={-1}
+      aria-label="Computer tools"
+      hidden={away}
+    >
       <div className="inspector-tabs" role="tablist" aria-label="Computer tools">
         {inspectorTabs.map(([id, label]) => (
           <button
@@ -2296,7 +2360,7 @@ export function Inspector({
             hidden={tab !== id}
           >
             {!opened.current.has(id) ? null : id === 'files' ? (
-              <Files workspace={workspace} />
+              <Files workspace={workspace} taskIsActive={taskIsActive} />
             ) : id === 'computer' ? (
               <Computer
                 workspace={workspace}

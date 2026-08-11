@@ -5,6 +5,7 @@ import {
   activityLine,
   activityOverview,
   agentNotice,
+  agentQuestion,
   asBotWall,
   botWallClearance,
   botWallFromEvent,
@@ -266,6 +267,91 @@ describe('timeline presentation', () => {
   it('preserves underscores in filenames', () => {
     expect(compactResultSummary('Published `experiment_results.csv`.')).toBe(
       'Published experiment_results.csv.'
+    );
+  });
+});
+
+describe('a question the agent stopped to ask', () => {
+  const asked = (payload?: unknown): TaskEvent => event(2, 'question_asked', payload);
+
+  it('reads the question, the reason and the answers it would act on', () => {
+    const question = agentQuestion(
+      asked({
+        question: 'Which mailbox should the invoice go from?',
+        why: 'Two are connected and the reply address changes what the client sees.',
+        options: ['work@', 'billing@', '  ']
+      })
+    );
+    expect(question).toEqual({
+      question: 'Which mailbox should the invoice go from?',
+      why: 'Two are connected and the reply address changes what the client sees.',
+      options: ['work@', 'billing@']
+    });
+  });
+
+  it('takes a question with no options at all, because most take a reply rather than a pick', () => {
+    expect(agentQuestion(asked({ question: 'What should the deadline be?' }))?.options).toEqual([]);
+  });
+
+  it('stays in the transcript rather than being folded into the work log', () => {
+    // The one event in the log whose whole purpose is to be read and replied to. Folded away with
+    // the machinery it would be a question nobody was shown - which is the failure it exists to fix
+    // from the other direction, where a blocker arrived as a completion card.
+    const nodes = buildConversation(
+      [
+        event(1, 'user_message', { markdown: 'Send the invoice' }),
+        event(2, 'tool_started', { tool: 'file_read' }),
+        asked({ question: 'Which mailbox?', why: 'Two are connected' })
+      ],
+      'awaiting_user'
+    );
+    expect(nodes.map((node) => node.kind)).toEqual(['user', 'activity', 'notice']);
+  });
+
+  it('is closed by the message that answers it, the way a decision closes an approval', () => {
+    // Without this the card stays lit for the life of the conversation, saying the agent is waiting
+    // on the owner directly above the sentence in which they answered it.
+    const nodes = buildConversation(
+      [
+        event(1, 'user_message', { markdown: 'Send the invoice' }),
+        asked({ question: 'Which mailbox?', why: 'Two are connected' }),
+        event(3, 'user_message', { markdown: 'billing@' })
+      ],
+      'running'
+    );
+    const question = nodes.find((node) => node.kind === 'notice');
+    expect(question?.kind === 'notice' && question.resolution?.sequence).toBe(3);
+    // The answer is left where it is: it is the owner's own message and belongs in the transcript.
+    expect(nodes.filter((node) => node.kind === 'user')).toHaveLength(2);
+  });
+
+  it('goes quiet the moment the answer is queued, not when a worker gets to it', () => {
+    // The answer is written to the queue on Enter and is not promoted to a user_message until a
+    // worker picks the conversation back up. That gap is the whole window in which the card would
+    // still be asking them something they have already answered.
+    const nodes = buildConversation(
+      [
+        event(1, 'user_message', { markdown: 'Send the invoice' }),
+        asked({ question: 'Which mailbox?', why: 'Two are connected' }),
+        event(3, 'queued_message', { markdown: 'billing@', position: 1 })
+      ],
+      'awaiting_user'
+    );
+    const question = nodes.find((node) => node.kind === 'notice');
+    expect(question?.kind === 'notice' && Boolean(question.resolution)).toBe(true);
+  });
+
+  it('says which of the two waits a parked conversation is in', () => {
+    // `awaiting_user` covers both now, and "Waiting for your approval" over a question with two
+    // options offered sends the owner looking for an Approve button that does not exist.
+    const events = [
+      event(1, 'approval_requested', { approvalId: 'a1' }),
+      asked({ question: 'Which mailbox?' })
+    ];
+    expect(activityOverview('awaiting_user', events)).toBe('Waiting for your answer');
+    // And the newest of the two wins, because only the last one is still outstanding.
+    expect(activityOverview('awaiting_user', [events[1]!, events[0]!])).toBe(
+      'Waiting for your approval'
     );
   });
 });
@@ -875,8 +961,12 @@ describe('conversation transcript', () => {
   });
 
   it('announces each task state in one plain sentence', () => {
+    // Not "needs your approval" any more: `awaiting_user` is now written by a question as well as
+    // by an approval, and this announcement has only the status to go on. Naming an Approve control
+    // to a screen-reader user who has actually been asked which of three files to edit is worse
+    // than the general sentence, and the card in the transcript says which wait it is.
     expect(taskStateAnnouncement('Quarterly report', 'awaiting_user')).toBe(
-      'Quarterly report: The agent needs your approval.'
+      'Quarterly report: The agent is waiting for you.'
     );
     expect(taskStateAnnouncement('Quarterly report', 'completed')).toBe(
       'Quarterly report: Work finished.'

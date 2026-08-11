@@ -36,6 +36,14 @@ const relative = (iso: string) => {
 };
 
 export function Sidebar(props: {
+  /**
+   * The id the keyboard aims at, on the one copy of this list that is a place focus can go.
+   *
+   * The shell mounts this component twice - once for the drawer a phone opens, once for the wide
+   * layout - and an id has to belong to exactly one of them, so the shell passes it only to the
+   * copy that is on screen when there is a keyboard to walk with.
+   */
+  regionId?: string;
   user: User;
   workspaces: Workspace[];
   tasks: Task[];
@@ -301,7 +309,7 @@ export function Sidebar(props: {
   };
 
   return (
-    <aside className="sidebar">
+    <aside className="sidebar" id={props.regionId} tabIndex={-1} aria-label="Conversations">
       <button className="workspace-switcher computer-summary" onClick={props.onComputerSettings}>
         <span className="workspace-avatar agent-brand-avatar">
           <BrandMark />

@@ -1,0 +1,134 @@
+{
+  "ambiguous-a-question-before-looking-is-refused": {
+    "modelCalls": 3,
+    "promptTokens": 12200
+  },
+  "ambiguous-a-real-blocker-parks-the-conversation": {
+    "modelCalls": 2,
+    "promptTokens": 7945
+  },
+  "ambiguous-question-after-a-read-costs-a-round-trip": {
+    "modelCalls": 3,
+    "promptTokens": 12292
+  },
+  "ambiguous-question-finished-cheaply": {
+    "modelCalls": 1,
+    "promptTokens": 3925
+  },
+  "ambiguous-question-without-finish-is-nagged": {
+    "modelCalls": 5,
+    "promptTokens": 21083
+  },
+  "answer-conversational-no-tools": {
+    "modelCalls": 1,
+    "promptTokens": 3934
+  },
+  "answer-document-question": {
+    "modelCalls": 3,
+    "promptTokens": 12146
+  },
+  "answer-missing-file-is-not-a-dead-turn": {
+    "modelCalls": 4,
+    "promptTokens": 16378
+  },
+  "answer-not-applicable-after-tools-is-refused": {
+    "modelCalls": 3,
+    "promptTokens": 12288
+  },
+  "files-a-silent-turn-is-asked-to-speak": {
+    "modelCalls": 3,
+    "promptTokens": 12324
+  },
+  "files-code-declares-acceptance-first": {
+    "modelCalls": 4,
+    "promptTokens": 16627
+  },
+  "files-code-holds-for-acceptance": {
+    "modelCalls": 5,
+    "promptTokens": 21087
+  },
+  "files-open-plan-steps-hold-the-finish": {
+    "modelCalls": 4,
+    "promptTokens": 16730
+  },
+  "files-parallel-reads-cost-one-call": {
+    "modelCalls": 2,
+    "promptTokens": 8150
+  },
+  "files-prose-write-needs-no-acceptance": {
+    "modelCalls": 2,
+    "promptTokens": 8065
+  },
+  "files-stale-evidence-is-refused": {
+    "modelCalls": 4,
+    "promptTokens": 16606
+  },
+  "refusal-approval-defers-the-rest-of-the-batch": {
+    "modelCalls": 1,
+    "promptTokens": 3940
+  },
+  "refusal-declined-in-one-call": {
+    "modelCalls": 1,
+    "promptTokens": 3937
+  },
+  "refusal-git-push-stops-for-the-owner": {
+    "modelCalls": 2,
+    "promptTokens": 8038
+  },
+  "refusal-public-publish-stops-for-the-owner": {
+    "modelCalls": 1,
+    "promptTokens": 3936
+  },
+  "research-a-thin-search-is-requeried": {
+    "modelCalls": 4,
+    "promptTokens": 16867
+  },
+  "research-identical-read-is-not-paid-twice": {
+    "modelCalls": 3,
+    "promptTokens": 12216
+  },
+  "research-search-then-read": {
+    "modelCalls": 3,
+    "promptTokens": 12602
+  },
+  "research-untrusted-page-cannot-lower-the-floor": {
+    "modelCalls": 2,
+    "promptTokens": 8090
+  },
+  "small-haiku-writes-no-plan": {
+    "modelCalls": 1,
+    "promptTokens": 3929
+  },
+  "small-one-look-and-an-answer": {
+    "modelCalls": 2,
+    "promptTokens": 7938
+  },
+  "small-repeating-answer-is-stopped": {
+    "modelCalls": 2,
+    "promptTokens": 3981
+  },
+  "small-third-call-writes-a-plan-nobody-asked-for": {
+    "modelCalls": 3,
+    "promptTokens": 12189
+  },
+  "verify-checks-that-already-pass-are-refused": {
+    "modelCalls": 5,
+    "promptTokens": 21472
+  },
+  "verify-failed-check-refuses-the-finish": {
+    "modelCalls": 6,
+    "promptTokens": 25595
+  },
+  "verify-output-limit-is-continued": {
+    "modelCalls": 2,
+    "promptTokens": 7963
+  },
+  "verify-shell-observes-its-own-change": {
+    "modelCalls": 3,
+    "promptTokens": 12306
+  },
+  "verify-step-ceiling-hands-off": {
+    "modelCalls": 3,
+    "promptTokens": 8156
+  }
+}

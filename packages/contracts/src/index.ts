@@ -620,6 +620,16 @@ export const TaskEventKind = z.enum([
   'artifact',
   'approval_requested',
   'approval_resolved',
+  /**
+   * The agent stopped and put a question to the owner.
+   *
+   * Its own kind rather than an approval, because the two are different acts and were being drawn
+   * as one: a blocker used to come back as a `finish` with a `not_applicable` verification, which
+   * lands as a completion card indistinguishable from finished work. An approval asks permission for
+   * something the agent is about to do and is answered yes or no; this asks for a decision the agent
+   * cannot make and is answered in words, or by picking one of the options it listed.
+   */
+  'question_asked',
   'cost',
   /** Something the agent decided the owner should be told at that moment, not on their next visit. */
   'notice',

@@ -8501,3 +8501,142 @@ a.blocked-resource:hover {
   color: var(--muted);
   cursor: default;
 }
+
+/* ---------------------------------------------------------------------------
+   The skip link and the pane walk, the Files order, and a question.
+   --------------------------------------------------------------------------- */
+
+/*
+ * The skip link has to leave the layout, not sit in it.
+ *
+ * `.app-shell` is a three-column grid whose children are the sidebar, the workbench and the
+ * Inspector, one per column - the drawer copy of the sidebar is `display: none` on the wide layout
+ * and claims no cell. The link is the shell's first child, so left in normal flow it takes column
+ * one and pushes each of those three one cell right: the sidebar into the chat column, the chat
+ * into the Inspector column, the Inspector onto a second implicit row. This rule is load-bearing.
+ *
+ * `fixed` and not `absolute`: `.app-shell` is `overflow: hidden` and is not itself positioned, so
+ * an absolutely-positioned child would escape the clip only by that accident staying true. Moved
+ * off-screen rather than hidden, because a link nothing can focus cannot be the first stop in the
+ * tab order, which is the only reason it exists.
+ */
+.skip-link {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 60;
+  margin: 10px;
+  padding: 9px 14px;
+  border: 1px solid var(--silver-edge);
+  border-radius: 10px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: 13px;
+  text-decoration: none;
+  transform: translateY(-200%);
+  transition: transform 150ms var(--ease);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+/*
+ * Where F6 just put you.
+ *
+ * The three regions carry `tabIndex={-1}` so the pane walk, the digit chords and the skip link can
+ * land on the region rather than on the first control inside it. The focus sheet names button,
+ * input, textarea and select and nothing else, so a walk between regions moved focus and left no
+ * mark - which reads as a key that does nothing at all. Inset, because these are full-height
+ * columns whose outer edge the shell clips.
+ */
+.sidebar:focus-visible,
+.chat-canvas:focus-visible,
+.inspector:focus-visible {
+  outline: 2px solid var(--silver-edge);
+  outline-offset: -2px;
+}
+
+/*
+ * Three orders, drawn as text and not as a control.
+ *
+ * It sits directly above a list of file rows and must not read as another one: no fill, no box,
+ * only the current order brightening and taking a hairline. That is the shape the Inspector's own
+ * tab strip already uses, one size down, so the panel has a single idea of "pick one of these".
+ */
+.file-sort {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 9px 14px 3px;
+}
+
+.file-sort button {
+  border: 0;
+  border-bottom: 1px solid transparent;
+  background: transparent;
+  padding: 1px 0;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition:
+    color 140ms var(--ease),
+    border-color 140ms var(--ease);
+}
+
+.file-sort button.active {
+  border-bottom-color: var(--silver-edge);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/*
+ * A question is not a warning, and the card says so by declaring no colour of its own.
+ *
+ * There is deliberately no `.system-event.question` rule: it takes the ordinary lit panel every
+ * system event gets, while approvals and warnings take the sand and clay this product reserves for
+ * caution. Drawing "which of these two mailboxes" in that treatment would teach the owner to read
+ * every pause in a run as something to be wary of.
+ *
+ * The one warm thing is this dot - small, bright, moving, the mark reserved for "alive, or your
+ * move" - and it goes the moment the question is answered.
+ */
+.question-live {
+  display: inline-block;
+  vertical-align: middle;
+  width: 6px;
+  height: 6px;
+  margin: -2px 8px 0 0;
+  border-radius: 50%;
+  background: var(--ember);
+  box-shadow: 0 0 0 3px var(--ember-glow);
+  animation: running-mark-pulse 2.2s var(--ease) infinite;
+}
+
+/*
+ * The answers it said it would act on, shaped like a reply rather than like buttons.
+ *
+ * There is no Approve and no Deny on this card and there must not appear to be: anything with a
+ * border and a fill promises that pressing it sends that answer, and nothing here does. The default
+ * marker is kept deliberately - removing list styling strips list semantics from a `<ul>` in some
+ * browsers, and a bullet is already the clearest statement that these are choices to read.
+ */
+.question-options {
+  margin: 6px 0 0;
+  padding: 0 0 0 16px;
+}
+
+.question-options li {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/*
+ * Answered, and still worth reading. The dot has gone; the heading steps back to the muted weight
+ * the rest of the transcript uses, because a record of a question is not a thing still wanting
+ * attention.
+ */
+.system-event.question.answered strong {
+  color: var(--muted);
+}

@@ -573,3 +573,51 @@ describe('the evidence a call left behind', () => {
     expect(markup).toContain('&quot;saved&quot;: true');
   });
 });
+
+describe('a question on the transcript', () => {
+  /*
+   * The tool it draws exists because a blocker used to come back as a finish with a not_applicable
+   * verification, which lands as a completion card indistinguishable from finished work. So the
+   * thing to hold this card to is that it does not read like either of the two cards it sits
+   * between: not a completion, and not an approval.
+   */
+  const question = (extra: TaskEvent[] = []): string =>
+    render(
+      [
+        event(1, 'user_message', 'Send the invoice', { markdown: 'Send the invoice' }),
+        event(2, 'question_asked', 'Which mailbox should the invoice go from?', {
+          question: 'Which mailbox should the invoice go from?',
+          why: 'Two are connected and the reply address changes what the client sees.',
+          options: ['work@', 'billing@']
+        }),
+        ...extra
+      ],
+      'awaiting_user'
+    );
+
+  it('shows the question, the reason for it, and the answers it would act on', () => {
+    const markup = question();
+    expect(markup).toContain('Which mailbox should the invoice go from?');
+    expect(markup).toContain('the reply address changes what the client sees');
+    expect(markup).toContain('billing@');
+  });
+
+  it('is not dressed as an approval', () => {
+    // No risk language and no Approve/Deny: neither is an answer to "which of these", and the sand
+    // and clay the approval card wears is this product's caution treatment. A question is the
+    // owner's move, so the only warm thing on it is the small live dot the visual rule reserves.
+    const markup = question();
+    expect(markup).toContain('system-event question');
+    expect(markup).not.toContain('system-event approval');
+    expect(markup).not.toContain('Approve');
+    expect(markup).not.toContain('Deny');
+    expect(markup).toContain('question-live');
+  });
+
+  it('goes quiet once it has been answered', () => {
+    const markup = question([event(3, 'user_message', 'billing@', { markdown: 'billing@' })]);
+    expect(markup).toContain('You answered');
+    // The dot means "your move", so it cannot still be burning over a question they have answered.
+    expect(markup).not.toContain('question-live');
+  });
+});

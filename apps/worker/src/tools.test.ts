@@ -798,7 +798,18 @@ describe('the size of the catalogue the model is sent', () => {
     // needs to know about the backoff, the crash-loop give-up and the restart record is read back
     // through `process`, not declared here, which is why it costs a sentence and not a tool.
     // Measured at 52,055 against it, so the room this leaves is 145 bytes and not a licence.
-    expect(bytes).toBeLessThan(52_200);
+    //
+    // Then raised from 52,200 to 53,870 for `ask`: 1,601 bytes, of which 1,002 are the description
+    // and most of that is the list of cases in which not to call it. It is a capability by this
+    // test's own definition and the clearest one in the catalogue - the operating contract has
+    // always told the model to ask when a missing choice materially changes the result, and there
+    // was nowhere to ask, so a genuine blocker came back as a finish with a not_applicable
+    // verification and read to the owner exactly like finished work. No wording could have fixed
+    // that. The description is where the bytes went on purpose: the tool's own failure mode is an
+    // agent that asks instead of working, and every clause telling it when not to ask is cheaper
+    // than one parked conversation the owner did not need to be interrupted by.
+    // Measured at 53,722 against it.
+    expect(bytes).toBeLessThan(53_870);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
     // union of what twenty-four actions across mail, calendar and repositories accept. Those are

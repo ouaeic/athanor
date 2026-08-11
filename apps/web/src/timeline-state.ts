@@ -101,6 +101,21 @@ export const settledToolStarts = (
   return (event) => settled.has(event.id);
 };
 
+/**
+ * Which of the two waits a parked conversation is in, named from the log rather than the status.
+ *
+ * The newest of the two wins: a turn can raise an approval, be answered, carry on and then stop to
+ * ask something, and only the last one is still outstanding.
+ */
+const waitingOn = (events: TaskEvent[]): string => {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const kind: string = events[index]!.kind;
+    if (kind === 'question_asked') return 'Waiting for your answer';
+    if (kind === 'approval_requested') return 'Waiting for your approval';
+  }
+  return 'Waiting for you';
+};
+
 export const activityOverview = (taskStatus: string, events: TaskEvent[]): string => {
   let actionCount = 0;
   let turnCount = 0;
@@ -115,7 +130,11 @@ export const activityOverview = (taskStatus: string, events: TaskEvent[]): strin
     ].filter(Boolean);
     return parts.length ? `${parts.join(' · ')} · finished` : 'Finished';
   }
-  if (taskStatus === 'awaiting_user') return 'Waiting for your approval';
+  // `awaiting_user` covers two different waits now, and reading "Waiting for your approval" over a
+  // question with three options offered is worse than saying nothing: it sends the owner looking for
+  // an Approve button that does not exist. Which one it is is read off the last of the two events
+  // that park a conversation, because the status alone cannot tell them apart.
+  if (taskStatus === 'awaiting_user') return waitingOn(events);
   if (taskStatus === 'awaiting_resource') return 'Waiting for the computer';
   if (taskStatus === 'paused') return 'Paused';
   const settled = settledToolStarts(events, taskStatus);
@@ -206,6 +225,10 @@ const conversationalKinds = new Set([
   // answered it was filed inside a collapsed activity group - so the one thing the owner might scroll
   // back to check, whether they said yes, was the one thing the transcript would not say.
   'approval_resolved',
+  // The agent stopping to ask something is the most conversational thing in the log: it is the one
+  // event whose whole purpose is to be read and replied to, and folded into the work log it would be
+  // a question nobody was shown.
+  'question_asked',
   'completed'
 ]);
 
@@ -246,6 +269,9 @@ const activityBoundary = new Set([
   'queued_message',
   'approval_requested',
   'approval_resolved',
+  // The work stopped here and did not resume until the owner wrote back, so the group of steps
+  // before the question and the group after the answer are two different stretches of work.
+  'question_asked',
   'artifact',
   'preview',
   'completed'
@@ -295,6 +321,37 @@ export const agentNotice = (event: TaskEvent): AgentNotice | undefined => {
   const headline = firstString(data, ['headline']) || event.summary.trim();
   if (!headline) return undefined;
   return { headline, detail: firstString(data, ['detail']) };
+};
+
+export interface AgentQuestion {
+  /** The question, in the agent's own words. */
+  question: string;
+  /** What it cannot do until this is answered, which is what makes the question worth a stop. */
+  why: string;
+  /** The answers it would act on. Empty means any reply will do. */
+  options: string[];
+}
+
+/**
+ * The question card's contents, read out of the event.
+ *
+ * Written here rather than in the component for the same reason `agentNotice` is: the shapes a box
+ * either side of this client can send are a thing to test, and a card that renders an empty question
+ * is worse than no card. The summary is the fallback because the worker writes the question into it.
+ */
+export const agentQuestion = (event: TaskEvent): AgentQuestion | undefined => {
+  const kind: string = event.kind;
+  if (kind !== 'question_asked') return undefined;
+  const data = eventPayload(event);
+  const question = firstString(data, ['question']) || event.summary.trim();
+  if (!question) return undefined;
+  const options = Array.isArray(data.options)
+    ? data.options
+        .map((option) => (typeof option === 'string' ? option.trim() : ''))
+        .filter(Boolean)
+        .slice(0, 5)
+    : [];
+  return { question, why: firstString(data, ['why']), options };
 };
 
 /**
@@ -465,7 +522,11 @@ export type ConversationNode =
   | { kind: 'thinking'; id: string; event: TaskEvent; markdown: string; streaming: boolean }
   | { kind: 'activity'; id: string; events: ActivityEntry[] }
   | { kind: 'output'; id: string; event: TaskEvent }
-  /** `resolution` is present on an approval that has since been answered; the two render as one. */
+  /**
+   * `resolution` is present on an approval that has since been answered, and on a question the owner
+   * has since replied to; the two render as one. Nothing about it is approval-shaped - it is the
+   * event that ended the wait, which for a question is the owner's own message.
+   */
   | { kind: 'notice'; id: string; event: TaskEvent; resolution?: TaskEvent }
   /** The agent stopped at a challenge and the browser is waiting for the owner. */
   | { kind: 'handoff'; id: string; event: TaskEvent; wall: BotWall }
@@ -1173,6 +1234,30 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
       thinkingStepStart = 0;
     }
 
+    if (event.kind === 'user_message' || event.kind === 'queued_message') {
+      /*
+       * A message that answers a question closes it, the same way a decision closes an approval.
+       *
+       * Without this the question card stays lit for the life of the conversation, saying the agent
+       * is waiting on the owner directly above the sentence in which they answered it - the exact
+       * failure the approval pairing below was written to fix, arriving from the other direction.
+       * The answer itself is left where it is: it is the owner's own message and belongs in the
+       * transcript, so the card is only marked answered rather than absorbing it.
+       *
+       * A queued message counts, and that is the case that matters most. The answer is written to
+       * the queue the instant they press Enter and is not promoted to a `user_message` until a
+       * worker picks the conversation back up, which on a box under load is the whole window in
+       * which the card would otherwise still be asking them a question they have just answered.
+       */
+      const asked = nodes.findIndex(
+        (node) => node.kind === 'notice' && node.event.kind === 'question_asked' && !node.resolution
+      );
+      if (asked >= 0) {
+        const question = nodes[asked];
+        if (question?.kind === 'notice') nodes[asked] = { ...question, resolution: event };
+      }
+    }
+
     if (event.kind === 'user_message') {
       nodes.push({
         kind: 'user',
@@ -1343,7 +1428,11 @@ const statusAnnouncements: Record<string, string> = {
   queued: 'Work queued.',
   planning: 'The agent is planning.',
   running: 'The agent is working.',
-  awaiting_user: 'The agent needs your approval.',
+  // One sentence for both waits. This is the live region's announcement and it has only the status
+  // to go on, so it says the thing that is true of an approval and of a question alike rather than
+  // announcing an Approve button to a screen-reader user who has been asked which of three files to
+  // edit. The card in the transcript is where which one it is gets said.
+  awaiting_user: 'The agent is waiting for you.',
   awaiting_resource: 'The agent is waiting on a resource. It can be resumed.',
   paused: 'Paused.',
   completed: 'Work finished.',

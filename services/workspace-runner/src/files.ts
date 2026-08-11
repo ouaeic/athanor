@@ -170,12 +170,29 @@ export const listFiles = async (root: string, requested = '.'): Promise<unknown[
       .map(async (entry) => {
         const entryPath = path.join(target, entry.name);
         const details = await lstat(entryPath);
+        /*
+         * The one honest thing a folder can say about itself.
+         *
+         * `details.size` on a directory is the size of the directory record - 64 or 96 bytes on
+         * APFS, 4096 on ext4 - so the file browser had nothing to print on a folder row and printed
+         * the word "Folder". A count is one extra `readdir` per folder in the listing, alongside
+         * the `lstat` each entry already costs, and it is bounded by what is on screen. A folder
+         * the agent's account cannot read is left without a count rather than failing the listing
+         * it appears in: the row is still real, it just says less.
+         */
+        const itemCount = entry.isDirectory()
+          ? await readdir(entryPath).then(
+              (names) => names.filter((name) => name !== '.athanor').length,
+              () => undefined
+            )
+          : undefined;
         return {
           name: entry.name,
           path: path.relative(root, entryPath),
           type: entry.isDirectory() ? 'directory' : entry.isSymbolicLink() ? 'symlink' : 'file',
           sizeBytes: details.size,
-          modifiedAt: details.mtime.toISOString()
+          modifiedAt: details.mtime.toISOString(),
+          ...(itemCount === undefined ? {} : { itemCount })
         };
       })
   );

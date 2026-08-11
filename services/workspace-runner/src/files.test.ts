@@ -19,6 +19,7 @@ import {
   clearStagedUploads,
   createWorkspaceFolder,
   ensureWorkspace,
+  listFiles,
   readWorkspaceFile,
   readWorkspaceFileLines,
   renameWorkspaceEntry,
@@ -81,6 +82,50 @@ describe('workspace files', () => {
     expect(() => assertUserDataPath(root, 'workspace/../.athanor/browser/Cookies')).toThrow(
       'Only workspace files'
     );
+  });
+
+  /*
+   * The file browser had nothing to print on a folder row and printed the word "Folder" - beside a
+   * folder icon - because `lstat` on a directory reports the size of the directory record rather
+   * than of what is in it. The count is the one honest thing a folder can say about itself, and it
+   * is what the row now shows next to when the folder last changed.
+   */
+  it('counts what is in a folder, and reports no size for one', async () => {
+    await mkdir(path.join(root, 'workspace', 'reports'), { recursive: true });
+    await writeFile(path.join(root, 'workspace', 'reports', 'q1.csv'), 'a,b\n');
+    await writeFile(path.join(root, 'workspace', 'reports', 'q2.csv'), 'a,b\n');
+    await writeFile(path.join(root, 'workspace', 'notes.md'), 'hello');
+    const entries = (await listFiles(root, 'workspace')) as {
+      name: string;
+      type: string;
+      itemCount?: number;
+      modifiedAt: string;
+    }[];
+    const folder = entries.find((entry) => entry.name === 'reports');
+    const file = entries.find((entry) => entry.name === 'notes.md');
+    expect(folder).toMatchObject({ type: 'directory', itemCount: 2 });
+    // Files carry no count at all, so nothing downstream can mistake one for a size.
+    expect(file?.itemCount).toBeUndefined();
+    expect(Date.parse(folder?.modifiedAt ?? '')).not.toBeNaN();
+  });
+
+  /* A folder the listing cannot read still appears - the row says less rather than the whole
+     listing failing on one directory the agent's account was denied. */
+  it('leaves an unreadable folder without a count instead of failing the listing', async () => {
+    await mkdir(path.join(root, 'workspace', 'locked'));
+    await chmod(path.join(root, 'workspace', 'locked'), 0o000);
+    try {
+      const entries = (await listFiles(root, 'workspace')) as {
+        name: string;
+        itemCount?: number;
+      }[];
+      const locked = entries.find((entry) => entry.name === 'locked');
+      expect(locked).toBeDefined();
+      // Running as root reads it anyway, which is a legitimate outcome rather than a failure.
+      expect(locked?.itemCount === undefined || locked?.itemCount === 0).toBe(true);
+    } finally {
+      await chmod(path.join(root, 'workspace', 'locked'), 0o700);
+    }
   });
 
   it('writes inside the workspace, leaving nothing of a longer earlier version', async () => {

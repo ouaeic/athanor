@@ -31,6 +31,7 @@ import { DiffView } from './DiffView.js';
 import {
   activityLine,
   activityOverview,
+  agentQuestion,
   botWallClearance,
   buildConversation,
   compactResultSummary,
@@ -585,6 +586,41 @@ function Event({
         <div>
           <strong>{answered || 'Approval requested'}</strong>
           <span>{event.summary}</span>
+        </div>
+      </div>
+    );
+  }
+  if (event.kind === 'question_asked') {
+    /*
+     * The approval card's shape, and deliberately none of its colour.
+     *
+     * A question is not a risk: the sand and clay `.system-event.approval` wears is the product's
+     * caution treatment, and putting a choice between two file formats in it teaches the owner to
+     * read every pause in a run as a warning. So this is the ordinary lit panel, and the one thing
+     * on it that is warm is the small dot - the mark reserved for "alive, or your move" - which
+     * stops the moment the question has been answered. There is no Approve and no Deny, because
+     * neither is an answer to "which of these"; the answer is whatever they type next, and the
+     * options are shown as the ones the agent said it would act on rather than as controls.
+     */
+    const asked = agentQuestion(event);
+    if (!asked) return null;
+    return (
+      <div className={`system-event question${resolution ? ' answered' : ''}`}>
+        <UserRoundCheck />
+        <div>
+          <strong>
+            {!resolution && <i className="question-live" aria-hidden="true" />}
+            {resolution ? 'You answered' : 'athanor asked you'}
+          </strong>
+          <span>{asked.question}</span>
+          {asked.options.length > 0 && (
+            <ul className="question-options">
+              {asked.options.map((option) => (
+                <li key={option}>{option}</li>
+              ))}
+            </ul>
+          )}
+          {asked.why && <span>{asked.why}</span>}
         </div>
       </div>
     );

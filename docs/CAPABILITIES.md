@@ -22,6 +22,12 @@ numbers rather than an allowance: the daily, monthly and per-task spending caps,
 compute budget that stops one runaway loop from spending the afternoon. Both stop work rather than
 throttle it.
 
+A turn may hand itself another step budget rather than stopping to be spoken to, but only while the
+harness has just run the turn's own acceptance checks and found them failing, only while it is still
+changing things, and at most twice. It buys steps, not money: the compute budget above is sized once
+when the task is created and nothing raises it, so a self-continuing turn spends the remainder a
+stopped one would have left behind.
+
 ## Deliberate design decisions
 
 ### Reviewed memory rather than automatic capture

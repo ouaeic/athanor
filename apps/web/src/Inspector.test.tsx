@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { Inspector } from './Inspector.js';
+import { paneId, windowShortcut } from './shortcuts.js';
 import { UndoProvider } from './Undo.js';
 import { createUndoQueue } from './undo-queue.js';
 import type { InspectorTab } from './client-state.js';
@@ -69,6 +70,45 @@ describe('the panel behind the tabs', () => {
     expect(markup).toContain('files-pane');
     expect(markup).not.toContain('terminal-pane');
     expect(markup).not.toContain('computer-pane');
+  });
+
+  /*
+   * A place the keyboard can land.
+   *
+   * The panel used to be reachable only by tabbing past every conversation in the sidebar and the
+   * whole transcript. It is a named region with `tabIndex={-1}` so ⌘4, ⌘⌥1–4 and F6 have somewhere
+   * to put focus, and the id is the one `shortcuts.ts` aims at rather than a second spelling.
+   */
+  it('is a region the keyboard can be sent to', () => {
+    expect(markup).toContain(`id="${paneId('tools')}"`);
+    expect(markup).toContain('aria-label="Computer tools"');
+    expect(markup).toContain('tabindex="-1"');
+  });
+
+  /*
+   * ⌘⌥1–4 choose these tabs by position, so the order of this strip is part of what those keys
+   * mean. A tab inserted here without a thought for that would silently rebind two of them.
+   */
+  it('keeps the strip in the order the ⌘⌥ digits name', () => {
+    const strip = ['files', 'computer', 'terminal', 'preview'];
+    const at = strip.map((id) => markup.indexOf(`id="inspector-tab-${id}"`));
+    expect(at.every((index) => index > -1)).toBe(true);
+    expect(at).toEqual([...at].sort((left, right) => left - right));
+    for (const [index, id] of strip.entries())
+      expect(
+        windowShortcut(
+          {
+            key: String(index + 1),
+            code: `Digit${index + 1}`,
+            metaKey: true,
+            ctrlKey: false,
+            shiftKey: false,
+            altKey: true,
+            inField: false
+          },
+          { agentWorking: false }
+        )
+      ).toBe(`tool-${id}`);
   });
 });
 

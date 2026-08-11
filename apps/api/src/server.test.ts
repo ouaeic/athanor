@@ -2277,6 +2277,66 @@ describe('unattended recovery', () => {
     ).toBe('awaiting_user');
   }, 30_000);
 
+  test('an answer to a parked question puts the conversation back in the queue', async () => {
+    /*
+     * Nothing re-leases `awaiting_user`. Before the agent could ask, the only thing that ever put a
+     * task there was an approval, which its own card takes it back out of - so a question answered
+     * by writing would have queued the answer against a conversation no worker would ever pick up
+     * again. Both halves are here, because requeueing on any message would be wrong: a live
+     * approval is answered by its card, and the worker resumes into a pending call expecting a
+     * decision.
+     */
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-question-answer-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'question-answer',
+      'Send the invoice'
+    );
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id);
+    await database.query(`UPDATE tasks SET status='awaiting_user' WHERE id=$1`, [taskId]);
+
+    const answer = await app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/messages`,
+      headers: { cookie, 'idempotency-key': 'question-answer-1' },
+      payload: { prompt: 'billing@', maxComputeCredits: 5 }
+    });
+    expect(answer.statusCode, answer.body).toBe(200);
+    expect(answer.json<{ status: string }>().status).toBe('queued');
+    // Queued for the turn that asked, rather than started as a new one: the window it resumes into
+    // still holds everything the agent had established before it stopped.
+    expect(await store.getNextQueuedTaskMessage(taskId)).not.toBeNull();
+
+    // And the other half. A conversation waiting on an approval stays waiting on it.
+    await database.query(`UPDATE tasks SET status='awaiting_user' WHERE id=$1`, [taskId]);
+    await store.createApproval({
+      userId: workspace.userId,
+      taskId,
+      action: 'connector_action',
+      sideEffect: 'external_consequential',
+      previewCiphertext: encryptJson({ action: 'Email the client' }, key, `approval:${taskId}`),
+      previewHash: 'not-a-real-binding-hash',
+      expiresAt: new Date(Date.now() + 60 * 60_000)
+    });
+    const aside = await app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/messages`,
+      headers: { cookie, 'idempotency-key': 'question-answer-2' },
+      payload: { prompt: 'while you are there, check the address', maxComputeCredits: 5 }
+    });
+    expect(aside.statusCode, aside.body).toBe(200);
+    expect(
+      (await app.inject({ method: 'GET', url: `/v1/tasks/${taskId}`, headers: { cookie } })).json<{
+        status: string;
+      }>().status
+    ).toBe('awaiting_user');
+  }, 30_000);
+
   test('finishes a scheduled dispatch the API died in the middle of', async () => {
     const resumed: string[] = [];
     stubProviderFetch((url) => {

@@ -81,7 +81,7 @@ import { modelDisplayName } from './model-names.js';
 import type { AgentNotification } from './notice-log.js';
 import { rewindOffer, rewindResultNotice, type TrajectoryDraft } from './rewind.js';
 import { RewindDialog } from './RewindDialog.js';
-import { shortcutRows, windowShortcut } from './shortcuts.js';
+import { paneId, panes, shortcutRows, stepPane, windowShortcut, type Pane } from './shortcuts.js';
 import { hostStorageBlocksWork } from './usage-model.js';
 import { composerStrip } from './composer-strip.js';
 import {
@@ -248,11 +248,69 @@ export function App() {
     window.requestAnimationFrame(() => approvalCard.current?.focus());
   }, []);
   // Window-level shortcuts are registered once and must not capture the first render's closures.
-  const live = useRef<{ stop: () => void; editLast: () => void; active: boolean }>({
+  const live = useRef<{
+    stop: () => void;
+    editLast: () => void;
+    openTool: (tab: InspectorTab) => void;
+    active: boolean;
+  }>({
     stop: () => undefined,
     editLast: () => undefined,
+    openTool: () => undefined,
     active: false
   });
+  /**
+   * The element a region shortcut aims at. The message box answers to the ref the shell already
+   * holds; the other three carry the ids in `shortcuts.ts` and `tabIndex={-1}`, so focus can be put
+   * on the region itself rather than on the first control inside it.
+   */
+  const paneNode = useCallback(
+    (pane: Pane): HTMLElement | null =>
+      pane === 'composer' ? composer.current : document.getElementById(paneId(pane)),
+    []
+  );
+  /*
+   * Reaching a whole pane, including one that is not on screen yet.
+   *
+   * The tools panel is code-split and each of its panes is built the first time it is looked at, so
+   * the element ⌘4 asks for does not exist for a frame or two after a cold panel is opened.
+   * Retrying across a handful of frames costs nothing when the element is already there, and is the
+   * difference between the key working and appearing to do nothing the first time it is pressed.
+   */
+  const focusPane = useCallback(
+    (pane: Pane) => {
+      if (pane === 'tools') setInspectorOpen(true);
+      const attempt = (left: number) => {
+        const node = paneNode(pane);
+        if (node) node.focus();
+        else if (left > 0) window.requestAnimationFrame(() => attempt(left - 1));
+      };
+      attempt(10);
+    },
+    [paneNode]
+  );
+  /*
+   * F6 steps over a region this layout is not showing.
+   *
+   * On a phone the wide sidebar is `display: none` and the copy in the drawer is inert, so putting
+   * focus on it would move the cursor nowhere and leave the walk pressing the same key for ever.
+   * `offsetParent` is the cheap read for that; the tools panel is exempt because it is `position:
+   * fixed` on a phone — and because F6 opens it on the way in, so "not on screen" is not "not a
+   * destination".
+   */
+  const stepFocus = useCallback(
+    (step: 1 | -1) => {
+      const active = document.activeElement;
+      const here = panes.find((pane) => paneNode(pane)?.contains(active) ?? false);
+      let next = stepPane(here, step);
+      for (let hop = 1; hop < panes.length; hop += 1) {
+        if (next === 'tools' || paneNode(next)?.offsetParent) break;
+        next = stepPane(next, step);
+      }
+      focusPane(next);
+    },
+    [focusPane, paneNode]
+  );
   const recorder = useRef<MediaRecorder | undefined>(undefined);
   const recordedChunks = useRef<Blob[]>([]);
   const pendingShareId = useRef(new URLSearchParams(window.location.search).get('share'));
@@ -1294,9 +1352,11 @@ export function App() {
       const action = windowShortcut(
         {
           key: event.key,
+          code: event.code,
           metaKey: event.metaKey,
           ctrlKey: event.ctrlKey,
           shiftKey: event.shiftKey,
+          altKey: event.altKey,
           inField:
             event.target instanceof HTMLElement &&
             ['INPUT', 'TEXTAREA'].includes(event.target.tagName)
@@ -1312,7 +1372,18 @@ export function App() {
       // The editor's own reflex for "that came out wrong": reopen the last thing you sent.
       else if (action === 'edit-last') live.current.editLast();
       else if (action === 'stop-agent') live.current.stop();
-      else setShortcutSheet(true);
+      else if (action === 'pane-next' || action === 'pane-back')
+        stepFocus(action === 'pane-next' ? 1 : -1);
+      else if (action === 'go-conversations') focusPane('conversations');
+      else if (action === 'go-conversation') focusPane('conversation');
+      else if (action === 'go-tools') focusPane('tools');
+      // The tool shortcuts are named after the tab they choose, so the tail of the id is the tab.
+      // Going through the panel's own selection is what keeps this one route rather than a second
+      // idea of which tab is showing; focus then follows, or the key would only move the picture.
+      else if (action.startsWith('tool-')) {
+        live.current.openTool(action.slice(5) as InspectorTab);
+        focusPane('tools');
+      } else setShortcutSheet(true);
     };
     window.addEventListener('keydown', shortcut);
     return () => window.removeEventListener('keydown', shortcut);
@@ -1593,6 +1664,7 @@ export function App() {
           return;
         }
       },
+      openTool: openInspector,
       active: taskIsActive && !busy
     };
   });
@@ -2216,6 +2288,25 @@ export function App() {
   return (
     <UndoProvider value={undo.queue}>
       <div className={`app-shell ${inspectorOpen ? '' : 'inspector-closed'}`}>
+        {/*
+          The first thing in the tab order, and invisible until it is reached.
+
+          The sidebar lists every conversation the owner has, so before this the transcript was as
+          many Tab presses away as there were conversations - sixty-odd on a well-used athanor. It
+          moves focus itself rather than letting the browser follow the fragment, because the shell
+          keeps the open conversation in the query string and a hash would push a history entry the
+          back button then has to walk back through.
+        */}
+        <a
+          className="skip-link"
+          href={`#${paneId('conversation')}`}
+          onClick={(event) => {
+            event.preventDefault();
+            focusPane('conversation');
+          }}
+        >
+          Skip to the conversation
+        </a>
         {/* The same sidebar is mounted twice - this one for the narrow layout, the one below for
             the wide - and CSS decides which is seen. `inert` is what stops the unseen copy from
             also being there for a screen reader and for the tab order: without it the page offers
@@ -2263,6 +2354,9 @@ export function App() {
           />
         )}
         <Sidebar
+          /* Only this copy. The drawer above is the same component and an id has to be unique -
+             and on a phone that one is inert or off-screen, so it is not a place focus can go. */
+          regionId={paneId('conversations')}
           user={data.user}
           workspaces={data.workspaces}
           tasks={data.tasks}
@@ -2349,7 +2443,14 @@ export function App() {
               </button>
             </div>
           </header>
-          <section className="chat-canvas">
+          {/* A named region with `tabIndex={-1}`: the skip link, ⌘2 and F6 all put focus here, and
+              a region that can be focused has to be able to say what it is when they do. */}
+          <section
+            className="chat-canvas"
+            id={paneId('conversation')}
+            tabIndex={-1}
+            aria-label="Conversation"
+          >
             <Timeline
               task={task}
               tasks={data.tasks}
@@ -2519,6 +2620,7 @@ export function App() {
               {...(browserWall ? { wall: browserWall } : {})}
               hidden={!inspectorOpen}
               onTab={chooseInspectorTab}
+              taskIsActive={taskIsActive}
             />
           </Suspense>
         )}

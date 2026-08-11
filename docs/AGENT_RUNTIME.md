@@ -70,12 +70,13 @@ model already had in front of it, billed a full pass over the window to do it, a
 own description that it unlocked nothing.
 
 The catalogue covers plans, the acceptance record that defines what would prove the job done, shell
-commands and background processes, files, conflict-detecting patches, repository search and
-diagnostics, subscription coding specialists, private document extraction and lexical search,
-encrypted task search, web search, browser and desktop control, parallel source reading, PDF
-capture, media generation, connected services and MCP, schedules, reviewed memory and a question the
-agent may ask it mid-task, skills, read-only delegation, a notice the agent may raise to the owner,
-artifact and preview publication, and completion.
+commands, background processes and services the computer keeps running, files, conflict-detecting
+patches, repository search and diagnostics, subscription coding specialists, private document
+extraction and lexical search, encrypted task search, web search, browser and desktop control,
+parallel source reading, PDF capture, media generation, connected services and MCP, schedules,
+reviewed memory and a mid-task lookup in it, skills, read-only delegation, a notice the agent may
+raise to the owner and a question it may stop and put to them, artifact and preview publication,
+and completion.
 
 Order is fixed for the life of a task rather than assembled per step, because the tool block opens
 the prompt prefix: a definition that moves position ends the shared prefix at that point.

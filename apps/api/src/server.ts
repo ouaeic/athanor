@@ -3131,7 +3131,34 @@ export const buildServer = async (
             'The task changed while this message was being queued; send it again',
             409
           );
-        return privateTaskResponse(queued, workspace);
+        /*
+         * A reply to a conversation parked on a question is the thing it is parked for.
+         *
+         * Nothing re-leases `awaiting_user` - the lease query only ever hands out queued, planning
+         * and running - and until the agent had a way to ask, the only thing that ever put a task
+         * into that state was an approval, which the approval card takes it back out of. A question
+         * is answered by writing, so without this the answer would sit in the message queue for
+         * ever and the conversation could never be reached again from any door.
+         *
+         * A live approval is deliberately excluded. That card is the way to answer it and the
+         * worker resumes into the pending call expecting a decision; requeueing on a message would
+         * spend a lease discovering the approval is still pending and park again. Ordinary
+         * follow-ups to a working task are untouched: only a task that has actually stopped for the
+         * owner is moved, and the message it just queued is what the resumed turn reads.
+         */
+        const unparked =
+          task.status === 'awaiting_user' &&
+          !(await store.listApprovals(user.id, 'pending')).some(
+            (approval) => String(approval.taskId) === task.id
+          ) &&
+          (await store.setTaskStatusForUser(user.id, task.id, 'queued'));
+        // Re-read only when it moved. `enqueueTaskMessage` returns the row as it was before the
+        // status changed, and that row is what the client decides from - answering a question and
+        // being told the conversation is still waiting for you is the wrong sentence to end on.
+        return privateTaskResponse(
+          unparked ? ((await store.getTask(user.id, task.id)) ?? queued) : queued,
+          workspace
+        );
       }
       if (!task.agentStateCiphertext || task.agentStateCiphertext.aad !== `task-state:${task.id}`)
         throw new AthanorError(

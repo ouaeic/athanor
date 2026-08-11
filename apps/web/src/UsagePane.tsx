@@ -157,6 +157,33 @@ export function UsagePane({
     () => (conversationEvents?.length ? tokenSplit(conversationCost(conversationEvents)) : null),
     [conversationEvents]
   );
+  /*
+   * What the server says the whole conversation spent, as against what the loaded transcript can
+   * account for.
+   *
+   * The events handed down here are the transcript's own window, and a transcript opens at its
+   * newest page - so on any conversation long enough to have paged, this card was adding up the
+   * last few turns and labelling the answer "the conversation you have open". The cost line at the
+   * foot of the transcript had exactly this bug and was fixed by preferring the server's settled
+   * figure over the window; this is the same move with the figure the server actually holds.
+   *
+   * It holds a total, not a split: `usage_entries` stores one scalar quantity per model call
+   * (`unit: 'tokens'`), so there is no server-side input/output/cache breakdown to prefer and none
+   * is invented here. The total is enough to know when the window is short, which is the part that
+   * was misleading. Read out of the usage response this pane already fetched, so it costs no extra
+   * request; settled rows only, matching the cost line, and a ledger truncated by its own history
+   * limit can only under-report, which leaves the card saying exactly what it says today.
+   */
+  const wholeConversationTokens = useMemo(() => {
+    const openTaskId = conversationEvents?.[0]?.taskId;
+    if (!usage || !openTaskId) return 0;
+    return usage.history
+      .filter(
+        (entry) =>
+          entry.taskId === openTaskId && entry.unit === 'tokens' && entry.state === 'settled'
+      )
+      .reduce((total, entry) => total + entry.quantity, 0);
+  }, [usage, conversationEvents]);
 
   const storage = hostStoragePercent(workspace);
 
@@ -259,7 +286,17 @@ export function UsagePane({
                 </strong>
               </div>
               <small>
-                The conversation you have open
+                {/*
+                  A twentieth of margin before it says so. The ledger's per-call total is the
+                  provider's own `total_tokens` and the split beside it is the provider's prompt and
+                  completion counts, which are the same figures but need not reconcile to the token
+                  on every route - while a genuine paging gap is at least one whole turn, thousands
+                  of tokens and usually most of the conversation. The margin can only make this say
+                  less than it knows, which is the safe direction for a line about under-reporting.
+                */}
+                {wholeConversationTokens > (tokens.inputTokens + tokens.outputTokens) * 1.05
+                  ? `${formatTokens(wholeConversationTokens)} in the whole conversation; the split covers what is loaded here`
+                  : 'The conversation you have open'}
                 {tokens.cacheSharePercent > 0
                   ? `, ${tokens.cacheSharePercent}% of its input from cache`
                   : ''}

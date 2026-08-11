@@ -270,6 +270,18 @@ interface AgentState {
   checkpoint?: { turn: number; id: string | null };
   pending?: { approvalId: string; toolCall: ModelToolCall; handoffOnly?: boolean };
   /**
+   * The question this turn is parked on, and how many it has asked.
+   *
+   * Persisted beside `pending` and for the same reasons. The park is durable - the task is written
+   * `awaiting_user` with its lease cleared, exactly as an approval does - so the question has to
+   * survive being picked up by a different worker, and the count has to survive it too or the bound
+   * is one an owner's answer resets for free. `question` is deliberately not the whole tool call:
+   * the call is answered in the window before the park, so nothing is left to re-run on resume, and
+   * what is needed back is only the sentence to put beside the owner's reply.
+   */
+  question?: { question: string; askedAtStep: number };
+  questionsAsked?: number;
+  /**
    * The tool call this worker had started but not yet recorded a result for. Written durably before
    * the call runs, so a worker that dies mid-call leaves evidence of what it had already set in
    * motion instead of nothing at all.
@@ -636,6 +648,20 @@ export const MAX_ARGUMENT_TRUNCATIONS = 3;
  * belongs in the conversation the owner opens rather than on their lock screen.
  */
 export const MAX_NOTICES_PER_TURN = 3;
+
+/**
+ * How many times one turn may stop and ask the owner something.
+ *
+ * The bound is on the harness rather than on the model's judgement, for the same reason the notice
+ * bound is: a question parks the conversation and rings a device, and the failure mode this tool
+ * creates is an agent that asks instead of working. Two, not one, because the answer to a question
+ * is consumed back into the *same* turn - so a single budget covers the whole exchange, and one
+ * genuine second blocker uncovered by the first answer is a real thing that happens. Past that it is
+ * a dialogue, and a dialogue belongs in the reply the owner reads when they open the conversation.
+ * A reply from the owner that ends the turn starts the count again from zero, like every other
+ * per-turn ceiling in this file.
+ */
+export const MAX_QUESTIONS_PER_TURN = 2;
 
 /**
  * How many times a reply cut off at the output limit is continued before the answer has to change
@@ -1303,7 +1329,15 @@ export const previewUrl = (
  * completion contract closing a loop on itself. `set_acceptance` in particular succeeds by being
  * well-formed, so without this the cheapest citation in any turn would be the promise it made.
  */
-const DECLARATION_TOOLS = new Set(['set_plan', 'set_acceptance']);
+const DECLARATION_TOOLS = new Set([
+  'set_plan',
+  'set_acceptance',
+  // Asking is the same kind of act: it is something the model said, not something it observed, and
+  // a finish that cited its own question as the result verifying a claim would be the loop above
+  // closed one step wider. It also keeps a turn whose only successful call was a question eligible
+  // for a not_applicable verification, which is exactly what such a turn is.
+  'ask'
+]);
 
 /**
  * Names the tool calls a finish is actually allowed to cite. Without this a rejected finish only
@@ -1353,6 +1387,12 @@ export const startTurnState = <T extends Record<string, unknown>>(
     // The bound is per turn - the tool says so, the constant is named for it, and the refusal tells
     // the model "this turn". Carrying it through made it per conversation instead.
     notices: 0,
+    // Per turn as well, and for the same reason - the tool tells the model "twice in a turn". This
+    // door is the one a message the agent was still running comes through, so a turn that ends
+    // while a question is outstanding must not carry the park into the next: the answer to a parked
+    // question is taken back into its own turn by `run`, and anything that gets here instead has
+    // already had that turn ended out from under it.
+    questionsAsked: 0,
     /*
      * The egress budget, for exactly the reason above it.
      *
@@ -1393,11 +1433,13 @@ export const startTurnState = <T extends Record<string, unknown>>(
     reasoningFloor?: unknown;
     compactedAtStep?: unknown;
     pending?: unknown;
+    question?: unknown;
     continuationMark?: unknown;
   };
   delete next.reasoningFloor;
   delete next.compactedAtStep;
   delete next.pending;
+  delete next.question;
   // What the last turn had changed by its last ceiling says nothing about this one, and left behind
   // it would be the bar a fresh turn has to clear before it may renew its own budget.
   delete next.continuationMark;
@@ -1409,6 +1451,80 @@ export const startTurnState = <T extends Record<string, unknown>>(
  * be noticed and the record put back rather than silently lost.
  */
 export const ACCEPTANCE_MARKER = 'ACTIVE ACCEPTANCE CHECKS';
+
+/**
+ * Every tool whose successful result is the agent talking rather than the agent looking.
+ *
+ * `DECLARATION_TOOLS` plus `notify`, and deliberately a second set rather than an addition to that
+ * one. That set is also what a finish may not cite, where adding a member changes a shipped gate
+ * and has a price the fixtures in `evals/` would move; here the only question is whether a turn has
+ * been anywhere yet, and by that question a notice is exactly what a plan is - something the model
+ * composed, carrying nothing back about the world. Without this, `notify` then `ask` cleared the
+ * first-act guard below on two calls that between them observed nothing at all.
+ */
+const AGENT_SPEECH = new Set([...DECLARATION_TOOLS, 'notify']);
+
+/**
+ * What a question has to be before the conversation is parked on it.
+ *
+ * Pure, and separate from the method that parks, because every clause here is a judgement about the
+ * failure this tool creates rather than about plumbing: an agent that asks instead of working. Two
+ * of the four are that judgement made mechanical.
+ *
+ * The one worth explaining is the last. `finish` already lets a turn that used no tools complete
+ * conversationally, and the completion nag already bounds a turn that keeps replying without acting
+ * - both are athanor deciding what to do about a turn that did nothing. A question asked before the
+ * turn has observed anything is the same shape from the front: the computer exists to go and look,
+ * and the choice between "which of these two files" and "I read both and they differ like this,
+ * which do you want" is the whole difference between a machine and a form. So the first act of a
+ * turn may not be a question - it has to have looked at something first, and nothing the agent
+ * itself said counts as looking, which is what `AGENT_SPEECH` above is.
+ */
+export const askOutcome = (
+  state: Pick<AgentState, 'turnToolResults' | 'questionsAsked'>,
+  args: Record<string, unknown>
+):
+  | { ok: true; question: string; options: string[]; why: string }
+  | { ok: false; refusal: string } => {
+  const question = textValue(args.question).trim().replace(/\s+/g, ' ').slice(0, 200);
+  const why = textValue(args.why).trim().replace(/\s+/g, ' ').slice(0, 240);
+  const options = (Array.isArray(args.options) ? args.options : [])
+    .map((option) => textValue(option).trim().slice(0, 80))
+    .filter(Boolean)
+    .slice(0, 5);
+  if (!question)
+    return {
+      ok: false,
+      refusal: 'Refused: a question needs one line the user can answer from a lock screen.'
+    };
+  if (!why)
+    return {
+      ok: false,
+      refusal:
+        'Refused: say in why what you cannot do until this is answered. If you can say what you would do either way, do that instead and state the assumption in your reply.'
+    };
+  if (options.length === 1)
+    return {
+      ok: false,
+      refusal:
+        'Refused: one option is not a choice. Send at least two, or leave options out and take any reply.'
+    };
+  const observed = Object.values(state.turnToolResults ?? {}).some(
+    (result) => result.success && !AGENT_SPEECH.has(result.name)
+  );
+  if (!observed)
+    return {
+      ok: false,
+      refusal:
+        'Refused: this turn has not looked at anything yet, so it has not earned a question. Go and find out - read the files, list what is connected, try the thing - and ask only about what is still genuinely undecidable afterwards.'
+    };
+  if ((state.questionsAsked ?? 0) >= MAX_QUESTIONS_PER_TURN)
+    return {
+      ok: false,
+      refusal: `Refused: this turn has already asked ${MAX_QUESTIONS_PER_TURN} questions, which is the limit. Make the most reasonable assumption, carry on, and say plainly in your reply what you assumed and what would change it.`
+    };
+  return { ok: true, question, options, why };
+};
 
 export const citableEvidence = (state: AgentState): string => {
   const citable = Object.entries(state.turnToolResults ?? {}).filter(
@@ -3421,6 +3537,85 @@ ${clockLine(new Date(), timeZone)}
     });
     state.turnToolResults ??= {};
     state.turnToolResults[call.id] = { name: call.name, success: true };
+  }
+
+  /**
+   * Stops the turn on a question, which is the other half of `#sendNotice`.
+   *
+   * It mirrors the approval path deliberately rather than inventing a second way to wait: the call
+   * is answered in the window, the remaining calls in the batch are deferred in writing, an event is
+   * written, and the task is saved `awaiting_user` with its lease cleared. What it does not mirror is
+   * the approvals table. A question is not an approval - there is nothing to bind arguments to,
+   * nothing to expire into a denial, and no yes or no to be given - so the answer is the owner's next
+   * message, taken back into this same turn by `run`.
+   *
+   * The notification is the one an unattended run already has. It carries the agent's own sentence
+   * to a device, which is exactly what a question is, and it is charged against the same
+   * per-conversation ceiling as every other notification the agent raises. Failure to queue it is
+   * swallowed, like the takeover raise: the question is in the transcript and the conversation is
+   * parked either way, and a device that could not be reached is not a reason to keep working past a
+   * decision the model has just said it cannot make.
+   *
+   * Returns whether the turn is parked. A refused question is an ordinary failed tool call and the
+   * turn carries on, which is the point: the refusals tell the model to go and find out instead.
+   */
+  async #askUser(
+    task: TaskRecord,
+    key: Uint8Array,
+    state: AgentState,
+    call: ModelToolCall,
+    deferred: readonly ModelToolCall[]
+  ): Promise<boolean> {
+    const outcome = askOutcome(state, call.arguments);
+    state.turnToolResults ??= {};
+    if (!outcome.ok) {
+      state.messages.push({ role: 'tool', toolCallId: call.id, content: outcome.refusal });
+      state.turnToolResults[call.id] = { name: call.name, success: false };
+      return false;
+    }
+    const { question, options, why } = outcome;
+    state.questionsAsked = (state.questionsAsked ?? 0) + 1;
+    state.question = { question, askedAtStep: state.step };
+    // Answered before the park, not after it: a tool call with no result is a malformed window, and
+    // this one is saved and reloaded by whichever worker picks the conversation back up.
+    state.messages.push({
+      role: 'tool',
+      toolCallId: call.id,
+      content: `Asked. The conversation is parked until the user answers, and their reply arrives as the next user message - so do not ask again, and do not act on a guess in the meantime. Question: ${question}${
+        options.length ? `\nOptions offered: ${options.join(' | ')}` : ''
+      }`
+    });
+    state.turnToolResults[call.id] = { name: call.name, success: true };
+    for (const later of deferred)
+      state.messages.push({
+        role: 'tool',
+        toolCallId: later.id,
+        content:
+          'Deferred because the turn stopped for a question. Request it again if still needed.'
+      });
+    await this.store
+      .createAgentNotification({
+        userId: task.userId,
+        taskId: task.id,
+        kind: 'agent_message',
+        messageCiphertext: encryptJson({ message: question }, key, agentNotificationAad(task.id))
+      })
+      .catch(() => undefined);
+    await event(this.store, task, key, 'question_asked', question, {
+      question,
+      why,
+      ...(options.length ? { options } : {}),
+      unattended: state.unattended === true
+    });
+    await this.store.updateTask({
+      id: task.id,
+      workerId: this.config.WORKER_ID,
+      status: 'awaiting_user',
+      actualComputeCredits: state.credits,
+      agentStateCiphertext: encryptJson(state, key, `task-state:${task.id}`),
+      clearLease: true
+    });
+    return true;
   }
 
   /**
@@ -7636,6 +7831,67 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       }
     }
 
+    /*
+     * The answer to a parked question, taken back into the turn that asked it.
+     *
+     * A question is answered by the owner writing, and a message sent to a conversation the agent
+     * still holds is queued rather than started - so this is the same move `drainCorrection` makes
+     * mid-turn, at the one point where waiting for it is the whole state of the machine. Keeping the
+     * turn is the point: everything the agent had already established is still in the window, and
+     * the alternative - ending the turn and starting a fresh one on the reply - throws away the
+     * context that made the question worth asking.
+     *
+     * `interrupt` is not required here, as it is for a correction. There the distinction earns its
+     * keep, because "do this next" and "no, not that" are different intentions and timing alone
+     * cannot tell them apart; here the agent has stopped and said what it is waiting for, so the
+     * next thing the owner writes is the answer by construction.
+     *
+     * With nothing queued the conversation is parked again exactly as it was, mirroring the pending
+     * approval that is still waiting above. That is what makes a re-lease from any direction - a
+     * worker restart, a sweep, an owner resuming - safe: the machine returns to waiting rather than
+     * carrying on as though it had been answered.
+     */
+    if (state.question) {
+      const asked = state.question;
+      const waiting = await this.store.getNextQueuedTaskMessage(task.id).catch(() => null);
+      const answer = waiting
+        ? decryptJson<{ prompt: string }>(waiting.promptCiphertext, key).prompt.trim()
+        : '';
+      const consumed =
+        waiting && answer
+          ? await this.store.consumeQueuedTaskMessageInTurn({
+              taskId: task.id,
+              messageId: waiting.id,
+              workerId: this.config.WORKER_ID,
+              // The reply reserved credits of its own, and the turn it is rejoining was budgeted
+              // before they existed - without this the loop trips its own ceiling immediately.
+              additionalComputeCredits: waiting.maxComputeCredits,
+              ...(waiting.maxSpendUsd === null ? {} : { additionalSpendUsd: waiting.maxSpendUsd }),
+              userMessageCiphertext: encryptJson({ markdown: answer }, key, `task-event:${task.id}`)
+            })
+          : false;
+      if (!consumed) {
+        await this.store.updateTask({
+          id: task.id,
+          workerId: this.config.WORKER_ID,
+          status: 'awaiting_user',
+          clearLease: true
+        });
+        return;
+      }
+      delete state.question;
+      // Their words, unaltered and in their own role: the answer is owner speech everywhere it
+      // matters - the taint model, the compaction rule that never paraphrases what the user said,
+      // and the transcript. The question it answers is one message above it in the window.
+      state.messages.push({ role: 'user', content: answer });
+      // Written before anything else can fail, so a crash here loses neither the answer nor the
+      // fact that it has already been taken out of the queue.
+      await this.#checkpoint(task, key, state);
+      await event(this.store, task, key, 'status', 'Answered - carrying on', {
+        question: asked.question
+      });
+    }
+
     if (await honorUserControl()) return;
     await this.store.updateTask({
       id: task.id,
@@ -8537,6 +8793,14 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         }
         if (call.name === 'notify') {
           await this.#sendNotice(task, key, state, call);
+          continue;
+        }
+        if (call.name === 'ask') {
+          // The same shape as the approval park below: everything the model proposed behind the
+          // question is answered in writing before the turn is saved, so the window it resumes into
+          // is well formed and nothing behind a decision runs before the decision is made.
+          if (await this.#askUser(task, key, state, call, response.toolCalls.slice(callIndex + 1)))
+            return;
           continue;
         }
         if (call.name === 'set_acceptance') {

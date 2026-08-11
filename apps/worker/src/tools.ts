@@ -643,6 +643,49 @@ export const agentTools: ModelTool[] = [
     }
   },
   {
+    name: 'ask',
+    /**
+     * The operating contract has always told the model to ask when a missing choice materially
+     * changes the result, and until now there was nowhere to ask: `awaiting_user` was written only
+     * by the approval path, so a genuine blocker came back as a `finish` with a `not_applicable`
+     * verification and landed as a completion card that reads exactly like finished work - and on
+     * an unattended run the box then went silent until the owner next looked.
+     *
+     * The description spends most of its length on when *not* to call it, deliberately. The failure
+     * this tool creates is an agent that asks instead of working, and that failure is far more
+     * likely than the one it fixes: a reversible assumption stated out loud costs the owner one
+     * sentence to correct, and a question costs them a round trip they are not there for.
+     */
+    description:
+      'Put one question to the user and stop this turn until they answer. Only for a decision you cannot make and cannot take back: a fork whose branches cost different things and only they can weigh, an authority nobody gave you, a fact about them nothing on this computer holds. Never for something you could find out by looking - read the file, call connector_list, search the workspace, try it. Never for a detail you can decide reversibly: choose the sensible option, say in your reply which way you went and what would change it, and carry on. A stated assumption beats a question every time, because they correct it in one sentence and the work is already done. It is not an approval and does not stand in for one - buying, sending, publishing, deleting and pushing stop on their own. Ask at most twice in a turn, and never as your first act: a turn that has looked at nothing has not earned a question. The conversation parks, their devices are told, and their answer comes back as their next message.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['question', 'why'],
+      properties: {
+        question: {
+          type: 'string',
+          maxLength: 200,
+          description:
+            'The question itself, in one line, answerable from a phone without opening anything.'
+        },
+        options: {
+          type: 'array',
+          minItems: 2,
+          maxItems: 5,
+          items: { type: 'string', maxLength: 80 },
+          description:
+            'The answers you would act on, when there is a fixed set of them. Omit it and any reply will do.'
+        },
+        why: {
+          type: 'string',
+          maxLength: 240,
+          description: 'What you cannot do until this is answered, in one line.'
+        }
+      }
+    }
+  },
+  {
     name: 'schedule',
     description:
       'List, create, edit, run now, pause, resume, or remove durable scheduled work on this computer. Use when the user asks for future or recurring work; changes always require one clear approval. Schedule in the user’s time zone, which is in your runtime context, unless they name another.',
@@ -1253,6 +1296,9 @@ const coreToolNames = new Set([
   'memory_recall',
   'web_search',
   'notify',
+  // Beside notify because they are the same act from the two sides: one tells the owner something,
+  // the other needs something back. Both are read on a device nobody is holding.
+  'ask',
   'schedule',
   'memory',
   'skill',
@@ -1348,6 +1394,10 @@ const WRITING_GIT_SUBCOMMANDS = new Set([
 
 /** Tools whose successful result is a check, not a change; everything else here changes something. */
 const NON_MUTATING_TOOLS = new Set([
+  // A question changes nothing on the computer or outside it. Counting it as a change would put it
+  // in front of the completion-evidence rule, where the only result after it is the question - which
+  // shows nothing about the work, for exactly the reason notify is listed below.
+  'ask',
   'browser_snapshot',
   'code_diagnostics',
   'code_search',

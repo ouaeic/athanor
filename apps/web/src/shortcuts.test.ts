@@ -2,19 +2,28 @@ import { describe, expect, it } from 'vitest';
 import {
   decisionKey,
   keyNotation,
+  paneId,
+  panes,
   shortcutRows,
+  stepPane,
   windowShortcut,
   type ShortcutEvent
 } from './shortcuts.js';
 
 const press = (patch: Partial<ShortcutEvent>): ShortcutEvent => ({
   key: 'a',
+  code: '',
   metaKey: false,
   ctrlKey: false,
   shiftKey: false,
+  altKey: false,
   inField: false,
   ...patch
 });
+
+/** A digit chord as a real keyboard sends it: the physical key, whatever character it produced. */
+const digit = (number: number, patch: Partial<ShortcutEvent> = {}): ShortcutEvent =>
+  press({ key: String(number), code: `Digit${number}`, metaKey: true, ...patch });
 
 const working = { agentWorking: true };
 const idle = { agentWorking: false };
@@ -60,6 +69,9 @@ describe('the keystrokes the workbench answers', () => {
         windowShortcut(press({ key: '/', metaKey: true }), working),
         windowShortcut(press({ key: 'ArrowUp', metaKey: true }), working),
         windowShortcut(press({ key: 'Escape' }), working),
+        windowShortcut(press({ key: 'F6' }), working),
+        windowShortcut(digit(1), working),
+        windowShortcut(digit(1, { altKey: true }), working),
         windowShortcut(press({ key: '?' }), working)
       ].filter(Boolean)
     );
@@ -84,8 +96,13 @@ describe('the keystrokes the workbench answers', () => {
    * keyboard does not have, for keys it accepted all along.
    */
   it('writes the keys in the notation of the keyboard reading it', () => {
-    expect(keyNotation('MacIntel')).toMatchObject({ cmd: '⌘', shift: '⇧', del: '⌫' });
-    expect(keyNotation('Win32')).toMatchObject({ cmd: 'Ctrl+', shift: 'Shift+', del: 'Backspace' });
+    expect(keyNotation('MacIntel')).toMatchObject({ cmd: '⌘', alt: '⌥', shift: '⇧', del: '⌫' });
+    expect(keyNotation('Win32')).toMatchObject({
+      cmd: 'Ctrl+',
+      alt: 'Alt+',
+      shift: 'Shift+',
+      del: 'Backspace'
+    });
     expect(keyNotation('Linux x86_64').cmd).toBe('Ctrl+');
     expect(keyNotation('iPhone').cmd).toBe('⌘');
   });
@@ -110,6 +127,78 @@ describe('the keystrokes the workbench answers', () => {
     expect(windowShortcut(press({ key: 'Enter' }), working)).toBeUndefined();
     expect(windowShortcut(press({ key: 'o', metaKey: true }), working)).toBeUndefined();
     expect(windowShortcut(press({ key: 'ArrowUp' }), working)).toBeUndefined();
+  });
+});
+
+/*
+ * The workbench had per-element accessibility and nothing above the element: no way to move focus
+ * between the three panes at all. With twenty conversations listed, the tools panel was something
+ * like sixty-seven Tab presses from the sidebar, and every one of these keys exists to make that a
+ * single keystroke.
+ */
+describe('the keys that move between panes', () => {
+  it('jumps to each of the four with ⌘1 to ⌘4', () => {
+    expect(windowShortcut(digit(1), idle)).toBe('go-conversations');
+    expect(windowShortcut(digit(2), idle)).toBe('go-conversation');
+    // ⌘3 is the message box, which is the binding ⌘/ already had rather than a second one.
+    expect(windowShortcut(digit(3), idle)).toBe('focus-composer');
+    expect(windowShortcut(digit(4), idle)).toBe('go-tools');
+    expect(windowShortcut(digit(5), idle)).toBeUndefined();
+  });
+
+  it('chooses a computer tool with ⌘⌥1 to ⌘⌥4, in the order of the strip', () => {
+    expect(windowShortcut(digit(1, { altKey: true }), idle)).toBe('tool-files');
+    expect(windowShortcut(digit(2, { altKey: true }), idle)).toBe('tool-computer');
+    expect(windowShortcut(digit(3, { altKey: true }), idle)).toBe('tool-terminal');
+    expect(windowShortcut(digit(4, { altKey: true }), idle)).toBe('tool-preview');
+  });
+
+  /*
+   * The one this pair exists for. ⌥1 on a Mac produces "¡" and a French keyboard produces "&" for
+   * the unshifted 1 key, so a chord matched on the character would have worked for some owners of
+   * a self-installed server and silently not for others. The physical key is the same everywhere.
+   */
+  it('reads the physical digit rather than the character it produced', () => {
+    expect(
+      windowShortcut(press({ key: '¡', code: 'Digit1', metaKey: true, altKey: true }), idle)
+    ).toBe('tool-files');
+    expect(windowShortcut(press({ key: '&', code: 'Digit1', metaKey: true }), idle)).toBe(
+      'go-conversations'
+    );
+    // And falls back to the character where there is no physical key to read, as on a soft keyboard.
+    expect(windowShortcut(press({ key: '2', code: '', metaKey: true }), idle)).toBe(
+      'go-conversation'
+    );
+  });
+
+  it('walks the panes with F6, both ways, with or without a text field under it', () => {
+    expect(windowShortcut(press({ key: 'F6' }), idle)).toBe('pane-next');
+    expect(windowShortcut(press({ key: 'F6', shiftKey: true }), idle)).toBe('pane-back');
+    expect(windowShortcut(press({ key: 'F6', inField: true }), working)).toBe('pane-next');
+  });
+
+  it('walks in a ring, and enters at whichever end it was asked from', () => {
+    expect(stepPane('conversations', 1)).toBe('conversation');
+    expect(stepPane('tools', 1)).toBe('conversations');
+    expect(stepPane('conversations', -1)).toBe('tools');
+    expect(stepPane(undefined, 1)).toBe('conversations');
+    expect(stepPane(undefined, -1)).toBe('tools');
+  });
+
+  /* One spelling of each id, because the markup and the keystroke have to name the same element. */
+  it('gives every pane one id', () => {
+    expect(panes.map(paneId)).toEqual([
+      'pane-conversations',
+      'pane-conversation',
+      'pane-composer',
+      'pane-tools'
+    ]);
+  });
+
+  /* ⌘⇧1 is not a pane. The sheet claims no shifted digit and the window must not answer one. */
+  it('does not answer a shifted digit', () => {
+    expect(windowShortcut(digit(1, { shiftKey: true }), idle)).toBeUndefined();
+    expect(windowShortcut(press({ key: '1', code: 'Digit1' }), idle)).toBeUndefined();
   });
 });
 

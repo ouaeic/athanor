@@ -998,8 +998,10 @@ describe('what actually reaches the provider', () => {
     // Thirty-eight: nothing is connected on this box, so connector_action is withheld (see below);
     // media_catalog is gone, because generate_media picks the reviewed model itself; media_status
     // is gone, because a generation now returns its file rather than a receipt; and code_symbols is
-    // gone, folded into code_search's wholeWord.
-    expect(names).toHaveLength(38);
+    // gone, folded into code_search's wholeWord. Thirty-nine since `ask`, which is the first way
+    // the model has had to put a question to the owner and stop - before it, a blocker came back as
+    // a finish nobody could tell from finished work.
+    expect(names).toHaveLength(39);
     expect(names).toEqual(
       expect.arrayContaining([
         'document_read',
@@ -1012,7 +1014,8 @@ describe('what actually reaches the provider', () => {
         'web_search',
         // The retrieval store could be read once at task start and never asked a question again.
         'memory_recall',
-        'notify'
+        'notify',
+        'ask'
       ])
     );
     // The catalogue is sent whole on every request and is the largest fixed cost in a turn, and
@@ -3773,6 +3776,226 @@ describe('a correction sent while the task is working', () => {
   });
 });
 
+describe('a question the agent stops to ask', () => {
+  /*
+   * The operating contract has always told the model to ask when a missing choice materially
+   * changes the result, and until now there was nowhere to ask: `awaiting_user` was written only by
+   * the approval path, so a genuine blocker came back as a finish with a not_applicable
+   * verification and landed as a completion card nobody could tell from finished work - and on an
+   * unattended run the box then went silent until the owner next looked.
+   */
+  const parked = {
+    question: 'Which mailbox should the invoice go from?',
+    why: 'Two are connected and the reply address changes what the client sees.',
+    options: ['work@', 'billing@']
+  };
+
+  it('parks the conversation, writes the question, and rings a device', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        // Something first: a turn that has looked at nothing may not ask, which is the guard against
+        // an agent that asks instead of working.
+        toolFrame('call-1', 'file_read', { path: 'workspace/invoice.md' }),
+        `data: ${JSON.stringify({
+          choices: [
+            {
+              finish_reason: 'tool_calls',
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'call-2',
+                    function: { name: 'ask', arguments: JSON.stringify(parked) }
+                  },
+                  {
+                    index: 1,
+                    id: 'call-3',
+                    function: {
+                      name: 'file_read',
+                      arguments: JSON.stringify({ path: 'workspace/terms.md' })
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        })}\n\ndata: [DONE]\n\n`,
+        textFrame('Never reached.')
+      ],
+      log,
+      {
+        route: (url) =>
+          url.includes('/file?')
+            ? new Response(JSON.stringify({ content: 'Invoice for March' }), {
+                headers: { 'content-type': 'application/json' }
+              })
+            : undefined
+      }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 6 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    // The three things the approval path does, done the same way rather than a second mechanism.
+    const asked = probe.events.filter((entry) => entry.kind === 'question_asked');
+    expect(asked).toHaveLength(1);
+    expect(asked[0]?.payload).toMatchObject(parked);
+    expect(probe.notifications).toEqual([{ kind: 'agent_message', message: parked.question }]);
+    expect(probe.checkpoints.at(-1)).toMatchObject({ status: 'awaiting_user', clearLease: true });
+
+    // No approval was raised, and nothing about it is dressed as one: there is no decision to bind
+    // arguments to and no yes or no that would answer "which mailbox".
+    expect(probe.events.some((entry) => entry.kind === 'approval_requested')).toBe(false);
+    // Nor did it finish. A blocker that lands as a completion card is the whole reason for this.
+    expect(probe.events.some((entry) => entry.kind === 'completed')).toBe(false);
+
+    const saved = decryptCheckpoints(probe.checkpoints).at(-1) as unknown as {
+      question?: { question: string };
+      questionsAsked?: number;
+      messages: Array<{ role: string; toolCallId?: string; content: string }>;
+    };
+    expect(saved.question).toMatchObject({ question: parked.question });
+    expect(saved.questionsAsked).toBe(1);
+    // The call is answered before the park - a tool call with no result is a malformed window, and
+    // this one is reloaded by whichever worker picks the conversation back up - and the read the
+    // model proposed behind the question is deferred in writing rather than run.
+    expect(saved.messages.find((message) => message.toolCallId === 'call-2')?.content).toContain(
+      'parked until the user answers'
+    );
+    expect(saved.messages.find((message) => message.toolCallId === 'call-3')?.content).toContain(
+      'Deferred because the turn stopped for a question'
+    );
+    expect(log.calls.filter((entry) => entry.includes('terms.md'))).toHaveLength(0);
+  });
+
+  it('refuses a question from a turn that has looked at nothing, and keeps working', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [toolFrame('call-1', 'ask', parked), textFrame('Assumed the work address; say if not.')],
+      log
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 3 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(probe.events.some((entry) => entry.kind === 'question_asked')).toBe(false);
+    expect(probe.notifications).toHaveLength(0);
+    expect(probe.checkpoints.some((entry) => entry.status === 'awaiting_user')).toBe(false);
+    const refusal = decryptCheckpoints(probe.checkpoints)
+      .at(-1)
+      ?.messages.find((message) => message.toolCallId === 'call-1');
+    expect(refusal?.content).toContain('has not looked at anything yet');
+  });
+
+  it('takes the answer back into the turn that asked, rather than starting a fresh one', async () => {
+    const asking = {
+      messages: [
+        { role: 'user', content: 'Send the invoice' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call-2', name: 'ask', arguments: parked }]
+        },
+        { role: 'tool', toolCallId: 'call-2', content: 'Asked. The conversation is parked.' }
+      ],
+      step: 2,
+      credits: 0,
+      turn: 0,
+      question: { question: parked.question, askedAtStep: 2 },
+      questionsAsked: 1,
+      turnToolResults: { 'call-1': { name: 'files_list', success: true } }
+    };
+    const task = makeTask(asking);
+    const probe = probeStore(() => task);
+    const consumed: Array<Record<string, unknown>> = [];
+    let pending = 1;
+    Object.assign(probe.store, {
+      getNextQueuedTaskMessage: async () => {
+        if (pending <= 0) return null;
+        pending -= 1;
+        return {
+          id: 'answer-1',
+          taskId,
+          userId,
+          promptCiphertext: encryptJson({ prompt: 'billing@' }, dataKey, `task-message:${taskId}`),
+          modelId: model.id,
+          privacyRoute: 'provider_zdr',
+          maxComputeCredits: 5,
+          maxSpendUsd: null,
+          resourceClass: 'task_compute',
+          reservationKey: 'r',
+          status: 'queued',
+          // Deliberately not an interrupt. A correction has to be marked, because "do this next"
+          // and "no, not that" cannot be told apart by timing; an answer needs no marking, because
+          // the agent has stopped and said what it is waiting for.
+          interrupt: false,
+          createdAt: '2026-07-01T00:00:00.000Z',
+          promotedAt: null
+        };
+      },
+      consumeQueuedTaskMessageInTurn: async (input: Record<string, unknown>) => {
+        consumed.push(input);
+        return true;
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Sent from billing@.')], log);
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 4 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(consumed).toHaveLength(1);
+    expect(consumed[0]).toMatchObject({ messageId: 'answer-1', additionalComputeCredits: 5 });
+    const sent = log.modelRequests.at(-1)?.messages as Array<{ role: string; content: string }>;
+    // Their words, in their own role, in the same window as the question - so the turn carries on
+    // with everything it had already established rather than re-deriving it from a new turn.
+    expect(sent.some((message) => message.role === 'user' && message.content === 'billing@')).toBe(
+      true
+    );
+    expect(sent.some((message) => message.role === 'tool')).toBe(true);
+    expect(decryptCheckpoints(probe.checkpoints).at(-1)).not.toHaveProperty('question');
+  });
+
+  it('goes back to waiting when it is re-leased before the answer arrives', async () => {
+    // A worker restart, a sweep, an owner pressing Resume: whatever picks the conversation up, a
+    // question with no answer yet has to return to waiting rather than carry on as though it had
+    // been answered. It costs no model call at all.
+    const task = makeTask({
+      messages: [
+        { role: 'user', content: 'Send the invoice' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call-2', name: 'ask', arguments: parked }]
+        },
+        { role: 'tool', toolCallId: 'call-2', content: 'Asked. The conversation is parked.' }
+      ],
+      step: 2,
+      credits: 0,
+      turn: 0,
+      question: { question: parked.question, askedAtStep: 2 }
+    });
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Never reached.')], log);
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 4 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(log.modelRequests).toHaveLength(0);
+    expect(probe.checkpoints.at(-1)).toMatchObject({ status: 'awaiting_user', clearLease: true });
+  });
+});
+
 describe('an agent that asks the same question twice', () => {
   it('answers an identical read with a pointer instead of running it again', async () => {
     // A stuck agent re-runs the identical search, gets the identical answer, and spends the whole
@@ -4656,5 +4879,170 @@ describe('a turn that finishes the job rather than the budget', () => {
     // Nothing was run to establish it: the turn a record belongs to is a free read, and it comes in
     // front of the checks, which can be a whole build.
     expect(log.calls.some((call) => call.includes('/exec'))).toBe(false);
+  }, 15_000);
+});
+
+describe('what a tainted turn is charged for sending', () => {
+  /**
+   * The turn's novelty budget is the only bound on how much material can leave in a series of
+   * addresses that are each individually innocent, and where it is charged decides whether it
+   * bounds anything at all. Both halves below rested on a comment.
+   *
+   * The owner names the host, so reading it is ordinary and the second read of the same host is
+   * inside every per-address bound - which is the case that has to be charged, not carded.
+   */
+  const OWNER_PROMPT = 'Read https://docs.example.test/guide and tell me what changed';
+
+  const readingTask = (): TaskRecord => ({
+    ...makeTask(),
+    promptCiphertext: encryptJson({ prompt: OWNER_PROMPT }, dataKey, `task-prompt:${taskId}`)
+  });
+
+  /** What the runner answers a page read with, in the one field the taint and the origins are read from. */
+  const pageRead = (url: string): Response =>
+    new Response(
+      JSON.stringify({
+        sources: [{ url, requestedUrl: url, title: 'Guide', status: 200 }],
+        pages: [{ url, text: 'Somebody else wrote this.' }]
+      }),
+      { headers: { 'content-type': 'application/json' } }
+    );
+
+  /** What the turn had spent when it was last written down, which is the running total itself. */
+  const noveltySpent = (probe: StoreProbe): number | undefined =>
+    probe.checkpoints
+      .flatMap((input) =>
+        input.agentStateCiphertext
+          ? [
+              decryptJson<{ turnNoveltyBytes?: number }>(
+                input.agentStateCiphertext as Parameters<typeof decryptJson>[0],
+                dataKey
+              )
+            ]
+          : []
+      )
+      .at(-1)?.turnNoveltyBytes;
+
+  it('charges a request that threw, because the request still went out', async () => {
+    /*
+     * Charging on the answer alone made stalling a free channel: a collector that accepts a request
+     * and never replies produced `TOOL_REQUEST_TIMEOUT_MS`, left the total where it was, and the
+     * next chunk was judged against the same figure again - so the per-turn bound bounded nothing
+     * an attacker was willing to wait for. The hostname was resolved and the payload was in the
+     * path before anything failed, and the only party who decides whether a request is answered is
+     * the server being talked to.
+     */
+    const task = readingTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-1', 'parallel_web_read', { urls: ['https://docs.example.test/guide'] }),
+        toolFrame('call-2', 'parallel_web_read', {
+          urls: ['https://docs.example.test/guide/changelog']
+        }),
+        textFrame('The second page never answered.')
+      ],
+      log,
+      {
+        route: (url) =>
+          url.includes('/browser/read-many')
+            ? log.calls.filter((call) => call.includes('/browser/read-many')).length > 1
+              ? new Response(
+                  JSON.stringify({
+                    error: { code: 'runner_request_failed', message: 'the page never answered' }
+                  }),
+                  { status: 502, headers: { 'content-type': 'application/json' } }
+                )
+              : pageRead('https://docs.example.test/guide')
+            : undefined
+      }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 3 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    // The call failed, and the turn was told so.
+    expect(probe.events.some((entry) => entry.kind === 'error')).toBe(true);
+    // `changelog` is the one thing in that address that appears nowhere in the owner's words, so
+    // it is exactly what the turn is charged. Asserted as the figure rather than as "more than
+    // nothing": a charge of the whole URL would be a different bug wearing the same assertion.
+    expect(noveltySpent(probe)).toBe('changelog'.length);
+  }, 15_000);
+
+  it('charges nothing for an answer the harness wrote, because nothing was sent', async () => {
+    /*
+     * The other side of the same rule. A repeat the loop answers from an earlier call, a plan the
+     * owner republished under a proposed call, arguments cut off mid-JSON: nothing was run and
+     * nothing left the machine, so a budget that spends itself on those raises approval cards on
+     * turns where nothing was sent at all.
+     *
+     * Driven through the plan case because it is the one that can carry addresses: the repeat set
+     * is workspace reads, which reach no host to charge for.
+     */
+    const task = readingTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    let read = false;
+    let version = 0;
+    // The owner is republishing the plan, so the version the loop reads is newer than the one the
+    // step began with - which is what "changed after this tool call was proposed" is. Held back
+    // until the first read has landed, so the turn is tainted and the budget is live when the
+    // second call is skipped; without the taint neither branch charges anything and this would
+    // pass on a bug.
+    const store = {
+      ...probe.store,
+      getLatestTaskPlan: async () =>
+        read
+          ? {
+              id: 'plan',
+              taskId,
+              version: (version += 1),
+              parentVersion: null,
+              branchName: 'Main',
+              stepsCiphertext: encryptJson(
+                { steps: [{ id: 'step-1', title: 'Read the guide', status: 'in_progress' }] },
+                dataKey,
+                `task-plan:${taskId}`
+              ),
+              createdBy: 'user' as const,
+              createdAt: '2026-07-01T00:00:00.000Z'
+            }
+          : null
+    } as unknown as DataStore;
+    installFetch(
+      [
+        toolFrame('call-1', 'parallel_web_read', { urls: ['https://docs.example.test/guide'] }),
+        toolFrame('call-2', 'parallel_web_read', {
+          urls: ['https://docs.example.test/guide/changelog']
+        }),
+        textFrame('Replanning.')
+      ],
+      log,
+      {
+        route: (url) => {
+          if (!url.includes('/browser/read-many')) return undefined;
+          read = true;
+          return pageRead('https://docs.example.test/guide');
+        }
+      }
+    );
+
+    await new AgentWorker(store, config({ TASK_MAX_STEPS: 3 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    // One read reached the runner; the second call was answered by the harness instead.
+    expect(log.calls.filter((call) => call.includes('/browser/read-many'))).toHaveLength(1);
+    expect(
+      probe.events.some(
+        (entry) =>
+          entry.kind === 'tool_result' &&
+          JSON.stringify(entry.payload).includes('changed the active plan')
+      )
+    ).toBe(true);
+    // Nothing was ever added, so the running total is still untouched rather than merely small.
+    expect(noveltySpent(probe) ?? 0).toBe(0);
   }, 15_000);
 });

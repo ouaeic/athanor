@@ -28,6 +28,8 @@ import {
   MAX_FINISH_REJECTIONS,
   approvalOutcome,
   approvalPreviewHash,
+  askOutcome,
+  MAX_QUESTIONS_PER_TURN,
   boundedToolResultForModel,
   compactionEventSummary,
   compactionModel,
@@ -1152,6 +1154,8 @@ describe('what a new turn keeps and what it drops', () => {
     reasoningFloor: 'high',
     compactedAtStep: 12,
     pending: { approvalId: 'a1' },
+    questionsAsked: 2,
+    question: { question: 'Which mailbox?', askedAtStep: 9 },
     // Conversation state, none of which may be dropped.
     taint: { sources: ['web pages'] },
     webToolMode: 'in_house',
@@ -1188,6 +1192,17 @@ describe('what a new turn keeps and what it drops', () => {
     expect(next).not.toHaveProperty('reasoningFloor');
     expect(next).not.toHaveProperty('compactedAtStep');
     expect(next).not.toHaveProperty('pending');
+    /*
+     * The question park goes the same way as the approval park, and for a sharper reason.
+     *
+     * An answer to a parked question is taken back into the turn that asked it, by `run`, before
+     * any of this. Anything that reaches this door with a question still outstanding has had that
+     * turn ended out from under it - the owner cancelled, or a sweep moved it - so the park is
+     * stale, and left behind it would make the next turn wait for an answer to a question nobody is
+     * still looking at. The count resets with it because the tool tells the model "twice in a turn".
+     */
+    expect(next).not.toHaveProperty('question');
+    expect(next.questionsAsked).toBe(0);
     /*
      * The egress budget goes with them, and it is the one where keeping it would have been the
      * quieter mistake: the taint it is charged under is never cleared, so a budget that carried
@@ -1464,6 +1479,99 @@ describe('completion verification', () => {
       }
     );
     expect(checked.ok).toBe(true);
+  });
+});
+
+describe('when the agent is allowed to stop and ask', () => {
+  /**
+   * The tool exists because the operating contract told the model to ask when a missing choice
+   * materially changes the result and gave it nowhere to ask - a blocker came back as a finish with
+   * a not_applicable verification and read to the owner exactly like finished work. The failure it
+   * creates is the opposite one, an agent that asks instead of working, and these are the four
+   * places that failure is caught before the conversation is parked and a device is rung.
+   */
+  const looked = { turnToolResults: { 'call-1': { name: 'file_read', success: true } } };
+
+  it('takes a real question with a reason and trims it to one line', () => {
+    const outcome = askOutcome(looked, {
+      question: '  Which  mailbox\n  should the invoice go from? ',
+      why: 'Two are connected and the reply address changes what the client sees.',
+      options: ['work@', 'billing@', '', 'work@ but bcc billing@']
+    });
+    expect(outcome).toMatchObject({
+      ok: true,
+      question: 'Which mailbox should the invoice go from?',
+      options: ['work@', 'billing@', 'work@ but bcc billing@']
+    });
+  });
+
+  it('refuses a question from a turn that has not looked at anything', () => {
+    // The sharp one. A computer that can go and read the two files is not entitled to ask which of
+    // them differs, and this is the same judgement the completion nag and the finish gate already
+    // make about a turn that did nothing - taken from the front instead of the back.
+    const outcome = askOutcome(
+      { turnToolResults: {} },
+      { question: 'Which file?', why: 'Blocked' }
+    );
+    expect(outcome).toMatchObject({ ok: false });
+    expect(outcome.ok ? '' : outcome.refusal).toContain('has not looked at anything yet');
+  });
+
+  it('does not count its own declarations as having looked', () => {
+    // set_plan and set_acceptance are the model speaking, so a turn that published a plan and then
+    // asked a question has still observed nothing - the same set citableEvidence refuses to cite.
+    const outcome = askOutcome(
+      { turnToolResults: { 'call-1': { name: 'set_plan', success: true } } },
+      { question: 'Which file?', why: 'Blocked' }
+    );
+    expect(outcome.ok).toBe(false);
+  });
+
+  it('does not count telling the owner something as having looked', () => {
+    // The cheapest way round the guard, if a notice counted: notify then ask is two calls that
+    // between them observed nothing, and both of them are the agent talking. A notice is not in the
+    // citable set for the same reason, but by a different route - see AGENT_SPEECH.
+    const outcome = askOutcome(
+      { turnToolResults: { 'call-1': { name: 'notify', success: true } } },
+      { question: 'Which file?', why: 'Blocked' }
+    );
+    expect(outcome.ok ? '' : outcome.refusal).toContain('has not looked at anything yet');
+  });
+
+  it('refuses a question with no reason it could not be assumed instead', () => {
+    const outcome = askOutcome(looked, { question: 'Which font?', why: '  ' });
+    expect(outcome.ok ? '' : outcome.refusal).toContain('state the assumption');
+  });
+
+  it('refuses a single option, because one option is not a choice', () => {
+    const outcome = askOutcome(looked, { question: 'A4?', why: 'Page size', options: ['A4'] });
+    expect(outcome.ok ? '' : outcome.refusal).toContain('at least two');
+  });
+
+  it('stops a dialogue at the bound, and tells the model to assume and carry on', () => {
+    const outcome = askOutcome(
+      { ...looked, questionsAsked: MAX_QUESTIONS_PER_TURN },
+      { question: 'And the margins?', why: 'Layout' }
+    );
+    expect(outcome.ok ? '' : outcome.refusal).toContain('what you assumed');
+  });
+
+  it('bounds a turn well inside a conversation the owner is not watching', () => {
+    // The answer rejoins the same turn, so this one number covers the whole exchange rather than
+    // one question - which is why it is small.
+    expect(MAX_QUESTIONS_PER_TURN).toBeLessThanOrEqual(2);
+  });
+
+  it('is not something a finish may cite as having verified anything', () => {
+    // A question is what the model said, not what it observed. Citing it would be the completion
+    // contract closing a loop on itself one step wider than set_plan already could.
+    const guidance = citableEvidence({
+      messages: [],
+      step: 0,
+      credits: 0,
+      turnToolResults: { 'call-1': { name: 'ask', success: true } }
+    });
+    expect(guidance).toContain('not_applicable');
   });
 });
 
