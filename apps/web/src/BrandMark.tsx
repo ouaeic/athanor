@@ -23,6 +23,12 @@ import { useId } from 'react';
  * object stopped reading as masonry. `metal` is only the door frame, where the brightness is
  * earned, because it is what throws the fire forward.
  *
+ * Both were blue-grey until the interface went warm, and a cool mark inside a bronze rim reads as
+ * a mistake. They are warmed at the same lightness they had, so the specular jump that makes them
+ * read as struck metal rather than more masonry is unchanged - that contrast between stops is what
+ * carries the material, not the hue. Iron sits near the neutral axis, as blackened steel does;
+ * the door frame is frankly warm, because it is the one surface in the drawing with a fire on it.
+ *
  * The gradients are given document-unique ids because the mark renders twice on the sign-in screen,
  * and two `<defs>` sharing an id is one gradient serving both - which is invisible until the day
  * one of them is removed.
@@ -54,14 +60,14 @@ export function BrandMark({ className }: { className?: string }) {
           <stop offset="1" stopColor="#2c211a" />
         </linearGradient>
         <linearGradient id={iron} x1="30" y1="28" x2="98" y2="108" gradientUnits="userSpaceOnUse">
-          <stop stopColor="#9aa0a3" />
-          <stop offset=".45" stopColor="#6e7477" />
-          <stop offset="1" stopColor="#4a4f52" />
+          <stop stopColor="#a39a92" />
+          <stop offset=".45" stopColor="#77706a" />
+          <stop offset="1" stopColor="#514c47" />
         </linearGradient>
         <linearGradient id={metal} x1="44" y1="84" x2="84" y2="108" gradientUnits="userSpaceOnUse">
-          <stop stopColor="#f7f8f8" />
-          <stop offset=".5" stopColor="#b6babd" />
-          <stop offset="1" stopColor="#7d8285" />
+          <stop stopColor="#fdf5ee" />
+          <stop offset=".5" stopColor="#c2b4a6" />
+          <stop offset="1" stopColor="#867b72" />
         </linearGradient>
         {/* The heat the door lets out. It is what makes the mark look lit rather than drawn. */}
         <radialGradient id={glow} cx=".5" cy=".5" r=".5">

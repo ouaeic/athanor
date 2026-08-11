@@ -16,14 +16,14 @@
       <stop offset="1" stop-color="#2c211a"/>
     </linearGradient>
     <linearGradient id="iron" x1="30" y1="28" x2="98" y2="108" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#9aa0a3"/>
-      <stop offset=".45" stop-color="#6e7477"/>
-      <stop offset="1" stop-color="#4a4f52"/>
+      <stop stop-color="#a39a92"/>
+      <stop offset=".45" stop-color="#77706a"/>
+      <stop offset="1" stop-color="#514c47"/>
     </linearGradient>
     <linearGradient id="metal" x1="44" y1="84" x2="84" y2="108" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#f7f8f8"/>
-      <stop offset=".5" stop-color="#b6babd"/>
-      <stop offset="1" stop-color="#7d8285"/>
+      <stop stop-color="#fdf5ee"/>
+      <stop offset=".5" stop-color="#c2b4a6"/>
+      <stop offset="1" stop-color="#867b72"/>
     </linearGradient>
     <radialGradient id="glow" cx=".5" cy=".5" r=".5">
       <stop stop-color="#f2a13f" stop-opacity=".55"/>
