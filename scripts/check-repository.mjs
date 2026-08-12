@@ -673,6 +673,64 @@ else
     `Runtime files: the update places all ${installerPlaces.size - installOnly.size} the installer does, ${installOnly.size} install-only by decision.`
   );
 
+/*
+ * Numbers the client holds a second copy of, against the file that owns them.
+ *
+ * Each copy is deliberate and says so where it is written: the client is on the far side of a
+ * 150 kB bundle gate, and importing any of these would drag a schema library or `node:fs` into the
+ * first paint to evaluate arithmetic. What was missing is the thing that makes a copy safe. Both
+ * sides have tests, and they assert different examples - the disk floor is checked at 400 GiB on
+ * one side and 500 GiB on the other - so a changed formula fails neither.
+ *
+ * The drift is not cosmetic. `hostStorageFloorBytes` is what the runner refuses a write by and
+ * what the interface draws the disk bar from, so a copy left behind puts the owner in front of a
+ * bar with room on it while every write is refused: the screen asserting the opposite of what the
+ * machine has already decided.
+ *
+ * Compared as source text, because that is what has to match. Anything cleverer would need to
+ * import one side, and the whole reason there are two is that importing is what nobody can do.
+ */
+const copiedConstants = [
+  {
+    what: 'the host disk floor',
+    owner: 'services/workspace-runner/src/host-storage.ts',
+    copy: 'apps/web/src/usage-model.ts',
+    // The body only. Both files declare it with the same name and signature, so matching from the
+    // arrow to the semicolon compares the arithmetic and nothing about how it is spelled.
+    find: /hostStorageFloorBytes = \(hostStorageTotalBytes: number\): number =>([\s\S]*?);/
+  },
+  {
+    what: 'the spending ceiling limits',
+    owner: 'packages/contracts/src/index.ts',
+    copy: 'apps/web/src/usage-model.ts',
+    find: /MAX_SPEND_CAP_USD = ([\d_]+)/
+  },
+  {
+    what: 'the per-conversation ceiling limit',
+    owner: 'packages/contracts/src/index.ts',
+    copy: 'apps/web/src/usage-model.ts',
+    find: /MAX_TASK_SPEND_USD = ([\d_]+)/
+  }
+];
+const drifted = [];
+for (const { what, owner, copy, find } of copiedConstants) {
+  const here = read(owner).match(find);
+  const there = read(copy).match(find);
+  // A pattern that stops matching is the failure this check exists to prevent, wearing the costume
+  // of a pass. Renaming either side has to be as loud as changing the number.
+  if (!here || !there)
+    drifted.push(
+      `${what} could not be read from ${!here ? owner : copy}; the comparison is no longer running`
+    );
+  else if (here[1].replace(/\s+/g, ' ').trim() !== there[1].replace(/\s+/g, ' ').trim())
+    drifted.push(`${what} is "${here[1].trim()}" in ${owner} and "${there[1].trim()}" in ${copy}`);
+}
+if (drifted.length) for (const message of drifted) fail(message);
+else
+  say(
+    `Copied constants: ${copiedConstants.length} the client holds a second copy of still match the file that owns them.`
+  );
+
 if (failures.length > 0) {
   process.stderr.write(`\n${failures.map((message) => `- ${message}`).join('\n')}\n`);
   process.exitCode = 1;
