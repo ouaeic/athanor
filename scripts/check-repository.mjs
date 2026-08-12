@@ -474,8 +474,12 @@ if (NAMED_PRODUCTS) {
 const hostTable = read('scripts/athanor-host.sh')
   .split('\n')
   .slice(
-    read('scripts/athanor-host.sh').split('\n').findIndex((line) => line.startsWith('capability\t')),
-    read('scripts/athanor-host.sh').split('\n').findIndex((line) => line === 'TABLE')
+    read('scripts/athanor-host.sh')
+      .split('\n')
+      .findIndex((line) => line.startsWith('capability\t')),
+    read('scripts/athanor-host.sh')
+      .split('\n')
+      .findIndex((line) => line === 'TABLE')
   )
   .filter(Boolean);
 const [tableHeader, ...tableRows] = hostTable;
@@ -484,7 +488,9 @@ if (families.length < 4) fail('the host package table names fewer than four fami
 for (const row of tableRows) {
   const cells = row.split('\t');
   if (cells.length !== families.length + 1)
-    fail(`host table row "${cells[0]}" has ${cells.length - 1} entries for ${families.length} families`);
+    fail(
+      `host table row "${cells[0]}" has ${cells.length - 1} entries for ${families.length} families`
+    );
   if (cells.slice(1).every((cell) => cell === '-'))
     fail(`host table row "${cells[0]}" names no package on any family, so nothing can provide it`);
 }
@@ -544,7 +550,9 @@ say(`Upgrade paths: ${upgradePaths.length} carry the non-interactive and withdra
  */
 const declaredVersion = JSON.parse(read('package.json')).version;
 const installUi = read('apps/web/src/ServerInstall.tsx');
-const pinnedRefs = [...installUi.matchAll(/\/(?:v)?(\d+\.\d+\.\d+)\/|ATHANOR_REF=v(\d+\.\d+\.\d+)/g)]
+const pinnedRefs = [
+  ...installUi.matchAll(/\/(?:v)?(\d+\.\d+\.\d+)\/|ATHANOR_REF=v(\d+\.\d+\.\d+)/g)
+]
   .map((match) => match[1] ?? match[2])
   .filter(Boolean);
 if (!pinnedRefs.length) fail('apps/web/src/ServerInstall.tsx pins no revision for the installer');
@@ -604,6 +612,66 @@ else if (undocumented.length)
 else if (imaginary.length)
   fail(`README documents ${imaginary.join(', ')}, which scripts/athanor does not answer to`);
 else say(`Server commands: ${shippedCommands.size} shipped, all of them documented.`);
+
+/**
+ * Every file a fresh install puts on a box is a file an update puts there too.
+ *
+ * The installer and `install_runtime_files` keep the same list twice, by hand and by nothing else,
+ * and the second copy fell behind without a single test noticing: a server that had only ever been
+ * updated had no athanor-backup.timer, so nothing was ever going to take the backup the interface
+ * described. The comparison below is the one nobody was running. It is one-directional - the update
+ * may place more, as it does for the relay directory - and the exceptions are named rather than
+ * inferred, because "the update does not place this" has to be a decision somebody made.
+ */
+const installerSource = read('scripts/install-native.sh').replace(/\\\n\s*/g, ' ');
+const installerPlaces = new Set();
+for (const line of installerSource.split('\n')) {
+  const asset = line.match(/^\s*install_asset\s+\d+\s+(\S+)\s+(\/\S+)\s*$/);
+  if (asset) installerPlaces.add(asset[2]);
+  // The few the installer places without going through install_asset, because they need an owner
+  // and a group, or because the source is something it downloaded rather than a file in the tree.
+  const direct = line.match(/^\s*install\s+-m\s+(?:\S+\s+|-[og]\s+\S+\s+)+(\/\S+)\s*$/);
+  if (direct) installerPlaces.add(direct[1]);
+}
+const updateSource = read('scripts/athanor');
+const listStart = updateSource.indexOf('install_runtime_files() {');
+const listBlock =
+  listStart === -1 ? '' : updateSource.slice(listStart, updateSource.indexOf('\n}\n', listStart));
+const updatePlaces = new Set([...listBlock.matchAll(/runtime_path (\/\S+?)\)/g)].map((m) => m[1]));
+// Placed by an install and deliberately not by an update. The listen snippet is chosen from two
+// assets by the host's nginx version; the HSTS snippet belongs to `athanor certificate enable` and
+// an update that rewrote it would switch HSTS off on a box with a real certificate; the AppArmor
+// profile needs apparmor_parser and a host that has it; the ImageMagick shim exists only where the
+// host has ImageMagick 6; typst is a downloaded release binary rather than a file in this checkout.
+const installOnly = new Set([
+  '/etc/nginx/snippets/athanor-https-listen.conf',
+  '/etc/nginx/snippets/athanor-hsts.conf',
+  '/etc/apparmor.d/athanor-chromium',
+  '/usr/local/bin/magick',
+  '/usr/local/bin/typst'
+]);
+const neverUpdated = [...installerPlaces]
+  .filter((target) => !updatePlaces.has(target) && !installOnly.has(target))
+  .sort();
+const staleException = [...installOnly].filter((target) => !installerPlaces.has(target)).sort();
+// A floor rather than a presence test, for the same reason the script discovery above has one: a
+// comparison that quietly stops finding either list passes every time and protects nothing.
+if (installerPlaces.size < 30 || updatePlaces.size < 30)
+  fail(
+    `only ${installerPlaces.size} installer and ${updatePlaces.size} update runtime files were found; the lists are no longer being read rather than the tree being that small`
+  );
+else if (neverUpdated.length)
+  fail(
+    `scripts/install-native.sh places ${neverUpdated.join(', ')}, which install_runtime_files never does; a server that was updated rather than reinstalled would never receive it`
+  );
+else if (staleException.length)
+  fail(
+    `${staleException.join(', ')} is listed as install-only but the installer no longer places it`
+  );
+else
+  say(
+    `Runtime files: the update places all ${installerPlaces.size - installOnly.size} the installer does, ${installOnly.size} install-only by decision.`
+  );
 
 if (failures.length > 0) {
   process.stderr.write(`\n${failures.map((message) => `- ${message}`).join('\n')}\n`);

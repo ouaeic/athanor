@@ -122,6 +122,9 @@ cp "$repository_root/scripts/athanor" \
   "$repository_root/scripts/athanor-ddns" \
   "$repository_root/scripts/athanor-certificate" \
   "$repository_root/scripts/athanor-document" \
+  "$repository_root/scripts/athanor-office-convert" \
+  "$repository_root/scripts/athanor-pdf-tables" \
+  "$repository_root/scripts/athanor-document-proof" \
   "$repository_root/scripts/athanor-snapshot" \
   "$seed/scripts/"
 cp "$repository_root/infra/native/start-desktop-session.sh" \
@@ -143,6 +146,8 @@ cp "$repository_root/infra/native/start-desktop-session.sh" \
   "$repository_root/infra/native/athanor-backup-alert.service" \
   "$repository_root/infra/native/athanor-motd" \
   "$repository_root/infra/native/nginx.conf" \
+  "$repository_root/infra/native/nginx-security-headers.conf" \
+  "$repository_root/infra/native/nginx-app-csp.conf" \
   "$seed/infra/native/"
 # The readiness gate compares the schema the database reports against the highest migration in
 # the checkout, so the checkout needs one to read.
@@ -233,6 +238,19 @@ test -x "$runtime/usr/local/lib/athanor/athanor-package-helper"
 test ! -e "$runtime/usr/local/bin/athanor-package-helper"
 test -x "$runtime/usr/local/lib/athanor/athanor-sandbox"
 printf 'ok  root helpers are installed off the agent PATH\n'
+
+# What the installer places and the update did not. The backup units were one instance of it; these
+# were the rest, and both were found by comparing the two lists rather than by anything failing. The
+# document commands are named by absolute path in the shipped skills, so on a box that has only ever
+# been updated the agent was reading this release's instructions and running install day's binary,
+# or on a box older than they are, running nothing. The nginx snippets are included by the site file
+# the update replaces, so the policy and the site that expects it moved apart at every release.
+test -x "$runtime/usr/local/bin/athanor-office-convert"
+test -x "$runtime/usr/local/bin/athanor-pdf-tables"
+test -x "$runtime/usr/local/lib/athanor/athanor-document-proof"
+test -f "$runtime/etc/nginx/snippets/athanor-security-headers.conf"
+test -f "$runtime/etc/nginx/snippets/athanor-app-csp.conf"
+printf 'ok  the update places every runtime file the installer does\n'
 
 # The relay identity key is this server's address on every relay it has enrolled with: replacing it
 # would silently change the hostname every paired client holds. An update has to leave what is in
@@ -337,6 +355,100 @@ grep -q 'Update complete after' <<EOF
 $outage_output
 EOF
 printf 'ok  the outage is announced beforehand and measured afterwards\n'
+
+# A file added in a release has to land in that release.
+#
+# `athanor update` is /usr/local/bin/athanor, the previous release's copy of the script, and the
+# running shell goes on executing it after the pull: the tree being installed from was the new one
+# and the list of what to install from it was the old one. So anything a release added reached an
+# existing box a release late, and nothing reported an error, because nothing had gone wrong. The
+# server that showed this had the backup units in its checkout, no timer anywhere on disk, and an
+# interface still describing a daily copy. The fixture is a unit the published revision installs and
+# the revision performing the update has never heard of.
+printf '[Unit]\nDescription=A unit the published release adds\n' \
+  >"$seed/infra/native/athanor-late-addition.service"
+awk '
+  { print }
+  /^install_runtime_files\(\) \{$/ {
+    print "  install -D -m 0644 infra/native/athanor-late-addition.service \\"
+    print "    \"$(runtime_path /etc/systemd/system/athanor-late-addition.service)\""
+  }
+' "$seed/scripts/athanor" >"$test_root/seed-athanor"
+mv "$test_root/seed-athanor" "$seed/scripts/athanor"
+chmod 0755 "$seed/scripts/athanor"
+printf '\n# fixture-version=v8\n' >>"$seed/scripts/athanor-service"
+publish_fixture v8-adds-a-unit
+run_update >/dev/null 2>&1
+test -f "$runtime/etc/systemd/system/athanor-late-addition.service"
+grep -q 'fixture-version=v8' "$runtime/usr/local/lib/athanor/athanor-service"
+printf 'ok  a file added in a release is installed by that release\n'
+
+# And the phase is asked only of a revision that answers it.
+#
+# Handing it to one that does not is not a no-op: before this release `update` ignored anything
+# after it and simply updated, so a checkout that mentions the phase without answering to it turns
+# the install step into a whole second update, run from inside the first, against a server the
+# first one has already stopped - and that second update asks the same question again. Drilled with
+# a real checkout, that chain did not end; it was still forking full updates, each taking its own
+# backup, ten minutes later. So what the run looks for is the dispatch arm rather than the name,
+# which also appears in prose. The fixture keeps every mention and loses the arm, and answers an
+# unrecognised argument the way releases before this one did: without failing.
+cp "$seed/scripts/athanor" "$test_root/seed-athanor-answering"
+sed \
+  -e 's/^      install-runtime-files)$/      a-phase-under-some-other-name)/' \
+  -e 's|^      \*) fail "usage: athanor update" ;;$|      *) printf "asked for the phase\\n" >>"$ATHANOR_TEST_COMMAND_LOG"; exit 0 ;;|' \
+  "$test_root/seed-athanor-answering" >"$seed/scripts/athanor"
+chmod 0755 "$seed/scripts/athanor"
+grep -q 'install-runtime-files' "$seed/scripts/athanor"
+if grep -q '^ *install-runtime-files)' "$seed/scripts/athanor"; then
+  printf 'the fixture still answers to the phase, so it tests nothing\n' >&2
+  exit 1
+fi
+printf '\n# fixture-version=v9\n' >>"$seed/scripts/athanor-service"
+publish_fixture v9-mentions-the-phase-without-answering
+: >"$command_log"
+if run_update >/dev/null 2>&1; then unanswered_update=completed; else unanswered_update=""; fi
+if grep -q 'asked for the phase' "$command_log"; then
+  printf 'the install step was handed to a revision with no arm to answer it\n' >&2
+  exit 1
+fi
+[ -n "$unanswered_update" ] || {
+  printf 'the update did not complete against a revision that does not answer the phase\n' >&2
+  exit 1
+}
+grep -q 'fixture-version=v9' "$runtime/usr/local/lib/athanor/athanor-service"
+printf 'ok  the install phase is asked only of a revision that answers to it\n'
+
+# And a generation that came from the phase does not start another.
+#
+# The marker above is a reading of a file, and the file is the one thing here nobody controls. This
+# is the bound that does not depend on reading it right: the phase is entered once, and a child
+# that finds itself already inside one places the files itself instead of passing the job on. The
+# fixture is the mistake this is for - a revision whose arm calls the wrapper rather than the list -
+# and it counts its own generations so that a regression fails the drill rather than forking until
+# something else stops it.
+awk '
+  /^        install_runtime_files$/ {
+    print "        printf \"phase generation\\\\n\" >>\"$ATHANOR_TEST_COMMAND_LOG\""
+    print "        [ \"$(grep -c \"phase generation\" \"$ATHANOR_TEST_COMMAND_LOG\")\" -lt 4 ] ||"
+    print "          fail \"the phase re-entered itself\""
+    print "        install_checked_out_runtime_files"
+    next
+  }
+  { print }
+' "$test_root/seed-athanor-answering" >"$seed/scripts/athanor"
+chmod 0755 "$seed/scripts/athanor"
+printf '\n# fixture-version=v10\n' >>"$seed/scripts/athanor-service"
+publish_fixture v10-the-phase-calls-the-wrapper
+: >"$command_log"
+run_update >/dev/null 2>&1 || true
+phase_generations=$(grep -c 'phase generation' "$command_log")
+if [ "$phase_generations" -ne 1 ]; then
+  printf 'the install phase ran %s times in one update\n' "$phase_generations" >&2
+  exit 1
+fi
+grep -q 'fixture-version=v10' "$runtime/usr/local/lib/athanor/athanor-service"
+printf 'ok  the install phase does not start a second generation of itself\n'
 
 # The daily backup, and whether the box can say anything true about it.
 #

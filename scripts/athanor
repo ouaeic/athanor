@@ -615,6 +615,23 @@ doctor() {
   else
     check_note "unattended updates are off; run sudo athanor auto-update on to enable them"
   fi
+  # Off and never installed are different faults with different repairs, and `is-enabled --quiet`
+  # cannot tell them apart: it answers no to both. Only one of them is fixed by switching backups on,
+  # because `systemctl enable` on a unit that is not on the disk fails - so a server that was updated
+  # across the release adding these units, and never received them, was being sent at a command that
+  # could not work. Reported and not repaired: a diagnostic that enables a timer on the owner's
+  # behalf is one they cannot run to find out where they stand.
+  backup_timer_state=$(systemctl is-enabled "$backup_timer" 2>/dev/null || true)
+  case "$backup_timer_state" in
+    enabled|enabled-runtime) backup_timer_on=yes ;;
+    *) backup_timer_on="" ;;
+  esac
+  if [ "$backup_timer_state" = not-found ]; then
+    check_warn "the daily backup timer is not installed on this server, so no backup will ever be taken on its own; sudo athanor update places it"
+    backup_timer_repair="sudo athanor update installs the daily timer, then sudo athanor backup auto on switches it on"
+  else
+    backup_timer_repair="sudo athanor backup auto on takes one daily"
+  fi
   # Twenty-five checks and not one of them used to mention backups, on a product whose whole promise
   # is that it keeps running while nobody is watching. A copy that does not exist is the one fault
   # here that cannot be repaired after the fact.
@@ -631,10 +648,10 @@ doctor() {
           check_fail "no backup exists; the last run $backup_outcome - $backup_reason. Run sudo athanor backup to take one now"
           ;;
         *)
-          if systemctl is-enabled --quiet "$backup_timer" 2>/dev/null; then
+          if [ -n "$backup_timer_on" ]; then
             check_note "no backup yet; the daily window will take the first one"
           else
-            check_warn "no backup exists: sudo athanor backup auto on takes one daily"
+            check_warn "no backup exists: $backup_timer_repair"
           fi
           ;;
       esac
@@ -649,10 +666,10 @@ doctor() {
     *)
       if [ "$backup_outcome" = failed ] || [ "$backup_outcome" = skipped ]; then
         check_warn "newest backup is $backup_age days old; the last run $backup_outcome - $backup_reason"
-      elif systemctl is-enabled --quiet "$backup_timer" 2>/dev/null; then
+      elif [ -n "$backup_timer_on" ]; then
         check_warn "newest backup is $backup_age days old; check athanor logs for why the daily run stopped"
       else
-        check_warn "newest backup is $backup_age days old: sudo athanor backup auto on keeps it daily"
+        check_warn "newest backup is $backup_age days old: $backup_timer_repair"
       fi
       ;;
   esac
@@ -1199,6 +1216,18 @@ install_runtime_files() {
     "$(runtime_path /usr/local/lib/athanor/athanor-certificate)"
   install -D -m 0755 scripts/athanor-document \
     "$(runtime_path /usr/local/lib/athanor/athanor-document)"
+  # The three the skill library names by absolute path. The installer placed them and no update ever
+  # did, so a release could ship a skill telling the agent to run a flag that only exists in the copy
+  # under scripts/ - and on a box installed before they were added, a command that is not there at
+  # all. Same fault as the backup units, found by comparing the two lists rather than by anyone
+  # noticing. Two of them sit on the agent's PATH deliberately: they hold no privilege the agent does
+  # not already have, and they are what the skills tell it to run.
+  install -D -m 0755 scripts/athanor-office-convert \
+    "$(runtime_path /usr/local/bin/athanor-office-convert)"
+  install -D -m 0755 scripts/athanor-pdf-tables \
+    "$(runtime_path /usr/local/bin/athanor-pdf-tables)"
+  install -D -m 0755 scripts/athanor-document-proof \
+    "$(runtime_path /usr/local/lib/athanor/athanor-document-proof)"
   install -D -m 0755 scripts/athanor-snapshot \
     "$(runtime_path /usr/local/lib/athanor/athanor-snapshot)"
   install -D -m 0755 infra/native/start-desktop-session.sh \
@@ -1254,6 +1283,80 @@ install_runtime_files() {
     "$(runtime_path /etc/update-motd.d/99-athanor)"
   install -D -m 0644 infra/native/nginx.conf \
     "$(runtime_path /etc/nginx/sites-available/athanor)"
+  # The site file above includes these on nearly every location it serves, and an update replaced it
+  # while leaving them at whatever the install day wrote - so a release that tightened the policy
+  # shipped the site that expects the new one and kept the old. The listen snippet is not here on
+  # purpose: the installer picks between two of them by the host's nginx version, which an update has
+  # no reason to re-decide and no business guessing at. `nginx -t` below is what stands behind these.
+  install -D -m 0644 infra/native/nginx-security-headers.conf \
+    "$(runtime_path /etc/nginx/snippets/athanor-security-headers.conf)"
+  install -D -m 0644 infra/native/nginx-app-csp.conf \
+    "$(runtime_path /etc/nginx/snippets/athanor-app-csp.conf)"
+}
+
+# Whether the checkout's copy of this script can place its own runtime files.
+#
+# Asked of the file rather than of the process: a revision from before the phase existed answers
+# `athanor update install-runtime-files` with a usage line and exit 0, which is not distinguishable
+# from having done the work. What it looks for is the dispatch arm and not merely the name, because
+# the name also appears in prose here - and a revision that kept these helpers while losing the arm
+# does not print a usage line at all. Every release before this one ignored an argument after
+# `update` and simply updated, so asking such a checkout for the phase asks it for a whole second
+# update, from inside the first one, on a stopped server.
+#
+# Anchored so that the pattern does not find itself. Unanchored, this line is a mention of the arm
+# in a file being asked whether it has one, and every revision carrying this function would answer
+# yes whether or not it kept the arm.
+checkout_installs_its_own_runtime_files() {
+  grep -q '^ *install-runtime-files)' "$athanor_root/scripts/athanor" 2>/dev/null
+}
+
+# Places the runtime files the checkout now holds, using that revision's list rather than this one.
+#
+# `athanor update` is /usr/local/bin/athanor, which is the previous release's copy of this script
+# and is what the running shell goes on executing after the pull. So the list above was always one
+# release behind the tree it was installing from, and anything a release added first landed on an
+# existing box at the release after it. The server that showed this had the backup units in its
+# checkout, no athanor-backup.timer anywhere on disk, and a settings screen still describing a daily
+# copy - and nothing about the update had reported an error, because nothing had gone wrong.
+#
+# The pulled copy runs as a child rather than replacing this shell: the rollback trap, the outage
+# clock and `database_at_risk` live here and have to outlive the phase.
+#
+# What bounds it is the marker below and nothing about the phase, because what the child does is a
+# property of the checkout and the whole reason this function exists is that this shell cannot read
+# the checkout's mind. Asked for the phase, a revision that does not answer to it runs whatever its
+# `update` arm does with an unrecognised argument; for every release before this one that was to
+# update, which asks the same question again one generation down. Measured, from a checkout that
+# kept these helpers and lost the dispatch arm: an unbounded chain of full updates, each one taking
+# its own backup of a server the one above it had already stopped. So the marker is the arm itself,
+# and the variable is carried into the child as the second bound - a generation that already came
+# from the phase places the files here rather than asking anyone else to.
+install_checked_out_runtime_files() {
+  if [ -n "${ATHANOR_PLACING_RUNTIME_FILES:-}" ]; then
+    install_runtime_files
+  elif checkout_installs_its_own_runtime_files; then
+    ATHANOR_PLACING_RUNTIME_FILES=1 \
+      /bin/sh "$athanor_root/scripts/athanor" update install-runtime-files
+  else
+    # A revision from before the phase cannot place its own files, so this run places them the way
+    # every run used to. That is the old behaviour carrying the old fault, and it is the most this
+    # shell can honestly do about a list it has no way to read.
+    install_runtime_files
+  fi
+  runtime_files_match_checkout ||
+    fail "the install step left /usr/local/bin/athanor differing from this revision's own copy"
+}
+
+# That the runtime files are now this revision's, rather than that something was asked to make them
+# so. The copy of this script under /usr/local/bin is the first thing install_runtime_files places,
+# so if it still differs from the checkout, the phase did nothing at all - which is precisely how a
+# revision that mentions the sub-command without answering to it would fail, silently and looking
+# exactly like success. Where `cmp` is missing the update goes on without the evidence, for the
+# reason the step timeout does: refusing to update at all is worse than an unwitnessed step.
+runtime_files_match_checkout() {
+  command -v cmp >/dev/null 2>&1 || return 0
+  cmp -s "$athanor_root/scripts/athanor" "$(runtime_path /usr/local/bin/athanor)"
 }
 
 # No step of an update may run without a bound. `timeout` is coreutils, so it is on every host
@@ -1334,7 +1437,11 @@ rollback_athanor() {
     cd "$athanor_root" || fail "could not enter $athanor_root"
     CI=true pnpm install --frozen-lockfile || fail "could not install dependencies for $target_revision"
     CI=true pnpm -r build || fail "could not build $target_revision"
-    install_runtime_files
+    # The revision being rolled back to places its own files, which is what separates this call site
+    # from the one inside the update's own trap. The shell running this command is the release being
+    # rolled back *from*, and its list names files a revision from before them never carried: an
+    # `install` refusing one of those would abandon the rollback with the data still to go.
+    install_checked_out_runtime_files
     nginx -t
     systemctl daemon-reload
   else
@@ -1392,6 +1499,10 @@ update_athanor() {
     if cd "$athanor_root"; then
       CI=true pnpm install --frozen-lockfile >/dev/null 2>&1 || rollback_ok=0
       CI=true pnpm -r build >/dev/null 2>&1 || rollback_ok=0
+      # This shell's own copy, deliberately, and the one place that is still right. `athanor update`
+      # runs the previous release's script, so the function in memory here is already the logic of
+      # the revision the reset above just put back; going out to the disk for the same code would
+      # only add a way for a rollback to fail.
       install_runtime_files || rollback_ok=0
     else
       rollback_ok=0
@@ -1444,7 +1555,7 @@ update_athanor() {
   # rolls straight back, so the box could never leave the release that dropped the package.
   run_update_step "installing dependencies" env CI=true pnpm install --frozen-lockfile
   run_update_step "building" env CI=true pnpm -r build
-  install_runtime_files
+  install_checked_out_runtime_files
   nginx -t
   systemctl daemon-reload
   systemctl enable --now athanor-network-watch.service athanor-network-refresh.timer \
@@ -1797,7 +1908,21 @@ case "$command_name" in
     esac
     ;;
   restore) restore_athanor "${1:-}" "${2:-}" ;;
-  update) update_athanor ;;
+  update)
+    case "${1:-}" in
+      # One phase of an update, run by the update as a child so that the files a release adds are
+      # placed by that release's own code. Under `update` rather than beside it because it is not a
+      # command of its own: on its own it puts a checkout's files onto a running server without
+      # stopping it, without a backup and with nothing to go back to. The update is the command.
+      install-runtime-files)
+        need_root update install-runtime-files
+        cd "$athanor_root" || fail "could not enter $athanor_root"
+        install_runtime_files
+        ;;
+      '') update_athanor ;;
+      *) fail "usage: athanor update" ;;
+    esac
+    ;;
   rollback) rollback_athanor "${1:-}" ;;
   auto-update) auto_update "${1:-status}" ;;
   relay) relay_command "${1:-status}" ;;
