@@ -714,6 +714,56 @@ describe('the media catalogue the chat refresh throws away', () => {
     expect(of(strict)?.unavailableReason).toBe('no verified private route');
   });
 
+  /**
+   * The pricing block this path used to throw away, and what reading it settles.
+   *
+   * The importer had never looked at it, and tagged every live entry "Price not published" on the
+   * strength of not having looked. It is there, and it is per-token on both fields the importer
+   * parses - which converts to dollars per minute for nothing. So no price is set, and the two
+   * facts the old tag ran together are now told apart.
+   */
+  const pricedInTokens = {
+    data: [
+      {
+        id: 'vendor/hears-1',
+        name: 'Vendor: Hears 1',
+        architecture: { input_modalities: ['audio'], output_modalities: ['transcription'] },
+        pricing: { prompt: '0.000001', completion: '0.000004' }
+      },
+      {
+        id: 'vendor/draws-1',
+        architecture: { input_modalities: ['text'], output_modalities: ['image'] }
+      }
+    ]
+  };
+
+  it('reads the pricing block rather than claiming the provider published nothing', async () => {
+    const options = await refreshOpenRouterMediaCatalog({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'owner-key',
+      fetch: vi.fn(async (input: string | URL | Request) => {
+        const url = input instanceof Request ? input.url : input.toString();
+        if (url.endsWith('/models')) return respondWith(pricedInTokens);
+        return respondWith({ data: [] });
+      }) as typeof fetch,
+      now: NOW
+    });
+
+    const hears = options.find((entry) => entry.providerModelId === 'vendor/hears-1');
+    // The feed's own word for a model that reads a recording, which is what separates it from a
+    // chat model that merely accepts audio in a conversation.
+    expect(hears?.modality).toBe('transcription');
+    // Per token is not per minute, so nothing is converted and nothing is claimed.
+    expect(hears).toMatchObject({ priceSource: 'unknown', usdPerMinute: null });
+    expect(hears?.recommendationTags).toEqual([
+      'No per-minute price published',
+      'Provider prices this route per token'
+    ]);
+    // ...and a route the provider prices nowhere at all says only the first of those two things.
+    const draws = options.find((entry) => entry.providerModelId === 'vendor/draws-1');
+    expect(draws?.recommendationTags).toEqual(['No per-image price published']);
+  });
+
   it('does not withdraw private media routes on the strength of one failed request', async () => {
     const options = await refreshOpenRouterMediaCatalog({
       baseUrl: 'https://openrouter.ai/api/v1',

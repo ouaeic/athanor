@@ -105,7 +105,11 @@ import {
   mediaEstimateUsd,
   resolvedMediaModel,
   resolvedTranscriptionRoute,
-  transcriptionEstimateUsd,
+  transcriptionEstimateAtRate,
+  transcriptionRate,
+  transcriptionRateFromReading,
+  transcriptionRouteWithMeasuredRate,
+  transcriptionWindow,
   type ResolvedMediaModel,
   type StoredMediaRoutes
 } from './media.js';
@@ -168,6 +172,19 @@ interface AgentState {
   contextBrief?: ContextBrief;
   /** Counts summarisation calls so each one bills under its own idempotency key. */
   compactions?: number;
+  /**
+   * What a minute of reading has actually cost on this task, per transcription route.
+   *
+   * Kept because a route whose price nobody publishes has to be measured before a spend cap can be
+   * enforced against it, and the first reading of a task is where that measurement comes from. It
+   * is persisted with the rest of the state for the ordinary reason: a worker handover or a pause
+   * for approval in the middle of a long recording must not throw the price away and go back to
+   * measuring it a minute at a time.
+   *
+   * Per task rather than per box. Nothing here can write to the owner's sealed media routes, so a
+   * new conversation on an unpriced route measures again - one billing minute, once.
+   */
+  transcriptionRates?: Record<string, number>;
   /**
    * The tightest floor any request in this task has applied to older tool results. Persisted so the
    * squeeze stays one-way: once a result has been shortened it is never restored, and the prompt
@@ -5247,7 +5264,13 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
               String(maxCharacters)
             ],
             cwd: '.',
-            timeoutSeconds: 120,
+            // Long enough to contain the reader's own OCR budget and the page still being
+            // recognised when it runs out. A PDF whose pages are pictures is read a page at a time
+            // and stops on a page boundary to name the pages it did not reach; killing the process
+            // before it can get there turns that reading into a failed tool call, which is the one
+            // outcome worse than a short answer. Every other format returns in milliseconds and
+            // never comes near this.
+            timeoutSeconds: 300,
             maxOutputBytes: 1024 * 1024
           }
         );
@@ -5300,12 +5323,20 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
             'transcription_privacy_conflict',
             'This task requires zero-retention model routing, and the transcription route this computer would use does not offer a zero-retention endpoint, so Athanor will not send a private recording to it. Choosing a transcription model that offers one in Settings, or starting a standard-privacy task if you deliberately want this one, is what opens this route.'
           );
+        // What a minute of this route costs, on the best evidence this task holds: the price the
+        // owner's catalogue published, or failing that the one measured from a reading the provider
+        // has already billed here. While it is neither, the window below is cut to a single billing
+        // minute, so the guard is never asked to enforce a cap against an estimate of zero.
+        const rate = transcriptionRate(chosen, state?.transcriptionRates?.[modelId]);
+        const readingWindow = transcriptionWindow({
+          startSeconds,
+          ...(Number.isFinite(endValue) && endValue > startSeconds ? { endSeconds: endValue } : {}),
+          rate
+        });
         const prepared = await this.#runner.prepareAudio(task.workspaceId, task.id, {
           path,
           startSeconds,
-          ...(Number.isFinite(endValue) && endValue > startSeconds
-            ? { endSeconds: Math.min(86_400, Math.floor(endValue)) }
-            : {})
+          endSeconds: readingWindow.endSeconds
         });
         // Priced on what was actually cut rather than on what was asked for, and checked before the
         // recording leaves this computer. Duration billing means the money is spent the moment the
@@ -5313,7 +5344,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         const decision = await this.store.spendGuard({
           userId: task.userId,
           taskId: task.id,
-          estimateUsd: transcriptionEstimateUsd(prepared.preparedSeconds, chosen),
+          estimateUsd: transcriptionEstimateAtRate(prepared.preparedSeconds, rate),
           includeOpenCommitments: true
         });
         if (decision.outcome === 'deny')
@@ -5327,7 +5358,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
             audio: prepared.bytes,
             format: prepared.format,
             seconds: prepared.preparedSeconds,
-            usdPerMinute: chosen?.usdPerMinute ?? null
+            usdPerMinute: rate.usdPerMinute
           })
           .catch((error: unknown) => {
             throw new AthanorError(
@@ -5335,6 +5366,16 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
               error instanceof Error ? error.message : 'The recording could not be read'
             );
           });
+        // What the provider charged for a minute of this route, now that it has charged for one.
+        //
+        // This is the whole point of the short first window. From here the next reading of the same
+        // recording is priced on a figure that came from an invoice rather than from nothing, so the
+        // daily cap applies to it exactly as it applies to a route whose price was published all
+        // along. A provider that states no cost teaches nothing and is left unrecorded rather than
+        // recorded as free.
+        const measured = transcriptionRateFromReading(reading, prepared.preparedSeconds);
+        if (state && measured !== null)
+          state.transcriptionRates = { ...(state.transcriptionRates ?? {}), [modelId]: measured };
         // Recorded between the charge and everything that could still fail, exactly as a generation
         // is. The provider has billed by this line, and media spend was the least visible line on a
         // task's bill precisely because a path existed that spent money without writing one of these.
@@ -5376,8 +5417,32 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           characters: reading.text.length,
           truncated: reading.text.length > text.length,
           modelId,
-          costUsd: reading.costUsd,
-          billedBy: 'connected provider',
+          // Null rather than zero when nobody has said what this cost. The provider stated no
+          // figure and publishes no per-minute price, so `transcribe` had nothing to multiply and
+          // returned zero - and a zero handed to the model here comes back to the owner as the
+          // sentence "that reading was free", which is a claim this computer cannot make.
+          ...(reading.costFromProvider || rate.usdPerMinute !== null
+            ? {
+                costUsd: reading.costUsd,
+                billedBy: reading.costFromProvider
+                  ? 'connected provider'
+                  : `this route's ${rate.source} price per minute`
+              }
+            : {
+                costUsd: null,
+                billedBy:
+                  'not known here: the provider stated no cost for this reading and publishes no per-minute price for this route. It will appear on the provider account.'
+              }),
+          // Said when the window was cut short to find out what a minute costs, so the model reads
+          // a deliberately short first reading as the start of a long one rather than as the end of
+          // the recording. Not said when the recording ended inside that minute anyway: there is no
+          // rest to go back for, and pointing at a `nextStartSeconds` that is not there would send
+          // the model looking for audio that does not exist.
+          ...(readingWindow.measuring && prepared.more
+            ? {
+                pricing: `No per-minute price is published for ${modelId}, so this first reading was limited to one billed minute to establish what it costs. Continue from nextStartSeconds to read the rest.`
+              }
+            : {}),
           text,
           ...(reading.text.length > text.length
             ? {
@@ -7179,7 +7244,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       ...(call.name === 'audio_read'
         ? {
             mediaCommittedUsd: await this.#mediaCommittedUsd(task),
-            ...(await this.#transcriptionModelForCall(task))
+            ...(await this.#transcriptionModelForCall(task, state))
           }
         : {}),
       ...(existingSkill ? { existingSkill } : {}),
@@ -7272,10 +7337,22 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
    * would be naming a guess. Absent also prices nothing, which is what makes the card ask on every
    * reading until a route with a published per-minute price is chosen - the same treatment an
    * unpriced image route already gets, for the same reason.
+   *
+   * A route this task has already been billed for is no longer one of unknown price, so the rate
+   * measured from the provider's own first invoice is carried onto it here. Without that the card
+   * would go on saying the cost cannot be known while the dispatch arm below priced the very same
+   * reading from a figure it was holding.
    */
-  async #transcriptionModelForCall(task: TaskRecord): Promise<{ mediaModel?: ResolvedMediaModel }> {
+  async #transcriptionModelForCall(
+    task: TaskRecord,
+    state?: AgentState
+  ): Promise<{ mediaModel?: ResolvedMediaModel }> {
     const secret = await this.#inferenceCredential(task).catch(() => undefined);
-    const route = resolvedTranscriptionRoute(secret?.mediaRoutes);
+    const chosen = resolvedTranscriptionRoute(secret?.mediaRoutes);
+    const route = transcriptionRouteWithMeasuredRate(
+      chosen,
+      chosen ? state?.transcriptionRates?.[chosen.modelId] : null
+    );
     return route ? { mediaModel: route } : {};
   }
 

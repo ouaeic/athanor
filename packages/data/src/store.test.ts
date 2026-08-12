@@ -6,6 +6,7 @@ import {
   MEMORY_PREDICATES,
   buildConversationNameIndex,
   buildMemoryItemIndex,
+  conversationNamePrefixTokens,
   buildMemorySourceIndex,
   memoryIndexKey,
   memoryOriginKey,
@@ -4497,6 +4498,73 @@ describe('task spend on the owner-facing reads', () => {
     ).resolves.toEqual([]);
   });
 
+  /**
+   * How a person actually searches: the first few letters of a word they half remember, with the
+   * list narrowing as they type. The client covers the conversations this device has already
+   * loaded - two hundred of them - by matching their titles as substrings, and then throws that
+   * list away for whatever the box says. So a conversation past the loaded band was unreachable by
+   * a prefix, and one inside it appeared while the request was in flight and then vanished.
+   */
+  it('finds a conversation by the first letters of a word in its name, past the loaded band', async () => {
+    const user = await store.createUser({ username: 'prefix', displayName: 'Prefix' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Prefixing'));
+    const key = memoryIndexKey(generateDataKey());
+    const named = (title: string, prompt: string) => buildConversationNameIndex(title, prompt, key);
+
+    const audit = await store.createTask({
+      ...taskInput(user.id, workspace.id),
+      nameIndex: named('Grimbolder audit', 'Go through the ledger for the quarter')
+    });
+    // The conversation actually called that, so the tiers can be told apart: an exact name must
+    // still outrank a name that merely starts with what was typed.
+    const exact = await store.createTask({
+      ...taskInput(user.id, workspace.id),
+      nameIndex: named('Grimbold', 'Ask about the estate')
+    });
+    // Two hundred and ten conversations on top, which is more than the client ever holds, so the
+    // only thing that can answer this is the index.
+    for (let index = 0; index < 210; index += 1)
+      await store.createTask({
+        ...taskInput(user.id, workspace.id),
+        nameIndex: named(`Unrelated ${index}`, 'Something else entirely')
+      });
+
+    const typed = async (query: string) =>
+      store.searchTaskNames(user.id, {
+        lexemes: planMemoryQuery(query, key).lexemes,
+        prefixes: conversationNamePrefixTokens(query, key),
+        limit: 10
+      });
+
+    // The case from the commit that disclosed this: the index matches whole stemmed lexemes, and
+    // `grimbold` is not one of the lexemes of "Grimbolder audit".
+    const hits = await typed('grimbold');
+    expect(hits.map((hit) => hit.id)).toEqual([exact.id, audit.id]);
+    expect(hits[0]).toMatchObject({ wholeName: true, namePrefix: true });
+    expect(hits[1]).toMatchObject({ wholeName: false, inName: false, namePrefix: true });
+
+    // Narrowing as the word is typed out, and stopping when it stops being a prefix of anything.
+    await expect(typed('gri').then((rows) => rows.length)).resolves.toBe(2);
+    await expect(typed('grimbolder').then((rows) => rows.map((hit) => hit.id))).resolves.toEqual([
+      audit.id
+    ]);
+    await expect(typed('grimbolt')).resolves.toEqual([]);
+
+    // A finished word before the one being typed is still matched as a word, not as a prefix, so
+    // both conversations are carried by a word of their name and the prefix. Nothing separates
+    // them but which was touched last, which is what the clock is there for.
+    const both = await typed('audit grimbold');
+    expect(both.map((hit) => hit.id).sort()).toEqual([audit.id, exact.id].sort());
+    expect(both.every((hit) => hit.inName && hit.namePrefix)).toBe(true);
+    // And a search with nothing half-typed in it answers exactly as it did before.
+    const whole = await store.searchTaskNames(user.id, {
+      lexemes: planMemoryQuery('grimbolder', key).lexemes,
+      limit: 10
+    });
+    expect(whole.map((hit) => hit.id)).toEqual([audit.id]);
+    expect(whole[0]).toMatchObject({ namePrefix: false });
+  });
+
   it('leaves a conversation written before the index existed for the boot pass to pick up', async () => {
     const user = await store.createUser({ username: 'backfill', displayName: 'Backfill' });
     const workspace = await store.createWorkspace(workspaceInput(user.id, 'Backfill'));
@@ -4517,6 +4585,42 @@ describe('task spend on the owner-facing reads', () => {
       lexemes: planMemoryQuery('sailing trip', key).lexemes
     });
     expect(hits.map((hit) => hit.id)).toEqual([task.id]);
+  });
+
+  /**
+   * The other half of the same pass, and the one an update actually meets: a row indexed by the
+   * previous shape of the vector is not NULL, so nothing would ever have looked at it again and
+   * the whole history would have kept the loss the new column was written to remove.
+   */
+  it('re-reads a conversation whose name was indexed by an older shape of the vector', async () => {
+    const user = await store.createUser({ username: 'restamp', displayName: 'Restamp' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Restamp'));
+    const key = memoryIndexKey(generateDataKey());
+    const task = await store.createTask({
+      ...taskInput(user.id, workspace.id),
+      nameIndex: buildConversationNameIndex('Grimbolder audit', 'Go through the ledger', key)
+    });
+    // Exactly what the previous build wrote: the name at A, the request at D, no prefixes and no
+    // stamp. A row nobody would have looked at twice.
+    const previous = buildConversationNameIndex('Grimbolder audit', 'Go through the ledger', key);
+    await database.query(
+      `UPDATE tasks SET name_tsv = setweight(to_tsvector('simple', $2::text), 'A')
+         || setweight(to_tsvector('simple', $3::text), 'D') WHERE id=$1`,
+      [task.id, previous.nameTokens, previous.openingTokens]
+    );
+    const typed = () =>
+      store.searchTaskNames(user.id, {
+        lexemes: planMemoryQuery('grimbold', key).lexemes,
+        prefixes: conversationNamePrefixTokens('grimbold', key)
+      });
+    await expect(typed()).resolves.toEqual([]);
+
+    const waiting = await store.listTasksMissingNameIndex();
+    expect(waiting.map((row) => row.id)).toEqual([task.id]);
+    await store.setTaskNameIndex(task.id, previous);
+    // Re-indexed once and then left alone, however many times the box is restarted.
+    await expect(store.listTasksMissingNameIndex()).resolves.toEqual([]);
+    expect((await typed()).map((hit) => hit.id)).toEqual([task.id]);
   });
 
   it('anchors a turn checkpoint to the point in the transcript it was taken at', async () => {

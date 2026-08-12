@@ -74,6 +74,7 @@ import {
   type MailSocketFactory,
   resolveDataMasterKey,
   buildConversationNameIndex,
+  conversationNamePrefixTokens,
   decryptJson,
   encryptJson,
   generateDataKey,
@@ -2873,10 +2874,30 @@ export const buildServer = async (
     );
     // One plan per workspace, because the tokens are keyed to the workspace: the same word is a
     // different token in each one, and both passes have to ask with the token the writer used.
+    const indexKeys = new Map(
+      workspaces.map((workspace) => [workspace.id, memoryIndexKey(keys.get(workspace.id)!)])
+    );
     const plans = new Map(
       workspaces.map((workspace) => [
         workspace.id,
-        planMemoryQuery(input.q, memoryIndexKey(keys.get(workspace.id)!))
+        planMemoryQuery(input.q, indexKeys.get(workspace.id)!)
+      ])
+    );
+    /*
+     * The word the owner has not finished typing, keyed the same way, for the pass that can use it.
+     *
+     * Only names carry prefixes: a name is a line, and typing the first letters of one is how a
+     * person looks through their own history, where the transcript pass is answering a question
+     * that was finished being asked. While the box answers, the client stands in for it by matching
+     * the titles this device has already loaded as substrings, and then replaces that list with
+     * this one - so until the box could make the same match, a conversation the client had just
+     * listed under `grimbold` disappeared the moment the answer arrived, and one past the loaded
+     * band never appeared at all.
+     */
+    const prefixes = new Map(
+      workspaces.map((workspace) => [
+        workspace.id,
+        conversationNamePrefixTokens(input.q, indexKeys.get(workspace.id)!)
       ])
     );
 
@@ -2919,6 +2940,7 @@ export const buildServer = async (
         workspaces.map(async (workspace) =>
           store.searchTaskNames(user.id, {
             lexemes: plans.get(workspace.id)!.lexemes,
+            prefixes: prefixes.get(workspace.id)!,
             workspaceId: workspace.id,
             limit: input.limit
           })
@@ -2926,11 +2948,12 @@ export const buildServer = async (
       )
     )
       .flat()
-      // The database ranked each workspace; this only interleaves them, on the same three keys.
+      // The database ranked each workspace; this only interleaves them, on the same four keys.
       .sort(
         (left, right) =>
           Number(right.wholeName) - Number(left.wholeName) ||
           Number(right.inName) - Number(left.inName) ||
+          Number(right.namePrefix) - Number(left.namePrefix) ||
           new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()
       )
       .slice(0, input.limit);
@@ -2942,10 +2965,11 @@ export const buildServer = async (
         workspaceId: hit.workspaceId,
         title,
         updatedAt: hit.updatedAt,
-        // One rather than zero for the weakest of the three, because the two passes are ordered
-        // rather than added: a conversation that opened by asking this still goes above one that
-        // only mentioned it somewhere in the middle.
-        named: (hit.wholeName ? 2 : 0) + (hit.inName ? 1 : 0) + 1,
+        // The same four tiers the database ordered by, in a single number, and one rather than
+        // zero for the weakest of them: the two passes are ordered rather than added, so a
+        // conversation that opened by asking this still goes above one that only mentioned it
+        // somewhere in the middle.
+        named: (hit.wholeName ? 4 : 0) + (hit.inName ? 2 : 0) + (hit.namePrefix ? 1 : 0) + 1,
         said: null,
         opening: memoryExcerpt(prompt || title, input.q, { maxChars: SEARCH_EXCERPT_CHARS })
       });

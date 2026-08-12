@@ -87,8 +87,20 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
   {
     id: 'pdf-extraction',
     purpose:
-      'Read text, tables and page geometry out of a PDF, and give a scanned one a text layer so it can be read at all',
-    binaries: ['pdftotext', 'pdfinfo', 'athanor-pdf-tables', 'ocrmypdf', 'tesseract', 'gs'],
+      'Read text, tables and page geometry out of a PDF, read a scanned one off pictures of its pages, and give it a text layer of its own so it stays readable',
+    // pdftoppm belongs to this capability as well as to conversion: it is what renders a page of a
+    // scan for the recogniser, so document_read and document_search read a scan when this whole
+    // list is present and say they cannot when any of it is missing. A capability that reported
+    // itself ready without it would be claiming a reading the computer could not perform.
+    binaries: [
+      'pdftotext',
+      'pdfinfo',
+      'pdftoppm',
+      'athanor-pdf-tables',
+      'ocrmypdf',
+      'tesseract',
+      'gs'
+    ],
     pythonModules: [],
     fonts: [],
     // ghostscript arrives as a dependency of ocrmypdf, and is what compresses an oversized PDF.

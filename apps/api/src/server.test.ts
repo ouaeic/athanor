@@ -5401,6 +5401,77 @@ describe('searching the owner’s own history', () => {
   });
 
   /*
+   * The way a person searches their own history: type the first few letters of a word they half
+   * remember and watch the list narrow. The client stands in for the box while it answers, by
+   * matching the titles this device has already loaded as substrings - and then replaces that list
+   * with the box's, so before this a conversation it had just listed under `grimbold` disappeared
+   * the moment the answer arrived, and one past the loaded band never appeared at all.
+   */
+  test('narrows on the first letters of a word in a name, however deep the conversation is', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-search-prefix-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'prefix-search',
+      'Go through the ledger for the quarter'
+    );
+    const renamed = await app.inject({
+      method: 'PATCH',
+      url: `/v1/tasks/${taskId}`,
+      headers: { cookie, 'idempotency-key': 'prefix-search-rename' },
+      payload: { title: 'Grimbolder audit' }
+    });
+    expect(renamed.statusCode, renamed.body).toBe(200);
+
+    // Two hundred and ten conversations on top of it, which is more than the bootstrap carries, so
+    // the client has nothing of this one to match and the box is the only thing that can answer.
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const dataKey = unwrapDataKey(workspace.wrappedKey!, masterKey, workspaceId);
+    for (let index = 0; index < 210; index += 1) {
+      const name = `Unrelated ${index}`;
+      await store.createTask({
+        userId: workspace.userId,
+        workspaceId,
+        titleCiphertext: encryptJson({ title: name }, dataKey, `task-title:${workspaceId}`),
+        nameIndex: buildConversationNameIndex(
+          name,
+          'Something else entirely',
+          memoryIndexKey(dataKey)
+        ),
+        modelId: 'qwen',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 1,
+        promptCiphertext: encryptJson(
+          { prompt: 'Something else entirely' },
+          dataKey,
+          `task-prompt:${workspaceId}`
+        )
+      });
+    }
+
+    const typed = async (query: string) => {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/v1/search?q=${encodeURIComponent(query)}&workspaceId=${workspaceId}`,
+        headers: { cookie }
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      return response.json<{ taskId: string; title: string }[]>();
+    };
+    // The exact case the commit that built this index wrote down and left: a conversation called
+    // "Grimbolder audit", found by "grimbold".
+    for (const half of ['gri', 'grimb', 'grimbold'])
+      expect(await typed(half)).toEqual([
+        expect.objectContaining({ taskId, title: 'Grimbolder audit' })
+      ]);
+    // And it stops narrowing when what was typed stops being the front of the word.
+    expect(await typed('grimbolt')).toEqual([]);
+  });
+
+  /*
    * The boot pass that gives the older half of the history its name index reads oldest first, and
    * every conversation it reads it decrypts. One that will not open therefore sits in front of
    * everything newer than it, and if it ends the pass rather than costing only itself, the far end

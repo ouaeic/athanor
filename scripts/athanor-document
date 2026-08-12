@@ -14,6 +14,7 @@ import math
 import os
 import posixpath
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -30,8 +31,9 @@ from urllib.parse import unquote
 # What a folder of one person's documents actually holds. The formats missing from this set used to
 # be missing from every answer as well - not ranked low, absent - so a 2009 Word file, a bank's
 # .xls, a forwarded email and an e-book were invisible to a search that had walked straight past
-# them. A format that cannot be read well is still listed here: it is refused by name, with a
-# reason, which is a thing the owner can act on. Silence is not.
+# them. Nothing in this set is refused for its format any more: the last one that was - an Outlook
+# .msg - turned out to want a reader rather than a package. A file that still cannot be read is
+# refused as that file, with a reason, which is a thing the owner can act on. Silence is not.
 SUPPORTED = {
     ".csv",
     ".doc",
@@ -90,8 +92,58 @@ MAX_BOOK_CHARACTERS = 400_000
 # returning nothing is not the same fact as the document not matching. Deliberately lower than the
 # sparsest real page: a slide deck exported to PDF can be down at a dozen characters a page and is
 # genuinely text, so the number errs towards missing a marginal scan rather than towards telling
-# the owner that a thin document is one. See `unread_reason`, which is the point of it.
+# the owner that a thin document is one. See `pdf_is_pictures`, which is the point of it.
 MIN_PDF_CHARACTERS_PER_PAGE = 16
+
+# What reads a PDF, and what reads the pictures in one once they are known to be pictures. All
+# four have been on this computer all along - poppler for the first two, and the installer carries
+# tesseract with its English data - and until now nothing here called the last two, so a folder of
+# scanned contracts was told truthfully that it could not be read and left at that. Truthfully is
+# not the same as read.
+PDF_TEXT_READER = "/usr/bin/pdftotext"
+PDF_PAGE_COUNTER = "/usr/bin/pdfinfo"
+PAGE_RASTERISER = "/usr/bin/pdftoppm"
+OCR_ENGINE = "/usr/bin/tesseract"
+
+# 300 dpi is where scanned body text stops losing characters; above it a page costs more seconds
+# without giving up more words, and grey is what the recogniser thresholds the page down to anyway.
+OCR_DPI = 300
+
+# One page renders in about a second and is recognised in a few, so this is the number at which a
+# page has stopped rather than slowed. It is deliberately small compared with the budgets below:
+# the seconds are counted after a page finishes, so a page that hangs runs on past whatever is left
+# and the whole reading has to still come back inside the time its caller allows.
+OCR_PAGE_TIMEOUT_SECONDS = 45
+
+# Pages, not characters, is the bound that matters here, because each one is a rasterising and a
+# recognition rather than a slice of something already in memory. A reading that stops at this
+# says which pages it did not reach, in the same words the e-book above uses.
+MAX_OCR_PAGES = 20
+
+# Recognition is slower than every other reader here by a factor of a hundred - seconds a page
+# against milliseconds a file - so it takes the same trade LibreOffice takes above, out of a pot of
+# its own. Kept apart from that one deliberately: a folder holding a stack of .doc files and a
+# stack of scans must not spend one format's seconds on the other and then report the second stack
+# as unread. A `read` of a file the owner named affords more than a search across a folder does.
+#
+# Both sit under the seconds the caller allows this whole process, with room left for the page that
+# is still being recognised when the seconds run out - `document_read` and `document_search` in the
+# agent each name a timeout, and a budget larger than one of those is not a budget at all. It would
+# be a reading killed part-way with nothing to show for it, where the entire point of counting the
+# seconds here is to stop on a page boundary and say which pages were not reached. Twenty dense
+# pages at the seconds a page really costs is what these numbers are sized against; a reading that
+# wants more asks for the next range, which is what the sentence it comes back with says.
+OCR_SEARCH_BUDGET_SECONDS = 90.0
+OCR_READ_BUDGET_SECONDS = 180.0
+
+# Said once, at the top of what recognition produced. Text lifted off a picture of a page is not
+# the same evidence as text the document carried, and a figure read off a scan is wrong in ways a
+# copied figure cannot be, so the agent holding it is told which of the two it has.
+OCR_NOTE = (
+    "[Read by OCR: this PDF carries no text of its own, so the words below were recognised from "
+    "pictures of its pages. Recognition misreads characters, and digits worst of all, so check a "
+    "figure against the page before repeating it and say that a quotation came from OCR.]"
+)
 
 # Naming every populated cell is what makes a figure citable, and it is also what makes a large
 # sheet unreadable, so a reading stops at a bounded number of cells and says where it stopped.
@@ -474,10 +526,7 @@ def extract_open_document(target: Path) -> str:
 
 
 class ConversionBudget:
-    """Seconds of LibreOffice one search may spend, and what is left of them.
-
-    A `read` passes None instead, because the owner asked for that one file by name.
-    """
+    """Seconds of one slow reader that one reading may spend, and what is left of them."""
 
     def __init__(self, seconds: float) -> None:
         self.remaining = seconds
@@ -486,18 +535,49 @@ class ConversionBudget:
         self.remaining -= seconds
 
 
-def office_converter() -> str | None:
-    """The installed converter, named absolutely rather than looked up on the search path.
+class Budgets(NamedTuple):
+    """The two slow readers on this computer, each with its own seconds.
+
+    Converting and recognising are both worth minutes of one file the owner named and seconds of a
+    folder walked past looking for a phrase, which is the difference between the pots a `read`
+    hands out and the pots a `search` does.
+    """
+
+    office: ConversionBudget
+    ocr: ConversionBudget
+
+
+def read_budgets() -> Budgets:
+    """What one file the owner asked for by name may cost.
+
+    LibreOffice is unbounded here, as it always has been: the per-file timeout is the only ceiling
+    a single conversion ever had. Recognition is not, because a two-hundred-page scan would be an
+    hour, and the page ceiling and these seconds are what make it a reading rather than a wait.
+    """
+    return Budgets(ConversionBudget(math.inf), ConversionBudget(OCR_READ_BUDGET_SECONDS))
+
+
+def search_budgets() -> Budgets:
+    """What a walk over a whole folder may spend before it owes the owner an answer."""
+    return Budgets(
+        ConversionBudget(LEGACY_SEARCH_BUDGET_SECONDS), ConversionBudget(OCR_SEARCH_BUDGET_SECONDS)
+    )
+
+
+def installed(default: str, override: str) -> str | None:
+    """A tool this reader runs, named absolutely rather than looked up on the search path.
 
     The path an agent command runs with includes directories the agent itself can write to, and
-    this is the one place where reading a document would execute something out of one of them. The
-    override exists so the test can drive a stub through it, exactly as the converter is tested.
+    reading a document is the one place that must not execute something out of one of them. Every
+    override exists for the same two reasons: the test drives stubs through them, and a developer
+    whose machine keeps poppler somewhere other than where a provisioned computer does can still
+    run the whole proof rather than skipping the half of it that touches a PDF.
     """
-    candidate = os.environ.get("ATHANOR_OFFICE_CONVERT") or OFFICE_CONVERT
+    candidate = os.environ.get(override) or default
     return candidate if os.access(candidate, os.X_OK) else None
 
 
-def extract_legacy_office(target: Path, budget: ConversionBudget | None) -> str:
+def extract_legacy_office(target: Path, budget: ConversionBudget) -> str:
     """A pre-2007 Word, Excel or PowerPoint file, through the converter the skills already use.
 
     These are binary formats with no reader in the standard library, and the bytes decoded as text
@@ -505,7 +585,7 @@ def extract_legacy_office(target: Path, budget: ConversionBudget | None) -> str:
     owner's folder, and it is read by the extractor that was already here.
     """
     modern = LEGACY_OFFICE[target.suffix.lower()]
-    converter = office_converter()
+    converter = installed(OFFICE_CONVERT, "ATHANOR_OFFICE_CONVERT")
     if converter is None:
         raise ValueError(
             f"a {target.suffix.lower()} file is read by converting it first, and "
@@ -513,7 +593,7 @@ def extract_legacy_office(target: Path, budget: ConversionBudget | None) -> str:
             "apt-get install -y libreoffice-writer libreoffice-impress libreoffice-calc, then "
             "re-run the athanor installer, is what opens it"
         )
-    if budget is not None and budget.remaining <= 0:
+    if budget.remaining <= 0:
         raise ValueError(
             "not converted: this search had already spent the time it allows LibreOffice by the "
             "time it reached this file. Reading this one file with document_read converts it"
@@ -534,8 +614,7 @@ def extract_legacy_office(target: Path, budget: ConversionBudget | None) -> str:
                 f"{LEGACY_TIMEOUT_SECONDS}s, so nothing was read from it"
             ) from None
         finally:
-            if budget is not None:
-                budget.spend(time.monotonic() - started)
+            budget.spend(time.monotonic() - started)
         if result.returncode != 0 or not converted.is_file():
             detail = normalized(result.stderr.decode("utf-8", "replace")).splitlines()
             raise ValueError(
@@ -593,6 +672,275 @@ def extract_eml(target: Path) -> str:
     if attached:
         lines.append("")
         lines.append(f"[{plural(len(attached), 'attachment')}: {', '.join(attached)}]")
+    return normalized("\n".join(lines))
+
+
+# A compound file is a filesystem inside a file: a header, two allocation tables and a directory
+# of named streams, all fixed-width. An Outlook .msg is one of those, with each field of the
+# message in a stream named after the property it holds.
+#
+# This format was refused by name here for a long time, on the grounds that nothing on the computer
+# decoded it and no package would. The second half of that is still true - the pinned Python
+# environment holds pypdf and python-pptx and nothing else, the installer's package table names no
+# reader for this, and apt runs with --no-install-recommends, so nothing arrives on the side
+# either. The first half was never true. The container is documented and fixed-width, `struct` is
+# the whole of what reads it, and a forwarded Outlook mail is an ordinary thing to have in a folder.
+CFB_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+FREE_SECTOR = 0xFFFFFFFF
+END_OF_CHAIN = 0xFFFFFFFE
+ROOT_STORAGE = 5
+STORAGE = 1
+STREAM = 2
+
+
+class DirectoryEntry(NamedTuple):
+    name: str
+    kind: int
+    left: int
+    right: int
+    child: int
+    start: int
+    size: int
+
+
+class CompoundFile:
+    """The streams inside a compound file, read by name.
+
+    A reader and nothing else: it walks the two allocation tables and the directory, and where it
+    cannot account for what it finds it says so rather than guessing. Every walk below is bounded by
+    the sector count the file's own length allows, because a chain that points back at itself is
+    how a format like this turns a document reader into a computer that never answers.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        if len(data) < 512 or data[:8] != CFB_SIGNATURE:
+            raise ValueError("it does not begin like a compound file")
+        self.data = data
+        sector_shift, mini_shift = struct.unpack_from("<HH", data, 30)
+        self.sector_size = 1 << sector_shift
+        self.mini_size = 1 << mini_shift
+        if self.sector_size not in {512, 4096} or self.mini_size != 64:
+            raise ValueError("its sectors are not a size a compound file has")
+        fat_count, directory_start = struct.unpack_from("<II", data, 44)
+        (self.mini_cutoff,) = struct.unpack_from("<I", data, 56)
+        mini_fat_start, _, difat_start, difat_count = struct.unpack_from("<IIII", data, 60)
+        self.sectors = max(0, (len(data) - self.sector_size) // self.sector_size)
+        self.fat = self._allocation_table(fat_count, difat_start, difat_count)
+        self.mini_fat = self._entries(self._sectors_of(mini_fat_start))
+        self.directory = self._directory(directory_start)
+        # Entry zero is the root storage by definition, and it carries two jobs: it is the top of
+        # the directory tree, and its own stream is where every stream too small for a sector lives.
+        self.root = self.directory[0]
+        self.mini_stream = self._sectors_of(self.root.start, self.root.size)
+
+    def _sector(self, number: int) -> bytes:
+        if number < 0 or number >= self.sectors:
+            raise ValueError("a sector chain points outside the file")
+        start = (number + 1) * self.sector_size
+        return self.data[start : start + self.sector_size]
+
+    @staticmethod
+    def _entries(raw: bytes) -> list[int]:
+        return list(struct.unpack_from(f"<{len(raw) // 4}I", raw, 0))
+
+    def _allocation_table(self, count: int, difat_start: int, difat_count: int) -> list[int]:
+        """Which sector follows which, assembled from the list of sectors that says so.
+
+        The first hundred and nine of those are in the header; a file large enough to need more
+        keeps the rest in a chain of its own, each link ending in the number of the next.
+        """
+        numbers = self._entries(self.data[76:512])
+        sector = difat_start
+        for _ in range(min(difat_count, self.sectors)):
+            if sector >= self.sectors:
+                break
+            block = self._entries(self._sector(sector))
+            numbers.extend(block[:-1])
+            sector = block[-1]
+        raw = b"".join(self._sector(number) for number in numbers[:count] if number < self.sectors)
+        return self._entries(raw)
+
+    def _chain(self, start: int, table: list[int]) -> Iterable[int]:
+        seen: set[int] = set()
+        sector = start
+        while sector < len(table) and sector not in {FREE_SECTOR, END_OF_CHAIN}:
+            if sector in seen:
+                raise ValueError("a sector chain in this file loops")
+            seen.add(sector)
+            yield sector
+            sector = table[sector]
+
+    def _sectors_of(self, start: int, size: int | None = None) -> bytes:
+        raw = b"".join(self._sector(number) for number in self._chain(start, self.fat))
+        return raw if size is None else raw[:size]
+
+    def _directory(self, start: int) -> list[DirectoryEntry]:
+        raw = self._sectors_of(start)
+        entries: list[DirectoryEntry] = []
+        for at in range(0, len(raw) - 127, 128):
+            length, kind = struct.unpack_from("<HB", raw, at + 64)
+            # The length counts the terminating null as two of its bytes, and a corrupt one is
+            # clamped rather than trusted, because it indexes straight into the file.
+            name = raw[at : at + max(0, min(64, length - 2))].decode("utf-16-le", "replace")
+            left, right, child = struct.unpack_from("<III", raw, at + 68)
+            sector, size = struct.unpack_from("<IQ", raw, at + 116)
+            entries.append(DirectoryEntry(name, kind, left, right, child, sector, size))
+        if not entries or entries[0].kind != ROOT_STORAGE:
+            raise ValueError("its directory does not begin with a root storage")
+        return entries
+
+    def contents(self, storage: DirectoryEntry) -> dict[str, DirectoryEntry]:
+        """What is directly inside one storage, by name.
+
+        The children of a storage are held as a tree rather than a list, so this is a walk: the
+        storage names one child, and that child's left and right are its siblings rather than its
+        own contents. Order is the tree's own and carries nothing, which is why the answer is a
+        mapping and the caller asks for what it wants by name.
+        """
+        found: dict[str, DirectoryEntry] = {}
+        pending = [storage.child]
+        seen: set[int] = set()
+        while pending:
+            index = pending.pop()
+            if index >= len(self.directory) or index in seen:
+                continue
+            seen.add(index)
+            entry = self.directory[index]
+            if entry.kind in {STORAGE, STREAM}:
+                found[entry.name] = entry
+            pending.extend((entry.left, entry.right))
+        return found
+
+    def stream(self, entry: DirectoryEntry) -> bytes:
+        """One stream's bytes, from the mini stream when it is small and the file when it is not."""
+        size = min(entry.size, MAX_ARCHIVE_MEMBER_BYTES)
+        if size >= self.mini_cutoff:
+            return self._sectors_of(entry.start, size)
+        parts: list[bytes] = []
+        for number in self._chain(entry.start, self.mini_fat):
+            at = number * self.mini_size
+            parts.append(self.mini_stream[at : at + self.mini_size])
+        return b"".join(parts)[:size]
+
+
+# The properties a message is made of, named by the tag Outlook stores each one under. Read in this
+# order because it is the order a person reads a message in, which is the order extract_eml puts a
+# saved .eml in as well - the two formats are the same message and they come back looking alike.
+MSG_SENDER_NAME = "0C1A"
+MSG_SENDER_ADDRESS = "0C1F"
+MSG_SENDER_SMTP = "5D01"
+MSG_DISPLAY_TO = "0E04"
+MSG_DISPLAY_CC = "0E03"
+MSG_SUBJECT = "0037"
+MSG_HEADERS = "007D"
+MSG_BODY = "1000"
+MSG_BODY_HTML = "1013"
+MSG_ATTACHMENT_NAME = "3707"
+MSG_ATTACHMENT_SHORT_NAME = "3704"
+
+
+def msg_text(message: CompoundFile, streams: dict[str, DirectoryEntry], tag: str) -> str | None:
+    """One property as text, in whichever of the two string types it happens to be stored as.
+
+    The eight-bit form carries the code page it was written in somewhere else entirely, and the
+    overwhelming majority of those are the Windows Latin one. UTF-8 is tried first because a modern
+    producer writes it and it fails loudly on anything else, where the fallback fails silently.
+    """
+    entry = streams.get(f"__substg1.0_{tag}001F")
+    if entry is not None:
+        return message.stream(entry).decode("utf-16-le", "replace").strip() or None
+    entry = streams.get(f"__substg1.0_{tag}001E")
+    if entry is None:
+        return None
+    raw = message.stream(entry)
+    try:
+        return raw.decode("utf-8").strip() or None
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", "replace").strip() or None
+
+
+def msg_attachments(message: CompoundFile, streams: dict[str, DirectoryEntry]) -> list[str]:
+    """Named, never opened - the same trade a saved .eml gets, and for the same reason."""
+    names: list[str] = []
+    for name, entry in sorted(streams.items()):
+        if entry.kind != STORAGE or not name.startswith("__attach_version1.0"):
+            continue
+        inside = message.contents(entry)
+        filename = msg_text(message, inside, MSG_ATTACHMENT_NAME) or msg_text(
+            message, inside, MSG_ATTACHMENT_SHORT_NAME
+        )
+        if filename:
+            names.append(filename)
+    return names
+
+
+def extract_msg(target: Path) -> str:
+    """A saved Outlook message, read as the message it is rather than refused for being binary.
+
+    What comes back is shaped exactly like a saved .eml: who it is from and about, then what it
+    says, then what was attached. The two are the same message and an answer should not be able to
+    tell the owner which client happened to save it.
+
+    Strict on purpose, in both directions. A file that is not a compound file at all, or one whose
+    streams hold none of the properties a message has, is refused with the sentence the owner can
+    act on - because handing back a plausible-looking half of a message is the failure this format
+    was refused by name to avoid, and being able to read one is no reason to start doing that.
+    """
+    try:
+        message = CompoundFile(target.read_bytes())
+        streams = message.contents(message.root)
+    except (ValueError, struct.error, IndexError) as error:
+        raise ValueError(
+            f"this file is named as an Outlook message but is not one that can be opened here: "
+            f"{error}. Saving the message again as .eml from the mail client, or forwarding it, is "
+            "what makes it readable"
+        ) from None
+    sender = msg_text(message, streams, MSG_SENDER_NAME)
+    address = msg_text(message, streams, MSG_SENDER_ADDRESS) or msg_text(
+        message, streams, MSG_SENDER_SMTP
+    )
+    headers = msg_text(message, streams, MSG_HEADERS)
+    # A message that was sent carries the headers it was sent with, and the date is one of them,
+    # parsed by the same standard-library reader a saved .eml goes through. A draft carries no such
+    # stream and has no send date to report, so it is given none rather than the day it was saved.
+    posted = email.message_from_string(headers, policy=email.policy.default) if headers else None
+    sent = posted.get("Date") if posted is not None else None
+    fields = [
+        ("From", f"{sender} <{address}>" if sender and address else sender or address),
+        ("To", msg_text(message, streams, MSG_DISPLAY_TO)),
+        ("Cc", msg_text(message, streams, MSG_DISPLAY_CC)),
+        ("Date", sent),
+        ("Subject", msg_text(message, streams, MSG_SUBJECT)),
+    ]
+    lines: list[str] = []
+    for name, value in fields:
+        if not value:
+            continue
+        # A long recipient list is folded across lines in the file and is one fact here.
+        folded = re.sub(r"\s+", " ", str(value)).strip()
+        lines.append(f"{name}: {folded}")
+    body = msg_text(message, streams, MSG_BODY)
+    if body is None:
+        html_body = msg_text(message, streams, MSG_BODY_HTML)
+        body = html_text(html_body) if html_body else None
+    if not lines and not body:
+        raise ValueError(
+            "this file is a compound file but holds none of the properties a message has, so "
+            "whatever it is, it is not a message this computer can read"
+        )
+    if body is None:
+        # The remaining case is a body kept only as formatted text, which is a compressed stream in
+        # a format of its own. Saying so is worth more than returning the headers and letting the
+        # message look like one that said nothing.
+        body = (
+            "[The body of this message is stored only as formatted text, which this reader does "
+            "not decode. The fields above are what it could read; opening the message and saving "
+            "it as .eml, or forwarding it, brings the body with it.]"
+        )
+    attached = msg_attachments(message, streams)
+    lines.extend(["", body])
+    if attached:
+        lines.extend(["", f"[{plural(len(attached), 'attachment')}: {', '.join(attached)}]"])
     return normalized("\n".join(lines))
 
 
@@ -664,9 +1012,16 @@ def extract_epub(target: Path) -> str:
 
 
 def extract_pdf(target: Path, start_page: int, end_page: int) -> tuple[str, int | None]:
+    reader = installed(PDF_TEXT_READER, "ATHANOR_PDFTOTEXT")
+    counter = installed(PDF_PAGE_COUNTER, "ATHANOR_PDFINFO")
+    if reader is None or counter is None:
+        raise ValueError(
+            "poppler is what reads a PDF on this computer and it is not installed here, so this "
+            "file cannot be read as text at all. apt-get install -y poppler-utils is what opens it"
+        )
     pages: int | None = None
     info = subprocess.run(
-        ["/usr/bin/pdfinfo", str(target)],
+        [counter, str(target)],
         check=False,
         capture_output=True,
         text=True,
@@ -679,7 +1034,7 @@ def extract_pdf(target: Path, start_page: int, end_page: int) -> tuple[str, int 
             except ValueError:
                 pass
     command = [
-        "/usr/bin/pdftotext",
+        reader,
         "-f",
         str(start_page),
         "-l",
@@ -703,34 +1058,177 @@ class Extraction(NamedTuple):
     # How many pages this reading actually covered, which is what decides whether the characters
     # that came back are a document or the absence of one. Zero for everything that has no pages.
     pages_read: int = 0
+    # What recognition did not get to, on the occasions it did not get to all of it - a scan no
+    # recogniser could be run on at all, or one this reading stopped part of the way through. Read
+    # by `unread_reason` for the first and by the search for the second, because both owe the owner
+    # the difference between a document that says nothing and a document nothing here finished.
+    ocr_gap: str | None = None
 
 
-# Refused rather than read, because reading it would mean handing back rubbish and calling it the
-# document. Written as one sentence of what and one of how to get past it, because the owner is the
-# only person who can act on either.
-UNREADABLE_FORMATS = {
-    ".msg": (
-        "an Outlook .msg is a compound binary that nothing on this computer decodes, and its bytes "
-        "read as text are noise rather than the message. Saving the message again as .eml from the "
-        "mail client, or forwarding it, is what makes it readable here"
+def pdf_is_pictures(extraction: Extraction) -> bool:
+    """Whether what came back from a PDF is a document or the absence of one.
+
+    A page of a scan yields nothing through pdftotext, and nothing is not a low score - it is the
+    same output an empty file gives. This is the one test that separates the two, and both the
+    decision to recognise the pages and the sentence the owner is told hang off it.
+    """
+    pages = max(1, extraction.pages_read)
+    return len(extraction.text.strip()) < MIN_PDF_CHARACTERS_PER_PAGE * pages
+
+
+def last_line(stream: bytes) -> str:
+    """The last thing a tool said before it gave up, which is the part worth repeating."""
+    said = normalized(stream.decode("utf-8", "replace")).splitlines()
+    return said[-1] if said else ""
+
+
+def recognise_page(engine: str, rasteriser: str, target: Path, page: int, scratch: Path) -> str:
+    """One page of a scan, rendered to a picture and read off it.
+
+    The picture goes with the page rather than with the document: a 300 dpi page is a megabyte, and
+    twenty of them held at once to read them one at a time would be a megabyte nineteen times over.
+    """
+    image = scratch / f"page-{page}"
+    rendered = subprocess.run(
+        [
+            rasteriser,
+            "-r",
+            str(OCR_DPI),
+            "-gray",
+            "-png",
+            "-singlefile",
+            "-f",
+            str(page),
+            "-l",
+            str(page),
+            str(target),
+            str(image),
+        ],
+        check=False,
+        capture_output=True,
+        timeout=OCR_PAGE_TIMEOUT_SECONDS,
     )
-}
+    picture = image.with_suffix(".png")
+    if rendered.returncode != 0 or not picture.is_file():
+        raise ValueError(last_line(rendered.stderr) or f"page {page} could not be rendered")
+    try:
+        recognised = subprocess.run(
+            [engine, str(picture), "-", "--dpi", str(OCR_DPI), "-l", "eng"],
+            check=False,
+            capture_output=True,
+            timeout=OCR_PAGE_TIMEOUT_SECONDS,
+        )
+    finally:
+        picture.unlink(missing_ok=True)
+    if recognised.returncode != 0:
+        raise ValueError(last_line(recognised.stderr) or f"page {page} could not be recognised")
+    # One picture is one page, so the recogniser's own page break carries no information here and
+    # would read as a page of its own to everything downstream that counts them.
+    return recognised.stdout.decode("utf-8", "replace").replace("\f", "").strip()
+
+
+def recognised_pdf(
+    plain: Extraction, target: Path, start_page: int, end_page: int, budget: ConversionBudget
+) -> Extraction:
+    """A PDF whose pages are pictures, read off the pictures, a page at a time.
+
+    A page at a time rather than one conversion of the whole document is what makes the budget mean
+    anything: a reading that has spent its seconds stops on a page boundary and can name the pages
+    it did not reach, where one long conversion can only be waited for or killed with nothing at
+    all to show for it. The pictures live in a temporary directory that goes when the reading does,
+    so a folder of the owner's scans is read without a byte being written next to them.
+
+    Whatever the text layer held wins if recognition cannot beat it. A page with a scanner's header
+    burnt into it is still that header, and losing it to a recogniser that found nothing would be a
+    worse answer than the one this started from.
+    """
+
+    def unreadable(gap: str | None) -> Extraction:
+        return Extraction(plain.text, plain.pages, plain.extractor, plain.pages_read, gap)
+
+    engine = installed(OCR_ENGINE, "ATHANOR_TESSERACT")
+    rasteriser = installed(PAGE_RASTERISER, "ATHANOR_PDFTOPPM")
+    if engine is None or rasteriser is None:
+        return unreadable(
+            "nothing installed here reads the pictures: apt-get install -y tesseract-ocr "
+            "tesseract-ocr-eng poppler-utils is what opens a scan"
+        )
+    if budget.remaining <= 0:
+        return unreadable(
+            "this search had already spent the seconds it allows OCR by the time it reached this "
+            "file. Reading this one file with document_read recognises it"
+        )
+    total = plain.pages or end_page
+    last = min(end_page, total, start_page + MAX_OCR_PAGES - 1)
+    recognised: list[str] = []
+    failure: str | None = None
+    with tempfile.TemporaryDirectory(prefix="athanor-ocr-") as scratch:
+        for page in range(start_page, last + 1):
+            started = time.monotonic()
+            try:
+                recognised.append(recognise_page(engine, rasteriser, target, page, Path(scratch)))
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                failure = f"OCR stopped on page {page}: {str(error) or type(error).__name__}"
+                break
+            finally:
+                budget.spend(time.monotonic() - started)
+            if budget.remaining <= 0:
+                break
+    body = "\f".join(recognised)
+    if len(body.strip()) <= len(plain.text.strip()):
+        return unreadable(failure)
+    reached = start_page + len(recognised) - 1
+    short: str | None = None
+    # Only where the page count is a fact. A PDF whose count pdfinfo could not report would
+    # otherwise have the pages this reading guessed at subtracted from the pages it read, and be
+    # told it had left behind four hundred and eighty pages that were never there.
+    if plain.pages and reached < plain.pages:
+        # Named rather than silently dropped, in the words the e-book reader uses for the same
+        # thing: a search that stops halfway through a scan and says nothing has told the owner
+        # that the clause is not in a document it never finished looking at.
+        why = failure or (
+            "the seconds this reading allows OCR were spent"
+            if budget.remaining <= 0
+            else f"one reading recognises at most {plural(MAX_OCR_PAGES, 'page')}"
+        )
+        short = (
+            f"{plural(plain.pages - reached, 'page')} of this scan "
+            f"{'was' if plain.pages - reached == 1 else 'were'} never recognised, because {why}"
+        )
+        body += (
+            f"\n\n[Not read: {plural(plain.pages - reached, 'further page')} of this scan, because "
+            f"{why}. Asking for those pages by page range with document_read reads them.]"
+        )
+    # Carried on the extraction as well as written into the text, because the two readers need it
+    # in different places. A `read` hands the whole document over and the line above travels with
+    # it; a search hands back three excerpts chosen by score, and the line sits on the last page it
+    # got to, which has no reason to be one of the three. Told only through the text, a search that
+    # got half way through a scan and stopped would report every file as read and let the owner
+    # conclude the clause is not in a document nothing here finished looking at.
+    return Extraction(
+        f"{OCR_NOTE}\n\n{normalized(body)}", plain.pages, "OCR", len(recognised), short
+    )
 
 
 def extract_text(
     target: Path,
     start_page: int = 1,
     end_page: int = 20,
-    budget: ConversionBudget | None = None,
+    budgets: Budgets | None = None,
 ) -> Extraction:
     suffix = target.suffix.lower()
-    if suffix in UNREADABLE_FORMATS:
-        raise ValueError(UNREADABLE_FORMATS[suffix])
+    budgets = budgets or read_budgets()
     if suffix == ".pdf":
         text, pages = extract_pdf(target, start_page, end_page)
-        return Extraction(
+        plain = Extraction(
             text, pages, None, max(1, min(pages or end_page, end_page) - start_page + 1)
         )
+        # Recognition only where the alternative is nothing. A PDF that carries its own text is
+        # never rasterised and read back: that would be minutes spent to replace exact characters
+        # with recognised ones, which is slower and worse than what the file already said.
+        if not pdf_is_pictures(plain):
+            return plain
+        return recognised_pdf(plain, target, start_page, end_page, budgets.ocr)
     if suffix == ".docx":
         return Extraction(extract_docx(target))
     if suffix == ".pptx":
@@ -739,11 +1237,13 @@ def extract_text(
         text, extractor = extract_xlsx(target)
         return Extraction(text, None, extractor)
     if suffix in LEGACY_OFFICE:
-        return Extraction(extract_legacy_office(target, budget), None, "LibreOffice")
+        return Extraction(extract_legacy_office(target, budgets.office), None, "LibreOffice")
     if suffix == ".epub":
         return Extraction(extract_epub(target))
     if suffix == ".eml":
         return Extraction(extract_eml(target))
+    if suffix == ".msg":
+        return Extraction(extract_msg(target), None, "compound file")
     if suffix in {".odt", ".ods", ".odp"}:
         return Extraction(extract_open_document(target))
     data = target.read_bytes()
@@ -775,21 +1275,26 @@ def unread_reason(extraction: Extraction, suffix: str) -> str | None:
     page, every page yields zero characters, every page ranks below everything - and the owner
     concluded the clause was not there. It is the wrong conclusion and the search handed it to them.
 
-    OCR is not the fix here and is deliberately not done: recognising a two-hundred-page scan is
-    minutes of a two-core computer and it writes a new file, neither of which a search may do behind
-    the owner's back. What a search owes them is the true sentence and the command that acts on it.
+    The pictures are read now rather than only described, so what is left to say here is what
+    reading them could not fix: a scan on a computer with no recogniser installed, one a search ran
+    out of seconds before it reached, and one where recognition ran and came back with nothing. All
+    three used to arrive as the same empty result, and only ever one of them is true at a time.
     """
     body = extraction.text.strip()
     if suffix == ".pdf":
-        pages = max(1, extraction.pages_read)
-        if len(body) >= MIN_PDF_CHARACTERS_PER_PAGE * pages:
+        if not pdf_is_pictures(extraction):
             return None
-        return (
+        opening = (
             f"almost nothing in this PDF is text - {plural(len(body), 'character')} across "
-            f"{plural(pages, 'page')}. Pages that are images of pages read exactly like this, and "
-            "no search of the text can see inside them. `ocrmypdf --output-type pdfa --sidecar "
-            "out.txt --rotate-pages --deskew in.pdf out.pdf` writes a copy that can be read, and "
-            "OCR misreads digits, so say that a quotation came from OCR"
+            f"{plural(max(1, extraction.pages_read), 'page')}. Pages that are images of pages read "
+            "exactly like this"
+        )
+        if extraction.ocr_gap:
+            return f"{opening}, and {extraction.ocr_gap}"
+        return (
+            f"{opening}, and reading those pictures with OCR produced almost nothing either - a "
+            "scan of a blank page, a photograph, or handwriting reads like this. Nothing in it can "
+            "be searched, and it is still not an empty document"
         )
     return None if body else "no text at all came out of this file"
 
@@ -925,11 +1430,18 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
     corpus_tokens = 0
     failures = 0
     unread: list[dict[str, str]] = []
-    budget = ConversionBudget(LEGACY_SEARCH_BUDGET_SECONDS)
+    # Scans this walk started reading and did not finish. Their pages that were recognised are in
+    # the results like anything else; what is owed here is the pages that were not.
+    partial: list[dict[str, str]] = []
+    # Which reader produced a file's text, for the files where that is not simply the file itself.
+    # An excerpt recognised off a picture and an excerpt copied out of a document look identical on
+    # the way to the owner, and they are not worth the same.
+    readers: dict[Path, str] = {}
+    budgets = search_budgets()
     for target in files:
         relative = os.path.relpath(target, Path.cwd())
         try:
-            extraction = extract_text(target, 1, args.max_pages, budget)
+            extraction = extract_text(target, 1, args.max_pages, budgets)
         except Exception as error:
             # Deliberately every exception rather than the named five. A search runs over whatever
             # the owner happens to have on disk, and the extractors reach into third-party parsers
@@ -943,6 +1455,12 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
         reason = unread_reason(extraction, target.suffix.lower())
         if reason:
             unread.append({"path": relative, "reason": reason})
+        # Read, but not all of it. Kept apart from `unread` because these files did match on what
+        # was recognised and saying they could not be read would be its own false sentence.
+        elif extraction.ocr_gap:
+            partial.append({"path": relative, "reason": extraction.ocr_gap})
+        if extraction.extractor:
+            readers[target] = extraction.extractor
         for chunk, page in located_chunks(extraction.text, target.suffix.lower()):
             counts = Counter(term.lower() for term in TOKEN.findall(chunk))
             token_count = sum(counts.values())
@@ -985,10 +1503,34 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
         }
         if page is not None:
             result["page"] = page
+        if target in readers:
+            result["extractor"] = readers[target]
         results.append(result)
         per_file[relative] += 1
         if len(results) >= args.max_results:
             break
+    # The sentences that have to travel with these results rather than be worked out from them.
+    notes: list[str] = []
+    if unread:
+        notes.append(
+            f"{plural(len(unread), 'document')} of {len(files)} could not be read as text, so "
+            "nothing in them could have matched whatever they contain; `unread` says which and "
+            "why. Say that alongside these results - never report a search as finding nothing "
+            "without it."
+        )
+    if partial:
+        notes.append(
+            f"{plural(len(partial), 'scan')} of {len(files)} was read only as far as this search "
+            "got through it, so a phrase on a page it never reached could not have matched; "
+            "`partiallyRead` says which and how much was left. Say that alongside these results, "
+            "and read one of those files with document_read to recognise the rest of it."
+        )
+    if any(reader == "OCR" for reader in readers.values()):
+        notes.append(
+            "A result marked `extractor: OCR` was recognised from a picture of a page rather than "
+            "carried as text by the document. Say so when quoting one, and check any figure in it "
+            "against the page, because recognition misreads digits."
+        )
     return {
         "query": args.query,
         "path": os.path.relpath(root, Path.cwd()),
@@ -999,17 +1541,11 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
         # otherwise return a list longer than the results it is explaining. The count above is the
         # whole truth either way.
         "unread": unread[:25],
+        # Bounded for the same reason `unread` is, and only present when there is one: a search that
+        # finished every scan it opened should not carry an empty list saying so.
+        **({} if not partial else {"partiallyRead": partial[:25]}),
         "results": results,
-        **(
-            {}
-            if not unread
-            else {
-                "note": f"{plural(len(unread), 'document')} of {len(files)} could not be read as "
-                "text, so nothing in them could have matched whatever they contain; `unread` says "
-                "which and why. Say that alongside these results - never report a search as "
-                "finding nothing without it."
-            }
-        ),
+        **({} if not notes else {"note": " ".join(notes)}),
         "method": "private source-linked BM25 retrieval; ask follow-up searches with synonyms when wording may differ",
     }
 

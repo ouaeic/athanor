@@ -651,6 +651,35 @@ export const refreshOpenRouterCatalog = async (
 };
 
 /**
+ * What the feed says about a media route's price, in the unit that route is actually billed in.
+ *
+ * The pricing block was thrown away wholesale on this path, and the tag that stood in for it said
+ * "Price not published" about every live entry - which the importer had no grounds for, having never
+ * looked. Looking settles it: `prompt` and `completion` are the only price fields parsed here and
+ * both are dollars per token, which is what the chat catalogue reads them as. An image is billed per
+ * image, speech per character and a reading per minute of recording, so none of the three converts,
+ * and nothing here sets a price.
+ *
+ * What the tags now carry is the difference between the two facts that zero used to cover. A route
+ * this provider prices nowhere is one thing; a route it prices in a unit athanor cannot turn into
+ * dollars per minute is another, and an owner deciding which model to point their recordings at is
+ * entitled to know which of the two they are looking at.
+ */
+const mediaPriceTags = (
+  modality: 'image' | 'audio' | 'transcription',
+  pricing: OpenRouterPricing | undefined
+): string[] => {
+  const unit =
+    modality === 'image' ? 'per-image' : modality === 'audio' ? 'per-character' : 'per-minute';
+  const pricedPerToken =
+    perMillion(pricing?.prompt) !== null || perMillion(pricing?.completion) !== null;
+  return [
+    `No ${unit} price published`,
+    ...(pricedPerToken ? ['Provider prices this route per token'] : [])
+  ];
+};
+
+/**
  * The generators the owner's provider account can reach, which the chat refresh above throws away.
  *
  * `refreshOpenRouterCatalog` skips every model whose output is not text - correctly, they cannot
@@ -659,12 +688,14 @@ export const refreshOpenRouterCatalog = async (
  * is exactly the complaint: there was no control because there was no catalogue to control.
  *
  * What this cannot do is price them. The chat side reads `pricing.prompt` and `pricing.completion`
- * off the same feed and those are the only price fields this repository has ever confirmed; there
- * is no field here that is known to state dollars per generated image, and guessing at one would
- * put a number under a control the owner is about to trust. So a live entry's price is reported as
- * `unknown`, the reviewed seeds keep their measured figures, and the worker's approval card asks
- * every single time for a model whose cost nobody has stated. A live account is what it would take
- * to confirm whether a per-image price is published here and under what key.
+ * off the same feed and those are the only price fields this repository has ever confirmed; both
+ * are dollars per token, and no media route is billed in tokens - see `mediaPriceTags`, which is
+ * where that block is now read rather than discarded. Guessing at a conversion would put a number
+ * under a control the owner is about to trust. So a live entry's price is reported as `unknown`,
+ * the reviewed seeds keep their measured figures, and the worker's approval card asks every single
+ * time for a model whose cost nobody has stated - but the reading itself no longer treats that
+ * unknown as free: `transcriptionWindow` in the worker measures a route's per-minute cost from the
+ * provider's own first invoice rather than waiting for this feed to publish one.
  */
 export const refreshOpenRouterMediaCatalog = async (options: {
   baseUrl: string;
@@ -741,7 +772,7 @@ export const refreshOpenRouterMediaCatalog = async (options: {
       usdPerMinute: null,
       priceSource: 'unknown' as const,
       defaultVoice: null,
-      recommendationTags: ['Price not published'],
+      recommendationTags: mediaPriceTags(modality, model.pricing),
       updatedAt,
       // Undefined rather than false when the endpoint feed could not be read, so an outage on one
       // of two requests cannot silently withdraw every private media route the owner has.

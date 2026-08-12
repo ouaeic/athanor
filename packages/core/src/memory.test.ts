@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CONVERSATION_NAME_INDEX_STAMP,
+  conversationNamePrefixTokens,
+  isMemoryToken,
   MEMORY_EXCERPT_CHARS,
   MEMORY_FUZZY_SIMILARITY_THRESHOLD,
   MEMORY_PACK_QUOTAS,
@@ -203,6 +206,114 @@ describe('keyed blind index', () => {
     expect(long.openingTokens.split(' ')).not.toContain(
       buildConversationNameIndex('gooseberry', '', indexKey).nameTokens
     );
+  });
+
+  it('finds a name by the first letters of a word in it, and only by the word being typed', () => {
+    const audit = buildConversationNameIndex('Grimbolder audit', '', indexKey).prefixTokens!;
+    // The case the index could not answer at all: a word the owner is half way through typing.
+    for (const typed of ['gri', 'grim', 'grimbold', 'grimbolder'])
+      expect(audit.split(' ')).toContain(conversationNamePrefixTokens(typed, indexKey)[0]);
+
+    // Two letters narrow nothing, so nothing is indexed for them and nothing is asked for.
+    expect(conversationNamePrefixTokens('gr', indexKey)).toEqual([]);
+    expect(audit.split(' ')).not.toContain(
+      conversationNamePrefixTokens('grx', indexKey)[0] ?? 'none'
+    );
+
+    // Only the word still being typed. "audit" is finished, and a finished word that happens to
+    // start another word must not quietly widen the search that was actually asked for.
+    const [typing] = conversationNamePrefixTokens('audit grimbold', indexKey);
+    expect(typing).toBe(conversationNamePrefixTokens('grimbold', indexKey)[0]);
+    expect(conversationNamePrefixTokens('grimbold audit', indexKey)[0]).toBe(
+      conversationNamePrefixTokens('audit', indexKey)[0]
+    );
+
+    // Through the same stemmer as the index, so a half-typed word lands where the whole one did.
+    expect(
+      buildConversationNameIndex('Released relays', '', indexKey).prefixTokens!.split(' ')
+    ).toContain(conversationNamePrefixTokens('releas', indexKey)[0]);
+
+    // And through the same alias expansion, so a prefix reaches a compound name by its parts the
+    // way the whole word already does.
+    const relay = buildConversationNameIndex('athanor-relay ticket', '', indexKey).prefixTokens!;
+    expect(relay.split(' ')).toContain(conversationNamePrefixTokens('rel', indexKey)[0]);
+    expect(relay.split(' ')).toContain(conversationNamePrefixTokens('athanor-rel', indexKey)[0]);
+
+    // A word nobody is typing the front of has nothing to ask with.
+    expect(conversationNamePrefixTokens('what', indexKey)).toEqual([]);
+    expect(conversationNamePrefixTokens('', indexKey)).toEqual([]);
+  });
+
+  it('keeps the prefixes keyed, bounded, and out of the blob guard’s reach', () => {
+    const index = buildConversationNameIndex('Grimbolder audit', '', indexKey);
+    const tokens = index.prefixTokens!.split(' ');
+    // Nothing here is reversible: a prefix is a keyed token like any other, in its own domain, so
+    // the database can match one and cannot read one, and the same name under another workspace's
+    // key is a different set of tokens entirely.
+    for (const token of tokens) expect(isMemoryToken(token)).toBe(true);
+    expect(index.prefixTokens).not.toContain('grim');
+    expect(buildConversationNameIndex('Grimbolder audit', '', otherKey).prefixTokens).not.toBe(
+      index.prefixTokens
+    );
+    // The whole-word surface and the prefix surface are separate token spaces, so a row matched by
+    // a prefix can be ranked below one matched by the word.
+    expect(tokens).not.toContain(buildConversationNameIndex('grimbolder', '', indexKey).nameTokens);
+
+    // What it costs: one token per length, from three to the word, per word of the name.
+    expect(tokens).toHaveLength('grimbolder'.length - 2 + ('audit'.length - 2));
+
+    // A pasted line in a name is bounded rather than indexed once per character.
+    const pasted = buildConversationNameIndex(
+      Array.from({ length: 60 }, (_, index) => `word${index}`).join(' '),
+      '',
+      indexKey
+    );
+    expect(pasted.prefixTokens!.split(' ').length).toBeLessThanOrEqual(128);
+
+    // A name the blob guard refused has no prefixes either: it must not come back in through them.
+    const blob = Buffer.from('x'.repeat(80_000)).toString('base64');
+    expect(buildConversationNameIndex(blob, '', indexKey).prefixTokens).toBe('');
+  });
+
+  it('writes the prefixes in an order that says nothing about the words they came from', () => {
+    /*
+     * A tsvector keeps the position of every lexeme, so the order this string is written in is
+     * stored and can be read straight off a database dump. Anything the order depends on is
+     * therefore published: hand the prefixes over in the order of the words they came from and each
+     * row states which keyed token sorts before which, which merges across a history into an
+     * alphabetical order over the whole vocabulary and takes most of the work out of guessing what
+     * the tokens stand for. Sorted by the token, each one sits where its own value puts it, which
+     * a reader could already have worked out from the token itself.
+     */
+    const tokens = buildConversationNameIndex('zebra apple', '', indexKey).prefixTokens!.split(' ');
+    expect(tokens).toEqual([...tokens].sort());
+
+    // The same set of words in the other order is the same name to a reader of the column, which is
+    // the whole property: the order carries the tokens' own values and nothing about the plaintext.
+    expect(buildConversationNameIndex('apple zebra', '', indexKey).prefixTokens).toBe(
+      tokens.join(' ')
+    );
+
+    // And the ordering of the plaintext is not recoverable from it: `apple`'s rungs sort before
+    // `zebra`'s as plaintext, and where they land here is decided by something the key controls.
+    const rungsOf = (word: string): string[] =>
+      buildConversationNameIndex(word, '', indexKey).prefixTokens!.split(' ');
+    const apple = new Set(rungsOf('apple'));
+    expect(tokens.filter((token) => apple.has(token))).not.toEqual(tokens.slice(0, apple.size));
+  });
+
+  it('stamps the shape of the vector it wrote, in a value that says nothing about the owner', () => {
+    // The one thing a backfill can ask a row that has already been written, and the reason it can
+    // tell "indexed before prefixes existed" from "a name with no prefixes in it".
+    expect(isMemoryToken(CONVERSATION_NAME_INDEX_STAMP)).toBe(true);
+    expect(CONVERSATION_NAME_INDEX_STAMP).toHaveLength(20);
+    // Longer than any keyed lexeme token, so no name can ever produce it.
+    const lengths = new Set(
+      buildConversationNameIndex('Grimbolder audit', 'Look at the ledger', indexKey)
+        .nameTokens.split(' ')
+        .map((token) => token.length)
+    );
+    expect(lengths).toEqual(new Set([16]));
   });
 });
 

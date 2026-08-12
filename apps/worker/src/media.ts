@@ -1,4 +1,8 @@
-import { MEDIA_VIDEO_UNAVAILABLE_REASON, type MediaModelOption } from '@athanor/contracts';
+import {
+  AUDIO_READ_MAX_SECONDS,
+  MEDIA_VIDEO_UNAVAILABLE_REASON,
+  type MediaModelOption
+} from '@athanor/contracts';
 import { managedMediaModels } from '@athanor/model-gateway';
 
 /**
@@ -155,34 +159,142 @@ export const resolvedTranscriptionRoute = (
 };
 
 /**
- * What a reading of this length will cost, before a second of it is sent.
+ * The unit transcription is quoted and billed in, and so the smallest stretch of a recording that
+ * can be sent to find out what a minute of it costs.
+ */
+export const TRANSCRIPTION_BILLING_MINUTE_SECONDS = 60;
+
+/**
+ * What this computer is entitled to say a minute of reading costs on a route, and on what evidence.
+ *
+ * Three states rather than a number, because two of them used to arrive here as the same zero. A
+ * published price is the provider's own figure carried on the owner's chosen route. A measured one
+ * is arithmetic on a reading the provider has already billed, on this route, in this task - the
+ * same kind of evidence the two seeded media prices carry, and the only kind this side can come by
+ * for a route nobody publishes. Unknown is neither, and it is not free.
+ */
+export interface TranscriptionRate {
+  usdPerMinute: number | null;
+  source: 'published' | 'measured' | 'unknown';
+}
+
+const finiteRate = (value: number | null | undefined): number | null =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+
+/**
+ * The strongest evidence available about a route's price, published beating measured.
+ *
+ * The published figure wins where there is one: it is what the provider will bill, whereas the
+ * measured one is what it billed for a particular reading, and a route with tiered or rounded
+ * duration billing can differ between the two.
+ */
+export const transcriptionRate = (
+  model: ResolvedMediaModel | null,
+  measuredUsdPerMinute?: number | null
+): TranscriptionRate => {
+  const published = model?.priceKnown ? finiteRate(model.usdPerMinute) : null;
+  if (published !== null) return { usdPerMinute: published, source: 'published' };
+  const measured = finiteRate(measuredUsdPerMinute);
+  if (measured !== null) return { usdPerMinute: measured, source: 'measured' };
+  return { usdPerMinute: null, source: 'unknown' };
+};
+
+/**
+ * Dollars per minute, read back off a reading the provider itself put a price on.
+ *
+ * Only from the provider's own figure. `transcribe` falls back to multiplying duration by whatever
+ * per-minute price it was handed when the response states no cost, and deriving a rate from that
+ * would be this side reading its own guess back to itself and promoting it to a measurement - which
+ * is exactly how a constant nobody measured ends up tagged as one.
+ *
+ * The provider's duration is preferred over the prepared one for the same reason the ledger prefers
+ * it: what was billed is what a price per billed minute has to be divided by.
+ */
+export const transcriptionRateFromReading = (
+  reading: { costUsd: number; billedSeconds: number | null; costFromProvider: boolean },
+  preparedSeconds: number
+): number | null => {
+  if (!reading.costFromProvider) return null;
+  const cost = finiteRate(reading.costUsd);
+  const seconds = finiteRate(reading.billedSeconds) ?? finiteRate(preparedSeconds);
+  if (cost === null || seconds === null || seconds <= 0) return null;
+  return Math.round(((cost * 60) / seconds) * 1e6) / 1e6;
+};
+
+/**
+ * What a reading of this length will cost at a known rate, before a second of it is sent.
  *
  * Rounded up to the minute, because that is how duration billing is quoted and rounding down would
- * make the card understate every job. A route whose price nobody published prices at zero here and
- * is caught by `priceKnown` instead, exactly as an unpriced image route is: an unknown price is a
- * card every time, never a small number.
+ * make the card understate every job.
  */
+export const transcriptionEstimateAtRate = (seconds: number, rate: TranscriptionRate): number =>
+  Math.ceil(Math.max(0, seconds) / 60) * (rate.usdPerMinute ?? 0);
+
 /**
- * What a reading is expected to cost, from its duration alone.
+ * What a reading is expected to cost, from its duration and the best price anyone has stated.
  *
- * No transcription route publishes a per-minute figure this side can read, so today every one of
- * them lands here with `usdPerMinute` null and prices at zero. That is deliberate and it is not the
- * same thing as free: the image path can fall back to a compiled-in constant because athanor has
- * run and priced that model, and nothing here has ever transcribed anything, so a number in this
- * file would be a price claim about a model nobody has measured. Inventing one is worse than
- * admitting there is none.
- *
- * What actually protects the owner is therefore not this estimate. A route with no published price
- * has `priceKnown` false, so the approval card asks before every single reading and states the
- * minutes; the ledger settles from the provider's own figure once the work is done; and the spend
- * guard is asked again at the next step boundary against money that has really been spent. The
- * exposure is one reading's worth of overshoot on a cap, on a reading the owner was asked about
- * first. Seed a real figure here the moment one can be measured, and this stops being true.
+ * A route nobody has priced still lands on zero here, and that zero is now a floor rather than a
+ * claim: it is the true lower bound on a cost nothing on this computer has any evidence about, and
+ * `transcriptionWindow` below is what stops the guard being asked to enforce a cap against it.
+ * Inventing a number instead would put a price claim about a model nobody billed in front of the
+ * owner, which is the defect this repository already carries once and is not repeating.
  */
 export const transcriptionEstimateUsd = (
   seconds: number,
-  model: ResolvedMediaModel | null
-): number => Math.ceil(Math.max(0, seconds) / 60) * (model?.usdPerMinute ?? 0);
+  model: ResolvedMediaModel | null,
+  measuredUsdPerMinute?: number | null
+): number => transcriptionEstimateAtRate(seconds, transcriptionRate(model, measuredUsdPerMinute));
+
+/**
+ * A route restated with the price this computer has since been billed for it.
+ *
+ * For the approval card, which reads `priceKnown` and otherwise says the cost cannot be known until
+ * the provider bills it. That sentence is true of a route nobody has ever read a recording on, and
+ * it stops being true the moment one has: the provider has stated a figure by then, and repeating
+ * the admission in front of a number this side is holding is the interface reporting an absence it
+ * could answer. A published price is left exactly as it was - it is the stronger evidence and this
+ * has nothing to add to it.
+ */
+export const transcriptionRouteWithMeasuredRate = (
+  route: ResolvedMediaModel | null,
+  measuredUsdPerMinute?: number | null
+): ResolvedMediaModel | null => {
+  if (!route) return null;
+  const rate = transcriptionRate(route, measuredUsdPerMinute);
+  if (rate.source !== 'measured') return route;
+  return { ...route, usdPerMinute: rate.usdPerMinute, priceKnown: true };
+};
+
+/**
+ * The stretch of a recording one reading is allowed to send.
+ *
+ * The whole of what was asked for, once anyone has said what a minute costs. While nobody has, the
+ * first reading is cut to a single billing minute - not to save the owner money, since the rest is
+ * read by the calls that follow and the total duration billed is the same, but because a cap cannot
+ * be enforced against an estimate of zero. Ninety minutes of unknown price went past the spend
+ * guard in one request and the guard was told it was free; one minute of unknown price comes back
+ * with the provider's own figure attached, and every minute after it is priced, checked against the
+ * daily cap and refused if it does not fit.
+ *
+ * So a long recording behaves the same way before and after a provider publishes a price: the same
+ * audio is read, the same money is spent, the same cap stops it in the same place. What changes is
+ * that the number the owner is shown stops being a zero nobody stood behind.
+ */
+export const transcriptionWindow = (input: {
+  startSeconds: number;
+  endSeconds?: number | undefined;
+  rate: TranscriptionRate;
+}): { endSeconds: number; measuring: boolean } => {
+  const start = Math.max(0, Math.floor(input.startSeconds));
+  const asked = Number(input.endSeconds);
+  const requested =
+    Number.isFinite(asked) && asked > start
+      ? Math.min(86_400, Math.floor(asked))
+      : Math.min(86_400, start + AUDIO_READ_MAX_SECONDS);
+  if (input.rate.usdPerMinute !== null) return { endSeconds: requested, measuring: false };
+  const measuring = Math.min(requested, start + TRANSCRIPTION_BILLING_MINUTE_SECONDS);
+  return { endSeconds: measuring, measuring: measuring < requested };
+};
 
 const clamp = (value: unknown, minimum: number, maximum: number, fallback: number): number => {
   const parsed = Number(value ?? fallback);

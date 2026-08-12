@@ -682,19 +682,130 @@ export const buildMemorySourceIndex = (body: string, key: Uint8Array): MemorySou
 export const MAX_INDEXED_OPENING_CHARS = 2_000;
 
 /**
- * The two keyed surfaces a conversation is findable by before anything it said was captured: what
- * it is called, and what it was asked to do.
+ * The band of prefixes a conversation's name is findable by.
  *
- * Both go through `buildMemorySourceIndex`, which is the same tokenizer, the same stemmer, the same
- * alias expansion and the same keyed token space the verbatim corpus uses - so a query planned by
- * `planMemoryQuery` matches a conversation's name exactly as it matches its transcript, and there
- * is no second indexer to drift away from the first. Running it twice rather than over one joined
- * string is what keeps a pasted-blob request from taking the name down with it: the blob guard
- * fires on the request alone and the name is still indexed.
+ * A person searching their own history types the first few letters of a word they half remember
+ * and waits for the list to narrow. The index matches whole stemmed lexemes, so `grimbold` cannot
+ * reach a conversation called *Grimbolder audit* however it is planned - a keyed token is not a
+ * string the database can match the front of, which is the price of the plaintext never being
+ * there. The only way a prefix becomes matchable is for it to have been indexed as a token in its
+ * own right, so that is what happens here, at write time, under the same key.
+ *
+ * Three at the short end because two letters narrow nothing on any real history - the list still
+ * holds most of the box - and because a two-letter prefix is the rung a frequency attack on a
+ * stolen database labels first. Twenty-four at the long end because nobody types more of one word
+ * than that, and because it is the bound that stops a pasted path in a name from indexing itself
+ * once per character. A query longer than the band uses its first twenty-four characters, which
+ * can only over-match, and twenty-four characters of agreement is a match by any reading.
+ *
+ * The request is deliberately not prefixed. It is up to two thousand characters, which is a couple
+ * of hundred lexemes and would be a couple of thousand prefixes, on a column read on every page
+ * load - the corpus twice over to buy the second half of a surface the reader already has by name.
+ */
+const MIN_NAME_PREFIX_CHARS = 3;
+const MAX_NAME_PREFIX_CHARS = 24;
+/** A name needing more prefixes than this is a pasted line; its whole words are indexed regardless. */
+const MAX_NAME_PREFIX_TOKENS = 128;
+
+/**
+ * Every prefix, within the band, of every word a name is findable by.
+ *
+ * Both surfaces the name already has, because a prefix has to reach whatever the whole word
+ * reaches: `athanor-relay` for its exact name, and the `athanor` and `relay` its alias expansion
+ * produced, so `rel` narrows to it the way `relay` already does.
+ *
+ * Whole chains first, in the order the words were found, because the bound below cuts the tail off
+ * this list: keeping a word's rungs together means a name too long to index entirely loses whole
+ * words from the end rather than losing the middle of every word it has.
+ */
+const namePrefixes = (name: string): string[] => {
+  const prefixes = new Set<string>();
+  for (const lexeme of [...memoryLexemes(name), ...memoryAliasLexemes(name)]) {
+    const longest = Math.min(lexeme.length, MAX_NAME_PREFIX_CHARS);
+    for (let chars = MIN_NAME_PREFIX_CHARS; chars <= longest; chars += 1)
+      prefixes.add(lexeme.slice(0, chars));
+  }
+  return [...prefixes];
+};
+
+/**
+ * The prefix token a half-typed request is looking for, or nothing when it is not looking for one.
+ *
+ * Only the last word, because that is the only one a person is in the middle of. Everything before
+ * it they finished typing and meant as a word, and treating a finished word as a prefix would
+ * quietly widen every search anyone ever ran. There is no trailing space to consult either way -
+ * the route trims the query before it gets here.
+ *
+ * The same stemmer as the index, for the same reason the rest of this file uses it: a half-typed
+ * `releas` and an indexed `released` have to arrive at the same place.
+ */
+export const conversationNamePrefixTokens = (query: string, key: Uint8Array): string[] => {
+  const words = query.normalize('NFKC').toLocaleLowerCase('en').match(LEXEME_PATTERN) ?? [];
+  const last = words.at(-1)?.replace(TRAILING_PUNCTUATION, '') ?? '';
+  if (!last || memoryStopWords.has(last)) return [];
+  const stemmed = PLAIN_WORD.test(last) ? stemPlainWord(last) : last;
+  if (stemmed.length < MIN_NAME_PREFIX_CHARS) return [];
+  return [keyedToken('pre', stemmed.slice(0, MAX_NAME_PREFIX_CHARS), key, LEXEME_TOKEN_CHARS)];
+};
+
+/**
+ * Which shape of name vector a row carries, written into every one of them.
+ *
+ * A row indexed before prefixes existed is not distinguishable from a fresh one by looking at it:
+ * a name of one short word indexes to no prefixes at all, so "has no prefix tokens" and "was
+ * written by the old indexer" are the same picture, and a backfill that guessed would either miss
+ * the whole history or re-read it on every boot forever. Stamping the shape makes the question
+ * exact, and makes the next change to this vector a one-line bump rather than a migration that
+ * cannot reach the tokens anyway.
+ *
+ * Unkeyed on purpose - it is the same value in every workspace and on every box, so it says
+ * nothing about any owner. It is drawn from the same alphabet as a keyed token so it can be handed
+ * to `to_tsvector` and `tsquery` on the same terms, and it is longer than any of them so it can
+ * never be mistaken for one.
+ *
+ * At v3 because v2 wrote its prefixes in the order of the words they came from, which put the
+ * alphabetical order of the plaintext into the positions the vector keeps. Any row a box wrote in
+ * that shape has to be read again rather than left sitting there saying it, and this is the line
+ * that asks for it.
+ */
+export const CONVERSATION_NAME_INDEX_STAMP = encodeToken(
+  createHash('sha256').update('athanor-conversation-name-index-v3-sorted-prefixes').digest(),
+  20
+);
+
+/**
+ * The keyed surfaces a conversation is findable by before anything it said was captured: what it
+ * is called, the prefixes of what it is called, and what it was asked to do.
+ *
+ * The name and the request go through `buildMemorySourceIndex`, which is the same tokenizer, the
+ * same stemmer, the same alias expansion and the same keyed token space the verbatim corpus uses -
+ * so a query planned by `planMemoryQuery` matches a conversation's name exactly as it matches its
+ * transcript, and there is no second indexer to drift away from the first. Running it twice rather
+ * than over one joined string is what keeps a pasted-blob request from taking the name down with
+ * it: the blob guard fires on the request alone and the name is still indexed.
+ *
+ * The prefixes sit in their own domain rather than beside the whole words, so a row that matched
+ * `grimbold` as a prefix can be told apart from one whose name is that word, and ranked below it.
+ *
+ * They are also sorted after they are keyed, which matters more than it looks. A tsvector keeps the
+ * position of every lexeme it was given, so whatever order this line hands over is written down and
+ * can be read back off a stolen database. Handing over the prefixes in the order of the words they
+ * came from would publish, row by row, which keyed token sorts before which - and one such row is
+ * harmless where a history of them is not: merged across a few hundred conversations they compose
+ * into a near-total alphabetical order over the whole prefix vocabulary, and an alphabetical order
+ * over a set as guessable as "the first three letters of an English word" is most of the way to
+ * reading the names back. Sorting by the token puts each one where its own value says it goes,
+ * which is something the reader can already work out from the token, so the positions say nothing
+ * the tokens did not already say.
  */
 export interface ConversationNameIndex {
   /** Keyed lexemes of the conversation's own name; indexed above the request. */
   readonly nameTokens: string;
+  /**
+   * Keyed prefixes of those lexemes. Optional because a caller with nothing to index says so by
+   * passing empty strings, and a name whose every word is a stop word has none of these either.
+   */
+  readonly prefixTokens?: string;
   /** Keyed lexemes of the opening of the request, bounded by `MAX_INDEXED_OPENING_CHARS`. */
   readonly openingTokens: string;
 }
@@ -703,10 +814,23 @@ export const buildConversationNameIndex = (
   name: string,
   opening: string,
   key: Uint8Array
-): ConversationNameIndex => ({
-  nameTokens: buildMemorySourceIndex(name, key).bodyTokens,
-  openingTokens: buildMemorySourceIndex(opening.slice(0, MAX_INDEXED_OPENING_CHARS), key).bodyTokens
-});
+): ConversationNameIndex => {
+  const named = buildMemorySourceIndex(name, key);
+  return {
+    nameTokens: named.bodyTokens,
+    // Only when the name was indexable at all: a name the blob guard refused must not come back in
+    // through its prefixes.
+    prefixTokens: named.indexed
+      ? namePrefixes(name)
+          .slice(0, MAX_NAME_PREFIX_TOKENS)
+          .map((prefix) => keyedToken('pre', prefix, key, LEXEME_TOKEN_CHARS))
+          .sort()
+          .join(' ')
+      : '',
+    openingTokens: buildMemorySourceIndex(opening.slice(0, MAX_INDEXED_OPENING_CHARS), key)
+      .bodyTokens
+  };
+};
 
 /* ------------------------------------------------------------------------ *
  * Excerpting

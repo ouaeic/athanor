@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
   AthanorError,
+  CONVERSATION_NAME_INDEX_STAMP,
   MEMORY_PACK_BUDGET_TOKENS,
   MEMORY_FUZZY_SIMILARITY_THRESHOLD,
   MEMORY_PACK_DEFAULT_QUOTA,
@@ -439,17 +440,32 @@ const SCHEDULE_RUNS_PER_PAGE = 5;
 /**
  * The searchable form of a conversation's name, written by every statement that writes the name.
  *
- * Two weights, because the two questions are not the same question: A is what the conversation is
- * called, D is what it was asked to do. A search for "berlin flights" should reach the thread
- * called that before the one that merely mentioned it in passing, and this is where that ordering
- * comes from - `searchTaskNames` counts matches at A before it counts matches anywhere.
+ * Four weights, because they are four different questions. A is what the conversation is called, B
+ * is the prefixes of what it is called, D is what it was asked to do: a search for "berlin
+ * flights" should reach the thread called that before the one half-way through typing it, and both
+ * before the one that merely mentioned it in a paragraph. `searchTaskNames` probes the three and
+ * orders by them in that order.
+ *
+ * C is the vector's own shape, the same constant on every row, and it is what tells a row written
+ * by this indexer from one written by an older one. Interpolated rather than bound because it is
+ * one compile-time constant over the sixteen-letter token alphabet, which is also why it cannot
+ * carry punctuation into the statement.
  *
  * It takes the parameter positions rather than being a constant because these statements are
  * insert, update and backfill and no two of them number their placeholders alike.
  */
-const taskNameTsv = (name: number, opening: number): string =>
+const taskNameTsv = (name: number, prefixes: number, opening: number): string =>
   `setweight(to_tsvector('simple', $${name}::text), 'A')` +
+  ` || setweight(to_tsvector('simple', $${prefixes}::text), 'B')` +
+  ` || setweight(to_tsvector('simple', '${CONVERSATION_NAME_INDEX_STAMP}'), 'C')` +
   ` || setweight(to_tsvector('simple', $${opening}::text), 'D')`;
+
+/** The three token surfaces above, in the order every statement below binds them. */
+const taskNameTokens = (nameIndex: ConversationNameIndex): [string, string, string] => [
+  nameIndex.nameTokens,
+  nameIndex.prefixTokens ?? '',
+  nameIndex.openingTokens
+];
 
 export type TaskListFilter = 'active' | 'archived' | 'all';
 
@@ -476,43 +492,63 @@ export interface TaskNameHit {
   updatedAt: string;
   /** The conversation's own name carries every term of the request. */
   wholeName: boolean;
-  /** Its name carries at least one of them; false means only its opening request does. */
+  /** Its name carries at least one of them. */
   inName: boolean;
+  /** A word of its name begins with the word the owner had not finished typing. */
+  namePrefix: boolean;
 }
 
 /**
- * Three tiers and a clock, and nothing per row that grows.
+ * Four tiers and a clock, and nothing per row that grows.
  *
  * Ranking by how many of the request's terms each candidate carries reads better on paper and cost
  * seven times as much to run: counting means `unnest` and an aggregate per row, and on the query
  * that matches the whole history - a word the owner puts in every conversation - the whole history
- * is what it runs over. Two extra `@@` probes against a vector already in hand answer the question
- * that actually decides the order: is this the conversation called that, is it one whose name
- * mentions it, or is it one that merely opened by asking about it. Measured over ten thousand
- * conversations every one of which matched, that is 15ms where counting was 101ms, and there is no
- * candidate cap anywhere in it - nothing is dropped to make the number, so nothing has to be
- * confessed to the owner either.
+ * is what it runs over. Three extra `@@` probes against a vector already in hand answer the
+ * question that actually decides the order: is this the conversation called that, is it one whose
+ * name mentions it, is it one whose name starts with what is still being typed, or is it one that
+ * merely opened by asking about it. Measured over ten thousand conversations every one of which
+ * matched, that is 15ms where counting was 101ms, and there is no candidate cap anywhere in it -
+ * nothing is dropped to make the number, so nothing has to be confessed to the owner either.
+ *
+ * The prefix probe is a separate array rather than more lexemes because it must not be allowed to
+ * satisfy the other two: a conversation whose name merely starts with what was typed is not a
+ * conversation called that, and folding the two together would put every `grim*` in the box above
+ * the thread actually named Grimbold. It is restricted to B for the same reason it is written
+ * there - the prefix of a name is a weaker claim than the name.
  *
  * The lexemes are keyed HMAC tokens over a sixteen-letter alphabet with no digits and no
  * punctuation (`isMemoryToken` is asserted before they get here), which is what lets them be
  * assembled into a tsquery by string concatenation without a lexeme ever being read as an
  * operator.
  *
+ * A request that is not half-typed leaves the prefix probe out of the statement rather than
+ * passing an empty array to it. `array_to_string` over nothing is the empty string, and an empty
+ * tsquery is a syntax error rather than a query that matches nothing - and a guard around it in
+ * SQL is not enough, because the planner is free to fold a cast over constant parameters before it
+ * ever reaches the branch that would have skipped it.
+ *
  * The columns are named rather than `t.*`: a task row carries its agent state, which is the whole
  * conversation, and pulling fifty of those back to read fifty titles would rebuild here the cost
  * the index was added to remove.
  */
-const TASK_NAME_SEARCH_SQL = `
+const taskNameSearchSql = (prefixed: boolean): string => `
 SELECT t.id, t.workspace_id, t.title, t.prompt_ciphertext, t.updated_at,
        (t.name_tsv @@ (array_to_string($2::text[], ':A & ') || ':A')::tsquery) AS whole_name,
-       (t.name_tsv @@ (array_to_string($2::text[], ':A | ') || ':A')::tsquery) AS in_name
+       (t.name_tsv @@ (array_to_string($2::text[], ':A | ') || ':A')::tsquery) AS in_name,
+       ${prefixed ? `(t.name_tsv @@ (array_to_string($5::text[], ':B | ') || ':B')::tsquery)` : 'false'} AS name_prefix
 FROM tasks t JOIN workspaces w ON w.id = t.workspace_id
 WHERE w.user_id = $1
   AND ($3::uuid IS NULL OR t.workspace_id = $3)
-  AND t.name_tsv @@ array_to_string($2::text[], ' | ')::tsquery
-ORDER BY whole_name DESC, in_name DESC,
+  AND t.name_tsv @@ (array_to_string($2::text[], ' | ')${
+    prefixed ? ` || ' | ' || array_to_string($5::text[], ':B | ') || ':B'` : ''
+  })::tsquery
+ORDER BY whole_name DESC, in_name DESC, name_prefix DESC,
          GREATEST(t.updated_at, t.created_at) DESC, t.id DESC
 LIMIT $4`;
+
+/** Both shapes are built once: the statement is chosen per query, never assembled per query. */
+const TASK_NAME_SEARCH_SQL = { plain: taskNameSearchSql(false), prefixed: taskNameSearchSql(true) };
 
 /**
  * The sidebar's position, as the three values its ordering is built from.
@@ -2479,7 +2515,7 @@ export class DataStore {
       `INSERT INTO tasks(
         id,user_id,workspace_id,title,status,model_id,privacy_route,max_compute_credits,
         prompt_ciphertext,security_mode,max_spend_usd,name_tsv
-       ) VALUES ($1,$2,$3,$4,'queued',$5,$6,$7,$8::jsonb,$9,$10,${taskNameTsv(11, 12)})
+       ) VALUES ($1,$2,$3,$4,'queued',$5,$6,$7,$8::jsonb,$9,$10,${taskNameTsv(11, 12, 13)})
        RETURNING *`,
       [
         id,
@@ -2492,8 +2528,7 @@ export class DataStore {
         JSON.stringify(input.promptCiphertext),
         input.securityMode ?? 'balanced',
         input.maxSpendUsd ?? null,
-        input.nameIndex.nameTokens,
-        input.nameIndex.openingTokens
+        ...taskNameTokens(input.nameIndex)
       ]
     );
     const task = mapTask(result.rows[0]!);
@@ -2531,7 +2566,7 @@ export class DataStore {
         fork_kind,security_mode,max_spend_usd,rewind_scope,restored_checkpoint_id,name_tsv
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,
         CASE WHEN $7='completed' THEN NOW() ELSE NULL END,$13,$14,$15,$16,$17,
-        ${taskNameTsv(18, 19)})
+        ${taskNameTsv(18, 19, 20)})
        RETURNING *`,
       [
         id,
@@ -2551,8 +2586,7 @@ export class DataStore {
         input.maxSpendUsd ?? null,
         input.rewindScope ?? 'conversation',
         input.restoredCheckpointId ?? null,
-        input.nameIndex.nameTokens,
-        input.nameIndex.openingTokens
+        ...taskNameTokens(input.nameIndex)
       ]
     );
     const fork = mapTask(result.rows[0]!);
@@ -3227,11 +3261,11 @@ export class DataStore {
   ): Promise<TaskRecord | null> {
     const result = await this.database.query(
       `UPDATE tasks t SET title=$3::jsonb, title_source='owner', updated_at=NOW(),
-         name_tsv = ${taskNameTsv(4, 5)}
+         name_tsv = ${taskNameTsv(4, 5, 6)}
        FROM workspaces w
        WHERE t.id=$1 AND w.id=t.workspace_id AND w.user_id=$2
        RETURNING t.*, 0 AS queued_message_count`,
-      [id, userId, JSON.stringify(titleCiphertext), nameIndex.nameTokens, nameIndex.openingTokens]
+      [id, userId, JSON.stringify(titleCiphertext), ...taskNameTokens(nameIndex)]
     );
     return result.rows[0] ? mapTask(result.rows[0]) : null;
   }
@@ -3271,9 +3305,9 @@ export class DataStore {
   ): Promise<boolean> {
     const result = await this.database.query(
       `UPDATE tasks SET title=$2::jsonb, title_source='generated',
-         name_tsv = ${taskNameTsv(3, 4)}
+         name_tsv = ${taskNameTsv(3, 4, 5)}
        WHERE id=$1 AND title_source='prompt'`,
-      [id, JSON.stringify(titleCiphertext), nameIndex.nameTokens, nameIndex.openingTokens]
+      [id, JSON.stringify(titleCiphertext), ...taskNameTokens(nameIndex)]
     );
     return result.rowCount === 1;
   }
@@ -4806,16 +4840,21 @@ export class DataStore {
     nameIndex: ConversationNameIndex
   ): Promise<void> {
     await this.database.query(
-      `UPDATE tasks SET title=$2,updated_at=NOW(), name_tsv = ${taskNameTsv(3, 4)} WHERE id=$1`,
-      [id, JSON.stringify(titleCiphertext), nameIndex.nameTokens, nameIndex.openingTokens]
+      `UPDATE tasks SET title=$2,updated_at=NOW(), name_tsv = ${taskNameTsv(3, 4, 5)} WHERE id=$1`,
+      [id, JSON.stringify(titleCiphertext), ...taskNameTokens(nameIndex)]
     );
   }
 
   /**
-   * One batch of conversations whose name has never been through the tokenizer - everything that
-   * existed before `name_tsv` did, and anything a half-finished backfill did not reach. The API
-   * drains this on the boot after the update for the same reason it drains the legacy titles: the
-   * tokens are keyed, so only a process holding the workspace key can produce them.
+   * One batch of conversations whose name is not indexed the way this build indexes names -
+   * everything that existed before `name_tsv` did, anything a half-finished backfill did not reach,
+   * and everything sealed by an earlier shape of the vector. The API drains this on the boot after
+   * the update for the same reason it drains the legacy titles: the tokens are keyed, so only a
+   * process holding the workspace key can produce them.
+   *
+   * The shape is asked about by the stamp every write puts in the vector rather than by looking for
+   * the tokens themselves, because a name of one short word indexes to no prefixes and would then
+   * be re-read on every boot for the life of the box.
    *
    * Oldest first, because the old end of the history is precisely the part a bounded decrypt window
    * could never see and the part this exists to recover.
@@ -4834,8 +4873,9 @@ export class DataStore {
   > {
     const result = await this.database.query(
       `SELECT id, workspace_id, title, prompt_ciphertext FROM tasks
-       WHERE name_tsv IS NULL ORDER BY created_at, id LIMIT $1`,
-      [Math.max(1, Math.min(Math.trunc(limit), MAX_TASK_PAGE))]
+       WHERE name_tsv IS NULL OR NOT (name_tsv @@ $2::text::tsquery)
+       ORDER BY created_at, id LIMIT $1`,
+      [Math.max(1, Math.min(Math.trunc(limit), MAX_TASK_PAGE)), CONVERSATION_NAME_INDEX_STAMP]
     );
     return result.rows.map((row) => {
       const title = encryptedText(row.title);
@@ -4851,10 +4891,9 @@ export class DataStore {
 
   /** Writes the search vector without touching the name it was built from, or `updated_at`. */
   async setTaskNameIndex(id: string, nameIndex: ConversationNameIndex): Promise<void> {
-    await this.database.query(`UPDATE tasks SET name_tsv = ${taskNameTsv(2, 3)} WHERE id=$1`, [
+    await this.database.query(`UPDATE tasks SET name_tsv = ${taskNameTsv(2, 3, 4)} WHERE id=$1`, [
       id,
-      nameIndex.nameTokens,
-      nameIndex.openingTokens
+      ...taskNameTokens(nameIndex)
     ]);
   }
 
@@ -4869,20 +4908,32 @@ export class DataStore {
    *
    * The order is what the conversation is called first and when it was last touched second: the
    * one named exactly what was asked for, then the one whose name says part of it, then the one
-   * that only opened by asking about it.
+   * whose name begins with the word still being typed, then the one that only opened by asking
+   * about it.
    */
   async searchTaskNames(
     userId: string,
-    input: { lexemes: readonly string[]; workspaceId?: string | null; limit?: number }
+    input: {
+      lexemes: readonly string[];
+      /** From `conversationNamePrefixTokens`: the word the owner had not finished typing. */
+      prefixes?: readonly string[];
+      workspaceId?: string | null;
+      limit?: number;
+    }
   ): Promise<TaskNameHit[]> {
     const lexemes = [...new Set(input.lexemes.filter(isMemoryToken))];
     if (lexemes.length === 0) return [];
-    const result = await this.database.query(TASK_NAME_SEARCH_SQL, [
-      userId,
-      lexemes,
-      input.workspaceId ?? null,
-      Math.max(1, Math.min(Math.trunc(input.limit ?? 20), MAX_TASK_PAGE))
-    ]);
+    const prefixes = [...new Set((input.prefixes ?? []).filter(isMemoryToken))];
+    const result = await this.database.query(
+      prefixes.length > 0 ? TASK_NAME_SEARCH_SQL.prefixed : TASK_NAME_SEARCH_SQL.plain,
+      [
+        userId,
+        lexemes,
+        input.workspaceId ?? null,
+        Math.max(1, Math.min(Math.trunc(input.limit ?? 20), MAX_TASK_PAGE)),
+        ...(prefixes.length > 0 ? [prefixes] : [])
+      ]
+    );
     return result.rows.map((row) => {
       const title = encryptedText(row.title);
       return {
@@ -4893,7 +4944,8 @@ export class DataStore {
         promptCiphertext: json<EncryptedEnvelope>(row.prompt_ciphertext),
         updatedAt: iso(row.updated_at),
         wholeName: Boolean(row.whole_name),
-        inName: Boolean(row.in_name)
+        inName: Boolean(row.in_name),
+        namePrefix: Boolean(row.name_prefix)
       };
     });
   }
