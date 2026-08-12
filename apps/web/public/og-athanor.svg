@@ -40,16 +40,6 @@
   <rect width="1200" height="630" fill="url(#background)"/>
   <circle cx="166" cy="123" r="290" fill="#fff" opacity=".018"/>
   <rect x="72" y="76" width="1056" height="478" rx="38" fill="#fff" opacity=".018" stroke="#fff" stroke-opacity=".09"/>
-  <g transform="translate(102 140) scale(2.4)">
-    <path d="M54 29h20v7H54z" fill="url(#iron)"/>
-    <path d="M57 34h14v24H57z" fill="url(#iron)"/>
-    <path d="M26 104 L31 70 C31 50 97 50 97 70 L102 104 Z" fill="url(#brick)"/>
-    <path d="M30.6 74.5h66.8" fill="none" stroke="url(#iron)" stroke-width="5"/>
-    <ellipse cx="64" cy="93" rx="34" ry="28" fill="url(#glow)"/>
-    <path d="M48 104V90c0-16 32-16 32 0v14Z" fill="#0b0908" stroke="url(#metal)" stroke-width="5" stroke-linejoin="round"/>
-    <path d="M64 82c6 8.5 9.5 14.5 9.5 19 0 5.4-4.2 9-9.5 9s-9.5-3.6-9.5-9c0-4.5 3.5-10.5 9.5-19Z" fill="#f2a13f"/>
-    <path d="M26 107.5h76" fill="none" stroke="url(#iron)" stroke-width="6" stroke-linecap="round"/>
-  </g>
   <text x="390" y="305" fill="url(#word)" font-family="Inter, Arial, sans-serif" font-size="110" font-weight="590" letter-spacing="-5">athanor</text>
   <text x="397" y="376" fill="#a2988e" font-family="Inter, Arial, sans-serif" font-size="29" font-weight="420" letter-spacing="-.4">your private cloud computer, through chat</text>
   <text x="397" y="436" fill="#7a706a" font-family="Inter, Arial, sans-serif" font-size="17" font-weight="430" letter-spacing="1.2">OPEN SOURCE · MANAGED OPEN-WEIGHT AI · ZERO CONTENT LOGGING</text>

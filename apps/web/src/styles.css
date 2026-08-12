@@ -241,27 +241,20 @@ select:focus-visible {
   900ms, five times slower than this interface's 180ms, because a fire is a mass and not a light
   switch; the model retargets every 250ms, so the eye is given lag rather than steps.
 */
-.mark-flame {
-  transform-box: view-box;
-  transform-origin: 64px 110px;
-  transform: scale(calc(0.88 + var(--draught) * 0.16), calc(0.55 + var(--draught) * 0.62));
-  transition: transform 900ms var(--ease);
-}
-
 .mark-glow {
   opacity: calc(0.18 + var(--draught) * 0.72);
   transition: opacity 900ms var(--ease);
 }
 
 /*
-  Out. #7c736c is the grey this product already uses for a thing that is not alive
-  (.status-dot.queued, :4285); it measures 4.53:1 on black. The flame also drops to a third of its
-  height, so the state is carried by shape as well as by colour - and the sidebar prints the word
-  beside it, so it is carried by neither alone.
+  Out. The drawing loses its colour rather than changing shape, because the shape is a baked
+  image now and cannot be redrawn - and the light in the door goes out entirely, which is the part
+  a reader actually looks at. Greyscale plus a drop in brightness reads as a cold furnace rather
+  than a dimmed one, and the sidebar prints the word beside it, so the state is never colour alone.
 */
-[data-fire='cold'] .mark-flame {
-  fill: #7c736c;
-  transform: scale(0.82, 0.34);
+[data-fire='cold'] .mark-drawing {
+  filter: grayscale(1) brightness(0.66);
+  transition: filter 900ms var(--ease);
 }
 
 [data-fire='cold'] .mark-glow {
@@ -270,14 +263,10 @@ select:focus-visible {
 
 /*
   Your move. `calling` and `drawing` differ by a pulse, and a pulse does not exist for a reader who
-  asked for less motion - so the difference is carried statically by the door rim leaving its metal
-  for ember, and the pulse is the enhancement on top. 2.2s because that is already this product's
+  asked for less motion - so what carries it statically is the floor the glow sits at, which is
+  higher for `calling` than for a turn merely in flight. 2.2s because that is already this product's
   one request cadence (running-mark-pulse); no second cadence is invented.
 */
-[data-fire='calling'] .mark-door {
-  stroke: var(--ember);
-}
-
 [data-fire='calling'] .mark-glow {
   animation: mark-called 2.2s var(--ease) infinite;
 }
