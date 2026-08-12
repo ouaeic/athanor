@@ -410,6 +410,61 @@ describe('an empty conversation', () => {
   });
 });
 
+/*
+ * The incident this card was measured against: the owner saw a turn going wrong, typed a correction
+ * and sent it, and the provider stopped answering nine hundred seconds later. The turn died with
+ * the correction still in the queue, and this card went on saying it ran after the current turn -
+ * of a conversation that had no current turn and will not be leased again.
+ *
+ * The card is drawn from the event that recorded the message being accepted, and that event is
+ * never taken back - so it outlives the queue row by design, and taking the message out of the
+ * queue does not touch it. Whatever the box decides to do with the message, this has to agree with
+ * what the conversation can still do.
+ */
+describe('a follow-up sent while the agent was working', () => {
+  const correction = [
+    event(1, 'user_message', 'Rewrite the billing page'),
+    event(2, 'queued_message', 'Stop - the staging copy, not production', {
+      markdown: 'Stop - the staging copy, not production',
+      position: 1
+    })
+  ];
+
+  const card = (status: Task['status']): string =>
+    renderToStaticMarkup(
+      <Timeline
+        task={{ ...task, status }}
+        events={correction}
+        modelName={modelName}
+        onCompose={() => undefined}
+      />
+    );
+
+  it('says when it runs while there is still something to run it', () => {
+    expect(card('running')).toContain('runs after the current turn');
+    expect(card('running')).not.toContain('Never started');
+  });
+
+  it('keeps saying so for a conversation stopped part-way, because resuming does run it', () => {
+    expect(card('paused')).toContain('runs after the current turn');
+    expect(card('awaiting_resource')).toContain('runs after the current turn');
+  });
+
+  it('stops promising a turn that will never come, on every finished status', () => {
+    for (const status of ['failed', 'cancelled', 'completed'] as const) {
+      expect(card(status)).toContain('Never started');
+      expect(card(status)).not.toContain('runs after the current turn');
+    }
+  });
+
+  it('hands the words back rather than describing where they went', () => {
+    expect(card('failed')).toContain('Put it back in the composer');
+    // Still legible on the card itself: the offer is only useful next to what it would send.
+    expect(card('failed')).toContain('Stop - the staging copy, not production');
+    expect(card('running')).not.toContain('Put it back in the composer');
+  });
+});
+
 describe('a turn that read something nobody here wrote', () => {
   const readThenActed = [
     event(1, 'user_message', 'Research this and update the brief', {

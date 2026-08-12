@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -493,6 +494,168 @@ describe('DataStore', () => {
       { sequence: 2, kind: 'status' },
       { sequence: 3, kind: 'user_message' }
     ]);
+  });
+
+  /**
+   * The turn the owner corrected died before it could read the correction.
+   *
+   * Everything here is about one question: whether a message they sent is still going to happen.
+   * The store is where that is decided, because it is the only place that can read the task's
+   * status, its attempt count and its queue in one breath and act on all three at once.
+   */
+  describe('a message left over from a turn that died', () => {
+    /** A task a worker is inside, with one message queued behind the turn it is running. */
+    const workingTaskWithAMessage = async (
+      name: string
+    ): Promise<{ userId: string; taskId: string; messageId: string }> => {
+      const user = await store.createUser({ username: name, displayName: name });
+      const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+      const task = await store.createTask(taskInput(user.id, workspace.id));
+      await store.leaseNextTask('worker-1');
+      const messageId = randomUUID();
+      await store.enqueueTaskMessage({
+        id: messageId,
+        taskId: task.id,
+        userId: user.id,
+        modelId: 'qwen',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 2,
+        resourceClass: 'medium',
+        reservationKey: `task:${task.id}:message:${messageId}:reservation`,
+        interrupt: true,
+        promptCiphertext: { v: 1, iv: 'queue', tag: 'tag', ciphertext: 'cipher' },
+        queuedEventCiphertext: { v: 1, iv: 'event', tag: 'tag', ciphertext: 'cipher' }
+      });
+      return { userId: user.id, taskId: task.id, messageId };
+    };
+
+    it('puts the conversation back in the queue without spending a second budget on it', async () => {
+      const { userId, taskId } = await workingTaskWithAMessage('carried');
+
+      await expect(
+        store.requeueTaskForQueuedMessage({ id: taskId, workerId: 'worker-1' })
+      ).resolves.toEqual({ attempt: 1, queuedMessageCount: 1 });
+
+      // Leasable again, and the message is untouched - the loop takes it at its next step, which is
+      // what the owner was told would happen before the turn died.
+      const requeued = await store.getTask(userId, taskId);
+      expect(requeued).toMatchObject({ status: 'queued', attempt: 1, queuedMessageCount: 1 });
+      expect(requeued?.leaseOwner).toBeNull();
+      await expect(store.leaseNextTask('worker-2')).resolves.toMatchObject({
+        id: taskId,
+        attempt: 2
+      });
+    });
+
+    /**
+     * The bound, and it is the one the queue already has. Nothing here invents a retry budget: the
+     * attempt count is left standing on every requeue, so a failure that simply repeats walks the
+     * count up to the ceiling and stops, rather than running the owner's money out against it.
+     */
+    it('stops at the ceiling the queue already keeps, rather than a second one of its own', async () => {
+      const { userId, taskId } = await workingTaskWithAMessage('bounded');
+      let requeues = 0;
+      for (let round = 0; round < TASK_MAX_ATTEMPTS * 2; round += 1) {
+        if (!(await store.requeueTaskForQueuedMessage({ id: taskId, workerId: 'worker-1' }))) break;
+        requeues += 1;
+        // What the worker does next: the queue hands the task back out, which is the attempt.
+        if (!(await store.leaseNextTask('worker-1'))) break;
+      }
+      expect(requeues).toBe(TASK_MAX_ATTEMPTS - 1);
+      expect(await store.getTask(userId, taskId)).toMatchObject({ attempt: TASK_MAX_ATTEMPTS });
+      await expect(store.leaseNextTask('worker-1')).resolves.toBeNull();
+    });
+
+    /**
+     * The one thing this must never do. Stop is the owner saying stop, and a message they sent
+     * before they said it cannot become the way the conversation starts itself up again.
+     */
+    it('never restarts a conversation the owner cancelled', async () => {
+      const { userId, taskId } = await workingTaskWithAMessage('cancelled');
+      expect(await store.cancelTaskAndReleaseReservations(userId, taskId)).toBe(true);
+
+      await expect(
+        store.requeueTaskForQueuedMessage({ id: taskId, workerId: 'worker-1' })
+      ).resolves.toBeNull();
+      // Cancelling empties the queue, so that refusal could have come from either lock. This is the
+      // other one on its own: a queued row against a stopped conversation still starts nothing.
+      await database.query(
+        `UPDATE task_message_queue SET status='queued' WHERE task_id=$1 AND status='cancelled'`,
+        [taskId]
+      );
+      await expect(
+        store.requeueTaskForQueuedMessage({ id: taskId, workerId: 'worker-1' })
+      ).resolves.toBeNull();
+      expect(await store.getTask(userId, taskId)).toMatchObject({ status: 'cancelled' });
+      await expect(store.leaseNextTask('worker-2')).resolves.toBeNull();
+    });
+
+    it('leaves a task another worker has taken over alone', async () => {
+      const { taskId } = await workingTaskWithAMessage('handed-over');
+      await database.query(`UPDATE tasks SET lease_owner='worker-2' WHERE id=$1`, [taskId]);
+
+      await expect(
+        store.requeueTaskForQueuedMessage({ id: taskId, workerId: 'worker-1' })
+      ).resolves.toBeNull();
+    });
+
+    it('has nothing to say about a failure with no message behind it', async () => {
+      const user = await store.createUser({ username: 'plain', displayName: 'Plain' });
+      const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+      const task = await store.createTask(taskInput(user.id, workspace.id));
+      await store.leaseNextTask('worker-1');
+
+      await expect(
+        store.requeueTaskForQueuedMessage({ id: task.id, workerId: 'worker-1' })
+      ).resolves.toBeNull();
+    });
+
+    /**
+     * The header pill read a count of queued rows, so a message stuck on a dead conversation was
+     * advertised for ever. Taking the row out of the queue is what makes the count true again, and
+     * handing it back is what stops that being the same thing as throwing it away.
+     */
+    it('hands back the words it can no longer deliver, and stops advertising them', async () => {
+      const { userId, taskId, messageId } = await workingTaskWithAMessage('undelivered');
+      await store.updateTask({ id: taskId, status: 'failed', clearLease: true });
+
+      const stranded = await store.strandQueuedTaskMessages(taskId);
+      expect(stranded).toMatchObject([
+        { id: messageId, status: 'undelivered', promptCiphertext: { iv: 'queue' } }
+      ]);
+      expect(await store.getTask(userId, taskId)).toMatchObject({ queuedMessageCount: 0 });
+      // And the ceiling it was holding against work nobody is going to do comes back.
+      await expect(store.reservedUsageForTask(taskId)).resolves.toBe(0);
+      // Said once. A second sweep of the same conversation has nothing left to report.
+      await expect(store.strandQueuedTaskMessages(taskId)).resolves.toEqual([]);
+    });
+
+    it('leaves a message alone while the conversation can still reach it', async () => {
+      const { userId, taskId } = await workingTaskWithAMessage('still-running');
+
+      await expect(store.strandQueuedTaskMessages(taskId)).resolves.toEqual([]);
+      expect(await store.getTask(userId, taskId)).toMatchObject({ queuedMessageCount: 1 });
+    });
+
+    /**
+     * A turn that takes the worker process down with it never reaches the worker's own failure
+     * path, so the sweep is the only thing that ever reads these rows again.
+     */
+    it('clears the queue of a conversation the attempt sweep has given up on', async () => {
+      const { userId, taskId } = await workingTaskWithAMessage('swept');
+      await database.query(
+        `UPDATE tasks SET attempt=$2, lease_expires_at=NOW() - INTERVAL '1 second' WHERE id=$1`,
+        [taskId, TASK_MAX_ATTEMPTS]
+      );
+
+      await expect(store.failTasksAtAttemptLimit()).resolves.toMatchObject([
+        { id: taskId, undeliveredMessages: 1 }
+      ]);
+      expect(await store.getTask(userId, taskId)).toMatchObject({
+        status: 'failed',
+        queuedMessageCount: 0
+      });
+    });
   });
 
   it('versions task plans atomically and preserves explicit branch ancestry', async () => {
@@ -1070,7 +1233,8 @@ describe('DataStore', () => {
         id: task.id,
         userId: user.id,
         workspaceId: workspace.id,
-        attempt: TASK_MAX_ATTEMPTS
+        attempt: TASK_MAX_ATTEMPTS,
+        undeliveredMessages: 0
       }
     ]);
     expect((await store.getTask(user.id, task.id))?.status).toBe('failed');

@@ -138,11 +138,16 @@ const WORKSPACE_IS_FREE_FOR = (taskId: string): string =>
 /**
  * How many times a task may be leased before the queue stops handing it to anyone.
  *
- * The count is cleared at every point where something puts a task back in the queue - a follow-up
- * message (`continueTask`, `promoteQueuedTaskMessage`) or a resume (`setTaskStatusForUser`) - and
- * those are the only ways back into a leasable status, so this is six starts since the last time
- * anything went right, not six turns. A step that merely runs long renews its lease rather than
- * taking a new one, so it never spends one of these.
+ * The count is cleared wherever something went right on the far side of the write that puts a task
+ * back in the queue - a follow-up message (`continueTask`, `promoteQueuedTaskMessage`) or a resume
+ * (`setTaskStatusForUser`) - so this is six starts since the last time anything went right, not six
+ * turns. A step that merely runs long renews its lease rather than taking a new one, so it never
+ * spends one of these.
+ *
+ * `requeueTaskForQueuedMessage` is the one door back that leaves the count standing, because
+ * nothing went right on its far side: a turn died holding a message the owner had sent it. Carrying
+ * the count is the whole of what bounds that retry, so a failure that simply repeats walks up to
+ * this number and stops rather than needing a second limit of its own.
  *
  * Six because a task that kills its worker was otherwise immortal: systemd restarts the worker,
  * `ORDER BY created_at` puts the corpse back at the front, and the box spends forever re-running
@@ -2721,6 +2726,104 @@ export class DataStore {
   }
 
   /**
+   * Puts a task back in the queue because a turn died with the owner's message still waiting.
+   *
+   * The message they sent is nearly always a correction, and a correction is the most likely thing
+   * in the conversation to get past whatever just failed - so the turn that could not deliver it is
+   * not the end of it. The saved trajectory is untouched, so the retry resumes from where the turn
+   * stopped rather than starting the work again, and the loop takes the message at its first step
+   * boundary the way it would have done if nothing had gone wrong.
+   *
+   * `attempt` is deliberately left standing, which is the whole of the bound. Every other door back
+   * into the queue clears it, because on the far side of each of them something went right - a turn
+   * finished, or the owner wrote again. Nothing went right here, so the count carries: this can
+   * happen at most until the ceiling, each retry sits behind everything else in the queue, and then
+   * the task stops being leasable by anything. There is no second limit to keep in step.
+   *
+   * Refuses on every other reading of the row, and the refusals are the point:
+   *
+   * - a status the queue no longer owns. Cancelled above all - the owner said stop, and a message
+   *   they sent before they said it must never be the thing that starts the conversation again.
+   *   Cancelling already marks the queue rows too, so this is the second of two locks on that door.
+   * - a lease belonging to somebody else, meaning this worker is no longer the one running the
+   *   task and has no business writing its status.
+   * - nothing actually queued, so a plain failure stays a plain failure.
+   * - the attempt ceiling, which is the caller's cue to tell the owner their message is not coming.
+   */
+  async requeueTaskForQueuedMessage(input: { id: string; workerId: string }): Promise<{
+    attempt: number;
+    queuedMessageCount: number;
+  } | null> {
+    const requeued = await this.database.transaction(async (tx) => {
+      const locked = await tx.query(
+        `SELECT attempt FROM tasks
+         WHERE id=$1 AND status IN ${COMMITTED_TASK_STATUSES}
+           AND (lease_owner IS NULL OR lease_owner=$2)
+         FOR UPDATE`,
+        [input.id, input.workerId]
+      );
+      const attempt = Number(locked.rows[0]?.attempt);
+      if (!locked.rows[0] || attempt >= TASK_MAX_ATTEMPTS) return null;
+      const waiting = await tx.query(
+        `SELECT COUNT(*) AS count FROM task_message_queue
+         WHERE task_id=$1 AND status='queued'`,
+        [input.id]
+      );
+      const queuedMessageCount = Number(waiting.rows[0]?.count ?? 0);
+      if (queuedMessageCount === 0) return null;
+      const updated = await tx.query(
+        `UPDATE tasks SET status='queued',lease_owner=NULL,lease_expires_at=NULL,
+           completed_at=NULL,updated_at=NOW()
+         WHERE id=$1`,
+        [input.id]
+      );
+      if (updated.rowCount !== 1) return null;
+      return { attempt, queuedMessageCount };
+    });
+    // News for the queue in both directions at once: the workspace this task was holding is free,
+    // and the task itself is leasable again the instant a worker looks.
+    if (requeued) this.#signal(TASK_QUEUE_CHANNEL, input.id);
+    return requeued;
+  }
+
+  /**
+   * Takes the owner's words out of a queue that will never be read again, and hands them back.
+   *
+   * Only for a conversation that has actually stopped for good. Until this existed the rows simply
+   * stayed 'queued' on a dead task, which is what put a pill reading "1 queued" in the header of a
+   * conversation whose message could never run - the interface asserting something the machine had
+   * no reason to believe. The count the header reads is a count of 'queued' rows, so moving them is
+   * what makes it true again.
+   *
+   * The rows are returned rather than merely marked, because the caller is the only party that can
+   * open them: the message is encrypted under the workspace key, and what the owner is owed is not
+   * a number going down but their own sentence, said back to them, with the reason it did not land.
+   *
+   * Their reservations go back at the same time. A message that will never run must not go on
+   * holding a slice of the owner's daily ceiling against work nothing is going to do.
+   */
+  async strandQueuedTaskMessages(taskId: string): Promise<TaskMessageQueueRecord[]> {
+    return this.database.transaction(async (tx) => {
+      const stranded = await tx.query(
+        `UPDATE task_message_queue SET status='undelivered'
+         WHERE task_id=$1 AND status='queued'
+           AND EXISTS (
+             SELECT 1 FROM tasks t WHERE t.id=$1 AND t.status IN ('failed','cancelled')
+           )
+         RETURNING *`,
+        [taskId]
+      );
+      if (stranded.rowCount)
+        await tx.query(
+          `UPDATE usage_entries SET state='released'
+           WHERE state='reserved' AND idempotency_key = ANY($1::text[])`,
+          [stranded.rows.map((row) => String(row.reservation_key))]
+        );
+      return stranded.rows.map(mapTaskMessage);
+    });
+  }
+
+  /**
    * Takes a queued message into the turn that is already running, rather than handing it the next
    * one. The row is marked promoted, the credit ceiling is raised by what the message reserved -
    * without that the loop trips its own budget on the very next iteration - and a `user_message`
@@ -5016,9 +5119,16 @@ export class DataStore {
    * leasable when the lease expired, not now, and the poll interval has always been the floor for
    * that. Waking here would be announcing a release that happened minutes ago.
    */
-  async failTasksAtAttemptLimit(
-    limit = 20
-  ): Promise<Array<{ id: string; userId: string; workspaceId: string; attempt: number }>> {
+  async failTasksAtAttemptLimit(limit = 20): Promise<
+    Array<{
+      id: string;
+      userId: string;
+      workspaceId: string;
+      attempt: number;
+      /** Messages the owner sent that this sweep has just established will never be started. */
+      undeliveredMessages: number;
+    }>
+  > {
     return this.database.transaction(async (tx) => {
       const failed = await tx.query(
         `UPDATE tasks SET status='failed',lease_owner=NULL,lease_expires_at=NULL,
@@ -5035,17 +5145,29 @@ export class DataStore {
          RETURNING id, user_id, workspace_id, attempt`,
         [TASK_MAX_ATTEMPTS, limit]
       );
+      const undelivered = new Map<string, number>();
       for (const row of failed.rows) {
         await tx.query(
           `UPDATE usage_entries SET state='released' WHERE task_id=$1 AND state='reserved'`,
           [String(row.id)]
         );
+        // The worker that was carrying these tasks died without writing a word, so nothing else has
+        // moved the messages queued behind them. Left alone they would sit at 'queued' for ever on
+        // a task the queue has just stopped handing out, which is the header pill telling the owner
+        // a correction is on its way to a conversation that has stopped for good.
+        const stranded = await tx.query(
+          `UPDATE task_message_queue SET status='undelivered'
+           WHERE task_id=$1 AND status='queued'`,
+          [String(row.id)]
+        );
+        undelivered.set(String(row.id), stranded.rowCount ?? 0);
       }
       return failed.rows.map((row) => ({
         id: String(row.id),
         userId: String(row.user_id),
         workspaceId: String(row.workspace_id),
-        attempt: Number(row.attempt)
+        attempt: Number(row.attempt),
+        undeliveredMessages: undelivered.get(String(row.id)) ?? 0
       }));
     });
   }

@@ -2237,5 +2237,25 @@ export const migrations = [
               AND (NEW.lease_expires_at IS NULL OR NEW.lease_expires_at <= NOW()))
         EXECUTE FUNCTION release_workspace_hold();
     `
+  },
+  {
+    version: 65,
+    name: 'a_message_the_conversation_can_no_longer_deliver',
+    // A queued message had three ends: it ran, the owner stopped the conversation, or it waited.
+    // Waiting was the only one available to a turn that died, so a correction sent to a task that
+    // then failed for good stayed 'queued' on a task nothing would ever lease again - and the count
+    // the header reads off this column went on telling the owner a message was on its way.
+    //
+    // 'undelivered' is that fourth end, and it is deliberately not 'cancelled': the owner cancelling
+    // and athanor running out of attempts are different events, and the row is the only place that
+    // difference survives once the timeline has scrolled.
+    //
+    // Safe on a live box: a constraint swap on a table whose every existing row already satisfies
+    // the wider check, and the partial index the queue is read through is defined on 'queued'.
+    sql: `
+      ALTER TABLE task_message_queue DROP CONSTRAINT IF EXISTS task_message_queue_status_check;
+      ALTER TABLE task_message_queue ADD CONSTRAINT task_message_queue_status_check
+        CHECK (status IN ('queued','promoted','cancelled','undelivered'));
+    `
   }
 ] as const;

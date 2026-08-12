@@ -41,6 +41,30 @@ export const pauseAction = (task: Task | undefined): 'pause' | 'resume' =>
   isPausedTask(task) ? 'resume' : 'pause';
 
 /**
+ * Whether a follow-up already accepted onto this conversation can still be started.
+ *
+ * The box takes a message off a dying turn and carries it into the next attempt, and takes it out
+ * of the queue for good when the attempts run out — so the count and the status usually agree by
+ * themselves. This is the reading for when they do not. A finished conversation is never leased
+ * again, whatever is still counted against it, and the message being counted is the one that
+ * matters most: the usual reason to queue anything is to correct a turn that is going wrong, which
+ * makes that turn dying the likeliest way for words to be left here.
+ */
+export const queuedMessagesCanRun = (task: Task | undefined): boolean => !isTerminalTask(task);
+
+/**
+ * What the header may say about follow-ups already sent, or nothing when there are none.
+ *
+ * Both halves are counts of the same rows. The difference is the only thing the owner needs from
+ * this corner of the screen: whether their words are on their way, or whether they are theirs to
+ * deal with again.
+ */
+export const queuedFollowUpLabel = (task: Task | undefined): string =>
+  !task || task.queuedMessageCount < 1
+    ? ''
+    : `${task.queuedMessageCount} ${queuedMessagesCanRun(task) ? 'queued' : 'never started'}`;
+
+/**
  * Whether more text can still arrive on this conversation.
  *
  * Wider than terminal, and that is the point. The transcript decided "is this answer still being

@@ -10188,6 +10188,47 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         { owner: true, code: error instanceof AthanorError ? error.code : 'agent_failed' }
       );
     }
+    /*
+     * A message the owner sent while this turn was running outlives the turn.
+     *
+     * Nothing here used to look at the queue at all. A correction typed into a turn that was going
+     * wrong - which is the moment the queue exists for - was answered with "the agent picks it up
+     * at its next step", and if the turn then died there was no next step, ever: the row stayed
+     * queued on a task nothing would lease again, and the header went on counting it.
+     *
+     * `awaiting_resource` is deliberately not in here. A provider wall is already resumed by the
+     * sweep in the API, on a widening interval and with a line of its own when it gives up asking,
+     * and the message really is still waiting on that path - so the count is telling the truth and
+     * requeueing underneath the sweep would only take the pacing away from it.
+     */
+    const carried = waiting
+      ? null
+      : await this.store
+          .requeueTaskForQueuedMessage({ id: task.id, workerId: this.config.WORKER_ID })
+          .catch(() => null);
+    if (carried) {
+      this.logger.info('task.retried_for_queued_message', {
+        taskId: task.id,
+        attempt: carried.attempt,
+        attempts: TASK_MAX_ATTEMPTS
+      });
+      // Said after the requeue rather than before it, so nothing is announced that did not happen.
+      // The cost is that a worker may lease the task back before this line lands; an event arriving
+      // a moment into the next attempt is a smaller wrong than a promise the write did not keep.
+      if (workspace?.wrappedKey)
+        await event(
+          this.store,
+          task,
+          unwrapDataKey(workspace.wrappedKey, this.#masterKey, workspace.id),
+          'warning',
+          `This turn stopped before the message you sent could be started. It is still queued and this conversation is going back in the queue to carry on from where it stopped - start ${carried.attempt + 1} of ${TASK_MAX_ATTEMPTS}.`,
+          { owner: true, code: 'queued_message_retried', attempt: carried.attempt + 1 }
+        ).catch(() => undefined);
+      // The reservation stays reserved and the status stays leasable, exactly as on the provider
+      // wall above: this task is going to run again, and releasing the credits it is about to spend
+      // would leave the next attempt budgeted for nothing.
+      return;
+    }
     if (!waiting)
       await this.store.transitionUsage(reservationUsageKey(task.id, turn), 'reserved', 'released');
     await this.store.updateTask({
@@ -10196,5 +10237,64 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       status: waiting ? 'awaiting_resource' : 'failed',
       clearLease: true
     });
+    if (!waiting) await this.#refuseUndeliveredMessages(task, workspace);
+  }
+
+  /**
+   * Says out loud that the owner's message is not going to run, and gives them back their words.
+   *
+   * Reached when the conversation has stopped for good with something still queued - which after
+   * the retry above means the attempt ceiling, or a task the owner cancelled while it was dying.
+   * Cancelling already empties this queue, so in practice that second door finds nothing, which is
+   * the intended shape: a conversation the owner stopped stays stopped and says nothing further.
+   *
+   * A correction that is quietly dropped is worse than one that is refused, so the refusal carries
+   * the message back verbatim. The row is moved out of 'queued' either way - that is what stops the
+   * header counting a message that cannot arrive - but the sentence is what the owner is actually
+   * owed, and the text in the payload is what a re-send can be built on without asking them to
+   * retype anything.
+   */
+  async #refuseUndeliveredMessages(
+    task: TaskRecord,
+    workspace: { id: string; wrappedKey?: string } | null
+  ): Promise<void> {
+    const stranded = await this.store.strandQueuedTaskMessages(task.id).catch(() => []);
+    if (!stranded.length) return;
+    this.logger.warn('task.queued_messages_undelivered', {
+      taskId: task.id,
+      attempt: task.attempt,
+      count: stranded.length
+    });
+    if (!workspace?.wrappedKey) return;
+    const key = unwrapDataKey(workspace.wrappedKey, this.#masterKey, workspace.id);
+    // Said only where it is known to be true. The ceiling is the reason nearly every time, but this
+    // is also where a conversation the owner stopped mid-failure arrives, and telling them their
+    // work was tried six times when they cancelled it after one is the kind of confident wrong
+    // sentence the whole of this file is meant to stop writing.
+    const exhausted =
+      task.attempt >= TASK_MAX_ATTEMPTS
+        ? ` This conversation was started ${task.attempt} times without finishing.`
+        : '';
+    for (const queued of stranded) {
+      // A message whose envelope will not open is still a message that did not arrive, so the
+      // refusal is written either way and only the quotation is missing from it. Reading it must
+      // not be able to throw: this is the last thing said about a conversation that has already
+      // failed once, and losing the refusal to a bad envelope would leave the owner with silence.
+      let markdown = '';
+      try {
+        if (queued.promptCiphertext.aad === `task-message:${task.id}`)
+          markdown = decryptJson<{ prompt: string }>(queued.promptCiphertext, key).prompt.trim();
+      } catch {
+        markdown = '';
+      }
+      await event(
+        this.store,
+        task,
+        key,
+        'warning',
+        `Your message was not started, and athanor is not going to start it on its own.${exhausted}${markdown ? ` What you sent was: "${markdown.slice(0, 240)}"` : ''} Send it again to try.`,
+        { owner: true, code: 'queued_message_undelivered', ...(markdown ? { markdown } : {}) }
+      ).catch(() => undefined);
+    }
   }
 }

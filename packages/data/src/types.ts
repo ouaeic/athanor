@@ -154,7 +154,8 @@ export interface TaskMessageQueueRecord {
   maxSpendUsd: number | null;
   resourceClass: string;
   reservationKey: string;
-  status: 'queued' | 'promoted' | 'cancelled';
+  /** `undelivered` is a message the conversation stopped for good before it could be started. */
+  status: 'queued' | 'promoted' | 'cancelled' | 'undelivered';
   /** The owner wants this applied to the turn already running, not the one after it. */
   interrupt: boolean;
   createdAt: string;

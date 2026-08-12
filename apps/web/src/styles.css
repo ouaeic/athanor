@@ -8965,3 +8965,52 @@ a.blocked-resource:hover {
 .system-event.question.answered strong {
   color: var(--muted);
 }
+
+/*
+  A follow-up that was accepted and then had nothing left to start it.
+
+  The dashes stay - these words never became part of the conversation, and that is still exactly
+  what a dashed edge on this card says. What goes is the dimming. While a message is on its way it
+  is rightly the quietest thing on the card, because it is the one thing there that has not
+  happened yet; once nothing is going to run it, the owner is the only party left who can, and
+  holding it at four fifths is the interface being quiet about its own mistake.
+*/
+.queued-user-message.never-started {
+  opacity: 1;
+}
+
+/*
+  The way back, in the register of the line above it.
+
+  Bronze rather than ember, and that is a decision rather than a default: nothing here is alive and
+  nothing is moving, so the loudest colour on the box would be claiming a state this card does not
+  have. It is an interactive edge, which is what --edge is for, and it is the same shape as every
+  other small control the transcript offers. The words carry the weight instead.
+*/
+.queued-resend {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 9px;
+  padding: 4px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    border-color 140ms var(--ease),
+    color 140ms var(--ease);
+}
+
+.queued-resend:hover {
+  border-color: var(--edge);
+  color: var(--text);
+}
+
+.queued-resend svg {
+  width: 13px;
+  height: 13px;
+}

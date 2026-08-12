@@ -246,6 +246,10 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     setWorkspaceStorage: async () => undefined,
     transitionUsage: async () => undefined,
     getNextQueuedTaskMessage: async () => null,
+    // What a turn that died does about a message the owner sent to it. The default is the ordinary
+    // failure: nothing was queued, so nothing is carried and nothing is refused.
+    requeueTaskForQueuedMessage: async () => null,
+    strandQueuedTaskMessages: async () => [],
     // What the turn deposits in memory. Capture has its own try/catch inside the agent, so a probe
     // missing these methods logs one warning and records nothing - which is why the label a turn
     // files itself under went unwatched for so long.
@@ -4769,6 +4773,127 @@ describe('the warnings that are the owner’s business', () => {
       .catch(() => undefined);
 
     expect(journal.lines[0]).toContain('workspace_unreachable');
+  });
+});
+
+/**
+ * The owner typed a correction into a turn that was going wrong, was told the agent would pick it
+ * up at its next step, and then the turn died. There was no next step. These are the three ways
+ * that can end, and the only one of them that used to exist was the middle of the night.
+ */
+describe('a correction the turn it was sent to did not survive', () => {
+  const ownerLines = (probe: ReturnType<typeof probeStore>): string[] =>
+    probe.events
+      .filter((entry) => (entry.payload as { owner?: unknown } | undefined)?.owner === true)
+      .map((entry) => entry.summary);
+
+  /** One message waiting, encrypted the way the API writes it. */
+  const waiting = (prompt: string): Record<string, unknown> => ({
+    id: 'message-1',
+    taskId,
+    userId,
+    promptCiphertext: encryptJson({ prompt }, dataKey, `task-message:${taskId}`),
+    modelId: model.id,
+    privacyRoute: 'provider_zdr',
+    maxComputeCredits: 2,
+    maxSpendUsd: null,
+    resourceClass: 'medium',
+    reservationKey: `task:${taskId}:message:message-1:reservation`,
+    status: 'undelivered',
+    interrupt: true,
+    createdAt: '2026-07-01T00:00:00.000Z',
+    promotedAt: null
+  });
+
+  it('carries it into a fresh start rather than letting the failure end it', async () => {
+    const task = makeTask({ messages: [], step: 4, credits: 0, turn: 1 });
+    const probe = probeStore(() => task);
+    const released: string[] = [];
+    let requeued: Record<string, unknown> | null = null;
+    Object.assign(probe.store, {
+      requeueTaskForQueuedMessage: async (input: Record<string, unknown>) => {
+        requeued = input;
+        return { attempt: 1, queuedMessageCount: 1 };
+      },
+      transitionUsage: async (key: string) => {
+        released.push(key);
+      }
+    });
+
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret, silentLogger).fail(
+      task,
+      new AthanorError('model_timeout', 'The model provider did not respond within 900 seconds')
+    );
+
+    expect(requeued).toEqual({ id: taskId, workerId: 'worker-test' });
+    // Not written off, so nothing here marks it finished or hands back the credits the next start
+    // is about to spend.
+    expect(probe.checkpoints).toEqual([]);
+    expect(released).toEqual([]);
+    expect(ownerLines(probe)).toEqual([
+      'The model provider did not respond within 900 seconds',
+      'This turn stopped before the message you sent could be started. It is still queued and this conversation is going back in the queue to carry on from where it stopped - start 2 of 6.'
+    ]);
+  });
+
+  /**
+   * The other end of the same bound. Nothing decides here that this particular failure is hopeless
+   * - the box does not know that - it decides only that the queue has stopped handing this
+   * conversation out, which it can read off the attempt count it already keeps.
+   */
+  it('refuses it out loud, in the owner’s own words, once nothing will start it again', async () => {
+    // At the ceiling, which is where the store's refusal to requeue comes from in real life.
+    const task = { ...makeTask({ messages: [], step: 4, credits: 0, turn: 1 }), attempt: 6 };
+    const probe = probeStore(() => task);
+    Object.assign(probe.store, {
+      requeueTaskForQueuedMessage: async () => null,
+      strandQueuedTaskMessages: async () => [waiting('No, leave the invoices alone')]
+    });
+
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret, silentLogger).fail(
+      task,
+      new AthanorError('model_timeout', 'The model provider did not respond within 900 seconds')
+    );
+
+    expect(probe.checkpoints).toMatchObject([{ status: 'failed', clearLease: true }]);
+    expect(ownerLines(probe)[1]).toBe(
+      'Your message was not started, and athanor is not going to start it on its own. This conversation was started 6 times without finishing. What you sent was: "No, leave the invoices alone" Send it again to try.'
+    );
+    // Their words in the payload as well as the sentence, so sending it again need not mean
+    // typing it again.
+    expect(probe.events.at(-1)?.payload).toMatchObject({
+      code: 'queued_message_undelivered',
+      markdown: 'No, leave the invoices alone'
+    });
+  });
+
+  /**
+   * A provider wall is the one failure the box does know will repeat, and it is already paced by
+   * the sweep that retries it. The message stays queued because on that path it really is still
+   * waiting - so the count in the header is telling the truth and nothing here should touch it.
+   */
+  it('leaves a wall to the sweep that is already asking again', async () => {
+    const task = makeTask({ messages: [], step: 4, credits: 0, turn: 1 });
+    const probe = probeStore(() => task);
+    let asked = 0;
+    Object.assign(probe.store, {
+      requeueTaskForQueuedMessage: async () => {
+        asked += 1;
+        return { attempt: 1, queuedMessageCount: 1 };
+      },
+      strandQueuedTaskMessages: async () => {
+        asked += 1;
+        return [waiting('Use the other account')];
+      }
+    });
+
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret, silentLogger).fail(
+      task,
+      new AthanorError('provider_quota_exhausted', 'The provider is out of quota')
+    );
+
+    expect(asked).toBe(0);
+    expect(probe.checkpoints).toMatchObject([{ status: 'awaiting_resource' }]);
   });
 });
 

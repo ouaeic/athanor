@@ -2247,6 +2247,79 @@ describe('unattended recovery', () => {
     expect(resumed.json<{ status: string }>().status).toBe('queued');
   }, 30_000);
 
+  /**
+   * A turn that takes the worker process down never reaches the worker's own failure path, so the
+   * only thing that ever reads the message queued behind it again is this sweep. It used to fail
+   * the task, say so, and leave the row - and the header went on counting a correction that could
+   * not arrive. Taking the row out of the queue is what makes the count true; saying it out loud
+   * is what stops that being the same thing as dropping the owner's words without a word.
+   */
+  test('says the message a task died holding was never started', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-undelivered-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database, runMaintenance } = await buildServer(isolatedConfig(directory), {
+      masterKey
+    });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'undelivered-message',
+      'Reconcile last quarter against the bank export'
+    );
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id);
+
+    // The correction, typed into a turn that was going wrong and accepted while it was still held.
+    const messageId = randomUUID();
+    await database.query(`UPDATE tasks SET status='running' WHERE id=$1`, [taskId]);
+    await store.enqueueTaskMessage({
+      id: messageId,
+      taskId,
+      userId: workspace.userId,
+      modelId: 'openrouter/openai/gpt-oss-120b',
+      privacyRoute: 'provider_zdr',
+      maxComputeCredits: 2,
+      resourceClass: 'medium',
+      reservationKey: `task:${taskId}:message:${messageId}:reservation`,
+      interrupt: true,
+      promptCiphertext: encryptJson(
+        { prompt: 'No - the bank export is the one from March' },
+        key,
+        `task-message:${taskId}`
+      ),
+      queuedEventCiphertext: encryptJson(
+        { markdown: 'No - the bank export is the one from March', position: 1 },
+        key,
+        `task-event:${taskId}`
+      )
+    });
+    // Six starts and a worker that is no longer there to write any of them down.
+    await database.query(
+      `UPDATE tasks SET attempt=6, lease_owner='dead-worker',
+         lease_expires_at=NOW() - INTERVAL '1 minute' WHERE id=$1`,
+      [taskId]
+    );
+
+    await runMaintenance();
+
+    // The header counts queued rows, so this is the pill that used to stay on screen.
+    expect(
+      (await app.inject({ method: 'GET', url: `/v1/tasks/${taskId}`, headers: { cookie } })).json<{
+        status: string;
+        queuedMessageCount: number;
+      }>()
+    ).toMatchObject({ status: 'failed', queuedMessageCount: 0 });
+
+    const limit = (
+      await app.inject({ method: 'GET', url: `/v1/tasks/${taskId}/events`, headers: { cookie } })
+    )
+      .json<Array<{ summary: string; payload?: { code?: string; undelivered?: number } }>>()
+      .find((event) => event.payload?.code === 'task_attempt_limit');
+    expect(limit?.summary).toContain('The message you sent to it was never started.');
+    expect(limit?.payload?.undelivered).toBe(1);
+  }, 30_000);
+
   test('leaves a task alone while its approval can still be answered', async () => {
     stubProviderFetch();
     const directory = await mkdtemp(join(tmpdir(), 'athanor-api-approvals-live-'));

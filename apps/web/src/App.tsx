@@ -60,7 +60,13 @@ import {
 } from './event-window.js';
 import { composerSubmission, hasSomethingToSend, sendBlock } from './composer-state.js';
 import { removeTask, upsertTask } from './task-list.js';
-import { isLiveTask, isTerminalTask, pauseAction, terminalTaskStatuses } from './task-status.js';
+import {
+  isLiveTask,
+  isTerminalTask,
+  pauseAction,
+  queuedFollowUpLabel,
+  terminalTaskStatuses
+} from './task-status.js';
 import { securityModeNotice } from './security-mode.js';
 import { Dialog } from './Dialog.js';
 import { UndoProvider, UndoToasts, useUndoQueue } from './Undo.js';
@@ -2526,8 +2532,18 @@ export function App() {
               )}
             </div>
             <div className="header-actions">
-              {task && task.queuedMessageCount > 0 && (
-                <span className="header-pill queue-pill">{task.queuedMessageCount} queued</span>
+              {/*
+                A count of rows in the message queue, said either way round. "1 queued" stayed on
+                screen after a turn died mid-step, over a conversation that will not be leased
+                again, so the interface went on promising delivery of the correction the owner had
+                typed to stop that very turn. The box now carries a message onto the next attempt
+                and takes it out of the queue when the attempts are gone, which empties the count on
+                its own in the ordinary case; this is what the header says when a write got no
+                further than the status. The card those words are on is where they can be picked
+                back up — this only has to stop claiming they are on their way.
+              */}
+              {queuedFollowUpLabel(task) && (
+                <span className="header-pill queue-pill">{queuedFollowUpLabel(task)}</span>
               )}
               {taskIsActive && task && (
                 <button
@@ -2597,8 +2613,8 @@ export function App() {
                     setError(describeFailure(cause, 'That preview could not be opened'))
                   );
               }}
-              onStarter={(starter) => {
-                setPrompt(starter);
+              onCompose={(text) => {
+                setPrompt(text);
                 window.requestAnimationFrame(() => composer.current?.focus());
               }}
               onBranch={(event) => void branchFrom(event.id)}

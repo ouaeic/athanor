@@ -57,7 +57,7 @@ import {
 } from './timeline-state.js';
 import { externalRead, provenanceReport, sourcesPhrase } from './provenance.js';
 import { completionCard, verificationReceiptLabel, type HarnessCheck } from './completion-card.js';
-import { taskIsGenerating, terminalTaskStatuses } from './task-status.js';
+import { queuedMessagesCanRun, taskIsGenerating, terminalTaskStatuses } from './task-status.js';
 import { formatUsd } from './usage-model.js';
 import { fileKindLabel, inlineMediaKind, splitAttachments } from './attachments.js';
 import { AttachmentStrip } from './AttachmentTray.js';
@@ -1395,7 +1395,7 @@ export function Timeline({
   onBranch,
   onEdit,
   onRetry,
-  onStarter,
+  onCompose,
   turnChanges
 }: {
   task: Task | undefined;
@@ -1421,7 +1421,12 @@ export function Timeline({
   onBranch?: (event: TaskEvent) => void;
   onEdit?: (event: TaskEvent) => void;
   onRetry?: (event: TaskEvent) => void;
-  onStarter?: (prompt: string) => void;
+  /**
+   * Writes a message into the composer without sending it. Two things ask for this and they are
+   * the same request: one of the three starts offered on an empty canvas, and the words of a
+   * follow-up that was queued on a conversation which then stopped before reading it.
+   */
+  onCompose?: (prompt: string) => void;
   /**
    * What one finished turn did to the files, named by the completion it belongs to. Asked for
    * above, where the client's requests are made, and only ever for the newest completion — the
@@ -1533,7 +1538,7 @@ export function Timeline({
       <div className="empty-canvas">
         <div className="starter-capabilities">
           {starters.map((starter) => (
-            <button key={starter.label} type="button" onClick={() => onStarter?.(starter.prompt)}>
+            <button key={starter.label} type="button" onClick={() => onCompose?.(starter.prompt)}>
               {starter.label}
             </button>
           ))}
@@ -1624,15 +1629,46 @@ export function Timeline({
                 {...(onBranch ? { onBranch } : {})}
               />
             );
-          if (node.kind === 'queued')
+          if (node.kind === 'queued') {
+            /*
+              A queued message runs when a worker next leases the conversation, and on a finished
+              one none ever will. The card is drawn from the event that recorded the message being
+              accepted, which stays in the transcript whatever became of the message afterwards, so
+              this went on reading "runs after the current turn" over a turn that had already died —
+              under the words the owner wrote to correct it. Saying so is the smaller half: the
+              words are right here, so the way back is to hand them to the composer, where they can
+              be changed before they go, which after a turn that failed is usually what is wanted.
+            */
+            const willRun = queuedMessagesCanRun(task);
             return (
-              <article className="user-brief queued-user-message" key={node.id}>
+              <article
+                className={`user-brief queued-user-message${willRun ? '' : ' never-started'}`}
+                key={node.id}
+              >
                 <Markdown>{node.markdown}</Markdown>
                 <span className="message-meta">
-                  <Clock3 /> Queued · runs after the current turn
+                  {willRun ? (
+                    <>
+                      <Clock3 /> Queued · runs after the current turn
+                    </>
+                  ) : (
+                    <>
+                      <XCircle /> Never started · the conversation stopped first
+                    </>
+                  )}
                 </span>
+                {!willRun && onCompose && (
+                  <button
+                    className="queued-resend"
+                    type="button"
+                    onClick={() => onCompose(node.markdown)}
+                  >
+                    <RotateCcw /> Put it back in the composer
+                  </button>
+                )}
               </article>
             );
+          }
           if (node.kind === 'thinking')
             return (
               /*
