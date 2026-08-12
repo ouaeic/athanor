@@ -127,8 +127,8 @@ python-lxml	python3-lxml	python3-lxml	python-lxml	python3-lxml
 python-matplotlib	python3-matplotlib	python3-matplotlib	python-matplotlib	python3-matplotlib
 python-openpyxl	python3-openpyxl	python3-openpyxl	python-openpyxl	python3-openpyxl
 python-pandas	python3-pandas	python3-pandas	python-pandas	python3-pandas
-python-scipy	python3-scipy	python3-scipy	python-scipy	-
-python-statsmodels	python3-statsmodels	python3-statsmodels	-	-
+python-scipy	python3-scipy	python3-scipy	python-scipy	python3-scipy
+python-statsmodels	python3-statsmodels	python3-statsmodels	python-statsmodels	python3-statsmodels
 python-pillow	python3-pil	python3-pillow	python-pillow	python3-Pillow
 python-atspi	python3-pyatspi	python3-pyatspi	python-atspi	python3-atspi
 python-pip	python3-venv	python3-pip	python-pip	python3-pip

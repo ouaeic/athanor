@@ -2,11 +2,11 @@
 name: data-analysis
 description: Clean a messy dataset and analyse it with a saved, re-runnable script that states its assumptions, so the numbers can be reproduced and audited rather than asserted. Use when the request involves a CSV, TSV, parquet file, database extract or pasted table and the deliverable is an answer, a summary statistic, a comparison or a chart. Do not use when the deliverable is a formula workbook the owner will edit, which belongs to xlsx-authoring.
 license: AGPL-3.0-or-later
-compatibility: Every tool named here is installed on this computer by athanor - pandas, matplotlib and Pillow through /usr/local/lib/athanor/python/bin/python3.
+compatibility: Every tool named here is installed on this computer by athanor - pandas, matplotlib, Pillow, scipy and statsmodels through /usr/local/lib/athanor/python/bin/python3.
 allowed-tools: shell file_read file_write files_list document_read image_read set_acceptance publish_artifact
 metadata:
   athanor.tier: 'builtin'
-  athanor.version: '2.2.0'
+  athanor.version: '2.3.0'
   athanor.risk: 'workspace'
   athanor.domain: 'data'
 ---
@@ -59,8 +59,8 @@ before the analysis continues.
 - When comparing groups, check the base rates first; a difference in composition explains most
   apparent differences in outcome.
 - Round only at presentation time, never in intermediate steps.
-- For a file too large to hold in memory, read it in chunks and aggregate as you go — pandas is the
-  only analysis engine on this computer and it is enough:
+- For a file too large to hold in memory, read it in chunks and aggregate as you go — pandas holds
+  the whole of this on its own:
   ```python
   totals = None
   for chunk in pd.read_csv(path, dtype=str, keep_default_na=False, chunksize=250_000):
@@ -69,6 +69,31 @@ before the analysis continues.
   ```
   Apply exactly the same cleaning function to every chunk, and print the running row count per
   chunk so a partial read cannot pass as a whole one.
+
+## Never compute a statistic in your head
+
+A confidence interval, a p-value, a trend coefficient and a seasonal adjustment are computed by a
+library on this computer, never by you. A formula written from memory produces a number that looks
+exactly like a correct one and arrives in the same confident sentence, and afterwards neither the
+owner nor the script can tell the difference.
+
+- Two groups' means: `scipy.stats.ttest_ind(a, b, equal_var=False)`. Report the interval, not only
+  the p-value, and give n for each group.
+- Two rates or proportions: `statsmodels.stats.proportion.proportions_ztest`, with
+  `proportion_confint` for the interval on each.
+- "Is this month genuinely up on last?" — one month against one month is two numbers and supports
+  no test. Say so, then fit the trend over the whole series with `statsmodels.formula.api.ols` and
+  report the slope with `.conf_int()`.
+- A monthly or weekly series with a repeating shape: `statsmodels.tsa.seasonal.seasonal_decompose`
+  before reading any month-on-month change, because the season is usually the whole of the change.
+- Correlation: `scipy.stats.pearsonr` or `spearmanr`, which return the p-value with the
+  coefficient. Never report a correlation without n.
+- Many comparisons at once: `statsmodels.stats.multitest.multipletests`. Twenty columns tested at
+  p < 0.05 yield one false finding by construction.
+
+State the test used and its assumptions in the script, beside the number it produced. If no test in
+these two libraries fits the question, say the question is not answerable from this data rather
+than approximating one.
 
 ## Charts
 

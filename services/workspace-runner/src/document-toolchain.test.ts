@@ -67,6 +67,7 @@ describe('the document toolchain is declared where the drill can assert it', () 
       'pdf-extraction',
       'typeset-pdf',
       'data-analysis',
+      'statistics',
       'image-work',
       'media'
     ])
@@ -179,6 +180,8 @@ describe('what the skills ask for is what the drill refuses to ship without', ()
       'python3-openpyxl',
       'python3-pandas',
       'python3-matplotlib',
+      'python3-scipy',
+      'python3-statsmodels',
       'python3-pil',
       'python3-venv',
       'poppler-utils',
@@ -230,6 +233,45 @@ describe('what the skills ask for is what the drill refuses to ship without', ()
     expect(requirements, 'python-pptx is pinned, because apt no longer carries it').toMatch(
       /^python-pptx==/m
     );
+  });
+
+  /**
+   * A dash in the table says a family reaches a capability another way, and for OCR or a metric
+   * font that is a degraded install the owner can see. For these two rows it is not visible at
+   * all: the statistics capability exists so that an interval or a p-value is computed by a
+   * library rather than recalled by a model, and on a host missing the package the model answers
+   * the same question from memory in the same confident sentence. Nothing downstream can tell the
+   * two apart, so the absence has to be caught here.
+   *
+   * Both rows carried a dash while the package was sitting in the family's own repositories -
+   * Arch has python-statsmodels in extra, openSUSE has both in the main OSS repo - so the
+   * capability was quietly off on two of the four families athanor supports.
+   *
+   * The families come from the table's own header rather than a count written here, so adding a
+   * fifth column asks that family for a package instead of failing on arithmetic.
+   */
+  it('names a statistics package on every family, because a dash is a number nobody computed', async () => {
+    const lines = (
+      await readFile(path.join(repositoryRoot, 'scripts', 'athanor-host.sh'), 'utf8')
+    ).split('\n');
+    const families = lines
+      .find((line) => line.startsWith('capability\t'))
+      ?.split('\t')
+      .slice(1);
+    expect(families?.length, 'the host table header could not be read').toBeGreaterThan(0);
+    for (const capability of ['python-scipy', 'python-statsmodels']) {
+      const row = lines.find((line) => line.startsWith(`${capability}\t`));
+      expect(row, `the host table has no row for ${capability}`).toBeTruthy();
+      const packages = (row ?? '').split('\t').slice(1);
+      expect(packages, `${capability} does not name a package for every family`).toHaveLength(
+        families?.length ?? 0
+      );
+      for (const [index, name] of packages.entries())
+        expect(
+          name,
+          `${families?.[index]} installs no ${capability}, so statistics is silently off there`
+        ).not.toBe('-');
+    }
   });
 });
 
