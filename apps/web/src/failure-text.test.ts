@@ -19,6 +19,29 @@ describe('failure wording', () => {
     expect(isTransportFailure(aborted)).toBe(true);
   });
 
+  it('says the software is restarting when a proxy answered instead of it', () => {
+    // What the owner actually hits: nginx stays up across an update while athanor@api is down, so
+    // the browser gets HTML, `request` cannot parse it, and the whole failure is a status code.
+    for (const status of [502, 503, 504])
+      expect(describeFailure(new ApiFailure('request_failed', 'Request failed', status), 'x')).toBe(
+        'Your athanor answered, but the software on it is not up yet. That normally means it is ' +
+          'restarting; this device will keep trying.'
+      );
+  });
+
+  it('leaves athanor its own 503, which says more than the gateway sentence could', () => {
+    expect(
+      describeFailure(
+        new ApiFailure(
+          'transcription_route_unavailable',
+          'The connected provider offers no model that reads recordings.',
+          503
+        ),
+        'x'
+      )
+    ).toBe('The connected provider offers no model that reads recordings.');
+  });
+
   it('passes a real answer from the box through untouched', () => {
     expect(
       describeFailure(new ApiFailure('storage_limit', 'Workspace storage limit reached', 400), 'x')
