@@ -303,7 +303,7 @@ doctor() {
       missing_document_tools="$missing_document_tools $document_binary"
   done
   if [ -x "$document_python" ]; then
-    for document_module in pptx docx openpyxl pandas matplotlib PIL pypdf; do
+    for document_module in pptx docx openpyxl pandas numpy scipy statsmodels matplotlib PIL pypdf; do
       "$document_python" -c "import $document_module" >/dev/null 2>&1 ||
         missing_document_tools="$missing_document_tools python:$document_module"
     done
@@ -435,10 +435,18 @@ doctor() {
   # as "notifications are being delivered", and the endpoint says which of the two this is.
   notifications_health=$(curl -fsS --max-time 5 http://127.0.0.1:4203/healthz 2>/dev/null || true)
   case "$notifications_health" in
-    *'"deliveryEnabled":true'*) check_ok "push notification delivery" ;;
     *'"deliveryEnabled":false'*)
       check_warn "push notifications are switched off: no Web Push signing keys in /etc/athanor/control.env; re-run the installer to generate a pair"
       ;;
+    *'"endpointsFailing":0'*) check_ok "push notification delivery" ;;
+    # Keys configured, the service sending, and a device not receiving. The one thing that cannot
+    # report a broken push is a push, so this is where the owner finds out.
+    *'"endpointsFailing"'*)
+      check_warn "a device is refusing notifications and is being retried with a growing wait; run sudo athanor logs notifications to see which push service and why"
+      ;;
+    # A notifier too old to count refusing endpoints says nothing about them, and silence is not a
+    # warning: keys are configured and it is sending, which is all the older build could report.
+    *'"deliveryEnabled":true'*) check_ok "push notification delivery" ;;
     *) check_fail "the notification service is not answering; run sudo athanor logs" ;;
   esac
   if pg_isready -q -h 127.0.0.1 -U athanor -d athanor; then
@@ -796,6 +804,31 @@ set_hostname() {
   printf 'Native-client passkeys remain valid. Direct-browser passkeys from the old origin must be added again.\n'
 }
 
+# Free kibibytes on the filesystem holding a path, or nothing at all when df cannot say - a
+# destination on a mount that has just gone away answers with neither a number nor a guess, and
+# every caller here treats "no number" as "do not claim to know".
+free_kb() {
+  df -Pk "$1" 2>/dev/null | awk 'NR == 2 {print $4}'
+}
+
+# Half a gibibyte of elbow room on top of whatever is being written. Compression means the archive
+# is smaller than its source and the margin covers the postgres dump alongside it, but the real
+# reason for a margin at all is that finishing with a full disk is its own outage: journald, the
+# database and nginx all need somewhere to write the moment the services come back.
+athanor_space_margin_kb=524288
+
+# The one backup directory prune_backups may not remove: the copy a restore is reading from.
+protected_backup=""
+
+# Compared as resolved paths rather than as the strings they were typed as. The operator names the
+# backup on the command line and `find` names it from the root, so a trailing slash or a relative
+# path would be a different string for the same directory - and the whole point of this is not to
+# delete that directory.
+is_protected_backup() {
+  [ -n "$protected_backup" ] || return 1
+  [ "$(cd "$1" 2>/dev/null && pwd -P)" = "$protected_backup" ]
+}
+
 # Keeps the most recent backups this script created and removes the rest. A destination the
 # operator named themselves is theirs to manage and is never touched, which is why only the
 # generated timestamp directories match.
@@ -804,10 +837,16 @@ set_hostname() {
 # produces - left five unusable directories occupying all five retained slots, each run having
 # deleted a good backup to make room for rubbish. Failed runs are cleared here too, so the disk does
 # not fill with them.
+#
+# The copy a restore is reading from is never removed, whatever its age. A restore prunes to make
+# room exactly as a backup does, and deleting the copy the operator is in the middle of restoring
+# is the one way that could turn a recovery into a loss - and the sixth-newest is precisely the one
+# somebody reaches for when the newest five all carry the fault they are recovering from.
 prune_backups() {
   [ -d "$athanor_backup_root" ] || return 0
   find "$athanor_backup_root" -mindepth 1 -maxdepth 1 -type d -name '*.partial' 2>/dev/null |
     while IFS= read -r abandoned; do
+      is_protected_backup "$abandoned" && continue
       rm -rf -- "$abandoned"
       printf 'Removed incomplete backup %s\n' "$abandoned"
     done
@@ -819,6 +858,7 @@ prune_backups() {
     sort -r |
     tail -n +$((athanor_backup_keep + 1)) |
     while IFS= read -r superseded; do
+      is_protected_backup "$superseded" && continue
       rm -rf -- "$superseded"
       printf 'Removed superseded backup %s\n' "$superseded"
     done
@@ -960,6 +1000,40 @@ restore_athanor() {
     fail "configuration backup contains an unexpected path"
   rm -f "$workspace_listing" "$configuration_listing"
   trap - EXIT INT TERM
+  # Restore empties the workspace tree before it extracts into it, so a disk that turns out to be
+  # too small is discovered with the owner's files already deleted and the archive half unpacked -
+  # the one failure this command exists to recover from, caused by the command itself. The backup
+  # path refuses before it stops a single service for exactly that reason. This is the same care in
+  # the same order: size the source, look at the destination, prune, look again, refuse.
+  #
+  # The size is the length of the decompressed stream, measured by decompressing it, rather than
+  # the length gzip records in its own trailer - that one is only correct below 4 GiB and a
+  # workspace tree is routinely past it. Counting the tar headers and padding along with the files
+  # overstates the answer by a fraction of a per cent, which is the direction to be wrong in. It
+  # costs a second read of the archive, spent here rather than after the services are down, so none
+  # of it is outage time. The database dump is deliberately not measured beside it: what a
+  # custom-format dump expands to cannot be known without restoring it, and dropping the old
+  # database first frees roughly what the new one takes, so the margin below is the honest
+  # allowance rather than a number invented to look like a calculation.
+  #
+  # What the wipe is about to free counts as room. A box restored over itself needs almost no new
+  # space at all, and a check that ignored that would refuse the commonest recovery there is.
+  restore_kb=$(gzip -dc "$source_directory/workspaces.tar.gz" 2>/dev/null | wc -c |
+    awk '{ printf "%.0f\n", ($1 + 1023) / 1024 }')
+  reclaimed_kb=$(du -sk "$athanor_home" 2>/dev/null | awk '{print $1}')
+  [ -n "$reclaimed_kb" ] || reclaimed_kb=0
+  available_kb=$(free_kb "$athanor_home")
+  if [ -n "$restore_kb" ] && [ -n "$available_kb" ] &&
+    [ "$((available_kb + reclaimed_kb))" -lt "$((restore_kb + athanor_space_margin_kb))" ]; then
+    protected_backup=$(cd "$source_directory" && pwd -P)
+    prune_backups
+    protected_backup=""
+    available_kb=$(free_kb "$athanor_home")
+  fi
+  if [ -n "$restore_kb" ] && [ -n "$available_kb" ] &&
+    [ "$((available_kb + reclaimed_kb))" -lt "$((restore_kb + athanor_space_margin_kb))" ]; then
+    fail "not enough room to restore: $(((available_kb + reclaimed_kb) / 1024)) MiB would be free on $athanor_home, about $(((restore_kb + athanor_space_margin_kb) / 1024)) MiB needed. Nothing has been stopped and nothing has been changed. Free space, or restore onto a larger disk."
+  fi
   systemctl stop athanor.target
   for unit_name in $service_units; do systemctl stop "$unit_name"; done
   trap 'systemctl start athanor.target >/dev/null 2>&1 || true' EXIT INT TERM

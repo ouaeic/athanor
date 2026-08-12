@@ -130,7 +130,12 @@ import {
   seedModels,
   verifyOpenRouterKey
 } from '@athanor/model-gateway';
-import { AgentWorker, connectorHostAllowance, startTurnState } from '@athanor/worker';
+import {
+  AgentWorker,
+  buildIdentity,
+  connectorHostAllowance,
+  startTurnState
+} from '@athanor/worker';
 import { registerAuthRoutes } from './auth-routes.js';
 import type { ApiConfig } from './config.js';
 import { createLogger, errorFields, type Logger } from './log.js';
@@ -1295,7 +1300,7 @@ export const buildServer = async (
   });
   let embeddedWorkerLoop: Promise<void> = Promise.resolve();
   if (config.EMBEDDED_WORKER ?? config.DATABASE_DRIVER === 'pglite') {
-    const embeddedWorker = new AgentWorker(store, config, masterKey, runnerSharedSecret);
+    const embeddedWorker = new AgentWorker(store, config, masterKey, runnerSharedSecret, log);
     embeddedWorkerRunning = true;
     /**
      * Pickup waits on the write, not on a clock: `waitForQueuedTask` returns the moment a task is
@@ -4712,7 +4717,11 @@ export const buildServer = async (
       read('ddns.error'),
       readBackup()
     ]);
-    return { certificate, dynamicDns, backup };
+    // Which build is answering. It belongs on this route rather than on one of its own because it
+    // is the same kind of fact as the three above - something the box knows about itself that an
+    // owner otherwise needs a terminal to ask - and because a bug report that does not start with
+    // it starts with a guess.
+    return { certificate, dynamicDns, backup, build: buildIdentity() };
   });
 
   app.get('/v1/relay', async (request) => {

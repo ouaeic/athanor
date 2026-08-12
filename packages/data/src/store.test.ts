@@ -749,6 +749,110 @@ describe('DataStore', () => {
     expect(await store.leaseNextTask('worker-3')).toMatchObject({ id: waiting.id });
   });
 
+  /**
+   * The window this closes cannot be reproduced against one connection, so what is proved here is
+   * the property that makes it impossible rather than the collision itself: the answer to "is
+   * anybody in this workspace" is a column on the row the statement locks, so a poll whose snapshot
+   * of the tasks table is a moment out of date has nothing to read it from.
+   */
+  it('decides one writer from the workspace row, not from a reading of the tasks in it', async () => {
+    const user = await store.createUser({ username: 'row-truth', displayName: 'Row truth' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+    const first = await store.createTask(taskInput(user.id, workspace.id));
+    const second = await store.createTask(taskInput(user.id, workspace.id));
+    // Stands in for the turn another worker just started. Parked, so it is never a candidate here
+    // and can only ever appear as a name on the hold.
+    const competitor = await store.createTask(taskInput(user.id, workspace.id));
+    await database.query("UPDATE tasks SET status='paused' WHERE id=$1", [competitor.id]);
+    // Two rows can be created in the same instant, so which one the queue prefers is said.
+    await database.query(`UPDATE tasks SET created_at=NOW() + INTERVAL '1 second' WHERE id=$1`, [
+      second.id
+    ]);
+    const hold = async (): Promise<Record<string, unknown> | undefined> =>
+      (
+        await database.query(
+          `SELECT w.lease_task_id, w.lease_expires_at = t.lease_expires_at AS same_deadline
+           FROM workspaces w LEFT JOIN tasks t ON t.id=w.lease_task_id WHERE w.id=$1`,
+          [workspace.id]
+        )
+      ).rows[0];
+    const freeEveryTaskLease = async (): Promise<unknown> =>
+      database.query('UPDATE tasks SET lease_owner=NULL, lease_expires_at=NULL');
+
+    expect(await store.leaseNextTask('worker-1')).toMatchObject({ id: first.id });
+    // Written by the statement that leased the task, and written to run out at the same instant:
+    // a worker that dies holding both lets go of both together, with nobody left to do it for it.
+    expect(await hold()).toMatchObject({ lease_task_id: first.id, same_deadline: true });
+
+    // Exactly what a poll a millisecond behind the winner reads. Every task in the workspace looks
+    // free, and the only trace of the turn that just started is on the row being locked - which is
+    // the one place the question is now asked, and the one place it was never written before.
+    await database.query(
+      `UPDATE workspaces SET lease_task_id=$2, lease_expires_at=NOW() + INTERVAL '1 minute'
+       WHERE id=$1`,
+      [workspace.id, competitor.id]
+    );
+    await freeEveryTaskLease();
+    await expect(store.leaseNextTask('worker-2')).resolves.toBeNull();
+
+    // And the same row is what hands the computer back, three ways, none of which needs anything
+    // to still be running to notice: a deadline that has passed, a holder that was deleted, and a
+    // hold half written. A workspace nothing can take back is the one failure worse than the race.
+    await database.query(
+      `UPDATE workspaces SET lease_expires_at=NOW() - INTERVAL '1 second' WHERE id=$1`,
+      [workspace.id]
+    );
+    expect(await store.leaseNextTask('worker-2')).toMatchObject({ id: second.id });
+
+    await store.deleteTask(user.id, second.id);
+    expect(await hold()).toMatchObject({ lease_task_id: null });
+    expect(await store.leaseNextTask('worker-3')).toMatchObject({ id: first.id });
+
+    await database.query(
+      `UPDATE workspaces SET lease_task_id=$2, lease_expires_at=NULL WHERE id=$1`,
+      [workspace.id, competitor.id]
+    );
+    await freeEveryTaskLease();
+    expect(await store.leaseNextTask('worker-4')).toMatchObject({ id: first.id });
+  });
+
+  /**
+   * The invariant used to be eight callers each remembering one flag. A task the queue will not
+   * hand out again cannot go on holding a workspace, so the status decides and the caller cannot
+   * get it wrong.
+   */
+  it('takes the workspace back from a caller that forgot to let go of it', async () => {
+    const user = await store.createUser({ username: 'forgetful', displayName: 'Forgetful' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+    const first = await store.createTask(taskInput(user.id, workspace.id));
+    const second = await store.createTask(taskInput(user.id, workspace.id));
+    await database.query(`UPDATE tasks SET created_at=NOW() + INTERVAL '1 second' WHERE id=$1`, [
+      second.id
+    ]);
+    const holder = async (): Promise<unknown> =>
+      (await database.query('SELECT lease_task_id FROM workspaces WHERE id=$1', [workspace.id]))
+        .rows[0]?.lease_task_id;
+
+    expect(await store.leaseNextTask('worker-1')).toMatchObject({ id: first.id });
+    // Mid-turn, still working: a status the queue would lease keeps what it was given.
+    await store.updateTask({ id: first.id, workerId: 'worker-1', status: 'running' });
+    expect(await holder()).toBe(first.id);
+
+    // Parked without the flag - and the workspace comes back anyway, along with the wake-up the
+    // conversation waiting behind it would otherwise have sat out a whole worker poll for.
+    const startedAt = Date.now();
+    const woken = store.waitForQueuedTask(4_000);
+    await store.updateTask({ id: first.id, workerId: 'worker-1', status: 'awaiting_user' });
+    await woken;
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(await holder()).toBeNull();
+    expect(await store.getTask(user.id, first.id)).toMatchObject({
+      leaseOwner: null,
+      leaseExpiresAt: null
+    });
+    expect(await store.leaseNextTask('worker-2')).toMatchObject({ id: second.id });
+  });
+
   it('takes the workspace back when the worker holding it dies, and still retries its task', async () => {
     const user = await store.createUser({ username: 'dead-worker', displayName: 'Dead worker' });
     const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
@@ -771,6 +875,45 @@ describe('DataStore', () => {
       [second.id]
     );
     expect(await store.leaseNextTask('worker-3')).toMatchObject({ id: first.id, attempt: 2 });
+  });
+
+  /**
+   * The hold is a deadline, and any answer worth waiting for outlives it. Nothing else in the
+   * schema says the workspace is occupied any more, so whatever keeps a task's lease alive has to
+   * keep the workspace's alive with it - otherwise the one-writer rule quietly stops applying two
+   * minutes into every long turn, which is the only kind of turn during which the owner has time
+   * to ask a second question.
+   */
+  it('holds the workspace for as long as the worker keeps saying it is alive', async () => {
+    const user = await store.createUser({ username: 'long-turn', displayName: 'Long turn' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+    const running = await store.createTask(taskInput(user.id, workspace.id));
+    const waiting = await store.createTask(taskInput(user.id, workspace.id));
+    const hold = async (): Promise<Record<string, unknown> | undefined> =>
+      (
+        await database.query(
+          `SELECT w.lease_task_id, w.lease_expires_at = t.lease_expires_at AS same_deadline
+           FROM workspaces w LEFT JOIN tasks t ON t.id=w.lease_task_id WHERE w.id=$1`,
+          [workspace.id]
+        )
+      ).rows[0];
+
+    // A hold short enough to run out inside a test, and a turn that goes on past it.
+    expect(await store.leaseNextTask('worker-1', 1)).toMatchObject({ id: running.id });
+    await expect(store.renewTaskLease(running.id, 'worker-1', 120)).resolves.toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    // The original hold has run out; the turn has not, and says so every step.
+    await expect(store.leaseNextTask('worker-2')).resolves.toBeNull();
+    // Still welded to the lease it renewed, so a worker that dies now still lets go of both at the
+    // same instant and no sweep has to exist.
+    expect(await hold()).toMatchObject({ lease_task_id: running.id, same_deadline: true });
+
+    await database.query(
+      `UPDATE tasks SET lease_expires_at=NOW() - INTERVAL '1 second' WHERE id=$1`,
+      [running.id]
+    );
+    expect(await store.leaseNextTask('worker-2')).toMatchObject({ id: waiting.id });
   });
 
   /**
@@ -2175,6 +2318,94 @@ describe('DataStore', () => {
       [recentlyExpired.id, evergreen.id].sort()
     );
     expect(remaining.map((record) => record.id)).not.toContain(stale.id);
+  });
+
+  /**
+   * Three tables nothing ever swept. A watcher on a quarter-hour writes a schedule run every
+   * fifteen minutes for as long as the box is owned, and the owner is also the operator: nobody
+   * else is going to notice the disk.
+   */
+  it('gives a horizon to the three records that used to be kept forever', async () => {
+    const user = await store.createUser({ username: 'housekeeper', displayName: 'Housekeeper' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+    const envelope = { v: 1 as const, iv: 'a', tag: 'b', ciphertext: 'c' };
+    const schedule = await store.createTaskSchedule({
+      userId: user.id,
+      workspaceId: workspace.id,
+      titleCiphertext: envelope,
+      promptCiphertext: envelope,
+      modelId: 'qwen',
+      privacyRoute: 'provider_zdr',
+      maxComputeCredits: 1,
+      spec: { kind: 'interval', everyMinutes: 15 },
+      nextRunAt: new Date(Date.now() - 60_000)
+    });
+    const connector = await store.createConnector({
+      id: '00000000-0000-4000-8000-0000000000c1',
+      userId: user.id,
+      kind: 'webdav',
+      authMode: 'secret',
+      label: 'Files',
+      baseUrl: 'https://files.example/dav',
+      scopes: ['webdav:files.read'],
+      secretCiphertext: envelope
+    });
+
+    const runs: string[] = [];
+    for (const runId of [
+      '00000000-0000-4000-8000-0000000000d1',
+      '00000000-0000-4000-8000-0000000000d2'
+    ]) {
+      await store.leaseDueTaskSchedule('scheduler');
+      await store.materializeTaskSchedule({
+        scheduleId: schedule.id,
+        workerId: 'scheduler',
+        taskId: runId,
+        nextRunAt: new Date(Date.now() - 60_000),
+        resourceClass: 'medium',
+        preparingEventCiphertext: envelope,
+        failureEventCiphertext: envelope
+      });
+      await store.createAgentNotification({
+        userId: user.id,
+        taskId: runId,
+        kind: 'agent_message',
+        messageCiphertext: envelope
+      });
+      await store.recordConnectorAudit({
+        connectorId: connector.id,
+        userId: user.id,
+        taskId: runId,
+        operation: 'GET /calendar.ics',
+        outcome: 'succeeded'
+      });
+      runs.push(runId);
+    }
+
+    const count = async (table: string): Promise<number> =>
+      Number((await database.query(`SELECT COUNT(*) AS count FROM ${table}`)).rows[0]?.count ?? 0);
+    const age = async (table: string, column: string, days: number): Promise<unknown> =>
+      database.query(
+        `UPDATE ${table} SET created_at=NOW() - ($2 * INTERVAL '1 day') WHERE ${column}=$1`,
+        [runs[0], days]
+      );
+
+    // Each one is aged past its own horizon and no further, so this fails if a horizon moves.
+    await age('task_schedule_runs', 'task_id', 31);
+    await age('agent_notifications', 'task_id', 91);
+    await age('connector_audit_events', 'task_id', 31);
+
+    await store.cleanupExpired();
+
+    for (const table of ['task_schedule_runs', 'agent_notifications', 'connector_audit_events'])
+      expect(await count(table), table).toBe(1);
+    // The conversation each run produced is not a record of the run and is not swept with it: the
+    // sidebar groups these by the schedule the task itself names.
+    await expect(store.getTask(user.id, runs[0]!)).resolves.toMatchObject({
+      scheduleId: schedule.id
+    });
+    // And the ledger the owner's money reconciles against is not a retention question at all.
+    await expect(count('usage_entries')).resolves.toBe(2);
   });
 
   it('bounds the backfills the API runs before it serves traffic', async () => {

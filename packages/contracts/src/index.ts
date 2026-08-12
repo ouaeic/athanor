@@ -1538,3 +1538,27 @@ export interface ParallelWebReadResult {
   requested: number;
   read: number;
 }
+
+/**
+ * Which build of athanor is running.
+ *
+ * Both halves are needed and neither is enough. The version is the number a person can say out
+ * loud, the one the install command pins and the one a release is cut at - but it does not move
+ * between releases, so two boxes that are weeks apart on `main` both call themselves 0.1.1 and an
+ * owner asking whether `athanor update` changed anything gets the same answer either way. The
+ * revision moves with every commit and settles that, and on its own it means nothing to anybody
+ * who is not holding the repository.
+ *
+ * The revision is nullable because it can honestly be unknown - a tree without its git metadata is
+ * still a running box - and saying so is the point. A field that fell back to a plausible-looking
+ * value would be a build identity that lies, which is worse than none at all.
+ */
+export const BuildIdentity = z.object({
+  version: z.string(),
+  commit: z.string().nullable()
+});
+export type BuildIdentity = z.infer<typeof BuildIdentity>;
+
+/** The two halves said in one breath, so the journal, the API and Settings word it the same way. */
+export const buildLabel = (build: BuildIdentity): string =>
+  build.commit ? `${build.version} (${build.commit})` : build.version;

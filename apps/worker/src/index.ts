@@ -6,7 +6,8 @@ import {
   migrateDatabase
 } from '@athanor/data';
 import { deriveServiceSecret, resolveDataMasterKey } from '@athanor/core';
-import { AgentWorker, journalLevelPrefix } from './agent.js';
+import { buildLabel } from '@athanor/contracts';
+import { AgentWorker, buildIdentity, failureFields, workerLogger } from './agent.js';
 import { loadConfig } from './config.js';
 import { runLeaseLoops, type WorkerCounters } from './lease.js';
 
@@ -25,7 +26,8 @@ const worker = new AgentWorker(
   store,
   config,
   keyRelease.key,
-  config.RUNNER_SHARED_SECRET ?? deriveServiceSecret(keyRelease.key, 'runner-capabilities')
+  config.RUNNER_SHARED_SECRET ?? deriveServiceSecret(keyRelease.key, 'runner-capabilities'),
+  workerLogger
 );
 let running = true;
 const counters: WorkerCounters = { active: 0, completed: 0, failed: 0, leaseErrors: 0 };
@@ -55,13 +57,11 @@ let leaseHealthy = true;
 const reportLeaseHealth = (healthy: boolean, error?: unknown): void => {
   if (healthy === leaseHealthy) return;
   leaseHealthy = healthy;
-  process.stderr.write(
-    healthy
-      ? `${journalLevelPrefix('info')}[athanor] leasing recovered; the worker is accepting tasks again\n`
-      : `${journalLevelPrefix('error')}[athanor] leasing the next task failed, so this worker is accepting nothing: ${
-          error instanceof Error ? error.message : String(error)
-        }\n`
-  );
+  // The thrown message used to be on this line. A driver quotes back whatever it was handed, so a
+  // connection that dropped mid-statement published a piece of it - the code and the frames say the
+  // same thing about the box without ever being about the owner.
+  if (healthy) workerLogger.info('worker.lease_recovered');
+  else workerLogger.error('worker.lease_failed', failureFields(error));
 };
 
 // When each in-flight attempt was handed out, so the line a failure writes can say how long it ran.
@@ -74,11 +74,16 @@ const startedAt = new Map<string, number>();
 // master key, the migration, the health socket - and a worker that never reached the queue looks
 // exactly like one whose queue is empty: both say nothing at all. One line, and then silence until
 // something happens.
-process.stderr.write(
-  `${journalLevelPrefix('info')}[athanor] worker ${config.WORKER_ID} is taking tasks: ${
-    config.WORKER_CONCURRENCY
-  } at once, ${config.DATABASE_DRIVER} database\n`
-);
+//
+// It carries the build because this is the line a restart puts a fresh timestamp on, which makes it
+// the one place in the journal where "which code is this box running" is answered next to "since
+// when" - the two halves of every question that starts with an update.
+workerLogger.info('worker.ready', {
+  workerId: config.WORKER_ID,
+  concurrency: config.WORKER_CONCURRENCY,
+  driver: config.DATABASE_DRIVER,
+  build: buildLabel(buildIdentity())
+});
 
 await runLeaseLoops({
   concurrency: config.WORKER_CONCURRENCY,

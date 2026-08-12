@@ -12,8 +12,11 @@ import {
   ACCEPTANCE_EARLIER_TURN_CAVEAT,
   AgentWorker,
   approvalPreviewHash,
+  createLogger,
   DELEGATE_MAX_STEPS,
+  type Logger,
   MAX_NOTICES_PER_TURN,
+  silentLogger,
   startTurnState,
   UNTRUSTED_NOTICE_MARKER
 } from './agent.js';
@@ -4699,12 +4702,20 @@ describe('the warnings that are the owner’s business', () => {
     expect(ownerFlag(capped)).toBe(true);
   });
 
+  /** A worker whose journal can be read back, which is how the two tests below read it. */
+  const journalled = (): { logger: Logger; lines: string[] } => {
+    const lines: string[] = [];
+    return {
+      logger: createLogger({ level: 'info', service: 'worker', write: (line) => lines.push(line) }),
+      lines
+    };
+  };
+
   it('raises the reason a task stopped without doing what was asked', async () => {
     const task = makeTask();
     const probe = probeStore(() => task);
-    const journal = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
 
-    await new AgentWorker(probe.store, config(), masterKey, runnerSecret).fail(
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret, silentLogger).fail(
       task,
       new Error('The workspace could not be reached')
     );
@@ -4712,7 +4723,6 @@ describe('the warnings that are the owner’s business', () => {
     const failure = probe.events.find((entry) => entry.kind === 'error');
     expect(failure?.summary).toBe('The workspace could not be reached');
     expect(ownerFlag(failure)).toBe(true);
-    journal.mockRestore();
   });
 
   /**
@@ -4723,23 +4733,28 @@ describe('the warnings that are the owner’s business', () => {
   it('writes the failure to the journal, where the owner can read it without a key', async () => {
     const task = makeTask({ messages: [], step: 12, credits: 0, turn: 2 });
     const probe = probeStore(() => task);
-    const journal = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const journal = journalled();
 
-    await new AgentWorker(probe.store, config(), masterKey, runnerSecret).fail(
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret, journal.logger).fail(
       task,
       new AthanorError('model_timeout', 'The model provider did not respond within 900 seconds'),
       903_000
     );
 
-    const line = String(journal.mock.calls.at(0)?.[0]);
-    journal.mockRestore();
-    expect(line).toContain(`task ${taskId} failed at turn 2 step 12 after 903.0s`);
-    expect(line).toContain('model_timeout');
+    expect(JSON.parse(journal.lines[0]!)).toMatchObject({
+      level: 'error',
+      event: 'task.failed',
+      taskId,
+      turn: 2,
+      step: 12,
+      durationMs: 903_000,
+      code: 'model_timeout'
+    });
     // The sentence the model provider wrote is in the encrypted event and nowhere else.
-    expect(line).not.toContain('did not respond');
+    expect(journal.lines[0]).not.toContain('did not respond');
   });
 
-  it('leaves that line behind even when the store is what failed', async () => {
+  it('leaves that record behind even when the store is what failed', async () => {
     const task = makeTask();
     const probe = probeStore(() => task);
     Object.assign(probe.store, {
@@ -4747,15 +4762,13 @@ describe('the warnings that are the owner’s business', () => {
         throw new Error('database is not accepting connections');
       }
     });
-    const journal = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const journal = journalled();
 
-    await new AgentWorker(probe.store, config(), masterKey, runnerSecret)
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret, journal.logger)
       .fail(task, new AthanorError('workspace_unreachable', 'The workspace could not be reached'))
       .catch(() => undefined);
 
-    const line = String(journal.mock.calls.at(0)?.[0]);
-    journal.mockRestore();
-    expect(line).toContain('workspace_unreachable');
+    expect(journal.lines[0]).toContain('workspace_unreachable');
   });
 });
 

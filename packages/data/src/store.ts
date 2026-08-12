@@ -116,6 +116,26 @@ const providerRefModelId = (providerRef: string | undefined): string | null => {
 const COMMITTED_TASK_STATUSES = "('queued','planning','running')";
 
 /**
+ * Whether workspace `w` is free for the given task to walk into.
+ *
+ * Said twice in the one statement that leases a task: once to pick a candidate, and again on the
+ * write that records the hold. The first is where the race is settled - it sits under a row lock,
+ * so a competitor that committed a hold in the meantime is re-read and this is evaluated again
+ * against what it wrote, and the candidate falls out. The second cannot fire once the first has
+ * passed; it is there so that a write which somehow reached it with a live hold in place would
+ * record nothing and lease nothing, rather than quietly putting a second agent in the room.
+ *
+ * Free in three ways, and the breadth is the point: nobody holds it, nobody wrote a deadline, or
+ * the deadline has passed. Only a complete and live hold by somebody else excludes anything, so
+ * every half-written state - including the one the foreign key leaves when a conversation holding a
+ * workspace is deleted - reads as free. A workspace nothing can take back is a computer the owner
+ * can no longer use, which is worse than anything this predicate is defending against.
+ */
+const WORKSPACE_IS_FREE_FOR = (taskId: string): string =>
+  `(w.lease_task_id IS NULL OR w.lease_task_id = ${taskId}
+      OR w.lease_expires_at IS NULL OR w.lease_expires_at < NOW())`;
+
+/**
  * How many times a task may be leased before the queue stops handing it to anyone.
  *
  * The count is cleared at every point where something puts a task back in the queue - a follow-up
@@ -4917,54 +4937,60 @@ export class DataStore {
    * than running beside the first - the concurrency the worker is configured for still applies, it
    * just spreads across workspaces instead of stacking up inside one.
    *
-   * Held, not parked or dead: the exclusion looks only at an unexpired lease, and every path that
-   * parks or finishes a task clears the lease as it goes. A worker that died holds the workspace
-   * for the remainder of its lease and no longer, which is the same window after which its own task
-   * becomes leasable again - so nothing can be wedged by a process that is gone. A task never
-   * excludes itself, so a retry of the one that died is still the next thing to run.
+   * The hold is written on the workspace row, not inferred from the tasks in it. That is what makes
+   * this decidable in one statement: the fact being read and the row being locked are the same row,
+   * so a poll whose snapshot predates a competitor's commit does not get to act on it - PostgreSQL
+   * re-checks the predicate against the version the competitor left, and the loser matches nothing
+   * and leases nothing. Asking the tasks table instead only ever narrowed that window, because the
+   * lock that made the second poll wait was released at exactly the moment its snapshot went stale.
+   *
+   * Held, not parked or dead: the hold carries the same deadline as the task lease written beside
+   * it, so a worker that died lets go of the workspace at the same instant its own task becomes
+   * leasable again and nothing can be wedged by a process that is gone. Every other way out of a
+   * turn hands the workspace back sooner, and none of them has to remember to: the release is
+   * welded to the lease in the schema. A task never excludes itself, so a retry of the one that
+   * died is still the next thing to run.
    *
    * A task that is passed over is left exactly as it was. It is filtered out of the candidates
    * rather than leased and rejected, so waiting for the workspace costs it no attempt and the queue
    * cannot spend a conversation's whole allowance on it before its turn ever comes.
    *
-   * The workspace row is locked while the choice is made, which narrows the one case this cannot
-   * decide alone: two workers polling within a millisecond of each other. The second is passed over
-   * while the first holds the row, but a poll that began before the first committed and reaches the
-   * lock after it still reads a snapshot from before that lease existed, and would take a second
-   * task in the same workspace. Closing that needs the hold written on the workspace row itself,
-   * where the lock and the fact being read are the same row; until then this is a narrow race in
-   * place of a certainty. `SKIP LOCKED` means the statement waits on nothing, so it can neither
-   * block nor take part in a deadlock.
+   * `SKIP LOCKED` means the choice waits on nothing, so it can neither block nor take part in a
+   * deadlock - and the hold is written to the row this same statement has already locked, so that
+   * write cannot wait either. If the hold cannot be recorded, nothing is leased: a worker sent away
+   * empty-handed polls again in a second, and there is no version of this worth being wrong about.
    */
   async leaseNextTask(workerId: string, leaseSeconds = 60): Promise<TaskRecord | null> {
     const result = await this.database.query(
-      `UPDATE tasks SET
+      `WITH candidate AS (
+         SELECT t.id, t.workspace_id FROM tasks t
+         JOIN workspaces w ON w.id = t.workspace_id
+         WHERE t.status IN ${COMMITTED_TASK_STATUSES}
+           AND (t.lease_expires_at IS NULL OR t.lease_expires_at < NOW())
+           AND t.attempt < $3
+           AND ${WORKSPACE_IS_FREE_FOR('t.id')}
+         -- Attempt first, then age. A task that has already died once is behind everything that
+         -- has not, so a turn that kills its worker can no longer starve the message the owner
+         -- sent while it was crashing; it drops a place each time and stops being handed out at
+         -- all once it is at the ceiling. The tie-break on age is the original queue order.
+         ORDER BY t.attempt, t.created_at, t.id
+         FOR UPDATE OF t, w SKIP LOCKED
+         LIMIT 1
+       ), hold AS (
+         UPDATE workspaces w SET
+           lease_task_id = candidate.id,
+           lease_expires_at = NOW() + ($2 * INTERVAL '1 second')
+         FROM candidate
+         WHERE w.id = candidate.workspace_id AND ${WORKSPACE_IS_FREE_FOR('candidate.id')}
+         RETURNING candidate.id AS task_id
+       )
+       UPDATE tasks SET
          lease_owner = $1,
          lease_expires_at = NOW() + ($2 * INTERVAL '1 second'),
          status = CASE WHEN status = 'queued' THEN 'planning' ELSE status END,
          attempt = attempt + 1,
          updated_at = NOW()
-       WHERE id = (
-         SELECT candidate.id FROM tasks candidate
-         JOIN workspaces workspace ON workspace.id = candidate.workspace_id
-         WHERE candidate.status IN ('queued','planning','running')
-           AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at < NOW())
-           AND candidate.attempt < $3
-           AND NOT EXISTS (
-             SELECT 1 FROM tasks holder
-             WHERE holder.workspace_id = candidate.workspace_id
-               AND holder.id <> candidate.id
-               AND holder.status IN ('queued','planning','running')
-               AND holder.lease_expires_at > NOW()
-           )
-         -- Attempt first, then age. A task that has already died once is behind everything that
-         -- has not, so a turn that kills its worker can no longer starve the message the owner
-         -- sent while it was crashing; it drops a place each time and stops being handed out at
-         -- all once it is at the ceiling. The tie-break on age is the original queue order.
-         ORDER BY candidate.attempt, candidate.created_at, candidate.id
-         FOR UPDATE OF candidate, workspace SKIP LOCKED
-         LIMIT 1
-       )
+       WHERE id = (SELECT task_id FROM hold)
        RETURNING *`,
       [workerId, leaseSeconds, TASK_MAX_ATTEMPTS]
     );
@@ -5046,13 +5072,43 @@ export class DataStore {
     };
   }
 
+  /**
+   * The worker saying it is still there, which it does on every step and throughout any wait long
+   * enough to outlive a lease.
+   *
+   * It renews the workspace with the task, and it has to: the hold is a deadline like the lease is,
+   * and the lease is the only reason that deadline is safe to trust. Renewing one without the other
+   * would mean every turn that lasts longer than a lease quietly stopped excluding anything, and
+   * those are the only turns during which the owner has time to ask a second question.
+   *
+   * Both rows get the identical timestamp - the one the task was just given, read back rather than
+   * computed twice - so a worker that dies a second later lets go of both at the same instant, and
+   * nothing has to exist to sweep up after it.
+   *
+   * The hold is taken back rather than merely extended, under the same predicate the lease uses, so
+   * a workspace that somehow came free under a running turn is quietly reclaimed by it. A live hold
+   * belonging to somebody else is the one thing that stops this, which is the whole rule.
+   *
+   * `tasks` then `workspaces`, the order every statement here that can wait takes them in.
+   */
   async renewTaskLease(taskId: string, workerId: string, leaseSeconds = 60): Promise<boolean> {
     const result = await this.database.query(
-      `UPDATE tasks SET lease_expires_at = NOW() + ($3 * INTERVAL '1 second')
-       WHERE id = $1 AND lease_owner = $2`,
+      `WITH renewed AS (
+         UPDATE tasks SET lease_expires_at = NOW() + ($3 * INTERVAL '1 second')
+         WHERE id = $1 AND lease_owner = $2
+         RETURNING id, workspace_id, lease_expires_at
+       ), hold AS (
+         UPDATE workspaces w SET
+           lease_task_id = renewed.id,
+           lease_expires_at = renewed.lease_expires_at
+         FROM renewed
+         WHERE w.id = renewed.workspace_id AND ${WORKSPACE_IS_FREE_FOR('renewed.id')}
+         RETURNING w.id
+       )
+       SELECT id FROM renewed`,
       [taskId, workerId, leaseSeconds]
     );
-    return result.rowCount === 1;
+    return result.rows.length === 1;
   }
 
   async updateTask(input: {
@@ -5061,6 +5117,10 @@ export class DataStore {
     status: string;
     agentStateCiphertext?: EncryptedEnvelope | null;
     actualComputeCredits?: number;
+    /**
+     * Let go of the workspace on this write. Only meaningful for a status that could keep it:
+     * anything the queue will not lease releases it whether this is set or not.
+     */
     clearLease?: boolean;
     /**
      * When the box stopped this task at a spending ceiling, or null to clear it. Undefined leaves
@@ -5079,26 +5139,33 @@ export class DataStore {
       input.spendPausedAt === undefined ? null : input.spendPausedAt,
       input.spendPausedAt !== undefined
     ];
+    // A parked or finished task holding a live lease is the one shape the one-writer rule cannot
+    // survive: the queue will never hand that task to a worker again, and its lease goes on
+    // excluding everything else in the workspace until it times out. It used to be eight callers
+    // each remembering to say so. Now the status decides - only a status the queue would lease can
+    // keep a lease - and `clearLease` ($5) is left to the callers that let go while staying
+    // leasable.
+    const letGo = `($5 OR $2 NOT IN ${COMMITTED_TASK_STATUSES})`;
     const result = await this.database.query(
       `UPDATE tasks SET
          status = $2,
          agent_state_ciphertext = COALESCE($3::jsonb, tasks.agent_state_ciphertext),
          actual_compute_credits = COALESCE($4, tasks.actual_compute_credits),
-         lease_owner = CASE WHEN $5 THEN NULL ELSE tasks.lease_owner END,
-         lease_expires_at = CASE WHEN $5 THEN NULL ELSE tasks.lease_expires_at END,
+         lease_owner = CASE WHEN ${letGo} THEN NULL ELSE tasks.lease_owner END,
+         lease_expires_at = CASE WHEN ${letGo} THEN NULL ELSE tasks.lease_expires_at END,
          spend_paused_at = CASE WHEN $8 THEN $7::timestamptz ELSE tasks.spend_paused_at END,
          completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN NOW() ELSE tasks.completed_at END,
          updated_at = NOW()
        ${HELD_LEASE_JOIN}
        WHERE tasks.id = held.held_id AND ($6::text IS NULL OR tasks.lease_owner = $6)
-       RETURNING held.held_until > NOW() AS was_held`,
+       RETURNING held.held_until > NOW() AND tasks.lease_expires_at IS NULL AS released`,
       params
     );
     // The end of a turn is the ordinary way a workspace comes free, and it is the one the owner is
     // most often watching: they have just read the last line of one answer and the next question is
-    // already queued behind it.
-    if (input.clearLease && result.rows[0]?.was_held === true)
-      this.#signalWorkspaceRelease(input.id);
+    // already queued behind it. Read off the row rather than off the flag, so a caller that let go
+    // without meaning to still wakes whoever was waiting on it.
+    if (result.rows[0]?.released === true) this.#signalWorkspaceRelease(input.id);
   }
 
   /**
@@ -6933,6 +7000,14 @@ export class DataStore {
       "DELETE FROM security_events WHERE created_at < NOW() - ($1 * INTERVAL '1 day')",
       [securityEventRetentionDays]
     );
+    // The other half of the same record, kept for the same length of time: a security event is who
+    // signed in, and this is what the box then went and did to somebody else's server on the
+    // owner's behalf. Two horizons for one question would only mean the export answered it twice
+    // and disagreed with itself.
+    await this.database.query(
+      "DELETE FROM connector_audit_events WHERE created_at < NOW() - ($1 * INTERVAL '1 day')",
+      [securityEventRetentionDays]
+    );
     await this.database.query(
       `UPDATE approvals SET status = 'expired' WHERE status = 'pending' AND expires_at <= NOW()`
     );
@@ -6973,6 +7048,24 @@ export class DataStore {
     await this.database.query(
       `DELETE FROM workspace_memories
        WHERE valid_until IS NOT NULL AND valid_until < NOW() - INTERVAL '90 days'`
+    );
+    // A run every fifteen minutes is a row every fifteen minutes, forever. They stop a due slot
+    // being materialised twice, which is decided within one schedule lease, and they keep a
+    // finished run from being pushed as though the owner had started it - that one lasts as long as
+    // the run is still something `listPendingNotifications` would consider, so the horizon is the
+    // ledger's rather than the candidate window's. The conversation each row produced is untouched;
+    // the sidebar groups those by `tasks.schedule_id`, which never needed this table.
+    await this.database.query(
+      'DELETE FROM task_schedule_runs WHERE created_at < NOW() - $1::interval',
+      [NOTIFICATION_LEDGER_INTERVAL]
+    );
+    // What the agent chose to tell the owner, which is theirs and is read long after the push that
+    // carried it. Kept far past the fortnight in which it could still be sent, so this only ever
+    // reaches a notification nobody has opened in a season. It also gives a conversation still
+    // alive at that age its notification allowance back, which is the right answer: the cap is
+    // there to stop one turn shouting, not to ration a watcher across a year.
+    await this.database.query(
+      "DELETE FROM agent_notifications WHERE created_at < NOW() - INTERVAL '90 days'"
     );
   }
 }

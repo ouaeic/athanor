@@ -12,8 +12,10 @@ import {
   spendLimitsDraft,
   spendLimitsPatch,
   spendMeters,
+  taskRowName,
   tasksBySpend,
   tokenSplit,
+  UNNAMED_CONVERSATION,
   type UsageEntry,
   type UsageResponse
 } from './usage-model.js';
@@ -171,6 +173,52 @@ describe('spend breakdown', () => {
     );
     expect(tasksBySpend(history)).toHaveLength(5);
     expect(tasksBySpend(history)[0]?.key).toBe('t8');
+  });
+
+  it('carries a name the server put on the row through to the pane', () => {
+    // Written as a value rather than inline because the wire type does not carry `label` yet: this
+    // is the row a server that names its own conversations sends, read by a client that survives
+    // one that does not.
+    const labelled = [{ key: 'task-a', costUsd: 25, calls: 90, label: 'Rewriting the site' }];
+    const breakdown = spendBreakdown(usage(), summary({ byTask: labelled }));
+    expect(taskRowName(breakdown.byTask[0]!, new Map())).toEqual({
+      label: 'Rewriting the site',
+      title: 'Rewriting the site',
+      named: true
+    });
+  });
+});
+
+describe('naming a conversation the money is charged to', () => {
+  const row = { key: 'task-a', costUsd: 25, calls: 90 };
+
+  it('uses the loaded conversation’s own name when the sidebar has it', () => {
+    expect(taskRowName(row, new Map([['task-a', 'Rewriting the site']]))).toEqual({
+      label: 'Rewriting the site',
+      title: 'Rewriting the site',
+      named: true
+    });
+  });
+
+  it('prefers the sidebar over the server, because a rename shows there first', () => {
+    expect(
+      taskRowName({ ...row, label: 'Old name' }, new Map([['task-a', 'New name']])).label
+    ).toBe('New name');
+  });
+
+  it('does not call a conversation deleted merely because this screen cannot see it', () => {
+    const named = taskRowName(row, new Map());
+    expect(named.named).toBe(false);
+    expect(named.label).toBe(UNNAMED_CONVERSATION);
+    expect(named.label).not.toMatch(/no longer|deleted|gone/i);
+    // The id is all an owner reconciling a bill has left, so the tooltip keeps it.
+    expect(named.title).toBe('task-a');
+  });
+
+  it('treats a blank name as no name rather than as an empty label', () => {
+    expect(taskRowName({ ...row, label: '  ' }, new Map([['task-a', '   ']])).label).toBe(
+      UNNAMED_CONVERSATION
+    );
   });
 });
 

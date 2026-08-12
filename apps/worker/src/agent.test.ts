@@ -1,6 +1,7 @@
+import { readFileSync } from 'node:fs';
 import { acceptanceCommandRefusal } from './acceptance.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ModelRelease } from '@athanor/contracts';
+import { buildLabel, type ModelRelease } from '@athanor/contracts';
 import type { ModelMessage, ModelToolCall } from '@athanor/model-gateway';
 import { markCacheBreakpoints } from './context.js';
 import { injectMemoryPack, MEMORY_PACK_MARKER } from './memory-runtime.js';
@@ -66,8 +67,11 @@ import {
   usableCapabilities,
   haltReason,
   startStopWatch,
+  buildIdentity,
+  createLogger,
+  failureFields,
   journalLevelPrefix,
-  taskFailureLogLine,
+  taskFailureRecord,
   withPeriodicRenewal,
   withRequestDeadline
 } from './agent.js';
@@ -2378,13 +2382,17 @@ describe('the reads a batch may run at the same time', () => {
  * is bounded by what the payload is encrypted for: the code, the counters and the machine's own
  * account of where it broke, never a word the owner or the model wrote.
  */
-describe('the journal line a failed turn leaves', () => {
+describe('the journal record a failed turn leaves', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
   });
 
-  const failure = (error: unknown, seen = new Set<string>(), overrides = {}): string =>
-    taskFailureLogLine(
+  const failure = (
+    error: unknown,
+    seen = new Set<string>(),
+    overrides = {}
+  ): ReturnType<typeof taskFailureRecord> =>
+    taskFailureRecord(
       {
         taskId: '33333333-3333-4333-8333-333333333333',
         attempt: 2,
@@ -2400,25 +2408,33 @@ describe('the journal line a failed turn leaves', () => {
     );
 
   it('says which task, how far it got and what the code was', () => {
-    const line = failure(new AthanorError('model_timeout', 'The model provider did not respond'));
-    expect(line).toContain('task 33333333-3333-4333-8333-333333333333 failed');
-    expect(line).toContain('at turn 3 step 17');
-    expect(line).toContain('after 62.4s');
-    expect(line).toContain('attempt 2 of 6');
-    expect(line).toContain('model model-1');
-    expect(line.trimEnd().endsWith('model_timeout')).toBe(true);
-    expect(line.endsWith('\n')).toBe(true);
+    const { level, event, fields } = failure(
+      new AthanorError('model_timeout', 'The model provider did not respond')
+    );
+    expect(level).toBe('error');
+    expect(event).toBe('task.failed');
+    expect(fields).toEqual({
+      taskId: '33333333-3333-4333-8333-333333333333',
+      turn: 3,
+      step: 17,
+      attempt: 2,
+      attempts: 6,
+      modelId: 'model-1',
+      durationMs: 62_400,
+      code: 'model_timeout'
+    });
   });
 
   it('never carries the message, which is where the owner’s work ends up', () => {
-    const line = failure(
+    const { fields } = failure(
       new Error('ENOENT: no such file or directory, open /home/owner/tax-return-2025.pdf')
     );
-    expect(line).not.toContain('tax-return-2025');
-    expect(line).not.toContain('no such file');
+    expect(JSON.stringify(fields)).not.toContain('tax-return-2025');
+    expect(JSON.stringify(fields)).not.toContain('no such file');
     // The class and the frames are still there: neither of them is the owner's.
-    expect(line).toContain('agent_failed (Error)');
-    expect(line).toContain('agent.test.ts');
+    expect(fields.code).toBe('agent_failed');
+    expect(fields.class).toBe('Error');
+    expect(String(fields.frames)).toContain('agent.test.ts');
   });
 
   /**
@@ -2430,7 +2446,7 @@ describe('the journal line a failed turn leaves', () => {
    * exactly as a real frame does. The header is what tells the two apart.
    */
   it('keeps a message that is shaped like a stack out of the frames', () => {
-    const line = failure(
+    const { fields } = failure(
       new Error(
         [
           'workspace command failed: node build.js',
@@ -2439,11 +2455,10 @@ describe('the journal line a failed turn leaves', () => {
         ].join('\n')
       )
     );
-    expect(line).not.toContain('tax-return-2025');
-    expect(line).not.toContain('build.js');
+    expect(JSON.stringify(fields)).not.toContain('tax-return-2025');
+    expect(JSON.stringify(fields)).not.toContain('build.js');
     // This file's own frames, which is where the failure really came from.
-    expect(line).toContain('agent.test.ts');
-    expect(line.split('\n').filter(Boolean)).toHaveLength(1);
+    expect(String(fields.frames)).toContain('agent.test.ts');
   });
 
   /**
@@ -2453,18 +2468,17 @@ describe('the journal line a failed turn leaves', () => {
    * records in the journal.
    */
   it('will not print a code it did not choose itself', () => {
-    const line = failure(
+    const { fields } = failure(
       new AthanorError(
         'bad_request: could not write /home/owner/therapy.md\noutcome=fine',
         'irrelevant'
       )
     );
-    expect(line).not.toContain('therapy.md');
-    expect(line).not.toContain('outcome=fine');
-    expect(line).toContain('agent_failed');
-    expect(line.split('\n').filter(Boolean)).toHaveLength(1);
-    // A code that is a code is still printed whole.
-    expect(failure(new AthanorError('provider_quota_exhausted', 'out of credit'))).toContain(
+    expect(JSON.stringify(fields)).not.toContain('therapy.md');
+    expect(JSON.stringify(fields)).not.toContain('outcome=fine');
+    expect(fields.code).toBe('agent_failed');
+    // A code that is a code is still recorded whole.
+    expect(failure(new AthanorError('provider_quota_exhausted', 'out of credit')).fields.code).toBe(
       'provider_quota_exhausted'
     );
   });
@@ -2472,24 +2486,28 @@ describe('the journal line a failed turn leaves', () => {
   it('prefers the errno or SQLSTATE a driver carried over the class name', () => {
     expect(
       failure(Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:5432'), { code: '57P01' }))
-    ).toContain('agent_failed (57P01)');
-    expect(failure('a bare string')).toContain('agent_failed (string)');
-    expect(failure(null)).toContain('agent_failed (null)');
+        .fields.class
+    ).toBe('57P01');
+    expect(failure('a bare string').fields).toMatchObject({
+      code: 'agent_failed',
+      class: 'string'
+    });
+    expect(failure(null).fields.class).toBe('null');
     // `name` is an ordinary writable property, so a library is free to put a sentence in it.
     const named = new Error('x');
     named.name = 'Failed reading /home/owner/therapy.md';
-    expect(failure(named)).toContain('agent_failed (Error)');
+    expect(failure(named).fields.class).toBe('Error');
   });
 
-  it('prints one stack for a failure that repeats, and a one-line record every time', () => {
+  it('records one stack for a failure that repeats, and says where it went', () => {
     const seen = new Set<string>();
     const error = new Error('the runner refused the connection');
     const first = failure(error, seen);
     const second = failure(error, seen, { attempt: 3 });
-    expect(first).toContain('agent.test.ts');
-    expect(second).not.toContain('agent.test.ts');
-    expect(second).toContain('stack already logged above');
-    expect(second).toContain('attempt 3 of 6');
+    expect(String(first.fields.frames)).toContain('agent.test.ts');
+    expect(second.fields).not.toHaveProperty('frames');
+    expect(second.fields.framesRepeated).toBe(true);
+    expect(second.fields.attempt).toBe(3);
   });
 
   it('remembers a bounded number of stacks, however long the worker runs', () => {
@@ -2498,25 +2516,19 @@ describe('the journal line a failed turn leaves', () => {
     expect(seen.size).toBeLessThanOrEqual(64);
   });
 
-  it('declares a real failure err and a parked one warning, but only to the journal', () => {
-    vi.stubEnv('JOURNAL_STREAM', '8:1234567');
-    expect(failure(new AthanorError('model_timeout', 'no reply')).startsWith('<3>')).toBe(true);
-    expect(
-      failure(new AthanorError('provider_quota_exhausted', 'out of credit'), new Set(), {
-        waiting: true
-      })
-    ).toMatch(/^<4>\[athanor] task \S+ is waiting on a provider/);
-    expect(journalLevelPrefix('info')).toBe('<6>');
-    vi.unstubAllEnvs();
-    // Started from a terminal there is no journal to file it in, so the sentence stands alone.
-    expect(failure(new AthanorError('model_timeout', 'no reply')).startsWith('[athanor]')).toBe(
-      true
+  it('declares a real failure err and a parked one warning', () => {
+    expect(failure(new AthanorError('model_timeout', 'no reply')).level).toBe('error');
+    const parked = failure(
+      new AthanorError('provider_quota_exhausted', 'out of credit'),
+      new Set(),
+      { waiting: true }
     );
-    expect(journalLevelPrefix('error')).toBe('');
+    expect(parked.level).toBe('warn');
+    expect(parked.event).toBe('task.waiting');
   });
 
   it('says nothing about a duration nobody measured', () => {
-    const line = taskFailureLogLine({
+    const { fields } = taskFailureRecord({
       taskId: 'task-1',
       attempt: 1,
       turn: 0,
@@ -2525,7 +2537,147 @@ describe('the journal line a failed turn leaves', () => {
       error: new AthanorError('workspace_unreachable', 'no runner'),
       waiting: false
     });
-    expect(line).not.toContain('after');
-    expect(line).toContain('at turn 0 step 0 (attempt 1 of 6');
+    expect(fields).not.toHaveProperty('durationMs');
+    expect(fields).toMatchObject({ turn: 0, step: 0, attempt: 1, attempts: 6 });
+  });
+
+  /**
+   * The other failures a worker has, which are not a task's: leasing stopped working, and the line
+   * that said so used to carry the thrown message. A driver quotes back whatever statement it was
+   * given, so a connection that dropped mid-write published a fragment of it.
+   */
+  it('identifies a failure that is nobody’s task without quoting it', () => {
+    const refused = Object.assign(
+      new Error('terminating connection due to administrator command'),
+      {
+        code: '57P01'
+      }
+    );
+    expect(failureFields(refused).code).toBe('57P01');
+    expect(JSON.stringify(failureFields(refused))).not.toContain('administrator');
+    expect(failureFields(new AthanorError('workspace_missing', 'gone')).code).toBe(
+      'workspace_missing'
+    );
+    expect(failureFields('a bare string')).toEqual({ code: 'string' });
+  });
+});
+
+/**
+ * What any of this box's processes may write to the journal.
+ *
+ * The owner of this box is also its operator, so a failure they cannot read is a failure they
+ * cannot fix - and the only record of one used to be an encrypted event. What may be said out here
+ * is bounded by what the payload is encrypted for: identifiers, counters and the machine's own
+ * account of where it broke, never a word the owner or the model wrote. The list is an allowlist
+ * for that reason: a field nobody put on it is dropped rather than printed, so the cost of an
+ * oversight is a missing value and not a disclosure.
+ */
+describe('the journal every process writes', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  const capture = (level: 'debug' | 'info' | 'warn' | 'error' | 'silent' = 'info') => {
+    const lines: string[] = [];
+    const logger = createLogger({
+      level,
+      service: 'worker',
+      write: (line) => lines.push(line),
+      now: () => new Date('2026-08-10T09:00:00.000Z')
+    });
+    return { logger, lines };
+  };
+
+  it('writes one identifying object per line', () => {
+    const { logger, lines } = capture();
+    logger.info('worker.ready', { workerId: 'worker-7', concurrency: 2, build: '0.1.1 (8425b21)' });
+    expect(JSON.parse(lines[0]!)).toEqual({
+      time: '2026-08-10T09:00:00.000Z',
+      level: 'info',
+      service: 'worker',
+      event: 'worker.ready',
+      workerId: 'worker-7',
+      concurrency: 2,
+      build: '0.1.1 (8425b21)'
+    });
+  });
+
+  it('drops every field that is not on the allowlist', () => {
+    const { logger, lines } = capture();
+    logger.error('task.failed', {
+      taskId: 'c3d4',
+      code: 'agent_failed',
+      prompt: 'summarise my divorce papers',
+      title: 'Private task',
+      apiKey: 'sk-live-000111222333444555666'
+    });
+    expect(JSON.parse(lines[0]!)).toEqual({
+      time: '2026-08-10T09:00:00.000Z',
+      level: 'error',
+      service: 'worker',
+      event: 'task.failed',
+      taskId: 'c3d4',
+      code: 'agent_failed'
+    });
+  });
+
+  it('scrubs a secret that reaches an allowlisted field anyway', () => {
+    const { logger, lines } = capture();
+    logger.warn('worker.lease_failed', { code: 'Bearer sk-live-000111222333444555666' });
+    expect(lines[0]).not.toContain('sk-live');
+    expect(lines[0]).toContain('[REDACTED]');
+  });
+
+  it('honours the configured threshold, and silence means silence', () => {
+    const { logger, lines } = capture('warn');
+    logger.info('worker.ready', { workerId: 'worker-7' });
+    logger.error('worker.lease_failed', { code: 'ECONNREFUSED' });
+    expect(lines.map((line) => (JSON.parse(line) as { event: string }).event)).toEqual([
+      'worker.lease_failed'
+    ]);
+    const silenced = capture('silent');
+    silenced.logger.error('worker.lease_failed', { code: 'ECONNREFUSED' });
+    expect(silenced.lines).toHaveLength(0);
+  });
+
+  /**
+   * Without the prefix every line this box writes sits at info, and `journalctl -p err` - the first
+   * thing anybody runs on a server that is misbehaving - answers that nothing has ever gone wrong.
+   */
+  it('marks the priority for journald, and only when journald is reading', () => {
+    const { logger, lines } = capture();
+    vi.stubEnv('JOURNAL_STREAM', '8:1234567');
+    logger.error('worker.lease_failed', { code: 'ECONNREFUSED' });
+    expect(lines[0]!.startsWith('<3>')).toBe(true);
+    expect(JSON.parse(lines[0]!.slice(3))).toMatchObject({ level: 'error' });
+    expect(journalLevelPrefix('warn')).toBe('<4>');
+    expect(journalLevelPrefix('info')).toBe('<6>');
+    vi.unstubAllEnvs();
+    // In a terminal there is no journal to file anything in, so the line is JSON and nothing else.
+    logger.error('worker.lease_failed', { code: 'ECONNREFUSED' });
+    expect(lines[1]!.startsWith('{')).toBe(true);
+    expect(journalLevelPrefix('error')).toBe('');
+  });
+});
+
+/**
+ * Which build is running, which nothing could say before: a bug report started with a guess, and an
+ * owner who had just run `athanor update` had no way to tell whether anything had changed.
+ */
+describe('the build identity', () => {
+  it('names the version this checkout calls itself and the revision it is on', () => {
+    const build = buildIdentity();
+    const manifest = JSON.parse(
+      readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')
+    ) as { version: string };
+    // The same string `scripts/check-repository.mjs` holds the printed install command to, which is
+    // what makes "0.1.1" mean the release a new box is handed rather than a number in a file.
+    expect(build.version).toBe(manifest.version);
+    expect(build.commit).toMatch(/^[0-9a-f]{7}$/);
+    expect(buildLabel(build)).toBe(`${manifest.version} (${build.commit})`);
+  });
+
+  it('is worked out once, so it answers for the code that is running', () => {
+    expect(buildIdentity()).toBe(buildIdentity());
   });
 });

@@ -409,3 +409,47 @@ printf 'at=2026-08-10T03:00:00Z\noutcome=ok\nreason=\n' >"$backup_status_file"
 run_athanor backup auto alert >/dev/null 2>&1
 test "$(status_field outcome)" = ok
 printf 'ok  a run killed before it finished is recorded, and a finished one is left alone\n'
+
+# Restore is the command the owner reaches for on their worst day, and it empties the workspace
+# tree before it extracts into it. The backup path has refused before stopping anything since the
+# day a full disk cost somebody an outage; restore checked nothing at all, so a destination too
+# small to hold the archive was discovered with the data already deleted and the copy half unpacked
+# - the exact loss this command exists to undo, caused by the command itself.
+printf 'data-worth-recovering\n' >"$home/persistent.txt"
+run_athanor backup >/dev/null 2>&1
+recovery_backup=$(
+  find "$backups" -mindepth 1 -maxdepth 1 -type d -name '????????T??????Z' | sort -r | sed -n '1p'
+)
+sleep 1
+printf 'data-written-since\n' >"$home/persistent.txt"
+run_athanor backup >/dev/null 2>&1
+: >"$command_log"
+make_fake df '
+printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+printf "/dev/synthetic 1024 1000 24 98%% /\n"'
+# Retaining one copy while restoring from the older of two: the prune that makes room would
+# otherwise take the very directory being read from, which is how a recovery becomes a loss.
+if refused_restore=$(
+  ATHANOR_TEST_BACKUP_KEEP=1 run_athanor restore "$recovery_backup" --yes 2>&1
+); then
+  printf 'a restore that could not fit reported success\n' >&2
+  exit 1
+fi
+rm -f "$fake_bin/df"
+grep -q 'not enough room to restore' <<REFUSAL
+$refused_restore
+REFUSAL
+# The three things that make the refusal worth having: nothing was stopped, the data that was about
+# to be deleted is still there, and the copy being restored from survived the prune.
+if grep -q 'systemctl stop' "$command_log"; then
+  printf 'the restore stopped the server before finding out it could not fit\n' >&2
+  exit 1
+fi
+test "$(cat "$home/persistent.txt")" = "data-written-since"
+test -f "$recovery_backup/SHA256SUMS"
+printf 'ok  a restore that would not fit refuses before it stops or wipes anything\n'
+
+# And it is a check rather than a wall: with room on the disk the same restore puts the data back.
+run_athanor restore "$recovery_backup" --yes >/dev/null 2>&1
+test "$(cat "$home/persistent.txt")" = "data-worth-recovering"
+printf 'ok  a restore that fits still restores\n'

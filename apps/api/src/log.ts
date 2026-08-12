@@ -1,83 +1,26 @@
-import { AthanorError, redactText } from '@athanor/core';
-
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
-export type LogThreshold = LogLevel | 'silent';
-
-const levelRank: Record<LogThreshold, number> = {
-  debug: 10,
-  info: 20,
-  warn: 30,
-  error: 40,
-  silent: 100
-};
+import { AthanorError } from '@athanor/core';
 
 /**
- * Server logs exist so the owner can tie a failure report back to what the process did, and for
- * nothing else. Prompts, messages, titles, file contents, keys, tokens and cookies must never
- * reach a log line, so the field set is an allowlist rather than a denylist: a name nobody put
- * here is dropped instead of printed, which makes an accidental leak a missing field rather than
- * a disclosure. Everything on the list is a random identifier, a code the server itself chose, or
- * a number.
+ * The API's end of the one journal format.
+ *
+ * The logger itself, and with it the allowlist that decides what a line may name, is in
+ * `@athanor/worker`: the API depends on that package, nothing depends on the API, and the only
+ * other thing every process imports is compiled into the browser bundle where there is no stdout
+ * to write to. What stays here is what needs athanor's own error vocabulary, which lives a layer
+ * above the logger.
  */
-const loggableFields = new Set([
-  'approvalId',
-  'attempt',
-  'code',
-  'count',
-  'driver',
-  'delayMs',
-  'durationMs',
-  'frames',
-  /** What a throw was, when it carried no frames to read. */
-  'thrown',
-  'kind',
-  /** The box's relay address: derived from its own public key, and public in certificate logs. */
-  'label',
-  'method',
-  'modelId',
-  'outcome',
-  'port',
-  'privacyRoute',
-  'requestId',
-  'resourceClass',
-  'route',
-  'scheduleId',
-  'service',
-  'status',
-  'statusCode',
-  'taskId',
-  'userId',
-  'workspaceId'
-]);
-
-export type LogValue = string | number | boolean | null | undefined;
-export type LogFields = Readonly<Record<string, LogValue>>;
-
-/**
- * Objects and arrays are refused outright: nothing structured on a failure path is worth the risk
- * that one of its branches carries user data. Strings still pass through the shared secret
- * scrubber, so a value that turns out to embed an API key is neutered rather than published.
- */
-const safeValue = (value: LogValue): LogValue => {
-  if (value === null || value === undefined) return undefined;
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
-  // Types are a promise, not a guarantee: a logger that throws on an unexpected value would
-  // silence the very failure it was called to record.
-  if (typeof value !== 'string') return undefined;
-  return redactText(value).slice(0, 300);
-};
-
-export const loggableEntries = (fields: LogFields): Record<string, string | number | boolean> => {
-  const entries: Record<string, string | number | boolean> = {};
-  for (const [key, raw] of Object.entries(fields)) {
-    if (!loggableFields.has(key)) continue;
-    const value = safeValue(raw);
-    if (value === undefined || value === null) continue;
-    entries[key] = value;
-  }
-  return entries;
-};
+export {
+  createLogger,
+  journalLevelPrefix,
+  silentLogger,
+  type Logger,
+  type LoggerOptions,
+  type LogFields,
+  type LogLevel,
+  type LogThreshold,
+  type LogValue
+} from '@athanor/worker';
+import type { LogFields, Logger } from '@athanor/worker';
 
 /**
  * A stack trace names code locations, never the data that flowed through them, so the frames are
@@ -85,17 +28,44 @@ export const loggableEntries = (fields: LogFields): Record<string, string | numb
  * error routinely quotes the offending value back.
  */
 const errorFrames = (error: unknown): string | undefined => {
-  const stack = error instanceof Error ? error.stack : undefined;
-  if (!stack) return undefined;
-  // Matched on shape rather than on the leading "at ", so a multi-line message cannot pass one of
-  // its own lines off as a frame: a real V8 frame always ends in a file position.
-  const frames = stack
+  if (!(error instanceof Error) || !error.stack) return undefined;
+  /*
+   * Found by cutting the header off the front, rather than by recognising what a frame looks like.
+   *
+   * A stack begins with the message, the message can be several lines long, and one of those lines
+   * can be shaped exactly like a frame - which is not a contrivance: an error that wraps a failed
+   * subprocess carries that program's own trace in its message, and that trace names the owner's
+   * files. Recognising frames by shape printed those, because a real frame and a quoted one are the
+   * same string. The header is the one part of a stack whose exact text is known here; a stack that
+   * does not begin with the one it should - anything that rewrote it - gets no frames at all,
+   * because silence is the only safe answer to a string this cannot account for.
+   */
+  const header = error.message === '' ? error.name : `${error.name}: ${error.message}`;
+  if (!error.stack.startsWith(header)) return undefined;
+  const frames = error.stack
+    .slice(header.length)
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => /^at\s\S.*:\d+:\d+\)?$/.test(line))
     .slice(0, 3);
   return frames.length ? frames.join(' | ') : undefined;
 };
+
+/**
+ * One word, or nothing.
+ *
+ * Every candidate for `code` on this line is a string somebody else chose. Two of them are not
+ * athanor's to trust however much they look like it: an AthanorError's code is this repository's
+ * own vocabulary where it is written by hand, but `runnerFailure` mints one from the `code` field
+ * of whatever JSON the workspace runner answered with, and `name` is an ordinary writable property
+ * that a library is free to put a sentence in. Both arrive off a wire, unbounded, free to carry
+ * what the failing call was about - which is the owner's.
+ *
+ * So the shape is the gate rather than the provenance, and it is the same shape the worker holds
+ * its half of this format to. A value that is not one machine word is dropped, and the line still
+ * says what failed and where.
+ */
+const MACHINE_WORD = /^[A-Za-z0-9_.-]{1,64}$/;
 
 /**
  * The identity of a failure without its wording: an Athanor code where one exists, otherwise a
@@ -105,11 +75,15 @@ export const errorFields = (error: unknown): LogFields => {
   const carried = (error as { code?: unknown } | null)?.code;
   const code =
     error instanceof AthanorError
-      ? error.code
-      : typeof carried === 'string' && /^[A-Za-z0-9_.-]{1,40}$/.test(carried)
+      ? MACHINE_WORD.test(error.code)
+        ? error.code
+        : 'api_failed'
+      : typeof carried === 'string' && MACHINE_WORD.test(carried)
         ? carried
         : error instanceof Error
-          ? error.name
+          ? MACHINE_WORD.test(error.name)
+            ? error.name
+            : 'Error'
           : 'non_error_throw';
   const frames = errorFrames(error);
   // What was thrown, when it left no frames to read.
@@ -130,54 +104,6 @@ export const errorFields = (error: unknown): LogFields => {
           ? 'plain object'
           : typeof error;
   return { code, ...(frames ? { frames } : {}), ...(shape ? { thrown: shape } : {}) };
-};
-
-export interface Logger {
-  debug(event: string, fields?: LogFields): void;
-  info(event: string, fields?: LogFields): void;
-  warn(event: string, fields?: LogFields): void;
-  error(event: string, fields?: LogFields): void;
-}
-
-export interface LoggerOptions {
-  level: LogThreshold;
-  service?: string;
-  write?: (line: string) => void;
-  now?: () => Date;
-}
-
-/**
- * One JSON object per line on stdout, which is what journald stores and `athanor logs` replays.
- */
-export const createLogger = (options: LoggerOptions): Logger => {
-  const threshold = levelRank[options.level];
-  const write = options.write ?? ((line: string) => process.stdout.write(`${line}\n`));
-  const now = options.now ?? (() => new Date());
-  const emit = (level: LogLevel, event: string, fields: LogFields = {}): void => {
-    if (levelRank[level] < threshold) return;
-    write(
-      JSON.stringify({
-        time: now().toISOString(),
-        level,
-        ...(options.service ? { service: options.service } : {}),
-        event,
-        ...loggableEntries(fields)
-      })
-    );
-  };
-  return {
-    debug: (event, fields) => emit('debug', event, fields),
-    info: (event, fields) => emit('info', event, fields),
-    warn: (event, fields) => emit('warn', event, fields),
-    error: (event, fields) => emit('error', event, fields)
-  };
-};
-
-export const silentLogger: Logger = {
-  debug: () => undefined,
-  info: () => undefined,
-  warn: () => undefined,
-  error: () => undefined
 };
 
 export interface ProcessGuardTarget {

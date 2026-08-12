@@ -51,6 +51,7 @@ import type {
   MediaModelSelection,
   MediaSettings
 } from '@athanor/contracts';
+import { buildLabel, type BuildIdentity } from '@athanor/contracts';
 import { webSearchSummary } from './web-search-route.js';
 import { spendLimitsDraft, spendLimitsPatch, type SpendLimitsDraft } from './usage-model.js';
 import { securityModeCopy, securityModeNotice, securityModes } from './security-mode.js';
@@ -493,6 +494,7 @@ export function SelfHostedSettings({
     certificate: { failedAt: string; reason: string } | null;
     dynamicDns: { failedAt: string; reason: string } | null;
     backup?: BackupStatus | null;
+    build?: BuildIdentity;
   }>();
   const [relayHost, setRelayHost] = useState('');
   const [relayToken, setRelayToken] = useState('');
@@ -2470,6 +2472,16 @@ export function SelfHostedSettings({
                 about updates, and had nothing install itself.
               */}
               <small>
+                {/*
+                  Which build is running, beside the command that changes it. An owner who runs
+                  `sudo athanor update` had no way to see whether anything moved, and a bug report
+                  had to start with a guess. One line where it is about something, not a panel.
+                */}
+                {diagnostics?.build ? (
+                  <>
+                    Running <code>{buildLabel(diagnostics.build)}</code>.{' '}
+                  </>
+                ) : null}
                 Updates are yours to run: <code>sudo athanor update</code>. To have them install
                 themselves weekly, backing up first and rolling back if the new release does not
                 serve: <code>sudo athanor auto-update on</code>. Also on the server:{' '}

@@ -130,7 +130,18 @@ const REQUIRED_BINARIES = [
   'unzip',
   'zip'
 ];
-const REQUIRED_MODULES = ['PIL', 'docx', 'matplotlib', 'openpyxl', 'pandas', 'pptx', 'pypdf'];
+const REQUIRED_MODULES = [
+  'PIL',
+  'docx',
+  'matplotlib',
+  'numpy',
+  'openpyxl',
+  'pandas',
+  'pptx',
+  'pypdf',
+  'scipy',
+  'statsmodels'
+];
 // Carlito and Caladea are the Calibri and Cambria metrics; the rest are what a typeset document
 // and a rendered slide fall back to, and a missing fallback is a silent substitution.
 const REQUIRED_FONTS = ['Carlito', 'Caladea', 'Liberation Sans', 'Liberation Serif', 'DejaVu Sans'];

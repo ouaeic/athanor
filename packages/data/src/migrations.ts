@@ -2181,5 +2181,61 @@ export const migrations = [
       CREATE INDEX IF NOT EXISTS tasks_name_tsv_gin ON tasks USING gin (name_tsv)
         WITH (fastupdate = off) WHERE name_tsv IS NOT NULL;
     `
+  },
+  {
+    version: 64,
+    name: 'the_workspace_says_who_is_inside_it',
+    // One agent per workspace was enforced by asking the tasks table whether any other task in the
+    // workspace held a live lease. Under READ COMMITTED that question is answered from a snapshot,
+    // and the snapshot outlives a competitor's commit by exactly as long as the competitor's lock
+    // does - so two polls a millisecond apart could both read a free workspace and both take a
+    // task in it. No arrangement of that query closes the gap, because the lock that would make
+    // the second wait is released at precisely the moment its snapshot stops being stale.
+    //
+    // Recording the hold on the workspace row turns the question into a predicate on the row being
+    // locked, which is the one thing PostgreSQL will re-check for you: a writer that finds the row
+    // updated under it re-evaluates its WHERE against the version the competitor committed, and
+    // the loser matches nothing.
+    //
+    // The expiry beside it is the part that matters most. A hold nothing can clear would wedge the
+    // workspace forever, which is far worse than the race it replaces, so the hold carries the same
+    // deadline as the task lease written in the same statement: a worker that dies holding both
+    // lets go of both at the same instant, with nobody to run the sweep that would have done it.
+    // The trigger is the second, faster path - it hands the workspace back the moment the task
+    // stops holding a live lease, however the task got there, so no future caller has to remember.
+    //
+    // Every incomplete state reads as free, deliberately and in that order: a null holder, a null
+    // deadline, a deadline in the past. The foreign key nulls the holder when a conversation is
+    // deleted, which leaves exactly one of those states behind, and it is the harmless one.
+    //
+    // Safe on a live box: two nullable columns with no default are a catalogue change, and the
+    // foreign key validates against a table where every value is still NULL.
+    sql: `
+      ALTER TABLE workspaces
+        ADD COLUMN IF NOT EXISTS lease_task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,
+        ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+
+      CREATE OR REPLACE FUNCTION release_workspace_hold() RETURNS trigger
+      LANGUAGE plpgsql AS $ath$
+      BEGIN
+        UPDATE workspaces SET lease_task_id = NULL, lease_expires_at = NULL
+        WHERE id = NEW.workspace_id AND lease_task_id = NEW.id;
+        RETURN NULL;
+      END $ath$;
+
+      -- Narrow on purpose, because tasks are written several times a step. The column list means
+      -- a write that does not mention the lease never considers this at all, and the condition
+      -- means a turn that is still running - by far the common case - stops at a boolean.
+      --
+      -- It reaches the workspace holding the task, which is the order every statement here that
+      -- can wait already takes those two rows in. The one that takes them the other way round is
+      -- the lease itself, and it waits on nothing, so there is no cycle to close.
+      CREATE OR REPLACE TRIGGER t_workspace_hold_release
+        AFTER UPDATE OF lease_owner, lease_expires_at ON tasks
+        FOR EACH ROW
+        WHEN (OLD.lease_expires_at IS NOT NULL
+              AND (NEW.lease_expires_at IS NULL OR NEW.lease_expires_at <= NOW()))
+        EXECUTE FUNCTION release_workspace_hold();
+    `
   }
 ] as const;

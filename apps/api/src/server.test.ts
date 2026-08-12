@@ -3410,7 +3410,11 @@ describe('authentication posture', () => {
       headers: { cookie }
     });
     expect(healthy.statusCode, healthy.body).toBe(200);
-    expect(healthy.json()).toEqual({ certificate: null, dynamicDns: null, backup: null });
+    // The build is always there, healthy or not: it is what a bug report about any of the rest of
+    // this has to start with, and it is the only way to read it without a terminal.
+    const { build } = healthy.json<{ build: { version: string; commit: string | null } }>();
+    expect(build.version).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(healthy.json()).toEqual({ certificate: null, dynamicDns: null, backup: null, build });
 
     await writeFile(
       join(directory, 'certificate.error'),

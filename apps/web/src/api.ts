@@ -41,7 +41,7 @@ import {
   type UpdateNotificationSettingsRequest
 } from './notification-settings.js';
 import { readNotices, type AgentNotification } from './notice-log.js';
-import type { SecurityMode } from '@athanor/contracts';
+import type { BuildIdentity, SecurityMode } from '@athanor/contracts';
 import {
   startAuthentication,
   startRegistration,
@@ -848,6 +848,8 @@ export const api = {
       dynamicDns: { failedAt: string; reason: string } | null;
       /** The last backup run and the newest copy it left. Absent from a box older than this field. */
       backup?: BackupStatus | null;
+      /** Which build is answering. Absent from a box older than this field. */
+      build?: BuildIdentity;
     }>('/v1/instance/diagnostics'),
   revokePreview: (id: string) =>
     request<{ revoked: boolean }>(`/v1/previews/${id}`, mutation('DELETE', {})),

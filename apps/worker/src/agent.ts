@@ -1,9 +1,11 @@
 import { createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MAX_AGENT_NOTIFICATIONS_PER_TASK,
   TaskScheduleSpec,
   resolveWebToolPlan,
+  type BuildIdentity,
   type ModelRelease,
   type ParallelWebReadResult,
   type ServerToolUse,
@@ -2852,20 +2854,260 @@ const event = async (
   });
 
 /**
+ * What every athanor process writes to the journal.
+ *
+ * Two formats used to share this box. The API wrote one JSON object per line, with an allowlist of
+ * field names deciding what may appear; this process wrote English sentences, each of them guarding
+ * its own values by hand. Both were defensible alone. Together they meant the owner greps twice for
+ * one failure, and that half the lines on the box rested on every author remembering the rule
+ * rather than on a list that drops what nobody put on it. The lease line is what that costs: it
+ * printed the thrown message, so a database that refused a connection published whatever the driver
+ * felt like quoting back.
+ *
+ * The structured line won, and it gained the one thing the sentences had that it lacked - the
+ * priority prefix, so `journalctl -p err` still finds a real failure.
+ *
+ * It lives here rather than in the API because the API depends on this package and not the other
+ * way round, and the only other thing both import - `@athanor/contracts` - is compiled into the
+ * browser bundle, where there is no `process` to read a journal stream or a stdout off.
+ */
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+export type LogThreshold = LogLevel | 'silent';
+export type LogValue = string | number | boolean | null | undefined;
+export type LogFields = Readonly<Record<string, LogValue>>;
+
+const levelRank: Record<LogThreshold, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+  silent: 100
+};
+
+/**
+ * Logs exist so the owner can tie a failure report back to what the process did, and for nothing
+ * else. Prompts, messages, titles, file contents, keys, tokens and cookies must never reach a log
+ * line, so the field set is an allowlist rather than a denylist: a name nobody put here is dropped
+ * instead of printed, which makes an accidental leak a missing field rather than a disclosure.
+ * Everything on the list is a random identifier, a code the machine itself chose, or a number.
+ */
+const loggableFields = new Set([
+  'approvalId',
+  'attempt',
+  /** How many attempts a task gets in all, so `attempt` reads as a fraction of something. */
+  'attempts',
+  /** Which build produced the line: a version and a revision, and nothing about this box. */
+  'build',
+  /** What was thrown, where athanor's own vocabulary has no word for it. */
+  'class',
+  'code',
+  'concurrency',
+  'count',
+  'driver',
+  'delayMs',
+  'durationMs',
+  'frames',
+  /** The same stack came round again and was printed further up rather than a second time. */
+  'framesRepeated',
+  /** What a throw was, when it carried no frames to read. */
+  'thrown',
+  'kind',
+  /** The box's relay address: derived from its own public key, and public in certificate logs. */
+  'label',
+  'method',
+  'modelId',
+  'outcome',
+  'port',
+  'privacyRoute',
+  'requestId',
+  'resourceClass',
+  'route',
+  'scheduleId',
+  'service',
+  'status',
+  'statusCode',
+  'step',
+  'taskId',
+  'turn',
+  'userId',
+  'workerId',
+  'workspaceId'
+]);
+
+/**
+ * Objects and arrays are refused outright: nothing structured on a failure path is worth the risk
+ * that one of its branches carries user data. Strings still pass through the shared secret
+ * scrubber, so a value that turns out to embed an API key is neutered rather than published.
+ */
+const safeValue = (value: LogValue): LogValue => {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  // Types are a promise, not a guarantee: a logger that throws on an unexpected value would
+  // silence the very failure it was called to record.
+  if (typeof value !== 'string') return undefined;
+  return redactText(value).slice(0, 300);
+};
+
+const loggableEntries = (fields: LogFields): Record<string, string | number | boolean> => {
+  const entries: Record<string, string | number | boolean> = {};
+  for (const [key, raw] of Object.entries(fields)) {
+    if (!loggableFields.has(key)) continue;
+    const value = safeValue(raw);
+    if (value === undefined || value === null) continue;
+    entries[key] = value;
+  }
+  return entries;
+};
+
+/**
  * systemd reads a leading `<N>` off a line and files it at that priority, which is the difference
  * between a failed task appearing in `journalctl -p err` and sitting at info among everything else
  * the box says. JOURNAL_STREAM is set by systemd itself, and only when this process's output goes
- * to the journal, so a worker started in a terminal prints the plain sentence instead.
+ * to the journal, so a process started in a terminal writes plain JSON and journald is the only
+ * reader that ever sees the marker.
  */
-export const journalLevelPrefix = (level: 'error' | 'warning' | 'info'): string =>
-  process.env.JOURNAL_STREAM ? { error: '<3>', warning: '<4>', info: '<6>' }[level] : '';
+export const journalLevelPrefix = (level: LogLevel): string =>
+  process.env.JOURNAL_STREAM ? { debug: '<7>', info: '<6>', warn: '<4>', error: '<3>' }[level] : '';
+
+export interface Logger {
+  debug(event: string, fields?: LogFields): void;
+  info(event: string, fields?: LogFields): void;
+  warn(event: string, fields?: LogFields): void;
+  error(event: string, fields?: LogFields): void;
+}
+
+export interface LoggerOptions {
+  level: LogThreshold;
+  service?: string;
+  write?: (line: string) => void;
+  now?: () => Date;
+}
+
+/** One JSON object per line on stdout, which is what journald stores and `athanor logs` replays. */
+export const createLogger = (options: LoggerOptions): Logger => {
+  const threshold = levelRank[options.level];
+  const write = options.write ?? ((line: string) => process.stdout.write(`${line}\n`));
+  const now = options.now ?? (() => new Date());
+  const emit = (level: LogLevel, event: string, fields: LogFields = {}): void => {
+    if (levelRank[level] < threshold) return;
+    write(
+      `${journalLevelPrefix(level)}${JSON.stringify({
+        time: now().toISOString(),
+        level,
+        ...(options.service ? { service: options.service } : {}),
+        event,
+        ...loggableEntries(fields)
+      })}`
+    );
+  };
+  return {
+    debug: (event, fields) => emit('debug', event, fields),
+    info: (event, fields) => emit('info', event, fields),
+    warn: (event, fields) => emit('warn', event, fields),
+    error: (event, fields) => emit('error', event, fields)
+  };
+};
+
+export const silentLogger: Logger = {
+  debug: () => undefined,
+  info: () => undefined,
+  warn: () => undefined,
+  error: () => undefined
+};
+
+/** The journal this process writes to when nobody handed it one. */
+export const workerLogger = createLogger({ level: 'info', service: 'worker' });
+
+/** Everything below the running file: `apps/worker/{src,dist}` sit the same distance from it. */
+const checkoutRoot = new URL('../../../', import.meta.url);
+
+const readTextFile = (file: URL): string | null => {
+  try {
+    return readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+};
+
+/** A directory that may be named absolutely or from where the file naming it sits. */
+const directoryNamed = (name: string, from: URL): URL =>
+  new URL(name.endsWith('/') ? name : `${name}/`, from);
+
+const FULL_REVISION = /^[0-9a-f]{40}$/;
+
+/**
+ * What HEAD points at, read out of git's own files rather than by running git: this is a boot path,
+ * it runs under systemd where there is barely a PATH, and the files involved are a documented
+ * format that has not changed in twenty years.
+ *
+ * Installing at a pinned tag leaves HEAD detached, so it holds the revision itself. `athanor update`
+ * checks out a branch and pulls, so from then on it is a reference to a loose file. A clone that has
+ * never moved has neither, and the reference is in the packed set instead. A linked worktree - which
+ * is a developer's tree and never a box - keeps its HEAD apart from the refs both of them mean, and
+ * says where each lives.
+ */
+const headRevision = (): string | null => {
+  const linked = /^gitdir:\s*(.+)$/m.exec(readTextFile(new URL('.git', checkoutRoot)) ?? '')?.[1];
+  const gitDirectory = linked
+    ? directoryNamed(linked.trim(), checkoutRoot)
+    : new URL('.git/', checkoutRoot);
+  const common = readTextFile(new URL('commondir', gitDirectory))?.trim();
+  const refsDirectory = common ? directoryNamed(common, gitDirectory) : gitDirectory;
+  const head = readTextFile(new URL('HEAD', gitDirectory))?.trim();
+  if (!head) return null;
+  const reference = /^ref:\s*(\S+)$/.exec(head)?.[1];
+  if (!reference) return FULL_REVISION.test(head) ? head.slice(0, 7) : null;
+  // A path taken out of a file and turned into another file to read is worth bounding, even where
+  // the file it came from is our own.
+  if (!/^refs\/[A-Za-z0-9._/-]+$/.test(reference)) return null;
+  const loose = readTextFile(new URL(reference, refsDirectory))?.trim();
+  if (loose && FULL_REVISION.test(loose)) return loose.slice(0, 7);
+  for (const line of (readTextFile(new URL('packed-refs', refsDirectory)) ?? '').split('\n')) {
+    const [revision, name] = line.trim().split(' ');
+    if (name === reference && revision && FULL_REVISION.test(revision)) return revision.slice(0, 7);
+  }
+  return null;
+};
+
+/**
+ * Which build this process is.
+ *
+ * Derived at runtime, deliberately, rather than stamped in by the build. `pnpm -r build` is not the
+ * only way a dist directory comes to exist, and a stamp that is absent whenever the step did not run
+ * spends its life reading "unknown" - an identity that is usually unknown is not an identity, and it
+ * is worse than none because it looks like one. Both halves here are facts about the tree the
+ * running file is sitting in, which cannot go stale: the version out of the one package.json that
+ * `scripts/check-repository.mjs` already holds the printed install command to, so it names the
+ * release a new box is handed rather than a number in a file; and the revision out of the checkout,
+ * because `athanor update` is a `git pull` and HEAD is the thing it moved.
+ *
+ * Worked out once. A box that has been updated in place is running the code it started with, so a
+ * second reading would answer for a tree this process is no longer the product of.
+ */
+let identity: BuildIdentity | null = null;
+export const buildIdentity = (): BuildIdentity =>
+  (identity ??= { version: declaredVersion(), commit: headRevision() });
+
+const declaredVersion = (): string => {
+  try {
+    const manifest = JSON.parse(readTextFile(new URL('package.json', checkoutRoot)) ?? '{}') as {
+      version?: string;
+    };
+    return manifest.version ?? 'unknown';
+  } catch {
+    // Nothing about a build identity is worth taking a process down for, and a checkout whose
+    // package.json will not parse has already failed at something louder than this.
+    return 'unknown';
+  }
+};
 
 /** How many stacks are remembered before the set is emptied and one of them may repeat. */
 const REMEMBERED_FAILURE_STACKS = 64;
 
 /**
- * The shape of everything this line is allowed to name: a code, an errno, a class. Anything that
- * does not fit was not chosen by the machine, and this line prints only what the machine chose.
+ * The shape of everything this record is allowed to name: a code, an errno, a class. Anything that
+ * does not fit was not chosen by the machine, and this record carries only what the machine chose.
  */
 const MACHINE_WORD = /^[A-Za-z0-9_.-]{1,64}$/;
 
@@ -2926,6 +3168,20 @@ const failureStack = (error: unknown): string => {
   );
 };
 
+/**
+ * The identity of a failure that is not a task's, in the same words a failed task uses: athanor's
+ * own code where it has one, otherwise the driver's SQLSTATE, the system errno or the class that
+ * was thrown - and the frames, which name code locations and never what flowed through them.
+ */
+export const failureFields = (error: unknown): LogFields => {
+  const kind = failureClass(error);
+  const stack = kind ? failureStack(error) : '';
+  return {
+    code: error instanceof AthanorError ? failureCode(error) : (kind ?? 'unknown'),
+    ...(stack ? { frames: stack } : {})
+  };
+};
+
 export interface TaskFailureLog {
   taskId: string;
   attempt: number;
@@ -2940,7 +3196,7 @@ export interface TaskFailureLog {
 }
 
 /**
- * A journal line an operator can act on, for a turn that has just died.
+ * The journal record an operator can act on, for a turn that has just died.
  *
  * The encrypted `error` event is the owner's record and stays exactly as it is - it can quote a
  * path, a command, a fragment of the work - which means reading it needs the master key and a
@@ -2949,16 +3205,19 @@ export interface TaskFailureLog {
  * the message, because the message is where the owner's content ends up - a driver quotes the
  * offending value back, a filesystem error names the file, a provider echoes the prompt.
  *
- * The stack is the exception, and it is the same exception the API's logger already makes: frames
- * name code locations and never the data that flowed through them. They are printed only where the
- * failure came from the machine rather than from athanor's own judgement - an AthanorError says
- * what it is in one word and needs no frames - and only the first time this process prints that
- * particular stack, so a task handed out six times leaves six one-line records and one trace.
+ * The stack is the exception: frames name code locations and never the data that flowed through
+ * them. They are recorded only where the failure came from the machine rather than from athanor's
+ * own judgement - an AthanorError says what it is in one word and needs no frames - and only the
+ * first time this process records that particular stack, so a task handed out six times leaves six
+ * records and one trace. `framesRepeated` is how the five other records say where it went.
+ *
+ * A turn parked on a provider is a warning rather than an error, which is what keeps
+ * `journalctl -p err` a list of things that are actually broken.
  */
-export const taskFailureLogLine = (
+export const taskFailureRecord = (
   input: TaskFailureLog,
   loggedStacks: Set<string> = new Set()
-): string => {
+): { level: LogLevel; event: string; fields: LogFields } => {
   const code = failureCode(input.error);
   const kind = failureClass(input.error);
   const stack = kind ? failureStack(input.error) : '';
@@ -2970,14 +3229,22 @@ export const taskFailureLogLine = (
     if (loggedStacks.size >= REMEMBERED_FAILURE_STACKS) loggedStacks.clear();
     loggedStacks.add(fingerprint);
   }
-  const detail = kind
-    ? ` (${kind}${repeated ? ', stack already logged above' : ''})${repeated || !stack ? '' : ` ${stack}`}`
-    : '';
-  const ran =
-    input.durationMs === undefined ? '' : ` after ${(input.durationMs / 1000).toFixed(1)}s`;
-  return `${journalLevelPrefix(input.waiting ? 'warning' : 'error')}[athanor] task ${input.taskId} ${
-    input.waiting ? 'is waiting on a provider' : 'failed'
-  } at turn ${input.turn} step ${input.step}${ran} (attempt ${input.attempt} of ${TASK_MAX_ATTEMPTS}, model ${input.modelId}): ${code}${detail}\n`;
+  return {
+    level: input.waiting ? 'warn' : 'error',
+    event: input.waiting ? 'task.waiting' : 'task.failed',
+    fields: {
+      taskId: input.taskId,
+      turn: input.turn,
+      step: input.step,
+      attempt: input.attempt,
+      attempts: TASK_MAX_ATTEMPTS,
+      modelId: input.modelId,
+      ...(input.durationMs === undefined ? {} : { durationMs: input.durationMs }),
+      code,
+      ...(kind ? { class: kind } : {}),
+      ...(stack ? (repeated ? { framesRepeated: true } : { frames: stack }) : {})
+    }
+  };
 };
 
 export class AgentWorker {
@@ -3009,7 +3276,13 @@ export class AgentWorker {
     private readonly store: DataStore,
     private readonly config: AgentWorkerConfig,
     masterKey: Uint8Array,
-    runnerSharedSecret: string
+    runnerSharedSecret: string,
+    /**
+     * Where this worker's own records go. The API runs one of these inside its own process, and a
+     * failure there belongs in the API's journal at the API's threshold rather than in a second
+     * stream nobody configured.
+     */
+    private readonly logger: Logger = workerLogger
   ) {
     if (masterKey.byteLength !== 32) throw new Error('Agent worker master key must be 32 bytes');
     this.#masterKey = Buffer.from(masterKey);
@@ -9887,22 +10160,21 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       }
     }
     // Before the writes below, all of which need the database - which is one of the things that
-    // fails here. The journal line is the record that survives the store being the problem.
-    process.stderr.write(
-      taskFailureLogLine(
-        {
-          taskId: task.id,
-          attempt: task.attempt,
-          turn,
-          step,
-          modelId: task.modelId,
-          ...(durationMs === undefined ? {} : { durationMs }),
-          error,
-          waiting
-        },
-        this.#loggedFailureStacks
-      )
+    // fails here. The journal record is the one that survives the store being the problem.
+    const record = taskFailureRecord(
+      {
+        taskId: task.id,
+        attempt: task.attempt,
+        turn,
+        step,
+        modelId: task.modelId,
+        ...(durationMs === undefined ? {} : { durationMs }),
+        error,
+        waiting
+      },
+      this.#loggedFailureStacks
     );
+    this.logger[record.level](record.event, record.fields);
     if (workspace?.wrappedKey) {
       const key = unwrapDataKey(workspace.wrappedKey, this.#masterKey, workspace.id);
       await event(

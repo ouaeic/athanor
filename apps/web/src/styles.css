@@ -2896,8 +2896,24 @@ video.artifact-media {
   margin: 12px 0;
 }
 
+/*
+  The one text field in Settings that nobody wrapped in a label.
+
+  The dressed treatment further down hangs off `.modal label > input`, which is how the other
+  twenty-seven fields on these pages are written. This one is not inside a label - it sits in a grid
+  beside its button - so it took only the colour from the bare-input rule and kept the user agent's
+  own two-pixel inset border and square corners, in a column of one-pixel nine-radius ones. Measured
+  in the browser rather than noticed by eye: every other field reported `9px / 1px / #3c3731` and
+  this reported `0 / 2px`.
+
+  Dressed here rather than by loosening the selector above, because that rule is what keeps the
+  range, checkbox and radio controls out, and widening it to reach one field would put every custom
+  control in the product back inside it.
+*/
 .recovery-create input {
   min-width: 0;
+  border: 1px solid #3c3731;
+  border-radius: 9px;
 }
 
 .recovery-create button,
@@ -6802,6 +6818,17 @@ button.spend-bar:hover .spend-bar-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/*
+  A conversation the money pane cannot put a name to.
+
+  The charge is real and the row still opens, so it stays a row - but it must not read as a name.
+  Dimmed to the muted the smallest print already uses. `button.spend-bar:hover .spend-bar-name` is
+  more specific and still brightens it, which is right: it is still a way in.
+*/
+.spend-bar-name.unnamed {
+  color: var(--muted);
 }
 .spend-bar-value {
   font-size: 12px;

@@ -103,11 +103,52 @@ describe('error identity in logs', () => {
     expect(String(errorFields(error).frames)).not.toContain('Northwind');
   });
 
+  /*
+   * A message can be several lines long and one of those lines can be shaped exactly like a frame,
+   * which is not a contrivance: an error wrapping a failed subprocess carries that program's trace
+   * in its wording, and that trace names the owner's files. Frames picked out by shape published
+   * them, because a real frame and a quoted one are the same string. The header tells them apart.
+   */
+  test('will not accept a quoted trace as this process’s own frames', () => {
+    const error = new Error(
+      [
+        'command failed: node build.js',
+        '    at Object.<anonymous> (/home/owner/tax-return-2025/index.js:3:9)',
+        '    at Module._compile (node:internal/modules/cjs/loader:1234:14)'
+      ].join('\n')
+    );
+    expect(String(errorFields(error).frames)).not.toContain('tax-return-2025');
+    expect(String(errorFields(error).frames)).toContain('log.test.ts');
+  });
+
   test('falls back to a driver code, then to the class name', () => {
     const driverError = Object.assign(new Error('terminating connection'), { code: '57P01' });
     expect(errorFields(driverError).code).toBe('57P01');
     expect(errorFields(new TypeError('x is not a function')).code).toBe('TypeError');
     expect(errorFields('a thrown string').code).toBe('non_error_throw');
+  });
+
+  /*
+   * `code` looks like the one field on this line nobody could hide anything in, and it is the field
+   * two different wires write. `runnerFailure` builds an AthanorError whose code is the `code` of
+   * whatever JSON the workspace runner answered with, and `name` is a writable property a library
+   * may put a sentence in. Both were printed whole, so a runner that quoted the failing command
+   * back published it - the same shape of leak as the message, wearing the one field that had
+   * always been safe. One machine word, or the line says only that something failed.
+   */
+  test('will not print a sentence that arrived where a code was expected', () => {
+    const fromTheRunner = new AthanorError(
+      'refused: psql -c "select * from clients" --password=hunter2',
+      'the runner said no'
+    );
+    expect(errorFields(fromTheRunner).code).toBe('api_failed');
+
+    const renamed = new Error('boom');
+    renamed.name = 'Failed while reading /home/owner/tax-return-2025/settlement.pdf';
+    expect(errorFields(renamed).code).toBe('Error');
+
+    // And the ordinary case is untouched: athanor's own vocabulary still reads as itself.
+    expect(errorFields(new AthanorError('workspace_busy', 'busy')).code).toBe('workspace_busy');
   });
 });
 

@@ -8,7 +8,9 @@ import {
   modelLabel,
   spendBreakdown,
   spendMeters,
+  taskRowName,
   tokenSplit,
+  type SpendRow,
   type UsageResponse
 } from './usage-model.js';
 import type { SpendSummary, Task, TaskEvent, Workspace } from './types.js';
@@ -67,16 +69,22 @@ function BucketList({
   buckets,
   render
 }: {
-  buckets: Array<{ key: string; costUsd: number; calls: number }>;
-  render: (key: string) => { label: string; title: string; onOpen?: () => void };
+  buckets: SpendRow[];
+  render: (bucket: SpendRow) => {
+    label: string;
+    title: string;
+    /** False dims the label, which is how a stand-in is told apart from a name. */
+    named?: boolean;
+    onOpen?: () => void;
+  };
 }) {
   return (
     <div className="spend-bars">
       {buckets.map((bucket) => {
-        const { label, title, onOpen } = render(bucket.key);
+        const { label, title, named, onOpen } = render(bucket);
         const row = (
           <>
-            <span className="spend-bar-name" title={title}>
+            <span className={`spend-bar-name${named === false ? ' unnamed' : ''}`} title={title}>
               {label}
             </span>
             <span className="spend-bar-value">{formatUsd(bucket.costUsd)}</span>
@@ -235,7 +243,7 @@ export function UsagePane({
             {breakdown.byModel.length ? (
               <BucketList
                 buckets={breakdown.byModel}
-                render={(key) => ({ label: modelLabel(key), title: key })}
+                render={(bucket) => ({ label: modelLabel(bucket.key), title: bucket.key })}
               />
             ) : (
               <small>No billed model calls yet.</small>
@@ -257,10 +265,13 @@ export function UsagePane({
             {breakdown.byTask.length ? (
               <BucketList
                 buckets={breakdown.byTask}
-                render={(key) => ({
-                  label: taskTitles.get(key) ?? 'Conversation no longer here',
-                  title: taskTitles.get(key) ?? key,
-                  ...(onOpenTask && taskTitles.has(key) ? { onOpen: () => onOpenTask(key) } : {})
+                render={(bucket) => ({
+                  ...taskRowName(bucket, taskTitles),
+                  // Every row opens, named or not. Whether a conversation is still there is a
+                  // question this pane cannot answer and the conversation view can: it fetches one
+                  // the sidebar page did not carry, and says so when it is genuinely gone. Refusing
+                  // the click was the pane guessing, and guessing wrong on its most expensive rows.
+                  ...(onOpenTask ? { onOpen: () => onOpenTask(bucket.key) } : {})
                 })}
               />
             ) : (

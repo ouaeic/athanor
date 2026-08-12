@@ -238,9 +238,24 @@ export const modelsBySpend = (history: UsageEntry[], limit = 5): SpendBucket[] =
     .slice(0, limit);
 };
 
+/**
+ * One row of a spend breakdown, as the pane needs it rather than as the wire carries it.
+ *
+ * A bucket is a key and two numbers, and the key of a conversation row is its task id — so the row
+ * arrives with no name on it at all. `label` is the name the server put on the row when it could
+ * read one; it is optional because a box that has not been updated yet sends none, and everything
+ * below has to stay true on both.
+ */
+export interface SpendRow {
+  key: string;
+  costUsd: number;
+  calls: number;
+  label?: string;
+}
+
 export interface SpendBreakdown {
   byModel: SpendBucket[];
-  byTask: SpendBucket[];
+  byTask: SpendRow[];
   /** True when the figures cover the whole capped month rather than the recent history window. */
   complete: boolean;
 }
@@ -253,6 +268,39 @@ export const spendBreakdown = (usage: UsageResponse, spend: SpendSummary | null)
         byTask: tasksBySpend(usage.history),
         complete: false
       };
+
+/**
+ * What to call a conversation this pane is reporting money against.
+ *
+ * The names it can reach are the conversations the sidebar happens to have loaded — its first page,
+ * active ones only — and the rows here are the twenty most expensive of the month, which are the
+ * long-running and the long-finished. So the overlap is partial by construction, and every row
+ * outside it used to be labelled "Conversation no longer here": a conversation the owner can open
+ * from the sidebar, reported as deleted on the screen that accounts for their money.
+ *
+ * Nothing here can tell whether a conversation still exists, so nothing here says. A name is used
+ * when one is in reach — the server's own, or the sidebar's, which is fresher because a rename
+ * shows there before it is saved — and otherwise the row says only what is true, that this is a
+ * conversation the screen cannot see from here. Opening it is what answers the question, and the
+ * conversation view already fetches one the sidebar page did not carry and says so if it is
+ * genuinely gone.
+ */
+export const UNNAMED_CONVERSATION = 'A conversation not in view';
+
+export interface SpendRowName {
+  label: string;
+  /** The tooltip: the full name, or the raw id, which is what an owner debugging their bill has. */
+  title: string;
+  /** False when the label is a stand-in rather than this conversation's own name. */
+  named: boolean;
+}
+
+export const taskRowName = (row: SpendRow, titles: ReadonlyMap<string, string>): SpendRowName => {
+  const name = titles.get(row.key)?.trim() || row.label?.trim();
+  return name
+    ? { label: name, title: name, named: true }
+    : { label: UNNAMED_CONVERSATION, title: row.key, named: false };
+};
 
 export interface SpendLimitsDraft {
   dailyCapUsd: string;

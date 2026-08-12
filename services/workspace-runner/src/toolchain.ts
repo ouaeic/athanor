@@ -107,9 +107,39 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
     id: 'data-analysis',
     purpose: 'Read, reshape and chart spreadsheet and CSV data',
     binaries: [ATHANOR_PYTHON],
-    pythonModules: ['pandas', 'matplotlib'],
+    // numpy is not a fourth package: pandas and matplotlib both depend on it, so it is on every box
+    // that has either. It is named because procedures import it directly, and a capability list
+    // that leaves out what the work actually calls is the list that sends an agent guessing.
+    pythonModules: ['pandas', 'numpy', 'matplotlib'],
     fonts: [],
-    install: 'apt-get install -y python3-pandas python3-matplotlib'
+    install: 'apt-get install -y python3-pandas python3-numpy python3-matplotlib'
+  },
+  {
+    /**
+     * Separate from data-analysis on purpose. Charting a column and testing whether a difference is
+     * real are different jobs, and folding them together would mean a box without the statistics
+     * packages reported that it could not chart either.
+     *
+     * The gap this closes: with pandas and matplotlib alone, a confidence interval, a significance
+     * test or a seasonal forecast is arithmetic done by a language model in its own head. That is
+     * the class of answer that is wrong in a way nobody notices - a plausible p-value, a sound-
+     * looking interval - and it is handed to the owner as a finding about their own data.
+     *
+     * Two packages and no more. scipy carries the distributions and the tests; statsmodels carries
+     * the models that state their own uncertainty - regression with standard errors, seasonal
+     * decomposition, exponential smoothing. Both come from the distribution, signed and security
+     * supported, and statsmodels pulls scipy in anyway, so the pair costs one download. Nothing
+     * here needs a machine-learning stack: scikit-learn would add a few hundred megabytes to
+     * answer questions nobody asks of a household spreadsheet, and a deep-learning runtime would
+     * be gigabytes on a computer whose contract says no model weights run locally.
+     */
+    id: 'statistics',
+    purpose:
+      'Answer a question about data with a stated confidence rather than arithmetic done in a model’s head - a confidence interval, a significance test, a regression, a seasonal decomposition or a forecast',
+    binaries: [ATHANOR_PYTHON],
+    pythonModules: ['scipy', 'statsmodels'],
+    fonts: [],
+    install: 'apt-get install -y python3-scipy python3-statsmodels'
   },
   {
     id: 'image-work',
