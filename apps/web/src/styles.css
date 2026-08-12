@@ -208,8 +208,84 @@ select:focus-visible {
 .brand-mark.large svg {
   width: 28px;
 }
-.brand .collapse {
-  margin-left: auto;
+
+/*
+  THE FIRE IS THE STATUS DISPLAY.
+
+  A spinner spins the same whether a turn is producing tokens or has been dead for eleven minutes,
+  and the eleven-minute one is the turn this product exists for (see live-activity.ts:1-9, measured
+  on somebody's own box). So the flame's motion is not a loop: it is the arriving events, summed and
+  decayed. Forty seconds of silence lets it fall to the floor for its state and stay there - which
+  is the whole signal. A still flame during a run means the run is still.
+
+  `--draught` is written on the registered <svg>s only, never on :root: an inherited custom property
+  on the root invalidates style for the whole document, and this one moves four times a second while
+  an answer is arriving. The default below is the value a mark has for the frame before `fire.ts`
+  reaches it.
+
+  It is also what the sign-in screen shows, and deliberately. `App` derives the state above the auth
+  gate, so there is no bootstrap and no workspace on the splash or the sign-in pair - and read
+  literally that is `cold`, which put a grey flame at a third height on the first screen a new owner
+  ever sees. Out means we looked and the fire is not lit; it does not mean we have not looked yet,
+  and the difference matters most on the one screen where nothing has been checked either way. The
+  derivation rests at `banked` until the box has answered, so what a new owner meets is a furnace
+  burning low - which is the only state the thing this is named after is ever in.
+*/
+:root {
+  --draught: 0.18;
+}
+
+/*
+  Height and width together - driven on height alone a full draught reads as a stretched triangle
+  rather than a bigger fire. Banked lands at .66 of the drawn flame; a turn in flight at .87-1.12.
+  900ms, five times slower than this interface's 180ms, because a fire is a mass and not a light
+  switch; the model retargets every 250ms, so the eye is given lag rather than steps.
+*/
+.mark-flame {
+  transform-box: view-box;
+  transform-origin: 64px 110px;
+  transform: scale(calc(0.88 + var(--draught) * 0.16), calc(0.55 + var(--draught) * 0.62));
+  transition: transform 900ms var(--ease);
+}
+
+.mark-glow {
+  opacity: calc(0.18 + var(--draught) * 0.72);
+  transition: opacity 900ms var(--ease);
+}
+
+/*
+  Out. #7c736c is the grey this product already uses for a thing that is not alive
+  (.status-dot.queued, :4285); it measures 4.53:1 on black. The flame also drops to a third of its
+  height, so the state is carried by shape as well as by colour - and the sidebar prints the word
+  beside it, so it is carried by neither alone.
+*/
+[data-fire='cold'] .mark-flame {
+  fill: #7c736c;
+  transform: scale(0.82, 0.34);
+}
+
+[data-fire='cold'] .mark-glow {
+  opacity: 0;
+}
+
+/*
+  Your move. `calling` and `drawing` differ by a pulse, and a pulse does not exist for a reader who
+  asked for less motion - so the difference is carried statically by the door rim leaving its metal
+  for ember, and the pulse is the enhancement on top. 2.2s because that is already this product's
+  one request cadence (running-mark-pulse); no second cadence is invented.
+*/
+[data-fire='calling'] .mark-door {
+  stroke: var(--ember);
+}
+
+[data-fire='calling'] .mark-glow {
+  animation: mark-called 2.2s var(--ease) infinite;
+}
+
+@keyframes mark-called {
+  50% {
+    opacity: 0.34;
+  }
 }
 .icon-btn {
   display: inline-grid;
@@ -658,14 +734,17 @@ select:focus-visible {
 }
 /*
   The measure, set for reading rather than for filling the pane.
- 
-  820px of 13px text is about 115 characters a line; the eye loses its place returning from the end
-  of one line to the start of the next somewhere past 90. This is the column an owner reads the
-  answer in, and the answer is the product.
+
+  Three numbers, and they are one arithmetic: 704 outside, 32 of padding a side, so the content
+  column is 640. Prose then clamps itself to 528 (`.markdown > *`) and the 112px left over is a
+  working margin - the one thing on the page that code, tables and the ledger are allowed to break
+  into, which is how evidence reads as wider than the sentence describing it without a second
+  column or a mode. 528px of 15px text is 66-70 characters; the eye loses its place returning from
+  the end of one line to the start of the next somewhere past 90.
 */
 .timeline {
-  max-width: 720px;
-  padding: 30px 34px 30px;
+  max-width: 704px;
+  padding: 34px 32px 30px;
   margin: 0 auto;
 }
 .user-brief {
@@ -895,22 +974,12 @@ select:focus-visible {
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
 }
+/* One child since the avatar went, so the two-column grid has nothing left to align. The body keeps
+   its own `min-width: 0`, which a block child no longer needs but which costs nothing to leave
+   correct. */
 .assistant-message {
-  display: grid;
-  grid-template-columns: 28px 1fr;
-  gap: 12px;
+  display: block;
   margin: 22px 0;
-}
-.ai-avatar {
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 9px;
-  background: var(--text);
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 700;
 }
 .markdown {
   min-width: 0;
@@ -921,37 +990,110 @@ select:focus-visible {
     the tie between content and chrome.
   */
   font-size: 15px;
-  line-height: 1.65;
-  color: #36302c;
+  line-height: 1.62;
+  /*
+    Light type on true black blooms. 0.006em at 15px is invisible per glyph and measurably calmer
+    per line - the dark-mode equivalent of a hair less weight.
+  */
+  letter-spacing: 0.006em;
 }
+/*
+  TWO MEASURES. Prose is set for reading; evidence gets the whole column. 33rem = 528px is 66-70
+  characters; the pane is 640px, and the 112px left over is a working margin that code, tables and
+  the ledger break into. Two rules, no layout-model change.
+
+  The exceptions are named for what `MarkdownBody` actually emits rather than for the tags markdown
+  implies. A fenced block arrives as `figure.code-block` wrapping its own `<pre>` (`MarkdownBody.tsx`
+  :102, and the `pre` override at :173 exists precisely so there is only one), and a table arrives
+  inside `div.table-scroll` (:193) - so neither `pre` nor `table` is ever a direct child of
+  `.markdown`, and clamping their wrappers is what would put code and tables back inside the prose
+  measure. `pre` stays in the list for the plain case; `img` needs no entry because it sits inside
+  its own paragraph, where the reading measure is exactly what it should keep.
+*/
+.markdown > * {
+  max-width: 33rem;
+}
+.markdown > :is(pre, .code-block, .table-scroll, .katex-display) {
+  max-width: none;
+}
+.markdown p {
+  margin: 0 0 24px;
+  text-wrap: pretty;
+}
+/* Space ABOVE a heading, not equal space either side: a heading belongs to what follows it, and
+   equal margins are the tell that nobody set them. */
+.markdown :is(h1, h2, h3, h4) {
+  margin: 36px 0 10px;
+  line-height: 1.25;
+  letter-spacing: -0.018em;
+  color: var(--text);
+  text-wrap: balance;
+}
+/* Was 3px, which was compensating for the user agent's own paragraph margins. Nothing here has
+   them now, so the answer starts where the message starts. */
 .markdown > :first-child {
-  margin-top: 3px;
+  margin-top: 0;
 }
 .markdown > :last-child {
   margin-bottom: 0;
 }
-.markdown h1,
-.markdown h2,
-.markdown h3 {
-  letter-spacing: -0.02em;
+.markdown h1 {
+  font-size: 24px;
+  font-weight: 640;
 }
 .markdown h2 {
-  font-size: 21px;
+  font-size: 20px;
+  font-weight: 640;
 }
 .markdown h3 {
   font-size: 17px;
+  font-weight: 620;
+}
+.markdown h4 {
+  font-size: 15px;
+  font-weight: 660;
+}
+/* h5 and h6 rendered at 12.45px and 10.05px - smaller than the body they head. They stop being
+   undersized headings and become what they are: labels. `all-small-caps` is this file's own idiom,
+   see `.code-language`. */
+.markdown :is(h5, h6) {
+  margin: 28px 0 6px;
+  font-size: 13px;
+  font-weight: 620;
+  color: var(--muted);
+  font-variant: all-small-caps;
+  letter-spacing: 0.06em;
+}
+.markdown :is(ul, ol) {
+  margin: 0 0 24px;
+}
+.markdown li {
+  margin: 0 0 7px;
+  text-wrap: pretty;
+}
+/* Hanging quote: the rule sits in the margin so quoted text keeps the measure of the prose around
+   it, which is the point of a quote and not what an indent does. */
+.markdown blockquote {
+  margin: 24px 0 24px -18px;
+  padding: 0 0 0 16px;
+}
+.markdown hr {
+  margin: 38px 0;
+}
+/* Numbers that change in place must not jitter. */
+.markdown table,
+.ledger,
+.message-meta {
+  font-variant-numeric: tabular-nums lining-nums;
 }
 .markdown code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  background: #fbece0;
   padding: 2px 4px;
   border-radius: 4px;
   font-size: 0.9em;
 }
 .markdown pre {
   overflow: auto;
-  background: #231f1a;
-  color: #f3e5da;
   padding: 14px;
   border-radius: 10px;
 }
@@ -959,9 +1101,9 @@ select:focus-visible {
   background: transparent;
   padding: 0;
 }
-.markdown a {
-  color: #696059;
-}
+/* The colour and the four fills this block used to carry were the light era's, and every one of
+   them was already being overridden further down by the dark contract. They were the paint under
+   the paint: invisible, and repainted on every match. */
 .system-event,
 .completion-card {
   display: flex;
@@ -1449,14 +1591,8 @@ video.artifact-media {
   gap: 7px;
   margin: 18px 0 14px;
 }
-.starter-capabilities span {
-  border: 1px solid #ecded2;
-  border-radius: 999px;
-  padding: 7px 10px;
-  background: #fffaed;
-  color: #645c56;
-  font-size: 12px;
-}
+/* The chips became buttons that run the example; the pill they wore as spans is at
+   `.starter-capabilities button`, and this rule had been styling nothing since. */
 
 .eyebrow {
   text-transform: uppercase;
@@ -1691,10 +1827,9 @@ video.artifact-media {
   white-space: nowrap;
 }
 
-.computer-pane .browser-viewport {
-  background:
-    radial-gradient(circle at 50% 25%, rgba(217, 255, 92, 0.05), transparent 38%), #1a1611;
-}
+/* A lime light source used to sit at the top-centre of this pane, at a chroma of about 90 - three
+   and a half times the accent, on the largest surface in the product, and lit whether or not
+   anything was happening in it. `.browser-viewport` at the dark contract carries the surface. */
 .breadcrumbs {
   display: flex;
   align-items: center;
@@ -3578,6 +3713,14 @@ video.artifact-media {
   .timeline {
     padding: 22px 14px 22px;
   }
+  /* The quote stops hanging where there is nothing to hang into. Below this width the transcript
+     keeps 14px of side padding and 8px on a phone, so an 18px hang puts the rule at -4px and -10px
+     - past the left edge, where it is not clipped so much as gone, and the quote is then marked by
+     nothing at all. It indents instead, which is the lesser reading of a quote and the only one
+     that survives 375px. */
+  .markdown blockquote {
+    margin-left: 0;
+  }
   .system-event,
   .completion-card,
   .tool-event,
@@ -3655,14 +3798,6 @@ video.artifact-media {
   .preview-chat-card {
     margin-left: 8px;
     margin-right: 8px;
-  }
-  .assistant-message {
-    grid-template-columns: 24px 1fr;
-    gap: 8px;
-  }
-  .ai-avatar {
-    width: 24px;
-    height: 24px;
   }
   .approval-drawer {
     left: 7px;
@@ -4112,7 +4247,6 @@ textarea::placeholder {
 }
 
 .brand-mark,
-.ai-avatar,
 .completion-card > svg {
   background: #2e2824;
   color: #c9bdb3;
@@ -4224,8 +4358,7 @@ a {
 /* Higher-specificity dark contracts for controls that deliberately carried
    light-theme component styles above. These keep every interactive surface
    dark instead of leaving bright islands inside the OLED-first shell. */
-.search,
-.starter-capabilities span {
+.search {
   border-color: #38322d;
   background: #1b1612;
   color: #e7dace;
@@ -4317,6 +4450,102 @@ a {
   color: #e0d3c8;
 }
 
+/*
+  THE WRITING EDGE IS STILL HOT.
+
+  Heat is recency of evidence, and the most recent evidence in the product is the sentence being
+  typed. The last two lines of an arriving answer have not cooled yet; everything above them has.
+
+  Nothing animates, and that is the whole trick. The gradient is static and the box is growing, so
+  the heat sits wherever the text currently ends and travels down the page at exactly the speed the
+  machine is writing - which is a reading of throughput no caret can give, because a caret blinks at
+  the same rate through a turn that died eleven minutes ago. It stops dead the instant the turn
+  does, because `.cooling` is `node.streaming` and nothing else.
+
+  The cool stop is the body colour declared three lines above, so the settled text and the top of a
+  streaming answer are the same ink. Contrast holds end to end: #e0d3c8 is 14.32:1 on black and
+  #f2a13f is 9.95:1, and every value the ramp passes through lies between them.
+*/
+.cooling .markdown {
+  background-image: linear-gradient(to bottom, #e0d3c8 0 calc(100% - 3.2em), var(--ember) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/*
+  Anything with a colour of its own opts out, so a half-arrived fenced block is never invisible.
+  `-webkit-text-fill-color` is the only thing that takes an element back off an inherited fill, and
+  the list is the elements `MarkdownBody` actually emits that could carry one - asserted in
+  MarkdownBody.test.tsx rather than trusted, because if the renderer stops emitting one of these the
+  rule silently stops matching and nothing else complains.
+*/
+.cooling .markdown :is(pre, code, table, th, td, a, img, .katex) {
+  -webkit-text-fill-color: initial;
+}
+
+/*
+  And the members of that list with no ink of their own are given the body's ink outright, because
+  `-webkit-text-fill-color: initial` resolves to `currentColor`, which is the `transparent` above.
+
+  Two ways an element loses its glyphs to that, and both are here. Inline code (:4181) and an even
+  table row (:4472) paint a background of their own, and the clipped gradient is painted by
+  `.markdown`, so it sits UNDER them - a half-arrived answer would lose exactly its code and its
+  data and keep its prose. And KaTeX draws a fraction bar as a `border-bottom` and a radical as a
+  `fill`, both `currentColor` and neither of them text, so a transparent ink does not tint them, it
+  deletes them: measured side by side, `(a+b)/c = √d` arrives with no divider and no radical, which
+  is a different expression rather than a dimmer one.
+
+  `td` and `.katex` land on the same #e0d3c8 they inherit when settled, so nothing about them
+  changes; `pre code` shifts by one step off #e8dacf for as long as the answer is arriving, which is
+  below the threshold of a side-by-side, and every highlighted token sets its own colour and is
+  untouched.
+*/
+.cooling .markdown :is(code, td, .katex) {
+  color: #e0d3c8;
+}
+
+/*
+  And the mask itself has to be told what is not on the page.
+
+  `background-clip: text` cuts the gradient out of every glyph in the subtree, and it reads the
+  glyphs before a descendant's own clipping is applied - so text a child has hidden by sizing itself
+  1px and setting `overflow: hidden` is still cut out of the mask, and painted at this element,
+  where that 1px box does not exist. KaTeX hides its MathML that way (its `.sr-only` equivalent, and
+  the copy a screen reader actually reads), so a streaming equation arrived with a second, offset
+  copy of itself printed over the first. `contain: paint` gives that node a paint box of its own and
+  takes it back out of the mask; it cannot change any layout, because the node is already 1px square
+  with its overflow hidden, and it stays in the accessibility tree, which `display: none` would not.
+*/
+.cooling .markdown .katex-mathml {
+  contain: paint;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /*
+    No motion to remove - there is none. Reduced to a tint instead: a shorter ramp at the accent's
+    chroma rather than the fire's, so the still form still says "this line is arriving" without a
+    flare travelling down the page in the colour reserved for now.
+  */
+  .cooling .markdown {
+    background-image: linear-gradient(to bottom, #e0d3c8 0 calc(100% - 1.4em), var(--accent) 100%);
+  }
+}
+
+@media (forced-colors: active) {
+  /*
+    The first forced-colors block in this file, and it is here because this is the one rule that
+    fails silently rather than loudly: under a forced palette `background-clip: text` has no
+    gradient to clip and `color: transparent` is honoured, so the arriving answer would be blank.
+    The rest of the stylesheet wants the same audit and has not had it.
+  */
+  .cooling .markdown {
+    background-image: none;
+    color: CanvasText;
+    -webkit-text-fill-color: CanvasText;
+  }
+}
+
 .markdown a,
 .switch-auth button {
   color: var(--accent);
@@ -4360,9 +4589,10 @@ a {
   background: #14100d;
 }
 
+/* Spacing for the block elements is set once, with the rest of the reading column, rather than a
+   margin at a time next to whatever rule happened to need one. What is left here is the drawing:
+   the rule, the marker and the quote's edge. */
 .markdown blockquote {
-  margin: 14px 0;
-  padding: 2px 0 2px 14px;
   border-left: 2px solid #37322d;
   color: var(--muted);
 }
@@ -4370,17 +4600,11 @@ a {
 .markdown hr {
   border: 0;
   border-top: 1px solid #2a2621;
-  margin: 22px 0;
 }
 
 .markdown ul,
 .markdown ol {
-  margin: 10px 0;
   padding-left: 22px;
-}
-
-.markdown li {
-  margin: 5px 0;
 }
 
 .markdown li::marker {
@@ -4448,120 +4672,204 @@ a {
   background: #2e2824;
 }
 
-/* Keep the conversation calm: results stay visible, execution detail lives in one disclosure. */
-.task-activity {
-  margin: 14px 0;
-  overflow: hidden;
-  border: 1px solid #35302b;
-  border-radius: 13px;
-  background: #171410;
-  color: #e8dacf;
-}
+/* ==========================================================================
+   THE LEDGER
 
-.task-activity > summary {
-  display: grid;
-  grid-template-columns: 30px minmax(0, 1fr) 16px;
-  align-items: center;
-  gap: 10px;
-  min-height: 52px;
-  padding: 9px 12px;
-  cursor: pointer;
+   A turn's evidence, in the column the owner is already reading, in the order it happened. It used
+   to be behind a disclosure whose label was a count of itself - the software describing its own
+   volume instead of showing its work. There is no fold now and nothing to click to find out what
+   the machine did; a click only ever buys you MORE about one line.
+   ========================================================================== */
+
+.ledger {
+  margin: 18px 0 24px;
+  padding: 0;
   list-style: none;
+  border-block: 1px solid var(--line);
 }
 
-.task-activity > summary::-webkit-details-marker {
+/*
+  The rows lose the card. Thirty-four rounded, shadowed, 40px-inset boxes were what a list looks
+  like when every row was designed alone. Alignment is the separator; there are no inner rules,
+  because 47 hairlines is louder than the thing they separate.
+*/
+.ledger .tool-event,
+.ledger .cost-event,
+.ledger .system-event {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: 0 0;
+  box-shadow: none;
+  overflow: visible;
+}
+
+/*
+  Gutter, verb, subject, figure - on every row without exception, which is what makes a forty-step
+  turn skimmable at all. 5rem holds the longest verb this product has (`publishing`) at the mono
+  advance below, and the verbs are the one column that must never wrap: a rail that steps in and out
+  by a line is not a rail.
+*/
+.ledger > li > :is(.tool-event, .cost-event) > summary,
+.ledger > li > :is(.cost-event, .system-event) {
+  display: grid;
+  grid-template-columns: 9px 5rem minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 3px;
+  font:
+    12.5px/1.72 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted); /* 7.42:1 on black, measured */
+}
+
+.ledger > li > .tool-event > summary {
+  cursor: pointer;
+}
+
+/* The tick, the chevron and the clock: the grid says all three, and the words say the rest. */
+.ledger .tool-event > summary > svg,
+.ledger > li > :is(.cost-event, .system-event) > svg {
   display: none;
 }
 
-.task-activity-icon {
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 9px;
-  background: #231f1a;
-  color: #bdb2a8;
+/*
+  A cost, a status line or a recovered failure has no verb and does not pretend to one. Each keeps
+  the subject rail, so the column holds down the whole log rather than breaking around the rows that
+  are not calls.
+
+  Losing the caution panel is the point of the last of those. Almost every warning athanor writes is
+  a note to itself about something it went on to handle, so an amber block between ruled rows would
+  be the loudest thing in the log for the quietest fact in it. The one the owner has to act on is
+  not in here at all - it is raised into the transcript - and that is what makes the difference
+  between the two legible rather than decorative.
+*/
+.ledger > li > .cost-event > span,
+.ledger > li > .system-event > div {
+  grid-column: 3 / -1;
 }
 
-.task-activity-icon svg,
-.task-activity-chevron {
-  width: 14px;
-  height: 14px;
+.ledger > li > .system-event :is(strong, span) {
+  font-size: inherit;
+  color: inherit;
 }
 
-.task-activity-copy strong,
-.task-activity-copy small {
+/*
+  Nothing is drawn for a settled row. A dot that means "this one is normal" is furniture, and at the
+  grey it wanted (#4a433d) it measured 2.16:1 anyway. The gutter stays; only news fills it.
+*/
+.ledger-mark {
+  align-self: center;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+}
+
+.tool-event.live .ledger-mark {
+  background: var(--ember); /* alive: small, bright, still */
+}
+
+/* Dim and static - and the row already says `never finished` in words in its figure column. */
+.tool-event.unfinished .ledger-mark {
+  background: var(--caution);
+}
+
+.tool-event.live .ledger-verb {
+  color: var(--text);
+}
+
+.ledger-verb {
+  white-space: nowrap;
+}
+
+.ledger-subject {
+  display: flex;
+  min-width: 0;
+  color: var(--text); /* 17.19:1 */
+}
+
+/*
+  #8a8178 is the value already at `.source-copy small` and measures 5.49:1. #6f665f, which is what a
+  dim path "wants" to be, measures 3.74:1 and must not be used.
+*/
+.ledger-dim {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #8a8178;
+}
+
+.ledger-subject b {
+  flex: none;
+  font-weight: 500;
+}
+
+/*
+  A file name is never elided, because the directory in front of it is what gives way. When the
+  subject is the whole of itself - a command, a host, a tool's own object - there is nothing in
+  front to give way, so it elides at its own end rather than running under the figure.
+*/
+.ledger-subject b:only-child {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ledger-figure {
+  font-size: 11.5px;
+}
+
+.ledger .tool-event > summary:hover {
+  background: #0c0a08;
+  color: var(--text);
+}
+
+.ledger .tool-evidence,
+.ledger .tool-command,
+.ledger .tool-pages {
+  padding-left: 19px;
+}
+
+/* A capture is not a one-line fact and is not flattened into a row; it lines up under the row it
+   belongs to, where the rest of that row evidence is. */
+.ledger .browser-capture-card {
+  margin: 8px 0 10px 19px;
+}
+
+.ledger-more {
   display: block;
-}
-
-.task-activity-copy strong {
-  color: #ebddd2;
-  font-size: 13px;
-}
-
-.task-activity-copy small {
-  margin-top: 3px;
-  color: #938a81;
-  font-size: 12px;
-}
-
-.task-activity-chevron {
+  width: 100%;
+  margin: 0;
+  padding: 6px 3px 6px 22px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: 0 0;
   color: var(--muted);
-  transition: transform 160ms var(--ease);
+  text-align: left;
+  cursor: pointer;
+  font:
+    12.5px/1.72 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
 }
 
-.task-activity[open] .task-activity-chevron {
-  transform: rotate(90deg);
+.ledger-more:hover {
+  color: var(--text);
 }
 
-.task-activity-body {
-  padding: 12px;
-  border-top: 1px solid #312c27;
-  background: #14100d;
-}
-
-.task-activity .task-plan-panel {
-  margin: 0 0 12px;
-  border-color: #342e2a;
-  background: #1b1612;
-  box-shadow: none;
-}
-
-.task-activity .task-plan-actions button,
-.task-activity .task-plan-steps select:disabled {
-  border-color: #3c3731;
-  background: #231f1a;
-  color: #bdb2a8;
-  opacity: 1;
-  -webkit-text-fill-color: #bdb2a8;
-}
-
-.task-activity .task-plan-actions button:hover {
-  border-color: #615953;
-  background: #2f2925;
-  color: #fceee1;
-}
-
-.task-activity .tool-event,
-.task-activity .system-event,
-.task-activity .cost-event,
-.task-activity .assistant-message,
-.task-activity .browser-capture-card {
-  margin-right: 0;
-  margin-left: 0;
-}
-
-.task-activity .assistant-message {
-  margin-top: 14px;
-  margin-bottom: 14px;
-}
-
-.task-activity .ai-avatar {
-  width: 24px;
-  height: 24px;
-  border: 1px solid #3c3731;
-  background: #26221d;
-  color: #ccbfb5;
+@media (max-width: 430px) {
+  .ledger > li > :is(.tool-event, .cost-event) > summary,
+  .ledger > li > :is(.cost-event, .system-event) {
+    grid-template-columns: 7px 4.6rem minmax(0, 1fr) auto;
+    gap: 8px;
+    font-size: 12px;
+  }
 }
 
 .task-result {
@@ -4824,14 +5132,15 @@ a {
   initial-value: 0deg;
 }
 
+/* Both of these emitted light sideways and downwards into the transcript, permanently. A wall does
+   not glow and a header casts rather than shines; the edge is the whole of what either one needs to
+   say, and the warmth they were spending belongs to whatever just happened. */
 .sidebar {
   border-right-color: #504943;
-  box-shadow: 1px 0 20px #f0e2d70d;
 }
 
 .workbench-header {
   border-bottom-color: #3e3933;
-  box-shadow: 0 1px 18px #f0e2d70a;
 }
 
 .composer {
@@ -5066,16 +5375,9 @@ a {
     neon-edge-pulse 2.2s ease-in-out infinite;
 }
 
-/* An empty canvas is the owner's move, which is why this line is allowed to breathe. It breathes
-   at accent chroma rather than in full ember: the motion carries the invitation and the saturation
-   stays with the furniture, so a whole line of type never shouts the way a 6px dot may. */
-.empty-canvas .eyebrow {
-  color: var(--accent);
-  text-shadow:
-    0 0 7px #f2a13f4f,
-    0 0 15px #f2a13f24;
-  animation: signal-caption-pulse 2.7s ease-in-out infinite;
-}
+/* An eyebrow on the empty canvas pulsed here, on the argument that an empty canvas is the owner's
+   move. The eyebrow was deleted from that screen - see the note at `Timeline.tsx` - and the rule
+   went on pulsing nothing for as long as it took someone to grep. */
 
 .modal {
   border-color: #575049;
@@ -5092,6 +5394,7 @@ button:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 select:focus-visible,
+summary:focus-visible,
 a:focus-visible {
   outline: 1px solid var(--ember);
   outline-offset: 3px;
@@ -5118,22 +5421,6 @@ a:focus-visible {
   }
   50% {
     opacity: 1;
-  }
-}
-
-@keyframes signal-caption-pulse {
-  0%,
-  100% {
-    opacity: 0.68;
-    text-shadow:
-      0 0 5px #f2a13f35,
-      0 0 11px #f2a13f1c;
-  }
-  50% {
-    opacity: 1;
-    text-shadow:
-      0 0 9px #ffd9a08c,
-      0 0 20px #f2a13f45;
   }
 }
 
@@ -5652,23 +5939,9 @@ a:focus-visible {
   min-width: 0;
 }
 
-/* A caret only while text is still arriving, so a finished answer is visually settled. */
-.streaming-caret {
-  display: inline-block;
-  width: 7px;
-  height: 15px;
-  margin-left: 2px;
-  border-radius: 1px;
-  /* The one place a word is being written this instant. */
-  background: var(--ember);
-  vertical-align: text-bottom;
-  animation: streaming-caret-blink 1.05s steps(2, start) infinite;
-}
-@keyframes streaming-caret-blink {
-  to {
-    visibility: hidden;
-  }
-}
+/* An ember caret blinked here at a fixed 1.05s while an answer was arriving - and went on blinking
+   at exactly that rate when the box had been dead for eleven minutes, because a timer is not the
+   event stream. It spent the one colour that means alive on a claim it could not check. */
 
 .message-actions {
   display: flex;
@@ -5720,9 +5993,8 @@ a:focus-visible {
   }
 }
 
-.user-message .markdown {
-  font-size: 13px;
-}
+/* The owner's own instruction was set two sizes below the answer to it. Both are the conversation;
+   there is one size for both now. */
 .user-message .markdown > :first-child {
   margin-top: 0;
 }
@@ -6096,9 +6368,10 @@ a:focus-visible {
    *
    * The policy itself is unchanged and deliberate: a looping decorative animation is the case the
    * preference exists for, so the orbiting edge highlight on the composer, the new-conversation
-   * button and the tools toggle stops with everything else, along with the streaming caret and the
-   * timeline's smooth scroll - both of which had their own block until it turned out the rules
-   * below already covered them. The spinner is the one exception, slowed rather than frozen,
+   * button and the tools toggle stops with everything else, along with the timeline's smooth
+   * scroll - which had its own block until it turned out the rules below already covered it. The
+   * streaming caret was named here too, and is gone. The spinner is the one exception, slowed
+   * rather than frozen,
    * because it is the only sign that long work is still alive.
    *
    * Worth knowing when this looks like a bug: on macOS the switch is Accessibility → Display →
@@ -7083,22 +7356,6 @@ button.spend-bar:hover .spend-bar-name {
 .source-copy small {
   color: #8a8178;
   font-size: 10px;
-}
-
-/* "Step 2 of 5" belongs where the spinner is, not one click behind it. */
-.task-activity-progress {
-  display: block;
-  height: 3px;
-  margin-top: 6px;
-  overflow: hidden;
-  border-radius: 2px;
-  background: #2a2621;
-}
-.task-activity-progress i {
-  display: block;
-  height: 100%;
-  background: var(--ember-deep);
-  transition: width 200ms var(--ease);
 }
 
 /* A long agentic task mounts a window of the transcript; this reaches the rest of it. */

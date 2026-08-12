@@ -21,7 +21,8 @@ import {
 } from './task-list.js';
 import { shortcutKeys } from './shortcuts.js';
 import { formatUsd } from './usage-model.js';
-import { workspaceStatusLabel } from './workspace-status.js';
+import { hearthLabel } from './workspace-status.js';
+import type { FireState } from './fire.js';
 import type { ConversationSearchResult, Task, TaskSchedule, User, Workspace } from './types.js';
 
 const relative = (iso: string) => {
@@ -45,6 +46,8 @@ export function Sidebar(props: {
    */
   regionId?: string;
   user: User;
+  /** What the fire in the mark above this list is doing, so the word beside it agrees with it. */
+  fire: FireState;
   workspaces: Workspace[];
   tasks: Task[];
   schedules: TaskSchedule[];
@@ -316,7 +319,9 @@ export function Sidebar(props: {
         </span>
         <span>
           <strong>{workspace ? 'Agent computer' : 'Server computer'}</strong>
-          <small>{workspace ? workspaceStatusLabel(workspace.status) : 'Check server setup'}</small>
+          <small>
+            {workspace ? hearthLabel(props.fire, workspace.status) : 'Check server setup'}
+          </small>
         </span>
       </button>
       <button className="new-task" onClick={props.onNewTask}>

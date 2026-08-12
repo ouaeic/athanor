@@ -1,4 +1,5 @@
-import { useId } from 'react';
+import { useEffect, useId, useRef } from 'react';
+import { registerFire } from './fire.js';
 
 /**
  * The mark, drawn rather than photographed.
@@ -32,8 +33,18 @@ import { useId } from 'react';
  * The gradients are given document-unique ids because the mark renders twice on the sign-in screen,
  * and two `<defs>` sharing an id is one gradient serving both - which is invisible until the day
  * one of them is removed.
+ *
+ * Three classes and a ref are the whole of what turns the drawing into an instrument: `fire.ts`
+ * writes `--draught` on this element and the stylesheet spends it on the flame's scale and the
+ * glow's opacity. Nothing about the drawing changes, because CSS beats a presentation attribute -
+ * the inline `fill` and `stroke` below are overridable by the state rules without being touched.
  */
 export function BrandMark({ className }: { className?: string }) {
+  const svg = useRef<SVGSVGElement>(null);
+  // Every mark that mounts registers, and every one that goes unregisters: this component is on
+  // the sign-in screen twice and in the shell twice more, and a set of detached nodes is a leak
+  // that gets written to four times a second.
+  useEffect(() => registerFire(svg.current), []);
   const id = useId();
   const tile = `${id}-tile`;
   const brick = `${id}-brick`;
@@ -42,6 +53,7 @@ export function BrandMark({ className }: { className?: string }) {
   const glow = `${id}-glow`;
   return (
     <svg
+      ref={svg}
       className={className}
       viewBox="0 0 128 128"
       role="img"
@@ -97,9 +109,10 @@ export function BrandMark({ className }: { className?: string }) {
       {/* Butt caps, not round: a rounded band overhangs the brick and becomes a brim. */}
       <path d="M30.6 74.5h66.8" fill="none" stroke={`url(#${iron})`} strokeWidth="5" />
 
-      <ellipse cx="64" cy="93" rx="34" ry="28" fill={`url(#${glow})`} />
+      <ellipse className="mark-glow" cx="64" cy="93" rx="34" ry="28" fill={`url(#${glow})`} />
 
       <path
+        className="mark-door"
         d="M48 104V90c0-16 32-16 32 0v14Z"
         fill="#0b0908"
         stroke={`url(#${metal})`}
@@ -107,6 +120,7 @@ export function BrandMark({ className }: { className?: string }) {
         strokeLinejoin="round"
       />
       <path
+        className="mark-flame"
         d="M64 82c6 8.5 9.5 14.5 9.5 19 0 5.4-4.2 9-9.5 9s-9.5-3.6-9.5-9c0-4.5 3.5-10.5 9.5-19Z"
         fill="var(--ember)"
       />

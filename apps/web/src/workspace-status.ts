@@ -1,3 +1,4 @@
+import type { FireState } from './fire.js';
 import type { Workspace } from './types.js';
 
 /**
@@ -21,3 +22,22 @@ export const workspaceStatusLabel = (status: Workspace['status']): string =>
     failed: 'Needs attention',
     deleting: 'Deleting'
   })[status] ?? String(status).replace(/_/g, ' ');
+
+/**
+ * The same corner of the screen, told what the fire is doing.
+ *
+ * `workspaceStatusLabel` describes the computer, and the computer is "running" throughout a turn -
+ * so the sidebar said **Ready** while an answer was being written and while something was waiting
+ * to be approved. Both were lies of the useful kind: the owner reads that word to decide whether to
+ * go and do something else.
+ *
+ * It is also what makes the mark legible without seeing it. Every fire state now has a word beside
+ * it, so nothing in this instrument is carried by colour, motion or shape alone. The two states
+ * with nothing to say fall through to the computer's own label, which is what they are about.
+ */
+export const hearthLabel = (state: FireState, status: Workspace['status']): string =>
+  state === 'calling'
+    ? 'Your move'
+    : state === 'drawing'
+      ? 'Working'
+      : workspaceStatusLabel(status);

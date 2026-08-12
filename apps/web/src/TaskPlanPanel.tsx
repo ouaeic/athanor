@@ -14,60 +14,20 @@ import { api, ApiFailure } from './api.js';
 import { terminalTaskStatuses } from './task-status.js';
 import type { Task, TaskPlan, TaskPlanStep } from './types.js';
 
-export interface PlanProgress {
-  completed: number;
-  total: number;
-  /** The step being worked on right now, for the one line a waiting owner reads. */
-  current: string;
-}
-
-const resolved = new Set(['completed', 'skipped']);
-
-export const planProgress = (steps: TaskPlanStep[]): PlanProgress | null => {
-  if (!steps.length) return null;
-  return {
-    completed: steps.filter((step) => resolved.has(step.status)).length,
-    total: steps.length,
-    current:
-      steps.find((step) => step.status === 'in_progress')?.title ??
-      steps.find((step) => step.status === 'pending')?.title ??
-      ''
-  };
-};
-
-/**
- * How far through it is, fetched without opening anything.
+/*
+ * `planProgress`, `PlanProgress` and `useTaskPlan` stood here and are gone.
  *
- * The plan used to be mounted only inside the expanded activity log, so it was not even requested
- * until the owner clicked — and "is this nearly done or has it barely started" is the question they
- * are asking for most of the time the agent is working.
+ * They existed to put "Step 2 of 5" and a progress bar on the closed work log's summary, and the
+ * ledger deleted the summary along with the fold - the steps are on the page now, so there is
+ * nothing left to count on behalf of a reader who cannot see them. `useTaskPlan` was the second
+ * read of one record: this component already fetches the plan itself, and the hook was a separate
+ * fetch per activity group whose result every group but the live one threw away.
+ *
+ * Worth knowing rather than rediscovering: `BUNDLE-BUDGET-2026-08-12.md` names those two exports as
+ * the reason this ~2 kB module cannot go behind `lazy` - `Timeline` had to import them eagerly even
+ * though it renders the panel only on a live turn. `Timeline` imports nothing from here now except
+ * the component.
  */
-export const useTaskPlan = (taskId: string, refreshKey: number): TaskPlan | null => {
-  const [plan, setPlan] = useState<TaskPlan | null>(null);
-  useEffect(() => {
-    let active = true;
-    setPlan(null);
-    // An empty id is a caller saying it does not want the plan on this render - a work log from
-    // twenty minutes ago has no use for today's. Hooks cannot be called conditionally, so the
-    // condition lives here instead, and the request is simply not made.
-    if (!taskId) return;
-    const read = () =>
-      void api
-        .taskPlan(taskId)
-        .then((latest) => {
-          if (active) setPlan(latest);
-        })
-        .catch(() => undefined);
-    read();
-    return () => {
-      active = false;
-    };
-    // `refreshKey` is the newest plan event's sequence, so a plan the agent revised is re-read
-    // without polling for one that never changes.
-  }, [taskId, refreshKey]);
-  return plan;
-};
-
 export function TaskPlanPanel({ task, refreshKey }: { task: Task; refreshKey: number }) {
   const [plan, setPlan] = useState<TaskPlan | null>(null);
   const [steps, setSteps] = useState<TaskPlanStep[]>([]);

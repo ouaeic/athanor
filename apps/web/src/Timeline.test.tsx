@@ -99,10 +99,42 @@ describe('a streamed turn on screen', () => {
     expect(markup).not.toContain('cached');
   });
 
-  it('keeps the tool traffic in one collapsed group and does not open one for the cost alone', () => {
+  /*
+   * The caret blinked at exactly the same rate whether tokens were arriving or the turn had been
+   * dead for eleven minutes. What is on the answer instead is a class the heat hangs off and a line
+   * only a screen reader gets - and both drop the instant the turn settles, which is the whole
+   * claim: heat is recency, so it must be impossible for it to outlive the thing it is about.
+   */
+  it('marks an answer that is still arriving, and unmarks it the moment it is not', () => {
+    const arriving = render(streamedTurn.slice(0, 5), 'running');
+    expect(arriving).toContain('assistant-message cooling');
+    expect(arriving).toContain('aria-busy="true"');
+    expect(arriving).toContain('Still writing');
+    expect(arriving).not.toContain('streaming-caret');
+
+    const settled = render(streamedTurn);
+    expect(settled).toContain('class="assistant-message"');
+    expect(settled).not.toContain('cooling');
+    expect(settled).not.toContain('aria-busy');
+    expect(settled).not.toContain('Still writing');
+  });
+
+  it('keeps the tool traffic in one ledger and does not open one for the cost alone', () => {
     const markup = render(streamedTurn);
-    expect(occurrences(markup, '<details class="task-activity')).toBe(1);
+    expect(occurrences(markup, '<ol class="ledger" role="list"')).toBe(1);
     expect(markup).not.toContain('Step 1 completed');
+  });
+
+  /*
+   * The fold is gone and the count that labelled it went with it. `Work log · 47 steps` was the
+   * software describing its own volume; what is on the page now is the steps.
+   */
+  it('shows the work instead of counting it', () => {
+    const markup = render(streamedTurn);
+    expect(markup).not.toContain('Work log');
+    expect(markup).not.toContain('task-activity');
+    expect(markup).toContain('<span class="ledger-verb">read</span>');
+    expect(markup).toContain('<b>a file</b>');
   });
 });
 
@@ -133,25 +165,25 @@ describe('the model working out loud', () => {
     const markup = render(turn);
     expect(occurrences(markup, '<article class="assistant-message">')).toBe(1);
     expect(markup).toContain('Background cut, four sizes and a contact sheet.');
-    // Filed in the work log, which is a disclosure that stays shut until somebody opens it.
-    expect(markup).not.toContain('Let me think about');
-    expect(markup).toContain('task-activity');
+    // "Nothing else" includes the machine's initial. Every answer in this column is its own, so a
+    // badge repeating that on each one said nothing and took 40px out of the 375 a phone has.
+    expect(markup).not.toContain('ai-avatar');
+    // Filed as a ledger row, which is one word and a disclosure that stays shut until it is opened.
+    expect(markup).toContain('<span class="ledger-verb">thought</span>');
+    expect(markup).not.toContain('<div class="markdown">Let me think about');
+    expect(markup).toContain('<p class="tool-quiet">Let me think about');
   });
 
   /*
-   * A block of the model's prose is not a step, and a log that counts it claims work it never did.
-   * Read off an earlier group, because the live one shows what the agent is doing instead.
+   * A block of the model's prose is not work, and a row that gave it a subject or a figure would be
+   * claiming it was. The verb is the whole row: the machine thought here, and the prose is under it.
    */
-  it('does not count itself as a step in a finished group', () => {
-    const markup = render([
-      ...turn,
-      event(7, 'user_message', 'And the favicon', { markdown: 'And the favicon' }),
-      event(8, 'tool_started', 'Running shell', { tool: 'shell', toolCallId: 'c2' }),
-      event(9, 'tool_result', 'shell finished', { toolCallId: 'c2', result: { exitCode: 0 } }),
-      event(10, 'assistant_message', 'Done', { markdown: 'Done.' })
-    ]);
-    expect(markup).toContain('>1 step<');
-    expect(markup).not.toContain('>2 steps<');
+  it('gives the narration a verb and nothing else to say', () => {
+    const markup = render(turn);
+    expect(markup).toContain(
+      '<span class="ledger-verb">thought</span><span class="ledger-subject">' +
+        '<b></b></span><span class="ledger-figure"></span>'
+    );
   });
 });
 
@@ -518,11 +550,14 @@ describe('a turn that read something nobody here wrote', () => {
     expect(raised).toContain('system-event warning');
     expect(raised).not.toContain('external-content-mark');
 
+    expect(raised).not.toContain('class="ledger"');
+
     // A page that would not load is a thing the turn went on to handle. It is still recorded - the
-    // work log holds it - but it is not what the conversation is about.
+    // ledger holds it - but it is not what the conversation is about, so it is filed among the
+    // steps rather than raised into the reading column beside the answer.
     const filed = render([event(2, 'warning', 'A page would not load', { message: 'Timed out' })]);
-    expect(filed).not.toContain('system-event warning');
-    expect(filed).toContain('task-activity');
+    expect(filed).toContain('<ol class="ledger" role="list"');
+    expect(filed.indexOf('class="ledger"')).toBeLessThan(filed.indexOf('system-event warning'));
   });
 
   /**
@@ -884,27 +919,83 @@ describe('a finished turn, on the record', () => {
     ).not.toContain('On the computer');
   });
 
-  it('does not call a failed conversation finished in its own work log', () => {
-    // The row in the list said failed while this line said finished, with the provider timeout
-    // that ended it sitting between them.
-    expect(withChanges(undefined, 'failed')).toContain('<small>1 action · failed</small>');
-    expect(withChanges(undefined, 'cancelled')).toContain('<small>1 action · stopped</small>');
-    expect(withChanges(undefined, 'completed')).toContain('<small>1 action · finished</small>');
+  /*
+   * The run used to be summed up twice — a glyph and a line reading "1 action · finished" — over a
+   * completion card that says how it ended, in words, three rows below. One of the two was wrong
+   * often enough to matter: "18 actions · 12 AI turns · finished" over a provider timeout, on a
+   * conversation whose own row in the list said failed. The ledger sums nothing up; it shows the
+   * steps, and how the turn ended is the completion card's one job.
+   */
+  it('does not sum the run up a second time above the card that says how it ended', () => {
+    for (const status of ['failed', 'cancelled', 'completed'] as Array<Task['status']>) {
+      const markup = withChanges(undefined, status);
+      expect(markup).not.toContain('1 action');
+      expect(markup).not.toContain('task-activity');
+      expect(markup).toContain('<ol class="ledger" role="list"');
+    }
   });
 
-  /** The mark on the work log itself, which is the one place a whole run is summed up in a glyph. */
-  const logIcon = (status: Task['status']): string =>
-    withChanges(undefined, status).match(/task-activity-icon"><svg[^>]*class="([^"]*)"/)?.[1] ?? '';
+  /*
+   * A start the task stopped on top of keeps the participle, because it never became a past tense:
+   * it was begun and it did not end. What says so is the word in the figure column, not the mark,
+   * which is exactly the case a reader who cannot see the mark must still be able to read.
+   */
+  it('says a call never came back in words, not only in the colour of a dot', () => {
+    const markup = withChanges(undefined, 'failed');
+    expect(markup).toContain('<span class="ledger-verb">writing</span>');
+    expect(markup).toContain('<span class="ledger-figure">never finished</span>');
+    expect(markup).toContain('tool-event unfinished');
+  });
+});
 
-  it('does not put a tick on a run that failed, over the word that says it failed', () => {
-    expect(logIcon('failed')).toContain('triangle-alert');
-    expect(logIcon('completed')).toContain('circle-check');
-    expect(logIcon('cancelled')).toContain('hourglass');
+/*
+ * The guarantee the whole promotion rests on: the ledger is what a turn with tool traffic gets, and
+ * a conversation without any is untouched by it.
+ */
+describe('a conversation with nothing to show', () => {
+  it('renders no ledger at all for a three-line exchange', () => {
+    const markup = render([
+      event(1, 'user_message', 'What is the capital of Peru?', {
+        markdown: 'What is the capital of Peru?'
+      }),
+      event(2, 'assistant_message', 'Lima.', { markdown: 'Lima.' })
+    ]);
+    expect(markup).not.toContain('<ol');
+    expect(markup).not.toContain('ledger');
+  });
+});
+
+/*
+ * A three-hundred-step turn is the case the fold was hiding from, and a list with no bound is the
+ * same firehose with the tap left open. Newest at the bottom, next to the composer, because on a
+ * live turn that is where the interesting rows are.
+ */
+describe('a turn with more steps than anybody reads at once', () => {
+  const markup = render([
+    event(1, 'user_message', 'Rebuild everything', { markdown: 'Rebuild everything' }),
+    ...Array.from({ length: 26 }, (_, index) =>
+      event(index + 2, 'tool_started', 'Running shell', {
+        tool: 'shell',
+        toolCallId: `c${index}`
+      })
+    )
+  ]);
+
+  it('opens with the last ten rows and says how many it is holding back', () => {
+    expect(occurrences(markup, '<li>')).toBe(11);
+    expect(markup).toContain('16 earlier steps');
   });
 
-  it('stops the work log spinning over a conversation that is waiting for its owner', () => {
-    expect(logIcon('running')).toContain('spin');
-    expect(logIcon('awaiting_user')).not.toContain('spin');
-    expect(logIcon('paused')).not.toContain('spin');
+  it('counts one held-back step as one step', () => {
+    const eleven = render([
+      event(1, 'user_message', 'Go', { markdown: 'Go' }),
+      ...Array.from({ length: 11 }, (_, index) =>
+        event(index + 2, 'tool_started', 'Running shell', {
+          tool: 'shell',
+          toolCallId: `c${index}`
+        })
+      )
+    ]);
+    expect(eleven).toContain('1 earlier step<');
   });
 });

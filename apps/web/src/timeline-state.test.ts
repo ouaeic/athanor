@@ -1,10 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Task, TaskEvent } from './types.js';
-import { terminalTaskStatuses } from './task-status.js';
 import {
   activeBotWall,
-  activityLine,
-  activityOverview,
   agentNotice,
   agentQuestion,
   asBotWall,
@@ -17,6 +14,7 @@ import {
   formatBytes,
   forkFamily,
   formatTokens,
+  ledgerRow,
   liveActivityId,
   mergeTaskEvent,
   mergeTaskEvents,
@@ -189,109 +187,6 @@ describe('timeline presentation', () => {
     expect(settled(events[2]!)).toBe(false);
   });
 
-  it('describes only the current action while work is active', () => {
-    const events = [
-      event(1, 'tool_started', { tool: 'file_read', toolCallId: 'call-1' }),
-      event(2, 'tool_result', { toolCallId: 'call-1' }),
-      event(3, 'tool_started', { tool: 'file_write', toolCallId: 'call-2' })
-    ];
-    expect(activityOverview('running', events)).toBe('Writing a file');
-  });
-
-  it('names the action rather than the tool that performs it', () => {
-    for (const [tool, phrase] of [
-      ['web_search', 'Searching the web'],
-      ['browser_snapshot', 'Reading a page'],
-      ['parallel_web_read', 'Reading several pages'],
-      ['desktop_observe', 'Looking at the screen']
-    ] as Array<[string, string]>)
-      expect(
-        activityOverview('running', [event(1, 'tool_started', { tool, toolCallId: 'call-1' })])
-      ).toBe(phrase);
-  });
-
-  it('replaces running language with compact final counts', () => {
-    const events = [
-      event(1, 'tool_started', { tool: 'file_write', toolCallId: 'call-1' }),
-      event(2, 'cost'),
-      event(3, 'cost')
-    ];
-    expect(activityOverview('completed', events)).toBe('1 action · 2 AI turns · finished');
-  });
-
-  it('names the ending it had, rather than calling every ending finished', () => {
-    /*
-     * Observed on a real conversation: "18 actions · 12 AI turns · finished" over a provider
-     * timeout, on a task whose own row said failed. The line was asking whether anything was still
-     * running, which is true of all three of these and is not what anybody reads it for.
-     */
-    const events = [
-      event(1, 'tool_started', { tool: 'shell', toolCallId: 'call-1' }),
-      event(2, 'cost')
-    ];
-    expect(activityOverview('failed', events)).toBe('1 action · 1 AI turn · failed');
-    expect(activityOverview('cancelled', events)).toBe('1 action · 1 AI turn · stopped');
-    expect(activityOverview('completed', events)).toBe('1 action · 1 AI turn · finished');
-    // And with nothing to count, which is the whole line rather than its last word.
-    expect(activityOverview('failed', [])).toBe('Failed');
-    expect(activityOverview('cancelled', [])).toBe('Stopped');
-    expect(activityOverview('completed', [])).toBe('Finished');
-  });
-
-  it('gives every ending the interface knows a word of its own', () => {
-    // The word is chosen per status and the gate is the shared set, so a status added to one and
-    // not the other would quietly go back to describing itself as something it is not.
-    for (const status of terminalTaskStatuses)
-      expect(activityOverview(status, [])).not.toBe('Ended');
-  });
-
-  it('does not call a conversation waiting for its owner finished, or working', () => {
-    const events = [event(1, 'tool_started', { tool: 'shell', toolCallId: 'call-1' })];
-    expect(activityOverview('awaiting_user', events)).toBe('Waiting for you');
-    expect(activityOverview('awaiting_resource', events)).toBe('Waiting for the computer');
-    expect(activityOverview('paused', events)).toBe('Paused');
-  });
-
-  it('says nothing about a turn that is only thinking, because the thinking node says it', () => {
-    // "Thinking" rendered one line above a thinking block whose heading is the same word.
-    expect(activityOverview('running', [event(1, 'assistant_reasoning')])).toBe('');
-    expect(activityOverview('planning', [])).toBe('Preparing the task');
-  });
-
-  it('counts the steps that are done once there are none left to start', () => {
-    // "Step 2 of 2" beside a bar already at 100%: the counter was written as the step being worked
-    // on, and at the end of a plan there is no such step.
-    expect(
-      activityLine({
-        progress: { completed: 2, total: 2, current: '' },
-        overview: '',
-        steps: 4,
-        live: true
-      })
-    ).toBe('2 steps done');
-    expect(
-      activityLine({
-        progress: { completed: 1, total: 3, current: 'Draft the note' },
-        overview: 'Writing a file',
-        steps: 4,
-        live: true
-      })
-    ).toBe('Step 2 of 3 · Draft the note');
-  });
-
-  it('renders no line at all rather than an empty one', () => {
-    expect(activityLine({ progress: null, overview: '', steps: 4, live: true })).toBe('');
-    expect(
-      activityLine({
-        progress: { completed: 1, total: 2, current: '' },
-        overview: '',
-        steps: 4,
-        live: true
-      })
-    ).toBe('Step 2 of 2');
-    expect(activityLine({ progress: null, overview: '', steps: 1, live: false })).toBe('1 step');
-  });
-
   it('creates a short plain-language result while preserving the full source separately', () => {
     const source = `Created **three deliverables** in \`workspace/results\`. ${'More detail. '.repeat(60)}`;
     const summary = compactResultSummary(source);
@@ -375,20 +270,6 @@ describe('a question the agent stopped to ask', () => {
     );
     const question = nodes.find((node) => node.kind === 'notice');
     expect(question?.kind === 'notice' && Boolean(question.resolution)).toBe(true);
-  });
-
-  it('says which of the two waits a parked conversation is in', () => {
-    // `awaiting_user` covers both now, and "Waiting for your approval" over a question with two
-    // options offered sends the owner looking for an Approve button that does not exist.
-    const events = [
-      event(1, 'approval_requested', { approvalId: 'a1' }),
-      asked({ question: 'Which mailbox?' })
-    ];
-    expect(activityOverview('awaiting_user', events)).toBe('Waiting for your answer');
-    // And the newest of the two wins, because only the last one is still outstanding.
-    expect(activityOverview('awaiting_user', [events[1]!, events[0]!])).toBe(
-      'Waiting for your approval'
-    );
   });
 });
 
@@ -1812,5 +1693,103 @@ describe('what a call actually did', () => {
     ).toBeUndefined();
     // A write whose arguments never arrived has nothing to draw.
     expect(workEvidence({ tool: 'file_write', arguments: {} }, { ok: true })).toBeUndefined();
+  });
+});
+
+/*
+ * The row grammar, which is what the owner actually reads now that there is no fold in front of it.
+ * Verb, subject, figure - and the verb's tense, which is the only state cue on the row that is not
+ * a colour.
+ */
+describe('one line of the ledger', () => {
+  const row = (tool: string, args: unknown, result: unknown, live = false) =>
+    ledgerRow(tool, `${tool} completed`, workEvidence({ tool, arguments: args }, result), live);
+
+  it('says what was done to which file, and how big it ended up', () => {
+    const wrote = row(
+      'file_write',
+      { path: 'apps/api/src/billing.ts', content: 'x'.repeat(1200) },
+      {
+        sha256: 'abc'
+      }
+    );
+    // The directory is the elidable part; the name of the file never is.
+    expect(wrote).toEqual({
+      verb: 'wrote',
+      prefix: 'apps/api/src/',
+      name: 'billing.ts',
+      figure: '1.2 KB'
+    });
+    expect(row('file_write', { path: 'notes.md', content: 'hi' }, {}).prefix).toBe('');
+  });
+
+  it('does not name one file when the call changed several', () => {
+    const patched = row(
+      'file_patch',
+      {
+        patches: [
+          { path: 'a.ts', oldText: 'a', newText: 'aa' },
+          { path: 'b.ts', oldText: 'b', newText: 'bbb' }
+        ]
+      },
+      {}
+    );
+    expect(patched).toEqual({ verb: 'edited', prefix: '', name: '2 files', figure: '5 B' });
+  });
+
+  it('gives a command its line and its ending, and says nothing when it exited zero', () => {
+    const args = { executable: 'pnpm', args: ['test'] };
+    expect(row('shell', args, { exitCode: 0, stdout: 'ok' })).toEqual({
+      verb: 'ran',
+      prefix: '',
+      name: 'pnpm test',
+      figure: ''
+    });
+    expect(row('shell', args, { exitCode: 1 }).figure).toBe('exit 1');
+  });
+
+  it('gives a read its host, and counts pages only when there is more than one', () => {
+    const one = row('browser_snapshot', {}, { url: 'https://developer.mozilla.org/en/x' });
+    expect(one).toEqual({ verb: 'read', prefix: '', name: 'developer.mozilla.org', figure: '' });
+    expect(
+      row(
+        'parallel_web_read',
+        {},
+        { sources: [{ url: 'https://a.test/1' }, { url: 'https://b.test/2' }] }
+      ).figure
+    ).toBe('2 pages');
+  });
+
+  /*
+   * The tool's own label is already a verb and its object, so the split that fills the two columns
+   * is the first space. What must never happen is the worker's sentence - `web_search completed` -
+   * printed beside the owner's words, which is the machine's register underneath theirs.
+   */
+  it('splits a tool with no evidence of its own into the same two columns', () => {
+    expect(row('web_search', {}, { ok: true })).toEqual({
+      verb: 'searched',
+      prefix: '',
+      name: 'the web',
+      figure: ''
+    });
+    expect(row('set_plan', {}, { ok: true }).verb).toBe('updated');
+    expect(row('web_search', {}, { ok: true }, true).verb).toBe('searching');
+    // A tool this client has never heard of falls back to the worker's own sentence, unmangled.
+    expect(row('teleport', {}, { ok: true })).toEqual({
+      verb: 'teleport',
+      prefix: '',
+      name: 'completed',
+      figure: ''
+    });
+  });
+
+  it('carries live against settled in the verb, not only in the mark', () => {
+    const args = { path: 'notes.md', content: 'hi' };
+    expect(row('file_write', args, {}, true).verb).toBe('writing');
+    expect(row('file_write', args, {}, false).verb).toBe('wrote');
+    expect(row('shell', { executable: 'ls', args: [] }, {}, true).verb).toBe('running');
+    expect(row('browser_snapshot', {}, { url: 'https://a.test/' }, true).verb).toBe('reading');
+    // The folded run of narration, whose verb is the whole row.
+    expect(ledgerRow('', 'thinking', undefined, false).verb).toBe('thought');
   });
 });

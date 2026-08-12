@@ -27,12 +27,10 @@ import {
   XCircle
 } from 'lucide-react';
 import type { BotWall, FileRequest, Task, TaskEvent } from './types.js';
-import { TaskPlanPanel, planProgress, useTaskPlan } from './TaskPlanPanel.js';
+import { TaskPlanPanel } from './TaskPlanPanel.js';
 import { CopyButton, Markdown } from './Markdown.js';
 import { DiffView } from './DiffView.js';
 import {
-  activityLine,
-  activityOverview,
   agentQuestion,
   botWallClearance,
   buildConversation,
@@ -41,12 +39,12 @@ import {
   formatBytes,
   forkFamily,
   hostOf,
+  ledgerRow,
   liveActivityId,
   previewLifetime,
   lastLine,
   reasoningEffortLabel,
   settledToolStarts,
-  toolLabel,
   workEvidence,
   type ActivityEntry,
   type ConversationNode,
@@ -57,7 +55,7 @@ import {
 } from './timeline-state.js';
 import { externalRead, provenanceReport, sourcesPhrase } from './provenance.js';
 import { completionCard, verificationReceiptLabel, type HarnessCheck } from './completion-card.js';
-import { queuedMessagesCanRun, taskIsGenerating, terminalTaskStatuses } from './task-status.js';
+import { queuedMessagesCanRun } from './task-status.js';
 import { formatUsd } from './usage-model.js';
 import { fileKindLabel, inlineMediaKind, splitAttachments } from './attachments.js';
 import { AttachmentStrip } from './AttachmentTray.js';
@@ -246,15 +244,16 @@ function PageEvidence({ evidence }: { evidence: Extract<WorkEvidence, { kind: 'p
  *
  * Memoised on the four values rather than on the joined call, because the join rebuilds its objects
  * on every rebuild of the transcript and a streaming turn rebuilds the transcript once per frame -
- * so a component keyed on the call itself would re-derive every open work log's evidence sixty
- * times a second. `arguments` and `result` are the payload objects the event carries, which are the
- * same references for the life of the event, so the shallow comparison holds.
+ * so a component keyed on the call itself would re-derive every ledger row's evidence sixty times a
+ * second. `arguments` and `result` are the payload objects the event carries, which are the same
+ * references for the life of the event, so the shallow comparison holds. That matters more now than
+ * it did behind the fold: every row in the window is mounted, where once none of them was.
  *
  * The raw payload is one more disclosure down rather than gone. This is about what is promoted.
  *
- * Exported for the test that guards the bug this replaced: a work log's body is mounted only once
- * the reader opens the group, so nothing rendered from the transcript's own root can reach it, and
- * the shipped defect was exactly a row rendered from the wrong branch.
+ * Exported for the test that guards the bug this replaced: this renders inside a ledger row's own
+ * disclosure and nowhere else, and the shipped defect was exactly a row rendered from the wrong
+ * branch.
  */
 export const ToolEvidence = memo(function ToolEvidence({
   tool,
@@ -448,15 +447,21 @@ function AssistantMessage({
   onBranch?: (event: TaskEvent) => void;
 }) {
   return (
-    <article className="assistant-message">
-      <div className="ai-avatar" aria-hidden="true">
-        a
-      </div>
+    // No monogram. Every answer in this column is the machine's, so a badge saying so on each one
+    // was the software signing its own work - and it took 40px out of the 375px the owner reads on
+    // a phone to do it.
+    <article
+      className={`assistant-message${node.streaming ? ' cooling' : ''}`}
+      {...(node.streaming ? { 'aria-busy': true } : {})}
+    >
       <div className="assistant-message-body">
         <Markdown>{node.markdown}</Markdown>
         {node.sources && node.sources.length > 0 && <Sources sources={node.sources} />}
         {node.streaming ? (
-          <span className="streaming-caret" role="img" aria-label="Still writing" />
+          // The caret blinked at the same rate through a turn that had been dead for eleven
+          // minutes. What replaces it is not drawn at all: the heat on the last two lines is the
+          // sighted signal, and this is the same fact for a reader who is not looking at it.
+          <span className="sr-only">Still writing</span>
         ) : (
           <>
             <MessageActions
@@ -472,6 +477,49 @@ function AssistantMessage({
     </article>
   );
 }
+
+/**
+ * The four cells a ledger row is made of.
+ *
+ * `memo` because this is per-event work on a streaming frame, which is the cost the note at :167
+ * measured: every prop here is either a primitive or an object off the event payload, whose
+ * identity survives a transcript rebuild, so a frame that changes nothing about this row does no
+ * work for it. It is also why `workEvidence` is called here rather than lifted into `Event`, which
+ * is not memoised and cannot be while it holds the whole transcript's branches.
+ *
+ * The empty cells are deliberate and are not written away: an absent figure is a column of
+ * alignment the next row's figure lands in, and alignment is the only separator this list has.
+ */
+const LedgerCells = memo(function LedgerCells({
+  tool,
+  summary,
+  args,
+  result,
+  live,
+  unfinished
+}: {
+  tool: string;
+  summary: string;
+  args?: unknown;
+  result?: unknown;
+  /** Whether the call is still out. Past tense is the settled row's state cue. */
+  live: boolean;
+  /** A start the task stopped on top of: begun, never concluded, so never past tense either. */
+  unfinished?: boolean;
+}) {
+  const row = ledgerRow(tool, summary, workEvidence({ tool, arguments: args }, result), live);
+  return (
+    <>
+      <i className="ledger-mark" aria-hidden="true" />
+      <span className="ledger-verb">{row.verb}</span>
+      <span className="ledger-subject">
+        {row.prefix && <span className="ledger-dim">{row.prefix}</span>}
+        <b>{row.name}</b>
+      </span>
+      <span className="ledger-figure">{unfinished ? 'never finished' : row.figure}</span>
+    </>
+  );
+});
 
 function Event({
   event,
@@ -530,7 +578,11 @@ function Event({
       <details className="tool-event">
         <summary>
           <Brain />
-          <span>{event.summary}</span>
+          {/* A folded run of narration has no tool, no subject and no figure: the verb is the whole
+              row, and the prose it stands for is one click under it. `thinking` is the label; the
+              ledger's own tense makes it `thought`, which is true by construction — a run is only
+              folded here once the turn has moved on from it. */}
+          <LedgerCells tool="" summary="thinking" live={false} />
           <ChevronRight />
         </summary>
         {/* One paragraph per paragraph, in the padded grid every other body in this log uses, so
@@ -562,15 +614,21 @@ function Event({
      * `settled` is exactly that second case now, and it used to draw a green tick and the success
      * class over it. The tick was honest when this branch also drew calls that had returned; it
      * cannot stay, because the only rows left here are the ones that did not.
+     *
+     * Both cases keep the participle. One is happening and one never stopped happening; a past
+     * tense over `never finished` would be the row arguing with itself.
      */
     return (
-      <details className={`tool-event ${settled ? 'unfinished' : ''}`}>
+      <details className={`tool-event ${settled ? 'unfinished' : 'live'}`}>
         <summary>
           {settled ? <Hourglass /> : <LoaderCircle className="spin" />}
-          <span>
-            {toolLabel(tool, event.summary)}
-            {settled && ' · never finished'}
-          </span>
+          <LedgerCells
+            tool={tool}
+            summary={event.summary}
+            args={data.arguments}
+            live
+            {...(settled ? { unfinished: true } : {})}
+          />
           <ChevronRight />
         </summary>
         <ToolEvidence
@@ -587,7 +645,26 @@ function Event({
     const screenshot = result?.screenshotBase64;
     const isDesktop = Boolean(result && ('activeApplication' in result || 'nodes' in result));
     return (
-      <>
+      <details className="tool-event success">
+        <summary>
+          <Check />
+          {/* The call's own tool, not the summary's: the worker writes "file_write completed",
+              and the owner has been reading "Writing a file" for the whole run. */}
+          <LedgerCells
+            tool={call?.tool ?? ''}
+            summary={event.summary}
+            args={call?.arguments}
+            result={data.result}
+            live={false}
+          />
+          <ChevronRight />
+        </summary>
+        {/*
+          Under the row rather than beside it. The capture used to sit outside the disclosure, which
+          was harmless while the whole log was behind one more — and would now put a 390px
+          screenshot in the reading column for every step a browsing turn takes. A click buys more
+          about one line; it is the only thing a click in here ever buys.
+        */}
         {typeof screenshot === 'string' && screenshot.length > 0 && (
           <figure className="browser-capture-card">
             <img
@@ -613,24 +690,15 @@ function Event({
             </figcaption>
           </figure>
         )}
-        <details className="tool-event success">
-          <summary>
-            <Check />
-            {/* The call's own tool, not the summary's: the worker writes "file_write completed",
-                and the owner has been reading "Writing a file" for the whole run. */}
-            <span>{toolLabel(call?.tool ?? '', event.summary)}</span>
-            <ChevronRight />
-          </summary>
-          <ToolEvidence
-            tool={call?.tool ?? ''}
-            args={call?.arguments}
-            {...(call?.before === undefined ? {} : { before: call.before })}
-            result={data.result}
-            stage="result"
-            {...(onOpenFile ? { onOpenFile } : {})}
-          />
-        </details>
-      </>
+        <ToolEvidence
+          tool={call?.tool ?? ''}
+          args={call?.arguments}
+          {...(call?.before === undefined ? {} : { before: call.before })}
+          result={data.result}
+          stage="result"
+          {...(onOpenFile ? { onOpenFile } : {})}
+        />
+      </details>
     );
   }
   if (event.kind === 'approval_requested') {
@@ -1012,30 +1080,31 @@ function Event({
 }
 
 /**
- * Whether anything is moving, and how it stopped when it is not.
+ * How much of a long turn a ledger opens with, and how much a click adds.
  *
- * One spinner for "not terminal" and one tick for everything else, which meant a run that failed
- * wore the same mark as a verified one, directly above the word that said so. Only the live group
- * answers for the conversation; every earlier group is finished by construction.
+ * Newest at the bottom, next to the composer, because on a live turn that is where the interesting
+ * rows are. Ten is what fits above the fold on a phone without the answer leaving the screen; forty
+ * is what a reader who has decided to look back actually wants, rather than four more clicks.
  */
-function ActivityIcon({ status, live }: { status: string; live: boolean }) {
-  if (!live) return <CheckCircle2 />;
-  if (taskIsGenerating(status)) return <LoaderCircle className="spin" />;
-  if (status === 'failed') return <AlertTriangle />;
-  if (status === 'completed') return <CheckCircle2 />;
-  // Stopped, or parked on the owner or on the box: work outstanding either way.
-  return <Hourglass />;
-}
+const LEDGER_ROWS = 10;
+const LEDGER_MORE = 40;
 
 /**
- * `overview`, `settled` and `planSequence` are derived from the whole event log, which is why they
- * are passed in rather than computed here: every group would otherwise re-derive them from the
- * full array on every frame of a streaming answer.
+ * What the turn did, in the column the owner is already reading.
+ *
+ * It used to be one `<details>` whose label was a count of itself — `Work log · 47 steps` — with
+ * every step behind it. That is the software describing its own volume instead of showing its work,
+ * and the data was already computed: `workEvidence` classifies every call and `toolLabel` names all
+ * thirty tools in the owner's words. There is no fold now, and nothing to click to find out what
+ * the machine did; a click only ever buys more about one line.
+ *
+ * `settled` and `planSequence` are derived from the whole event log, which is why they are passed
+ * in rather than computed here: every group would otherwise re-derive them from the full array on
+ * every frame of a streaming answer.
  */
 function ActivityLog({
   task,
   events,
-  overview,
   settled,
   planSequence,
   live,
@@ -1044,7 +1113,6 @@ function ActivityLog({
 }: {
   task: Task;
   events: ActivityEntry[];
-  overview: string;
   settled: (event: TaskEvent) => boolean;
   planSequence: number;
   /** Whether this is the group the agent is working in right now. */
@@ -1052,78 +1120,45 @@ function ActivityLog({
   onOpenSurface?: (surface: Surface) => void;
   onOpenFile?: (request: FileRequest) => void;
 }) {
-  const terminal = terminalTaskStatuses.has(task.status);
-  const [open, setOpen] = useState(false);
-  // Only the live group asks. This component is mounted once per activity group, so the plan - one
-  // record on the box - was fetched once per group, and every one of those reads was discarded by
-  // the `live ?` below except the last.
-  const plan = useTaskPlan(live ? task.id : '', planSequence);
-  const progress = live ? planProgress(plan?.steps ?? []) : null;
-  const line = activityLine({
-    progress: progress && !terminal ? progress : null,
-    overview,
-    // Entries, minus the ones that are not steps: a folded run of narration is a block of the
-    // model's prose filed here, and counting it would make a finished log claim work it never did.
-    steps: events.filter(({ event }) => event.kind !== 'assistant_delta').length,
-    live
-  });
+  const [cap, setCap] = useState(LEDGER_ROWS);
+  const hidden = events.length - cap;
   return (
-    <details
-      className={`task-activity ${terminal ? 'finished' : 'active'}`}
-      open={open}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
-    >
-      <summary>
-        <span className="task-activity-icon">
-          <ActivityIcon status={task.status} live={live} />
-        </span>
-        <span className="task-activity-copy">
-          <strong>{live && !terminal ? 'Agent activity' : 'Work log'}</strong>
-          {/*
-            "Step 2 of 5 · Writing a file" rather than "Thinking": the count is the answer to the
-            question a waiting owner is actually asking, and it used to cost a click to reach. It
-            belongs only to the group being worked in — every earlier group repeating the live
-            progress made the transcript claim the agent was in four places at once. What it says
-            when there is nothing to count, and when the count has run out, is `activityLine`.
-          */}
-          {line && <small>{line}</small>}
-          {progress && !terminal && (
-            <span
-              className="task-activity-progress"
-              role="progressbar"
-              aria-label={`${progress.completed} of ${progress.total} steps done`}
-              aria-valuenow={progress.completed}
-              aria-valuemin={0}
-              aria-valuemax={progress.total}
-            >
-              <i style={{ width: `${(progress.completed / progress.total) * 100}%` }} />
-            </span>
-          )}
-        </span>
-        <ChevronRight className="task-activity-chevron" />
-      </summary>
-      {open && (
-        <div className="task-activity-body">
-          {/*
-            The plan belongs to the conversation, not to one group of its steps, and it is a live
-            editor with a Save button. Rendered in every group, a work log from twenty minutes ago
-            presented today's plan as its own under a heading reading "Live plan", and expanding two
-            groups put two editors for one record on the screen at once.
-          */}
-          {live && <TaskPlanPanel task={task} refreshKey={planSequence} />}
-          {events.map(({ event, call }) => (
+    <>
+      {/*
+        The plan belongs to the conversation, not to one group of its steps, and it is a live editor
+        with a Save button. Rendered in every group, a work log from twenty minutes ago presented
+        today's plan as its own; above the rows rather than among them, because it is the one thing
+        here that is about what happens next.
+      */}
+      {live && <TaskPlanPanel task={task} refreshKey={planSequence} />}
+      {/* eslint-disable-next-line jsx-a11y/no-redundant-roles -- It is redundant everywhere except
+          the browser this product's owner reads it in on a train. Safari drops list semantics from
+          any list whose marker is removed, and `.ledger` removes the marker; a countable list of
+          steps is the whole of what a reader who cannot see the alignment gets in place of the one
+          collapsed noun this replaces. */}
+      <ol className="ledger" role="list" aria-label="What this turn did">
+        {hidden > 0 && (
+          <li>
+            {/* What keeps a three-hundred-step turn from being a firehose. It is a count of what is
+                withheld, which is the one thing a count is honest about. */}
+            <button className="ledger-more" onClick={() => setCap(cap + LEDGER_MORE)}>
+              {hidden} earlier step{hidden === 1 ? '' : 's'}
+            </button>
+          </li>
+        )}
+        {(hidden > 0 ? events.slice(-cap) : events).map(({ event, call }) => (
+          <li key={event.id}>
             <Event
-              key={event.id}
               event={event}
               settled={settled(event)}
               {...(call ? { call } : {})}
               {...(onOpenSurface ? { onOpenSurface } : {})}
               {...(onOpenFile ? { onOpenFile } : {})}
             />
-          ))}
-        </div>
-      )}
-    </details>
+          </li>
+        ))}
+      </ol>
+    </>
   );
 }
 
@@ -1462,7 +1497,6 @@ export function Timeline({
       }
     return {
       nodes: buildConversation(events, status),
-      overview: activityOverview(status, events),
       settled: settledToolStarts(events, status),
       planSequence
     };
@@ -1703,7 +1737,6 @@ export function Timeline({
                 key={node.id}
                 task={task}
                 events={node.events}
-                overview={transcript.overview}
                 settled={transcript.settled}
                 planSequence={transcript.planSequence}
                 live={node.id === lastActivityId}

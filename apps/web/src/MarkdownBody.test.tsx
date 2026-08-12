@@ -97,3 +97,68 @@ describe('an agent-authored message', () => {
     expect(html).toContain('table-scroll');
   });
 });
+
+/**
+ * The reading column is two measures: prose clamps to 33rem and evidence is let out to the full
+ * width, and `styles.css` spends that exemption on a list of selectors — `.markdown > :is(pre,
+ * .code-block, .table-scroll, .katex-display)`. The list is only right for as long as those are the
+ * elements this renderer actually puts directly under `.markdown`. If a wrapper is renamed or
+ * dropped here, nothing breaks loudly: code and tables quietly shrink back inside the prose measure
+ * and stay there. So the wrapping is asserted where it is decided.
+ */
+describe('what the renderer puts directly under .markdown', () => {
+  const topLevel = (markdown: string): string[] => {
+    const body = render(markdown).replace(/^<div class="markdown">/, '');
+    const names: string[] = [];
+    let depth = 0;
+    for (const [, slash, tag, attrs, selfShut] of body.matchAll(
+      /<(\/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*?)(\/?)>/g
+    )) {
+      if (slash === '/') {
+        depth -= 1;
+        continue;
+      }
+      const shut = selfShut === '/' || ['img', 'hr', 'br', 'input'].includes(tag ?? '');
+      const first = /class="([^" ]*)/.exec(attrs ?? '')?.[1];
+      if (depth === 0) names.push(first ? `${tag}.${first}` : `${tag}`);
+      if (!shut) depth += 1;
+    }
+    return names;
+  };
+
+  it('wraps a fenced block and a table, so neither pre nor table is ever a direct child', () => {
+    const kids = topLevel(
+      'Prose.\n\n```ts\nconst x = 1;\n```\n\n| a | b |\n| - | - |\n| 1 | 2 |\n'
+    );
+    expect(kids).toContain('figure.code-block');
+    expect(kids).toContain('div.table-scroll');
+    expect(kids).not.toContain('pre');
+    expect(kids).not.toContain('table');
+  });
+
+  /*
+   * The other list of selectors spent on this renderer's output, and the one that fails quietly.
+   * While an answer is arriving `.cooling .markdown` paints its text from one gradient, and the
+   * elements that carry ink or a background of their own are named individually so they are taken
+   * back off it - `styles.css`, `.cooling .markdown :is(pre, code, table, th, td, a, img, .katex)`.
+   * If the renderer stops emitting one of these tags the rule stops matching it, and what a reader
+   * sees is a half-arrived answer with a hole in it where its code or its table was.
+   */
+  it('emits the tags the cooling gradient has to hand back their own ink', () => {
+    const html = render(
+      'Prose with `inline` code.\n\n```ts\nconst x = 1;\n```\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\n[a link](/somewhere) and ![a chart](/v1/artifacts/abc/content)\n'
+    );
+    for (const tag of ['<pre', '<code', '<table', '<th', '<td', '<a ', '<img'])
+      expect(html, tag).toContain(tag);
+  });
+
+  it('leaves prose, headings and lists bare, which is what takes the reading measure', () => {
+    expect(topLevel('# Title\n\nProse.\n\n- one\n- two\n\n> quoted\n\n---\n')).toEqual([
+      'h1',
+      'p',
+      'ul',
+      'blockquote',
+      'hr'
+    ]);
+  });
+});

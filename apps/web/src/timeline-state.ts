@@ -57,6 +57,10 @@ const activityLabels: Record<string, string> = {
  * row printed the worker's own sentence — "shell", "file_write completed" — so a single screen
  * described the same action in two registers, the machine's underneath the owner's. The table
  * already covers all thirty tools; nothing here needed writing except the export.
+ *
+ * `ledgerRow` splits what comes back at its first space, because every entry is written as a verb
+ * and its object. A label added here that is not will read as a verb with no subject; that is the
+ * only thing the shape of this table now has to hold.
  */
 export const toolLabel = (tool: string, fallback: string): string =>
   activityLabels[tool] ?? fallback.replace(/^Running\s+/i, '');
@@ -101,113 +105,6 @@ export const settledToolStarts = (
   return (event) => settled.has(event.id);
 };
 
-/**
- * Which of the two waits a parked conversation is in, named from the log rather than the status.
- *
- * The newest of the two wins: a turn can raise an approval, be answered, carry on and then stop to
- * ask something, and only the last one is still outstanding.
- */
-const waitingOn = (events: TaskEvent[]): string => {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const kind: string = events[index]!.kind;
-    if (kind === 'question_asked') return 'Waiting for your answer';
-    if (kind === 'approval_requested') return 'Waiting for your approval';
-  }
-  return 'Waiting for you';
-};
-
-/**
- * How a conversation ended, in the word for the ending it actually had.
- *
- * Every one of these used to read "finished", because the line asked whether anything was still
- * running rather than how it stopped. Observed: "18 actions · 12 AI turns · finished" over a
- * provider timeout, on a conversation whose own row in the list said failed - two answers to one
- * question on one screen, and the confident one was wrong. Nothing is running is true of all three
- * and is not what a reader is asking.
- */
-const endingWords: Record<string, string> = {
-  completed: 'finished',
-  failed: 'failed',
-  cancelled: 'stopped'
-};
-
-export const activityOverview = (taskStatus: string, events: TaskEvent[]): string => {
-  let actionCount = 0;
-  let turnCount = 0;
-  for (const event of events) {
-    if (event.kind === 'tool_started') actionCount += 1;
-    else if (event.kind === 'cost') turnCount += 1;
-  }
-  if (terminalTaskStatuses.has(taskStatus)) {
-    // A terminal status with no word of its own gets the one thing that is certainly true of it.
-    const ending = endingWords[taskStatus] ?? 'ended';
-    const parts = [
-      actionCount ? `${actionCount} ${actionCount === 1 ? 'action' : 'actions'}` : '',
-      turnCount ? `${turnCount} AI ${turnCount === 1 ? 'turn' : 'turns'}` : ''
-    ].filter(Boolean);
-    return parts.length
-      ? `${parts.join(' · ')} · ${ending}`
-      : `${ending[0]!.toUpperCase()}${ending.slice(1)}`;
-  }
-  // `awaiting_user` covers two different waits now, and reading "Waiting for your approval" over a
-  // question with three options offered is worse than saying nothing: it sends the owner looking for
-  // an Approve button that does not exist. Which one it is is read off the last of the two events
-  // that park a conversation, because the status alone cannot tell them apart.
-  if (taskStatus === 'awaiting_user') return waitingOn(events);
-  if (taskStatus === 'awaiting_resource') return 'Waiting for the computer';
-  if (taskStatus === 'paused') return 'Paused';
-  const settled = settledToolStarts(events, taskStatus);
-  let current: TaskEvent | undefined;
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]!;
-    if (event.kind === 'tool_started' && !settled(event)) {
-      current = event;
-      break;
-    }
-  }
-  if (current) {
-    const rawTool = eventPayload(current).tool;
-    const tool = typeof rawTool === 'string' ? rawTool : '';
-    return activityLabels[tool] ?? current.summary.replace(/^Running\s+/i, '');
-  }
-  /*
-   * Nothing, rather than "Thinking".
-   *
-   * A turn with no tool call in flight is thinking, and the transcript already says so: the word
-   * rendered on the work log's own line, in a different typeface, directly above the thinking node
-   * carrying the actual reasoning. Two printings of one fact, and the smaller of them was the one
-   * with nothing in it.
-   */
-  return taskStatus === 'queued' || taskStatus === 'planning' ? 'Preparing the task' : '';
-};
-
-/**
- * The one line under the work log's heading, or nothing at all.
- *
- * Assembled here rather than in the component so the empty cases are a thing a test can reach.
- * Measured: a two-step plan whose steps were both done rendered "Step 2 of 2" beside a bar already
- * at 100%, because the counter was written as "the step being worked on" and there was none. When
- * every part of the line is empty the line itself does not render - an empty row is furniture.
- */
-export const activityLine = (input: {
-  /** The live plan's progress, or null when this group is not the one being worked in. */
-  progress: { completed: number; total: number; current: string } | null;
-  overview: string;
-  /** How many entries a finished group holds. */
-  steps: number;
-  /** Whether this is the group the agent is working in right now. */
-  live: boolean;
-}): string => {
-  const plural = (count: number): string => `${count} ${count === 1 ? 'step' : 'steps'}`;
-  if (input.progress) {
-    const { completed, total, current } = input.progress;
-    const counter =
-      completed >= total ? `${plural(total)} done` : `Step ${completed + 1} of ${total}`;
-    return [counter, current || input.overview].filter(Boolean).join(' · ');
-  }
-  return input.live ? input.overview : plural(input.steps);
-};
-
 export const compactResultSummary = (markdown: string, maxLength = 320): string => {
   const plain = markdown
     .replace(/```[\s\S]*?```/g, ' ')
@@ -229,7 +126,7 @@ export const compactResultSummary = (markdown: string, maxLength = 320): string 
   return `${candidate.slice(0, wordEnd > 0 ? wordEnd : maxLength).trim()}…`;
 };
 
-/** Events that belong in the transcript rather than inside a collapsed activity group. */
+/** Events that belong in the transcript rather than among the steps in the turn ledger. */
 const conversationalKinds = new Set([
   'user_message',
   'queued_message',
@@ -252,7 +149,8 @@ const conversationalKinds = new Set([
 ]);
 
 /**
- * What a folded run of narration is called in the work log, in the register of the rows beside it.
+ * What a folded run of narration is called on the event itself, for anything that reads a summary
+ * rather than the row. The ledger draws it as one word, `thought`, and no subject.
  */
 export const NARRATION_SUMMARY = 'Thinking out loud';
 
@@ -343,7 +241,7 @@ const staysInTranscript = (event: TaskEvent): boolean =>
   ownerFacing(event) || externalRead(event) !== undefined;
 
 /**
- * The conversational events that close the work log where they stand.
+ * The conversational events that close the ledger where they stand.
  *
  * A turn boundary, and the things whose meaning depends on sitting next to what produced them: a
  * decision beside its request, an output card where it was produced, the completion card last.
@@ -715,7 +613,7 @@ export interface ToolCall {
   before?: string;
 }
 
-/** One row of a work log: an event, and the call it belongs to where there is one. */
+/** One row of the ledger: an event, and the call it belongs to where there is one. */
 export interface ActivityEntry {
   event: TaskEvent;
   index: number;
@@ -869,6 +767,96 @@ export const workEvidence = (
   return undefined;
 };
 
+/**
+ * One line of the ledger: what happened, what it happened to, and the one figure worth a column.
+ *
+ * Three cells and a gutter, in that order, on every row without exception - which is what makes a
+ * forty-step turn skimmable at all. Alignment is doing the work a disclosure triangle used to do
+ * badly.
+ */
+export interface LedgerRow {
+  verb: string;
+  /** The elidable head of the subject - a directory, never the thing itself. Usually empty. */
+  prefix: string;
+  name: string;
+  figure: string;
+}
+
+/**
+ * The four participles this product uses whose past tense English does not derive.
+ *
+ * `thinking` is here because a folded run of narration is a row too, and by construction it is
+ * always a run the turn moved on from.
+ */
+const irregularPast: Record<string, string> = {
+  reading: 'read',
+  running: 'ran',
+  splitting: 'split',
+  thinking: 'thought',
+  writing: 'wrote'
+};
+
+/**
+ * Tense is the state cue, and it is the only one that is not a colour.
+ *
+ * A row that is happening keeps its participle - `writing`, `running` - and a row that is finished
+ * takes the past. The lit dot beside a live row says the same thing in ember, and a dot is exactly
+ * the kind of thing a reader can be unable to see; the word cannot be missed by anybody who can
+ * read the row at all. Stripping `-ing` and appending `-ed` is right for every label in this file
+ * except the five above, and it leaves anything that is not a participle alone, because an unknown
+ * tool falls back to the worker's own sentence and that must not be mangled.
+ */
+const pastTense = (participle: string): string =>
+  irregularPast[participle] ??
+  (participle.endsWith('ing') ? `${participle.slice(0, -3)}ed` : participle);
+
+/**
+ * The row one call is read as, from evidence that is already computed.
+ *
+ * Deliberately not `+82 −14` per row: line counts need the diff, and the note at `Timeline.tsx:167`
+ * records what per-event work costs on a streaming frame. A byte length and an exit code are free
+ * off the payload already in hand.
+ */
+export const ledgerRow = (
+  tool: string,
+  summary: string,
+  evidence: WorkEvidence | undefined,
+  live: boolean
+): LedgerRow => {
+  const row = (verb: string, prefix: string, name: string, figure = ''): LedgerRow => ({
+    verb: live ? verb : pastTense(verb),
+    prefix,
+    name,
+    figure
+  });
+  if (evidence?.kind === 'files') {
+    const { changes } = evidence;
+    const verb = tool === 'file_patch' ? 'editing' : 'writing';
+    const bytes = formatBytes(changes.reduce((total, change) => total + change.after.length, 0));
+    // One patch call can carry several files, and naming only the first is a lie by omission the
+    // row has no room to correct. The count is the honest subject; the paths are one click below.
+    if (changes.length !== 1) return row(verb, '', `${changes.length} files`, bytes);
+    const path = changes[0]!.path;
+    const cut = path.lastIndexOf('/') + 1;
+    return row(verb, path.slice(0, cut), path.slice(cut), bytes);
+  }
+  // The command is already shell-quoted, and an exit code of zero is not news.
+  if (evidence?.kind === 'command') return row('running', '', evidence.command, evidence.status);
+  if (evidence?.kind === 'pages') {
+    const { pages } = evidence;
+    return row('reading', '', pages[0]!.host, pages.length > 1 ? `${pages.length} pages` : '');
+  }
+  /*
+   * Everything else is the tool's own label, which is already written as a verb and its object -
+   * "Searching the web", "Updating the plan" - so the split that gives this file its two columns
+   * is the first space. The worker's sentence for the same call is `${tool} completed`, and
+   * printing that beside the owner's words would be the machine's register underneath theirs.
+   */
+  const label = toolLabel(tool, summary).toLowerCase();
+  const cut = label.indexOf(' ');
+  return cut < 0 ? row(label, '', '') : row(label.slice(0, cut), '', label.slice(cut + 1));
+};
+
 const payloadText = (event: TaskEvent, key: string): string => {
   const value = eventPayload(event)[key];
   return typeof value === 'string' ? value : '';
@@ -952,7 +940,7 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
    *
    * A blocked search is retried, and the next two calls to the same site are refused the same way,
    * so one challenge can produce three or four refusals in a single turn. The first is news; the
-   * rest are the same fact and stay in the work log rather than repeating a card that fills the
+   * rest are the same fact and stay among the steps rather than repeating a card that fills the
    * screen. A clean browser result means the wall is gone, so the next one is news again.
    */
   let standingWallSite = '';
@@ -1013,7 +1001,7 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
   };
 
   /*
-   * Where the work log belongs, remembered from when its first entry arrived.
+   * Where the ledger belongs, remembered from when its first entry arrived.
    *
    * The group is placed where the agent started working, but it is not closed until the turn ends,
    * so it collects everything the turn did rather than everything it did between two thoughts. The
@@ -1071,7 +1059,7 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
   };
 
   /**
-   * Files one frame of narration in the work log rather than in the reading column.
+   * Files one frame of narration among the turn steps rather than in the reading column.
    *
    * The text is not dropped - it is the same words, one disclosure away, beside the calls they were
    * written between. What changes is that they are no longer promoted as the answer to a question
@@ -1147,8 +1135,8 @@ export const buildConversation = (events: TaskEvent[], taskStatus: string): Conv
 
   events.forEach((event, index) => {
     // Taken wherever it lands: the harness publishes a run as a status event when it passes and
-    // repeats it on the warning that refuses a finish, and both are ordinary work-log entries that
-    // would otherwise be folded into a collapsed group and never reach the card.
+    // repeats it on the warning that refuses a finish, and both are ordinary ledger rows that
+    // would otherwise never reach the card.
     const run = harnessRun(event);
     if (run) pendingHarness = run;
     /*
