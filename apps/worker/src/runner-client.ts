@@ -360,9 +360,9 @@ export class AgentRunnerClient {
    * This used to read the plain file endpoint and then refuse anything that was not one of four
    * types. That refusal was the whole of athanor's answer to a phone photograph: HEIC arrived as
    * bytes of no stated kind, and the owner was told their computer could not open a file sitting in
-   * front of them in the Files pane. The runner now converts what no model accepts, so the check
-   * below is no longer a policy - it is this side making sure the other side kept its promise
-   * before a data URL is built out of it.
+   * front of them in the Files pane. The runner now re-encodes every picture it answers with, so
+   * the check below is no longer a policy - it is this side making sure the other side kept its
+   * promise before a data URL is built out of it.
    */
   async readImage(
     workspaceId: string,
@@ -389,16 +389,15 @@ export class AgentRunnerClient {
       throw new Error(`The workspace returned ${mimeType}, which no model accepts as a picture`);
     const bytes = Buffer.from(await response.arrayBuffer());
     if (bytes.length > 20 * 1024 * 1024) throw new Error('Image exceeds the 20 MB vision limit');
-    // Only when it happened, and named by what the file actually was: a turn that reads a
-    // photograph is entitled to know it is looking at a re-encoding rather than at the pixels on
-    // disk, and a turn that reads a PNG should not be told anything at all.
+    // Named by what the file on disk actually is. Every picture is re-encoded on its way out of the
+    // runner now - that pass is what takes a photograph's location and camera off it - so a turn is
+    // always looking at a re-encoding rather than at the pixels on disk, and is entitled to know
+    // which file it came from even when the format did not change.
     const sourceType = response.headers.get('x-image-source-type');
     return {
       mimeType,
       base64: bytes.toString('base64'),
-      ...(response.headers.get('x-image-converted') === 'true' && sourceType
-        ? { convertedFrom: sourceType }
-        : {})
+      ...(sourceType ? { convertedFrom: sourceType } : {})
     };
   }
 
@@ -466,8 +465,14 @@ export class AgentRunnerClient {
       AUDIO_REQUEST_TIMEOUT_MS
     );
     if (!response.ok) throw await runnerFailure(response);
+    // The absent header has to be told apart from the zero, because the runner leaves the duration
+    // out precisely when ffprobe could not measure the track - and `Number(null)` is 0, which is
+    // finite, so the missing measurement used to arrive as a recording of no length at all sitting
+    // next to the ninety minutes that were just read out of it.
     const header = (name: string): number | null => {
-      const parsed = Number(response.headers.get(name));
+      const raw = response.headers.get(name);
+      if (raw === null) return null;
+      const parsed = Number(raw);
       return Number.isFinite(parsed) ? parsed : null;
     };
     return {

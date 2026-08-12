@@ -14,6 +14,31 @@ import { recoveryFile } from './account-recovery.js';
 import { BrandMark } from './BrandMark.js';
 import { ServerInstall } from './ServerInstall.js';
 
+/**
+ * What to put in front of the owner when the passkey ceremony came back with nothing.
+ *
+ * One failure is not about passkeys at all. A browser switches WebAuthn off completely on a page
+ * whose certificate it does not trust, and accepting the warning to reach this screen does not
+ * switch it back on — so a server serving the certificate it signed itself has a working sign-in
+ * screen and no way through it. The sentence the browser rejects with talks about TLS, and passed
+ * straight through it read as a fault in the device or the key, which sent the owner back to press
+ * the same button. The condition is named instead, along with what removes it, which is work on the
+ * server rather than anything that can be done here.
+ */
+export const authFailureText = (cause: unknown): string => {
+  const reported = cause instanceof Error ? cause.message : '';
+  const underlying =
+    cause instanceof Error && cause.cause instanceof Error ? cause.cause.message : '';
+  if (/certificate error/i.test(`${reported} ${underlying}`))
+    return [
+      'This browser will not create or use a passkey on a page whose certificate it does not trust,',
+      'and this server signed its own — accepting the warning does not lift that.',
+      'On the server: sudo athanor certificate enable --agree-tos --email you@example.com.',
+      'If it has no domain name yet, sudo athanor set-hostname your.domain comes first.'
+    ].join(' ');
+  return reported || 'Authentication failed';
+};
+
 export function Auth({ onReady }: { onReady: () => void }) {
   const [mode, setMode] = useState<AuthMode>('login');
   const [name, setName] = useState('');
@@ -134,7 +159,7 @@ export function Auth({ onReady }: { onReady: () => void }) {
         onReady();
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Authentication failed');
+      setError(authFailureText(cause));
     } finally {
       setBusy(false);
     }

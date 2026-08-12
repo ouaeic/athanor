@@ -90,6 +90,12 @@ export interface Bootstrap {
   tasks: Task[];
   /** Where the conversation list resumes, or null when this page was all of them. */
   tasksCursor?: string | null;
+  /**
+   * How many runs each schedule really has, which is not how many of them `tasks` carries: the list
+   * holds only the newest few of any one schedule so that a watcher firing every fifteen minutes
+   * cannot bury the owner's own work. Absent from a box older than this field.
+   */
+  scheduleRunCounts?: Record<string, number>;
   schedules: TaskSchedule[];
   /**
    * The catalogue as this client uses it: enough to name a model, order the picker and keep the

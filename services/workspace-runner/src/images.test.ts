@@ -70,11 +70,9 @@ describe('the pictures this computer can name', () => {
       expect(MODEL_IMAGE_TYPES.has(type)).toBe(true);
   });
 
-  it('has a conversion for every picture a model will not take, and none for one it will', () => {
-    for (const type of Object.values(IMAGE_CONTENT_TYPES)) {
-      if (MODEL_IMAGE_TYPES.has(type)) expect(conversionTargetFor(type)).toBeUndefined();
-      else expect(MODEL_IMAGE_TYPES.has(conversionTargetFor(type) ?? '')).toBe(true);
-    }
+  it('turns every picture it can name into one a model takes', () => {
+    for (const type of Object.values(IMAGE_CONTENT_TYPES))
+      expect(MODEL_IMAGE_TYPES.has(conversionTargetFor(type) ?? '')).toBe(true);
   });
 });
 
@@ -118,9 +116,35 @@ describe('the conversion a photograph gets', () => {
     expect(args.join(' ')).toContain('-density 150');
   });
 
-  it('gives a picture a model already takes no conversion at all', () => {
-    expect(imageConvertArguments('image/png')).toBeUndefined();
+  /*
+   * The branch a phone photograph actually takes, and the one that used to not exist. A JPEG needs
+   * no conversion to be accepted, so it was answered with the bytes off the disk - and a JPEG is
+   * what a camera roll, a message and a download all produce, with where it was taken,
+   * when, and on which body still written into it. The strip is on this pass and on no other, so
+   * the format most likely to be carrying all three has to take it.
+   */
+  it('strips a JPEG, which is what a photograph off a phone is', () => {
+    const args = imageConvertArguments('image/jpeg') ?? [];
+    expect(args).toContain('jpeg:-');
+    expect(args.at(-1)).toBe('jpeg:-');
+    expect(args).toContain('-strip');
+    expect(args).toContain('-auto-orient');
+  });
+
+  /* Whatever a model would have taken as it stood is the set that skipped the strip entirely. */
+  it('leaves no picture a model accepts without a pass that strips it', () => {
+    for (const type of MODEL_IMAGE_TYPES) expect(imageConvertArguments(type)).toContain('-strip');
+  });
+
+  /* A lossless WebP and a flat-colour GIF both survive PNG; neither survives a guess at a quality. */
+  it('answers a WebP and a GIF as PNG', () => {
+    expect(conversionTargetFor('image/webp')).toBe('image/png');
+    expect(conversionTargetFor('image/gif')).toBe('image/png');
+  });
+
+  it('gives a file that was never a picture no conversion at all', () => {
     expect(imageConvertArguments('application/pdf')).toBeUndefined();
+    expect(imageConvertArguments('text/markdown')).toBeUndefined();
   });
 
   it('hands back the converter output under the type it was asked for', async () => {

@@ -42,7 +42,7 @@ export const MODEL_IMAGE_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * How each format athanor can read but no model can take is re-encoded, and by which reader.
+ * How each format athanor can read is re-encoded on its way out, and by which reader.
  *
  * The coder is named rather than inferred. ImageMagick will otherwise choose one by looking at the
  * bytes, and some of the coders it can choose that way execute what they read; a picture that
@@ -53,12 +53,25 @@ export const MODEL_IMAGE_TYPES: ReadonlySet<string> = new Set([
  * bytes on the wire for nothing. Line art becomes PNG, where JPEG's ringing eats thin strokes and
  * small text - which for a diagram is the entire content.
  *
+ * The four formats a model already accepts are in this table too, and they are most of the point of
+ * it. Those four used to go out as they sat on disk, which read as a kindness and was the leak:
+ * the strip below lives on this pass and nowhere else, so the pictures that skipped it
+ * left carrying where they were taken, when, and on which camera body. JPEG is what every photo off
+ * a camera roll, out of a message or off a download is, so the arrangement stripped the formats
+ * that rarely hold coordinates and sent the one that almost always does. WebP and GIF become PNG
+ * rather than themselves because either can have been lossless where it came from and neither
+ * encoder can be asked to match a source nobody measured; PNG is lossless for both.
+ *
  * `msvg` is ImageMagick's own renderer rather than the delegate it would otherwise reach for. The
  * delegate resolves external references, and an SVG holding an `href` to somewhere inside this
  * network would make looking at a downloaded drawing into a request the owner never made.
  */
 const CONVERSIONS: Readonly<Record<string, { coder: string; target: 'image/jpeg' | 'image/png' }>> =
   {
+    'image/jpeg': { coder: 'jpeg', target: 'image/jpeg' },
+    'image/png': { coder: 'png', target: 'image/png' },
+    'image/webp': { coder: 'webp', target: 'image/png' },
+    'image/gif': { coder: 'gif', target: 'image/png' },
     'image/heic': { coder: 'heic', target: 'image/jpeg' },
     'image/heif': { coder: 'heif', target: 'image/jpeg' },
     'image/avif': { coder: 'avif', target: 'image/jpeg' },
@@ -72,8 +85,9 @@ const CONVERSIONS: Readonly<Record<string, { coder: string; target: 'image/jpeg'
  *
  * A vision model reads an image in tiles and stops gaining from resolution well below what a phone
  * camera produces, so a 48-megapixel photograph re-encoded at full size buys nothing and costs the
- * owner both the upload and the tokens. This only ever applies to a file being re-encoded anyway;
- * a picture that passes straight through is handed over exactly as it sits on disk.
+ * owner both the upload and the tokens. Nothing sharp is given up by applying it to a screenshot
+ * too: a picture larger than this is resampled to about this size at the other end regardless, so
+ * the only difference is which machine pays for the pixels nobody reads.
  */
 export const CONVERTED_IMAGE_MAX_SIDE = 1568;
 

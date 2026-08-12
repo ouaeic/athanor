@@ -29,8 +29,7 @@ import {
   conversionTargetFor,
   convertImageForModel,
   IMAGE_CONTENT_TYPES,
-  IMAGE_SOURCE_MAX_BYTES,
-  MODEL_IMAGE_TYPES
+  IMAGE_SOURCE_MAX_BYTES
 } from './images.js';
 import { commandLimits, resolveCommandLimiter } from './limits.js';
 import { ProcessManager } from './processes.js';
@@ -701,6 +700,11 @@ export const buildServer = async (config: RunnerConfig) => {
    * because doing it anywhere else means sending a picture in order to learn it was not accepted -
    * a failure that arrives from a provider, minutes later, naming a coder rather than the photo the
    * owner attached.
+   *
+   * Every picture goes through it, including the four a model would have taken as they are. That
+   * pass is also the only thing that takes the camera's own notes off a photograph, and a picture
+   * shown to a model is a picture leaving this computer, so the one exit is the one place the
+   * coordinates come off.
    */
   app.get<{ Params: { workspaceId: string }; Querystring: { path: string } }>(
     '/v1/workspaces/:workspaceId/image',
@@ -709,7 +713,7 @@ export const buildServer = async (config: RunnerConfig) => {
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       const requestedPath = assertUserDataPath(root, request.query.path);
       const declared = contentTypeFor(requestedPath);
-      if (!MODEL_IMAGE_TYPES.has(declared) && conversionTargetFor(declared) === undefined)
+      if (conversionTargetFor(declared) === undefined)
         throw new WorkspaceFileError(
           `${path.basename(requestedPath)} is not a picture. Read it with file_read or document_read instead.`,
           415
@@ -728,16 +732,17 @@ export const buildServer = async (config: RunnerConfig) => {
             .send({ error: { code: 'file_not_found', message: 'Workspace file not found' } });
         throw error;
       }
-      const picture = MODEL_IMAGE_TYPES.has(declared)
-        ? { mimeType: declared, content: source.content }
-        : await convertImageForModel(config.IMAGE_CONVERT_EXECUTABLE, declared, source.content);
+      const picture = await convertImageForModel(
+        config.IMAGE_CONVERT_EXECUTABLE,
+        declared,
+        source.content
+      );
       // Said on the wire rather than inferred from the type, because the two facts differ: a JPEG
-      // converted from HEIC is still a JPEG, and the turn that looks at it is entitled to know it
-      // is not seeing the pixels the file holds.
+      // answered as a JPEG has still been re-encoded, and the turn that looks at it is entitled to
+      // know it is not seeing the pixels the file holds.
       return reply
         .type(picture.mimeType)
         .header('x-image-source-type', declared)
-        .header('x-image-converted', String(picture.mimeType !== declared))
         .send(picture.content);
     }
   );

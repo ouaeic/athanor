@@ -107,7 +107,6 @@ describe('reading a picture a model can be shown', () => {
     expect(response.statusCode).toBe(200);
     expect(response.headers['content-type']).toContain('image/jpeg');
     expect(response.headers['x-image-source-type']).toBe('image/heic');
-    expect(response.headers['x-image-converted']).toBe('true');
     expect(response.rawPayload.toString()).toBe('converted-heic-bytes');
   });
 
@@ -117,7 +116,6 @@ describe('reading a picture a model can be shown', () => {
       const response = await read(name);
       expect(response.statusCode).toBe(200);
       expect(response.headers['content-type']).toContain('image/jpeg');
-      expect(response.headers['x-image-converted']).toBe('true');
     }
   });
 
@@ -130,16 +128,32 @@ describe('reading a picture a model can be shown', () => {
   });
 
   /*
-   * The other half of the promise. A picture a model already accepts is handed over untouched -
-   * re-encoding a screenshot would cost the owner sharpness for nothing.
+   * The other half of the promise, and the half that was a leak. A picture a model already accepts
+   * used to be handed over exactly as it sat on disk, which sounded like care for the owner's
+   * sharpness and meant that the one format every camera roll produces went out with the camera's
+   * own notes on it. The converter is where the stripping happens, so a photograph has to reach it.
    */
-  it('hands a PNG over exactly as it sits on disk', async () => {
-    const { read } = await serve({ 'shot.png': 'png-bytes' });
-    const response = await read('shot.png');
+  it('sends a photograph to the converter rather than out as it sits on disk', async () => {
+    const { read } = await serve({ 'IMG_0422.JPG': 'jpeg-bytes' });
+    const response = await read('IMG_0422.JPG');
     expect(response.statusCode).toBe(200);
-    expect(response.headers['content-type']).toContain('image/png');
-    expect(response.headers['x-image-converted']).toBe('false');
-    expect(response.rawPayload.toString()).toBe('png-bytes');
+    expect(response.headers['content-type']).toContain('image/jpeg');
+    expect(response.headers['x-image-source-type']).toBe('image/jpeg');
+    expect(response.rawPayload.toString()).toBe('converted-jpeg-bytes');
+  });
+
+  it('sends a screenshot, a saved WebP and a chart through it as well', async () => {
+    const { read } = await serve({
+      'shot.png': 'png-bytes',
+      'saved.webp': 'webp-bytes',
+      'chart.gif': 'gif-bytes'
+    });
+    for (const name of ['shot.png', 'saved.webp', 'chart.gif']) {
+      const response = await read(name);
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('image/png');
+      expect(response.rawPayload.toString()).toContain('converted-');
+    }
   });
 
   it('refuses a file that was never a picture, and says what to read it with', async () => {

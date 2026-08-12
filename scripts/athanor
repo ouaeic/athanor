@@ -223,6 +223,20 @@ control_env_value() {
   sed -n "s/^$1=//p" "$athanor_config/control.env" | sed -n '1p'
 }
 
+# What the certificate a browser is shown actually is, in the one word that decides what a browser
+# will do with this server. The comparison already lives in athanor-certificate, which owns the
+# file, so it is asked rather than repeated here: a second copy of the same test is a second thing
+# free to drift. "unknown" is a real answer and is kept as one - a report that cannot reach that
+# script has not learned that the certificate is self-signed, only that it did not find out.
+certificate_trust_state() {
+  case "$("$(runtime_path /usr/local/lib/athanor/athanor-certificate)" status 2>/dev/null |
+    sed -n 's/^Certificate: *//p' | sed -n '1p')" in
+    'issued by a certificate authority') printf 'trusted' ;;
+    'self-signed'*) printf 'self-signed' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 relay_directory="$athanor_config/relay"
 relay_settings="$relay_directory/settings.json"
 relay_status_file="$relay_directory/status.json"
@@ -374,10 +388,11 @@ doctor() {
         ;;
     esac
   fi
-  # A WebAuthn Relying Party ID has to be a registrable domain name; the specification does not
-  # allow an address literal. A server reached only by address therefore has publicly trusted
-  # TLS, an installable app and push notifications, but no way to register or use a passkey in a
-  # browser, so the owner can only sign in from a native client.
+  # Two separate things have to be true before anyone can sign in from a browser, and each one on
+  # its own looks like success. A WebAuthn Relying Party ID has to be a registrable domain name,
+  # because the specification does not allow an address literal. And the page has to be one the
+  # browser trusts: a certificate error switches WebAuthn off entirely, which accepting the warning
+  # does not undo. Either one missing leaves the owner able to sign in from a native client only.
   configured_rp_id=$(
     sed -n 's/^WEBAUTHN_RP_ID=//p' "$athanor_config/control.env" 2>/dev/null | sed -n '1p'
   )
@@ -386,8 +401,18 @@ doctor() {
     *[!0-9.]*) rp_id_is_hostname=yes ;;
     *) rp_id_is_hostname="" ;;
   esac
+  certificate_trust=$(certificate_trust_state)
   if [ -n "$rp_id_is_hostname" ]; then
-    check_ok "browser sign-in origin https://$configured_rp_id"
+    case "$certificate_trust" in
+      trusted) check_ok "browser sign-in origin https://$configured_rp_id" ;;
+      self-signed)
+        check_warn "browser sign-in cannot work at https://$configured_rp_id yet: this server is serving a certificate it signed itself, and a browser will not create or use a passkey on a page whose certificate it does not trust"
+        check_warn "to finish: sudo athanor certificate enable --agree-tos --email you@example.com"
+        ;;
+      *)
+        check_warn "browser sign-in origin https://$configured_rp_id: the name is right, but what certificate this server is serving could not be confirmed, and a browser refuses a passkey on one it does not trust; run sudo athanor certificate status"
+        ;;
+    esac
   else
     check_warn "this server has no hostname, so browser sign-in cannot work: a passkey is bound to a domain name and the standard does not allow an IP address"
     if [ -n "$configured_ddns_provider" ]; then
@@ -520,7 +545,19 @@ doctor() {
     check_fail "TLS renewal failed at $(sed -n '1p' "$athanor_state/certificate.error"): $(sed -n '2p' "$athanor_state/certificate.error")"
   fi
   if openssl x509 -in "$served_certificate" -noout -checkend "$certificate_margin" >/dev/null 2>&1; then
-    check_ok "TLS certificate valid until $certificate_expiry"
+    # A self-signed certificate is written with 825 days on it, so an expiry test alone calls it
+    # healthy for over two years and says nothing a browser agrees with. What the browser does with
+    # it is the fact worth reporting, because it is the whole of the owner's first hour: a full-page
+    # warning, no installable app, no notifications, and no passkey.
+    case "$certificate_trust" in
+      trusted) check_ok "TLS certificate valid until $certificate_expiry" ;;
+      self-signed)
+        check_warn "TLS certificate is self-signed, valid until $certificate_expiry: browsers warn on every visit and refuse to create a passkey, so no owner account can be made from a browser. Run sudo athanor certificate enable --agree-tos --email you@example.com"
+        ;;
+      *)
+        check_warn "TLS certificate valid until $certificate_expiry, but who issued it could not be confirmed, so whether a browser will accept this server is unknown; run sudo athanor certificate status"
+        ;;
+    esac
   elif [ "$(control_env_value ACME_ENABLED)" = true ]; then
     check_fail "TLS certificate expires within $certificate_margin_label and renewal has not replaced it ($certificate_expiry)"
   else
@@ -797,9 +834,31 @@ set_hostname() {
   fi
   restart_athanor
   printf 'Stable hostname saved: %s\n' "$hostname_value"
-  printf 'Browser sign-in now works: a passkey can be bound to %s, which it could never be to an\n' \
-    "$hostname_value"
-  printf 'IP address.\n'
+  # This used to be printed whatever the certificate was, five lines under the test for whether a
+  # trusted one is even being requested. A name is only half of what a browser needs: it will not
+  # run the passkey ceremony at all on a page it does not trust, so on a self-signed certificate
+  # the sentence sent the owner straight to a button that cannot succeed.
+  certificate_trust=$(certificate_trust_state)
+  if [ "$certificate_trust" = trusted ]; then
+    printf 'Browser sign-in now works: a passkey can be bound to %s, which it could never be to an\n' \
+      "$hostname_value"
+    printf 'IP address.\n'
+  else
+    printf 'A passkey can now be bound to %s, which it could never be to an IP address. That is\n' \
+      "$hostname_value"
+    printf 'half of what a browser needs. The other half is a certificate the browser trusts: it\n'
+    printf 'will not create a passkey on a page it does not trust, and accepting the warning does\n'
+    printf 'not change that.\n'
+    if [ "$certificate_trust" = self-signed ]; then
+      printf 'This server is still serving the certificate it signed itself. To finish:\n'
+      printf '  sudo athanor certificate enable --agree-tos --email you@example.com\n'
+    else
+      printf 'What this server is serving could not be confirmed. To see it, and to fix it if it needs\n'
+      printf 'fixing:\n'
+      printf '  sudo athanor certificate status\n'
+      printf '  sudo athanor certificate enable --agree-tos --email you@example.com\n'
+    fi
+  fi
   printf 'Run “sudo athanor pairing-code” for a fresh code and a QR against the new name.\n'
   printf 'Native-client passkeys remain valid. Direct-browser passkeys from the old origin must be added again.\n'
 }

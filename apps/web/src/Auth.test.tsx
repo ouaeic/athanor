@@ -11,7 +11,7 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { Auth } from './Auth.js';
+import { Auth, authFailureText } from './Auth.js';
 
 // The screen names the box it is signing in to, which is the one thing on it that comes from the
 // browser rather than from the server.
@@ -34,5 +34,35 @@ describe('the screen seen before there is an account', () => {
   it('does not ask a second device for a name it already knows', () => {
     expect(markup).not.toContain('Device link');
     expect(markup).not.toContain('Name used during setup');
+  });
+});
+
+/*
+ * A server serving the certificate it signed itself refuses nothing and offers everything: the
+ * screen loads, the button is live, and the browser then declines to run WebAuthn at all because
+ * the page is not trusted. The refusal names TLS, which on this screen reads as the passkey having
+ * failed, so the owner presses the button again. The library passes a NotAllowedError through with
+ * the browser's own wording and keeps the original on `cause`, so both are looked at.
+ */
+describe('the refusal a browser gives on an untrusted page', () => {
+  const rejection = 'WebAuthn is not supported on sites with TLS certificate errors.';
+
+  it('names the certificate and the command that fixes it', () => {
+    const shown = authFailureText(new Error(rejection));
+    expect(shown).toContain('does not trust');
+    expect(shown).toContain('sudo athanor certificate enable --agree-tos --email you@example.com');
+    expect(shown).not.toContain(rejection);
+  });
+
+  it('reads the wrapped original when the library has renamed the failure', () => {
+    const wrapped = new Error('Registration failed', { cause: new Error(rejection) });
+    expect(authFailureText(wrapped)).toContain('does not trust');
+  });
+
+  it('leaves every other failure exactly as the box reported it', () => {
+    expect(authFailureText(new Error('That pairing code has already been used'))).toBe(
+      'That pairing code has already been used'
+    );
+    expect(authFailureText('a thrown string')).toBe('Authentication failed');
   });
 });

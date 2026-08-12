@@ -33,6 +33,20 @@ Checked-out source:
 sudo ./install.sh
 ```
 
+With a domain already pointed at the server, browser sign-in can be working when the installer
+finishes rather than two commands later:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.1/install.sh | sudo env ATHANOR_REF=v0.1.1 ATHANOR_HOSTNAME=your.domain ATHANOR_ACME_EMAIL=you@example.com sh
+```
+
+Both variables are needed for that, for two unrelated reasons set out under **Network and TLS**:
+the name is what a passkey is bound to, and the trusted certificate is what allows a browser to
+create one at all. `ATHANOR_ACME_EMAIL` is also the act of accepting the certificate authority's
+subscriber agreement, which is why no certificate is requested without it. Neither is required to
+install: without them the server runs, the native clients sign in, and the installer reports that
+browser sign-in does not work yet instead of reporting success.
+
 The bootstrap clones or updates `/opt/athanor`; the native installer then:
 
 1. validates the OS, CPU architecture, memory and free disk, and stops before doing any work if the
@@ -60,8 +74,12 @@ The bootstrap clones or updates `/opt/athanor`; the native installer then:
 10. enables native systemd services and the dynamic-address watcher, and installs the certificate
     renewal and unattended-update units without enabling them;
 11. configures dynamic DNS when `ATHANOR_DDNS_TOKEN` was supplied, and otherwise says plainly that a
-    server without a hostname cannot be signed into from a browser and how to fix that; and
-12. prints a QR ticket and single-use first-owner code.
+    server without a hostname cannot be signed into from a browser and how to fix that;
+12. requests a publicly trusted certificate when `ATHANOR_ACME_EMAIL` was supplied, and afterwards
+    inspects whatever certificate is actually being served: a server that is still on its
+    self-signed one is reported as an installation the owner account cannot be created on, with the
+    command that fixes it, rather than as "athanor is ready"; and
+13. prints a QR ticket and single-use first-owner code.
 
 The apt and browser caches are ordinary dependencies, not an Athanor runtime image. Installed
 applications and datasets live once on the host.
@@ -137,9 +155,12 @@ process derives the ports it already has settings for and is told the rest as
 database.
 
 The installer creates a self-signed certificate from the stable server key covering every current
-address, so the server is usable immediately. That certificate is a bootstrap, not the destination:
-a browser will not register a service worker on a certificate error, so on self-signed TLS there is
-no installable app, no push notification and no share target.
+address, so the server is usable from the native clients immediately. That certificate is a
+bootstrap, not the destination, and what a browser withholds on it is more than cosmetic: it will
+not register a service worker on a certificate error, so there is no installable app, no push
+notification and no share target — and it will not run WebAuthn at all, so no passkey can be
+created or used, which means no owner account. Accepting the interstitial does not restore either;
+the page is loaded but still marked as having certificate errors.
 
 ```bash
 sudo athanor certificate enable --agree-tos --email you@example.com
@@ -162,6 +183,13 @@ registrable domain name; the specification does not permit an address literal. A
 is `https://203.0.113.9` therefore has valid TLS, a service worker, an installable app, and Web
 Push — and still no way to register or use a passkey in a browser. Its owner can sign in from the
 native clients only. See **Getting a hostname** below.
+
+**Trusted TLS is also required for browser sign-in, and the hostname does not answer that one
+either.** Browsers disable WebAuthn on any page carrying a certificate error, which is why a server
+with a perfectly good domain name and its own self-signed certificate presents a working sign-in
+screen that nothing can get through. It is not a warning the owner can dismiss and it is not
+reachable with a command-line flag. Both conditions have to hold, so `athanor doctor` reports the
+origin as working only when both do, and the installer says which one is missing.
 
 Renewal also reissues when the served certificate is missing a configured name, not only when it is
 close to expiry. Acquiring a hostname after issuance is the normal case, and no expiry check would
@@ -200,9 +228,12 @@ hostname, then for the provider token with the input hidden. It then:
 4. reissues the certificate for the new name when automatic issuance is already on; and
 5. refreshes the connection manifest and restarts the services.
 
-Step 3 is what makes browser sign-in work. Publishing DNS alone does not: `--keep-origin` stops
-after step 1 for a server that sits behind a separate reverse proxy, and `ddns status` and `doctor`
-both point out that the published name is not the origin.
+Step 3 is what moves the passkey's scope onto the name. Publishing DNS alone does not: `--keep-origin`
+stops after step 1 for a server that sits behind a separate reverse proxy, and `ddns status` and
+`doctor` both point out that the published name is not the origin. Step 4 is the other half, and it
+is conditional — on a server with automatic issuance still off, the name is in place and the
+certificate is still self-signed, so browser sign-in remains impossible. `set-hostname` says which
+of the two states it left the server in rather than announcing that sign-in works.
 
 Unattended installs pass `ATHANOR_DDNS_PROVIDER`, `ATHANOR_DDNS_HOSTNAME`, optionally
 `ATHANOR_DDNS_ZONE_ID`, and `ATHANOR_DDNS_TOKEN` to the installer, which runs the same path without

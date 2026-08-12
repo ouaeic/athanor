@@ -1663,6 +1663,13 @@ export function App() {
           ? {
               ...current,
               tasks: page.tasks.reduce(upsertTask, current.tasks),
+              // Merged rather than replaced: a later page carries counts only for the schedules it
+              // happens to hold, and dropping the rest would take the real total back off the folded
+              // lines the first page drew.
+              scheduleRunCounts: {
+                ...current.scheduleRunCounts,
+                ...page.scheduleRunCounts
+              },
               tasksCursor: page.hasMore ? page.nextCursor : null
             }
           : current
@@ -2464,6 +2471,7 @@ export function App() {
             fire={fireState}
             workspaces={data.workspaces}
             tasks={data.tasks}
+            scheduleRunCounts={data.scheduleRunCounts}
             schedules={data.schedules}
             selectedWorkspaceId={workspaceId}
             selectedTaskId={taskId}
@@ -2509,6 +2517,7 @@ export function App() {
           fire={fireState}
           workspaces={data.workspaces}
           tasks={data.tasks}
+          scheduleRunCounts={data.scheduleRunCounts}
           schedules={data.schedules}
           selectedWorkspaceId={workspaceId}
           selectedTaskId={taskId}

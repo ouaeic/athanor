@@ -50,6 +50,18 @@ export function Sidebar(props: {
   fire: FireState;
   workspaces: Workspace[];
   tasks: Task[];
+  /**
+   * How many runs each schedule really has, which is not how many of them `tasks` carries: the list
+   * holds only the newest few of any one schedule so that a watcher firing every fifteen minutes
+   * cannot bury the owner's own work. Absent from a box older than this field, and the folded line
+   * then reports what it is holding, which is the most it can honestly claim.
+   *
+   * Undefined is allowed but leaving it out is not, which is deliberate: the count reached the wire
+   * and then sat unread, because a caller that simply never mentioned an optional prop compiled and
+   * shipped a folded line still reporting five. Spelling the absence is a decision; omitting it was
+   * an accident nobody could see.
+   */
+  scheduleRunCounts: Readonly<Record<string, number>> | undefined;
   schedules: TaskSchedule[];
   selectedWorkspaceId: string | undefined;
   selectedTaskId: string | undefined;
@@ -161,7 +173,10 @@ export function Sidebar(props: {
    * below, which is drawn when the list in view has nothing in it, and the runs that happened
    * overnight are exactly the ones that are somewhere else or already filed.
    */
-  const arrival = useMemo(() => arrivalLine(props.tasks), [props.tasks]);
+  const arrival = useMemo(
+    () => arrivalLine(props.tasks, Date.now(), props.scheduleRunCounts),
+    [props.tasks, props.scheduleRunCounts]
+  );
 
   const commitRename = (task: Task) => {
     setRenaming(undefined);
@@ -277,13 +292,17 @@ export function Sidebar(props: {
     const open = openSchedules.has(group.scheduleId);
     const name = props.schedules.find((item) => item.id === group.scheduleId)?.title ?? group.title;
     const outcome = group.latest.status.replace('_', ' ');
+    // What the schedule has run, not what this list is holding. The two are the same until the
+    // ceiling bites, and after that the count was the collapse's whole justification and was
+    // reporting five.
+    const total = props.scheduleRunCounts?.[group.scheduleId] ?? group.runs.length;
     return (
       <Fragment key={`schedule-${group.scheduleId}`}>
         <div className="task-row schedule-run-group">
           <button
             className="task-open"
             aria-expanded={open}
-            aria-label={`${name}, ${group.runs.length} scheduled runs, last ${outcome}`}
+            aria-label={`${name}, ${total} scheduled runs, last ${outcome}`}
             onClick={() =>
               setOpenSchedules((current) => {
                 const next = new Set(current);
@@ -296,7 +315,7 @@ export function Sidebar(props: {
             <span className="task-copy">
               <strong>{name}</strong>
               <small>
-                {outcome} · {relative(group.latest.updatedAt)} · {group.runs.length} runs
+                {outcome} · {relative(group.latest.updatedAt)} · {total} runs
               </small>
             </span>
             <ChevronRight size={13} className={`schedule-run-chevron ${open ? 'open' : ''}`} />
@@ -305,6 +324,14 @@ export function Sidebar(props: {
         {open && (
           <div className="schedule-run-list">
             {group.runs.map((run) => conversationRow(run, '', undefined))}
+            {/* The line above now says how many runs there are, and opening it shows the newest
+                few, so the gap between the two is stated rather than left for the owner to
+                discover by counting. */}
+            {total > group.runs.length && (
+              <p className="schedule-run-more">
+                Newest {group.runs.length} of {total}.
+              </p>
+            )}
           </div>
         )}
       </Fragment>

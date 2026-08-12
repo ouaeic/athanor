@@ -18,14 +18,14 @@
  * deliberately no vocabulary here for the difference between reasoning and writing an answer - the
  * client cannot see it, and a word that guesses is worse than a number that does not.
  *
- * Not yet rendered. `Timeline.tsx` holds the one line this belongs on (`TaskActivity`'s `<small>`),
- * and it was being edited by another agent for the whole of this session. The integration is one
- * expression, and the ordering is the point - the clock replaces the label rather than following it:
- *
- *     const waiting = liveActivity({ events, taskStatus: task.status, now: Date.now() });
- *     {(waiting || line) && <small>{waiting || line}</small>}
- *
- * with `now` coming from a 15-second interval while `live && !terminal`, so the number ages.
+ * Drawn at the foot of the transcript by `Timeline.tsx`'s `LiveActivity`, beside the running cost.
+ * That is where the owner went looking the first time - the cost that had stopped moving was what
+ * they read the stall off - and it is the one place on the page that does not depend on the shape
+ * of the newest node, which matters because a turn stalled between two model calls often has no
+ * activity group at the bottom to hang a line on. `TaskActivity`'s `<small>`, which this was
+ * written against, went with the work log's fold; there is no label left for the clock to replace,
+ * so it is a line of its own or it is nothing. `now` comes from a 15-second interval that runs only
+ * while the turn is generating, so the number ages and a finished conversation holds no timer.
  */
 import { taskIsGenerating } from './task-status.js';
 import { settledToolStarts, toolLabel } from './timeline-state.js';

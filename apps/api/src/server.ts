@@ -1166,7 +1166,7 @@ export const buildServer = async (
   };
   void backfillConversationNames().then(
     (written) => {
-      if (written) log.info('search.names_backfilled', { conversations: written });
+      if (written) log.info('search.names_backfilled', { count: written });
     },
     (error: unknown) => log.error('search.names_backfill_failed', errorFields(error))
   );
@@ -2520,7 +2520,7 @@ export const buildServer = async (
       ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
     });
     await store.upsertModels(live);
-    log.info('models.catalog_repaired', { models: live.length });
+    log.info('models.catalog_repaired', { count: live.length });
   };
   void repairFlattenedCatalog().catch((error: unknown) => {
     log.warn('models.catalog_repair_failed', errorFields(error));
@@ -2761,6 +2761,8 @@ export const buildServer = async (
       ),
       /** Where GET /v1/tasks resumes from, so the sidebar can reach past this first page. */
       tasksCursor: tasks.nextCursor,
+      /** How many runs each schedule above really has, which is not how many of them fitted. */
+      scheduleRunCounts: tasks.scheduleRunCounts,
       schedules: await Promise.all(
         schedules.map((schedule) =>
           privateScheduleResponse(
@@ -3571,7 +3573,12 @@ export const buildServer = async (
     return {
       tasks: await Promise.all(page.tasks.map((task) => privateTaskResponse(task))),
       nextCursor: page.nextCursor,
-      hasMore: page.hasMore
+      hasMore: page.hasMore,
+      // The page deliberately carries only the newest few runs of any one schedule, so the number
+      // of runs on it is not the number of runs there are. Without this the folded line in the
+      // sidebar could only count what it was holding, and a watcher that had fired four hundred
+      // times said five.
+      scheduleRunCounts: page.scheduleRunCounts
     };
   });
 

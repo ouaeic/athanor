@@ -999,3 +999,72 @@ describe('a turn with more steps than anybody reads at once', () => {
     expect(eleven).toContain('1 earlier step<');
   });
 });
+
+/*
+ * The eleven minutes this week came out of. The transcript already held which tool had gone out and
+ * when the last model call settled; the screen showed a spinner, the word "running" and a cost that
+ * had stopped moving, so the frozen cost was the only honest signal on it. `live-activity.ts` works
+ * the line out and had been rendered by nobody, which left the one surface the owner actually reads
+ * as the one place this could not be found.
+ */
+describe('a turn the owner is watching for signs of life', () => {
+  const minutesAgo = (minutes: number): string =>
+    new Date(Date.now() - minutes * 60_000).toISOString();
+
+  /** Dated against the clock the component reads, since the whole claim is about elapsed time. */
+  const aged = (
+    sequence: number,
+    kind: TaskEvent['kind'],
+    summary: string,
+    minutes: number,
+    payload?: unknown
+  ): TaskEvent => ({ ...event(sequence, kind, summary, payload), createdAt: minutesAgo(minutes) });
+
+  it('names the tool that has not come back, and how long it has been gone', () => {
+    const markup = render(
+      [
+        aged(1, 'user_message', 'Rebuild the index', 4, { markdown: 'Rebuild the index' }),
+        aged(2, 'tool_started', 'Running shell', 3, { tool: 'shell', toolCallId: 'c1' })
+      ],
+      'running'
+    );
+    expect(markup).toContain('Running a command · 3m');
+  });
+
+  it('says how long a turn has been quiet when no tool is out', () => {
+    const markup = render(
+      [
+        aged(1, 'user_message', 'Write the briefing', 12, { markdown: 'Write the briefing' }),
+        aged(2, 'cost', 'Step 1 completed', 11, { costUsd: 0.02 }),
+        aged(3, 'assistant_delta', 'Agent response', 10, { markdown: 'One moment', append: true })
+      ],
+      'running'
+    );
+    // Streamed frames are the same activity continuing, so the clock counts from the billed call
+    // rather than from the newest line in the log.
+    expect(markup).toContain('Thinking · 11m');
+  });
+
+  it('leaves a turn that is behaving exactly as it was', () => {
+    const markup = render(
+      [
+        aged(1, 'user_message', 'Read the file', 0, { markdown: 'Read the file' }),
+        aged(2, 'tool_started', 'Running file_read', 0, { tool: 'file_read', toolCallId: 'c1' })
+      ],
+      'running'
+    );
+    expect(markup).not.toContain(' · 0s');
+    expect(markup).toContain('<b>a file</b>');
+  });
+
+  it('cannot outlive the turn it is about', () => {
+    const finished = [
+      aged(1, 'user_message', 'Rebuild the index', 40, { markdown: 'Rebuild the index' }),
+      aged(2, 'tool_started', 'Running shell', 39, { tool: 'shell', toolCallId: 'c1' }),
+      aged(3, 'completed', 'Done', 38, { markdown: 'Done' })
+    ];
+    expect(render(finished, 'completed')).not.toContain('Running a command · ');
+    // Nor while the machine is waiting on a person: that clock would be counting the owner.
+    expect(render(finished.slice(0, 2), 'awaiting_user')).not.toContain('Running a command · ');
+  });
+});

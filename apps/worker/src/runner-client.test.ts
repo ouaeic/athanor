@@ -168,3 +168,60 @@ describe('a workspace runner that is restarting', () => {
     expect((failure as Error).name).toBe('AbortError');
   });
 });
+
+describe('what the runner measured, and what it could not', () => {
+  const audio = (headers: Record<string, string>): void => {
+    vi.stubGlobal(
+      'fetch',
+      async () =>
+        new Response(new Uint8Array([0x4f, 0x67, 0x67, 0x53]), {
+          headers: { 'x-audio-format': 'ogg', 'x-audio-more': 'false', ...headers }
+        })
+    );
+  };
+
+  /*
+   * The runner leaves this header out on purpose, for the one recording ffprobe cannot measure - a
+   * stream copy declares no duration. Read through `Number`, the absent header became zero, and the
+   * model was handed a recording of no length at all beside the ninety minutes just read out of it.
+   */
+  it('leaves a length the runner could not measure absent rather than calling it zero', async () => {
+    audio({ 'x-audio-start-seconds': '0', 'x-audio-prepared-seconds': '5400' });
+
+    const prepared = await client.prepareAudio(workspaceId, taskId, { path: 'workspace/memo.m4a' });
+
+    expect(prepared.durationSeconds).toBeNull();
+    expect(prepared.preparedSeconds).toBe(5400);
+  });
+
+  it('reads the length when the runner did measure one', async () => {
+    audio({
+      'x-audio-start-seconds': '0',
+      'x-audio-prepared-seconds': '5400',
+      'x-audio-duration-seconds': '7200'
+    });
+
+    const prepared = await client.prepareAudio(workspaceId, taskId, { path: 'workspace/memo.m4a' });
+
+    expect(prepared.durationSeconds).toBe(7200);
+  });
+
+  /*
+   * A photograph is re-encoded on its way out of the runner, which is what takes the camera's notes
+   * off it, so what the turn is looking at is never the file on disk even when both are JPEG.
+   */
+  it('says which file the picture was made from, including when the format did not change', async () => {
+    vi.stubGlobal(
+      'fetch',
+      async () =>
+        new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), {
+          headers: { 'content-type': 'image/jpeg', 'x-image-source-type': 'image/jpeg' }
+        })
+    );
+
+    const picture = await client.readImage(workspaceId, taskId, 'workspace/IMG_0422.JPG');
+
+    expect(picture.mimeType).toBe('image/jpeg');
+    expect(picture.convertedFrom).toBe('image/jpeg');
+  });
+});

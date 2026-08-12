@@ -2066,6 +2066,69 @@ describe('conversation management', () => {
     // One page holds all three, so the client is told there is nothing to resume.
     expect(bootstrap.tasksCursor).toBeNull();
   }, 30_000);
+
+  /*
+   * A page carries at most a handful of any one schedule's runs, so that a watcher firing every
+   * fifteen minutes cannot bury the owner's own work. The number of runs there really are was
+   * counted, tested and then dropped here, at the boundary: the client was handed five rows and
+   * nothing else, so the line that folds them said five however many times the watcher had fired.
+   */
+  test('tells the client how many runs a schedule has, not how many of them fitted', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-runcount-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'runcount-workspace' },
+        payload: { name: 'Watched' }
+      })
+    ).json<{ id: string }>().id;
+    await app.inject({
+      method: 'PUT',
+      url: '/v1/providers',
+      headers: { cookie, 'idempotency-key': 'runcount-provider' },
+      payload: { provider: 'openrouter', apiKey: 'test-key', enforceZeroDataRetention: true }
+    });
+    const scheduleId = '018f3dd3-8a2a-7d8b-8d3c-a2f4c8316bf7';
+    for (let fired = 0; fired < 8; fired += 1) {
+      const run = (
+        await app.inject({
+          method: 'POST',
+          url: '/v1/tasks',
+          headers: { cookie, 'idempotency-key': `runcount-${fired}` },
+          payload: {
+            workspaceId,
+            prompt: `Watch ${fired}`,
+            modelId: 'openrouter/openai/gpt-oss-120b',
+            privacyRoute: 'provider_zdr',
+            maxComputeCredits: 5
+          }
+        })
+      ).json<{ id: string }>().id;
+      await database.query('UPDATE tasks SET schedule_id=$2 WHERE id=$1', [run, scheduleId]);
+    }
+
+    const page = (await app.inject({ method: 'GET', url: '/v1/tasks', headers: { cookie } })).json<{
+      tasks: Array<{ id: string; scheduleId: string | null }>;
+      scheduleRunCounts: Record<string, number>;
+    }>();
+    expect(page.tasks.filter((task) => task.scheduleId === scheduleId)).toHaveLength(5);
+    expect(page.scheduleRunCounts).toEqual({ [scheduleId]: 8 });
+
+    // And on the request that is actually behind "Opening your private computer…", which is the
+    // one the sidebar is drawn from.
+    const bootstrap = (
+      await app.inject({ method: 'GET', url: '/v1/bootstrap', headers: { cookie } })
+    ).json<{ scheduleRunCounts: Record<string, number> }>();
+    expect(bootstrap.scheduleRunCounts).toEqual({ [scheduleId]: 8 });
+  }, 30_000);
 });
 
 const stubProviderFetch = (onRunnerRequest?: (url: string) => void) =>

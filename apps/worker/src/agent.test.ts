@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { acceptanceCommandRefusal } from './acceptance.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildLabel, type ModelRelease } from '@athanor/contracts';
+import { buildLabel, type MediaModelOption, type ModelRelease } from '@athanor/contracts';
 import type { ModelMessage, ModelToolCall } from '@athanor/model-gateway';
 import { markCacheBreakpoints } from './context.js';
 import { injectMemoryPack, MEMORY_PACK_MARKER } from './memory-runtime.js';
@@ -64,6 +64,7 @@ import {
   untrustedOriginOfResult,
   untrustedTurnNotice,
   UNTRUSTED_NOTICE_MARKER,
+  transcriptionRouteAllowed,
   usableCapabilities,
   haltReason,
   startStopWatch,
@@ -941,6 +942,60 @@ describe('capability routing', () => {
     expect(
       usableCapabilities(modelRelease({ privacyRoute: 'external' }), 'provider_zdr').size
     ).toBe(0);
+  });
+
+  /*
+   * Audio used to be the one modality that never asked. A recording is the owner speaking, and the
+   * transcription model is picked from whatever the provider happens to list, so a private task
+   * could send a voice to an endpoint no reviewed row on the box vouches for.
+   */
+  describe('the model a recording is read by', () => {
+    const route = (overrides: Partial<MediaModelOption> = {}): MediaModelOption => ({
+      id: 'vendor/hears',
+      providerModelId: 'vendor/hears-1',
+      displayName: 'Hears',
+      provider: 'vendor',
+      modality: 'transcription',
+      usdPerImage: null,
+      usdPerMillionCharacters: null,
+      usdPerMinute: 0.01,
+      priceSource: 'provider',
+      zeroDataRetentionAvailable: true,
+      recommendationTags: [],
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      ...overrides
+    });
+
+    /*
+     * The route the owner never chose. `audio_read` then falls back to whatever the provider listed
+     * a moment ago, and this box has recorded nothing about it either way.
+     */
+    it('sends nothing private down a route this box knows nothing about', () => {
+      expect(transcriptionRouteAllowed(undefined, 'provider_zdr')).toBe(false);
+    });
+
+    it('refuses a chosen route that offers no zero-retention endpoint', () => {
+      expect(
+        transcriptionRouteAllowed(route({ zeroDataRetentionAvailable: false }), 'provider_zdr')
+      ).toBe(false);
+      // Absent is not the same as false, but it is just as far from a promise.
+      expect(
+        transcriptionRouteAllowed(route({ zeroDataRetentionAvailable: undefined }), 'provider_zdr')
+      ).toBe(false);
+    });
+
+    /*
+     * The case the first version of this guard could not reach. It asked the chat catalogue, which
+     * by construction holds no transcription model at all, so it answered no on every box - and a
+     * check that can only refuse is the tool removed rather than the recording protected.
+     */
+    it('allows a chosen route that does offer one', () => {
+      expect(transcriptionRouteAllowed(route(), 'provider_zdr')).toBe(true);
+    });
+
+    it('leaves an ordinary task the route it already had', () => {
+      expect(transcriptionRouteAllowed(undefined, 'external')).toBe(true);
+    });
   });
 });
 
@@ -2618,6 +2673,24 @@ describe('the journal every process writes', () => {
       event: 'task.failed',
       taskId: 'c3d4',
       code: 'agent_failed'
+    });
+  });
+
+  /*
+   * A dropped field is silent, so a line whose only field was dropped reads as an event name and
+   * nothing after it. `checkpoint.preview_failed` was exactly that: the operator was told a preview
+   * had failed and never which restore point it was for, on the one path where the answer is the
+   * whole of what makes the line worth writing.
+   */
+  it('keeps the identifier that says which restore point a line is about', () => {
+    const { logger, lines } = capture();
+    logger.warn('checkpoint.preview_failed', {
+      checkpointId: '00000000-0000-4000-8000-000000000001',
+      code: 'token_mint_failed'
+    });
+    expect(JSON.parse(lines[0]!)).toMatchObject({
+      checkpointId: '00000000-0000-4000-8000-000000000001',
+      code: 'token_mint_failed'
     });
   });
 

@@ -129,20 +129,56 @@ const AWAY_WINDOW_MS = 24 * 60 * 60 * 1_000;
  * Floored at a day. With no conversation of the owner's own in view - every one archived, or a box
  * that has only ever run schedules - "since they last looked" reduced to the beginning of time, and
  * the line reported every run the schedule had ever made as having happened overnight.
+ *
+ * The number is only spoken when this device is holding every run it would be counting. The list is
+ * capped at a handful of runs per schedule, so ninety failed runs behind five good ones read as
+ * "5 scheduled runs finished while you were away" - the count of what fitted, on the one screen the
+ * owner reads after being away, saying the opposite of what happened. `scheduleRunCounts` is how
+ * many runs each schedule really has, and where that is more than this device is holding, the
+ * sentence says what did happen and leaves the arithmetic to the schedule's own line, which has the
+ * real total beside it. A floor stated as a total is worse than no total.
  */
-export const arrivalLine = (tasks: Task[], now = Date.now()): string | undefined => {
+export const arrivalLine = (
+  tasks: Task[],
+  now = Date.now(),
+  scheduleRunCounts: Readonly<Record<string, number>> = {}
+): string | undefined => {
   const lastOwnTouch = tasks.reduce(
     (latest, task) => (task.scheduleId ? latest : Math.max(latest, lastActivityAt(task))),
     now - AWAY_WINDOW_MS
   );
   const away = tasks.filter((task) => task.scheduleId && lastActivityAt(task) > lastOwnTouch);
   if (!away.length) return undefined;
+  // Held per schedule against the count the box reported for it. Anything short means runs of that
+  // schedule exist whose outcome this device cannot see, and any of them could have been the one
+  // that failed or the one that is waiting.
+  //
+  // Pinned and filed runs are outside both sides of the comparison, because the count is taken over
+  // the same list the sidebar draws: a run the owner pinned is theirs now, and a filed one is out of
+  // the way.
+  const held = new Map<string, number>();
+  for (const task of tasks)
+    if (task.scheduleId && !task.pinned && !task.archivedAt)
+      held.set(task.scheduleId, (held.get(task.scheduleId) ?? 0) + 1);
+  const whole = away.every(
+    (task) =>
+      task.scheduleId !== null &&
+      (scheduleRunCounts[task.scheduleId] ?? 0) <= (held.get(task.scheduleId) ?? 0)
+  );
   const runs = (count: number) => `${count} scheduled run${count === 1 ? '' : 's'}`;
   const waiting = away.filter((task) => task.status === 'awaiting_user').length;
-  if (waiting) return `${runs(waiting)} ${waiting === 1 ? 'needs' : 'need'} you.`;
+  if (waiting)
+    return whole
+      ? `${runs(waiting)} ${waiting === 1 ? 'needs' : 'need'} you.`
+      : 'Scheduled work needs you.';
   const failed = away.filter((task) => task.status === 'failed').length;
-  if (failed) return `${runs(failed)} failed while you were away.`;
-  return `${runs(away.length)} finished while you were away.`;
+  if (failed)
+    return whole
+      ? `${runs(failed)} failed while you were away.`
+      : 'Scheduled work failed while you were away.';
+  return whole
+    ? `${runs(away.length)} finished while you were away.`
+    : 'Scheduled work ran while you were away.';
 };
 
 export interface ConversationMatch {

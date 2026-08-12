@@ -1101,7 +1101,7 @@ if [ -z "$server_has_hostname" ]; then
   # record and nothing else; dynamic DNS exists for an address that changes, which is a home
   # connection, and offering it first sent owners of perfectly stable servers to configure a service
   # that solves a problem they do not have.
-  say "  Fixed address: point a domain at $(printf '%s' "$ipv4_addresses" | awk '{print $1}') and re-run with ATHANOR_HOSTNAME=your.domain, or run sudo athanor set-hostname your.domain"
+  say "  Fixed address: point a domain at $(printf '%s' "$ipv4_addresses" | awk '{print $1}') and re-run with ATHANOR_HOSTNAME=your.domain ATHANOR_ACME_EMAIL=you@example.com, or run sudo athanor set-hostname your.domain"
   say "  Address that changes, as on a home connection: sudo athanor ddns configure"
 fi
 
@@ -1184,6 +1184,31 @@ if [ -n "${ATHANOR_ACME_EMAIL:-}" ]; then
   fi
 fi
 
+# What the certificate now on disk is, asked of the script that owns that file rather than worked
+# out again here. Asked afterwards, about what is actually being served, rather than from whether an
+# email was supplied: a reinstall can already have a trusted certificate and no email set, and a
+# request that was made can still have failed. "Unknown" stays unknown - not having reached that
+# script is not the same as having learned the certificate is self-signed.
+certificate_description=$(
+  /usr/local/lib/athanor/athanor-certificate status 2>/dev/null |
+    sed -n 's/^Certificate: *//p' | sed -n '1p'
+)
+case "$certificate_description" in
+  'issued by a certificate authority') certificate_trust=trusted ;;
+  'self-signed'*) certificate_trust=self-signed ;;
+  *) certificate_trust=unknown ;;
+esac
+# A browser switches WebAuthn off completely on a page whose certificate it does not trust, and
+# accepting the warning does not switch it back on. So a self-signed certificate is not only an ugly
+# first visit: it is an install nobody can create the owner account on. The no-hostname case above
+# has already said its piece; this is the one that used to finish in silence, with a real hostname, a
+# certificate dated two years out, and a sign-in screen offering a button that could not work.
+if [ -n "$server_has_hostname" ] && [ "$certificate_trust" = self-signed ]; then
+  warn "the owner account cannot be created from a browser yet: this computer is serving a certificate it signed itself, and no browser will create a passkey on a page whose certificate it does not trust. Re-run with ATHANOR_ACME_EMAIL=you@example.com, or run sudo athanor certificate enable --agree-tos --email you@example.com"
+elif [ "$certificate_trust" = unknown ]; then
+  warn "what certificate this computer is serving could not be confirmed, so whether a browser will accept it is unknown; run sudo athanor certificate status"
+fi
+
 printf '\n'
 if [ -n "$install_warnings" ]; then
   printf 'athanor is installed, but these need attention first:\n\n'
@@ -1192,16 +1217,19 @@ else
   printf 'athanor is ready.\n\n'
 fi
 printf 'Open your computer at: %s\n' "$public_url"
-# Directly under the address, because it is what happens when the address is opened. With no ACME
-# email this is the ordinary install and nothing above collects a warning about it - so the script
-# said "athanor is ready", the owner opened the link, and met a full-page "Your connection is not
+# Directly under the address, because it is what happens when the address is opened. The owner used
+# to be told "athanor is ready", open the link, and meet a full-page "Your connection is not
 # private" with the explanation thirty lines further down, below a rule this script's own comment
-# describes as being for diagnosing a connection rather than making the first one.
-if [ -z "${ATHANOR_ACME_EMAIL:-}" ]; then
+# describes as being for diagnosing a connection rather than making the first one. Keyed on the
+# certificate that is serving rather than on whether an email was passed, so a requested certificate
+# that failed to issue is described as what it left behind.
+if [ "$certificate_trust" = self-signed ]; then
   printf '\nYour browser will warn you the first time and ask you to accept the certificate -\n'
-  printf 'this server signed its own. Until TLS is publicly trusted athanor cannot be installed\n'
-  printf 'as an app and cannot send notifications. To fix that now (no domain needed - a bare IP\n'
-  printf 'address works):\n'
+  printf 'this server signed its own. Accepting that warning is not enough to get in: a browser\n'
+  printf 'will not create a passkey on a page whose certificate it does not trust, so the owner\n'
+  printf 'account cannot be created from a browser until this is done. athanor also cannot be\n'
+  printf 'installed as an app and cannot send notifications until then. To fix it now (no domain\n'
+  printf 'needed for the certificate itself - a bare IP address works):\n'
   printf '  sudo athanor certificate enable --agree-tos --email you@example.com\n'
 fi
 printf '\nOr scan this from a phone:\n\n'
@@ -1239,7 +1267,10 @@ if [ -z "$server_has_hostname" ]; then
   printf '\nIf this address is fixed, which it usually is on a rented server, point a domain at\n'
   printf '%s and then:\n' "$(printf '%s' "$ipv4_addresses" | awk '{print $1}')"
   printf '  sudo athanor set-hostname your.domain\n'
-  printf 'Or re-run this installer with ATHANOR_HOSTNAME=your.domain to do it in one step.\n'
+  printf '  sudo athanor certificate enable --agree-tos --email you@example.com\n'
+  printf 'Both, not either: the name is what a passkey is bound to, and the trusted certificate is\n'
+  printf 'what lets the browser create one at all. Or re-run this installer with\n'
+  printf 'ATHANOR_HOSTNAME=your.domain ATHANOR_ACME_EMAIL=you@example.com to do it in one step.\n'
   printf '\nIf the address changes, as on a home connection, dynamic DNS is the tool for that:\n'
   printf '  1. create a name at https://www.duckdns.org or https://desec.io\n'
   printf '  2. sudo athanor ddns configure\n'

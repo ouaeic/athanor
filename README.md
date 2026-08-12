@@ -24,6 +24,24 @@ The command is pinned to a tag rather than a branch. The install action in the n
 further: it passes the exact commit its own build was made from, and the installer refuses to
 continue if the source it checked out is not that commit.
 
+That command installs the computer, and the native clients can sign in to it immediately — they
+pin the server’s own key rather than trusting a certificate authority. Signing in from a **browser**
+needs two more things, and it needs both: a domain name, because a passkey is bound to one and the
+standard does not allow an address; and a publicly trusted certificate, because no current browser
+will create a passkey on a page whose certificate it does not trust, and clicking past the warning
+does not change that. If a domain already points at the server, ask for both during the install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.1/install.sh | sudo env ATHANOR_REF=v0.1.1 ATHANOR_HOSTNAME=your.domain ATHANOR_ACME_EMAIL=you@example.com sh
+```
+
+`ATHANOR_ACME_EMAIL` is the contact address the certificate authority is given, and supplying it is
+how the subscriber agreement is accepted — athanor will not accept it on the operator’s behalf, so
+without that variable no certificate is requested. Install without them and nothing is lost: the
+installer ends by saying that browser sign-in does not work yet, and prints whichever of
+`sudo athanor set-hostname` and `sudo athanor certificate enable` that server still needs. Both do
+the same job afterwards, and `sudo athanor doctor` keeps saying so until they are done.
+
 From a checked-out source tree:
 
 ```bash

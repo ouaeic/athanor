@@ -398,9 +398,12 @@ export const api = {
    * search, which needs the owner to remember something about them.
    */
   tasks: (cursor: string) =>
-    request<{ tasks: Task[]; nextCursor: string | null; hasMore: boolean }>(
-      `/v1/tasks?cursor=${encodeURIComponent(cursor)}`
-    ),
+    request<{
+      tasks: Task[];
+      nextCursor: string | null;
+      hasMore: boolean;
+      scheduleRunCounts?: Record<string, number>;
+    }>(`/v1/tasks?cursor=${encodeURIComponent(cursor)}`),
   search: (query: string, workspaceId?: string) =>
     request<ConversationSearchResult[]>(
       `/v1/search?q=${encodeURIComponent(query)}${

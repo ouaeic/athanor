@@ -517,7 +517,16 @@ export type Task = z.infer<typeof Task>;
 export const TaskPage = z.object({
   tasks: z.array(Task),
   nextCursor: z.string().nullable(),
-  hasMore: z.boolean()
+  hasMore: z.boolean(),
+  /**
+   * For every schedule with a run on this page, how many runs it has in the list being read.
+   *
+   * Not how many of them the page is carrying: a page holds at most a handful of any one
+   * schedule's runs, on purpose, so that a watcher firing every fifteen minutes cannot bury the
+   * owner's own work. This is what lets a folded line say four hundred while holding five, and it
+   * is the only number on the client that knows the difference.
+   */
+  scheduleRunCounts: z.record(z.string(), z.number().int().nonnegative()).default({})
 });
 export type TaskPage = z.infer<typeof TaskPage>;
 

@@ -876,7 +876,7 @@ export const agentTools: ModelTool[] = [
   {
     name: 'image_read',
     description:
-      'Look at a picture already in the workspace with the selected vision model, and get back what is in it. PNG, JPEG, GIF, WebP, HEIC, HEIF, AVIF, TIFF, BMP and SVG all work; anything a model cannot take is converted first. Use it for screenshots, phone photographs, scans, diagrams, and the page images you render to prove a document before publishing it. It only looks at pictures that already exist: use document_read for a PDF or an office file, and use generate_media to make a new image.',
+      'Look at a picture already in the workspace with the selected vision model, and get back what is in it. PNG, JPEG, GIF, WebP, HEIC, HEIF, AVIF, TIFF, BMP and SVG all work; every one of them is re-encoded on this computer first, which is also what takes the location, capture time and camera off a photograph before it is shown to a model. Use it for screenshots, phone photographs, scans, diagrams, and the page images you render to prove a document before publishing it. It only looks at pictures that already exist: use document_read for a PDF or an office file, and use generate_media to make a new image.',
     parameters: {
       type: 'object',
       additionalProperties: false,

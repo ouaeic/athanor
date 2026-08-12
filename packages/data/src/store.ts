@@ -463,7 +463,7 @@ export interface TaskPage {
    * how many of them the page is carrying, which the ceiling above keeps small on purpose. This is
    * what lets one folded line report four hundred runs while holding five of them.
    */
-  scheduleRunCounts?: Record<string, number>;
+  scheduleRunCounts: Record<string, number>;
 }
 
 /** Just enough of a conversation to rank it, name it and open it. Never its agent state. */
@@ -3074,13 +3074,54 @@ export class DataStore {
     const result = await this.database.query(
       // The ordering key is selected as the database's own text as well as being ordered on, so the
       // cursor for the last row of this page is the exact value the next page compares against.
-      `SELECT t.*,
+      //
+      // Each schedule is answered once, before any row of the page is looked at. Asking each row
+      // where its schedule's boundary falls gives the same answer, and asked that way it was asked
+      // once per conversation on the box: a year of one fifteen-minute watcher is thirty-five
+      // thousand runs, so opening the app spent a third of a second re-deriving one timestamp
+      // thirty-five thousand times. A schedule has one boundary and one total however many times it
+      // has fired, and both are read here from the index the runs are already stored in.
+      `WITH schedule_runs AS MATERIALIZED (
+         -- A run the owner pinned is theirs now rather than the schedule's, which is why it is
+         -- neither counted nor allowed to set the boundary; the client leaves pinned runs out of
+         -- the fold for the same reason.
+         SELECT r.schedule_id, COUNT(*)::int AS runs
+         FROM tasks r
+         WHERE r.user_id=$1 AND r.schedule_id IS NOT NULL AND NOT r.pinned
+           AND ($3::text = 'all'
+                OR ($3::text = 'active' AND r.archived_at IS NULL)
+                OR ($3::text = 'archived' AND r.archived_at IS NOT NULL))
+         GROUP BY r.schedule_id
+       ),
+       schedule_ceiling AS MATERIALIZED (
+         -- Where the newest few runs of each schedule stop. Null for a schedule that has not fired
+         -- that many times yet, which is what admits every run it has.
+         --
+         -- It ranks over exactly the rows this page is drawn from, which it has to: ranked over all
+         -- of them, five runs the owner had archived or pinned would set the boundary and then not
+         -- be on the page to occupy it, and a schedule whose newest five had been filed away
+         -- vanished from the list entirely while the count beside it still said three hundred.
+         SELECT s.schedule_id, s.runs, oldest.created_at AS oldest_shown
+         FROM schedule_runs s
+         LEFT JOIN LATERAL (
+           SELECT r.created_at FROM tasks r
+           WHERE r.schedule_id = s.schedule_id AND NOT r.pinned
+             AND ($3::text = 'all'
+                  OR ($3::text = 'active' AND r.archived_at IS NULL)
+                  OR ($3::text = 'archived' AND r.archived_at IS NOT NULL))
+           ORDER BY r.created_at DESC
+           OFFSET COALESCE($9::int, 1) - 1 LIMIT 1
+         ) oldest ON TRUE
+       )
+       SELECT t.*,
          GREATEST(t.updated_at, t.created_at)::text AS activity_at,
+         c.runs AS schedule_run_count,
          (SELECT COUNT(*) FROM task_message_queue q
            WHERE q.task_id=t.id AND q.status='queued') AS queued_message_count,
          (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
            WHERE u.task_id=t.id AND u.state='settled' AND u.cost_usd>0) AS spent_usd
        FROM tasks t JOIN workspaces w ON w.id=t.workspace_id
+       LEFT JOIN schedule_ceiling c ON c.schedule_id = t.schedule_id
        WHERE w.user_id=$1
          AND ($2::uuid IS NULL OR t.workspace_id=$2)
          AND ($3::text = 'all'
@@ -3088,25 +3129,9 @@ export class DataStore {
               OR ($3::text = 'archived' AND t.archived_at IS NOT NULL))
          AND ($8::uuid IS NULL OR t.schedule_id=$8)
          -- The ceiling, asked of the row rather than of the page: is this run one of the newest few
-         -- its schedule has made. The subquery walks the schedule index in the order it is already
-         -- stored in and stops as soon as it has counted that far, so it costs the same on a
-         -- watcher that has fired four hundred times as on one that has fired twice; COALESCE is
-         -- what admits every run of a schedule that has not fired that many times yet.
-         --
-         -- It ranks over exactly the rows this page is drawn from, which it has to: ranked over all
-         -- of them, five runs the owner had archived or pinned would set the boundary and then not
-         -- be on the page to occupy it, and a schedule whose newest five had been filed away
-         -- vanished from the list entirely while the count beside it still said three hundred.
+         -- its schedule has made.
          AND ($9::int IS NULL OR t.schedule_id IS NULL OR t.pinned
-              OR t.created_at >= COALESCE((
-                   SELECT run.created_at FROM tasks run
-                   WHERE run.schedule_id = t.schedule_id AND NOT run.pinned
-                     AND ($3::text = 'all'
-                          OR ($3::text = 'active' AND run.archived_at IS NULL)
-                          OR ($3::text = 'archived' AND run.archived_at IS NOT NULL))
-                   ORDER BY run.created_at DESC
-                   OFFSET $9 - 1 LIMIT 1
-                 ), t.created_at))
+              OR c.oldest_shown IS NULL OR t.created_at >= c.oldest_shown)
          AND ($4::boolean IS NULL OR
               (t.pinned, GREATEST(t.updated_at, t.created_at), t.id)
                 < ($4::boolean, $5::timestamptz, $6::uuid))
@@ -3130,45 +3155,21 @@ export class DataStore {
     const hasMore = result.rows.length > limit;
     const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
     const last = rows.at(-1);
-    const tasks = rows.map(mapTask);
+    // Only the schedules the page is actually carrying, because that is what the client can fold
+    // and the count exists to make that fold honest. It travels on the rows rather than in a query
+    // of its own, so a schedule is counted in the same pass that decides which of its runs fit.
+    const scheduleRunCounts: Record<string, number> = {};
+    for (const row of rows) {
+      const schedule = optionalText(row.schedule_id);
+      if (schedule !== null && row.schedule_run_count !== null)
+        scheduleRunCounts[schedule] = Number(row.schedule_run_count);
+    }
     return {
-      tasks,
+      tasks: rows.map(mapTask),
       hasMore,
       nextCursor: hasMore && last ? encodeTaskCursor(last) : null,
-      scheduleRunCounts: await this.#scheduleRunCounts(userId, tasks, include)
+      scheduleRunCounts
     };
-  }
-
-  /**
-   * How many runs each schedule on a page has, for the schedules that page carries.
-   *
-   * Counted rather than inferred, because the page is capped and the number the owner is shown
-   * beside a folded schedule should be the number of runs there are, not the number that fitted.
-   * Only the schedules already on the page are counted, so a box with no scheduled work never pays
-   * for this at all, and the count is taken over the same filter the page was read with - a folded
-   * line in the active list should not be counting the runs the owner filed away.
-   */
-  async #scheduleRunCounts(
-    userId: string,
-    tasks: readonly TaskRecord[],
-    include: TaskListFilter
-  ): Promise<Record<string, number>> {
-    const scheduleIds = [
-      ...new Set(tasks.map((task) => task.scheduleId).filter((id): id is string => id !== null))
-    ];
-    if (!scheduleIds.length) return {};
-    const counted = await this.database.query(
-      `SELECT t.schedule_id, COUNT(*)::int AS runs FROM tasks t
-       WHERE t.user_id=$1 AND t.schedule_id = ANY($2::uuid[]) AND NOT t.pinned
-         AND ($3::text = 'all'
-              OR ($3::text = 'active' AND t.archived_at IS NULL)
-              OR ($3::text = 'archived' AND t.archived_at IS NOT NULL))
-       GROUP BY t.schedule_id`,
-      [userId, scheduleIds, include]
-    );
-    return Object.fromEntries(
-      counted.rows.map((row) => [String(row.schedule_id), Number(row.runs)])
-    );
   }
 
   /**

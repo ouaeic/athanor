@@ -618,6 +618,42 @@ select:focus-visible {
   margin-top: 3px;
   text-transform: capitalize;
 }
+
+/*
+  The line that says which conversation is holding the computer, and the way to it.
+
+  It is a sentence, and it landed inside a rule written for a single status word - so it inherited
+  `capitalize` and rendered "Waiting For The Computer. My Logo Draft Has It.", Title-Casing the
+  owner's own conversation name, and then inherited `nowrap` with an ellipsis and truncated the way
+  out of it. Both are undone here rather than at the source, because the status word above still
+  wants them.
+
+  The name is the only thing to press and the only thing that shortens, so a narrow window costs the
+  part the owner can already see in the sidebar rather than the part that explains the wait. It is
+  bronze on hover and never ember: nothing here is alive and nothing is moving, it is a fact about
+  the machine plus a door.
+*/
+.task-title .computer-held {
+  max-width: 420px;
+  text-transform: none;
+  white-space: normal;
+}
+.computer-held-open {
+  display: inline;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--muted);
+  text-underline-offset: 3px;
+  cursor: pointer;
+  transition: text-decoration-color 120ms var(--ease);
+}
+.computer-held-open:hover {
+  text-decoration-color: var(--edge);
+}
 .task-title i {
   display: inline-block;
   width: 6px;
@@ -9055,6 +9091,25 @@ a.blocked-resource:hover {
   margin: 0 0 4px 15px;
   padding-left: 8px;
   border-left: 1px solid var(--line);
+}
+
+/*
+  What the fold says, against what opening it shows.
+
+  The line above reports how many runs the schedule has actually made; the list below holds only the
+  newest few, because a watcher firing every fifteen minutes would otherwise take the whole sidebar.
+  The difference is stated rather than left for the owner to find by counting rows - which is what
+  it was doing before, when the capped array was the only number anything had and "5 runs" was what
+  a schedule that had fired four hundred times reported about itself.
+
+  Muted and small, matching `.arrival-line`: both are the list telling the owner something rather
+  than offering them a control.
+*/
+.schedule-run-more {
+  margin: 2px 0 4px;
+  padding: 4px 8px 0;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 /*

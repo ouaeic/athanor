@@ -249,6 +249,64 @@ describe('what happened while the owner was away', () => {
       )
     ).toBe('1 scheduled run failed while you were away.');
   });
+
+  /*
+   * The list holds only the newest few runs of any one schedule, so the number of them on this
+   * device is the number that fitted rather than the number that ran. Ninety failed runs behind
+   * five good ones read as "5 scheduled runs finished while you were away", on the one screen this
+   * product exists for, saying the opposite of what the night had been.
+   */
+  it('does not report the runs it happens to be holding as the runs that happened', () => {
+    const held = [
+      run('newest-1', '2026-07-31T04:00:00.000Z'),
+      run('newest-2', '2026-07-31T03:00:00.000Z'),
+      run('newest-3', '2026-07-31T02:00:00.000Z')
+    ];
+    expect(arrivalLine(held, now, { 'rent-watcher': 95 })).toBe(
+      'Scheduled work ran while you were away.'
+    );
+    // The count agreeing with what is held is the whole list, so the number is the truth again.
+    expect(arrivalLine(held, now, { 'rent-watcher': 3 })).toBe(
+      '3 scheduled runs finished while you were away.'
+    );
+  });
+
+  /*
+   * The outcome the owner has to act on survives the cap, because one run they can see holding an
+   * approval is enough to know that something is waiting. It is the arithmetic that is dropped,
+   * not the news.
+   */
+  it('still leads with what needs the owner when the runs behind the cap are unknown', () => {
+    const held = [
+      run('waiting', '2026-07-31T02:00:00.000Z', 'awaiting_user'),
+      run('fine', '2026-07-31T04:00:00.000Z')
+    ];
+    expect(arrivalLine(held, now, { 'rent-watcher': 40 })).toBe('Scheduled work needs you.');
+    expect(
+      arrivalLine(
+        [
+          run('broken', '2026-07-31T03:00:00.000Z', 'failed'),
+          run('fine', '2026-07-31T04:00:00.000Z')
+        ],
+        now,
+        { 'rent-watcher': 40 }
+      )
+    ).toBe('Scheduled work failed while you were away.');
+  });
+
+  /* A pinned run is the owner's, and the count the box sends leaves it out, so this side must too. */
+  it('does not read a pinned run as evidence that the whole history is here', () => {
+    expect(
+      arrivalLine(
+        [
+          { ...run('pinned', '2026-07-31T04:00:00.000Z'), pinned: true },
+          run('newest', '2026-07-31T03:00:00.000Z')
+        ],
+        now,
+        { 'rent-watcher': 2 }
+      )
+    ).toBe('Scheduled work ran while you were away.');
+  });
 });
 
 describe('upsertTask', () => {

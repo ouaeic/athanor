@@ -6,6 +6,7 @@ import {
   TaskScheduleSpec,
   resolveWebToolPlan,
   type BuildIdentity,
+  type MediaModelOption,
   type ModelRelease,
   type ParallelWebReadResult,
   type ServerToolUse,
@@ -949,6 +950,11 @@ interface AgentApprovalRequirement {
 interface ImageObservation {
   mimeType: string;
   base64: string;
+  /**
+   * What the file on disk is. The runner re-encodes every picture on its way out, which is what
+   * takes a photograph's location and camera off it, so this is never the bytes the file holds.
+   */
+  convertedFrom?: string;
 }
 
 interface CompletionVerification {
@@ -2426,7 +2432,7 @@ export const createStreamFlusher = (
 export const boundedToolResultForModel = (
   toolName: string,
   result: unknown,
-  imageSummary?: { mimeType: string; bytes: number; path: string }
+  imageSummary?: { mimeType: string; bytes: number; path: string; convertedFrom?: string }
 ): unknown => {
   if (imageSummary)
     return { ...imageSummary, image: '[attached to this conversation for inspection]' };
@@ -2526,6 +2532,35 @@ export const usableCapabilities = (
       (capability) => capability !== 'vision' || model.modalities.includes('image')
     )
   );
+};
+
+/**
+ * Whether a recording may be sent to the model that would read it.
+ *
+ * Every other modality already asks. A chat model is routed through `usableCapabilities`, and so is
+ * the vision specialist an image is handed to when the lead cannot see; audio was the one that
+ * asked nobody, which made the owner's own voice the least protected thing on the box.
+ *
+ * The question goes to the owner's own transcription route, because that is the only place the
+ * answer is recorded. It cannot go to the chat catalogue: a model that reads a recording declares
+ * `transcription` where a chat model declares `text`, and the catalogue builder drops everything
+ * that cannot answer with text, so a transcription id is never a row there. Asked of that
+ * catalogue the question had exactly one answer on every box - no - which is a tool switched off
+ * wearing the clothes of a privacy check.
+ *
+ * A route the owner has never chosen falls back to whatever the provider listed a moment ago, and
+ * about that this box knows nothing at all. On a zero-retention task nothing at all is a refusal; a
+ * recording is not the thing to guess about.
+ *
+ * An ordinary task keeps the route it has always had. Its owner has already accepted external
+ * handling for this work, so asking here would close the tool rather than protect anyone.
+ */
+export const transcriptionRouteAllowed = (
+  route: MediaModelOption | undefined,
+  privacyRoute: string
+): boolean => {
+  if (privacyRoute !== 'provider_zdr') return true;
+  return route?.zeroDataRetentionAvailable === true;
 };
 
 const USAGE_CLASS_RANK: Record<ModelRelease['usageClass'], number> = {
@@ -2898,6 +2933,8 @@ const loggableFields = new Set([
   'attempts',
   /** Which build produced the line: a version and a revision, and nothing about this box. */
   'build',
+  /** Which restore point a line is about: the row's own random id, and nothing about its contents. */
+  'checkpointId',
   /** What was thrown, where athanor's own vocabulary has no word for it. */
   'class',
   'code',
@@ -5255,6 +5292,13 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
             'transcription_route_unavailable',
             'The connected provider offers no model that reads recordings, so this file cannot be transcribed. Choosing a transcription model in Settings, or connecting a provider that has one, is what opens this route.',
             503
+          );
+        // Asked before a second of the recording is cut, so a task that cannot send it never
+        // encodes it either.
+        if (!transcriptionRouteAllowed(secret.mediaRoutes?.transcription, task.privacyRoute))
+          throw new AthanorError(
+            'transcription_privacy_conflict',
+            'This task requires zero-retention model routing, and the transcription route this computer would use does not offer a zero-retention endpoint, so Athanor will not send a private recording to it. Choosing a transcription model that offers one in Settings, or starting a standard-privacy task if you deliberately want this one, is what opens this route.'
           );
         const prepared = await this.#runner.prepareAudio(task.workspaceId, task.id, {
           path,
@@ -7681,7 +7725,10 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         ? {
             mimeType: image.mimeType,
             bytes: Buffer.byteLength(image.base64, 'base64'),
-            path: textValue(call.arguments.path)
+            path: textValue(call.arguments.path),
+            // Spread rather than assigned, because under exactOptionalPropertyTypes an explicit
+            // undefined is not the same as an absent field.
+            ...(image.convertedFrom ? { convertedFrom: image.convertedFrom } : {})
           }
         : undefined;
     const eventResult = imageSummary ?? result;

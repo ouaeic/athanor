@@ -55,7 +55,8 @@ import {
 } from './timeline-state.js';
 import { externalRead, provenanceReport, sourcesPhrase } from './provenance.js';
 import { completionCard, verificationReceiptLabel, type HarnessCheck } from './completion-card.js';
-import { queuedMessagesCanRun } from './task-status.js';
+import { liveActivity } from './live-activity.js';
+import { queuedMessagesCanRun, taskIsGenerating } from './task-status.js';
 import { formatUsd } from './usage-model.js';
 import { fileKindLabel, inlineMediaKind, splitAttachments } from './attachments.js';
 import { AttachmentStrip } from './AttachmentTray.js';
@@ -1271,6 +1272,53 @@ function CostSummary({ task, events }: { task: Task | undefined; events: TaskEve
 }
 
 /**
+ * How often the clock below is allowed to age.
+ *
+ * The line it draws is in whole seconds under a minute and whole minutes above one, so anything
+ * quicker than this buys a re-render and no new information.
+ */
+const LIVE_ACTIVITY_TICK_MS = 15_000;
+
+/**
+ * What the machine is doing now, and how long it has been doing it.
+ *
+ * It stands beside the running cost because that is where the owner went looking for it: fourteen
+ * minutes into a turn, with a spinner and the word "running" on screen, the only thing on the page
+ * that disagreed was a cost figure that had stopped moving, and they read it correctly. The clock
+ * says the same thing in words, and `liveActivity` keeps it silent until a state has lasted long
+ * enough to be worth reading - so an ordinary turn looks exactly as it did.
+ *
+ * Its own component, so the tick that ages the number re-renders one line rather than a transcript
+ * of several hundred nodes. `now` is held rather than read at render time for the case this exists
+ * for: a turn that publishes nothing at all for eleven minutes renders nothing in that time either,
+ * so a number read off the render would be frozen at precisely the moment it matters.
+ *
+ * Deliberately not a live region. It would announce itself every fifteen seconds for the whole of a
+ * long turn, which is the noise the transcript's own `role` note above was written to stop; it is
+ * read here the way the cost beside it is, by going to the foot of the conversation and looking.
+ */
+function LiveActivity({ events, taskStatus }: { events: TaskEvent[]; taskStatus: string }) {
+  const [now, setNow] = useState(() => Date.now());
+  const generating = taskIsGenerating(taskStatus);
+  useEffect(() => {
+    if (!generating) return;
+    // Reset on the way in as well as on every tick: the interval only exists while a turn is being
+    // generated, so without this the first frame of a new turn would date from the last one.
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), LIVE_ACTIVITY_TICK_MS);
+    return () => window.clearInterval(timer);
+  }, [generating]);
+  const waiting = liveActivity({ events, taskStatus, now });
+  if (!waiting) return null;
+  return (
+    <div className="cost-event">
+      <Clock3 />
+      <span>{waiting}</span>
+    </div>
+  );
+}
+
+/**
  * What this conversation read from outside, and what it did after.
  *
  * It sits at the foot of the transcript beside the running cost, because both answer the same kind
@@ -1797,6 +1845,11 @@ export function Timeline({
             already in the stream and waiting for the task to finish is waiting too long. */}
         <ProvenanceSummary events={events} />
         <CostSummary task={task} events={events} />
+        {/* Last, under the cost and next to the composer, because it is the only line here about
+            what is happening rather than about what has happened. Only where there is a task to
+            report on: a conversation this device has not been told the status of is one whose
+            state nothing here knows. */}
+        {task && <LiveActivity events={events} taskStatus={task.status} />}
       </div>
       {!scroll.pinned && (
         <button className="jump-to-latest" onClick={scroll.jump} title="Jump to the newest message">
