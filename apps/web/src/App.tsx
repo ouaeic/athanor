@@ -27,7 +27,7 @@ import {
 import { api, ApiFailure } from './api.js';
 import { BrandMark } from './BrandMark.js';
 import { bumpFire, setFire, startFire, type FireState } from './fire.js';
-import { Approvals, NoticeLog, ScheduleModal } from './TaskModals.js';
+import { Approvals } from './TaskModals.js';
 import type { SettingsPage } from './SelfHostedSettings.js';
 import { Sidebar } from './Sidebar.js';
 import { Timeline } from './Timeline.js';
@@ -146,6 +146,20 @@ const RewindDialog = lazy(() =>
  */
 const Auth = lazy(() =>
   import('./Auth.js').then(({ Auth: AuthScreen }) => ({ default: AuthScreen }))
+);
+
+/**
+ * Scheduling and the notice log are both reached by an explicit choice from a menu, and both
+ * carried their whole weight into the first paint because `Approvals` sat in the same file and an
+ * approval has to be eager. Splitting the file is what lets these two leave; the owner who opens
+ * one is looking at a dialog while it arrives.
+ */
+const ScheduleModal = lazy(() =>
+  import('./ScheduleModal.js').then(({ ScheduleModal: Schedules }) => ({ default: Schedules }))
+);
+
+const NoticeLog = lazy(() =>
+  import('./NoticeLog.js').then(({ NoticeLog: Notices }) => ({ default: Notices }))
 );
 
 /**
@@ -3081,27 +3095,31 @@ export function App() {
           search={searchConversations}
         />
         {noticeLog && (
-          <NoticeLog
-            notices={notices}
-            onOpenTask={(target) => {
-              setTaskId(target);
-              setMobileNav(false);
-            }}
-            onClose={() => setNoticeLog(false)}
-          />
+          <Suspense fallback={null}>
+            <NoticeLog
+              notices={notices}
+              onOpenTask={(target) => {
+                setTaskId(target);
+                setMobileNav(false);
+              }}
+              onClose={() => setNoticeLog(false)}
+            />
+          </Suspense>
         )}
         {scheduleModal && (
-          <ScheduleModal
-            schedules={data.schedules}
-            workspaces={data.workspaces}
-            models={data.models}
-            {...(workspaceId ? { defaultWorkspaceId: workspaceId } : {})}
-            initialPrompt={prompt}
-            onClose={() => setScheduleModal(false)}
-            onChanged={async () => {
-              await load();
-            }}
-          />
+          <Suspense fallback={null}>
+            <ScheduleModal
+              schedules={data.schedules}
+              workspaces={data.workspaces}
+              models={data.models}
+              {...(workspaceId ? { defaultWorkspaceId: workspaceId } : {})}
+              initialPrompt={prompt}
+              onClose={() => setScheduleModal(false)}
+              onChanged={async () => {
+                await load();
+              }}
+            />
+          </Suspense>
         )}
         {settingsPage && (
           <Suspense fallback={null}>
