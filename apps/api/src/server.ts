@@ -5529,21 +5529,41 @@ export const buildServer = async (
       appTitle: 'athanor',
       enforceZeroDataRetention: secret.provider === 'openrouter' && secret.enforceZeroDataRetention
     });
-    const response = await adapter.chat({
-      model: model.providerModelId,
-      messages: [
-        { role: 'system', content: TITLE_SYSTEM_PROMPT },
-        { role: 'user', content: input.prompt }
-      ],
-      tools: [],
-      temperature: 0.2,
-      // A title is a few words. This is the ceiling that makes a model which decides to explain
-      // itself cost the same as one that answers.
-      maxTokens: 32,
-      signal: input.signal
-        ? AbortSignal.any([input.signal, AbortSignal.timeout(20_000)])
-        : AbortSignal.timeout(20_000)
-    });
+    /*
+     * A provider that will not serve us is answered with `null`, which is this function's word for
+     * "not the titler's fault" - the sweep reads it as `provider_failed`, stands down for five
+     * minutes and stops asking.
+     *
+     * Every check above already returns `null` that way, and the call itself did not: it threw, so
+     * the sweep caught the throw, charged the conversation an attempt, wrote a warning with a stack
+     * trace, and carried straight on to the next one. Observed on a box with no provider
+     * configured: fourteen conversations, fourteen stack traces, on every single boot, and the
+     * cooldown built for exactly this never once engaged.
+     *
+     * Only the three the box already knows are walls, and only those - anything else is a fault in
+     * this code and must still be reported rather than quietly becoming a cooldown.
+     */
+    const response = await adapter
+      .chat({
+        model: model.providerModelId,
+        messages: [
+          { role: 'system', content: TITLE_SYSTEM_PROMPT },
+          { role: 'user', content: input.prompt }
+        ],
+        tools: [],
+        temperature: 0.2,
+        // A title is a few words. This is the ceiling that makes a model which decides to explain
+        // itself cost the same as one that answers.
+        maxTokens: 32,
+        signal: input.signal
+          ? AbortSignal.any([input.signal, AbortSignal.timeout(20_000)])
+          : AbortSignal.timeout(20_000)
+      })
+      .catch((error: unknown) => {
+        if (error instanceof AthanorError && error.code in providerWalls) return null;
+        throw error;
+      });
+    if (!response) return null;
     return {
       text: response.text,
       costUsd: response.usage.costUsd ?? 0,

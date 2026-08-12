@@ -1,4 +1,5 @@
 import {
+  AthanorError,
   buildConversationNameIndex,
   decryptJson,
   encryptJson,
@@ -69,6 +70,27 @@ const MAX_TRACKED_ATTEMPTS = 500;
 
 /** How long the titler waits out a provider that just failed, rather than asking it per answer. */
 const PROVIDER_COOLDOWN_MS = 5 * 60_000;
+
+/**
+ * A provider refusing to serve us, however it says so.
+ *
+ * `complete` answers a wall with `null` and the sweep stands down for five minutes, which is the
+ * contract and is tested. What was not tested is a caller honouring it, and the one caller did not:
+ * every pre-flight check returned `null` and the call itself threw, so the throw landed in the
+ * catch below, charged the conversation an attempt, wrote a stack trace and carried on to the next
+ * one. A box with no provider configured did that fourteen times on every boot and never once
+ * reached the cooldown built for exactly this.
+ *
+ * The caller is fixed. This is the sweep refusing to depend on it, for the same reason the store
+ * stopped depending on callers to clear a lease: a bound that holds only while everybody remembers
+ * is not a bound. `apps/api/src/server.ts` keys its owner-facing notices on the same three codes
+ * and the two must agree - it is the fuller table, this is only the recognition.
+ */
+const PROVIDER_WALL_CODES = new Set([
+  'provider_quota_exhausted',
+  'provider_unavailable',
+  'provider_not_connected'
+]);
 
 /**
  * How long a shutdown gives a naming call that is already in flight.
@@ -247,6 +269,14 @@ export const titleTasksOnce = async (
     } catch (error) {
       // A call cut short by shutdown is the shutdown working, not a failure to report.
       if (signal?.aborted) break;
+      // A wall reached us as a throw rather than as `null`. It is still a wall: stand down for the
+      // cooldown and say so once, rather than charging this conversation an attempt it did not get
+      // and asking the same refusing provider again for the next one.
+      if (error instanceof AthanorError && PROVIDER_WALL_CODES.has(error.code)) {
+        state.providerReadyAt = now + PROVIDER_COOLDOWN_MS;
+        deps.log.warn('task.title_provider_unavailable', { code: error.code });
+        return named;
+      }
       recordAttempt(state.attempts, task.id);
       deps.log.warn('task.title_failed', { taskId: task.id, ...errorFields(error) });
     }

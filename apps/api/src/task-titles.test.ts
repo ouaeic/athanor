@@ -6,6 +6,7 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  AthanorError,
   buildConversationNameIndex,
   decryptJson,
   encryptJson,
@@ -225,6 +226,57 @@ describe('the titler', () => {
 
       await expect(titleTasksOnce(deps, state, state.providerReadyAt + 1)).resolves.toBe(0);
       expect(complete).toHaveBeenCalledTimes(2);
+    } finally {
+      await database.close();
+    }
+  }, 60_000);
+
+  /*
+   * The same wall, arriving as a throw.
+   *
+   * `complete` promises `null` for a provider that will not serve us, and the caller in server.ts
+   * kept that promise for every check it made before the call and broke it on the call itself. So a
+   * box with no provider configured charged each conversation an attempt, wrote a stack trace for
+   * each, and asked the same refusing provider again for the next one - fourteen times on every
+   * boot, never once reaching the cooldown built for it.
+   *
+   * The caller is fixed. This pins the sweep not depending on it.
+   */
+  it('waits out a provider that refuses by throwing, and spends no conversation on it', async () => {
+    const { database, store } = await boxWithAnsweredTask();
+    try {
+      const complete = vi.fn<TaskTitlerDeps['complete']>(async () => {
+        throw new AthanorError('provider_unavailable', 'the provider did not answer');
+      });
+      const state = freshState();
+      const deps: TaskTitlerDeps = { store, masterKey, log, complete };
+
+      await expect(titleTasksOnce(deps, state, 1_000)).resolves.toBe(0);
+      expect(complete).toHaveBeenCalledTimes(1);
+      expect(state.providerReadyAt).toBeGreaterThan(1_000);
+      // The conversation was not tried - the provider was - so it keeps every one of its chances.
+      expect(state.attempts.size).toBe(0);
+
+      await expect(titleTasksOnce(deps, state, 2_000)).resolves.toBe(0);
+      expect(complete).toHaveBeenCalledTimes(1);
+    } finally {
+      await database.close();
+    }
+  }, 60_000);
+
+  /* A fault in this code is not a wall, and must still be reported per conversation. */
+  it('still reports a failure that is not the provider refusing', async () => {
+    const { database, store } = await boxWithAnsweredTask();
+    try {
+      const complete = vi.fn<TaskTitlerDeps['complete']>(async () => {
+        throw new TypeError('undefined is not a function');
+      });
+      const state = freshState();
+      const deps: TaskTitlerDeps = { store, masterKey, log, complete };
+
+      await expect(titleTasksOnce(deps, state, 1_000)).resolves.toBe(0);
+      expect(state.providerReadyAt).toBe(0);
+      expect(state.attempts.size).toBe(1);
     } finally {
       await database.close();
     }
