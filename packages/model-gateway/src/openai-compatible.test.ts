@@ -626,13 +626,26 @@ describe('OpenAICompatibleAdapter', () => {
       }
     });
 
+    /*
+     * The ceiling is put out of reach on purpose. Both bounds can stop this stream, and with them
+     * anywhere near each other the test is a race between them: on an idle machine the 5ms clock
+     * wins, and under the load of the whole repo's suites running at once the reader gets through
+     * enough chunks first and the answer comes back `overrun`. That failed exactly once, in
+     * `pnpm check` and never in the package alone, which is the worst way for a test to be wrong.
+     *
+     * Five million characters is roughly fifty thousand chunks, each of them parsed. Nothing
+     * reaches that in five milliseconds, so the only bound that can fire here is the clock - which
+     * is the whole claim: a stream that never makes the reader wait is stopped by the loop reading
+     * the time itself, not by a promise racing a timer that a settled read would always beat.
+     */
     const result = (await streamRequest(
-      streamingAdapter(body, { generationTimeoutMs: 5, generationMaxChars: 60_000 }),
+      streamingAdapter(body, { generationTimeoutMs: 5, generationMaxChars: 5_000_000 }),
       deltas
     )) as { truncated?: { reason: string } };
 
     expect(result.truncated?.reason).toBe('timeout');
-    expect(deltas.join('').length).toBeLessThan(60_000);
+    // Far below the ceiling, so a regression that let the ceiling do the stopping still fails here.
+    expect(deltas.join('').length).toBeLessThan(500_000);
   });
 
   /*
