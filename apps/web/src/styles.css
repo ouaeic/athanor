@@ -700,6 +700,46 @@ select:focus-visible {
   font-size: 12px;
   cursor: pointer;
 }
+
+/*
+  The one launch after an update that shows the release before it.
+
+  The shell is served from disk and refreshed behind it, so exactly one open per update is the
+  previous version - a good trade, and the only person who ever pays it is whoever has just deployed
+  and cannot tell a stale open from a failed one. This is that, said. It is chrome: a fact about the
+  machine and the door to it, in the header, where nothing already on screen has to move for it. No
+  fire and no caution - nothing is wrong, nothing is burning, and nothing expires if it is ignored
+  for the rest of the day.
+*/
+.update-offer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.update-offer span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.update-offer button {
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 6px 9px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 150ms var(--ease);
+}
+/* An edge under a pointer is an edge that can be acted on: the same crossing from chrome chroma
+   into accent chroma that every other pressable in this header makes. */
+.update-offer button:hover {
+  border-color: var(--accent-muted);
+}
 .header-pill svg {
   width: 13px;
 }
@@ -3777,6 +3817,21 @@ video.artifact-media {
   }
 }
 @media (max-width: 430px) {
+  /*
+    At this width the header is a menu button, a title that is already truncating and a 32px tools
+    button; the sentence does not fit beside them and the title is the more useful of the two.
+    Clipped rather than removed, because the sentence is the whole of what the button means and a
+    reader who cannot see the header still has to be told which version this is.
+  */
+  .update-offer span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
   .workspace-tools-button span {
     display: none;
   }
@@ -6639,6 +6694,92 @@ body,
 }
 
 /*
+  The question about a ceiling, in the slot that is otherwise empty.
+
+  Not caution and not danger: nothing is wrong and nothing is being held back. It is the only thing
+  that reaches this slot as a question rather than as a report, so it wears the plain warm chrome a
+  status wears and spends its saturation on the two controls - which is the part the owner can act
+  on. It wraps because it carries a field: on a phone the sentence takes the first line and the
+  amount and the two answers take the second, rather than the amount being squeezed to three
+  characters. The greys are lifted verbatim from the dark `.inline-notice` override.
+*/
+.spend-ceiling-ask {
+  pointer-events: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid #605952;
+  background: #25211c;
+  color: #d3c7bc;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.spend-ceiling-ask > svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--accent);
+}
+.spend-ceiling-ask > span {
+  flex: 1 1 22ch;
+  min-width: 0;
+}
+/*
+  The label carries the whole of what pressing Set does - one number is typed and a month and a day
+  are installed, and the day is the half that can refuse work tomorrow morning, so it is named here
+  rather than in the notice afterwards. That sentence does not fit beside an 8ch field on a 320px
+  screen, and an item that may neither shrink nor wrap inside itself pushes the strip wider than the
+  page. Allowed to do both.
+*/
+.spend-ceiling-ask label {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  min-width: 0;
+  gap: 6px;
+  align-items: center;
+  color: var(--muted);
+}
+.spend-ceiling-ask input {
+  width: 8ch;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 5px 7px;
+  background: #17130f;
+  color: var(--text);
+  font: inherit;
+  text-align: right;
+}
+.spend-ceiling-ask input:focus-visible {
+  outline: 2px solid var(--ember);
+  outline-offset: 1px;
+}
+.spend-ceiling-ask button {
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: #2d2723;
+  color: #d3c7bc;
+  font-size: 12px;
+  cursor: pointer;
+}
+.spend-ceiling-ask button.primary {
+  border-color: var(--edge);
+  color: var(--text);
+}
+.spend-ceiling-ask button:hover:not(:disabled) {
+  border-color: var(--edge);
+  color: var(--text);
+}
+.spend-ceiling-ask button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/*
   The one slot above the composer, at one width and one radius.
 
   `composerStrip` returns exactly one of these four and they disagreed about every measurement:
@@ -6651,7 +6792,8 @@ body,
 .composer-block,
 .usage-warning,
 .inline-error,
-.inline-notice {
+.inline-notice,
+.spend-ceiling-ask {
   width: min(820px, 100%);
   margin: 0 auto 8px;
   border-radius: 12px;

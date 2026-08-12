@@ -53,7 +53,14 @@ import type {
 } from '@athanor/contracts';
 import { buildLabel, type BuildIdentity } from '@athanor/contracts';
 import { webSearchSummary } from './web-search-route.js';
-import { spendLimitsDraft, spendLimitsPatch, type SpendLimitsDraft } from './usage-model.js';
+import {
+  anyCapInForce,
+  BASE_MONTHLY_CEILING_USD,
+  spendLimitsDraft,
+  spendLimitsPatch,
+  suggestedMonthlyCeilingUsd,
+  type SpendLimitsDraft
+} from './usage-model.js';
 import { securityModeCopy, securityModeNotice, securityModes } from './security-mode.js';
 import { alwaysAsks, balancedVsAutonomous } from './asking-rules.js';
 import {
@@ -257,16 +264,6 @@ function MediaModalityRow({
     </label>
   );
 }
-
-/**
- * The number already in the box when the ceiling is asked for.
- *
- * A prefilled figure is the difference between a question and a chore: it can be accepted without
- * thinking about it, changed by anyone who has a figure of their own, and cleared by anyone who
- * wants no ceiling. Fifty dollars a month is more than a personal computer that thinks costs most
- * months and far less than an unattended loop can spend in one night.
- */
-export const SUGGESTED_MONTHLY_CEILING_USD = 50;
 
 /**
  * What the connect form sends about money, from what is in the field.
@@ -481,7 +478,10 @@ export function SelfHostedSettings({
     // The owner's own zone is the only sensible default for "today"; the server accepts any IANA id.
     timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
   });
-  const [ceilingDraft, setCeilingDraft] = useState(String(SUGGESTED_MONTHLY_CEILING_USD));
+  /* Replaced below by a figure sized from what this box has actually spent, once that is known. A
+     prefilled number is the difference between a question and a chore, so there is one from the
+     first paint rather than an empty field while a request is in flight. */
+  const [ceilingDraft, setCeilingDraft] = useState(String(BASE_MONTHLY_CEILING_USD));
   /*
    * Whether this box has ever had an answer about money, which is what decides whether the question
    * is asked at all. It starts as answered so the field cannot flash up on a box that settled this
@@ -489,6 +489,14 @@ export function SelfHostedSettings({
    * stamped at the epoch, which is how a default is told from a choice that happens to match one.
    */
   const [capsAnswered, setCapsAnswered] = useState(true);
+  /**
+   * Whether any ceiling is actually in force, which is not what the fields say.
+   *
+   * Read from what the server last confirmed rather than from the form, because a half-edited field
+   * is not a change to the machine: clearing the daily box must not make this page announce that
+   * nothing stops a run while the old cap is still stopping one.
+   */
+  const [capsInForce, setCapsInForce] = useState(true);
   const [relay, setRelay] = useState<RelayReport | null>();
   const [diagnostics, setDiagnostics] = useState<{
     certificate: { failedAt: string; reason: string } | null;
@@ -595,11 +603,29 @@ export function SelfHostedSettings({
     loadRemembered(rememberedLimit);
   };
   const loadSpendLimits = () =>
-    void api
-      .spendLimits()
-      .then((limits) => {
+    /* The summary is best-effort beside the caps themselves: losing it costs a better-sized
+       suggestion, and refusing to load the caps over that would cost the whole section. */
+    void Promise.all([api.spendLimits(), api.spend().catch(() => null)])
+      .then(([limits, summary]) => {
         setSpendLimitsForm(spendLimitsDraft(limits));
         setCapsAnswered(Date.parse(limits.updatedAt) > 0);
+        setCapsInForce(anyCapInForce(limits));
+        /*
+         * The figure offered is sized from this box rather than fixed.
+         *
+         * A flat fifty in front of an owner whose box has already spent four hundred this month is
+         * a ceiling the month has crossed: accept it and the next turn is refused for money that
+         * went before the question was asked, which reads as the product breaking. The rule lives
+         * in `suggestedMonthlyCeilingUsd`, next to the day-cap share it has to leave room for.
+         */
+        if (!summary) return;
+        const spent = (name: 'daily' | 'monthly'): number =>
+          summary.windows.find((window) => window.name === name)?.spentUsd ?? 0;
+        setCeilingDraft(
+          String(
+            suggestedMonthlyCeilingUsd({ monthlyUsd: spent('monthly'), dailyUsd: spent('daily') })
+          )
+        );
       })
       // A server without the caps route keeps the local defaults, which are what it enforces.
       .catch(() => undefined);
@@ -1198,6 +1224,10 @@ export function SelfHostedSettings({
             />
           </label>
         </div>
+        {/* The blank fields above are already the answer, but a blank field reads as a thing not
+            filled in rather than as a ceiling that does not exist. This is the same fact stated as
+            what the box does, which is the part worth knowing. */}
+        {!capsInForce && <p className="spend-note">No ceiling is set. Nothing here stops a run.</p>}
         <button
           disabled={busy}
           onClick={() =>
@@ -1206,7 +1236,13 @@ export function SelfHostedSettings({
               if (!patch.ok) throw new Error(patch.message);
               const saved = await api.updateSpendLimits(patch.body);
               setSpendLimitsForm(spendLimitsDraft(saved));
-              setNotice('Spending caps saved. Work stops before it crosses them.');
+              setCapsAnswered(Date.parse(saved.updatedAt) > 0);
+              setCapsInForce(anyCapInForce(saved));
+              setNotice(
+                anyCapInForce(saved)
+                  ? 'Spending caps saved. Work stops before it crosses them.'
+                  : 'Saved. No ceiling: nothing here stops a run.'
+              );
             })
           }
         >

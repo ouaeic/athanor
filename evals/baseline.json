@@ -1,57 +1,57 @@
 {
   "ambiguous-a-question-before-looking-is-refused": {
     "modelCalls": 3,
-    "promptTokens": 12410,
+    "promptTokens": 12411,
     "cachePrefix": 97
   },
   "ambiguous-a-real-blocker-parks-the-conversation": {
     "modelCalls": 2,
-    "promptTokens": 8085,
+    "promptTokens": 8086,
     "cachePrefix": 97
   },
   "ambiguous-question-after-a-read-costs-a-round-trip": {
     "modelCalls": 3,
-    "promptTokens": 12598,
+    "promptTokens": 12599,
     "cachePrefix": 96
   },
   "ambiguous-question-finished-cheaply": {
     "modelCalls": 1,
-    "promptTokens": 3995,
+    "promptTokens": 3996,
     "cachePrefix": 0
   },
   "ambiguous-question-without-finish-is-nagged": {
     "modelCalls": 5,
-    "promptTokens": 21431,
+    "promptTokens": 21434,
     "cachePrefix": 97
   },
   "answer-conversational-no-tools": {
     "modelCalls": 1,
-    "promptTokens": 4003,
+    "promptTokens": 4004,
     "cachePrefix": 0
   },
   "answer-document-question": {
     "modelCalls": 3,
-    "promptTokens": 12356,
+    "promptTokens": 12357,
     "cachePrefix": 97
   },
   "answer-missing-file-is-not-a-dead-turn": {
     "modelCalls": 4,
-    "promptTokens": 16755,
+    "promptTokens": 16757,
     "cachePrefix": 97
   },
   "answer-not-applicable-after-tools-is-refused": {
     "modelCalls": 3,
-    "promptTokens": 12497,
+    "promptTokens": 12498,
     "cachePrefix": 97
   },
   "files-a-silent-turn-is-asked-to-speak": {
     "modelCalls": 3,
-    "promptTokens": 12532,
+    "promptTokens": 12535,
     "cachePrefix": 97
   },
   "files-code-declares-acceptance-first": {
     "modelCalls": 4,
-    "promptTokens": 16906,
+    "promptTokens": 16907,
     "cachePrefix": 97
   },
   "files-code-holds-for-acceptance": {
@@ -66,17 +66,17 @@
   },
   "files-open-plan-steps-hold-the-finish": {
     "modelCalls": 4,
-    "promptTokens": 17009,
+    "promptTokens": 17011,
     "cachePrefix": 97
   },
   "files-parallel-reads-cost-one-call": {
     "modelCalls": 2,
-    "promptTokens": 8288,
+    "promptTokens": 8290,
     "cachePrefix": 96
   },
   "files-prose-write-needs-no-acceptance": {
     "modelCalls": 2,
-    "promptTokens": 8204,
+    "promptTokens": 8205,
     "cachePrefix": 97
   },
   "files-stale-evidence-is-refused": {
@@ -86,22 +86,22 @@
   },
   "long-finished-phases-condense-rather-than-shred": {
     "modelCalls": 39,
-    "promptTokens": 2679333,
+    "promptTokens": 2679348,
     "cachePrefix": 65
   },
   "media-logo-set-declares-its-own-done": {
     "modelCalls": 7,
-    "promptTokens": 32005,
+    "promptTokens": 31723,
     "cachePrefix": 97
   },
   "media-logo-set-holds-for-acceptance": {
     "modelCalls": 7,
-    "promptTokens": 31657,
+    "promptTokens": 31303,
     "cachePrefix": 97
   },
   "media-one-generation-is-not-re-rolled": {
     "modelCalls": 5,
-    "promptTokens": 21631,
+    "promptTokens": 21633,
     "cachePrefix": 97
   },
   "refusal-approval-defers-the-rest-of-the-batch": {
@@ -116,7 +116,7 @@
   },
   "refusal-git-push-stops-for-the-owner": {
     "modelCalls": 2,
-    "promptTokens": 8178,
+    "promptTokens": 8179,
     "cachePrefix": 97
   },
   "refusal-public-publish-stops-for-the-owner": {
@@ -126,96 +126,107 @@
   },
   "research-a-thin-search-is-requeried": {
     "modelCalls": 4,
-    "promptTokens": 17147,
+    "promptTokens": 17148,
     "cachePrefix": 97
   },
   "research-identical-read-is-not-paid-twice": {
     "modelCalls": 3,
-    "promptTokens": 12425,
+    "promptTokens": 12427,
     "cachePrefix": 97
   },
   "research-search-then-read": {
     "modelCalls": 3,
-    "promptTokens": 12810,
+    "promptTokens": 12813,
     "cachePrefix": 96
   },
   "research-untrusted-page-cannot-lower-the-floor": {
     "modelCalls": 2,
-    "promptTokens": 8229,
+    "promptTokens": 8230,
     "cachePrefix": 96
   },
   "small-a-cut-off-answer-is-not-asked-for-again": {
     "modelCalls": 2,
-    "promptTokens": 23100,
+    "promptTokens": 23186,
     "cachePrefix": 51
   },
   "small-deliberation-that-ignores-the-break-is-stopped": {
     "modelCalls": 7,
-    "promptTokens": 31788,
+    "promptTokens": 31791,
     "cachePrefix": 97
   },
   "small-deliberation-without-action-is-broken-out-of": {
     "modelCalls": 5,
-    "promptTokens": 21686,
+    "promptTokens": 21688,
     "cachePrefix": 97
   },
   "small-haiku-writes-no-plan": {
     "modelCalls": 1,
-    "promptTokens": 3999,
+    "promptTokens": 4000,
     "cachePrefix": 0
+  },
+  "small-hunks-that-miss-in-different-places-are-a-search": {
+    "modelCalls": 9,
+    "promptTokens": 40440,
+    "cachePrefix": 97
   },
   "small-long-thinking-that-keeps-moving-is-not-interrupted": {
     "modelCalls": 7,
-    "promptTokens": 31137,
+    "promptTokens": 31141,
     "cachePrefix": 97
   },
   "small-one-look-and-an-answer": {
     "modelCalls": 2,
-    "promptTokens": 8126,
+    "promptTokens": 8127,
     "cachePrefix": 97
   },
   "small-reasoning-between-commands-is-not-called-a-stall": {
     "modelCalls": 6,
-    "promptTokens": 26001,
+    "promptTokens": 26004,
     "cachePrefix": 97
   },
   "small-repeating-answer-is-stopped": {
     "modelCalls": 2,
-    "promptTokens": 4050,
+    "promptTokens": 4051,
     "cachePrefix": 98
+  },
+  "small-the-same-call-failing-the-same-way-is-stopped": {
+    "modelCalls": 6,
+    "promptTokens": 26991,
+    "cachePrefix": 97
   },
   "small-third-call-writes-a-plan-nobody-asked-for": {
     "modelCalls": 3,
-    "promptTokens": 12397,
+    "promptTokens": 12399,
     "cachePrefix": 97
   },
   "verify-checks-that-already-pass-are-refused": {
     "modelCalls": 5,
-    "promptTokens": 21821,
+    "promptTokens": 21824,
     "cachePrefix": 97
   },
   "verify-failed-check-refuses-the-finish": {
     "modelCalls": 6,
-    "promptTokens": 26037,
+    "promptTokens": 26041,
+    "cachePrefix": 97
+  },
+  "verify-output-limit-forever-still-ends": {
+    "modelCalls": 8,
+    "promptTokens": 36055,
     "cachePrefix": 97
   },
   "verify-output-limit-is-continued": {
     "modelCalls": 2,
-    "promptTokens": 8102,
+    "promptTokens": 8103,
     "cachePrefix": 97
   },
   "verify-shell-observes-its-own-change": {
     "modelCalls": 3,
-    "promptTokens": 12516,
+    "promptTokens": 12517,
     "cachePrefix": 97
   },
   "verify-step-ceiling-hands-off": {
     "modelCalls": 3,
-    "promptTokens": 8344,
+    "promptTokens": 8345,
     "cachePrefix": 98
-  },
-  "verify-output-limit-forever-still-ends": {
-    "modelCalls": 8,
-    "promptTokens": 36050
   }
 }

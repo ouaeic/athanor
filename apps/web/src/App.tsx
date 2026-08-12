@@ -10,6 +10,7 @@ import {
 } from 'react';
 import {
   Archive,
+  CircleDollarSign,
   HardDrive,
   Keyboard,
   Menu,
@@ -91,7 +92,13 @@ import { modelDisplayName } from './model-names.js';
 import type { AgentNotification } from './notice-log.js';
 import { rewindOffer, rewindResultNotice, type TrajectoryDraft } from './rewind.js';
 import { paneId, panes, shortcutRows, stepPane, windowShortcut, type Pane } from './shortcuts.js';
-import { hostStorageBlocksWork } from './usage-model.js';
+import {
+  formatUsd,
+  hostStorageBlocksWork,
+  spendCeilingAnswer,
+  spendCeilingAsk,
+  type SpendCeilingAsk
+} from './usage-model.js';
 import { composerStrip } from './composer-strip.js';
 import {
   attachmentPath,
@@ -165,6 +172,24 @@ export const computerHeldBy = (task: Task | undefined, tasks: Task[]): Task | un
       )
     : undefined;
 
+/**
+ * Whether the offer to reload can be made without asking the owner to lose something for it.
+ *
+ * A reload throws away whatever exists only in this tab. The sentence in the composer does not: it
+ * is banked on the way out and read back on the way in. A voice note being recorded is bytes that
+ * have never left the microphone, and the attachment tray is a set of files this browser is the
+ * only record of until the message is sent — the box is told about them alongside the next
+ * keystroke, not when they land, so a reload can strip a tray the box has never heard of.
+ *
+ * Neither is a reason to interrupt anyone, so the offer simply waits. It is not urgent, nothing
+ * expires, and it appears the moment this tab is holding nothing of its own.
+ */
+export const mayOfferReload = (state: {
+  superseded: boolean;
+  recording: boolean;
+  attachmentCount: number;
+}): boolean => state.superseded && !state.recording && state.attachmentCount === 0;
+
 export function App() {
   const [auth, setAuth] = useState<'loading' | 'required' | 'ready'>('loading');
   const [data, setData] = useState<Bootstrap>();
@@ -232,6 +257,16 @@ export function App() {
   const [pendingSend, setPendingSend] = useState<PendingUserMessage>();
   const [missingTask, setMissingTask] = useState(false);
   const [settingsPage, setSettingsPage] = useState<SettingsPage>();
+  /**
+   * The question about a ceiling, when this box owes it, plus what is in its field.
+   *
+   * Null covers both "not asked yet" and "answered", because the two look the same from here: the
+   * question is put once and then never again. See `spendCeilingAsk` for what has to be true for it
+   * to exist at all.
+   */
+  const [ceilingAsk, setCeilingAsk] = useState<SpendCeilingAsk | null>(null);
+  const [ceilingDraft, setCeilingDraft] = useState('');
+  const [ceilingBusy, setCeilingBusy] = useState(false);
   const [scheduleModal, setScheduleModal] = useState(false);
   const [notices, setNotices] = useState<AgentNotification[]>([]);
   const [noticeLog, setNoticeLog] = useState(false);
@@ -527,6 +562,20 @@ export function App() {
     window.requestAnimationFrame(() => composer.current?.focus());
   };
 
+  /*
+   * Taking the offer, without spending anything on the way through.
+   *
+   * The draft is written to this device on a 900ms debounce, so the last thing typed is routinely
+   * still only in React state — and this is the one control in the product that deliberately throws
+   * React state away. Banked synchronously first, and read back by the composer on the way in.
+   * Everything else on this screen is the box's and arrives again with the next bootstrap; the turn
+   * that is running is the box's too, and does not notice.
+   */
+  const reloadForNewShell = () => {
+    writeDraft(taskId, prompt);
+    window.location.reload();
+  };
+
   const applyNativeTarget = (
     target: { kind: 'task' | 'workspace'; id: string },
     source = currentData.current
@@ -723,6 +772,30 @@ export function App() {
     navigator.serviceWorker.addEventListener('message', receivePush);
     return () => navigator.serviceWorker.removeEventListener('message', receivePush);
   }, [load, loadNotices]);
+  /**
+   * Whether what is on screen is a release the box has already replaced.
+   *
+   * The shell is served from disk and refreshed behind it, which is the whole difference between an
+   * icon that opens and an icon that loads. Its one cost is a single launch, after an update, that
+   * shows the previous release — and the person who pays it is whoever has just deployed, who read
+   * a logo that should have changed as a deploy that had failed. The worker holds both documents at
+   * the moment it can compare them; this is that answer arriving.
+   *
+   * Asked for as well as listened for, because the comparison is a round trip to the box and this
+   * window has a module graph to evaluate first: on a box on the same network the answer is
+   * routinely ready before there is anything here to receive it.
+   */
+  const [shellSuperseded, setShellSuperseded] = useState(false);
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    const receive = (event: MessageEvent<unknown>) => {
+      const message = event.data as { source?: unknown } | null;
+      if (message?.source === 'athanor-shell-superseded') setShellSuperseded(true);
+    };
+    navigator.serviceWorker.addEventListener('message', receive);
+    navigator.serviceWorker.controller?.postMessage({ source: 'athanor-shell-check' });
+    return () => navigator.serviceWorker.removeEventListener('message', receive);
+  }, []);
   useEffect(() => {
     void load();
     loadNotices();
@@ -742,6 +815,82 @@ export function App() {
   }, [load, loadNotices]);
 
   const workspace = data?.workspaces.find((item) => item.id === workspaceId);
+
+  /*
+   * The one question about money that nothing on an existing box has ever put to its owner.
+   *
+   * A ceiling is asked for when a provider key is saved, which is the right moment and reaches
+   * nobody who saved their key before that existed - so on every box that already had an owner on
+   * it, all three caps are null, the guard builds no window for a null cap, and the whole
+   * DST-correct machinery refuses nothing while the box spends. The setting is reachable, in
+   * Settings under Model & spending; an owner who never opens it never learns the question exists.
+   *
+   * The evidence is already in the bootstrap this screen has: what the provider charged today and
+   * this month. Only when that is more than nothing does this go and ask the caps route whether
+   * anybody has ever answered - so a box that has spent nothing makes no request and shows nothing,
+   * which is right on both counts, because it has no evidence and therefore nothing to say.
+   */
+  const spentToday = data?.usage.providerSpend.windows.daily.used ?? 0;
+  const spentThisMonth = data?.usage.providerSpend.windows.monthly.used ?? 0;
+  /* Asked at most once a session. The answer can only arrive from here or from the settings screen,
+     and that one says so when it closes; polling for it would be this screen waiting to interrupt. */
+  const ceilingChecked = useRef(false);
+  const [ceilingProbe, setCeilingProbe] = useState(0);
+  useEffect(() => {
+    if (ceilingChecked.current || !(spentThisMonth > 0)) return;
+    ceilingChecked.current = true;
+    /*
+     * Deliberately without a cleanup that abandons the answer in flight.
+     *
+     * These figures move whenever a turn settles a charge, which on the box this exists for is
+     * while the request is open - and dropping the reply on that would be dropping it for good,
+     * because the ref above has already spent the one ask this session gets. Nothing here writes
+     * anything that has to be undone, and a state write after this screen is gone is a no-op.
+     */
+    void api
+      .spendLimits()
+      .then((limits) => {
+        const ask = spendCeilingAsk(limits, {
+          monthlyUsd: spentThisMonth,
+          dailyUsd: spentToday
+        });
+        setCeilingAsk(ask);
+        if (ask) setCeilingDraft(String(ask.suggestedUsd));
+      })
+      // A box too old for the caps route enforces none, and saying so here would be a second
+      // strip about a setting this server does not have.
+      .catch(() => undefined);
+  }, [spentThisMonth, spentToday, ceilingProbe]);
+
+  /**
+   * The answer, in either direction, written once.
+   *
+   * Both answers are a tightening as far as the server is concerned - every cap was null - so
+   * neither asks for a passkey, and declining lands a row whose timestamp is what stops this being
+   * asked again. The zone travels with it because until somebody answers, "today" on this box is a
+   * UTC day rather than the owner's, and every daily figure they have been shown was measured in it.
+   */
+  const answerSpendCeiling = async (draft: string) => {
+    const body = spendCeilingAnswer(draft, Intl.DateTimeFormat().resolvedOptions().timeZone);
+    if (!body) {
+      setError('A ceiling is an amount in dollars. Leave it empty for none.');
+      return;
+    }
+    setCeilingBusy(true);
+    try {
+      const saved = await api.updateSpendLimits(body);
+      setCeilingAsk(null);
+      setNotice(
+        saved.monthlyCapUsd === null
+          ? 'No ceiling. Nothing stops a run on this box; Model & spending is where that changes.'
+          : `Work stops at ${formatUsd(saved.monthlyCapUsd)} a month, ${formatUsd(saved.dailyCapUsd ?? 0)} in a day.`
+      );
+    } catch (cause) {
+      setError(describeFailure(cause, 'That ceiling could not be saved'));
+    } finally {
+      setCeilingBusy(false);
+    }
+  };
 
   /**
    * What the fire in the mark is doing, derived from state this component already holds.
@@ -2438,6 +2587,53 @@ export function App() {
         return undefined;
     }
   })();
+  /*
+   * And what fills that shelf when nothing above has claimed it.
+   *
+   * Every kind `composerStrip` ranks is about the message being typed or the box being unable to
+   * carry it, and each of them is more urgent than this by construction - so this cannot be given a
+   * rank without being given one it would sometimes win. It takes the empty shelf instead, which
+   * puts it strictly below all seven and leaves that ordering the single place it is decided.
+   *
+   * It is one line and it goes for good the moment it is answered, in either direction. The
+   * loudness is the figure in it and nothing else: four dollars and four hundred are the same
+   * sentence with a different number in it, and the number is the part worth reading. Anything more
+   * would be the software making a case about the owner's own money, which is not its to make.
+   */
+  const spendCeilingBanner = ceilingAsk ? (
+    <form
+      className="spend-ceiling-ask"
+      aria-label="Monthly spending ceiling"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void answerSpendCeiling(ceilingDraft);
+      }}
+    >
+      <CircleDollarSign />
+      <span>{formatUsd(ceilingAsk.monthlyUsd)} spent this month, with no ceiling set.</span>
+      <label>
+        Stop at
+        <input
+          inputMode="decimal"
+          aria-label="Monthly spending ceiling in dollars"
+          value={ceilingDraft}
+          onChange={(event) => setCeilingDraft(event.target.value)}
+        />
+        {/* The day cap that lands with it, named before it is installed rather than reported after.
+            One number is typed and two are enforced, and the one that is not typed is the one that
+            can refuse work tomorrow morning - so it is said here, where the press happens. */}
+        a month, a quarter of it in a day
+      </label>
+      <button className="primary" type="submit" disabled={ceilingBusy}>
+        Set
+      </button>
+      {/* Declining is an answer, not a dismissal, and it is recorded as one - which is what stops
+          this coming back tomorrow with a bigger number in it. */}
+      <button type="button" disabled={ceilingBusy} onClick={() => void answerSpendCeiling('')}>
+        No ceiling
+      </button>
+    </form>
+  ) : undefined;
 
   return (
     <UndoProvider value={undo.queue}>
@@ -2587,6 +2783,32 @@ export function App() {
             </div>
             <div className="header-actions">
               {/*
+                One fact, and the way to see it.
+
+                Not a strip and not a dialog: this is not an error and it is not the owner's turn,
+                so it takes none of the space above the composer and nothing that is already on
+                screen moves for it. It says only what this device actually knows — that the box is
+                serving something other than this — and never what changed, which it has no way of
+                reading. There is no dismiss, because a dismissed fact the machine still holds is
+                the silence this exists to end; ignoring it costs a glance and nothing else, and it
+                is stated once whether the owner acts on it now or in four hours.
+              */}
+              {mayOfferReload({
+                superseded: shellSuperseded,
+                recording,
+                attachmentCount: attachments.length
+              }) && (
+                <div className="update-offer" role="status">
+                  <span>This screen is not the version on your athanor.</span>
+                  <button
+                    onClick={reloadForNewShell}
+                    title="This screen is not the version on your athanor. Reload to catch up."
+                  >
+                    Reload
+                  </button>
+                </div>
+              )}
+              {/*
                 A count of rows in the message queue, said either way round. "1 queued" stayed on
                 screen after a turn died mid-step, over a conversation that will not be leased
                 again, so the interface went on promising delivery of the correction the owner had
@@ -2698,7 +2920,7 @@ export function App() {
             />
           </section>
           <Composer
-            banners={strip}
+            banners={strip ?? spendCeilingBanner}
             prompt={prompt}
             onPrompt={setPrompt}
             textareaRef={composer}
@@ -2903,6 +3125,11 @@ export function App() {
               onClose={() => {
                 setSettingsPage(undefined);
                 void load();
+                /* Spending caps are on that screen, so this is the one moment the answer can have
+                   changed without this component being the one that changed it. */
+                setCeilingAsk(null);
+                ceilingChecked.current = false;
+                setCeilingProbe((count) => count + 1);
               }}
               onLogout={() =>
                 void api

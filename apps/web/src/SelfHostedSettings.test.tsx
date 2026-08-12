@@ -7,12 +7,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import {
-  RememberedList,
-  SpendCeilingField,
-  spendCeilingRequest,
-  SUGGESTED_MONTHLY_CEILING_USD
-} from './SelfHostedSettings.js';
+import { RememberedList, SpendCeilingField, spendCeilingRequest } from './SelfHostedSettings.js';
+import { BASE_MONTHLY_CEILING_USD } from './usage-model.js';
 import type { MemoryItem } from './api.js';
 
 const items: MemoryItem[] = [
@@ -89,7 +85,7 @@ describe('the spending ceiling asked for with the key', () => {
     renderToStaticMarkup(<SpendCeilingField value={value} onChange={() => undefined} />);
 
   it('arrives with a number in it that can be accepted without thinking', () => {
-    const markup = field(String(SUGGESTED_MONTHLY_CEILING_USD));
+    const markup = field(String(BASE_MONTHLY_CEILING_USD));
     expect(markup).toContain('value="50"');
     expect(markup).toContain('Stop at, per month');
   });

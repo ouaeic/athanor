@@ -3227,6 +3227,90 @@ describe('spending caps', () => {
   }, 40_000);
 
   /*
+   * The same first answer, given by an owner whose key was saved before anything asked.
+   *
+   * That is every box that already had an owner on it, and the question can only reach them where
+   * they are - so it is put beside the composer and answered through the caps route rather than by
+   * re-saving a credential nobody wants to touch. Two things have to hold for that to be an ask
+   * rather than an obstacle, and neither is obvious from the route's own rules: a first ceiling is
+   * a tightening from nothing, so it cannot demand a passkey; and declining has to leave a record,
+   * or the screen cannot tell an owner who said no from one nobody has asked, and asks them again.
+   */
+  test('takes a first ceiling, and a first refusal, from a box whose key was saved long ago', async () => {
+    stubProviderAndRunner();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-first-answer-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const signIn = async (username: string): Promise<string> =>
+      sessionCookie(
+        await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username } })
+      );
+    const limits = async (cookie: string) =>
+      (await app.inject({ method: 'GET', url: '/v1/spend-limits', headers: { cookie } })).json<{
+        dailyCapUsd: number | null;
+        monthlyCapUsd: number | null;
+        defaultTaskCapUsd: number | null;
+        timeZone: string;
+        updatedAt: string;
+      }>();
+    const answer = (cookie: string, key: string, payload: Record<string, unknown>) =>
+      app.inject({
+        method: 'PUT',
+        url: '/v1/spend-limits',
+        headers: { cookie, 'idempotency-key': key },
+        payload
+      });
+
+    const accepter = await signIn('late-accepter');
+    const decliner = await signIn('late-decliner');
+    // The question is only owed while this is the epoch, so the whole surface rests on it.
+    expect(Date.parse((await limits(accepter)).updatedAt)).toBe(0);
+
+    /* Nothing here has stepped up, and nothing should have to: every cap was null, so both of these
+       requests can only narrow what the agent may spend. A biometric prompt on the way to setting a
+       first ceiling would be a toll on the safest thing an owner can do. */
+    await database.query("UPDATE sessions SET step_up_at=NOW()-INTERVAL '1 day'");
+
+    // Exactly what the strip sends when the figure in it is accepted: the month, and the quarter of
+    // it that makes the month mean anything overnight. It says nothing about the per-conversation
+    // cap, which it never asked about.
+    const set = await answer(accepter, 'first-answer-set', {
+      monthlyCapUsd: 50,
+      dailyCapUsd: 12.5,
+      timeZone: 'Europe/Lisbon'
+    });
+    expect(set.statusCode, set.body).toBe(200);
+    expect(await limits(accepter)).toMatchObject({
+      monthlyCapUsd: 50,
+      dailyCapUsd: 12.5,
+      defaultTaskCapUsd: null,
+      timeZone: 'Europe/Lisbon'
+    });
+
+    // And what it sends when the answer is no. The caps stay off, and the timestamp stops being the
+    // epoch - which is the entire difference between a decision and a silence.
+    const declined = await answer(decliner, 'first-answer-decline', {
+      dailyCapUsd: null,
+      monthlyCapUsd: null,
+      timeZone: 'Europe/Lisbon'
+    });
+    expect(declined.statusCode, declined.body).toBe(200);
+    expect(await limits(decliner)).toMatchObject({ monthlyCapUsd: null, dailyCapUsd: null });
+    expect(Date.parse((await limits(decliner)).updatedAt)).toBeGreaterThan(0);
+
+    /* Once a ceiling exists, taking it away is the escalation the route already guards - so the same
+       refusal, arriving a second time against caps that are now real, is not waved through. */
+    const clearing = await answer(accepter, 'first-answer-clear', {
+      dailyCapUsd: null,
+      monthlyCapUsd: null
+    });
+    expect(clearing.statusCode, clearing.body).toBe(403);
+    expect(clearing.json<{ error: { code: string } }>().error.code).toBe('step_up_required');
+    expect(await limits(accepter)).toMatchObject({ monthlyCapUsd: 50, dailyCapUsd: 12.5 });
+  }, 40_000);
+
+  /*
    * The failure a seeded ceiling can cause, which is worse than shipping none at all.
    *
    * The per-conversation cap is enforced by reserving its whole value the moment work is queued, so

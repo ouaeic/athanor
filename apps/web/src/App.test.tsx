@@ -7,7 +7,7 @@
  * is telling the owner to wait for a computer that is free, or saying nothing while they wait.
  */
 import { describe, expect, it } from 'vitest';
-import { computerHeldBy } from './App.js';
+import { computerHeldBy, mayOfferReload } from './App.js';
 import type { Task } from './types.js';
 
 const conversation = (id: string, status: Task['status'], workspaceId = 'desk'): Task =>
@@ -45,5 +45,37 @@ describe('the conversation holding the computer', () => {
   it('is nobody for a conversation that is itself working', () => {
     const working = conversation('second', 'running');
     expect(computerHeldBy(working, [conversation('first', 'running'), working])).toBeUndefined();
+  });
+});
+
+/**
+ * When the screen may say it is showing a release the box has replaced.
+ *
+ * The offer ends in a reload, and a reload throws away everything that exists only in this tab. The
+ * sentence in the composer is banked on the way out; a recording and an attachment tray cannot be,
+ * so the offer waits rather than asking anyone to trade work for it. Nothing here expires, so
+ * waiting costs nothing at all.
+ */
+describe('offering the reload', () => {
+  const tab = { superseded: true, recording: false, attachmentCount: 0 };
+
+  it('is made when this tab is holding nothing of its own', () => {
+    expect(mayOfferReload(tab)).toBe(true);
+  });
+
+  it('is not made when there is nothing to say', () => {
+    expect(mayOfferReload({ ...tab, superseded: false })).toBe(false);
+  });
+
+  it('waits while a voice note is being recorded, which exists nowhere else yet', () => {
+    expect(mayOfferReload({ ...tab, recording: true })).toBe(false);
+  });
+
+  it('waits while files are attached, because the box is told about them with the next keystroke', () => {
+    expect(mayOfferReload({ ...tab, attachmentCount: 1 })).toBe(false);
+  });
+
+  it('never appears for its own sake once the recording and the tray are done', () => {
+    expect(mayOfferReload({ superseded: false, recording: true, attachmentCount: 3 })).toBe(false);
   });
 });

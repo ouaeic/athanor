@@ -3847,6 +3847,22 @@ describe('how full the window is believed to be', () => {
       'data: [DONE]'
     ].join('\n\n') + '\n\n';
 
+  /**
+   * The listing the repeated call actually gets back.
+   *
+   * The default stub answers anything with `/file` in it with a 404, which a `files_list` URL
+   * matches - so every step of these runs used to be a tool call that threw, sixty times over. That
+   * is now a turn athanor stops on its own, and rightly: a call that fails byte-identically is the
+   * one shape the loop has no other bound for. These tests are about which number the compaction
+   * trigger believes, so the workspace they run against has to work.
+   */
+  const listsTheWorkspace = (url: string): Response | undefined =>
+    url.includes('/files?')
+      ? new Response(JSON.stringify({ path: 'workspace', entries: [] }), {
+          headers: { 'content-type': 'application/json' }
+        })
+      : undefined;
+
   // Every step answers with the same tool call and the same reported size, so the run builds the
   // history compaction needs (MIN_CONDENSED_MESSAGES is 6) and the trigger is asked the same
   // question each step. installFetch repeats its last body once the list runs out.
@@ -3854,7 +3870,7 @@ describe('how full the window is believed to be', () => {
     const task = makeTask();
     const probe = probeStore(() => task);
     const log: FetchLog = { calls: [], modelRequests: [] };
-    installFetch([usageFrame(promptTokens)], log);
+    installFetch([usageFrame(promptTokens)], log, { route: listsTheWorkspace });
     await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 12 }), masterKey, runnerSecret)
       .run(task)
       .catch(() => undefined);
@@ -3907,7 +3923,7 @@ describe('how full the window is believed to be', () => {
     const task = makeTask();
     const probe = probeStore(() => task);
     const log: FetchLog = { calls: [], modelRequests: [] };
-    installFetch([usageFrame(0)], log);
+    installFetch([usageFrame(0)], log, { route: listsTheWorkspace });
     await new AgentWorker(
       {
         ...(probe.store as unknown as Record<string, unknown>),

@@ -309,6 +309,188 @@ describe('offline shell', () => {
   });
 });
 
+/**
+ * The cost of opening from disk, and the one moment it can be named.
+ *
+ * Serving the shell from disk and refreshing behind it means a single launch, after an update,
+ * shows the previous release. That trade stays. What these hold is that the launch which pays for
+ * it is also told — and, just as importantly, that a launch which paid nothing is told nothing.
+ */
+describe('a release the box has replaced', () => {
+  /** What the fetch stub is handed: a URL for a precache add, the request itself for a navigation. */
+  const asUrl = (target: unknown): string =>
+    typeof target === 'string' ? target : String((target as { url: string }).url);
+
+  const shellNaming = (entry: string, title = 'athanor') =>
+    `<!doctype html><title>${title}</title><script type="module" crossorigin src="${entry}"></script>`;
+
+  /** One box, one window, and a deployment that can be replaced under it. */
+  const box = () => {
+    const state = {
+      entry: '/assets/index-abc.js',
+      page: undefined as string | undefined,
+      /** A box that accepted the connection and has not answered yet, which is every launch. */
+      slow: false
+    };
+    const sw = worker({
+      clients: [{}],
+      respond: async (target) => {
+        const url = asUrl(target);
+        if (url.endsWith('/asset-manifest.json'))
+          return new Response(JSON.stringify({ eager: [state.entry] }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          });
+        if (url.endsWith('.js'))
+          return new Response('export default 1', {
+            status: 200,
+            headers: { 'content-type': 'text/javascript' }
+          });
+        if (state.slow) return new Promise<Response>(() => undefined);
+        return new Response(state.page ?? shellNaming(state.entry), {
+          status: 200,
+          headers: { 'content-type': 'text/html' }
+        });
+      }
+    });
+    return { sw, state };
+  };
+
+  const launch = () => ({
+    method: 'GET',
+    url: 'https://box.example/',
+    mode: 'navigate',
+    destination: 'document'
+  });
+
+  /** Opens once so the shell on disk is a real deployment, the way any returning device is. */
+  const opened = async () => {
+    const { sw, state } = box();
+    await sw.dispatch('install', {});
+    await sw.respond(launch());
+    await sw.drain();
+    return { sw, state };
+  };
+
+  const superseded = (sw: { messages: unknown[] }) =>
+    sw.messages.filter(
+      (message) => (message as { source?: string }).source === 'athanor-shell-superseded'
+    );
+
+  it('tells the window when the shell it just served is not the one the box now serves', async () => {
+    const { sw, state } = await opened();
+    state.entry = '/assets/index-def.js';
+
+    await sw.respond(launch());
+    await sw.drain();
+
+    expect(superseded(sw)).toHaveLength(1);
+  });
+
+  it('says nothing at all when the box is serving the same build', async () => {
+    const { sw } = await opened();
+
+    await sw.respond(launch());
+    await sw.drain();
+
+    expect(superseded(sw)).toHaveLength(0);
+  });
+
+  it('says nothing for a page rewritten around the same build, which is the same software', async () => {
+    const { sw, state } = await opened();
+    state.page = shellNaming('/assets/index-abc.js', 'athanor — your private computer');
+
+    await sw.respond(launch());
+    await sw.drain();
+
+    expect(superseded(sw)).toHaveLength(0);
+  });
+
+  it('says nothing when what came back names no build, which is not evidence of a deploy', async () => {
+    const { sw, state } = await opened();
+    // A captive portal, a maintenance page, anything standing in for the shell with a 200 on it.
+    state.page = '<!doctype html><title>Sign in to this network</title>';
+
+    await sw.respond(launch());
+    await sw.drain();
+
+    expect(superseded(sw)).toHaveLength(0);
+  });
+
+  it('stops saying it once the launch is the new release', async () => {
+    const { sw, state } = await opened();
+    state.entry = '/assets/index-def.js';
+    await sw.respond(launch());
+    await sw.drain();
+    const asked: unknown[] = [];
+
+    // The shell on disk is now the new release, so this launch is showing it and has nothing owed.
+    await sw.respond(launch());
+    await sw.drain();
+    await sw.dispatch('message', {
+      data: { source: 'athanor-shell-check' },
+      source: { postMessage: (message: unknown) => asked.push(message) }
+    });
+
+    expect(asked).toHaveLength(0);
+  });
+
+  it('answers a window that asks after the comparison already finished', async () => {
+    // The refresh is a round trip to a box often on the same network, and the page it races has a
+    // module graph to evaluate first: the broadcast regularly lands before anything is listening.
+    const { sw, state } = await opened();
+    state.entry = '/assets/index-def.js';
+    await sw.respond(launch());
+    await sw.drain();
+    const asked: unknown[] = [];
+
+    await sw.dispatch('message', {
+      data: { source: 'athanor-shell-check' },
+      source: { postMessage: (message: unknown) => asked.push(message) }
+    });
+
+    expect(asked).toEqual([{ source: 'athanor-shell-superseded' }]);
+  });
+
+  /*
+   * The reload the offer asked for, answered before its own refresh has come back.
+   *
+   * A window asks the moment it can hear, and its refresh is a round trip to the box - so on any
+   * launch the ask can arrive first. If the answer being held is the previous launch's, the page
+   * that has just caught up is told it is stale, and the reload it offers leads straight back here.
+   * That is the one way this can be a permanent line on a screen that is perfectly up to date.
+   */
+  it('does not hand a page that has just caught up the verdict on the one before it', async () => {
+    const { sw, state } = await opened();
+    state.entry = '/assets/index-def.js';
+    await sw.respond(launch());
+    await sw.drain();
+    const asked: unknown[] = [];
+
+    state.slow = true;
+    await sw.respond(launch());
+    await sw.dispatch('message', {
+      data: { source: 'athanor-shell-check' },
+      source: { postMessage: (message: unknown) => asked.push(message) }
+    });
+
+    expect(asked).toHaveLength(0);
+  });
+
+  it('hands the page a body the comparison has not already drunk', async () => {
+    const { sw, state } = await opened();
+    state.entry = '/assets/index-def.js';
+
+    const answer = await sw.respond(launch());
+    // Deliberately after the comparison has run to completion: a body may be read once, so reading
+    // the shell rather than a copy of it would leave the launch this exists for with a blank page.
+    await sw.drain();
+
+    expect(answer).toBeInstanceOf(Response);
+    expect(await (answer as Response).text()).toContain('/assets/index-abc.js');
+  });
+});
+
 describe('push', () => {
   it('raises a notification carrying the real title, body and actions', async () => {
     const sw = worker({});

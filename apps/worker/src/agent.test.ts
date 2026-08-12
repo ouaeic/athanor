@@ -42,6 +42,14 @@ import {
   idleStepsAfter,
   IDLE_STEPS_BEFORE_STOP,
   MAX_IDLE_STEPS,
+  failingCallKey,
+  failureSignature,
+  repeatedFailureBreak,
+  repeatedFailureKey,
+  repeatedFailureRise,
+  repeatedFailuresAfter,
+  MAX_REPEATED_FAILURES,
+  REPEATED_FAILURES_BEFORE_STOP,
   previewUrl,
   normalizeAssistantText,
   ownerFixableCheckpointFailure,
@@ -211,6 +219,151 @@ describe('agent chat output', () => {
 
   it('preserves ordinary assistant text', () => {
     expect(normalizeAssistantText('  All outputs are ready.  ')).toBe('All outputs are ready.');
+  });
+});
+
+describe('a failure that keeps happening', () => {
+  type Call = { name: string; arguments: Record<string, unknown> };
+  /** The observed shape: the same hunk sent again against a file it does not match. */
+  const patch = (oldText: string, path = 'workspace/importer.py'): Call => ({
+    name: 'file_patch',
+    arguments: { patches: [{ path, oldText, newText: 'return rows or []' }] }
+  });
+  const conflict = (): unknown =>
+    new AthanorError('patch_conflict', 'oldText appears 0 times in workspace/importer.py');
+  const threw = (call: Call, error: unknown): { call: string; failure: string } => ({
+    call: failingCallKey(call),
+    failure: repeatedFailureKey(call, error)
+  });
+  const answered = (call: Call): { call: string; failure: null } => ({
+    call: failingCallKey(call),
+    failure: null
+  });
+  const counted = (
+    call: Call,
+    error: unknown,
+    times: number,
+    from: Record<string, number> = {}
+  ): Record<string, number> => {
+    let counts = from;
+    for (let attempt = 0; attempt < times; attempt += 1)
+      counts = repeatedFailuresAfter(counts, threw(call, error));
+    return counts;
+  };
+
+  it('counts one call failing one way, and only when it is the same both times', () => {
+    const call = patch('def load(rows):');
+    expect(Object.values(counted(call, conflict(), 1))).toEqual([1]);
+    expect(Object.values(counted(call, conflict(), MAX_REPEATED_FAILURES))).toEqual([
+      MAX_REPEATED_FAILURES
+    ]);
+    // The wording of the error moves and the failure does not: the same conflict reported with a
+    // different line number, a different byte count or a different request id is the same refusal.
+    const noisy = new AthanorError('patch_conflict', 'oldText appears 0 times, request 4f9c2a1b8e');
+    expect(Object.values(counted(call, noisy, 1, counted(call, conflict(), 2)))).toEqual([3]);
+  });
+
+  it('leaves a search that misses in four different places alone', () => {
+    /*
+     * The hardest honest case, and the one that decides what "the same failure" means.
+     *
+     * An agent looking for where a project keeps its config reads four candidate paths and gets the
+     * same "no such file" four times. Keyed on the error alone that is a pattern and the turn gets
+     * interrupted; keyed on the call it is what a search looks like from outside - every miss rules
+     * a path out, and the next call is the one that finds it. Nothing here may reach even the first
+     * pushback, let alone the stop.
+     */
+    const missing = new AthanorError('not_found', 'File not found');
+    let counts: Record<string, number> = {};
+    for (const path of ['.eslintrc', '.eslintrc.json', 'config/eslint.json', 'eslint.config.js'])
+      counts = repeatedFailuresAfter(counts, threw(patch('module.exports', path), missing));
+    expect(Object.values(counts)).toEqual([1, 1, 1, 1]);
+    expect(repeatedFailureRise({}, counts)).toEqual({ tool: 'file_patch', count: 1 });
+  });
+
+  it('treats a retry that works, or that breaks differently, as the correction it is', () => {
+    /*
+     * The ordinary rhythm this must never fire on. A command fails because the thing it needs is
+     * not up yet, the agent starts it, and the same command succeeds - the count for it is gone,
+     * because the count only ever meant "this produced identical bytes to last time".
+     *
+     * Note what is not tested here, because it cannot happen: a suite that fails, is fixed and
+     * passes never reaches any of this. A non-zero exit is a tool result, not a thrown call, and
+     * only a thrown call is counted. `evals/fixtures.ts` runs that end to end.
+     */
+    const call = patch('def load(rows):');
+    expect(repeatedFailuresAfter(counted(call, conflict(), 2), answered(call))).toEqual({});
+    // A second attempt that fails for a new reason is new information, so the old count goes with
+    // the old reason rather than being added to.
+    const unreachable = new Error('The workspace runner could not be reached');
+    expect(
+      Object.values(repeatedFailuresAfter(counted(call, conflict(), 2), threw(call, unreachable)))
+    ).toEqual([1]);
+    // And the same file patched with a different hunk is a different call, whatever it fails with.
+    expect(
+      Object.values(
+        repeatedFailuresAfter(
+          counted(call, conflict(), 2),
+          threw(patch('    return rows'), conflict())
+        )
+      )
+    ).toEqual([2, 1]);
+  });
+
+  it('reads what this step did rather than what the counts stand at', () => {
+    // A call that failed three times and was then left alone keeps its three. Judged on the
+    // standing maximum, the loop would push the same sentence back on every step afterwards, about
+    // something the model had already stopped doing.
+    const abandoned = counted(patch('def load(rows):'), conflict(), 3);
+    expect(repeatedFailureRise(abandoned, abandoned)).toBeNull();
+    const other = repeatedFailuresAfter(abandoned, threw(patch('    return rows'), conflict()));
+    expect(repeatedFailureRise(abandoned, other)).toEqual({ tool: 'file_patch', count: 1 });
+  });
+
+  it('keeps no arguments and no error text in what it stores', () => {
+    // The counts outlive the call and are written to task state on every step. The owner's file
+    // body goes into a file_patch and their own code comes back in the conflict, so what is kept
+    // has to prove only that two attempts were the same attempt.
+    const secret = patch('const apiToken = "the owner private value";');
+    const key = repeatedFailureKey(
+      secret,
+      new AthanorError('patch_conflict', 'the owner private value')
+    );
+    expect(key.startsWith('file_patch:')).toBe(true);
+    expect(key).not.toContain('owner');
+    expect(key.split(':').slice(1).join('')).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it('says the number, the tool and the two ways out, three times before it ends anything', () => {
+    const said = repeatedFailureBreak(MAX_REPEATED_FAILURES, 'file_patch');
+    expect(said).toContain(`FAILED ${MAX_REPEATED_FAILURES} TIMES`);
+    expect(said).toContain('file_patch');
+    expect(said).toContain('take a different action');
+    expect(said).toContain('finish');
+    // The stop is the half that costs the owner a turn, so it is never the first thing the model
+    // hears - the same three-warnings shape the idle guard was given.
+    expect(REPEATED_FAILURES_BEFORE_STOP - MAX_REPEATED_FAILURES).toBe(3);
+  });
+
+  it('keeps a bounded number of failing calls', () => {
+    let counts: Record<string, number> = {};
+    for (let index = 0; index < 40; index += 1)
+      counts = repeatedFailuresAfter(counts, threw(patch(`hunk ${index}`), conflict()));
+    expect(Object.keys(counts)).toHaveLength(16);
+    // What survives is what the turn is still failing at, not what it failed at first.
+    expect(counts[repeatedFailureKey(patch('hunk 39'), conflict())]).toBe(1);
+  });
+
+  it('reads a plain error by its shape and an athanor error by its code', () => {
+    expect(failureSignature(new AthanorError('patch_conflict', 'anything at all'))).toBe(
+      'patch_conflict'
+    );
+    expect(failureSignature(new Error('Workspace tool failed (503): upstream 8f2c91ab0d'))).toBe(
+      failureSignature(new Error('Workspace tool failed (500): upstream 41bd77e9c3'))
+    );
+    expect(failureSignature(new Error('Connection refused'))).not.toBe(
+      failureSignature(new Error('Permission denied'))
+    );
   });
 });
 

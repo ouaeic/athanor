@@ -120,6 +120,53 @@ const cachedAsset = async (request) => {
 };
 
 /**
+ * The hashed files a shell names, which is the only part of a page that says which build it is.
+ *
+ * Byte-comparing the two documents would report a deploy for a changed `<title>`, and
+ * `/asset-manifest.json` describes only the build that is live — never the one this device is
+ * looking at, which is the half of the comparison that is hard to come by. Both bodies are already
+ * in hand at the instant below, and a hashed name is immutable, so a set that differs is different
+ * software and a set that matches is the same software however the HTML around it was rewritten.
+ */
+const buildAssets = (html) =>
+  [...new Set([...html.matchAll(/["'](\/assets\/[^"']+)["']/g)].map((match) => match[1]))]
+    .sort()
+    .join(' ');
+
+/**
+ * Whether the page on screen is a release the box has since replaced.
+ *
+ * Held only for as long as this worker is alive, which is long enough: it exists to answer the one
+ * window that opened onto the stale shell, and that window asks within a moment of starting. A
+ * worker that has been recycled since has nothing to say, and the next launch is the new release
+ * anyway, so the answer it would have given no longer applies.
+ */
+let supersededShell = false;
+
+const tellWindows = async () => {
+  const clients = await self.clients.matchAll({ type: 'window' });
+  for (const client of clients) client.postMessage({ source: 'athanor-shell-superseded' });
+};
+
+/**
+ * The cost of the trade below, made visible.
+ *
+ * Serving from disk and refreshing behind it means exactly one launch per update shows the previous
+ * release. That is a good trade and it stays; what is not acceptable is that the only way to notice
+ * it was to already know what had changed — somebody who had just deployed read the old logo as a
+ * failed deploy. Nothing is claimed unless both sides name a build: the dev server names none, and
+ * an error page or a captive portal standing in for the shell names none either, and neither is
+ * evidence that anything was deployed.
+ */
+const compareShells = async (served, fresh) => {
+  const before = buildAssets(served);
+  const after = buildAssets(fresh);
+  if (!before || !after) return;
+  supersededShell = before !== after;
+  if (supersededShell) await tellWindows();
+};
+
+/**
  * Everything else: the network decides, and what came back is kept so the next flight has it.
  *
  * Only a page request may be answered with the app shell. Answering a module, a stylesheet or an
@@ -145,12 +192,26 @@ const cachedDocument = async (request, isNavigation, keepAlive) => {
   if (isNavigation && url.pathname === '/') {
     const shell = await caches.match('/index.html');
     if (shell) {
+      // Copied before the page is handed the original, because a body may only be read once and
+      // the document about to be run is one half of the comparison.
+      const served = shell.clone();
+      /*
+       * The verdict is about the document being handed over here, so the last one is dropped before
+       * this page can be handed it by mistake.
+       *
+       * A window asks the moment it can hear an answer, and its own refresh is a round trip to the
+       * box - so the ask routinely arrives first. Without this, the page that has just reloaded
+       * onto the new release is told, from the same live worker, that it is the old one: the offer
+       * comes back on a screen that is already current and the reload it asks for leads here again.
+       */
+      supersededShell = false;
       keepAlive(
         fetch(request)
           .then(async (fresh) => {
             if (!fresh.ok) return;
             const cache = await caches.open(SHELL);
             await cache.put('/index.html', fresh.clone());
+            await compareShells(await served.text(), await fresh.text());
           })
           .catch(() => undefined)
       );
@@ -217,6 +278,19 @@ self.addEventListener('fetch', (event) => {
       (work) => event.waitUntil(work)
     )
   );
+});
+
+/*
+ * The launch this exists for is also the one hardest to tell.
+ *
+ * The refresh behind the shell is a round trip to a box that is often on the same network, and the
+ * page it is racing has a module graph to evaluate before anything in it is listening — so the
+ * comparison regularly finishes first and the broadcast lands on an empty room. The window asks the
+ * moment it can hear an answer, and this is the answer.
+ */
+self.addEventListener('message', (event) => {
+  if (event.data?.source !== 'athanor-shell-check' || !supersededShell) return;
+  event.source?.postMessage({ source: 'athanor-shell-superseded' });
 });
 
 const ICON = '/brand/athanor-icon-192.png';

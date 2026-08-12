@@ -375,6 +375,136 @@ export const spendLimitsPatch = (
   };
 };
 
+/**
+ * The figure that goes in the box when a ceiling is asked for on a box with no history to size one
+ * from. More than a personal computer that thinks costs most months, far less than an unattended
+ * loop spends in one night.
+ */
+export const BASE_MONTHLY_CEILING_USD = 50;
+
+/**
+ * Money already spent this month and today, which is the only evidence there is for what a ceiling
+ * on this particular box should be.
+ */
+export interface SpendSoFar {
+  monthlyUsd: number;
+  dailyUsd: number;
+}
+
+/** The steps a person actually writes down when they mean "about this much a month". */
+const READABLE_STEPS = [1, 1.5, 2, 2.5, 3, 4, 5, 7.5] as const;
+
+const readableCeiling = (value: number): number => {
+  if (!Number.isFinite(value) || value <= 0) return BASE_MONTHLY_CEILING_USD;
+  const magnitude = 10 ** Math.floor(Math.log10(value));
+  for (const step of READABLE_STEPS) {
+    const candidate = step * magnitude;
+    // A hair of tolerance so a value that is already a readable figure is not pushed to the next.
+    if (candidate >= value - 1e-9) return candidate;
+  }
+  return 10 * magnitude;
+};
+
+/**
+ * What to prefill, and why it cannot be a constant.
+ *
+ * Fifty dollars is the right number in front of a box that has spent nothing and the wrong one in
+ * front of a box that has spent four hundred this month: accepted there it installs a ceiling the
+ * month has already crossed, and the very next turn is refused for money that went before the
+ * question was asked - which reads as the product breaking rather than as a setting. So the
+ * suggestion is sized from what this box has actually spent. Twice the month so far leaves room to
+ * finish the month; six times today matters because the day's ceiling that lands beside it is a
+ * quarter of this number, so today has to fit under that with room left over.
+ *
+ * It is still only a suggestion. It arrives in a field, and accepting it, changing it and declining
+ * it are all one press away.
+ */
+export const suggestedMonthlyCeilingUsd = (spend: SpendSoFar): number =>
+  Math.max(
+    BASE_MONTHLY_CEILING_USD,
+    readableCeiling(Math.max(spend.monthlyUsd * 2, spend.dailyUsd * 6))
+  );
+
+/**
+ * Whether anything at all is standing between the agent and the owner's provider account.
+ *
+ * All three, because all three stop a run. The per-conversation cap is the easiest to forget and
+ * the hardest to forget safely: it is enforced by reserving its whole value the moment work is
+ * queued, so a box carrying only that one is a box where a run is already being refused - and a
+ * screen that reads the other two and says nothing stops a run is telling its owner something the
+ * field directly above it disproves.
+ */
+export const anyCapInForce = (limits: SpendLimits): boolean =>
+  limits.dailyCapUsd !== null || limits.monthlyCapUsd !== null || limits.defaultTaskCapUsd !== null;
+
+/** The question, once there is a reason to put it, with the evidence that is the reason. */
+export interface SpendCeilingAsk {
+  /** What the provider has charged this month. Nothing else here is an argument; this is. */
+  monthlyUsd: number;
+  /** The figure already in the field. */
+  suggestedUsd: number;
+}
+
+/**
+ * Whether this box owes its owner the question about a ceiling, from what the server already says.
+ *
+ * Three things have to be true at once, and each of them is a fact rather than a judgement. Nobody
+ * has ever answered - limits nobody has saved come back stamped at the epoch, which is how a
+ * default is told apart from a choice that happens to match one. No ceiling is in force, so there
+ * is genuinely nothing between the agent and the owner's provider account. And money has actually
+ * changed hands, because a box that has spent nothing has no evidence to show and the question
+ * would be the software talking about itself.
+ *
+ * Answered means answered for good, in either direction. Declining a ceiling is the owner's to do
+ * on their own computer, and an interface that asks again once the bill grows is not asking, it is
+ * lobbying.
+ */
+export const spendCeilingAsk = (
+  limits: SpendLimits | null,
+  spend: SpendSoFar
+): SpendCeilingAsk | null => {
+  if (!limits) return null;
+  if (Date.parse(limits.updatedAt) > 0) return null;
+  if (anyCapInForce(limits)) return null;
+  if (!(spend.monthlyUsd > 0)) return null;
+  return { monthlyUsd: spend.monthlyUsd, suggestedUsd: suggestedMonthlyCeilingUsd(spend) };
+};
+
+/**
+ * The answer, as the caps route takes it, from whatever is in the field.
+ *
+ * An empty field is not silence - it is the owner saying no ceiling, and it is sent as explicit
+ * nulls so the server records that the question was put and never puts it again. Text that is not
+ * money at all sends nothing, because the wrong number here is a box that stops working.
+ *
+ * `defaultTaskCapUsd` is deliberately absent from both answers. It is the one cap enforced by
+ * reserving its whole value the moment work is queued, so a figure guessed from a monthly ceiling
+ * refuses the third conversation of the morning over money nobody has spent - and this question
+ * never mentioned it, so it does not get to speak for it either way.
+ */
+export const spendCeilingAnswer = (
+  draft: string,
+  timeZone: string
+): UpdateSpendLimitsRequest | undefined => {
+  const zone = timeZone.trim() || 'UTC';
+  const text = draft.trim().replace(/^\$/, '');
+  if (!text) return { dailyCapUsd: null, monthlyCapUsd: null, timeZone: zone };
+  const monthlyCapUsd = Number(text);
+  if (!Number.isFinite(monthlyCapUsd) || monthlyCapUsd <= 0 || monthlyCapUsd > MAX_SPEND_CAP_USD)
+    return undefined;
+  return {
+    monthlyCapUsd,
+    /*
+     * A month is the unit a bill arrives in; a day is what makes a monthly ceiling mean anything
+     * overnight, because a loop that has gone wrong can spend a month's allowance between two and
+     * six in the morning without ever crossing a monthly cap. The same quarter the connect form
+     * names, so both routes to a first answer install the same pair.
+     */
+    dailyCapUsd: Math.round(monthlyCapUsd * 25) / 100,
+    timeZone: zone
+  };
+};
+
 /** A bar is only readable relative to the largest thing in the same chart. */
 export const bucketShare = (bucket: SpendBucket, buckets: SpendBucket[]): number => {
   const largest = buckets.reduce((max, item) => Math.max(max, item.costUsd), 0);

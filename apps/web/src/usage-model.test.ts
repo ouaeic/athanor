@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import type { SpendSummary } from './types.js';
+import type { SpendLimits, SpendSummary } from './types.js';
 import {
+  anyCapInForce,
+  BASE_MONTHLY_CEILING_USD,
   bucketShare,
   formatUsd,
   hostStorageBlocksWork,
@@ -9,9 +11,12 @@ import {
   modelLabel,
   modelsBySpend,
   spendBreakdown,
+  spendCeilingAnswer,
+  spendCeilingAsk,
   spendLimitsDraft,
   spendLimitsPatch,
   spendMeters,
+  suggestedMonthlyCeilingUsd,
   taskRowName,
   tasksBySpend,
   tokenSplit,
@@ -381,5 +386,146 @@ describe('the provider’s own account of a conversation', () => {
 
   it('says nothing about a conversation the provider never billed', () => {
     expect(tokenSplit({ inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 })).toBeNull();
+  });
+});
+
+/**
+ * The question a box that already had an owner on it was never asked.
+ *
+ * A ceiling is asked for when a provider key is saved, and that reaches nobody who saved their key
+ * before it existed - so every box with an owner on it runs with all three caps null, and a null
+ * cap builds no window and refuses nothing. What is pinned here is when the question is owed, when
+ * it is not, and that the figure offered can be accepted without stopping the box on the spot.
+ */
+const unanswered: SpendLimits = {
+  dailyCapUsd: null,
+  monthlyCapUsd: null,
+  defaultTaskCapUsd: null,
+  warnAtPercent: 80,
+  timeZone: 'UTC',
+  updatedAt: new Date(0).toISOString()
+};
+
+describe('the ceiling question owed to a box that was never asked', () => {
+  it('is owed once the provider has charged for something', () => {
+    expect(spendCeilingAsk(unanswered, { monthlyUsd: 5.93, dailyUsd: 3.78 })).toEqual({
+      monthlyUsd: 5.93,
+      suggestedUsd: 50
+    });
+  });
+
+  /* No money has moved, so there is no evidence, and a question with no evidence behind it is the
+     software talking about itself. */
+  it('is not owed by a box that has spent nothing', () => {
+    expect(spendCeilingAsk(unanswered, { monthlyUsd: 0, dailyUsd: 0 })).toBeNull();
+  });
+
+  /* Declining is a decision. The row it writes has a real timestamp and no caps in it, and that is
+     the whole difference between an owner who said no and one who was never asked. */
+  it('is never owed again once it has been answered, including with a no', () => {
+    const declined: SpendLimits = { ...unanswered, updatedAt: '2026-08-11T09:00:00.000Z' };
+    expect(spendCeilingAsk(declined, { monthlyUsd: 412.6, dailyUsd: 380 })).toBeNull();
+  });
+
+  it('is not owed where a ceiling is already doing its job', () => {
+    const capped: SpendLimits = { ...unanswered, monthlyCapUsd: 50 };
+    expect(spendCeilingAsk(capped, { monthlyUsd: 5.93, dailyUsd: 3.78 })).toBeNull();
+  });
+
+  /*
+   * All three stop a run, so all three count as a ceiling.
+   *
+   * The per-conversation one is the easiest to read past and the worst to read past: it is enforced
+   * by reserving its whole value the moment work is queued, so a box carrying only that is a box
+   * already refusing work - and a screen that checks the other two would say nothing stops a run
+   * directly under the field that does.
+   */
+  it('counts the per-conversation cap as a ceiling, because it stops a run', () => {
+    expect(anyCapInForce(unanswered)).toBe(false);
+    expect(anyCapInForce({ ...unanswered, defaultTaskCapUsd: 5 })).toBe(true);
+    expect(
+      spendCeilingAsk({ ...unanswered, defaultTaskCapUsd: 5 }, { monthlyUsd: 5, dailyUsd: 1 })
+    ).toBeNull();
+  });
+
+  /* Nothing is known yet, so nothing is asserted: a caps route that did not answer is not the same
+     thing as a box with no caps. */
+  it('says nothing when the caps could not be read', () => {
+    expect(spendCeilingAsk(null, { monthlyUsd: 5.93, dailyUsd: 3.78 })).toBeNull();
+  });
+});
+
+describe('the figure offered as a first ceiling', () => {
+  it('is the flat suggestion for a box whose spending it comfortably covers', () => {
+    expect(suggestedMonthlyCeilingUsd({ monthlyUsd: 5.93, dailyUsd: 3.78 })).toBe(
+      BASE_MONTHLY_CEILING_USD
+    );
+  });
+
+  /*
+   * The failure this exists to prevent.
+   *
+   * A constant fifty in front of a box that has already spent four hundred this month is a ceiling
+   * the month has crossed: accepting it refuses the next turn for money that went before the
+   * question was asked, which reads as the product breaking rather than as a setting.
+   */
+  it('clears what the month has already spent, with room to finish the month', () => {
+    const suggested = suggestedMonthlyCeilingUsd({ monthlyUsd: 412.6, dailyUsd: 38 });
+    expect(suggested).toBeGreaterThan(412.6 * 1.5);
+  });
+
+  /*
+   * The day's ceiling that lands beside it is a quarter of this figure, so a box that spent most of
+   * its month today needs the monthly suggestion sized against the day as well - otherwise the pair
+   * that arrives together has the day's half of it already breached.
+   */
+  it('leaves the day it seeds standing clear of what today has already cost', () => {
+    const spend = { monthlyUsd: 400, dailyUsd: 380 };
+    expect(suggestedMonthlyCeilingUsd(spend) / 4).toBeGreaterThan(spend.dailyUsd);
+  });
+
+  it('offers a figure somebody would actually type', () => {
+    expect(suggestedMonthlyCeilingUsd({ monthlyUsd: 1_130, dailyUsd: 0 })).toBe(2_500);
+  });
+});
+
+describe('the answer sent back about a first ceiling', () => {
+  it('turns one number into the month and the day that make it mean anything overnight', () => {
+    expect(spendCeilingAnswer('50', 'Europe/Lisbon')).toEqual({
+      monthlyCapUsd: 50,
+      dailyCapUsd: 12.5,
+      timeZone: 'Europe/Lisbon'
+    });
+  });
+
+  /* An empty field is a decision, sent as one: explicit nulls are what record that the question was
+     put, so it is never put again. */
+  it('sends an explicit no rather than nothing when the field is cleared', () => {
+    expect(spendCeilingAnswer('  ', 'UTC')).toEqual({
+      dailyCapUsd: null,
+      monthlyCapUsd: null,
+      timeZone: 'UTC'
+    });
+  });
+
+  /* Not mentioned in the question, so not answered by it either way: the per-conversation cap is
+     the one enforced by reserving its whole value up front, and a guess there refuses the third
+     conversation of the morning over money nobody has spent. */
+  it('says nothing about the per-conversation cap it never asked about', () => {
+    expect(spendCeilingAnswer('50', 'UTC')).not.toHaveProperty('defaultTaskCapUsd');
+    expect(spendCeilingAnswer('', 'UTC')).not.toHaveProperty('defaultTaskCapUsd');
+  });
+
+  /* The wrong number here is a box that stops working, so text nobody can price sends nothing. */
+  it('withholds an answer it cannot read as money', () => {
+    expect(spendCeilingAnswer('soon', 'UTC')).toBeUndefined();
+    expect(spendCeilingAnswer('-5', 'UTC')).toBeUndefined();
+    expect(spendCeilingAnswer('2000000', 'UTC')).toBeUndefined();
+  });
+
+  /* Until somebody answers, the stored zone is UTC, so every "today" this owner has been shown was
+     measured in a day that is not theirs. The answer is the moment that can be put right. */
+  it('falls back to UTC only when the device cannot name a zone', () => {
+    expect(spendCeilingAnswer('50', '   ')).toMatchObject({ timeZone: 'UTC' });
   });
 });

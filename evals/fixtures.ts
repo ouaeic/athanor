@@ -1892,6 +1892,182 @@ export const fixtures: readonly Fixture[] = [
       replies: 7
     }
   },
+  {
+    id: 'small-hunks-that-miss-in-different-places-are-a-search',
+    shape: 'small',
+    request: 'The importer drops rows. Fix it and show me the suite passing.',
+    why: 'The case the repeat-failure count has to leave alone, and the one that decides what "the same failure" means. Three patches miss, all with the identical error - `patch_conflict` every time, because the model is guessing at text it has not read - and then it reads the file and lands the hunk. A count keyed on the error alone reaches its bound on the third miss and interrupts a search that is one step from succeeding; keyed on the call, every one of these is a different attempt and nothing fires. The second half is the rhythm underneath all of this work: the suite runs, fails honestly, is fixed, and passes. A non-zero exit is a tool result and not a failed call, so none of it is ever counted - which is the property this fixture pins end to end, where the unit tests can only assert it about a function.',
+    runner: { files: workspaceFiles, exec: [1, 0] },
+    model: ({ index, lastMessage }) => {
+      // The trap: reaching here means the count fired on a search that was converging.
+      if (lastMessage.includes('THE SAME CALL HAS FAILED'))
+        return {
+          calls: [{ id: 'call-trap', name: 'web_search', args: { query: 'patch failed' } }]
+        };
+      const missingHunk = (id: string, oldText: string): ModelTurn => ({
+        calls: [
+          {
+            id,
+            name: 'file_patch',
+            args: {
+              patches: [
+                { path: 'workspace/importer.py', oldText, newText: '    return rows or []' }
+              ]
+            }
+          }
+        ]
+      });
+      return (
+        (
+          [
+            // Three guesses at text that is not in the file. Same tool, same refusal, three
+            // different calls - and each one rules a shape of the code out.
+            missingHunk('call-1', '    rows = rows[1:]'),
+            missingHunk('call-2', 'def load(rows, skip):'),
+            missingHunk('call-3', '    return rows[1:]'),
+            {
+              calls: [{ id: 'call-4', name: 'file_read', args: { path: 'workspace/importer.py' } }]
+            },
+            {
+              calls: [
+                {
+                  id: 'call-5',
+                  name: 'file_patch',
+                  args: {
+                    patches: [
+                      {
+                        path: 'workspace/importer.py',
+                        oldText: '    return rows',
+                        newText: '    return [row for row in rows if row]'
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            // Fails, and that is not a failed call: the command ran and said so.
+            {
+              calls: [{ id: 'call-6', name: 'shell', args: { executable: 'pytest', args: ['-q'] } }]
+            },
+            {
+              calls: [
+                {
+                  id: 'call-7',
+                  name: 'file_patch',
+                  args: {
+                    patches: [
+                      {
+                        path: 'workspace/importer.py',
+                        oldText: '    return [row for row in rows if row]',
+                        newText: '    return [row for row in rows if any(row)]'
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              calls: [{ id: 'call-8', name: 'shell', args: { executable: 'pytest', args: ['-q'] } }]
+            },
+            {
+              text: 'The importer keeps every row with content in it, and the suite passes.',
+              // Both in one step, which is what the acceptance gate asks for and what keeps this
+              // fixture about the failure count rather than about that gate.
+              calls: [
+                {
+                  id: 'call-9',
+                  name: 'set_acceptance',
+                  args: {
+                    checks: [
+                      {
+                        kind: 'command',
+                        label: 'the importer suite passes',
+                        executable: 'pytest',
+                        args: ['-q']
+                      }
+                    ]
+                  }
+                },
+                ...finishCall('call-10', {
+                  summary: 'Fixed the importer and ran the suite.',
+                  verification: evidence('call-8', 'The suite passes after the change')
+                })
+              ]
+            }
+          ] satisfies readonly ModelTurn[]
+        )[Math.min(index, 8)] ?? {}
+      );
+    },
+    expect: {
+      modelCalls: 9,
+      tools: [
+        'file_patch',
+        'file_patch',
+        'file_patch',
+        'file_read',
+        'file_patch',
+        'shell',
+        'file_patch',
+        'shell'
+      ],
+      status: 'completed',
+      verification: 'verified',
+      toolsExclude: ['web_search'],
+      // Two runs of the suite, one failing and one passing, and neither of them counted anywhere.
+      // The third run the acceptance check would have needed is answered from the run athanor had
+      // already watched, which is a saving this fixture inherits rather than one it is about.
+      commandsRun: 2,
+      // Nothing was held. Nine steps of a job going wrong three times and then right, at the price
+      // of the work itself.
+      holds: []
+    }
+  },
+  {
+    id: 'small-the-same-call-failing-the-same-way-is-stopped',
+    shape: 'small',
+    request: 'Patch the importer to drop empty rows.',
+    why: 'The shape nothing in the loop could see: one call, byte-identical arguments, the identical error, over and over. The repetition watch cannot see it because the model writes something new each time and the idle guard cannot see it because a call that runs and throws has started a tool - so before this, the only bound was the step budget, and the turn died at the ceiling having spent every step of it on the same refusal. Six attempts is what it costs now: three that are the ordinary latitude any retry gets, and three more after being told, in as many words, that nothing in between is changing the outcome. The replies below are the proof the telling happened - this agent says nothing until it has been told, so one bubble per pushback is one sentence the model was given and ignored.',
+    runner: { files: workspaceFiles },
+    model: ({ index, lastMessage }) => ({
+      ...(lastMessage.includes('THE SAME CALL HAS FAILED')
+        ? { text: 'The hunk is right; the workspace must be stale. Sending it again.' }
+        : {}),
+      calls: [
+        {
+          id: `call-${index + 1}`,
+          name: 'file_patch',
+          args: {
+            patches: [
+              {
+                path: 'workspace/importer.py',
+                oldText: '    return rows[1:]',
+                newText: '    return [row for row in rows if any(row)]'
+              }
+            ]
+          }
+        }
+      ]
+    }),
+    expect: {
+      // Six attempts and six replies, and nothing shorter is available: three before the loop may
+      // say anything, and three telling it. Without this the same script runs the step ceiling out.
+      modelCalls: 6,
+      tools: Array.from({ length: 6 }, () => 'file_patch'),
+      status: 'completed',
+      // Ended the way every other bounded stop in this file ends: the turn is completed and
+      // interrupted, so whatever it produced stays the owner's and a reply carries it on.
+      verification: 'not_applicable',
+      /*
+       * The proof the model was told, three times, before anything ended.
+       *
+       * This agent writes nothing until it has been pushed back on, so every bubble the owner sees
+       * is one pushback that reached it and was ignored. Take the break away and this reads zero
+       * while the turn runs to the step ceiling; leave it and it reads the number of warnings, so
+       * the count and the stop are pinned by the same number.
+       */
+      replies: 3
+    }
+  },
   /* --------------------------------------------- a job long enough that the window decides its cost */
   {
     id: 'long-finished-phases-condense-rather-than-shred',

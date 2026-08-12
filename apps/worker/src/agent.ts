@@ -266,6 +266,15 @@ interface AgentState {
   toolsStarted?: number;
   /** Consecutive steps that started no tool. See `MAX_IDLE_STEPS`. */
   idleSteps?: number;
+  /**
+   * Calls that have failed identically this turn, hashed, to how many times running.
+   *
+   * A count per call rather than one running total, because two tools failing alternately are two
+   * problems and neither of them is a repeat of the other. See `MAX_REPEATED_FAILURES`. Keys carry
+   * no arguments and no error text - both are digested, and what is stored proves only that two
+   * attempts were the same attempt.
+   */
+  repeatedFailures?: Record<string, number>;
   /** Cut-off tool calls answered this turn, bounding the retry of an oversized payload. */
   argumentTruncations?: number;
   /** What each file held when this turn last read or wrote it, so a whole-file write can say so. */
@@ -758,6 +767,161 @@ export const idleStepsAfter = (
  */
 export const idleStepBreak = (steps: number): string =>
   `NOTHING HAS RUN FOR ${steps} STEPS. Every tool you asked for in that time was answered from what this turn already has - a repeat of a call already made, or a call that could not be run - so the work has not moved since. Deciding again in different words will not move it either. Do one of two things now: take the next concrete action, with arguments that differ from anything already tried, or call finish and say plainly what you are stuck on and what you would need to get past it.`;
+
+/**
+ * How many times one call may fail in exactly the same way before the loop says so.
+ *
+ * The last shape in this file that nothing counted. A tool that fails is written to the timeline,
+ * answered into the window and charged for its addresses, and then forgotten: nothing accumulates,
+ * so a tool failing the same way twenty times running is twenty separate surprises, each one
+ * answered, paid for and dropped. Neither of the two watches that exist can see it. The repetition
+ * watch reads the model's own text, and the text around a retry is different every time - often
+ * better every time, which is what a model does when it is sure the next attempt will work. The
+ * idle guard reads whether a tool started, and a call that starts, runs and throws has started one,
+ * which is precisely what resets it.
+ *
+ * Three, matching the idle guard, and for the same reason. Two identical failures is an ordinary
+ * correction - a command re-run after the service it needs was started, a patch re-sent after the
+ * file was re-read - and the third is the point at which the retry has stopped being a correction
+ * and become the plan. Every attempt past it costs a full step and a full model call, which is what
+ * makes this the most expensive failure shape there is.
+ *
+ * What it would not have caught, said plainly, because it was the turn that prompted it: the
+ * seventy-two-call turn on the owner's box that spent $3.78 while ignoring an instruction to stop
+ * was making progress by every measure the loop has. Its calls succeeded. Nothing below would have
+ * touched it, and a bound that claimed otherwise would be athanor asserting something it cannot
+ * see. That turn needs a different bound; this one is for the retry that cannot work.
+ */
+export const MAX_REPEATED_FAILURES = 3;
+
+/**
+ * How many before the turn is ended rather than pushed back on. Twice the first number, exactly as
+ * the idle guard does it: told, told again with the count risen, told a third time, and only then
+ * stopped - so nothing ends here without the model having been given both exits three times.
+ */
+export const REPEATED_FAILURES_BEFORE_STOP = MAX_REPEATED_FAILURES * 2;
+
+/**
+ * How many separate failing calls one turn keeps a count for.
+ *
+ * The counts live in the encrypted task state, which is written on every step, so this is a size
+ * bound on that write rather than a judgement: sixteen distinct calls each failing in their own way
+ * is already a turn in trouble, and the ones dropped are the ones the turn has stopped returning
+ * to.
+ */
+const TRACKED_FAILING_CALLS = 16;
+
+/**
+ * The failure as its kind rather than its wording, for deciding whether two of them are one.
+ *
+ * The wording carries the parts that legitimately move between two attempts at the same thing - a
+ * duration, a byte count, a request id - and two attempts differing only in those are the same
+ * attempt. `AthanorError` already publishes the kind as its code, which is the runner's own reason
+ * for refusing; everything else is reduced to its shape.
+ *
+ * Not `failureClass` below, which answers a different question for the journal: that one is about
+ * what may be written to an unencrypted line on the owner's box, and it deliberately drops the
+ * message entirely. This one needs the message, because on a plain `Error` the message is the only
+ * thing that distinguishes one failure from another - and it never leaves the encrypted state.
+ */
+export const failureSignature = (error: unknown): string =>
+  error instanceof AthanorError
+    ? error.code
+    : (error instanceof Error ? error.message : 'tool failed')
+        .toLowerCase()
+        .replace(/[0-9a-f]{8,}/g, '#')
+        .replace(/\d+/g, '#')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 160);
+
+/**
+ * The call a repeat is counted against: the tool and its exact arguments.
+ *
+ * Hashed, and this is the reason. The arguments to a `file_write` are a whole file of the owner's
+ * writing and the arguments to a `shell` are their command line, and the count outlives the call by
+ * design - so what is kept is sixteen bytes that prove two calls were identical and say nothing
+ * whatever about what they were.
+ */
+export const failingCallKey = (call: {
+  name: string;
+  arguments: Record<string, unknown>;
+}): string => `${call.name}:${sha256(canonicalJson(call.arguments)).slice(0, 16)}`;
+
+/**
+ * That call failing that way, which is the thing counted, and the whole decision of this guard.
+ *
+ * The arguments are in the key and the error is not enough on its own, which is the opposite of the
+ * obvious reading, so here is the case against it. Same error across *different* arguments is what
+ * a search looks like from outside: four candidate paths for a config file, three mirrors of a
+ * package index, a walk down a list of ports. Every one of those misses rules something out, so a
+ * guard keyed on the error alone interrupts work that is converging - and being wrong in that
+ * direction costs the owner a turn that was going to succeed. Same arguments *and* same error is
+ * the opposite kind of fact: the call produced the identical bytes it produced last time, so
+ * whatever happened in between - a read, a fix, an install, a whole step of reasoning - provably
+ * did not touch the thing that is failing. It is the one statement here that a model cannot talk
+ * its way out of, and it is why the reset needs no cleverness at all: an attempt that succeeds, or
+ * that fails differently, clears the count by being different.
+ *
+ * It also settles the case the owner's own work is made of. A test that fails, is fixed and passes
+ * is never seen by any of this: a command with a non-zero exit is a tool *result*, the call ran and
+ * returned what the runner said, and only a call that threw reaches the counter at all.
+ */
+export const repeatedFailureKey = (
+  call: { name: string; arguments: Record<string, unknown> },
+  error: unknown
+): string => `${failingCallKey(call)}:${sha256(failureSignature(error)).slice(0, 16)}`;
+
+/**
+ * The counts after one call was answered: `failure` is its key when it threw, and null when it
+ * returned anything at all.
+ *
+ * Everything already counted for this call is dropped whichever way it went, so a success clears
+ * it and a different error replaces it rather than adding to it.
+ */
+export const repeatedFailuresAfter = (
+  previous: Readonly<Record<string, number>> | undefined,
+  outcome: { call: string; failure: string | null }
+): Record<string, number> => {
+  const others = Object.entries(previous ?? {}).filter(
+    ([key]) => !key.startsWith(`${outcome.call}:`)
+  );
+  if (!outcome.failure) return Object.fromEntries(others);
+  // Appended rather than left in place, so the cap drops the calls the turn stopped retrying
+  // longest ago rather than whichever happened to be inserted first.
+  return Object.fromEntries(
+    [...others, [outcome.failure, (previous?.[outcome.failure] ?? 0) + 1] as const].slice(
+      -TRACKED_FAILING_CALLS
+    )
+  );
+};
+
+/**
+ * The worst count this step actually moved, and which tool it belongs to.
+ *
+ * Read as a difference across the step rather than as the highest count standing, because a call
+ * that failed three times and was then left alone still has its three: judged on the standing
+ * maximum the loop would push the same sentence back on every step afterwards, about something the
+ * model has already stopped doing.
+ */
+export const repeatedFailureRise = (
+  before: Readonly<Record<string, number>> | undefined,
+  after: Readonly<Record<string, number>> | undefined
+): { tool: string; count: number } | null => {
+  let worst: { tool: string; count: number } | null = null;
+  for (const [key, count] of Object.entries(after ?? {})) {
+    if (count <= (before?.[key] ?? 0) || count <= (worst?.count ?? 0)) continue;
+    worst = { tool: key.split(':')[0] ?? 'that call', count };
+  }
+  return worst;
+};
+
+/**
+ * What the model is told when the count runs out. The idle guard's shape: the number it has
+ * reached, the fact underneath it, and the two ways out named before anything ends.
+ */
+export const repeatedFailureBreak = (count: number, tool: string): string =>
+  `THE SAME CALL HAS FAILED ${count} TIMES RUNNING. Each of those was ${tool} with byte-identical arguments, and each came back with the same error, so nothing that happened in between changed what is failing - asking again will cost another step and return that error again. Do one of two things now: take a different action - different arguments, a look at why it is failing, or starting whatever it depends on first - or call finish and say plainly what is broken and what you would need to get past it.`;
 
 /**
  * How many cut-off tool calls one turn answers before it tells the model to stop trying.
@@ -1531,6 +1695,10 @@ export const startTurnState = <T extends Record<string, unknown>>(
     // that this one has, and a turn that opens by thinking must not inherit a stalled count.
     toolsStarted: 0,
     idleSteps: 0,
+    // Per turn as well, and this one has a second reason on top of theirs: the count means "nothing
+    // in between changed what is failing", and the owner replying is something changing. A patch
+    // that would not apply because they had the file open is a patch worth trying again.
+    repeatedFailures: {},
     // The bound is per turn - the tool says so, the constant is named for it, and the refusal tells
     // the model "this turn". Carrying it through made it per conversation instead.
     notices: 0,
@@ -4339,6 +4507,14 @@ ${clockLine(new Date(), timeZone)}
     // well as on the success path. Left out, a server that simply never answered made the whole
     // budget optional - see `#chargeCallNovelty`.
     this.#chargeCallNovelty(state, call);
+    // Counted here rather than at the call sites for the same reason the takeover raise is: both
+    // places a tool can be executed reach this one, and an approved call that fails on resumption
+    // is the same failure as any other. What is done about the count is the loop's, at the end of
+    // the step, where every other bound in this file speaks.
+    state.repeatedFailures = repeatedFailuresAfter(state.repeatedFailures, {
+      call: failingCallKey(call),
+      failure: repeatedFailureKey(call, error)
+    });
     if (wall) await this.#raiseTakeover(task, key, state, wall);
   }
 
@@ -7814,6 +7990,20 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       result: eventResult
     });
     const provenanceNotice = await this.#recordProvenance(task, key, state, call, result);
+    /*
+     * Any result at all is this call producing something other than what it produced last time,
+     * which is the only thing the repeat count counts.
+     *
+     * A non-zero exit is a result: the command ran and the runner said what it printed, so a suite
+     * that fails, is fixed and passes never touches this - which is the ordinary rhythm of the work
+     * this product exists to do. A harness answer is not a result: nothing ran, so it is evidence
+     * of nothing in either direction, and it is skipped here exactly as the novelty charge skips it.
+     */
+    if (!isHarnessAnswer(result))
+      state.repeatedFailures = repeatedFailuresAfter(state.repeatedFailures, {
+        call: failingCallKey(call),
+        failure: null
+      });
     state.turnToolResults ??= {};
     state.turnToolResults[call.id] = {
       name: call.name,
@@ -9463,6 +9653,9 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       // Read before the batch and again after it. Anything in between that starts a tool moves it,
       // and nothing else in the loop can - which is what makes the difference the guard's evidence.
       const startedBeforeBatch = state.toolsStarted ?? 0;
+      // Read the same way and for the same reason: what this step did to the counts is the
+      // evidence, not what they stood at when it began.
+      const failuresBeforeBatch = state.repeatedFailures;
 
       // The last index a concurrent run has already answered. Those calls have their results in the
       // window and their events on the timeline; walking into them again would run them twice.
@@ -10133,6 +10326,14 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
             });
             state.turnToolResults ??= {};
             state.turnToolResults[call.id] = { name: call.name, success: true, mutating: false };
+            // Said here as well as in `#recordToolResult`, because this is the one success in the
+            // loop that does not go through it. Without it a publish that fails, works, and fails
+            // the same way again carries its old count forward, and a call the turn is genuinely
+            // completing can reach a bound meant for one that never completes.
+            state.repeatedFailures = repeatedFailuresAfter(state.repeatedFailures, {
+              call: failingCallKey(call),
+              failure: null
+            });
           } else {
             await this.#recordToolResult(task, key, state, call, result, model, catalog);
           }
@@ -10211,6 +10412,61 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
           steps: idle
         });
         state.messages.push({ role: 'system', content: idleStepBreak(idle) });
+      }
+      /*
+       * And did any of it fail the way it failed last time.
+       *
+       * The step above and this one cannot both fire: a call that runs and throws has started a
+       * tool, which zeroes the idle count, and a step that started nothing has nothing here to
+       * count. They are the two halves of the same question - the first asks whether the turn is
+       * still doing anything, the second whether what it is doing is still capable of working.
+       */
+      const repeated = repeatedFailureRise(failuresBeforeBatch, state.repeatedFailures);
+      if (repeated && repeated.count >= REPEATED_FAILURES_BEFORE_STOP) {
+        /*
+         * Ended exactly as the idle break ends one, and the reason goes where the owner reads
+         * reasons. The event carries the tool and the count and nothing else: the arguments are the
+         * owner's file or the owner's command line, and the error can quote their own code back.
+         */
+        await event(
+          this.store,
+          task,
+          key,
+          'warning',
+          'Stopped a turn that was retrying a failure',
+          {
+            tool: repeated.tool,
+            attempts: repeated.count
+          }
+        );
+        const stuckOpen = await this.#outstandingPlanSteps(task, key).catch(() => []);
+        await this.#completeTurn(task, key, state, {
+          summary: `Stopped after ${repeated.count} identical ${repeated.tool} calls that all failed the same way.`,
+          interrupted: true,
+          ...(stuckOpen.length ? { outstanding: stuckOpen } : {}),
+          verification: {
+            status: 'not_applicable',
+            evidence: [],
+            remainingRisks: [
+              `athanor stopped this turn: ${repeated.tool} was called ${repeated.count} times with the same arguments and failed the same way every time, so nothing it did in between was changing the outcome. Reply to carry on, or say which way you want it decided.`
+            ]
+          }
+        });
+        return;
+      }
+      if (repeated && repeated.count >= MAX_REPEATED_FAILURES) {
+        await event(
+          this.store,
+          task,
+          key,
+          'warning',
+          `${repeated.tool} has failed ${repeated.count} times the same way`,
+          { tool: repeated.tool, attempts: repeated.count }
+        );
+        state.messages.push({
+          role: 'system',
+          content: repeatedFailureBreak(repeated.count, repeated.tool)
+        });
       }
       await this.store.updateTask({
         id: task.id,
