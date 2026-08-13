@@ -22,6 +22,7 @@ import {
   compactionTargetTail,
   compactionTrigger,
   contextShortfall,
+  declaredCompactionTargetTail,
   MINIMUM_WORKING_TOKENS,
   modelInputBudget,
   perPartOutputChars,
@@ -259,6 +260,8 @@ describe('what a request already carries, before the first message', () => {
 });
 
 describe('summarising compaction', () => {
+  /** What the tool catalogue and the operating contract cost before a word of conversation. */
+  const CATALOGUE = 17_886;
   const recordingSummariser =
     (calls: Array<{ brief: string; transcript: string; note?: string }>) =>
     async (request: { brief: string; transcript: string; note?: string }): Promise<string> => {
@@ -481,16 +484,132 @@ describe('summarising compaction', () => {
     expect(unansweredToolCalls(answered)).toEqual([]);
   });
 
-  it('condenses a small span only when the agent asks for it explicitly', async () => {
-    const messages = trajectory(6);
-    expect(planCompaction(messages, { targetTailTokens: 2_000 })).toBeNull();
+  it('answers a declared phase against the window in front of it, not against the budget', async () => {
+    // The measured complaint: an agent that said a phase was finished at 39,039 tokens on a
+    // 128,000-token window was offered a 31,950-token verbatim tail - a number derived from the
+    // budget, which has nothing to do with the size the declaration arrived at - and freed 3,031
+    // tokens for the two model calls it cost. Below the budget-derived tail it freed nothing at
+    // all, which is most of the range this trigger runs in: a window that had reached the budget
+    // trigger would have been condensed before the agent ever got its turn.
+    const budget = modelInputBudget(128_000, 16_384, CATALOGUE);
+    const messages = trajectory(30);
+    const window = estimatedContextTokens(messages);
+    // The declaration point this pins: above the budget-derived tail, and well under the trigger,
+    // which is where every agent declaration lands - a window that had reached the trigger would
+    // have been condensed by the budget path before the agent got its turn.
+    expect(window).toBeGreaterThan(compactionTargetTail(budget));
+    expect(window).toBeLessThan(compactionTrigger(budget));
+
+    const summarise = async (): Promise<string> => 'the brochure phase finished';
+    const fromBudget = await compactContext({
+      messages,
+      targetTailTokens: compactionTargetTail(budget),
+      summarise
+    });
+    const declared = await compactContext({
+      messages,
+      targetTailTokens: declaredCompactionTargetTail(budget, window),
+      summarise
+    });
+
+    // Thirty-one thousand tokens of finished work under the tail, and the budget-derived number
+    // leaves every one of them: the agent is told there is not enough superseded conversation to
+    // condense yet. Halving that number would move the line rather than remove it.
+    expect(fromBudget).toBeNull();
+    expect(declared).not.toBeNull();
+    if (!declared) return;
+    expect(declared.estimatedTokensBefore - declared.estimatedTokensAfter).toBeGreaterThan(
+      window * 0.35
+    );
+  });
+
+  it('never hands back a window larger than the one a declared phase was answered on', async () => {
+    // The floor a relative tail needs. Half the window is more than everything condensable until
+    // the conversation outweighs the preamble and the goal, so most of this sweep refuses outright
+    // rather than paying a model call for a brief larger than the span it replaces. Swept rather
+    // than sampled, because the band where that inverts is narrow and moves with the shape of the
+    // results.
+    //
+    // The summariser answers at `MAX_BRIEF_SECTION_CHARS` with a footer, which is what production
+    // caps a model brief at, and that is load-bearing rather than incidental: at an eleven-token
+    // stub this passed on a message floor alone, and at the real cap the same sweep handed back
+    // 7,159 tokens on a 6,547-token window. A brief is only cheap if you measure it small.
+    const budget = modelInputBudget(128_000, 16_384, CATALOGUE);
+    const head: ModelMessage[] = [
+      { role: 'system', content: BASE_SYSTEM_PROMPT },
+      { role: 'user', content: 'Keep this original goal.' }
+    ];
+    let compacted = 0;
+    for (const size of [40, 200, 1_200]) {
+      for (let turns = 5; turns <= 40; turns += 1) {
+        const messages = [...head, ...trajectory(turns, size).slice(3)];
+        const window = estimatedContextTokens(messages);
+        const outcome = await compactContext({
+          messages,
+          targetTailTokens: declaredCompactionTargetTail(budget, window),
+          summarise: async () => 'S'.repeat(3_000),
+          citableFooter: 'Cite: workspace/notes.md'
+        });
+        if (!outcome) continue;
+        compacted += 1;
+        expect(outcome.estimatedTokensAfter).toBeLessThan(outcome.estimatedTokensBefore);
+      }
+    }
+    // Most of the sweep refuses, which is the floor doing its work; a sweep where nothing ever
+    // compacted at all would pass on an empty assertion.
+    expect(compacted).toBeGreaterThan(20);
+  });
+
+  it('takes more without taking anything the turn is still working to', async () => {
+    // Taking more is only an improvement if the things a compaction may never take hold at the
+    // shorter tail too. Four of them at once, on a window where the halved tail reaches past every
+    // one: the owner's correction after the opening request, an assistant turn whose call is still
+    // unanswered, the results belonging to calls that stay, and the procedure whose body goes.
+    const messages = trajectory(35);
+    messages.splice(5, 0, {
+      role: 'assistant',
+      content: 'Opening the proof procedure.',
+      toolCalls: [
+        { id: 'call-skill', name: 'skill', arguments: { action: 'view', id: 'render-proof' } }
+      ]
+    });
+    messages.splice(6, 0, {
+      role: 'tool',
+      toolCallId: 'call-skill',
+      content: `<skill name="render-proof">${'z'.repeat(4_000)}</skill>`
+    });
+    const correction = { role: 'user' as const, content: 'Not that document - the insert.' };
+    messages.splice(12, 0, correction);
+    messages.splice(20, 0, {
+      role: 'assistant',
+      content: 'Waiting on approval.',
+      toolCalls: [{ id: 'awaiting-approval', name: 'shell', arguments: { executable: 'rm' } }]
+    });
+
+    const budget = modelInputBudget(128_000, 16_384, CATALOGUE);
     const outcome = await compactContext({
       messages,
-      targetTailTokens: 2_000,
-      minimumCondensed: 2,
-      summarise: async () => 'the audit phase finished'
+      targetTailTokens: declaredCompactionTargetTail(budget, estimatedContextTokens(messages)),
+      summarise: async () => 'the brochure phase finished'
     });
-    expect(outcome?.condensedMessages).toBeGreaterThanOrEqual(2);
+    expect(outcome).not.toBeNull();
+    if (!outcome) return;
+    // The shorter tail really did reach past the procedure and the correction, or none of this is
+    // evidence of anything. It stops short of the rest of the window because the unanswered call
+    // pulls the boundary back to itself - which is the guard, holding, at a tail that now starts
+    // far enough back to reach it at all.
+    expect(outcome.condensedMessages).toBeGreaterThan(12);
+
+    expect(outcome.messages[2]).toEqual({ role: 'user', content: 'Keep this original goal.' });
+    expect(outcome.messages).toContainEqual(correction);
+    expect(
+      outcome.messages.some((message) =>
+        message.toolCalls?.some((call) => call.id === 'awaiting-approval')
+      )
+    ).toBe(true);
+    expect(orphanToolResults(outcome.messages)).toEqual([]);
+    expect(outcome.section.text).toContain('render-proof');
+    expect(outcome.section.text).toContain('no longer in the window');
   });
 
   it('keeps a brief inherited without its saved sections instead of discarding it', async () => {
@@ -1516,6 +1635,16 @@ describe('when the window is condensed instead of truncated', () => {
         const budget = modelInputBudget(contextTokens, maxOutputTokens, reservedTokens);
         expect(compactionTargetTail(budget) * 2).toBeLessThanOrEqual(compactionTrigger(budget));
         expect(compactionTargetTail(budget)).toBeGreaterThan(0);
+        // The declared tail is the same halving read against the window rather than the budget, so
+        // the ratio holds there too - and the budget-derived tail stays its ceiling, which is what
+        // keeps a declaration made on an oversized window from condensing less than the budget
+        // trigger would have taken from the same window a step later.
+        for (const window of [4_000, 39_039, 134_804, 2_000_000]) {
+          const declared = declaredCompactionTargetTail(budget, window);
+          expect(declared).toBeLessThanOrEqual(compactionTargetTail(budget));
+          expect(declared * 2).toBeLessThanOrEqual(Math.max(window, compactionTrigger(budget)));
+        }
+        expect(declaredCompactionTargetTail(budget, 2_000_000)).toBe(compactionTargetTail(budget));
       }
     }
   });

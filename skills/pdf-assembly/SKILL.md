@@ -6,7 +6,7 @@ compatibility: Every tool named here is installed on this computer by athanor - 
 allowed-tools: shell file_read file_write files_list document_read image_read publish_artifact
 metadata:
   athanor.tier: 'builtin'
-  athanor.version: '2.0.0'
+  athanor.version: '2.1.0'
   athanor.risk: 'workspace'
   athanor.domain: 'pdf'
 ---
@@ -101,7 +101,8 @@ action, not yours.
 ## Verification
 
 - `qpdf --check out.pdf` clean.
-- Page count equals the arithmetic you intended, checked with `pdfinfo`.
+- Page count equals the arithmetic you intended, declared as `expectPages` on the acceptance render
+  clause before the merge.
 - For merges, the first and last page of each source appear in the right order in the render.
 - For form fills, the plan and the read-back values match exactly, and the rendered page shows the
   values.

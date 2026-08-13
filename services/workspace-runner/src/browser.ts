@@ -25,6 +25,7 @@ import {
   stageUserFileForUpload,
   writeWorkspaceFile
 } from './files.js';
+import { failureCode, runnerLogger } from './log.js';
 import {
   duckDuckGoSearchUrl,
   readSearchRows,
@@ -539,9 +540,7 @@ const scanFrameElements = async (
     // out loud because the failure is otherwise indistinguishable from a page with no controls,
     // which is exactly how a broken scan stayed invisible while the agent kept working blind.
     .catch((cause: unknown) => {
-      console.warn(
-        `athanor runner: a frame could not be scanned for controls: ${cause instanceof Error ? cause.message : 'unknown reason'}`
-      );
+      runnerLogger.warn('browser.frame_scan_failed', { code: failureCode(cause) });
       return [];
     });
   return foldScannedElements(raw, limit);
@@ -1181,9 +1180,12 @@ export class BrowserManager {
     // Worth saying out loud rather than degrading quietly: headless changes what pages serve, and
     // an unsandboxed renderer is a weaker boundary on the process that browses arbitrary content.
     if (settled !== ladder[0])
-      console.warn(
-        `athanor runner: the browser started ${settled?.headless ? 'headless' : 'on the workspace display'} with the renderer sandbox ${settled?.chromiumSandbox ? 'on' : 'off'} after the preferred configuration was refused: ${refused instanceof Error ? refused.message.split('\n')[0] : 'unknown reason'}`
-      );
+      runnerLogger.warn('browser.reduced_launch', {
+        workspaceId,
+        headless: settled?.headless,
+        sandbox: settled?.chromiumSandbox,
+        code: failureCode(refused)
+      });
     const page = context.pages()[0] ?? (await context.newPage());
     const session: Session = {
       context,
@@ -1728,12 +1730,10 @@ export class BrowserManager {
     try {
       return await chromium.launch(options(true));
     } catch (error) {
-      console.warn(
-        'athanor runner: the isolated browser started with the renderer sandbox off after the ' +
-          `preferred configuration was refused: ${
-            error instanceof Error ? error.message.split('\n')[0] : 'unknown reason'
-          }`
-      );
+      runnerLogger.warn('browser.isolated_sandbox_off', {
+        sandbox: false,
+        code: failureCode(error)
+      });
       return chromium.launch(options(false));
     }
   }

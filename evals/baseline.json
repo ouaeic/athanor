@@ -86,18 +86,18 @@
   },
   "long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly": {
     "modelCalls": 40,
-    "promptTokens": 981072,
+    "promptTokens": 906597,
     "cachePrefix": 94
   },
   "long-a-finished-phase-is-never-declared": {
     "modelCalls": 38,
-    "promptTokens": 961395,
+    "promptTokens": 980695,
     "cachePrefix": 96
   },
   "long-finished-phases-condense-rather-than-shred": {
     "modelCalls": 39,
-    "promptTokens": 2577516,
-    "cachePrefix": 64
+    "promptTokens": 2489826,
+    "cachePrefix": 66
   },
   "media-logo-set-declares-its-own-done": {
     "modelCalls": 7,

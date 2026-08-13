@@ -1,6 +1,6 @@
 schema: 1
 id: typst-pdf
-version: 2.1.0
+version: 2.2.0
 catalog_line: 'Typeset precise PDFs — reports, letters, invoices, CVs — from a Typst source.'
 
 lineage:

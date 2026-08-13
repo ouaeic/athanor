@@ -1,6 +1,6 @@
 schema: 1
 id: pdf-assembly
-version: 2.0.0
+version: 2.1.0
 catalog_line: 'Merge, split, stamp, redact and encrypt PDFs, and fill AcroForm fields safely.'
 
 lineage:

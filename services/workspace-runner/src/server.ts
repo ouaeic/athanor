@@ -32,6 +32,7 @@ import {
   IMAGE_SOURCE_MAX_BYTES
 } from './images.js';
 import { commandLimits, resolveCommandLimiter } from './limits.js';
+import { runnerLogger } from './log.js';
 import { ProcessManager } from './processes.js';
 import { findRenderTools, proveRender, RENDER_SOURCE_MAX_BYTES } from './render-proof.js';
 import { resolveAgentSandbox, sandboxedInvocation, sandboxedShell } from './sandbox.js';
@@ -216,9 +217,9 @@ export const buildServer = async (config: RunnerConfig) => {
   if (!limiter && process.platform === 'linux') {
     // Worth saying out loud: on Linux the limiter is expected to exist, and without it a single
     // command can take the memory and the process table the rest of the computer needs.
-    console.warn(
-      `athanor runner: ${config.RESOURCE_LIMIT_EXECUTABLE} is missing, so commands run without memory, file-size and process limits. Install util-linux to restore them.`
-    );
+    runnerLogger.warn('command.limits_unavailable', {
+      executable: config.RESOURCE_LIMIT_EXECUTABLE
+    });
   }
 
   /*

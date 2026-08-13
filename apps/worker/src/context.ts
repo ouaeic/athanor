@@ -517,13 +517,70 @@ export const compactionTrigger = (inputBudget: number): number =>
   Math.min(COMPACTION_TRIGGER_TOKENS, inputBudget * COMPACTION_TRIGGER_SHARE);
 export const compactionTargetTail = (inputBudget: number): number =>
   Math.floor(compactionTrigger(inputBudget) * (COMPACTION_TARGET_SHARE / COMPACTION_TRIGGER_SHARE));
+
+/**
+ * The tail to aim for when the agent is the one who said a phase is finished.
+ *
+ * The halving above is a statement about the window, not about the budget, and on the budget
+ * trigger the two are the same sentence: that path fires exactly when the window reaches the
+ * trigger, so half the trigger is half the window. Nothing pins the window when the declaration
+ * comes from the agent instead - it says a phase is over when the work is over, at whatever size
+ * the window happens to be - and a budget-derived tail then has no relation at all to what is in
+ * front of it. Measured on a 128,000-token window: a phase declared finished at 39,039 tokens was
+ * offered a 31,950-token tail and freed 3,031 of them, and every declaration below about 32,000
+ * tokens - which is most of the range this trigger runs in, since a window that reached the trigger
+ * would have been condensed before the agent got its turn - freed nothing at all while still
+ * costing the step that asked. Halving the budget-derived number instead only moves that dead band
+ * down to 16,000 and leaves the result independent of where the agent spoke, which is the part that
+ * was wrong.
+ *
+ * So the same halving is taken against the window actually in front of the declaration, and the
+ * budget-derived tail becomes the ceiling it may not exceed rather than the number it aims for.
+ *
+ * The share is taken of the whole window while the tail it bounds covers only the condensable part
+ * below the head, and that gap is what makes this safe at the small end without a floor of its own:
+ * until the conversation outweighs the fixed preamble and goal above it, half the window is still
+ * more than everything that could be condensed, `planCompaction` comes back empty, and the tool
+ * tells the agent there is not enough superseded conversation yet.
+ */
+export const declaredCompactionTargetTail = (inputBudget: number, windowTokens: number): number =>
+  Math.min(
+    compactionTargetTail(inputBudget),
+    Math.floor(windowTokens * (COMPACTION_TARGET_SHARE / COMPACTION_TRIGGER_SHARE))
+  );
 /** Never condense so far forward that the model loses the turns it is actively working through. */
 export const MIN_PROTECTED_TAIL_MESSAGES = 8;
-/** Below this a compaction costs a model call and a cache rewrite without freeing useful room. */
+/**
+ * Below this a compaction costs a model call and a cache rewrite without freeing useful room.
+ *
+ * One number for both triggers. An agent-declared compaction used to be let through at two, because
+ * a budget-derived tail left it a sliver or nothing and two was the only way it ever condensed
+ * anything; with the tail now taken from the window in front of it, a span this short is no longer
+ * a small compaction but the sign that there is nothing worth condensing - and swept across window
+ * shapes it is exactly where the brief section written to replace the span comes out larger than
+ * the span itself, so the turn pays a model call to make its own prompt bigger.
+ */
 export const MIN_CONDENSED_MESSAGES = 6;
 /** Capped so the rendered brief always stays inside the 32k-character system-message bound below. */
 const MAX_BRIEF_SECTIONS = 8;
 const MAX_BRIEF_SECTION_CHARS = 3_000;
+
+/**
+ * The span has to be worth more than the brief that will stand in for it.
+ *
+ * The message floor above reasons about exactly this and counts the wrong thing. Six messages is a
+ * proxy for "enough to be worth replacing", and it stops being one when the messages are small: six
+ * two-hundred-character tool results are a span the summariser can answer at full length, and then
+ * the turn has paid a model call to make its own prompt bigger. Swept at a production-sized brief
+ * that shape hands back a window up to 785 tokens larger, which is the one case where compaction is
+ * strictly worse than doing nothing.
+ *
+ * Measured against the largest brief that could come back rather than the one that does, because
+ * the decision is made before the summariser is called - which is the point, since a floor that
+ * fired afterwards would save the window and still spend the call. That makes it deliberately
+ * conservative: a span this size is refused even when the brief would have come back short.
+ */
+const MIN_CONDENSED_TOKENS = Math.ceil(MAX_BRIEF_SECTION_CHARS / 4);
 const MAX_COMPACTION_TRANSCRIPT_CHARS = 80_000;
 
 export const CONDENSED_HISTORY_MARKER = 'CONDENSED HISTORY BRIEF';
@@ -741,14 +798,10 @@ export const planCompaction = (
   messages: ModelMessage[],
   options: {
     targetTailTokens: number;
-    minimumTail?: number;
-    minimumCondensed?: number;
     transcriptChars?: number;
   }
 ): CompactionPlan | null => {
   const start = condensableStart(messages);
-  const minimumTail = options.minimumTail ?? MIN_PROTECTED_TAIL_MESSAGES;
-  const minimumCondensed = options.minimumCondensed ?? MIN_CONDENSED_MESSAGES;
   let boundary = messages.length;
   let tailTokens = 0;
   for (let index = messages.length - 1; index >= start; index -= 1) {
@@ -758,7 +811,7 @@ export const planCompaction = (
     if (tailTokens > options.targetTailTokens) break;
     boundary = index;
   }
-  boundary = Math.max(start, Math.min(boundary, messages.length - minimumTail));
+  boundary = Math.max(start, Math.min(boundary, messages.length - MIN_PROTECTED_TAIL_MESSAGES));
 
   // An assistant message with a call nothing has answered yet is still waiting for its result, so
   // condensing it would orphan the result that arrives next. The agent's own compact_context call is
@@ -799,7 +852,11 @@ export const planCompaction = (
       message.role === 'tool' && !!message.toolCallId && !retainedCallIds.has(message.toolCallId);
     if (index < boundary || orphaned) condensed.push(index);
   }
-  if (condensed.length < minimumCondensed) return null;
+  if (condensed.length < MIN_CONDENSED_MESSAGES) return null;
+  // The four divides the same way `estimatedTokens` does, so the span and the brief it would be
+  // replaced by are compared in one unit.
+  if (estimatedTokens(condensed.flatMap((index) => messages[index] ?? [])) < MIN_CONDENSED_TOKENS)
+    return null;
   return {
     boundary,
     condensed,
@@ -844,8 +901,6 @@ export const compactContext = async (input: {
   targetTailTokens: number;
   summarise?: CompactionSummariser;
   note?: string;
-  minimumTail?: number;
-  minimumCondensed?: number;
   transcriptChars?: number;
   /**
    * Written verbatim onto the end of the new section. `finish` requires tool-call ids drawn from
@@ -858,8 +913,6 @@ export const compactContext = async (input: {
 }): Promise<CompactionOutcome | null> => {
   const plan = planCompaction(input.messages, {
     targetTailTokens: input.targetTailTokens,
-    ...(input.minimumTail === undefined ? {} : { minimumTail: input.minimumTail }),
-    ...(input.minimumCondensed === undefined ? {} : { minimumCondensed: input.minimumCondensed }),
     ...(input.transcriptChars === undefined ? {} : { transcriptChars: input.transcriptChars })
   });
   if (!plan) return null;

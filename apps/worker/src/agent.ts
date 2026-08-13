@@ -87,6 +87,7 @@ import {
   compactionRequest,
   compactionTargetTail,
   compactionTrigger,
+  declaredCompactionTargetTail,
   clockLine,
   dropLegacyGuidance,
   contextShortfall,
@@ -7658,13 +7659,22 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           .map(([id, result]) => `${id} (${result.name})`)
           .join(', ')}.`
       : '';
+    // Read before the messages go, because after it there is nothing left to read them from. Here
+    // rather than at the budget caller, which is where it used to live: an agent-declared compaction
+    // drops messages exactly as durably, so on a turn that condensed because the agent said a phase
+    // was over, the episode's `Touched:` list lost every path and command from before it.
+    state.carriedArtifacts = [
+      ...new Set([...(state.carriedArtifacts ?? []), ...extractTurn(state.messages).artifacts])
+    ].slice(-64);
     const outcome = await compactContext({
       messages: state.messages,
       ...(state.contextBrief ? { brief: state.contextBrief } : {}),
-      targetTailTokens: compactionTargetTail(budget),
-      // An explicit call means the agent knows a phase is finished, so it is worth condensing a
-      // span far smaller than the budget-driven trigger would ever bother with.
-      ...(input.trigger === 'agent' ? { minimumCondensed: 2 } : {}),
+      // A declaration is answered against the window in front of it; the budget trigger fires at a
+      // window it already knows the size of, so its own target is the one derived from the budget.
+      targetTailTokens:
+        input.trigger === 'agent'
+          ? declaredCompactionTargetTail(budget, estimatedContextTokens(state.messages))
+          : compactionTargetTail(budget),
       transcriptChars: Math.min(80_000, Math.max(8_000, summariser.contextTokens * 2)),
       ...(input.note ? { note: input.note } : {}),
       ...(citableFooter ? { citableFooter } : {}),
@@ -9301,10 +9311,6 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
         (state.preparedInputTokens ?? estimatedContextTokens(state.messages)) >
         compactionTrigger(modelInputBudget(model.contextTokens, maxOutputTokens, reservedTokens))
       ) {
-        // Read before the messages go, because after it there is nothing left to read them from.
-        state.carriedArtifacts = [
-          ...new Set([...(state.carriedArtifacts ?? []), ...extractTurn(state.messages).artifacts])
-        ].slice(-64);
         const compacted = await this.#compactContext(task, key, state, {
           model,
           catalog,

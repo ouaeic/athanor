@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ProcessManager } from './processes.js';
 import {
   DEFAULT_SERVICE_POLICY,
@@ -106,6 +106,59 @@ describe('service registry', () => {
     expect(await new ServiceRegistry(root).load()).toEqual([]);
     await writeFile(registryFile(root), '[{"id":"svc_x"}]');
     expect(await new ServiceRegistry(root).load()).toEqual([]);
+  });
+
+  /**
+   * The one promise a service makes is that it is still there tomorrow, so a record that could not
+   * be written is the moment that promise quietly stops being true. It said so in prose for months
+   * and journald filed every one of them at the default priority, where nobody looking for a
+   * problem would ever pass.
+   */
+  it('files a record it could not write where a priority filter will find it', async () => {
+    const root = await workspace();
+    // A regular file where the registry needs a directory. ENOTDIR stands in for the real causes -
+    // a full disk, a read-only mount - none of which a test can arrange on the machine running it.
+    const blocked = path.join(root, 'blocked');
+    await writeFile(blocked, '');
+    const record = newServiceRecord({
+      workspaceId: 'workspace-1',
+      owner: 'task-1',
+      name: 'invoice dashboard',
+      launch: {
+        executable: '/bin/sh',
+        args: ['-c', 'sleep 1'],
+        cwd: 'workspace',
+        env: {},
+        network: false,
+        maxOutputBytes: 4_096
+      }
+    });
+    const lines: string[] = [];
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write);
+    try {
+      // Every service the owner ever starts comes through here, so a line raised on the ordinary
+      // path would bury the one raised on this one in its own noise.
+      await new ServiceRegistry(root).put(record);
+      expect(lines).toEqual([]);
+      await new ServiceRegistry(blocked).put(record);
+    } finally {
+      stdout.mockRestore();
+    }
+    expect(JSON.parse(lines[0]!)).toMatchObject({
+      level: 'warn',
+      service: 'runner',
+      event: 'services.record_write_failed',
+      detail:
+        'could not record services in .athanor/services.json - services will not survive a restart',
+      // Whose services these were. The sentence names the file relative to a workspace it does not
+      // name, so without this the owner of a box with several workspaces is told that some
+      // services somewhere will not come back.
+      workspaceId: 'workspace-1',
+      code: 'ENOTDIR'
+    });
   });
 
   it('lists only real workspaces beside the snapshot and checkpoint directories', async () => {

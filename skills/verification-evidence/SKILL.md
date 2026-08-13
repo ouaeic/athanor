@@ -6,7 +6,7 @@ compatibility: No external binaries required.
 allowed-tools: set_acceptance shell file_read files_list document_read image_read publish_artifact finish
 metadata:
   athanor.tier: 'builtin'
-  athanor.version: '1.2.0'
+  athanor.version: '1.3.0'
   athanor.risk: 'read_only'
   athanor.domain: 'discipline'
 ---
@@ -39,7 +39,7 @@ Use the strongest rung the task allows. Anything below rung 3 is not evidence.
 | Outcome                     | Minimum rung | The specific check                                                                    |
 | --------------------------- | ------------ | ------------------------------------------------------------------------------------- |
 | Text or Markdown file       | 3            | `file_read` the file; confirm length and that the last section exists                 |
-| .docx / .pptx / PDF / .xlsx | 5            | run `render-proof`; confirm page count, no placeholder tokens, fonts embedded         |
+| .docx / .pptx / PDF / .xlsx | 5            | run `render-proof`; declare the render clause, confirm no placeholder tokens and fonts embedded |
 | .xlsx with formulas         | 6            | LibreOffice recalculation reports `error_cells == 0`                                  |
 | Code change                 | 4            | the project's own test command exits 0, and it failed before the change               |
 | Data analysis               | 4            | the analysis script re-runs from a clean state and produces the same numbers          |
@@ -55,7 +55,8 @@ Use the strongest rung the task allows. Anything below rung 3 is not evidence.
    you call `finish` and refuses the finish while any fails, so they are the definition of done
    rather than a claim about it — which is why they are declared before the work, when you have no
    stake in what passes. A `command` check is an executable, its arguments and the exit code and
-   stdout it must produce; an `artifact` check is a path that must exist and not be under a size.
+   stdout it must produce; an `artifact` check is a path that must exist, not be under a size, and
+   — for a document — render to the pages the job asked for.
    Pick from the table above: "the budget workbook exists" is not a check, and
    `athanor-office-convert budget.xlsx proofs/budget.pdf` with `expectExit: 0` is.
 
@@ -75,9 +76,11 @@ Use the strongest rung the task allows. Anything below rung 3 is not evidence.
    and finishing is held until this turn declares its own.
 
    **Calling it again is allowed and both versions are shown to the owner**, because weakening your
-   own test is a different act from passing it. And the harness only runs commands and looks at
-   files: everything on rungs 5 and 6 is still yours to do and to cite, so a rendered page read with
-   `image_read` is evidence you gather, not a check you can declare.
+   own test is a different act from passing it. And the harness runs commands, looks at files, and
+   measures the pages of a document — how many, whether any word was cut at an edge, whether any
+   page is blank. What is left on rungs 5 and 6 is judgement: a rendered page read with `image_read`
+   is evidence you gather, not a check you can declare, because no measurement can tell you the
+   chart is mislabelled.
 
 2. **Do the work.**
 3. **Gather evidence in the same session.** Do not rely on a tool result from twenty steps ago; a

@@ -20,7 +20,7 @@ import {
   startTurnState,
   UNTRUSTED_NOTICE_MARKER
 } from './agent.js';
-import { RUNTIME_CONTEXT_MARKER } from './context.js';
+import { compactionTargetTail, modelInputBudget, RUNTIME_CONTEXT_MARKER } from './context.js';
 import { managedMediaCatalog } from './media.js';
 import { memoryItemAad, MEMORY_PACK_MARKER } from './memory-runtime.js';
 import { agentTools } from './tools.js';
@@ -4310,6 +4310,146 @@ describe('how full the window is believed to be', () => {
     expect(first).toBeDefined();
     // And the first one frees a third of the window rather than a fifth.
     expect(first!.estimatedTokensAfter).toBeLessThan(first!.estimatedTokensBefore * 0.7);
+  });
+
+  it('condenses a phase the agent declares finished on a window the budget never noticed', async () => {
+    /*
+     * The other trigger, and the one the budget-derived target was never sized for. An agent says a
+     * phase is over when the work is over, so its declarations land far below the budget trigger -
+     * anything above it was condensed before the model got its turn. Ten steps of bulk here put
+     * about fifteen thousand tokens in front of a 128,000-token model whose budget-derived tail asks
+     * to keep thirty thousand, so the whole window fitted under the tail and the tool answered the
+     * declaration with "there is not enough superseded conversation to condense yet" - every time,
+     * for the entire lower half of the range this trigger runs in. The provider reports zero prompt
+     * tokens throughout, so the budget path cannot fire and nothing here is its work.
+     */
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    // The first step reads somewhere nothing later touches, so what the episode remembers of it is
+    // evidence about the compaction rather than about the steps that outlived it.
+    const firstLook = `data: ${JSON.stringify({
+      choices: [
+        {
+          finish_reason: 'tool_calls',
+          delta: {
+            content: 'x'.repeat(6_000),
+            tool_calls: [
+              {
+                index: 0,
+                id: 'call-early',
+                function: {
+                  name: 'files_list',
+                  arguments: JSON.stringify({ path: 'workspace/early-notes' })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    })}\n\ndata: [DONE]\n\n`;
+    installFetch(
+      [
+        firstLook,
+        ...Array.from({ length: 9 }, () => usageFrame(0, 6_000)),
+        toolFrame('call-declared', 'compact_context', {
+          finishedPhase: 'The listing pass is finished; only the report is left.'
+        }),
+        textFrame('The listing pass is finished.')
+      ],
+      log,
+      { route: listsTheWorkspace }
+    );
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 14 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const compaction = probe.events
+      .filter((entry) => entry.summary.includes('Condensed a finished phase'))
+      .map(
+        (entry) =>
+          (
+            entry.payload as {
+              compaction: {
+                trigger: string;
+                estimatedTokensBefore: number;
+                estimatedTokensAfter: number;
+              };
+            }
+          ).compaction
+      )[0];
+    expect(compaction).toBeDefined();
+    if (!compaction) return;
+    expect(compaction.trigger).toBe('agent');
+    // The window really is under the budget-derived tail, or this is measuring the budget path
+    // wearing the other trigger's name.
+    const budget = modelInputBudget(model.contextTokens, 16_384, 0);
+    expect(compaction.estimatedTokensBefore).toBeLessThan(compactionTargetTail(budget));
+    expect(compaction.estimatedTokensAfter).toBeLessThan(compaction.estimatedTokensBefore * 0.8);
+    // And the first step survives the taking. The paths a turn touched are read out of the window
+    // when it ends, and this compaction deleted the message that first look lived on - so the
+    // episode a later task recalls this run by would have had no record it ever happened.
+    expect(probe.episodes.join('\n')).toContain('workspace/early-notes');
+  });
+
+  it('carries what the turn touched past a compaction the budget triggered', async () => {
+    /*
+     * The same claim as the test above against the other trigger, and it had none of its own:
+     * deleting the capture that carries a turn's paths and commands forward turned exactly one test
+     * red, the agent-declared one, so a budget compaction that stopped carrying them would have
+     * shipped green. Both triggers reach the same code by different routes and only one was watched.
+     *
+     * The difference is who decides. Nothing is declared here - the window fills, the loop compacts
+     * on its own, and the first step's listing is just as gone from it. The 64k model is the
+     * helper's own pressure case, which is what keeps the window above the trigger for a whole run.
+     */
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    // The first step reads somewhere no later step touches, so what the episode remembers of it is
+    // evidence about the compaction rather than about the steps that outlived it.
+    const firstLook = `data: ${JSON.stringify({
+      choices: [
+        {
+          finish_reason: 'tool_calls',
+          delta: {
+            content: 'x'.repeat(6_000),
+            tool_calls: [
+              {
+                index: 0,
+                id: 'call-early',
+                function: {
+                  name: 'files_list',
+                  arguments: JSON.stringify({ path: 'workspace/early-notes' })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    })}\n\ndata: [DONE]\n\n`;
+    installFetch([firstLook, usageFrame(0)], log, { route: listsTheWorkspace });
+    await new AgentWorker(
+      {
+        ...(probe.store as unknown as Record<string, unknown>),
+        listModels: async () => [{ ...model, contextTokens: 64_000 }]
+      } as unknown as DataStore,
+      config({ TASK_MAX_STEPS: 30 }),
+      masterKey,
+      runnerSecret
+    )
+      .run(task)
+      .catch(() => undefined);
+
+    // The budget path names itself differently from the declared one, and reading for the wrong
+    // sentence is how this would pass while measuring nothing.
+    const compaction = probe.events
+      .filter((entry) => entry.summary.includes('Condensed earlier work'))
+      .map((entry) => (entry.payload as { compaction: { trigger: string } }).compaction)[0];
+    expect(compaction).toBeDefined();
+    if (!compaction) return;
+    expect(compaction.trigger).toBe('budget');
+    expect(probe.episodes.join('\n')).toContain('workspace/early-notes');
   });
 });
 

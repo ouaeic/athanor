@@ -678,7 +678,7 @@ else
  *
  * Every copy here is deliberate and says so where it is written, and the reason is always that the
  * two sides cannot reach each other: three are in the web client, which is behind a 150 kB bundle
- * gate that importing a schema library or `node:fs` would blow, and one is across the worker and
+ * gate that importing a schema library or `node:fs` would blow, and two are across the worker and
  * the runner, which are separate processes. What was missing is the thing that makes a copy safe.
  * Both sides have tests, and they assert different examples - the disk floor is checked at 400 GiB
  * on one side and 500 GiB on the other - so a changed formula fails neither.
@@ -690,7 +690,12 @@ else
  * on the worker side which files a model may claim a render proof on and on the runner side which
  * it will actually measure, so drift either offers a clause that is refused at the finish with a
  * 415 - the late refusal the worker-side list exists to prevent - or hides a format the runner
- * could have proved all along.
+ * could have proved all along. `journalLevelPrefix` is the difference between `journalctl -p err`
+ * being an answer and being a guess. The runner holds its own copy because it can import neither
+ * the package the worker keeps it in nor the one compiled into the web bundle, and a copy that
+ * filed a warning at `<5>` would put a browser that lost its renderer sandbox below the priority
+ * the owner filters at - which is the exact silence the runner's copy was written to end, arriving
+ * by a slower route.
  *
  * Compared as source text, because that is what has to match. Anything cleverer would need to
  * import one side, and the whole reason there are two is that importing is what nobody can do.
@@ -725,6 +730,15 @@ const copiedConstants = [
     // off a name itself, so one side is dotted and the other is not. That difference is spelling;
     // the set is the fact, so the leading dot comes off before the comparison.
     normalise: (body) => body.replace(/\./g, '')
+  },
+  {
+    what: 'the priority journald files a line at',
+    owner: 'apps/worker/src/agent.ts',
+    copy: 'services/workspace-runner/src/log.ts',
+    // Arrow to semicolon, so this covers the JOURNAL_STREAM gate as well as the map. A copy that
+    // kept the numbers and dropped the gate would print `<4>` at an owner running the runner in a
+    // terminal, which is the same fact drifting by the other half.
+    find: /journalLevelPrefix = \(level: LogLevel\): string =>([\s\S]*?);/
   }
 ];
 const drifted = [];

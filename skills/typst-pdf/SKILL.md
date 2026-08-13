@@ -6,7 +6,7 @@ compatibility: Every tool named here is installed on this computer by athanor - 
 allowed-tools: shell file_read file_write files_list image_read publish_artifact
 metadata:
   athanor.tier: 'builtin'
-  athanor.version: '2.1.0'
+  athanor.version: '2.2.0'
   athanor.risk: 'workspace'
   athanor.domain: 'documents'
 ---
@@ -104,8 +104,9 @@ about — it just adds a second page. Build for density first, then measure, the
 margin on every role without a table. `tight: true` on lists and a `leading` around `0.55em` are
 where the space comes from. 9.6pt body on A4 is readable in print and holds roughly 700 words.
 
-Then `pdfinfo cv.pdf | grep Pages`. If it says 2, cut content — do not drop below 9pt, and do not
-shrink the margins under 1.4cm, because both produce a CV that reads as though it was squeezed.
+Declare `expectPages: 1` on the acceptance render clause before you compile. If the harness reports
+2, cut content — do not drop below 9pt, and do not shrink the margins under 1.4cm, because both
+produce a CV that reads as though it was squeezed.
 Cut the oldest role's bullets first.
 
 **Escape the `@`.** In Typst markup `@` starts a reference, so `candidate@example.org` fails to
@@ -118,7 +119,7 @@ on it, so this is the first error you will hit.
 2. `qpdf --check report.pdf` reports no errors.
 3. `pdffonts report.pdf` — every font shows `emb yes`.
 4. `pdftoppm -jpeg -r 120` and `image_read` each page: no overflowing table, no orphaned heading,
-   no widow line, page numbers present and correct, nothing running into the margin.
+   no widow line, page numbers present and correct.
 5. `pdftotext report.pdf - | grep -n -E '\bTODO\b|\bLorem\b|\{\{|\bNone\b|\bnan\b|\bNaN\b'`. Keep
    the word boundaries: bare `none` and `nan` match ordinary prose — "none of the above",
    "finance" — and a placeholder scan that fires on every document is one nobody reads.
@@ -137,5 +138,5 @@ on it, so this is the first error you will hit.
   another, and that is a conversation with the owner, not an install.
 - **Writing HTML and hoping to print it.** There is no HTML-to-PDF path on this computer. A
   deliverable that must be a PDF is authored here; a web page stays a web page.
-- **Forgetting `pdfinfo` on a document with a page limit.** A CV, a one-pager, a covering letter and
+- **Not declaring the page limit as `expectPages`.** A CV, a one-pager, a covering letter and
   an abstract all have one, and the compiler is perfectly happy to exceed it.

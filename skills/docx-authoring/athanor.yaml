@@ -1,6 +1,6 @@
 schema: 1
 id: docx-authoring
-version: 2.0.0
+version: 2.1.0
 catalog_line: 'Create or edit Word documents with real styles, TOC, tables and a rendered proof.'
 
 lineage:

@@ -3,6 +3,7 @@ import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { uptime } from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
+import { failureCode, runnerLogger } from './log.js';
 
 /**
  * A service is one background process the owner's computer keeps running.
@@ -235,9 +236,14 @@ export class ServiceRegistry {
       await writeFile(staging, contents, { mode: 0o600 });
       await rename(staging, this.#file);
     } catch (cause) {
-      console.warn(
-        `athanor runner: could not record services at ${this.#file} - services will not survive a restart (${cause instanceof Error ? cause.message : String(cause)})`
-      );
+      // Which workspace, because the prose this replaced named the file by its absolute path and
+      // that path was the only thing saying whose services had just stopped being durable. Read off
+      // the records rather than held on the registry: every one of them belongs to this workspace,
+      // and a flush that emptied the set has no workspace left to name.
+      runnerLogger.warn('services.record_write_failed', {
+        workspaceId: [...this.#records.values()][0]?.workspaceId,
+        code: failureCode(cause)
+      });
     }
   }
 }

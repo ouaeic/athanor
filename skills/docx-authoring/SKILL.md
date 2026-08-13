@@ -6,7 +6,7 @@ compatibility: Every tool named here is installed on this computer by athanor - 
 allowed-tools: shell file_read file_write files_list document_read image_read publish_artifact
 metadata:
   athanor.tier: 'builtin'
-  athanor.version: '2.0.0'
+  athanor.version: '2.1.0'
   athanor.risk: 'workspace'
   athanor.domain: 'documents'
 ---
@@ -82,8 +82,9 @@ not mean it is absent.
    here is why a TOC comes out empty.
 2. `athanor-office-convert out.docx proofs/out.pdf`, then `pdftoppm -jpeg -r 120 proofs/out.pdf
 proofs/p`.
-3. Run the rest of `render-proof`: page count, blank-page scan, placeholder scan, `pdffonts`
-   embedding, and the round-trip word count that detects content lost off a page.
+3. Run the rest of `render-proof`: placeholder scan, `pdffonts` embedding, image resolution and
+   the round-trip word count that detects content lost off a page. Page count and blank pages are
+   the acceptance render clause's, declared before the document was written.
 4. Look at the pages with `image_read`. Check specifically: heading hierarchy consistent, tables
    not clipped on the right, images not overlapping text, no orphaned heading at a page bottom.
 5. Publish with `publish_artifact` and attach the page images.

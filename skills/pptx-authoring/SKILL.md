@@ -6,7 +6,7 @@ compatibility: Every tool named here is installed on this computer by athanor - 
 allowed-tools: shell file_read file_write files_list document_read image_read publish_artifact
 metadata:
   athanor.tier: 'builtin'
-  athanor.version: '2.1.0'
+  athanor.version: '2.2.0'
   athanor.risk: 'workspace'
   athanor.domain: 'presentations'
 ---
@@ -146,12 +146,14 @@ scratch to change three slides; the master, theme and custom layouts will not su
    is empty that should not be, and that every slide has notes.
 2. `athanor-office-convert deck.pptx proofs/deck.pdf`, then `pdftoppm -jpeg -r 120 proofs/deck.pdf
 proofs/p`.
-3. `pdfinfo proofs/deck.pdf | grep Pages` must equal the slide count.
+3. The slide count is `expectPages` on the acceptance render clause, declared before the deck was
+   built rather than counted afterwards.
 4. `pdftotext -layout proofs/deck.pdf proofs/deck.txt` and compare its word count against the sum
    of the text you placed. A deficit above 2% means a text box clipped its content. Nothing else
    catches this.
-5. `image_read` every slide image. Check: nothing overlapping, no text touching a slide edge,
-   chart axes labelled, the same title position on every slide, no slide that is only a title.
+5. `image_read` every slide image. Check: nothing overlapping, chart axes labelled, the same title
+   position on every slide, no slide that is only a title. Text at the slide edge belongs to the
+   render clause, which tolerates it on purpose: a full-bleed slide is meant to reach the edge.
 6. Publish with `publish_artifact` and attach the slide images.
 
 ## Failure modes

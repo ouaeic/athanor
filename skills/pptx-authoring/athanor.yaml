@@ -1,6 +1,6 @@
 schema: 1
 id: pptx-authoring
-version: 2.1.0
+version: 2.2.0
 catalog_line: 'Build editable PowerPoint decks from master layouts with native charts and notes.'
 
 lineage:
