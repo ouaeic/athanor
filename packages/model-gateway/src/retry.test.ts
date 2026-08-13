@@ -161,16 +161,20 @@ describe('provider status classification', () => {
     for (const status of [500, 502, 503, 504]) {
       expect(
         isRetryableError(
-          new AthanorError('provider_request_failed', `openrouter request failed (${status})`, status)
+          new AthanorError(
+            'provider_request_failed',
+            `openrouter request failed (${status})`,
+            status
+          )
         )
       ).toBe(true);
     }
   });
 
   it('still refuses to retry a genuine client-side rejection', () => {
-    expect(
-      isRetryableError(new AthanorError('provider_request_failed', 'bad prompt', 400))
-    ).toBe(false);
+    expect(isRetryableError(new AthanorError('provider_request_failed', 'bad prompt', 400))).toBe(
+      false
+    );
   });
 
   it('honours a Retry-After carried on the error details', () => {

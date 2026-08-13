@@ -29,9 +29,9 @@ describe('relay is off unless it is deliberately turned on', () => {
   });
 
   it('treats a half-configured relay as off rather than reconnecting at a host that will not answer', () => {
-    expect(relayIsUsable(RelayClientConfigSchema.parse({ enabled: true, host: 'relay.example' }))).toBe(
-      false
-    );
+    expect(
+      relayIsUsable(RelayClientConfigSchema.parse({ enabled: true, host: 'relay.example' }))
+    ).toBe(false);
     expect(
       relayIsUsable(
         RelayClientConfigSchema.parse({ enabled: true, host: 'relay.example', label: 'abc' })

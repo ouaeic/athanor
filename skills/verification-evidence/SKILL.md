@@ -36,18 +36,18 @@ Use the strongest rung the task allows. Anything below rung 3 is not evidence.
 
 ## Required evidence per outcome
 
-| Outcome                     | Minimum rung | The specific check                                                                    |
-| --------------------------- | ------------ | ------------------------------------------------------------------------------------- |
-| Text or Markdown file       | 3            | `file_read` the file; confirm length and that the last section exists                 |
+| Outcome                     | Minimum rung | The specific check                                                                              |
+| --------------------------- | ------------ | ----------------------------------------------------------------------------------------------- |
+| Text or Markdown file       | 3            | `file_read` the file; confirm length and that the last section exists                           |
 | .docx / .pptx / PDF / .xlsx | 5            | run `render-proof`; declare the render clause, confirm no placeholder tokens and fonts embedded |
-| .xlsx with formulas         | 6            | LibreOffice recalculation reports `error_cells == 0`                                  |
-| Code change                 | 4            | the project's own test command exits 0, and it failed before the change               |
-| Data analysis               | 4            | the analysis script re-runs from a clean state and produces the same numbers          |
-| Web form submitted          | 6            | a confirmation page, reference number, or a re-fetch of the record                    |
-| Deployment                  | 4            | a health check against the deployed URL returns the expected status and body          |
-| Research claim              | 6            | the cited source was re-fetched and the quoted span still supports the claim          |
-| Background job              | 4            | the job's own completion record plus a check of the output it was supposed to produce |
-| Conversational answer       | n/a          | `verification.status = not_applicable`; no external state changed                     |
+| .xlsx with formulas         | 6            | LibreOffice recalculation reports `error_cells == 0`                                            |
+| Code change                 | 4            | the project's own test command exits 0, and it failed before the change                         |
+| Data analysis               | 4            | the analysis script re-runs from a clean state and produces the same numbers                    |
+| Web form submitted          | 6            | a confirmation page, reference number, or a re-fetch of the record                              |
+| Deployment                  | 4            | a health check against the deployed URL returns the expected status and body                    |
+| Research claim              | 6            | the cited source was re-fetched and the quoted span still supports the claim                    |
+| Background job              | 4            | the job's own completion record plus a check of the output it was supposed to produce           |
+| Conversational answer       | n/a          | `verification.status = not_applicable`; no external state changed                               |
 
 ## Procedure
 

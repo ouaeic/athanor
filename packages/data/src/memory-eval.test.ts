@@ -393,9 +393,10 @@ describe('memory retrieval eval', () => {
       sessionRun.recall,
       formatMemoryEvalSearchReport('index', sessionRun)
     ).toBeGreaterThanOrEqual(MIN_SESSION_RECALL);
-    expect(sessionRun.mrr, formatMemoryEvalSearchReport('index', sessionRun)).toBeGreaterThanOrEqual(
-      MIN_SESSION_MRR
-    );
+    expect(
+      sessionRun.mrr,
+      formatMemoryEvalSearchReport('index', sessionRun)
+    ).toBeGreaterThanOrEqual(MIN_SESSION_MRR);
     for (const probe of sessionRun.probes)
       expect(probe.returned).toBeLessThanOrEqual(MEMORY_EVAL_SESSION_SEARCH_K);
   });

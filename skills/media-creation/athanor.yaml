@@ -10,16 +10,7 @@ lineage:
   approved_at: null
 
 requires:
-  tools:
-    [
-      generate_media,
-      image_read,
-      shell,
-      file_write,
-      publish_artifact,
-      file_read,
-      files_list
-    ]
+  tools: [generate_media, image_read, shell, file_write, publish_artifact, file_read, files_list]
   binaries: [ffmpeg, ffprobe, magick, dot, pdftoppm]
 
 capability:

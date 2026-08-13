@@ -266,7 +266,8 @@ export const spendWindowBounds = (timeZone: string, now = new Date()): SpendPeri
   const monthStart: CalendarDate = { year: today.year, month: today.month, day: 1 };
   // Weekday of the local calendar date, not of the instant: the two disagree either side of
   // midnight in every zone that is not UTC. Monday is 0, which is where the week starts.
-  const sinceMonday = (new Date(Date.UTC(today.year, today.month - 1, today.day)).getUTCDay() + 6) % 7;
+  const sinceMonday =
+    (new Date(Date.UTC(today.year, today.month - 1, today.day)).getUTCDay() + 6) % 7;
   const weekStart = shiftDays(today, -sinceMonday);
   return {
     daily: {

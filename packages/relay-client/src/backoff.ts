@@ -18,7 +18,11 @@ export interface BackoffInput {
   readonly random?: () => number;
 }
 
-export const reconnectDelayMs = ({ attempt, requestedMs, random = Math.random }: BackoffInput): number => {
+export const reconnectDelayMs = ({
+  attempt,
+  requestedMs,
+  random = Math.random
+}: BackoffInput): number => {
   const exponential = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** Math.max(0, attempt));
   const jittered = Math.floor(random() * exponential);
   if (requestedMs === undefined) return jittered;

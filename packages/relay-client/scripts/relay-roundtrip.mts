@@ -16,29 +16,90 @@ import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer as createTlsServer, connect as connectTls } from 'node:tls';
-import { Metrics, Registry, RelayServer, createSelfSignedCertificate, generateIdentityKeyPair, parseRelayConfig, silentLogger } from '@athanor/relay';
-import { RelayClientConfigSchema, RelayConnection, enroll, loadOrCreateIdentity } from '../src/index.js';
+import {
+  Metrics,
+  Registry,
+  RelayServer,
+  createSelfSignedCertificate,
+  generateIdentityKeyPair,
+  parseRelayConfig,
+  silentLogger
+} from '@athanor/relay';
+import {
+  RelayClientConfigSchema,
+  RelayConnection,
+  enroll,
+  loadOrCreateIdentity
+} from '../src/index.js';
 
-process.on('uncaughtException', (e) => { console.error('FAILED, uncaught:', e); process.exit(3); });
-process.on('unhandledRejection', (e) => { console.error('FAILED, unhandled rejection:', e); process.exit(4); });
+process.on('uncaughtException', (e) => {
+  console.error('FAILED, uncaught:', e);
+  process.exit(3);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('FAILED, unhandled rejection:', e);
+  process.exit(4);
+});
 
 const RELAY_DOMAIN = 'relay.example';
 const dir = await mkdtemp(join(tmpdir(), 'relay-repro-'));
 const { privateKey } = generateIdentityKeyPair();
-const cert = createSelfSignedCertificate({ privateKey, commonName: RELAY_DOMAIN, dnsNames: [RELAY_DOMAIN, `*.${RELAY_DOMAIN}`] });
-const config = parseRelayConfig({ relayDomain: RELAY_DOMAIN, listenHost: '127.0.0.1', httpsPort: 0, controlPort: 0, httpPort: 0, metricsPort: 0, tlsCertPath: 'x', tlsKeyPath: 'x', registryPath: join(dir, 'r.json'), pingIntervalMs: 60000 });
-const registry = await Registry.open({ path: config.registryPath, relayDomain: config.relayDomain, maxPeers: config.limits.global.maxPeers, registrationEnabled: config.registrationEnabled, defaultQuota: { monthlyBytes: config.limits.perPeer.monthlyBytes, maxConcurrentStreams: config.limits.perPeer.concurrentStreams, rateBps: config.limits.perPeer.rateBps } });
-const server = new RelayServer({ config, registry, metrics: new Metrics(), logger: silentLogger, tlsCert: cert.certPem, tlsKey: cert.keyPem });
+const cert = createSelfSignedCertificate({
+  privateKey,
+  commonName: RELAY_DOMAIN,
+  dnsNames: [RELAY_DOMAIN, `*.${RELAY_DOMAIN}`]
+});
+const config = parseRelayConfig({
+  relayDomain: RELAY_DOMAIN,
+  listenHost: '127.0.0.1',
+  httpsPort: 0,
+  controlPort: 0,
+  httpPort: 0,
+  metricsPort: 0,
+  tlsCertPath: 'x',
+  tlsKeyPath: 'x',
+  registryPath: join(dir, 'r.json'),
+  pingIntervalMs: 60000
+});
+const registry = await Registry.open({
+  path: config.registryPath,
+  relayDomain: config.relayDomain,
+  maxPeers: config.limits.global.maxPeers,
+  registrationEnabled: config.registrationEnabled,
+  defaultQuota: {
+    monthlyBytes: config.limits.perPeer.monthlyBytes,
+    maxConcurrentStreams: config.limits.perPeer.concurrentStreams,
+    rateBps: config.limits.perPeer.rateBps
+  }
+});
+const server = new RelayServer({
+  config,
+  registry,
+  metrics: new Metrics(),
+  logger: silentLogger,
+  tlsCert: cert.certPem,
+  tlsKey: cert.keyPem
+});
 await server.listen();
 console.log('relay up: control', server.controlPort, 'https', server.httpsPort);
 
 const identity = await loadOrCreateIdentity(dir);
 const { token } = registry.createInvite('t', 600000);
-const enrollment = await enroll({ host: RELAY_DOMAIN, address: '127.0.0.1', port: server.controlPort! }, identity, token);
+const enrollment = await enroll(
+  { host: RELAY_DOMAIN, address: '127.0.0.1', port: server.controlPort! },
+  identity,
+  token
+);
 console.log('enrolled:', enrollment.hostname);
 
-const boxCert = createSelfSignedCertificate({ privateKey: generateIdentityKeyPair().privateKey, commonName: enrollment.hostname, dnsNames: [enrollment.hostname] });
-const box = createTlsServer({ key: boxCert.keyPem, cert: boxCert.certPem }, (s) => s.on('data', (c) => s.write(c.toString().toUpperCase())));
+const boxCert = createSelfSignedCertificate({
+  privateKey: generateIdentityKeyPair().privateKey,
+  commonName: enrollment.hostname,
+  dnsNames: [enrollment.hostname]
+});
+const box = createTlsServer({ key: boxCert.keyPem, cert: boxCert.certPem }, (s) =>
+  s.on('data', (c) => s.write(c.toString().toUpperCase()))
+);
 await new Promise<void>((r) => box.listen(0, '127.0.0.1', r));
 const boxPort = (box.address() as any).port;
 
@@ -52,20 +113,39 @@ await new Promise<void>((r) => boxHttp.listen(0, '127.0.0.1', r));
 const boxHttpPort = (boxHttp.address() as any).port;
 
 const conn = new RelayConnection({
-  config: RelayClientConfigSchema.parse({ enabled: true, host: RELAY_DOMAIN, address: '127.0.0.1', port: server.controlPort!, label: enrollment.label, pinnedRelaySpkiSha256: enrollment.pinnedRelaySpkiSha256, localHost: '127.0.0.1', localPort: boxPort, localHttpPort: boxHttpPort }),
+  config: RelayClientConfigSchema.parse({
+    enabled: true,
+    host: RELAY_DOMAIN,
+    address: '127.0.0.1',
+    port: server.controlPort!,
+    label: enrollment.label,
+    pinnedRelaySpkiSha256: enrollment.pinnedRelaySpkiSha256,
+    localHost: '127.0.0.1',
+    localPort: boxPort,
+    localHttpPort: boxHttpPort
+  }),
   identity,
   logger: (l, m, f) => console.log('[relay-client]', l, m, JSON.stringify(f ?? {}))
 });
 conn.start();
-for (let i = 0; i < 200 && conn.status.state !== 'online'; i++) await new Promise((r) => setTimeout(r, 50));
+for (let i = 0; i < 200 && conn.status.state !== 'online'; i++)
+  await new Promise((r) => setTimeout(r, 50));
 console.log('state:', conn.status.state, 'label:', conn.status.label);
 
-const client = connectTls({ host: '127.0.0.1', port: server.httpsPort!, servername: enrollment.hostname, rejectUnauthorized: false });
+const client = connectTls({
+  host: '127.0.0.1',
+  port: server.httpsPort!,
+  servername: enrollment.hostname,
+  rejectUnauthorized: false
+});
 const reply = await new Promise<string>((res, rej) => {
   const t = setTimeout(() => rej(new Error('timeout')), 8000);
   client.on('error', rej);
   client.once('secureConnect', () => client.write('hello through the relay'));
-  client.once('data', (c) => { clearTimeout(t); res(c.toString()); });
+  client.once('data', (c) => {
+    clearTimeout(t);
+    res(c.toString());
+  });
 });
 if (reply !== 'HELLO THROUGH THE RELAY') {
   console.error('FAILED: relay did not carry the bytes through, got', JSON.stringify(reply));
@@ -80,12 +160,22 @@ const httpReply = await new Promise<string>((res, rej) => {
   const t = setTimeout(() => rej(new Error('timeout')), 8000);
   const chunks: Buffer[] = [];
   httpSocket.on('error', rej);
-  httpSocket.on('connect', () => httpSocket.write(`GET ${challengePath} HTTP/1.1\r\nHost: ${enrollment.hostname}\r\nConnection: close\r\n\r\n`));
+  httpSocket.on('connect', () =>
+    httpSocket.write(
+      `GET ${challengePath} HTTP/1.1\r\nHost: ${enrollment.hostname}\r\nConnection: close\r\n\r\n`
+    )
+  );
   httpSocket.on('data', (c) => chunks.push(c));
-  httpSocket.on('end', () => { clearTimeout(t); res(Buffer.concat(chunks).toString()); });
+  httpSocket.on('end', () => {
+    clearTimeout(t);
+    res(Buffer.concat(chunks).toString());
+  });
 });
 if (!httpReply.includes(`box-http ${challengePath}`)) {
-  console.error('FAILED: relayed :80 did not reach the box HTTP listener, got', JSON.stringify(httpReply));
+  console.error(
+    'FAILED: relayed :80 did not reach the box HTTP listener, got',
+    JSON.stringify(httpReply)
+  );
   process.exit(2);
 }
 console.log('ok: a plaintext :80 request reached the box HTTP listener through the relay');
@@ -112,6 +202,10 @@ if (conn.status.state !== 'off') {
 }
 console.log('ok: the relay survived the box disconnecting, and the connection is off');
 
-client.destroy(); httpSocket.destroy(); box.close(); boxHttp.close(); await server.close();
+client.destroy();
+httpSocket.destroy();
+box.close();
+boxHttp.close();
+await server.close();
 console.log('ok: clean shutdown');
 process.exit(0);

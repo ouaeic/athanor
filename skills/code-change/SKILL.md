@@ -79,8 +79,7 @@ follow the project's own message conventions and never rewrite shared history.
 
 - **Fixing the symptom.** Adding a null check where the null should never have been produced.
 - **Inventing an API.** A plausible-looking method name is the single most common defect. Verify the
-  real signature with ``, or by reading the installed source in `node_modules` or
-  `site-packages` — not from memory of the library.
+  real signature with ``, or by reading the installed source in `node_modules`or`site-packages` — not from memory of the library.
 - **Testing the mock.** A test that asserts the mock was called proves the test wired the mock.
 - **The green suite that never ran your code.** A misnamed file, a missing marker or a directory
   outside the collection root means the new test is silently skipped. Confirm the reported test

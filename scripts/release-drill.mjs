@@ -199,9 +199,7 @@ check(
   proof
     ? [
         `passed: ${proof.passed.join(', ') || 'none'}`,
-        ...proof.jobs
-          .filter((job) => job.failure)
-          .map((job) => `${job.id} failed: ${job.failure}`),
+        ...proof.jobs.filter((job) => job.failure).map((job) => `${job.id} failed: ${job.failure}`),
         ...(proof.skipped.length ? [`skipped: ${proof.skipped.join(', ')}`] : [])
       ].join(' | ')
     : [documents.stdout.trim(), documents.stderr.trim()].filter(Boolean).join(' | ').slice(0, 600)

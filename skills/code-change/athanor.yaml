@@ -14,7 +14,7 @@ requires:
     [
       repo_overview,
       code_search,
-      
+
       code_diagnostics,
       file_read,
       file_write,

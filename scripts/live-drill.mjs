@@ -25,9 +25,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const { seedModels, refreshOpenRouterCatalog } = await import(
   pathToFileURL(join(here, '../packages/model-gateway/dist/index.js')).href
 );
-const { buildServer } = await import(
-  pathToFileURL(join(here, '../apps/api/dist/server.js')).href
-);
+const { buildServer } = await import(pathToFileURL(join(here, '../apps/api/dist/server.js')).href);
 
 const apiKey = process.env.OPENROUTER_API_KEY ?? '';
 if (!apiKey) {
@@ -265,7 +263,9 @@ const runJob = async (job) => {
         break;
       }
       for (const approval of mine) {
-        asked.push(`${approval.action ?? '?'} :: ${JSON.stringify(approval.preview ?? '').slice(0, 220)}`);
+        asked.push(
+          `${approval.action ?? '?'} :: ${JSON.stringify(approval.preview ?? '').slice(0, 220)}`
+        );
         await app.inject({
           method: 'POST',
           url: `/v1/approvals/${approval.id}/approve`,
@@ -394,13 +394,19 @@ const JOBS = [
     check: async (before, run) => {
       const files = appeared(await listFiles(), before);
       const source = files.find((entry) => /tally\.js$/i.test(entry.name ?? entry.path ?? ''));
-      const manifest = files.find((entry) => /package\.json$/i.test(entry.name ?? entry.path ?? ''));
+      const manifest = files.find((entry) =>
+        /package\.json$/i.test(entry.name ?? entry.path ?? '')
+      );
       if (!source) return { passed: false, detail: `no tally.js; got ${files.length} file(s)` };
       if (!manifest) return { passed: false, detail: 'no package.json' };
       const bytes = await readWorkspaceFile(source.path);
       const text = bytes?.toString('utf8') ?? '';
-      const tests = files.filter((entry) => /\.test\.(m?js|cjs)$/i.test(entry.name ?? entry.path ?? ''));
-      const testText = tests.length ? ((await readWorkspaceFile(tests[0].path))?.toString('utf8') ?? '') : '';
+      const tests = files.filter((entry) =>
+        /\.test\.(m?js|cjs)$/i.test(entry.name ?? entry.path ?? '')
+      );
+      const testText = tests.length
+        ? ((await readWorkspaceFile(tests[0].path))?.toString('utf8') ?? '')
+        : '';
       // The API deliberately exposes no way to run a command, so the proof that the tests pass is
       // the harness's own: an acceptance check is a command athanor ran and watched exit zero, and
       // the completion carries what it observed. That is a stronger signal than anything this
@@ -426,11 +432,14 @@ const JOBS = [
     name: 'image',
     // Media generation has never been exercised end to end from a prompt. The provider layer was
     // verified by hand; this is the whole path, and it is scored on a real PNG arriving.
-    prompt: 'Generate a simple square image of a red circle on a white background, and save it in the workspace.',
+    prompt:
+      'Generate a simple square image of a red circle on a white background, and save it in the workspace.',
     timeoutMs: 420_000,
     check: async (before) => {
       const files = appeared(await listFiles(), before);
-      const image = files.find((entry) => /\.(png|jpe?g|webp)$/i.test(entry.name ?? entry.path ?? ''));
+      const image = files.find((entry) =>
+        /\.(png|jpe?g|webp)$/i.test(entry.name ?? entry.path ?? '')
+      );
       if (!image) return { passed: false, detail: `no image written; got ${files.length} file(s)` };
       const bytes = await readWorkspaceFile(image.path);
       const png = bytes?.subarray(0, 8).toString('hex') === '89504e470d0a1a0a';
@@ -501,11 +510,13 @@ for (const job of JOBS) {
     // The task's own account of what happened, not just its final state - a job that fails in a
     // second failed for a reason the events already recorded.
     const trail = run.taskId
-      ? (await app.inject({
-          method: 'GET',
-          url: `/v1/tasks/${run.taskId}/events`,
-          headers: { cookie }
-        }).then((response) => (response.statusCode === 200 ? response.json() : [])))
+      ? await app
+          .inject({
+            method: 'GET',
+            url: `/v1/tasks/${run.taskId}/events`,
+            headers: { cookie }
+          })
+          .then((response) => (response.statusCode === 200 ? response.json() : []))
       : [];
     const rows = Array.isArray(trail) ? trail : (trail.events ?? []);
     if (process.env.DRILL_TRACE)
@@ -524,7 +535,9 @@ for (const job of JOBS) {
   const verdict = await job.check(beforeNames, run);
   const cost = run.task?.spendUsd ?? run.task?.costUsd;
   const priced = cost === undefined ? '' : `, $${Number(cost).toFixed(4)}`;
-  const gates = run.asked?.length ? `, ${run.asked.length} approval(s): ${run.asked.join(' ; ')}` : '';
+  const gates = run.asked?.length
+    ? `, ${run.asked.length} approval(s): ${run.asked.join(' ; ')}`
+    : '';
   if (verdict.passed) ok(`${job.name}`, `${run.seconds}s${priced} - ${verdict.detail}${gates}`);
   else fail(`${job.name}`, `${run.seconds}s${priced} - ${verdict.detail}${gates}`);
 }

@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
-import { connect as connectHttp2, type ClientHttp2Session, type ClientHttp2Stream } from 'node:http2';
+import {
+  connect as connectHttp2,
+  type ClientHttp2Session,
+  type ClientHttp2Stream
+} from 'node:http2';
 import { createConnection, type Socket } from 'node:net';
 import { connect as connectTls, type TLSSocket } from 'node:tls';
 import {
@@ -143,7 +147,12 @@ export class RelayConnection {
    * rescheduled at all, because retrying a revoked identity is a reconnect loop that can never
    * succeed and looks like an attack from the relay's side.
    */
-  #retry(reason: string, requestedMs?: number, revoked = false, generation = this.#generation): void {
+  #retry(
+    reason: string,
+    requestedMs?: number,
+    revoked = false,
+    generation = this.#generation
+  ): void {
     if (generation !== this.#generation) return;
     this.#generation += 1;
     this.#teardown();
@@ -207,7 +216,12 @@ export class RelayConnection {
       if (config.pinnedRelaySpkiSha256 && config.pinnedRelaySpkiSha256 !== fingerprint) {
         // Refusing here is the point of pinning: whoever now controls the hostname is not who this
         // box enrolled with, and continuing would hand them every client connection.
-        this.#retry('relay key does not match the one pinned at enrollment', undefined, false, generation);
+        this.#retry(
+          'relay key does not match the one pinned at enrollment',
+          undefined,
+          false,
+          generation
+        );
         return;
       }
       this.#openSession(generation);
@@ -428,9 +442,7 @@ export const enroll = async (
     });
     try {
       const stream = session.request({ ':method': 'POST', ':path': PATH_ENROLL });
-      stream.end(
-        JSON.stringify({ token, identityPub: identity.rawPublicKey.toString('base64') })
-      );
+      stream.end(JSON.stringify({ token, identityPub: identity.rawPublicKey.toString('base64') }));
       const { status, body } = await new Promise<{ status: number; body: Record<string, unknown> }>(
         (resolve, reject) => {
           const chunks: Buffer[] = [];
@@ -441,7 +453,10 @@ export const enroll = async (
           stream.on('data', (chunk: Buffer) => chunks.push(chunk));
           stream.on('end', () => {
             const text = Buffer.concat(chunks).toString('utf8');
-            resolve({ status: code, body: text ? (JSON.parse(text) as Record<string, unknown>) : {} });
+            resolve({
+              status: code,
+              body: text ? (JSON.parse(text) as Record<string, unknown>) : {}
+            });
           });
           stream.on('error', reject);
         }

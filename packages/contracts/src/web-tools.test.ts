@@ -234,12 +234,7 @@ describe('provider web tools', () => {
       for (const forceInHouse of [true, false, undefined])
         for (const startedMode of ['in_house', 'server', undefined] as const) {
           const plan = resolveWebToolPlan({ provider, forceInHouse, startedMode });
-          expect(Object.keys(plan).sort()).toEqual([
-            'disclosure',
-            'mode',
-            'reason',
-            'serverTools'
-          ]);
+          expect(Object.keys(plan).sort()).toEqual(['disclosure', 'mode', 'reason', 'serverTools']);
           expect(plan.serverTools.length > 0).toBe(plan.mode === 'server');
           expect(plan.disclosure).toBe(WEB_TOOL_DISCLOSURE[plan.mode]);
         }
