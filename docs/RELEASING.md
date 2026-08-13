@@ -95,6 +95,30 @@ not ship a mutable updater feed or an additional updater signing root. This keep
 release independent of a hosted control service; a future release may change that boundary only
 through an explicit, reviewed threat-model and migration decision.
 
+## What each client needs to build
+
+Worth stating because the obvious check gives the wrong answer. `xcodebuild -version` fails on a
+machine with only the Command Line Tools installed, and it is tempting to read that as "no Apple
+target can be built here". It is not what it means: it reports where `xcode-select` points, not what
+the machine can compile.
+
+| Client  | Needs                                      | Buildable with Command Line Tools alone |
+| ------- | ------------------------------------------ | --------------------------------------- |
+| macOS   | macOS SDK, `aarch64-apple-darwin`          | **Yes** — confirmed, `.app` and `.dmg`  |
+| iOS     | the iPhoneOS SDK, which ships inside Xcode | No                                      |
+| Android | Android SDK and NDK, `ANDROID_HOME` set    | N/A — no Apple toolchain involved       |
+| Windows | the MSVC toolchain, on Windows             | N/A                                     |
+
+`pnpm --filter @athanor/desktop native:build` produces a signed `.app` and a `.dmg` with nothing but
+the Command Line Tools: the SDKs under `/Library/Developer/CommandLineTools/SDKs` are enough, and
+`build-native.mjs` sets an ad-hoc signing identity when no Apple identity is configured, so a local
+build is launchable without a developer account. Notarisation is skipped and says so.
+
+iOS is the one that genuinely cannot: `xcrun --sdk iphoneos --show-sdk-path` reports the SDK cannot
+be located, and a `cargo build --target aarch64-apple-ios` dies on the same thing. The
+`aarch64-apple-ios` Rust target being installed is not sufficient and is what makes this look ready
+— the target is a compiler backend, while the SDK and headers live inside `Xcode.app`.
+
 ## Declared operating-system floors
 
 Reviewed 13 August 2026. These four numbers are a decision, not a default. Each is asserted twice:
@@ -105,9 +129,13 @@ of the package that is about to be published.
 | Platform | Floor          | Why this number                                                                                                       |
 | -------- | -------------- | --------------------------------------------------------------------------------------------------------------------- |
 | Android  | `minSdk 26`    | A deliberate raise above Tauri's configuration default of 24. No external rule constrains it.                         |
-| Android  | `targetSdk 36` | The store's target-API rule for submissions from 31 August 2026.                                                      |
+| Android  | `targetSdk 36` | Which behaviour changes the app declares it was written for; a lower number asks for older security defaults.         |
 | iOS      | `15.0`         | The oldest deployment target Xcode 27 will build. Range is 15.0 to 27.0.                                              |
 | macOS    | `12.0`         | The oldest deployment target Xcode 27 will build, and the oldest the macOS 27 SDK back-deploys a universal binary to. |
+
+The macOS floor is confirmed in a built artifact rather than only in configuration: a local
+`native:build` produces an `athanor.app` whose `Info.plist` carries `LSMinimumSystemVersion 12.0`,
+ad-hoc signed with the hardened runtime, and `verify-macos-artifact.mjs` accepts it.
 
 macOS was the one that was wrong. No `minimumSystemVersion` was declared at all, so the bundle
 inherited Tauri's default of `10.13` and the artifact verifier ratified it by asserting only
@@ -125,21 +153,28 @@ Windows declares no floor, which is correct rather than an oversight. Tauri stat
 Windows 7 and later, the default `webviewInstallMode` bootstraps the WebView2 runtime from the
 installer, `minimumWebview2Version` is unset, and no store rule applies to a direct download.
 
-Next review is forced by the store's target-API rule. `targetSdk 36` meets the 31 August 2026
-requirement, so nothing is due now; an extension to 1 November 2026 exists but is not needed.
-Android 17 is API 37, so on the annual cadence `targetSdk 37` becomes the requirement around
-31 August 2027. Treat that date as expected rather than confirmed: only the 2026 requirement is
-published today. Re-read the target-API help page before planning the work, and note that raising
-`targetSdk` is a behaviour change rather than a number change — API 37 gates local-network access
-behind a runtime permission, which this client needs for the Bonjour discovery declared in
-`Info.plist`. Budget a real device test for it.
+**`targetSdk` matters here for what the operating system does, not for what a store permits.**
+athanor is distributed as a direct download and is not submitted to any store, so the target-API
+rule that forces most projects to move is not what is pushing on this number. What is: Android reads
+`targetSdk` as a declaration of which behaviour changes the app has been written for, and runs an
+app that declares less under the older, laxer defaults. Every one of those defaults that matters
+here is a security default — scoped storage, the restrictions on implicit intents, foreground
+service types. A client that reaches an owner's private server over their local network should not
+be asking the system for the 2017 rules.
 
-`minSdk 26` is the only one of the four with nothing external pushing on it: no store rule sets a
-minimum, and Tauri's own prerequisites do not state an Android floor, so the 26 is this project's
-choice rather than a constraint. It costs whatever compatibility shims API 26 to 36 imply and buys
-back devices on Android 8 and 9. Move it only on evidence about the owner's actual install base,
-which lives in the Play Console under Reach and devices; that figure is no longer published on a
-public dashboard and should not be guessed at from third-party version-share articles.
+So the review cadence is Android's own, not a deadline. Android 17 is API 37; on the annual cadence
+that is the next one to consider, around mid-2027. Raising `targetSdk` is a behaviour change rather
+than a number change — API 37 gates local-network access behind a runtime permission, which this
+client needs for the Bonjour discovery declared in `Info.plist`. Budget a real device test for it.
+
+For reference if that ever changes: a store submission would have required API 36 from 31 August
+2026, which this already meets.
+
+`minSdk 26` has nothing external pushing on it at all, and for a directly distributed app there is
+no install-base report to consult either — the Play Console figure other projects use does not exist
+for a build nobody downloads through a store. So 26 is this project's own choice and stays one until
+somebody has a reason: it costs whatever compatibility shims API 26 to 36 imply and buys back
+devices on Android 8 and 9. Raise it when a specific API is wanted, not on a version-share article.
 
 ## Install verification
 
