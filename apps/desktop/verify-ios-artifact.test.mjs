@@ -48,6 +48,14 @@ test('requires exact iOS identity, pairing, transport, discovery, and privacy po
   assert.throws(() => validateIosInfo(broadDomain, '0.1.0'));
 });
 
+test('pins the iOS deployment floor rather than accepting any newer one', () => {
+  for (const version of ['14.0', '16.0', '26.0']) {
+    const drifted = validInfo();
+    drifted.MinimumOSVersion = version;
+    assert.throws(() => validateIosInfo(drifted, '0.1.0'));
+  }
+});
+
 test('distinguishes parser labels from complete private keys', () => {
   assert.doesNotThrow(() =>
     assertNoIosSensitiveContent(

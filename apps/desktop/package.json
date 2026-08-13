@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
-    "test": "node --test release-build-env.test.mjs verify-android-artifact.test.mjs verify-ios-artifact.test.mjs verify-macos-artifact.test.mjs",
+    "test": "node --test release-build-env.test.mjs verify-android-artifact.test.mjs verify-ios-artifact.test.mjs verify-macos-artifact.test.mjs verify-native-config.test.mjs",
     "native:build": "node verify-native-config.mjs && node build-native.mjs",
     "info": "tauri info",
     "android:init": "tauri android init",

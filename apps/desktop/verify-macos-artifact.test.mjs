@@ -9,7 +9,7 @@ function validInfo() {
     CFBundleShortVersionString: '0.1.0',
     CFBundleVersion: '1',
     CFBundleExecutable: 'athanor-desktop',
-    LSMinimumSystemVersion: '10.13',
+    LSMinimumSystemVersion: '12.0',
     CFBundleURLTypes: [{ CFBundleURLSchemes: ['athanor'] }],
     NSAppTransportSecurity: {
       NSExceptionDomains: {
@@ -35,6 +35,14 @@ test('requires exact macOS identity, pairing, transport, discovery, and privacy 
   const broadDomain = validInfo();
   broadDomain.NSAppTransportSecurity.NSExceptionDomains['example.com'] = {};
   assert.throws(() => validateMacInfo(broadDomain, '0.1.0'));
+});
+
+test('pins the macOS deployment floor rather than accepting any newer one', () => {
+  for (const version of ['10.13', '11.0', '13.0']) {
+    const drifted = validInfo();
+    drifted.LSMinimumSystemVersion = version;
+    assert.throws(() => validateMacInfo(drifted, '0.1.0'));
+  }
 });
 
 test('distinguishes parser labels from complete private keys in macOS artifacts', () => {

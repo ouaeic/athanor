@@ -41,6 +41,10 @@ const generatedIosIconDirectory = new URL(
   './src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/',
   import.meta.url
 );
+const generatedAndroidGradle = await readFile(
+  new URL('./src-tauri/gen/android/app/build.gradle.kts', import.meta.url),
+  'utf8'
+);
 function inspectPng(png, name) {
   const isPng =
     png.length >= 33 &&
@@ -72,6 +76,21 @@ for (const name of iosIcons) {
     throw new Error(`The generated iOS icon dimensions are stale: ${name}`);
   }
 }
+// Each floor is argued in docs/RELEASING.md. They are checked here as well as in the artifact
+// verifiers because a regenerated mobile project changes them without any build running.
+if (
+  config.bundle?.macOS?.minimumSystemVersion !== '12.0' ||
+  config.bundle?.iOS?.minimumSystemVersion !== '15.0' ||
+  config.bundle?.android?.minSdkVersion !== 26 ||
+  !/^\s*minSdk = 26$/m.test(generatedAndroidGradle) ||
+  !/^\s*targetSdk = 36$/m.test(generatedAndroidGradle) ||
+  !/^\s*compileSdk = 36$/m.test(generatedAndroidGradle)
+) {
+  throw new Error(
+    'A declared operating-system floor drifted from the agreed one: macOS 12.0, iOS 15.0, Android minSdk 26, Android targetSdk 36'
+  );
+}
+
 const configuredUrl = config.app?.windows?.[0]?.url;
 const remoteCapability = capability.remote;
 const desktopSchemes = config.plugins?.['deep-link']?.desktop?.schemes;

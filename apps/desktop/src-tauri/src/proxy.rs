@@ -247,9 +247,7 @@ pub async fn start(state: Arc<ClientState>) -> Result<String, String> {
             Ok(bound) => bound,
             Err(_) => TcpListener::bind(("127.0.0.1", 0))
                 .await
-                .map_err(|error| {
-                    format!("Could not start the private client gateway: {error}")
-                })?,
+                .map_err(|error| format!("Could not start the private client gateway: {error}"))?,
         },
         None => TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -924,6 +922,15 @@ async fn connect_server_websocket(
     .map(|(server, _)| server)
 }
 
+// axum and tungstenite each wrap their own UTF-8-checked view over the same `Bytes`, so a text
+// frame crosses the bridge by handing the buffer over: one validation pass rather than a copy of
+// every streamed token. The check cannot fail on a payload that arrived inside the peer's own
+// checked type, but a relay is the wrong place to assert that.
+fn relay_text<T: TryFrom<bytes::Bytes>>(payload: impl Into<bytes::Bytes>) -> Result<T, String> {
+    T::try_from(payload.into())
+        .map_err(|_| "A WebSocket text frame was not valid UTF-8".to_string())
+}
+
 async fn bridge_websocket(
     browser: WebSocket,
     state: Arc<ClientState>,
@@ -950,7 +957,7 @@ async fn bridge_websocket(
             incoming = browser_in.next() => match incoming {
                 Some(Ok(message)) => {
                     let message = match message {
-                        BrowserMessage::Text(value) => ServerMessage::Text(value),
+                        BrowserMessage::Text(value) => ServerMessage::Text(relay_text(value)?),
                         BrowserMessage::Binary(value) => ServerMessage::Binary(value),
                         BrowserMessage::Ping(value) => ServerMessage::Ping(value),
                         BrowserMessage::Pong(value) => ServerMessage::Pong(value),
@@ -963,7 +970,7 @@ async fn bridge_websocket(
             incoming = server_in.next() => match incoming {
                 Some(Ok(message)) => {
                     let message = match message {
-                        ServerMessage::Text(value) => Some(BrowserMessage::Text(value)),
+                        ServerMessage::Text(value) => Some(BrowserMessage::Text(relay_text(value)?)),
                         ServerMessage::Binary(value) => Some(BrowserMessage::Binary(value)),
                         ServerMessage::Ping(value) => Some(BrowserMessage::Ping(value)),
                         ServerMessage::Pong(value) => Some(BrowserMessage::Pong(value)),
@@ -1165,6 +1172,16 @@ mod tests {
             &HeaderMap::new(),
             None
         ));
+    }
+
+    #[test]
+    fn carries_a_text_frame_both_ways_across_the_bridge_intact() {
+        let original = "a streamed token — multi-byte, and \"quoted\"";
+        let outbound: tokio_tungstenite::tungstenite::Utf8Bytes =
+            relay_text(BrowserMessage::Text(original.into()).into_text().unwrap()).unwrap();
+        assert_eq!(outbound.as_str(), original);
+        let inbound: axum::extract::ws::Utf8Bytes = relay_text(outbound).unwrap();
+        assert_eq!(inbound.as_str(), original);
     }
 
     #[test]

@@ -95,6 +95,52 @@ not ship a mutable updater feed or an additional updater signing root. This keep
 release independent of a hosted control service; a future release may change that boundary only
 through an explicit, reviewed threat-model and migration decision.
 
+## Declared operating-system floors
+
+Reviewed 13 August 2026. These four numbers are a decision, not a default. Each is asserted twice:
+once in `apps/desktop/verify-native-config.mjs`, which needs no build and therefore runs on every
+`pnpm check`, and once in the artifact verifier for that platform, which reads the number back out
+of the package that is about to be published.
+
+| Platform | Floor          | Why this number                                                                                                       |
+| -------- | -------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Android  | `minSdk 26`    | A deliberate raise above Tauri's configuration default of 24. No external rule constrains it.                         |
+| Android  | `targetSdk 36` | The store's target-API rule for submissions from 31 August 2026.                                                      |
+| iOS      | `15.0`         | The oldest deployment target Xcode 27 will build. Range is 15.0 to 27.0.                                              |
+| macOS    | `12.0`         | The oldest deployment target Xcode 27 will build, and the oldest the macOS 27 SDK back-deploys a universal binary to. |
+
+macOS was the one that was wrong. No `minimumSystemVersion` was declared at all, so the bundle
+inherited Tauri's default of `10.13` and the artifact verifier ratified it by asserting only
+`>= 10.13`. That number was never chosen and could not have been honoured: Tauri supports macOS
+10.15 and newer, `rustc --print=deployment-target` reports `11.0` for `aarch64-apple-darwin`, and
+the key is documented as setting `MACOSX_DEPLOYMENT_TARGET` as well as `LSMinimumSystemVersion`. A
+10.13 or 10.14 Mac would have been offered an install of a binary whose own toolchain never targeted
+it. `12.0` is the lowest value that no part of the toolchain contradicts.
+
+Both Apple floors are now exact-match assertions rather than `>=`. A lower bound cannot detect the
+failure these invariants exist to catch, which is a regenerated project silently shipping a
+different target than the one that was agreed.
+
+Windows declares no floor, which is correct rather than an oversight. Tauri states support for
+Windows 7 and later, the default `webviewInstallMode` bootstraps the WebView2 runtime from the
+installer, `minimumWebview2Version` is unset, and no store rule applies to a direct download.
+
+Next review is forced by the store's target-API rule. `targetSdk 36` meets the 31 August 2026
+requirement, so nothing is due now; an extension to 1 November 2026 exists but is not needed.
+Android 17 is API 37, so on the annual cadence `targetSdk 37` becomes the requirement around
+31 August 2027. Treat that date as expected rather than confirmed: only the 2026 requirement is
+published today. Re-read the target-API help page before planning the work, and note that raising
+`targetSdk` is a behaviour change rather than a number change — API 37 gates local-network access
+behind a runtime permission, which this client needs for the Bonjour discovery declared in
+`Info.plist`. Budget a real device test for it.
+
+`minSdk 26` is the only one of the four with nothing external pushing on it: no store rule sets a
+minimum, and Tauri's own prerequisites do not state an Android floor, so the 26 is this project's
+choice rather than a constraint. It costs whatever compatibility shims API 26 to 36 imply and buys
+back devices on Android 8 and 9. Move it only on evidence about the owner's actual install base,
+which lives in the Play Console under Reach and devices; that figure is no longer published on a
+public dashboard and should not be guessed at from third-party version-share articles.
+
 ## Install verification
 
 Download the release and manifest into one empty directory, then run the platform's SHA-256 tool:

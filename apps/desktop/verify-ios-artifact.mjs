@@ -73,8 +73,8 @@ export function validateIosInfo(info, expectedVersion) {
     'iOS bundle version is missing'
   );
   invariant(
-    Number.parseFloat(info.MinimumOSVersion) >= 15,
-    'iOS minimum operating-system version must remain at least 15'
+    info.MinimumOSVersion === '15.0',
+    'iOS minimum operating-system version must remain 15.0'
   );
   const schemes = (info.CFBundleURLTypes ?? []).flatMap((entry) => entry.CFBundleURLSchemes ?? []);
   invariant(

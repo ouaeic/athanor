@@ -66,8 +66,8 @@ export function validateMacInfo(info, expectedVersion) {
     'macOS executable name is missing'
   );
   invariant(
-    Number.parseFloat(info.LSMinimumSystemVersion) >= 10.13,
-    'macOS minimum operating-system version is invalid'
+    info.LSMinimumSystemVersion === '12.0',
+    'macOS minimum operating-system version must remain 12.0'
   );
   const schemes = (info.CFBundleURLTypes ?? []).flatMap((entry) => entry.CFBundleURLSchemes ?? []);
   invariant(

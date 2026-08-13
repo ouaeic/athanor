@@ -752,6 +752,25 @@ mod tests {
         assert_eq!(certificate_spki(&certificate), Some(spki.as_slice()));
     }
 
+    // A second rustls provider feature anywhere in the graph makes the process-wide default
+    // ambiguous, and rustls answers that by panicking the first time anything builds a config
+    // without naming a provider. Nothing installs a default here, so the ambiguity would only
+    // surface on a live connection. Fail the build instead: builder() panics when the features
+    // name two providers, and the comparison catches a graph that quietly settled on the other.
+    #[test]
+    fn every_unnamed_call_site_resolves_the_same_provider_the_pinned_client_uses() {
+        let _ = rustls::ClientConfig::builder();
+        let ambient = rustls::crypto::CryptoProvider::get_default().unwrap();
+        let suites = |provider: &rustls::crypto::CryptoProvider| {
+            provider
+                .cipher_suites
+                .iter()
+                .map(|suite| suite.suite())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(suites(ambient), suites(&default_provider()));
+    }
+
     #[test]
     fn creates_only_safe_port_443_endpoints_from_mdns_addresses() {
         assert_eq!(
