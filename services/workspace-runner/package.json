@@ -13,11 +13,11 @@
   "dependencies": {
     "@fastify/helmet": "13.1.0",
     "@fastify/websocket": "11.3.0",
-    "@homebridge/node-pty-prebuilt-multiarch": "0.13.1",
+    "@homebridge/node-pty-prebuilt-multiarch": "0.14.1",
     "@athanor/contracts": "workspace:*",
     "@athanor/core": "workspace:*",
     "fastify": "5.11.3",
-    "playwright-core": "1.61.1",
+    "playwright-core": "1.62.1",
     "ws": "8.21.3",
     "zod": "4.4.3"
   },
