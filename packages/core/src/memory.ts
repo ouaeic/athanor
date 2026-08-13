@@ -1075,6 +1075,86 @@ export const MEMORY_PROCEDURE_STALE_DAYS = 180;
 export const MEMORY_PROCEDURE_MIN_SUCCESS_RATE = 0.5;
 
 /* ------------------------------------------------------------------------ *
+ * Dead ends
+ *
+ * A procedure is written when the harness watches an acceptance command pass, and nothing at all is
+ * written when it watches one fail - so the box remembers every route that worked and walks back
+ * into every route that did not. This is the missing half, and it is built out of the same evidence:
+ * a command the harness ran itself, its working directory, and the result it observed.
+ *
+ * It is the more dangerous half. "This worked" is wrong only if the machine has changed; "this did
+ * not work" is wrong the moment anything downstream of it changes, and it is wrong in the direction
+ * that talks the next turn out of the approach that would now succeed. Three things hold that edge:
+ * it is written in the past tense about one run rather than as a rule; it carries a validity window
+ * an order of magnitude shorter than a procedure's, after which the retrieval prior discounts it
+ * almost to nothing; and the same command observed passing retires it outright, which is the
+ * store's existing supersession rather than a second lifecycle invented here.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * The tag every dead end carries. Hyphenated on purpose: the tokenizer keeps it whole rather than
+ * stemming it to `fail`, so an ordinary question about something that failed does not pull every
+ * dead end in the workspace into the structural channel on the strength of one word.
+ */
+export const MEMORY_DEAD_END_TAG = 'check-failed';
+
+/**
+ * The keyed form of that tag. The database holds no plaintext, so this is the only handle it has on
+ * the rows a later success has to retire.
+ */
+export const memoryDeadEndTagKey = (key: Uint8Array): string =>
+  keyedToken('lex', MEMORY_DEAD_END_TAG, key, LEXEME_TOKEN_CHARS);
+
+/**
+ * How long one observed failure is worth carrying. Two weeks against a procedure's 180 days: a
+ * command that succeeded says something about how this project is built, where a command that
+ * failed says something about the state it was in on one afternoon, and that state is exactly what
+ * later work sets out to change.
+ */
+export const MEMORY_DEAD_END_TRUST_DAYS = 14;
+
+/** Enough for the first line of a compiler or test failure, and nothing like enough for a log. */
+const MEMORY_DEAD_END_DETAIL_CHARS = 240;
+
+export interface MemoryDeadEndCheck {
+  readonly label: string;
+  /** Executable and arguments as one line, matching the subject a passing run is keyed on. */
+  readonly command: string;
+  readonly cwd: string;
+  /** What the harness reported. Redacted by the caller: this is command output. */
+  readonly detail: string;
+}
+
+/**
+ * Keyed on the command exactly as a passing run is, so both sides of one command share a subject
+ * and the pack ranks them against each other instead of in separate worlds.
+ */
+export const deadEndFromCheck = (
+  check: MemoryDeadEndCheck,
+  observedAt: Date,
+  indexKey: Uint8Array
+): { content: MemoryItemContent; index: MemoryItemIndex; validTo: Date } => {
+  const command = check.command.slice(0, 400);
+  const content: MemoryItemContent = {
+    title: check.label.slice(0, 200),
+    subject: command,
+    tags: [MEMORY_DEAD_END_TAG],
+    // What was observed, and the bound on it in the same breath. The sentence deliberately never
+    // says the command is broken: the harness saw one run end this way, which is a smaller claim
+    // and the only one it can support.
+    body:
+      `In ${check.cwd}, \`${command}\` did not pass when the harness last ran it: ` +
+      `${check.detail.slice(0, MEMORY_DEAD_END_DETAIL_CHARS)}. ` +
+      'Running it again is what settles whether that is still true.'
+  };
+  return {
+    content,
+    index: buildMemoryItemIndex(content, indexKey),
+    validTo: new Date(observedAt.getTime() + MEMORY_DEAD_END_TRUST_DAYS * 86_400_000)
+  };
+};
+
+/* ------------------------------------------------------------------------ *
  * Contradiction resolution policy
  * ------------------------------------------------------------------------ */
 

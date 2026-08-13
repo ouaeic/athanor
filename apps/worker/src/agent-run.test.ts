@@ -124,6 +124,11 @@ interface StoreProbe {
   readonly episodes: string[];
   /** The grade each injected item was given, which is what procedure health is computed from. */
   readonly memoryUses: Array<{ itemIds: string[]; outcome: string }>;
+  /**
+   * What the turn asked the store to do about the acceptance commands the harness watched: the
+   * bodies of the cautions it wrote, and the keyed commands whose cautions it retired.
+   */
+  readonly deadEnds: Array<{ wrote: string[]; retired: string[] }>;
   /** Seeds the pack this task recalled, so the grade the turn writes on it is observable. */
   readonly recallPack: (itemIds: string[]) => void;
 }
@@ -143,6 +148,7 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
   const forgottenUndoPoints: string[][] = [];
   const episodes: string[] = [];
   const memoryUses: Array<{ itemIds: string[]; outcome: string }> = [];
+  const deadEnds: StoreProbe['deadEnds'] = [];
   let memoryPack: Record<string, unknown> | null = null;
   let sources = 0;
   const store = {
@@ -267,6 +273,25 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
         );
       return { id: 'item' };
     },
+    // The failing half of the same lesson. Both lists are captured, because "wrote nothing" and
+    // "was never asked" are different results and only one of them is the guard working.
+    recordMemoryDeadEnds: async (input: {
+      passed?: readonly string[];
+      failed?: readonly { documentCiphertext: Parameters<typeof decryptJson>[0] }[];
+    }) => {
+      deadEnds.push({
+        wrote: (input.failed ?? []).map(
+          (item) =>
+            decryptJson<{ body: string }>(
+              item.documentCiphertext,
+              dataKey,
+              `memory-item:${workspaceId}`
+            ).body
+        ),
+        retired: [...(input.passed ?? [])]
+      });
+      return { recorded: [], retired: [] };
+    },
     createMemorySource: async () => {
       sources += 1;
       return { id: `source-${sources}` };
@@ -297,6 +322,7 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     forgottenUndoPoints,
     episodes,
     memoryUses,
+    deadEnds,
     recallPack: (itemIds: string[]) => {
       memoryPack = {
         taskId,
@@ -3655,6 +3681,178 @@ describe('what would prove the job is done', () => {
     ]);
   });
 
+  const importerCheck = {
+    id: 'check-1',
+    kind: 'command',
+    label: 'the importer test passes',
+    executable: 'pytest',
+    args: ['-q'],
+    cwd: 'workspace',
+    expectExit: 0,
+    timeoutSeconds: 300
+  };
+
+  /**
+   * A turn that ends with a check still failing has already been sent round three times to fix it.
+   * That is what makes the observation worth keeping: not a command that failed once, but a route
+   * the model could not open after four goes at it.
+   */
+  it('keeps the command the harness watched fail once the model has run out of repairs', async () => {
+    const task = makeTask(
+      acceptanceState({
+        acceptance: { checks: [importerCheck], revisions: 1, declaredAtStep: 0 }
+      })
+    );
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        finishCall('call-1'),
+        finishCall('call-2'),
+        finishCall('call-3'),
+        finishCall('call-4'),
+        textFrame('It still fails.'),
+        finishCall('call-5')
+      ],
+      log,
+      { route: execRoute(1) }
+    );
+    const worker = new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 8 }),
+      masterKey,
+      runnerSecret
+    );
+
+    await worker.run(task).catch(() => undefined);
+
+    expect(probe.deadEnds).toHaveLength(1);
+    const [written] = probe.deadEnds[0]?.wrote ?? [];
+    // The command as a passing run would name it, the working directory, and what was actually
+    // seen - the same three things the successful half is built out of.
+    expect(written).toContain('pytest -q');
+    expect(written).toContain('workspace');
+    expect(written).toContain('AssertionError: expected 3 rows');
+    // And it is written as one observation with a way out, not as a property of the command.
+    expect(written).toContain('did not pass when the harness last ran it');
+    expect(probe.deadEnds[0]?.retired).toEqual([]);
+  });
+
+  /**
+   * The hardest case for this to stay quiet in, and the ordinary one: a check fails, the model is
+   * told, it fixes the work, and the second run passes. Nothing about that turn is a dead end - and
+   * the pass is what takes back any caution an earlier turn left behind.
+   */
+  it('keeps nothing about a check the same turn went back and fixed', async () => {
+    const task = makeTask(
+      acceptanceState({ acceptance: { checks: [importerCheck], revisions: 1, declaredAtStep: 0 } })
+    );
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([finishCall('call-1'), textFrame('Fixed it.'), finishCall('call-2')], log, {
+      route: execRoute(1, 0)
+    });
+    const worker = new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 4 }),
+      masterKey,
+      runnerSecret
+    );
+
+    await worker.run(task).catch(() => undefined);
+
+    expect(probe.events.some((entry) => entry.summary.startsWith('Finish refused:'))).toBe(true);
+    expect(probe.events.some((entry) => entry.kind === 'completed')).toBe(true);
+    expect(probe.deadEnds).toHaveLength(1);
+    expect(probe.deadEnds[0]?.wrote).toEqual([]);
+    expect(probe.deadEnds[0]?.retired).toHaveLength(1);
+  });
+
+  /**
+   * The other way a guard like this fires on real work: the runner is unreachable, every check
+   * comes back failed, and the box would learn that a perfectly good command does not work - a
+   * belief it would then carry into turns that could have run it.
+   */
+  it('keeps nothing about a command it never managed to run', async () => {
+    const task = makeTask(
+      acceptanceState({
+        acceptance: { checks: [importerCheck], revisions: 1, declaredAtStep: 0 }
+      })
+    );
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        finishCall('call-1'),
+        finishCall('call-2'),
+        finishCall('call-3'),
+        finishCall('call-4'),
+        textFrame('The runner is down.'),
+        finishCall('call-5')
+      ],
+      log,
+      {
+        route: (url: string) =>
+          url.includes('/exec') ? new Response('no runner', { status: 502 }) : undefined
+      }
+    );
+    const worker = new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 8 }),
+      masterKey,
+      runnerSecret
+    );
+
+    await worker.run(task).catch(() => undefined);
+
+    // The turn did end with the check counted as failed - this is not a test that nothing happened.
+    const completed = probe.events.find((entry) => entry.kind === 'completed');
+    const risks =
+      (completed?.payload as { verification?: { remainingRisks?: string[] } } | undefined)
+        ?.verification?.remainingRisks ?? [];
+    expect(risks.join(' ')).toContain('could not run');
+    expect(probe.deadEnds.flatMap((entry) => entry.wrote)).toEqual([]);
+  });
+
+  /**
+   * The commands are the model's, and a page that steers it into declaring a check against the
+   * wrong directory would otherwise get a standing caution out of the machine's own observation.
+   * The same gate a fact and a procedure carry, for the entry that has the sharpest edge.
+   */
+  it('settles no caution on a turn that read somebody else’s words', async () => {
+    const task = makeTask(
+      acceptanceState({
+        acceptance: { checks: [importerCheck], revisions: 1, declaredAtStep: 0 },
+        taint: { level: 'untrusted', sources: ['example.com'], sinceStep: 0 }
+      })
+    );
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        finishCall('call-1'),
+        finishCall('call-2'),
+        finishCall('call-3'),
+        finishCall('call-4'),
+        textFrame('It still fails.'),
+        finishCall('call-5')
+      ],
+      log,
+      { route: execRoute(1) }
+    );
+    const worker = new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 8 }),
+      masterKey,
+      runnerSecret
+    );
+
+    await worker.run(task).catch(() => undefined);
+
+    expect(probe.events.some((entry) => entry.kind === 'completed')).toBe(true);
+    expect(probe.deadEnds.flatMap((entry) => entry.wrote)).toEqual([]);
+  });
+
   it('keeps the order athanor did its own steps in out of the completion', async () => {
     const task = makeTask(acceptanceState());
     const probe = probeStore(() => task);
@@ -3806,6 +4004,164 @@ describe('what would prove the job is done', () => {
     const ending = probe.events.find((entry) => entry.kind === 'completed');
     expect((ending?.payload as { interrupted?: boolean } | undefined)?.interrupted).toBe(true);
     expect(lastMessage(log, 1)).toContain('Finish rejected');
+  });
+
+  const deckCheck = {
+    id: 'check-1',
+    kind: 'artifact',
+    label: 'the deck is twelve slides with nothing cut off',
+    path: 'workspace/deck.pptx',
+    minBytes: 1_024,
+    render: { expectPages: 12, marginPoints: 0 }
+  };
+
+  /** A workspace holding the deliverable, and a runner that answers for its rendered pages. */
+  const deckRoute =
+    (proof: () => Response) =>
+    (url: string): Response | undefined => {
+      if (url.includes('/document/render-proof')) return proof();
+      if (url.includes('/files?path='))
+        return new Response(
+          JSON.stringify({ entries: [{ name: 'deck.pptx', type: 'file', sizeBytes: 48_000 }] }),
+          { headers: { 'content-type': 'application/json' } }
+        );
+      return undefined;
+    };
+
+  const acceptanceResults = (probe: StoreProbe): Array<{ passed: boolean; detail: string }> =>
+    (
+      probe.events.find((entry) => entry.summary.startsWith('Acceptance checks:'))?.payload as
+        | { acceptance?: Array<{ passed: boolean; detail: string }> }
+        | undefined
+    )?.acceptance ?? [];
+
+  /**
+   * The deliverable this product leads with, held against how it renders rather than how big it is.
+   *
+   * A deck whose text runs off slide four is comfortably past a byte floor, so a check that could
+   * only weigh the file left the model that made it as the only witness to how it looks. What the
+   * turn is refused on here is a measurement of the file as it stands at finish, and the sentence
+   * the model is sent back with is the one the owner reads.
+   */
+  it('holds a deck on how its slides render, not on how many bytes it is', async () => {
+    const task = makeTask(
+      acceptanceState({ acceptance: { checks: [deckCheck], revisions: 1, declaredAtStep: 0 } })
+    );
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [], runnerRequests: [] };
+    installFetch([finishCall('call-1'), textFrame('Fixing the overflow.')], log, {
+      route: deckRoute(
+        () =>
+          new Response(
+            JSON.stringify({
+              passed: false,
+              detail:
+                'slide 4 of 12: “Attribution” runs 6.4pt past the right edge of the slide and is cut off there',
+              pages: 12,
+              words: 486,
+              crossings: 1,
+              blankPages: [],
+              converted: true
+            }),
+            { headers: { 'content-type': 'application/json' } }
+          )
+      )
+    });
+    const worker = new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 2 }),
+      masterKey,
+      runnerSecret
+    );
+
+    await worker.run(task).catch(() => undefined);
+
+    // The measurement was asked for at all, of that file, with the count the owner named.
+    expect(
+      (log.runnerRequests ?? []).find((entry) => entry.url.includes('/document/render-proof'))?.body
+    ).toMatchObject({ path: 'workspace/deck.pptx', expectPages: 12 });
+    // Its finding is the check's verdict, and the check's detail is the finding's own sentence.
+    expect(acceptanceResults(probe)[0]).toMatchObject({
+      passed: false,
+      detail:
+        'slide 4 of 12: “Attribution” runs 6.4pt past the right edge of the slide and is cut off there'
+    });
+    expect(lastMessage(log, 1)).toContain('runs 6.4pt past the right edge');
+  });
+
+  /**
+   * The failure that would be worst of all: a box with no renderer reporting the file as fine
+   * because it is big enough. A refusal has to arrive as a check that did not pass, carrying why.
+   */
+  it('says a deck could not be measured rather than that it is fine', async () => {
+    const task = makeTask(
+      acceptanceState({ acceptance: { checks: [deckCheck], revisions: 1, declaredAtStep: 0 } })
+    );
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [], runnerRequests: [] };
+    installFetch([finishCall('call-1'), textFrame('No renderer here.')], log, {
+      route: deckRoute(
+        () =>
+          new Response(
+            JSON.stringify({
+              error: {
+                code: 'runner_request_failed',
+                message:
+                  'This computer has no PDF page reader, so nothing about the rendered pages can be measured and this check cannot say whether the document is right.',
+                requestId: 'r1'
+              }
+            }),
+            { status: 503, headers: { 'content-type': 'application/json' } }
+          )
+      )
+    });
+    const worker = new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 2 }),
+      masterKey,
+      runnerSecret
+    );
+
+    await worker.run(task).catch(() => undefined);
+
+    const [result] = acceptanceResults(probe);
+    expect(result?.passed).toBe(false);
+    expect(result?.detail).toContain('has no PDF page reader');
+  });
+
+  /**
+   * And the case it must not fire on: an artifact check with no render clause is the check it
+   * always was, answered by the byte count and never by a render nobody asked for.
+   */
+  it('asks for no render on an artifact check that declared none', async () => {
+    const task = makeTask(
+      acceptanceState({
+        acceptance: {
+          checks: [{ ...deckCheck, render: undefined, path: 'workspace/deck.pptx' }],
+          revisions: 1,
+          declaredAtStep: 0
+        }
+      })
+    );
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [], runnerRequests: [] };
+    installFetch([finishCall('call-1'), textFrame('Done.')], log, {
+      route: deckRoute(() => new Response('should never be asked', { status: 500 }))
+    });
+    const worker = new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 2 }),
+      masterKey,
+      runnerSecret
+    );
+
+    await worker.run(task).catch(() => undefined);
+
+    expect(log.calls.some((entry) => entry.includes('/document/render-proof'))).toBe(false);
+    expect(acceptanceResults(probe)[0]).toMatchObject({
+      passed: true,
+      detail: '48000 bytes (needs at least 1024)'
+    });
   });
 });
 

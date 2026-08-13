@@ -8,8 +8,11 @@ import {
   buildMemoryItemIndex,
   conversationNamePrefixTokens,
   buildMemorySourceIndex,
+  deadEndFromCheck,
+  memoryDeadEndTagKey,
   memoryIndexKey,
   memoryOriginKey,
+  memorySubjectKey,
   planMemoryQuery,
   renderMemoryPack,
   spendWindowBounds
@@ -3213,6 +3216,133 @@ describe('tiered agent memory', () => {
     for (const outcome of ['ok', 'ok', 'ok', 'ok'] as const)
       await store.recordMemoryUse({ workspaceId, itemIds: [procedure.id], outcome });
     await expect(recall('rebuild the search index')).resolves.toHaveLength(1);
+  });
+
+  /**
+   * The other half of what an acceptance check teaches. A passing command becomes a procedure; a
+   * failing one used to become nothing at all, so the box walked back into the same wall.
+   */
+  it('keeps what the harness watched fail, and takes it back when the same command passes', async () => {
+    const command = 'pytest -q tests/importer';
+    const failure = deadEndFromCheck(
+      {
+        label: 'the importer test passes',
+        command,
+        cwd: '/srv/importer',
+        detail: 'exit 1 (expected 0): AssertionError: expected 3 rows'
+      },
+      now,
+      key
+    );
+    const written = await store.recordMemoryDeadEnds({
+      workspaceId,
+      markerTag: memoryDeadEndTagKey(key),
+      failed: [
+        {
+          userId,
+          workspaceId,
+          trust: 'derived',
+          documentCiphertext: sealed(failure.content.body),
+          index: failure.index,
+          observedAt: now,
+          validFrom: now,
+          validTo: failure.validTo
+        }
+      ]
+    });
+    expect(written.recorded).toHaveLength(1);
+    // Admitted to recall like any other procedure, which is the entire point of writing it down.
+    await expect(recall('the importer test')).resolves.toHaveLength(1);
+
+    const cleared = await store.recordMemoryDeadEnds({
+      workspaceId,
+      markerTag: memoryDeadEndTagKey(key),
+      passed: [memorySubjectKey(command, key)],
+      at: now
+    });
+    expect(cleared.retired).toEqual(written.recorded);
+    // Gone from recall, still on the row: "what was wrong with this last month" stays answerable.
+    await expect(recall('the importer test')).resolves.toEqual([]);
+    await expect(store.getMemoryItem(workspaceId, written.recorded[0]!)).resolves.toMatchObject({
+      status: 'superseded'
+    });
+  });
+
+  /**
+   * Two checks can name one command - one answered by a run athanor already watched succeed, one it
+   * ran again - and a caution written out of that turn would be contradicted by the same turn.
+   */
+  it('writes nothing about a command the same turn also watched pass', async () => {
+    const command = 'pnpm build';
+    const failure = deadEndFromCheck(
+      { label: 'it builds', command, cwd: '/srv', detail: 'exit 1 (expected 0): no such file' },
+      now,
+      key
+    );
+    await expect(
+      store.recordMemoryDeadEnds({
+        workspaceId,
+        markerTag: memoryDeadEndTagKey(key),
+        passed: [memorySubjectKey(command, key)],
+        failed: [
+          {
+            userId,
+            workspaceId,
+            trust: 'derived',
+            documentCiphertext: sealed(failure.content.body),
+            index: failure.index,
+            observedAt: now,
+            validFrom: now,
+            validTo: failure.validTo
+          }
+        ]
+      })
+    ).resolves.toEqual({ recorded: [], retired: [] });
+    await expect(recall('pnpm build')).resolves.toEqual([]);
+  });
+
+  /**
+   * A procedure written by the passing half carries no dead-end tag, so a later pass must leave it
+   * exactly where it is. Retiring it would delete the box's memory of how this project is built.
+   */
+  it('leaves the procedure for the same command standing when it retires the caution', async () => {
+    const command = 'pytest -q tests/importer';
+    const procedure = await addItem('procedure', {
+      title: 'the importer test passes',
+      subject: command,
+      body: `In /srv/importer, \`${command}\` succeeds.`
+    });
+    const failure = deadEndFromCheck(
+      { label: 'the importer test passes', command, cwd: '/srv/importer', detail: 'exit 1' },
+      now,
+      key
+    );
+    await store.recordMemoryDeadEnds({
+      workspaceId,
+      markerTag: memoryDeadEndTagKey(key),
+      failed: [
+        {
+          userId,
+          workspaceId,
+          trust: 'derived',
+          documentCiphertext: sealed(failure.content.body),
+          index: failure.index,
+          observedAt: now,
+          validFrom: now,
+          validTo: failure.validTo
+        }
+      ]
+    });
+    const cleared = await store.recordMemoryDeadEnds({
+      workspaceId,
+      markerTag: memoryDeadEndTagKey(key),
+      passed: [memorySubjectKey(command, key)],
+      at: now
+    });
+    expect(cleared.retired).not.toContain(procedure.id);
+    await expect(store.getMemoryItem(workspaceId, procedure.id)).resolves.toMatchObject({
+      status: 'active'
+    });
   });
 
   it('drops a procedure that has not been verified inside the staleness window', async () => {

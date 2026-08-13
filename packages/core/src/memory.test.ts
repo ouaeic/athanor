@@ -3,8 +3,14 @@ import {
   CONVERSATION_NAME_INDEX_STAMP,
   conversationNamePrefixTokens,
   isMemoryToken,
+  MEMORY_DEAD_END_TAG,
+  MEMORY_DEAD_END_TRUST_DAYS,
   MEMORY_EXCERPT_CHARS,
   MEMORY_FUZZY_SIMILARITY_THRESHOLD,
+  MEMORY_PROCEDURE_STALE_DAYS,
+  deadEndFromCheck,
+  memoryDeadEndTagKey,
+  memorySubjectKey,
   MEMORY_PACK_QUOTAS,
   MEMORY_RECALL_BUDGET_TOKENS,
   MEMORY_RECALL_QUOTAS,
@@ -453,6 +459,72 @@ describe('memory contradiction policy', () => {
     expect(isFunctionalMemoryPredicate('default_shell')).toBe(true);
     expect(isFunctionalMemoryPredicate('prefers')).toBe(false);
     expect(isFunctionalMemoryPredicate('not_a_predicate')).toBe(false);
+  });
+});
+
+describe('dead ends', () => {
+  const key = memoryIndexKey(Buffer.alloc(32, 3));
+  const observedAt = new Date('2026-08-12T09:00:00.000Z');
+  const command = 'pytest -q tests/importer';
+  const built = deadEndFromCheck(
+    {
+      label: 'the importer test passes',
+      command,
+      cwd: '/srv/importer',
+      detail: 'exit 1 (expected 0): AssertionError: expected 3 rows'
+    },
+    observedAt,
+    key
+  );
+
+  /**
+   * The sentence is the whole safety argument. A memory that says a command does not work will be
+   * read by a turn that could have made it work, so it says what was seen and when, and stops.
+   */
+  it('records one observation rather than a verdict on the command', () => {
+    expect(built.content.body).toContain('did not pass when the harness last ran it');
+    expect(built.content.body).toContain('AssertionError: expected 3 rows');
+    expect(built.content.body).toContain('Running it again is what settles whether');
+    // Nothing that reads as a standing property of the command or of the project.
+    expect(built.content.body).not.toMatch(/does not work|is broken|always fails|never/iu);
+  });
+
+  it('is trusted for two weeks where a procedure is trusted for six months', () => {
+    expect(built.validTo.getTime() - observedAt.getTime()).toBe(
+      MEMORY_DEAD_END_TRUST_DAYS * 86_400_000
+    );
+    expect(MEMORY_DEAD_END_TRUST_DAYS).toBeLessThan(MEMORY_PROCEDURE_STALE_DAYS);
+  });
+
+  /**
+   * The two halves have to meet on the same subject or nothing ever retires anything: a passing run
+   * keys its procedure on the bare command line, so this does too.
+   */
+  it('keys on the command exactly as a passing run does', () => {
+    expect(built.index.subjectKey).toBe(memorySubjectKey(command, key));
+  });
+
+  /**
+   * And the store, which holds no plaintext, has to be able to find these rows by that tag. If the
+   * two ever drifted apart, dead ends would still be written and nothing could ever take them back.
+   */
+  it('carries a tag the store can match without the key', () => {
+    expect(built.index.tagsHashed).toContain(memoryDeadEndTagKey(key));
+    // Kept whole by the tokenizer, so asking about something that failed does not summon all of
+    // them on the strength of one stemmed word.
+    expect(memoryLexemes(MEMORY_DEAD_END_TAG)).toEqual([MEMORY_DEAD_END_TAG]);
+    expect(planMemoryQuery('why did the deploy fail', key).tagTokens).not.toContain(
+      memoryDeadEndTagKey(key)
+    );
+  });
+
+  it('keeps a wall of output out of the pack', () => {
+    const noisy = deadEndFromCheck(
+      { label: 'build', command: 'make', cwd: '/srv', detail: 'exit 2: '.padEnd(9_000, 'x') },
+      observedAt,
+      key
+    );
+    expect(noisy.content.body.length).toBeLessThan(600);
   });
 });
 

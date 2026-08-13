@@ -3686,6 +3686,64 @@ export class DataStore {
     return { item, supersededIds };
   }
 
+  /**
+   * Both sides of what the harness watched an acceptance command do, written in one statement.
+   *
+   * A dead end is a procedure the harness saw fail, and the thing that refutes it is the same
+   * command later observed passing - so the write that would record a pass is the write that has to
+   * retire the caution, or the caution outlives the problem and starts arguing against work that
+   * would now succeed. Doing it here rather than in two calls is what makes that true even when the
+   * turn crashes between them: a pass never leaves a stale dead end standing, because there is no
+   * moment at which one has been recorded and the other has not.
+   *
+   * `passed` wins inside the turn as well as across turns. A command can reach both lists at once -
+   * two checks naming the same command, one answered by a run athanor already watched succeed and
+   * one it ran again - and the pass is the later evidence, so nothing is written for it.
+   *
+   * The subject is the command alone, exactly as a passing run keys it, so a command that fails in
+   * one directory and passes in another retires the caution about the first. That is the deliberate
+   * direction of the error: forgetting a warning costs a re-run, and keeping a wrong one costs the
+   * approach.
+   */
+  async recordMemoryDeadEnds(input: {
+    workspaceId: string;
+    /** Keyed `MEMORY_DEAD_END_TAG`; the only handle this store has on rows it cannot read. */
+    markerTag: string;
+    /** Keyed subjects of the commands the harness watched pass on this turn. */
+    passed?: readonly string[];
+    /** One per command it watched fail, already built and encrypted by the caller. */
+    failed?: readonly Omit<CreateMemoryItemInput, 'kind'>[];
+    at?: Date | string | null;
+  }): Promise<{ recorded: string[]; retired: string[] }> {
+    const passed = [...new Set(input.passed ?? [])];
+    const failed = (input.failed ?? []).filter(
+      (item) => item.index.subjectKey && !passed.includes(item.index.subjectKey)
+    );
+    if (passed.length === 0 && failed.length === 0) return { recorded: [], retired: [] };
+    return this.database.transaction(async (transaction) => {
+      const retired: string[] = [];
+      if (passed.length > 0) {
+        // Superseded rather than deleted, for the same reason a retired fact is: "what was wrong
+        // with this last month" stays answerable, and only `status='active'` reaches recall.
+        const result = await transaction.query<{ id: string }>(
+          `UPDATE mem.item SET status='superseded', valid_to=COALESCE($4::timestamptz,NOW()),
+                               retired_at=NOW(), updated_at=NOW()
+           WHERE workspace_id=$1 AND kind='procedure' AND status='active'
+             AND tags_hashed @> ARRAY[$2::text] AND subject_key = ANY($3::text[])
+           RETURNING id`,
+          [input.workspaceId, input.markerTag, passed, input.at ?? null]
+        );
+        retired.push(...result.rows.map((row) => row.id));
+      }
+      const recorded: string[] = [];
+      for (const item of failed) {
+        const written = await this.#insertMemoryItem(transaction, { ...item, kind: 'procedure' });
+        recorded.push(written.id);
+      }
+      return { recorded, retired };
+    });
+  }
+
   async getMemoryItem(workspaceId: string, id: string): Promise<MemoryItemRecord | null> {
     const result = await this.database.query(
       'SELECT * FROM mem.item WHERE id=$2 AND workspace_id=$1',

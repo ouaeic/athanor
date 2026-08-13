@@ -1,5 +1,5 @@
 /**
- * Forty-two owner-shaped requests, each with something machine-checkable to say.
+ * Forty-nine owner-shaped requests, each with something machine-checkable to say.
  *
  * They are grounded in two files: the operating contract in `apps/worker/src/context.ts`, which is
  * what the model is told it can do, and the catalogue in `apps/worker/src/tools.ts`, which is what
@@ -101,6 +101,131 @@ const overrunningAnswer = (characters = 140_000): string => {
   }
   return lines.join('\n');
 };
+
+/**
+ * The two documents the proof job goes through, and the reason it is two rather than one.
+ *
+ * The first is the finished phase: it is long because the verbatim tail a compaction is asked to
+ * keep is half of its own trigger, so nothing is condensed at all until the conversation behind it
+ * is larger than that, and at the size these logs come back it takes about this many pages to get
+ * there. The second is the work that follows the phase, and it is what makes the pair mean
+ * anything: a compaction only ever pays for itself over the steps that come after it, so an arm
+ * that condensed with nothing left to do would price the mechanism at its cost and none of its
+ * return. Six is enough to show the sign and few enough that the arm which never condenses stays
+ * under the budget trigger and really does condense nothing.
+ */
+const PROOF_PAGES = 30;
+const PROOF_INSERT_PAGES = 6;
+
+/**
+ * What one page render prints: a line per glyph run, at the size this actually comes back.
+ *
+ * Deliberately a few thousand characters rather than the tens of thousands the log fixture uses,
+ * and that is the whole difference between this pair and the long fixture below. A result smaller
+ * than the older-output floor is a result that floor can never cut, so the cheap mechanism has
+ * nothing to take here however full the window gets, and what the cached share measures is the
+ * expensive mechanism on its own. Distinct per page for the same reason the log batches are: a
+ * window of identical results would compress the same whatever the loop did with it.
+ */
+const pageProof = (page: number, runs = 40): string =>
+  Array.from(
+    { length: runs },
+    (_, run) =>
+      `page=${page} run=${run} font=Source-${(page * 7 + run) % 17} type=Type1C emb=yes subset=yes glyphs=${(page * 31 + run * 17) % 997} box=${72 + run},${96 + page},${540 - run},${720 - page} ink=${((page * 13 + run * 3) % 100) / 100}`
+  ).join('\n');
+
+/** The one request both halves of the proof pair are the answer to, so the rows are comparable. */
+const PROOF_REQUEST =
+  'Render every page of workspace/brochure.pdf and then workspace/insert.pdf, and check the fonts are embedded in both before I send them.';
+
+const proofRunner = {
+  files: {
+    'workspace/brochure.pdf': 'Clause 7: either party may terminate with 60 days written notice.',
+    'workspace/insert.pdf': 'Rates are held at 4.25 per cent for the current term.'
+  },
+  stdout: Array.from({ length: PROOF_PAGES + PROOF_INSERT_PAGES }, (_, page) => pageProof(page))
+};
+
+/** One page of one document, or the sentence the contract asks for between two of them. */
+type ProofMove = { readonly document: string; readonly page: number } | 'phase-done';
+
+const proofMoves = (declaresTheFinishedPhase: boolean): readonly ProofMove[] => [
+  ...Array.from({ length: PROOF_PAGES }, (_, index) => ({
+    document: 'brochure.pdf',
+    page: index + 1
+  })),
+  ...(declaresTheFinishedPhase ? (['phase-done'] as const) : []),
+  ...Array.from({ length: PROOF_INSERT_PAGES }, (_, index) => ({
+    document: 'insert.pdf',
+    page: index + 1
+  }))
+];
+
+/**
+ * The proof job, done twice: once saying when the first document is finished and once never
+ * saying it.
+ *
+ * One script rather than two, because the pair is only worth reading if the arms are identical
+ * everywhere else. Two copies would drift on the first edit to either, and the difference between
+ * the rows would stop being the price of a compaction. The call ids are keyed on the document and
+ * the page rather than on the step, so the finish cites the same evidence in both arms even though
+ * one of them has an extra step in the middle.
+ */
+const proofRun =
+  (options: { declaresTheFinishedPhase: boolean }) =>
+  ({ step, summarising }: { step: number; summarising: boolean }): ModelTurn => {
+    // The brief this turn will keep re-reading. It says nothing about which procedure is open, so
+    // the assertion that the brief names it can only be satisfied by the notice the compaction
+    // writes for itself - and writing one at all is what stops this measuring the deterministic
+    // fallback, which is what a script that answered a compaction with a tool call would measure.
+    if (summarising)
+      return {
+        text: 'The brochure is rendered page by page and every font table read back so far reports every face embedded and subset. No page failed to render and none was skipped; the insert is still to do.'
+      };
+    if (step === 0)
+      return {
+        calls: [{ id: 'call-1', name: 'skill', args: { action: 'view', id: 'render-proof' } }]
+      };
+    const move = proofMoves(options.declaresTheFinishedPhase)[step - 1];
+    if (move === undefined)
+      return {
+        text: 'Both documents render and every font in them is embedded, so they are safe to send.',
+        calls: finishCall('call-finish', {
+          summary: 'Rendered both documents and read back every font table.',
+          verification: evidence(
+            `call-insert-${PROOF_INSERT_PAGES}`,
+            'The last font table reports every face embedded'
+          )
+        })
+      };
+    if (move === 'phase-done')
+      return {
+        calls: [
+          {
+            id: 'call-compaction',
+            name: 'compact_context',
+            args: {
+              finishedPhase:
+                'The brochure is rendered and every font table in it is read back, all faces embedded. Only the insert is left.'
+            }
+          }
+        ]
+      };
+    return {
+      text: `${move.document} page ${move.page} rendered and its font table read back; every face on it is embedded.`,
+      calls: [
+        {
+          id: `call-${move.document === 'insert.pdf' ? 'insert' : 'brochure'}-${move.page}`,
+          name: 'shell',
+          args: {
+            executable: 'pdffonts',
+            args: ['-f', String(move.page), '-l', String(move.page), move.document],
+            cwd: 'workspace'
+          }
+        }
+      ]
+    };
+  };
 
 /** A workspace with a couple of ordinary things in it, which most fixtures can share. */
 const workspaceFiles = {
@@ -941,6 +1066,126 @@ export const fixtures: readonly Fixture[] = [
       askedOwner: true,
       status: 'awaiting_user',
       untrusted: true
+    }
+  },
+
+  {
+    id: 'research-a-specialist-reads-and-the-turn-inherits-it',
+    shape: 'research',
+    request:
+      'Compare the refund terms at https://vendor-a.example/terms and https://vendor-b.example/terms, and separately check whether either of them dates its own page.',
+    why: 'The delegated path, priced and its two floors held. Priced: the lead spends two calls and the two missions behind one of them spend four more, so a delegate is one step of the turn and an open-ended bill underneath it - read delegated against total, because the same six is reached by a turn that thought for six steps and by this one. First floor: a specialist reads with the lead’s own tools and none of the lead’s window, and its report is a model’s rendering of pages nobody on this computer wrote - so the turn has to come out marked as having read them. Quarantine that hands its findings back unmarked is worse than none, because the lead has been given a reason to trust it, and before this the whole path was a hole straight through the taint model. Second floor: a specialist is read-only and has no way to ask the owner for anything, so the mission that reaches for a command is refused rather than parked - the workspace runs nothing, and that zero is the assertion. It stops being zero the moment the allowed set gains a member.',
+    runner: {
+      pages: {
+        'https://vendor-a.example/terms':
+          'Refunds are issued within 14 days of the request, less a 5 per cent handling charge.',
+        'https://vendor-b.example/terms':
+          'Refunds are issued within 30 days of the request, with no handling charge.'
+      }
+    },
+    model: ({ delegated, messages, step }) => {
+      if (delegated) {
+        // Read off whether this specialist has been answered yet rather than off the model call
+        // index, which counts every mission at once: two are in flight here and the provider
+        // answers them in whichever order it likes, so an index-driven script would answer one
+        // mission's second step with the other mission's first.
+        const answered = messages.some(
+          (content) => content.startsWith('Denied:') || content.includes('handling charge')
+        );
+        const reader = messages.some((content) => content.includes('the two refund pages'));
+        if (!answered)
+          return reader
+            ? {
+                calls: [
+                  {
+                    id: 'mission-read',
+                    name: 'parallel_web_read',
+                    args: {
+                      urls: ['https://vendor-a.example/terms', 'https://vendor-b.example/terms'],
+                      maxCharactersPerPage: 20_000
+                    }
+                  }
+                ]
+              }
+            : {
+                // Nothing a specialist is allowed to do, asked for in the most ordinary way there
+                // is. It has to come back as a refusal it can act on rather than as a command the
+                // workspace ran on the lead's behalf with none of the lead's gates in front of it.
+                calls: [
+                  {
+                    id: 'mission-shell',
+                    name: 'shell',
+                    args: { executable: '/bin/date', args: ['-u'], cwd: 'workspace' }
+                  }
+                ]
+              };
+        return {
+          text: JSON.stringify(
+            reader
+              ? {
+                  answer:
+                    'Vendor A refunds in 14 days less a 5 per cent handling charge; vendor B refunds in 30 days with no charge.',
+                  evidence: [
+                    {
+                      claim: 'Vendor A charges a handling fee',
+                      source: 'https://vendor-a.example/terms',
+                      quotedSpan: 'less a 5 per cent handling charge'
+                    }
+                  ],
+                  couldNotEstablish: ['whether either figure is current']
+                }
+              : {
+                  answer:
+                    'I could not date either page: I am read-only and the command I tried was refused.',
+                  evidence: [],
+                  couldNotEstablish: ['the publication date of either page']
+                }
+          )
+        };
+      }
+      return step === 0
+        ? {
+            calls: [
+              {
+                id: 'call-1',
+                name: 'delegate',
+                args: {
+                  missions: [
+                    {
+                      name: 'refund-terms',
+                      instruction:
+                        'Read the two refund pages the user named and say where their terms disagree.',
+                      context:
+                        'https://vendor-a.example/terms and https://vendor-b.example/terms, both named by the user.'
+                    },
+                    {
+                      name: 'page-dates',
+                      instruction: 'Establish when either of those pages was last dated.',
+                      context: 'The user named both addresses.'
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        : {
+            text: 'They disagree on both counts: vendor A refunds in 14 days less a 5 per cent handling charge, vendor B in 30 days with none. Neither page dates itself.',
+            calls: finishCall('call-2', {
+              summary: 'Compared the two refund pages through delegated readers.',
+              verification: evidence('call-1', 'The specialists reported both refund windows')
+            })
+          };
+    },
+    expect: {
+      modelCalls: 6,
+      delegatedCalls: 4,
+      tools: ['delegate'],
+      proposed: ['delegate', 'finish'],
+      commandsRun: 0,
+      status: 'completed',
+      verification: 'verified',
+      untrusted: true,
+      holds: []
     }
   },
 
@@ -2068,13 +2313,77 @@ export const fixtures: readonly Fixture[] = [
       replies: 3
     }
   },
+  {
+    id: 'long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly',
+    shape: 'long',
+    request: PROOF_REQUEST,
+    why: 'What saying "this phase is finished" costs, and what it must carry across. Read it against long-a-finished-phase-is-never-declared, which is the identical job with that one sentence never said, so the whole difference between the rows is compaction: two model calls - the step that asks and the tool-free call that writes the brief - and, measured on a 128,000-token window, 19,679 more prompt tokens rather than fewer. It condensed five messages and freed 3,031 tokens of a 39,039-token window, because the verbatim tail the target asks to keep is 35% of the budget whether the agent says a phase is over or not, so there is almost nothing left below it to take. What it did buy is a 2,668-token lower peak prompt and two points of cached prefix given up for it. That is the number this pair exists to commit; a change to it is a decision about that target, not a build to fix. Then the part nobody could see at all. A procedure is loaded into the window as an ordinary tool result, so a compaction condenses it exactly like the render logs beside it, and the agent goes on working to instructions it can no longer read with nothing anywhere saying so. It is the worst shape a silent loss takes: the model still believes it is following a vetted procedure and what it is following is its own memory of one. So the brief - the only record a condensed turn keeps reading - has to name every procedure the compaction took. The name and not the body: reprinting the procedure into a record re-read on every later step would cost more than the compaction saved, and reopening it is one call. The summariser here is deliberately given nothing to say about which procedure was open, so this can only come out green by the mechanism putting it there.',
+    runner: proofRunner,
+    maxSteps: PROOF_PAGES + PROOF_INSERT_PAGES + 6,
+    maxCredits: 500,
+    model: proofRun({ declaresTheFinishedPhase: true }),
+    expect: {
+      status: 'completed',
+      verification: 'verified',
+      toolsInclude: ['skill'],
+      holds: [],
+      /*
+       * The claim, in four parts.
+       *
+       * A compaction has to have actually run and left a section behind - a notice appended to a
+       * brief nobody wrote is not a notice - and that section has to name the one procedure this
+       * turn opened. The whole list rather than a floor, because naming a skill still in the window
+       * would send the model to spend a call and a window reopening something it is already holding.
+       *
+       * The owner's sentence survives it byte for byte, which is what fixes the brief at one
+       * position for the life of the task and is why the rewrite below costs one step and not every
+       * step after it.
+       *
+       * And the cached share, which is the whole reason a long job is worth condensing at all. This
+       * turn's tool results are small enough that the older-output floor never has to cut one, so
+       * the only thing that moves the front of the prompt all run is the compaction itself: one
+       * rewrite, paid once. A floor of 90 leaves room for that one step and none for a mechanism
+       * that has started rewriting the window on steps it is not condensing on.
+       */
+      minCompactions: 1,
+      minBriefSections: 1,
+      // The brief this row is priced on has to be one a model wrote. A summariser that stops being
+      // answered degrades to the deterministic fallback silently, and the whole delta above would
+      // then be the price of a different mechanism than the one named.
+      minModelWrittenBriefs: 1,
+      skillsNamedInBrief: ['render-proof'],
+      ownerMessageIntact: true,
+      minCachePrefix: 90
+    }
+  },
+  {
+    id: 'long-a-finished-phase-is-never-declared',
+    shape: 'long',
+    request: PROOF_REQUEST,
+    why: 'The same job, the same pages, the same procedure open, and the one sentence the contract asks for never said - so nothing is condensed and the whole run is carried verbatim to the end. It is the control the fixture above is priced against: subtract the rows and what is left is a compaction, on a job whose tool results are deliberately small enough that the older-output floor never cuts one, so nothing else in the window is moving while the measurement is taken. Zero compactions is the assertion that makes the pair a pair, and it is a real bound rather than a restatement: this arm ends about six thousand tokens under the budget trigger, so an arm that condensed anyway would be doing the same work as the other one and the difference between the rows would be reported as free. If the page count here ever grows, check this stays zero before believing the delta.',
+    runner: proofRunner,
+    maxSteps: PROOF_PAGES + PROOF_INSERT_PAGES + 6,
+    maxCredits: 500,
+    model: proofRun({ declaresTheFinishedPhase: false }),
+    expect: {
+      status: 'completed',
+      verification: 'verified',
+      toolsInclude: ['skill'],
+      holds: [],
+      compactions: 0,
+      skillsNamedInBrief: [],
+      ownerMessageIntact: true,
+      minCachePrefix: 90
+    }
+  },
+
   /* --------------------------------------------- a job long enough that the window decides its cost */
   {
     id: 'long-finished-phases-condense-rather-than-shred',
     shape: 'long',
     request:
       'Go through every batch in workspace/logs, one at a time, and tell me which entries changed.',
-    why: 'The only fixture whose cost is decided by how the window is held down rather than by which gate fired, and the shape every unattended overnight job has. Thirty-two batches too large to keep are thirty-two chances to choose between two mechanisms: condense the finished part into the durable brief, which costs one summarising call and leaves everything after it verbatim, or cut the middle out of every older tool result on every step, which costs nothing visible and quietly re-bills the whole prompt each time. The agent here does what the contract asks and says when a phase is over, three times. On both shipped defaults every one of those is answered with a refusal to condense anything - the verbatim tail the target asks to keep is larger than the whole conversation - so the window is held down by cutting results to the two-thousand-character floor instead, and the owner pays the write price on the lot. Measured against the same run on a window where the target does fit: 3,683,938 prompt tokens becomes 2,670,814, and the largest single prompt 173,241 becomes 108,160.',
+    why: 'The extreme of the shape every unattended overnight job has, and the one place both window mechanisms run at once. Thirty-two batches too large to keep are thirty-two chances to choose between them: condense the finished part into the durable brief, which costs one summarising call and leaves everything after it verbatim, or cut the middle out of every older tool result on every step, which costs nothing visible and quietly re-bills the whole prompt each time. The agent does what the contract asks and says when a phase is over, three times, and all three now condense - they used to be refused outright, because the verbatim tail the target asked to keep was larger than the whole conversation, and capping the trigger in absolute tokens is what fixed it. What this row still reports is the other mechanism, unopposed: these results are far larger than the older-output floor, so the floor walks down anyway and re-cuts every one of them each time it moves. Read the cached share against long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly, which condenses the same way with results small enough that the floor never has to cut one: 64 per cent here against 94 there, on the same mechanism, decided by nothing but the size of what the tools returned.',
     contextTokens: 1_000_000,
     maxSteps: 44,
     // Forty-odd steps against the default fifty credits would end this turn on the compute ceiling
@@ -2151,6 +2460,11 @@ export const fixtures: readonly Fixture[] = [
        */
       minCompactions: 1,
       minBriefSections: 1,
+      // And that a model wrote them. Every number in this row is the price of condensing, and
+      // `compactContext` answers a summariser it cannot parse with a deterministic summary and
+      // reports success - which is what this suite measured for its whole life before the stub
+      // learnt to answer a request that did not ask to be streamed.
+      minModelWrittenBriefs: 3,
       ownerMessageIntact: true,
       minToolResultFloor: 2_500,
       minCachePrefix: 60

@@ -842,7 +842,18 @@ describe('the size of the catalogue the model is sent', () => {
     // money to find out are declared there: which containers arrive from a phone and are converted
     // rather than refused, and that a reading is bounded at ninety minutes and resumes by second
     // rather than failing on a long file. Measured at 55,107 against it.
-    expect(bytes).toBeLessThan(55_300);
+    //
+    // Then raised from 55,300 to 56,100 for `set_acceptance`'s render clause: 712 bytes, 590 of it
+    // the clause and 122 the sentence on the tool that is the only place the model finds out it is
+    // there. It is a capability by this test's own definition and the substitution test is the
+    // sharpest it has been - every visual deliverable this product leads with was proved by being
+    // bigger than four kilobytes, and a deck with text running off slide four is comfortably past
+    // that, so the only witness to how the thing looked was the model that made it. No wording
+    // could have fixed that: the measurement is a render the harness performs at finish
+    // (services/workspace-runner/src/render-proof.ts), and a field is the only way to ask for one.
+    // The bytes are in the two things a model cannot discover by trying - what is measured, and
+    // that text pushed entirely off a page is not among it. Measured at 55,937 against it.
+    expect(bytes).toBeLessThan(56_100);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
     // union of what twenty-four actions across mail, calendar and repositories accept. Those are

@@ -9,12 +9,22 @@ completion nag — plus a fallback plan, a baseline refusal, a repetition watch 
 continuer. Each of them was right about the failure it saw. None of them can be removed, because
 nobody could say what removing one would cost.
 
-`evals/` answers that. Forty-two owner-shaped requests run against the real agent loop with a
+`evals/` answers that. Forty-nine owner-shaped requests run against the real agent loop with a
 stubbed model, a stubbed workspace runner and a stubbed media provider, and every one reports what
 it cost: how many model calls, how many prompt tokens, how much of each request repeated the one
 before it byte for byte, how many commands the workspace ran, how many generations the provider was
 charged for and on which route, and which gates fired. Delete a gate, run the suite, read the
 difference. That is the whole point.
+
+Not every model call in a turn is a step of it. Two of them are somebody else's: the tool-free call
+a compaction makes to write its brief, and every step a delegated specialist takes inside its own
+window. Both are billed, so both are in the model-call count; neither is a link in the chain the
+cached share is measured along, and neither is asked for by the model whose `proposed` list a
+fixture asserts on. They are told apart structurally rather than by their wording - a compaction's
+request carries no tool catalogue at all, and a specialist's carries one without `finish`, which is
+the tool that ends a turn and the one thing no run withdraws from the lead. `delegatedCalls` splits
+the specialists back out, because the same total is reached by a turn that thought for six steps and
+by a turn that thought for two and sent two missions.
 
 ## Running it
 
@@ -79,13 +89,29 @@ for, and the model id each of them named on the wire; where the task ended up (`
 approve something; whether untrusted content was recorded as entering the turn; whether a plan
 nobody asked for was written; how many separate replies the owner sees; which gates fired, in order;
 the least share of a request that may repeat the one before it; how many times the window was
-condensed and how many sections the running brief ended up carrying; whether the owner's own words
-survived in the last window byte for byte; and the shortest a squeezed tool result may be left.
+condensed — as a floor, or as an exact count for the arm of a pair that must condense nothing — and
+how many sections the running brief ended up carrying, and how many of those briefs a model actually
+wrote; which of the procedures the turn opened the brief names as no longer in the window; how many
+of its model calls a delegated specialist spent; whether the owner's own words survived in the last
+window byte for byte; and the shortest a squeezed tool result may be left.
+
+The brief's authorship is asserted wherever a compaction is priced, and it is there because of how
+this suite was once wrong about it. `compactContext` answers a summariser it cannot read with a
+deterministic summary and reports the compaction as a success, so the difference between the two
+shows up as a few per cent on every number and nowhere as a failure. Reading the source off the
+compaction's own record is what makes a summariser that stops being answered a red fixture rather
+than a quiet retune of the baseline.
 
 The one place the suite is coupled to text is recognising _which_ gate fired, because the loop
 pushes its holds back as prose and exports no enum for them. The markers live in one table in
 `evals/harness.ts`. A fixture never asserts on a sentence — only on which gate and what it cost — so
 a reworded hold fails loudly at the marker rather than silently reporting a green run.
+
+Naming a condensed procedure is the one assertion that reads the brief's own text, and it reads an
+identifier rather than a sentence: the skill's name, which is what the model needs in order to
+reopen it, matched against the names the fixture's own script asked for. The fixture that makes the
+claim gives its summariser nothing to say about which procedure was open, so the name can only be
+there because the compaction put it there.
 
 The media assertion is deliberately on the far side of the wire. The unit tests around generated
 media hand a resolved route in and assert on the value they handed in, which stays green whether or
@@ -104,16 +130,41 @@ is decided by how its window is held down rather than by which gate fired.
 They come in deliberate pairs — the same work done two ways — so the cost of a gate is the
 difference between two rows rather than an absolute number nobody can interpret.
 
-`long-finished-phases-condense-rather-than-shred` is the exception and fails on purpose. Thirty-two
+The three mechanisms that decide a long job's bill are covered where they are decided, not where
+they are described. Delegation, on `research-a-specialist-reads-and-the-turn-inherits-it`: a mission
+is one step of the turn and an open-ended bill underneath it, and the two floors that hold it are
+that a specialist's reading crosses back into the turn as untrusted content and that its reach for a
+command runs nothing. Compaction, as a pair of proof jobs which differ only in whether the agent
+says the first document is finished. Measured on a 128,000-token window, saying so costs two model
+calls and 19,679 more prompt tokens rather than fewer, and returns a 2,668-token lower peak prompt:
+the verbatim tail the target asks to keep is 35% of the budget whether or not the agent has declared
+a phase over, so an explicit compaction fires with almost nothing left below it to take. That is a
+number to argue with, and it is now committed. And skills, on the same pair: an opened procedure is
+an ordinary tool result, so a compaction condenses it like anything else, and the brief has to name
+what it took or the agent works on to a procedure it can no longer read with nothing saying so.
+
+The mechanisms judged not worth a fixture, so that the next person does not read their absence as an
+oversight. `memory_recall`, `schedule`, `connector_list`/`connector_action`, `desktop_*`,
+`browser_action` and `coding_agent` are all single tool calls whose result the loop stores and hands
+back; what is interesting about each of them is inside the tool, where its own tests are, and a
+fixture would assert that a scripted call produced a scripted result. Two of them additionally
+cannot say anything here: the connector tools are withdrawn from the catalogue when nothing is
+connected, which is the state every fixture runs in, and `coding_agent` is a sub-agent whose whole
+cost is on the other side of a seam this rig does not stub. The three above are different in kind
+because none of them is one call: a delegation spends a model, a compaction rewrites the window, and
+a skill puts thousands of characters into it that every later step then carries.
+
+`long-finished-phases-condense-rather-than-shred` is the extreme of the same shape. Thirty-two
 batches of log output on a million-token release — the window both shipped defaults declare — with
-the agent saying a phase is finished three times, as the contract asks it to. Every one of those is
-answered with a refusal to condense anything, because the verbatim tail the compaction target asks
-to keep is larger than the whole conversation; so the window is held down by cutting older tool
-results to the two-thousand-character floor instead, and the owner pays the write price on the
-prompt again on every step it moves. Run against a window where the same target does fit, the same
-job costs 2,670,814 prompt tokens instead of 3,683,938, and its largest single prompt 108,160
-instead of 173,241. The fixture goes green when compaction can run on the shipped defaults; until
-then `pnpm eval` exits non-zero on this one row, and that is the number it is reporting.
+the agent saying a phase is finished three times, as the contract asks it to. It used to fail on
+purpose: every one of those was answered with a refusal to condense anything, because the verbatim
+tail the compaction target asked to keep was larger than the whole conversation, so the window was
+held down by cutting older tool results to the two-thousand-character floor instead. Capping the
+trigger in absolute tokens fixed that, and all three now condense. What the row still reports is the
+other half of that story: its tool results are far larger than the older-output floor, so the floor
+walks down anyway and re-cuts every one of them each time it moves, and the cached share sits at 64%
+where the proof pair above — same mechanism, results small enough that the floor never has to cut
+one — reads 94%. Thirty points of a long job's bill, decided by the size of what its tools return.
 
 ## What it does not do
 

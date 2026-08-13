@@ -674,18 +674,23 @@ else
   );
 
 /*
- * Numbers the client holds a second copy of, against the file that owns them.
+ * Values held in two places on purpose, against the file that owns them.
  *
- * Each copy is deliberate and says so where it is written: the client is on the far side of a
- * 150 kB bundle gate, and importing any of these would drag a schema library or `node:fs` into the
- * first paint to evaluate arithmetic. What was missing is the thing that makes a copy safe. Both
- * sides have tests, and they assert different examples - the disk floor is checked at 400 GiB on
- * one side and 500 GiB on the other - so a changed formula fails neither.
+ * Every copy here is deliberate and says so where it is written, and the reason is always that the
+ * two sides cannot reach each other: three are in the web client, which is behind a 150 kB bundle
+ * gate that importing a schema library or `node:fs` would blow, and one is across the worker and
+ * the runner, which are separate processes. What was missing is the thing that makes a copy safe.
+ * Both sides have tests, and they assert different examples - the disk floor is checked at 400 GiB
+ * on one side and 500 GiB on the other - so a changed formula fails neither.
  *
- * The drift is not cosmetic. `hostStorageFloorBytes` is what the runner refuses a write by and
- * what the interface draws the disk bar from, so a copy left behind puts the owner in front of a
- * bar with room on it while every write is refused: the screen asserting the opposite of what the
- * machine has already decided.
+ * The drift is never cosmetic, and each pair fails its own way. `hostStorageFloorBytes` is what the
+ * runner refuses a write by and what the interface draws the disk bar from, so a copy left behind
+ * puts the owner in front of a bar with room on it while every write is refused: the screen
+ * asserting the opposite of what the machine has already decided. `RENDERABLE_EXTENSIONS` decides
+ * on the worker side which files a model may claim a render proof on and on the runner side which
+ * it will actually measure, so drift either offers a clause that is refused at the finish with a
+ * 415 - the late refusal the worker-side list exists to prevent - or hides a format the runner
+ * could have proved all along.
  *
  * Compared as source text, because that is what has to match. Anything cleverer would need to
  * import one side, and the whole reason there are two is that importing is what nobody can do.
@@ -710,10 +715,20 @@ const copiedConstants = [
     owner: 'packages/contracts/src/index.ts',
     copy: 'apps/web/src/usage-model.ts',
     find: /MAX_TASK_SPEND_USD = ([\d_]+)/
+  },
+  {
+    what: 'the formats a render proof is offered on',
+    owner: 'services/workspace-runner/src/render-proof.ts',
+    copy: 'apps/worker/src/acceptance.ts',
+    find: /RENDERABLE_EXTENSIONS[^=]*= new Set\(\[([\s\S]*?)\]\)/,
+    // The runner works in the extensions `path.extname` hands it and the worker in what it splits
+    // off a name itself, so one side is dotted and the other is not. That difference is spelling;
+    // the set is the fact, so the leading dot comes off before the comparison.
+    normalise: (body) => body.replace(/\./g, '')
   }
 ];
 const drifted = [];
-for (const { what, owner, copy, find } of copiedConstants) {
+for (const { what, owner, copy, find, normalise = (value) => value } of copiedConstants) {
   const here = read(owner).match(find);
   const there = read(copy).match(find);
   // A pattern that stops matching is the failure this check exists to prevent, wearing the costume
@@ -722,13 +737,15 @@ for (const { what, owner, copy, find } of copiedConstants) {
     drifted.push(
       `${what} could not be read from ${!here ? owner : copy}; the comparison is no longer running`
     );
-  else if (here[1].replace(/\s+/g, ' ').trim() !== there[1].replace(/\s+/g, ' ').trim())
+  else if (
+    normalise(here[1]).replace(/\s+/g, '').trim() !== normalise(there[1]).replace(/\s+/g, '').trim()
+  )
     drifted.push(`${what} is "${here[1].trim()}" in ${owner} and "${there[1].trim()}" in ${copy}`);
 }
 if (drifted.length) for (const message of drifted) fail(message);
 else
   say(
-    `Copied constants: ${copiedConstants.length} the client holds a second copy of still match the file that owns them.`
+    `Copied constants: ${copiedConstants.length} held in two places still match the file that owns them.`
   );
 
 if (failures.length > 0) {

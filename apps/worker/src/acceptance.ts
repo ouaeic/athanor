@@ -32,6 +32,48 @@ export interface AcceptanceCommandCheck {
   readonly timeoutSeconds: number;
 }
 
+/**
+ * What the harness measures on the pages of a document, rather than on the bytes of a file.
+ *
+ * A byte count is the whole vocabulary an artifact check had, and every visual deliverable this
+ * product leads with - the deck that must not overflow its slide, the CV that must stay one page -
+ * was proved by being bigger than four kilobytes. A deck with text spilling off slide four passes
+ * that comfortably, so the only witness to how it looks was the model that made it.
+ *
+ * Two measurements, chosen because they are the failures that are both common in a generated
+ * document and provable from the render without anything looking at it: how many pages it comes to,
+ * and whether any text was cut off at the edge of its page. The runner renders the file as it
+ * stands at the moment finish is called - the .pptx itself, not a proof PDF from earlier in the
+ * turn - so a stale render cannot pass this.
+ */
+export interface AcceptanceRenderClause {
+  /** The exact page count the job asked for. Absent when nobody asked for one. */
+  readonly expectPages?: number;
+  /** How far inside the page edge text has to stay; the edge itself by default. */
+  readonly marginPoints: number;
+}
+
+/**
+ * Every extension that has a rendered page at all.
+ *
+ * The runner is the authority and refuses anything it cannot render, in its own words. This list
+ * exists so the refusal arrives when the model declares the check rather than at finish, which is
+ * the difference between a correction that costs a sentence and one that costs the whole turn.
+ */
+const RENDERABLE_EXTENSIONS = new Set([
+  'pdf',
+  'docx',
+  'pptx',
+  'xlsx',
+  'odt',
+  'odp',
+  'ods',
+  'doc',
+  'ppt',
+  'xls',
+  'rtf'
+]);
+
 /** A file that must exist, and optionally be at least this big, when the turn claims to be done. */
 export interface AcceptanceArtifactCheck {
   readonly id: string;
@@ -39,6 +81,8 @@ export interface AcceptanceArtifactCheck {
   readonly label: string;
   readonly path: string;
   readonly minBytes: number;
+  /** Present when the file is a document and the claim is about its pages, not its size. */
+  readonly render?: AcceptanceRenderClause;
 }
 
 export type AcceptanceCheck = AcceptanceCommandCheck | AcceptanceArtifactCheck;
@@ -176,6 +220,47 @@ const normalisedCwd = (value: unknown): string => {
 
 const checkId = (index: number, kind: string): string => `${kind}-${index + 1}`;
 
+/** The largest page count worth naming; past it the number is a mistake rather than a document. */
+const MAX_EXPECTED_PAGES = 5_000;
+/** A margin wider than this is most of a slide, so it is a typo rather than a layout. */
+const MAX_MARGIN_POINTS = 200;
+
+/**
+ * Reads a render clause, or says why this file cannot have one.
+ *
+ * A clause with neither field is still worth declaring and is accepted: it says the file renders,
+ * that nothing on it was cut off at an edge, and that no page of it came out blank, which is three
+ * facts a byte count does not carry.
+ */
+const parseRenderClause = (
+  value: unknown,
+  filePath: string
+): { ok: true; render?: AcceptanceRenderClause } | { ok: false; reason: string } => {
+  if (value === undefined || value === null) return { ok: true };
+  if (typeof value !== 'object' || Array.isArray(value))
+    return { ok: false, reason: 'render must be an object.' };
+  const extension = filePath.split('.').pop()?.toLowerCase() ?? '';
+  if (!filePath.includes('.') || !RENDERABLE_EXTENSIONS.has(extension))
+    return {
+      ok: false,
+      reason: `${filePath} has no rendered page, so there is nothing on it to measure. Drop render, or name the PDF or Office document you produce from it.`
+    };
+  const record = value as Record<string, unknown>;
+  const pages = record.expectPages;
+  if (pages !== undefined && (!Number.isInteger(pages) || Number(pages) < 1))
+    return { ok: false, reason: 'render.expectPages must be a whole number of pages, at least 1.' };
+  const margin = Number(record.marginPoints ?? 0);
+  if (!Number.isFinite(margin) || margin < 0)
+    return { ok: false, reason: 'render.marginPoints must be a distance in points, or left out.' };
+  return {
+    ok: true,
+    render: {
+      ...(pages === undefined ? {} : { expectPages: Math.min(MAX_EXPECTED_PAGES, Number(pages)) }),
+      marginPoints: Math.min(MAX_MARGIN_POINTS, margin)
+    }
+  };
+};
+
 /**
  * Reads the model's declaration into checks the harness can run, or says exactly what is wrong.
  *
@@ -229,14 +314,17 @@ export const parseAcceptanceChecks = (
       continue;
     }
     if (kind === 'artifact') {
-      const path = textValue(record.path).trim();
+      const path = textValue(record.path).trim().slice(0, 400);
       if (!path) return { ok: false, reason: `Check ${index + 1} needs the path it expects.` };
+      const render = parseRenderClause(record.render, path);
+      if (!render.ok) return { ok: false, reason: `Check ${index + 1}: ${render.reason}` };
       checks.push({
         id: checkId(index, 'check'),
         kind: 'artifact',
         label,
-        path: path.slice(0, 400),
-        minBytes: Math.max(1, Math.trunc(Number(record.minBytes)) || 1)
+        path,
+        minBytes: Math.max(1, Math.trunc(Number(record.minBytes)) || 1),
+        ...(render.render ? { render: render.render } : {})
       });
       continue;
     }
@@ -299,12 +387,31 @@ export const acceptanceAlreadyObserved = (
   };
 };
 
+/**
+ * What a render clause promises, in the words the owner reads it in.
+ *
+ * Deliberately says what was measured rather than that it was measured: "no text past the page
+ * edge" is a claim this computer can stand behind from the render, and "it looks right" is not.
+ */
+export const describeRenderClause = (render: AcceptanceRenderClause): string =>
+  [
+    render.expectPages === undefined
+      ? 'renders'
+      : `renders as exactly ${render.expectPages} page${render.expectPages === 1 ? '' : 's'}`,
+    render.marginPoints > 0
+      ? `with every word inside a ${render.marginPoints}pt margin`
+      : 'with no text cut off at a page edge',
+    'and no page blank'
+  ].join(' ');
+
 export const describeAcceptanceCheck = (check: AcceptanceCheck): string =>
   check.kind === 'command'
     ? `${check.id} (${check.label}): ${[check.executable, ...check.args].join(' ')}${
         check.expectStdoutContains ? ` — stdout must contain "${check.expectStdoutContains}"` : ''
       }`
-    : `${check.id} (${check.label}): ${check.path} exists and is at least ${check.minBytes} bytes`;
+    : `${check.id} (${check.label}): ${check.path} exists and is at least ${check.minBytes} bytes${
+        check.render ? `, and ${describeRenderClause(check.render)}` : ''
+      }`;
 
 /** What the window is told after a declaration, so the model knows what it will be held to. */
 export const acceptanceAcceptedResult = (record: AcceptanceRecord): string =>

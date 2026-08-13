@@ -33,6 +33,7 @@ import {
 } from './images.js';
 import { commandLimits, resolveCommandLimiter } from './limits.js';
 import { ProcessManager } from './processes.js';
+import { findRenderTools, proveRender, RENDER_SOURCE_MAX_BYTES } from './render-proof.js';
 import { resolveAgentSandbox, sandboxedInvocation, sandboxedShell } from './sandbox.js';
 import {
   assertUserDataPath,
@@ -122,6 +123,16 @@ const FolderRequest = z.object({ path: WorkspaceRelativePath });
 const RenameRequest = z.object({ from: WorkspaceRelativePath, to: WorkspaceRelativePath });
 const BinaryProbeRequest = z.object({
   binaries: z.array(z.string().min(1).max(120)).min(1).max(64)
+});
+/**
+ * What the harness wants proved about a rendered document. Both measurements are optional in
+ * different senses: a page count is only checked when the job asked for one, and a margin only
+ * moves the boundary the text has to stay inside, which is the page edge by default.
+ */
+const RenderProofRequest = z.object({
+  path: WorkspaceRelativePath,
+  expectPages: z.number().int().min(1).max(5_000).optional(),
+  marginPoints: z.number().min(0).max(200).optional()
 });
 /**
  * A window of a recording, in seconds from its start. The ceiling is a day, which no owner's voice
@@ -862,6 +873,34 @@ export const buildServer = async (config: RunnerConfig) => {
         present: requested.binaries.filter((name) => present.has(name)),
         missing: requested.binaries.filter((name) => !present.has(name))
       };
+    }
+  );
+
+  /**
+   * How a generated document actually renders, for an acceptance check the harness runs itself.
+   *
+   * This is the one measurement of a visual deliverable that the model does not make about its own
+   * work. It renders the file as it stands - not a proof PDF left over from earlier in the turn -
+   * counts its pages and reports every word the render had to cut at an edge, and it refuses rather
+   * than reassures when the toolchain to do that is not on this computer.
+   */
+  app.post<{ Params: { workspaceId: string } }>(
+    '/v1/workspaces/:workspaceId/document/render-proof',
+    async (request) => {
+      requireScope(request, 'exec');
+      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
+      await ensureRuntimeWorkspace(root);
+      const requested = RenderProofRequest.parse(request.body);
+      return proveRender(
+        root,
+        {
+          path: assertUserDataPath(root, requested.path),
+          expectPages: requested.expectPages,
+          marginPoints: requested.marginPoints
+        },
+        await findRenderTools(root),
+        Math.min(config.MAX_FILE_BYTES, RENDER_SOURCE_MAX_BYTES)
+      );
     }
   );
 

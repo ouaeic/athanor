@@ -44,6 +44,7 @@ export const check = (expect: Expectation, outcome: RunOutcome): string[] => {
   };
   if (outcome.error) failures.push(`the run threw: ${outcome.error}`);
   compare('model calls', expect.modelCalls, outcome.modelCalls);
+  compare('model calls spent inside specialists', expect.delegatedCalls, outcome.delegatedCalls);
   compare('status', expect.status, outcome.status);
   compare('verification', expect.verification, outcome.verification);
   compare('asked the owner', expect.askedOwner, outcome.askedOwner);
@@ -51,6 +52,7 @@ export const check = (expect: Expectation, outcome: RunOutcome): string[] => {
   compare('untrusted content recorded', expect.untrusted, outcome.untrusted);
   compare('replies to the owner', expect.replies, outcome.replies);
   compare('commands run in the workspace', expect.commandsRun, outcome.commandsRun);
+  compare('compactions performed', expect.compactions, outcome.compactions);
   compare('media generations charged for', expect.mediaGenerated, outcome.mediaGenerated);
   compare(
     'the closing request offered the same catalogue as the step before it',
@@ -73,6 +75,17 @@ export const check = (expect: Expectation, outcome: RunOutcome): string[] => {
   if (expect.minBriefSections !== undefined && outcome.briefSections < expect.minBriefSections)
     failures.push(
       `sections in the running brief: expected at least ${expect.minBriefSections}, got ${outcome.briefSections}`
+    );
+  if (
+    expect.minModelWrittenBriefs !== undefined &&
+    outcome.modelWrittenBriefs < expect.minModelWrittenBriefs
+  )
+    failures.push(
+      `compactions whose brief a model wrote rather than the deterministic fallback: expected at least ${expect.minModelWrittenBriefs}, got ${outcome.modelWrittenBriefs}`
+    );
+  if (expect.skillsNamedInBrief && !same(expect.skillsNamedInBrief, outcome.skillsNamedInBrief))
+    failures.push(
+      `procedures the brief says are no longer in the window: expected [${expect.skillsNamedInBrief.join(', ')}], got [${outcome.skillsNamedInBrief.join(', ')}]`
     );
   // Nothing squeezed is not a failure: the claim is that no result was cut all the way down, and a
   // window that never had to cut one has not cut one down.

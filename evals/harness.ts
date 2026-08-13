@@ -13,6 +13,15 @@
  * exports none of it. Keeping the copy honest is cheap - both drive the same loop, so a shape this
  * one gets wrong fails loudly on the first fixture rather than silently reporting a green run.
  *
+ * That claim was wrong once, and the correction is the reason `completionBody` exists below. The
+ * copy had only the streaming half: every request was answered with frames, including the two the
+ * loop does not stream - a compaction's brief and a delegated specialist's steps. Both callers are
+ * written to survive a bad answer rather than to fail on one, so a compaction silently used its
+ * deterministic fallback and a mission silently came back as a failed tool call, and the suite
+ * reported green for a mechanism it was not exercising. `agent-run.test.ts` has both halves. The
+ * lesson is narrower than "keep it honest": a shape this one gets wrong fails loudly only where the
+ * loop has nothing to fall back on.
+ *
  * The one difference that matters: the model here is a function of what athanor just said, not a
  * fixed list of replies. Every hold in the loop works by pushing a message back and asking again,
  * so a fixed list cannot tell "the model complied on the second attempt" from "the second reply
@@ -95,6 +104,20 @@ export interface ScriptContext {
    * is a green run measuring the deterministic fallback.
    */
   readonly summarising: boolean;
+  /**
+   * Whether this is a delegated specialist's own request rather than a step of the turn.
+   *
+   * Recognised by the catalogue rather than by the mission text: a specialist is offered the
+   * read-only set and never `finish`, because `finish` is how a turn ends and a specialist does not
+   * end one. Nothing else in the loop withdraws it - the closing handoff is deliberately handed the
+   * same array every other step sent - so "no `finish` on offer" is the one structural statement
+   * that separates a specialist's window from the lead's.
+   *
+   * It matters beyond letting a script answer the right model. A specialist's window is its own:
+   * its request shares nothing with the lead's but the catalogue, so counting it as the next link
+   * in the chain would report a cache miss for a turn whose own window never moved.
+   */
+  readonly delegated: boolean;
 }
 
 /** A model, as a function of what athanor just said to it. */
@@ -194,6 +217,43 @@ const framesFor = (turn: ModelTurn): string[] => {
   );
   parts.push('data: [DONE]\n\n');
   return parts;
+};
+
+/**
+ * The same turn as one whole JSON body, for the requests that are not streamed.
+ *
+ * Only the reply the owner is watching is streamed; a request with nowhere to put deltas asks for
+ * an ordinary completion, and the two calls this suite most needs to see are exactly those - the
+ * tool-free call a compaction makes to write its brief, and every step of a delegated specialist.
+ * Answered with SSE they arrive as `Unexpected token 'd', "data: {"ch"...`, which both paths then
+ * swallow: a compaction falls back to its deterministic summary and reports success, and a mission
+ * comes back as a failed tool call. Both look like a working run from the outside, which is how a
+ * suite ends up unable to see the two mechanisms that decide what a long task costs.
+ */
+const completionBody = (turn: ModelTurn): unknown => {
+  const text = (turn.chunks ?? (turn.text ? [turn.text] : [])).join('');
+  return {
+    choices: [
+      {
+        finish_reason: turn.calls?.length ? 'tool_calls' : turn.truncated ? 'length' : 'stop',
+        message: {
+          content: text,
+          ...(turn.calls?.length
+            ? {
+                tool_calls: turn.calls.map((call) => ({
+                  id: call.id,
+                  type: 'function',
+                  function: { name: call.name, arguments: JSON.stringify(call.args) }
+                }))
+              }
+            : {})
+        }
+      }
+    ],
+    // Counted the same rough way the window is estimated, so a specialist's own compute budget is
+    // spent against something proportional to what it actually wrote rather than against nought.
+    usage: { prompt_tokens: 0, completion_tokens: Math.ceil(text.length / 4) }
+  };
 };
 
 const encoder = new TextEncoder();
@@ -476,6 +536,13 @@ export interface Expectation {
   /** Exactly how many model calls the turn cost, including the closing handoff when one happens. */
   readonly modelCalls?: number;
   /**
+   * How many of those calls were spent inside delegated specialists rather than by the turn.
+   *
+   * Asserted alongside `modelCalls` rather than instead of it, because the two move for different
+   * reasons: the first is what the loop did, the second is what a mission cost once it was sent.
+   */
+  readonly delegatedCalls?: number;
+  /**
    * Every tool athanor actually started, in order. `finish` and `set_acceptance` never appear: the
    * loop answers those itself, ahead of the line that records a tool as started.
    */
@@ -532,8 +599,31 @@ export interface Expectation {
   readonly minCachePrefix?: number;
   /** The fewest compactions this turn must have performed. */
   readonly minCompactions?: number;
+  /**
+   * Exactly how many compactions this turn performed, for the arm of a pair that must perform none.
+   *
+   * A floor cannot say "none". The control half of a paired measurement has to, or an arm that
+   * quietly condensed on the budget trigger would be doing the same work as the other one and the
+   * difference between the two rows would be reported as free.
+   */
+  readonly compactions?: number;
   /** The fewest sections the running brief must have ended up carrying. */
   readonly minBriefSections?: number;
+  /**
+   * The fewest of this turn's compactions whose brief a model wrote rather than the fallback.
+   *
+   * Asserted wherever a compaction is being priced. Without it a summariser that stops being
+   * answered - a stub that only speaks one wire format, a request shape that changes - degrades to
+   * the deterministic summary and every row here stays green while measuring something else.
+   */
+  readonly minModelWrittenBriefs?: number;
+  /**
+   * Exactly which of the procedures this turn opened the brief names as no longer in the window.
+   *
+   * The whole list, not a floor: naming one that is still open would be athanor telling the model
+   * to re-read something it is already holding, which costs a step and a window for nothing.
+   */
+  readonly skillsNamedInBrief?: readonly string[];
   /** Whether the owner's own words were still in the last window, byte for byte. */
   readonly ownerMessageIntact?: boolean;
   /**
@@ -634,6 +724,15 @@ const holdsIn = (messages: readonly string[]): { holds: HoldName[]; pushback: st
 export interface RunOutcome {
   /** Provider calls, which is what a step costs and what the owner is billed for. */
   readonly modelCalls: number;
+  /**
+   * How many of those calls a delegated specialist spent, rather than the turn itself.
+   *
+   * `modelCalls` alone cannot be read a year from now: a delegate call is one step of the turn and
+   * then as many provider calls as the missions behind it take, so the same total is reached by a
+   * turn that thought for nine steps and by a turn that thought for three and sent two specialists.
+   * Split out so a diff can say which of the two moved.
+   */
+  readonly delegatedCalls: number;
   /** The prompt athanor built, in tokens, by its own estimate, summed over every call. */
   readonly promptTokens: number;
   /** The largest single prompt, which is what decides whether a long task fits its window. */
@@ -676,6 +775,28 @@ export interface RunOutcome {
   readonly compactions: number;
   /** Sections the running brief ended up carrying, which is how much history survived condensing. */
   readonly briefSections: number;
+  /**
+   * Of those compactions, the ones whose brief a model actually wrote.
+   *
+   * `compactContext` swallows a summariser that fails and falls back to a deterministic summary, so
+   * a compaction reports success either way and every other number here moves by a few per cent.
+   * That is how this suite spent its whole life measuring the fallback: the stub answered the
+   * tool-free summarising call with SSE, the parse failed, and nothing anywhere said so. This is
+   * the one figure that separates the two, and it is why `completionBody` cannot be narrowed back
+   * without a fixture going red.
+   */
+  readonly modelWrittenBriefs: number;
+  /**
+   * Of the skills this turn opened, the ones a compaction's brief names, sorted.
+   *
+   * An opened procedure arrives as an ordinary tool result, so a compaction condenses it away like
+   * any other - and the model then goes on working to instructions it can no longer read, with
+   * nothing in the transcript saying so. The brief is the only place that can say it, so the claim
+   * is that the name of every procedure a compaction took survives in the record the model keeps
+   * reading. A skill still in the window is not named and must not be: this is a notice about
+   * something lost, not a list of what was loaded.
+   */
+  readonly skillsNamedInBrief: readonly string[];
   /** Whether the owner's own words were still in the last window, byte for byte. */
   readonly ownerMessageIntact: boolean;
   /**
@@ -886,7 +1007,9 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   // against. A forty-step fixture sends forty windows of up to a megabyte each, and holding them
   // all measures this process's heap rather than the loop.
   let steps = 0;
-  let lastRequest: Record<string, unknown> = {};
+  // The last request that was a step of the turn, which is not simply the last request: a
+  // compaction and a specialist both send one afterwards, and neither is the window the turn ended
+  // in nor the catalogue it was offered.
   let lastAgentRequest: Record<string, unknown> = {};
   let previousBytes = '';
   // The catalogue of the last two steps, as sent. Only the two, for the same reason the bytes above
@@ -896,6 +1019,9 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   const prefixShares: number[] = [];
   const everyMessage = new Set<string>();
   const proposed: string[] = [];
+  /** Of the calls above, the ones a delegated specialist spent rather than the turn itself. */
+  let delegatedCalls = 0;
+  const openedSkills = new Set<string>();
   const execState: RunnerState = { execs: 0, written: new Map(), media: 0, mediaModels: [] };
   const original = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -905,13 +1031,17 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       if (media) return media;
       const body = bodyOf(init);
       modelCalls += 1;
-      lastRequest = body;
       // The summarising call a compaction makes carries no catalogue, and it is a fresh prompt with
       // no predecessor rather than the next step of one - so it is neither the window the turn was
       // working in nor a link in the chain a cache reads back along. What it costs is already in the
       // step count and the token total, which is where a one-off call belongs.
-      const summarising = !((body.tools ?? []) as unknown[]).length;
-      if (!summarising) {
+      const catalogue = (body.tools ?? []) as Array<{ function?: { name?: unknown } }>;
+      const summarising = !catalogue.length;
+      // A specialist's request carries a catalogue and no `finish`; see ScriptContext.delegated.
+      const delegated =
+        !summarising && !catalogue.some((tool) => asText(tool.function?.name) === 'finish');
+      if (delegated) delegatedCalls += 1;
+      if (!summarising && !delegated) {
         steps += 1;
         lastAgentRequest = body;
         const bytes = promptBytes(body);
@@ -932,12 +1062,35 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
           [...messages].reverse().find((content) => !content.startsWith(RUNTIME_CONTEXT_MARKER)) ??
           '',
         messages,
-        summarising
+        summarising,
+        delegated
       });
-      for (const call of turn.calls ?? []) proposed.push(call.name);
-      return new Response(streamOf(framesFor(turn), init?.signal), {
-        headers: { 'content-type': 'text/event-stream' }
-      });
+      // A specialist's calls are the specialist's, not the turn's. `tools`, `proposed` and
+      // `finalCatalogue` are all statements about what this turn did, and folding a subordinate
+      // model's proposals into them would make the lead's list depend on how many missions were
+      // running and in what order three concurrent ones happened to answer. What a specialist
+      // actually reached is measured where it lands instead: in `commandsRun`, in the media count,
+      // and in whether the turn came out marked as having read untrusted content.
+      if (!delegated) {
+        for (const call of turn.calls ?? []) {
+          proposed.push(call.name);
+          // Which procedures this turn opened, so a compaction that drops one can be asked whether
+          // it said so. Read off the call rather than off the result, because the claim is about
+          // an instruction the model was given and is no longer holding.
+          if (call.name === 'skill' && asText(call.args.action) === 'view') {
+            const id = asText(call.args.id) || asText(call.args.name);
+            if (id) openedSkills.add(id);
+          }
+        }
+      }
+      // What the request asked for, rather than what this stub finds convenient: the adapter sets
+      // `stream` only when the caller gave it somewhere to put the deltas, and answering the other
+      // shape with frames is a parse error the caller is written to survive quietly.
+      return body.stream === true
+        ? new Response(streamOf(framesFor(turn), init?.signal), {
+            headers: { 'content-type': 'text/event-stream' }
+          })
+        : json(completionBody(turn));
     }
     return runnerResponse(fixture.runner ?? {}, execState, url, init);
   }) as typeof fetch;
@@ -999,9 +1152,19 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   const compactions = events
     .map(
       (entry) =>
-        ((entry.payload ?? {}) as { compaction?: { briefParts?: unknown } }).compaction ?? {}
+        (
+          (entry.payload ?? {}) as {
+            compaction?: { briefParts?: unknown; brief?: unknown; source?: unknown };
+          }
+        ).compaction ?? {}
     )
     .filter((compaction) => typeof compaction.briefParts === 'number');
+  // The sections a compaction wrote, which is where a notice about something the window lost has to
+  // land: the brief is the one part of a condensed turn the model keeps reading.
+  const brief = compactions.map((compaction) => asText(compaction.brief)).join('\n');
+  const modelWrittenBriefs = compactions.filter(
+    (compaction) => asText(compaction.source) === 'model'
+  ).length;
   const lastWindow = (
     (lastAgentRequest.messages ?? []) as Array<{ role?: unknown; content?: unknown }>
   ).map((message) => ({ role: asText(message.role), content: contentOf(message) }));
@@ -1016,6 +1179,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
 
   return {
     modelCalls,
+    delegatedCalls,
     promptTokens: costs.reduce((total, value) => total + value, 0),
     peakPromptTokens: costs.reduce((peak, value) => Math.max(peak, value), 0),
     tools: events
@@ -1038,11 +1202,13 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       (most, payload) => Math.max(most, Number(payload.briefParts) || 0),
       0
     ),
+    modelWrittenBriefs,
+    skillsNamedInBrief: [...openedSkills].filter((name) => brief.includes(name)).sort(),
     ownerMessageIntact: lastWindow.some((message) => message.content.includes(fixture.request)),
     toolResultFloor: squeezed.length ? Math.min(...squeezed) : 0,
-    finalCatalogue: ((lastRequest.tools ?? []) as Array<{ function?: { name?: unknown } }>).map(
-      (tool) => asText(tool.function?.name)
-    ),
+    finalCatalogue: (
+      (lastAgentRequest.tools ?? []) as Array<{ function?: { name?: unknown } }>
+    ).map((tool) => asText(tool.function?.name)),
     finalCatalogueUnchanged: previousCatalogue === '' || previousCatalogue === lastCatalogue,
     ...holdsIn([...everyMessage]),
     status: finalStatus,

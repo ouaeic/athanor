@@ -20,6 +20,7 @@ import {
 import {
   assertMemoryValidity,
   connectorActions,
+  deadEndFromCheck,
   decryptJson,
   encryptJson,
   executeConnectorAction,
@@ -28,6 +29,9 @@ import {
   readRoutingMetadata,
   type RoutingMetadata,
   nextScheduleRun,
+  memoryDeadEndTagKey,
+  memoryIndexKey,
+  memorySubjectKey,
   memoryTemporalStatus,
   recallMemories,
   untrustedFromOutside,
@@ -37,6 +41,7 @@ import {
   unwrapDataKey,
   type AnyConnectorKind,
   type ConnectorSecret,
+  type MemoryDeadEndCheck,
   type MemoryDocument,
   type MemoryKind
 } from '@athanor/core';
@@ -117,6 +122,7 @@ import {
   buildTaskMemoryPack,
   extractTurn,
   injectMemoryPack,
+  memoryItemAad,
   memoryPackBudgetTokens,
   recallMemory,
   recordMemoryPackOutcome,
@@ -7818,15 +7824,46 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           `${root}/files?path=${encodeURIComponent(directory)}`
         );
         const entry = listing.entries.find((candidate) => candidate.name === name);
+        const present = entry?.type === 'file' && entry.sizeBytes >= check.minBytes;
+        /*
+         * What the file is, for a job a byte count was never about.
+         *
+         * Asked of the runner, and only once the file is known to be there: it renders the
+         * deliverable as it stands at this moment - the .pptx itself, not a proof PDF from earlier
+         * in the turn - and answers with the finding already in the sentence the owner reads. A
+         * render that cannot be made throws, which the surrounding catch reports as a check that
+         * could not run; nothing here can report an unmeasured document as a passing one.
+         */
+        const render = check.render;
+        const rendered =
+          present && render
+            ? await this.#withLeaseRenewal(task, () =>
+                this.#runner.call<{ passed: boolean; detail: string }>(
+                  task.workspaceId,
+                  task.id,
+                  'exec',
+                  `${root}/document/render-proof`,
+                  {
+                    path: check.path,
+                    ...(render.expectPages === undefined
+                      ? {}
+                      : { expectPages: render.expectPages }),
+                    marginPoints: render.marginPoints
+                  }
+                )
+              )
+            : undefined;
         results.push({
           id: check.id,
           label: check.label,
-          passed: entry?.type === 'file' && entry.sizeBytes >= check.minBytes,
+          passed: present && (rendered?.passed ?? true),
           detail: !entry
             ? `${check.path} does not exist`
             : entry.type !== 'file'
               ? `${check.path} is a ${entry.type}, not a file`
-              : `${entry.sizeBytes} bytes (needs at least ${check.minBytes})`
+              : rendered
+                ? rendered.detail
+                : `${entry.sizeBytes} bytes (needs at least ${check.minBytes})`
         });
       } catch (error) {
         results.push({
@@ -8172,8 +8209,11 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       interrupted?: boolean;
       /** Acceptance checks the harness ran and watched pass on the finishing turn. */
       verifiedCommands?: readonly AcceptanceCommandCheck[];
-    }
+    },
+    /** The commands it watched fail on that same run, which is the other half of the same lesson. */
+    deadEnds: readonly MemoryDeadEndCheck[] = []
   ): Promise<void> {
+    const occurredAt = new Date();
     try {
       const { request, artifacts } = extractTurn(state.messages);
       // What this turn touched, including the steps a compaction removed from the window. Carried
@@ -8210,7 +8250,13 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
           : {}),
         // A turn that read somebody else's words records what happened but settles nothing.
         tainted: Boolean(state.taint),
-        occurredAt: new Date()
+        occurredAt
+      });
+      await this.#recordDeadEnds(task, key, {
+        tainted: Boolean(state.taint),
+        passed: completion.verifiedCommands ?? [],
+        failed: deadEnds,
+        observedAt: occurredAt
       });
       // A turn that never finished has graded nothing. The injection-time row already counted the
       // use as `unknown`, so the items keep their salience and simply stay ungraded, which is the
@@ -8248,6 +8294,73 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
     }
   }
 
+  /**
+   * What the harness watched an acceptance command fail to do, and what a later pass does to it.
+   *
+   * The write half carries the same gate as a fact and a procedure: a turn that read somebody
+   * else's words settles nothing durable. It matters more here than there. The commands are the
+   * model's, and a page that can steer the model into declaring a check against the wrong directory
+   * gets a standing "this does not work" out of the machine's own observation - which is the one
+   * way something outside could plant a belief that survives the conversation it arrived in.
+   *
+   * The retirement half deliberately runs anyway. Nothing anyone reads can make a command exit
+   * zero, and forgetting a caution costs a re-run where keeping a wrong one costs the approach.
+   *
+   * Failures here are swallowed rather than reported. The turn's own record is already written by
+   * the time this runs, and the warning above says the turn was not recorded at all - which would
+   * be false, and the owner would go looking for a conversation that is in fact there.
+   */
+  async #recordDeadEnds(
+    task: TaskRecord,
+    key: Uint8Array,
+    input: {
+      tainted: boolean;
+      passed: readonly AcceptanceCommandCheck[];
+      failed: readonly MemoryDeadEndCheck[];
+      observedAt: Date;
+    }
+  ): Promise<void> {
+    const indexKey = memoryIndexKey(key);
+    // Sliced exactly as a passing run keys its subject, so the two sides of one command meet.
+    const passed = input.passed.map((check) =>
+      memorySubjectKey([check.executable, ...check.args].join(' ').slice(0, 400), indexKey)
+    );
+    const failed = input.tainted
+      ? []
+      : input.failed.map((observation) => {
+          const { content, index, validTo } = deadEndFromCheck(
+            // Redacted at the door, like everything else that lands in memory: this is up to two
+            // kilobytes of stderr, which is where an inline token in a failing request shows up.
+            { ...observation, detail: redactText(observation.detail) },
+            input.observedAt,
+            indexKey
+          );
+          return {
+            userId: task.userId,
+            workspaceId: task.workspaceId,
+            // Derived like the passing half, and for the same reason: the harness ran it and
+            // watched the result. Nothing here is the model's account of its own work.
+            trust: 'derived' as const,
+            documentCiphertext: encryptJson(content, key, memoryItemAad(task.workspaceId)),
+            index,
+            observedAt: input.observedAt,
+            validFrom: input.observedAt,
+            validTo,
+            taskId: task.id
+          };
+        });
+    if (passed.length === 0 && failed.length === 0) return;
+    await this.store
+      .recordMemoryDeadEnds({
+        workspaceId: task.workspaceId,
+        markerTag: memoryDeadEndTagKey(indexKey),
+        passed,
+        failed,
+        at: input.observedAt
+      })
+      .catch(() => undefined);
+  }
+
   async #completeTurn(
     task: TaskRecord,
     key: Uint8Array,
@@ -8267,6 +8380,12 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
     },
     options: {
       label?: string;
+      /**
+       * The commands the harness watched fail on the run that finished this turn. Kept out of
+       * `completion` because that object is the completed event's payload, and every one of these
+       * is already in it as a remaining risk.
+       */
+      deadEnds?: readonly MemoryDeadEndCheck[];
     } = {}
   ): Promise<void> {
     sealUnansweredToolCalls(state.messages, 'the agent finished the turn before this call ran');
@@ -8289,7 +8408,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         markdown: completion.summary
       }).catch(() => undefined);
     await event(this.store, task, key, 'completed', options.label ?? 'Task completed', completion);
-    await this.#captureMemory(task, key, state, completion);
+    await this.#captureMemory(task, key, state, completion, options.deadEnds ?? []);
     const turn = state.turn ?? 0;
     await this.store.transitionUsage(
       state.reservationKey ?? reservationUsageKey(task.id, turn),
@@ -9938,6 +10057,16 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
           // commands: an artifact check says a file exists, which is about this afternoon, where a
           // command that exits zero is about the machine.
           let verifiedCommands: AcceptanceCommandCheck[] = [];
+          /*
+           * And the other half, which reaching this line is most of what makes it worth keeping.
+           *
+           * A check that fails sends the model round again, up to `MAX_ACCEPTANCE_FAILURES` times,
+           * and only the last of those runs is ever read here - so a command that failed and was
+           * then fixed leaves nothing behind, and a command that arrives here failed after the
+           * model had four goes at it. That is the difference between a bad afternoon and a route
+           * worth remembering was closed.
+           */
+          let deadEnds: MemoryDeadEndCheck[] = [];
           if (state.acceptance) {
             // Carrying what athanor has already run, so a check naming a command it executed
             // itself after the last change is answered by that run rather than by a second build.
@@ -9950,6 +10079,22 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
                 check.kind === 'command' &&
                 results.some((result) => result.id === check.id && result.passed)
             );
+            deadEnds = state.acceptance.checks.flatMap((check) => {
+              if (check.kind !== 'command') return [];
+              const result = results.find((entry) => entry.id === check.id && !entry.passed);
+              // Only a run that ended. "timed out after 900s" and "the check could not run" are the
+              // harness failing to observe the command rather than the command failing, and a
+              // caution written out of either would outlive a wedged network or a runner restart.
+              if (!result?.detail.startsWith('exit ')) return [];
+              return [
+                {
+                  label: check.label,
+                  command: [check.executable, ...check.args].join(' '),
+                  cwd: check.cwd,
+                  detail: result.detail
+                }
+              ];
+            });
             acceptanceEvidence = acceptancePassedEvidence(results);
             const failed = results.filter((result) => !result.passed);
             if (failed.length) {
@@ -10047,15 +10192,23 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
               verification
             })
           });
-          await this.#completeTurn(task, key, state, {
-            summary,
-            deliverables: Array.isArray(call.arguments.deliverables)
-              ? call.arguments.deliverables
-              : [],
-            verification,
-            ...(acceptanceEvidence.length ? { acceptance: acceptanceEvidence } : {}),
-            ...(verifiedCommands.length ? { verifiedCommands } : {})
-          });
+          await this.#completeTurn(
+            task,
+            key,
+            state,
+            {
+              summary,
+              deliverables: Array.isArray(call.arguments.deliverables)
+                ? call.arguments.deliverables
+                : [],
+              verification,
+              ...(acceptanceEvidence.length ? { acceptance: acceptanceEvidence } : {}),
+              ...(verifiedCommands.length ? { verifiedCommands } : {})
+            },
+            // Carried beside the completion rather than inside it: the card already prints each of
+            // these as a remaining risk, and this copy exists only for the memory write.
+            deadEnds.length ? { deadEnds } : {}
+          );
           return;
         }
         if (call.name === 'compact_context') {

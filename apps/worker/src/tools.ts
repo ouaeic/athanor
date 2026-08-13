@@ -223,7 +223,7 @@ export const agentTools: ModelTool[] = [
   {
     name: 'set_acceptance',
     description:
-      'State what would prove this job is done, before you do it. The harness runs these itself when you call finish, and refuses the finish while any of them fails - so they are the definition of done rather than a claim about it. Name checks that would actually fail if the work were wrong: the command that builds it, the test that exercises it, the extraction that shows the document says what you were asked to make it say, the file that has to exist and not be empty. Call it again to correct a check; both versions are shown to the user, because weakening your own test is a different act from passing it.',
+      'State what would prove this job is done, before you do it. The harness runs these itself when you call finish, and refuses the finish while any of them fails - so they are the definition of done rather than a claim about it. Name checks that would actually fail if the work were wrong: the command that builds it, the test that exercises it, the extraction that shows the document says what you were asked to make it say, the file that has to exist and not be empty - and on a document, render, because a byte count cannot tell a deck whose text runs off slide four from one that does not. Call it again to correct a check; both versions are shown to the user, because weakening your own test is a different act from passing it.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -254,7 +254,26 @@ export const agentTools: ModelTool[] = [
               },
               timeoutSeconds: { type: 'integer', minimum: 1, maximum: 900 },
               path: { type: 'string', description: 'artifact checks: the workspace path.' },
-              minBytes: { type: 'integer', minimum: 1 }
+              minBytes: { type: 'integer', minimum: 1 },
+              render: {
+                type: 'object',
+                additionalProperties: false,
+                description:
+                  'artifact checks on a PDF or Office document: the harness renders the file itself and measures the pages it gets - how many, that no word was cut off at a page edge, that none came out blank. It cannot see text pushed entirely off a page.',
+                properties: {
+                  expectPages: {
+                    type: 'integer',
+                    minimum: 1,
+                    description: 'The exact number of pages, when the job asked for one.'
+                  },
+                  marginPoints: {
+                    type: 'number',
+                    minimum: 0,
+                    description:
+                      'Text must stay this far inside the page edge. Leave out unless a margin was asked for.'
+                  }
+                }
+              }
             }
           }
         }
