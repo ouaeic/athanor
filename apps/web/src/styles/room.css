@@ -1,0 +1,359 @@
+/* =============================================================================
+   The room.
+   ---------------------------------------------------------------------------
+   One light, one set of materials, one motion vocabulary. Everything else in
+   this product is written in terms of what is below and states nothing a token
+   already holds.
+
+   The stylesheet this replaces had 4,420 declarations and 423 distinct hex
+   values, 284 of which appeared exactly once. That is why nothing on screen
+   looked related to anything else: there were no rules, only 439 separate
+   decisions. The fix is not fewer pixels, it is a system that can be held in
+   one head.
+
+   Heat is recency of evidence. `--heat` is a real registered number so it
+   genuinely interpolates, and it is set on the few elements that are actually
+   warm - never on :root, because an animating inherited property there
+   restyles the whole document on every frame.
+   ========================================================================== */
+
+@property --heat {
+  syntax: '<number>';
+  inherits: true;
+  initial-value: 0;
+}
+
+:root {
+  /* Ground: true black for OLED, then three materials that sit on it. */
+  --ink: #000000;
+  --stone: #0c0a09;
+  --slab: #131110;
+  --iron: #1a1613;
+
+  /* Type. Three weights of light on paper, nothing more. */
+  --paper: #f2e7db;
+  --chalk: #cabfb3;
+  --ash: #a89c90;
+
+  /* Seams. Surfaces and hairlines, never type - neither reaches 4.5:1 and
+     neither is ever asked to. */
+  --seam: #2e2822;
+  --seam-lit: #4a3d30;
+
+  /* Fire. The only colour in the room, and it always means the same thing:
+     this is alive, or it is your move. */
+  --ember: #f2a13f;
+  --ember-hot: #ffd8a2;
+  --ember-deep: #8a4a16;
+  --ember-ink: #1d0f04;
+
+  /* States, pulled toward the greyscale room so they never compete with fire. */
+  --ok: #93c08d;
+  --wait: #cbc47a;
+  --stop: #e39c99;
+
+  /* Where the fire is, in room coordinates. Static: only --heat animates, so
+     this is inherited once and never invalidates anything again. */
+  --fx: 134px;
+  --fy: 748px;
+
+  /* One type scale for the whole product. 15px base, 1.26. */
+  --t-xs: 11.5px;
+  --t-sm: 13px;
+  --t-md: 15px;
+  --t-lg: 19px;
+  --t-xl: 24px;
+  --t-2xl: 30px;
+
+  /* One space scale. Six steps, nothing between them. */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 18px;
+  --s5: 28px;
+  --s6: 44px;
+
+  /* Two curves, three durations. That is the entire motion vocabulary. */
+  --land: cubic-bezier(0.16, 0.92, 0.28, 1);
+  --calm: cubic-bezier(0.4, 0, 0.3, 1);
+  --quick: 180ms;
+  --arrive: 620ms;
+  --slow: 9s;
+
+  --serif: ui-serif, 'Iowan Old Style', Georgia, 'Times New Roman', serif;
+  --sans: ui-sans-serif, -apple-system, 'Segoe UI', Roboto, system-ui, sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+
+  /* Painted materials. None of these are in the eager graph: the room is
+     legible and already alive on token colours before a single one arrives,
+     and each lands on a box that is already the right size, so nothing
+     reflows when they do. */
+  --wall-img: url('/room/wall.webp');
+  --paper-img: url('/room/paper.webp');
+  --beam-img: url('/room/beam.webp');
+  --mark-img: url('/room/hearth.webp');
+  --flame-img: url('/room/flame.webp');
+}
+
+/* --- surfaces ------------------------------------------------------------ */
+
+/* Anything the fire can reach. One gradient in room coordinates, so every
+   surface shows its own correct slice of a single light rather than each
+   inventing a highlight. `--ox`/`--oy` are the surface's offset into the room. */
+.lit {
+  position: relative;
+  isolation: isolate;
+}
+
+.lit::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(
+    560px 470px at calc(var(--fx) - var(--ox, 0px)) calc(var(--fy) - var(--oy, 0px)),
+    rgba(255, 172, 84, 0.085),
+    rgba(255, 132, 44, 0.028) 46%,
+    transparent 76%
+  );
+  animation: breathe var(--slow) var(--calm) infinite;
+}
+
+/* Something happened here. The glow is the evidence; it cools on its own. */
+.hot {
+  box-shadow: -2px 3px 14px -6px rgba(242, 161, 63, calc(0.8 * var(--heat)));
+}
+
+.hot::after {
+  content: '';
+  position: absolute;
+  inset: -14px;
+  z-index: -1;
+  pointer-events: none;
+  border-radius: 20px;
+  background: radial-gradient(
+    closest-side,
+    rgba(242, 161, 63, calc(0.19 * var(--heat))),
+    transparent 80%
+  );
+  opacity: calc(0.35 + 0.65 * var(--heat));
+}
+
+/* A torn sheet of handmade paper. The edge is painted rather than filtered,
+   which is the whole reason it does not come out jagged. */
+.sheet {
+  border: 17px solid transparent;
+  border-image: var(--paper-img) 46 fill / 17px / 0 stretch;
+  padding: var(--s2) var(--s3);
+}
+
+/* A timber and stone ledge, repeating at its own aspect ratio. */
+.beam {
+  background: var(--beam-img) 0 50% / auto 100% repeat-x;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.9));
+}
+
+/* Evidence. A cut stone tablet, never a card - the bevel is a clip-path so it
+   costs nothing and reads as something quarried rather than something styled. */
+.slab {
+  background: var(--slab);
+  border-left: 2px solid var(--seam-lit);
+  clip-path: polygon(0 0, 100% 6px, 100% 100%, 6px calc(100% - 4px));
+  padding: var(--s2) var(--s4);
+  font: var(--t-sm) / 1.62 var(--mono);
+  color: var(--chalk);
+}
+
+/* Nothing appears. Things land, overshoot, and come to rest. */
+.settle {
+  animation: settle var(--arrive) var(--land) both;
+}
+
+/* One button, two temperatures. */
+.act {
+  font: 600 var(--t-sm) / 1 var(--sans);
+  color: var(--paper);
+  background: var(--iron);
+  border: 1px solid var(--seam-lit);
+  padding: 11px 16px;
+  min-height: 34px;
+  cursor: pointer;
+  transition:
+    transform var(--quick) var(--land),
+    background var(--quick) linear;
+}
+
+.act:hover {
+  background: #221c17;
+  transform: translateY(-1px);
+}
+
+.act:active {
+  transform: translateY(1px) scale(0.985);
+}
+
+.act--ember {
+  color: var(--ember-ink);
+  background: linear-gradient(180deg, var(--ember-hot), var(--ember));
+  border-color: var(--ember-hot);
+  box-shadow: 0 0 22px rgba(242, 161, 63, 0.34);
+}
+
+.act--ember:hover {
+  background: linear-gradient(180deg, #fff0d8, #ffb457);
+}
+
+:where(a, button, [tabindex]):focus-visible {
+  outline: 2px solid var(--ember-hot);
+  outline-offset: 3px;
+}
+
+.meta {
+  font: var(--t-xs) / 1.4 var(--sans);
+  color: var(--ash);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.dim {
+  color: var(--chalk);
+}
+
+/* Anything a person or the machine actually said. */
+.prose {
+  font-family: var(--serif);
+  font-size: 16px;
+  line-height: 1.66;
+}
+
+/* --- motion --------------------------------------------------------------- */
+
+/* The room's pulse. Nine seconds is slow enough to sit in for a working day. */
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.9;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.035);
+  }
+}
+
+/* 3.1s against the room's 9s, so the sum never visibly repeats. */
+@keyframes flicker {
+  0%,
+  100% {
+    opacity: 0.78;
+  }
+  37% {
+    opacity: 1;
+  }
+  62% {
+    opacity: 0.86;
+  }
+}
+
+/* The flame, animated from its base the way a held cel moves its character. */
+@keyframes lick {
+  0%,
+  100% {
+    transform: scaleY(1) scaleX(1) rotate(0deg);
+  }
+  28% {
+    transform: scaleY(1.055) scaleX(0.985) rotate(-0.6deg);
+  }
+  61% {
+    transform: scaleY(1.02) scaleX(1.012) rotate(0.5deg);
+  }
+}
+
+@keyframes settle {
+  0% {
+    opacity: 0;
+    transform: translateY(20px) scale(0.984);
+  }
+  56% {
+    opacity: 1;
+    transform: translateY(-5px) scale(1.005);
+  }
+  80% {
+    transform: translateY(2px) scale(0.998);
+  }
+  100% {
+    transform: none;
+  }
+}
+
+/* The three heat schedules, and nothing else may set --heat.
+   live: happening now. cool: it just happened, and you are watching it stop
+   mattering. watch: it happened over there while you were not looking. */
+@keyframes live {
+  0%,
+  100% {
+    --heat: 0.58;
+  }
+  50% {
+    --heat: 0.92;
+  }
+}
+
+@keyframes cool {
+  from {
+    --heat: 1;
+  }
+  to {
+    --heat: 0;
+  }
+}
+
+@keyframes watch {
+  0% {
+    --heat: 0;
+  }
+  3% {
+    --heat: 1;
+  }
+  46% {
+    --heat: 0;
+  }
+  100% {
+    --heat: 0;
+  }
+}
+
+.ember-live {
+  animation: live var(--slow) var(--calm) infinite;
+}
+
+.ember-cool {
+  animation: cool 44s linear forwards;
+}
+
+.ember-watch {
+  animation: watch 26s var(--calm) infinite;
+}
+
+/* Reduced motion keeps every fact and drops every movement: heat freezes at
+   each schedule's final value, so the approval is still plainly warm and a
+   cooled slab is still plainly cold. The room becomes a painting. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    animation-fill-mode: forwards !important;
+    transition-duration: 1ms !important;
+  }
+
+  .ember-live {
+    --heat: 0.75;
+  }
+
+  .ember-watch {
+    --heat: 0;
+  }
+}

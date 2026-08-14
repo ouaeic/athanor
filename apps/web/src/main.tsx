@@ -2,6 +2,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App.js';
 import { keyboardInset } from './keyboard-inset.js';
+import './styles/room.css';
 import './styles.css';
 import '@xterm/xterm/css/xterm.css';
 

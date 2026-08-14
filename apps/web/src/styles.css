@@ -247,13 +247,33 @@ select:focus-visible {
 }
 
 /*
-  Out. The drawing loses its colour rather than changing shape, because the shape is a baked
-  image now and cannot be redrawn - and the light in the door goes out entirely, which is the part
-  a reader actually looks at. Greyscale plus a drop in brightness reads as a cold furnace rather
-  than a dimmed one, and the sidebar prints the word beside it, so the state is never colour alone.
+  The height is back, and it is the half of the signal that was lost while the mark was one baked
+  drawing. The fire is its own layer now, registered to the same canvas as the stone, so a draught
+  can scale it from its own base - upward, the way a flame grows, rather than swelling about its
+  middle. Height and width together, because driven on height alone a full draught reads as a
+  stretched triangle rather than a bigger fire: banked lands near .84 of the drawn flame, a turn in
+  flight at 1.0-1.12.
 */
-[data-fire='cold'] .mark-drawing {
-  filter: grayscale(1) brightness(0.66);
+.mark-flame {
+  transform: scale(calc(0.78 + var(--draught) * 0.34), calc(0.72 + var(--draught) * 0.46));
+  transition: transform 900ms var(--ease);
+}
+
+/*
+  Out. The fire goes out - the layer leaves entirely, which is the part a reader actually looks at -
+  and the stone stays exactly as drawn, because it is stone and a cold furnace is still a furnace.
+  The sidebar prints the word beside it, so the state is never colour alone.
+*/
+[data-fire='cold'] .mark-flame {
+  opacity: 0;
+  transform: scale(0.7, 0.55);
+  transition:
+    opacity 900ms var(--ease),
+    transform 900ms var(--ease);
+}
+
+[data-fire='cold'] .mark-stone {
+  filter: brightness(0.72);
   transition: filter 900ms var(--ease);
 }
 
