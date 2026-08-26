@@ -1,10 +1,8 @@
-schema: 1
 id: pdf-assembly
 version: 2.1.0
 catalog_line: 'Merge, split, stamp, redact and encrypt PDFs, and fill AcroForm fields safely.'
 
 lineage:
-  parent: null
   origin: builtin
   approved_by: null
   approved_at: null
@@ -49,7 +47,3 @@ verify:
     assert: 'page count equals the intended arithmetic'
   - check: 'Filled field values read back identical to the plan and are visible in the rendered page.'
   - check: 'For redaction, the removed string is absent from pdftotext output.'
-
-budget:
-  max_body_tokens: 5000
-  max_activation_ms: 600000

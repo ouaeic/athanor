@@ -2,7 +2,7 @@
 name: pdf-extraction
 description: Get text, tables and metadata out of a PDF with the page number kept attached to every extracted fact, and make scanned PDFs readable with OCR before trusting anything from them. Use when a PDF must be read, summarised, searched, or have its tables pulled into a dataset. Do not use to create, merge, split or fill PDFs, and do not use to summarise a document athanor can already read through document_read when page-level provenance is not needed.
 license: AGPL-3.0-or-later
-compatibility: Every tool named here is installed on this computer by athanor - poppler-utils, athanor-pdf-tables, ocrmypdf with tesseract, qpdf, and /usr/local/lib/athanor/python/bin/python3.
+compatibility: poppler-utils, athanor-pdf-tables, tesseract, qpdf and /usr/local/lib/athanor/python/bin/python3 are installed on every supported host. ocrmypdf is packaged only by Debian and Ubuntu, so on a Fedora, Arch or openSUSE host the OCR route is unavailable - check the binary is there before promising a searchable PDF.
 allowed-tools: shell file_read file_write files_list document_read document_search image_read
 metadata:
   athanor.tier: 'builtin'
@@ -30,6 +30,11 @@ will return nothing while appearing to succeed. Do not proceed; OCR it.
 ```
 ocrmypdf --output-type pdfa --sidecar doc.txt --rotate-pages --deskew doc.pdf doc.ocr.pdf
 ```
+
+`ocrmypdf` is packaged by Debian and Ubuntu and by no other supported family, so on a Fedora, Arch
+or openSUSE host it is not there. The opened skill tells you when a declared binary is missing; if it
+does, say plainly that this PDF is a scan and this computer cannot read it, rather than extracting
+nothing and reporting success.
 
 `--sidecar` writes the recognised text alongside, which is what you search. `--rotate-pages` fixes
 pages scanned sideways, which otherwise OCR to noise. If ocrmypdf refuses because the file already

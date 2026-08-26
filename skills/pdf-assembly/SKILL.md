@@ -2,7 +2,7 @@
 name: pdf-assembly
 description: Merge, split, rotate, stamp, watermark, compress, redact and encrypt PDFs deterministically, and fill AcroForm fields through a validated plan before flattening. Use when an existing PDF must be reshaped or a PDF form must be completed. Do not use to author a PDF from scratch, to read one, or to submit a form on a website.
 license: AGPL-3.0-or-later
-compatibility: Every tool named here is installed on this computer by athanor - qpdf, poppler-utils, ghostscript, img2pdf, ImageMagick, and pypdf through /usr/local/lib/athanor/python/bin/python3.
+compatibility: qpdf, poppler-utils, ghostscript, ImageMagick and pypdf through /usr/local/lib/athanor/python/bin/python3 are installed on every supported host. img2pdf is absent from openSUSE only; check it is there before rasterising, because it is what rebuilds a page without recompressing it.
 allowed-tools: shell file_read file_write files_list document_read image_read publish_artifact
 metadata:
   athanor.tier: 'builtin'
@@ -58,6 +58,10 @@ and in the extracted text. Real redaction removes the characters:
    page with `img2pdf page-N.png -o page-N.pdf`.
 2. Reassemble with qpdf.
 3. **Verify**: `pdftotext redacted.pdf - | grep -i '<the redacted string>'` must return nothing.
+
+`img2pdf` is absent on openSUSE. The opened skill tells you when a declared binary is missing; if
+it does, say that real redaction is unavailable on this host rather than drawing a rectangle and
+calling it redacted, because that is the failure this section exists to prevent.
 
 Report to the owner that redacted pages became images and are no longer searchable.
 

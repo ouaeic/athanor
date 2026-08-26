@@ -1,10 +1,8 @@
-schema: 1
 id: render-proof
 version: 2.3.0
 catalog_line: 'Render a document, deck, workbook or PDF to page images and prove it looks right.'
 
 lineage:
-  parent: null
   origin: builtin
   approved_by: null
   approved_at: null
@@ -50,7 +48,3 @@ verify:
   - run: 'pdffonts proofs/out.pdf'
     assert: 'no font row reports emb=no'
   - check: 'Every rendered page was graded against the rubric and the images are attached.'
-
-budget:
-  max_body_tokens: 5000
-  max_activation_ms: 900000

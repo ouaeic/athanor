@@ -1,10 +1,8 @@
-schema: 1
 id: pptx-authoring
 version: 2.2.0
 catalog_line: 'Build editable PowerPoint decks from master layouts with native charts and notes.'
 
 lineage:
-  parent: null
   origin: builtin
   approved_by: null
   approved_at: null
@@ -43,7 +41,3 @@ verify:
     assert: 'exits 0 and pdfinfo reports one page per slide'
   - check: 'Round-tripped text word count is within 2 percent of the placed text, so nothing was clipped.'
   - check: 'Every slide image was inspected: no overlap, no edge-touching text, charts labelled.'
-
-budget:
-  max_body_tokens: 5000
-  max_activation_ms: 900000

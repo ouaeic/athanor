@@ -1,10 +1,8 @@
-schema: 1
 id: code-change
 version: 2.0.0
 catalog_line: 'Cut where the behaviour is decided, watch the test fail first, verify with the project’s commands.'
 
 lineage:
-  parent: null
   origin: builtin
   approved_by: null
   approved_at: null
@@ -14,7 +12,6 @@ requires:
     [
       repo_overview,
       code_search,
-
       code_diagnostics,
       file_read,
       file_write,
@@ -37,7 +34,3 @@ verify:
     assert: 'exits 0 and the reported test count increased by the new tests'
   - check: 'The new test was observed failing before the change.'
   - check: 'The diff contains no reformatting or renames outside the requested change.'
-
-budget:
-  max_body_tokens: 5000
-  max_activation_ms: 1800000

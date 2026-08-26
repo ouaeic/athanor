@@ -31,12 +31,20 @@ Rules:
   cannot stop.
 - **Poll on a schedule proportional to the work**: every few seconds for a build, every minute for
   an hour-long batch. Between polls, do something useful or report progress; do not spin.
-- **Know what ends it.** A background process stops at whichever comes first: its own
+- **Know what ends it.** An unnamed background process stops at whichever comes first: its own
   `timeoutSeconds`, which is an hour at most; a `process action=kill`; or the next restart of the
-  workspace runtime. Nothing restarts it afterwards, so work that must outlive an hour belongs in a
-  schedule that resumes from the manifest, not in one long-lived process.
-- **Never leave a process running at the end of a task.** Kill it, or hand over its session id and
-  say plainly that it runs until the computer restarts.
+  workspace runtime. Nothing restarts it afterwards.
+- **Know when it should not end.** `shell background=true service=<name>` is the other primitive:
+  the computer keeps that one running, with no timeout, restarts it with backoff if it dies, and
+  brings it back after a reboot. It stops for good on `process action=kill`, and starting one raises
+  an approval card saying exactly that, so it is the owner's decision rather than a side effect.
+  Reach for it when the thing is a _server_ the owner will keep using. Work that is a _job_ — many
+  items, a definite end, a report — still belongs in a schedule that resumes from the manifest, not
+  in one long-lived process, because a job that restarts from the beginning is worse than one that
+  stopped.
+- **Never leave an unnamed process running at the end of a task.** Kill it, or hand over its session
+  id and say plainly that it runs until the computer restarts. A named service is the exception: say
+  that it is running, that it stays running, and how to stop it.
 
 ## The manifest is the design
 

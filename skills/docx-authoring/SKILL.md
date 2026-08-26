@@ -2,7 +2,7 @@
 name: docx-authoring
 description: Produce or edit Word documents that open cleanly in Word with real heading styles, a working table of contents, headers and footers, tables and images, using python-docx to create and OOXML surgery to edit, then prove the result with a rendered page proof. Use when the deliverable is a .docx, a report, memo, letter, contract or CV in Word format, or when an existing Word file must be changed while keeping its template. Do not use for PDFs authored from scratch, for spreadsheets, or for plain Markdown deliverables.
 license: AGPL-3.0-or-later
-compatibility: Every tool named here is installed on this computer by athanor - python-docx through /usr/local/lib/athanor/python/bin/python3, athanor-office-convert, poppler-utils, zip and unzip.
+compatibility: athanor-office-convert, poppler-utils, zip and unzip are installed on every supported host. python-docx comes from the host's own packages and Arch and openSUSE do not carry it, so on those the document toolchain reports office-authoring as unavailable rather than failing mid-procedure - read the runtime block before starting.
 allowed-tools: shell file_read file_write files_list document_read image_read publish_artifact
 metadata:
   athanor.tier: 'builtin'
@@ -91,10 +91,12 @@ proofs/p`.
 
 ## Failure modes
 
-- **Fonts.** A document specifying Calibri or Cambria renders in Carlito and Caladea here, which
-  are metric-compatible, so the layout holds. Any _other_ font the owner's template names must be
-  checked with `fc-list | grep -i <family>`; a substitution that is not metric-compatible moves
-  every line break.
+- **Fonts.** A document specifying Calibri or Cambria renders in Carlito and Caladea where those
+  are installed, which are metric-compatible, so the layout holds. Neither is packaged on every
+  supported host - Caladea is absent on Arch and openSUSE, Carlito on openSUSE - so check with
+  `fc-list | grep -i <family>` rather than assuming, and check any _other_ font the owner's
+  template names the same way. A substitution that is not metric-compatible moves every line
+  break, and the render proof is where you will see it.
 - **The TOC that is empty.** A TOC field only fills in if the headings use real heading styles. An
   empty TOC in the proof means the styles were not applied.
 - **Table columns that vanish.** A table wider than the text area is clipped at the margin in the

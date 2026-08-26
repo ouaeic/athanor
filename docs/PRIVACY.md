@@ -75,8 +75,22 @@ payment detail, CAPTCHA, or other human-only value.
 ## Memory
 
 Long-term memory is not automatically extracted behind the user’s back. The agent proposes a compact
-entry and the user approves, edits, or denies it. Exact old task content stays in encrypted task
-history and is retrieved only by explicit search.
+entry, and the entries that are hardest to undo stop for the user to approve, edit, or deny:
+every replacement, every removal, anything written into user memory rather than one computer's
+memory, anything the credential scanner recognises, anything without an expiry or with one more than
+a year out, and anything written on a turn that had read untrusted content — where the card names
+the origin that put it there.
+
+A dated, computer-scoped addition on a clean turn is saved without a card. That is a deliberate
+boundary rather than an oversight: requiring a card for every write meant an agent keeping a nightly
+journal woke the user at 3am, which teaches people to approve without reading and makes the floor
+worth less than no floor. Everything saved either way is listed in the memory pane, is inspectable
+with its provenance and validity window, and can be removed there. The review queue lists the
+entries the computer itself has flagged — procedures that have gone stale or started failing, and
+entries recorded as contradicting each other — and each can be confirmed as still right, retracted
+so it stops being recalled while the record of it survives, or forgotten outright.
+
+Exact old task content stays in encrypted task history and is retrieved only by explicit search.
 
 Do not save credentials, private keys, recovery codes, transient medical/legal/financial details, or
 third-party secrets as memory.

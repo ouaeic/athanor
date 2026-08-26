@@ -1,10 +1,8 @@
-schema: 1
 id: typst-pdf
 version: 2.2.0
 catalog_line: 'Typeset precise PDFs — reports, letters, invoices, CVs — from a Typst source.'
 
 lineage:
-  parent: null
   origin: builtin
   approved_by: null
   approved_at: null
@@ -29,7 +27,3 @@ verify:
   - run: 'pdfinfo report.pdf'
     assert: 'the page count is within any stated page limit, one page for a one-page CV'
   - check: 'Every page was inspected; totals recomputed from line items match the printed totals.'
-
-budget:
-  max_body_tokens: 5000
-  max_activation_ms: 600000

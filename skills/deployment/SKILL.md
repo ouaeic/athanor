@@ -1,8 +1,8 @@
 ---
 name: deployment
-description: Get a built application running and reachable, on this computer or the owner's own host, with the two facts about this machine that decide whether it works — bind 0.0.0.0, and nothing here survives a restart — stated plainly to the owner along with the rollback command. Use when the owner asks to run, preview, publish or deploy an application. Do not use to publish anything publicly without explicit approval, do not use for third-party paid hosting platforms, and never claim a systemd service was installed, because the agent account cannot install one.
+description: Get a built application running and reachable, on this computer or the owner's own host, with the two facts about this machine that decide whether it works — bind 0.0.0.0, and choose deliberately between a process that ends and a service the computer keeps running — stated plainly to the owner along with the rollback command. Use when the owner asks to run, preview, publish or deploy an application. Do not use to publish anything publicly without explicit approval, do not use for third-party paid hosting platforms, and never claim a systemd unit was installed, because the agent account cannot install one.
 license: AGPL-3.0-or-later
-compatibility: Requires the application's own runtime. systemctl and journalctl exist on this computer but the agent account has no root, so a unit file is written for the owner to install rather than installed here.
+compatibility: Requires the application's own runtime. A service the computer keeps running is supervised by athanor's own workspace runtime and needs no root. systemctl and journalctl exist here but the agent account has no root, so a systemd unit file is written for the owner to install rather than installed here; neither binary is part of the document toolchain and neither is installed by athanor.
 allowed-tools: shell process publish_preview publish_site file_read file_write files_list browser_snapshot browser_action
 metadata:
   athanor.tier: 'builtin'
@@ -23,24 +23,37 @@ Both are invisible until they bite, and between them they cause most failed demo
 **Bind to `0.0.0.0`, never `127.0.0.1`.** The preview proxy cannot reach a loopback-bound socket.
 The app is fine, the port is listening, and the link answers with a proxy error.
 
-**Nothing you start survives a restart.** A `shell background=true` process is supervised by the
-workspace runtime and ends at whichever comes first: its own `timeoutSeconds`, which is an hour at
-most; a `process action=kill`; or the next restart of that runtime — a reboot, an update, an
-`athanor restart`. Nothing brings it back, and you cannot arrange for anything to: `sudo` and every
-other escalation is refused by the runtime, and `systemctl daemon-reload` run as the agent's own
-unprivileged account fails, so a unit file you write is a file and nothing more.
+**A plain background process ends; a named service does not.** Pick one deliberately and say which
+one the owner got.
 
-So say which of two things the owner is getting, in words, every time:
+A `shell background=true` process without a name is scoped to the work: it ends at whichever comes
+first — its own `timeoutSeconds`, which is an hour at most; a `process action=kill`; or the next
+restart of the workspace runtime. Nothing brings it back.
 
-- **A demonstration** — the normal case. Start it in the background, publish a preview, and tell
-  them plainly that it runs until the computer restarts or the timeout expires, and that asking you
-  again brings it straight back.
-- **Something that must survive a reboot** — their action, not yours. Write the unit file into the
-  workspace with `Restart=on-failure`, a `RestartSec`, an explicit `WorkingDirectory` and an
+`shell background=true service=<name>` is the other primitive and it is the answer whenever the
+owner is being handed a link. The computer keeps it running: no timeout, started again with backoff
+whenever it stops, and still there after a reboot, an update or an `athanor restart`. It stops for
+good on `process action=kill`. Starting one raises an approval card that says exactly this, so the
+owner has agreed to a program that outlives the task before it starts. There are sixteen services
+per computer, and a program that dies immediately five times in a row is treated as misconfigured
+rather than restarted forever — read the state back through `process` rather than assuming it.
+
+So say which of three things the owner is getting, in words, every time:
+
+- **Something they will keep using** — the normal case for anything with a link.
+  `shell background=true service=<name>`, then publish a preview, and tell them it stays up and
+  comes back by itself, and that asking you to stop it is what ends it.
+- **A throwaway demonstration** — a plain `background=true` process. Tell them plainly that it runs
+  until the computer restarts or the timeout expires, and that asking you again brings it straight
+  back.
+- **A systemd unit on a host athanor does not manage** — their action, not yours, and it is a
+  different machine or a deliberate choice to sit outside athanor's supervision. Write the unit file
+  into the workspace with `Restart=on-failure`, a `RestartSec`, an explicit `WorkingDirectory` and an
   `EnvironmentFile` pointing at a root-readable secrets file, then hand them the three commands to
   run as root: `systemctl daemon-reload`, `systemctl enable --now <unit>`, and
-  `journalctl -u <unit> -n 100 --no-pager`. Never say the service is installed; say the unit is
-  written and waiting for them.
+  `journalctl -u <unit> -n 100 --no-pager`. Never say the unit is installed; say it is written and
+  waiting for them. Do not reach for this on this computer when `service` would do — a unit file the
+  owner has to install by hand is a worse answer to "give me a link" than one string.
 
 ## Proving it runs, before anyone else sees it
 
@@ -55,8 +68,12 @@ of the real message.
 Then exercise it from `shell`, with `curl`, not from the browser — **the browser reaches the public
 internet and nothing else, so a request to this computer's own port is refused**. Check the health
 endpoint returns the expected status _and body_: a 200 serving an error page passes a status check.
-Walk the primary user path end to end, carrying the session cookie between requests if it needs one.
-Read the logs again afterwards; errors often appear only on the first real request.
+Save the response body to `workspace/deploy/health-response.txt` as you go: `set_acceptance` refuses
+`curl`, `wget` and `ssh` outright, by the shape of the command and inside an inline script too, so
+the durable check is an artifact check on what the request returned rather than a check that makes
+the request again. Walk the primary user path end to end, carrying the session cookie between
+requests if it needs one. Read the logs again afterwards; errors often appear only on the first real
+request.
 
 Check configuration explicitly. Every environment variable the app reads must be present and correct
 for the environment being deployed to — a missing one usually surfaces as a runtime 500 on the first
@@ -96,7 +113,9 @@ switch.
 - **Publishing without asking.** Public exposure is irreversible in the sense that matters: the URL
   has been seen.
 - **A link handed over as if it were permanent.** The link outlives the process behind it, so a
-  preview the owner opens tomorrow answers with a proxy error unless someone restarted the app.
+  preview the owner opens tomorrow answers with a proxy error unless the program behind it is a
+  named service. This is the failure `service` exists to remove: reach for it before handing over a
+  link, not after the owner reports the link is dead.
 - **No rollback path.** Write the rollback command in the report _before_ switching.
 - **Migrations without a plan.** A schema change the previous release cannot read makes rollback
   impossible; deploy backward-compatible migrations in two steps.

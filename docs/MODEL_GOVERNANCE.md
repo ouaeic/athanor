@@ -9,10 +9,10 @@ or uses Codex/Claude subscriptions for bounded coding missions.
 
 `MODEL_CATALOG_SCOPE` decides how much of the provider's catalog the owner is offered.
 
-| Scope                        | Selection                                                            | When a weight-licence review lapses                     |
-| ---------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------- |
-| `provider_catalog` (default) | Every chat model the owner's own provider account can reach          | The model keeps working and loses its open-weight badge |
-| `reviewed_open_weight`       | Only models carrying a current independent commercial-licence review | The model is withdrawn from selection (fails closed)    |
+| Scope                        | Selection                                                     | When no review confirms the declared licence            |
+| ---------------------------- | ------------------------------------------------------------- | ------------------------------------------------------- |
+| `provider_catalog` (default) | Every chat model the owner's own provider account can reach   | The model keeps working and loses its open-weight badge |
+| `reviewed_open_weight`       | Only models carrying an independent commercial-licence review | The model is withdrawn from selection (fails closed)    |
 
 The default is `provider_catalog` because Athanor never redistributes model weights. It calls a
 hosted endpoint using the owner's own provider account, so a model's weight licence governs
@@ -21,8 +21,15 @@ review as a _badge_ rather than a _gate_ also means a model released after an At
 without a code change, which is what keeps an unattended server working.
 
 `reviewed_open_weight` preserves the stricter posture for owners who deliberately want to run only
-permissively licensed open-weight models. In that scope an expired review still fails closed, and
-the reviewed allowlist can never be expanded by live provider metadata.
+permissively licensed open-weight models. In that scope a model the manifest cannot confirm still
+fails closed, and the reviewed allowlist can never be expanded by live provider metadata.
+
+A review does not expire. It records the licence a model was published under and the exact upstream
+revision that reading was made against, which is a fact about a published artefact rather than a
+subscription. What retires a review is the catalogue declaring a licence the review does not
+confirm - which is what a relicensing upstream looks like from here - not the passage of time. An
+expiry date would fail a checkout nobody had touched, on a machine installed from a tag and left to
+run, and in this scope that turns a working catalogue into an unselectable one.
 
 Neither scope changes what Athanor itself is licensed under, and neither implies the model's
 output rights, acceptable-use terms, or jurisdictional rules. See **Licenses** below.

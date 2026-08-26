@@ -1,10 +1,8 @@
-schema: 1
 id: deployment
 version: 2.0.0
-catalog_line: 'Run an app here: bind 0.0.0.0, prove it with curl, preview it, say what a restart ends.'
+catalog_line: 'Run an app here: bind 0.0.0.0, prove it with curl, then keep it up as a named service.'
 
 lineage:
-  parent: null
   origin: builtin
   approved_by: null
   approved_at: null
@@ -22,6 +20,8 @@ requires:
       browser_action,
       files_list
     ]
+  # Neither is in the document toolchain and neither is installed by athanor: they belong to this
+  # skill's own subject matter, and document-toolchain.test.ts exempts them by name for that reason.
   binaries: [systemctl, journalctl]
 
 capability:
@@ -33,13 +33,9 @@ capability:
   spend: none
 
 verify:
-  - run: 'curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:PORT/health'
-    assert: 'expected status code and expected response body'
-  - check: 'The health check passed twice, sixty seconds apart, so a crash loop cannot pass.'
+  - artifact: 'workspace/deploy/health-response.txt'
+    assert: 'the captured health response body, saved during the work - set_acceptance refuses curl, wget and ssh outright, so the check is on what the request returned rather than on making the request again'
+  - check: 'The health check was made twice from shell, sixty seconds apart, so a crash loop cannot pass.'
   - check: 'The rollback command is written down and was validated before the switch.'
   - check: 'Public publishing, if any, was explicitly approved by the owner.'
-  - check: 'The report says how long the app stays up on its own, and no systemd service was described as installed unless the owner installed it.'
-
-budget:
-  max_body_tokens: 5000
-  max_activation_ms: 1800000
+  - check: 'The report says whether the app is a named service or a process that ends, and no systemd unit was described as installed unless the owner installed it.'

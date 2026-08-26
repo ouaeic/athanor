@@ -17,10 +17,21 @@ administration, and a plugin marketplace. Those belong to a different product wi
 support burden.
 
 There is no paid tier and no metering of the owner against a plan. The owner holds the
-model-provider account and pays it directly. Two ceilings bound a run, and both are the owner's own
-numbers rather than an allowance: the daily, monthly and per-task spending caps, and a per-turn
-compute budget that stops one runaway loop from spending the afternoon. Both stop work rather than
-throttle it.
+model-provider account and pays it directly. Four ceilings bound a run, and none of them is an
+allowance:
+
+- the **pre-flight price ceiling** (`sudo athanor spend-ceiling`), a maximum rate in dollars per
+  million tokens that athanor will not select a model above. It is the only one that acts before
+  any money is spent, and the only one that works while the owner is asleep; a model the owner
+  names explicitly is never constrained by it;
+- the **daily, monthly and per-task spending caps** in Settings, which watch what a task has
+  already spent and halt it;
+- a **per-turn compute budget**, which stops one runaway loop from spending the afternoon; and
+- a **two-hour wall clock per leased execution**, because the other three compose rather than cap
+  and a turn that is cheap per step and never stops is invisible to all of them.
+
+All four stop work rather than throttle it, and a stopped turn hands over what it did with a reply
+that resumes it.
 
 A turn may hand itself another step budget rather than stopping to be spoken to, but only while the
 harness has just run the turn's own acceptance checks and found them failing, only while it is still
@@ -33,8 +44,21 @@ stopped one would have left behind.
 ### Reviewed memory rather than automatic capture
 
 Automatic fact extraction preserves wrong and sensitive claims with equal confidence. athanor lets
-the agent propose a compact memory and pauses for review before writing it. Exact conversation
-evidence stays searchable without promoting every message into long-term memory.
+the agent propose a compact memory, and pauses for review where review is worth having: every
+replacement and every removal, because both destroy something the owner already approved; and an
+addition that would reach user memory, that carries anything the credential scanner recognises, that
+has no expiry or one more than a year out, or that was written on a turn which had read untrusted
+content. A dated, workspace-scoped addition on a clean turn is saved without a card. That boundary
+is deliberate and was moved: a card on every write read as a strict floor and behaved as the
+opposite, because an agent keeping a nightly journal woke the owner at 3am and taught them to
+approve without reading. What remains behind the card is what is hard to undo or is loaded into
+every future task.
+
+Judgement that does not belong on the write path is served by a review queue instead: the stale and
+failing procedures, and the items recorded as contradicting one another, are listed together, and
+each can be verified as still right, retracted — kept, but no longer recalled, with the record that
+it stopped being true — or forgotten outright. Exact conversation evidence stays searchable without
+promoting every message into long-term memory.
 
 Each accepted fact records owner/agent provenance, optional source task, update lineage, and
 `validFrom`/`validUntil`. Expired and future facts remain inspectable but are excluded from model

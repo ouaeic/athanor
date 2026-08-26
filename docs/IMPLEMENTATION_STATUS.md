@@ -18,8 +18,10 @@
   catalogue reports it unavailable rather than accepting a job that cannot finish.
 - Codex CLI, Claude Code, and OpenCode setup, publisher login paths, bounded missions, compact
   streaming progress, resume IDs, and task cancellation.
-- Reviewed temporal memory with provenance/validity, reviewed skills, task search, friendly and cron
-  schedules, read-only delegation, GitHub, WebDAV, mailbox (IMAP and SMTP submission), calendar
+- Reviewed temporal memory with provenance/validity and a review queue for stale, failing and
+  contradicting entries; reviewed skills; task search; friendly and cron
+  schedules that can be edited, paused, resumed, run now or removed; read-only delegation; GitHub,
+  WebDAV, mailbox (IMAP and SMTP submission), calendar
   (CalDAV), and remote MCP with no-auth, bearer, or discovery/PKCE OAuth.
 - Mail and calendar deliberately speak the open protocols against the owner's own server rather than
   going through a hosted provider's OAuth: a mailbox that can only be opened with Google or
@@ -28,7 +30,8 @@
 - Bounded private extraction and source-linked BM25 retrieval for PDF, office, spreadsheet,
   OpenDocument, HTML, CSV, and text files, with phrase/title/coverage/diversity ranking and no
   duplicate vector store.
-- Native Ubuntu/Debian installer, systemd services, loopback private ports, Nginx TLS gateway,
+- Native installer for four distribution families - Debian/Ubuntu, Fedora/RHEL/Rocky/AlmaLinux,
+  Arch and openSUSE - systemd services, loopback private ports, Nginx TLS gateway,
   PostgreSQL, doctor, strict checksum/path-validated backup/restore with approved package replay,
   merge-safe reinstall, clean-checkout transactional update with automatic data/code rollback, and
   data-preserving uninstall.
@@ -115,8 +118,10 @@ What the numbers were always for is in `apps/api/src/plans.ts` instead, and it i
 itself rather than an account being metered: `serverLimits` caps workspaces, storage, recovery
 points, schedules and previews at deliberately generous values, and `currentPeriod()` is the
 calendar month the usage pane totals against, because nothing is being billed and so nothing has to
-remember a period. What actually stops a runaway unattended run is the owner's own spend cap, in the
-currency the provider bills.
+remember a period. What actually stops a runaway unattended run is the owner's own two numbers, in
+the currency the provider bills: the spending caps, which halt a task once it is over, and the
+pre-flight price ceiling (`sudo athanor spend-ceiling`), which refuses to pick a model priced above
+the rates the owner named in the first place. The second is the one that works overnight.
 
 The workspace table can hold more than one row, and the server allows exactly one: `maxWorkspaces`
 is 1, and the interface presents one computer. The id remains the authorization and encryption

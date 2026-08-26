@@ -51,9 +51,11 @@ The bootstrap clones or updates `/opt/athanor`; the native installer then:
 
 1. validates the OS, CPU architecture, memory and free disk, and stops before doing any work if the
    host cannot finish;
-2. installs apt dependencies, Node.js, pnpm, PostgreSQL, Nginx, Xvfb, Openbox, AT-SPI, LibreOffice,
+2. installs the host's own packages through its own package manager - Node.js, pnpm, PostgreSQL,
+   Nginx, Xvfb, Openbox, AT-SPI, LibreOffice,
    FFmpeg, OCR, and document utilities;
-3. installs the pieces apt does not carry, each pinned to an exact version: the `typst` typesetting
+3. installs the pieces no distribution carries at the version athanor pins, each against an exact
+   version: the `typst` typesetting
    binary, checked against a SHA-256 recorded in the installer before it is unpacked; the document
    Python environment, installed with `--require-hashes` against a hash-locked requirement file;
    and Chromium, fetched by the lockfile-pinned Playwright dependency at the browser revision that
@@ -81,7 +83,7 @@ The bootstrap clones or updates `/opt/athanor`; the native installer then:
     command that fixes it, rather than as "athanor is ready"; and
 13. prints a QR ticket and single-use first-owner code.
 
-The apt and browser caches are ordinary dependencies, not an Athanor runtime image. Installed
+The package and browser caches are ordinary dependencies, not an Athanor runtime image. Installed
 applications and datasets live once on the host.
 
 ### Install from a client
@@ -339,10 +341,11 @@ the official Claude Code integration rather than an unofficial OpenCode auth plu
 Commands the agent runs execute as `athanor-agent`, an unprivileged account separate from the
 `athanor` account the runner itself uses, so a command cannot read the runner's process, its
 capability signing secret, or the browser profile the owner's logins live in. The two share a group,
-which is how the runner still reads back what a command wrote. A fixed root helper permits only
-approved `apt-get update` and package-name-only `apt-get install` requests. Review and Balanced modes
-pause for approval. The runner rejects arbitrary privilege escalation and shell/package-manager
-injection.
+which is how the runner still reads back what a command wrote. A fixed root helper permits only an
+approved package-index refresh and package-name-only installs; it rejects options, paths, hooks and
+shell syntax on every branch, and the package-name filter is a security control rather than a
+convenience. Review and Balanced modes pause for approval. The runner rejects arbitrary privilege
+escalation and shell/package-manager injection.
 
 Programs installed this way are real host packages and survive Athanor restarts. GUI programs run in
 the private Xvfb/Openbox session; the user opens the computer panel only when useful.

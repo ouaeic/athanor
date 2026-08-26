@@ -83,8 +83,12 @@ Clients keep presentation state only. Durable data remains on the server.
 
 ## Agent design
 
-- Stable operating contract, including the craft guidance, plus a small runtime block.
-- The whole tool catalogue on every request, with a search over it for the model's own use.
+- Stable operating contract, including the craft guidance, plus a small runtime block kept at the
+  tail of the request, where a block that changes during a task costs its own bytes and not the
+  window behind it.
+- The whole tool catalogue on every request, in a fixed order, with nothing gated and no search over
+  it. A search was built and removed: it ranked definitions the model already had in front of it and
+  billed a pass over the window to do so.
 - Visible, user-editable plan.
 - Lead model owns decisions; vision/coding/read-only specialists return bounded evidence.
 - Durable memory is compact and reviewed.

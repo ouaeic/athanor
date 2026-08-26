@@ -33,26 +33,63 @@ The relevant adversaries are:
 
 ## Security invariants
 
-- The web app is the only public application surface. Runner, database, browser, desktop, and
-  terminal services are never published directly.
+- The web app is the public application surface, and the one exception is written down rather than
+  implied: Nginx publishes a fixed path allowlist of runner routes — the terminal socket, and
+  `stream`, `action` and `holder` for each of the browser and the desktop — because a live view of
+  the computer cannot be proxied through the API without buffering it. Every one of them is
+  regex-anchored to a single workspace UUID and every one requires a capability token. Nothing else
+  on the runner, and nothing at all of the database, is reachable from outside; `action` and
+  `holder` are control routes rather than streams, which is why they are named here individually
+  instead of behind the word "stream".
 - The first account claims the server; registration then closes by default.
 - Passkeys, origin checks, secure cookies, revocable sessions, and recent-authentication checks guard
   owner settings.
-- Workspace requests require capability tokens that are short-lived (60-120 seconds, and never more
-  than 900 whatever a signer asks for), single-use, bound to one workspace, and scoped per route. A
-  token that names the request it was minted for is refused against any other, so one observed on a
-  file read cannot be turned against `exec`.
+- Workspace requests require capability tokens. Every one is signed, bound to one workspace and one
+  subject, scoped to the routes it may use, and rejected past its expiry — which is 90 seconds for
+  the worker's own tool calls and never more than 900 seconds for anything, whatever a signer asks
+  for. The interactive terminal is the one credential minted at that 900-second ceiling, and
+  deliberately: the runner closes the socket when the capability expires, so a shorter life killed
+  shells mid-command rather than reducing anyone's blast radius.
+- Every capability additionally names the request or requests it was minted for, and is refused
+  against any other — so one observed on a stream cannot be turned against a control route. A token
+  that names no request at all is refused everywhere, rather than admitted on its scopes. The
+  worker's own tokens name one request each; the browser and desktop credentials name the three
+  routes their pane spends them on and nothing else — not the browser's arbitrary-URL fetch, not its
+  search.
+- A capability is spent once. Every HTTP route consults a nonce ledger and refuses a replay. The
+  terminal's `renew` frame arrives inside an already-open socket and so never reaches that hook; it
+  consults a ledger of its own, so a captured renewal cannot re-arm this shell or any other the owner
+  has open. It is also checked against the session it would extend — same owner, same workspace, same
+  role, same scope, same audience — and a renewal that does not match is ignored rather than
+  honoured.
 - Task content, plans, events, schedules, memory, skills, connector credentials, and provider keys are
   encrypted at rest.
-- Application logs, metrics, notifications, and connector audits intentionally exclude prompts,
-  replies, file contents, screenshots, browser text, terminal output, URLs with tokens, and secrets.
+- Application logs, metrics, and connector audits intentionally exclude prompts, replies, file
+  contents, screenshots, browser text, terminal output, URLs with tokens, and secrets.
+- Notifications are the deliberate exception, because a notice with no content is not a notice. One
+  carries the conversation's own title and, when the agent asked for the owner's attention, the
+  sentence the agent wrote — a reply excerpt by construction. It never carries file contents,
+  screenshots, terminal output, browser text or credentials. On the Web Push path the whole payload
+  is encrypted to the subscription's own key, so the push relay that carries it reads none of it;
+  the packaged desktop and mobile clients hold no push subscription and raise the notice through the
+  operating system from data they already have, so nothing leaves the connection to the owner's own
+  server at all.
 - Provider and connector credentials never enter a model prompt.
 - Browser/desktop secure-input mode stops agent observation and actions until the user hands control
   back.
 - External submissions, messages, purchases, public publishing, destructive operations, ambiguous
   coordinate clicks, subscription-agent missions, and every MCP tool execution pass approval policy.
-- Untrusted content is labeled as data and cannot alter system policy, approval rules, or credential
-  boundaries.
+- Untrusted content cannot alter system policy, approval rules, or credential boundaries. Nothing in
+  a tool result reaches the security mode, the approval requirement other than by raising taint, or
+  any credential.
+- Labelling is narrower than that and is worth stating exactly, because the difference is what an
+  attacker would look for. A connector, mail or MCP read arrives wrapped as
+  `{provenance, trust:"untrusted", origin, content}`. A web search, a page read, a browser snapshot,
+  a delegated specialist's report, a shell command that reached the network, a background process's
+  output, and a file read out of the download or mail quarantine directories are classified by the
+  call that produced them rather than by a wrapper around the bytes. A file read back out of a
+  repository the agent cloned earlier is judged on the clone, not on the read — so a turn that only
+  reads such a file is not tainted by it.
 - Remote WebDAV and MCP endpoints require HTTPS on port 443 with no credentials in the URL, public
   DNS addresses only, a lookup pinned to the addresses that were checked, redirect denial, bounded
   request and response bodies, and timeouts. The host itself is allowed because the owner named it
@@ -103,10 +140,10 @@ The database refuses local-socket connections for the application role, so a com
 peer authentication to open the database as the owner of every encrypted row. Access needs the
 password held in root-owned configuration.
 
-Direct `sudo`, `su`, and `doas` execution is rejected. An approved `apt update` or
-package-name-only `apt install` passes through a root-owned helper that rejects options, paths, hooks,
-and shell syntax. Debian package maintainer scripts still execute as root, so approving a package
-extends trust to the configured APT repositories and that package.
+Direct `sudo`, `su`, and `doas` execution is rejected. An approved package-index refresh or
+package-name-only install passes through a root-owned helper that rejects options, paths, hooks, and
+shell syntax. Package maintainer scripts still execute as root, so approving a package extends trust
+to the host's configured package repositories and to that package.
 
 The API, worker, registry, media, and notification services run as a separate `athanor-control`
 account under systemd hardening and cannot read `/home/athanor` directly. They reach the runner over a loopback-only
@@ -143,7 +180,7 @@ ingress and egress at their host or cloud firewall.
 ## Backups and recovery
 
 `athanor backup` pauses mutating services, dumps PostgreSQL, archives `/home/athanor` and
-`/etc/athanor`, records additional approved APT packages, and writes checksums. The backup contains
+`/etc/athanor`, records the additional packages the owner approved, and writes checksums. The backup contains
 encryption keys, browser state, publisher logins, installed user tooling, and user files, so it is as
 sensitive as the live server. Store it in an operator-provided encrypted destination and off-host,
 then test `athanor restore` before depending on it.
@@ -153,7 +190,8 @@ Losing `DATA_MASTER_KEY` makes encrypted records unrecoverable. Rotating or repl
 
 ## Hardening checklist
 
-1. Patch the supported Ubuntu/Debian host and reboot when kernel/security updates require it.
+1. Patch the host and reboot when kernel/security updates require it. Any of the four supported
+   distribution families is fine; the installer and `athanor doctor` both know which one this is.
 2. Expose only SSH as needed and Nginx on 80/443; use `athanor doctor` to verify every private service
    remains loopback-only.
 3. Restrict SSH, disable password login where practical, and protect the server provider account.

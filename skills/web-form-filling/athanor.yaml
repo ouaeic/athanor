@@ -1,10 +1,8 @@
-schema: 1
 id: web-form-filling
 version: 2.1.0
 catalog_line: 'Enumerate, plan, batch-fill and read back any web form or portal; submit only on approval.'
 
 lineage:
-  parent: null
   origin: builtin
   approved_by: null
   approved_at: null
@@ -27,7 +25,3 @@ verify:
   - check: 'The completed form was presented to the owner and explicitly approved before submitting.'
   - check: 'After submission a reference number or re-fetched record confirms it landed.'
   - check: 'Any field populated by the site own autofill was read back and corrected against the owner source data rather than accepted.'
-
-budget:
-  max_body_tokens: 5000
-  max_activation_ms: 1800000

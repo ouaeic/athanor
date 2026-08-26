@@ -169,6 +169,34 @@ Address handling follows what each provider actually does:
 `ddns test` forces a publish, prints what the provider echoed back, resolves the hostname, and says
 whether the answer already includes this computer's address or is still cached.
 
+## Spending ceiling
+
+```bash
+sudo athanor spend-ceiling show
+sudo athanor spend-ceiling set 2 10
+sudo athanor spend-ceiling set none 10
+sudo athanor spend-ceiling clear
+```
+
+The pre-flight half of the spending brake, and the half that works while nobody is watching. The
+daily, monthly and per-task caps in Settings watch what a task has already spent and halt it once it
+is over; this refuses to _pick_ a model priced above the rates named here in the first place. Both
+rates are dollars per million tokens — `set 2 10` means at most $2 per million in and $10 per million
+out — and either may be the word `none`.
+
+Every place athanor selects a model for the owner ranks against it: the lead when a task is created,
+the vision specialist, the model the picker recommends, and the support picker behind titling and the
+subscription flows. When the ceiling leaves nothing eligible, selection is refused with the cheapest
+route that could have done the work and what it costs, rather than quietly substituting something
+weaker or reporting the model as unavailable. A model the owner names explicitly is never
+constrained: the ceiling governs what athanor chooses for them, not what they choose for themselves.
+
+`show` prints the ceiling currently stored. Changes take effect on the next selection; a task
+already running keeps the model it was given. On a server whose database predates the column, both
+`show` and `set` say so and change nothing rather than validating a number and storing it nowhere —
+a control wearing a brake's name while wired to nothing is the exact failure this command exists not
+to be.
+
 ## Backup
 
 A daily backup is enabled by the installer and needs no attention:
@@ -200,7 +228,7 @@ Mutating Athanor services pause under a restart trap. A backup contains:
 The configuration archive contains the keys required to decrypt the database; the workspace archive
 contains files, browser state, installed user-scoped tooling, and publisher logins. Package binaries
 are not duplicated into the archive: a clean restore validates `packages.txt` and reinstalls those
-packages from the host's configured APT repositories. Encrypt backups and copy them off-host.
+packages from the host's own configured repositories. Encrypt backups and copy them off-host.
 
 ## Restore
 
@@ -283,7 +311,10 @@ and backups. Removal of preserved data is a separate, explicit operator action.
   not answering from one that is running with no Web Push signing keys. A missing key pair does not
   stop the unit — it disables delivery and says so, because a crash-looping unit hides its own
   reason. Confirm the `PUSH_VAPID_*` values in `/etc/athanor/control.env` and inspect
-  `journalctl -u athanor@notifications`.
+  `journalctl -u athanor@notifications`. This covers browsers and installed web apps only: the
+  packaged desktop and mobile clients hold no push subscription and raise notices through the
+  operating system themselves, so a phone that is quiet while a browser is not is a client-side
+  permission rather than a server fault.
 - **Changed address:** inspect `/.well-known/athanor`, timer state, mDNS, provider DNS, and firewall.
 - **Dynamic DNS stale:** run `sudo athanor ddns status`, which prints the last recorded provider
   error, then `sudo athanor ddns test` to force a publish and see the provider's answer.

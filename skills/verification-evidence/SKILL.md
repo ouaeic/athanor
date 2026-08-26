@@ -3,7 +3,7 @@ name: verification-evidence
 description: Decide what counts as proof that a task is actually done, gather that proof with the tools that produce it, and refuse to report completion without it. Use before calling finish, whenever a deliverable file has been written, and whenever a command "succeeded" but nothing was inspected. Do not use as a substitute for the format-specific verification in render-proof, xlsx-authoring or code-change; this skill decides what evidence is required, those produce it.
 license: AGPL-3.0-or-later
 compatibility: No external binaries required.
-allowed-tools: set_acceptance shell file_read files_list document_read image_read publish_artifact finish
+allowed-tools: set_acceptance shell file_read files_list document_read image_read audio_read publish_artifact finish
 metadata:
   athanor.tier: 'builtin'
   athanor.version: '1.3.0'
@@ -44,9 +44,10 @@ Use the strongest rung the task allows. Anything below rung 3 is not evidence.
 | Code change                 | 4            | the project's own test command exits 0, and it failed before the change                         |
 | Data analysis               | 4            | the analysis script re-runs from a clean state and produces the same numbers                    |
 | Web form submitted          | 6            | a confirmation page, reference number, or a re-fetch of the record                              |
-| Deployment                  | 4            | a health check against the deployed URL returns the expected status and body                    |
+| Deployment                  | 4            | a health check made from `shell` returns the expected status and body, saved as an artifact     |
 | Research claim              | 6            | the cited source was re-fetched and the quoted span still supports the claim                    |
 | Background job              | 4            | the job's own completion record plus a check of the output it was supposed to produce           |
+| Generated speech            | 4            | `audio_read` transcribes the clip and the transcript matches the script word for word           |
 | Conversational answer       | n/a          | `verification.status = not_applicable`; no external state changed                               |
 
 ## Procedure
@@ -60,6 +61,15 @@ Use the strongest rung the task allows. Anything below rung 3 is not evidence.
    Pick from the table above: "the budget workbook exists" is not a check, and
    `athanor-office-convert budget.xlsx proofs/budget.pdf` with `expectExit: 0` is.
 
+   **A check may not reach the network or change the machine**, and the harness refuses it by the
+   shape of the command rather than by a name list: `curl`, `wget`, `ssh`, `scp`, `rsync`, `gh`,
+   `rm`, `mv`, `dd`, `chmod`, `chown`, the package managers, `systemctl`, `reboot` and
+   `git push`/`clean`/`reset`/`restore`/`checkout`. A wrapper is judged by what it runs and an
+   interpreter by the script it is handed, so `bash -lc "curl …"` is refused too. When the thing you
+   want to prove needed one of those — a deployment health check is the usual case — make the
+   request during the work, save what came back, and declare an `artifact` check on the saved
+   response.
+
    Three things to know about it.
 
    **A definition of done that already passes is refused.** When you declare checks before anything
@@ -70,10 +80,14 @@ Use the strongest rung the task allows. Anything below rung 3 is not evidence.
    one, because that is a regression guard.
 
    **Declare them before you change anything.** Checks declared after the turn has already written
-   something are still accepted, but the harness never watched them fail, and the completion says so
-   where the owner reads it. The same applies to a record inherited from an earlier turn: it was
-   green before this turn began, so it shows that nothing broke rather than that this work is right,
-   and finishing is held until this turn declares its own.
+   something are still accepted, and nothing marks them — the hold on `finish` is the only thing
+   that ever asks for a record, and it fires because something has already changed, so a caveat for
+   it would print on nearly every completed task and would be about this box's step order rather
+   than about your checks. Declaring late costs you the one thing worth having instead: a check
+   written after the work is a check written by someone with a stake in what passes. A record
+   inherited from an earlier turn _is_ marked, because it was green before this turn began, so it
+   shows that nothing broke rather than that this work is right — and finishing is held until this
+   turn declares its own.
 
    **Calling it again is allowed and both versions are shown to the owner**, because weakening your
    own test is a different act from passing it. And the harness runs commands, looks at files, and

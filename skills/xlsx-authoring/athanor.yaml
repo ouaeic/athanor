@@ -1,10 +1,8 @@
-schema: 1
 id: xlsx-authoring
 version: 2.0.0
 catalog_line: 'Build spreadsheets with live formulas, formats and charts, then assert zero error cells.'
 
 lineage:
-  parent: null
   origin: builtin
   approved_by: null
   approved_at: null
@@ -28,7 +26,3 @@ verify:
     assert: 'exits 0, so error_cells == 0 and uncached_formulas == 0'
   - check: 'One headline total matches the same arithmetic done independently from the source data.'
   - check: 'No column renders as ##### and every chart axis is labelled in the page proof.'
-
-budget:
-  max_body_tokens: 5000
-  max_activation_ms: 900000

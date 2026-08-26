@@ -3,7 +3,7 @@ name: media-creation
 description: Produce images, speech, diagrams and video edits — pictures and voiceovers generated through the owner's configured provider, everything else edited deterministically with ffmpeg, ImageMagick and Graphviz — and inspect the result before delivering it. Use when the deliverable is a picture, an illustration, a diagram, an audio clip, a voiceover, a video edit or a screen recording. Do not use to run any model locally, do not use to generate a video from a prompt because there is no route to one, and do not use for charts derived from data, which belong to data-analysis.
 license: AGPL-3.0-or-later
 compatibility: Every deterministic tool named here is installed on this computer by athanor - ffmpeg, ImageMagick as `magick`, and Graphviz. Generated images and speech go through the owner's configured provider; there is no generated video here at all.
-allowed-tools: generate_media image_read shell file_read file_write files_list publish_artifact
+allowed-tools: generate_media image_read audio_read shell file_read file_write files_list publish_artifact
 metadata:
   athanor.tier: 'builtin'
   athanor.version: '2.2.0'
@@ -87,12 +87,18 @@ has. No model weights run on this machine and nothing is downloaded to run local
    Set a hard limit — usually three attempts — then show the owner what you have and ask.
 
 Speech: the prompt is the script, word for word, and it is what the provider bills for. State the
-voice, pace and any pronunciation guidance in the surrounding request. Listening back is not
-possible, so verify by transcribing the output and comparing the text to the script.
+voice, pace and any pronunciation guidance in the surrounding request. Then **listen back with
+`audio_read`**: it transcribes the generated `.mp3` and returns what was actually said, which is the
+only way to catch a mispronounced name, a dropped clause or a number read as digits. Compare that
+transcript to the script word for word. `audio_read` is billed by the minute of recording, so one
+call covers a whole voiceover; a reading is bounded at ninety minutes and resumes by second rather
+than failing on a long file.
 
 ## Verification
 
 - Every image is inspected with `image_read` against the brief before delivery.
+- Every generated voiceover is transcribed with `audio_read` and the transcript compared to the
+  script; a clip nobody listened to is not a delivered clip.
 - Every edited video: check duration, resolution and audio presence with
   `ffprobe -hide_banner in.mp4`, and extract two frames to look at.
 - Every diagram: read every label and confirm it against the source of truth.

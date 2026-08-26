@@ -9,7 +9,7 @@ completion nag — plus a fallback plan, a baseline refusal, a repetition watch 
 continuer. Each of them was right about the failure it saw. None of them can be removed, because
 nobody could say what removing one would cost.
 
-`evals/` answers that. Forty-nine owner-shaped requests run against the real agent loop with a
+`evals/` answers that. Fifty-three owner-shaped requests run against the real agent loop with a
 stubbed model, a stubbed workspace runner and a stubbed media provider, and every one reports what
 it cost: how many model calls, how many prompt tokens, how much of each request repeated the one
 before it byte for byte, how many commands the workspace ran, how many generations the provider was
@@ -33,8 +33,22 @@ pnpm eval                     # the whole suite and the report
 pnpm eval --filter research   # only fixtures whose id or shape matches
 pnpm eval --trace             # also print what the loop said back to the model
 pnpm eval --json out.json     # write the raw results as well
-pnpm eval --update            # rewrite evals/baseline.json from this run
+pnpm eval --accept            # rewrite evals/baseline.json from this run
+pnpm eval:context             # the context-quality matrix, deterministic half
+pnpm eval:context --judge     # also the graded half; needs OPENROUTER_API_KEY
 ```
+
+The flag was called `--update` until the baseline became a gate rather than a printout. Rewriting a
+committed baseline is an acceptance, so it is spelled like one; the old name exits 2 and names the
+new one rather than silently writing nothing.
+
+`pnpm eval:context` is a second rig beside this one, in `evals/context-quality/`. This suite asserts
+counters — step counts, token counts, which holds fired — over a scripted model, so it cannot tell
+whether narrowing the window cost the agent anything it needed. That is what the context-quality
+matrix is for: it replays sixty steps of one task under each candidate context configuration and
+scores whether the fact each probe needs was still in the window at the step that needed it. Run it
+before changing any constant in `apps/worker/src/context.ts`. Its `--ci` arm is deterministic, needs
+no provider key, and exits 1 on a quality regression.
 
 It is offline and deterministic: no provider key, no network, no workspace runner, nothing to set
 up. A run takes a few seconds.
@@ -65,11 +79,15 @@ previously see. Every provider that bills a cached prefix bills it as a prefix �
 the first byte that differs from what it already holds — so the leading run one request shares with
 the last is the ceiling on what could be handed back cheaply. A turn that only appends to its window
 measures about 97%. A turn that rewrites bytes near the front of it, for any reason, falls into the
-sixties, and the step count does not move at all. Measured on the long fixture, which condenses
-nothing on a million-token window: with its tool results small enough that the older-output floor
-never has to move, the same thirty-two steps read 95%; with them large enough that the floor walks
-down to its hard limit, 65%. Thirty points of a long job's bill, and not one other number in the
-report changes. A single-call turn has no previous request and reports `-`.
+sixties, and the step count does not move at all. The two long fixtures make the point on the same
+mechanism: `long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly` keeps its tool results
+small enough that the older-output floor never has to move and reads **94%**, while
+`long-finished-phases-condense-rather-than-shred` returns results far larger than that floor, so the
+floor walks down and re-cuts every one of them each time it moves, and it reads **66%**. Twenty-eight
+points of a long job's bill, decided by nothing but the size of what the tools returned, and not one
+other number in the report changes. Every percentage in this document is a committed cell of
+`evals/baseline.json`; read it there rather than trusting the sentence. A single-call turn has no
+previous request and reports `-`.
 
 It is measured on the request as the provider reads it — the tool catalogue first, then the
 conversation — rather than in the order the JSON body happens to be written, and the tool-free call
@@ -135,11 +153,16 @@ they are described. Delegation, on `research-a-specialist-reads-and-the-turn-inh
 is one step of the turn and an open-ended bill underneath it, and the two floors that hold it are
 that a specialist's reading crosses back into the turn as untrusted content and that its reach for a
 command runs nothing. Compaction, as a pair of proof jobs which differ only in whether the agent
-says the first document is finished. Measured on a 128,000-token window, saying so costs two model
-calls and 19,679 more prompt tokens rather than fewer, and returns a 2,668-token lower peak prompt:
-the verbatim tail the target asks to keep is 35% of the budget whether or not the agent has declared
-a phase over, so an explicit compaction fires with almost nothing left below it to take. That is a
-number to argue with, and it is now committed. And skills, on the same pair: an opened procedure is
+says the first document is finished. Measured on a 128,000-token window, saying so costs **two model
+calls** — the step that asks and the tool-free call that writes the brief — and saves **74,246
+prompt tokens**, for two points of cached prefix given up. Both halves of that are committed cells,
+so the claim is arithmetic rather than recollection: `long-a-finished-phase-is-never-declared` is
+983,830 prompt tokens over 38 model calls at 96% cached, and
+`long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly` is 909,584 over 40 at 94%;
+983,830 − 909,584 = 74,246. Subtract the rows and what is left is a compaction, because the control
+arm asserts zero compactions and its tool results are deliberately small enough that the
+older-output floor never cuts one. That is a number to argue with, and it is now committed —
+re-derive it from the baseline after any change rather than copying this sentence forward. And skills, on the same pair: an opened procedure is
 an ordinary tool result, so a compaction condenses it like anything else, and the brief has to name
 what it took or the agent works on to a procedure it can no longer read with nothing saying so.
 
@@ -162,9 +185,10 @@ tail the compaction target asked to keep was larger than the whole conversation,
 held down by cutting older tool results to the two-thousand-character floor instead. Capping the
 trigger in absolute tokens fixed that, and all three now condense. What the row still reports is the
 other half of that story: its tool results are far larger than the older-output floor, so the floor
-walks down anyway and re-cuts every one of them each time it moves, and the cached share sits at 64%
+walks down anyway and re-cuts every one of them each time it moves, and the cached share sits at 66%
 where the proof pair above — same mechanism, results small enough that the floor never has to cut
-one — reads 94%. Thirty points of a long job's bill, decided by the size of what its tools return.
+one — reads 94%. Twenty-eight points of a long job's bill, decided by the size of what its tools
+return.
 
 ## What it does not do
 

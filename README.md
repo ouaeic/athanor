@@ -58,7 +58,7 @@ installer, and imports the returned connection ticket. No Athanor website or rel
 secret. Browsers cannot safely open raw SSH, so the PWA shows the command instead.
 
 The installer gathers the computer’s usable addresses, installs its dependencies as ordinary host
-packages — plus the three pinned pieces apt does not carry: the `typst` typesetter against a
+packages — plus the three pinned pieces no distribution carries at these versions: the `typst` typesetter against a
 recorded SHA-256, a hash-locked document Python environment, and Chromium at the revision the
 lockfile’s Playwright carries — builds athanor, creates isolated service accounts and keys, starts
 systemd services, opens the existing HTTPS gateway on ports 80/443, and prints the address of the
@@ -100,6 +100,9 @@ athanor does not silently add a relay, VPN, or tracking directory; see
 - Persistent home, files, Chromium profile, installed programs, and publisher CLI logins.
 - Foreground and background commands with timeouts, output bounds, polling, cancellation, and
   explicit network intent.
+- Named services the computer keeps running: no timeout, restarted with backoff if they die, and
+  still there after the machine reboots — which is what a link the agent hands the owner needs in
+  order to still answer in the morning.
 - Approval-gated host package installation through a narrow root helper; arbitrary `sudo`, `su`,
   `doas`, and package-manager injection are rejected.
 - Repository map, fast search, symbols, diagnostics, conflict-checked patches, and verification.
@@ -128,10 +131,13 @@ athanor does not silently add a relay, VPN, or tracking directory; see
 - One-time, interval, daily, weekly, and advanced five-field cron schedules with IANA time zones.
   Schedules can be edited, paused, resumed, run now, or removed and keep working while clients are
   offline.
-- A hidden runtime block naming this computer, the time in the owner’s own time zone, the working
-  root, what the document toolchain on this machine can do, the security mode, and the preview
-  gateway — followed by the active memory entries, the index of saved and built-in skills, the
-  running brief of anything already condensed, and the current plan.
+- A request assembled for the cache as much as for the model: the operating contract, then the
+  active memory entries and the index of saved and built-in skills, then the recalled memory pack,
+  then the workspace brief, then the request and the trajectory, then the current plan — and last of
+  all a hidden runtime block naming this computer, the time in the owner’s own time zone, the
+  working root, what the document toolchain on this machine can do, the security mode, and the
+  preview gateway. The runtime block is last because it is the only part that changes during a task,
+  and anything that changes early re-bills everything behind it.
 - Capability-aware model routing: a lead model without vision receives bounded observations from the
   best eligible vision model and remains responsible for the result.
 - Notifications to the owner's own devices for an approval, a finished task, a paused spend, a
@@ -146,7 +152,7 @@ athanor does not silently add a relay, VPN, or tracking directory; see
 
 - Every chat model the owner's own provider account can reach, so a model released after this build
   appears without an athanor update. `MODEL_CATALOG_SCOPE=reviewed_open_weight` narrows selection to
-  models carrying a current independent open-weight licence review.
+  models carrying an independent open-weight licence review.
 - Provider prompt caching, so the operating contract, tool catalogue, and trajectory that an agent
   turn re-sends on every step are billed once rather than on each step.
 - Bounded retry with backoff on transient provider failures, and a request deadline, so one 429 or a
@@ -195,9 +201,18 @@ sudo athanor auto-update {status|on|off}
 sudo athanor certificate
 sudo athanor ddns
 sudo athanor set-hostname NAME
+sudo athanor spend-ceiling {show|set INPUT OUTPUT|clear}
 sudo athanor relay {status|on|off}
 sudo athanor uninstall
 ```
+
+`spend-ceiling` is the pre-flight half of the spending brake. The daily, monthly and per-task caps
+in Settings watch what a task has already spent and halt it; this refuses to pick a model priced
+above the rates you name in the first place, which is the half that works while you are asleep.
+Both rates are dollars per million tokens - `sudo athanor spend-ceiling set 2 10` means "at most $2
+per million in and $10 per million out" - and either may be the word `none`. A model you choose by
+name is never constrained by it: the ceiling governs what athanor picks for you, not what you pick
+for yourself.
 
 `certificate` requests a publicly trusted certificate for the existing server identity key, so the
 pinned client identity is unchanged. It is a separate command rather than part of install because
@@ -215,8 +230,8 @@ because only the running server can redeem an enrollment token. See
 backups. See [Deployment](docs/DEPLOYMENT.md) and [Operations](docs/OPERATIONS.md).
 
 Backups contain the database encryption keys, server identity, browser profile, publisher logins,
-and user files. They also record additional approved APT packages so a clean host can reinstall
-them. Store backups in an operator-provided encrypted destination and copy them off-host; Athanor
+and user files. They also record the additional packages the owner approved, so a clean host can
+reinstall them. Store backups in an operator-provided encrypted destination and copy them off-host; Athanor
 never uploads them.
 
 ## Architecture
