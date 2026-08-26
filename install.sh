@@ -63,29 +63,53 @@ if [ ! -f "$athanor_root/scripts/install-native.sh" ]; then
   if [ -e "$athanor_root" ]; then
     [ -d "$athanor_root/.git" ] ||
       fail "$athanor_root already exists and is not an athanor Git checkout"
-    git -C "$athanor_root" fetch --tags --prune origin
-    git -C "$athanor_root" checkout "$revision"
   else
     # Not shallow. The update path rolls back by resetting to the revision it came from, and a
     # depth-1 clone has no revision to go back to.
     git clone --branch "$revision" "$repository" "$athanor_root"
   fi
-  # Installed at a pinned revision, but on a branch that can move.
-  #
-  # Checking out a tag leaves a detached HEAD with no upstream, so `git pull --ff-only` answers
-  # "Already up to date" for ever: the box never received another line of code while `doctor`
-  # cheerfully reported that unattended updates were on. Since the documented install command pins a
-  # tag, that was every installation. The tree still starts exactly at the pinned revision - that is
-  # what the pin is for - and this only gives the update path somewhere to fast-forward to.
-  git -C "$athanor_root" fetch --tags --prune origin
-  git -C "$athanor_root" checkout -B "$athanor_branch" "$revision"
-  git -C "$athanor_root" branch --set-upstream-to="origin/$athanor_track" "$athanor_branch" ||
-    fail "could not follow origin/$athanor_track for updates"
-  if [ -n "$expected_commit" ]; then
-    installed_commit=$(git -C "$athanor_root" rev-parse --verify HEAD)
-    [ "$installed_commit" = "$expected_commit" ] ||
-      fail "the downloaded source does not match the client release commit"
-  fi
+fi
+
+# Everything below runs on every bootstrap, including one that found a checkout already here.
+#
+# It used to sit inside the block above, so a run that found /opt/athanor/scripts/install-native.sh
+# already on disk skipped the fetch, the checkout and the commit verification, and installed
+# whatever revision happened to be lying there. The arrangement that reaches this a second time is
+# not an owner running the command twice - the packaged client asks a working box for a pairing code
+# instead of installing - it is a partial install, where the source arrived and the `athanor` CLI
+# never reached PATH. That is precisely the box whose state nobody can vouch for, and it was the one
+# box where ATHANOR_EXPECTED_COMMIT was not checked. The same skip meant the documented
+# `ATHANOR_REF=v0.1.1` never moved an existing checkout to v0.1.1; it rebuilt what was on disk.
+[ -d "$athanor_root/.git" ] ||
+  fail "$athanor_root is not an athanor Git checkout"
+command -v git >/dev/null 2>&1 ||
+  fail "git is needed to verify the source at $athanor_root and is not installed"
+git -C "$athanor_root" fetch --tags --prune origin
+
+# A branch name is taken from the remote and everything else is taken as written. `main` names a
+# local branch too, and on a box that has been here a while that local ref is whatever the clone
+# left behind - checking it out would quietly move the server backwards to install day. A tag or a
+# commit has no remote-tracking ref and is resolved as itself, which is what a pin means.
+if git -C "$athanor_root" rev-parse --verify --quiet "refs/remotes/origin/$revision" >/dev/null; then
+  target="origin/$revision"
+else
+  target="$revision"
+fi
+
+# Installed at a pinned revision, but on a branch that can move.
+#
+# Checking out a tag leaves a detached HEAD with no upstream, so `git pull --ff-only` answers
+# "Already up to date" for ever: the box never received another line of code while `doctor`
+# cheerfully reported that unattended updates were on. Since the documented install command pins a
+# tag, that was every installation. The tree still starts exactly at the pinned revision - that is
+# what the pin is for - and this only gives the update path somewhere to fast-forward to.
+git -C "$athanor_root" checkout -B "$athanor_branch" "$target"
+git -C "$athanor_root" branch --set-upstream-to="origin/$athanor_track" "$athanor_branch" ||
+  fail "could not follow origin/$athanor_track for updates"
+if [ -n "$expected_commit" ]; then
+  installed_commit=$(git -C "$athanor_root" rev-parse --verify HEAD)
+  [ "$installed_commit" = "$expected_commit" ] ||
+    fail "the downloaded source does not match the client release commit"
 fi
 
 exec /bin/sh "$athanor_root/scripts/install-native.sh" "$@"
