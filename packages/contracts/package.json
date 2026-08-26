@@ -18,7 +18,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "NODE_OPTIONS=--conditions=development vitest run --exclude 'dist/**' --passWithNoTests"
+    "test": "NODE_OPTIONS=--conditions=development vitest run --exclude 'dist/**'"
   },
   "dependencies": {
     "zod": "4.4.3"

@@ -1,5 +1,10 @@
 /**
- * Forty-nine owner-shaped requests, each with something machine-checkable to say.
+ * Owner-shaped requests, each with something machine-checkable to say.
+ *
+ * Counted in the report rather than here: this opening said "forty-nine" while the file held
+ * fifty-three, which is what a number in prose does to itself. One row is not a request at all -
+ * `schema-every-catalogued-tool-has-a-handler` runs no turn and asserts about the catalogue every
+ * other row is priced on - and it is marked `shape: 'schema'` so the coverage table says so.
  *
  * They are grounded in two files: the operating contract in `apps/worker/src/context.ts`, which is
  * what the model is told it can do, and the catalogue in `apps/worker/src/tools.ts`, which is what
@@ -16,6 +21,10 @@
  * least one of: how many model calls the turn cost, which tools ran, whether the owner was asked,
  * where the task ended up, or which hold fired.
  */
+import { readFileSync } from 'node:fs';
+
+import { COMPACT_CONTEXT_TOOL } from '../apps/worker/src/context.js';
+import { agentToolsFor } from '../apps/worker/src/tool-catalogue.js';
 import {
   conversational,
   evidence,
@@ -81,6 +90,12 @@ const scanPlan: ReadonlyArray<number | 'phase-done'> = Array.from(
 ).flatMap((batch) =>
   batch % 8 === 7 && batch !== BATCHES - 1 ? [batch, 'phase-done' as const] : [batch]
 );
+
+/**
+ * The same job with the sentence never said, on a window small enough that the loop has to decide
+ * for itself. Sixteen batches is where the plateau below is unmistakable and no longer moving.
+ */
+const BUDGET_BATCHES = 16;
 
 /**
  * More than a route is allowed to write in one answer: eight characters to the token against the
@@ -227,12 +242,184 @@ const proofRun =
     };
   };
 
+/**
+ * Two warnings a single fixture raises several times over, named so the expectation reads as a
+ * count rather than as a wall of repeated prose. Everything else a fixture warns about it says in
+ * full, at the fixture, because the point of the empty default is that a warning is worth reading.
+ */
+const OUTPUT_LIMIT_CONTINUED = 'The reply reached the model’s output limit and is being continued';
+const OUTPUT_LIMIT_CAPPED =
+  'The reply reached the model’s output limit again, so it was not continued automatically';
+
+/**
+ * A workspace that has been used before: a brief, saved notes, a remembered fact and a procedure.
+ *
+ * Every block it fills sits in the preamble, ahead of the whole trajectory and under both cache
+ * breakpoints, and until this fixture existed not one of them was filled on any row here. The pool
+ * was empty, the skill list was empty and there was no `workspace/ATHANOR.md` anywhere in the rig -
+ * so four separate repairs to the order and the freezing of those blocks could each have been
+ * reverted, one at a time, without a single committed number moving.
+ */
+const REMEMBERING_WORKSPACE = {
+  knowledge: [
+    {
+      target: 'workspace' as const,
+      content: 'Invoices for the brochure job are raised monthly in arrears.'
+    },
+    { target: 'user' as const, content: 'Say what changed before sending anything out.' },
+    {
+      target: 'workspace' as const,
+      /*
+       * An expiry inside the run, which is the entry the whole block turns on.
+       *
+       * The temporal filter is anchored to the task's own creation instant, not to the wall clock:
+       * a note that stops being true while the task is running was in this block on one request and
+       * gone from the next, and the block whose header says "frozen for this run" rewrote itself
+       * mid-run - re-billing the pack, the goal and the entire trajectory behind it. Dated after
+       * this task starts and before any wall clock that will ever run this suite, so the anchored
+       * reading keeps it and an unanchored one drops it. `anchorHeld` below is what notices.
+       */
+      content: 'The rate freeze on the brochure job holds until the end of the quarter.',
+      validUntil: '2026-07-20T00:00:00.000Z'
+    }
+  ],
+  recall: [
+    {
+      kind: 'fact' as const,
+      title: 'brochure renewal rate',
+      body: 'The renewal rate on the brochure job is 4.25 per cent for the current term.',
+      score: 9
+    },
+    {
+      kind: 'episode' as const,
+      title: 'the last brochure send',
+      body: 'The last brochure send was held back until every font came back embedded.',
+      score: 4
+    },
+    {
+      /*
+       * A belief that stopped being true before this task started, ranked above everything else.
+       *
+       * `asOf` and `now` are different parameters answering different questions, and until this
+       * wave only the second was passed - so `q.as_of` was NULL on every memory pack ever built and
+       * the validity half of the admissibility predicate short-circuited to true. A dead end filed
+       * with a fortnight's validity was still being told to the next turn a month later, at the top
+       * of the window, as a current fact. The score here is deliberately the highest in the pool:
+       * if the predicate is armed this entry cannot appear whatever it scores, and if it is not,
+       * nothing else could keep it out.
+       */
+      kind: 'fact' as const,
+      title: 'a belief that has expired',
+      // Long on purpose. A pack that admits this row is a pack whose largest request grew by about
+      // six hundred tokens, so `maxPeakPromptTokens` on the fixture below fails on it rather than
+      // needing a reader to notice a sentence that should not be there.
+      body: `The brochure job is on hold pending a signature. ${'The countersigned copy has still not come back from the client. '.repeat(38)}`,
+      validTo: '2026-06-01T00:00:00.000Z',
+      score: 99
+    },
+    {
+      // And one the curated overlay has already replaced. Superseded rows are admissible only to a
+      // caller that asks for them, and the pack never does.
+      kind: 'fact' as const,
+      title: 'the rate before it was renegotiated',
+      body: `The renewal rate on the brochure job is 3.9 per cent. ${'That figure was agreed in the previous term and carried forward by mistake. '.repeat(34)}`,
+      status: 'superseded' as const,
+      score: 98
+    }
+  ]
+};
+
+/**
+ * Ten pages at the size the runner actually hands one back, for the delegated fixture.
+ *
+ * Sixteen thousand characters each is above `boundedKnowledge`'s cap on what a specialist's own
+ * report may carry and well above what any of the other research fixtures read, which is the point:
+ * a mission that reads pages this size is the only shape in this file whose specialist window comes
+ * under real pressure, and therefore the only one where its truncation floor and its share of the
+ * task's budget do anything at all.
+ */
+const SURVEY_PAGES = Object.fromEntries(
+  Array.from({ length: 10 }, (_, page) => [
+    `https://registry-${page}.example/policy`,
+    [
+      `Registry ${page} publishes its retention policy here.`,
+      ...Array.from(
+        { length: 150 },
+        (_, line) =>
+          `  clause ${page}.${line}: records of class ${(page * 7 + line) % 23} are retained for ${180 + ((page * line) % 900)} days, reviewed every ${1 + (line % 12)} months, and disposed of by ${line % 2 === 0 ? 'secure erasure' : 'physical destruction'}.`
+      )
+    ].join('\n')
+  ])
+);
+
 /** A workspace with a couple of ordinary things in it, which most fixtures can share. */
 const workspaceFiles = {
   'workspace/notes.txt': 'Renewal is due on 14 March 2027 at the standard rate.\n',
   'workspace/contract.pdf': 'Clause 7: either party may terminate with 60 days written notice.\n',
   'workspace/importer.py': 'def load(rows):\n    return rows\n'
 };
+
+/* ------------------------------------------------------------------ the catalogue, as a claim */
+
+/**
+ * The catalogue every request of a run carries, derived from the same two sources the loop builds
+ * it from rather than written out by name.
+ *
+ * Naming forty tools here would make a fixture fail every time one is added, which is how an
+ * assertion about the catalogue turns into an assertion about its length - the objection
+ * `Expectation.finalCatalogueUnchanged` was written against. Deriving it keeps the two real claims
+ * and drops that one:
+ *
+ *   the order is fixed for the life of the run. `agentToolsFor()` puts core tools first and the
+ *   rest in declaration order, `compact_context` goes last, and nothing after `agent.ts:8552`
+ *   touches the array - so a catalogue assembled per step, or reordered, fails here.
+ *
+ *   the closing handoff is handed the caller's own array. The handoff request is the largest of
+ *   the turn and it is the one a narrowed catalogue would be cheapest to sneak into; a shorter
+ *   list on it rewrites the head of the biggest prompt of the run.
+ *
+ * And the withdrawal is exactly one. `connector_action` is the only tool any run drops, on a box
+ * with nothing connected, which is what every fixture here is; `connector_list` stays, precisely so
+ * the model can find out. A second withdrawal appearing - the `web_search` swap this set used to
+ * do - is a model reading descriptions of a computer it is not on, and it fails here.
+ */
+const EVAL_CATALOGUE: readonly string[] = [...agentToolsFor(), COMPACT_CONTEXT_TOOL]
+  .map((tool) => tool.name)
+  .filter((name) => name !== 'connector_action');
+
+/**
+ * Names read out of a source file, failing loudly when the pattern stops matching.
+ *
+ * The two tables the schema fixture is about are module-private on purpose - the dispatch table is
+ * the authority on what runs and the loop-answered set is the authority on what does not - so this
+ * reads them the way `scripts/check-repository.mjs` reads a constant it must not copy. A rename is
+ * then as loud as a deletion, which is the failure mode this is guarding against: a table that has
+ * quietly become unreadable reports that everything matches.
+ */
+const namesIn = (file: string, pattern: RegExp, what: string): readonly string[] => {
+  const source = readFileSync(new URL(`../apps/worker/src/${file}`, import.meta.url), 'utf8');
+  const block = source.match(pattern);
+  if (!block?.[1])
+    throw new Error(`${what} could not be read from ${file}; this check is not running`);
+  // A quoted member on a line of its own, or a `name: handler` arm. The last member of a list has
+  // no trailing comma, which is why the punctuation is optional and the line end will do instead.
+  return [...block[1].matchAll(/^\s*'?([a-z_]+)'?\s*(?:[,:]|$)/gm)].map((entry) => entry[1]!);
+};
+
+/**
+ * One part of a long answer, at a size that says the route was writing fast rather than slowly.
+ *
+ * The continuation rule divides characters by seconds: a route producing fewer than twenty-eight
+ * characters a second cannot finish this product's longest answer in the four calls it is allowed,
+ * however patiently it is asked. Two of these across ten fixture-minutes clear that comfortably,
+ * which is what makes the pair of fixtures below a test of the rate and not of the clock.
+ */
+const longAnswerPart = (part: number, lines = 260): string =>
+  Array.from(
+    { length: lines },
+    (_, line) =>
+      `${part * lines + line}. workspace/notes/${part}-${line}.md still wants a heading, a date and an owner before it can go out.`
+  ).join('\n');
 
 export const fixtures: readonly Fixture[] = [
   /* ------------------------------------------------------ read a document and answer about it */
@@ -280,6 +467,64 @@ export const fixtures: readonly Fixture[] = [
       status: 'completed',
       verification: 'verified',
       holds: [],
+      replies: 1
+    }
+  },
+  {
+    id: 'answer-a-remembering-workspace-pays-for-its-preamble-once',
+    shape: 'answer',
+    request: 'What rate are we renewing the brochure job at, and is anything holding it up?',
+    why: 'The preamble, on a workspace that has been used before: an operating contract, a curated knowledge block, a frozen memory pack, a workspace brief and a saved procedure, in that order, with the brief last because it is the only one of the four that a turn can rewrite while it runs. Every one of those blocks sits ahead of the whole trajectory and under both cache breakpoints, so a byte that moves in any of them re-bills the entire request - and every fixture in this file before this one ran against an empty pool, an empty skill list and no brief at all, which is why four separate repairs to how those blocks are ordered and frozen could each have been reverted without a number here moving. The assertion is not that the blocks are present, which a reader could check; it is `anchorHeld`, that they did not move once across four steps, which nothing outside this rig can check at all. The pack also carries the admissibility predicate: two of the four remembered rows are inadmissible at the task’s clock anchor and both of them outrank everything that is admissible, so a pack that includes either is a pack that ranked before it filtered.',
+    runner: {
+      files: {
+        ...workspaceFiles,
+        'workspace/ATHANOR.md':
+          '# Brochure work\n\nRates are agreed per term. Anything sent to a client goes past Dan first.\n'
+      }
+    },
+    memory: REMEMBERING_WORKSPACE,
+    skills: [
+      {
+        name: 'brochure-check',
+        description: 'What this workspace checks on a brochure before it goes to a client.'
+      }
+    ],
+    model: sequence(
+      { calls: [{ id: 'call-1', name: 'file_read', args: { path: 'workspace/notes.txt' } }] },
+      {
+        calls: [{ id: 'call-2', name: 'document_read', args: { path: 'workspace/contract.pdf' } }]
+      },
+      {
+        text: 'The renewal is at 4.25 per cent, and nothing is holding it up - the freeze runs to the end of the quarter and the notice period is 60 days.',
+        calls: finishCall('call-3', {
+          summary: 'Answered the rate and what is outstanding.',
+          verification: evidence('call-2', 'Clause 7 sets the notice period the answer cites')
+        })
+      }
+    ),
+    expect: {
+      modelCalls: 3,
+      tools: ['file_read', 'document_read'],
+      status: 'completed',
+      verification: 'verified',
+      holds: [],
+      /*
+       * The four claims about the front of the window.
+       *
+       * It stood still - across three requests, no byte of the leading system run changed, which is
+       * what the anchor breakpoint is placed on the end of and what every other breakpoint is
+       * unreachable behind. Both breakpoints were placed on every request, which is what makes a
+       * repeated prefix billable rather than merely repeated. The owner's own sentence survived.
+       * And the whole turn stays inside a ceiling that a memory pack carrying either of the two
+       * inadmissible rows would breach: each of them is about six hundred tokens of body against a
+       * measured peak of 4,774, so the predicate failing open is a red row here rather than a
+       * sentence somebody has to notice in a prompt.
+       */
+      anchorHeld: true,
+      minCacheBreakpoints: 2,
+      minCachePrefix: 95,
+      maxPeakPromptTokens: 5_200,
+      ownerMessageIntact: true,
       replies: 1
     }
   },
@@ -334,6 +579,10 @@ export const fixtures: readonly Fixture[] = [
     expect: {
       modelCalls: 4,
       tools: ['file_read', 'files_list', 'file_read'],
+      // The first read is the failure this fixture is about. Said out loud because the default is
+      // that nothing throws: `tools` lists the same three names whether the read found the file or
+      // died on it, so without this line the whole subject of the fixture is unstated.
+      noFailedTools: false,
       status: 'completed',
       verification: 'verified',
       holds: []
@@ -486,6 +735,69 @@ export const fixtures: readonly Fixture[] = [
       verification: 'verified',
       commandsRun: 2,
       holds: []
+    }
+  },
+  {
+    id: 'answer-a-procedure-opened-twice-is-sent-once',
+    shape: 'answer',
+    request:
+      'Read the contract and the note and tell me the renewal date and the notice period, with the clause each comes from.',
+    why: 'A model that opens a procedure, works for a few steps and opens it again is doing the ordinary thing - it has lost track of what is still in its window, and asking is cheaper than guessing. What it used to cost was the whole procedure a second time: `openSkill` has always taken an `active` list and answered a repeat with a short stub, and nothing anywhere supplied one, so every re-view put a five-thousand-character body back into a window that already held it. The second copy is not merely wasted - it lands at the tail of a prompt whose front is cached, so it is billed at the write premium, and it pushes the recency boundaries forward, which re-cuts every older result behind them. This fixture opens the same procedure twice with two reads in between and pins the largest request the turn may build. The guard on the other side is why the bound is a ceiling rather than an equality: a compaction that condensed the first body away makes the next view a real one again, because a stub is not a body and answering a reopen with one would strand the turn on instructions it can no longer read.',
+    runner: { files: workspaceFiles },
+    model: ({ step }) => {
+      if (step === 0)
+        return {
+          calls: [
+            { id: 'call-1', name: 'skill', args: { action: 'view', id: 'citation-discipline' } }
+          ]
+        };
+      if (step === 1)
+        return {
+          calls: [{ id: 'call-2', name: 'document_read', args: { path: 'workspace/contract.pdf' } }]
+        };
+      if (step === 2)
+        return {
+          calls: [{ id: 'call-3', name: 'file_read', args: { path: 'workspace/notes.txt' } }]
+        };
+      // The re-open, with the body still in the window and nothing having condensed it away.
+      if (step === 3)
+        return {
+          calls: [
+            { id: 'call-4', name: 'skill', args: { action: 'view', id: 'citation-discipline' } }
+          ]
+        };
+      return {
+        text: 'Renewal is 14 March 2027, and clause 7 gives either side 60 days written notice.',
+        calls: finishCall('call-5', {
+          summary: 'Answered the renewal date and the notice period, with their clauses.',
+          verification: evidence('call-2', 'Clause 7 sets a 60-day notice period')
+        })
+      };
+    },
+    expect: {
+      modelCalls: 5,
+      // Both views ran. A fixture that asserted only the ceiling would also be green on a turn
+      // where the second view never happened, which is the opposite measurement.
+      tools: ['skill', 'document_read', 'file_read', 'skill'],
+      status: 'completed',
+      verification: 'verified',
+      holds: [],
+      /*
+       * The ceiling, which is where the whole claim is, and the three numbers it sits between.
+       *
+       * Measured on this turn: 6,415 tokens at the largest request with the stub, 6,325 with the
+       * fourth step replaced by an ordinary read - so the stub itself is worth 90 tokens - and
+       * 7,740 with the fourth step opening a DIFFERENT procedure, which is what a second body in
+       * the window actually costs. 6,800 leaves the row six per cent of room to grow and none for a
+       * body that should not be there.
+       *
+       * A ceiling rather than an equality, because the honest answer to a re-view is not always a
+       * stub: once a compaction has taken the first body, the second view has to be a real one, and
+       * a fixture that pinned the number would call that repair a regression.
+       */
+      maxPeakPromptTokens: 6_800,
+      anchorHeld: true,
+      minCachePrefix: 95
     }
   },
   {
@@ -860,6 +1172,7 @@ export const fixtures: readonly Fixture[] = [
       modelCalls: 3,
       status: 'completed',
       holds: ['step_budget'],
+      warnings: ['This turn used its whole step budget before the work was finished'],
       finalCatalogueUnchanged: true
     }
   },
@@ -883,7 +1196,8 @@ export const fixtures: readonly Fixture[] = [
       tools: [],
       status: 'completed',
       verification: 'not_applicable',
-      holds: ['output_limit_continued']
+      holds: ['output_limit_continued'],
+      warnings: [OUTPUT_LIMIT_CONTINUED]
     }
   },
   {
@@ -900,14 +1214,43 @@ export const fixtures: readonly Fixture[] = [
       tools: [],
       status: 'completed',
       verification: 'not_applicable',
+      /*
+       * Three continuations, and then the cap itself - once per remaining step, each followed by
+       * the nag that ends the turn.
+       *
+       * The four `output_limit_capped` rows are new to this list and nothing about the loop
+       * changed to put them there. The harness kept its own copy of the loop's wording, that copy
+       * had eleven of the sixteen pushbacks in it, and `OUTPUT LIMIT REACHED` was one of the five
+       * it had never heard of - so the cap fired four times on this fixture, on every run, and was
+       * counted as no hold at all. The comment that used to sit here said `holds` could not show
+       * this group; it can, and this is what it shows.
+       */
       holds: [
         'output_limit_continued',
         'output_limit_continued',
         'output_limit_continued',
+        'output_limit_capped',
         'completion_nag',
+        'output_limit_capped',
         'completion_nag',
+        'output_limit_capped',
         'completion_nag',
+        'output_limit_capped',
         'completion_nag'
+      ],
+      // The owner-visible half of the same count, and the half that says the cap held: three
+      // continuations, then five replies that reached the ceiling and were deliberately not
+      // continued.
+      warnings: [
+        OUTPUT_LIMIT_CONTINUED,
+        OUTPUT_LIMIT_CONTINUED,
+        OUTPUT_LIMIT_CONTINUED,
+        OUTPUT_LIMIT_CAPPED,
+        OUTPUT_LIMIT_CAPPED,
+        OUTPUT_LIMIT_CAPPED,
+        OUTPUT_LIMIT_CAPPED,
+        OUTPUT_LIMIT_CAPPED,
+        'Answered without calling finish'
       ]
     }
   },
@@ -956,6 +1299,15 @@ export const fixtures: readonly Fixture[] = [
       status: 'completed',
       verification: 'verified',
       untrusted: true,
+      // Named hosts, not the words "web pages". The name is only available if the read came back
+      // in the shape the runner actually speaks, so this line is where the fixture stops taking a
+      // read's word for it: for the whole life of this rig the stub answered `pages` where the
+      // runner answers `sources`, every reader of the result got nothing, and `untrusted: true`
+      // above was satisfied by the fallback label that means "a read happened, hosts unknown".
+      warnings: [
+        'Untrusted content entered this turn from web search results',
+        'Untrusted content entered this turn from web page regulator.example, press.example'
+      ],
       holds: []
     }
   },
@@ -996,6 +1348,10 @@ export const fixtures: readonly Fixture[] = [
       modelCalls: 4,
       tools: ['web_search', 'web_search', 'parallel_web_read'],
       status: 'completed',
+      warnings: [
+        'Untrusted content entered this turn from web search results',
+        'Untrusted content entered this turn from web page regulator.example'
+      ],
       holds: []
     }
   },
@@ -1065,7 +1421,8 @@ export const fixtures: readonly Fixture[] = [
       tools: ['parallel_web_read'],
       askedOwner: true,
       status: 'awaiting_user',
-      untrusted: true
+      untrusted: true,
+      warnings: ['Untrusted content entered this turn from web page forum.example']
     }
   },
 
@@ -1185,11 +1542,138 @@ export const fixtures: readonly Fixture[] = [
       status: 'completed',
       verification: 'verified',
       untrusted: true,
+      // The taint crosses the delegation boundary named by what the specialists actually touched,
+      // which is the whole first floor above stated as bytes: a report whose hosts had been lost on
+      // the way back would still have set `untrusted: true`, from the fallback that says only that
+      // some read happened.
+      warnings: [
+        'Untrusted content entered this turn from delegated specialist (web page vendor-a.example, vendor-b.example)'
+      ],
       holds: []
     }
   },
 
   /* --------------------------------------------------------------- a genuinely ambiguous request */
+  {
+    id: 'research-a-long-mission-holds-its-own-window-down',
+    shape: 'research',
+    /*
+     * The addresses are in the owner's own words, and they have to be.
+     *
+     * A specialist may only read a host this run has already been sent to - a mission cannot invent
+     * one and cannot ask - so a request that says "the ten sites in my notes" produces ten refusals
+     * and a mission that burns its sixteen steps on them. That is the floor working, and it is why
+     * this fixture spells the addresses out: the subject here is what a long mission does to its
+     * own window, not what the host allowance does to a mission that was never given one.
+     */
+    request: `Survey the retention policies at these registry sites and tell me which keeps records longest: ${Array.from(
+      { length: 10 },
+      (_, page) => `https://registry-${page}.example/policy`
+    ).join(', ')}.`,
+    why: 'One mission, ten reads, and a specialist window under real pressure - which is a shape nothing here had. A specialist gets up to sixteen steps of read-only tools against a window it shares with nothing and nobody persists: no agent state, no brief, no compaction, and a truncation floor that lives in a local for exactly as long as the mission does. Two defects lived in there unmeasured. It was told it had the whole window for conversation, because the term that is actually subtracted from the budget was not passed - so the tool catalogue in front of every one of those sixteen requests was spent twice. And its floor was recomputed from scratch on each step rather than carried, so between two steps a page read could re-lengthen, rewriting the front of a window the provider had just cached. Both are invisible from the lead’s side: a mission is one tool result to the turn that sent it, and every number in this table before this row was the lead’s. `minDelegatedCachePrefix` is measured over the specialist’s own consecutive requests, which is only a chain at all because this fixture sends exactly one mission.',
+    runner: { pages: SURVEY_PAGES },
+    // Ten reads and a report inside the mission, against a quarter of the task's compute. Raised
+    // so the mission ends because it has finished rather than because it ran out.
+    maxCredits: 400,
+    model: ({ delegated, messages, step }) => {
+      if (delegated) {
+        // Which page this specialist is on, read off its own window rather than off a call index:
+        // the index counts every provider call in the run, and the lead's are in there too.
+        const read = messages.filter((content) =>
+          content.includes('publishes its retention')
+        ).length;
+        if (read < 10)
+          return {
+            calls: [
+              {
+                id: `mission-read-${read}`,
+                name: 'parallel_web_read',
+                args: {
+                  urls: [`https://registry-${read}.example/policy`],
+                  maxCharactersPerPage: 20_000
+                }
+              }
+            ]
+          };
+        return {
+          text: JSON.stringify({
+            answer:
+              'Registry 9 keeps records longest; the shortest retention on any clause read was 180 days.',
+            evidence: [
+              {
+                claim: 'Registry 9 sets the longest retention',
+                source: 'https://registry-9.example/policy',
+                quotedSpan: 'Registry 9 publishes its retention policy here.'
+              }
+            ]
+          })
+        };
+      }
+      if (step === 0)
+        return {
+          calls: [
+            {
+              id: 'call-1',
+              name: 'delegate',
+              args: {
+                missions: [
+                  {
+                    name: 'registry survey',
+                    instruction:
+                      'Read the retention policy page at each of the ten registry sites and report which keeps records longest.'
+                  }
+                ]
+              }
+            }
+          ]
+        };
+      return {
+        text: 'Registry 9 keeps records longest, at up to 1,080 days on some classes.',
+        calls: finishCall('call-2', {
+          summary: 'Surveyed the ten registry retention policies.',
+          verification: evidence('call-1', 'The specialist read every registry policy page')
+        })
+      };
+    },
+    expect: {
+      status: 'completed',
+      verification: 'verified',
+      holds: [],
+      // Two steps of the turn, and eleven model calls inside the one mission behind the first of
+      // them - ten reads and the report. Read the two numbers against each other: this is what an
+      // open-ended bill under a single step of a turn looks like.
+      modelCalls: 13,
+      delegatedCalls: 11,
+      tools: ['delegate'],
+      // A specialist's report is a model's rendering of pages nobody on this computer wrote, and
+      // the turn has to come out marked as having read them however far down it happened. The
+      // warning is the owner-visible half and it names the hosts it could still see: the report the
+      // lead receives is bounded, so the classifier reads the three whose names survived it.
+      untrusted: true,
+      warnings: [
+        'Untrusted content entered this turn from delegated specialist (web page registry-0.example, web page registry-1.example, web page registry-2.example)'
+      ],
+      /*
+       * The specialist's own window, across eleven consecutive requests of its own.
+       *
+       * Measured at 77%, and the arithmetic is worth stating so nobody reads it as poor: a mission
+       * only ever appends, and each of these steps appends a page of about 19,000 characters to a
+       * window that started at 1,500, so the share of each request that repeats the one before it
+       * is close to the ratio of their sizes. It is high for a growing window, not low for a stable
+       * one.
+       *
+       * The floor is set seven points under it, and what those seven points are for is the one
+       * thing in the specialist's window that could rewrite rather than append: its truncation
+       * floor is held in a local for the life of the mission, and a floor that relaxed between two
+       * steps would re-lengthen an older page read and move bytes at the front. That arm has not
+       * been run here - it lives in `agent.ts` and this rig cannot disarm it - so the seven points
+       * are a bound rather than a measured difference, and this comment says so rather than
+       * implying a probe that was never done.
+       */
+      minDelegatedCachePrefix: 70,
+      anchorHeld: true
+    }
+  },
   {
     id: 'ambiguous-question-finished-cheaply',
     shape: 'ambiguous',
@@ -1225,6 +1709,7 @@ export const fixtures: readonly Fixture[] = [
       status: 'completed',
       verification: 'not_applicable',
       holds: ['completion_nag', 'completion_nag', 'completion_nag', 'completion_nag'],
+      warnings: ['Answered without calling finish'],
       replies: 1
     }
   },
@@ -1920,7 +2405,8 @@ export const fixtures: readonly Fixture[] = [
       modelCalls: 2,
       tools: [],
       status: 'completed',
-      holds: ['repetition_stopped']
+      holds: ['repetition_stopped'],
+      warnings: ['Stopped a repeating answer']
     }
   },
   {
@@ -1942,9 +2428,21 @@ export const fixtures: readonly Fixture[] = [
       tools: [],
       status: 'completed',
       verification: 'not_applicable',
-      // The completion check and nothing else. `output_limit_continued` here would mean the loop
-      // read a cutoff nobody could finish as an answer worth paying for the rest of.
-      holds: ['completion_nag'],
+      /*
+       * The cut, and then the completion check. `output_limit_continued` here would mean the loop
+       * read a cutoff nobody could finish as an answer worth paying for the rest of - the two
+       * markers are the difference between "carry on" and "that is what you get", and the second
+       * is the one this fixture is about.
+       *
+       * `reply_cut_off` is new to this list and the loop has always pushed it. The comment that
+       * used to sit here said `YOUR REPLY WAS CUT OFF` was a pushback with no marker in the table,
+       * so the fixture's own subject could only be asserted through the warning below. The table
+       * now comes from `agent.ts`, which has always had it.
+       */
+      holds: ['reply_cut_off', 'completion_nag'],
+      // The owner-visible half of the same statement, kept because a hold is what the model was
+      // told and a warning is what the owner reads, and this turn is worth both.
+      warnings: ['The answer was cut off before it finished'],
       replies: 1
     }
   },
@@ -1982,7 +2480,8 @@ export const fixtures: readonly Fixture[] = [
       tools: ['file_read'],
       proposed: ['file_read', 'file_read', 'file_read', 'file_read', 'finish'],
       status: 'completed',
-      verification: 'verified'
+      verification: 'verified',
+      warnings: ['Nothing has run for 3 steps']
     }
   },
   {
@@ -2125,6 +2624,15 @@ export const fixtures: readonly Fixture[] = [
       status: 'completed',
       verification: 'not_applicable',
       holds: ['idle_break', 'idle_break', 'idle_break'],
+      // The three breaks the model was shown, and the stop it was not: `Stopped a turn that had
+      // stopped moving` has no marker in the hold table, so this line is the only place the ending
+      // this fixture is named for appears in its own expectation.
+      warnings: [
+        'Nothing has run for 3 steps',
+        'Nothing has run for 4 steps',
+        'Nothing has run for 5 steps',
+        'Stopped a turn that had stopped moving'
+      ],
       /*
        * One bubble per step, and this is the number to watch.
        *
@@ -2258,6 +2766,9 @@ export const fixtures: readonly Fixture[] = [
       status: 'completed',
       verification: 'verified',
       toolsExclude: ['web_search'],
+      // Three of the eight calls threw, and that is the subject: a patch that misses is a failed
+      // call, and the claim is that three of them in a row are a search rather than a repeat.
+      noFailedTools: false,
       // Two runs of the suite, one failing and one passing, and neither of them counted anywhere.
       // The third run the acceptance check would have needed is answered from the run athanor had
       // already watched, which is a saving this fixture inherits rather than one it is about.
@@ -2302,6 +2813,16 @@ export const fixtures: readonly Fixture[] = [
       // Ended the way every other bounded stop in this file ends: the turn is completed and
       // interrupted, so whatever it produced stays the owner's and a reply carries it on.
       verification: 'not_applicable',
+      // Every one of the six threw, which is the shape being bounded.
+      noFailedTools: false,
+      // The count and the stop, in the loop's own words. The three notices are the three pushbacks
+      // the replies below are the other half of, and the fourth line is the bound arriving.
+      warnings: [
+        'file_patch has failed 3 times the same way',
+        'file_patch has failed 4 times the same way',
+        'file_patch has failed 5 times the same way',
+        'Stopped a turn that was retrying a failure'
+      ],
       /*
        * The proof the model was told, three times, before anything ended.
        *
@@ -2314,10 +2835,144 @@ export const fixtures: readonly Fixture[] = [
     }
   },
   {
+    id: 'long-a-full-window-condenses-rather-than-stubbing-itself',
+    shape: 'long',
+    request:
+      'Go through every batch in workspace/logs, one at a time, and tell me which entries changed.',
+    /*
+     * This row states what the loop should do with a window that fills on a small model. It was
+     * PENDING for two waves on one expectation, and the expectation was the thing that was wrong:
+     * see the derivation of `minCachePrefix` at the bottom of `expect`, which replaces a target
+     * taken by analogy with one taken off this row's own sixteen request pairs.
+     */
+    why: 'The same job as long-finished-phases-condense-rather-than-shred, at the same batch sizes, on the smaller of the two shipped windows and with the finished-phase sentence never said - so the only mechanism that can hold this window down is the loop\u2019s own. This row is the only thing in this file that exercises a compaction the model did not ask for, and it now does it twice. Step by step: the prepared window climbs to 63,721 tokens by the ninth request against a budget trigger at 63,924, the provider\u2019s own prompt_tokens carries it over, and the tenth request comes back at 34,405 with a compaction event and a model-written brief behind it; it climbs again to 68,144 and condenses a second time at 34,788. What it used to do instead is the reason the row was written. The deterministic soft pass sat at 0.72 of the budget against a trigger at 0.70 - a gap of 1,826 tokens on a window that moves in jumps of several thousand - so it fired first on three requests, spliced a COMPRESSED TRAJECTORY block into the leading system run, and left 52,206 / 47,183 / 47,359 where the untrimmed trajectory behind it stood at 84,644 / 94,699 / 104,860. The trigger reads the size of the last prepared request, so those were the numbers it saw, and the turn never condensed again. The leading system run is also exactly what the cache anchor is placed at the end of, so from the first soft pass the anchor was on bytes rewritten every step. The older-output floor separately walked to a 2,000-character bottom while the request was at seventy per cent of its budget. The cached share settled at 44%; it now reads 52%. Read it against long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly, which condenses once on the same mechanism and reads 94% because its results are small enough that the floor never has to cut one: the difference between the two rows is not what the model did, it is what the window did underneath it.',
+
+    contextTokens: 128_000,
+    maxSteps: BUDGET_BATCHES + 4,
+    // Sixteen steps of this size are well past the default fifty credits; the subject is the
+    // window, and a turn that ended on the compute ceiling would measure the other bound.
+    maxCredits: 5_000,
+    runner: { stdout: Array.from({ length: BUDGET_BATCHES + 8 }, (_, batch) => batchLog(batch)) },
+    model: ({ step, summarising }) => {
+      // Written rather than left to the fallback, for the same reason the fixture above writes one:
+      // a compaction that used the deterministic summary would report success and price a different
+      // mechanism. If this row ever goes green, `minModelWrittenBriefs` is what proves the brief on
+      // it was a model's.
+      if (summarising)
+        return {
+          text: 'Earlier batches of workspace/logs are scanned and their changed entries are listed against their batch numbers. Nothing failed and no batch was skipped; the scan continues from the next batch number.'
+        };
+      if (step >= BUDGET_BATCHES)
+        return {
+          text: 'Every batch in workspace/logs is scanned; the changed entries are listed by batch.',
+          calls: finishCall(`call-${step + 1}`, {
+            summary: 'Scanned every batch and listed what changed.',
+            verification: evidence(`call-${step}`, 'The last batch was scanned in the workspace')
+          })
+        };
+      return {
+        // The report is the half no floor can cut, exactly as in the fixture above. The difference
+        // between the two rows is the window they run in and the sentence this one never says.
+        ...(step > 0 ? { text: batchReport(step - 1) } : {}),
+        calls: [
+          {
+            id: `call-${step + 1}`,
+            name: 'shell',
+            args: { executable: 'python3', args: ['scan.py', '--batch', String(step)] }
+          }
+        ]
+      };
+    },
+    expect: {
+      status: 'completed',
+      // The turn still finishes, and that matters: nothing here is about a task that breaks. It is
+      // about a task that works and costs several times what it should.
+      holds: [],
+      /*
+       * The target, in seven parts. All seven hold. Six of them were met by step 3.1; the seventh
+       * was re-derived here, because it was wrong rather than unmet.
+       *
+       * Met by the loop: two compactions, both set off by the budget rather than by a declaration
+       * this fixture never makes, with a brief a model wrote rather than the deterministic
+       * fallback; no soft-pass window at all, because the soft pass is the warning a budget
+       * compaction answers and not the answer itself; a preamble that stands still, which is what
+       * the anchor breakpoint is placed at the end of; and a floor that stops at 4,000 characters
+       * instead of walking to the 2,000-character bottom.
+       *
+       * ── The seventh, and why 75 was never a number this row could reach ─────────────────────
+       *
+       * `minCachePrefix` was 75, taken by analogy: the small-result arm of the pair above condenses
+       * on the same mechanism and reads 94, the shred row - floor unopposed, nothing condensing on
+       * the budget - reads 66, so a row that condenses AND holds its floor was put between them. It
+       * read 44, then 52 once 3.1 separated the tiers, and 75 stayed out of reach through two
+       * waves; it is not reachable at RECENT_TOOL_OUTPUT_MESSAGES = 2 either, which reads 60. The
+       * analogy was the mistake. Both of those rows run on a 1,000,000-token window with results
+       * small enough that the floor never has to cut one, and this row's entire subject is a window
+       * that fills on the smaller of the two shipped ones.
+       *
+       * Re-derived from this row's own requests instead. Nineteen model calls are seventeen step
+       * requests and two summarising ones, so sixteen consecutive pairs, and every pair falls into
+       * exactly one of three regimes - measured by dumping the divergence point of each pair, in
+       * scratchpad/wave4/4H.md:
+       *
+       *   7 pairs  growth only   mean 77.9%  nothing is rewritten; the request first differs at the
+       *                                      assistant message the previous one did not carry.
+       *   7 pairs  floor re-cut  mean 31.1%  a result that has just left the recency window is cut,
+       *                                      so the request first differs just past the preamble.
+       *   2 pairs  compaction    mean 34.4%  the brief replaces the run that was condensed.
+       *
+       * (7 x 77.9 + 7 x 31.1 + 2 x 34.4) / 16 = 52.0, which is what the row reports - so this is a
+       * decomposition of the measurement and not a restatement of it.
+       *
+       * Two of those numbers are fixed points of the fixture rather than opinions. The preamble -
+       * the catalogue plus the leading system run - is 65,207 bytes, and it is the shortest common
+       * prefix any pair has. A row every one of whose requests diverged immediately after it would
+       * read mean(65,207 / request bytes) = 31.2%; the floor-re-cut regime reads 31.1%, the same
+       * number, which is what a floor-cutting step actually costs: the cache reads back the
+       * catalogue and nothing else. The other fixed point is 77.9%, what a pair costs when nothing
+       * is rewritten at all.
+       *
+       * So this target is a count of rewritten requests wearing a percentage, and that is what
+       * fixes its value. Losing one more pair out of the growth regime costs (77.9 - 31.1) / 16 =
+       * 2.9 points to the floor or (77.9 - 34.4) / 16 = 2.7 points to a third compaction; either
+       * way the row reads 49. 50 is therefore the largest floor this run clears that the smallest
+       * real degradation - one more request rewritten by anything other than the two compactions -
+       * still fails. It is deliberately not 52: the measured value written back is a target that
+       * can never go red, which is how a target becomes furniture.
+       *
+       * And 75 was above this row's ceiling by any route. Turning all seven floor-re-cut pairs into
+       * growth-only pairs - what a recency boundary counted in tool results rather than messages
+       * would do, ledger C3-2 - gives (14 x 77.9 + 2 x 34.4) / 16 = 72.5%. If that change lands,
+       * re-derive this from the run it produces rather than reinstating 75.
+       *
+       * Drift is a separate gate and is already covered: baseline.json commits cachePrefix 52 and
+       * report.ts bands it one-sided by three points, so a slide to 48 fails there too. That one is
+       * the tripwire; this one is the statement about what the row is for.
+       */
+      minCompactions: 1,
+      // Two, and both on the budget rather than on a declaration this fixture never makes. It read
+      // one, and the second was missing for the reason the pending note gives: the soft pass fired
+      // first and reported the size it had just shredded to the trigger. Condensing twice in
+      // nineteen requests on a 128,000-token window is the mechanism working, not running hot - it
+      // is what this row is named for.
+      compactionTriggers: ['budget', 'budget'],
+      minModelWrittenBriefs: 1,
+      // Zero, not one. This was written as 1 with a comment reading "one soft-pass window at most",
+      // which is the target; the exact number the design predicts once the tiers are separated is
+      // none at all, because the compaction answers the pressure a whole step before the soft pass
+      // is reached and the soft pass is what runs when compaction was unavailable.
+      softPassWindows: 0,
+      anchorHeld: true,
+      minToolResultFloor: 4_000,
+      minCachePrefix: 50,
+      ownerMessageIntact: true
+    }
+  },
+  {
     id: 'long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly',
     shape: 'long',
     request: PROOF_REQUEST,
-    why: 'What saying "this phase is finished" costs, and what it must carry across. Read it against long-a-finished-phase-is-never-declared, which is the identical job with that one sentence never said, so the whole difference between the rows is compaction: two model calls - the step that asks and the tool-free call that writes the brief - and, measured on a 128,000-token window, 74,098 fewer prompt tokens. It condensed 29 of 69 messages and freed 16,502 tokens of a 39,560-token window, because the verbatim tail a declared phase is answered with is half the window in front of the declaration rather than a share of a budget that has nothing to do with it - the budget-derived tail, 31,950 here, is only the ceiling it may not exceed. It also buys a 6,519-token lower peak prompt, for two points of cached prefix given up. That is the number this pair exists to commit; a change to it is a decision about that target, not a build to fix. Then the part nobody could see at all. A procedure is loaded into the window as an ordinary tool result, so a compaction condenses it exactly like the render logs beside it, and the agent goes on working to instructions it can no longer read with nothing anywhere saying so. It is the worst shape a silent loss takes: the model still believes it is following a vetted procedure and what it is following is its own memory of one. So the brief - the only record a condensed turn keeps reading - has to name every procedure the compaction took. The name and not the body: reprinting the procedure into a record re-read on every later step would cost more than the compaction saved, and reopening it is one call. The summariser here is deliberately given nothing to say about which procedure was open, so this can only come out green by the mechanism putting it there.',
+    why: 'What saying "this phase is finished" costs, and what it must carry across. Read it against long-a-finished-phase-is-never-declared, which is the identical job with that one sentence never said, so the whole difference between the rows is compaction: two model calls - the step that asks and the tool-free call that writes the brief - and, measured on a 128,000-token window, 74,246 fewer prompt tokens. It condensed 29 of 69 messages and freed 16,502 tokens of a 39,560-token window, because the verbatim tail a declared phase is answered with is half the window in front of the declaration rather than a share of a budget that has nothing to do with it - the budget-derived tail, 31,950 here, is only the ceiling it may not exceed. It also buys a 6,520-token lower peak prompt, for two points of cached prefix given up. That is the number this pair exists to commit; a change to it is a decision about that target, not a build to fix. Then the part nobody could see at all. A procedure is loaded into the window as an ordinary tool result, so a compaction condenses it exactly like the render logs beside it, and the agent goes on working to instructions it can no longer read with nothing anywhere saying so. It is the worst shape a silent loss takes: the model still believes it is following a vetted procedure and what it is following is its own memory of one. So the brief - the only record a condensed turn keeps reading - has to name every procedure the compaction took. The name and not the body: reprinting the procedure into a record re-read on every later step would cost more than the compaction saved, and reopening it is one call. The summariser here is deliberately given nothing to say about which procedure was open, so this can only come out green by the mechanism putting it there.',
     runner: proofRunner,
     maxSteps: PROOF_PAGES + PROOF_INSERT_PAGES + 6,
     maxCredits: 500,
@@ -2466,8 +3121,436 @@ export const fixtures: readonly Fixture[] = [
       // learnt to answer a request that did not ask to be streamed.
       minModelWrittenBriefs: 3,
       ownerMessageIntact: true,
-      minToolResultFloor: 2_500,
+      /*
+       * The floor itself, in characters, and not what it used to be.
+       *
+       * This assertion used to be read by grepping the LAST window for the sentence a squeezed
+       * result carries and taking the shortest one, which could only ever see one step and
+       * measured a message length rather than a floor. It is now `cost.context.olderToolOutputChars`
+       * - the number the context layer chose and acted on - at its lowest over the whole run. On
+       * this fixture the two happen to agree at 11,000, because a squeezed result is cut to the
+       * floor and this turn's floor only ever tightens; on the two proof fixtures they do not agree
+       * at all, and the old reading called both of them 0.
+       *
+       * Raised from 2,500 with the change of quantity. The floor descends in quarters, so 11,000
+       * has to take four more steps - 8,250, 6,187, 4,640 - before this bites, which leaves room
+       * for an ordinary re-measurement and none for the mechanism collapsing onto the 2,000
+       * character hard floor, which is what this row exists to refuse.
+       */
+      minToolResultFloor: 4_000,
       minCachePrefix: 60
+    }
+  },
+
+  /* ------------------------------------------------- the bounds, each with a fixture at last */
+
+  {
+    id: 'schema-every-catalogued-tool-has-a-handler',
+    shape: 'schema',
+    request: 'None: this row runs no turn.',
+    why: 'The catalogue and the dispatch table are two lists that have to agree, and nothing made them. A tool described to the model with no arm in `#execute` answers every call with "Unknown tool" - a capability the prompt promises on every request of every task and the box cannot do. The other direction is quieter and costs money: a handler with no catalogue entry is code kept alive by nothing, and a tool the loop answers itself that nobody declared as such would be counted twice by two bounds. Read out of both files rather than copied, so a rename fails here rather than passing silently.',
+    model: () => ({}),
+    schema: () => {
+      const dispatched = new Set(
+        namesIn(
+          'tool-dispatch.ts',
+          /const DOMAIN_OF: Readonly<Record<string, ToolDomain>> = \{([\s\S]*?)\n\};/,
+          'the dispatch table'
+        )
+      );
+      const loopAnswered = new Set(
+        namesIn(
+          'turn-bounds.ts',
+          /const LOOP_ANSWERED_TOOLS: ReadonlySet<string> = new Set\(\[([\s\S]*?)\n\]\);/,
+          'the loop-answered tools'
+        )
+      );
+      const findings: string[] = [];
+      for (const name of EVAL_CATALOGUE)
+        if (!dispatched.has(name) && !loopAnswered.has(name))
+          findings.push(
+            `${name} is in the catalogue and has no handler and is not answered by the loop`
+          );
+      for (const name of dispatched)
+        // `connector_action` is the one tool a run withdraws, and it keeps its handler on purpose:
+        // the withdrawal is per-box, and a box with a connector enabled is offered it again.
+        if (!EVAL_CATALOGUE.includes(name) && name !== 'connector_action')
+          findings.push(`${name} has a handler and is in no catalogue this suite ever sends`);
+      for (const name of loopAnswered)
+        if (!EVAL_CATALOGUE.includes(name))
+          findings.push(`${name} is answered by the loop and is in no catalogue`);
+      return findings;
+    },
+    expect: {
+      modelCalls: 0,
+      // The finding list, empty. Anything in it is printed by name in the failure.
+      warnings: []
+    }
+  },
+  {
+    id: 'answer-the-catalogue-is-one-list-for-the-whole-run',
+    shape: 'answer',
+    request: 'What is in the notes about the renewal date?',
+    why: 'The catalogue is the head of the prompt and the largest fixed cost of a turn, and the one thing that makes it cheap is that it never moves: it is built once for the life of the run and the closing handoff is handed the caller’s own array. Nothing asserted any of that. This row asserts all three - the exact membership, that no step changed it, and that the last request offered what the step before it did - against a list derived from the same two sources the loop builds it from, so adding a tool does not break it and assembling the catalogue per step does.',
+    runner: { files: workspaceFiles },
+    model: sequence(
+      { calls: [{ id: 'call-1', name: 'file_read', args: { path: 'workspace/notes.txt' } }] },
+      {
+        text: 'The renewal is on 14 March 2027.',
+        calls: finishCall('call-2', {
+          summary: 'Read the notes and gave the renewal date.',
+          verification: evidence('call-1', 'The renewal date is in workspace/notes.txt')
+        })
+      }
+    ),
+    expect: {
+      modelCalls: 2,
+      tools: ['file_read'],
+      status: 'completed',
+      holds: [],
+      finalCatalogue: EVAL_CATALOGUE,
+      finalCatalogueUnchanged: true,
+      catalogueStableThroughout: true
+    }
+  },
+  {
+    id: 'media-a-picture-the-lead-cannot-see-is-routed-to-a-specialist',
+    shape: 'media',
+    request: 'Look at workspace/logo.png and tell me whether the wordmark is legible at that size.',
+    why: 'The lead model on this box declares text only, so the picture it was just handed is bytes it cannot read. The loop picks the best vision model on the same provider, pays for one small call, and hands the observation back into the lead’s window as a system message the model then answers from. This is the first fixture in the suite that can reach that path at all: the eval registry held one text-only release, so `vision_routed` has read "never fired" on the holds table for three waves - not because the routing was broken, but because there was nothing to route to.',
+    visionSpecialist: true,
+    runner: { files: { 'workspace/logo.png': 'PNG' } },
+    model: ({ vision, lastMessage }) => {
+      // The specialist's answer. It carries no tools and no finish; what it returns is the whole of
+      // what the lead is told about the picture.
+      if (vision)
+        return {
+          text: 'A dark wordmark on a light square. The letterforms are clean at this size and the descenders are not clipped.'
+        };
+      if (lastMessage.includes('VISION SPECIALIST HANDOFF'))
+        return {
+          text: 'The wordmark is legible: the letterforms are clean and nothing is clipped.',
+          calls: finishCall('call-2', {
+            summary: 'Looked at the logo and reported whether the wordmark is legible.',
+            verification: evidence('call-1', 'The logo was read from the workspace')
+          })
+        };
+      return {
+        calls: [{ id: 'call-1', name: 'image_read', args: { path: 'workspace/logo.png' } }]
+      };
+    },
+    expect: {
+      tools: ['image_read'],
+      status: 'completed',
+      // The handoff notice, and nothing else. `VISION ROUTING NOTICE` is deliberately not a marker:
+      // it says routing was attempted and did not happen, which is the opposite of this claim.
+      holds: ['vision_routed']
+    }
+  },
+  {
+    id: 'media-a-picture-priced-above-the-ceiling-is-not-routed',
+    shape: 'media',
+    request: 'Look at workspace/logo.png and tell me whether the wordmark is legible at that size.',
+    why: 'The negative control the whole spending ceiling rests on, and until now it did not exist. This is the fifth and last ranking site and the only one that chooses a model while the owner is asleep: the lead cannot see, a replacement is picked mid-turn, and nothing between the two used to read the ceiling - so a box with a $1/M limit would route an image to a $75/M model without asking anybody. Identical to the fixture above in every respect but one number. The ceiling is set under the specialist’s price, no specialist call is made, `vision_routed` does not fire, and the owner is told in as many words why their picture was not looked at. One assertion in one unit test has been the entire repository-side guard on this for three waves; the sibling test stays green with the enforcement switched off, which is precisely what this row cannot do.',
+    visionSpecialist: true,
+    priceCeiling: { maxInputUsdPerMillionTokens: 5, maxOutputUsdPerMillionTokens: 10 },
+    runner: { files: { 'workspace/logo.png': 'PNG' } },
+    model: ({ lastMessage }) => {
+      if (lastMessage.includes('VISION ROUTING NOTICE'))
+        return {
+          text: 'I could not look at the logo: every model on this provider that can read a picture is priced above the price ceiling you set, so only you can change that.',
+          calls: finishCall('call-2', {
+            summary: 'Could not inspect the logo under the owner’s price ceiling and said so.',
+            verification: evidence('call-1', 'The logo was read from the workspace')
+          })
+        };
+      return {
+        calls: [{ id: 'call-1', name: 'image_read', args: { path: 'workspace/logo.png' } }]
+      };
+    },
+    expect: {
+      // Two steps and no third: the specialist is never called, which is the money this saves.
+      modelCalls: 2,
+      tools: ['image_read'],
+      status: 'completed',
+      // Not routed. The whole assertion is the absence, held against the fixture above, which is
+      // identical apart from the ceiling and does fire it.
+      holds: [],
+      // Said to the owner as well as to the model, because the model cannot raise a price ceiling
+      // and the owner cannot read a system message.
+      warnings: ['An image could not be read under your price ceiling']
+    }
+  },
+  {
+    id: 'small-the-compute-ceiling-ends-the-turn',
+    shape: 'small',
+    request: 'Go through every batch in workspace/logs and tell me which entries changed.',
+    why: 'The money bound, and the last hold in the table with no fixture. Three long rows already raise `maxCredits` explicitly so the turn does not end here, which is the shape of a bound everybody works around and nobody measures: a ceiling that stopped stopping anything would have moved no number in this file. The turn is given a budget it cannot finish inside, and it has to stop on it, say so to the model in the sentence the loop owns, and come back with what it has rather than with nothing.',
+    runner: { stdout: Array.from({ length: 12 }, (_, batch) => batchLog(batch)) },
+    maxSteps: 12,
+    /*
+     * Small enough that the scan cannot finish inside it, and large enough that the turn does real
+     * work first: a ceiling that fires on the opening step measures the arithmetic, not the bound.
+     *
+     * A credit is `(input + 2 x output) / 1,000,000` times the usage class, so a light route
+     * spending thirty thousand prompt tokens a step costs about fifteen thousandths of one. Every
+     * other row in this file is at fifty and three of the long ones raise it to five hundred, which
+     * is how a bound nobody could reach came to have no fixture: the number that stops this turn is
+     * two orders of magnitude below the default.
+     */
+    maxCredits: 0.05,
+    model: ({ step, lastMessage }) =>
+      lastMessage.includes('COMPUTE BUDGET EXHAUSTED')
+        ? {
+            text: 'I stopped on the compute budget with batches still to scan.',
+            calls: finishCall('call-stop', {
+              summary: 'Scanned the batches the budget allowed and stopped there.',
+              verification: evidence(`call-${step}`, 'The batches scanned are in the workspace')
+            })
+          }
+        : {
+            calls: [
+              {
+                id: `call-${step + 1}`,
+                name: 'shell',
+                args: { executable: 'python3', args: ['scan.py', '--batch', String(step)] }
+              }
+            ]
+          },
+    expect: {
+      status: 'completed',
+      holds: ['compute_budget'],
+      // The owner's half of the same statement. A ceiling that stopped a turn and told only the
+      // model would be a job that came back short with nothing anywhere saying why.
+      warnings: ['This turn used its whole compute budget before the work was finished'],
+      toolsInclude: ['shell']
+    }
+  },
+  {
+    id: 'small-a-provider-blip-is-retried-and-the-turn-finishes',
+    shape: 'small',
+    request: 'What is in the notes about the renewal date?',
+    why: 'A 5xx is a wall the loop is meant to sit behind and come back from, and nothing in this suite could tell a retried request from one that never happened. The provider fails the opening call twice and then answers; the turn does the same work it would have done, and the extra requests appear in the committed count rather than being absorbed into a number that says the outage was free. The other half of the same rule - that a 400 is never retried, because an identical replay of a rejected prompt fails identically - is asserted by the row below.',
+    runner: { files: workspaceFiles, providerFailures: [503, 500] },
+    model: sequence(
+      { calls: [{ id: 'call-1', name: 'file_read', args: { path: 'workspace/notes.txt' } }] },
+      {
+        text: 'The renewal is on 14 March 2027.',
+        calls: finishCall('call-2', {
+          summary: 'Read the notes and gave the renewal date.',
+          verification: evidence('call-1', 'The renewal date is in workspace/notes.txt')
+        })
+      }
+    ),
+    expect: {
+      // Two blips and two steps. If this ever reads four, the retry has stopped being a retry and
+      // become a second turn.
+      modelCalls: 4,
+      tools: ['file_read'],
+      status: 'completed',
+      holds: []
+    }
+  },
+  {
+    id: 'small-a-generation-that-ran-out-of-time-is-carried-on',
+    shape: 'small',
+    request: 'Write up everything the notes say still needs doing, in full.',
+    why: 'Measured on the owner’s box: one call streamed for a quarter of an hour and never finished, and the request deadline killed the turn with it. The bound that catches it is on time, and what it must not do is throw the answer away - so a generation cut here comes back marked, and the loop decides. This arm is a real long answer that ran out of room: it arrived fast enough that asking the route to carry on can finish it, so it is carried on and the turn ends with one answer rather than half of one. The clock is the fixture’s own, because the shortest of these bounds is ten minutes and no test can spend that.',
+    // Ten minutes of generation across two frames, on a clock only this fixture has. The stream
+    // then goes quiet and stays open, which is the shape the incident had and the only one where
+    // the deadline is the deterministic winner rather than racing a frame already buffered.
+    clock: { msPerFrame: 300_000 },
+    model: ({ index }) =>
+      index === 0
+        ? { chunks: [longAnswerPart(0), longAnswerPart(1)], silent: true }
+        : {
+            text: 'That is the rest of the list.',
+            calls: finishCall('call-1', {
+              summary: 'Listed everything outstanding in the notes.',
+              verification: conversational()
+            })
+          },
+    expect: {
+      // The cut, the continuation, and the finish on it.
+      modelCalls: 2,
+      tools: [],
+      status: 'completed',
+      verification: 'not_applicable',
+      holds: ['output_limit_continued'],
+      warnings: ['The reply reached the model’s output limit and is being continued'],
+      // The half that had never been asserted anywhere: a generation this side stopped is still
+      // billed. There is no usage frame on a cut call, so this number can only be this side's own
+      // estimate of what arrived - and for the whole life of the product it was nought.
+      minOutputTokens: 1_000
+    }
+  },
+  {
+    id: 'small-a-generation-too-slow-to-finish-is-not-carried-on',
+    shape: 'small',
+    request: 'Write up everything the notes say still needs doing, in full.',
+    why: 'The other side of the same rate test, and the incident itself. A thousand frames reached the timeline in fifteen minutes and nothing else did: about ten characters a second, a tenth of what a working route on this box produces, sustained. Twelve thousand characters is an ordinary long answer - the model was not writing too much, it was writing too slowly, for ever. So the deadline cuts it and the loop must NOT ask it to carry on: four calls at this rate is forty minutes and the answer is still cut off at the end. Identical to the row above but for how much text arrived in the same ten minutes, which is the only evidence that separates a long answer from a stuck one.',
+    clock: { msPerFrame: 300_000 },
+    model: ({ index }) =>
+      index === 0
+        ? { chunks: ['Still working through the notes. ', 'One moment.'], silent: true }
+        : {
+            text: 'The list stopped part way; what arrived stands in the reply above.',
+            calls: finishCall('call-1', {
+              summary: 'The write-up was cut off part way and what arrived stands.',
+              verification: conversational()
+            })
+          },
+    expect: {
+      modelCalls: 2,
+      tools: [],
+      status: 'completed',
+      verification: 'not_applicable',
+      // `output_limit_continued` here would mean the loop bought the same ten minutes again.
+      holds: ['reply_cut_off', 'completion_nag'],
+      warnings: ['The answer was cut off before it finished']
+      // No `minOutputTokens` here, deliberately. This generation produced about forty characters,
+      // so any floor small enough to hold would also be met by the closing call beside it - and an
+      // assertion that cannot fail for the reason it names is worse than none. The billing of a cut
+      // call is proved on the row above, where a thousand tokens can have come from nowhere else.
+    }
+  },
+  {
+    id: 'small-a-correction-survives-a-provider-blip',
+    shape: 'small',
+    request: 'Summarise workspace/notes.txt for the newsletter.',
+    why: 'Two mechanisms that have never been exercised together, and the join is where the owner loses work. A correction sent mid-turn is taken at the next step boundary and the turn keeps everything it has already done - that is the whole point of steering rather than restarting. A provider blip retries the request underneath it. If the correction were read once and dropped on the failed attempt, it would be gone: the message is consumed from the queue by the turn, so there is no second chance at it. The turn has to come back having read what the owner actually said.',
+    runner: { files: workspaceFiles, providerFailures: [0, 503] },
+    correction: 'Actually make it two sentences, not a bullet list.',
+    // Read across the whole window rather than off the last message: a correction is spliced in as
+    // an ordinary user turn wherever the step boundary fell, and the runtime block is what sits at
+    // the end. Asking whether the turn is holding it is the question; asking whether it arrived
+    // last is a question about the window's layout.
+    model: ({ index, messages }) =>
+      index > 0 && messages.some((content) => content.includes('two sentences'))
+        ? {
+            text: 'The renewal is on 14 March 2027 at the standard rate. Nothing else in the notes needs saying.',
+            calls: finishCall('call-2', {
+              summary: 'Summarised the notes in two sentences as asked.',
+              verification: evidence('call-1', 'The notes are what the summary is drawn from')
+            })
+          }
+        : {
+            calls: [
+              { id: `call-${index + 1}`, name: 'file_read', args: { path: 'workspace/notes.txt' } }
+            ]
+          },
+    expect: {
+      tools: ['file_read'],
+      status: 'completed',
+      holds: []
+    }
+  },
+  {
+    id: 'research-a-browser-page-taints-the-turn-by-where-it-came-from',
+    shape: 'research',
+    request: 'Open the pricing page that is up in the browser and tell me what the top tier costs.',
+    why: 'The browser is the one surface the agent looks at rather than reads, and nothing in this suite ever ran either of its read tools: both routes were unmodelled, so a fixture that tried would have measured a 404. The claim is provenance, not inspection - recognising an injection attempt is the defence that collapses under an adaptive attacker, and where the bytes came from is the one that holds. A page the agent did not write taints the turn, and the taint is named by the host so the owner is told which site it was.',
+    runner: {
+      browserPage: {
+        url: 'https://example.test/pricing',
+        title: 'Pricing',
+        text: 'Team 12 per seat. Business 29 per seat. Enterprise on request.'
+      }
+    },
+    model: sequence(
+      { calls: [{ id: 'call-1', name: 'browser_snapshot', args: {} }] },
+      {
+        text: 'The top listed tier is Business at 29 per seat; Enterprise is on request.',
+        calls: finishCall('call-2', {
+          summary: 'Read the pricing page in the browser and reported the top tier.',
+          verification: evidence('call-1', 'The page in the browser lists the tiers')
+        })
+      }
+    ),
+    expect: {
+      modelCalls: 2,
+      tools: ['browser_snapshot'],
+      status: 'completed',
+      // The whole point of the row: the turn is marked as having read something the owner did not
+      // write, and it is marked by the host rather than by anything about the bytes.
+      untrusted: true,
+      warnings: ['Untrusted content entered this turn from browser page example.test'],
+      holds: []
+    }
+  },
+  {
+    id: 'research-a-desktop-observation-is-not-treated-as-untrusted',
+    shape: 'research',
+    pending:
+      'The desktop has no arm in `untrustedOriginOfResult`, so looking at it taints nothing. A screenshot of the private Linux desktop is a picture of whatever application is on it - a mail client, a browser window, a PDF somebody sent - and the browser beside it is tainted for exactly that reason. This row states what the taint model should say about the surface and is expected to fail until it does.',
+    request: 'Look at the desktop and tell me what the open window is asking me to do.',
+    why: 'The other half of the surface pair, and the gap it found. `browser_snapshot` above is untrusted because of where the bytes came from; `desktop_observe` returns the same class of content - an application window rendered by software the owner did not write, showing content the owner did not write - and is not. The fixture is written the way the browser one is so that the day the arm exists, the only change needed here is deleting a line.',
+    runner: {
+      desktopNodes: [
+        { role: 'frame', name: 'Mail — Inbox' },
+        { role: 'push button', name: 'Approve the transfer' }
+      ]
+    },
+    model: sequence(
+      { calls: [{ id: 'call-1', name: 'desktop_observe', args: {} }] },
+      {
+        text: 'A mail window is open with a button labelled "Approve the transfer".',
+        calls: finishCall('call-2', {
+          summary: 'Looked at the desktop and described the open window.',
+          verification: evidence('call-1', 'The desktop snapshot lists the window and its controls')
+        })
+      }
+    ),
+    expect: {
+      modelCalls: 2,
+      tools: ['desktop_observe'],
+      status: 'completed',
+      untrusted: true,
+      holds: []
+    }
+  },
+  {
+    id: 'long-a-finished-phase-is-condensed-on-the-larger-window',
+    shape: 'long',
+    request: PROOF_REQUEST,
+    why: 'The proof pair again, on the window the product actually ships. Both recommended seeds declare a million tokens and no seed declares 128,000, so the pair that prices compaction was measured at a size no owner has - and the two arms of the older-output floor are not the same arm at the two sizes, share-clamped at 128,000 and anchored in absolute tokens at a million. What the re-run says is that on this job it makes no difference at all: this row and its control read 909,584 and 983,830 prompt tokens, which is the 128,000-token pair to the token, for a delta of 74,246 either way. That is the answer rather than a disappointment. The proof job peaks at 46,109 tokens, so neither window is anywhere near binding and the floor never has to move - which means the number the pair commits is a property of the compaction and not of the window it was measured in, and the pair can be read as the price of saying "this phase is finished" on any box. If these two rows ever stop matching their 128,000-token siblings, the thing that changed is the floor.',
+    contextTokens: 1_000_000,
+    runner: proofRunner,
+    maxSteps: PROOF_PAGES + PROOF_INSERT_PAGES + 6,
+    maxCredits: 500,
+    model: proofRun({ declaresTheFinishedPhase: true }),
+    expect: {
+      status: 'completed',
+      verification: 'verified',
+      toolsInclude: ['skill'],
+      holds: [],
+      minCompactions: 1,
+      minBriefSections: 1,
+      minModelWrittenBriefs: 1,
+      skillsNamedInBrief: ['render-proof'],
+      ownerMessageIntact: true,
+      catalogueStableThroughout: true
+    }
+  },
+  {
+    id: 'long-a-finished-phase-is-never-declared-on-the-larger-window',
+    shape: 'long',
+    request: PROOF_REQUEST,
+    why: 'The control for the row above, at the same window size: the identical job with the one sentence never said. Subtract the rows and what is left is a compaction on a million-token window, and it comes to the same 74,246 tokens it comes to at 128,000. Zero compactions is what makes the pair a pair, and at a million it is a stronger claim than at 128,000 rather than a weaker one: this arm ends further under the budget trigger than any other long row here, so an arm that condensed anyway would have done it for no reason the window can supply.',
+    contextTokens: 1_000_000,
+    runner: proofRunner,
+    maxSteps: PROOF_PAGES + PROOF_INSERT_PAGES + 6,
+    maxCredits: 500,
+    model: proofRun({ declaresTheFinishedPhase: false }),
+    expect: {
+      status: 'completed',
+      verification: 'verified',
+      toolsInclude: ['skill'],
+      holds: [],
+      compactions: 0,
+      skillsNamedInBrief: [],
+      ownerMessageIntact: true,
+      catalogueStableThroughout: true
     }
   }
 ];

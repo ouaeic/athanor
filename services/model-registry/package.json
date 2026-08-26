@@ -8,7 +8,7 @@
     "start": "node dist/index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "NODE_OPTIONS=--conditions=development vitest run --exclude 'dist/**' --passWithNoTests"
+    "test": "NODE_OPTIONS=--conditions=development vitest run --exclude 'dist/**'"
   },
   "dependencies": {
     "@athanor/contracts": "workspace:*",

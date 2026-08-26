@@ -7,7 +7,13 @@
  * what removing one would cost. A number per fixture, held against a committed baseline, turns that
  * into an ordinary engineering question: delete the hold, run this, read the difference.
  */
-import type { Expectation, Fixture, HoldName, RunOutcome } from './harness.js';
+import {
+  HOLD_ORDER,
+  type Expectation,
+  type Fixture,
+  type HoldName,
+  type RunOutcome
+} from './harness.js';
 
 export interface Baseline {
   readonly [id: string]: {
@@ -33,16 +39,82 @@ export interface Result {
   readonly failures: readonly string[];
 }
 
+/**
+ * Whether a row's failures are the ones it was written to have.
+ *
+ * A pending fixture states the target rather than the present, so its failures are the measurement
+ * and not the problem; the run reports them and stays green. A pending fixture with NO failures is
+ * a failure of its own, because it means the thing it was waiting for arrived and nobody noticed -
+ * and the marker, once stale, turns the next real regression on that row into a pending row.
+ */
+export const pendingHeld = (result: Result): boolean =>
+  result.fixture.pending !== undefined && result.failures.length > 0;
+
+export const brokenPromise = (result: Result): boolean =>
+  result.fixture.pending !== undefined && result.failures.length === 0;
+
 const same = (left: readonly string[], right: readonly string[]): boolean =>
   left.length === right.length && left.every((value, index) => value === right[index]);
 
-export const check = (expect: Expectation, outcome: RunOutcome): string[] => {
+/**
+ * How far a committed number may move before it is a decision rather than drift.
+ *
+ * Steps are exact and always were: a step is a provider call and the whole point of committing the
+ * count is that changing it costs a conversation. The other two need a band, and each for its own
+ * reason.
+ *
+ * Tokens move under this suite without anything in the loop changing, because part of the prompt is
+ * a function of the day it is built - the clock line, and every relative date the window renders.
+ * Frozen deliberately and measured: pinning the wall clock to the task's own start instant moves
+ * the three longest fixtures by 33, 31 and 28 tokens on rows of 910,080, 984,416 and 2,491,662, so
+ * the calendar is worth about three thousandths of a per cent. Two per cent is not calibrated to
+ * that - it is calibrated to the largest drift a real baseline has actually carried, which was 1,807
+ * tokens on a 982,609-token row when this gate was written, or 0.18%. Ten times the worst observed
+ * drift and still a fiftieth of the smallest change worth arguing about.
+ *
+ * The cached share is one-sided. A prefix that repeats MORE than the committed number is the thing
+ * this wave is trying to produce and must never fail a run; one that repeats less is the regression
+ * the number exists to catch, and it is quoted in whole points, so three points is the smallest
+ * band that does not fire on the rounding.
+ */
+const TOKEN_BAND = 0.02;
+const CACHE_PREFIX_BAND = 3;
+
+export const check = (
+  expect: Expectation,
+  outcome: RunOutcome,
+  /** The committed row for this fixture, when it has one. A new fixture has none and is not banded. */
+  before?: Baseline[string]
+): string[] => {
   const failures: string[] = [];
   const compare = <T>(label: string, wanted: T | undefined, got: T): void => {
     if (wanted !== undefined && wanted !== got)
       failures.push(`${label}: expected ${String(wanted)}, got ${String(got)}`);
   };
   if (outcome.error) failures.push(`the run threw: ${outcome.error}`);
+  // Asserted for every fixture and never declarable, because a fixture cannot consent to this: a
+  // route the stub does not model is answered 404, and whatever number this row reports about the
+  // mechanism behind that route was produced by its failure branch.
+  for (const route of outcome.unstubbedRoutes)
+    failures.push(`the runner stub does not model ${route}, so this run measured a 404`);
+  // Also never declarable. A request carrying the directory this checkout happens to sit in makes
+  // the row a measurement of this machine, and hands a model provider somebody's home directory.
+  if (outcome.checkoutPathLeaks)
+    failures.push(
+      `${outcome.checkoutPathLeaks} request(s) carried this machine's checkout path, so this row is not reproducible anywhere else`
+    );
+  // A tool is recorded as started before it runs, so `tools` is green whether the call worked or
+  // threw. This is the difference, and it defaults on: a fixture has to say when one of its own
+  // calls was meant to fail.
+  if (expect.noFailedTools !== false && outcome.failedTools.length)
+    failures.push(`tools that threw rather than returning: [${outcome.failedTools.join(', ')}]`);
+  // Likewise the empty list is the default. A warning is the loop surviving something it should not
+  // have had to survive, and one that fires on every run is the shape a broken subsystem takes in a
+  // suite that reports green.
+  if (!same(expect.warnings ?? [], outcome.warnings))
+    failures.push(
+      `warnings raised: expected [${(expect.warnings ?? []).join(' | ')}], got [${outcome.warnings.join(' | ')}]`
+    );
   compare('model calls', expect.modelCalls, outcome.modelCalls);
   compare('model calls spent inside specialists', expect.delegatedCalls, outcome.delegatedCalls);
   compare('status', expect.status, outcome.status);
@@ -59,6 +131,16 @@ export const check = (expect: Expectation, outcome: RunOutcome): string[] => {
     expect.finalCatalogueUnchanged,
     outcome.finalCatalogueUnchanged
   );
+  compare(
+    'every step was offered the same catalogue',
+    expect.catalogueStableThroughout,
+    outcome.catalogueStableThroughout
+  );
+  compare('compute credits spent', expect.creditsSpent, outcome.creditsSpent);
+  if (expect.minOutputTokens !== undefined && outcome.outputTokens < expect.minOutputTokens)
+    failures.push(
+      `output tokens the ledger recorded: expected at least ${expect.minOutputTokens}, got ${outcome.outputTokens}`
+    );
   compare('the owner’s own words survived', expect.ownerMessageIntact, outcome.ownerMessageIntact);
   if (expect.mediaModels && !same(expect.mediaModels, outcome.mediaModels))
     failures.push(
@@ -87,16 +169,43 @@ export const check = (expect: Expectation, outcome: RunOutcome): string[] => {
     failures.push(
       `procedures the brief says are no longer in the window: expected [${expect.skillsNamedInBrief.join(', ')}], got [${outcome.skillsNamedInBrief.join(', ')}]`
     );
-  // Nothing squeezed is not a failure: the claim is that no result was cut all the way down, and a
-  // window that never had to cut one has not cut one down.
+  // No `> 0` escape any more. The floor is now read off the number the context layer chose rather
+  // than reconstructed from the last window, and a turn that squeezed nothing reports the floor it
+  // started at - so "nothing to cut" satisfies this on its own terms instead of by being excused.
   if (
     expect.minToolResultFloor !== undefined &&
-    outcome.toolResultFloor > 0 &&
     outcome.toolResultFloor < expect.minToolResultFloor
   )
     failures.push(
-      `the smallest squeezed tool result: expected at least ${expect.minToolResultFloor} characters, got ${outcome.toolResultFloor}`
+      `the older-tool-output floor: expected it never to fall below ${expect.minToolResultFloor} characters, got ${outcome.toolResultFloor}`
     );
+  if (
+    expect.minDelegatedCachePrefix !== undefined &&
+    outcome.delegatedCachePrefix < expect.minDelegatedCachePrefix
+  )
+    failures.push(
+      `cached prefix inside the specialist: expected at least ${expect.minDelegatedCachePrefix}% of each of its requests to repeat the one before it, got ${outcome.delegatedCachePrefix}%`
+    );
+  if (
+    expect.maxPeakPromptTokens !== undefined &&
+    outcome.peakPromptTokens > expect.maxPeakPromptTokens
+  )
+    failures.push(
+      `the largest single prompt: expected no more than ${expect.maxPeakPromptTokens} tokens, got ${outcome.peakPromptTokens}`
+    );
+  if (
+    expect.minCacheBreakpoints !== undefined &&
+    outcome.cacheBreakpoints < expect.minCacheBreakpoints
+  )
+    failures.push(
+      `cache breakpoints: expected every request to carry at least ${expect.minCacheBreakpoints}, and one carried ${outcome.cacheBreakpoints}`
+    );
+  if (expect.compactionTriggers && !same(expect.compactionTriggers, outcome.compactionTriggers))
+    failures.push(
+      `what set the compactions off: expected [${expect.compactionTriggers.join(', ')}], got [${outcome.compactionTriggers.join(', ')}]`
+    );
+  compare('requests carrying a soft-pass summary', expect.softPassWindows, outcome.softPassWindows);
+  compare('the leading preamble stood still', expect.anchorHeld, outcome.anchorHeld);
   if (expect.tools && !same(expect.tools, outcome.tools))
     failures.push(
       `tools: expected [${expect.tools.join(', ')}], got [${outcome.tools.join(', ')}]`
@@ -118,6 +227,40 @@ export const check = (expect: Expectation, outcome: RunOutcome): string[] => {
       failures.push(`${tool} never ran; the run used [${outcome.tools.join(', ')}]`);
   for (const tool of expect.toolsExclude ?? [])
     if (outcome.tools.includes(tool)) failures.push(`${tool} ran, and nothing should have let it`);
+  /*
+   * And the committed row, which until now was a column in the report and nothing else.
+   *
+   * Everything above is a claim a fixture makes about itself. This is the claim the suite makes
+   * about the product: that what it costs today is what it cost when somebody last looked at it and
+   * said so. A drift nobody has to answer for is how forty-nine green rows come to be measuring a
+   * loop that has quietly become dearer - the four cache regressions this rig was built after were
+   * every one of them inside a run that reported 49/49 and a column of small positive numbers.
+   *
+   * Accepting a move is one command and it rewrites the file, which is the point: the movement
+   * becomes a diff somebody reviewed rather than a number nobody read.
+   */
+  if (before) {
+    if (outcome.modelCalls !== before.modelCalls)
+      failures.push(
+        `model calls against the committed baseline: was ${before.modelCalls}, now ${outcome.modelCalls} - accept it with \`pnpm eval --accept\` if it is meant`
+      );
+    const drift = Math.abs(outcome.promptTokens - before.promptTokens);
+    if (before.promptTokens > 0 && drift > before.promptTokens * TOKEN_BAND)
+      failures.push(
+        `prompt tokens against the committed baseline: was ${before.promptTokens}, now ${outcome.promptTokens}, which is ${(
+          (drift / before.promptTokens) *
+          100
+        ).toFixed(2)}% and the band is ${TOKEN_BAND * 100}%`
+      );
+    if (
+      before.cachePrefix !== undefined &&
+      outcome.modelCalls > 1 &&
+      outcome.cachePrefix < before.cachePrefix - CACHE_PREFIX_BAND
+    )
+      failures.push(
+        `cached prefix against the committed baseline: was ${before.cachePrefix}%, now ${outcome.cachePrefix}%, and this row may not lose more than ${CACHE_PREFIX_BAND} points`
+      );
+  }
   return failures;
 };
 
@@ -133,17 +276,29 @@ const drift = (now: number, before: number | undefined): string => {
 /** The one line an owner reads per fixture. */
 const row = (result: Result, baseline: Baseline, width: number): string => {
   const before = baseline[result.fixture.id];
+  const state = brokenPromise(result)
+    ? 'PASS'
+    : pendingHeld(result)
+      ? 'pend'
+      : result.failures.length
+        ? 'FAIL'
+        : ' ok ';
   const steps = drift(result.outcome.modelCalls, before?.modelCalls);
   const tokens = drift(result.outcome.promptTokens, before?.promptTokens);
   const cached = drift(result.outcome.cachePrefix, before?.cachePrefix);
   return [
-    result.failures.length ? 'FAIL' : ' ok ',
+    state,
     pad(result.fixture.id, width),
     pad(result.fixture.shape, 10),
     padStart(String(result.outcome.modelCalls), 5),
     padStart(steps, 5),
     padStart(String(result.outcome.promptTokens), 8),
     padStart(tokens, 8),
+    // The largest single request, beside the sum of them. The sum says what a turn cost; this says
+    // whether it fitted, and the two move independently - condensing a long turn raises the total
+    // by a summarising call and lowers this by whatever it condensed. A row whose peak approaches
+    // its window is a row about to start refusing requests, and nothing in this table could see it.
+    padStart(String(result.outcome.peakPromptTokens), 8),
     // A single-call turn has no previous request, so there is nothing a cache could have read back
     // and no share to report - which is not the same statement as nought per cent.
     padStart(result.outcome.modelCalls > 1 ? `${result.outcome.cachePrefix}%` : '-', 6),
@@ -152,23 +307,12 @@ const row = (result: Result, baseline: Baseline, width: number): string => {
   ].join(' ');
 };
 
-const HOLD_ORDER: readonly HoldName[] = [
-  'finish_rejected',
-  'plan_hold',
-  'acceptance_hold',
-  'silence_hold',
-  'acceptance_failed',
-  'completion_nag',
-  'baseline_refused',
-  'repetition_stopped',
-  'output_limit_continued',
-  'step_budget',
-  'idle_break'
-];
-
 export const render = (results: readonly Result[], baseline: Baseline): string => {
   const lines: string[] = [];
-  const failed = results.filter((result) => result.failures.length);
+  const pending = results.filter(pendingHeld);
+  const failed = results.filter(
+    (result) => (result.failures.length > 0 || brokenPromise(result)) && !pendingHeld(result)
+  );
   const steps = results.reduce((total, result) => total + result.outcome.modelCalls, 0);
   const tokens = results.reduce((total, result) => total + result.outcome.promptTokens, 0);
   const beforeSteps = results.reduce(
@@ -182,10 +326,10 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
 
   lines.push('');
   lines.push(
-    `     ${pad('fixture', width)} ${pad('shape', 10)} ${padStart('steps', 5)} ${padStart('Δ', 5)} ${padStart('tokens', 8)} ${padStart('Δ', 8)} ${padStart('cached', 6)} ${padStart('Δ', 5)} holds`
+    `     ${pad('fixture', width)} ${pad('shape', 10)} ${padStart('steps', 5)} ${padStart('Δ', 5)} ${padStart('tokens', 8)} ${padStart('Δ', 8)} ${padStart('peak', 8)} ${padStart('cached', 6)} ${padStart('Δ', 5)} holds`
   );
   lines.push(
-    `     ${'-'.repeat(width)} ${'-'.repeat(10)} ${'-'.repeat(5)} ${'-'.repeat(5)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(6)} ${'-'.repeat(5)} -----`
+    `     ${'-'.repeat(width)} ${'-'.repeat(10)} ${'-'.repeat(5)} ${'-'.repeat(5)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(6)} ${'-'.repeat(5)} -----`
   );
   for (const result of results) lines.push(row(result, baseline, width));
 
@@ -195,6 +339,22 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
     for (const result of failed) {
       lines.push(`  ${result.fixture.id}`);
       lines.push(`    protects: ${result.fixture.why}`);
+      if (brokenPromise(result))
+        lines.push(
+          `    - this fixture is marked pending and every expectation in it now holds. Delete the marker: ${result.fixture.pending}`
+        );
+      for (const failure of result.failures) lines.push(`    - ${failure}`);
+    }
+  }
+
+  // Reported in full and separately, because a pending row is a measurement rather than a mishap
+  // and burying it under the passes is how it stops being read.
+  if (pending.length) {
+    lines.push('');
+    lines.push('WHAT IS PENDING - stated targets the loop does not meet yet, not regressions');
+    for (const result of pending) {
+      lines.push(`  ${result.fixture.id}`);
+      lines.push(`    waiting on: ${result.fixture.pending}`);
       for (const failure of result.failures) lines.push(`    - ${failure}`);
     }
   }
@@ -225,7 +385,9 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
 
   lines.push('');
   lines.push(
-    `${results.length - failed.length}/${results.length} fixtures pass. ${steps} model calls in total${
+    `${results.length - failed.length - pending.length}/${results.length - pending.length} fixtures pass${
+      pending.length ? `, ${pending.length} pending` : ''
+    }. ${steps} model calls in total${
       beforeSteps ? ` (baseline ${beforeSteps})` : ''
     }, ${tokens} estimated prompt tokens, the largest single prompt ${peak}.`
   );

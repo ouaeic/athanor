@@ -28,6 +28,10 @@
  * happened to be next". A script that reads the pushback can, and the step count it produces is
  * then the measured price of that hold.
  */
+import { writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import type { ModelRelease } from '../packages/contracts/src/index.js';
 import {
   decryptJson,
@@ -35,9 +39,66 @@ import {
   generateDataKey,
   wrapDataKey
 } from '../packages/core/src/crypto.js';
-import type { DataStore, TaskRecord, WorkspaceRecord } from '../packages/data/src/index.js';
-import { AgentWorker } from '../apps/worker/src/agent.js';
-import { RUNTIME_CONTEXT_MARKER } from '../apps/worker/src/context.js';
+import {
+  MEMORY_PACK_BUDGET_TOKENS,
+  type MemoryKind,
+  type MemoryStatus,
+  type MemoryTrust
+} from '../packages/core/src/memory.js';
+import type {
+  DataStore,
+  MemoryCandidateRecord,
+  RecallMemoryInput,
+  TaskRecord,
+  WorkspaceMemoryRecord,
+  WorkspaceRecord,
+  WorkspaceSkillRecord
+} from '../packages/data/src/index.js';
+import { AgentWorker, PUSHBACK_MARKERS, type PushbackName } from '../apps/worker/src/agent.js';
+import {
+  COMPRESSED_TRAJECTORY_MARKER,
+  RUNTIME_CONTEXT_MARKER
+} from '../apps/worker/src/context.js';
+import { memoryItemAad, memorySourceAad } from '../apps/worker/src/memory-runtime.js';
+import { builtinSkillLibrary } from '../apps/worker/src/skills.js';
+
+/* ---------------------------------------------------------------- a checkout-independent root */
+
+/**
+ * Where this rig tells the model the built-in procedures live.
+ *
+ * `DEFAULT_SKILL_ROOT` is derived from `import.meta.url`, so on this machine a skill the turn opens
+ * arrives in the window as `Skill directory: /Users/somebody/some folder/athanor/skills/<name>` -
+ * and `promptTokens` is an estimate over that window, carried through every later step of the turn.
+ * Two things follow, and only one of them is small. The small one: the committed baseline is a
+ * function of where the repository happens to sit, so a CI checkout and a laptop cannot compare
+ * rows in a file whose entire purpose is that a diff records what a change cost. The other one is
+ * that the absolute path of a stranger's home directory is being handed to a model provider.
+ *
+ * This rig can fix the first and can only report the second. `builtinSkillLibrary()` is a
+ * process-wide memo of plain objects, read once and reused for the life of the run, so it is
+ * rewritten here - once, before any fixture runs - to a fixed installation path. Nothing reads
+ * those directories on this side: the loader has already read every file, and the workspace that
+ * would resolve a path against them is a stub. What changes is the bytes the model is sent, which
+ * is exactly what is being measured.
+ *
+ * The second half is `checkoutPathLeaks` below, which fails any fixture whose request still carries
+ * the checkout root. That is the guard, not this: a normalisation nobody checks is a normalisation
+ * that stops covering the next place a path escapes into a prompt.
+ */
+const NORMALISED_SKILL_ROOT = '/athanor/skills';
+
+/** The checkout this file was loaded from, which is the string that must never reach a request. */
+const CHECKOUT_ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');
+
+(() => {
+  const library = builtinSkillLibrary();
+  // Assigning through the readonly declaration on purpose: the memo is the only copy, and there is
+  // no setter. A cast rather than a mutable alias, so this reads as the deliberate act it is.
+  for (const skill of library.skills)
+    (skill as { directory: string }).directory = `${NORMALISED_SKILL_ROOT}/${skill.name}`;
+  (library as { root: string }).root = NORMALISED_SKILL_ROOT;
+})();
 
 const masterKey = Buffer.alloc(32, 5);
 const runnerSecret = 'r'.repeat(48);
@@ -45,6 +106,23 @@ const userId = '11111111-1111-4111-8111-111111111111';
 const workspaceId = '22222222-2222-4222-8222-222222222222';
 const taskId = '33333333-3333-4333-8333-333333333333';
 const dataKey = generateDataKey();
+
+/**
+ * The worker this rig is, written once because both halves of the lease have to agree.
+ *
+ * The fixture task used to be stamped `leaseOwner: 'worker-test'` while the `AgentWorker` under it
+ * was configured `WORKER_ID: 'worker-eval'`, so every fixture in this suite described a task held
+ * by some other worker. Nothing asked, so nothing noticed. Wave 7.2's #140 arm asks: `haltReason`
+ * is now consulted at every step boundary and not only mid-model-call, and it answers `disowned`
+ * for a lease that names somebody else - correctly, because a worker that has lost the task must
+ * not execute another batch against a workspace someone else is now running. The suite stood down
+ * on its first step boundary and reported 53 fixtures at 0 model calls with no error anywhere,
+ * because standing down is deliberately silent.
+ *
+ * So the two are one constant. A rig whose task is owned by a worker other than the one running it
+ * is not exercising a scenario worth having; it was a typo with nothing to trip over it.
+ */
+const WORKER_ID = 'worker-eval';
 
 const PROVIDER_URL = 'https://provider.test/v1';
 const RUNNER_URL = 'http://127.0.0.1:4300';
@@ -76,6 +154,16 @@ export interface ModelTurn {
    * long enough to reach the ceiling, which is why the fixture that uses it generates its answer.
    */
   readonly cut?: boolean;
+  /**
+   * The route goes quiet mid-answer and never closes the socket.
+   *
+   * `cut` ends the stream where the text stops, which is a socket that died. This is the other
+   * shape, and it is the one the fifteen-minute incident was: the frames stop arriving and the
+   * connection stays open, so nothing on this side ends until a clock does. It implies `cut` - no
+   * finish reason, no usage frame - and it is only useful beside `Fixture.clock`, because what it
+   * is waiting for is the generation deadline.
+   */
+  readonly silent?: boolean;
 }
 
 export interface ScriptContext {
@@ -118,6 +206,17 @@ export interface ScriptContext {
    * in the chain would report a cache miss for a turn whose own window never moved.
    */
   readonly delegated: boolean;
+  /**
+   * True on the one call a vision specialist is asked to make.
+   *
+   * A vision handoff sends `tools: []`, which is exactly the shape a compaction's summarising call
+   * has - so without this the specialist's answer would be scripted by whatever branch the fixture
+   * wrote for `summarising`, and a fixture asserting on the handoff would be asserting about a
+   * summary. Told apart by the model on the wire rather than by the empty catalogue: a specialist
+   * is by definition a different release from the lead, which is the only difference the request
+   * carries and the only one that cannot be true of a compaction.
+   */
+  readonly vision: boolean;
 }
 
 /** A model, as a function of what athanor just said to it. */
@@ -179,13 +278,25 @@ const commonPrefix = (left: string, right: string): number => {
 const promptBytes = (body: Record<string, unknown>): string =>
   `${JSON.stringify(body.tools ?? [])}${JSON.stringify(body.messages ?? [])}`;
 
-const framesFor = (turn: ModelTurn): string[] => {
+/**
+ * What the provider says the request cost it, counted from the request.
+ *
+ * Four characters to the token, which is the same rough conversion the window is estimated with on
+ * the other side - so this is a plausible provider count rather than a copy of athanor's own
+ * number, and the two are allowed to disagree by whatever the two roundings differ by. The
+ * catalogue is included because a provider bills the whole request, which is precisely the term
+ * that was missing from the estimate the loop falls back on when nobody sends one.
+ */
+const promptTokensFor = (body: Record<string, unknown>): number =>
+  Math.ceil(promptBytes(body).length / 4);
+
+const framesFor = (turn: ModelTurn, promptTokens: number): string[] => {
   const parts: string[] = [];
   const pieces = turn.chunks ?? (turn.text ? [turn.text] : []);
   // A cut stream stops mid-answer: every piece arrives as an ordinary delta and then nothing does.
   // No closing frame, because the closing frame is exactly what a cut call never sends - which is
   // why the usage it carries has to be worked out on the other side.
-  if (turn.cut) {
+  if (turn.cut || turn.silent) {
     for (const piece of pieces) parts.push(sse({ choices: [{ delta: { content: piece } }] }));
     return parts;
   }
@@ -215,6 +326,49 @@ const framesFor = (turn: ModelTurn): string[] => {
       ]
     })
   );
+  /*
+   * The usage frame, which every real route sends and this rig never did.
+   *
+   * A streamed request here asks for it - the adapter sets `stream_options.include_usage` whenever
+   * it has somewhere to put deltas - and the answer arrived without one on every fixture in this
+   * file, for the life of the suite. That is not a missing number, it is a different branch, and it
+   * turned out to be the branch that decides when a window is condensed.
+   *
+   * The small half: with no usage the gateway marks the reply `estimated`, the loop sees
+   * `estimated && inputTokens === 0` and bills its own window estimate, so every row priced the
+   * fallback and the path a configured provider takes was never exercised.
+   *
+   * The half that matters: `agent.ts:4115` replaces `state.preparedInputTokens` with
+   * `prompt_tokens - reservedTokens` whenever a route reports usage, and `state.preparedInputTokens`
+   * is precisely what the compaction trigger is compared against on the next step. So with no usage
+   * frame the single most consequential decision in the loop was being taken from
+   * characters-divided-by-four on all forty-nine fixtures, and the code the product actually runs -
+   * decide it from what the provider counted - had never once run here. Measured on the fixture
+   * written for it: with no frame the window parks at 63,721 tokens, fourteen tokens over the
+   * trigger, and never condenses; with one, the same turn condenses on its tenth request and comes
+   * back at 34,405. One frame, and a mechanism goes from never firing to firing.
+   *
+   * `prompt_tokens` counts the serialised request, catalogue included, at four characters to the
+   * token. That is deliberately the whole body rather than a copy of athanor's own estimate: a
+   * provider bills the JSON it receives, the estimate on the other side counts message content and
+   * cannot see the envelope, and the gap between the two is exactly the thing `agent.ts:4108` says
+   * this replacement exists to correct.
+   *
+   * A cut stream deliberately still gets none, and that is the whole point of the exception: usage
+   * arrives in the last frame and a cut call never reaches it, so the fallback stays under test on
+   * the one fixture that is about a cut. Both branches are now live, one row apart.
+   */
+  if (!turn.cut && !turn.silent)
+    parts.push(
+      sse({
+        choices: [],
+        usage: {
+          prompt_tokens: promptTokens,
+          completion_tokens: Math.ceil(pieces.join('').length / 4),
+          total_tokens: promptTokens + Math.ceil(pieces.join('').length / 4)
+        }
+      })
+    );
   parts.push('data: [DONE]\n\n');
   return parts;
 };
@@ -259,6 +413,15 @@ const completionBody = (turn: ModelTurn): unknown => {
 const encoder = new TextEncoder();
 
 /**
+ * How the scripted stream reaches the running fixture's clock.
+ *
+ * `streamOf` is module scope and the clock belongs to one run, so the run installs its adder here
+ * and takes it away again in the same `finally` that puts `fetch` back. A no-op by default, which
+ * is what every fixture that has not asked for a clock gets.
+ */
+let advanceClockBy: (ms: number) => void = () => undefined;
+
+/**
  * The frames delivered one at a time, over a stream that dies when the request is torn down.
  *
  * A stub that hands back the whole body as a string cannot be interrupted, and two mechanisms in
@@ -269,7 +432,18 @@ const encoder = new TextEncoder();
  */
 const streamOf = (
   frames: readonly string[],
-  signal?: AbortSignal | null
+  signal?: AbortSignal | null,
+  /**
+   * Milliseconds the fixture's clock gains as each frame goes out.
+   *
+   * Zero for every fixture that has not asked for one, which is all of them but the three about
+   * what a generation is allowed to spend. It advances before the frame rather than after, so the
+   * elapsed time the budget reads when it decides is the time that had passed when the model went
+   * quiet - which is the reading the incident this bound was written for produced.
+   */
+  advanceMs = 0,
+  /** Leaves the stream open after the last frame: a provider that stopped talking and stayed on. */
+  hold = false
 ): ReadableStream<Uint8Array> =>
   new ReadableStream<Uint8Array>({
     start(controller) {
@@ -285,8 +459,23 @@ const streamOf = (
         for (const frame of frames) {
           await new Promise((resolve) => setTimeout(resolve, 0));
           if (closed) return;
-          controller.enqueue(encoder.encode(frame));
+          if (advanceMs) advanceClockBy(advanceMs);
+          try {
+            controller.enqueue(encoder.encode(frame));
+          } catch {
+            // The reader was cancelled between two frames, which is what a generation cut on this
+            // side does to the socket it was reading: the controller is closed from the other end
+            // and nothing here is told. Writing into it throws out of a queue nobody is awaiting
+            // and takes the process down - which is a rig failure wearing a defect's clothes.
+            closed = true;
+            return;
+          }
         }
+        // Nothing after the frames, for ever. The read the caller is in the middle of never
+        // resolves, so what ends the generation is the clock and only the clock - which makes the
+        // deadline this fixture is about the deterministic winner of that race rather than a
+        // coin toss against a frame that was already buffered.
+        if (hold) return;
         await new Promise((resolve) => setTimeout(resolve, 0));
         if (closed) return;
         closed = true;
@@ -323,8 +512,56 @@ export interface RunnerStub {
   readonly files?: Readonly<Record<string, string>>;
   /** The rows a `web_search` comes back with. */
   readonly search?: ReadonlyArray<{ readonly title: string; readonly url: string }>;
-  /** The text each address returns to `parallel_web_read`, by address. */
+  /**
+   * The text each address returns to `parallel_web_read`, by address. An address the read asks for
+   * and this map does not hold comes back as a source that could not be read, which is what the
+   * runner does with one, rather than as an address the answer never mentions.
+   */
   readonly pages?: Readonly<Record<string, string>>;
+  /**
+   * Binaries this computer does not have, for a fixture about a procedure that names one.
+   *
+   * Absent means the whole document toolchain is installed, which is what the installer leaves
+   * behind and what every fixture here assumes when it runs a document job.
+   */
+  readonly missingBinaries?: readonly string[];
+  /**
+   * HTTP statuses to answer the first inference calls with, positionally; `0` means answer it
+   * normally. The list runs out and every call after it is answered normally.
+   *
+   * On the runner stub rather than beside the model script because it is the same kind of thing as
+   * an exit code: a fact about the world outside the loop that a fixture declares once. The model
+   * script is a function of what athanor said, and a 500 is not something athanor said.
+   *
+   * This is what the retry wall has needed since it was written. `5xx` and `408/429` are walls the
+   * loop is meant to sit behind and come back from, `4xx` is a wall it must not retry, and until
+   * now the only fixtures that could tell those apart were unit tests of the gateway. A turn that
+   * survives a provider outage and finishes is a different claim from a request that was retried.
+   */
+  readonly providerFailures?: readonly number[];
+  /**
+   * The page the workspace browser is looking at, for the two tools that read one.
+   *
+   * `url` is what makes the fixture mean anything: it is what `untrustedOriginOfResult` names the
+   * taint by, so a snapshot with no address taints the turn as "browser page" and a fixture about
+   * where the content came from measures nothing.
+   */
+  readonly browserPage?: {
+    readonly url: string;
+    readonly title: string;
+    readonly text: string;
+  };
+  /**
+   * What the private Linux desktop currently shows, as the accessibility tree the runner returns.
+   *
+   * No screenshot: a desktop snapshot carrying image bytes is routed to a vision specialist, which
+   * is a different mechanism with its own fixtures, and a fixture about the desktop's own result
+   * should not be measuring that one.
+   */
+  readonly desktopNodes?: ReadonlyArray<{
+    readonly role: string;
+    readonly name: string;
+  }>;
 }
 
 const json = (body: unknown): Response =>
@@ -368,6 +605,31 @@ const mediaResponse = (
 /** What the document tools shell out to, whose stdout has to be JSON rather than a console line. */
 const DOCUMENT_BINARY = '/usr/local/lib/athanor/athanor-document';
 
+/**
+ * What a fully provisioned box answers `/toolchain` with, by capability id.
+ *
+ * The runner probes for these one binary, module and font at a time and reports which jobs the
+ * computer can actually do; a workspace the installer finished can do all of them, so that is what
+ * this answers. The list is named here rather than imported from the runner because importing it
+ * would pull that service's process machinery - the sandbox, the command policy, the executable
+ * resolver - into a rig whose whole point is that it needs no Linux box. `purpose` is not filled
+ * in: it is prose the runner carries for the Files screen rather than anything a probe establishes,
+ * and copying it here would be this harness asserting something about the other side's wording.
+ */
+const TOOLCHAIN_CAPABILITIES = [
+  'office-authoring',
+  'office-conversion',
+  'document-fonts',
+  'pdf-assembly',
+  'pdf-forms',
+  'pdf-extraction',
+  'typeset-pdf',
+  'data-analysis',
+  'statistics',
+  'image-work',
+  'media'
+] as const;
+
 /** What the workspace has been made to do so far, which is the only state the stub carries. */
 interface RunnerState {
   execs: number;
@@ -377,7 +639,35 @@ interface RunnerState {
   media: number;
   /** The model id each of those named on the wire, in order. */
   mediaModels: string[];
+  /**
+   * Every runner route this stub does not model, in the order they were first asked for.
+   *
+   * The reason this list exists rather than a permissive default: an unmodelled route used to be
+   * answered `{ok:true}`, which is a valid-looking answer to a question nobody asked. Four
+   * production mechanisms read a field off a route that was never stubbed, got `undefined`, and
+   * took the branch they take when the workspace cannot answer - the picture that could not be
+   * looked at, the toolchain the model was never told about, the binary probe that reported
+   * everything installed, the render check that passed whatever the document did. Every one of
+   * them ran its failure branch on all forty-nine fixtures and the suite reported green, because a
+   * failure branch is still a branch and the numbers it produces are still numbers.
+   */
+  unstubbed: string[];
 }
+
+/**
+ * A route named the way a person would have to model it: the method, and the path with this
+ * workspace's id and any query taken out. Two calls to the same route are one line in the report.
+ */
+const routeName = (url: string, init?: RequestInit): string => {
+  const path = (() => {
+    try {
+      return new URL(url).pathname;
+    } catch {
+      return url;
+    }
+  })();
+  return `${init?.method ?? 'GET'} ${path.replace(workspaceId, ':workspaceId')}`;
+};
 
 const runnerResponse = (
   stub: RunnerStub,
@@ -419,6 +709,42 @@ const runnerResponse = (
       timedOut: false
     });
   }
+  // What the workspace browser is looking at. Two tools read it and both are untrusted content by
+  // provenance rather than by inspection - the address is the whole of what the taint is named by.
+  if (url.includes('/browser/snapshot') || url.includes('/browser/elements')) {
+    const page = stub.browserPage;
+    if (!page) {
+      state.unstubbed.push(routeName(url, init));
+      return new Response(JSON.stringify({ error: 'no page' }), { status: 404 });
+    }
+    return json({
+      tabId: 'tab-1',
+      url: page.url,
+      title: page.title,
+      text: page.text,
+      elements: [{ ref: 'e1', role: 'link', name: page.title }]
+    });
+  }
+  if (url.includes('/browser/action')) {
+    const page = stub.browserPage;
+    if (!page) {
+      state.unstubbed.push(routeName(url, init));
+      return new Response(JSON.stringify({ error: 'no page' }), { status: 404 });
+    }
+    return json({ tabId: 'tab-1', url: page.url, title: page.title, text: page.text, ok: true });
+  }
+  if (url.includes('/desktop/snapshot')) {
+    const nodes = stub.desktopNodes;
+    if (!nodes) {
+      state.unstubbed.push(routeName(url, init));
+      return new Response(JSON.stringify({ error: 'no desktop' }), { status: 404 });
+    }
+    return json({
+      nodes: nodes.map((node, index) => ({ ref: `n${index + 1}`, ...node, tier: 0 })),
+      nodesOmitted: 0,
+      windowTitle: nodes[0]?.name ?? 'desktop'
+    });
+  }
   if (url.includes('/browser/search'))
     return json({
       engine: 'stub',
@@ -431,15 +757,37 @@ const runnerResponse = (
         snippet: row.title
       }))
     });
-  if (url.includes('/browser/read-many'))
+  if (url.includes('/browser/read-many')) {
+    // `sources`, and one entry per address asked for, because that is the contract both sides now
+    // name from one place (`ParallelWebReadResult`). This stub used to answer `pages`, which is the
+    // exact shape the product already found wrong and fixed: every reader of the result asks for
+    // `sources`, so an answer keyed on `pages` reads as a read that returned nothing. The turn then
+    // learnt no host from a page it had just read, the untrusted label lost its host names, and the
+    // spot-check that compares a specialist's quoted span against the source it cited compared it
+    // against an empty string and could never verify - on every research fixture, invisibly.
+    const requested = Array.isArray(body.urls) ? body.urls.map(String) : [];
+    const unique = [...new Set(requested)].slice(0, 12);
+    const perPage = Math.trunc(Number(body.maxCharactersPerPage)) || 20_000;
     return json({
-      pages: Object.entries(stub.pages ?? {}).map(([address, text]) => ({
-        url: address,
-        title: address,
-        text,
-        characters: text.length
-      }))
+      sources: unique.map((address) => {
+        const text = stub.pages?.[address];
+        // A miss is an entry that says so, not an absent entry: the requested address is what the
+        // turn reasons about afterwards - whether it has been to that host, whether the claim it
+        // was going to cite has a source - and dropping the row loses the question along with the
+        // answer. The wording is the runner's own for a source it never got to read.
+        return text === undefined
+          ? { requestedUrl: address, error: 'Source was not read' }
+          : {
+              requestedUrl: address,
+              url: address,
+              title: address,
+              text: text.slice(0, perPage)
+            };
+      }),
+      requested: requested.length,
+      read: unique.length
     });
+  }
   if (url.includes('/files?')) {
     const path = decodeURIComponent(new URL(url).searchParams.get('path') ?? '');
     // The runner's own field names, not an approximation of them. An artifact acceptance check
@@ -468,6 +816,26 @@ const runnerResponse = (
         }))
     });
   }
+  // `image_read` has a route of its own, and it is not the file route. The picture branch below
+  // used to be the whole of this stub's answer to a picture, and nothing ever reached it: the
+  // client GETs `/image?path=…`, which contains neither `/files?` nor `/file`, so every look at a
+  // generated logo fell through to the catch-all, came back as JSON, and was refused by the one
+  // line in the client that checks the workspace kept its promise about content types. The media
+  // fixtures still listed `image_read` among their tools, because a tool is recorded as started
+  // before it runs - so both of them measured a turn that could not see its own work.
+  if (url.includes('/image?')) {
+    const path = decodeURIComponent(new URL(url).searchParams.get('path') ?? '');
+    if (!state.written.has(path) && stub.files?.[path] === undefined)
+      return new Response('', { status: 404 });
+    // Re-encoded on the way out, which is what the runner does to every picture it answers with -
+    // so the source type travels beside the bytes rather than being inferred from the name.
+    return new Response(Buffer.from(ONE_PIXEL_PNG, 'base64'), {
+      headers: {
+        'content-type': 'image/png',
+        'x-image-source-type': `image/${(path.split('.').pop() ?? 'png').toLowerCase()}`
+      }
+    });
+  }
   if (url.includes('/file')) {
     // A write is acknowledged; a read of a path the fixture never put in the workspace is a miss,
     // which is how a fixture makes a read fail without inventing an error shape.
@@ -487,9 +855,9 @@ const runnerResponse = (
     }
     const path = decodeURIComponent(new URL(url).searchParams.get('path') ?? '');
     const known = state.written.has(path) || stub.files?.[path] !== undefined;
-    // A picture comes back as bytes with a picture's content type, because that is the only thing
-    // `image_read` accepts - and looking at what it just generated is the first thing the media tool
-    // tells the model to do, so a media fixture that could not do it would measure the wrong loop.
+    // A picture comes back as bytes with a picture's content type. Looking at one goes through
+    // `/image` above; this is the raw read behind publishing it, where the type on the wire is what
+    // the artifact is stored and served as.
     if (known && /\.(png|jpe?g|webp|gif)$/i.test(path))
       return new Response(Buffer.from(ONE_PIXEL_PNG, 'base64'), {
         headers: { 'content-type': 'image/png' }
@@ -514,10 +882,77 @@ const runnerResponse = (
       durationMs: 21,
       pruned: []
     });
-  return json({ ok: true, storageBytes: 2_048 });
+  // What this computer can do with documents. It is read once at the start of every run and folded
+  // into the frozen runtime block, so until this route existed the block that tells the model which
+  // document jobs the box can do was absent from every eval prompt and therefore from every
+  // committed baseline row - the suite priced a machine it never described.
+  if (url.endsWith('/toolchain'))
+    return json({
+      capabilities: TOOLCHAIN_CAPABILITIES.map((id) => ({
+        id,
+        ready: true,
+        missingBinaries: [],
+        missingPythonModules: [],
+        missingFonts: []
+      })),
+      ready: [...TOOLCHAIN_CAPABILITIES],
+      missing: [],
+      summary: `Available on this computer: ${TOOLCHAIN_CAPABILITIES.join(', ')}.`
+    });
+  // Which of a procedure's declared binaries this box does not have. The everything-is-installed
+  // answer is the default because that is what the installer leaves behind, but it is now an answer
+  // rather than the absence of one: the branch that warns a model off a procedure it cannot run was
+  // unreachable while this route fell through to a body with no `present` and no `missing` in it.
+  if (url.endsWith('/toolchain/probe')) {
+    const asked = Array.isArray(body.binaries) ? body.binaries.map(String) : [];
+    const absent = new Set(stub.missingBinaries ?? []);
+    return json({
+      present: asked.filter((binary) => !absent.has(binary)),
+      missing: asked.filter((binary) => absent.has(binary))
+    });
+  }
+  // Storage after a write, which the loop reads back to keep the workspace's own figure current.
+  if (url.endsWith('/usage')) return json({ storageBytes: 2_048 });
+  // Everything else is a route nobody modelled, and it is answered as one. A permissive `{ok:true}`
+  // here is not a convenience - it is an answer with the right status and the wrong contents, which
+  // every caller reads as a workspace that did what was asked and then found the field it wanted
+  // missing. `check()` refuses a fixture that reached this line, so a route added to the loop
+  // arrives here as a named failure rather than as a number that quietly means something else.
+  state.unstubbed.push(routeName(url, init));
+  return new Response(JSON.stringify({ error: `Unstubbed runner route: ${url}` }), {
+    status: 404,
+    headers: { 'content-type': 'application/json' }
+  });
 };
 
 /* --------------------------------------------------------------------------------- the fixture */
+
+/**
+ * What set a compaction off, in the loop's own words: the model declaring a phase over, or the
+ * window reaching the budget trigger.
+ */
+export type CompactionTrigger =
+  | 'agent'
+  | 'budget'
+  /**
+   * A compaction whose event carried neither, which no path in the loop produces. It exists so a
+   * payload this rig has got wrong reads as an unexpected value and fails the fixture that asserts
+   * on it, rather than being folded into whichever of the two is commoner and answering the
+   * question with a guess.
+   */
+  | 'unrecorded';
+
+/**
+ * The opening of the deterministic block `prepareModelContext` pushes at the tail of the window
+ * once the soft threshold is crossed.
+ *
+ * It was a literal here - the only one left in this file - because `context.ts` did not publish it.
+ * Step 3.1(b) gave that summary a marker constant, moved it out of the leading system run and
+ * excluded it from `cacheEligible`, so this is now an import and the fixture below is no longer
+ * coupled to prose. Matching an opening rather than the whole sentence, so the wording after it can
+ * change without this going quiet.
+ */
+const SOFT_PASS_MARKER = COMPRESSED_TRAJECTORY_MARKER;
 
 /** Which owner-shaped request this fixture stands for. Reported so a gap in coverage is visible. */
 export type FixtureShape =
@@ -530,7 +965,9 @@ export type FixtureShape =
   | 'small'
   | 'media'
   /** A job long enough that what it costs is decided by how the window is held down, not by holds. */
-  | 'long';
+  | 'long'
+  /** Not a job at all: a claim about the catalogue every other row here is priced on. */
+  | 'schema';
 
 export interface Expectation {
   /** Exactly how many model calls the turn cost, including the closing handoff when one happens. */
@@ -562,10 +999,55 @@ export interface Expectation {
    * assertion about caching turns into an assertion about the catalogue's length.
    */
   readonly finalCatalogueUnchanged?: boolean;
+  /**
+   * Whether every step of the turn was offered the identical catalogue, and not merely the last two.
+   *
+   * `finalCatalogueUnchanged` watches the seam a closing handoff could open. This watches all of
+   * them. The catalogue is the head of the prompt and it is fixed for the life of a run on purpose:
+   * a tool added or withdrawn at step nine rewrites the first fifty-six kilobytes of every request
+   * from step nine on, and a provider billing a cached prefix bills all of it as new. There is no
+   * assertion anywhere else that says the order is held - the constant that fixes it has a comment
+   * and no test - so a change that made the catalogue a function of the step would pass typecheck,
+   * pass every fixture, and show up only as a cached share that had quietly fallen.
+   */
+  readonly catalogueStableThroughout?: boolean;
+  /**
+   * The fewest output tokens the ledger must have recorded for this turn.
+   *
+   * A floor rather than an exact count: what a cut generation produced is an estimate over the
+   * characters that arrived, and the assertion worth making is that it is not nought.
+   */
+  readonly minOutputTokens?: number;
+  /** Compute credits the turn had spent when it stopped, exactly, for the fixtures about the ceiling. */
+  readonly creditsSpent?: number;
   /** Tools that must appear somewhere in the run. */
   readonly toolsInclude?: readonly string[];
   /** Tools that must never run - the check that a floor or a gate actually stopped something. */
   readonly toolsExclude?: readonly string[];
+  /**
+   * Whether every tool this turn started came back with a result rather than an exception.
+   *
+   * Defaults on; a fixture whose own call was meant to throw says so with `noFailedTools: false`.
+   * `tools` cannot carry this claim, because a tool is recorded as started before it runs - so a
+   * turn whose every call threw lists exactly the same tools as one whose every call worked, and a
+   * fixture pinning that list is green either way. That is not hypothetical: both media fixtures
+   * spent their whole lives with `image_read` throwing on the step the fixture exists to measure.
+   */
+  readonly noFailedTools?: boolean;
+  /**
+   * Every warning the turn raised, in order, by the summary the owner would read.
+   *
+   * The empty list is the default, and it is the assertion that matters: a warning is the loop
+   * saying something went wrong in a way it decided to survive, and a mechanism that fails softly
+   * on every run is exactly what a green suite cannot otherwise see. The memory pack failed to
+   * build on all forty-nine fixtures for the life of this rig, swallowed into one of these.
+   *
+   * Coupled to the summary rather than to a code, which the holds above no longer are: they read
+   * `PUSHBACK_MARKERS` out of the file that writes them, and there is no equivalent table for
+   * warnings - they are assembled at each site. A reworded warning failing loudly on the fixtures
+   * that expect it is the better half of that trade until there is one.
+   */
+  readonly warnings?: readonly string[];
   /** Where the task ended up: completed, awaiting_user for an approval, failed. */
   readonly status?: string;
   /** The verification status the completion carries. */
@@ -597,6 +1079,11 @@ export interface Expectation {
    * is that a turn which only appends to its window did not rewrite the front of it.
    */
   readonly minCachePrefix?: number;
+  /**
+   * The same floor for a delegated specialist's own window. One mission at a time; see
+   * `RunOutcome.delegatedCachePrefix`.
+   */
+  readonly minDelegatedCachePrefix?: number;
   /** The fewest compactions this turn must have performed. */
   readonly minCompactions?: number;
   /**
@@ -627,13 +1114,61 @@ export interface Expectation {
   /** Whether the owner's own words were still in the last window, byte for byte. */
   readonly ownerMessageIntact?: boolean;
   /**
-   * The shortest a squeezed tool result may be left in the last window.
+   * The lowest the older-tool-output floor may be driven, in characters.
    *
-   * Nothing squeezed at all satisfies this: the assertion is that no result was cut all the way to
-   * the hard floor, which is what a turn looks like when the cheap mechanism has been made to do
-   * the work the expensive one exists for.
+   * The assertion is that no result was cut all the way to the hard floor, which is what a turn
+   * looks like when the cheap mechanism has been made to do the work the expensive one exists for.
+   * A turn that never had to squeeze anything reads the starting floor and passes, so this no
+   * longer needs the `> 0` escape it used to carry - see `RunOutcome.toolResultFloor` for what that
+   * escape was hiding.
    */
   readonly minToolResultFloor?: number;
+  /**
+   * The fewest cache breakpoints every single request of this turn had to carry.
+   *
+   * The other half of `minCachePrefix`, and the half that is about the bill rather than about the
+   * window. A prefix that repeats is only worth anything if the request says where the repeat ends:
+   * on a route that bills explicit writes an unmarked request is a full-price write however much of
+   * it the provider has seen before. So a turn can hold 95% of its bytes still and pay for all of
+   * them, and nothing here could see the difference.
+   */
+  readonly minCacheBreakpoints?: number;
+  /**
+   * The largest single request this turn is allowed to build, in tokens.
+   *
+   * A ceiling rather than a floor, and the only expectation here that bounds a turn's size rather
+   * than its shape. `promptTokens` is a sum and hides this completely: a turn that sends one
+   * enormous request and nine small ones sums to the same number as one that sends ten middling
+   * ones, and only the first is about to be refused by the provider. It is also the sharpest way to
+   * assert that something was NOT re-sent - a body put back into the window is worth its own size
+   * on the step it lands, wherever the sum ends up.
+   */
+  readonly maxPeakPromptTokens?: number;
+  /**
+   * Exactly what set each compaction off, in order.
+   *
+   * The whole list rather than a floor, because the two triggers are two mechanisms: an arm built
+   * to measure the budget trigger is green on a run where the model happened to declare a phase
+   * finished instead, and the price of the two is not the same.
+   */
+  readonly compactionTriggers?: readonly CompactionTrigger[];
+  /**
+   * Exactly how many requests carried a soft-pass summary.
+   *
+   * Exact rather than a floor in both directions. Zero is the assertion for every turn that must
+   * never reach the soft threshold at all; a small number is the assertion for a turn built to
+   * cross it, where a larger one means the budget compaction that was supposed to answer it never
+   * fired and the deterministic block is now being rewritten at the head of every request.
+   */
+  readonly softPassWindows?: number;
+  /**
+   * Whether the leading system preamble stood still for the whole turn.
+   *
+   * The strongest cache statement a fixture can make, and the one `minCachePrefix` cannot make:
+   * the anchor breakpoint is placed at the end of that run, so a byte that moves inside it costs
+   * the whole request rather than the tail of it.
+   */
+  readonly anchorHeld?: boolean;
   /** Every hold the harness fired, in the order it fired them. */
   readonly holds?: readonly HoldName[];
   /** Whether the boilerplate fallback plan was written for a task that never asked for one. */
@@ -642,6 +1177,83 @@ export interface Expectation {
   readonly untrusted?: boolean;
   /** How many separate replies the owner sees. One answer should arrive as one bubble. */
   readonly replies?: number;
+}
+
+/**
+ * One row of the curated overlay: the workspace and user notes the knowledge block is built from.
+ *
+ * The block sits in the preamble ahead of the whole trajectory and its header says it is frozen for
+ * the run, so what a fixture puts here is under the two cache breakpoints in front of everything
+ * else. Two of the four repairs Wave 3 made to that block - anchoring the temporal filter and
+ * anchoring the ranking to `task.createdAt` - are only observable against a pool with more than one
+ * entry in it and an expiry inside the run.
+ */
+export interface FixtureKnowledge {
+  /** Whose note it is. The block renders the two groups separately. */
+  readonly target?: 'workspace' | 'user';
+  readonly content: string;
+  /**
+   * When the note stops being true, in the document AND in the clear column beside it, exactly as
+   * `createWorkspaceMemory` writes them: retention has to find an expired row without the key.
+   */
+  readonly validUntil?: string;
+  readonly updatedAt?: string;
+}
+
+/**
+ * One row of the tiered store, which is what the frozen memory pack is ranked out of.
+ *
+ * Sealed with the same associated data the real writer uses, because that is the half of this the
+ * loop actually checks: `openMemoryCandidate` drops any row whose envelope was sealed for another
+ * tier or another workspace, silently and one row at a time, so a stub that seals them wrongly
+ * hands back a pack of nothing while every count in the run says the recall worked.
+ */
+export interface FixtureMemoryItem {
+  readonly kind?: MemoryKind;
+  readonly title?: string;
+  readonly body: string;
+  readonly tags?: readonly string[];
+  readonly trust?: MemoryTrust;
+  readonly status?: MemoryStatus;
+  /** When it was observed. Defaults to the task's own creation instant. */
+  readonly observedAt?: string;
+  readonly validFrom?: string;
+  /** When the belief stopped being true. A row whose validity ended before the anchor is inadmissible. */
+  readonly validTo?: string | null;
+  /**
+   * Where this row ranks, stated by the fixture rather than computed here.
+   *
+   * The real ranking is reciprocal-rank fusion over four keyed channels inside PostgreSQL, and the
+   * plan reaching this stub carries only the keyed tokens - the query's own words are hashed by a
+   * function `packages/core` does not export, so nothing on this side can reproduce a score. What
+   * this rig can model exactly is everything the ranking is wrapped in: which rows are admissible
+   * at the anchor, which the caller already holds, how many fit the budget, and in what order they
+   * are rendered. A fixture that wants to assert about relevance states the order it is asserting
+   * about; a fixture that wants to assert about the pack's bytes does not have to care.
+   */
+  readonly score?: number;
+  readonly tokensEst?: number;
+}
+
+/** What a fixture remembers before it starts, on both of the surfaces a turn opens with. */
+export interface FixtureMemory {
+  readonly knowledge?: readonly FixtureKnowledge[];
+  readonly recall?: readonly FixtureMemoryItem[];
+}
+
+/**
+ * A procedure this workspace has saved, which is the second thing the preamble is built from.
+ *
+ * Only the index - the name and the description - travels in the window; the body is what a
+ * `skill(action=view)` puts there, and what a compaction later takes away.
+ */
+export interface FixtureSkill {
+  readonly name: string;
+  readonly description: string;
+  readonly body?: string;
+  readonly enabled?: boolean;
+  readonly status?: 'active' | 'stale' | 'archived';
+  readonly pinned?: boolean;
 }
 
 export interface Fixture {
@@ -665,49 +1277,118 @@ export interface Fixture {
   readonly contextTokens?: number;
   /** The compute ceiling in force, raised only by the fixtures long enough to reach the default. */
   readonly maxCredits?: number;
+  /**
+   * What this workspace already remembers. Absent everywhere but the fixtures that are about it.
+   *
+   * Empty is not a neutral default and is not treated as one: an empty pool is the shape every
+   * fixture here had for the life of this rig, and it is why four separate cache regressions in the
+   * two blocks built from these rows could have been reverted one at a time without a single number
+   * in the baseline moving. It stays the default only so that adding the knob moves no committed
+   * row; a fixture about the preamble has to fill it.
+   */
+  readonly memory?: FixtureMemory;
+  /** The procedures this workspace has saved, for the fixtures about opening and losing one. */
+  readonly skills?: readonly FixtureSkill[];
+  /**
+   * Why this fixture is expected to fail, and what would make it pass.
+   *
+   * A fixture that states what the loop SHOULD do about something it does not do yet. The suite
+   * reports the row as pending rather than failed and still exits zero, so a known gap cannot block
+   * a wave - and it inverts, so a pending fixture that starts passing fails the run until somebody
+   * deletes this line. That inversion is the whole point: the alternative to a marked red row is an
+   * unwritten fixture, and an unwritten fixture is how a defect survives four audits.
+   *
+   * It is not a way to park a regression. A row that was green and goes red is a regression and has
+   * to be argued with; this is for a measurement written ahead of the repair it describes.
+   */
+  readonly pending?: string;
+  /**
+   * A vision specialist in the registry beside the lead, priced at 30/60 USD per million tokens.
+   *
+   * Off by default so no existing row moves: `listModels` answers with the lead alone unless a
+   * fixture asks for the second row, and a fixture that does is a fixture about routing a picture.
+   */
+  readonly visionSpecialist?: boolean;
+  /**
+   * The owner's price ceiling, as `effectiveSpendLimits` reports it.
+   *
+   * Absent means no ceiling, which is what every fixture but the refusal one wants. The refusal one
+   * sets it under the specialist's price, which is the only way to reach the branch that says so.
+   */
+  readonly priceCeiling?: {
+    readonly maxInputUsdPerMillionTokens: number;
+    readonly maxOutputUsdPerMillionTokens: number;
+  };
+  /**
+   * A clock that runs faster than the wall, for the bounds that are measured in time.
+   *
+   * The generation deadline, the idle watch and the continuation rate are all read off `Date.now`,
+   * and the shortest of them is ten minutes. A fixture cannot spend that, and the gateway takes no
+   * timeout option from the worker's config, so the only seam left is the clock itself:
+   * `startGenerationBudget` reads it, `worthContinuing` divides by it, and every one of them goes
+   * through the global. Declared per fixture and installed for that fixture alone.
+   *
+   * `msPerFrame` advances it as each frame of a `silent` generation goes out, which is what makes
+   * one generation take a measured quarter of an hour without the run taking one; every other
+   * stream of the same fixture runs at the clock's current reading, because a turn whose closing
+   * call was also timed out would never get to say what it did. `msPerCall` advances it once per
+   * provider call, for the ceilings counted across a turn rather than inside one.
+   */
+  readonly clock?: { readonly msPerFrame?: number; readonly msPerCall?: number };
+  /**
+   * A correction the owner sent while the turn was running, waiting in the queue.
+   *
+   * Marked `interrupt`, because that is the only kind the loop takes mid-turn: "do this next" and
+   * "no, not that" are different intentions and reading one as the other from timing alone would be
+   * wrong half the time. Taken once - the second read finds an empty queue, exactly as the real one
+   * does after the message is consumed.
+   */
+  readonly correction?: string;
+  /**
+   * A fixture that asserts about the shape of the product rather than about a turn.
+   *
+   * It runs no loop, spends no call and prepares no window; it returns the list of things it found
+   * wrong, which arrive as warnings and are compared against `expect.warnings` like any others. The
+   * suite is the right home for these even though they are not behavioural: they are claims about
+   * the same catalogue every row here is priced on, and a claim checked in a file nobody runs on a
+   * schedule is a claim nobody checks.
+   */
+  readonly schema?: () => readonly string[];
   readonly expect: Expectation;
 }
 
 /* ------------------------------------------------------------------------------ what is watched */
 
 /**
- * The holds this suite can see, and the string each is recognised by.
+ * The holds this suite can see, taken from the file that writes them.
  *
- * These are markers in messages the loop pushes back to the model rather than an enum the loop
- * exports, which is the one place this harness is coupled to wording. It is deliberate and it is
- * narrow: a fixture never asserts on the sentence, only on which hold fired and how many model
- * calls it cost. If a marker below stops matching, every fixture that expects that hold fails at
- * once - which is the loud failure, not the silent one.
+ * This used to be a private table of sixteen sentences copied out of the loop, with a comment
+ * calling itself "the one place this harness is coupled to wording" - which was true and was the
+ * problem: nothing made the two copies agree, and the failure mode of a disagreement is silent.
+ * A fixture asserting `holds: ['plan_hold']` against a reworded marker does not go red; it stops
+ * observing the hold and reports the empty list it now measures. Five markers were also simply
+ * absent from the copy, so five mechanisms in the loop - the compute ceiling, both halves of the
+ * output limit, the vision handoff and the resumed-turn notice - could fire on any fixture here
+ * and be counted as no hold at all.
+ *
+ * `PUSHBACK_MARKERS` is published from `agent.ts` beside the sentences it matches, so a reworded
+ * pushback is now the same edit as the row that matches it.
  */
-const HOLD_MARKERS: ReadonlyArray<readonly [HoldName, string]> = [
-  ['finish_rejected', 'Finish rejected (attempt'],
-  ['plan_hold', 'Finish held: '],
-  ['acceptance_hold', 'Finish held: this turn changed'],
-  ['silence_hold', 'Finish held: this turn has not said'],
-  ['acceptance_failed', 'Finish refused (acceptance '],
-  ['completion_nag', 'COMPLETION CHECK ('],
-  ['baseline_refused', 'every one of them already passes'],
-  ['repetition_stopped', 'began repeating'],
-  ['output_limit_continued', 'CONTINUE THE ANSWER ('],
-  ['step_budget', 'STEP BUDGET EXHAUSTED'],
-  ['idle_break', 'NOTHING HAS RUN FOR']
-];
+export type HoldName = PushbackName;
 
-export type HoldName =
-  | 'finish_rejected'
-  | 'plan_hold'
-  | 'acceptance_hold'
-  | 'silence_hold'
-  | 'acceptance_failed'
-  | 'completion_nag'
-  | 'baseline_refused'
-  | 'repetition_stopped'
-  | 'output_limit_continued'
-  | 'step_budget'
-  | 'idle_break';
+/**
+ * The order the report lists them in, which is the order they are declared in beside the code that
+ * writes them - grouped by mechanism rather than by when this suite happened to learn about them.
+ * Derived rather than restated so a hold added to the loop appears in the table below it without a
+ * second list having to be remembered.
+ */
+export const HOLD_ORDER: readonly HoldName[] = PUSHBACK_MARKERS.map(([name]) => name);
 
 // The acceptance hold and the plan hold share an opening, so the longer marker is tried first.
-const ORDERED_MARKERS = [...HOLD_MARKERS].sort((left, right) => right[1].length - left[1].length);
+// `PUSHBACK_MARKERS`' own comment names this requirement for anything that reads the table.
+const ORDERED_MARKERS = [...PUSHBACK_MARKERS].sort(
+  (left, right) => right[1].length - left[1].length
+);
 
 const holdsIn = (messages: readonly string[]): { holds: HoldName[]; pushback: string[] } => {
   const holds: HoldName[] = [];
@@ -745,6 +1426,28 @@ export interface RunOutcome {
    * turn of a single step, which never swapped anything.
    */
   readonly finalCatalogueUnchanged: boolean;
+  /** Whether every step of the turn carried the same catalogue, byte for byte. */
+  readonly catalogueStableThroughout: boolean;
+  /**
+   * Output tokens the ledger recorded across the turn, summed off the cost events.
+   *
+   * Here for one question the suite could not ask: was a generation this side cut off still billed?
+   * A cut call never reaches the provider's usage frame, so the number can only come from this
+   * side's own estimate of what arrived - and until that estimate was written, the one generation
+   * the box stops on purpose was the one generation nobody ever paid for on paper. A fixture
+   * asserting a floor here is asserting that the estimate ran.
+   */
+  readonly outputTokens: number;
+  /** Compute credits the turn had spent when it stopped, as the last cost event reported them. */
+  readonly creditsSpent: number;
+  /**
+   * Requests that carried this machine's checkout path.
+   *
+   * Never declarable, like `unstubbedRoutes`: a fixture cannot consent to a prompt that names the
+   * directory the repository happens to sit in, because the number that fixture commits would then
+   * be a number about this machine.
+   */
+  readonly checkoutPathLeaks: number;
   readonly commandsRun: number;
   /** Generations the provider was actually billed for, which is the only real money a turn spends. */
   readonly mediaGenerated: number;
@@ -771,6 +1474,22 @@ export interface RunOutcome {
    * turn long enough for the conversation to outweigh the catalogue.
    */
   readonly cachePrefix: number;
+  /**
+   * The same share, measured over a delegated specialist's own consecutive requests.
+   *
+   * A specialist's window is its own: it shares nothing with the lead's but the catalogue, so its
+   * requests are deliberately kept out of `cachePrefix` above - counting them would report a cache
+   * miss for a turn whose own window never moved. But a mission is up to sixteen model calls
+   * against a window nobody persists, with its own truncation floor carried in a local, and until
+   * this line nothing measured any of it. A specialist that re-lengthens a page read between two of
+   * its own steps rewrites the front of a window the provider has just cached, and the whole cost
+   * of that lands inside one tool result the lead never sees.
+   *
+   * Only meaningful with ONE mission in flight. Two concurrent specialists are answered in
+   * whichever order the provider likes, so consecutive delegated requests are not consecutive
+   * anything - the fixture that asserts on this sends one mission, and says so.
+   */
+  readonly delegatedCachePrefix: number;
   /** Compactions the loop performed, each of which is a model call and a rewritten prefix. */
   readonly compactions: number;
   /** Sections the running brief ended up carrying, which is how much history survived condensing. */
@@ -800,11 +1519,65 @@ export interface RunOutcome {
   /** Whether the owner's own words were still in the last window, byte for byte. */
   readonly ownerMessageIntact: boolean;
   /**
-   * The shortest squeezed tool result left in the last window, or 0 when none was squeezed. Read
-   * against the hard floor: a window full of results cut to it is one the cheap mechanism has been
-   * left to hold down on its own.
+   * The tightest older-tool-output floor this turn ever applied, in characters.
+   *
+   * Read off `cost.context.olderToolOutputChars` - the number the context layer chose and acted
+   * on - rather than reconstructed by grepping the last window for the sentence a squeezed result
+   * carries. The grep was wrong in both directions and quietly. It could only see the LAST window,
+   * so a turn that walked its floor all the way down and then condensed reported whatever the
+   * post-compaction window happened to hold; it measured the length of a truncated MESSAGE, which
+   * is the floor plus the notice plus whatever the two ends of the result came to, not the floor;
+   * and it reported 0 for a turn that squeezed nothing, which the check then had to disarm with a
+   * `> 0` that also disarmed every genuine reading of the hard floor.
+   *
+   * A turn that never had to squeeze reads `RECENT_TOOL_OUTPUT_CHARS`, because that is the floor
+   * it applied: nothing was cut because nothing was over it. So "nothing squeezed passes" is now a
+   * property of the number rather than a hole in the assertion.
    */
   readonly toolResultFloor: number;
+  /**
+   * The fewest cache breakpoints any single request of this turn carried.
+   *
+   * The floor rather than the total: every request is marked independently, and a mechanism that
+   * stops marking - a window that slips under `MIN_CACHEABLE_TOKENS`, a `stablePrefixEnd` that
+   * collapses onto the preamble - shows up as one request with fewer, not as a smaller sum. The
+   * sum would hide it behind the steps either side.
+   */
+  readonly cacheBreakpoints: number;
+  /**
+   * What set off each compaction, in order: the model saying a phase was over, or the window.
+   *
+   * `compactions` alone cannot separate the two, and they are different mechanisms with different
+   * prices - one is a lever the model holds and the other is the loop refusing to send a request
+   * it knows is too large. A fixture built to measure the second is green on the first.
+   */
+  readonly compactionTriggers: readonly CompactionTrigger[];
+  /**
+   * How many requests carried a soft-pass summary - the deterministic `COMPRESSED TRAJECTORY`
+   * block `prepareModelContext` splices in once the window passes 72% of its budget.
+   *
+   * Worth counting separately from `compactions` because it is not one: no model call, no event,
+   * no brief, nothing on the timeline. It is a silent rewrite of the front of the window, and
+   * today it is spliced at the head of the trajectory, so the step it first appears on differs
+   * from the step before it at the first trajectory message and every cached byte behind that is
+   * re-billed. Nothing here could see it happen at all before this line.
+   */
+  readonly softPassWindows: number;
+  /**
+   * Whether the leading system preamble - the block the cache anchor closes - was byte-identical
+   * on every step of the turn.
+   *
+   * `markCacheBreakpoints` puts its anchor at the end of the leading run of system messages,
+   * because that run is the largest thing in the prompt that survives a whole task. A message that
+   * changes inside that run does not merely miss: it moves the anchor onto volatile bytes, so the
+   * anchor is written on one step and stale on the next, and every breakpoint behind it is
+   * unreachable. `cachePrefix` cannot say this on its own - it reports a share, and a share of 94%
+   * is what a turn looks like whether the 6% that moved was at the front or at the tail, while
+   * only one of those is billable.
+   *
+   * True for a turn of a single step, which never had a preamble to keep.
+   */
+  readonly anchorHeld: boolean;
   readonly holds: readonly HoldName[];
   /** What the loop actually said back, in full, for the runs that need explaining. */
   readonly pushback: readonly string[];
@@ -814,6 +1587,18 @@ export interface RunOutcome {
   readonly fallbackPlan: boolean;
   readonly untrusted: boolean;
   readonly replies: number;
+  /** Every tool that threw rather than returning, by name, in the order they failed. */
+  readonly failedTools: readonly string[];
+  /** Every warning the turn raised, in order, by summary. */
+  readonly warnings: readonly string[];
+  /**
+   * Runner routes this fixture reached that the stub does not model, de-duplicated.
+   *
+   * Never a fixture's business to declare: any entry here means some number in this row was
+   * produced by a production mechanism reading a field off a 404, which is a measurement of the
+   * failure branch wearing the result's clothes.
+   */
+  readonly unstubbedRoutes: readonly string[];
   /** Anything that escaped the loop, which is a fixture that ran off its own script. */
   readonly error: string | null;
 }
@@ -859,6 +1644,33 @@ const release: ModelRelease = {
   updatedAt: '2026-07-01T00:00:00.000Z'
 };
 
+/**
+ * A second row in the registry: one that can look at a picture, and one that is priced.
+ *
+ * Until this existed the eval release list was a single text-only model, so `routeImageObservation`
+ * could only ever reach its "no eligible vision specialist" branch. That is why `vision_routed` has
+ * sat on the holds table reading *never fired* for three waves - not because the routing was
+ * broken, but because no fixture could reach it: the suite had nothing to route to. It is also why
+ * the price ceiling on that route - the fifth ranking site, and the only one that picks a model
+ * while the owner is asleep - had exactly one unit assertion holding it up, whose sibling stays
+ * green with the enforcement switched off.
+ *
+ * Priced deliberately high. The ceiling fixtures set a limit under this and assert the refusal;
+ * the routing fixture sets none and asserts the handoff. Two fixtures, one row, and the branch that
+ * spends the owner's money without asking has a negative control at last.
+ */
+const visionRelease: ModelRelease = {
+  ...release,
+  id: 'model-vision',
+  providerModelId: 'vendor/model-vision',
+  displayName: 'Model Vision',
+  modalities: ['text', 'image'],
+  capabilities: ['chat', 'tools', 'reasoning', 'vision'],
+  inputUsdPerMillionTokens: 30,
+  outputUsdPerMillionTokens: 60,
+  measuredQuality: 0.9
+};
+
 const modelFor = (contextTokens?: number): ModelRelease =>
   contextTokens === undefined ? release : { ...release, contextTokens };
 
@@ -888,30 +1700,256 @@ const taskFor = (prompt: string, maxComputeCredits: number): TaskRecord => ({
   queuedMessageCount: 0,
   promptCiphertext: encryptJson({ prompt }, dataKey, `task-prompt:${taskId}`),
   agentStateCiphertext: null,
-  leaseOwner: 'worker-test',
+  leaseOwner: WORKER_ID,
   leaseExpiresAt: '2026-07-01T00:02:00.000Z',
   attempt: 1,
   createdAt: '2026-07-01T00:00:00.000Z',
   updatedAt: '2026-07-01T00:00:00.000Z'
 });
 
+/**
+ * A stable identifier of the shape the store demands.
+ *
+ * `mem.pack.item_ids` is a `uuid[]` and `recallMemoryCandidates` drops any exclusion that is not a
+ * UUID, so a pool keyed on `memory-1` would be stored and then quietly fail to be excluded from a
+ * later recall. Derived from the position so the same fixture always produces the same pack bytes,
+ * which is the whole point of the pack being frozen.
+ */
+const fixtureUuid = (prefix: number, index: number): string =>
+  `${String(prefix).padStart(8, '0')}-0000-4000-8000-${String(index).padStart(12, '0')}`;
+
+/**
+ * The tiered store's read path, modelled as far as this side can model it and no further.
+ *
+ * What it reproduces exactly, because every one of these is a rule the callers depend on and a
+ * rule a stub can get wrong silently:
+ *
+ * - the sealing. Each row is sealed with the associated data its own tier uses, so a row that
+ *   arrives at `openMemoryCandidate` for the wrong tier is dropped exactly as the real one is.
+ * - the admissibility predicate at the anchor. `asOf` is what `valid_from`/`valid_to` are compared
+ *   against, and it is not the same parameter as `now`: a belief whose validity ended before the
+ *   task started is a past belief and may not be ranked into the block at the top of the window as
+ *   a current fact. That clause was NULL on every pack ever built until this wave.
+ * - `status`, and `includeSuperseded` being the only thing that admits a superseded row.
+ * - `kinds`, `excludeIds`, `maxItems`, and the token budget, taken in order so the budget cuts the
+ *   tail of the ranking rather than a random subset of it.
+ * - `order`: `stable` is (kind, id) so the same rows always render to the same bytes, which is what
+ *   the prompt cache needs; `relevance` is the fixture's stated order.
+ *
+ * What it does NOT reproduce, stated here so nobody reads a green fixture as a statement about it:
+ * the fused score. Four keyed channels are fused inside PostgreSQL over tokens hashed by a function
+ * `packages/core` does not export, and the plan that arrives here carries only the hashes. A
+ * fixture asserting about which memories were recalled is asserting about the order it declared.
+ * The ranking itself is measured where it can be - `packages/data`'s own memory suite, against the
+ * real statements.
+ */
+const recallFrom = (
+  pool: readonly FixtureMemoryItem[],
+  input: RecallMemoryInput,
+  workspaceId: string,
+  createdAt: string,
+  dataKey: Uint8Array
+): MemoryCandidateRecord[] => {
+  const asOf = input.asOf === undefined || input.asOf === null ? null : new Date(input.asOf);
+  const excluded = new Set(input.excludeIds ?? []);
+  const kinds = input.kinds ? new Set(input.kinds) : null;
+  const admissible = pool
+    .map((item, index) => ({ item, index }))
+    .filter(({ item, index }) => {
+      const id = fixtureUuid(1, index);
+      if (excluded.has(id)) return false;
+      const kind = item.kind ?? 'fact';
+      if (kinds && !kinds.has(kind)) return false;
+      const status = item.status ?? 'active';
+      if (status === 'superseded') return input.includeSuperseded === true;
+      if (status !== 'active') return false;
+      if (asOf) {
+        const from = new Date(item.validFrom ?? item.observedAt ?? createdAt);
+        if (from > asOf) return false;
+        // The half that was NULL for the life of the product: a belief whose validity has ended is
+        // not a current fact, however well it scores.
+        if (item.validTo && new Date(item.validTo) <= asOf) return false;
+      }
+      return true;
+    });
+  const ranked =
+    input.order === 'relevance'
+      ? [...admissible].sort(
+          (left, right) =>
+            (right.item.score ?? 0) - (left.item.score ?? 0) || left.index - right.index
+        )
+      : [...admissible].sort(
+          (left, right) =>
+            (left.item.kind ?? 'fact').localeCompare(right.item.kind ?? 'fact') ||
+            fixtureUuid(1, left.index).localeCompare(fixtureUuid(1, right.index))
+        );
+  const budget = Math.trunc(input.budgetTokens ?? MEMORY_PACK_BUDGET_TOKENS);
+  const maxItems = Math.trunc(input.maxItems ?? 60);
+  const rows: MemoryCandidateRecord[] = [];
+  let spent = 0;
+  for (const { item, index } of ranked) {
+    if (rows.length >= maxItems) break;
+    const tokensEst =
+      item.tokensEst ?? Math.ceil((item.body.length + (item.title?.length ?? 0)) / 4);
+    if (spent + tokensEst > budget) continue;
+    spent += tokensEst;
+    const kind = item.kind ?? 'fact';
+    const layer = kind === 'source' ? 'source' : 'item';
+    rows.push({
+      id: fixtureUuid(1, index),
+      layer,
+      kind,
+      trust: item.trust ?? 'stated',
+      status: item.status ?? 'active',
+      observedAt: item.observedAt ?? createdAt,
+      validFrom: item.validFrom ?? item.observedAt ?? createdAt,
+      validTo: item.validTo ?? null,
+      subjectKey: null,
+      predicate: null,
+      tokensEst,
+      score: item.score ?? 0,
+      documentCiphertext: encryptJson(
+        {
+          ...(item.title === undefined ? {} : { title: item.title }),
+          ...(item.tags === undefined ? {} : { tags: [...item.tags] }),
+          body: item.body
+        },
+        dataKey,
+        layer === 'source' ? memorySourceAad(workspaceId) : memoryItemAad(workspaceId)
+      )
+    });
+  }
+  return rows;
+};
+
+/**
+ * What a fixture that runs no turn reports.
+ *
+ * Every number is the honest zero rather than a placeholder: nothing was called, nothing was
+ * prepared, no catalogue was offered. The findings arrive as warnings, which is the one channel
+ * `check()` already compares exactly and defaults to empty.
+ */
+const schemaOutcome = (findings: readonly string[]): RunOutcome => ({
+  modelCalls: 0,
+  delegatedCalls: 0,
+  promptTokens: 0,
+  peakPromptTokens: 0,
+  tools: [],
+  proposed: [],
+  commandsRun: 0,
+  mediaGenerated: 0,
+  mediaModels: [],
+  cachePrefix: 0,
+  delegatedCachePrefix: 0,
+  compactions: 0,
+  briefSections: 0,
+  modelWrittenBriefs: 0,
+  skillsNamedInBrief: [],
+  ownerMessageIntact: false,
+  toolResultFloor: 0,
+  cacheBreakpoints: 0,
+  compactionTriggers: [],
+  softPassWindows: 0,
+  anchorHeld: true,
+  finalCatalogue: [],
+  finalCatalogueUnchanged: true,
+  catalogueStableThroughout: true,
+  outputTokens: 0,
+  creditsSpent: 0,
+  checkoutPathLeaks: 0,
+  holds: [],
+  pushback: [],
+  status: 'completed',
+  verification: 'none',
+  askedOwner: false,
+  fallbackPlan: false,
+  untrusted: false,
+  replies: 0,
+  failedTools: [],
+  warnings: [...findings],
+  unstubbedRoutes: [],
+  error: null
+});
+
 export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
+  if (fixture.schema) return schemaOutcome(fixture.schema());
   const model = modelFor(fixture.contextTokens);
   const task = taskFor(fixture.request, fixture.maxCredits ?? 50);
   const events: Array<{ kind: string; summary: string; payload: unknown }> = [];
   const approvals: string[] = [];
   let finalStatus = 'running';
+  /** Whether the turn has already taken the owner's queued correction; see `Fixture.correction`. */
+  let correctionTaken = false;
   let plan: Record<string, unknown> | null = null;
   let fallbackPlan = false;
+  /** The one `mem.pack` row this task ever has, written once and read back from then on. */
+  let memoryPack: Record<string, unknown> | null = null;
+  /*
+   * What this workspace remembers, sealed once, the way the writers seal it.
+   *
+   * Built here rather than inside the reads so that a run asks the same rows the same questions
+   * every time: `listWorkspaceMemories` is called once per turn and the pack is ranked once per
+   * task, and two calls that produced two different envelopes would make the frozen block anything
+   * but frozen - which is the defect these fixtures exist to catch, arriving from the rig.
+   */
+  const knowledgeRows: WorkspaceMemoryRecord[] = (fixture.memory?.knowledge ?? []).map(
+    (entry, index) => ({
+      id: fixtureUuid(2, index),
+      userId,
+      workspaceId,
+      target: entry.target ?? 'workspace',
+      contentCiphertext: encryptJson(
+        {
+          content: entry.content,
+          ...(entry.validUntil === undefined ? {} : { validUntil: entry.validUntil }),
+          source: 'owner' as const
+        },
+        dataKey,
+        `workspace-memory:${workspaceId}`
+      ),
+      // Mirrored in the clear beside the document, as the real column is: retention finds an
+      // expired row without the workspace key, and the loop reads the one inside the envelope.
+      validUntil: entry.validUntil ?? null,
+      createdAt: '2026-07-01T00:00:00.000Z',
+      updatedAt: entry.updatedAt ?? '2026-07-01T00:00:00.000Z'
+    })
+  );
+  const skillRows: WorkspaceSkillRecord[] = (fixture.skills ?? []).map((skill, index) => ({
+    id: fixtureUuid(3, index),
+    userId,
+    workspaceId,
+    nameHash: skill.name,
+    documentCiphertext: encryptJson(
+      {
+        name: skill.name,
+        description: skill.description,
+        body: skill.body ?? `# ${skill.name}\n\n${skill.description}\n`
+      },
+      dataKey,
+      `workspace-skill:${workspaceId}`
+    ),
+    version: 1,
+    enabled: skill.enabled ?? true,
+    status: skill.status ?? 'active',
+    pinned: skill.pinned ?? false,
+    useCount: 0,
+    lastUsedAt: null,
+    createdAt: '2026-07-01T00:00:00.000Z',
+    updatedAt: '2026-07-01T00:00:00.000Z'
+  }));
 
   const store = {
     getWorkspaceById: async () => workspace,
     listConnectors: async () => [],
-    listModels: async () => [model],
+    listModels: async () => (fixture.visionSpecialist ? [model, visionRelease] : [model]),
     getManagedProviderCredential: async () => null,
-    listWorkspaceMemories: async () => [],
+    listWorkspaceMemories: async () => knowledgeRows,
+    // A no-op, and it has to be said why rather than left looking like the rest of them. The real
+    // one is a sweep that marks a skill stale at thirty days unused and archived at ninety; every
+    // row here is minted at the task's own creation instant with no use history, so there is
+    // nothing for it to move. A fixture that wants a stale skill declares one.
     curateWorkspaceSkills: async () => undefined,
-    listWorkspaceSkills: async () => [],
+    listWorkspaceSkills: async () => skillRows,
     getLatestTaskPlan: async () => plan,
     createTaskPlan: async (input: Record<string, unknown>) => {
       // The boilerplate fallback is recognised structurally rather than by what it says: it is the
@@ -982,16 +2020,93 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       reason: null,
       windows: []
     }),
-    effectiveSpendLimits: async () => ({ timeZone: 'Europe/London' }),
+    effectiveSpendLimits: async () => ({
+      timeZone: 'Europe/London',
+      ...(fixture.priceCeiling ?? {})
+    }),
     setWorkspaceStorage: async () => undefined,
     transitionUsage: async () => undefined,
-    getNextQueuedTaskMessage: async () => null,
+    // The owner's correction, waiting, and gone once the turn has taken it. Absent by default: a
+    // fixture that has not declared one has an empty queue, which is what every other row here is.
+    getNextQueuedTaskMessage: async () =>
+      // Not before the turn has started. A message already waiting when the task is leased is an
+      // ordinary opening prompt; what this models is the owner reading a reply and typing "no, not
+      // that" while the work is running, which is the only shape `drainCorrection` is written for.
+      fixture.correction === undefined || correctionTaken || answeredCalls === 0
+        ? null
+        : {
+            id: 'queued-1',
+            taskId,
+            interrupt: true,
+            modelId: release.id,
+            privacyRoute: 'provider_zdr',
+            maxComputeCredits: 10,
+            maxSpendUsd: null,
+            reservationKey: 'queued-1',
+            promptCiphertext: encryptJson(
+              { prompt: fixture.correction },
+              dataKey,
+              `task-message:${taskId}`
+            )
+          },
+    consumeQueuedTaskMessageInTurn: async () => {
+      correctionTaken = true;
+      return true;
+    },
     createMemoryItem: async () => ({ id: 'item' }),
     createMemorySource: async () => ({ id: 'source' }),
     attachMemoryEvidence: async () => undefined,
     observeMemoryFactCandidate: async () => undefined,
     promoteMemoryFactCandidates: async () => [],
-    getMemoryPack: async () => null,
+    getMemoryPack: async () => memoryPack,
+    // The tiered store's read path, which the loop calls once at the start of every run to build
+    // the frozen memory pack. Absent from this stub entirely, `buildTaskMemoryPack` threw
+    // `input.store.recallMemoryCandidates is not a function` on all forty-nine fixtures; the loop
+    // is written to survive a store it cannot read, so it swallowed the throw into a warning and
+    // carried on - and every fixture here measured a turn that starts with no memory pack at all,
+    // which is not the turn the product ships. Four documented, cache-destroying regressions could
+    // have been reverted one at a time without a single row of this baseline moving.
+    //
+    // An empty workspace recalls nothing, which is what every fixture without a `memory` block is:
+    // the pack renders to no entries, nothing is injected, and no prompt byte moves. A fixture that
+    // gives itself a pool gets `recallFrom` above, which models the predicate, the budget and the
+    // ordering faithfully and says plainly which channel it does not model.
+    recallMemoryCandidates: async (input: RecallMemoryInput) =>
+      recallFrom(fixture.memory?.recall ?? [], input, workspaceId, task.createdAt, dataKey),
+    // First writer wins, as the real store does: the row is written once and read back on every
+    // later turn, which is what keeps a resumed task emitting the bytes the provider already
+    // cached rather than re-ranking against a newer clock.
+    saveMemoryPack: async (input: {
+      taskId: string;
+      workspaceId: string;
+      bodyCiphertext: unknown;
+      sha256: string;
+      itemIds: readonly string[];
+      tokensEst: number;
+      briefVersion?: string | null;
+    }) => {
+      memoryPack ??= {
+        taskId: input.taskId,
+        workspaceId: input.workspaceId,
+        briefVersion: input.briefVersion ?? null,
+        bodyCiphertext: input.bodyCiphertext,
+        sha256: input.sha256,
+        itemIds: [...input.itemIds],
+        tokensEst: input.tokensEst,
+        createdAt: '2026-07-01T00:00:00.000Z'
+      };
+      return memoryPack;
+    },
+    // The other half of the write path: the acceptance checks this turn watched fail, filed as
+    // procedures so the next turn does not rediscover them, and the ones it watched pass, which
+    // retire the dead ends they contradict. Missing from this stub as well, it threw at the end of
+    // every turn that ran a check and was swallowed into "This turn was not recorded in memory" -
+    // which also meant the episode written one line earlier was the only part of the write path any
+    // fixture exercised. Nothing is stored here, so nothing can be retired.
+    recordMemoryDeadEnds: async (input: { failed?: readonly { id?: string }[] }) => ({
+      recorded: (input.failed ?? []).map((item) => asText(item.id)),
+      retired: []
+    }),
     recordMemoryUse: async () => 0,
     recordWorkspaceCheckpoint: async (input: Record<string, unknown>) => input,
     deleteWorkspaceCheckpoints: async () => 0,
@@ -1003,6 +2118,8 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   } as unknown as DataStore;
 
   let modelCalls = 0;
+  /** Of those, the ones the provider actually answered; see the failure branch below. */
+  let answeredCalls = 0;
   // Only the last request is kept, and the previous one only as the bytes the next is compared
   // against. A forty-step fixture sends forty windows of up to a megabyte each, and holding them
   // all measures this process's heap rather than the loop.
@@ -1012,36 +2129,111 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   // in nor the catalogue it was offered.
   let lastAgentRequest: Record<string, unknown> = {};
   let previousBytes = '';
+  /**
+   * The previous step's messages, one serialised string each, and how many leading system messages
+   * it opened with. Only the previous one is kept, for the same reason `previousBytes` is: the
+   * question is what moved between two consecutive requests, and forty windows of a megabyte would
+   * measure this process's heap.
+   */
+  let previousMessages: string[] = [];
+  let previousPreamble = 0;
+  let anchorHeld = true;
+  let softPassWindows = 0;
   // The catalogue of the last two steps, as sent. Only the two, for the same reason the bytes above
   // are only the previous request's: what a swap costs is paid on the step it happens.
   let lastCatalogue = '';
   let previousCatalogue = '';
   const prefixShares: number[] = [];
+  const delegatedPrefixShares: number[] = [];
+  let previousDelegatedBytes = '';
   const everyMessage = new Set<string>();
   const proposed: string[] = [];
   /** Of the calls above, the ones a delegated specialist spent rather than the turn itself. */
   let delegatedCalls = 0;
   const openedSkills = new Set<string>();
-  const execState: RunnerState = { execs: 0, written: new Map(), media: 0, mediaModels: [] };
+  const execState: RunnerState = {
+    execs: 0,
+    written: new Map(),
+    media: 0,
+    mediaModels: [],
+    unstubbed: []
+  };
+  /** Requests that carried this machine's checkout path; see `CHECKOUT_ROOT`. */
+  let checkoutPathLeaks = 0;
+  /** Whether every step so far was offered the identical catalogue, not merely the last two. */
+  let catalogueStableThroughout = true;
+  /** Provider statuses still to be handed out, in order; see `RunnerStub.providerFailures`. */
+  const providerFailures = [...(fixture.runner?.providerFailures ?? [])];
+  /*
+   * The fixture's clock, installed over the real one for the duration of this run.
+   *
+   * `offset` only ever grows, and only where the fixture said it should - as a frame goes out, or
+   * as a call is made. Everything else on this side reads the same clock the loop does, so a turn
+   * whose fixture declares no clock is measured against the wall exactly as before and no committed
+   * row can move because this exists.
+   */
+  const realNow = Date.now;
+  let clockOffset = 0;
+  const advanceClock = (ms: number): void => {
+    clockOffset += ms;
+  };
+  if (fixture.clock) {
+    Date.now = () => realNow.call(Date) + clockOffset;
+    advanceClockBy = advanceClock;
+  }
+
   const original = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = input instanceof Request ? input.url : input.toString();
+    // Asked of every request to either host, because the question is what left this process, not
+    // what the window happened to be assembled from.
+    if (typeof init?.body === 'string' && init.body.includes(CHECKOUT_ROOT)) checkoutPathLeaks += 1;
     if (url.startsWith(PROVIDER_URL)) {
       const media = mediaResponse(fixture.runner ?? {}, execState, url, init);
       if (media) return media;
       const body = bodyOf(init);
       modelCalls += 1;
+      advanceClock(fixture.clock?.msPerCall ?? 0);
+      // Counted apart from `modelCalls`, and this is what the script reads: a request the provider
+      // refused is a call the box made and not a call the model answered, so folding the two would
+      // shift every scripted turn of a fixture about an outage by however many times the provider
+      // said no - and the fixture would then be measuring a different script.
+      answeredCalls += 1;
+      // The provider being down, in the order the fixture declared. Answered before anything is
+      // read off the body: a route that returned 503 returned no window, so counting this as a step
+      // or comparing its prefix against the last one would price a request that never happened.
+      const failure = providerFailures.shift();
+      if (failure) {
+        answeredCalls -= 1;
+        // Counted, and deliberately: a retried request is a request the box made, and the whole
+        // value of a fixture about a provider outage is that the extra calls appear in the
+        // committed step count rather than being absorbed into a number that says the turn was
+        // free. It never becomes a step of the turn, because it prepared no window.
+        return new Response(
+          JSON.stringify({ error: { message: `the provider answered ${failure}` } }),
+          { status: failure, headers: { 'content-type': 'application/json' } }
+        );
+      }
       // The summarising call a compaction makes carries no catalogue, and it is a fresh prompt with
       // no predecessor rather than the next step of one - so it is neither the window the turn was
       // working in nor a link in the chain a cache reads back along. What it costs is already in the
       // step count and the token total, which is where a one-off call belongs.
       const catalogue = (body.tools ?? []) as Array<{ function?: { name?: unknown } }>;
-      const summarising = !catalogue.length;
+      // A vision handoff is the other tool-free request, and it has to be told from a compaction's
+      // before either is scripted; see ScriptContext.vision.
+      const vision = !catalogue.length && asText(body.model) !== model.providerModelId;
+      const summarising = !catalogue.length && !vision;
       // A specialist's request carries a catalogue and no `finish`; see ScriptContext.delegated.
       const delegated =
-        !summarising && !catalogue.some((tool) => asText(tool.function?.name) === 'finish');
-      if (delegated) delegatedCalls += 1;
-      if (!summarising && !delegated) {
+        catalogue.length > 0 && !catalogue.some((tool) => asText(tool.function?.name) === 'finish');
+      if (delegated) {
+        delegatedCalls += 1;
+        const bytes = promptBytes(body);
+        if (previousDelegatedBytes)
+          delegatedPrefixShares.push(commonPrefix(previousDelegatedBytes, bytes) / bytes.length);
+        previousDelegatedBytes = bytes;
+      }
+      if (!summarising && !delegated && !vision) {
         steps += 1;
         lastAgentRequest = body;
         const bytes = promptBytes(body);
@@ -1049,21 +2241,49 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
         previousBytes = bytes;
         previousCatalogue = lastCatalogue;
         lastCatalogue = JSON.stringify(body.tools ?? []);
+        if (previousCatalogue !== '' && previousCatalogue !== lastCatalogue)
+          catalogueStableThroughout = false;
+        // Per message rather than per byte, because the anchor is placed at a message boundary.
+        // Serialised whole - role, content and every block on it - so a message that keeps its text
+        // and changes its cache marking still counts as having moved.
+        const sent = ((body.messages ?? []) as unknown[]).map((message) => JSON.stringify(message));
+        const preamble = ((body.messages ?? []) as Array<{ role?: unknown }>).findIndex(
+          (message) => asText(message.role) !== 'system'
+        );
+        if (previousMessages.length) {
+          let first = 0;
+          while (first < sent.length && sent[first] === previousMessages[first]) first += 1;
+          // Measured against the run the PREVIOUS request opened with: a message spliced into the
+          // preamble makes this request's run one longer, and asking whether the change was inside
+          // the new run would let the splice excuse itself.
+          if (first < previousPreamble) anchorHeld = false;
+        }
+        previousMessages = sent;
+        previousPreamble = preamble < 0 ? sent.length : preamble;
       }
       const messages = ((body.messages ?? []) as Array<{ content?: unknown }>).map(contentOf);
+      // Counted on every provider call, not only on the turn's own steps: a specialist's window and
+      // a summariser's transcript are prepared by the same layer and cross the same threshold.
+      // `startsWith`, not `includes`, and the distinction is load-bearing: `trajectorySummary`
+      // writes this same opening twice over - once as the soft-pass block, which is a message of
+      // its own, and once as the deterministic summary a compaction falls back to, which is text
+      // INSIDE the running brief. Matching anywhere in the content would count every step after a
+      // fallback compaction as a soft pass and make the two mechanisms indistinguishable again.
+      if (messages.some((content) => content.startsWith(SOFT_PASS_MARKER))) softPassWindows += 1;
       // Collected as the requests arrive, deduplicated in order: a hold pushes one message that
       // then travels in every later request, so a raw scan would count the same hold once per
       // remaining step.
       for (const content of messages) everyMessage.add(content);
       const turn = fixture.model({
-        index: modelCalls - 1,
+        index: answeredCalls - 1,
         step: Math.max(0, steps - 1),
         lastMessage:
           [...messages].reverse().find((content) => !content.startsWith(RUNTIME_CONTEXT_MARKER)) ??
           '',
         messages,
         summarising,
-        delegated
+        delegated,
+        vision
       });
       // A specialist's calls are the specialist's, not the turn's. `tools`, `proposed` and
       // `finalCatalogue` are all statements about what this turn did, and folding a subordinate
@@ -1086,10 +2306,23 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       // What the request asked for, rather than what this stub finds convenient: the adapter sets
       // `stream` only when the caller gave it somewhere to put the deltas, and answering the other
       // shape with frames is a parse error the caller is written to survive quietly.
+      // Only the generation the fixture marked. A clock that ran fast on every stream of the run
+      // would cut the turn's own closing call too - the answer this fixture is waiting for arrives
+      // in the second frame of the next request, and the deadline would take it before the tool
+      // call landed. What is being measured is one generation, so one generation is what is timed.
+      const advance = turn.silent ? (fixture.clock?.msPerFrame ?? 0) : 0;
       return body.stream === true
-        ? new Response(streamOf(framesFor(turn), init?.signal), {
-            headers: { 'content-type': 'text/event-stream' }
-          })
+        ? new Response(
+            streamOf(
+              framesFor(turn, promptTokensFor(body)),
+              init?.signal,
+              advance,
+              turn.silent === true
+            ),
+            {
+              headers: { 'content-type': 'text/event-stream' }
+            }
+          )
         : json(completionBody(turn));
     }
     return runnerResponse(fixture.runner ?? {}, execState, url, init);
@@ -1100,7 +2333,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     await new AgentWorker(
       store,
       {
-        WORKER_ID: 'worker-eval',
+        WORKER_ID,
         DATABASE_DRIVER: 'pglite',
         DATABASE_URL: 'postgres://localhost/athanor',
         PGLITE_PATH: ':memory:',
@@ -1135,17 +2368,65 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     error = cause instanceof Error ? cause.message : String(cause);
   } finally {
     globalThis.fetch = original;
+    Date.now = realNow;
+    advanceClockBy = () => undefined;
   }
 
-  const costs = events
+  /**
+   * What the context layer decided on each billed step, read off the event it already writes.
+   *
+   * Three numbers come from here rather than from a reconstruction: the prompt size, the floor the
+   * older tool results were cut to, and how many cache breakpoints the request carried. The first
+   * always did. The second used to be recovered by grepping the last window for the sentence a
+   * squeezed result carries, which could only see one step and measured a message length rather
+   * than a floor; the third could not be recovered at all, because this release's route caches
+   * automatically and the adapter drops the markers before they reach the wire - so the one number
+   * that says whether a repeated prefix is billable was invisible to a suite whose subject is what
+   * a long turn costs.
+   */
+  const contexts = events
     .filter((entry) => entry.kind === 'cost')
     .map(
       (entry) =>
-        Number(
-          (entry.payload as { context?: { estimatedInputTokens?: unknown } } | undefined)?.context
-            ?.estimatedInputTokens
-        ) || 0
+        (
+          (entry.payload ?? {}) as {
+            context?: {
+              estimatedInputTokens?: unknown;
+              olderToolOutputChars?: unknown;
+              cacheBreakpoints?: unknown;
+            };
+          }
+        ).context ?? {}
     );
+  const costs = contexts.map((context) => Number(context.estimatedInputTokens) || 0);
+  /** The same events, read for what they billed rather than for what the window was. */
+  const billed = events
+    .filter((entry) => entry.kind === 'cost')
+    .map(
+      (entry) =>
+        (entry.payload ?? {}) as {
+          usage?: { outputTokens?: unknown };
+          cumulativeCredits?: unknown;
+        }
+    );
+  /*
+   * The cost events that carry window numbers at all, which is not all of them.
+   *
+   * The closing handoff prepares its own window - `#runHandoffCall` calls `prepareModelContext` and
+   * holds the result - and then writes a cost event with no `context` block on it. So the request
+   * that carries the most of any step-limited turn reports no size, no floor and no breakpoints,
+   * and a floor read as the minimum over every cost event would read 0 on every fixture that ends
+   * in a handoff. The 0 is the absence of a measurement, not a floor that reached the bottom.
+   *
+   * Filtered here rather than defaulted, because the two are different claims and only one of them
+   * is true. `costs` above is deliberately left alone: it has always summed over every cost event,
+   * the handoff has always contributed nought to it, and the committed baseline is that number -
+   * changing it here would move forty-nine rows for a reason that has nothing to do with the
+   * window. What it means is that `promptTokens` under-reports a turn that ends in a handoff by
+   * one whole request, which is a note for whoever next owns `agent.ts:5517`, not something this
+   * side can honestly fix.
+   */
+  const windows = contexts.filter((context) => context.olderToolOutputChars !== undefined);
   const completion = [...events].reverse().find((entry) => entry.kind === 'completed');
   // Only a compaction writes a brief, so the field it carries is what tells its status event from
   // every other one. Read structurally rather than off the sentence, which the interface owns.
@@ -1154,7 +2435,12 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       (entry) =>
         (
           (entry.payload ?? {}) as {
-            compaction?: { briefParts?: unknown; brief?: unknown; source?: unknown };
+            compaction?: {
+              briefParts?: unknown;
+              brief?: unknown;
+              source?: unknown;
+              trigger?: unknown;
+            };
           }
         ).compaction ?? {}
     )
@@ -1168,14 +2454,39 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   const lastWindow = (
     (lastAgentRequest.messages ?? []) as Array<{ role?: unknown; content?: unknown }>
   ).map((message) => ({ role: asText(message.role), content: contentOf(message) }));
-  // Squeezed, not merely short: a result the window never had to cut says nothing about the floor,
-  // and counting it would make every fixture that reads a small file look like an overrun window.
-  const squeezed = lastWindow
-    .filter(
-      (message) =>
-        message.role === 'tool' && message.content.includes('omitted from earlier tool output')
-    )
-    .map((message) => message.content.length);
+
+  /*
+   * The assembled window, on demand, which is the one thing this rig could not show.
+   *
+   * `EVAL_DUMP_WINDOW=<directory> pnpm eval --filter <id>` writes what the last step of the turn
+   * actually sent. Nothing asserts on it and nothing reads it back; it exists because every
+   * question worth asking of this suite - why did that row move by twenty tokens, is the knowledge
+   * block really in there, did the brief land last - was previously answerable only by editing the
+   * harness, and a diagnostic that has to be built each time is one nobody builds.
+   */
+  const dumpDirectory = process.env.EVAL_DUMP_WINDOW;
+  if (dumpDirectory)
+    writeFileSync(
+      path.join(dumpDirectory, `${fixture.id}.json`),
+      `${JSON.stringify(
+        {
+          catalogue: (
+            (lastAgentRequest.tools ?? []) as Array<{ function?: { name?: unknown } }>
+          ).map((tool) => asText(tool.function?.name)),
+          // What the catalogue costs, which is `reservedTokens` on the other side and the term the
+          // whole budget arithmetic turns on - every threshold in `context.ts` is a share of the
+          // window minus this. Read as bytes, because that is what this side can see.
+          catalogueBytes: JSON.stringify(lastAgentRequest.tools ?? []).length,
+          // Every prepared window's size in order, which is what the compaction trigger is compared
+          // against one step later. A single peak says whether a turn fitted; the sequence says
+          // where it was heading and which threshold it settled against.
+          windowTokens: windows.map((context) => Number(context.estimatedInputTokens) || 0),
+          messages: lastWindow
+        },
+        null,
+        2
+      )}\n`
+    );
 
   return {
     modelCalls,
@@ -1197,6 +2508,13 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
           (prefixShares.reduce((total, share) => total + share, 0) / prefixShares.length) * 100
         )
       : 0,
+    delegatedCachePrefix: delegatedPrefixShares.length
+      ? Math.round(
+          (delegatedPrefixShares.reduce((total, share) => total + share, 0) /
+            delegatedPrefixShares.length) *
+            100
+        )
+      : 0,
     compactions: compactions.length,
     briefSections: compactions.reduce(
       (most, payload) => Math.max(most, Number(payload.briefParts) || 0),
@@ -1205,11 +2523,38 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     modelWrittenBriefs,
     skillsNamedInBrief: [...openedSkills].filter((name) => brief.includes(name)).sort(),
     ownerMessageIntact: lastWindow.some((message) => message.content.includes(fixture.request)),
-    toolResultFloor: squeezed.length ? Math.min(...squeezed) : 0,
+    // The tightest floor any prepared window of this turn applied. A turn with no prepared window
+    // at all - one that threw before its first request - has nothing to report and reads 0, which
+    // is the one reading a floor assertion should refuse; `check()` sees the run threw and says so
+    // before it gets here.
+    toolResultFloor: windows.length
+      ? Math.min(...windows.map((context) => Number(context.olderToolOutputChars) || 0))
+      : 0,
+    cacheBreakpoints: windows.length
+      ? Math.min(...windows.map((context) => Number(context.cacheBreakpoints) || 0))
+      : 0,
+    // Named rather than defaulted: a payload carrying neither is a shape this rig has got wrong,
+    // and reading it as the commoner of the two would answer a fixture's question with a guess.
+    compactionTriggers: compactions.map((compaction) =>
+      asText(compaction.trigger) === 'agent'
+        ? 'agent'
+        : asText(compaction.trigger) === 'budget'
+          ? 'budget'
+          : 'unrecorded'
+    ),
+    softPassWindows,
+    anchorHeld,
     finalCatalogue: (
       (lastAgentRequest.tools ?? []) as Array<{ function?: { name?: unknown } }>
     ).map((tool) => asText(tool.function?.name)),
     finalCatalogueUnchanged: previousCatalogue === '' || previousCatalogue === lastCatalogue,
+    catalogueStableThroughout,
+    outputTokens: billed.reduce(
+      (total, entry) => total + (Number(entry.usage?.outputTokens) || 0),
+      0
+    ),
+    creditsSpent: Number(billed.at(-1)?.cumulativeCredits) || 0,
+    checkoutPathLeaks,
     ...holdsIn([...everyMessage]),
     status: finalStatus,
     verification:
@@ -1223,6 +2568,18 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       (entry) => entry.kind === 'warning' && entry.summary.startsWith('Untrusted content entered')
     ),
     replies: events.filter((entry) => entry.kind === 'assistant_message').length,
+    // Read off the error event the loop writes when a call throws, rather than off the `Tool
+    // failed:` message it pushes into the window. The event carries the tool call's id and survives
+    // a compaction; the message is a window byte and does not.
+    failedTools: events
+      .filter(
+        (entry) =>
+          entry.kind === 'error' &&
+          (entry.payload as { toolCallId?: unknown } | undefined)?.toolCallId !== undefined
+      )
+      .map((entry) => entry.summary.replace(/ failed$/, '')),
+    warnings: events.filter((entry) => entry.kind === 'warning').map((entry) => entry.summary),
+    unstubbedRoutes: [...new Set(execState.unstubbed)],
     error
   };
 };

@@ -1,7 +1,8 @@
 import { acceptanceAcceptedResult } from './acceptance.js';
+import { agentToolsFor } from './tools.js';
 import { ACCEPTANCE_MARKER } from './agent.js';
 import { describe, expect, it } from 'vitest';
-import { seedModels, type ModelMessage } from '@athanor/model-gateway';
+import { MAX_CACHE_BREAKPOINTS, seedModels, type ModelMessage } from '@athanor/model-gateway';
 import {
   appendBriefSection,
   BASE_PROMPT_MARKER,
@@ -9,6 +10,7 @@ import {
   compactContext,
   compactionRequest,
   COMPACT_CONTEXT_TOOL,
+  COMPRESSED_TRAJECTORY_MARKER,
   CONDENSED_HISTORY_MARKER,
   dropLegacyGuidance,
   emptyContextBrief,
@@ -19,6 +21,7 @@ import {
   markCacheBreakpoints,
   COMPACTION_TRIGGER_SHARE,
   COMPACTION_TRIGGER_TOKENS,
+  SOFT_PASS_SHARE,
   compactionTargetTail,
   compactionTrigger,
   contextShortfall,
@@ -109,15 +112,64 @@ describe('agent context preparation', () => {
     ];
     const prepared = prepareModelContext(messages, 32_000, 4_000);
     expect(prepared.compacted).toBe(true);
-    expect(prepared.messages[1]?.content).toContain('COMPRESSED TRAJECTORY');
-    expect(prepared.messages[1]?.content).toContain('shell');
-    expect(prepared.messages[2]?.content).toBe('Keep this original goal.');
+    /*
+     * The summary is at the TAIL, and this assertion is the whole review point of that move.
+     *
+     * It used to be asserted at index 1, which is inside the leading run of system messages - and
+     * the anchor breakpoint is placed at the end of that run, so every step that crossed the soft
+     * threshold rewrote the bytes the largest cached block in the prompt is anchored to. The eval
+     * row `long-a-full-window-condenses-rather-than-stubbing-itself` reads 44% of each request
+     * repeating the last with the summary at the head.
+     *
+     * What is given up by moving it: the model reads the stubs before it reads the account of what
+     * they replaced, where before it read the account first. The stub text now says where to look.
+     * What is kept, and is the reason this is a fair trade rather than a preference, is asserted
+     * below - the preamble and the owner's goal are untouched, and the summary is complete.
+     */
+    const summary = prepared.messages.at(-1);
+    expect(summary?.role).toBe('system');
+    expect(summary?.content.startsWith(COMPRESSED_TRAJECTORY_MARKER)).toBe(true);
+    expect(summary?.content).toContain('shell');
+    // Nothing was inserted ahead of the goal, so the anchor still closes a run of system messages
+    // whose bytes do not move, and the goal is still the first thing after it.
+    expect(prepared.messages[0]?.content).toBe('stable policy');
+    expect(prepared.messages[1]?.content).toBe('Keep this original goal.');
     expect(
       prepared.messages.some((message) =>
         message.content.includes('represented in the compressed trajectory')
       )
     ).toBe(true);
     expect(prepared.estimatedInputTokens).toBeLessThanOrEqual(20_000);
+  });
+
+  it('does not offer the soft-pass summary as a cache breakpoint, because it is rewritten every step', () => {
+    const messages: ModelMessage[] = [
+      { role: 'system', content: 'stable policy' },
+      { role: 'user', content: 'Keep this original goal.' },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'call-1', name: 'shell', arguments: { executable: 'test' } }]
+      },
+      { role: 'tool', toolCallId: 'call-1', content: `HEAD${'x'.repeat(100_000)}TAIL` },
+      ...Array.from(
+        { length: 16 },
+        (_, index): ModelMessage => ({
+          role: index % 2 ? 'assistant' : 'user',
+          content: `message-${index}-${'y'.repeat(10_000)}`
+        })
+      )
+    ];
+    const prepared = prepareModelContext(messages, 32_000, 4_000, { precedingTokens: 14_000 });
+    const marked = prepared.messages.flatMap((message, index) =>
+      message.cacheBreakpoint ? [index] : []
+    );
+    expect(marked.length).toBeGreaterThan(0);
+    expect(
+      marked.filter((index) =>
+        prepared.messages[index]?.content.startsWith(COMPRESSED_TRAJECTORY_MARKER)
+      )
+    ).toEqual([]);
   });
 });
 
@@ -418,7 +470,7 @@ describe('summarising compaction', () => {
     if (!outcome || !plan) return;
     expect(outcome.section.source).toBe('deterministic');
     expect(outcome.section.text).toBe(plan.deterministicSummary);
-    expect(outcome.section.text).toContain('COMPRESSED TRAJECTORY');
+    expect(outcome.section.text).toContain(COMPRESSED_TRAJECTORY_MARKER);
     // Degrading the brief must still bound the window; the task keeps running either way.
     expect(outcome.estimatedTokensAfter).toBeLessThan(outcome.estimatedTokensBefore / 2);
     expect(renderContextBrief(outcome.brief)).toContain('mechanical summary');
@@ -431,7 +483,7 @@ describe('summarising compaction', () => {
       summarise: async () => '   '
     });
     expect(outcome?.section.source).toBe('deterministic');
-    expect(outcome?.section.text).toContain('COMPRESSED TRAJECTORY');
+    expect(outcome?.section.text).toContain(COMPRESSED_TRAJECTORY_MARKER);
   });
 
   it('declines to compact a window with nothing superseded to condense', async () => {
@@ -681,9 +733,12 @@ describe('compaction and prompt caching', () => {
   it('leaves a prefix the request builder no longer rewrites on every step', async () => {
     const window = trajectory(24, 6_000);
     // Uncompacted, this window is past the soft threshold, so preparing it rewrites message bodies
-    // and inserts a summary ahead of the original goal - a cache miss on every single step.
+    // and appends a summary - a cache miss on every single step, from wherever the rewriting
+    // starts. The summary itself is at the tail rather than ahead of the goal: it used to go in at
+    // index 2, which put a block rebuilt on every step inside the run the anchor breakpoint closes.
     const uncompacted = prepareModelContext(window, 32_000, 4_000);
-    expect(uncompacted.messages[2]?.content).toContain('COMPRESSED TRAJECTORY');
+    expect(uncompacted.messages.at(-1)?.content).toContain(COMPRESSED_TRAJECTORY_MARKER);
+    expect(uncompacted.messages[2]?.content).toBe('Keep this original goal.');
 
     const outcome = await compactContext({
       messages: window,
@@ -1295,8 +1350,12 @@ describe('how much tool output survives the window', () => {
     expect(olderToolOutputChars(budget * 0.3, budget)).toBe(24_000);
     const half = olderToolOutputChars(budget * 0.7, budget);
     expect(half).toBeLessThan(24_000);
-    expect(half).toBeGreaterThan(2_000);
-    expect(olderToolOutputChars(budget * 1.1, budget)).toBe(2_000);
+    expect(half).toBeGreaterThan(4_000);
+    // The end of the CURVE, which is no longer the same number as the hard floor: the terminal pass
+    // at the end of prepareModelContext still cuts to 2,000 when the prepared window will not fit,
+    // and that pass is the safety property. This is a policy about how much older evidence to keep
+    // while there is still room, and 2,000 characters of a 24,000-character result is a stub.
+    expect(olderToolOutputChars(budget * 1.1, budget)).toBe(4_000);
   });
 
   it('charges the same work the same whether the model has a large window or a small one', () => {
@@ -1325,7 +1384,7 @@ describe('how much tool output survives the window', () => {
     // after a compaction frees room would rewrite bytes the provider has already cached.
     const budget = modelInputBudget(200_000, 16_384);
     expect(olderToolOutputChars(budget * 0.2, budget, 6_000)).toBe(6_000);
-    expect(olderToolOutputChars(budget * 0.95, budget, 6_000)).toBeLessThan(6_000);
+    expect(olderToolOutputChars(budget * 0.95, budget, 12_000)).toBeLessThan(12_000);
   });
 
   it('still bounds a window that genuinely overruns its budget', () => {
@@ -1541,32 +1600,38 @@ describe('what it costs to move the tool-output floor', () => {
     // A quarter off, and it follows the curve down to wherever the curve actually is.
     const moved = olderToolOutputChars(112_000, budget, applied);
     expect(moved).toBeLessThanOrEqual(18_000);
-    expect(moved).toBeGreaterThan(2_000);
+    expect(moved).toBeGreaterThan(4_000);
   });
 
-  it('still reaches the hard floor on a window that genuinely fills', () => {
-    // Lagging must not become never arriving: walk the whole ramp the way the agent loop does.
+  it('still walks the whole ramp on a window that genuinely fills', () => {
+    // Lagging must not become never arriving: walk the whole ramp the way the agent loop does. It
+    // ends at the curve's end and not at the hard floor, which are two different numbers now.
     const budget = modelInputBudget(1_000_000, 16_384);
     let floor = 24_000;
     for (let tokens = 80_000; tokens <= 200_000; tokens += 1_000)
       floor = olderToolOutputChars(tokens, budget, floor);
-    expect(floor).toBe(2_000);
+    expect(floor).toBe(4_000);
   });
 
-  it('reaches the hard floor from every floor a task could resume carrying', () => {
+  it('reaches the end of the curve from every floor a task could resume carrying', () => {
     /*
      * The rule is one-way and the floor is persisted per task, so a task resumed after any change
      * to how the curve is read arrives here carrying a number this run did not choose. Reaching the
-     * hard floor from a round number is the ordinary case and is covered above; reaching it from an
-     * unround one is the case that has no reason to work. It does not by arithmetic - a quarter off
-     * 2,500 is 1,875, which is under the hard floor, so the band alone refuses the only move left
-     * and the task keeps that floor for the rest of its life.
+     * end of the curve from a round number is the ordinary case and is covered above; reaching it
+     * from an unround one is the case that has no reason to work. It does not by arithmetic - a
+     * quarter off 4,500 is 3,375, which is under the curve's end, so the band alone would refuse
+     * the only move left and the task would keep that floor for the rest of its life.
+     *
+     * The values below the curve's end are the other half of the rule, and they are why this reads
+     * a minimum rather than a constant: the squeeze is ONE-WAY, so a task resumed carrying a floor
+     * tighter than anything this curve can now ask for keeps it. Restoring a result to its full
+     * length because the constants changed under it would rewrite bytes the provider has cached.
      */
     const budget = modelInputBudget(1_000_000, 16_384);
-    for (const carried of [24_000, 9_000, 3_000, 2_667, 2_666, 2_500, 2_100, 2_001]) {
+    for (const carried of [24_000, 9_000, 5_334, 5_333, 5_000, 4_500, 4_100, 4_001, 3_000, 2_000]) {
       let floor = carried;
       for (let step = 0; step < 8; step += 1) floor = olderToolOutputChars(500_000, budget, floor);
-      expect(floor).toBe(2_000);
+      expect(floor).toBe(Math.min(carried, 4_000));
     }
   });
 
@@ -1595,9 +1660,10 @@ describe('what it costs to move the tool-output floor', () => {
       previous = { bytes: bytes(prepared.messages.slice(0, through + 1)), through };
     }
     expect(rewrites).toBeLessThanOrEqual(8);
-    // A real descent, not a run that simply never squeezed: it starts high and ends on the floor.
+    // A real descent, not a run that simply never squeezed: it starts high and ends at the end of
+    // the curve, which is 4,000 and not the 2,000 the terminal pass uses.
     expect(floors[0]).toBeGreaterThan(9_000);
-    expect(floors.at(-1)).toBe(2_000);
+    expect(floors.at(-1)).toBe(4_000);
     // And it kept more than the smooth curve did on the way down, which is the point of lagging.
     expect(floors.reduce((sum, value) => sum + value, 0) / floors.length).toBeGreaterThan(9_250);
   });
@@ -1618,6 +1684,37 @@ describe('what it costs to move the tool-output floor', () => {
 });
 
 describe('when the window is condensed instead of truncated', () => {
+  it('leaves the compaction trigger a whole step of room before the soft pass shreds anything', () => {
+    /*
+     * The order the loop is designed around is: bound old tool output, condense superseded turns
+     * into the durable brief, and only then start replacing message bodies with stubs. The soft
+     * pass sat two points above the trigger, so on a window that moves in jumps of several thousand
+     * tokens - one tool result is up to 24,000 characters - it did not merely arrive out of turn.
+     * It shredded the window, and the agent loop decides whether to condense by reading the size of
+     * the request it last prepared, so the smaller number it left behind is what the trigger saw.
+     *
+     * Traced on `long-a-full-window-condenses-rather-than-stubbing-itself`, budget 91,320 and
+     * trigger 63,924: three requests crossed the old 65,750 threshold and were shredded to 52,206,
+     * 47,183 and 47,359 while the untrimmed trajectory behind them stood at 84,644, 94,699 and
+     * 104,860 tokens. The turn never condensed again. With the tiers separated it condenses twice,
+     * shreds nothing, and its cached share goes from 44% to 53%.
+     */
+    expect(SOFT_PASS_SHARE).toBeGreaterThan(COMPACTION_TRIGGER_SHARE);
+    const windows = [
+      ...new Set([...seedModels().map((model) => model.contextTokens), 32_000, 64_000, 200_000])
+    ];
+    for (const contextTokens of windows) {
+      const maxOutputTokens = Math.min(16_384, Math.max(2_048, Math.floor(contextTokens * 0.2)));
+      const budget = modelInputBudget(contextTokens, maxOutputTokens, 13_423);
+      // A whole recent result's worth of room between the two, wherever there is room at all to
+      // measure it. Below that the window is too small for the tiers to be distinguishable and the
+      // hard pass and the terminal tail pass are what hold it - which is what they are for.
+      const room = budget * SOFT_PASS_SHARE - compactionTrigger(budget);
+      if (budget > 60_000) expect(room).toBeGreaterThan(24_000 / 4);
+      expect(room).toBeGreaterThan(0);
+    }
+  });
+
   it('always aims at a tail worth half the size that set the compaction off', () => {
     // The gap between trigger and target is what buys byte-identical steps between rewrites, and it
     // was being measured against two different budgets - the trigger counted the tool catalogue, the
@@ -1680,5 +1777,755 @@ describe('what the running brief has to carry forward', () => {
       .join('\n');
     expect(prompt).toContain('approved or refused');
     expect(prompt).toContain('never ask twice');
+  });
+});
+
+/*
+ * The measurement harness every later change to this file has to answer to.
+ *
+ * Three separately briefed changes here have measured inert or wrong: a trigger cap that read as
+ * obviously right and moved nothing, and a halved compaction target that was wrong twice over.
+ * None of them was visible to anything above, because everything above drives one export across a
+ * hand-built window of filler - and what a prompt-cache change costs is not a property of one
+ * window. It is a property of sixty consecutive requests at production sizes.
+ *
+ * So this block builds those sixty. The real tool catalogue sits ahead of the real
+ * prepareModelContext, markCacheBreakpoints, compactContext and runtimeContext; the floor and the
+ * prepared size are threaded forward exactly as the step loop threads them (agent.ts:9249-9337 -
+ * and it is the PREPARED size the compaction trigger is measured against, not the raw window,
+ * which is the whole reason automatic compaction is rarer than the code reads); and each request
+ * is serialised the way the adapter serialises it (openai-compatible.ts:567-600), so the bytes
+ * counted are the bytes that leave the machine.
+ *
+ * Three numbers are committed, with bands generous enough that ordinary drift in the contract or
+ * the catalogue does not move them. They are a tripwire, not a specification - re-baselining one
+ * deliberately, in the commit that moves it and with the new figure quoted, is the intended way to
+ * change this file. In the order the audit that motivated the harness found them useful:
+ *
+ *   1. the mean byte-common prefix between consecutive requests - what a provider could read back
+ *      if the breakpoint were placed perfectly;
+ *   2. how many distinct older-result floors the run applied - a floor move re-cuts every older
+ *      result at once, ahead of every breakpoint, so each one is a rewrite of the whole prefix;
+ *   3. where the first differing message sits, by role and by distance from the tail. That is the
+ *      column that located the dominant defect. A mean prefix that improves while the histogram
+ *      moves is a different change from the one that was briefed, and only this column says so.
+ *
+ * The fixture is built to cross both recency boundaries - RECENT_TOOL_OUTPUT_MESSAGES, where a
+ * result already sent at the full bound is re-cut to the floor, and RECENT_DETAIL_MESSAGES, where
+ * an assistant message loses its reasoning and its tool arguments are compacted. A fixture that
+ * crosses neither measures an append-only window and proves nothing about this file, so the
+ * crossings are asserted first and separately.
+ */
+describe('sixty steps of one task, measured on the bytes that leave the machine', () => {
+  /** Tool results at the sizes production actually produces: 0.6 kB up to the 24 kB bound. */
+  const RESULT_SIZES = [600, 900, 1_500, 3_200, 6_400, 12_000, 18_000, 24_000];
+  const STEPS = 60;
+  /** The step at which the agent declares a phase finished, as the two `long-` eval fixtures do. */
+  const DECLARED_COMPACTION_STEP = 30;
+  /**
+   * Mirrors `BLOCK_CONTENT_ROLES` at openai-compatible.ts:91, which is private to the adapter. If
+   * the two ever disagree this harness is measuring a request no adapter would send, so the copy
+   * is named for what it is rather than quietly inlined.
+   */
+  const CACHE_MARKER_ROLES = new Set<ModelMessage['role']>(['system', 'user', 'tool']);
+
+  /** Tagged and non-repeating, so two different messages can never share bytes by accident. */
+  const text = (chars: number, tag: string): string => {
+    let value = '';
+    while (value.length < chars)
+      value += `${tag} ${value.length} the service answered in ${value.length % 97} ms and wrote ${value.length % 13} rows. `;
+    return value.slice(0, chars);
+  };
+
+  /** One message in the shape openai-compatible.ts:570-596 puts it on the wire. */
+  const onTheWire = (message: ModelMessage, marked: boolean): Record<string, unknown> => ({
+    role: message.role,
+    content: marked
+      ? [{ type: 'text', text: message.content, cache_control: { type: 'ephemeral' } }]
+      : message.content,
+    ...(message.toolCallId ? { tool_call_id: message.toolCallId } : {}),
+    ...(message.reasoning ? { reasoning: message.reasoning } : {}),
+    ...(message.reasoningDetails?.length ? { reasoning_details: message.reasoningDetails } : {}),
+    ...(message.toolCalls?.length
+      ? {
+          tool_calls: message.toolCalls.map((call) => ({
+            id: call.id,
+            type: 'function',
+            function: { name: call.name, arguments: JSON.stringify(call.arguments) }
+          }))
+        }
+      : {})
+  });
+
+  const commonPrefix = (left: string, right: string): number => {
+    const limit = Math.min(left.length, right.length);
+    let index = 0;
+    while (index < limit && left.charCodeAt(index) === right.charCodeAt(index)) index += 1;
+    return index;
+  };
+
+  const mean = (values: number[]): number =>
+    values.reduce((sum, value) => sum + value, 0) / Math.max(1, values.length);
+
+  const histogram = (values: string[]): Record<string, number> => {
+    const counts: Record<string, number> = {};
+    for (const value of values) counts[value] = (counts[value] ?? 0) + 1;
+    return counts;
+  };
+
+  interface StepMeasurement {
+    readonly step: number;
+    /** The whole serialized request, catalogue and cache hints included. */
+    readonly requestBytes: number;
+    readonly prefixShare: number;
+    readonly floor: number;
+    readonly windowMessages: number;
+    readonly firstDifferingIndex: number;
+    readonly firstDifferingRole: ModelMessage['role'];
+    /** The same position counted from the tail, which is where it holds still as the window grows. */
+    readonly firstDifferingFromTail: number;
+    /** Deepest marked breakpoint inside the run of messages identical to the previous request. */
+    readonly readableBreakpoint: number;
+    /** Positions that were identical to the previous request and still fell outside that mark. */
+    readonly breakpointLag: number;
+    /** The share of this request a provider could serve from cache at the marks it carries. */
+    readonly cacheReadShare: number;
+    /** Older results this request re-cut, having sent them longer on the previous one. */
+    readonly toolResultsRecut: number;
+    /** Whether the one-way floor tightened between the previous request and this one. */
+    readonly floorMoved: boolean;
+    /** Assistant messages that lost their reasoning or reasoning details since the last request. */
+    readonly assistantsLosingDetail: number;
+    readonly compactedFirst: boolean;
+    /** Whether re-running markCacheBreakpoints on the prepared window chooses the same indexes. */
+    readonly remarkedIdentically: boolean;
+    /** The breakpoints this request carries, in order. */
+    readonly marks: number[];
+    /**
+     * Where a RETROSPECTIVE edge would sit: the last cache-eligible index inside the run identical
+     * to the previous prepared window. The plan's 3.1(c). Recorded so the two placements can be
+     * priced against each other rather than argued about.
+     */
+    readonly retrospectiveEdge: number;
+  }
+
+  interface Run {
+    readonly steps: StepMeasurement[];
+    /**
+     * What an explicit-breakpoint provider could serve, modelled the way one actually behaves: a
+     * hit needs a breakpoint in THIS request at an index some earlier request also marked, with the
+     * whole prefix up to it byte-identical between the two. Distinct from `cacheReadShare`, which
+     * asks only whether a mark sits inside the run shared with the immediately previous request -
+     * the two agree to four figures on this fixture, and that agreement is what makes the
+     * comparison below a fair one.
+     */
+    readonly servedShare: number;
+    /** The same number with the edge placed retrospectively instead of forward. */
+    readonly servedShareWithRetrospectiveEdge: number;
+    readonly compactions: number;
+    readonly budgetCompactions: number;
+    readonly peakPreparedTokens: number;
+    readonly trigger: number;
+    readonly reservedTokens: number;
+  }
+
+  const drive = async (contextTokens: number): Promise<Run> => {
+    const tools = [...agentToolsFor(), COMPACT_CONTEXT_TOOL];
+    const catalogueOnTheWire = JSON.stringify(
+      tools.map((tool) => ({ type: 'function', function: tool }))
+    );
+    const reservedTokens = Math.ceil(JSON.stringify(tools).length / 4);
+    const maxOutputTokens = Math.min(16_384, Math.max(2_048, Math.floor(contextTokens * 0.2)));
+    const budget = modelInputBudget(contextTokens, maxOutputTokens, reservedTokens);
+    // The arrangement agent.ts:8586-8799 assembles, in its order and at its sizes.
+    const messages: ModelMessage[] = [
+      { role: 'system', content: BASE_SYSTEM_PROMPT },
+      {
+        role: 'system',
+        content: `WORKSPACE BRIEF (user-visible persistent project context)\n${text(2_400, 'brief')}`
+      },
+      {
+        role: 'system',
+        content: `CURATED ENCRYPTED KNOWLEDGE (user-visible and review-controlled; frozen for this run)\n${text(3_600, 'knowledge')}`
+      },
+      {
+        role: 'system',
+        content: `RECALLED MEMORY PACK (retrieved once at task start)\n${text(3_250, 'pack')}`
+      },
+      { role: 'user', content: text(600, 'goal') }
+    ];
+
+    // Result sizes vary the way real ones do, from one seed, so every number below is reproducible.
+    let seed = 20_260_303;
+    const nextSize = (): number => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+      return RESULT_SIZES[Math.floor((seed / 2_147_483_648) * RESULT_SIZES.length)] ?? 6_400;
+    };
+
+    let brief: ContextBrief | undefined;
+    let floor: number | undefined;
+    let preparedTokens: number | undefined;
+    let previous: { pieces: string[]; bytes: string } | null = null;
+    /** Every request as it went out, so a provider cache can be modelled across the whole run. */
+    const tape: Array<{
+      pieces: string[];
+      bytes: number;
+      catalogue: number;
+      marks: number[];
+      retrospectiveEdge: number;
+    }> = [];
+    let previousFloor: number | undefined;
+    let previousToolLengths = new Map<string, number>();
+    let previousDetailed = new Set<string>();
+    let compactions = 0;
+    let budgetCompactions = 0;
+    let peakPreparedTokens = 0;
+    const steps: StepMeasurement[] = [];
+
+    for (let step = 0; step < STEPS; step += 1) {
+      // Last of the tail blocks and re-pushed every step, exactly as refreshRuntimeContext does.
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const held = messages[index];
+        if (held && isRuntimeContext(held)) messages.splice(index, 1);
+      }
+      messages.push({
+        role: 'system',
+        content: runtimeContext(
+          { name: 'athanor', securityMode: 'balanced' },
+          'https://preview.example.com',
+          { now: new Date(Date.UTC(2026, 2, 3, 9, 15) + step * 45_000), timeZone: 'Europe/London' },
+          'python3 3.11, typst 0.12, libreoffice 24.2',
+          false,
+          'in_house'
+        )
+      });
+
+      const declared = step === DECLARED_COMPACTION_STEP;
+      // The prepared size, not the raw window - which is what the step loop measures, and is the
+      // whole of why the automatic path is as quiet as the case below records it to be.
+      const overBudget =
+        (preparedTokens ?? estimatedContextTokens(messages)) > compactionTrigger(budget);
+      let compactedFirst = false;
+      if (declared || overBudget) {
+        const outcome = await compactContext({
+          messages,
+          ...(brief ? { brief } : {}),
+          targetTailTokens: declared
+            ? declaredCompactionTargetTail(budget, estimatedContextTokens(messages))
+            : compactionTargetTail(budget),
+          transcriptChars: 80_000,
+          citableFooter: `Citable toolCallIds from this turn, for finish: call-${step - 1} (file_read).`,
+          summarise: ({ transcript }) =>
+            Promise.resolve(`${text(1_400, 'condensed')} (${transcript.length} characters read)`)
+        });
+        if (outcome) {
+          messages.splice(0, messages.length, ...outcome.messages);
+          brief = outcome.brief;
+          compactions += 1;
+          if (!declared) budgetCompactions += 1;
+          compactedFirst = true;
+        }
+      }
+
+      const prepared = prepareModelContext(messages, contextTokens, maxOutputTokens, {
+        precedingTokens: reservedTokens,
+        reservedTokens,
+        ...(floor === undefined ? {} : { toolOutputFloor: floor })
+      });
+      floor = prepared.olderToolOutputChars;
+      preparedTokens = prepared.estimatedInputTokens;
+      peakPreparedTokens = Math.max(peakPreparedTokens, preparedTokens);
+
+      const markedIn = (window: ModelMessage[]): number[] =>
+        window
+          .flatMap((message, index) =>
+            message.cacheBreakpoint &&
+            CACHE_MARKER_ROLES.has(message.role) &&
+            !message.images?.length
+              ? [index]
+              : []
+          )
+          .slice(-MAX_CACHE_BREAKPOINTS);
+      const marked = markedIn(prepared.messages);
+      // Driven directly as well as through prepareModelContext: the marks this harness reads are
+      // only the marks the adapter will see if choosing them twice over one window agrees.
+      markCacheBreakpoints(prepared.messages, reservedTokens, floor);
+      const remarkedIdentically = markedIn(prepared.messages).join(',') === marked.join(',');
+
+      const markedSet = new Set(marked);
+      const requestBytes = JSON.stringify({
+        model: 'measured/model',
+        messages: prepared.messages.map((message, index) =>
+          onTheWire(message, markedSet.has(index))
+        ),
+        tools: tools.map((tool) => ({ type: 'function', function: tool })),
+        temperature: 0.2,
+        max_tokens: maxOutputTokens,
+        stream: true,
+        stream_options: { include_usage: true }
+      }).length;
+
+      /*
+       * The comparison is made without the cache hint, for the reason the floor cases above give:
+       * the marker moves without moving the content a provider hashes. The catalogue leads, because
+       * that is where it sits in the cached prefix on both routes that bill breakpoints, whatever
+       * order the JSON body happens to carry its keys in.
+       */
+      const pieces = prepared.messages.map((message) => JSON.stringify(onTheWire(message, false)));
+      const bytes = catalogueOnTheWire + pieces.join(',');
+
+      const toolLengths = new Map(
+        prepared.messages.flatMap((message): [string, number][] =>
+          message.role === 'tool' && message.toolCallId
+            ? [[message.toolCallId, message.content.length]]
+            : []
+        )
+      );
+      // Keyed by the call rather than by position, so a compaction shifting every index does not
+      // read as every assistant message losing its reasoning at once.
+      const detailed = new Set(
+        prepared.messages.flatMap((message) =>
+          message.role === 'assistant' &&
+          (message.reasoning || message.reasoningDetails?.length) &&
+          message.toolCalls?.[0]
+            ? [message.toolCalls[0].id]
+            : []
+        )
+      );
+
+      // The same predicate markCacheBreakpoints applies, over the window it applied it to, so the
+      // retrospective placement below is measured against the same set of admissible indexes.
+      const eligibleHere = (index: number): boolean => {
+        const message = prepared.messages[index];
+        return (
+          !!message &&
+          CACHE_MARKER_ROLES.has(message.role) &&
+          !message.images?.length &&
+          !isRuntimeContext(message)
+        );
+      };
+
+      let retrospectiveEdge = -1;
+      if (previous) {
+        let index = 0;
+        while (
+          index < pieces.length &&
+          index < previous.pieces.length &&
+          pieces[index] === previous.pieces[index]
+        )
+          index += 1;
+        for (let candidate = index - 1; candidate >= 0; candidate -= 1)
+          if (eligibleHere(candidate)) {
+            retrospectiveEdge = candidate;
+            break;
+          }
+        const readableBreakpoint = marked.reduce(
+          (found, candidate) => (candidate < index ? candidate : found),
+          -1
+        );
+        steps.push({
+          step,
+          requestBytes,
+          prefixShare: commonPrefix(bytes, previous.bytes) / bytes.length,
+          floor,
+          windowMessages: prepared.messages.length,
+          firstDifferingIndex: index,
+          firstDifferingRole: prepared.messages[index]?.role ?? 'assistant',
+          firstDifferingFromTail: pieces.length - index,
+          readableBreakpoint,
+          breakpointLag: readableBreakpoint < 0 ? index : index - 1 - readableBreakpoint,
+          cacheReadShare:
+            readableBreakpoint < 0
+              ? 0
+              : (catalogueOnTheWire + pieces.slice(0, readableBreakpoint + 1).join(',')).length /
+                bytes.length,
+          toolResultsRecut: [...toolLengths].filter(
+            ([id, length]) => (previousToolLengths.get(id) ?? length) > length
+          ).length,
+          floorMoved: floor !== previousFloor,
+          assistantsLosingDetail: [...previousDetailed].filter((id) => !detailed.has(id)).length,
+          compactedFirst,
+          remarkedIdentically,
+          marks: marked,
+          retrospectiveEdge
+        });
+      }
+      tape.push({
+        pieces,
+        bytes: bytes.length,
+        catalogue: catalogueOnTheWire.length,
+        marks: marked,
+        retrospectiveEdge
+      });
+      previous = { pieces, bytes };
+      previousFloor = floor;
+      previousToolLengths = toolLengths;
+      previousDetailed = detailed;
+
+      const size = nextSize();
+      messages.push({
+        role: 'assistant',
+        content: text(420, `answer-${step}`),
+        reasoning: text(1_200, `thinking-${step}`),
+        reasoningDetails: [{ type: 'reasoning.text', text: text(900, `detail-${step}`) }],
+        toolCalls: [
+          // Every seventh call carries arguments past COMPACTED_TOOL_ARGUMENT_CHARS, so the
+          // argument half of the detail boundary is crossed as well as the reasoning half.
+          step % 7 === 6
+            ? {
+                id: `call-${step}`,
+                name: 'file_write',
+                arguments: {
+                  path: `workspace/notes/step-${step}.md`,
+                  content: text(6_000, `written-${step}`)
+                }
+              }
+            : {
+                id: `call-${step}`,
+                name: 'file_read',
+                arguments: {
+                  path: `workspace/logs/service-${step}.log`,
+                  note: text(180, `why-${step}`)
+                }
+              }
+        ]
+      });
+      messages.push({
+        role: 'tool',
+        toolCallId: `call-${step}`,
+        content: serializeToolResultForModel({
+          ok: true,
+          path: `workspace/logs/service-${step}.log`,
+          lines: Math.floor(size / 80),
+          content: text(size, `log-${step}`)
+        })
+      });
+    }
+    /*
+     * A provider cache, modelled the way an explicit-breakpoint route behaves: it looks for a hit
+     * at the breakpoints the current request carries, and finds one when some earlier request
+     * marked that same index and the whole prefix up to it is byte-identical between the two. The
+     * marks a request writes are therefore only worth what a LATER request can read back at the
+     * same boundary, which is the entire reason the checkpoint grid exists.
+     */
+    const servedBy = (choose: (marks: number[], retrospective: number) => number[]): number => {
+      const shares: number[] = [];
+      for (let here = 1; here < tape.length; here += 1) {
+        const request = tape[here];
+        if (!request) continue;
+        const mine = new Set(choose(request.marks, request.retrospectiveEdge));
+        let deepest = -1;
+        for (let earlier = 0; earlier < here; earlier += 1) {
+          const written = tape[earlier];
+          if (!written) continue;
+          let common = 0;
+          while (
+            common < request.pieces.length &&
+            common < written.pieces.length &&
+            request.pieces[common] === written.pieces[common]
+          )
+            common += 1;
+          for (const mark of choose(written.marks, written.retrospectiveEdge))
+            if (mark < common && mine.has(mark) && mark > deepest) deepest = mark;
+        }
+        shares.push(
+          deepest < 0
+            ? 0
+            : (request.catalogue + request.pieces.slice(0, deepest + 1).join(',').length) /
+                request.bytes
+        );
+      }
+      return mean(shares);
+    };
+
+    return {
+      steps,
+      servedShare: servedBy((marks) => marks),
+      servedShareWithRetrospectiveEdge: servedBy((marks, retrospective) =>
+        // The plan's 3.1(c): the same breakpoints with the edge replaced rather than added to.
+        [...new Set([...marks.slice(0, -1), retrospective])]
+          .filter((index) => index >= 0)
+          .sort((left, right) => left - right)
+          .slice(-MAX_CACHE_BREAKPOINTS)
+      ),
+      compactions,
+      budgetCompactions,
+      peakPreparedTokens,
+      trigger: compactionTrigger(budget),
+      reservedTokens
+    };
+  };
+
+  /** Sixty steps answer every case below, so the run is driven once per window and shared. */
+  const runs = new Map<number, Promise<Run>>();
+  const measured = (contextTokens: number): Promise<Run> => {
+    const existing = runs.get(contextTokens);
+    if (existing) return existing;
+    const started = drive(contextTokens);
+    runs.set(contextTokens, started);
+    return started;
+  };
+
+  /*
+   * What this harness measured on the tree it was written against, on the smallest and the largest
+   * shipped window. The two disagree on purpose: the small window's floor descends all the way and
+   * re-cuts older results, the large one's barely moves, and a change that helps one and hurts the
+   * other is exactly the shape the last three briefed changes here turned out to have.
+   *
+   * What these numbers are known to catch, measured by running this same driver against a patched
+   * copy of the module under a Node loader hook, with nothing in the tree changed:
+   *
+   *   RECENT_TOOL_OUTPUT_MESSAGES 8 -> 2   mean prefix 74.8% -> 78.3%, and `tool@-12` goes from 19
+   *                                        steps to none. The mean alone stays inside its band; the
+   *                                        histogram is what fails, which is the argument for
+   *                                        keeping the third number at all.
+   *   RECENT_DETAIL_MESSAGES 8 -> 2        mean prefix 74.8% -> 84.9% and 80.1% -> 92.1%, and the
+   *                                        divergence moves from `assistant@-9` to `assistant@-3`.
+   *                                        Both numbers fail.
+   *   TOOL_OUTPUT_FLOOR_STEP 0.75 -> 0.95  distinct floors 7 -> 16 and 3 -> 11. The second number
+   *                                        fails; the mean moves two points, which is inside its
+   *                                        band and would have been missed on its own.
+   *   CACHE_CHECKPOINT_STRIDE 8 -> 4       nothing but the breakpoint lag moves, 2.8 -> 1.3 on the
+   *                                        large window. That is why the lag band is the tight one.
+   *
+   * That last line is now the tree rather than a probe: the stride is 4, and the two numbers it
+   * moved - the lag and the served share - were re-baselined here deliberately when it landed. The
+   * prefix average did not move at all, to four figures, on either window, which is what a
+   * content-neutral change to breakpoint placement is supposed to look like.
+   */
+  const MEASURED = [
+    {
+      contextTokens: 131_072,
+      meanPrefix: 0.761,
+      meanCacheRead: 0.723,
+      distinctFloors: 6,
+      finalFloor: 4_000,
+      firstDifferences: { 'assistant@-9': 31, 'tool@-12': 19 },
+      breakpointLag: 2.3,
+      servedShare: 0.723,
+      servedShareWithRetrospectiveEdge: 0.705
+    },
+    {
+      contextTokens: 1_000_000,
+      meanPrefix: 0.801,
+      meanCacheRead: 0.778,
+      distinctFloors: 3,
+      finalFloor: 13_000,
+      firstDifferences: { 'assistant@-9': 51, 'tool@-12': 2 },
+      breakpointLag: 1.4,
+      servedShare: 0.778,
+      servedShareWithRetrospectiveEdge: 0.742
+    }
+  ];
+
+  it('crosses both recency boundaries, which is the only reason it measures anything', async () => {
+    for (const { contextTokens } of MEASURED) {
+      const run = await measured(contextTokens);
+      expect(run.steps.length).toBe(STEPS - 1);
+      // Deep enough that the tool boundary at lastToolIndex - 8 and the detail boundary at
+      // length - 8 both sit well inside the window rather than off the front of it. Measured at the
+      // widest the run reaches rather than at the last step, because the small window now condenses
+      // on the budget as well as on the declaration and the last step is on the far side of that.
+      expect(Math.max(...run.steps.map((step) => step.windowMessages))).toBeGreaterThan(60);
+      // A result sent at the full bound on one request and at the floor on the next - the
+      // retroactive rewrite the recency boundary performs. Without one of these the run is an
+      // append and its prefix says nothing about this file.
+      expect(run.steps.reduce((sum, step) => sum + step.toolResultsRecut, 0)).toBeGreaterThan(8);
+      // And the other boundary: an assistant message losing its reasoning as it ages out.
+      expect(
+        run.steps.filter((step) => step.assistantsLosingDetail > 0).length
+      ).toBeGreaterThanOrEqual(STEPS - 5);
+      // The whole request, at production size, rather than a toy one.
+      expect(mean(run.steps.map((step) => step.requestBytes))).toBeGreaterThan(120_000);
+      // Choosing breakpoints twice over one prepared window agrees, so the marks read here are the
+      // marks the adapter would translate.
+      expect(run.steps.filter((step) => !step.remarkedIdentically)).toEqual([]);
+      // compactContext really ran: the declared compaction at step 30 condensed the window.
+      expect(run.compactions).toBeGreaterThanOrEqual(1);
+      expect(run.steps.find((step) => step.compactedFirst)?.step).toBe(DECLARED_COMPACTION_STEP);
+    }
+  });
+
+  it('shares three quarters of each request with the request before it', async () => {
+    /*
+     * NUMBER ONE. The ceiling on what a provider could read back, independent of where the
+     * breakpoints landed: the byte-common prefix of consecutive requests, over the catalogue and
+     * the messages together, averaged across the run. Measured 74.8% on the small window and 80.1%
+     * on the large one. Bands of six points either side, because the catalogue and the operating
+     * contract are most of the head of every request and an ordinary edit to either moves this by
+     * a fraction of a point - anything larger is a change in what the window rewrites.
+     */
+    for (const expected of MEASURED) {
+      const run = await measured(expected.contextTokens);
+      const share = mean(run.steps.map((step) => step.prefixShare));
+      expect(share).toBeGreaterThan(expected.meanPrefix - 0.06);
+      expect(share).toBeLessThan(expected.meanPrefix + 0.06);
+    }
+  });
+
+  it('moves the older-result floor a handful of times over sixty steps', async () => {
+    /*
+     * NUMBER TWO. Every floor move re-cuts every older result at once, ahead of every breakpoint,
+     * so it re-bills the whole prefix at the write tier: the count is the cost. Measured seven
+     * distinct floors on the small window, ending on the hard floor, and three on the large one,
+     * which never gets past 13,000 because 60 steps of this size never fill it. The floor is
+     * one-way by contract, so the sequence must also be non-increasing - a run that raised its
+     * floor would mean the ratchet in PreparedContext.olderToolOutputChars had stopped being
+     * threaded, which is a defect no prefix average would show.
+     */
+    for (const expected of MEASURED) {
+      const run = await measured(expected.contextTokens);
+      const floors = run.steps.map((step) => step.floor);
+      const distinct = new Set(floors);
+      expect(distinct.size).toBeGreaterThanOrEqual(expected.distinctFloors - 2);
+      expect(distinct.size).toBeLessThanOrEqual(expected.distinctFloors + 2);
+      expect(floors.at(-1)).toBeLessThanOrEqual(expected.finalFloor);
+      expect(
+        floors.every((value, index) => index === 0 || value <= (floors[index - 1] ?? value))
+      ).toBe(true);
+    }
+  });
+
+  it('diverges from the previous request at the recency boundary, and further back only when the floor moved', async () => {
+    /*
+     * NUMBER THREE, and the one that locates a defect rather than pricing it. For each step: the
+     * index and role of the first message whose bytes differ from the previous request's, counted
+     * from the tail so it holds still as the window grows.
+     *
+     * Two positions account for nearly the whole run. `assistant@-9` is the detail boundary - the
+     * ninth message from the end is the assistant turn that has just aged past
+     * RECENT_DETAIL_MESSAGES and lost its reasoning. `tool@-12` is the tool boundary - the result
+     * that has just aged past lastToolIndex - RECENT_TOOL_OUTPUT_MESSAGES and been re-cut from the
+     * full bound to the floor. Which of the two dominates is a fact about the floor: on the small
+     * window it descends far enough that older results are genuinely re-cut, on the large one it
+     * barely moves and the reasoning boundary is almost always first.
+     *
+     * The invariant beneath the histogram is the strong statement: nothing but a floor move or a
+     * compaction ever moves a byte further back than the recency boundary. Every step whose first
+     * difference sits deeper than twelve from the tail is a step on which the one-way floor
+     * tightened or the window was condensed first. If that stops holding, something has started
+     * rewriting the settled part of the prompt, and the prefix average would report it as a point
+     * or two of drift and nothing else.
+     *
+     * The lag is what it costs to mark conservatively: the number of positions that were identical
+     * to the previous request and still fell outside the deepest readable breakpoint. Measured 3.4
+     * and 2.8 - between one and two whole steps of trajectory re-billed at full price on every
+     * step, which is the finding the edge breakpoint is placed to answer.
+     */
+    for (const expected of MEASURED) {
+      const run = await measured(expected.contextTokens);
+      const where = histogram(
+        run.steps.map((step) => `${step.firstDifferingRole}@-${step.firstDifferingFromTail}`)
+      );
+      for (const [position, count] of Object.entries(expected.firstDifferences)) {
+        expect(where[position] ?? 0).toBeGreaterThan(count - 9);
+        expect(where[position] ?? 0).toBeLessThan(count + 9);
+      }
+      // The two boundaries together are nearly the whole run; a third cause appearing in numbers
+      // is a new rewrite nobody asked for.
+      const atABoundary = run.steps.filter((step) => step.firstDifferingFromTail <= 12).length;
+      expect(atABoundary).toBeGreaterThan(run.steps.length * 0.75);
+      const deeper = run.steps
+        .filter((step) => step.firstDifferingFromTail > 12)
+        .map((step) => ({
+          step: step.step,
+          fromTail: step.firstDifferingFromTail,
+          floor: step.floor,
+          recut: step.toolResultsRecut,
+          explained: step.compactedFirst || step.floorMoved
+        }));
+      expect(deeper.filter((step) => !step.explained)).toEqual([]);
+      const lag = mean(run.steps.map((step) => step.breakpointLag));
+      expect(lag).toBeGreaterThan(expected.breakpointLag - 1.2);
+      expect(lag).toBeLessThan(expected.breakpointLag + 1.2);
+      // What the lag costs, which is the number a change to breakpoint placement is judged on: the
+      // share of each request a provider could actually serve at the marks the request carries.
+      // Measured 69.8% against the 74.8% available, and 75.8% against 80.1% - four to five points
+      // of every request, on every step, spent on marking behind the divergence rather than at it.
+      const read = mean(run.steps.map((step) => step.cacheReadShare));
+      expect(read).toBeGreaterThan(expected.meanCacheRead - 0.06);
+      expect(read).toBeLessThan(expected.meanCacheRead + 0.06);
+      expect(read).toBeLessThan(mean(run.steps.map((step) => step.prefixShare)));
+    }
+  });
+
+  it('places the cache edge ahead of where this request stopped matching the last one, because a retrospective edge measures worse', async () => {
+    /*
+     * The plan for this wave specified the opposite: put the edge at the last cache-eligible index
+     * inside the run identical to the previous prepared window. Measured here rather than adopted,
+     * and it is a regression on both shipped windows - 70.4% of each request served falling to
+     * 68.8% on the small one, 77.9% to 75.1% on the large.
+     *
+     * The reason is in the histogram this case also asserts. A step appends an assistant turn and
+     * its result, so the window grows by two, and `stablePrefixEnd` therefore lands two positions
+     * PAST the point where this request stopped matching its predecessor on most steps. Two ahead
+     * is exactly where the NEXT request will stop matching this one, which is what an edge is for:
+     * it is a forward statement, and scoring it against the divergence already behind it credits a
+     * mark for reading back a prefix it is itself writing.
+     *
+     * What the retrospective position IS worth is a fourth mark rather than a replacement for the
+     * third - spending the older grid checkpoint's slot on it measures 72.7% and 79.2% here. It is
+     * not taken because it cannot be derived from one window: it needs the previous prepared window
+     * carried across the step, and that is `agent.ts`'s state, not this module's. The number is
+     * recorded so that change arrives with a target rather than a hope.
+     */
+    for (const expected of MEASURED) {
+      const run = await measured(expected.contextTokens);
+      expect(run.servedShare).toBeGreaterThan(expected.servedShare - 0.03);
+      expect(run.servedShare).toBeLessThan(expected.servedShare + 0.03);
+      expect(run.servedShareWithRetrospectiveEdge).toBeGreaterThan(
+        expected.servedShareWithRetrospectiveEdge - 0.03
+      );
+      expect(run.servedShareWithRetrospectiveEdge).toBeLessThan(
+        expected.servedShareWithRetrospectiveEdge + 0.03
+      );
+      // The finding, stated as an inequality so it survives both numbers drifting inside their
+      // bands: the forward edge is worth more than the retrospective one on this fixture.
+      expect(run.servedShare).toBeGreaterThan(run.servedShareWithRetrospectiveEdge);
+      // And the mechanism underneath it, so a change that makes the inequality flip has somewhere
+      // to look: the edge sits at or ahead of the retrospective position on nearly every step.
+      const ahead = run.steps.filter(
+        (step) => (step.marks.at(-1) ?? -1) >= step.retrospectiveEdge
+      ).length;
+      expect(ahead).toBeGreaterThan(run.steps.length * 0.75);
+    }
+  });
+
+  it('never reaches the automatic compaction trigger, because the trigger reads the squeezed size', async () => {
+    /*
+     * Recorded rather than desired, and it still reads zero after a wave aimed at it.
+     * `compactContext` is reached in production by two routes: the agent declaring a phase
+     * finished, and this budget check. Sixty steps of tool-heavy work with results up to the full
+     * 24 kB bound reach 58,434 tokens against a trigger of 64,913 on the small window and 92,827
+     * against 120,000 on the large one, so the automatic route fires on neither.
+     *
+     * The reason is threaded above: the trigger is measured against the size AFTER the older-result
+     * floor has squeezed the window, so on tool-heavy work the floor holds the prepared size under
+     * the trigger indefinitely. Two of the three things that could be done about that were tried,
+     * and what they measured is recorded here rather than argued about again:
+     *
+     * - Ending the squeeze's curve higher does raise the prepared size into the trigger - at 6,000
+     *   characters this window peaks at 66,434 and condenses once on its own account. It also
+     *   pushes the window into the HARD pass, which replaces whole messages rather than the middles
+     *   of results, and `evals/context-quality` scores that at 1.00 on the artifact probe against
+     *   5.00 at 4,000, with 43,003 characters of rework where there had been none. So the curve
+     *   ends at 4,000 and this case still reads zero.
+     * - Separating the deterministic soft pass from the trigger DOES reach it, on a window whose
+     *   results are large enough to cross the soft threshold. It is invisible here because this
+     *   fixture never crosses that threshold at all; it is visible on
+     *   `long-a-full-window-condenses-rather-than-stubbing-itself`, which condensed once on the
+     *   budget and now condenses twice, having previously shredded itself three times instead.
+     *
+     * What is left is the third, and it is not this file's to change: the trigger reads the
+     * prepared size while the compaction target is measured against the untrimmed window, so the
+     * two ends of one decision are counted in different units. That comparison lives in `agent.ts`.
+     *
+     * A change that makes the automatic path fire here has to come and re-baseline this case.
+     */
+    for (const { contextTokens } of MEASURED) {
+      const run = await measured(contextTokens);
+      expect(run.budgetCompactions).toBe(0);
+      expect(run.peakPreparedTokens).toBeLessThan(run.trigger);
+    }
   });
 });

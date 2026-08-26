@@ -246,9 +246,31 @@ class EmbeddedDatabase implements Database {
   }
 
   async transaction<T>(callback: (database: Database) => Promise<T>): Promise<T> {
+    // PGlite is one backend on one connection, so the database itself would serve as the handle,
+    // and for a long time it was the handle. What that cost only shows up under nesting: the inner
+    // transaction() issued a second BEGIN, which PostgreSQL answers with a warning and ignores, and
+    // the inner COMMIT then committed the outer transaction for real - so the outer ROLLBACK had
+    // nothing left to undo and both writes landed. PostgresDatabase.transaction flattens a nested
+    // call onto the one transaction it opened, where the outer rollback takes the inner write with
+    // it. Every test in this repository runs on pglite and every installed box runs on postgres, so
+    // that difference is atomicity the suite can prove and the product does not have. The same
+    // scoped object here gives both drivers the same answer.
+    const scoped: Database = {
+      query: async <R extends Record<string, unknown>>(sql: string, params: unknown[] = []) =>
+        this.query<R>(sql, params),
+      exec: (sql: string) => this.exec(sql),
+      transaction: async <R>(nested: (database: Database) => Promise<R>) => nested(scoped),
+      withAdvisoryLock: <R>(key: number, locked: () => Promise<R>) =>
+        this.withAdvisoryLock(key, locked),
+      notify: (channel: string) => this.notify(channel),
+      listen: (channel: string) => this.listen(channel),
+      // The backend belongs to everything else in the process; a transaction handle owns nothing
+      // it could close. PostgresDatabase says the same about its pooled client.
+      close: async () => undefined
+    };
     await this.#db.exec('BEGIN');
     try {
-      const result = await callback(this);
+      const result = await callback(scoped);
       await this.#db.exec('COMMIT');
       return result;
     } catch (error) {

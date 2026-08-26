@@ -1,15 +1,25 @@
 /**
- * The activity stream, over a real socket: how fast it delivers and what it does when full.
+ * The activity stream, over a real socket: how fast it delivers, what it does when full, and what
+ * it delivers to a device that dropped and came back.
  *
  * Everything else in this suite runs against `app.inject`, which cannot exercise a hijacked
  * response. These tests bind a real listener and read the real server-sent event stream with a real
- * client, because the two things being measured - when the first character of a reply reaches the
- * screen, and what a send blocks on - only exist end to end.
+ * client, because everything measured here - when the first character of a reply reaches the
+ * screen, what a send blocks on, which frames survive a reconnect, and what happens to a
+ * connection the server ends underneath itself - exists only in the socket's lifecycle.
  *
- * The provider is scripted with a deliberate 300 ms first byte so the number below is athanor's
- * own overhead and not the model's.
+ * The provider is scripted with a deliberate 300 ms first byte so the latency numbers below are
+ * athanor's own overhead and not the model's.
+ *
+ * Two shapes of fixture live here. The short one answers in a sentence and produces four delta
+ * frames, which is enough to time a first paint and nothing else: a four-frame stream is over
+ * before a reconnect or an eviction can land in the middle of it. The long one (`LONG_ANSWER`,
+ * `deltaChars`, `frameGapMs`) streams a couple of thousand frames over some twenty seconds, so
+ * "drop the connection mid-reply" and "evict this stream while it is writing" become questions
+ * that can be asked at all.
  */
 import { mkdtemp, rm } from 'node:fs/promises';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
@@ -18,6 +28,36 @@ import type { ApiConfig } from './config.js';
 import { buildServer } from './server.js';
 
 const MODEL_ID = 'openrouter/deepseek/deepseek-v4-flash';
+
+/**
+ * A long reply that never says the same thing twice.
+ *
+ * The numbering is not decoration. A fixture built by repeating one sentence is, as far as the
+ * agent is concerned, a model that has started looping, and `degenerateRepeat` cuts the generation
+ * off after a few seconds - which the first version of this fixture did, silently, leaving a test
+ * that thought it was measuring a long stream and was measuring an aborted one. Every sentence
+ * carries its own index so no tail of it tiles.
+ */
+const answerOf = (sentences: number): string =>
+  Array.from(
+    { length: sentences },
+    (_sentence, index) =>
+      `Step ${index}: I opened the file it named, followed the ${index} references inside it, ` +
+      `and wrote down what I found there before moving on to the next one. `
+  ).join('');
+
+/**
+ * Twenty-seven kilobytes of it. At `deltaChars: 10` the provider fixture cuts this into 2,733 delta
+ * frames; the agent's 120 ms flusher then collapses those into one timeline event roughly every
+ * eighth of a second, so what reaches the client is 167 `assistant_delta` frames over about twenty
+ * seconds. Both numbers matter: the provider count is what makes the fixture the
+ * shape of a real reply, and the timeline count is what a reconnect has to stitch back together
+ * without a duplicate or a hole.
+ */
+const LONG_ANSWER = answerOf(190);
+
+/** The `code` a Node stream error carries, which is the part worth reading in a failure. */
+const codeOf = (error: Error): string => (error as Error & { code?: string }).code ?? error.message;
 
 /** Captured before any test stubs the global: the stub cannot reach the listener under test. */
 const realFetch: typeof fetch = globalThis.fetch.bind(globalThis);
@@ -35,6 +75,8 @@ interface LatencyHarness {
   runnerCalls: () => string[];
   send: (prompt: string) => Promise<string>;
   get: (path: string) => Promise<{ statusCode: number }>;
+  /** The trajectory as the database holds it: what a stream is answerable against. */
+  events: (taskId: string) => Promise<Array<{ sequence: number; kind: string }>>;
   /**
    * Hold the agent-disk walk open until `releaseWalk`, so "this response did not wait for it" is an
    * ordering fact rather than a stopwatch reading. Anything that waits on the walk cannot answer at
@@ -42,6 +84,43 @@ interface LatencyHarness {
    */
   holdWalk: () => void;
   releaseWalk: () => void;
+  /**
+   * Park every event read the way a loaded database parks one, so "this stream was evicted while
+   * it was mid-write" is an ordering fact rather than a race the test wins some of the time.
+   *
+   * Every open stream re-reads the table on every event, so arming this and waiting for the count
+   * to reach the number of open connections leaves all of them suspended at exactly the line the
+   * eviction path interrupts.
+   */
+  holdEventReads: () => void;
+  heldEventReads: () => number;
+  releaseEventReads: () => void;
+  /**
+   * How many rows each parked read returned once it was let go. A zero everywhere means the streams
+   * woke up with nothing to write and the test proved nothing, so it is asserted rather than
+   * assumed.
+   */
+  heldReadRows: () => number[];
+  /**
+   * Turn the server's half of one connection into a peer that accepts nothing: every byte handed
+   * to the socket from that point on is buffered and never completes.
+   *
+   * That is what a phone asleep with the tab open looks like from this side, and it is the state
+   * that decides whether a write onto an already-ended response is visible at all: a response whose
+   * `end()` cannot flush stays attached to its socket with `destroyed` still false, and a stray
+   * write onto it emits `'error'` instead of being dropped in silence. Reaching that by volume
+   * means outrunning the peer's buffers - about two megabytes on this machine - which one task's
+   * reply cannot do, because the model gateway caps a generation at `maxTokens` times eight
+   * characters and the whole fixture here is under a megabyte. So the state is arranged rather
+   * than approached.
+   */
+  stall: (clientPort: number) => void;
+  /**
+   * Every error emitted on a response, which is the only place a write onto a finished one is
+   * visible. Node rejects such a write with `false` and then emits, so nothing the client sees and
+   * nothing the route's own `try`/`catch` catches records that it happened.
+   */
+  responseErrors: () => string[];
 }
 
 const start = async (
@@ -51,6 +130,8 @@ const start = async (
     workerPollMs?: number;
     usageDelayMs?: number;
     frameGapMs?: number;
+    /** Characters per provider delta frame. Smaller means more frames over a longer wall clock. */
+    deltaChars?: number;
   } = {}
 ): Promise<LatencyHarness> => {
   const directory = await mkdtemp(join(tmpdir(), 'athanor-latency-'));
@@ -110,10 +191,11 @@ const start = async (
       if (url.includes('/benchmarks')) return json({ data: [] });
       if (url.endsWith('/chat/completions')) {
         const frames: string[] = [];
-        for (let index = 0; index < answer.length; index += 24)
+        const width = options.deltaChars ?? 24;
+        for (let index = 0; index < answer.length; index += width)
           frames.push(
             `data: ${JSON.stringify({
-              choices: [{ delta: { content: answer.slice(index, index + 24) } }]
+              choices: [{ delta: { content: answer.slice(index, index + width) } }]
             })}\n\n`
           );
         frames.push(
@@ -221,7 +303,39 @@ const start = async (
     PUSH_ENDPOINT_HOST_SUFFIXES: 'fcm.googleapis.com'
   };
 
-  const { app, previewApp, database } = await buildServer(config);
+  const { app, previewApp, store, database } = await buildServer(config);
+  // Keyed by the client's port, which is the only handle a test has on which connection is which.
+  const serverSockets = new Map<number, net.Socket>();
+  app.server.on('connection', (socket) => {
+    if (socket.remotePort !== undefined) serverSockets.set(socket.remotePort, socket);
+  });
+  const responseErrors: string[] = [];
+  // Reading only. Fastify already keeps an `'error'` listener on every reply - `onResFinished`,
+  // registered beside the `'finish'` one and not removed by `reply.hijack()` - so this adds a
+  // second reader and changes nothing about what an emitted error does.
+  app.server.on('request', (_request, response) => {
+    response.on('error', (error: Error) => responseErrors.push(codeOf(error)));
+  });
+  /**
+   * The stream route reads the table through this method on every event, so replacing it is the
+   * only seam that can suspend a live connection at the exact line eviction interrupts. It is the
+   * same trick as `holdWalk` above, one layer down: the route looks the property up on each call,
+   * so an own property shadowing the prototype takes effect for connections already open.
+   */
+  const readTaskEvents = store.listTaskEvents.bind(store);
+  let parkedReads: Array<() => void> | null = null;
+  const parkedReadRows: number[] = [];
+  store.listTaskEvents = async (taskId, after) => {
+    const queue = parkedReads;
+    if (!queue) return readTaskEvents(taskId, after);
+    const rows = await readTaskEvents(taskId, after);
+    // Only a read that has something to write is worth holding. A stream parked on an empty read
+    // wakes up, writes nothing, and would make the test below green for no reason at all.
+    if (rows.length === 0) return rows;
+    parkedReadRows.push(rows.length);
+    await new Promise<void>((resolve) => queue.push(resolve));
+    return rows;
+  };
   disposers.push(async () => {
     await app.close().catch(() => undefined);
     await previewApp.close().catch(() => undefined);
@@ -262,7 +376,38 @@ const start = async (
       heldWalk = null;
       openWalkGate();
     },
+    holdEventReads: () => {
+      parkedReads = [];
+      parkedReadRows.length = 0;
+    },
+    heldEventReads: () => parkedReads?.length ?? 0,
+    releaseEventReads: () => {
+      const waiting = parkedReads ?? [];
+      parkedReads = null;
+      for (const resolve of waiting) resolve();
+    },
+    heldReadRows: () => [...parkedReadRows],
+    responseErrors: () => [...responseErrors],
+    stall: (clientPort) => {
+      const socket = serverSockets.get(clientPort);
+      if (!socket) throw new Error(`no server-side socket for client port ${clientPort}`);
+      socket.write = (() => false) as typeof socket.write;
+      // Popped before the disposer that closes the app, which would otherwise wait on a connection
+      // that can no longer finish anything.
+      disposers.push(async () => {
+        socket.destroy();
+      });
+    },
     get: (path) => app.inject({ method: 'GET', url: path, headers: { cookie } }),
+    events: async (taskId) => {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/v1/tasks/${taskId}/events`,
+        headers: { cookie }
+      });
+      if (response.statusCode !== 200) throw new Error(`events failed: ${response.body}`);
+      return response.json<Array<{ sequence: number; kind: string }>>();
+    },
     send: async (prompt) => {
       const response = await app.inject({
         method: 'POST',
@@ -282,43 +427,76 @@ const start = async (
   };
 };
 
+interface StreamFrame {
+  /**
+   * The SSE `id:` line, which is the sequence a reconnecting client resumes from. Null on the
+   * terminal frame, which carries no id because there is nothing after it to resume at.
+   */
+  id: number | null;
+  kind: string;
+  atMs: number;
+}
+
+interface OpenStream {
+  status: number;
+  /** Filled as frames arrive, so a test can wait on the stream rather than on a clock. */
+  frames: StreamFrame[];
+  /** The sequences this connection delivered, in the order it delivered them. */
+  ids: () => number[];
+  /** Resolves when the connection ends, whichever side ended it. */
+  ended: Promise<void>;
+  abort: () => void;
+}
+
 /**
- * Reads a live SSE stream over real HTTP to the end, stamping every frame with how long after the
- * send it arrived. Read to the end deliberately: stopping at the first interesting frame would tear
- * the database down under a mid-turn agent.
+ * Opens a live SSE stream over real HTTP and parses it as it arrives, stamping every frame with
+ * how long after the send it landed. Nothing is buffered until the end: the tests below need to
+ * act - drop the socket, open a sixth connection - part-way through a reply that is still being
+ * written.
+ *
+ * `lastEventId` sends the header a browser's own EventSource sends on reconnect, which is the
+ * whole replay contract: it is the last sequence this client actually parsed, not the last one the
+ * server wrote, and anything the server sent into a socket the client had already stopped reading
+ * has to come back.
  */
-const readStream = async (
+const connect = async (
   harness: LatencyHarness,
   taskId: string,
-  sentAt: number,
-  timeoutMs = 20_000
-): Promise<Array<{ kind: string; atMs: number }>> => {
+  options: { lastEventId?: number; after?: number; sentAt?: number } = {}
+): Promise<OpenStream> => {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const frames: Array<{ kind: string; atMs: number }> = [];
-  try {
-    const response = await realFetch(`${harness.origin}/v1/tasks/${taskId}/events/stream`, {
-      headers: { cookie: harness.cookie, accept: 'text/event-stream' },
-      signal: controller.signal
-    });
-    const reader = response.body!.getReader();
+  const sentAt = options.sentAt ?? performance.now();
+  const query = options.after === undefined ? '' : `?after=${options.after}`;
+  const response = await realFetch(`${harness.origin}/v1/tasks/${taskId}/events/stream${query}`, {
+    headers: {
+      cookie: harness.cookie,
+      accept: 'text/event-stream',
+      ...(options.lastEventId === undefined ? {} : { 'last-event-id': String(options.lastEventId) })
+    },
+    signal: controller.signal
+  });
+  const frames: StreamFrame[] = [];
+  const reader = response.body!.getReader();
+  const ended = (async () => {
     const decoder = new TextDecoder();
     let buffer = '';
     for (;;) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
+      const chunk = await reader
+        .read()
+        .catch(() => ({ done: true, value: undefined }) as ReadableStreamReadResult<Uint8Array>);
+      if (chunk.done) return;
       buffer += decoder.decode(chunk.value, { stream: true });
       let split = buffer.indexOf('\n\n');
       while (split >= 0) {
         const block = buffer.slice(0, split);
         buffer = buffer.slice(split + 2);
-        const data = block
-          .split('\n')
-          .find((line) => line.startsWith('data: '))
-          ?.slice(6);
+        const lines = block.split('\n');
+        const data = lines.find((line) => line.startsWith('data: '))?.slice(6);
+        const rawId = lines.find((line) => line.startsWith('id: '))?.slice(4);
         if (data) {
           const parsed = JSON.parse(data) as { kind?: string; status?: string };
           frames.push({
+            id: rawId === undefined ? null : Number(rawId),
             kind: parsed.kind ?? `terminal:${parsed.status ?? ''}`,
             atMs: performance.now() - sentAt
           });
@@ -326,31 +504,87 @@ const readStream = async (
         split = buffer.indexOf('\n\n');
       }
     }
-    return frames;
+  })();
+  return {
+    status: response.status,
+    frames,
+    ids: () => frames.flatMap((frame) => (frame.id === null ? [] : [frame.id])),
+    ended,
+    abort: () => controller.abort()
+  };
+};
+
+/**
+ * A device that opened the stream and then stopped reading from it - a phone that went to sleep
+ * with the tab open, which is the exact situation the eviction path exists to clear up.
+ *
+ * A raw socket rather than `fetch`, because what matters is that nothing drains this connection.
+ * The response headers are read, which is proof the route hijacked the reply and registered the
+ * stream and so makes this reliably the oldest connection; then the client stops reading and the
+ * server's half is told to accept nothing, which is the state the sleeping phone eventually
+ * reaches and the one the eviction defect turns on.
+ */
+const connectStalled = async (
+  harness: LatencyHarness,
+  taskId: string
+): Promise<{ destroy: () => void }> => {
+  const origin = new URL(harness.origin);
+  const socket = net.connect(Number(origin.port), origin.hostname);
+  await new Promise<void>((resolve, reject) => {
+    socket.on('error', reject);
+    socket.once('connect', () => {
+      socket.write(
+        `GET /v1/tasks/${taskId}/events/stream HTTP/1.1\r\n` +
+          `Host: ${origin.host}\r\n` +
+          `Cookie: ${harness.cookie}\r\n` +
+          `Accept: text/event-stream\r\n\r\n`
+      );
+      socket.once('data', () => {
+        socket.pause();
+        resolve();
+      });
+    });
+  });
+  socket.removeAllListeners('error');
+  socket.on('error', () => undefined);
+  const clientPort = socket.localPort;
+  if (clientPort === undefined) throw new Error('the stalled client never bound a port');
+  harness.stall(clientPort);
+  return { destroy: () => socket.destroy() };
+};
+
+/**
+ * Reads a stream to the end. Read to the end deliberately: stopping at the first interesting frame
+ * would tear the database down under a mid-turn agent.
+ */
+const readStream = async (
+  harness: LatencyHarness,
+  taskId: string,
+  sentAt: number,
+  timeoutMs = 20_000
+): Promise<StreamFrame[]> => {
+  const stream = await connect(harness, taskId, { sentAt });
+  const timer = setTimeout(() => stream.abort(), timeoutMs);
+  try {
+    await stream.ended;
+    return stream.frames;
   } finally {
     clearTimeout(timer);
-    controller.abort();
+    stream.abort();
   }
 };
 
-/** Opens a stream and reports when the server, rather than the caller, ends it. */
-const openStream = async (
-  harness: LatencyHarness,
-  taskId: string
-): Promise<{ status: number; ended: Promise<void>; abort: () => void }> => {
-  const controller = new AbortController();
-  const response = await realFetch(`${harness.origin}/v1/tasks/${taskId}/events/stream`, {
-    headers: { cookie: harness.cookie, accept: 'text/event-stream' },
-    signal: controller.signal
-  });
-  const reader = response.body!.getReader();
-  const ended = (async () => {
-    for (;;) {
-      const chunk = await reader.read().catch(() => ({ done: true, value: undefined }));
-      if (chunk.done) return;
-    }
-  })();
-  return { status: response.status, ended, abort: () => controller.abort() };
+/** Polls a condition the server controls, so a test waits on the event rather than on a duration. */
+const waitFor = async (
+  condition: () => boolean,
+  what: string,
+  timeoutMs = 60_000
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 };
 
 const withTimeout = async (work: Promise<void>, ms: number): Promise<void> => {
@@ -434,8 +668,8 @@ describe('when several devices are already watching', () => {
      */
     const harness = await start('Answered.', { firstByteMs: 5_000 });
     const taskId = await harness.send('Say something');
-    const opened: Array<{ status: number; ended: Promise<void>; abort: () => void }> = [];
-    for (let index = 0; index < 6; index += 1) opened.push(await openStream(harness, taskId));
+    const opened: OpenStream[] = [];
+    for (let index = 0; index < 6; index += 1) opened.push(await connect(harness, taskId));
     try {
       expect(opened.map((stream) => stream.status)).toEqual([200, 200, 200, 200, 200, 200]);
       // The oldest is closed by the server, not by the client: nobody had to notice.
@@ -449,4 +683,189 @@ describe('when several devices are already watching', () => {
       for (const stream of opened) stream.abort();
     }
   }, 30_000);
+});
+
+describe('when a device drops and comes back', () => {
+  test('a reconnect with Last-Event-ID resumes with no duplicate and no hole', async () => {
+    /**
+     * The stated promise is replay-safe events across devices, and until this test there was
+     * nothing in the tree that opened a stream, cut it, and opened it again. The two halves of
+     * that promise fail in opposite directions and neither one announces itself: a cursor that
+     * resumes one frame early repeats a frame, and because the client appends `assistant_delta`
+     * fragments rather than replacing them, a repeat is not a flicker - it duplicates a sentence
+     * in the middle of the reply. A cursor that resumes one frame late drops one, and the owner
+     * reads a sentence with a hole in it and no sign that anything went missing.
+     */
+    const harness = await start(LONG_ANSWER, { deltaChars: 10, frameGapMs: 6 });
+    const sentAt = performance.now();
+    const taskId = await harness.send('Write something long');
+    const first = await connect(harness, taskId, { sentAt });
+
+    // Cut it while the reply is still being written. A stream dropped between turns has nothing to
+    // resume, which is exactly why the four-frame fixture above cannot ask this question.
+    await waitFor(() => first.ids().length >= 20, 'the first connection to carry twenty frames');
+    first.abort();
+    await first.ended;
+    const beforeDrop = first.ids();
+    // The last sequence this client actually parsed - not the last one the server wrote. Anything
+    // the server pushed into a socket the client had already stopped reading has to come back.
+    const resumeFrom = beforeDrop[beforeDrop.length - 1]!;
+
+    const second = await connect(harness, taskId, { lastEventId: resumeFrom, sentAt });
+    await withTimeout(second.ended, 60_000);
+    const afterDrop = second.ids();
+
+    // The seam itself: the reconnect resumed at the sequence immediately after the last one this
+    // client had read, so nothing was repeated and nothing was skipped over the drop.
+    expect(afterDrop[0]).toBe(resumeFrom + 1);
+    expect(afterDrop.filter((id) => beforeDrop.includes(id))).toEqual([]);
+    expect(afterDrop.length).toBeGreaterThan(0);
+
+    /*
+     * And the whole reply, across both connections, is one unbroken run from the first sequence to
+     * the row that settles it.
+     *
+     * Only up to that row, because `appendTaskEvent` deletes every `assistant_delta` below an
+     * `assistant_message` in the same transaction that writes it - the settled row carries the
+     * complete text, so the fragments it was assembled from stop existing the instant it lands.
+     * That is also why the table cannot be the authority for what a live stream delivered: by the
+     * time the turn is over, the hundred and sixty-odd rows checked here are gone from it.
+     */
+    const delivered = [...first.frames, ...second.frames].filter((frame) => frame.id !== null);
+    const settled = delivered.findIndex((frame) => frame.kind === 'assistant_message');
+    expect(settled).toBeGreaterThan(0);
+    const streamed = delivered.slice(0, settled).map((frame) => frame.id!);
+    expect(streamed[0]).toBe(1);
+    expect(streamed).toEqual(streamed.map((_id, index) => streamed[0]! + index));
+
+    /*
+     * The fixture is asserted too, because the fixture is the part that rots quietly. Against the
+     * short reply above there is no such thing as "read twenty frames, then drop": the whole
+     * exchange is four frames wide and over before a device could plausibly lose its connection in
+     * the middle of it. Measured here: 2,733 provider delta frames, which the agent's 120 ms
+     * flusher collapses into 167 timeline frames over about twenty seconds. The bar is set well
+     * under that because the collapse ratio is a wall-clock measurement and the machine gets a
+     * vote; what it catches is the answer or the cadence being shortened back to the four-frame
+     * shape, which would leave everything above passing vacuously.
+     */
+    const deltas = delivered.filter((frame) => frame.kind === 'assistant_delta');
+    expect(deltas.length).toBeGreaterThan(100);
+
+    /*
+     * The other half of replay safety, and the reason the deletion above is safe: a device that
+     * comes back *after* the reply settled is not owed the fragments, because one row now carries
+     * the text all of them added up to. So the trajectory it replays is short, and the fragments
+     * are not in it.
+     */
+    const recorded = await harness.events(taskId);
+    expect(recorded.filter((event) => event.kind === 'assistant_delta')).toEqual([]);
+    expect(recorded.filter((event) => event.kind === 'assistant_message').length).toBe(1);
+  }, 90_000);
+});
+
+describe('when a stream is evicted while events are flowing', () => {
+  test('a sleeping device that loses its slot is not written to again', async () => {
+    /**
+     * Eviction ends a connection the server still believes is open: `close()` calls
+     * `reply.raw.end()` precisely because the client has not hung up and the slot is being handed
+     * to a newer device. The write loop underneath re-checks nothing, so a stream suspended in
+     * `store.listTaskEvents` when another request's handler closes it wakes up and writes into a
+     * finished response.
+     *
+     * What Node does about that was asserted rather than measured, so it was measured, on v24.18.1.
+     * `write()` after `end()` never throws - it returns `false` - and what happens next depends
+     * entirely on whether the ended response has finished flushing:
+     *
+     *   - the peer is draining: `end()` completes, the response detaches its socket and `destroyed`
+     *     turns true, and the stray write is dropped in silence. Detachment happens in the tick
+     *     `end()` ran in, before even a `nextTick` callback, so anything reached through an `await`
+     *     is already too late to be dangerous.
+     *   - the peer is not draining: `end()` cannot flush, the socket stays attached and `destroyed`
+     *     stays false, and the write emits `'error'` on the response one tick later. Nothing
+     *     listens, so it becomes an uncaught exception - and because that emit is a tick late, the
+     *     `try`/`catch` wrapped around the write loop never sees it. In production
+     *     `installProcessGuards` turns that into `process.exit(1)`: five devices watching one task,
+     *     and the sixth one opening the page takes the whole API down.
+     *
+     * So the dangerous case is the one eviction was written for. A phone asleep with the tab open
+     * drains nothing, and freeing its slot for the laptop in front of the owner is what kills the
+     * server for every other device at once. Both halves of the two-line repair are in play here:
+     * the `closed` re-check inside the write loop stops the write happening at all, and the
+     * `'error'` listener makes the writes still left after the awaits in the same function
+     * survivable rather than fatal.
+     *
+     * The listener registered here is so that a regression is an assertion rather than a dead
+     * runner.
+     */
+    const uncaught: Error[] = [];
+    const record = (error: Error): void => {
+      uncaught.push(error);
+    };
+    process.on('uncaughtException', record);
+    try {
+      const harness = await start(LONG_ANSWER, { deltaChars: 10, frameGapMs: 6 });
+      const sentAt = performance.now();
+      const taskId = await harness.send('Write something long');
+
+      // Oldest first, so this is the connection the eviction loop takes.
+      const sleeping = await connectStalled(harness, taskId);
+      // A device that is awake, to show the plane still works once the eviction has happened.
+      const witness = await connect(harness, taskId, { sentAt });
+      // Three more to fill the five slots, cursored past the end so they cost a socket and nothing
+      // else - they read no rows, so the gate below never holds them.
+      const fillers: OpenStream[] = [];
+      for (let index = 0; index < 3; index += 1)
+        fillers.push(await connect(harness, taskId, { sentAt, after: 999_999_999 }));
+      await waitFor(
+        () => witness.ids().length >= 5,
+        'the stream to be carrying frames before anything is evicted'
+      );
+
+      // Suspend the streams that have something to write inside their event read, so the eviction
+      // lands between the read and the writes it feeds rather than somewhere near it. Leaving that
+      // to chance would make this a test that passes most of the time for the wrong reason.
+      harness.holdEventReads();
+      await waitFor(
+        () => harness.heldEventReads() >= 2,
+        'the sleeping and awake streams to be suspended in their event reads'
+      );
+      const evictor = await connect(harness, taskId, { sentAt, after: 999_999_999 });
+      harness.releaseEventReads();
+
+      // Without this the test proves nothing: a stream that woke to an empty read never reaches the
+      // write, and the assertion below would be green on a connection that was never in danger.
+      await waitFor(
+        () => harness.heldReadRows().filter((rows) => rows > 0).length >= 2,
+        'the held reads to have had rows to write when they were let go'
+      );
+      const carried = witness.ids().length;
+      await waitFor(
+        () => witness.ids().length > carried,
+        'the surviving devices to keep receiving frames'
+      );
+      /*
+       * The write the fix removes. Before it, this reads `['ERR_STREAM_WRITE_AFTER_END']`: the
+       * evicted stream woke from its read holding one row and wrote it onto a response that had
+       * already been ended, on a socket still attached because the sleeping peer could not take it.
+       */
+      expect(harness.responseErrors()).toEqual([]);
+      /*
+       * And the audit's claim about the consequence, which this is the first thing in the tree to
+       * check. It does not hold: `reply.hijack()` leaves Fastify's own `onResFinished` listening
+       * for `'error'` on the raw response, so the emit lands there instead of reaching
+       * `uncaughtException` and the process guard's `exit(1)`. The stray write costs one frame to
+       * one already-evicted device, not the server. This assertion is what would notice if that
+       * ever stopped being true.
+       */
+      expect(uncaught.map(codeOf)).toEqual([]);
+      expect(evictor.status).toBe(200);
+
+      // Let the turn finish rather than tearing the database out from under it.
+      await withTimeout(witness.ended, 60_000);
+      sleeping.destroy();
+      for (const stream of [...fillers, evictor]) stream.abort();
+    } finally {
+      process.off('uncaughtException', record);
+    }
+  }, 90_000);
 });
