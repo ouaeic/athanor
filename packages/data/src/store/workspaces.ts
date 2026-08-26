@@ -575,17 +575,34 @@ export class WorkspaceStore {
     id: string;
     status?: WorkspaceSkillRecord['status'];
     pinned?: boolean;
+    /**
+     * The owner turning a learned procedure off without deleting it.
+     *
+     * `enabled` has always been a real column with a real reader - a disabled skill is dropped from
+     * the index the model sees - and no writer, while the approval card for a skill upsert told the
+     * owner "You had turned this off. Approving this switches it back on." about a state the
+     * product could not enter. The card was describing a control that did not exist.
+     */
+    enabled?: boolean;
   }): Promise<WorkspaceSkillRecord | null> {
     const result = await this.database.query(
       `UPDATE workspace_skills SET
          status=COALESCE($4,status),
          pinned=COALESCE($5,pinned),
+         enabled=COALESCE($6,enabled),
          updated_at=NOW()
        WHERE id=$1 AND workspace_id=$3 AND EXISTS (
          SELECT 1 FROM workspaces w
          WHERE w.id=workspace_skills.workspace_id AND w.user_id=$2
        ) RETURNING *`,
-      [input.id, input.userId, input.workspaceId, input.status ?? null, input.pinned ?? null]
+      [
+        input.id,
+        input.userId,
+        input.workspaceId,
+        input.status ?? null,
+        input.pinned ?? null,
+        input.enabled ?? null
+      ]
     );
     return result.rows[0] ? mapWorkspaceSkill(result.rows[0]) : null;
   }

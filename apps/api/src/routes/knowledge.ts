@@ -506,15 +506,19 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
 
   app.patch<{
     Params: { workspaceId: string; skillId: string };
-    Body: { status?: 'active' | 'stale' | 'archived'; pinned?: boolean };
+    Body: { status?: 'active' | 'stale' | 'archived'; pinned?: boolean; enabled?: boolean };
   }>('/v1/workspaces/:workspaceId/skills/:skillId', async (request) => {
     const user = requireUser(request.user);
     const input = z
       .object({
         status: z.enum(['active', 'stale', 'archived']).optional(),
-        pinned: z.boolean().optional()
+        pinned: z.boolean().optional(),
+        enabled: z.boolean().optional()
       })
-      .refine((value) => value.status !== undefined || value.pinned !== undefined)
+      .refine(
+        (value) =>
+          value.status !== undefined || value.pinned !== undefined || value.enabled !== undefined
+      )
       .parse(request.body);
     const { key } = await workspaceKnowledgeKey(user.id, request.params.workspaceId);
     const updated = await store.setWorkspaceSkillState({
@@ -522,7 +526,8 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
       userId: user.id,
       workspaceId: request.params.workspaceId,
       ...(input.status === undefined ? {} : { status: input.status }),
-      ...(input.pinned === undefined ? {} : { pinned: input.pinned })
+      ...(input.pinned === undefined ? {} : { pinned: input.pinned }),
+      ...(input.enabled === undefined ? {} : { enabled: input.enabled })
     });
     if (!updated) throw new AthanorError('skill_not_found', 'Skill not found', 404);
     return {

@@ -707,8 +707,8 @@ else
  * Values held in two places on purpose, against the file that owns them.
  *
  * Every copy here is deliberate and says so where it is written, and the reason is always that the
- * two sides cannot reach each other: three are in the web client, which is behind a 150 kB bundle
- * gate that importing a schema library or `node:fs` would blow, and two are across the worker and
+ * two sides cannot reach each other: five are in the web client, which is behind a 150 kB bundle
+ * gate that importing a schema library or `node:fs` would blow, and six are across the worker and
  * the runner, which are separate processes. What was missing is the thing that makes a copy safe.
  * Both sides have tests, and they assert different examples - the disk floor is checked at 400 GiB
  * on one side and 500 GiB on the other - so a changed formula fails neither.
@@ -727,12 +727,25 @@ else
  * the owner filters at - which is the exact silence the runner's copy was written to end, arriving
  * by a slower route.
  *
+ * The two newest entries were both found by a sweep for capability the owner had no door to, and
+ * both fail silently by construction. `BROWSER_VIEWPORT` is the coordinate space the private
+ * browser is launched into and the space the page stream's clicks are mapped against, in two files
+ * that have never been able to see each other; the numbers agree today, so nothing is wrong, and
+ * the day the runner's viewport changes every human click on that pane lands proportionally off
+ * with no error, no refusal and nothing failing anywhere. `MAX_PRICE_CEILING_USD_PER_MILLION` is
+ * the bound the settings form refuses a typed rate at, and the server is still the authority - so
+ * a copy left low turns a rate the box would have accepted into a sentence saying it is too big,
+ * and a copy left high sends a number the route answers with a 400 the form never predicted. That
+ * one is the cheaper failure of the two, and it is here because a bound nothing compares is the
+ * drift this check exists to catch.
+ *
  * Compared as source text, because that is what has to match. Anything cleverer would need to
  * import one side, and the whole reason there are two is that importing is what nobody can do.
  */
 /**
- * The names a table or a set declares, sorted, for the two entries below that hold the same list
- * in two different shapes - a `Record` on one side and a `new Set([...])` on the other.
+ * The names a table or a set declares, sorted, for the entries below that hold the same list in
+ * two different shapes - a `Record` on one side and a `new Set([...])` on the other - and for the
+ * approval-phrase check after them, which reads a `Record` against a list of branch conditions.
  *
  * Anchored to exactly two spaces of indentation, so a nested `notice:` or `clearsOnItsOwn:` is not
  * mistaken for a member. If prettier ever reindents these declarations this stops matching and
@@ -769,6 +782,29 @@ const copiedConstants = [
     owner: 'packages/contracts/src/index.ts',
     copy: 'apps/web/src/usage-model.ts',
     find: /MAX_TASK_SPEND_USD = ([\d_]+)/
+  },
+  {
+    what: 'the price ceiling limit',
+    owner: 'packages/contracts/src/index.ts',
+    copy: 'apps/web/src/usage-model.ts',
+    // The third bound the settings form refuses a number at, and the one that measures a rate
+    // rather than an amount: the two above are dollars per window, this is dollars per million
+    // tokens. The copy declares itself loudly and names this file; this is the other half.
+    find: /MAX_PRICE_CEILING_USD_PER_MILLION = ([\d_]+)/
+  },
+  {
+    what: 'the coordinate space the private browser works in',
+    owner: 'services/workspace-runner/src/browser.ts',
+    copy: 'apps/web/src/Inspector.tsx',
+    // The object body, so both the width and the height are compared and neither the `as const`
+    // nor the name is. The runner launches the browser at this size, publishes the screencast at
+    // it and reads every agent-side coordinate off a screenshot of it; the pane divides a human
+    // click by it to decide where on the page that click landed. The pane prefers the size the
+    // stream reports on each state frame, so this is the answer before the first frame - which is
+    // exactly why drift here is silent: the first clicks of every session land wrong and then
+    // quietly start landing right.
+    find: /BROWSER_VIEWPORT = \{([\s\S]*?)\} as const;/,
+    findInCopy: /PAGE_VIEWPORT = \{([\s\S]*?)\};/
   },
   {
     what: 'the formats a render proof is offered on',
@@ -873,6 +909,61 @@ if (drifted.length) for (const message of drifted) fail(message);
 else
   say(
     `Copied constants: ${copiedConstants.length} held in two places still match the file that owns them.`
+  );
+
+/*
+ * The approval card's tool table, against the worker floor that decides what can raise one.
+ *
+ * The approval card is the only place the ten-item safety floor is ever cashed out to a person, and
+ * `approvalToolPhrases` is the half of it that says which tool is asking. A tool with no phrase
+ * does not fail: the card falls through to the reversibility class and shows the owner a generic
+ * sentence over a JSON dump of the call, which is a decision made on less than the box knows. That
+ * is how `audio_read` - whose entire subject is money leaving for a provider - and
+ * `parallel_web_read` - whose entire subject is which addresses data leaves by - were both missing
+ * for a long time while the comment above the table said it covered every tool that can raise an
+ * approval. Nothing failed, because nothing was checking.
+ *
+ * Read out of the worker's own branches rather than from a list kept beside the table, because a
+ * list kept beside the table is precisely what drifted. The floor is `approval-policy.ts` and not
+ * `tools.ts`, which only re-exports.
+ *
+ * Compared as sets in both directions. Uncovered is the failure that reaches an owner; a phrase for
+ * a tool the floor can no longer raise is only dead copy, but it is also the shape a rename takes
+ * from the other side, and requiring the two to agree is what keeps a regex that has stopped
+ * matching from passing this check by covering nothing.
+ */
+const approvalFloorPath = 'apps/worker/src/approval-policy.ts';
+const approvalPhrasePath = 'apps/web/src/approval-copy.ts';
+const raisesApproval = [
+  ...new Set(
+    [...read(approvalFloorPath).matchAll(/\bname === '([a-z_]+)'/g)].map(([, name]) => name)
+  )
+].sort();
+const phraseTable = read(approvalPhrasePath).match(
+  /approvalToolPhrases: Record<string, string> = \{([\s\S]*?)\n\};/
+);
+const phrasedTools = phraseTable ? keysAtTopLevel(phraseTable[1]).split(',').filter(Boolean) : [];
+const unphrased = raisesApproval.filter((tool) => !phrasedTools.includes(tool));
+const unraised = phrasedTools.filter((tool) => !raisesApproval.includes(tool));
+if (!raisesApproval.length)
+  fail(
+    `no approval-raising tools could be read from ${approvalFloorPath}; the approval card's table is no longer being checked against anything`
+  );
+else if (!phrasedTools.length)
+  fail(
+    `approvalToolPhrases could not be read from ${approvalPhrasePath}; the approval card's table is no longer being checked against anything`
+  );
+else if (unphrased.length)
+  fail(
+    `${unphrased.join(', ')} can raise an approval in ${approvalFloorPath} and has no phrase in ${approvalPhrasePath}; the card would ask the owner to decide from the reach class and a dump of the call`
+  );
+else if (unraised.length)
+  fail(
+    `${unraised.join(', ')} has a phrase in ${approvalPhrasePath} and no longer raises an approval in ${approvalFloorPath}; either the tool was renamed and the card has stopped naming it, or the phrase is dead`
+  );
+else
+  say(
+    `Approval phrases: all ${raisesApproval.length} tools that can raise an approval are named on the card.`
   );
 
 if (failures.length > 0) {

@@ -276,6 +276,70 @@ describe('DataStore', () => {
     await expect(store.deleteWorkspaceSkill(user.id, workspace.id, skill.id)).resolves.toBe(true);
   });
 
+  /*
+   * Turning a learned procedure off without deleting it.
+   *
+   * `enabled` was a real column with a real reader - a disabled skill is dropped from the index the
+   * model sees - and no writer anywhere in the repository, while the approval card for a skill
+   * upsert told the owner "You had turned this off. Approving this switches it back on." about a
+   * state the product could not enter. Deletion was the only way to stop a procedure the agent kept
+   * reaching for at the wrong moment, and deletion is not reversible.
+   *
+   * The omitted-leaves-alone half is the part worth pinning: the same statement writes status and
+   * pinned, so a caller flipping one of those must not silently re-enable a skill the owner turned
+   * off.
+   */
+  it('turns a learned skill off and leaves it off when something else about it changes', async () => {
+    const user = await store.createUser({ username: 'switcher', displayName: 'Switcher' });
+    const workspace = await store.createWorkspace({
+      userId: user.id,
+      name: 'Switching',
+      storageLimitBytes: 10 * 1024 ** 3,
+      imageRevision: 'dev',
+      region: 'auto',
+      wrappedKey: 'wrapped'
+    });
+    const skill = await store.upsertWorkspaceSkill({
+      userId: user.id,
+      workspaceId: workspace.id,
+      nameHash: 'ledger-reconcile',
+      documentCiphertext: { v: 1, iv: 'skill', tag: 'tag', ciphertext: 'cipher' }
+    });
+    await expect(
+      workspaces.getWorkspaceSkill(user.id, workspace.id, skill.id)
+    ).resolves.toMatchObject({ enabled: true });
+
+    await store.setWorkspaceSkillState({
+      id: skill.id,
+      userId: user.id,
+      workspaceId: workspace.id,
+      enabled: false
+    });
+    await expect(
+      workspaces.getWorkspaceSkill(user.id, workspace.id, skill.id)
+    ).resolves.toMatchObject({ enabled: false });
+
+    await store.setWorkspaceSkillState({
+      id: skill.id,
+      userId: user.id,
+      workspaceId: workspace.id,
+      pinned: true
+    });
+    await expect(
+      workspaces.getWorkspaceSkill(user.id, workspace.id, skill.id)
+    ).resolves.toMatchObject({ enabled: false, pinned: true });
+
+    await store.setWorkspaceSkillState({
+      id: skill.id,
+      userId: user.id,
+      workspaceId: workspace.id,
+      enabled: true
+    });
+    await expect(
+      workspaces.getWorkspaceSkill(user.id, workspace.id, skill.id)
+    ).resolves.toMatchObject({ enabled: true });
+  });
+
   it('leaves a skill whose occasion has not come up, instead of blinking it out every 31 days', async () => {
     // The clock was COALESCE(last_used_at,updated_at) while the same statement wrote updated_at, so
     // for a never-used skill the anchor was the column the transition overwrote: stale on day 31,
