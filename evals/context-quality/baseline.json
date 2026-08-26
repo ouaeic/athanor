@@ -1,139 +1,145 @@
 {
+  "$stamp": {
+    "acceptedAt": "2026-08-26T22:11:42.977Z",
+    "version": "0.1.1",
+    "commit": "784ed13",
+    "rig": "31ca58b3a2d1"
+  },
   "pool-migration-131k/shipped": {
-    "availability": 4.42,
-    "tokensPerTask": 3095134,
-    "cacheReadShare": 0.73,
+    "availability": 4.58,
+    "tokensPerTask": 3041097,
+    "cacheReadShare": 0.731,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 1
   },
   "pool-migration-131k/configuration-fidelity": {
-    "availability": 4.42,
-    "tokensPerTask": 3095134,
-    "cacheReadShare": 0.73,
+    "availability": 4.58,
+    "tokensPerTask": 3041097,
+    "cacheReadShare": 0.731,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 1
   },
   "pool-migration-131k/detail-2": {
-    "availability": 2.75,
-    "tokensPerTask": 2982408,
-    "cacheReadShare": 0.793,
+    "availability": 2.92,
+    "tokensPerTask": 2929976,
+    "cacheReadShare": 0.794,
     "newestReasoningSteps": 0,
     "unrecoverableLosses": 5
   },
   "pool-migration-131k/tool-2": {
-    "availability": 4.42,
-    "tokensPerTask": 2994172,
+    "availability": 4.58,
+    "tokensPerTask": 2945131,
     "cacheReadShare": 0.757,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 1
   },
   "pool-migration-131k/detail-4": {
-    "availability": 3.17,
-    "tokensPerTask": 3020518,
-    "cacheReadShare": 0.769,
+    "availability": 3.33,
+    "tokensPerTask": 2967551,
+    "cacheReadShare": 0.77,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 4
   },
   "pool-migration-131k/detail-5": {
-    "availability": 3.17,
-    "tokensPerTask": 3052253,
+    "availability": 3.33,
+    "tokensPerTask": 2998749,
     "cacheReadShare": 0.75,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 4
   },
   "pool-migration-131k/detail-6": {
-    "availability": 3.17,
-    "tokensPerTask": 3058098,
+    "availability": 3.33,
+    "tokensPerTask": 3004595,
     "cacheReadShare": 0.746,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 4
   },
   "pool-migration-131k/both-2": {
-    "availability": 2.75,
-    "tokensPerTask": 2881441,
+    "availability": 2.92,
+    "tokensPerTask": 2834010,
     "cacheReadShare": 0.844,
     "newestReasoningSteps": 0,
     "unrecoverableLosses": 5
   },
   "pool-migration-131k/stride-8": {
-    "availability": 4.42,
-    "tokensPerTask": 3095134,
+    "availability": 4.58,
+    "tokensPerTask": 3041097,
     "cacheReadShare": 0.715,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 1
   },
   "pool-migration-131k/starved": {
-    "availability": 3,
+    "availability": 3.17,
     "tokensPerTask": 1739472,
     "cacheReadShare": 0.833,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 1
   },
   "pool-migration-1m/shipped": {
-    "availability": 4.42,
-    "tokensPerTask": 3818590,
+    "availability": 4.58,
+    "tokensPerTask": 3736930,
     "cacheReadShare": 0.763,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 1
   },
   "pool-migration-1m/configuration-fidelity": {
-    "availability": 4.42,
-    "tokensPerTask": 3818590,
+    "availability": 4.58,
+    "tokensPerTask": 3736930,
     "cacheReadShare": 0.763,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 1
   },
   "pool-migration-1m/detail-2": {
-    "availability": 2.75,
-    "tokensPerTask": 3705864,
+    "availability": 2.92,
+    "tokensPerTask": 3625805,
     "cacheReadShare": 0.845,
     "newestReasoningSteps": 0,
     "unrecoverableLosses": 5
   },
   "pool-migration-1m/tool-2": {
-    "availability": 4.42,
-    "tokensPerTask": 3809783,
+    "availability": 4.58,
+    "tokensPerTask": 3728124,
     "cacheReadShare": 0.766,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 1
   },
   "pool-migration-1m/detail-4": {
-    "availability": 3.17,
-    "tokensPerTask": 3743977,
+    "availability": 3.33,
+    "tokensPerTask": 3663383,
     "cacheReadShare": 0.806,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 4
   },
   "pool-migration-1m/detail-5": {
-    "availability": 3.17,
-    "tokensPerTask": 3775706,
+    "availability": 3.33,
+    "tokensPerTask": 3694581,
     "cacheReadShare": 0.801,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 4
   },
   "pool-migration-1m/detail-6": {
-    "availability": 3.17,
-    "tokensPerTask": 3781551,
+    "availability": 3.33,
+    "tokensPerTask": 3700427,
     "cacheReadShare": 0.796,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 4
   },
   "pool-migration-1m/both-2": {
-    "availability": 2.75,
-    "tokensPerTask": 3697058,
+    "availability": 2.92,
+    "tokensPerTask": 3616999,
     "cacheReadShare": 0.877,
     "newestReasoningSteps": 0,
     "unrecoverableLosses": 5
   },
   "pool-migration-1m/stride-8": {
-    "availability": 4.42,
-    "tokensPerTask": 3818590,
+    "availability": 4.58,
+    "tokensPerTask": 3736930,
     "cacheReadShare": 0.739,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 1
   },
   "pool-migration-1m/starved": {
-    "availability": 3,
+    "availability": 3.17,
     "tokensPerTask": 1745823,
     "cacheReadShare": 0.833,
     "newestReasoningSteps": 59,
@@ -141,70 +147,70 @@
   },
   "pool-migration-131k-uncompacted/shipped": {
     "availability": 5,
-    "tokensPerTask": 3071463,
+    "tokensPerTask": 3073015,
     "cacheReadShare": 0.714,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 0
   },
   "pool-migration-131k-uncompacted/configuration-fidelity": {
     "availability": 5,
-    "tokensPerTask": 3071463,
+    "tokensPerTask": 3073015,
     "cacheReadShare": 0.714,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 0
   },
   "pool-migration-131k-uncompacted/detail-2": {
     "availability": 3.33,
-    "tokensPerTask": 2991237,
+    "tokensPerTask": 2992592,
     "cacheReadShare": 0.76,
     "newestReasoningSteps": 0,
     "unrecoverableLosses": 4
   },
   "pool-migration-131k-uncompacted/tool-2": {
     "availability": 5,
-    "tokensPerTask": 2961786,
+    "tokensPerTask": 2963336,
     "cacheReadShare": 0.749,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 0
   },
   "pool-migration-131k-uncompacted/detail-4": {
     "availability": 3.75,
-    "tokensPerTask": 2997916,
-    "cacheReadShare": 0.735,
+    "tokensPerTask": 2999467,
+    "cacheReadShare": 0.736,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 3
   },
   "pool-migration-131k-uncompacted/detail-5": {
     "availability": 3.75,
-    "tokensPerTask": 3029115,
+    "tokensPerTask": 3030663,
     "cacheReadShare": 0.718,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 3
   },
   "pool-migration-131k-uncompacted/detail-6": {
     "availability": 3.75,
-    "tokensPerTask": 3034961,
+    "tokensPerTask": 3036509,
     "cacheReadShare": 0.714,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 3
   },
   "pool-migration-131k-uncompacted/both-2": {
     "availability": 3.33,
-    "tokensPerTask": 3138162,
+    "tokensPerTask": 3138360,
     "cacheReadShare": 0.84,
     "newestReasoningSteps": 0,
     "unrecoverableLosses": 4
   },
   "pool-migration-131k-uncompacted/stride-8": {
     "availability": 5,
-    "tokensPerTask": 3071463,
+    "tokensPerTask": 3073015,
     "cacheReadShare": 0.715,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 0
   },
   "pool-migration-131k-uncompacted/starved": {
-    "availability": 3.42,
-    "tokensPerTask": 1833770,
+    "availability": 3.75,
+    "tokensPerTask": 1801917,
     "cacheReadShare": 0.839,
     "newestReasoningSteps": 59,
     "unrecoverableLosses": 0

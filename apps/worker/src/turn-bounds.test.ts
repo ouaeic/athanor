@@ -2,12 +2,21 @@ import { AthanorError } from '@athanor/core';
 import type { ModelMessage, ModelToolCall } from '@athanor/model-gateway';
 import { describe, expect, it } from 'vitest';
 import {
+  BOOKKEEPING_TOOLS,
   HOST_DISK_FULL_CHECKPOINT_CODE,
+  IDLE_STEPS_BEFORE_STOP,
   LATE_STEP_EFFORT_FLOOR,
   MAX_COMPLETION_NAGS,
+  MAX_FINISH_REJECTIONS,
+  MAX_IDLE_STEPS,
+  MAX_NOTICES_PER_TURN,
   MAX_PARALLEL_TOOL_CALLS,
+  MAX_QUESTIONS_PER_TURN,
   MAX_REPEATED_FAILURES,
+  MAX_STATIONARY_ACTING_STEPS,
+  MAX_STATIONARY_STEPS,
   PARALLEL_SAFE_TOOLS,
+  PUSHBACK_MARKERS,
   REPEATED_FAILURES_BEFORE_STOP,
   STEP_BUDGET_HANDOFF_STEPS,
   STEP_BUDGET_MARKER,
@@ -20,6 +29,7 @@ import {
   effortFloorEarned,
   failingCallKey,
   failureSignature,
+  idleStepsAfter,
   ownerFixableCheckpointFailure,
   parallelToolRun,
   reasoningEffortForStep,
@@ -29,8 +39,14 @@ import {
   repeatedFailuresAfter,
   spendHalt,
   spendWarning,
-  stepBudgetNotice
+  stationaryStepBreak,
+  stationaryStepRun,
+  stationaryStepsBeforeStop,
+  stepBudgetNotice,
+  stepSignature,
+  tombstoneMalformedCall
 } from './turn-bounds.js';
+import { degenerateRepeat } from './streaming.js';
 
 describe('a failure that keeps happening', () => {
   type Call = { name: string; arguments: Record<string, unknown> };
@@ -648,5 +664,431 @@ describe('the reads a batch may run at the same time', () => {
         0
       )
     ).toBe(1);
+  });
+});
+
+/**
+ * The turn that started this whole watch, and the three guards that could all see it happening and
+ * none of which could say so.
+ *
+ * Measured on the owner's box: a byte-identical `set_plan` twelve times running. `set_plan` is not
+ * in `LOOP_ANSWERED_TOOLS`, so every one of those steps started a tool and zeroed the idle count.
+ * Every one of them succeeded, so the failure counter never saw one. And the prose around each call
+ * was different every time, so the repetition watch in `streaming.ts` had nothing to match. Only the
+ * step budget stopped it, at up to a hundred and twenty steps.
+ *
+ * The first three tests below are the negative controls, and they are the reason this describe block
+ * is worth its length: each one asserts that an existing guard does *not* fire on the incident. If
+ * one of them ever starts failing, the guard it names has grown teeth and this one may be able to
+ * shrink.
+ */
+describe('a turn that stopped changing', () => {
+  /**
+   * The record the loop keeps of what actually ran, as `recordToolResult` writes it. The guard reads
+   * it rather than sniffing the tool result's text, because `success` is the one field that already
+   * tells a tool that ran apart from a call the harness answered and a call that threw.
+   */
+  const ran = (messages: readonly ModelMessage[]): Record<string, { success: boolean }> =>
+    Object.fromEntries(
+      messages
+        .flatMap((message) => message.toolCalls ?? [])
+        .map((call) => [call.id, { success: true }] as const)
+    );
+
+  const planArgs = {
+    branchName: 'Main',
+    steps: [
+      { title: 'Read the brief', status: 'completed' },
+      { title: 'Draft the importer', status: 'in_progress' }
+    ]
+  };
+
+  /**
+   * The window the incident wrote, at `repeats` steps.
+   *
+   * The result is the real one: `executePlanTool` answers `set_plan` with `{version, steps}` and the
+   * version rises on every publish. That detail is the trap this guard had to be built around, and
+   * the test below named for it holds the shape in place.
+   */
+  const planSpiral = (
+    repeats: number,
+    prose = (at: number): string => `Refining the plan (${at}).`
+  ) =>
+    Array.from({ length: repeats }, (_, at) => at).flatMap((at): ModelMessage[] => [
+      {
+        role: 'assistant',
+        content: prose(at),
+        toolCalls: [{ id: `call-${at}`, name: 'set_plan', arguments: planArgs }]
+      },
+      {
+        role: 'tool',
+        toolCallId: `call-${at}`,
+        content: JSON.stringify({ version: at + 1, steps: planArgs.steps })
+      }
+    ]);
+
+  it('is invisible to the idle guard, because every one of those steps started a tool', () => {
+    let idle = 0;
+    for (let step = 0; step < 12; step += 1) {
+      const next = idleStepsAfter(idle, { proposed: ['set_plan'], started: 1 });
+      idle = next ?? idle;
+    }
+    expect(idle).toBe(0);
+    expect(idle).toBeLessThan(MAX_IDLE_STEPS);
+  });
+
+  it('is invisible to the failure guard, because every one of those calls succeeded', () => {
+    let failures: Record<string, number> | undefined;
+    for (let step = 0; step < 12; step += 1)
+      failures = repeatedFailuresAfter(failures, {
+        call: failingCallKey({ name: 'set_plan', arguments: planArgs }),
+        failure: null
+      });
+    expect(repeatedFailureRise(undefined, failures)).toBeNull();
+  });
+
+  it('is invisible to the repetition watch, because the prose differs every time', () => {
+    const spoken = planSpiral(12)
+      .filter((message) => message.role === 'assistant')
+      .map((message) => message.content)
+      .join('\n\n');
+    expect(degenerateRepeat(spoken)).toBe('');
+  });
+
+  it('sees the incident, and reaches the stop', () => {
+    const run = stationaryStepRun(planSpiral(12), ran(planSpiral(12)));
+    expect(run?.tools).toEqual(['set_plan']);
+    expect(run?.limit).toBe(MAX_STATIONARY_STEPS);
+    expect(run?.steps).toBeGreaterThanOrEqual(stationaryStepsBeforeStop(MAX_STATIONARY_STEPS));
+  });
+
+  /**
+   * The trap, held open on purpose.
+   *
+   * The obvious build of this guard hashes the *(call, result)* pair for every tool, which is §4.4
+   * #53 read on its own. `set_plan` answers with the version it just created, so on the one incident
+   * the guard exists for the pairs are all different and the guard is silent. That is why the
+   * bookkeeping tier ignores the result, and this test is what stops somebody restoring the
+   * "obvious" version later: it asserts that the pairs really do differ, so the reader can see that
+   * the tier is load-bearing rather than decorative.
+   */
+  it('does not key the bookkeeping tier on the result, because the receipt differs every time', () => {
+    const withReceipts = [1, 2].map((version) =>
+      stepSignature([
+        {
+          name: 'set_plan',
+          arguments: planArgs,
+          result: JSON.stringify({ version, steps: planArgs.steps })
+        }
+      ])
+    );
+    expect(withReceipts[0]).not.toBe(withReceipts[1]);
+    // And the signature the guard actually uses, which does not read the receipt, is the same one.
+    expect(stepSignature([{ name: 'set_plan', arguments: planArgs }])).toBe(
+      stepSignature([{ name: 'set_plan', arguments: planArgs }])
+    );
+  });
+
+  it('holds a run open across a step that only spoke', () => {
+    const spiral = planSpiral(3);
+    const withAnAside: ModelMessage[] = [
+      ...spiral.slice(0, 4),
+      { role: 'assistant', content: 'Let me reconsider the second step before I go on.' },
+      ...spiral.slice(4)
+    ];
+    expect(stationaryStepRun(withAnAside, ran(withAnAside))?.steps).toBe(3);
+  });
+
+  it('breaks the run on the step that finally does something else', () => {
+    const moved: ModelMessage[] = [
+      ...planSpiral(5),
+      {
+        role: 'assistant',
+        content: 'Writing it.',
+        toolCalls: [{ id: 'call-w', name: 'file_write', arguments: { path: 'a.ts', content: 'x' } }]
+      },
+      { role: 'tool', toolCallId: 'call-w', content: '{"ok":true}' }
+    ];
+    expect(stationaryStepRun(moved, ran(moved))).toBeNull();
+  });
+
+  it('says nothing about a healthy turn, or about a step that started nothing', () => {
+    expect(stationaryStepRun(planSpiral(1), ran(planSpiral(1)))).toBeNull();
+    expect(
+      stationaryStepRun(
+        [
+          { role: 'user', content: 'tidy the notes' },
+          { role: 'assistant', content: 'Here is what I found.' }
+        ],
+        {}
+      )
+    ).toBeNull();
+  });
+
+  /**
+   * The acting tier's whole safety property, stated as the pair of cases it has to tell apart.
+   *
+   * `process` and `shell` are how the model is told to watch a build, and `browser_snapshot` and
+   * `desktop_observe` take no arguments at all so every call looks identical. Every one of those is
+   * a legitimate repeat, and every one of them produces a different report - which is why the acting
+   * tier folds the report in and therefore never sees them.
+   */
+  const shellRun = (outputs: readonly string[]): ModelMessage[] =>
+    outputs.flatMap((output, at) => [
+      {
+        role: 'assistant' as const,
+        content: 'Checking.',
+        toolCalls: [{ id: `sh-${at}`, name: 'shell', arguments: { command: 'pnpm test' } }]
+      },
+      { role: 'tool' as const, toolCallId: `sh-${at}`, content: output }
+    ]);
+
+  it('permits a poll whose report keeps changing', () => {
+    const polled = shellRun(['12 passed', '13 passed', '14 passed', '15 passed']);
+    expect(stationaryStepRun(polled, ran(polled))).toBeNull();
+  });
+
+  /**
+   * And counts the shape `MAX_REPEATED_FAILURES` says outright that it cannot see: a command with a
+   * non-zero exit is a tool *result*, not a throw, so a suite re-run twenty times reaches no counter
+   * in that file at all.
+   */
+  it('counts a command that keeps returning the identical failure', () => {
+    const stuck = shellRun(Array.from({ length: 8 }, () => 'exit 1: 3 tests failed'));
+    const run = stationaryStepRun(stuck, ran(stuck));
+    expect(run?.limit).toBe(MAX_STATIONARY_ACTING_STEPS);
+    expect(run?.steps).toBeGreaterThanOrEqual(
+      stationaryStepsBeforeStop(MAX_STATIONARY_ACTING_STEPS)
+    );
+    // Which is a count no other guard in this file reaches on that window.
+    expect(repeatedFailureRise(undefined, undefined)).toBeNull();
+  });
+
+  it('gives a step that touched the computer the looser tier, even beside a bookkeeping call', () => {
+    const mixed = Array.from({ length: 3 }, (_, at) => at).flatMap((at): ModelMessage[] => [
+      {
+        role: 'assistant',
+        content: 'Both.',
+        toolCalls: [
+          { id: `p-${at}`, name: 'set_plan', arguments: planArgs },
+          { id: `r-${at}`, name: 'file_read', arguments: { path: 'a.ts' } }
+        ]
+      },
+      { role: 'tool', toolCallId: `p-${at}`, content: JSON.stringify({ version: at + 1 }) },
+      { role: 'tool', toolCallId: `r-${at}`, content: 'export const a = 1;' }
+    ]);
+    // Three identical acting steps is under the acting tier's limit, and the plan receipt that rises
+    // each time is what keeps them apart at all - so this is below the bar rather than at it.
+    expect(stationaryStepRun(mixed, ran(mixed))).toBeNull();
+  });
+
+  it('matches a result to the step that asked for it, even when ids repeat across steps', () => {
+    // A scripted route that reuses one id: a single map over the window would answer every step with
+    // the newest result and make four identical steps look like four different ones.
+    const reused: ModelMessage[] = Array.from({ length: 8 }, (_, at) => at).flatMap(() => [
+      {
+        role: 'assistant' as const,
+        content: 'again',
+        toolCalls: [{ id: 'call-1', name: 'shell', arguments: { command: 'ls' } }]
+      },
+      { role: 'tool' as const, toolCallId: 'call-1', content: 'a.ts\nb.ts' }
+    ]);
+    expect(stationaryStepRun(reused, ran(reused))?.steps).toBeGreaterThanOrEqual(
+      stationaryStepsBeforeStop(MAX_STATIONARY_ACTING_STEPS)
+    );
+  });
+
+  /**
+   * The clause the eval rig bought, and the two guards it hands those runs back to.
+   *
+   * Without it this fired a second time on the two fixtures that belong to the guards beside it -
+   * `deliberation-that-ignores-the-break-is-stopped` and
+   * `the-same-call-failing-the-same-way-is-stopped` - and cost each of them two extra model calls
+   * restating a sentence the model had already been given, one step later and in worse words.
+   */
+  it('leaves a run of calls that threw to the failure guard', () => {
+    const threw = shellRun(Array.from({ length: 8 }, () => 'Tool failed: connection refused'));
+    const nothingRan = Object.fromEntries(
+      threw
+        .flatMap((message) => message.toolCalls ?? [])
+        .map((call) => [call.id, { success: false }] as const)
+    );
+    expect(stationaryStepRun(threw, nothingRan)).toBeNull();
+    // And the failure guard does see it, which is what makes handing it over rather than
+    // double-reporting it the right thing to do.
+    let failures: Record<string, number> | undefined;
+    const call = { name: 'shell', arguments: { command: 'pnpm test' } };
+    for (let attempt = 0; attempt < 8; attempt += 1)
+      failures = repeatedFailuresAfter(failures, {
+        call: failingCallKey(call),
+        failure: repeatedFailureKey(call, new Error('connection refused'))
+      });
+    expect(repeatedFailureRise(undefined, failures)?.count).toBeGreaterThanOrEqual(
+      REPEATED_FAILURES_BEFORE_STOP
+    );
+  });
+
+  it('leaves a run the harness answered without running to the idle guard', () => {
+    const answered = shellRun(
+      Array.from({ length: 8 }, () => '{"skipped":true,"reason":"the same call as call-0"}')
+    );
+    const nothingRan = Object.fromEntries(
+      answered
+        .flatMap((message) => message.toolCalls ?? [])
+        .map((call) => [call.id, { success: false }] as const)
+    );
+    expect(stationaryStepRun(answered, nothingRan)).toBeNull();
+    // The idle guard does see it: a call the loop answers instead of running starts nothing.
+    let idle = 0;
+    for (let step = 0; step < 8; step += 1)
+      idle = idleStepsAfter(idle, { proposed: ['shell'], started: 0 }) ?? idle;
+    expect(idle).toBeGreaterThanOrEqual(IDLE_STEPS_BEFORE_STOP);
+  });
+
+  it('reads the same action through a different spelling of it', () => {
+    const one = stepSignature([
+      { name: 'file_read', arguments: { path: 'a.ts', lines: 40 } },
+      { name: 'file_read', arguments: { path: 'b.ts', lines: 40 } }
+    ]);
+    // The same two reads proposed in the other order, with the argument keys in the other order.
+    const other = stepSignature([
+      { name: 'file_read', arguments: { lines: 40, path: 'b.ts' } },
+      { name: 'file_read', arguments: { lines: 40, path: 'a.ts' } }
+    ]);
+    expect(other).toBe(one);
+  });
+
+  it('keeps array order, because the order of a plan is the plan', () => {
+    const forwards = stepSignature([{ name: 'set_plan', arguments: { steps: ['read', 'write'] } }]);
+    const backwards = stepSignature([
+      { name: 'set_plan', arguments: { steps: ['write', 'read'] } }
+    ]);
+    expect(backwards).not.toBe(forwards);
+  });
+
+  it('cannot have its field boundary forged by an argument', () => {
+    // Two steps that are only the same step if the rendering lets a value spill across a separator.
+    expect(
+      stepSignature([{ name: 'shell', arguments: { command: 'ls' }, result: 'out' }])
+    ).not.toBe(stepSignature([{ name: 'shell', arguments: { command: 'ls', x: 'out' } }]));
+  });
+
+  it('names the repeated call in the sentence the model is given, and says which tier it is', () => {
+    expect(stationaryStepBreak(6, ['set_plan'])).toContain('NOTHING HAS CHANGED FOR 6 STEPS');
+    expect(stationaryStepBreak(6, ['set_plan'])).toContain('set_plan');
+    expect(stationaryStepBreak(6, ['set_plan'])).not.toContain('identical result');
+    expect(stationaryStepBreak(8, ['shell'])).toContain('identical result');
+  });
+
+  /** Published so the eval harness and the loop cannot start meaning different things by it. */
+  it('publishes its marker, and it is neither a prefix of the idle break nor prefixed by it', () => {
+    const marker = PUSHBACK_MARKERS.find(([name]) => name === 'stationary_stop')?.[1];
+    expect(marker).toBeTruthy();
+    expect(stationaryStepBreak(6, ['set_plan']).startsWith(marker ?? 'x')).toBe(true);
+    const idle = PUSHBACK_MARKERS.find(([name]) => name === 'idle_break')?.[1] ?? '';
+    expect(marker?.startsWith(idle)).toBe(false);
+    expect(idle.startsWith(marker ?? 'x')).toBe(false);
+  });
+
+  /**
+   * The three tools taken out of the bookkeeping tier, and why the subtraction is not arbitrary:
+   * each already carries a per-turn ceiling at or below this guard's, so counting them here would
+   * only restate a sentence the model already has, one step later and in worse words.
+   */
+  it('leaves the tools that already have a ceiling of their own to those ceilings', () => {
+    expect(BOOKKEEPING_TOOLS.has('set_plan')).toBe(true);
+    expect(BOOKKEEPING_TOOLS.has('set_acceptance')).toBe(true);
+    for (const owned of ['finish', 'ask', 'notify'])
+      expect(BOOKKEEPING_TOOLS.has(owned)).toBe(false);
+    expect(
+      Math.min(MAX_FINISH_REJECTIONS, MAX_QUESTIONS_PER_TURN, MAX_NOTICES_PER_TURN)
+    ).toBeLessThan(MAX_STATIONARY_STEPS);
+  });
+});
+
+/**
+ * The payload that would not parse, and the three costs of answering it in the real history.
+ *
+ * A response cut off mid-JSON at the output cap is answered rather than dropped, because a tool call
+ * with no tool result is a malformed turn the provider refuses on the next step. What was never
+ * done was taking the unparseable bytes back out: `rawArguments` carries the whole of a half-written
+ * file, and it is undeclared on `ModelMessage.toolCalls`, so the compiler could not see it and
+ * nothing between the push and the encrypted write ever dropped it.
+ */
+describe('the payload that would not parse', () => {
+  /** The shape the adapter actually pushes: three declared fields and three undeclared ones. */
+  const truncated = (bytes: number): ModelMessage[] => [
+    { role: 'user', content: 'write the importer' },
+    {
+      role: 'assistant',
+      content: 'Writing it now.',
+      toolCalls: [
+        {
+          id: 'call-1',
+          name: 'file_write',
+          arguments: {},
+          parseFailed: true,
+          argumentsTruncated: true,
+          rawArguments: `{"path":"workspace/importer.py","content":"${'x'.repeat(bytes)}`
+        } as ModelMessage['toolCalls'] extends (infer T)[] | undefined ? T : never
+      ]
+    },
+    {
+      role: 'tool',
+      toolCallId: 'call-1',
+      content: 'The arguments for file_write were cut off at the model output limit.'
+    }
+  ];
+
+  it('takes the unparseable bytes out and reports how many there were', () => {
+    const messages = truncated(40_000);
+    const dropped = tombstoneMalformedCall(messages, 'call-1');
+    expect(dropped).toBeGreaterThan(40_000);
+    expect(JSON.stringify(messages)).not.toContain('xxxxxxxxxx');
+    expect(JSON.stringify(messages)).not.toContain('rawArguments');
+    expect(JSON.stringify(messages)).not.toContain('parseFailed');
+  });
+
+  it('leaves the call standing, so the turn is still a shape a provider will take', () => {
+    const messages = truncated(2_000);
+    tombstoneMalformedCall(messages, 'call-1');
+    const call = messages.find((message) => message.role === 'assistant')?.toolCalls?.[0];
+    expect(call).toEqual({ id: 'call-1', name: 'file_write', arguments: {} });
+    // Every tool call in the window still has a result, which is the property the whole branch
+    // exists to preserve.
+    const answered = new Set(
+      messages.filter((message) => message.role === 'tool').map((message) => message.toolCallId)
+    );
+    for (const message of messages)
+      for (const proposed of message.toolCalls ?? []) expect(answered.has(proposed.id)).toBe(true);
+  });
+
+  /**
+   * The cost nobody had named, and the reason this is worth doing rather than merely tidy.
+   *
+   * `estimatedTokens` in context.ts sizes an assistant message with
+   * `JSON.stringify(message.toolCalls).length`, and that walks `rawArguments`. The adapter sends
+   * none of it - `openai-compatible.ts` serialises `id`, `name` and `JSON.stringify(arguments)`, and
+   * `arguments` is `{}` on this path - so one cut-off write charged the window thousands of tokens
+   * that no provider would ever see, and the compaction trigger is derived from that number. The
+   * turn condensed away real history to make room for bytes that do not exist on the wire.
+   */
+  it('stops the window being sized from bytes the wire never carries', () => {
+    const messages = truncated(40_000);
+    const assistant = messages.find((message) => message.role === 'assistant');
+    const measured = (): number => JSON.stringify(assistant?.toolCalls).length;
+    const before = measured();
+    // Four thousand tokens on the estimator's own characters-over-four, against a request that
+    // carries the two-character string "{}".
+    expect(Math.ceil(before / 4)).toBeGreaterThan(4_000);
+    tombstoneMalformedCall(messages, 'call-1');
+    expect(measured()).toBeLessThan(before / 100);
+  });
+
+  it('changes nothing when the id belongs to no call in the window', () => {
+    const messages = truncated(100);
+    const before = JSON.stringify(messages);
+    expect(tombstoneMalformedCall(messages, 'call-elsewhere')).toBe(0);
+    expect(JSON.stringify(messages)).toBe(before);
   });
 });

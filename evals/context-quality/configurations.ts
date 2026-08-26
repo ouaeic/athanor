@@ -190,7 +190,23 @@ export const CONFIGURATIONS: readonly ContextConfiguration[] = [
       OLDER_TOOL_OUTPUT_CHARS: 120,
       COMPACTED_TOOL_ARGUMENT_CHARS: 40,
       RECENT_TOOL_OUTPUT_CHARS: 300,
-      MAX_BRIEF_SECTION_CHARS: 400
+      MAX_BRIEF_SECTION_CHARS: 400,
+      /*
+       * Added when the anchor index landed, and the rig's own furniture guard is why.
+       *
+       * The anchor index is a model-free regex harvest of exact identifiers out of the span a
+       * compaction is about to drop, appended to the brief section AFTER its bound - deliberately,
+       * so a long summary can never crowd the identifiers out. That means no bound this row
+       * already sets can reach it, and with the paths surviving everywhere the artifact column
+       * read 5.00 in every configuration of every trajectory: a saturated column, which the guard
+       * in run.ts correctly refuses to accept as evidence, because a column that cannot move looks
+       * identical whether the mechanism works or the probe has stopped reading the window.
+       *
+       * This row is "the destructive end of every window mechanism at once", and a new mechanism
+       * arrived that it did not touch. Zeroing the budget is that end for this one. It restores
+       * the contrast the column is read for - 5.00 against 3.00 on both compacted trajectories.
+       */
+      ANCHOR_INDEX_CHARS: 0
     }
   }
 ];

@@ -28,11 +28,12 @@
  * happened to be next". A script that reads the pushback can, and the step count it produces is
  * then the measured price of that hold.
  */
-import { writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { ModelRelease } from '../packages/contracts/src/index.js';
+import type { ModelRelease, SpendDecision } from '../packages/contracts/src/index.js';
 import {
   decryptJson,
   encryptJson,
@@ -55,6 +56,7 @@ import type {
   WorkspaceSkillRecord
 } from '../packages/data/src/index.js';
 import { AgentWorker, PUSHBACK_MARKERS, type PushbackName } from '../apps/worker/src/agent.js';
+import { buildIdentity } from '../apps/worker/src/build-identity.js';
 import {
   COMPRESSED_TRAJECTORY_MARKER,
   RUNTIME_CONTEXT_MARKER
@@ -99,6 +101,65 @@ const CHECKOUT_ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$
     (skill as { directory: string }).directory = `${NORMALISED_SKILL_ROOT}/${skill.name}`;
   (library as { root: string }).root = NORMALISED_SKILL_ROOT;
 })();
+
+/* ------------------------------------------------------------- what produced a number, exactly */
+
+/**
+ * Which athanor, and which rig, a row was measured by.
+ *
+ * A trajectory is a log until somebody can re-run it and get the same numbers, and until this
+ * existed nothing in the output of `pnpm eval` said what it was the output *of*. A baseline diff a
+ * year from now reads "435 model calls became 441" with no way to tell a change in the loop from a
+ * change in the fixtures that measure it, and no way to check out the tree that produced either.
+ *
+ * Two halves, because they answer two different questions and move for different reasons.
+ *
+ * `version` and `commit` come from `buildIdentity()`, which is the same pair the box reports to its
+ * owner - `apps/api/src/routes/relay.ts` serves it and `apps/worker/src/index.ts` logs it - so a row
+ * here names a revision somebody can check out. It is read out of git's own files rather than by
+ * running git; see `build-identity.ts` for why. A worktree with nothing committed answers null, and
+ * null is reported as null rather than as a string that looks like a revision.
+ *
+ * `harness` is a digest of this rig's own three source files. It has to be derived rather than
+ * declared: a hand-maintained version number is a control wired to nothing the first time somebody
+ * edits a fixture and forgets it, and this suite has been burned by exactly that shape more than
+ * once. It moves on any edit to the harness, the fixtures or the report, which is the point - those
+ * three files decide every number the suite prints, so a baseline accepted under a different digest
+ * was accepted by a different instrument. That is a note in the report and never a failure: it is
+ * ordinary for a wave to add a fixture and re-accept, and a gate that fires on every commit is one
+ * somebody deletes.
+ */
+export interface RunIdentity {
+  readonly version: string;
+  readonly commit: string | null;
+  readonly harness: string;
+}
+
+const RIG_SOURCES: readonly string[] = ['harness.ts', 'fixtures.ts', 'report.ts'];
+
+const harnessDigest = (): string => {
+  try {
+    const hash = createHash('sha256');
+    // A separator that cannot occur in TypeScript source, so two files whose contents were shifted
+    // across the boundary between them do not hash the same.
+    for (const file of RIG_SOURCES)
+      hash.update(`${readFileSync(new URL(file, import.meta.url), 'utf8')}\0`);
+    return hash.digest('hex').slice(0, 12);
+  } catch {
+    // Nothing about a provenance stamp is worth failing a suite for. Named as the absence it is,
+    // rather than as a plausible-looking digest.
+    return 'unreadable';
+  }
+};
+
+let stampedIdentity: RunIdentity | null = null;
+
+/** Worked out once: a suite that re-read this per fixture would measure the filesystem. */
+export const runIdentity = (): RunIdentity =>
+  (stampedIdentity ??= { ...buildIdentity(), harness: harnessDigest() });
+
+export const identityLabel = (identity: RunIdentity): string =>
+  `athanor ${identity.version} at ${identity.commit ?? 'an uncommitted tree'}, rig ${identity.harness}`;
 
 const masterKey = Buffer.alloc(32, 5);
 const runnerSecret = 'r'.repeat(48);
@@ -1177,6 +1238,20 @@ export interface Expectation {
   readonly untrusted?: boolean;
   /** How many separate replies the owner sees. One answer should arrive as one bubble. */
   readonly replies?: number;
+  /**
+   * How many of this turn's memory uses were recorded as cited.
+   *
+   * There is no fixture in this file for which the true answer is anything but 0 today, and that is
+   * the finding rather than the default: see `RunOutcome.memoryCitations`. A row asserting a
+   * positive number is a pending row and says what would have to change to make it pass.
+   */
+  readonly memoryCitations?: number;
+  /** Provider calls sent after the spending guard refused one. Only ever asserted as 0. */
+  readonly modelCallsAfterSpendHalt?: number;
+  /** Whether the pause this turn wrote was stamped `spendPausedAt` rather than left ordinary. */
+  readonly spendPaused?: boolean;
+  /** Every spending sentence the owner was shown, in order, exactly. */
+  readonly spendNotices?: readonly string[];
 }
 
 /**
@@ -1256,6 +1331,76 @@ export interface FixtureSkill {
   readonly pinned?: boolean;
 }
 
+/**
+ * A spending cap the guard is answering against, and the step at which each arm starts.
+ *
+ * `daily` and `monthly` are the two windows that reach `claimSpendAlert` and the notification the
+ * owner actually receives; `task` deliberately does not, and a fixture that names it is measuring a
+ * shorter path. The fixtures below use `daily` for that reason.
+ */
+export interface FixtureSpend {
+  readonly window: 'task' | 'daily' | 'monthly';
+  /** Money the provider has already billed against this window. */
+  readonly spentUsd: number;
+  readonly capUsd: number;
+  /** The answered provider call from which the guard warns, counting from zero. */
+  readonly warnFrom?: number;
+  /** The answered provider call from which the guard denies. Beats `warnFrom` where both apply. */
+  readonly denyFrom?: number;
+}
+
+/**
+ * The guard's answer at a given point in the turn, in the shape `spendGuard` returns.
+ *
+ * Built here rather than declared per fixture because `spendHalt` and `spendWarning` both read the
+ * window out of `windows` by name: a decision that names a window it does not carry falls through
+ * to their "no cap" branch and the fixture would then be asserting the wrong sentence, green.
+ */
+const spendDecisionAt = (
+  spend: FixtureSpend | undefined,
+  answeredCalls: number
+): SpendDecision & { readonly outcome: 'allow' | 'warn' | 'deny' } => {
+  const outcome: 'allow' | 'warn' | 'deny' =
+    spend === undefined
+      ? 'allow'
+      : spend.denyFrom !== undefined && answeredCalls >= spend.denyFrom
+        ? 'deny'
+        : spend.warnFrom !== undefined && answeredCalls >= spend.warnFrom
+          ? 'warn'
+          : 'allow';
+  if (!spend || outcome === 'allow')
+    return {
+      outcome: 'allow',
+      estimateUsd: 0,
+      blockedBy: null,
+      warnedBy: [],
+      reason: null,
+      windows: []
+    };
+  return {
+    outcome,
+    estimateUsd: 0.01,
+    blockedBy: outcome === 'deny' ? spend.window : null,
+    warnedBy: outcome === 'warn' ? [spend.window] : [],
+    reason: null,
+    windows: [
+      {
+        name: spend.window,
+        spentUsd: spend.spentUsd,
+        pendingUsd: 0,
+        capUsd: spend.capUsd,
+        warnAtUsd: spend.capUsd * 0.8,
+        projectedUsd: spend.spentUsd + 0.01,
+        state: outcome === 'deny' ? 'exceeded' : 'warning',
+        // A window occurrence, which is the primary key `claimSpendAlert` de-duplicates on. Fixed
+        // for the run so a warn asked for twice is asked about the same day twice.
+        startsAt: spend.window === 'task' ? null : '2026-07-01T00:00:00.000Z',
+        endsAt: spend.window === 'task' ? null : '2026-07-02T00:00:00.000Z'
+      }
+    ]
+  };
+};
+
 export interface Fixture {
   readonly id: string;
   readonly shape: FixtureShape;
@@ -1319,6 +1464,22 @@ export interface Fixture {
     readonly maxInputUsdPerMillionTokens: number;
     readonly maxOutputUsdPerMillionTokens: number;
   };
+  /**
+   * The running spending cap, as the guard answers it, and from which step it starts to bite.
+   *
+   * Absent means the guard allows everything, which is what every other row here is - and which is
+   * what every row here was, hardcoded, for the whole life of this rig. Two of `spendGuard`'s three
+   * arms were therefore unreachable from this suite: the warn arm, which narrates once per window
+   * and carries on, and the deny arm, which pauses the task, stamps `spendPausedAt` and must send
+   * nothing further to the provider. The daily ceiling is the one bound in this product that spends
+   * the owner's money while they are asleep and stops on its own, and until now the only thing
+   * standing under it was a unit test over a store method.
+   *
+   * Stated as "from which answered provider call", because the guard runs once per step, before the
+   * request: a turn where the cap is crossed at step four is the shape that has to be measured, not
+   * one that was over before it began.
+   */
+  readonly spend?: FixtureSpend;
   /**
    * A clock that runs faster than the wall, for the bounds that are measured in time.
    *
@@ -1578,6 +1739,34 @@ export interface RunOutcome {
    * True for a turn of a single step, which never had a preamble to keep.
    */
   readonly anchorHeld: boolean;
+  /**
+   * How many `recordMemoryUse` calls this turn made claiming the item was cited in the answer.
+   *
+   * The numerator of the salience formula's citation term, measured at the only place a fixture can
+   * see it. See the stub's own note: no production caller passes `cited`, so this is 0 on every
+   * fixture in this file, and a fixture that says otherwise is stating a target rather than a fact.
+   */
+  readonly memoryCitations: number;
+  /**
+   * Provider calls the turn sent after the spending guard refused one, which must be nought.
+   *
+   * The assertion the deny arm is actually for. `status: 'paused'` says the loop wrote the right
+   * row; this says it stopped spending, which is the only part of a ceiling the owner is paying
+   * for. Reported as `-1` when the guard never denied, so "no halt" cannot be mistaken for "halted
+   * cleanly" by a fixture that asserts 0.
+   */
+  readonly modelCallsAfterSpendHalt: number;
+  /** Whether the pause the turn wrote was stamped `spendPausedAt`, which is what tells it apart. */
+  readonly spendPaused: boolean;
+  /**
+   * Every sentence the owner is shown about a spending window, in order.
+   *
+   * Read structurally, off the `windows` array a spend event carries in its payload, rather than
+   * off the wording - `spendHalt` and `spendWarning` own the sentence and both have a silent "no
+   * cap" branch, so a fixture matching on prose would go green against the branch that says the
+   * least.
+   */
+  readonly spendNotices: readonly string[];
   readonly holds: readonly HoldName[];
   /** What the loop actually said back, in full, for the runs that need explaining. */
   readonly pushback: readonly string[];
@@ -1857,6 +2046,11 @@ const schemaOutcome = (findings: readonly string[]): RunOutcome => ({
   outputTokens: 0,
   creditsSpent: 0,
   checkoutPathLeaks: 0,
+  memoryCitations: 0,
+  // Never halted, which is not the same statement as halted and then quiet; see the field.
+  modelCallsAfterSpendHalt: -1,
+  spendPaused: false,
+  spendNotices: [],
   holds: [],
   pushback: [],
   status: 'completed',
@@ -1884,6 +2078,19 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   let fallbackPlan = false;
   /** The one `mem.pack` row this task ever has, written once and read back from then on. */
   let memoryPack: Record<string, unknown> | null = null;
+  /** Every `recordMemoryUse` this turn made, and whether it claimed the item was cited. */
+  const memoryUses: Array<{ items: number; cited: boolean }> = [];
+  /** Window occurrences already alerted on, so the ledger de-duplicates as the real one does. */
+  const spendAlerts = new Set<string>();
+  /**
+   * The provider calls already answered when the spending guard first said no.
+   *
+   * Null until it does. The guard runs at the top of a step, before that step's request, so this is
+   * also the count the turn must end on: anything after it is a request sent past a ceiling.
+   */
+  let spendHaltedAfter: number | null = null;
+  /** Whether any write to the task carried `spendPausedAt`, which is what a spend pause is. */
+  let spendPaused = false;
   /*
    * What this workspace remembers, sealed once, the way the writers seal it.
    *
@@ -1982,6 +2189,10 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     taskClaim: async () => ({ status: task.status, leaseOwner: task.leaseOwner ?? null }),
     updateTask: async (input: Record<string, unknown>) => {
       if (typeof input.status === 'string') finalStatus = input.status;
+      // The column that separates a pause the ceiling imposed from one the owner asked for. An
+      // ordinary pause leaves it null on purpose, so `!= null` is the whole distinction and a
+      // truthiness test on a Date would read the same either way.
+      if (input.spendPausedAt !== undefined && input.spendPausedAt !== null) spendPaused = true;
       return task;
     },
     renewTaskLease: async () => true,
@@ -2012,14 +2223,35 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       version: 1
     }),
     mediaSpendForTask: async () => 0,
-    spendGuard: async () => ({
-      outcome: 'allow' as const,
-      estimateUsd: 0,
-      blockedBy: null,
-      warnedBy: [],
-      reason: null,
-      windows: []
-    }),
+    // The running spending cap, answering as `Fixture.spend` declares and as `allow` when nothing
+    // does. Hardcoded to `allow` for the life of this rig, which is why two of its three arms had
+    // no behavioural fixture at all; see `FixtureSpend`.
+    spendGuard: async () => {
+      const decision = spendDecisionAt(fixture.spend, answeredCalls);
+      if (decision.outcome === 'deny' && spendHaltedAfter === null) spendHaltedAfter = modelCalls;
+      return decision;
+    },
+    /*
+     * The alert ledger the halt and the warning both write through, and the reason this line is
+     * here rather than left out with the rest of billing.
+     *
+     * `#raiseSpendAlert` calls `this.store.claimSpendAlert(...)` and then attaches `.catch()`. A
+     * method this stub does not answer is `undefined`, so the call throws a TypeError before there
+     * is a promise for that catch to be attached to - the guard's whole deny arm would have escaped
+     * the loop as a run-level error rather than reaching the pause it exists to perform. The `task`
+     * window never gets this far (`#raiseSpendAlert` skips any window but daily and monthly), so a
+     * fixture on the task ceiling would have passed over the hole.
+     *
+     * True once per window occurrence per level, which is what the real one returns: the primary
+     * key is the occurrence, so a threshold crossed at step four is claimed once however many steps
+     * follow it.
+     */
+    claimSpendAlert: async (input: { windowName: string; level: string }) => {
+      const occurrence = `${input.windowName}:${input.level}`;
+      if (spendAlerts.has(occurrence)) return false;
+      spendAlerts.add(occurrence);
+      return true;
+    },
     effectiveSpendLimits: async () => ({
       timeZone: 'Europe/London',
       ...(fixture.priceCeiling ?? {})
@@ -2107,7 +2339,25 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       recorded: (input.failed ?? []).map((item) => asText(item.id)),
       retired: []
     }),
-    recordMemoryUse: async () => 0,
+    /*
+     * What the turn told the store about the items it was handed, and the one field of it nobody
+     * writes.
+     *
+     * `mem.item.cited_count` is a term of the salience formula - `0.20 *` the standardised citation
+     * count, in `packages/data/src/store/memory.ts` - and `recordMemoryUse` is the only writer of
+     * it, behind `cited`. Both production callers are in `apps/worker/src/memory-runtime.ts` and
+     * neither passes it: the recall path deliberately records `outcome: 'unknown'` at injection
+     * time, and `recordMemoryPackOutcome` grades the pack at verification with no citation of any
+     * kind. So the column is 0 for every item in every workspace that has ever run, a fifth of the
+     * salience score is a constant, and nothing anywhere went red about it.
+     *
+     * Counted here so that a fixture can say what it expects and be wrong out loud. This is the
+     * observation, not the repair - the writer belongs to whoever owns `memory-runtime.ts`.
+     */
+    recordMemoryUse: async (input: { itemIds?: readonly string[]; cited?: boolean }) => {
+      memoryUses.push({ items: input.itemIds?.length ?? 0, cited: input.cited === true });
+      return 0;
+    },
     recordWorkspaceCheckpoint: async (input: Record<string, unknown>) => input,
     deleteWorkspaceCheckpoints: async () => 0,
     completeTaskIfNoQueued: async () => {
@@ -2129,6 +2379,22 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   // in nor the catalogue it was offered.
   let lastAgentRequest: Record<string, unknown> = {};
   let previousBytes = '';
+  /**
+   * Where a trajectory is written, read once at the top of the run.
+   *
+   * Read here rather than at the end so the recording below is switched by the same value the write
+   * is: a variable read twice out of the environment is two decisions that can disagree, and the
+   * disagreement here would be a run that paid for the record and then did not write it.
+   */
+  const dumpDirectory = process.env.EVAL_DUMP_WINDOW;
+  /** Every provider request of this run, in order, kept only when the trajectory was asked for. */
+  const recordedRequests: Array<{
+    call: number;
+    kind: 'step' | 'compaction' | 'vision' | 'specialist';
+    model: string;
+    catalogue: string[];
+    messages: Array<{ role: string; content: string }>;
+  }> = [];
   /**
    * The previous step's messages, one serialised string each, and how many leading system messages
    * it opened with. Only the previous one is kept, for the same reason `previousBytes` is: the
@@ -2226,6 +2492,31 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       // A specialist's request carries a catalogue and no `finish`; see ScriptContext.delegated.
       const delegated =
         catalogue.length > 0 && !catalogue.some((tool) => asText(tool.function?.name) === 'finish');
+      /*
+       * The whole trajectory, request by request, when somebody has asked for it.
+       *
+       * Only under `EVAL_DUMP_WINDOW`, and the condition is load-bearing rather than tidiness: a
+       * forty-step fixture sends forty windows of up to a megabyte each, and the reason this rig
+       * keeps only the last one is that holding them all measures this process's heap instead of
+       * the loop. Opting in leaves every committed number produced by the same code path it always
+       * was, and pays the memory only on the run that wants the record.
+       *
+       * Every request, not only the steps. A compaction's summarising call, a vision handoff and a
+       * specialist's own steps are all provider calls the owner is billed for and all of them shape
+       * what the next step sees; a record that skipped them would explain a step count it could not
+       * reproduce. Each is labelled with the same classification the counters above use, so the
+       * dump and the numbers cannot disagree about what a call was.
+       */
+      if (dumpDirectory)
+        recordedRequests.push({
+          call: modelCalls,
+          kind: summarising ? 'compaction' : vision ? 'vision' : delegated ? 'specialist' : 'step',
+          model: asText(body.model),
+          catalogue: catalogue.map((tool) => asText(tool.function?.name)),
+          messages: ((body.messages ?? []) as Array<{ role?: unknown; content?: unknown }>).map(
+            (message) => ({ role: asText(message.role), content: contentOf(message) })
+          )
+        });
       if (delegated) {
         delegatedCalls += 1;
         const bytes = promptBytes(body);
@@ -2456,20 +2747,31 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   ).map((message) => ({ role: asText(message.role), content: contentOf(message) }));
 
   /*
-   * The assembled window, on demand, which is the one thing this rig could not show.
+   * The whole trajectory, on demand, which is the one thing this rig could not show.
    *
-   * `EVAL_DUMP_WINDOW=<directory> pnpm eval --filter <id>` writes what the last step of the turn
-   * actually sent. Nothing asserts on it and nothing reads it back; it exists because every
-   * question worth asking of this suite - why did that row move by twenty tokens, is the knowledge
-   * block really in there, did the brief land last - was previously answerable only by editing the
-   * harness, and a diagnostic that has to be built each time is one nobody builds.
+   * `EVAL_DUMP_WINDOW=<directory> pnpm eval --filter <id>` writes what the turn actually sent.
+   * Nothing asserts on it and nothing reads it back; it exists because every question worth asking
+   * of this suite - why did that row move by twenty tokens, is the knowledge block really in there,
+   * did the brief land last - was previously answerable only by editing the harness, and a
+   * diagnostic that has to be built each time is one nobody builds.
+   *
+   * It used to hold the last step alone, which is a log: it says where the turn ended and nothing
+   * about how it got there, so the two questions this suite exists to answer - which step first
+   * differed, and what did the model see when it decided - could be asked of it and not answered.
+   * `requests` is now every provider call in order, and `identity` names the athanor and the rig
+   * that produced them. Those two together are what makes a run reproducible by somebody who was
+   * not at this machine: check the revision out, hold the fixture beside it, send the same bytes.
    */
-  const dumpDirectory = process.env.EVAL_DUMP_WINDOW;
   if (dumpDirectory)
     writeFileSync(
       path.join(dumpDirectory, `${fixture.id}.json`),
       `${JSON.stringify(
         {
+          fixture: fixture.id,
+          // The version, the revision and the digest of the three files that decide every number
+          // below. See `runIdentity`.
+          identity: runIdentity(),
+          recordedAt: new Date().toISOString(),
           catalogue: (
             (lastAgentRequest.tools ?? []) as Array<{ function?: { name?: unknown } }>
           ).map((tool) => asText(tool.function?.name)),
@@ -2481,6 +2783,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
           // against one step later. A single peak says whether a turn fitted; the sequence says
           // where it was heading and which threshold it settled against.
           windowTokens: windows.map((context) => Number(context.estimatedInputTokens) || 0),
+          requests: recordedRequests,
           messages: lastWindow
         },
         null,
@@ -2555,6 +2858,14 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     ),
     creditsSpent: Number(billed.at(-1)?.cumulativeCredits) || 0,
     checkoutPathLeaks,
+    memoryCitations: memoryUses.filter((use) => use.cited).length,
+    modelCallsAfterSpendHalt: spendHaltedAfter === null ? -1 : modelCalls - spendHaltedAfter,
+    spendPaused,
+    // Every event whose payload carries the guard's own `windows` array: the warning at the soft
+    // threshold and the status line at the hard one, and nothing else in the loop writes one.
+    spendNotices: events
+      .filter((entry) => Array.isArray((entry.payload as { windows?: unknown })?.windows))
+      .map((entry) => entry.summary),
     ...holdsIn([...everyMessage]),
     status: finalStatus,
     verification:

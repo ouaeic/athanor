@@ -9,11 +9,39 @@
  */
 import {
   HOLD_ORDER,
+  identityLabel,
+  runIdentity,
   type Expectation,
   type Fixture,
   type HoldName,
   type RunOutcome
 } from './harness.js';
+
+/**
+ * What the committed numbers were measured by, written into the file beside them.
+ *
+ * Kept under a key no fixture id can collide with - ids are lower-case words and hyphens, and
+ * `evals/run.ts` reads the file only by fixture id, so this row is invisible to every lookup that
+ * matters. That is deliberate: a separate provenance file is a file that goes stale on its own, and
+ * a nested `{stamp, rows}` shape would be a format change in a file another lane owns the reader
+ * of.
+ *
+ * What it buys is the question a baseline diff could never answer. "435 model calls became 441" is
+ * unreadable a year later without knowing which athanor and which rig produced each half; with this
+ * both are a `git checkout` away. `harness` is the digest of the three files that decide every
+ * number in this file, so a baseline accepted under a different digest was accepted by a different
+ * instrument - reported as a note, never as a failure, because adding a fixture legitimately moves
+ * it and a gate that fires on every commit is one somebody deletes.
+ */
+export const BASELINE_STAMP_KEY = '$stamp';
+
+export interface BaselineStamp {
+  /** When `--accept` was run. Prose, for a reader; nothing compares it. */
+  readonly acceptedAt: string;
+  readonly version: string;
+  readonly commit: string | null;
+  readonly harness: string;
+}
 
 export interface Baseline {
   readonly [id: string]: {
@@ -31,6 +59,23 @@ export interface Baseline {
     readonly cachePrefix?: number;
   };
 }
+
+/**
+ * The stamp out of a parsed baseline, or null.
+ *
+ * Validated field by field rather than cast, because it arrives from a file: a stamp half-written
+ * by an interrupted `--accept`, or hand-edited, would otherwise print as a revision that never
+ * existed - which is worse than printing nothing, because somebody would try to check it out.
+ */
+export const stampOf = (baseline: Baseline): BaselineStamp | null => {
+  const row = (baseline as Record<string, unknown>)[BASELINE_STAMP_KEY];
+  if (typeof row !== 'object' || row === null) return null;
+  const { acceptedAt, version, commit, harness } = row as Record<string, unknown>;
+  if (typeof acceptedAt !== 'string' || typeof version !== 'string') return null;
+  if (typeof harness !== 'string') return null;
+  if (commit !== null && typeof commit !== 'string') return null;
+  return { acceptedAt, version, commit, harness };
+};
 
 export interface Result {
   readonly fixture: Fixture;
@@ -142,6 +187,28 @@ export const check = (
       `output tokens the ledger recorded: expected at least ${expect.minOutputTokens}, got ${outcome.outputTokens}`
     );
   compare('the owner’s own words survived', expect.ownerMessageIntact, outcome.ownerMessageIntact);
+  compare(
+    'memory uses this turn recorded as cited in the answer',
+    expect.memoryCitations,
+    outcome.memoryCitations
+  );
+  // Phrased so the -1 reading says what it is. A fixture asserting 0 here is asserting that a halt
+  // happened AND that nothing followed it; a run where the guard never denied has not met that.
+  if (expect.modelCallsAfterSpendHalt !== undefined)
+    failures.push(
+      ...(outcome.modelCallsAfterSpendHalt < 0
+        ? ['the spending guard never refused a call, so there was no halt to send nothing after']
+        : outcome.modelCallsAfterSpendHalt === expect.modelCallsAfterSpendHalt
+          ? []
+          : [
+              `provider calls sent after the spending halt: expected ${expect.modelCallsAfterSpendHalt}, got ${outcome.modelCallsAfterSpendHalt}`
+            ])
+    );
+  compare('the pause was stamped as a spending pause', expect.spendPaused, outcome.spendPaused);
+  if (expect.spendNotices && !same(expect.spendNotices, outcome.spendNotices))
+    failures.push(
+      `spending sentences shown to the owner: expected [${expect.spendNotices.join(' | ')}], got [${outcome.spendNotices.join(' | ')}]`
+    );
   if (expect.mediaModels && !same(expect.mediaModels, outcome.mediaModels))
     failures.push(
       `media models asked of the provider: expected [${expect.mediaModels.join(', ')}], got [${outcome.mediaModels.join(', ')}]`
@@ -324,6 +391,28 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
   // every number on that row and makes the table unreadable exactly when something has gone wrong.
   const width = results.reduce((widest, result) => Math.max(widest, result.fixture.id.length), 7);
 
+  /*
+   * Who is asking, and who the committed numbers belong to.
+   *
+   * Printed at the top of every run rather than only when they differ, because the value of a
+   * provenance line is that it is in the scrollback of the run somebody later has questions about.
+   * The mismatch note underneath is a note: a wave that adds a fixture moves the rig digest by
+   * design, and the intended answer is `--accept` in the same commit, not a red run.
+   */
+  const identity = runIdentity();
+  const stamp = stampOf(baseline);
+  lines.push('');
+  lines.push(`This run: ${identityLabel(identity)}.`);
+  lines.push(
+    stamp
+      ? `Baseline: accepted ${stamp.acceptedAt.slice(0, 10)} by ${identityLabel(stamp)}.`
+      : 'Baseline: unstamped - accept it once to record what measured it.'
+  );
+  if (stamp && (stamp.commit !== identity.commit || stamp.harness !== identity.harness))
+    lines.push(
+      'Note: the committed numbers were measured by a different revision of athanor or of this rig. A row that moved may have moved for that reason.'
+    );
+
   lines.push('');
   lines.push(
     `     ${pad('fixture', width)} ${pad('shape', 10)} ${padStart('steps', 5)} ${padStart('Δ', 5)} ${padStart('tokens', 8)} ${padStart('Δ', 8)} ${padStart('peak', 8)} ${padStart('cached', 6)} ${padStart('Δ', 5)} holds`
@@ -408,16 +497,26 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
   return lines.join('\n');
 };
 
-export const baselineFrom = (results: readonly Result[]): Baseline =>
-  Object.fromEntries(
-    [...results]
-      .sort((left, right) => left.fixture.id.localeCompare(right.fixture.id))
-      .map((result) => [
-        result.fixture.id,
-        {
-          modelCalls: result.outcome.modelCalls,
-          promptTokens: result.outcome.promptTokens,
-          cachePrefix: result.outcome.cachePrefix
-        }
-      ])
-  );
+export const baselineFrom = (results: readonly Result[]): Baseline => {
+  const identity = runIdentity();
+  const stamp: BaselineStamp = { acceptedAt: new Date().toISOString(), ...identity };
+  return {
+    // First, so a reader opening the file sees what produced it before the numbers. The cast is
+    // the one place the stamp and the rows share a map: `Baseline`'s index signature describes a
+    // row, and widening it to a union would push a narrow onto `evals/run.ts`, whose reader this
+    // lane does not own. Nothing reads this key back except `stampOf`, which validates it.
+    ...({ [BASELINE_STAMP_KEY]: stamp } as unknown as Baseline),
+    ...Object.fromEntries(
+      [...results]
+        .sort((left, right) => left.fixture.id.localeCompare(right.fixture.id))
+        .map((result) => [
+          result.fixture.id,
+          {
+            modelCalls: result.outcome.modelCalls,
+            promptTokens: result.outcome.promptTokens,
+            cachePrefix: result.outcome.cachePrefix
+          }
+        ])
+    )
+  };
+};

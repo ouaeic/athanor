@@ -1,6 +1,6 @@
 /**
- * The two questions a turn asks between steps: has the owner said something, and is this run still
- * the one in charge?
+ * The three questions a turn asks between steps: has the owner said something, is this run still the
+ * one in charge, and is the request about to go out the one this turn's own log accounts for?
  *
  * Lifted out of `AgentWorker.run` in Wave 7.2 carrying #140 (rel F10). `honorUserControl` read
  * status alone, so it could see a Stop and could not see a task that had been resumed out from
@@ -12,6 +12,7 @@
  */
 import { decryptJson, encryptJson } from '@athanor/core';
 import type { DataStore, TaskRecord } from '@athanor/data';
+import type { ModelMessage } from '@athanor/model-gateway';
 import type { AgentState, AgentWorkerConfig } from './agent-state.js';
 import type { Logger } from './log.js';
 import type { AgentRunnerClient } from './runner-client.js';
@@ -208,4 +209,73 @@ export const honorUserControl = async (
     clearLease: true
   });
   return true;
+};
+
+/**
+ * The third question, asked once per step and answered against the log rather than against a flag:
+ * is the request about to go out the one this turn's own record says it should be?
+ *
+ * This repository's named signature defect is a control wired to nothing - a gate that computes the
+ * right verdict and is never consulted, a set that is built and never read, a withdrawal that is
+ * decided and then not applied. The audit found that shape more than thirty times, and every one of
+ * them was found by a human reading two files against each other, because nothing in the product
+ * ever re-derives what it is about to do from what it has recorded.
+ *
+ * The model request is the largest such control in athanor: it is the whole of what the model sees,
+ * it is assembled from four independent inputs at three different points in the loop, and a
+ * divergence in it is silent - the provider answers a wrong window exactly as readily as a right
+ * one, and the answer looks like an ordinary reply. So it is re-derived immediately before the send
+ * and the turn is failed on any disagreement. Three live classes this closes, each of which is a
+ * defect that has actually existed in a loop of this shape:
+ *
+ * - `messages` no longer being a function of `state.messages`. `prepareModelContext` copies rather
+ *   than mutates, so its output is derivable from its inputs; anything that edits `state.messages`
+ *   between the preparation and the send - a taint notice, a pushback, a compaction re-entered on a
+ *   retry path - produces a request the persisted trajectory cannot account for, and a resume then
+ *   replays a different conversation than the one that was billed.
+ * - The tools sent diverging from the catalogue minus this run's withdrawals. The withdrawal set is
+ *   built once for the whole run precisely so the catalogue stays byte-identical across steps; a
+ *   later rebuild that forgets a withdrawal restores a tool the box cannot honour, and moves the
+ *   head of the cached prefix while doing it.
+ * - `reservedTokens` diverging from the array actually sent. Three places compute it independently
+ *   from three arrays, and it is the number the input budget, the compaction trigger and the
+ *   handoff's own floor are all derived from. A drift there is a window sized against a request
+ *   nobody is sending.
+ *
+ * It returns the sentence rather than throwing so the caller decides what a breach costs; the loop
+ * raises it, which is right - a request this side cannot account for must not be paid for.
+ */
+export const requestDerivationBreach = (request: {
+  /** The window as prepared, and the window as re-derived from the log at send time. */
+  prepared: readonly ModelMessage[];
+  rederived: readonly ModelMessage[];
+  /** The tools on the request, and the catalogue this run is entitled to send. */
+  sent: readonly { name: string }[];
+  entitled: readonly { name: string }[];
+  /** What the budget was computed against, and the array that is going out. */
+  reservedTokens: number;
+  reservedTokensOfSent: number;
+}): string | null => {
+  const sent = request.sent.map((tool) => tool.name);
+  const entitled = request.entitled.map((tool) => tool.name);
+  if (sent.length !== entitled.length || sent.some((name, at) => name !== entitled[at]))
+    return `the tools on this request are not the catalogue this run withdrew from: sending ${sent.length} (${sent.slice(0, 6).join(', ')}) against ${entitled.length} entitled`;
+  if (request.reservedTokens !== request.reservedTokensOfSent)
+    return `the input budget was computed against ${request.reservedTokens} reserved tokens and the tools actually being sent weigh ${request.reservedTokensOfSent}`;
+  if (request.prepared.length !== request.rederived.length)
+    return `the window being sent has ${request.prepared.length} messages and the same window re-derived from the saved trajectory has ${request.rederived.length}`;
+  for (const [at, message] of request.prepared.entries()) {
+    const again = request.rederived[at];
+    // Role, addressee and content, which is the whole of what a provider is told. Compared field by
+    // field rather than by serialising both sides: a message carries reasoning details whose key
+    // order is not this side's to guarantee, and a mismatch reported as "these two JSON blobs
+    // differ" is a mismatch nobody can act on.
+    if (!again || again.role !== message.role || again.toolCallId !== message.toolCallId)
+      return `message ${at} of this request is a ${message.role} the saved trajectory does not derive`;
+    if (again.content !== message.content)
+      return `message ${at} (${message.role}) differs from the same message re-derived from the saved trajectory: ${message.content.length} characters against ${again.content.length}`;
+    if ((again.toolCalls?.length ?? 0) !== (message.toolCalls?.length ?? 0))
+      return `message ${at} (${message.role}) carries ${message.toolCalls?.length ?? 0} tool calls and the re-derived one carries ${again.toolCalls?.length ?? 0}`;
+  }
+  return null;
 };

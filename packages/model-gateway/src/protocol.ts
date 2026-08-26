@@ -11,7 +11,22 @@ export const ModelMessage = z.object({
   toolCallId: z.string().optional(),
   toolCalls: z
     .array(
-      z.object({ id: z.string(), name: z.string(), arguments: z.record(z.string(), z.unknown()) })
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        arguments: z.record(z.string(), z.unknown()),
+        /**
+         * Present because a caller storing a turn stores the `ModelToolCall` it was handed, and on
+         * a call whose arguments would not parse that object carries the raw string as well - see
+         * the note on `ModelToolCall.rawArguments` below. Declared here so the shape describes what
+         * is actually held in a stored message rather than the subset that goes back on the wire:
+         * the window is *measured* from these objects, and a field the type denied existed was
+         * charging turns for bytes no provider would ever be sent. Nothing here serialises it into
+         * a request - the payload builder writes `id`, `name` and `arguments` and reads nothing
+         * else - so this is a description of what a caller holds, never an instruction to send it.
+         */
+        rawArguments: z.string().optional()
+      })
     )
     .optional(),
   /**
@@ -105,7 +120,13 @@ export interface ModelToolCall {
   parseFailed?: true;
   /** True only when the provider says it stopped at the output limit; otherwise the JSON was bad. */
   argumentsTruncated?: true;
-  rawArguments?: string;
+  /**
+   * `| undefined` spelt out under `exactOptionalPropertyTypes`, so a call read back off a stored
+   * `ModelMessage` is assignable here. Zod infers an optional field as `string | undefined` and this
+   * interface is the target those objects are handed to; without it the two descriptions of one
+   * object disagreed, and the disagreement is what a caller has to cast its way around.
+   */
+  rawArguments?: string | undefined;
 }
 
 export interface ModelResponse {

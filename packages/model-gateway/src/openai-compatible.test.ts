@@ -1,8 +1,9 @@
 import { resolveWebToolPlan } from '@athanor/contracts';
 import { AthanorError } from '@athanor/core';
 import { describe, expect, it, vi } from 'vitest';
+import { HUGE_REQUEST_TOKENS } from './generation-budget.js';
 import { ModelGateway } from './gateway.js';
-import { OpenAICompatibleAdapter } from './openai-compatible.js';
+import { DEFAULT_MAX_REQUEST_BYTES, OpenAICompatibleAdapter } from './openai-compatible.js';
 import { isProviderWall, isRetryableError, retryAfterMsOf } from './retry.js';
 
 describe('OpenAICompatibleAdapter', () => {
@@ -283,6 +284,127 @@ describe('OpenAICompatibleAdapter', () => {
     ]);
   });
 
+  const byteCeilingAdapter = (
+    capture: { body?: unknown; calls: number },
+    maxRequestBytes?: number
+  ): OpenAICompatibleAdapter =>
+    new OpenAICompatibleAdapter({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'managed-key',
+      provider: 'openrouter',
+      privacyRoute: 'external',
+      ...(maxRequestBytes === undefined ? {} : { maxRequestBytes }),
+      fetch: (async (_input: string | URL | Request, init?: RequestInit) => {
+        capture.calls += 1;
+        if (typeof init?.body !== 'string') throw new Error('Expected a JSON request body');
+        capture.body = JSON.parse(init.body);
+        return new Response(
+          JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: 'done' } }] }),
+          { status: 200 }
+        );
+      }) as typeof fetch
+    });
+
+  /** A base64 data URL of a stated size, which is the shape a screenshot reaches this adapter in. */
+  const still = (bytes: number): string => `data:image/png;base64,${'A'.repeat(bytes)}`;
+
+  it('sheds the oldest attachments to bring an over-large request under the byte ceiling', async () => {
+    // Four stills of a hundred thousand bytes each against a ceiling of a quarter of a million.
+    // The images dominate the body by three orders of magnitude, so which two have to go is
+    // arithmetic rather than a coincidence of envelope sizes.
+    const capture: { body?: unknown; calls: number } = { calls: 0 };
+    await byteCeilingAdapter(capture, 250_000).chat({
+      // A route that bills explicit cache breakpoints, so the marked prefix below is really marked.
+      model: 'anthropic/claude-opus-5',
+      messages: [
+        { role: 'system', content: 'contract', cacheBreakpoint: true },
+        ...Array.from({ length: 4 }, (_unused, index) => ({
+          role: 'user' as const,
+          content: `screenshot ${index}`,
+          images: [still(100_000)]
+        }))
+      ],
+      tools: [],
+      temperature: 0.2
+    });
+
+    const messages = (capture.body as { messages: Array<{ content: unknown }> }).messages;
+    // The cached prefix is untouched by the shedding that happens after it. Shedding rewrites
+    // messages, and a rewrite that moved or dropped a breakpoint would invalidate the prefix this
+    // request shares with every other step of the turn - paying for the images twice over.
+    expect(messages[0]?.content).toEqual([
+      { type: 'text', text: 'contract', cache_control: { type: 'ephemeral' } }
+    ]);
+    // Array content is what an image message travels as, so this reads which messages kept theirs:
+    // the two newest, because the two oldest went first.
+    expect(messages.slice(1).map((message) => Array.isArray(message.content))).toEqual([
+      false,
+      false,
+      true,
+      true
+    ]);
+    // The model is told, in the message it happened to, rather than left to wonder why it cannot
+    // see the picture it asked for.
+    expect(messages[1]?.content).toContain('screenshot 0');
+    expect(messages[1]?.content).toMatch(/one image was dropped from this message/);
+    expect(messages[2]?.content).toMatch(/read the file again/i);
+    expect(Buffer.byteLength(JSON.stringify(capture.body))).toBeLessThanOrEqual(250_000);
+    expect(capture.calls).toBe(1);
+  });
+
+  it('refuses a request still over the ceiling with nothing left to shed, and names bytes', async () => {
+    const capture: { body?: unknown; calls: number } = { calls: 0 };
+    const failure = await byteCeilingAdapter(capture, 10_000)
+      .chat({
+        model: 'z-ai/glm-5.2',
+        messages: [{ role: 'user', content: 'x'.repeat(40_000) }],
+        tools: [],
+        temperature: 0.2
+      })
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AthanorError);
+    expect((failure as AthanorError).code).toBe('provider_context_overflow');
+    expect((failure as AthanorError).statusCode).toBe(413);
+    // The whole point of this ceiling is that it is a different quantity from the one the token
+    // arithmetic bounds, so a refusal that talked about tokens would send the repair to the wrong
+    // number.
+    expect((failure as AthanorError).message).toMatch(/bytes/);
+    expect((failure as AthanorError).message).not.toMatch(/token/i);
+    expect((failure as AthanorError).details).toMatchObject({ maxRequestBytes: 10_000 });
+    expect(Number((failure as AthanorError).details?.requestBytes)).toBeGreaterThan(40_000);
+    // Refused here, so nothing was put on the wire and nothing was billed.
+    expect(capture.calls).toBe(0);
+  });
+
+  it('enforces the shipped ceiling when none was configured and leaves an ordinary request alone', async () => {
+    const capture: { body?: unknown; calls: number } = { calls: 0 };
+    const failure = await byteCeilingAdapter(capture)
+      .chat({
+        model: 'z-ai/glm-5.2',
+        messages: [{ role: 'user', content: 'x'.repeat(DEFAULT_MAX_REQUEST_BYTES + 1) }],
+        tools: [],
+        temperature: 0.2
+      })
+      .catch((error: unknown) => error);
+    expect((failure as AthanorError).code).toBe('provider_context_overflow');
+    expect(capture.calls).toBe(0);
+
+    await byteCeilingAdapter(capture).chat({
+      model: 'z-ai/glm-5.2',
+      messages: [{ role: 'user', content: 'go', images: [still(64)] }],
+      tools: [],
+      temperature: 0.2
+    });
+    expect(capture.calls).toBe(1);
+    expect(
+      (capture.body as { messages: Array<{ content: unknown }> }).messages[0]?.content
+    ).toEqual([
+      { type: 'text', text: 'go' },
+      { type: 'image_url', image_url: { url: still(64) } }
+    ]);
+  });
+
   const encode = (value: string): Uint8Array => new TextEncoder().encode(value);
 
   const streamingAdapter = (
@@ -416,6 +538,52 @@ describe('OpenAICompatibleAdapter', () => {
       usage: { outputTokens: 2, estimated: true }
     });
     expect(deltas).toEqual(['Thinking']);
+  });
+
+  it('gives a large request a longer idle deadline than an ordinary one', async () => {
+    /*
+     * The same route, going quiet for three hundred milliseconds after its first frame, asked twice.
+     * Against the base deadline that is a stall and the answer is cut where it stopped; on a request
+     * past the huge rung it is a route still reading the prompt, the deadline doubles, and the rest
+     * of the answer arrives. Nothing about the provider differs between the two calls - only the
+     * size of what it was asked to read, which is the whole claim.
+     */
+    const quiet = (): ReadableStream<Uint8Array> =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: {"choices":[{"delta":{"content":"Thinking"}}]}\n\n'));
+          setTimeout(() => {
+            try {
+              controller.enqueue(
+                encode(
+                  'data: {"choices":[{"finish_reason":"stop","delta":{"content":" done"}}]}\n\n'
+                )
+              );
+              controller.close();
+            } catch {
+              // The reader was already let go by the deadline on the first of the two calls, which
+              // is exactly what that call is asserting.
+            }
+          }, 300).unref();
+        }
+      });
+    const ask = (content: string): Promise<unknown> =>
+      streamingAdapter(quiet(), { streamIdleTimeoutMs: 200 }).chat({
+        model: 'z-ai/glm-5.2',
+        messages: [{ role: 'user', content }],
+        tools: [],
+        temperature: 0.2,
+        onTextDelta: () => {}
+      });
+
+    await expect(ask('brief')).resolves.toMatchObject({
+      text: 'Thinking',
+      truncated: { reason: 'stalled' }
+    });
+    // Four hundred thousand bytes of prompt is a hundred thousand estimated tokens: the huge rung.
+    const large = await ask('x'.repeat(HUGE_REQUEST_TOKENS * 4));
+    expect(large).toMatchObject({ text: 'Thinking done' });
+    expect((large as { truncated?: unknown }).truncated).toBeUndefined();
   });
 
   it('reports a stream that goes silent before it says anything as the retryable provider fault it is', async () => {
@@ -1870,6 +2038,7 @@ describe('OpenAICompatibleAdapter', () => {
           maxAttempts: 3,
           baseDelayMs: 0,
           maxDelayMs: 0,
+          maxRetryAfterMs: 0,
           random: () => 0,
           sleep: async () => undefined
         }

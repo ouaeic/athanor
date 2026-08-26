@@ -16,14 +16,113 @@ import {
   AthanorError,
   connectorActions,
   connectorContentOrigin,
+  connectorContentOrigins,
   isMailConnectorKind,
   untrustedFromOutside,
   type AnyConnectorKind
 } from '@athanor/core';
 import type { ModelMessage, ModelToolCall } from '@athanor/model-gateway';
 import { originOf } from './egress.js';
+import { sanitiseUntrustedText } from './sanitise.js';
 import { isQuarantinedDownloadPath, untrustedShellOrigin } from './tools.js';
 import { asRecord, textValue } from './values.js';
+
+/**
+ * The shape a detail inside an origin label is allowed to have: a host, a path, an action name.
+ *
+ * Every origin this file returns is read back out in two places that are the harness speaking - the
+ * once-per-turn notice the model is given, and the `Untrusted content entered this turn from X`
+ * line on the owner's timeline. So the label is a place where text chosen by somebody outside could
+ * be quoted in the voice of the thing that is supposed to be judging it, which is the finding-text
+ * channel §4.6 #91 is about: a classifier steered by a string the attacker wrote into a page.
+ *
+ * The bound is a shape rather than a blocklist. Nothing here needs a space, a full stop followed by
+ * a space, a newline or a quotation mark, and without those a detail cannot become a second
+ * sentence no matter what it says. `_` and `:` are in because connector kinds and provenance
+ * strings use them; `/` and `.` because paths and hostnames do.
+ */
+const ORIGIN_DETAIL = /^[A-Za-z0-9._:@\-/]{1,100}$/;
+
+/**
+ * One externally-chosen token, or nothing.
+ *
+ * Rejecting outright rather than filtering the offending characters out: a squashed string is still
+ * the attacker's words with the spaces taken out, and it reads as a label the harness chose. An
+ * empty answer sends the caller to its own fallback, which is a word from this file.
+ */
+export const originDetail = (value: string): string => {
+  const clean = sanitiseUntrustedText(value).trim();
+  return ORIGIN_DETAIL.test(clean) ? clean : '';
+};
+
+/** The words the connector table itself uses, which are harness prose and may carry a space. */
+const CONNECTOR_ORIGINS: ReadonlySet<string> = new Set(Object.values(connectorContentOrigins));
+
+/**
+ * The last thing done to any origin before it leaves this file.
+ *
+ * The phrases are literals written here and the details have already been through `originDetail`,
+ * so in principle this changes nothing. It is applied anyway because the one path that does not
+ * start with a literal - a specialist's report handing back the origins its own reads produced -
+ * arrives as a string, and a bound that is only correct while every producer stays correct is the
+ * kind of guarantee that lasts until the next producer.
+ */
+const boundedOrigin = (value: string): string =>
+  sanitiseUntrustedText(value)
+    // Controls and format characters, which is every remaining way to put a line break or an
+    // invisible steering character into a sentence the harness is signing.
+    .replace(/[\p{Cc}\p{Cf}]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+
+/**
+ * Every phrase this file will put in front of a detail. Adding a label means adding it here.
+ *
+ * It exists for one caller. A specialist's report hands back the origins its own reads produced,
+ * and that is the only origin the lead adopts from a value rather than from a literal in the switch
+ * below - so it is the only one where "harness prose" is a property of the *other* end having been
+ * correct. Checked against the closed list, a report can carry the words this build would have
+ * written and nothing else. Two of the entries come from `connectorContentOrigins` rather than from
+ * here, because that table is the thing a connector read is named by and a second copy of it in
+ * this file is the drift `connector-origin-totality.test.ts` was written to end.
+ */
+const ORIGIN_PHRASES: readonly string[] = [
+  'web search results',
+  'provider web search results',
+  'web pages',
+  'web page',
+  'browser page',
+  'coding agent report',
+  'delegated specialist',
+  'background process output',
+  'network command output',
+  'a downloaded file',
+  'downloaded file',
+  'connected service',
+  ...Object.values(connectorContentOrigins)
+];
+
+/**
+ * One origin off a specialist's report, kept only as far as it reads like something this build says.
+ *
+ * A label is a phrase, optionally followed by a comma-separated list of tokens - `web page a.test,
+ * b.test`, `downloaded file workspace/downloads/x.pdf`. Anything after the phrase that is not a
+ * token is dropped and the phrase is kept, because the phrase is still true: a specialist did read
+ * a web page, and the taint has to be raised whatever the rest of the string turned out to be.
+ */
+const specialistOrigin = (value: string): string => {
+  const label = boundedOrigin(value);
+  const phrase = ORIGIN_PHRASES.find(
+    (candidate) => label === candidate || label.startsWith(`${candidate} `)
+  );
+  // No phrase at all is the unrecognised-connector-kind case, which is a bare token by
+  // construction: keep it if it is one, and otherwise say nothing rather than say the far end's
+  // words.
+  if (!phrase) return originDetail(label);
+  const rest = label.slice(phrase.length).trim();
+  return !rest || rest.split(', ').every((token) => originDetail(token)) ? label : phrase;
+};
 
 /**
  * Whether this tool result is the harness's own answer rather than the tool's.
@@ -120,6 +219,17 @@ export const takeoverNotice = (wall: BotWall): string =>
  * `untrustedFromOutside` sets no `origin`, so `untrustedOriginOfResult` fell through to the
  * provenance string and the owner was told a read came from `external_mailbox` while every other
  * connector was named in the plain words of the table.
+ *
+ * A result that arrives already wearing `trust:'untrusted'` is re-labelled rather than let through.
+ * It used to be returned untouched, which was right about the *mail* case that motivated it - the
+ * mail connector wraps its own reads with `untrustedFromOutside`, four call sites in
+ * `mail-connectors.ts`, so passing through is what keeps a message from being wrapped twice - and
+ * wrong about every other kind, because the field it was trusting is a field the far end writes. An
+ * MCP server answering `{trust:'untrusted', origin:'<a sentence>'}` had that sentence carried
+ * verbatim into the once-per-turn notice and onto the owner's timeline, in the harness's own voice,
+ * by a check that existed to be careful. Unwrapping and re-wrapping is idempotent on the mail
+ * shape - the same object comes back out - and total on every other: whatever the far end claimed
+ * about itself ends up under `content`, where the rest of this file reads it as what it is.
  */
 export const labelledConnectorResult = (
   kind: AnyConnectorKind,
@@ -130,15 +240,28 @@ export const labelledConnectorResult = (
   // `mcp_call_tool` is declared as a write because an MCP tool can do anything, but what comes
   // back is entirely the remote server's own text - so its result is labelled like a read.
   if (definition && definition.sideEffect !== 'read' && action !== 'mcp_call_tool') return result;
-  if (asRecord(result)?.trust === 'untrusted') return result;
   const origin = connectorContentOrigin(kind);
+  const claimed = asRecord(result);
+  /*
+   * Unwrapped only when the envelope is one this build wrote.
+   *
+   * `trust:'untrusted'` on its own is a claim; the pair of it with the provenance string this kind
+   * would have produced is a claim only the harness could make by accident, and the four sites in
+   * `mail-connectors.ts` that wrap their own reads make it every time. Anything else keeps its
+   * whole payload, fields and all, one level down under `content` - so a server that answered with
+   * something envelope-shaped has said it inside the envelope rather than instead of it.
+   */
+  const body =
+    claimed?.trust === 'untrusted' && claimed.provenance === `external_${origin}`
+      ? claimed.content
+      : result;
   if (isMailConnectorKind(kind))
-    return { ...untrustedFromOutside(kind === 'imap' ? 'mailbox' : 'calendar', result), origin };
+    return { ...untrustedFromOutside(kind === 'imap' ? 'mailbox' : 'calendar', body), origin };
   return {
     provenance: `external_${origin}`,
     trust: 'untrusted' as const,
     origin,
-    content: result
+    content: body
   };
 };
 
@@ -153,12 +276,48 @@ export const labelledConnectorResult = (
  * lands.
  */
 export const untrustedOriginOfResult = (call: ModelToolCall, result: unknown): string | null => {
+  const origin = unboundedOriginOfResult(call, result);
+  if (origin === null) return null;
+  /*
+   * Never the empty string, which is the whole reason this line is not `boundedOrigin(origin)`.
+   *
+   * Every caller tests the answer for truth - `raiseTaint` returns early on a falsy origin - so a
+   * label that bounded away to nothing would not read as "an origin nobody could name", it would
+   * read as "no untrusted content", and the floor would come back down on a turn holding a hostile
+   * page. A bound put in to stop an attacker writing prose must not become a way for one to write
+   * nothing.
+   *
+   * No arm below can reach it as this file stands: every one of them ends at a literal or at a
+   * value `originDetail` has already made non-empty. It is here because the delegate arm *could*
+   * have - it is the one that builds its label out of strings from elsewhere, it did fail this way
+   * while this was being written, and it is fixed at the source rather than here. This is the floor
+   * under the next arm that composes a label out of something it was handed.
+   */
+  return boundedOrigin(origin) || 'an outside source this build could not name';
+};
+
+const unboundedOriginOfResult = (call: ModelToolCall, result: unknown): string | null => {
   const record = asRecord(result);
-  if (record?.trust === 'untrusted')
-    return textValue(record.origin) || textValue(record.provenance, 'connected service');
+  if (record?.trust === 'untrusted') {
+    // The table's own words first, because two of them carry a space and would fail the token
+    // shape; then the token shape, which is what an unrecognised kind or an `external_*` provenance
+    // string is; then a word from this file, because a read that came back with no label the
+    // harness recognises is still a read, and dropping the origin is the one outcome that changes
+    // what the turn is allowed to do next.
+    const named = textValue(record.origin);
+    if (CONNECTOR_ORIGINS.has(named)) return named;
+    return originDetail(named) || originDetail(textValue(record.provenance)) || 'connected service';
+  }
   switch (call.name) {
     case 'web_search':
       return 'web search results';
+    /*
+     * The two web cases pass no detail through `originDetail`, and that is the answer to the
+     * question rather than an omission of it: `originOf` is a `new URL(...).hostname`, so it has
+     * already answered with a hostname or with nothing, and a hostname cannot hold a space, a
+     * newline or a full stop followed by one. Adding the token check here would be a line no input
+     * can reach - and it would cost the label on an IPv6 host, whose `hostname` is bracketed.
+     */
     case 'parallel_web_read': {
       const hosts = [...new Set(readSourceUrls(record).map(originOf).filter(Boolean))].slice(0, 3);
       return hosts.length ? `web page ${hosts.join(', ')}` : 'web pages';
@@ -178,15 +337,21 @@ export const untrustedOriginOfResult = (call: ModelToolCall, result: unknown): s
     // in the lead's own turn would not.
     case 'delegate': {
       const reports = Array.isArray(record?.reports) ? record.reports : [];
-      const sources = [
-        ...new Set(
-          reports.flatMap((report) => {
-            const value = asRecord(report)?.untrustedSources;
-            return Array.isArray(value) ? value.map((entry) => textValue(entry)) : [];
-          })
-        )
-      ].filter(Boolean);
-      return sources.length ? `delegated specialist (${sources.slice(0, 3).join(', ')})` : null;
+      const reported = reports.flatMap((report) => {
+        const value = asRecord(report)?.untrustedSources;
+        return Array.isArray(value) ? value.map((entry) => textValue(entry)).filter(Boolean) : [];
+      });
+      // Whether a specialist read anything untrusted is decided here, on the raw list, and it is
+      // decided before the naming. Deciding it afterwards is a hole rather than a tidier line: the
+      // names below are checked against the closed list - this is the only origin the lead adopts
+      // from a value rather than from a literal in this switch - and a report whose every name
+      // failed that check would have left an empty list, a falsy answer, and a turn holding a
+      // hostile page with the floor back down. A source nobody can name is still a source.
+      if (!reported.length) return null;
+      const sources = [...new Set(reported.map(specialistOrigin))].filter(Boolean);
+      return sources.length
+        ? `delegated specialist (${sources.slice(0, 3).join(', ')})`
+        : 'delegated specialist';
     }
     case 'shell':
       return untrustedShellOrigin(call.arguments);
@@ -210,7 +375,13 @@ export const untrustedOriginOfResult = (call: ModelToolCall, result: unknown): s
     case 'image_read':
     case 'file_read': {
       const path = textValue(call.arguments.path).replace(/^\.?\//, '');
-      return isQuarantinedDownloadPath(path) ? `downloaded file ${path}` : null;
+      if (!isQuarantinedDownloadPath(path)) return null;
+      // The path is the model's own argument rather than the page's bytes, but a model holding a
+      // hostile page is exactly how a sentence gets into an argument, and this one is quoted into
+      // the notice and onto the timeline. A name that will not fit the token shape costs the owner
+      // the filename and costs an attacker the channel.
+      const named = originDetail(path);
+      return named ? `downloaded file ${named}` : 'a downloaded file';
     }
     default:
       return null;

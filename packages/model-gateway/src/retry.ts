@@ -11,8 +11,24 @@ export interface RetryPolicy {
   /** Total attempts including the first; `1` disables retry. */
   maxAttempts: number;
   baseDelayMs: number;
-  /** Ceiling for a single wait, including a provider's own Retry-After hint. */
+  /** Ceiling for a wait this side invented: the exponential curve and its jitter. */
   maxDelayMs: number;
+  /**
+   * Ceiling for a wait the provider itself asked for by name.
+   *
+   * Separate from `maxDelayMs` because the two bound different things, and one number was answering
+   * both questions. The exponential curve is this side guessing when an upstream might be well
+   * again, and a guess must not park a task; a `Retry-After` is the provider stating when it will
+   * serve this key again, and asking before then is spending an attempt on a refusal that is
+   * already known. Under one twenty-second cap a provider asking for sixty seconds was asked three
+   * more times inside its own window and the whole attempt budget was gone before the window
+   * opened.
+   *
+   * Two minutes, because past that a wait stops being a wait: `isProviderWall` below already names
+   * this class of failure to the caller, and the caller's answer to a wall is to park the task and
+   * pick it up later rather than to hold a worker's slot asleep in front of it.
+   */
+  maxRetryAfterMs: number;
   /** Jitter source in [0, 1); injected so tests are deterministic. */
   random: () => number;
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -33,10 +49,14 @@ const wait = (ms: number, signal?: AbortSignal): Promise<void> =>
     signal?.addEventListener('abort', finish, { once: true });
   });
 
+/** See `RetryPolicy.maxRetryAfterMs`; published so a caller building its own policy can reuse it. */
+export const DEFAULT_MAX_RETRY_AFTER_MS = 120_000;
+
 export const defaultRetryPolicy: RetryPolicy = {
   maxAttempts: 4,
   baseDelayMs: 500,
   maxDelayMs: 20_000,
+  maxRetryAfterMs: DEFAULT_MAX_RETRY_AFTER_MS,
   random: Math.random,
   sleep: wait
 };
@@ -146,13 +166,21 @@ const isAbortError = (error: unknown): boolean => {
 /**
  * Exponential backoff with full jitter, so a fleet of agents that all hit the same rate limit
  * spreads out instead of resynchronising on the provider's next window. A provider's own
- * Retry-After hint raises the floor but never lifts the wait past `maxDelayMs`, which keeps one
- * stuck upstream from parking a task for an unbounded stretch.
+ * Retry-After hint raises the floor, and raises the ceiling with it: a wait this side invented is
+ * never longer than `maxDelayMs`, and a wait the provider named is honoured up to the separate,
+ * larger `maxRetryAfterMs`. Neither can park a task unboundedly, which is what the single cap was
+ * there to prevent - it just stopped asking again at twenty seconds when the provider had said
+ * sixty.
  */
 export const backoffDelayMs = (policy: RetryPolicy, attempt: number, error: unknown): number => {
   const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (attempt - 1));
   const jittered = exponential * (0.5 + policy.random() * 0.5);
-  return Math.min(policy.maxDelayMs, Math.max(retryAfterMsOf(error) ?? 0, jittered));
+  const asked = retryAfterMsOf(error);
+  // Branching on the presence of the hint rather than defaulting it to zero, so an error carrying
+  // none takes arithmetic byte-identical to what it took before: only a request the provider itself
+  // put a number on can be waited on for longer than it used to be.
+  if (asked === undefined) return Math.min(policy.maxDelayMs, jittered);
+  return Math.min(policy.maxRetryAfterMs, Math.max(asked, jittered));
 };
 
 export interface RetryOptions {

@@ -35,6 +35,7 @@ import {
   untrustedOriginOfResult,
   untrustedTurnNotice
 } from './provenance.js';
+import { sanitiseUntrusted, sanitiseUntrustedText, untrustedEnvelope } from './sanitise.js';
 import { boundedToolResultForModel } from './streaming.js';
 import type { BotWall } from './provenance.js';
 import {
@@ -449,7 +450,35 @@ export const recordToolResult = async (
           ...(image.convertedFrom ? { convertedFrom: image.convertedFrom } : {})
         }
       : undefined;
-  const eventResult = imageSummary ?? result;
+  /*
+   * Asked here, before anything derived from this result is written anywhere.
+   *
+   * `recordProvenance` below asks the same question for its own purposes, and this is deliberately
+   * a second call rather than a value threaded out of it: `untrustedOriginOfResult` is a pure
+   * classification of the call and the result, the two answers cannot disagree, and the
+   * alternative is a signature change on a function four other files enter. What it buys is that
+   * the timeline row and the window entry are both written knowing whether these bytes are the
+   * owner's own or somebody else's - which used to be knowable only after both had been written.
+   *
+   * A harness answer is not content at all: nothing ran, nothing was fetched, and what the model
+   * is holding is this build's own sentence about why. Fencing that as data somebody else wrote is
+   * worse than not fencing it - it tells the model the harness's own refusal cannot be trusted.
+   * The taint transition below is deliberately left alone: whether a skipped repeat should still
+   * raise it is a separate question from whose words these are.
+   */
+  const untrustedOrigin = isHarnessAnswer(result) ? null : untrustedOriginOfResult(call, result);
+  /*
+   * The owner's copy is stripped too, not only the model's.
+   *
+   * The Tags block is invisible in the timeline exactly as it is invisible in a browser, so a
+   * hidden instruction that survives here is one the owner cannot see while deciding whether to
+   * approve the thing it asked for - and the approval card is rendered from this record. Nothing
+   * legible is lost: what is removed had no rendering to lose. Only untrusted results are touched,
+   * so a file the owner wrote keeps every codepoint they put in it.
+   */
+  const eventResult = untrustedOrigin
+    ? sanitiseUntrusted(imageSummary ?? result)
+    : (imageSummary ?? result);
   await event(deps.store, task, key, 'tool_result', `${call.name} completed`, {
     toolCallId: call.id,
     result: eventResult
@@ -494,10 +523,29 @@ export const recordToolResult = async (
     ...(shellObservation(call, result) ?? {})
   };
   const modelResult = boundedToolResultForModel(call.name, result, imageSummary);
+  /*
+   * Every untrusted result carries its own fence, not just the first one in the turn.
+   *
+   * The once-per-turn notice is the right thing to pay once - it says what the rules become - but
+   * it is not what tells the model where one page stops and the harness starts. Between the notice
+   * and step twenty there may be eleven reads, a compaction that dropped the notice's neighbours,
+   * and a window in which a fetched page is a JSON object sitting flush against harness prose with
+   * nothing between them. The marker is the answer to "is this line something I was told to do",
+   * asked where the bytes are rather than where the notice was.
+   *
+   * Sanitised after serialisation rather than before: `JSON.stringify` emits non-ASCII literally,
+   * so a tag character in a value or in a key is a tag character in this string, and one pass over
+   * the serialised form covers both without walking the object a second time. Fenced after
+   * truncation, so the closing marker cannot be the thing the 24,000-character cut removes.
+   */
+  const serialised = serializeToolResultForModel(modelResult);
+  const forModel = untrustedOrigin
+    ? untrustedEnvelope(untrustedOrigin, sanitiseUntrustedText(serialised))
+    : serialised;
   state.messages.push({
     role: 'tool',
     toolCallId: call.id,
-    content: `${serializeToolResultForModel(modelResult)}${provenanceNotice ? `\n\n${provenanceNotice}` : ''}`
+    content: `${forModel}${provenanceNotice ? `\n\n${provenanceNotice}` : ''}`
   });
   // A snapshot of a challenge page is a successful read, so the wall arrives here rather than in
   // the failure path - and it is the same thing to tell the owner about.

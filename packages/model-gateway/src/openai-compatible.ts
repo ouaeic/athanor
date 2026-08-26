@@ -21,6 +21,7 @@ import {
   estimatedOutputTokens,
   generationCharCeiling,
   startGenerationBudget,
+  streamIdleTimeoutFor,
   worthContinuing,
   type GenerationBudget,
   type GenerationCutoff
@@ -34,6 +35,37 @@ import {
  * quiet stretch while a reasoning model thinks, which still arrives as keep-alive bytes.
  */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
+
+/**
+ * Bytes the assembled request body may reach before this side stops sending it.
+ *
+ * A different quantity from every other bound on a request, and the only one nothing was watching.
+ * The window is bounded in tokens, and an attached image is *estimated* at a flat sixteen hundred
+ * of them however large it is - which is the right estimate, because a vision model bills a picture
+ * by its area and not by its bytes. It means the token arithmetic that decides a request fits
+ * cannot see this at all: the images ride as base64 data URLs and are bounded only by count, so
+ * four full-screen stills and a window capture are six thousand four hundred estimated tokens and
+ * upwards of twenty megabytes on the wire. That is a request the model budget calls small and a
+ * transport refuses - or worse, accepts and drops halfway through, which arrives here as a socket
+ * that died for no stated reason.
+ *
+ * Sixteen mebibytes, which is far above any window this product can assemble out of text alone - a
+ * 200k-token conversation is under a megabyte - and below the body limit of every route this
+ * adapter is pointed at. It is a transport bound, not a cost bound; the cost bounds are elsewhere
+ * and they still apply.
+ */
+export const DEFAULT_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
+
+/**
+ * What the model is told in place of an image that could not be sent.
+ *
+ * Written into the message the image was attached to, because that is the only place the model
+ * will look for it, and written to be acted on rather than merely apologised for: the picture is
+ * still on disk and the tool that reads it is still in the catalogue, so the recovery is one call
+ * away from wherever the model notices the gap.
+ */
+const shedImageNotice = (count: number, ceilingBytes: number): string =>
+  `[${count === 1 ? 'one image was' : `${count} images were`} dropped from this message: the assembled request was over the ${ceilingBytes}-byte transport ceiling and the oldest attachments went first. Read the file again if this step needs to see it.]`;
 
 interface Options {
   baseUrl: string;
@@ -50,6 +82,8 @@ interface Options {
   generationTimeoutMs?: number;
   /** Overrides the ceiling derived from the request's own output cap. Zero disables it. */
   generationMaxChars?: number;
+  /** Overrides the assembled-body byte ceiling. Zero disables it. */
+  maxRequestBytes?: number;
 }
 
 interface CompletionBody {
@@ -614,6 +648,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
   readonly #streamIdleTimeoutMs: number;
   readonly #generationTimeoutMs: number;
   readonly #generationMaxChars: number | undefined;
+  readonly #maxRequestBytes: number;
   #parameterCache: Promise<Map<string, ReadonlySet<string>>> | undefined;
 
   constructor(options: Options) {
@@ -628,6 +663,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     this.#streamIdleTimeoutMs = options.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS;
     this.#generationTimeoutMs = options.generationTimeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS;
     this.#generationMaxChars = options.generationMaxChars;
+    this.#maxRequestBytes = options.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
   }
 
   /** Turns a payload's own `error` object into the throw the caller's retry logic can reason about. */
@@ -868,12 +904,22 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       if (declared?.has('max_completion_tokens')) return { max_completion_tokens: value };
       return {};
     })();
-    const payload = (withReasoningDetails: boolean): string =>
+    const payload = (withReasoningDetails: boolean, shedImages: ReadonlySet<number>): string =>
       JSON.stringify({
         model: input.model,
         messages: input.messages.map((message, index) => ({
           role: message.role,
           content: ((): string | ContentBlock[] => {
+            // Shed first, and as plain text with no marker: only a message that carries images can
+            // be in this set, and `#cacheBreakpointIndexes` never marks one of those - so this
+            // message had no breakpoint to keep, exactly as it had none when its images were still
+            // attached. Writing the branch the other way round would be writing a marker this
+            // request was not built with, on the one path where the prefix has just changed.
+            if (shedImages.has(index))
+              return `${message.content}\n\n${shedImageNotice(
+                message.images?.length ?? 0,
+                this.#maxRequestBytes
+              )}`;
             if (message.images?.length)
               return [
                 { type: 'text', text: message.content },
@@ -921,13 +967,58 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
             }
           : {})
       });
+    // What the last assembled body measured. Read by the clocks below: the deadline a stream is
+    // held to is scaled to the size of the request that started it, and this is the only place that
+    // size is known rather than estimated.
+    let requestBytes = 0;
+    /*
+     * The body, measured, and brought under the byte ceiling if it can be.
+     *
+     * Oldest attachment first, because the newest picture is the one the current step is reasoning
+     * about and the oldest is the one the window would have aged out next anyway. Re-serialised
+     * rather than measured piecewise: escaping is what a data URL costs on the wire, and a
+     * subtraction that guessed at it would be measuring something other than the thing the
+     * transport counts.
+     *
+     * The refusal reuses `provider_context_overflow` deliberately. It is not a token overflow and
+     * the message says so - but the caller has exactly one repair for "this request is too big",
+     * which is to condense and try again, and it is keyed on that code. Minting a second code here
+     * would take the one refusal on this path that has a working repair and give it none. By the
+     * time it is raised every image is already gone, so what is left is text, which is precisely
+     * what condensing shrinks.
+     */
+    const assemble = (withReasoningDetails: boolean): { body: string; bytes: number } => {
+      const attachments = input.messages.flatMap((message, index) =>
+        message.images?.length ? [index] : []
+      );
+      const shed = new Set<number>();
+      for (;;) {
+        const body = payload(withReasoningDetails, shed);
+        const bytes = Buffer.byteLength(body, 'utf8');
+        if (this.#maxRequestBytes <= 0 || bytes <= this.#maxRequestBytes) return { body, bytes };
+        const oldest = attachments.find((index) => !shed.has(index));
+        if (oldest === undefined)
+          throw new AthanorError(
+            'provider_context_overflow',
+            `${this.provider} was not sent this request: the assembled body is ${bytes} bytes, past the ${this.#maxRequestBytes}-byte ceiling this side holds, and there is nothing left to leave out`,
+            413,
+            { requestBytes: bytes, maxRequestBytes: this.#maxRequestBytes }
+          );
+        shed.add(oldest);
+      }
+    };
     const send = async (withReasoningDetails: boolean): Promise<Response> => {
+      // Assembled outside the try on purpose: a refusal this side raised must not be caught by the
+      // catch below and reported as a provider that could not be reached. One is a fault the caller
+      // can repair and retry into; the other is an outage.
+      const assembled = assemble(withReasoningDetails);
+      requestBytes = assembled.bytes;
       try {
         return await this.#fetch(`${this.#baseUrl}/chat/completions`, {
           method: 'POST',
           headers: this.#headers(),
           ...(input.signal ? { signal: input.signal } : {}),
-          body: payload(withReasoningDetails)
+          body: assembled.body
         });
       } catch {
         throw new AthanorError(
@@ -1085,6 +1176,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       const reply = await this.#streamCompletion(
         response,
         budget,
+        streamIdleTimeoutFor(this.#streamIdleTimeoutMs, requestBytes),
         input.onTextDelta,
         firstToken,
         input.onReasoningDelta,
@@ -1233,12 +1325,13 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
    */
   async #readWithin(
     reader: ReadableStreamDefaultReader<Uint8Array>,
-    remainingMs: number
+    remainingMs: number,
+    /** This request's own idle deadline, scaled to its size by `chat`; zero still disables it. */
+    streamIdleTimeoutMs: number
   ): Promise<
     { outcome: 'chunk'; read: ReadableStreamReadResult<Uint8Array> } | { outcome: GenerationCutoff }
   > {
-    const idleMs =
-      this.#streamIdleTimeoutMs > 0 ? this.#streamIdleTimeoutMs : Number.POSITIVE_INFINITY;
+    const idleMs = streamIdleTimeoutMs > 0 ? streamIdleTimeoutMs : Number.POSITIVE_INFINITY;
     const deadlineMs = Math.min(idleMs, Math.max(0, remainingMs));
     const cutoff: GenerationCutoff = remainingMs <= idleMs ? 'timeout' : 'stalled';
     if (!Number.isFinite(deadlineMs)) return { outcome: 'chunk', read: await reader.read() };
@@ -1265,6 +1358,8 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     response: Response,
     /** Started by `chat` from the response headers, so both ways of reading a reply share one. */
     budget: GenerationBudget,
+    /** Scaled to the size of the request that started it; see `streamIdleTimeoutFor`. */
+    streamIdleTimeoutMs: number,
     onTextDelta: (delta: string) => void | Promise<void>,
     firstToken: { at?: number } = {},
     onReasoningDelta?: (delta: string) => void | Promise<void>,
@@ -1387,7 +1482,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     };
     try {
       for (;;) {
-        const step = await this.#readWithin(reader, budget.remainingMs());
+        const step = await this.#readWithin(reader, budget.remainingMs(), streamIdleTimeoutMs);
         if (step.outcome !== 'chunk') {
           cutoff = step.outcome;
           break;

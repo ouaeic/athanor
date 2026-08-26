@@ -38,6 +38,15 @@ no key, no network and no model: the half of this that can gate is the half that
 consecutive `--ci` runs produce byte-identical output, which is the property the baseline check
 depends on and is worth re-establishing after any change here.
 
+Every run opens with two provenance lines: which athanor and which rig are running, and which
+accepted the committed numbers. `--accept` writes that pair into `baseline.json` under `$stamp` —
+the version and short revision from `buildIdentity()`, the same pair the box reports to its owner,
+plus a digest of the six source files here that decide every number printed. The digest moves on any
+edit to a probe, a trajectory, a configuration or the measurement, which is the point: a baseline
+accepted under a different digest was accepted by a different instrument. That prints as a note and
+never as a failure — adding a probe legitimately moves it, and the answer is `--accept` in the same
+commit with the new figure quoted in the message.
+
 Typechecking is wired: `evals/tsconfig.json` includes `context-quality/*.ts`, so `pnpm check`
 compiles this directory. The run itself is deliberately not part of `pnpm check`, for the reason
 `evals/run.ts` gives about itself. The self-checks for the judged half run separately:

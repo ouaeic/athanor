@@ -212,6 +212,76 @@ export const isDurableInstructionPath = (path: string): boolean => {
   return skills === 0 || segments[skills - 1] === 'workspace';
 };
 
+/**
+ * Files nothing on this computer reads as prose and something on it later executes.
+ *
+ * The durable-instruction rule above is about text that becomes *instructions* in a later task.
+ * This is the harder case: text that becomes *execution* in a later process, without a model, a
+ * task or a card anywhere near it. The agent's `HOME` is the workspace root (execution.ts sets it),
+ * and the subscription coding CLIs run from there - so a written `.bashrc` runs at the next login
+ * shell, a written `.git/hooks/pre-commit` runs at the next commit, a written `.gitconfig` alias or
+ * `core.hooksPath` runs at the next git invocation of any kind, and a written CLI configuration
+ * runs inside a process holding somebody's subscription credentials. Every one of them executes
+ * after this task is over and outside every approval this task could have raised, which is why the
+ * card these raise is not gated on the turn being tainted: the write is deferred code execution
+ * whether or not anything hostile has been read yet.
+ *
+ * Matched on segments rather than anchored, for the same reason the durable rule is: `~/.bashrc`,
+ * `.bashrc`, `../.bashrc` and `/home/athanor/ws-1/.bashrc` are one file written by one call, and a
+ * rule that only recognised one spelling is a rule one spelling away from being no rule.
+ */
+const DEFERRED_EXECUTION_FILES = new Set([
+  '.bash_login',
+  '.bash_logout',
+  '.bash_profile',
+  '.bashrc',
+  '.gitconfig',
+  '.gitmodules',
+  '.mcp.json',
+  '.profile',
+  '.zlogin',
+  '.zlogout',
+  '.zprofile',
+  '.zshenv',
+  '.zshrc'
+]);
+
+/**
+ * Directories whose whole contents configure a process that runs on its own afterwards: the
+ * coding CLIs this computer installs, each of which reads its own directory under the agent's
+ * HOME. Named as directories rather than as files because none of them documents a fixed set of
+ * filenames, and a rule listing today's would miss tomorrow's.
+ */
+const DEFERRED_EXECUTION_DIRECTORIES = new Set(['.claude', '.codex', '.opencode']);
+
+/** The same directories spelled the way XDG spells them, as `~/.config/<name>`. */
+const XDG_DEFERRED_EXECUTION_DIRECTORIES = new Set(['claude', 'codex', 'opencode']);
+
+export const isDeferredExecutionPath = (path: string): boolean => {
+  const segments = path
+    .toLowerCase()
+    .split(/[\\/]+/)
+    .filter((segment) => segment && segment !== '.');
+  if (DEFERRED_EXECUTION_FILES.has(segments.at(-1) ?? '')) return true;
+  // `.git/hooks/<anything>` is run by git itself, and `.git/config` can point `core.hooksPath` at
+  // a directory of the writer's choosing, which is the same fact one level of indirection away.
+  // A bare `.git` or a bare `.git/hooks` is not a write to either.
+  const git = segments.lastIndexOf('.git');
+  if (git >= 0 && git < segments.length - 1) {
+    const next = segments[git + 1] ?? '';
+    if (next === 'hooks' ? git + 2 < segments.length : next === 'config') return true;
+  }
+  return segments.some((segment, index) => {
+    if (index === segments.length - 1) return false;
+    if (DEFERRED_EXECUTION_DIRECTORIES.has(segment)) return true;
+    return (
+      segment === '.config' &&
+      XDG_DEFERRED_EXECUTION_DIRECTORIES.has(segments[index + 1] ?? '') &&
+      index + 2 < segments.length
+    );
+  });
+};
+
 export const writtenPaths = (name: string, args: Record<string, unknown>): string[] => {
   if (name === 'file_write' || name === 'print_pdf') return [textValue(args.path)].filter(Boolean);
   // A redirect writes the brief as surely as file_write does, and the whole point of the durable

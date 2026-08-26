@@ -1,6 +1,7 @@
 import { AthanorError } from '@athanor/core';
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_MAX_RETRY_AFTER_MS,
   backoffDelayMs,
   isProviderWall,
   isRetryableError,
@@ -13,6 +14,7 @@ const policy = (overrides: Partial<RetryPolicy> = {}): RetryPolicy => ({
   maxAttempts: 4,
   baseDelayMs: 500,
   maxDelayMs: 20_000,
+  maxRetryAfterMs: DEFAULT_MAX_RETRY_AFTER_MS,
   random: () => 0,
   sleep: async () => {},
   ...overrides
@@ -81,7 +83,34 @@ describe('backoffDelayMs', () => {
     const longHint = new AthanorError('provider_quota_exhausted', 'wait', 429, {
       retryAfter: 600
     });
-    expect(backoffDelayMs(policy(), 1, longHint)).toBe(20_000);
+    expect(backoffDelayMs(policy(), 1, longHint)).toBe(120_000);
+  });
+
+  it('honours a named wait past the fallback cap and clamps a wait it invented itself', () => {
+    // The two ceilings bound different things. A provider asking for sixty seconds and being asked
+    // again at twenty spends the whole attempt budget inside its own window and never reaches the
+    // moment it said it would serve the key; a wait this side guessed at must still not park a task.
+    const named = (seconds: number): AthanorError =>
+      new AthanorError('provider_quota_exhausted', 'wait', 429, { retryAfter: seconds });
+    expect(backoffDelayMs(policy(), 1, named(60))).toBe(60_000);
+    expect(backoffDelayMs(policy(), 1, named(119))).toBe(119_000);
+    expect(backoffDelayMs(policy(), 1, named(3_600))).toBe(DEFAULT_MAX_RETRY_AFTER_MS);
+    // No hint anywhere on the error, at the attempt where the curve is fully saturated: the wait is
+    // the one it has always been, which is what makes the change above visible only where a
+    // provider named a number.
+    expect(backoffDelayMs(policy({ random: () => 0.999 }), 20, new Error('x'))).toBeLessThanOrEqual(
+      20_000
+    );
+    expect(backoffDelayMs(policy({ random: () => 0 }), 20, new Error('x'))).toBe(10_000);
+    // A policy whose hint ceiling is the shorter of the two still clamps to it: the hint raises the
+    // wait to what the policy allows, never to what the provider wants.
+    expect(backoffDelayMs(policy({ maxRetryAfterMs: 3_000 }), 1, named(60))).toBe(3_000);
+    // And that same short hint ceiling does not reach a wait nobody asked for. This is the pair
+    // that keeps the two horizons genuinely separate: fold the hint ceiling into the un-hinted path
+    // and this line drops to 3,000 while every other line here stays exactly where it is.
+    expect(
+      backoffDelayMs(policy({ maxRetryAfterMs: 3_000, random: () => 0 }), 20, new Error('x'))
+    ).toBe(10_000);
   });
 });
 

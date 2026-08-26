@@ -21,7 +21,8 @@
  * least one of: how many model calls the turn cost, which tools ran, whether the owner was asked,
  * where the task ended up, or which hold fired.
  */
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, type Dirent } from 'node:fs';
+import path from 'node:path';
 
 import { COMPACT_CONTEXT_TOOL } from '../apps/worker/src/context.js';
 import { agentToolsFor } from '../apps/worker/src/tool-catalogue.js';
@@ -404,6 +405,136 @@ const namesIn = (file: string, pattern: RegExp, what: string): readonly string[]
   // A quoted member on a line of its own, or a `name: handler` arm. The last member of a list has
   // no trailing comma, which is why the punctuation is optional and the line end will do instead.
   return [...block[1].matchAll(/^\s*'?([a-z_]+)'?\s*(?:[,:]|$)/gm)].map((entry) => entry[1]!);
+};
+
+/* ---------------------------------------------------- controls the product reads and nobody sets */
+
+/**
+ * Every file the shipped product is built from: no tests, no build output, no fixtures.
+ *
+ * The distinction is the whole check. Each of the three controls below has tests - good ones, which
+ * pass - and what those tests demonstrate is that the reader reads what it is handed. A caller in a
+ * `.test.ts` is the shape the defect takes, not evidence against it.
+ */
+const productionSources = (): ReadonlyArray<{ path: string; source: string }> => {
+  const root = new URL('../', import.meta.url);
+  const found: Array<{ path: string; source: string }> = [];
+  for (const area of ['apps', 'packages', 'services']) {
+    let workspaces: string[];
+    try {
+      workspaces = readdirSync(new URL(`${area}/`, root));
+    } catch {
+      continue;
+    }
+    for (const workspace of workspaces) {
+      const source = new URL(`${area}/${workspace}/src/`, root);
+      let entries: Dirent[];
+      try {
+        entries = readdirSync(source, { withFileTypes: true, recursive: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (!entry.isFile() || !/\.tsx?$/.test(entry.name) || /\.test\.tsx?$/.test(entry.name))
+          continue;
+        // `parentPath` rather than a join with `entry.name` alone: a recursive read answers with
+        // names relative to their own directory, and a check that flattened them would read two
+        // different files as one and report the wrong path in the finding.
+        const file = path.join(entry.parentPath, entry.name);
+        found.push({ path: file, source: readFileSync(file, 'utf8') });
+      }
+    }
+  }
+  return found;
+};
+
+/**
+ * A control with a live reader, and what a caller that feeds it would look like.
+ *
+ * `reader` proves the control is still there. That half is not decoration: if the salience formula
+ * loses its citation term, or the precedence line is deleted, the right answer is "this control no
+ * longer exists" and not the silence a check looking only for callers would report. A pattern that
+ * stops matching is a finding, exactly as it is in `namesIn` above.
+ */
+interface WiredControl {
+  readonly what: string;
+  readonly reader: { readonly file: string; readonly find: RegExp };
+  /** Where a caller would have to be, and the text that would make it one. */
+  readonly writer: { readonly find: RegExp; readonly exclude?: RegExp };
+}
+
+const CONTROLS: readonly WiredControl[] = [
+  {
+    what: '`cited_count`, which is 20 per cent of the memory salience score',
+    reader: {
+      file: 'packages/data/src/store/memory.ts',
+      // The term itself, out of the UPDATE that recomputes salience.
+      find: /0\.20 \* COALESCE\(\(g\.cites - m\.mc\)/
+    },
+    // The only writer is `recordMemoryUse`, and the only thing that makes it write is `cited`.
+    // Matched as a property inside a call, so the store's own parameter declaration is not a
+    // caller and neither is a comment about one.
+    writer: {
+      find: /recordMemoryUse\(\{[^}]*\bcited:/s,
+      exclude: /packages\/data\/src\/store\/memory\.ts$/
+    }
+  },
+  {
+    what: '`declaredKind`, documented as outranking every prose hint about what a turn is',
+    reader: {
+      file: 'packages/core/src/model-policy.ts',
+      find: /if \(signals\.declaredKind\)\s*\n?\s*return \{ kind: signals\.declaredKind/
+    },
+    // Anything that puts a kind into the signals. The file that declares the field is not a caller.
+    writer: {
+      find: /\bdeclaredKind:/,
+      exclude: /packages\/core\/src\/model-policy\.ts$/
+    }
+  },
+  {
+    what: '`resolveMemoryContradiction`, whose dispute arm feeds the owner’s memory review queue',
+    reader: {
+      file: 'packages/core/src/memory.ts',
+      find: /export const resolveMemoryContradiction = \(/
+    },
+    writer: {
+      find: /resolveMemoryContradiction\(/,
+      exclude: /packages\/core\/src\/memory\.ts$/
+    }
+  }
+];
+
+/**
+ * The findings, one per control that nothing feeds, plus one per control that has stopped existing.
+ *
+ * Returned rather than thrown so the row reports all three at once: a check that stopped at the
+ * first would take three waves to say what it can say in one.
+ */
+const unwiredControls = (): readonly string[] => {
+  const sources = productionSources();
+  // A walk that found nothing has not proved that nothing calls these; it has proved that the walk
+  // is broken, and reporting the three controls as unwired would be the same silence in a costume.
+  if (sources.length < 100)
+    return [
+      `only ${sources.length} production source files were found, so this check is not running`
+    ];
+  const findings: string[] = [];
+  for (const control of CONTROLS) {
+    const reader = sources.find((entry) => entry.path.endsWith(control.reader.file));
+    if (!reader || !control.reader.find.test(reader.source)) {
+      findings.push(
+        `${control.what}: the reader could not be found in ${control.reader.file}, so this check is not running`
+      );
+      continue;
+    }
+    const callers = sources.filter(
+      (entry) =>
+        control.writer.find.test(entry.source) &&
+        !(control.writer.exclude?.test(entry.path) ?? false)
+    );
+    if (!callers.length) findings.push(`${control.what}: read by the product, written by nothing`);
+  }
+  return findings;
 };
 
 /**
@@ -3551,6 +3682,121 @@ export const fixtures: readonly Fixture[] = [
       skillsNamedInBrief: [],
       ownerMessageIntact: true,
       catalogueStableThroughout: true
+    }
+  },
+
+  /* ------------------------------------------------- the running spending cap, both live arms */
+
+  {
+    id: 'small-a-warned-spending-cap-narrates-once-and-carries-on',
+    shape: 'small',
+    request: 'Read workspace/notes.txt and workspace/contract.pdf and tell me what the renewal is.',
+    why: 'The soft threshold on the owner’s daily cap: a sentence with the two numbers in it, said once, and a turn that then finishes normally. Both halves are the assertion. The rig hardcoded `spendGuard` to `allow` for its whole life, so this arm and the halt below were unreachable from every behavioural fixture in this file - the only thing under the one bound in this product that spends money while the owner is asleep was a unit test over a store method and a wording test over the sentence. Said once matters as much as said at all: the guard is asked before every step, and the de-duplication lives in the turn’s own state, so a warning that survived a round trip through `spendWarnings` narrates the same line on every step of a forty-step night.',
+    runner: { files: workspaceFiles },
+    spend: { window: 'daily', spentUsd: 8.4, capUsd: 10, warnFrom: 1 },
+    model: sequence(
+      { calls: [{ id: 'call-1', name: 'file_read', args: { path: 'workspace/notes.txt' } }] },
+      {
+        calls: [{ id: 'call-2', name: 'document_read', args: { path: 'workspace/contract.pdf' } }]
+      },
+      {
+        text: 'The renewal is on 14 March 2027 at 4.25 per cent.',
+        calls: finishCall('call-3', {
+          summary: 'Answered the renewal date and rate.',
+          verification: evidence('call-2', 'Clause 7 of the contract sets the renewal')
+        })
+      }
+    ),
+    expect: {
+      modelCalls: 3,
+      tools: ['file_read', 'document_read'],
+      status: 'completed',
+      verification: 'verified',
+      holds: [],
+      // The guard warns at the top of the second and third steps and the owner is told once. This
+      // is the same event read twice, on purpose: `warnings` is the general assertion every row in
+      // this file makes about the loop surviving something quietly, and `spendNotices` is read off
+      // the decision's own `windows` array rather than off the wording.
+      warnings: ['$8.40 of the $10.00 limit for today has been spent.'],
+      spendNotices: ['$8.40 of the $10.00 limit for today has been spent.'],
+      // A warning is not a pause. Nothing may be stamped, and the turn finishes on its own terms.
+      spendPaused: false
+    }
+  },
+  {
+    id: 'small-a-spent-ceiling-halts-the-turn-and-sends-nothing-after-it',
+    shape: 'small',
+    request: 'Read workspace/notes.txt and workspace/contract.pdf and tell me what the renewal is.',
+    why: 'The hard threshold, and the three things a ceiling is worth only if all of them hold: the owner is shown what was spent against what, the pause is stamped `spendPausedAt` so it is a ceiling’s pause and not the owner’s, and not one further request goes to the provider. The third is the only one that saves money and it is the one nothing could see - a loop that wrote the pause and then took one more step would satisfy every other assertion in this suite. `modelCallsAfterSpendHalt` reports -1 when the guard never refused, so a row asserting 0 cannot be satisfied by a turn that was never stopped.',
+    runner: { files: workspaceFiles },
+    spend: { window: 'daily', spentUsd: 10.4, capUsd: 10, denyFrom: 2 },
+    model: sequence(
+      { calls: [{ id: 'call-1', name: 'file_read', args: { path: 'workspace/notes.txt' } }] },
+      {
+        calls: [{ id: 'call-2', name: 'document_read', args: { path: 'workspace/contract.pdf' } }]
+      },
+      // Never reached. Scripted anyway, because a script that ran out would report a turn that
+      // stopped for want of a reply rather than for want of money.
+      {
+        text: 'The renewal is on 14 March 2027 at 4.25 per cent.',
+        calls: finishCall('call-3', {
+          summary: 'Answered the renewal date and rate.',
+          verification: evidence('call-2', 'Clause 7 of the contract sets the renewal')
+        })
+      }
+    ),
+    expect: {
+      modelCalls: 2,
+      tools: ['file_read', 'document_read'],
+      status: 'paused',
+      holds: [],
+      modelCallsAfterSpendHalt: 0,
+      spendPaused: true,
+      spendNotices: [
+        'Paused at $10.40 of the $10.00 limit for today. Raise the limit to carry on, or leave it here.'
+      ]
+    }
+  },
+
+  /* -------------------------------------------------------- controls nothing on the turn writes */
+
+  {
+    id: 'answer-a-remembered-fact-the-answer-used-is-recorded-as-cited',
+    shape: 'answer',
+    request: 'What rate are we renewing the brochure job at?',
+    why: 'A fifth of the memory salience score is a term over `mem.item.cited_count`, and nothing has ever written that column. `recordMemoryUse` is its only writer and takes `cited` as a parameter; both production callers in `apps/worker/src/memory-runtime.ts` leave it out, so every item in every workspace has a citation count of zero and the standardised term is a constant for every row in the pool. This is the observation that says so out loud: the turn is handed a remembered fact, quotes it in the answer, and records not one citation. The repair is a caller in `memory-runtime.ts` and belongs to whoever owns that file.',
+    pending:
+      'A production caller that passes `cited` to `recordMemoryUse`. `recallMemoryPack` records the use at injection time and cannot know; `recordMemoryPackOutcome` grades the pack at verification and is where the citation belongs, because by then the finish has named its evidence. Delete this line when the writer exists.',
+    memory: REMEMBERING_WORKSPACE,
+    model: sequence({
+      text: 'The renewal rate on the brochure job is 4.25 per cent for the current term.',
+      calls: finishCall('call-1', {
+        summary: 'Answered from what the workspace already remembered.',
+        verification: conversational()
+      })
+    }),
+    expect: {
+      modelCalls: 1,
+      tools: [],
+      status: 'completed',
+      holds: [],
+      // The claim. One item was recalled, used and quoted; one use should have been recorded as
+      // cited. It reports 0, which is what makes this row pending rather than green.
+      memoryCitations: 1
+    }
+  },
+  {
+    id: 'schema-a-control-the-product-reads-has-a-writer',
+    shape: 'schema',
+    request: 'None: this row runs no turn.',
+    why: 'The repository’s own named signature defect is a control wired to nothing, and three of them are still live after nine waves of repair. Each is real code with a real reader - a term of a formula, a documented precedence rule, a resolution table - and no production caller anywhere that produces the value it reads. None of them can fail a test, because each half works: the reader reads what it is given and the writer would write what it was handed. What is missing is the wire, and the only thing that can see a missing wire is a check that looks for the caller. Both directions are load-bearing here. A control that acquires a writer makes this row pass and the suite then goes red on the pending marker until somebody deletes it, which is how the repair gets noticed rather than absorbed.',
+    pending:
+      'The three wires. `cited` on a `recordMemoryUse` call in apps/worker/src/memory-runtime.ts; `declaredKind` on the `TaskSignals` the turn hands `modelFit`, which is the one place the caller already knows the shape of the work; and a caller for `resolveMemoryContradiction`, which is the nightly pass that pairs candidate facts and asks for a verdict. Each is one caller and none of them is in this lane. Delete this line when all three exist.',
+    model: () => ({}),
+    schema: unwiredControls,
+    expect: {
+      modelCalls: 0,
+      warnings: []
     }
   }
 ];

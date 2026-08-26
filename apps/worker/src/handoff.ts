@@ -26,8 +26,9 @@ import {
   type AcceptanceResult
 } from './acceptance.js';
 import type { AgentState, AgentWorkerConfig } from './agent-state.js';
+import { buildIdentity } from './build-identity.js';
 import { estimatedInferenceCostUsd, stepUsageKey, usageCredit } from './billing.js';
-import { prepareModelContext } from './context.js';
+import { modelInputBudget, prepareModelContext } from './context.js';
 import type { CompletionVerification } from './completion.js';
 import { routeTo } from './routing.js';
 import { createStreamFlusher, normalizeAssistantText } from './streaming.js';
@@ -35,6 +36,7 @@ import { event } from './tool-recording.js';
 import {
   MAX_ACCEPTANCE_FAILURES,
   MAX_FINISH_REJECTIONS,
+  reasoningEffortForStep,
   spendHalt,
   STEP_BUDGET_MARKER,
   STEP_HANDOFF_MARKER,
@@ -457,6 +459,31 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       ...(state.toolOutputFloor === undefined ? {} : { toolOutputFloor: state.toolOutputFloor })
     }
   );
+  /*
+   * The effort this turn has been thinking at, carried onto the call that closes it.
+   *
+   * It was the literal 'medium', twice - once on the request and once on the cost event - and that
+   * is the one request field the step loop goes out of its way not to flip. `reasoningEffortForStep`
+   * ratchets in one direction and pins itself, and the comment at its call site says why in as many
+   * words: a field that changes throws away the provider's cached trajectory below the system
+   * prefix. This is the largest request a step-limited turn sends - the whole window plus the
+   * catalogue - so it was the one place the flip cost the most, on a turn that had by definition
+   * been running long enough to have latched 'high'.
+   *
+   * Recomputed here rather than threaded in from the caller, and that is the deliberate half: this
+   * exit has three call sites, two of which are at the top of a loop iteration where the step's own
+   * effort has not been computed yet. Asking the same function the same question with the same state
+   * is the only version of this that cannot drift from what the step before it sent.
+   *
+   * Reasoning effort buys output tokens, and this call's output is bounded by `maxOutputTokens`;
+   * changing it re-bills the entire prefix at the write price. Keeping it is the cheaper of the two
+   * even on the arm where the turn is ending because the money ran out.
+   */
+  const reasoningEffort = reasoningEffortForStep({
+    ...state,
+    estimatedInputTokens: preparedContext.estimatedInputTokens,
+    inputBudgetTokens: modelInputBudget(model.contextTokens, maxOutputTokens, reservedTokens)
+  });
   const flusher = createStreamFlusher();
   let streamEvents = Promise.resolve();
   // Swallowed for the reason the loop's own frame writer swallows it: this is the call that
@@ -478,7 +505,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         tools,
         temperature: 0.2,
         maxTokens: maxOutputTokens,
-        reasoningEffort: 'medium',
+        reasoningEffort,
         sessionId: sha256(`athanor-task:${task.id}`).slice(0, 64),
         signal,
         onTextDelta: (delta) => {
@@ -547,7 +574,13 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
     cumulativeCredits: state.credits,
     usage: response.usage,
     metadata: response.metadata,
-    reasoningEffort: 'medium'
+    // Stamped on both cost paths or on neither: a baseline that carries the build on ordinary steps
+    // and drops it on the closing call of every step-limited turn is a baseline with a hole in the
+    // one row that is largest.
+    build: buildIdentity(),
+    // The same value the request carried, from the same variable. Two literals in one file that
+    // nothing held together is how a cost line comes to report an effort the request never used.
+    reasoningEffort
   }).catch(() => undefined);
   const assistantText = normalizeAssistantText(response.text);
   state.messages.push({

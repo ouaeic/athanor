@@ -614,6 +614,244 @@ export const repeatedFailureBreak = (count: number, tool: string): string =>
   `THE SAME CALL HAS FAILED ${count} TIMES RUNNING. Each of those was ${tool} with byte-identical arguments, and each came back with the same error, so nothing that happened in between changed what is failing - asking again will cost another step and return that error again. Do one of two things now: take a different action - different arguments, a look at why it is failing, or starting whatever it depends on first - or call finish and say plainly what is broken and what you would need to get past it.`;
 
 /**
+ * Tools whose result is the harness's own receipt rather than a fact about the world.
+ *
+ * The distinction the stationarity guard below is built on, and the reason it needs two tiers.
+ * `LOOP_ANSWERED_TOOLS` is already this set minus its one writer: those are answered by the loop
+ * itself, so their result is written a few lines from where the call was read. `set_plan` is added
+ * because it writes only athanor's account of what it is doing - the plan document, versioned
+ * against the owner's own edits - and never the computer, the outside world, or the owner's bill.
+ *
+ * Derived rather than listed, so a tool the loop learns to answer joins both sets in one edit, with
+ * one addition and one subtraction and both are named. `set_plan` is added for the reason above.
+ * `finish`, `ask` and `notify` are taken out because each already carries a per-turn ceiling of its
+ * own at or below this guard's - `MAX_FINISH_REJECTIONS` is three, `MAX_QUESTIONS_PER_TURN` is two
+ * and parks the turn, `MAX_NOTICES_PER_TURN` is three - so counting them here would only ever
+ * restate a sentence the model has already been given, one step later and in worse words. They are
+ * still *seen* by the guard; they simply fall to the acting tier, where a run of them breaks on the
+ * first differing result, which is what those three ceilings produce on the attempt that trips them.
+ */
+export const BOOKKEEPING_TOOLS: ReadonlySet<string> = new Set(
+  [...LOOP_ANSWERED_TOOLS, 'set_plan'].filter((name) => !['finish', 'ask', 'notify'].includes(name))
+);
+
+/**
+ * How many steps in a row may take the identical action before the loop says so.
+ *
+ * The case none of the three guards above can see, and it is the incident this watch was written
+ * for: a byte-identical `set_plan` twelve times running. It is not idle - `set_plan` is not a tool
+ * the loop answers, so every one of those steps started something and zeroed the idle count. It is
+ * not a repeated failure - every one of them succeeded, and only a call that *threw* reaches that
+ * counter. And it is not a degenerate generation - the prose around each call was different, often
+ * better each time, because that is what a model writes when it is sure this attempt is the one
+ * that lands. Only the step budget stopped it, at up to a hundred and twenty steps.
+ *
+ * Three, matching the idle guard and the failure guard, and for the third time the same reason: two
+ * identical actions is an ordinary correction - a plan republished after a step was marked, a
+ * declaration re-sent after an edit - and the third is the point at which repeating it *is* the
+ * plan.
+ */
+export const MAX_STATIONARY_STEPS = 3;
+
+/**
+ * The same count for a step that actually touched something, which is allowed one more.
+ *
+ * Two tiers, split on what the step's result is evidence *about*, because one number cannot be
+ * right for both. A bookkeeping call's result is a receipt this process wrote, so an identical call
+ * is stationary whatever came back. An acting call's result is a report from the workspace or the
+ * outside world, so it is only stationary when the report is identical too - and `stationaryStepRun`
+ * below folds the result into the signature for exactly this tier and only this tier.
+ *
+ * That difference is not a refinement, it is the whole safety property. It is what lets this watch
+ * cover every tool in the catalogue rather than an allowlist of eight: polling a build, re-observing
+ * a page and re-reading a growing log all produce a different report each time, so none of them is
+ * ever seen here at all. It is also why the bookkeeping tier must NOT read the result - `set_plan`
+ * answers with the version it just created, so its receipt differs by construction, and keying on it
+ * would have made the one incident this guard exists for invisible to it.
+ *
+ * Four rather than three because an acting result can legitimately be identical for a reason a
+ * bookkeeping one cannot - a build that has not finished changing, a page mid-load - and one extra
+ * step is cheap against being wrong in the direction that interrupts work about to converge. It is
+ * also the one thing that finally counts the shape `MAX_REPEATED_FAILURES` says outright that it
+ * cannot see: a command with a non-zero exit is a tool *result*, so a `shell` re-running the same
+ * failing suite twenty times reaches no counter in this file. Its report is identical every time,
+ * and identical reports are what this tier counts.
+ */
+export const MAX_STATIONARY_ACTING_STEPS = 4;
+
+/**
+ * How many before the turn is ended rather than pushed back on. Twice the tier's own number, as the
+ * idle and failure guards do it, so nothing ends here without having been told and given both exits
+ * three times over.
+ */
+export const stationaryStepsBeforeStop = (limit: number): number => limit * 2;
+
+/**
+ * The two separators the rendering below uses, and the sentinel for a call nothing answered.
+ *
+ * Unit and record separators rather than a colon or a newline, because one half of a rendered pair
+ * is attacker-influenced in the general case - a `shell` command line, a page body, a file the
+ * model was told to read - and a separator that can occur inside a field is a boundary a crafted
+ * argument can forge. Neither of these can appear unescaped in JSON text at all, so two steps can
+ * only collide here by genuinely being the same step.
+ */
+const FIELD = '\u001f';
+const RECORD = '\u001e';
+
+/**
+ * One step's action, as the thing that decides whether two steps did the same thing.
+ *
+ * Canonical and order-insensitive over the whole call set, which is three separate claims and each
+ * of them is load-bearing:
+ *
+ * - `canonicalJson` sorts object keys recursively, so a model emitting the same arguments with its
+ *   keys in a different order the second time is emitting the same arguments. Array order is
+ *   preserved by that function and must be: the order of `steps` in a plan and of `patches` in an
+ *   edit is the meaning, not the spelling.
+ * - The rendered set is sorted, so two `file_read`s proposed in the other order are the same step.
+ *   A model asking for the same four files is not making progress by shuffling them.
+ * - The result is folded in only when the caller passes one, which is the acting tier's business
+ *   and is argued at `MAX_STATIONARY_ACTING_STEPS`.
+ *
+ * Hashed, and for `failingCallKey`'s reason rather than for cheapness: the arguments to a
+ * `file_write` are a whole file of the owner's writing and the arguments to a `shell` are their
+ * command line, and this value goes in the payload of the event that reports the stop. Sixteen
+ * bytes prove two steps were identical and say nothing whatever about what they were.
+ */
+export const stepSignature = (
+  calls: readonly { name: string; arguments: Record<string, unknown>; result?: string }[]
+): string =>
+  sha256(
+    calls
+      .map(
+        (call) =>
+          `${call.name}${FIELD}${canonicalJson(call.arguments)}${
+            call.result === undefined ? '' : `${FIELD}${call.result}`
+          }`
+      )
+      .sort()
+      .join(RECORD)
+  ).slice(0, 16);
+
+/**
+ * The steps this window records, oldest first, each one a model turn that started something.
+ *
+ * Read out of `state.messages` rather than accumulated in a counter, and that is deliberate: the
+ * window is the part of a turn that is persisted, encrypted and carried across a compaction, an
+ * approval pause and a worker handover, so a bound derived from it survives all three. A counter in
+ * the loop frame would not, and this file's own rule is that a bound a restart clears is not one.
+ *
+ * A reply that carried no tool call neither ends a run nor starts one. That is what makes this
+ * *action* stationarity: a model that says something new between two identical actions has still
+ * taken the identical action twice, and the guards that judge what it said - the completion nag and
+ * the idle break - are the two directly above.
+ *
+ * Nor does a step where nothing actually ran, and that clause was bought by the eval rig rather than
+ * reasoned out: without it this guard fired a second time on the two fixtures that belong to the
+ * guards beside it - `deliberation-that-ignores-the-break-is-stopped` and
+ * `the-same-call-failing-the-same-way-is-stopped` - and cost each of them two extra model calls
+ * restating, one step later and in worse words, a sentence the model had already been given. A call
+ * the harness answered without running is the idle guard's, at three; a call that threw is the
+ * failure guard's, also at three. `turnToolResults` already records which of the three happened,
+ * per call id, in the persisted state, so this asks the record rather than reading the tool result's
+ * text back out of the window.
+ */
+const actionSteps = (
+  messages: readonly ModelMessage[],
+  ran: (callId: string) => boolean,
+  wanted: number
+): Array<{ calls: readonly ModelToolCall[]; results: Map<string, string> }> => {
+  const steps: Array<{ calls: readonly ModelToolCall[]; results: Map<string, string> }> = [];
+  for (const message of messages) {
+    if (message.role === 'assistant') {
+      steps.push({ calls: message.toolCalls ?? [], results: new Map() });
+      continue;
+    }
+    // Matched inside the step that proposed it rather than through one map over the whole window: a
+    // route may reuse a tool call id across steps, and a global map would then answer every one of
+    // them with the newest result - which reads as a changing report and breaks the run.
+    if (message.role === 'tool' && message.toolCallId)
+      steps.at(-1)?.results.set(message.toolCallId, message.content);
+  }
+  return steps.filter((step) => step.calls.some((call) => ran(call.id))).slice(-wanted);
+};
+
+/**
+ * The run of most recent steps that all did the same thing, and the ceiling that run is judged
+ * against.
+ *
+ * Null when the newest step started nothing - there is no action to be stationary about, and that
+ * step is the idle guard's - and null when the run is one, which is every healthy step.
+ *
+ * The tier is the *loosest* any call in the step earns: a step that read a file alongside its
+ * `set_plan` touched the computer, so it is judged as an acting step and its report has to match
+ * too. Being wrong in that direction costs a step; being wrong the other way stops a turn that was
+ * working.
+ */
+export const stationaryStepRun = (
+  messages: readonly ModelMessage[],
+  turnToolResults: Readonly<Record<string, { success?: boolean }>> | undefined
+): { signature: string; steps: number; limit: number; tools: string[] } | null => {
+  // `success` is true only where the tool itself ran and returned: `recordToolFailure` writes false
+  // for a call that threw, and `recordToolResult` writes false for every harness answer.
+  const ran = (callId: string): boolean => turnToolResults?.[callId]?.success === true;
+  const limitFor = (calls: readonly ModelToolCall[]): number =>
+    calls.every((call) => BOOKKEEPING_TOOLS.has(call.name))
+      ? MAX_STATIONARY_STEPS
+      : MAX_STATIONARY_ACTING_STEPS;
+  const window = actionSteps(
+    messages,
+    ran,
+    stationaryStepsBeforeStop(MAX_STATIONARY_ACTING_STEPS) + 1
+  );
+  const newest = window.at(-1);
+  if (!newest) return null;
+  const limit = limitFor(newest.calls);
+  const signatureOf = (step: {
+    calls: readonly ModelToolCall[];
+    results: Map<string, string>;
+  }): string =>
+    stepSignature(
+      step.calls.map((call) => ({
+        name: call.name,
+        arguments: call.arguments,
+        ...(limit === MAX_STATIONARY_STEPS
+          ? {}
+          : // A call whose result is not in the window is not the same as one answered with the
+            // empty string, and a sentinel that cannot be a tool result is what keeps them apart.
+            { result: step.results.get(call.id) ?? RECORD })
+      }))
+    );
+  const signature = signatureOf(newest);
+  let steps = 1;
+  for (let index = window.length - 2; index >= 0; index -= 1) {
+    const earlier = window[index];
+    // Judged at the newest step's tier throughout, so a run cannot be broken by re-tiering a step
+    // that is byte-identical to the one beside it.
+    if (!earlier || limitFor(earlier.calls) !== limit || signatureOf(earlier) !== signature) break;
+    steps += 1;
+  }
+  if (steps < 2) return null;
+  return {
+    signature,
+    steps,
+    limit,
+    tools: [...new Set(newest.calls.map((call) => call.name))].sort()
+  };
+};
+
+/**
+ * What the model is told when the run runs out. The idle guard's shape - the number it has reached,
+ * the fact underneath it, and both ways out named before anything ends - and the fact here is one a
+ * model cannot talk its way past: it is not being told that it looks stuck, it is being told the
+ * exact call it has now made identically N times.
+ */
+export const stationaryStepBreak = (steps: number, tools: readonly string[]): string =>
+  `NOTHING HAS CHANGED FOR ${steps} STEPS. Every one of them made the same call - ${tools.join(', ')} - with byte-identical arguments${
+    tools.every((tool) => BOOKKEEPING_TOOLS.has(tool)) ? '' : ' and got back the identical result'
+  }, so the work is exactly where it was ${steps} steps ago and doing it again will leave it there. Do one of two things now: take the next concrete action, with arguments that differ from anything already tried, or call finish and say plainly what is blocking you and what you would need to get past it.`;
+
+/**
  * How many cut-off tool calls one turn answers before it tells the model to stop trying.
  *
  * A truncated call is the model asking for more output than the cap allows, so the same call
@@ -621,6 +859,66 @@ export const repeatedFailureBreak = (count: number, tool: string): string =>
  * oversized write. Three is enough to let a model that shortens its payload succeed.
  */
 export const MAX_ARGUMENT_TRUNCATIONS = 3;
+
+/**
+ * Takes the unparseable payload back out of the window, leaving the call itself standing.
+ *
+ * The malformed turn is *answered* in the real history - a tool call with no tool result is a
+ * malformed window the provider refuses on the next step, so the call cannot simply be dropped -
+ * and until this existed the bytes that would not parse were answered and then kept. What is kept
+ * is the whole of `rawArguments`: a `file_write` cut off at a 16,384-token output cap carries tens
+ * of kilobytes of half-written file, on the assistant message, for the rest of the conversation.
+ *
+ * Three things that costs, and only the first is the one the floor names:
+ *
+ * - The record says the model called a tool with arguments nobody can read, so every later step is
+ *   reasoning from a turn that never happened. The remedy is a tombstone: the call stands, its
+ *   payload does not, and the error result beside it - which keeps its own three error-specific
+ *   sentences, they are the good half - is the whole account of what took place.
+ * - The window is *measured* from it. `estimatedTokens` in context.ts sizes an assistant message
+ *   with `JSON.stringify(message.toolCalls).length`, and that walks `rawArguments`. The adapter
+ *   sends none of it - `openai-compatible.ts` serialises `id`, `name` and `JSON.stringify(arguments)`
+ *   and `arguments` is `{}` on this path - so a truncated write charged the turn several thousand
+ *   tokens of window that no provider would ever see, and the compaction trigger reads that number.
+ *   A cut-off call therefore made the turn condense away real history to make room for bytes that do
+ *   not exist.
+ * - It is persisted. `state.messages` is encrypted into the task row on every step and carried into
+ *   every later turn of the conversation, so the garbage outlives the turn that produced it.
+ *
+ * The declared type is already right, and that is the sharpest way to say what went wrong here.
+ * `ModelMessage.toolCalls` in `protocol.ts` is `{id, name, arguments}` and nothing else - a stored
+ * tool call is those three fields by definition. The object actually pushed onto `state.messages` is
+ * the adapter's `ModelToolCall`, which carries three more, and nothing between the push and the
+ * encrypted write ever parses the message back through the schema that would have dropped them. So
+ * the extra fields were invisible to the compiler and present in every byte the box wrote to disk.
+ *
+ * Returns how many bytes were taken out, for the warning event that already reports the truncation:
+ * a number is the only part of that payload it is safe to publish, and it is what makes this
+ * visible in a transcript at all.
+ */
+export const tombstoneMalformedCall = (messages: ModelMessage[], callId: string): number => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== 'assistant' || !message.toolCalls?.length) continue;
+    const at = message.toolCalls.findIndex((call) => call.id === callId);
+    if (at < 0) continue;
+    const call = message.toolCalls[at];
+    if (!call) return 0;
+    // Read through a cast because the declared type does not admit it, which is the whole finding.
+    const dropped = (call as { rawArguments?: string }).rawArguments?.length ?? 0;
+    // Rebuilt rather than mutated in place, and rebuilt down to the three fields the wire format
+    // has: anything else the adapter carried is by definition something the request did not send,
+    // which is the whole class this is removing. `arguments` is already `{}` on this path and is
+    // kept so the call still pairs with the result the caller pushes next.
+    message.toolCalls = [
+      ...message.toolCalls.slice(0, at),
+      { id: call.id, name: call.name, arguments: call.arguments },
+      ...message.toolCalls.slice(at + 1)
+    ];
+    return dropped;
+  }
+  return 0;
+};
 
 /**
  * How many times one turn may interrupt the owner.
@@ -766,6 +1064,7 @@ export type PushbackName =
   | 'step_budget'
   | 'compute_budget'
   | 'idle_break'
+  | 'stationary_stop'
   | 'vision_routed'
   | 'resumed_turn';
 
@@ -807,6 +1106,10 @@ export const PUSHBACK_MARKERS: ReadonlyArray<readonly [PushbackName, string]> = 
   ['compute_budget', 'COMPUTE BUDGET EXHAUSTED'],
   ['resumed_turn', 'PREVIOUS TURN STOPPED AT ITS STEP LIMIT'],
   ['idle_break', 'NOTHING HAS RUN FOR'],
+  // The action watch beside it. Deliberately not a prefix of the line above and not prefixed by it:
+  // `holdsIn` matches longest-marker-first, and two guards that fire on different evidence must
+  // never be able to be read as each other.
+  ['stationary_stop', 'NOTHING HAS CHANGED FOR'],
   // The lead's window being handed an observation it could not make itself. The failure notice
   // beside it ("VISION ROUTING NOTICE") is deliberately not here: it says routing was attempted and
   // did not happen, which is the opposite of what a fixture asserting this would mean by it.

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AthanorError,
   decryptJson,
@@ -12,6 +12,7 @@ import {
   ACCEPTANCE_EARLIER_TURN_CAVEAT,
   AgentWorker,
   approvalPreviewHash,
+  buildIdentity,
   createLogger,
   DELEGATE_MAX_STEPS,
   type Logger,
@@ -22,6 +23,12 @@ import {
   WORKSPACE_BRIEF_MARKER
 } from './agent.js';
 import { compactionTargetTail, modelInputBudget, RUNTIME_CONTEXT_MARKER } from './context.js';
+import {
+  MAX_STATIONARY_STEPS,
+  PUSHBACK_MARKERS,
+  stationaryStepsBeforeStop,
+  type PushbackName
+} from './turn-bounds.js';
 import { TURN_WALL_CLOCK_MS } from './handoff.js';
 import { managedMediaCatalog } from './media.js';
 import { memoryItemAad, MEMORY_PACK_MARKER } from './memory-runtime.js';
@@ -355,6 +362,11 @@ const decryptCheckpoints = (checkpoints: Array<Record<string, unknown>>): AgentS
         ]
       : []
   );
+
+/** A pushback's published opening, so a test asserting a hold and the loop cannot drift apart. */
+const marker = (name: PushbackName): string =>
+  PUSHBACK_MARKERS.find(([published]) => published === name)?.[1] ??
+  `no marker published for ${name}`;
 
 const encode = (value: string): Uint8Array => new TextEncoder().encode(value);
 
@@ -4788,12 +4800,41 @@ describe('how full the window is believed to be', () => {
    * one shape the loop has no other bound for. These tests are about which number the compaction
    * trigger believes, so the workspace they run against has to work.
    */
-  const listsTheWorkspace = (url: string): Response | undefined =>
-    url.includes('/files?')
-      ? new Response(JSON.stringify({ path: 'workspace', entries: [] }), {
-          headers: { 'content-type': 'application/json' }
-        })
-      : undefined;
+  /*
+   * A workspace that changes while the turn works in it, which is what one does.
+   *
+   * It answered the identical empty listing on every call, and that was load this suite could no
+   * longer generate: the model side of this fixture emits the same `files_list` with the same
+   * arguments on every step by design, so an unchanging listing made every step of the run a
+   * byte-identical action with a byte-identical report - the exact shape `stationaryStepRun` was
+   * added to stop, and it stopped it at step eight of the sixty this fixture needs. The load is what
+   * was wrong, not the guard: a turn that lists the same directory sixty times and is told the same
+   * thing sixty times has stopped working, and the tests below are about compaction rather than
+   * about that.
+   *
+   * A growing listing is also the more honest fixture. It keeps the trajectory bulky, which is what
+   * these tests need, and it is what the runner would really answer a turn that is writing files.
+   */
+  let listed = 0;
+  // Reset per test, so what the runner reports is a function of the turn under test and not of how
+  // many turns ran before it in this file.
+  beforeEach(() => {
+    listed = 0;
+  });
+  const listsTheWorkspace = (url: string): Response | undefined => {
+    if (!url.includes('/files?')) return undefined;
+    listed += 1;
+    return new Response(
+      JSON.stringify({
+        path: 'workspace',
+        entries: Array.from({ length: listed }, (_, at) => ({
+          name: `note-${at}.md`,
+          kind: 'file'
+        }))
+      }),
+      { headers: { 'content-type': 'application/json' } }
+    );
+  };
 
   // Every step answers with the same tool call and the same reported size, so the run builds the
   // history compaction needs (MIN_CONDENSED_MESSAGES is 6) and the trigger is asked the same
@@ -7821,5 +7862,271 @@ describe('who reads a picture the lead model cannot', () => {
         (entry) => entry.summary === 'Vision handled by Cheap Eyes; returned to Model One'
       )
     ).toBe(true);
+  });
+});
+
+/**
+ * The turn that spent a step budget publishing the identical plan, driven end to end.
+ *
+ * Measured on the owner's box: a byte-identical `set_plan` twelve times running. Three guards could
+ * see every one of those steps and none of them could say anything about it - `set_plan` is not in
+ * `LOOP_ANSWERED_TOOLS` so each step zeroed the idle count, every call succeeded so the failure
+ * counter never saw one, and the prose around each call differed so the repetition watch had nothing
+ * to match. Only the step budget stopped it, at up to a hundred and twenty steps.
+ *
+ * `turn-bounds.test.ts` holds the three negative controls and the signature. This is the half that
+ * cannot be unit tested: that the guard is wired into the loop, that it fires there, and that it
+ * ends the turn the way the two guards beside it end one.
+ */
+describe('a turn that stopped changing', () => {
+  const planCall = (id: string): string =>
+    toolFrame(id, 'set_plan', {
+      branchName: 'Main',
+      steps: [
+        { title: 'Read the brief', status: 'completed' },
+        { title: 'Draft the importer', status: 'in_progress' }
+      ]
+    });
+
+  it('stops the turn well short of the step budget, and says why where the owner reads why', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    // The last body is served for every request past the end of the list, so this is the incident:
+    // the same call, forever, until something stops it.
+    installFetch([planCall('call-1')], log);
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 40 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const stopped = probe.events.find(
+      (entry) => entry.summary === 'Stopped a turn that had stopped changing'
+    );
+    expect(stopped?.kind).toBe('warning');
+    expect((stopped?.payload as { tools?: string[] } | undefined)?.tools).toEqual(['set_plan']);
+    // The payload carries the signature and not the arguments: sixteen bytes prove the steps were
+    // identical, and the arguments they were identical in are the owner's own writing.
+    expect((stopped?.payload as { signature?: string } | undefined)?.signature).toMatch(
+      /^[0-9a-f]{16}$/
+    );
+    expect(JSON.stringify(stopped?.payload)).not.toContain('Draft the importer');
+    // Short of the budget by a wide margin, which is the whole point: the budget was the only thing
+    // that used to stop this, at up to a hundred and twenty steps.
+    expect(log.modelRequests.length).toBeLessThanOrEqual(
+      stationaryStepsBeforeStop(MAX_STATIONARY_STEPS) + 2
+    );
+    expect(log.modelRequests.length).toBeGreaterThanOrEqual(
+      stationaryStepsBeforeStop(MAX_STATIONARY_STEPS)
+    );
+  });
+
+  it('tells the model once before it ends anything, and names the call in the sentence', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([planCall('call-1')], log);
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 40 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const told = decryptCheckpoints(probe.checkpoints)
+      .at(-1)
+      ?.messages.filter((message) => message.content.startsWith('NOTHING HAS CHANGED FOR'));
+    expect(told?.length).toBeGreaterThanOrEqual(1);
+    expect(told?.[0]?.content).toContain('set_plan');
+    // The marker the eval harness matches on, published from the file that writes the sentence.
+    expect(told?.[0]?.content.startsWith(marker('stationary_stop'))).toBe(true);
+  });
+
+  it('leaves the owner the reason on the completion, not a red error', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([planCall('call-1')], log);
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 40 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(probe.events.some((entry) => entry.kind === 'error')).toBe(false);
+    const completed = probe.events.find((entry) => entry.kind === 'completed');
+    expect(JSON.stringify(completed?.payload)).toContain('made the identical set_plan call');
+  });
+
+  /**
+   * And it does not fire on a turn that is working, which is the expensive direction to be wrong in.
+   * The same tool twice, then something else: a shape every healthy task has.
+   */
+  it('says nothing about a turn that repeats a call and then moves on', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        planCall('call-1'),
+        planCall('call-2'),
+        toolFrame('call-3', 'finish', {
+          summary: 'The plan is published and the notes are tidy.',
+          verification: { status: 'not_applicable', evidence: [] }
+        })
+      ],
+      log
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 40 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(
+      probe.events.some((entry) => entry.summary === 'Stopped a turn that had stopped changing')
+    ).toBe(false);
+    expect(
+      decryptCheckpoints(probe.checkpoints)
+        .at(-1)
+        ?.messages.some((message) => message.content.startsWith('NOTHING HAS CHANGED FOR'))
+    ).toBe(false);
+  });
+});
+
+/**
+ * A response cut off mid-JSON at the output cap, and what answering it in the real history cost.
+ *
+ * The call is answered rather than dropped, because a tool call with no tool result is a malformed
+ * turn the provider refuses on the next step. What was never done was taking the unparseable bytes
+ * back out: `rawArguments` carries the whole of a half-written file, it is undeclared on
+ * `ModelMessage.toolCalls` so the compiler never saw it, and nothing between the push and the
+ * encrypted write ever dropped it.
+ */
+describe('a tool call that was cut off mid-argument', () => {
+  /** The half-written file, at a size a real output cap produces. */
+  const halfAFile = `{"path":"workspace/importer.py","content":"${'import pandas as pd\\n'.repeat(1_200)}`;
+
+  /**
+   * The frame as the provider actually sends it: arguments that are a prefix of valid JSON, and
+   * `length` as the reason it stopped - which is what tells the adapter this was the output cap
+   * rather than a model writing bad JSON.
+   */
+  const cutOffFrame = (id: string, name: string, rawArguments: string): string =>
+    `data: ${JSON.stringify({
+      choices: [
+        {
+          finish_reason: 'length',
+          delta: { tool_calls: [{ index: 0, id, function: { name, arguments: rawArguments } }] }
+        }
+      ]
+    })}\n\ndata: [DONE]\n\n`;
+
+  const run = async (): Promise<{ probe: StoreProbe; log: FetchLog }> => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        cutOffFrame('call-1', 'file_write', halfAFile),
+        toolFrame('call-2', 'finish', {
+          summary: 'The write was too large to send in one piece.',
+          verification: { status: 'not_applicable', evidence: [] }
+        })
+      ],
+      log
+    );
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 4 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+    return { probe, log };
+  };
+
+  it('answers it, and keeps no fragment of the bytes that would not parse', async () => {
+    const { probe } = await run();
+
+    const warned = probe.events.find((entry) => entry.summary.includes('cut off mid-argument'));
+    expect(warned?.kind).toBe('warning');
+    // The precondition: the turn really did see a truncated call rather than an ordinary one.
+    expect((warned?.payload as { bytes?: number } | undefined)?.bytes).toBeGreaterThan(20_000);
+
+    const state = decryptCheckpoints(probe.checkpoints).at(-1);
+    const persisted = JSON.stringify(state);
+    expect(persisted).not.toContain('import pandas as pd');
+    expect(persisted).not.toContain('rawArguments');
+    expect(persisted).not.toContain('parseFailed');
+  });
+
+  it('leaves a window a provider will still take: every call has a result', async () => {
+    const { probe } = await run();
+
+    const state = decryptCheckpoints(probe.checkpoints).at(-1);
+    const answered = new Set(
+      (state?.messages ?? [])
+        .filter((message) => message.role === 'tool')
+        .map((message) => message.toolCallId)
+    );
+    const proposed = (state?.messages ?? []).flatMap(
+      (message) =>
+        (message as { toolCalls?: Array<{ id: string; name: string }> }).toolCalls?.map(
+          (call) => call.id
+        ) ?? []
+    );
+    expect(proposed).toContain('call-1');
+    for (const id of proposed) expect(answered.has(id)).toBe(true);
+    // And the reason string is untouched: it is #59's good half and it stays.
+    expect(
+      (state?.messages ?? []).some((message) =>
+        message.content.includes("were cut off at the model's output limit")
+      )
+    ).toBe(true);
+  });
+
+  /**
+   * The cost nobody had named. `estimatedTokens` in context.ts sizes an assistant message with
+   * `JSON.stringify(message.toolCalls).length`, and that walked the whole half-written file - so one
+   * cut-off write charged the window several thousand tokens the adapter would never send, and the
+   * compaction trigger is derived from that number.
+   */
+  it('stops the window being sized from a payload the wire never carries', async () => {
+    const { probe } = await run();
+
+    const state = decryptCheckpoints(probe.checkpoints).at(-1);
+    const cutOff = (state?.messages ?? [])
+      .flatMap((message) => (message as { toolCalls?: Array<{ id: string }> }).toolCalls ?? [])
+      .filter((call) => call.id === 'call-1');
+    expect(cutOff).toHaveLength(1);
+    // Three declared fields and an empty argument object, against twenty-five kilobytes.
+    expect(JSON.stringify(cutOff).length).toBeLessThan(halfAFile.length / 100);
+  });
+});
+
+/**
+ * Which athanor priced this.
+ *
+ * A cost line is the most-compared number the product emits - a baseline read back a year later, a
+ * regression argued from two transcripts - and until now nothing on it said which build produced it,
+ * so two figures that disagree could not be told apart from two builds that disagree. It is the
+ * §6.2 credibility move's precondition: "this harness, this commit, this model, N runs" needs the
+ * commit to be on the row.
+ */
+describe('the build that priced a step', () => {
+  it('is on the cost event, on the ordinary step path', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-1', 'finish', {
+          summary: 'The notes are tidy.',
+          verification: { status: 'not_applicable', evidence: [] }
+        })
+      ],
+      log
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const cost = probe.events.find((entry) => entry.kind === 'cost');
+    expect(cost).toBeTruthy();
+    expect((cost?.payload as { build?: unknown } | undefined)?.build).toEqual(buildIdentity());
   });
 });

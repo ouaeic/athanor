@@ -9,6 +9,7 @@ const instantPolicy = (waits: number[]): RetryPolicy => ({
   maxAttempts: 3,
   baseDelayMs: 500,
   maxDelayMs: 20_000,
+  maxRetryAfterMs: 120_000,
   random: () => 0,
   sleep: async (ms) => {
     waits.push(ms);

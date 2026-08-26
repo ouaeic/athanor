@@ -2,11 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_GENERATION_MAX_CHARS,
   DEFAULT_GENERATION_TIMEOUT_MS,
+  HUGE_REQUEST_TOKENS,
+  LARGE_REQUEST_TOKENS,
   MIN_CONTINUABLE_CHARS_PER_SECOND,
   describeCutoff,
   estimatedOutputTokens,
   generationCharCeiling,
   startGenerationBudget,
+  streamIdleTimeoutFor,
   worthContinuing
 } from './generation-budget.js';
 
@@ -112,6 +115,34 @@ describe('generation budget', () => {
     // Except when the ceiling was what stopped it: a route already past twice the longest answer
     // the request allowed for does not need more room, whatever rate it wrote at.
     expect(worthContinuing('overrun', productive)).toBe(false);
+  });
+
+  /*
+   * The idle clock is the one bound on a generation that a *large* request can trip while nothing
+   * is wrong. Everything else here measures what the route wrote; this measures the gap before it
+   * writes anything, and that gap grows with the prompt - a reasoning route reads a hundred
+   * thousand tokens of window before it emits its first one. A flat two minutes is generous for an
+   * ordinary step and a live risk of abandoning a healthy route on the largest step a task takes,
+   * which is also the most expensive one to throw away.
+   */
+  it('lengthens the idle deadline for a large request and leaves an ordinary one alone', () => {
+    const base = 120_000;
+    // Four characters to the token, the same conversion the rest of this file estimates with.
+    expect(streamIdleTimeoutFor(base, 40_000 * 4)).toBe(base);
+    expect(streamIdleTimeoutFor(base, LARGE_REQUEST_TOKENS * 4)).toBe(180_000);
+    expect(streamIdleTimeoutFor(base, 80_000 * 4)).toBe(180_000);
+    expect(streamIdleTimeoutFor(base, HUGE_REQUEST_TOKENS * 4)).toBe(240_000);
+    expect(streamIdleTimeoutFor(base, 900_000 * 4)).toBe(240_000);
+    // Monotonic across the whole range: a bigger request is never given less patience than a
+    // smaller one, which is the only property a caller can reason about without knowing the rungs.
+    const deadlines = [0, 1, 100_000, 200_000, 400_000, 4_000_000].map((bytes) =>
+      streamIdleTimeoutFor(base, bytes)
+    );
+    expect(deadlines).toEqual([...deadlines].sort((a, b) => a - b));
+    // Zero is the escape hatch that disables the deadline. Scaling it would turn "no deadline" into
+    // "no deadline, twice", and a negative one is the same escape hatch spelt differently.
+    expect(streamIdleTimeoutFor(0, 4_000_000)).toBe(0);
+    expect(streamIdleTimeoutFor(-1, 4_000_000)).toBe(-1);
   });
 
   it('says what stopped, how far it had got and how long it had been going', () => {

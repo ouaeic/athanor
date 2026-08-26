@@ -91,6 +91,7 @@ import {
 } from './streaming.js';
 import { executeToolCall } from './tool-dispatch.js';
 import { AgentRunnerClient, withRunnerAbort } from './runner-client.js';
+import { buildIdentity } from './build-identity.js';
 import { agentToolsFor, isMutatingToolCall, writesOnlyProse } from './tools.js';
 import {
   ACCEPTANCE_ALREADY_PASSED_CAVEAT,
@@ -127,7 +128,11 @@ import {
   repeatedFailuresAfter,
   spendHalt,
   spendWarning,
-  stepLimitCarryOver
+  stationaryStepBreak,
+  stationaryStepRun,
+  stationaryStepsBeforeStop,
+  stepLimitCarryOver,
+  tombstoneMalformedCall
 } from './turn-bounds.js';
 import {
   CANCELLATION_POLL_INTERVAL_MS,
@@ -151,6 +156,7 @@ import { compactTurnContext, type CompactionDeps } from './compaction.js';
 import {
   drainCorrection as drainCorrection_,
   honorUserControl as honorUserControl_,
+  requestDerivationBreach,
   type TurnControlDeps
 } from './turn-control.js';
 import {
@@ -322,8 +328,13 @@ export {
   repeatedFailuresAfter,
   spendHalt,
   spendWarning,
+  stationaryStepBreak,
+  stationaryStepRun,
+  stationaryStepsBeforeStop,
   stepBudgetNotice,
   stepLimitCarryOver,
+  stepSignature,
+  tombstoneMalformedCall,
   type PushbackName
 } from './turn-bounds.js';
 export {
@@ -890,6 +901,12 @@ export class AgentWorker {
       cumulativeCredits: state.credits,
       usage: response.usage,
       metadata: response.metadata,
+      // Which athanor priced this. A cost line is the most-compared number the product emits - a
+      // baseline read back a year later, a regression argued from two transcripts - and until now
+      // nothing on it said which build produced it, so two figures that disagree could not be told
+      // apart from two builds that disagree. `buildIdentity()` is derived once from the checkout and
+      // is a constant for the process, so it costs the row a few bytes and no work.
+      build: buildIdentity(),
       reasoningEffort,
       context: {
         estimatedInputTokens: preparedContext.estimatedInputTokens,
@@ -2407,15 +2424,22 @@ export class AgentWorker {
         });
         if (compacted) await refreshActivePlan();
       }
+      /*
+       * Held rather than written inline, because the invariant below re-derives from exactly these
+       * and the next line overwrites one of them: `toolOutputFloor` goes in as the *previous*
+       * step's floor and comes back as this step's, so a re-derivation reading it off the state
+       * would be re-deriving a different request and would fail on every healthy step.
+       */
+      const windowOptions = {
+        precedingTokens: reservedTokens,
+        reservedTokens,
+        ...(state.toolOutputFloor === undefined ? {} : { toolOutputFloor: state.toolOutputFloor })
+      };
       const preparedContext = prepareModelContext(
         state.messages,
         model.contextTokens,
         maxOutputTokens,
-        {
-          precedingTokens: reservedTokens,
-          reservedTokens,
-          ...(state.toolOutputFloor === undefined ? {} : { toolOutputFloor: state.toolOutputFloor })
-        }
+        windowOptions
       );
       state.toolOutputFloor = preparedContext.olderToolOutputChars;
       state.preparedInputTokens = preparedContext.estimatedInputTokens;
@@ -2563,6 +2587,38 @@ export class AgentWorker {
       const refusedWindow: { error?: AthanorError } = {};
       const looping = new AbortController();
       let streamed = '';
+      /*
+       * The request, checked against the log it is supposed to be a function of, immediately before
+       * it is sent - and the turn failed rather than billed if it is not.
+       *
+       * @see requestDerivationBreach in `turn-control.ts` for the three classes and why the largest
+       * control in the product is the one that gets this. It is asked here, past every branch that
+       * can still edit the window - the taint notice, the overflow repair, the compaction - and in
+       * front of the one call that spends the owner's money on it.
+       */
+      const derivationBreach = requestDerivationBreach({
+        prepared: preparedContext.messages,
+        rederived: prepareModelContext(
+          state.messages,
+          model.contextTokens,
+          maxOutputTokens,
+          windowOptions
+        ).messages,
+        sent: requestTools,
+        // Rebuilt from the same two facts the run built it from, rather than compared against a
+        // remembered copy: a remembered copy proves the array did not change, and what has to be
+        // proved is that it is still the catalogue this run is entitled to send.
+        entitled: [...agentToolsFor(), COMPACT_CONTEXT_TOOL].filter(
+          (tool) => !withdrawnTools.has(tool.name)
+        ),
+        reservedTokens,
+        reservedTokensOfSent: Math.ceil(JSON.stringify(requestTools).length / 4)
+      });
+      if (derivationBreach)
+        throw new AthanorError(
+          'request_not_derivable',
+          `This turn stopped before sending a request it could not account for: ${derivationBreach}. Nothing it produced was rolled back - reply to carry on.`
+        );
       const stopWatch = startStopWatch(() => this.store.taskClaim(task.id), this.config.WORKER_ID);
       const response = await this.#withLeaseRenewal(task, () =>
         withRequestDeadline((signal) =>
@@ -3064,6 +3120,18 @@ export class AgentWorker {
           const truncations = (state.argumentTruncations ?? 0) + 1;
           state.argumentTruncations = truncations;
           const cutOff = call.argumentsTruncated === true;
+          /*
+           * The payload that would not parse, taken back out of the window the moment it is
+           * answered. @see tombstoneMalformedCall in `turn-bounds.ts` for what keeping it cost -
+           * the short version is that the estimator sizes the window from bytes the adapter never
+           * sends, so one cut-off write made the turn compact away real history to make room for a
+           * payload that does not exist on the wire.
+           *
+           * Before the result rather than after it only so the warning below can report how much
+           * was removed; the call itself stands either way, because a tool call with no tool result
+           * is the malformed turn this whole branch exists to avoid producing.
+           */
+          const tombstoned = tombstoneMalformedCall(state.messages, call.id);
           await event(
             this.store,
             task,
@@ -3075,7 +3143,7 @@ export class AgentWorker {
             {
               tool: call.name,
               attempt: truncations,
-              bytes: call.rawArguments?.length ?? 0
+              bytes: tombstoned
             }
           );
           await this.#recordToolResult(
@@ -3854,6 +3922,62 @@ export class AgentWorker {
         state.messages.push({
           role: 'system',
           content: repeatedFailureBreak(repeated.count, repeated.tool)
+        });
+      }
+      /*
+       * And is it still doing anything different from what it did last step.
+       *
+       * The third of the three, and the one that sees the shape the other two are blind to by
+       * construction: the step above needs a call that threw, the step above that needs a step that
+       * started nothing, and the incident this was written for is a call that started, ran and
+       * succeeded - identically - twelve times. Asked after both of them so that a turn which is
+       * failing the same way is told the sharper of the two sentences; a step cannot trip both,
+       * because a call that throws is answered with an error whose text the acting tier folds into
+       * the signature only when it is byte-identical, and by then the failure guard has already
+       * fired at a lower count.
+       *
+       * Derived from the window rather than from a counter, so it survives the compaction, the
+       * approval pause and the worker handover that a counter in this frame would not.
+       */
+      const stationary = stationaryStepRun(state.messages, state.turnToolResults);
+      if (stationary && stationary.steps >= stationaryStepsBeforeStop(stationary.limit)) {
+        /*
+         * Ended exactly as the idle break and the failure break end one, and the payload carries the
+         * signature rather than the arguments: sixteen bytes prove the steps were identical, and the
+         * arguments they were identical *in* are the owner's file or the owner's command line.
+         */
+        await event(this.store, task, key, 'warning', 'Stopped a turn that had stopped changing', {
+          steps: stationary.steps,
+          tools: stationary.tools,
+          signature: stationary.signature
+        });
+        const stuckOn = await this.#outstandingPlanSteps(task, key).catch(() => []);
+        await this.#completeTurn(task, key, state, {
+          summary: `Stopped after ${stationary.steps} steps that all made the same ${stationary.tools.join(', ')} call.`,
+          interrupted: true,
+          ...(stuckOn.length ? { outstanding: stuckOn } : {}),
+          verification: {
+            status: 'not_applicable',
+            evidence: [],
+            remainingRisks: [
+              `athanor stopped this turn: ${stationary.steps} steps running made the identical ${stationary.tools.join(', ')} call, so the work had stopped moving. Reply to carry on, or say which way you want it decided.`
+            ]
+          }
+        });
+        return;
+      }
+      if (stationary && stationary.steps >= stationary.limit) {
+        await event(
+          this.store,
+          task,
+          key,
+          'warning',
+          `The same ${stationary.tools.join(', ')} call has been made ${stationary.steps} steps running`,
+          { steps: stationary.steps, tools: stationary.tools, signature: stationary.signature }
+        );
+        state.messages.push({
+          role: 'system',
+          content: stationaryStepBreak(stationary.steps, stationary.tools)
         });
       }
       await this.store.updateTask({

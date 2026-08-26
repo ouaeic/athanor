@@ -1,4 +1,10 @@
 {
+  "$stamp": {
+    "acceptedAt": "2026-08-26T22:11:17.640Z",
+    "version": "0.1.1",
+    "commit": "784ed13",
+    "harness": "177b0b520d04"
+  },
   "ambiguous-a-question-before-looking-is-refused": {
     "modelCalls": 3,
     "promptTokens": 12563,
@@ -28,6 +34,11 @@
     "modelCalls": 5,
     "promptTokens": 28760,
     "cachePrefix": 95
+  },
+  "answer-a-remembered-fact-the-answer-used-is-recorded-as-cited": {
+    "modelCalls": 1,
+    "promptTokens": 4339,
+    "cachePrefix": 0
   },
   "answer-a-remembering-workspace-pays-for-its-preamble-once": {
     "modelCalls": 3,
@@ -101,12 +112,12 @@
   },
   "long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly": {
     "modelCalls": 40,
-    "promptTokens": 909584,
+    "promptTokens": 910099,
     "cachePrefix": 94
   },
   "long-a-finished-phase-is-condensed-on-the-larger-window": {
     "modelCalls": 40,
-    "promptTokens": 909584,
+    "promptTokens": 910099,
     "cachePrefix": 94
   },
   "long-a-finished-phase-is-never-declared": {
@@ -121,13 +132,13 @@
   },
   "long-a-full-window-condenses-rather-than-stubbing-itself": {
     "modelCalls": 19,
-    "promptTokens": 726572,
+    "promptTokens": 728551,
     "cachePrefix": 52
   },
   "long-finished-phases-condense-rather-than-shred": {
     "modelCalls": 39,
-    "promptTokens": 2505407,
-    "cachePrefix": 66
+    "promptTokens": 2515984,
+    "cachePrefix": 67
   },
   "media-a-picture-priced-above-the-ceiling-is-not-routed": {
     "modelCalls": 2,
@@ -176,7 +187,7 @@
   },
   "research-a-browser-page-taints-the-turn-by-where-it-came-from": {
     "modelCalls": 2,
-    "promptTokens": 8342,
+    "promptTokens": 8409,
     "cachePrefix": 96
   },
   "research-a-desktop-observation-is-not-treated-as-untrusted": {
@@ -186,18 +197,18 @@
   },
   "research-a-long-mission-holds-its-own-window-down": {
     "modelCalls": 13,
-    "promptTokens": 8763,
-    "cachePrefix": 95
+    "promptTokens": 8851,
+    "cachePrefix": 94
   },
   "research-a-specialist-reads-and-the-turn-inherits-it": {
     "modelCalls": 6,
-    "promptTokens": 8681,
+    "promptTokens": 8758,
     "cachePrefix": 94
   },
   "research-a-thin-search-is-requeried": {
     "modelCalls": 4,
-    "promptTokens": 17366,
-    "cachePrefix": 97
+    "promptTokens": 17760,
+    "cachePrefix": 96
   },
   "research-identical-read-is-not-paid-twice": {
     "modelCalls": 3,
@@ -206,13 +217,18 @@
   },
   "research-search-then-read": {
     "modelCalls": 3,
-    "promptTokens": 12985,
-    "cachePrefix": 96
+    "promptTokens": 13188,
+    "cachePrefix": 95
   },
   "research-untrusted-page-cannot-lower-the-floor": {
     "modelCalls": 2,
-    "promptTokens": 8347,
+    "promptTokens": 8414,
     "cachePrefix": 96
+  },
+  "schema-a-control-the-product-reads-has-a-writer": {
+    "modelCalls": 0,
+    "promptTokens": 0,
+    "cachePrefix": 0
   },
   "schema-every-catalogued-tool-has-a-handler": {
     "modelCalls": 0,
@@ -242,6 +258,16 @@
   "small-a-provider-blip-is-retried-and-the-turn-finishes": {
     "modelCalls": 4,
     "promptTokens": 8191,
+    "cachePrefix": 97
+  },
+  "small-a-spent-ceiling-halts-the-turn-and-sends-nothing-after-it": {
+    "modelCalls": 2,
+    "promptTokens": 8211,
+    "cachePrefix": 97
+  },
+  "small-a-warned-spending-cap-narrates-once-and-carries-on": {
+    "modelCalls": 3,
+    "promptTokens": 12564,
     "cachePrefix": 97
   },
   "small-deliberation-that-ignores-the-break-is-stopped": {

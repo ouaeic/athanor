@@ -74,6 +74,39 @@ export const estimatedOutputTokens = (characters: number): number =>
   Math.ceil(characters / ESTIMATED_CHARS_PER_TOKEN);
 
 /**
+ * Where a request stops being an ordinary one, in estimated input tokens.
+ *
+ * The idle clock is the only bound in this file that a request can trip while the route is behaving
+ * perfectly. The others all measure what was written; this one measures the gap before anything is
+ * written, and that gap is a function of the prompt: a route reads the whole window before it emits
+ * a token, and a reasoning route deliberates over it as well. A flat deadline is therefore generous
+ * on a small step and, on the largest step a task takes - which is also the most expensive one to
+ * throw away and re-run - a live risk of abandoning a route that was about to answer.
+ *
+ * Two rungs rather than a curve, because the honest resolution of the underlying estimate is about
+ * that: the bytes on the wire are known exactly and the tokens they cost are not.
+ */
+export const LARGE_REQUEST_TOKENS = 50_000;
+export const HUGE_REQUEST_TOKENS = 100_000;
+
+/**
+ * The idle deadline this request gets, from the base deadline and the size of the assembled body.
+ *
+ * Measured in bytes because bytes are what the caller has in hand - the body has just been
+ * serialised to be sent - and converted at the same four characters to the token the rest of this
+ * file estimates with. A base of zero or less is the escape hatch that turns the deadline off
+ * entirely and is handed straight back: multiplying "no deadline" is still no deadline, and
+ * scaling it would only put a number where the caller asked for none.
+ */
+export const streamIdleTimeoutFor = (baseMs: number, requestBytes: number): number => {
+  if (baseMs <= 0) return baseMs;
+  const tokens = requestBytes / ESTIMATED_CHARS_PER_TOKEN;
+  if (tokens >= HUGE_REQUEST_TOKENS) return Math.round(baseMs * 2);
+  if (tokens >= LARGE_REQUEST_TOKENS) return Math.round(baseMs * 1.5);
+  return baseMs;
+};
+
+/**
  * The rate below which asking a route to carry on from where it stopped is throwing good money
  * after bad.
  *

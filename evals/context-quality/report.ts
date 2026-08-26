@@ -11,9 +11,87 @@
  * a decision about what athanor's agent can still remember, and the intended way to make it is to
  * re-accept the baseline in the commit that moves it, with the new figure quoted in the message.
  */
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+
+import { buildIdentity } from '../../apps/worker/src/build-identity.js';
 import { judgeCeiling } from './probes.js';
 import { meanCeiling, tokensPerTask, type Measurement } from './measure.js';
 import { PROBE_KINDS } from './probes.js';
+
+/* ------------------------------------------------------------- what produced a number, exactly */
+
+/**
+ * Which athanor, and which rig, a committed row was measured by.
+ *
+ * The twin of the block in `evals/report.ts`, and deliberately a twin rather than a shared import:
+ * `evals/harness.ts` rewrites the built-in skill library at module load, so importing anything from
+ * it into this rig would mutate global state a context measurement reads. They share a shape and
+ * nothing else - the file lists differ, because what decides a number differs.
+ *
+ * `version` and `commit` come from `buildIdentity()`, the same pair the box reports to its owner,
+ * so a row here names a revision somebody can check out. `rig` is a digest of the six files that
+ * decide every number this directory prints; it has to be derived rather than declared, because a
+ * hand-maintained version is a control wired to nothing the first time somebody edits a probe and
+ * forgets it. A stamp that disagrees with the current run is a note and never a failure: adding a
+ * probe legitimately moves the digest, and the answer is `--accept` in the same commit.
+ */
+export interface BaselineStamp {
+  readonly acceptedAt: string;
+  readonly version: string;
+  readonly commit: string | null;
+  readonly rig: string;
+}
+
+export const BASELINE_STAMP_KEY = '$stamp';
+
+const RIG_SOURCES: readonly string[] = [
+  'configurations.ts',
+  'judge.ts',
+  'measure.ts',
+  'probes.ts',
+  'report.ts',
+  'trajectories.ts'
+];
+
+const rigDigest = (): string => {
+  try {
+    const hash = createHash('sha256');
+    // A separator that cannot occur in TypeScript source, so text shifted across the boundary
+    // between two files does not hash the same as text that never moved.
+    for (const file of RIG_SOURCES)
+      hash.update(`${readFileSync(new URL(file, import.meta.url), 'utf8')}\0`);
+    return hash.digest('hex').slice(0, 12);
+  } catch {
+    // Named as the absence it is. A plausible-looking digest that means nothing is worse.
+    return 'unreadable';
+  }
+};
+
+let stamped: Omit<BaselineStamp, 'acceptedAt'> | null = null;
+
+export const rigIdentity = (): Omit<BaselineStamp, 'acceptedAt'> =>
+  (stamped ??= { ...buildIdentity(), rig: rigDigest() });
+
+export const identityLabel = (identity: Omit<BaselineStamp, 'acceptedAt'>): string =>
+  `athanor ${identity.version} at ${identity.commit ?? 'an uncommitted tree'}, rig ${identity.rig}`;
+
+/**
+ * The stamp out of a parsed baseline, or null.
+ *
+ * Validated field by field rather than cast, because it arrives from a file: a stamp half-written
+ * by an interrupted `--accept` would otherwise print as a revision that never existed, which is
+ * worse than printing nothing because somebody would try to check it out.
+ */
+export const stampOf = (baseline: Baseline | undefined): BaselineStamp | null => {
+  const row = (baseline as Record<string, unknown> | undefined)?.[BASELINE_STAMP_KEY];
+  if (typeof row !== 'object' || row === null) return null;
+  const { acceptedAt, version, commit, rig } = row as Record<string, unknown>;
+  if (typeof acceptedAt !== 'string' || typeof version !== 'string' || typeof rig !== 'string')
+    return null;
+  if (commit !== null && typeof commit !== 'string') return null;
+  return { acceptedAt, version, commit, rig };
+};
 
 export interface BaselineRow {
   readonly availability: number;
@@ -32,7 +110,14 @@ export const rowKey = (measurement: Measurement): string =>
 export const availabilityOf = (measurement: Measurement): number => meanCeiling(measurement);
 
 export const baselineFrom = (measurements: readonly Measurement[]): Baseline => {
-  const baseline: Baseline = {};
+  // First, so a reader opening the file sees what produced it before the numbers. The cast is the
+  // one place the stamp and the rows share a map: `check` looks the file up by `rowKey`, which is
+  // always `trajectory/configuration` and can never be this key.
+  const baseline: Baseline = {
+    ...({
+      [BASELINE_STAMP_KEY]: { acceptedAt: new Date().toISOString(), ...rigIdentity() }
+    } as unknown as Baseline)
+  };
   for (const measurement of measurements)
     baseline[rowKey(measurement)] = {
       availability: availabilityOf(measurement),
@@ -96,6 +181,26 @@ export const render = (
   judged: ReadonlyMap<string, readonly JudgedScore[]> = new Map()
 ): string => {
   const lines: string[] = [];
+  /*
+   * Who is asking, and who the committed numbers belong to.
+   *
+   * Printed on every run rather than only on a mismatch, because the value of a provenance line is
+   * that it sits in the scrollback of the run somebody later has questions about. The mismatch
+   * underneath is a note: a wave that adds a probe moves the digest by design.
+   */
+  const identity = rigIdentity();
+  const stamp = stampOf(baseline);
+  lines.push(`This run: ${identityLabel(identity)}.`);
+  lines.push(
+    stamp
+      ? `Baseline: accepted ${stamp.acceptedAt.slice(0, 10)} by ${identityLabel(stamp)}.`
+      : 'Baseline: unstamped - accept it once to record what measured it.'
+  );
+  if (stamp && (stamp.commit !== identity.commit || stamp.rig !== identity.rig))
+    lines.push(
+      'Note: the committed numbers were measured by a different revision of athanor or of this rig. A row that moved may have moved for that reason.'
+    );
+
   const byTrajectory = new Map<string, Measurement[]>();
   for (const measurement of measurements) {
     const list = byTrajectory.get(measurement.trajectoryId) ?? [];
