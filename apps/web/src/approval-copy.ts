@@ -5,15 +5,25 @@
  * 8/2/2026, 1:14:22 AM"). Neither is what someone deciding whether to get up and answer it needs:
  * the useful form is what the agent is about to do, and how long is left.
  */
+import { agentWording } from './approval-facts.js';
+import type { ContextNote } from './provenance.js';
 import type { Approval } from './types.js';
 
 /**
  * What the agent is about to touch, taken from the tool the approval is bound to.
  *
- * The tool is the specific answer and the reversibility class below is the general one. This table
- * covers every tool that can raise an approval; anything else falls through to the class.
+ * The tool is the specific answer and the reversibility class below is the general one, and the
+ * card says both. This table covers every tool that can raise an approval — a claim this comment
+ * made for a long time while missing two of them, so both `approval-copy.test.ts` and
+ * `scripts/check-repository.mjs` now read the tool names out of the worker's own approval floor
+ * and hold this table against them. The repository check is the one that matters: a new branch in
+ * `apps/worker/src/approval-policy.ts` fails the build rather than one client's test suite. The
+ * two that were missing are the two whose subject is not the workspace: `audio_read`, which asks
+ * about provider spend, and `parallel_web_read`, which asks about addresses data leaves by.
+ *
+ * Anything a newer box raises that this client has never heard of still falls through to the class.
  */
-const toolPhrases: Record<string, string> = {
+export const approvalToolPhrases: Record<string, string> = {
   shell: 'Runs a command on your computer',
   file_write: 'Changes a file on your computer',
   file_patch: 'Changes a file on your computer',
@@ -21,11 +31,13 @@ const toolPhrases: Record<string, string> = {
   desktop_launch: 'Opens an application on your computer',
   desktop_action: 'Uses an application on your computer',
   browser_action: 'Acts on a website',
+  parallel_web_read: 'Opens addresses on the public internet',
   connector_action: 'Uses a connected account',
   publish_site: 'Puts something on the public internet',
   publish_preview: 'Creates a private preview link',
   publish_artifact: 'Publishes a file into this conversation',
   generate_media: 'Spends money at a provider',
+  audio_read: 'Spends money at a provider to read a recording',
   coding_agent: 'Hands work to a coding agent',
   memory: 'Changes what athanor remembers',
   skill: 'Changes a saved skill',
@@ -35,30 +47,38 @@ const toolPhrases: Record<string, string> = {
 /**
  * How far the effect reaches, which is the only thing the box records about every approval.
  *
+ * Written as a clause rather than as a sentence because it is always said, and said after the tool
+ * phrase whenever there is one. It used to be the alternative to that phrase: `approvalReach`
+ * returned the tool phrase when it had one and only fell back to this, so `sideEffect` — the single
+ * fact the box records about every approval — was thrown away for sixteen of the eighteen tools
+ * that can raise one. A `desktop_action` that may not be undoable and a `desktop_action` that can
+ * be undone read as the same six words, on the one control where the difference is the decision.
+ *
  * These are the three values the worker actually writes. The table this replaced was keyed on
  * `read`/`write`/`connector_write` and so on — none of which are ever stored — so every card in the
  * product fell through to the fallback and told the owner "External consequential".
  */
-const reachPhrases: Record<string, string> = {
-  workspace_write: 'Changes your computer',
-  external_reversible: 'Reaches outside your computer',
-  external_consequential: 'Reaches outside your computer, and may not be undoable'
+const reachClauses: Record<string, string> = {
+  workspace_write: 'changes your computer',
+  external_reversible: 'reaches outside your computer',
+  external_consequential: 'reaches outside your computer, and may not be undoable'
 };
 
 /** An effect or tool this client does not know about still has to read as English, not as a column. */
-const humanise = (value: string): string =>
-  value.replaceAll('_', ' ').replace(/^./, (first) => first.toUpperCase());
+const humanise = (value: string): string => value.replaceAll('_', ' ');
+
+const sentence = (value: string): string => value.replace(/^./, (first) => first.toUpperCase());
 
 export const approvalReach = (approval: {
   sideEffect: string;
   preview: Approval['preview'];
 }): string => {
   const tool = typeof approval.preview === 'string' ? undefined : approval.preview.tool;
-  return (
-    (tool ? toolPhrases[tool] : undefined) ??
-    reachPhrases[approval.sideEffect] ??
-    humanise(approval.sideEffect)
-  );
+  const phrase = tool ? approvalToolPhrases[tool] : undefined;
+  const reach = reachClauses[approval.sideEffect] ?? humanise(approval.sideEffect);
+  // The separator the rest of this card already speaks: the eyebrow above joins its clauses the
+  // same way, so a screen reader is not being handed a new punctuation habit here.
+  return phrase ? `${phrase} · ${reach}` : sentence(reach);
 };
 
 export const expiryPhrase = (expiresAt: string, now = Date.now()): string => {
@@ -70,6 +90,50 @@ export const expiryPhrase = (expiresAt: string, now = Date.now()): string => {
   if (minutes < 60) return `expires in ${minutes} min`;
   const hours = Math.round(minutes / 60);
   return `expires in ${hours} ${hours === 1 ? 'hour' : 'hours'}`;
+};
+
+/**
+ * How long is left, and which way it fails if the owner never answers.
+ *
+ * A lapse is neither a block nor a denial. The worker treats an unanswered request as expired,
+ * skips the action and carries the turn on — "Approval request expired without an answer, so the
+ * action was not run" — and the only trace of it is one line in one transcript. The countdown is on
+ * this card so the owner can decide whether to get up and answer it, and that decision needs the
+ * consequence: a card saying only "expires in 23 hours" is read as "this waits for me".
+ */
+export const expiryNote = (expiresAt: string, now = Date.now()): string => {
+  const phrase = expiryPhrase(expiresAt, now);
+  if (phrase === 'no time limit') return phrase;
+  return phrase === 'expired'
+    ? 'expired · it was not run, and athanor carried on without it'
+    : `${phrase} · if it lapses it is not run, and athanor carries on without it`;
+};
+
+/**
+ * Where the instruction behind this request came from, from the row rather than from the timeline.
+ *
+ * Two answers to one question, and the recorded one wins. `origin` is written onto the approval by
+ * the turn that raised it, so it is the only answer available for a request raised in a
+ * conversation the owner is not looking at — which `nextApproval` deliberately makes the ordinary
+ * case. The trajectory-derived note can only be computed for the conversation on screen, so the
+ * card was silent about provenance for exactly the requests whose provenance is hardest to
+ * remember. A repeat origin across tasks is the residual attack this whole separation exists to
+ * make visible, and it is only visible if every card that has one says so.
+ *
+ * Put through `agentWording` for the same reason the facts are: the origin is derived from content
+ * that came from outside, and a host with a bidirectional override in it renders as another host.
+ */
+export const approvalProvenance = (
+  approval: Approval,
+  context: ContextNote | undefined
+): ContextNote | undefined => {
+  const origin = agentWording(approval.origin ?? '', 120);
+  return origin
+    ? {
+        exposed: true,
+        text: `This request was raised on a turn that had read content from ${origin}. Whoever wrote that could be the one asking for this.`
+      }
+    : context;
 };
 
 /**

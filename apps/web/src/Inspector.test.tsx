@@ -190,3 +190,52 @@ describe('the panel arriving with a file already asked for', () => {
     expect(asked).not.toContain('terminal-pane');
   });
 });
+
+/*
+ * The picture, and what a person can do to it.
+ *
+ * These panes need a live socket and a painted frame before any of this is on screen, and there is
+ * no DOM in this package - so what the mappings do is pinned in `inspector-api.test.ts`, where they
+ * are values, and what is pinned here is that the pane still *uses* them. A correct mapping nothing
+ * calls is the same lie as a wrong one, and this file already carries one guard of exactly this
+ * shape for exactly that reason (the Preview rename above).
+ */
+describe('the computer pane’s hands', () => {
+  const source = readFileSync(new URL('Inspector.tsx', import.meta.url), 'utf8');
+
+  /*
+   * `keyFrame` used to return unless the key was Enter or space. Everything else a person pressed
+   * while holding the agent's computer was dropped in silence: no Backspace, so a typo could not be
+   * fixed; no arrows; no ⌘A - on the one surface whose whole purpose is doing by hand what the
+   * agent could not.
+   */
+  it('no longer refuses every key but two', () => {
+    expect(source).not.toContain("['Enter', ' '].includes");
+    expect(source).toContain('keyChord(event)');
+  });
+
+  /* Scroll, right-click, double-click and drag: four gestures, four handlers, none of them there
+     before. Without the first of them anything below the fold was unreachable, including the
+     challenge the bot-wall banner had just invited the owner to clear. */
+  it('takes the wheel, the second button, the second click and a drag', () => {
+    for (const handler of ['onContextMenu', 'onDoubleClick', 'onPointerDown', 'onPointerUp'])
+      expect(source).toContain(`${handler}=`);
+    expect(source).toContain("frame.addEventListener('wheel', onWheel, { passive: false })");
+  });
+
+  /*
+   * The recovery control was already built and was shown only on `error || stalled`, neither of
+   * which is set when the stream stops delivering pixels down a healthy socket - so the one case
+   * where the pane is a photograph was the one case with no button on it.
+   */
+  it('watches for the freeze that used to have no error and no button', () => {
+    expect(source).toContain('streamStalled(');
+    expect(source).toContain('needKeyframeRef.current = true;');
+  });
+
+  /* The display has been 1280x800 since it was written because nothing ever told it otherwise. */
+  it('tells the box how big the screen is being watched', () => {
+    expect(source).toContain('viewportMessage(');
+    expect(source).toContain("{ type: 'hello', canDecodeVideo: canDecodeVideo() }");
+  });
+});

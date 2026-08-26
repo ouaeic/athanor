@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { CircleDollarSign, HardDrive, Hash, LoaderCircle, MessageSquare } from 'lucide-react';
+import {
+  CalendarDays,
+  CircleDollarSign,
+  HardDrive,
+  Hash,
+  LoaderCircle,
+  MessageSquare
+} from 'lucide-react';
 import { api } from './api.js';
 import {
   bucketShare,
@@ -13,6 +20,7 @@ import {
   type SpendRow,
   type UsageResponse
 } from './usage-model.js';
+import { conversationMeter, spendDays } from './spend-pane.js';
 import type { SpendSummary, Task, TaskEvent, Workspace } from './types.js';
 // One formatter for one quantity: the sidebar, the composer banner and this pane used to disagree
 // about how many gigabytes the same files were.
@@ -28,14 +36,15 @@ const resetLabel = (iso: string | null): string => {
   return `resets ${at.toLocaleDateString()}`;
 };
 
-function SpendCard({
+export function SpendCard({
   label,
   spentUsd,
   capUsd,
   pendingUsd,
   percent,
   state,
-  resetsAt
+  resetsAt,
+  capNote
 }: {
   label: string;
   spentUsd: number;
@@ -44,6 +53,8 @@ function SpendCard({
   percent: number | null;
   state: 'ok' | 'warning' | 'exceeded';
   resetsAt: string | null;
+  /** What "no ceiling" means for this particular window, when it is not a wall-clock one. */
+  capNote?: string;
 }) {
   return (
     <div className={`spend-card ${state}`}>
@@ -56,8 +67,10 @@ function SpendCard({
       )}
       <small>
         {capUsd !== null
-          ? `${percent}% of the ${formatUsd(capUsd)} cap`
-          : 'No cap set for this window'}
+          ? // `?? 0` because a cap of zero has no percentage to be a share of, and the line used to
+            // print the word "null" at the one owner whose ceiling admits only free routes.
+            `${percent ?? 0}% of the ${formatUsd(capUsd)} cap`
+          : (capNote ?? 'No cap set for this window')}
         {pendingUsd > 0 ? ` · ${formatUsd(pendingUsd)} committed` : ''}
         {resetsAt ? ` · ${resetLabel(resetsAt)}` : ''}
       </small>
@@ -109,6 +122,38 @@ function BucketList({
 }
 
 /**
+ * What each of the last days cost, which is the only shape an overnight runaway has.
+ *
+ * The failure the daily cap exists for is a night that spent a month's allowance, and a single
+ * day's total cannot show it - it takes the days either side to say whether last night was unlike
+ * them. The server has computed this series on every `/v1/spend` since the route existed, and
+ * nothing has ever drawn it.
+ */
+export function DailySpend({ days }: { days: SpendRow[] }) {
+  if (!days.length) return null;
+  return (
+    <div className="meter-card">
+      <div>
+        <span>
+          <CalendarDays size={14} /> Day by day
+        </span>
+        <strong>What each day cost</strong>
+      </div>
+      <BucketList
+        buckets={days}
+        // The key is the day as the server grouped it, which is what an owner reconciling a bill
+        // against a provider's statement needs to be able to read off the row.
+        render={(bucket) => ({ label: bucket.label ?? bucket.key, title: bucket.key })}
+      />
+      <small>
+        The most recent {days.length} {days.length === 1 ? 'day' : 'days'} money was billed on,
+        newest first, in the zone your day rolls over in. A day nothing was billed on is not listed.
+      </small>
+    </div>
+  );
+}
+
+/**
  * What the agent has actually cost, which is the one number a self-hoster pays for directly.
  *
  * Every model call already writes its settled provider cost; this is the surface that shows it,
@@ -155,7 +200,32 @@ export function UsagePane({
     };
   }, [workspace.id]);
 
-  const meters = useMemo(() => (usage ? spendMeters(usage, spend) : []), [usage, spend]);
+  /*
+   * The ceiling the open conversation is actually running under, when this pane can see the
+   * conversation it belongs to.
+   *
+   * The task row carries the ceiling and the settled total together, so none of it is added up from
+   * the transcript window the token card below has to warn about. The rows in reach are the
+   * sidebar's page, so a conversation it has not loaded produces no card at all rather than a card
+   * with a guessed ceiling on it.
+   */
+  const conversation = useMemo(() => {
+    const openTaskId = conversationEvents?.[0]?.taskId;
+    const open = openTaskId ? tasks.find((task) => task.id === openTaskId) : undefined;
+    return open ? { spentUsd: open.spentUsd, maxSpendUsd: open.maxSpendUsd } : null;
+  }, [tasks, conversationEvents]);
+
+  /*
+   * The conversation's own card sits after the three the owner already knows rather than in front
+   * of them: it is only there while a conversation is open, and leading with it would move Today,
+   * this week and this month one place along every time somebody opens this pane from a transcript.
+   */
+  const meters = useMemo(() => {
+    if (!usage) return [];
+    const own = conversationMeter(spend, conversation);
+    return own ? [...spendMeters(usage, spend), own] : spendMeters(usage, spend);
+  }, [usage, spend, conversation]);
+  const days = useMemo(() => spendDays(spend), [spend]);
   const breakdown = useMemo(
     () => (usage ? spendBreakdown(usage, spend) : { byModel: [], byTask: [], complete: false }),
     [usage, spend]
@@ -223,6 +293,7 @@ export function UsagePane({
                 percent={meter.percent}
                 state={meter.state}
                 resetsAt={meter.resetsAt}
+                {...(meter.id === 'task' ? { capNote: 'No ceiling on this conversation' } : {})}
               />
             ))}
           </div>
@@ -232,6 +303,8 @@ export function UsagePane({
               without ceilings.
             </p>
           )}
+
+          <DailySpend days={days} />
 
           <div className="meter-card">
             <div>

@@ -1,0 +1,89 @@
+/*
+ * The decisions log's own five additions, and nothing else.
+ *
+ * Co-located and imported from `DecisionsLog.tsx` rather than added to `styles.css`, which is parsed
+ * before first paint: this list is inside a settings page nobody sees until they open it, and a
+ * history screen is the last thing that should cost the first frame of a conversation.
+ *
+ * Every shape it needs already exists - `.settings-list` for the rows, `.settings-nav` for the four
+ * filters, `.approval-facts` for the harness's own record of what was asked, `.memory-observed-note`
+ * for the sentence above a list. What is here is only what those do not have.
+ */
+
+/* The filters belong to the section rather than to the page, so they sit closer to its heading. */
+.decisions-filter {
+  margin-top: 12px;
+}
+
+/*
+  What was asked, as the summary of the record underneath it.
+
+  `<details>` renders its content whether it is open or shut, so nothing here is about hiding: shut,
+  the model's sentence is held to two lines and the row stays a row; open, the facts the harness
+  recorded follow it. The marker is removed because the line is already a control, and a triangle
+  beside a quotation reads as decoration on the quotation.
+*/
+.decision-detail > summary {
+  cursor: pointer;
+  list-style: none;
+}
+.decision-detail > summary::-webkit-details-marker {
+  display: none;
+}
+.decision-detail > summary:hover .decision-asked {
+  color: #c9c9c9;
+}
+/*
+  Held to two lines, and the selector says `.settings-list small` back to itself on purpose.
+
+  The list this row lives in declares `display: block` on every `small` inside it, at one class and
+  one element - so a bare `.decision-asked` is the less specific rule of the two and the clamp would
+  simply never apply, however late the lazy chunk that carries it arrives.
+*/
+.settings-list small.decision-asked {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  color: var(--muted);
+  font-style: italic;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+.settings-list .decision-detail[open] small.decision-asked {
+  display: block;
+  overflow: visible;
+}
+
+/*
+  What became of it, which is the one line this whole screen exists to print.
+
+  Brighter than the date and the wording beside it, and deliberately not coloured by outcome: a
+  lapse is not an error and an approval is not a success, and painting them green and red would
+  make a record of ordinary work look like a list of alarms.
+*/
+.decision-outcome {
+  margin-top: 2px;
+  color: #c4c4c4;
+  line-height: 1.45;
+}
+
+/* A request this server cannot read back is still a request that was made. Say so, plainly. */
+.decision-unreadable {
+  color: var(--muted);
+  font-style: italic;
+  line-height: 1.45;
+}
+
+/*
+  Where the instruction behind the request came from.
+
+  The same grey the card's own provenance line uses when it is exposed, because it is the same
+  sentence about the same fact - and quiet for the same reason: a turn that read a web page is
+  doing what it was asked to, and this is a marker rather than an alarm.
+*/
+.decision-origin {
+  margin-top: 4px;
+  color: #bebebe;
+  line-height: 1.45;
+}

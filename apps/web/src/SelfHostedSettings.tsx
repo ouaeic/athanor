@@ -11,6 +11,7 @@ import {
   Download,
   KeyRound,
   LockKeyhole,
+  Pin,
   Plus,
   QrCode,
   Radio,
@@ -99,6 +100,48 @@ import { formatBytes } from './timeline-state.js';
 import { backupLine, type BackupStatus } from './backup-evidence.js';
 import { UsagePane } from './UsagePane.js';
 import { relayAddress, relayHostProblem, relayQuotaNote, relayStatusLine } from './relay-state.js';
+import { ApiFailure } from './api-failure.js';
+import { nativeBridge } from './native.js';
+import {
+  nativeNotificationsEnabled,
+  setNativeNotificationsEnabled
+} from './native-notifications.js';
+import {
+  backupTimerLine,
+  enrollmentLine,
+  enrollmentRevocable,
+  memoryExpiryField,
+  memoryPatch,
+  memoryProvenance,
+  memoryScope,
+  modelDetailLine,
+  modelOpennessLine,
+  providerModelFields,
+  timerStateKnown,
+  updateTimerLine,
+  workspaceDeletionArmed,
+  type TimerState
+} from './settings-facts.js';
+import type { ModelRelease } from '@athanor/contracts';
+/*
+  Three whole surfaces, built as their own modules and mounted here.
+
+  They are the queue of what the box has stopped being sure of, the cross-conversation record of
+  what it was allowed to do, and — on a packaged client only — which server this app is talking to.
+  All three cost the eager graph nothing, because this whole screen is already behind `lazy()` in
+  `App.tsx` and they ride in its chunk.
+
+  Imported statically rather than behind a second `lazy()`, deliberately and measured. Every one of
+  this dialog's four pages is mounted the moment it opens — they are switched with `hidden`, not
+  unmounted — so a second boundary would fetch all three anyway, one round trip later and three
+  requests instead of one. Both shapes were built against the same tree: `lazy()` moved the eager
+  graph by +19 bytes gzip and these imports by +44, all of it rolldown's own cross-chunk
+  bookkeeping in the entry chunk rather than any code from here. Twenty-five bytes is not worth a
+  waterfall.
+*/
+import { MemoryReview } from './MemoryReview.js';
+import { DecisionsLog } from './DecisionsLog.js';
+import { ConnectionRow } from './ConnectionRow.js';
 
 /*
   Four pages, each named after something the owner already wants to do. The previous six spent a
@@ -143,6 +186,60 @@ const mediaSettingsRequest = async (selection?: MediaModelSelection): Promise<Me
 };
 
 const loadMediaSettings = (): Promise<MediaSettings> => mediaSettingsRequest();
+
+/**
+ * The two routes this screen reaches that `api.ts` has no method for.
+ *
+ * Written the way `mediaSettingsRequest` above already is, and for the same reason: both are asked
+ * for from this one screen and from nowhere else, so neither earns a place on the shared surface
+ * every other module pays to import. The failure is raised as an `ApiFailure` rather than a bare
+ * `Error` because `withStepUp` reads `code` off it — a route that asks for a passkey has to be able
+ * to say so, and `DELETE /v1/workspaces/:id` is one.
+ */
+const settingsRequest = async <T,>(path: string, init?: RequestInit): Promise<T> => {
+  const response = await fetch(path, {
+    credentials: 'include',
+    signal: AbortSignal.timeout(45_000),
+    ...init,
+    headers: { 'content-type': 'application/json', ...init?.headers }
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as {
+      error?: { code?: string; message?: string; requestId?: string };
+    };
+    throw new ApiFailure(
+      body.error?.code ?? 'request_failed',
+      body.error?.message ?? `Request failed (${response.status})`,
+      response.status,
+      body.error?.requestId
+    );
+  }
+  return (await response.json()) as T;
+};
+
+/**
+ * The whole catalogue record, asked for when the owner opens the disclosure and never before.
+ *
+ * It is not on the bootstrap on purpose — `types.ts` records that shipping it put 424 kB in front
+ * of first paint — and this is the other door that comment implies and that nothing had built. It
+ * costs one request on an explicit press, on a box the owner owns.
+ */
+const loadModelCatalogue = (): Promise<ModelRelease[]> =>
+  settingsRequest<ModelRelease[]>('/v1/models');
+
+/**
+ * Remove this computer without removing the account it belongs to.
+ *
+ * The route has always been here, with its own step-up and its own typed-name confirmation, and
+ * nothing called it: the only path that removed a workspace was deleting the entire account and
+ * enrolling a passkey again from a pairing code.
+ */
+const deleteWorkspaceRequest = (workspaceId: string, confirmName: string): Promise<unknown> =>
+  settingsRequest(`/v1/workspaces/${encodeURIComponent(workspaceId)}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ confirmName }),
+    headers: { 'idempotency-key': crypto.randomUUID() }
+  });
 
 /**
  * Money, to as many places as it actually has and never fewer than two.
@@ -320,6 +417,38 @@ export function SpendCeilingField({
   );
 }
 
+/**
+ * How much the configured model holds, in one field both provider branches use.
+ *
+ * Its own component because what it shows is the thing the form used to lose. The value was
+ * write-only for as long as this screen has existed — saved into the catalogue, never returned,
+ * re-initialised to 128,000 on every open — so the next save of anything wrote that default back
+ * over whatever the owner had typed. A field with a name can be rendered in a test with a number in
+ * it, which is the only way that regression stays fixed.
+ */
+export function ContextWindowField({
+  value,
+  onChange,
+  hint
+}: {
+  value: number;
+  onChange: (next: number) => void;
+  hint?: string;
+}) {
+  return (
+    <label>
+      Context window {hint ? <small>{hint}</small> : null}
+      <input
+        type="number"
+        min={4096}
+        max={10_000_000}
+        value={value}
+        onChange={(event) => onChange(Number(event.target.value))}
+      />
+    </label>
+  );
+}
+
 /** How many of the agent's own memory rows are fetched at a time. */
 const REMEMBERED_PAGE = 20;
 
@@ -339,6 +468,172 @@ const rememberedKindLabel: Record<MemoryItem['kind'], string> = {
   fact: 'Fact',
   procedure: 'Procedure'
 };
+
+/**
+ * The durable facts: what put each one here, how long it lasts, and the way to change one word.
+ *
+ * This list was add-and-delete, and it printed the *scope* of a row where a reader looks for its
+ * provenance — so a fact the agent decided about the owner and a fact the owner typed read
+ * identically, and correcting either meant deleting it and retyping it, losing `createdAt` and any
+ * expiry with it. Skills, the parallel construct one section below, got the open-into-the-editor
+ * treatment long ago; this is the same move against the list that is read back into every task.
+ */
+export function MemoryList({
+  items,
+  editingId,
+  onEdit,
+  onForget,
+  onOpenTask
+}: {
+  items: WorkspaceMemory[];
+  /** Which row is in the editor above, so the list says where the form's contents came from. */
+  editingId?: string | undefined;
+  onEdit: (item: WorkspaceMemory) => void;
+  onForget: (item: WorkspaceMemory) => void;
+  onOpenTask?: ((taskId: string) => void) | undefined;
+}) {
+  return (
+    <div className="settings-list">
+      {items.map((item) => (
+        <div key={item.id}>
+          <button
+            className="settings-list-open"
+            title="Open this memory to change it"
+            onClick={() => onEdit(item)}
+          >
+            <strong>
+              {memoryScope(item)}
+              {item.status === 'expired' ? ' · expired' : ''}
+              {item.id === editingId ? ' · being edited above' : ''}
+            </strong>
+            <small>{item.content}</small>
+            <small>
+              {memoryProvenance(item)}
+              {item.validUntil
+                ? ` · ${item.status === 'expired' ? 'stopped being used' : 'used until'} ${new Date(
+                    item.validUntil
+                  ).toLocaleString()}`
+                : ' · no expiry'}
+            </small>
+          </button>
+          <span className="settings-row-actions">
+            {/* The conversation that decided this, when there was one. Judging a fact the owner
+                disagrees with used to mean deleting it blind: the id has been served and typed
+                since the list existed and was read by nothing. */}
+            {item.sourceTaskId && onOpenTask ? (
+              <button
+                className="icon-btn"
+                aria-label="Open the conversation that wrote this"
+                title="Open the conversation that wrote this"
+                onClick={() => onOpenTask(item.sourceTaskId as string)}
+              >
+                <ScrollText />
+              </button>
+            ) : null}
+            <button className="icon-btn" aria-label="Delete memory" onClick={() => onForget(item)}>
+              <Trash2 />
+            </button>
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The learned procedures, with the two things that decide whether one survives.
+ *
+ * Skills are demoted on a timer — stale at thirty days unused, archived at ninety — and every task
+ * start runs the curation that does it, dropping anything not active and not pinned from the index
+ * the model sees. The row printed the resulting status word and offered nothing, so the only way to
+ * keep a procedure used every six weeks was to re-open it in the editor and press Save, which
+ * resets the status through the upsert: an accident, not a control, and nothing said it worked.
+ */
+export function SkillList({
+  items,
+  busy,
+  onOpen,
+  onSetState,
+  onDelete
+}: {
+  items: WorkspaceSkill[];
+  busy: boolean;
+  onOpen: (item: WorkspaceSkill) => void;
+  onSetState: (
+    item: WorkspaceSkill,
+    patch: { pinned?: boolean; status?: 'active' | 'stale' | 'archived' }
+  ) => void;
+  onDelete: (item: WorkspaceSkill) => void;
+}) {
+  return (
+    <div className="settings-list">
+      {items.map((item) => (
+        <div key={item.id}>
+          {/* Saving by name is an upsert, so opening a skill into the editor above is the whole
+              edit path. The list was previously delete-only: the agent could write a procedure
+              the owner could read no part of and fix no part of. */}
+          <button
+            className="settings-list-open"
+            title={`Open the ${item.name} skill`}
+            onClick={() => onOpen(item)}
+          >
+            <strong>
+              {item.name}
+              {item.pinned ? ' · pinned' : ''}
+            </strong>
+            <small>
+              {item.description}
+              {item.status === 'active' ? '' : ` · ${item.status}`}
+              {item.useCount > 0
+                ? ` · used ${item.useCount} ${item.useCount === 1 ? 'time' : 'times'}`
+                : ' · never used yet'}
+            </small>
+            {item.status === 'active' ? null : (
+              <small>
+                Retired for not being used, so the agent no longer sees it. Making it active puts it
+                back; pinning it keeps it there.
+              </small>
+            )}
+          </button>
+          <span className="settings-row-actions">
+            {item.status === 'active' ? null : (
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() => onSetState(item, { status: 'active' })}
+              >
+                Make active
+              </button>
+            )}
+            <button
+              className="icon-btn"
+              aria-label={
+                item.pinned ? `Unpin the ${item.name} skill` : `Pin the ${item.name} skill`
+              }
+              title={
+                item.pinned
+                  ? 'Pinned: never retired for going unused'
+                  : 'Pin it so it is never retired for going unused'
+              }
+              aria-pressed={item.pinned}
+              disabled={busy}
+              onClick={() => onSetState(item, { pinned: !item.pinned })}
+            >
+              <Pin />
+            </button>
+            <button
+              className="icon-btn"
+              aria-label={`Delete the ${item.name} skill`}
+              onClick={() => onDelete(item)}
+            >
+              <Trash2 />
+            </button>
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 /**
  * What the computer wrote down for itself as work finished, and the way to take any of it back.
@@ -462,6 +757,18 @@ export function SelfHostedSettings({
   const [memories, setMemories] = useState<WorkspaceMemory[]>([]);
   const [memory, setMemory] = useState('');
   const [memoryTarget, setMemoryTarget] = useState<'workspace' | 'user'>('workspace');
+  /*
+   * The expiry the add form never offered.
+   *
+   * `POST …/memories` has accepted `validUntil` all along and the client method already declared
+   * it; the one call site omitted it, so every memory an owner wrote was permanent by construction
+   * while the agent's own tool could write an expiring one — and the runtime prompt tells the model
+   * an expiring fact saves without an approval, which makes it the cheap path the agent is pushed
+   * toward and the owner could not take.
+   */
+  const [memoryExpiry, setMemoryExpiry] = useState('');
+  /** Which stored fact the form above is editing, or nothing, in which case Save adds a new one. */
+  const [editingMemoryId, setEditingMemoryId] = useState('');
   const [remembered, setRemembered] = useState<MemoryItem[]>([]);
   /* This list has no end - a row lands every time a turn finishes - so it is asked for a page at a
      time and grows only when the owner asks it to. */
@@ -503,6 +810,16 @@ export function SelfHostedSettings({
     dynamicDns: { failedAt: string; reason: string } | null;
     backup?: BackupStatus | null;
     build?: BuildIdentity;
+    /*
+     * Whether the two timers the box runs on its own are enabled, which is the question the
+     * Updates and Backups rows below claimed to answer and could not: they were static copy. Both
+     * are declared here rather than on `api.instanceDiagnostics`'s return type because they are
+     * read by this screen alone, and both are optional because a box older than the field — or a
+     * host that is not Linux, where `systemctl is-enabled` has no answer — sends `'unknown'` or
+     * nothing at all, and "we could not tell" is a third state the rows have to say out loud.
+     */
+    autoUpdate?: TimerState;
+    backupTimer?: TimerState;
   }>();
   const [relayHost, setRelayHost] = useState('');
   const [relayToken, setRelayToken] = useState('');
@@ -543,14 +860,44 @@ export function SelfHostedSettings({
     webUri: string;
   }>();
   const [enrollmentQr, setEnrollmentQr] = useState('');
+  /** What the new device will be called in the sessions list, rather than the hardcoded literal. */
+  const [enrollmentLabelDraft, setEnrollmentLabelDraft] = useState('');
+  /** Every link minted in the last week and what became of it; undefined until the route answers. */
+  const [enrollments, setEnrollments] = useState<
+    Array<{
+      id: string;
+      label: string;
+      createdAt: string;
+      expiresAt: string;
+      status: 'pending' | 'used' | 'expired' | 'revoked';
+    }>
+  >();
   const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
   const [deleteAccountConfirmation, setDeleteAccountConfirmation] = useState('');
+  const [deleteWorkspaceOpen, setDeleteWorkspaceOpen] = useState(false);
+  const [deleteWorkspaceConfirmation, setDeleteWorkspaceConfirmation] = useState('');
+  /** Undefined until the disclosure is opened, null when the catalogue could not be read. */
+  const [catalogue, setCatalogue] = useState<ModelRelease[] | null>();
+  /*
+   * Whether this installation may raise an OS notification, which is a local answer to a local
+   * question: a packaged shell has no push subscription for the server to consult.
+   */
+  const [nativeNotifications, setNativeNotifications] = useState(nativeNotificationsEnabled);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [media, setMedia] = useState<MediaSettings | null>();
   const [mediaSelection, setMediaSelection] = useState<MediaModelSelection>({});
 
+  /**
+   * The saved credential, and the two fields the form used to forget it had.
+   *
+   * `contextTokens` and the vision capability were written by the save and restored by nothing, so
+   * the form re-initialised to 128k and no vision on every open. The next save of anything — a key
+   * rotation, a change of privacy route, a media model — wrote those defaults straight back over a
+   * 200k vision model, with no error and no sign until an image was refused weeks later. The route
+   * returns all three now, and `providerModelFields` is what puts them back.
+   */
   const loadProvider = () =>
     void api
       .provider()
@@ -560,6 +907,9 @@ export function SelfHostedSettings({
         setProviderUrl(value.baseUrl);
         setModelId(value.modelId ?? '');
         setZdr(value.enforceZeroDataRetention);
+        const fields = providerModelFields(value);
+        setContextTokens(fields.contextTokens);
+        setVision(fields.vision);
       })
       .catch(() => setProvider(undefined));
   /**
@@ -659,6 +1009,18 @@ export function SelfHostedSettings({
        */
       .catch(() => setSecurityUnavailable(true));
   };
+  /**
+   * The pairing links that are still out there.
+   *
+   * The route lists only the last seven days, so an empty list is "none this week" and not "you
+   * have never made one" — which is why the block below says that rather than "no device links".
+   */
+  const loadEnrollments = () =>
+    void api
+      .enrollments()
+      .then(setEnrollments)
+      // A server without the list route keeps the create button and the card, which is what it had.
+      .catch(() => setEnrollments(undefined));
   const loadSnapshots = () => {
     if (!workspace) return;
     void api
@@ -680,6 +1042,7 @@ export function SelfHostedSettings({
     loadKnowledge();
     loadBrief();
     loadSecurity();
+    loadEnrollments();
     loadSnapshots();
   }, [workspace?.id]);
   useEffect(() => {
@@ -976,16 +1339,7 @@ export function SelfHostedSettings({
                 Model ID
                 <input value={modelId} onChange={(event) => setModelId(event.target.value)} />
               </label>
-              <label>
-                Context window
-                <input
-                  type="number"
-                  min={4096}
-                  max={10_000_000}
-                  value={contextTokens}
-                  onChange={(event) => setContextTokens(Number(event.target.value))}
-                />
-              </label>
+              <ContextWindowField value={contextTokens} onChange={setContextTokens} />
             </>
           )}
           {/*
@@ -999,16 +1353,11 @@ export function SelfHostedSettings({
             provider already knew.
           */}
           {providerKind === 'ollama-cloud' && (
-            <label>
-              Context window <small>only for models that do not publish one</small>
-              <input
-                type="number"
-                min={4096}
-                max={10_000_000}
-                value={contextTokens}
-                onChange={(event) => setContextTokens(Number(event.target.value))}
-              />
-            </label>
+            <ContextWindowField
+              value={contextTokens}
+              onChange={setContextTokens}
+              hint="only for models that do not publish one"
+            />
           )}
         </div>
         {capsAnswered ? null : (
@@ -1091,6 +1440,48 @@ export function SelfHostedSettings({
             <ShieldCheck /> {busy ? 'Verifying…' : 'Verify and save'}
           </button>
         </div>
+        {/*
+          What each chat model costs, holds, is licensed under and how open it is.
+
+          The catalogue carries all of it and nothing anywhere read a single field: the media picker
+          above prints a price beside every option, and the chat picker — on a product that is
+          itself AGPL and grades its models on openness — printed none. It is asked for on the press
+          rather than with the page because the whole record is what `types.ts` says put 424 kB in
+          front of first paint when it rode the bootstrap; one request on an explicit press is the
+          other door that comment implies.
+        */}
+        {catalogue === undefined ? (
+          <button
+            className="secondary"
+            onClick={() =>
+              void loadModelCatalogue()
+                .then(setCatalogue)
+                .catch(() => setCatalogue(null))
+            }
+          >
+            <Scale /> What each model costs
+          </button>
+        ) : catalogue === null ? (
+          <p className="web-search-route">
+            <span>The model catalogue could not be read from this server just now.</span>
+            <small>Nothing changed. Reopen this page to try again.</small>
+          </p>
+        ) : (
+          <div className="settings-list">
+            {catalogue.map((model) => (
+              <div key={model.id}>
+                <span>
+                  <strong>
+                    {model.displayName}
+                    {model.availability === 'available' ? '' : ` · ${model.availability}`}
+                  </strong>
+                  <small>{modelDetailLine(model)}</small>
+                  <small>{modelOpennessLine(model)}</small>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
         <hr />
         {/*
           Which model makes a picture, and which one speaks.
@@ -1200,6 +1591,45 @@ export function SelfHostedSettings({
               value={spendLimitsForm.defaultTaskCapUsd}
               onChange={(event) =>
                 setSpendLimitsForm({ ...spendLimitsForm, defaultTaskCapUsd: event.target.value })
+              }
+            />
+          </label>
+          {/*
+            The one brake that acts before an expensive route is chosen rather than after the money
+            is gone. Every field above stops work once a total has been reached; these two decide
+            what may be picked in the first place, which is what a 3 a.m. scheduled run needs — it
+            has nothing else stopping it from taking the priciest route in the catalogue.
+
+            They are rates, not amounts, and the copy says so: an owner who reads "$5" here as five
+            dollars of spending has set a ceiling that admits almost every model there is.
+          */}
+          <label>
+            Price ceiling, input (USD per million tokens)
+            <small>the most it may pay for a model’s input rate — not an amount it may spend</small>
+            <input
+              inputMode="decimal"
+              placeholder="No ceiling"
+              value={spendLimitsForm.maxInputUsdPerMillionTokens ?? ''}
+              onChange={(event) =>
+                setSpendLimitsForm({
+                  ...spendLimitsForm,
+                  maxInputUsdPerMillionTokens: event.target.value
+                })
+              }
+            />
+          </label>
+          <label>
+            Price ceiling, output (USD per million tokens)
+            <small>models that publish a higher rate than either are not offered at all</small>
+            <input
+              inputMode="decimal"
+              placeholder="No ceiling"
+              value={spendLimitsForm.maxOutputUsdPerMillionTokens ?? ''}
+              onChange={(event) =>
+                setSpendLimitsForm({
+                  ...spendLimitsForm,
+                  maxOutputUsdPerMillionTokens: event.target.value
+                })
               }
             />
           </label>
@@ -1423,8 +1853,12 @@ export function SelfHostedSettings({
         <div className="form-grid two">
           <label>
             Scope
+            {/* Which of the two lists a fact belongs to is decided when it is written and cannot be
+                patched: the route takes `content` and `validUntil` and nothing else, so a row being
+                edited holds its scope rather than offering a move the server would refuse. */}
             <select
               value={memoryTarget}
+              disabled={Boolean(editingMemoryId)}
               onChange={(event) => setMemoryTarget(event.target.value as typeof memoryTarget)}
             >
               <option value="workspace">This computer</option>
@@ -1435,54 +1869,90 @@ export function SelfHostedSettings({
             Durable fact or preference
             <input value={memory} onChange={(event) => setMemory(event.target.value)} />
           </label>
+          <label>
+            Stop using it on <small>leave blank to keep it for good</small>
+            <input
+              type="datetime-local"
+              value={memoryExpiry}
+              onChange={(event) => setMemoryExpiry(event.target.value)}
+            />
+          </label>
         </div>
-        <button
-          disabled={!workspace || !memory.trim() || busy}
-          onClick={() =>
-            void act(async () => {
-              if (!workspace) return;
-              await api.addMemory(workspace.id, { target: memoryTarget, content: memory.trim() });
-              setMemory('');
-              loadKnowledge();
-            })
-          }
-        >
-          <Plus /> Add memory
-        </button>
-        <div className="settings-list">
-          {memories.map((item) => (
-            <div key={item.id}>
-              <span>
-                <strong>
-                  {item.target === 'user' ? 'You' : 'Computer'}
-                  {item.status === 'expired' ? ' · expired' : ''}
-                </strong>
-                <small>{item.content}</small>
-                {item.validUntil && (
-                  <small>
-                    {item.status === 'expired' ? 'Stopped being used' : 'Used until'}{' '}
-                    {new Date(item.validUntil).toLocaleString()}
-                  </small>
-                )}
-              </span>
-              <button
-                className="icon-btn"
-                aria-label="Delete memory"
-                onClick={() => {
-                  if (!workspace) return;
-                  setMemories((current) => current.filter((entry) => entry.id !== item.id));
-                  undo({
-                    message: 'Memory deleted',
-                    commit: () => api.deleteMemory(workspace.id, item.id),
-                    restore: loadKnowledge
+        <div className="modal-actions">
+          <button
+            disabled={!workspace || !memory.trim() || busy}
+            onClick={() =>
+              void act(async () => {
+                if (!workspace) return;
+                const patch = memoryPatch({ content: memory, expiry: memoryExpiry });
+                if (!patch.ok) throw new Error(patch.message);
+                if (editingMemoryId) {
+                  await api.updateMemory(workspace.id, editingMemoryId, patch.body);
+                  setNotice('Memory updated. The next conversation reads the new wording.');
+                } else {
+                  await api.addMemory(workspace.id, {
+                    target: memoryTarget,
+                    content: patch.body.content,
+                    // Omitted rather than sent as null: `POST` has no expiry to clear, and the
+                    // route's own default is the permanent one.
+                    ...(patch.body.validUntil ? { validUntil: patch.body.validUntil } : {})
                   });
-                }}
-              >
-                <Trash2 />
-              </button>
-            </div>
-          ))}
+                }
+                setMemory('');
+                setMemoryExpiry('');
+                setEditingMemoryId('');
+                loadKnowledge();
+              })
+            }
+          >
+            <Plus /> {editingMemoryId ? 'Save memory' : 'Add memory'}
+          </button>
+          {editingMemoryId ? (
+            <button
+              className="secondary"
+              onClick={() => {
+                setEditingMemoryId('');
+                setMemory('');
+                setMemoryExpiry('');
+              }}
+            >
+              Cancel
+            </button>
+          ) : null}
         </div>
+        <MemoryList
+          items={memories}
+          editingId={editingMemoryId || undefined}
+          onEdit={(item) => {
+            setEditingMemoryId(item.id);
+            setMemory(item.content);
+            setMemoryTarget(item.target);
+            setMemoryExpiry(memoryExpiryField(item.validUntil));
+          }}
+          onOpenTask={onOpenTask}
+          onForget={(item) => {
+            if (!workspace) return;
+            if (item.id === editingMemoryId) {
+              setEditingMemoryId('');
+              setMemory('');
+              setMemoryExpiry('');
+            }
+            setMemories((current) => current.filter((entry) => entry.id !== item.id));
+            undo({
+              message: 'Memory deleted',
+              commit: () => api.deleteMemory(workspace.id, item.id),
+              restore: loadKnowledge
+            });
+          }}
+        />
+        {/*
+          What the box has stopped being sure of, above the list of what it still believes.
+
+          The queue is built at three layers — a stale-procedure query, a verify, a retract — and
+          until now reached nothing: the only production caller discarded its result. It reads its
+          own list and owns its own failure sentence, so nothing is threaded through it.
+        */}
+        {workspace ? <MemoryReview workspaceId={workspace.id} onOpenTask={onOpenTask} /> : null}
         <RememberedList
           items={remembered}
           more={rememberedMore}
@@ -1549,48 +2019,49 @@ export function SelfHostedSettings({
         >
           <Plus /> {skills.some((item) => item.name === skillName) ? 'Update' : 'Save'} skill
         </button>
-        <div className="settings-list">
-          {skills.map((item) => (
-            <div key={item.id}>
-              {/* Saving by name is an upsert, so opening a skill into the editor above is the whole
-                  edit path. The list was previously delete-only: the agent could write a procedure
-                  the owner could read no part of and fix no part of. */}
-              <button
-                className="settings-list-open"
-                title={`Open the ${item.name} skill`}
-                onClick={() => {
-                  setSkillName(item.name);
-                  setSkillDescription(item.description);
-                  setSkillContent(item.content);
-                }}
-              >
-                <strong>{item.name}</strong>
-                <small>
-                  {item.description}
-                  {item.status === 'active' ? '' : ` · ${item.status}`}
-                  {item.useCount > 0
-                    ? ` · used ${item.useCount} ${item.useCount === 1 ? 'time' : 'times'}`
-                    : ' · never used yet'}
-                </small>
-              </button>
-              <button
-                className="icon-btn"
-                aria-label={`Delete the ${item.name} skill`}
-                onClick={() => {
-                  if (!workspace) return;
-                  setSkills((current) => current.filter((entry) => entry.id !== item.id));
-                  undo({
-                    message: `Deleted the “${item.name}” skill`,
-                    commit: () => api.deleteSkill(workspace.id, item.id),
-                    restore: loadKnowledge
-                  });
-                }}
-              >
-                <Trash2 />
-              </button>
-            </div>
-          ))}
-        </div>
+        <SkillList
+          items={skills}
+          busy={busy}
+          onOpen={(item) => {
+            setSkillName(item.name);
+            setSkillDescription(item.description);
+            setSkillContent(item.content);
+          }}
+          onSetState={(item, patch) =>
+            void act(async () => {
+              if (!workspace) return;
+              const saved = await api.setSkillState(workspace.id, item.id, patch);
+              setSkills((current) =>
+                current.map((entry) => (entry.id === saved.id ? saved : entry))
+              );
+              setNotice(
+                patch.status === 'active'
+                  ? `“${item.name}” is active again. Pin it if you want it kept through the next curation.`
+                  : saved.pinned
+                    ? `“${item.name}” is pinned. It is no longer retired for going unused.`
+                    : `“${item.name}” is unpinned. Thirty days unused makes it stale, ninety archives it.`
+              );
+            })
+          }
+          onDelete={(item) => {
+            if (!workspace) return;
+            setSkills((current) => current.filter((entry) => entry.id !== item.id));
+            undo({
+              message: `Deleted the “${item.name}” skill`,
+              commit: () => api.deleteSkill(workspace.id, item.id),
+              restore: loadKnowledge
+            });
+          }}
+        />
+        {/*
+          The record of what the box was allowed to do, across every conversation rather than one.
+
+          Approvals are answered in the conversation they arise in and were readable nowhere
+          afterwards: the route has taken a status filter and a cursor all along, and the four
+          statuses — including the one nobody chose, an approval that simply lapsed — had no reader.
+        */}
+        <hr />
+        <DecisionsLog onOpenTask={onOpenTask} />
       </div>
 
       <div className="settings-section" hidden={page !== 'agent'}>
@@ -1630,6 +2101,7 @@ export function SelfHostedSettings({
                     await api.revokeEnrollment(enrollment.id);
                     setEnrollment(undefined);
                     setEnrollmentQr('');
+                    loadEnrollments();
                   })
                 }
               >
@@ -1638,29 +2110,92 @@ export function SelfHostedSettings({
             </div>
           </div>
         ) : (
-          <button
-            disabled={busy}
-            onClick={() =>
-              void act(async () => {
-                await api.stepUp();
-                const created = await api.createEnrollment('New device');
-                setEnrollment(created);
-                // Loaded on demand: the encoder is only needed on this one screen.
-                const { toDataURL } = await import('qrcode');
-                setEnrollmentQr(
-                  await toDataURL(created.webUri, {
-                    errorCorrectionLevel: 'M',
-                    margin: 2,
-                    width: 240,
-                    color: { dark: '#e7e9ea', light: '#0c0d0e' }
-                  })
-                );
-              })
-            }
-          >
-            <QrCode /> Show device code
-          </button>
+          <>
+            <label>
+              What to call it
+              {/* The one call site sent the literal 'New device', so every device in the sessions
+                  list arrived with the same name and the list could not be read. The route has
+                  always taken a label. */}
+              <input
+                value={enrollmentLabelDraft}
+                maxLength={60}
+                placeholder="Kitchen laptop"
+                onChange={(event) => setEnrollmentLabelDraft(event.target.value)}
+              />
+            </label>
+            <button
+              disabled={busy}
+              onClick={() =>
+                void act(async () => {
+                  await api.stepUp();
+                  const created = await api.createEnrollment(
+                    enrollmentLabelDraft.trim() || 'New device'
+                  );
+                  setEnrollment(created);
+                  setEnrollmentLabelDraft('');
+                  loadEnrollments();
+                  // Loaded on demand: the encoder is only needed on this one screen.
+                  const { toDataURL } = await import('qrcode');
+                  setEnrollmentQr(
+                    await toDataURL(created.webUri, {
+                      errorCorrectionLevel: 'M',
+                      margin: 2,
+                      width: 240,
+                      color: { dark: '#e7e9ea', light: '#0c0d0e' }
+                    })
+                  );
+                })
+              }
+            >
+              <QrCode /> Show device code
+            </button>
+          </>
         )}
+        {/*
+          The links that are still out there, and the kill switch for each.
+
+          Minting one and revoking one were both reachable and the list between them was not: the
+          card holding a live invitation lived in component state, so navigating away, reloading or
+          closing Settings left a working grant to this account with no door — possibly with its
+          link sitting on a photographed screen. The server has listed them all along.
+        */}
+        {enrollments?.length ? (
+          <div className="settings-list">
+            {enrollments.map((grant) => (
+              <div key={grant.id}>
+                <span>
+                  <strong>{grant.label}</strong>
+                  <small>{enrollmentLine(grant)}</small>
+                </span>
+                {enrollmentRevocable(grant) && (
+                  <button
+                    className="icon-btn"
+                    aria-label={`Cancel the link for ${grant.label}`}
+                    title="Cancel this link"
+                    disabled={busy}
+                    onClick={() =>
+                      void act(async () => {
+                        await api.revokeEnrollment(grant.id);
+                        if (enrollment?.id === grant.id) {
+                          setEnrollment(undefined);
+                          setEnrollmentQr('');
+                        }
+                        setNotice('That link no longer works. Nothing was signed out.');
+                        loadEnrollments();
+                      })
+                    }
+                  >
+                    <Trash2 />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {enrollments?.length === 0 ? (
+          // "None this week", not "you have never made one": the route lists the last seven days.
+          <p className="settings-summary">No device links made in the last week.</p>
+        ) : null}
 
         <div className="section-heading">
           <LockKeyhole />
@@ -1820,41 +2355,101 @@ export function SelfHostedSettings({
           <BellRing />
           <div>
             <strong>Notifications on this device</strong>
+            {/*
+              The packaged app is a different device with a different answer, and this section used
+              to give it the browser's one.
+
+              `notificationState()` returns 'unsupported' in a WKWebView or a WebView2 because
+              `PushManager` genuinely is not there — so an installed athanor was told "this browser
+              cannot receive push notifications" and had its only button disabled, while the poll
+              behind the screen went on asking the operating system for permission with no user
+              gesture behind it. The owner was told it was impossible, never asked, and then got a
+              system prompt at a moment they did not choose. A packaged shell needs no push
+              subscription: it raises the notification itself, from a poll it is already running.
+            */}
             <span>
-              {pushState === 'checking'
-                ? 'Checking whether this device can be told.'
-                : pushState === 'unsupported'
-                  ? 'This browser cannot receive push notifications.'
-                  : pushState === 'unregistered'
-                    ? // The default install: no browser will run a service worker for an origin
-                      // whose certificate it does not trust, and without one there is nothing to
-                      // deliver a notification to. This used to wait on a promise that never
-                      // settles, so the section sat on "checking" for ever with a dead button.
-                      'No browser accepts notifications from a server using a self-signed certificate. On the server: sudo athanor certificate enable --agree-tos --email you@example.com'
-                    : pushState === 'unavailable'
-                      ? 'The server has no push key configured, so notifications are off.'
-                      : pushState === 'denied'
-                        ? 'This browser blocked notifications. Allow them in site settings first.'
-                        : 'Tell me when a long task finishes or needs approval, even with athanor closed.'}
+              {nativeBridge.available()
+                ? nativeNotifications
+                  ? 'This app can interrupt you through the operating system. It raises them itself — there is no push service in between and nothing leaves this box.'
+                  : 'This app can tell you through the operating system when work finishes or needs you. Turning it on asks your system for permission, once, on the press.'
+                : pushState === 'checking'
+                  ? 'Checking whether this device can be told.'
+                  : pushState === 'unsupported'
+                    ? 'This browser cannot receive push notifications.'
+                    : pushState === 'unregistered'
+                      ? // The default install: no browser will run a service worker for an origin
+                        // whose certificate it does not trust, and without one there is nothing to
+                        // deliver a notification to. This used to wait on a promise that never
+                        // settles, so the section sat on "checking" for ever with a dead button.
+                        'No browser accepts notifications from a server using a self-signed certificate. On the server: sudo athanor certificate enable --agree-tos --email you@example.com'
+                      : pushState === 'unavailable'
+                        ? 'The server has no push key configured, so notifications are off.'
+                        : pushState === 'denied'
+                          ? 'This browser blocked notifications. Allow them in site settings first.'
+                          : 'Tell me when a long task finishes or needs approval, even with athanor closed.'}
             </span>
           </div>
         </div>
-        <button
-          disabled={
-            busy ||
-            ['checking', 'unsupported', 'unregistered', 'unavailable', 'denied'].includes(pushState)
-          }
-          onClick={() =>
-            void act(async () => {
-              setPushState(
-                pushState === 'enabled' ? await disableNotifications() : await enableNotifications()
-              );
-            })
-          }
-        >
-          <BellRing />
-          {pushState === 'enabled' ? 'Turn off notifications' : 'Turn on notifications'}
-        </button>
+        {nativeBridge.available() ? (
+          <button
+            disabled={busy}
+            onClick={() =>
+              void act(async () => {
+                if (nativeNotifications) {
+                  setNativeNotificationsEnabled(false);
+                  setNativeNotifications(false);
+                  setNotice('This app will not interrupt you. athanor still shows notices in-app.');
+                  return;
+                }
+                /*
+                 * The permission prompt, attached to the press that asked for it.
+                 *
+                 * `notify` asks the OS only when it has not already been granted, and raising one
+                 * here is the round trip rather than a flourish: a preference stored without ever
+                 * having raised a notification is exactly the kind of switch this sweep exists to
+                 * remove. If the system refuses, nothing is stored and the refusal is said.
+                 */
+                const raised = await nativeBridge.notify(
+                  'athanor',
+                  'Notifications are on. This is what one looks like.'
+                );
+                if (!raised)
+                  throw new Error(
+                    'Your system did not allow the notification. Allow athanor to notify you in your system settings, then try again.'
+                  );
+                setNativeNotificationsEnabled(true);
+                setNativeNotifications(true);
+                setNotice(
+                  'On. The rules below decide which of them are worth interrupting you for.'
+                );
+              })
+            }
+          >
+            <BellRing />
+            {nativeNotifications ? 'Turn off notifications' : 'Turn on notifications'}
+          </button>
+        ) : (
+          <button
+            disabled={
+              busy ||
+              ['checking', 'unsupported', 'unregistered', 'unavailable', 'denied'].includes(
+                pushState
+              )
+            }
+            onClick={() =>
+              void act(async () => {
+                setPushState(
+                  pushState === 'enabled'
+                    ? await disableNotifications()
+                    : await enableNotifications()
+                );
+              })
+            }
+          >
+            <BellRing />
+            {pushState === 'enabled' ? 'Turn off notifications' : 'Turn on notifications'}
+          </button>
+        )}
         {pushSettings && (
           <>
             {/* Only the kinds this box stores: see notificationSettingsFromResponse. */}
@@ -2494,6 +3089,23 @@ export function SelfHostedSettings({
                 <small className={backupEvidence.attention ? 'settings-attention' : undefined}>
                   {backupEvidence.text}
                 </small>
+                {/*
+                  Evidence, then schedule. The line above reports the last copy that was actually
+                  taken, which an owner assuming backups are automatic reads as proof of a timer —
+                  and a box whose timer was never enabled looks identical to one whose timer ran
+                  yesterday. This is the other half, and it is the box's own answer.
+                */}
+                <small
+                  className={
+                    timerStateKnown(diagnostics?.backupTimer) &&
+                    diagnostics?.backupTimer === 'off' &&
+                    backupEvidence.attention
+                      ? 'settings-attention'
+                      : undefined
+                  }
+                >
+                  {backupTimerLine(diagnostics?.backupTimer)}
+                </small>
               </span>
             </div>
           )}
@@ -2501,11 +3113,14 @@ export function SelfHostedSettings({
             <span>
               <strong>Updates</strong>
               {/*
-                What the box does on its own, then what to type if you want to intervene — and it
-                has to be the box this installer actually ships. This said updates install
-                themselves weekly, which is the inverse of what the installer does: it enables the
-                backup timer and leaves the update timer off. An owner read it, stopped thinking
-                about updates, and had nothing install itself.
+                What the box does on its own, read off the box rather than assumed.
+
+                This row was static copy that told every owner to run `sudo athanor auto-update on`
+                — including the ones who already had, who were being instructed to enable something
+                already enabled and given no way to find out. The diagnostics route carried no timer
+                state at all, which is what made a description stand in for a reading. It carries
+                two now, and the third answer, "this host cannot say", is said as itself rather than
+                collapsed into "off".
               */}
               <small>
                 {/*
@@ -2518,16 +3133,25 @@ export function SelfHostedSettings({
                     Running <code>{buildLabel(diagnostics.build)}</code>.{' '}
                   </>
                 ) : null}
-                Updates are yours to run: <code>sudo athanor update</code>. To have them install
-                themselves weekly, backing up first and rolling back if the new release does not
-                serve: <code>sudo athanor auto-update on</code>. Also on the server:{' '}
-                <code>sudo athanor rollback</code> to undo a release that installed cleanly and
-                still went wrong, <code>sudo athanor backup</code> for a copy on demand, and{' '}
-                <code>sudo athanor doctor</code> for the full report.
+                {updateTimerLine(diagnostics?.autoUpdate)}
+              </small>
+              <small>
+                Also on the server: <code>sudo athanor rollback</code> to undo a release that
+                installed cleanly and still went wrong, <code>sudo athanor backup</code> for a copy
+                on demand, and <code>sudo athanor doctor</code> for the full report.
               </small>
             </span>
           </div>
         </div>
+        {/*
+          Which box this app is talking to, on the packaged client only.
+
+          It renders nothing in a browser — every route it calls is served by the shell's own
+          loopback gateway — so mounting it here costs a browser owner nothing at all. On a
+          packaged client it is the one thing this page could not previously say: which server the
+          window is pointed at, and how to point it at a different one.
+        */}
+        <ConnectionRow serverBuild={diagnostics?.build} />
         <div className="privacy-boundary">
           <ShieldCheck />
           <span>
@@ -2559,6 +3183,69 @@ export function SelfHostedSettings({
         >
           <Download /> Download the agent computer
         </button>
+        {/*
+          Wipe the computer without wiping the account.
+
+          The route has always been here — step-up, a typed name, the runner torn down and the row
+          removed — and nothing called it, so the only way to start clean was to delete the whole
+          account and enrol a passkey again from a pairing code. Two irreversible controls now sit
+          together, which is the reason each of them names exactly what it takes.
+        */}
+        {workspace &&
+          (deleteWorkspaceOpen ? (
+            <div className="restore-confirmation danger-confirmation">
+              <strong>Delete this computer and everything on it?</strong>
+              <span>
+                Working files, published results and the browser profile are removed, and the
+                computer is torn down. Your account, conversations, memory and skills stay. Nothing
+                on the computer can be restored afterwards — take a recovery point or download it
+                first if you want a copy. Type <code>{workspace.name}</code> to continue.
+              </span>
+              <input
+                value={deleteWorkspaceConfirmation}
+                aria-label="Confirm the computer’s name"
+                autoComplete="off"
+                onChange={(event) => setDeleteWorkspaceConfirmation(event.target.value)}
+              />
+              <span className="modal-actions">
+                <button
+                  className="secondary"
+                  onClick={() => {
+                    setDeleteWorkspaceOpen(false);
+                    setDeleteWorkspaceConfirmation('');
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="danger"
+                  disabled={
+                    busy || !workspaceDeletionArmed(deleteWorkspaceConfirmation, workspace.name)
+                  }
+                  onClick={() =>
+                    void act(async () => {
+                      await api.stepUp();
+                      await deleteWorkspaceRequest(
+                        workspace.id,
+                        deleteWorkspaceConfirmation.trim()
+                      );
+                      setDeleteWorkspaceOpen(false);
+                      setDeleteWorkspaceConfirmation('');
+                      setNotice(
+                        'The computer is gone. athanor provisions a fresh one the next time you send a message.'
+                      );
+                    })
+                  }
+                >
+                  <Trash2 /> Delete this computer
+                </button>
+              </span>
+            </div>
+          ) : (
+            <button className="danger" onClick={() => setDeleteWorkspaceOpen(true)}>
+              <Trash2 /> Delete this computer
+            </button>
+          ))}
         {deleteAccountOpen ? (
           <div className="restore-confirmation danger-confirmation">
             <strong>Delete this account and everything in it?</strong>

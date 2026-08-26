@@ -16,14 +16,73 @@ import type { RewindScope, TaskRewindPreview } from './types.js';
  * as the owner is rewriting it. Declared beside the wording it drives so the dialog, the workbench
  * that opens it and the tests all describe the same object.
  */
-export type TrajectoryDraft = { rewind: RewindScope } & (
+export type TrajectoryDraft = {
+  rewind: RewindScope;
+  /**
+   * The model the new path should run on, when the owner named one. Absent means the parent's,
+   * which is what a fork has always used — "that answer was weak, try the stronger model" is the
+   * whole reason the field exists, and until it was sent the only route to it was retyping the
+   * request as a fresh conversation and losing the thread.
+   */
+  modelId?: string;
+} & (
   | { operation: 'edit'; eventId: string; prompt: string; stopSource: boolean }
   | { operation: 'retry'; eventId: string; stopSource: boolean }
 );
 
-/** The sentence the server itself answers a missing checkpoint with, said before the attempt. */
+/**
+ * The model fields a trajectory request carries, taken from the draft the dialog produced.
+ *
+ * Here rather than at the call site because an empty string is a real value on the wire and means
+ * "a model with no id", which the server answers with `model_unavailable`. The dialog's "same model
+ * as before" option is an empty `<select>` value, so the one place that turns the draft into a body
+ * is the one place that has to know that.
+ */
+export const trajectoryModelFields = (draft: TrajectoryDraft): { modelId?: string } =>
+  draft.modelId ? { modelId: draft.modelId } : {};
+
+/**
+ * Why automatic undo points stopped, when the box knows and says so.
+ *
+ * Read off the preview structurally rather than through `TaskRewindPreview`, which does not declare
+ * it yet: a box that carries the refusal is understood, and one that does not falls back to the
+ * sentence below rather than being misreported.
+ */
+export interface CheckpointFailure {
+  /** The runner's own machine-readable refusal code, where the box is new enough to send one. */
+  code?: string | null;
+  /**
+   * The runner's sentence, which is written for a person and names the remedy — "This workspace
+   * holds more than 250000 files… Take a named recovery point instead." Shown as it arrived: the
+   * runner owns those words and rewording them here is how the guess below happened in the first
+   * place.
+   */
+  message: string;
+  /** Whether it names something the owner can clear, as `ownerFixableCheckpointFailure` decides. */
+  owner?: boolean;
+}
+
+/** The preview as it arrives, plus the refusal the contract has yet to declare. */
+export type RewindPreview = TaskRewindPreview & { checkpointFailure?: CheckpointFailure | null };
+
+/**
+ * What is said when no checkpoint covers the turn and nothing said why.
+ *
+ * It used to read "That turn changed nothing on the computer, or its undo point has been cleared",
+ * which is a guess with a benign edge, stated as fact. A workspace holding two `node_modules` trees
+ * crosses the runner's file ceiling, automatic checkpoints stop from then on, and every turn after
+ * that — turns that changed a great deal — was described by that sentence as harmless. The third
+ * possibility is now named, and so is where the answer actually is: the turn that lost its undo
+ * point carries a warning saying so.
+ */
 export const NO_CHECKPOINT_REASON =
-  'That turn changed nothing on the computer, or its undo point has been cleared.';
+  'No undo point covers that turn. It may have changed nothing, its point may have been pruned, or automatic undo points may have stopped — a turn that lost one says so in a warning.';
+
+/** The carried reason, said instead of the guess. */
+const noCheckpointReason = (failure: CheckpointFailure | null | undefined): string =>
+  failure?.message
+    ? `No undo point was taken for that turn. ${failure.message}`
+    : NO_CHECKPOINT_REASON;
 
 const UNREACHABLE_REASON =
   'The computer could not be asked what a rewind would change, so it is not offered.';
@@ -50,7 +109,7 @@ export interface RewindOffer {
 const plural = (count: number, one: string, many: string): string =>
   `${count} ${count === 1 ? one : many}`;
 
-export const rewindOffer = (preview: TaskRewindPreview | undefined): RewindOffer => {
+export const rewindOffer = (preview: RewindPreview | undefined): RewindOffer => {
   if (!preview)
     return {
       computerAvailable: false,
@@ -70,7 +129,7 @@ export const rewindOffer = (preview: TaskRewindPreview | undefined): RewindOffer
     return {
       ...base,
       computerAvailable: false,
-      computerReason: NO_CHECKPOINT_REASON,
+      computerReason: noCheckpointReason(preview.checkpointFailure),
       changes: [],
       caveats: []
     };

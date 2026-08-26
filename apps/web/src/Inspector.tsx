@@ -30,11 +30,11 @@ import {
   UserRound,
   X
 } from 'lucide-react';
-import { api } from './api.js';
+import { api, ApiFailure } from './api.js';
 import { deletionMessage, newFolderPath, renamedPath } from './file-actions.js';
 import { nextTabIndex } from './focus-trap.js';
 import { describeFailure } from './failure-text.js';
-import { readFilePreview } from './file-preview.js';
+import { previewMime, readFilePreview, TEXT_PREVIEW_LIMIT } from './file-preview.js';
 import { botWallClearance, formatBytes, hostOf } from './timeline-state.js';
 import { previewPortProblem, previewSummary } from './preview-rows.js';
 import {
@@ -55,8 +55,29 @@ import {
   parseDisplayMessage,
   type DisplayVideoConfig
 } from './display-protocol.js';
+import {
+  browserSnapshot,
+  desktopLaunch,
+  dragAction,
+  DRAG_THRESHOLD_PX,
+  framePassesThrough,
+  dialogBanner,
+  framePoint,
+  heldFor,
+  keyChord,
+  movedPath,
+  pointerAction,
+  processLog,
+  streamStalled,
+  surfaceNotice,
+  viewportMessage,
+  wheelAction,
+  type BrowserTabRow,
+  type FramePoint
+} from './inspector-api.js';
 import { DiffView } from './DiffView.js';
 import { useUndo } from './Undo.js';
+import './inspector.css';
 import type {
   Artifact,
   BackgroundProcess,
@@ -130,6 +151,25 @@ interface SurfaceState {
    * opened without a conversation open has no event log to read it out of.
    */
   botWall?: BotWall | null;
+  /**
+   * What the agent last did to this screen, in the sentence the approval card would have used.
+   *
+   * The runner has put it on every state frame since the display was written
+   * (`services/workspace-runner/src/desktop.ts`) and nothing read it, so the only account of what
+   * had just moved the pixels was the transcript, after the fact, once the tool result landed.
+   */
+  lastAction?: string;
+  /** When control last changed hands, so the holder line can say how long it has been that way. */
+  holderSince?: string;
+  /**
+   * The dialog holding this page, browser stream only.
+   *
+   * Parking a Playwright dialog suppresses its auto-dismiss, so the page is *blocked* until
+   * something answers — and the native dialog never renders, because Playwright intercepted it.
+   * An owner who took the browser over and clicked something raising `confirm()` watched the page
+   * stop with nothing on screen to explain it and no way out but hibernating the browser.
+   */
+  pendingDialog?: { type: string; message: string } | null;
 }
 
 /**
@@ -176,6 +216,24 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
    * have to recover from for no gain - the next keyframe is along shortly.
    */
   const needKeyframeRef = useRef(true);
+  /**
+   * When a frame last reached the screen, and when the socket last said anything at all.
+   *
+   * The pair is the freeze detector; `streamStalled` (inspector-api.ts) carries the reasoning for
+   * why it takes two marks rather than one. In short: an idle desktop legitimately sends nothing,
+   * so silence is not evidence, and the freeze this pane actually had was the opposite of silence.
+   */
+  const lastPaintRef = useRef<number | undefined>(undefined);
+  const lastSignalRef = useRef<number | undefined>(undefined);
+  /**
+   * The pane's way of publishing its own size the moment there is a socket to publish it down.
+   *
+   * A ref rather than a parameter because the size is measured where the picture is laid out and
+   * the socket is opened here, and the two do not happen in a fixed order: a `ResizeObserver` that
+   * fires before the handshake finishes would have its answer dropped, and the agent's screen would
+   * stay at the boot resolution until the owner next dragged something.
+   */
+  const viewportRef = useRef<(() => void) | undefined>(undefined);
   /** True once video has actually painted, which is what decides whether the still is still shown. */
   const [painting, setPainting] = useState(false);
   useEffect(() => {
@@ -186,12 +244,19 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
     let stopped = false;
     let attempts = 0;
 
+    /** A frame that has reached the screen, whichever transport carried it. See `streamStalled`. */
+    const painted = (): void => {
+      lastPaintRef.current = Date.now();
+      setStalled(false);
+    };
+
     const showJpeg = (data: ArrayBuffer): void => {
       const next = URL.createObjectURL(new Blob([data], { type: 'image/jpeg' }));
       const advanced = advanceFrame(framesRef.current, next);
       framesRef.current = advanced.slots;
       if (advanced.revoke) URL.revokeObjectURL(advanced.revoke);
       setFrameUrl(next);
+      painted();
     };
 
     const paint = (frame: VideoFrame): void => {
@@ -209,6 +274,7 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
       frame.close();
       setPainting(true);
       setError('');
+      painted();
     };
 
     const configureDecoder = (config: DisplayVideoConfig): void => {
@@ -280,7 +346,22 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
         ]);
         socket.binaryType = 'arraybuffer';
         socketRef.current = socket;
+        /*
+         * What this viewer can take, said before the first frame is encoded.
+         *
+         * `session.codec` was fixed at `avc1` when the session was constructed and nothing ever
+         * assigned it again, so the whole JPEG transport - which exists precisely for a browser
+         * with no `VideoDecoder` - was unreachable, and such a viewer got one still photograph for
+         * the life of the session with the takeover controls under it as though it were live. The
+         * runner now reads this and re-syncs the encoder on the spot.
+         */
+        socket.onopen = () => {
+          if (kind !== 'display') return;
+          direct({ type: 'hello', canDecodeVideo: canDecodeVideo() });
+          viewportRef.current?.();
+        };
         socket.onmessage = (event) => {
+          lastSignalRef.current = Date.now();
           if (event.data instanceof ArrayBuffer) {
             attempts = 0;
             // Two different wires behind one hook. The browser surface publishes Chromium's
@@ -372,6 +453,31 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
     };
   }, [workspaceId, kind, reconnectNonce]);
 
+  /*
+   * The watchdog that turns a frozen picture into something the owner can press.
+   *
+   * Recovery was already built and was shown only on `error || stalled`. Neither is set when the
+   * stream stops delivering pixels down a socket that is otherwise healthy, so the one case where
+   * the pane is a photograph of the agent's screen from some seconds ago was exactly the case with
+   * no error, no spinner and no button. This is the missing half: it sets `stalled`, and the
+   * existing "Try again" appears.
+   */
+  useEffect(() => {
+    if (!kind) return;
+    lastPaintRef.current = undefined;
+    lastSignalRef.current = undefined;
+    const timer = window.setInterval(() => {
+      if (
+        streamStalled(
+          { lastPaintAt: lastPaintRef.current, lastSignalAt: lastSignalRef.current },
+          Date.now()
+        )
+      )
+        setStalled(true);
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, [kind, workspaceId, reconnectNonce]);
+
   /** Over the open socket when there is one; the REST route is the fallback, not the norm. */
   const direct = (message: Record<string, unknown>): boolean => {
     const socket = socketRef.current;
@@ -399,9 +505,24 @@ function useRemoteSurface(workspaceId: string, kind: SurfaceKind | undefined) {
     send,
     setHolder,
     setError,
+    viewportRef,
+    /** Anything that is not an action or a handover: the `hello`, and the viewport this pane is. */
+    sendMessage: direct,
     reconnect: () => {
       setStalled(false);
       setError('');
+      /*
+       * The decoder is what was stuck, so the decoder is what has to be let go of.
+       *
+       * Without this the reconnect opened a new socket into a `needKeyframeRef` still holding
+       * `false` from the session before it, and the first access unit of the new stream - which is
+       * a delta, because the encoder's GOP is infinite - was fed to a decoder that had never seen
+       * its keyframe. Pressing "Try again" produced the same frozen picture, which is the worst
+       * possible answer to a recovery control.
+       */
+      needKeyframeRef.current = true;
+      lastPaintRef.current = undefined;
+      lastSignalRef.current = undefined;
       setReconnectNonce((current) => current + 1);
     }
   };
@@ -469,11 +590,32 @@ function Files({
   const [listingError, setListingError] = useState('');
   /** The decoded text as it was loaded, so Save is inert until something actually changed. */
   const [edit, setEdit] = useState<{ path: string; text: string } | undefined>();
+  /**
+   * The digest of what was read, which is what a save claims it is replacing.
+   *
+   * Without it the later write won in silence: the owner saving a file the agent was part-way
+   * through writing discarded that work with nothing anywhere recording that it had, and the pane
+   * defaults to Recent order *because* the agent is working, so this is the ordinary case rather
+   * than the edge. Null for a windowed read — see `open`.
+   */
+  const [readSha, setReadSha] = useState<string | null>(null);
+  /** Which lines of a file too large to hold are on screen, and where the next of them start. */
+  const [fileWindow, setFileWindow] = useState<{
+    startLine: number;
+    endLine: number;
+    totalLines: number | null;
+    nextStartLine: number | null;
+  }>();
+  /** The file the pager is paging, kept so "next" knows what it is reading more of. */
+  const [windowEntry, setWindowEntry] = useState<FileEntry>();
   const [saving, setSaving] = useState(false);
   /** The edited text, held until the owner has seen the diff their save would apply. */
   const [saveReview, setSaveReview] = useState<string>();
   /** One inline form at a time: a new folder here, or a new name for one entry. */
   const [naming, setNaming] = useState<{ entry?: FileEntry; value: string }>();
+  /** The entry being moved into another folder, and the folder chosen for it. */
+  const [moving, setMoving] = useState<FileEntry>();
+  const [moveTo, setMoveTo] = useState('');
   /*
    * Finished results are files too, so they live with the files rather than in a pane of their own.
    * They are fixed copies with a version each, which is why they are listed apart from the tree the
@@ -551,7 +693,8 @@ function Files({
        * being withdrawn and drop the file - which is the same complaint as a corrupted copy, from
        * the other end.
        */
-      if (preview?.downloadUrl) URL.revokeObjectURL(preview.downloadUrl);
+      // A window's download is a route rather than an object URL; there is nothing to revoke.
+      if (preview?.downloadUrl?.startsWith('blob:')) URL.revokeObjectURL(preview.downloadUrl);
     },
     [preview?.url, preview?.captionsUrl, preview?.downloadUrl]
   );
@@ -562,22 +705,71 @@ function Files({
    * so reading `entries` there would search the folder the owner was looking at before, and a video
    * opened that way would silently lose its companion captions.
    */
-  const open = async (entry: FileEntry, listing: FileEntry[] = entries) => {
+  const open = async (entry: FileEntry, listing: FileEntry[] = entries, startLine?: number) => {
     if (entry.type === 'directory') return load(entry.path);
     setListingError('');
-    const bytes = await api.file(workspace.id, entry.path).catch((cause: unknown) => {
-      // Clicking a file used to do nothing whatsoever when the runner was unavailable.
-      setListingError(describeFailure(cause, `Couldn’t open ${entry.name}`));
-      return undefined;
-    });
-    if (!bytes) return;
-    // The file as it arrived, before anything decodes or truncates it. Every branch below carries
-    // this through to the download, so what lands on the owner's device is what is on the server.
-    const downloadUrl = URL.createObjectURL(
-      new Blob([bytes], { type: 'application/octet-stream' })
+    /*
+     * A window when the file is too big to hold, the whole of it otherwise.
+     *
+     * The runner has read line ranges under a byte budget all along and answers with where the
+     * window starts and ends, how many lines there are and where to resume - and this pane could
+     * only ever ask for everything, so a large log was two million characters cut off mid-line with
+     * "download it for the whole file" as the only way on. The agent has known how much it did not
+     * read since the tool was written; the owner did not.
+     */
+    const paged =
+      startLine !== undefined || (entry.sizeBytes > TEXT_PREVIEW_LIMIT && !previewMime(entry.name));
+    const read = await api
+      .readFile(
+        workspace.id,
+        entry.path,
+        paged ? { startLine: startLine ?? 1, maxBytes: TEXT_PREVIEW_LIMIT } : {}
+      )
+      .catch((cause: unknown) => {
+        // Clicking a file used to do nothing whatsoever when the runner was unavailable.
+        setListingError(describeFailure(cause, `Couldn’t open ${entry.name}`));
+        return undefined;
+      });
+    if (!read) return;
+    const bytes = read.bytes;
+    /*
+     * What was on disk at the moment of the read, kept so the save can claim it.
+     *
+     * Null for a windowed read, deliberately: the runner computes the digest over what it read,
+     * and a digest of lines 40-80 is not a claim about the file. A window is therefore never
+     * editable here, which is also why the pager below renders read-only.
+     */
+    setReadSha(read.sha256);
+    setWindowEntry(paged ? entry : undefined);
+    setFileWindow(
+      paged
+        ? {
+            startLine: read.startLine ?? startLine ?? 1,
+            endLine: read.endLine ?? 0,
+            totalLines: read.totalLines,
+            nextStartLine: read.truncated ? read.nextStartLine : null
+          }
+        : undefined
     );
+    /*
+     * The file as it arrived, before anything decodes or truncates it. Every branch below carries
+     * this through to the download, so what lands on the owner's device is what is on the server.
+     *
+     * A window is the one case where the bytes in hand are not the file, so it gets the route
+     * itself rather than a blob of the slice: downloading "the whole file" and receiving lines
+     * 1-8,000 of it would be the same silent substitution the decoded-string download used to be.
+     */
+    const downloadUrl = paged
+      ? `/v1/workspaces/${workspace.id}/file?path=${encodeURIComponent(entry.path)}`
+      : URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
     const shown = readFilePreview(entry.name, bytes);
-    const common = { name: entry.name, downloadUrl, sizeBytes: bytes.byteLength };
+    // The size of the file, not of the window: `x-file-bytes` is what the runner read it from,
+    // and reporting the slice as though it were the whole is how a pane starts misinforming.
+    const common = {
+      name: entry.name,
+      downloadUrl,
+      sizeBytes: read.fileBytes ?? bytes.byteLength
+    };
     if (shown.kind === 'media') {
       const stem = entry.name.replace(/\.[^.]+$/, '');
       const captionEntry = shown.mime.startsWith('video/')
@@ -614,12 +806,16 @@ function Files({
     setPreview({
       ...common,
       text: shown.text,
-      editable: shown.editableText !== undefined,
+      // A window is never editable, whatever its size: saving it would write those lines over the
+      // whole file and silently drop everything outside the window that was just read.
+      editable: !paged && shown.editableText !== undefined,
       path: entry.path,
-      ...(shown.reason ? { reason: shown.reason } : {})
+      ...(paged ? { reason: 'read_only' as const } : shown.reason ? { reason: shown.reason } : {})
     });
     setEdit(
-      shown.editableText === undefined ? undefined : { path: entry.path, text: shown.editableText }
+      paged || shown.editableText === undefined
+        ? undefined
+        : { path: entry.path, text: shown.editableText }
     );
   };
 
@@ -718,12 +914,27 @@ function Files({
     setSaving(true);
     setUploadError('');
     try {
-      await api.writeFile(workspace.id, edit.path, new TextEncoder().encode(next));
+      /*
+       * The claim about what is being replaced, checked by the runner under the write's own
+       * descriptor. On a collision it answers `file_changed` with a sentence written for a person,
+       * which `describeFailure` puts on the pane - and the file is re-read, so what is on screen
+       * afterwards is the agent's version rather than a save that quietly won.
+       */
+      await api.writeFile(
+        workspace.id,
+        edit.path,
+        new TextEncoder().encode(next),
+        readSha ?? undefined
+      );
       setEdit({ path: edit.path, text: next });
       setPreview((current) => (current ? { ...current, text: next } : current));
       setSaveReview(undefined);
     } catch (cause) {
       setUploadError(describeFailure(cause, 'Could not save this file'));
+      if (cause instanceof ApiFailure && cause.code === 'file_changed') {
+        const entry = entries.find((item) => item.path === edit.path);
+        if (entry) await open(entry);
+      }
     } finally {
       setSaving(false);
     }
@@ -742,6 +953,36 @@ function Files({
       : undefined;
   const listedArtifacts = askedArtifact ? [askedArtifact, ...recentArtifacts] : recentArtifacts;
   const parent = path.split('/').slice(0, -1).join('/') || 'workspace';
+  /*
+   * Where a file can be moved to from here: the folders in this listing, and the one above.
+   *
+   * Offered rather than typed, so a destination is always a folder that exists and no path leaves
+   * the workspace. A listing with neither is a listing with nowhere to move to, and the control
+   * does not appear.
+   */
+  const moveTargets = [
+    ...(path === 'workspace' ? [] : [parent]),
+    ...entries.filter((entry) => entry.type === 'directory').map((entry) => entry.path)
+  ];
+  const submitMove = async () => {
+    if (!moving) return;
+    const target = moveTo || moveTargets[0];
+    if (!target) return;
+    const result = movedPath(moving, target);
+    if (!result.ok) {
+      setUploadError(result.message);
+      return;
+    }
+    setUploadError('');
+    try {
+      await api.renameFile(workspace.id, moving.path, result.path);
+      setMoving(undefined);
+      await load();
+    } catch (cause) {
+      // The runner refuses a collision rather than overwriting, which is the answer worth showing.
+      setUploadError(describeFailure(cause, `${moving.name} could not be moved`));
+    }
+  };
   const submitName = async () => {
     if (!naming) return;
     const result = naming.entry
@@ -1124,6 +1365,33 @@ function Files({
                   : `Too large to edit here — ${formatBytes(preview.sizeBytes ?? 0)}. Use the terminal, or download it.`}
             </p>
           )}
+          {/*
+            Which lines these are, and the way to the next of them. The pane used to say only that
+            it had been cut short, which told the owner they had lost something and nothing about
+            how to reach it.
+          */}
+          {fileWindow && windowEntry && (
+            <div className="file-window">
+              <span>
+                Lines {fileWindow.startLine.toLocaleString()}–{fileWindow.endLine.toLocaleString()}
+                {fileWindow.totalLines === null
+                  ? ''
+                  : ` of ${fileWindow.totalLines.toLocaleString()}`}
+              </span>
+              {fileWindow.startLine > 1 && (
+                <button onClick={() => void open(windowEntry, entries, 1)}>
+                  Back to the start
+                </button>
+              )}
+              {fileWindow.nextStartLine !== null && (
+                <button
+                  onClick={() => void open(windowEntry, entries, fileWindow.nextStartLine ?? 1)}
+                >
+                  Next lines
+                </button>
+              )}
+            </div>
+          )}
           {preview.text !== undefined &&
             (preview.editable && edit ? (
               <textarea
@@ -1160,6 +1428,24 @@ function Files({
         </div>
       ) : (
         <div className="file-list">
+          {moving && (
+            <div className="file-window" role="group" aria-label={`Move ${moving.name}`}>
+              <span>Move “{moving.name}” to</span>
+              <select
+                aria-label="Destination folder"
+                value={moveTo}
+                onChange={(event) => setMoveTo(event.target.value)}
+              >
+                {moveTargets.map((folder) => (
+                  <option key={folder} value={folder}>
+                    {folder.replace(/^workspace\/?/, '') || 'Files'}
+                  </option>
+                ))}
+              </select>
+              <button onClick={() => void submitMove()}>Move</button>
+              <button onClick={() => setMoving(undefined)}>Cancel</button>
+            </div>
+          )}
           {sortEntries(entries, order).map((entry) => (
             <div className="file-row" key={entry.path}>
               <button className="file-open" onClick={() => void open(entry)}>
@@ -1182,6 +1468,30 @@ function Files({
               >
                 <PencilLine />
               </button>
+              {/*
+                Moving, which the route has always done and the client always refused.
+
+                `renameWorkspaceEntry` resolves an arbitrary destination and mkdirs its parent - a
+                full move - and `renamedPath` replaces the last segment and rejects any slash,
+                which is right for renaming in place and was the whole of what the owner had. So
+                twenty files the agent dropped in the wrong folder could only be tidied through the
+                terminal. A folder is named rather than a path, so nothing here addresses a file by
+                hand.
+              */}
+              {moveTargets.length > 0 && (
+                <button
+                  className="icon-btn"
+                  title="Move to another folder"
+                  aria-label={`Move ${entry.name}`}
+                  onClick={() => {
+                    setUploadError('');
+                    setNaming(undefined);
+                    setMoving(entry);
+                  }}
+                >
+                  <FolderOpen />
+                </button>
+              )}
               <button
                 className="icon-btn"
                 title={entry.type === 'directory' ? 'Delete folder and contents' : 'Delete'}
@@ -1304,6 +1614,8 @@ function Computer({
   const [desktop, setDesktop] = useState<DesktopSnapshot>();
   const [probe, setProbe] = useState<{ done: boolean; error: string }>({ done: false, error: '' });
   const [address, setAddress] = useState('');
+  /** The name of a program to start, resolved against the session's PATH by the runner. */
+  const [program, setProgram] = useState('');
   const [privateText, setPrivateText] = useState('');
   /** The wall the owner has already dealt with, so the banner goes when they say it is done. */
   const [handled, setHandled] = useState('');
@@ -1377,13 +1689,24 @@ function Computer({
     look();
   }, [workspace.id, visible]);
 
-  const frameSize =
-    kind === 'page'
-      ? PAGE_VIEWPORT
-      : {
-          width: surface.state?.width ?? desktop?.width ?? PAGE_VIEWPORT.width,
-          height: surface.state?.height ?? desktop?.height ?? PAGE_VIEWPORT.height
-        };
+  /*
+   * The stream's own answer first, on both surfaces.
+   *
+   * The page surface used to map clicks against `PAGE_VIEWPORT` unconditionally - a hard-coded
+   * fourth copy of the runner's `BROWSER_VIEWPORT`, and the one `scripts/check-repository.mjs`
+   * did not police. The two numbers agree today, so nothing was wrong; the day anyone changed the
+   * runner's viewport every human click would have landed proportionally off with nothing failing.
+   * The browser publishes its width and height on every state frame, so the constant is now only
+   * the answer before the first frame arrives - and the copy is held against the runner's
+   * declaration by `check-repository.mjs`, so the two can no longer part company quietly.
+   *
+   * `||` and not `??`: a host with no desktop answers the snapshot with a width of zero, and zero
+   * is a number, so `??` would have kept it and divided every click by nothing.
+   */
+  const frameSize = {
+    width: surface.state?.width || desktop?.width || PAGE_VIEWPORT.width,
+    height: surface.state?.height || desktop?.height || PAGE_VIEWPORT.height
+  };
   const paneRef = useRef<HTMLDivElement | null>(null);
   const [expanded, setExpanded] = useState(false);
   /**
@@ -1439,6 +1762,47 @@ function Computer({
     }
   };
 
+  const frameRef = useRef<HTMLButtonElement | null>(null);
+  /*
+   * The wheel, and the size of the hole the screen is being watched through.
+   *
+   * Both are attached by hand rather than through React's props. `onWheel` is registered on the
+   * root as a passive listener, so `preventDefault` inside it does nothing and the panel scrolls
+   * under the pointer while the agent's screen sits still - the gesture would have gone to the
+   * wrong screen, silently. And the size has to be published on the socket rather than rendered:
+   * `DesktopManager.resize` has existed as long as the display has and had exactly one caller,
+   * a subscriber field no route ever set, so every agent computer has been 1280x800 whatever it
+   * was being watched on. A person taking over to read something was reading an upscale.
+   */
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame || !kind) return;
+    const onWheel = (event: globalThis.WheelEvent) => void scrollFrame(event);
+    frame.addEventListener('wheel', onWheel, { passive: false });
+    const publish = () => {
+      const box = frame.getBoundingClientRect();
+      const message = viewportMessage(box, window.devicePixelRatio);
+      if (message) surface.sendMessage(message);
+    };
+    // Held on the hook's ref so the socket can ask for it the moment it opens: the observer below
+    // fires on mount, which is usually before the handshake has finished.
+    if (kind === 'display') surface.viewportRef.current = publish;
+    const observer =
+      kind === 'display'
+        ? new ResizeObserver(() => {
+            if (frame.clientWidth > 0 && frame.clientHeight > 0) publish();
+          })
+        : undefined;
+    observer?.observe(frame);
+    return () => {
+      frame.removeEventListener('wheel', onWheel);
+      observer?.disconnect();
+      surface.viewportRef.current = undefined;
+    };
+    // `surface.painting` and the frame URL are in here because the button they attach to does not
+    // exist until there is something to draw in it: without them the listeners were installed
+    // against a null ref on the render before the first frame and never again.
+  }, [kind, holder, expanded, surface.painting, surface.frameUrl]);
   const clickFrame = async (event: MouseEvent<HTMLButtonElement>) => {
     /*
      * The picture does something whichever way control is held.
@@ -1455,32 +1819,103 @@ function Computer({
       return;
     }
     if (event.detail === 0) return;
-    // Measured against the picture, not the button around it. The button is a layout box and can be
-    // a different shape from what is drawn inside it - it is, in full screen - and mapping a click
-    // through the wrong box lands it somewhere the owner did not point.
-    const painted = event.currentTarget.querySelector('canvas:not([hidden]), img');
-    const bounds = (painted ?? event.currentTarget).getBoundingClientRect();
-    await surface.send({
-      type: 'click_at',
-      x: Math.max(
-        0,
-        Math.min(frameSize.width, ((event.clientX - bounds.left) / bounds.width) * frameSize.width)
-      ),
-      y: Math.max(
-        0,
-        Math.min(
-          frameSize.height,
-          ((event.clientY - bounds.top) / bounds.height) * frameSize.height
-        )
-      ),
-      button: 'left',
-      clicks: 1
-    });
+    // A press that turned into a drag has already been sent as one; the click that follows it is
+    // the browser telling us about the same gesture a second time.
+    if (draggedRef.current) {
+      draggedRef.current = false;
+      return;
+    }
+    // The second click of a double is left to `onDoubleClick`, which sends it as the one action the
+    // contract has for it: two clicks close enough together that the remote toolkit sees a double,
+    // which a pair of separate round trips over a home connection never would.
+    if (event.detail > 1) return;
+    await sendAt(event, { clicks: 1 });
   };
-  const keyFrame = async (event: KeyboardEvent<HTMLButtonElement>) => {
-    if (holder !== 'user' || !['Enter', ' '].includes(event.key)) return;
+  /**
+   * Where this pointer event lands on the agent's screen.
+   *
+   * Measured against the picture, not the button around it. The button is a layout box and can be
+   * a different shape from what is drawn inside it - it is, in full screen - and mapping a click
+   * through the wrong box lands it somewhere the owner did not point.
+   */
+  const pointAt = (event: MouseEvent<HTMLButtonElement>): FramePoint => {
+    const painted = event.currentTarget.querySelector('canvas:not([hidden]), img');
+    return framePoint(event, (painted ?? event.currentTarget).getBoundingClientRect(), frameSize);
+  };
+  /**
+   * A press of a button at a position, or an honest refusal.
+   *
+   * `pointerAction` returns nothing when the surface cannot express what was asked - a right-click
+   * or a double-click on the page stream, which has neither field - and this says so rather than
+   * sending a plain left click that would be reported as having worked.
+   */
+  const sendAt = async (
+    event: MouseEvent<HTMLButtonElement>,
+    press: { button?: 'left' | 'middle' | 'right'; clicks?: number }
+  ) => {
+    if (!kind) return;
+    const action = pointerAction(kind, pointAt(event), press);
+    if (!action) {
+      surface.setError(
+        'This host has no desktop, so the browser stream takes ordinary clicks only. Right-click and double-click need a screen.'
+      );
+      return;
+    }
+    await surface.send(action);
+  };
+  /*
+   * A drag, tracked across the picture rather than assembled from a press and a hope.
+   *
+   * No slider moves and no puzzle challenge is solvable without this, and a challenge is very
+   * often exactly what a person has been called in to clear. The threshold keeps an ordinary
+   * click - which wobbles a pixel or two under a real hand - a click.
+   */
+  const dragFromRef = useRef<FramePoint | undefined>(undefined);
+  const draggedRef = useRef(false);
+  const beginDrag = (event: MouseEvent<HTMLButtonElement>) => {
+    if (holder !== 'user') return;
+    dragFromRef.current = pointAt(event);
+    draggedRef.current = false;
+  };
+  const endDrag = async (event: MouseEvent<HTMLButtonElement>) => {
+    const from = dragFromRef.current;
+    dragFromRef.current = undefined;
+    if (!from || !kind || holder !== 'user') return;
+    const to = pointAt(event);
+    if (Math.hypot(to.x - from.x, to.y - from.y) < DRAG_THRESHOLD_PX) return;
+    const action = dragAction(kind, from, to);
+    draggedRef.current = true;
+    if (!action) {
+      surface.setError(
+        'Dragging needs a screen. This host has no desktop, so the browser stream cannot hold a button down across a movement.'
+      );
+      return;
+    }
+    await surface.send(action);
+  };
+  const scrollFrame = async (event: globalThis.WheelEvent) => {
+    if (holder !== 'user' || !kind) return;
+    // Otherwise the panel scrolls under the pointer instead, which is the one thing the owner did
+    // not mean by turning the wheel over somebody else's screen.
     event.preventDefault();
-    await surface.send({ type: 'press', key: event.key === ' ' ? 'space' : 'Enter' });
+    const action = wheelAction(kind, event);
+    if (action) await surface.send(action);
+  };
+  /**
+   * Every key, as the person pressed it.
+   *
+   * This was an allowlist of two - Enter and space - and everything else was dropped in silence.
+   * A person invited to clear a challenge could not press Backspace to fix a typo, could not use
+   * an arrow key, and could not reach anything below the fold. `keyChord` composes the modifiers
+   * into the one spelling both surfaces understand; `framePassesThrough` keeps Tab for the page,
+   * so focus that lands on the picture can still leave it.
+   */
+  const keyFrame = async (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (holder !== 'user' || framePassesThrough(event)) return;
+    const key = keyChord(event);
+    if (!key) return;
+    event.preventDefault();
+    await surface.send({ type: 'press', key });
   };
   const sendPrivateText = async () => {
     if (!privateText) return;
@@ -1549,6 +1984,111 @@ function Computer({
       surface.setError(describeFailure(cause, 'That page could not be brought to the front'));
     }
   };
+  /*
+   * Open an application, on a computer whose pane exists to be worked on directly.
+   *
+   * The route has been there all along with the owner's own role and scope on it, and there was no
+   * door: changing "Nothing open yet" meant asking the agent in prose and waiting a whole turn.
+   *
+   * The holder dance is the runner's rule, not a preference. `desktop.launch` refuses while the
+   * desktop is held by anyone but the agent (services/workspace-runner/src/desktop.ts), so the
+   * route as it stands is usable only in the state a person is not in. Rather than leave the
+   * control dead exactly when it is wanted, the screen goes back for the length of the launch and
+   * is taken again straight after, and the owner ends holding what they were holding.
+   */
+  const launch = async () => {
+    const executable = program.trim();
+    if (!executable) return;
+    const held = holder;
+    try {
+      if (held !== 'agent') await surface.setHolder('agent');
+      await desktopLaunch(workspace.id, { executable });
+      setProgram('');
+      // The window list is part of what the toolbar says, and it is stale the moment this returns.
+      look();
+    } catch (cause) {
+      surface.setError(describeFailure(cause, `${executable} did not start`));
+    } finally {
+      if (held !== 'agent') await surface.setHolder(held);
+    }
+  };
+  /*
+   * The browser's own history, beside the address bar that drives it.
+   *
+   * Offered only where a browser is known to be running and ours - the page surface, or a screen
+   * where the address bar or a challenge has already put one there. Elsewhere pressing Back would
+   * start a Chromium nobody asked for, which is the same mistake handing the screen back used to
+   * make.
+   */
+  const browserIsOurs = kind === 'page' || browserHeld || Boolean(openWall);
+  const browserStep = async (action: 'back' | 'reload') => {
+    try {
+      await api.browserPrivateAction(workspace.id, { type: action });
+    } catch (cause) {
+      surface.setError(describeFailure(cause, 'That did not reach the browser'));
+    }
+  };
+  /*
+   * The tabs, on the one surface where they are invisible.
+   *
+   * With a desktop the browser is a real window inside the stream and its tab strip is in the
+   * picture. Without one the pane shows Chromium's screencast of page content only - no window
+   * chrome, no strip - so four open tabs, and the one an agent left on a checkout page, were
+   * unreachable and unseeable. This also gives `POST /v1/workspaces/:id/browser/snapshot` its
+   * first caller.
+   */
+  const [tabs, setTabs] = useState<BrowserTabRow[]>([]);
+  /*
+   * A clock, only while there is a surface to count for.
+   *
+   * The holder line counts up from `holderSince`, and a number that has stopped is worse than no
+   * number - so it ticks while a stream is open and nowhere else, on the same rule the Running
+   * pane's elapsed column follows.
+   */
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!kind) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') setNow(Date.now());
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, [kind]);
+  const readTabs = () => {
+    if (kind !== 'page') return;
+    void browserSnapshot(workspace.id)
+      .then((snapshot) => setTabs(snapshot.tabs))
+      .catch(() => setTabs([]));
+  };
+  useEffect(() => {
+    setTabs([]);
+    readTabs();
+  }, [workspace.id, kind, holder]);
+  const tabAction = async (action: 'select_tab' | 'close_tab', tabId: string) => {
+    try {
+      await api.browserPrivateAction(workspace.id, { type: action, tabId });
+      readTabs();
+    } catch (cause) {
+      surface.setError(describeFailure(cause, 'That tab did not answer'));
+    }
+  };
+  /*
+   * The dialog holding the page, and the two buttons that are the only way out of it.
+   *
+   * It rides the stream the way `botWall` does. Until it did, an owner who took the browser over
+   * and clicked something raising `confirm()` watched the page stop responding with nothing to
+   * explain it: Playwright had intercepted the dialog, so the native one never drew, and parking
+   * the handle suppressed the auto-dismiss - so the page stayed blocked, and reloading the app did
+   * not clear it because the block is on the runner's side.
+   */
+  const pendingDialog = dialogBanner(surface.state?.pendingDialog);
+  const answerDialog = async (response: 'accept' | 'dismiss') => {
+    try {
+      await surface.send({ type: 'dialog', response });
+    } catch (cause) {
+      surface.setError(describeFailure(cause, 'That answer did not reach the page'));
+    }
+  };
 
   return (
     <div
@@ -1586,7 +2126,39 @@ function Computer({
           {expanded ? <Minimize2 /> : <Maximize2 />}
         </button>
       </div>
+      {/*
+        Why the screen is not working, when it is not. A box whose accessibility bridge has failed
+        looks identical to a healthy one while every agent action silently degrades to pixels, and
+        the runner has been sending the reason - "This Linux host does not have the Athanor GUI
+        dependencies configured", and the like - in the same response this pane already fetched.
+      */}
+      {surfaceNotice(desktop) && (
+        <div className="computer-message" role="status">
+          <ShieldAlert />
+          <span>{surfaceNotice(desktop)}</span>
+        </div>
+      )}
       <div className="browser-controls">
+        {browserIsOurs && (
+          <>
+            <button
+              className="icon-btn"
+              aria-label="Back"
+              title="Back"
+              onClick={() => void browserStep('back')}
+            >
+              <ArrowLeft />
+            </button>
+            <button
+              className="icon-btn"
+              aria-label="Reload this page"
+              title="Reload"
+              onClick={() => void browserStep('reload')}
+            >
+              <RotateCcw />
+            </button>
+          </>
+        )}
         <div className="address">
           <LockKeyhole />
           <input
@@ -1607,7 +2179,74 @@ function Computer({
         >
           <Play />
         </button>
+        {kind === 'display' && (
+          <span className="computer-launch">
+            <input
+              aria-label="Open a program on this computer"
+              placeholder="Program"
+              value={program}
+              onChange={(event) => setProgram(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void launch();
+              }}
+            />
+            <button
+              className="icon-btn"
+              aria-label="Open this program"
+              title="Open a program on the agent computer"
+              disabled={!program.trim()}
+              onClick={() => void launch()}
+            >
+              <Monitor />
+            </button>
+          </span>
+        )}
       </div>
+      {/* The tabs, where the picture cannot show them. Titles, so a row is worth reading. */}
+      {kind === 'page' && tabs.length > 1 && (
+        <div className="surface-strip" aria-label="Browser tabs">
+          {tabs.map((entry) => (
+            <span key={entry.tabId} className={`strip-tab${entry.active ? ' active' : ''}`}>
+              <button title={entry.url} onClick={() => void tabAction('select_tab', entry.tabId)}>
+                {entry.title || hostOf(entry.url)}
+              </button>
+              <button
+                className="strip-close"
+                aria-label={`Close ${entry.title || hostOf(entry.url)}`}
+                onClick={() => void tabAction('close_tab', entry.tabId)}
+              >
+                <X />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      {/* Which windows are open, rather than how many. The toolbar could only ever count them. */}
+      {kind === 'display' && desktop && desktop.windows.length > 0 && (
+        <div className="surface-strip" aria-label="Open windows">
+          {desktop.windows.map((entry) => (
+            <button key={entry.id} title={entry.role}>
+              {entry.name || entry.role}
+            </button>
+          ))}
+        </div>
+      )}
+      {pendingDialog && (
+        <div className="wall-banner" role="alert">
+          <ShieldAlert />
+          <div>
+            <strong>This page is waiting for an answer</strong>
+            <span>{pendingDialog.kind}</span>
+            <small>{pendingDialog.detail}</small>
+          </div>
+          <div className="wall-actions">
+            <button onClick={() => void answerDialog('dismiss')}>Dismiss</button>
+            <button className="primary" onClick={() => void answerDialog('accept')}>
+              Accept
+            </button>
+          </div>
+        </div>
+      )}
       {openWall && (
         <div className="wall-banner" role="alert">
           <ShieldAlert />
@@ -1659,8 +2298,22 @@ function Computer({
                   ? 'Live view of the agent computer. Activate to leave full screen. Take over below to interact.'
                   : 'Live view of the agent computer. Activate to show it full screen. Take over below to interact.'
             }
+            ref={frameRef}
             onClick={(event) => void clickFrame(event)}
             onKeyDown={(event) => void keyFrame(event)}
+            onDoubleClick={(event) => void sendAt(event, { clicks: 2 })}
+            /*
+              The menu the agent's own applications draw, which used to be unreachable: the
+              browser's context menu is over the picture rather than in it, so it was the only
+              thing a right-click could ever produce here.
+            */
+            onContextMenu={(event) => {
+              if (holder !== 'user') return;
+              event.preventDefault();
+              void sendAt(event, { button: 'right' });
+            }}
+            onPointerDown={beginDrag}
+            onPointerUp={(event) => void endDrag(event)}
           >
             {/*
               Decoded video paints here. The canvas is mounted for the computer surface whether or
@@ -1743,11 +2396,22 @@ function Computer({
           <div className="browser-status">
             <span className={holder}>
               {holder === 'agent' ? <Bot /> : <UserRound />}
-              {holder === 'agent'
-                ? 'Agent has control'
-                : holder === 'secure_input'
-                  ? 'Secure input mode'
-                  : 'You have control'}
+              <span>
+                {holder === 'agent'
+                  ? 'Agent has control'
+                  : holder === 'secure_input'
+                    ? 'Secure input mode'
+                    : 'You have control'}
+                {surface.state?.holderSince ? ` · ${heldFor(surface.state.holderSince, now)}` : ''}
+                {/*
+                  What moved the pixels, in the same sentence the approval card would have used.
+                  It is on every state frame and was read by nobody, so the only answer to "what is
+                  it doing right now" was the transcript, after the fact, once the result landed.
+                */}
+                {holder === 'agent' && surface.state?.lastAction && (
+                  <small className="status-detail">{surface.state.lastAction}</small>
+                )}
+              </span>
             </span>
             <div>
               {holder === 'user' && (
@@ -1792,6 +2456,44 @@ function Computer({
             </button>
             <button onClick={() => void surface.send({ type: 'press', key: 'Escape' })}>Esc</button>
           </div>
+          {/*
+            The screen as something other than pixels.
+
+            Two things at once. It is the semantic layer the agent has had all along and the person
+            did not: `invoke` and `focus` name a control rather than a position, which is the only
+            way to press a twelve-pixel checkbox in a stream that has been scaled to fit a sidebar.
+            And it is the only representation of this pane that is not a photograph - without it,
+            for a screen-reader user the whole Computer tab is a canvas and an empty alt attribute,
+            while the tree that would fix it sits in the response the pane already fetched.
+          */}
+          {kind === 'display' && desktop && desktop.nodes.length > 0 && (
+            <details className="computer-nodes">
+              <summary>What is on the screen ({desktop.nodes.length})</summary>
+              <ul>
+                {desktop.nodes
+                  .filter((node) => node.name && !node.sensitive)
+                  .slice(0, 120)
+                  .map((node) => (
+                    <li key={node.id}>
+                      <span>{node.role}</span>
+                      <strong>{node.name}</strong>
+                      <button onClick={() => void surface.send({ type: 'focus', nodeId: node.id })}>
+                        Focus
+                      </button>
+                      {node.actions.length > 0 && (
+                        <button
+                          onClick={() =>
+                            void surface.send({ type: 'invoke', nodeId: node.id, actionIndex: 0 })
+                          }
+                        >
+                          {node.actions[0] ?? 'Press'}
+                        </button>
+                      )}
+                    </li>
+                  ))}
+              </ul>
+            </details>
+          )}
           {/* Only while it is true, and only where it explains the control right above it. */}
           <div className="browser-note">
             <LockKeyhole />
@@ -2097,9 +2799,29 @@ function RunningPane({ workspace, visible }: { workspace: Workspace; visible: bo
   const undo = useUndo();
   const [port, setPort] = useState(3000);
   const [label, setLabel] = useState('App preview');
+  /** Where inside the served port the link lands. Empty means the root, which is what it was. */
+  const [entryPath, setEntryPath] = useState('');
   const [activeUrl, setActiveUrl] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  /** Which row's output is open, and what it said. One at a time: this is a tail, not a console. */
+  const [openLog, setOpenLog] = useState('');
+  const [logText, setLogText] = useState('');
+  const showLog = async (sessionId: string) => {
+    if (openLog === sessionId) {
+      setOpenLog('');
+      return;
+    }
+    setOpenLog(sessionId);
+    setLogText('');
+    try {
+      const answer = await processLog(workspace.id, sessionId);
+      // stderr last, because on a failure it is the part being looked for and the pane scrolls.
+      setLogText([answer.stdout ?? '', answer.stderr ?? ''].filter(Boolean).join('\n').trimEnd());
+    } catch (cause) {
+      setLogText(describeFailure(cause, 'That output could not be read'));
+    }
+  };
   const load = () =>
     void api
       .previews(workspace.id)
@@ -2192,6 +2914,24 @@ function RunningPane({ workspace, visible }: { workspace: Workspace; visible: bo
                   <small>{processState(row)}</small>
                 </div>
                 <span className="running-elapsed">{processElapsed(row, now)}</span>
+                {/*
+                  Why it died, or what it is saying while it lives.
+
+                  The runner buffers a session's stdout and stderr and has answered `log` all
+                  along; the API hard-coded `kill`, so the only thing an owner could do with a
+                  crash-looping service was stop it. A dev server that lost a port, a build that
+                  failed: the reason was in the runner's memory with no door, and the Terminal pane
+                  does not have that process's pipes.
+                */}
+                <button
+                  className="running-stop"
+                  title="Show what this has written"
+                  aria-label={`Show the output of ${processCommand(row.command)}`}
+                  aria-expanded={openLog === row.sessionId}
+                  onClick={() => void showLog(row.sessionId)}
+                >
+                  <FileCode2 />
+                </button>
                 {/* The half the panel was missing. A service outlives the conversation that started
                     it and comes back after every restart, so seeing one with no way to stop it was
                     the owner watching their own machine through glass. */}
@@ -2209,6 +2949,11 @@ function RunningPane({ workspace, visible }: { workspace: Workspace; visible: bo
                   >
                     <CircleStop />
                   </button>
+                )}
+                {openLog === row.sessionId && (
+                  <pre className={`process-log${logText ? '' : ' empty'}`}>
+                    {logText || 'This has written nothing since anyone last looked.'}
+                  </pre>
                 )}
               </div>
             );
@@ -2361,6 +3106,24 @@ function RunningPane({ workspace, visible }: { workspace: Workspace; visible: bo
               onChange={(event) => setPort(Number(event.target.value))}
             />
           </label>
+          {/*
+            Where the link opens.
+
+            The contract has taken an entry path since previews existed, the address builder folds
+            it into every URL, and the agent's own tool sets it — so the agent's link for an app
+            landed on `/dashboard` and the owner's link for the same app landed on a 404 or a
+            directory index. Absolute and relative to the port, never to a host: the server refuses
+            a value carrying a scheme or a `..` rather than cleaning it up.
+          */}
+          <label className="preview-entry">
+            Path
+            <input
+              value={entryPath}
+              maxLength={300}
+              placeholder="/"
+              onChange={(event) => setEntryPath(event.target.value)}
+            />
+          </label>
           <button
             className="primary"
             disabled={busy || !label.trim() || portProblem !== ''}
@@ -2370,7 +3133,13 @@ function RunningPane({ workspace, visible }: { workspace: Workspace; visible: bo
               try {
                 // No lifetime is named here on purpose: a private preview lasts as long as the box
                 // says it does, and the row above reports whatever that turns out to be.
-                const created = await api.createPreview(workspace.id, { label, port });
+                const created = await api.createPreview(workspace.id, {
+                  label,
+                  port,
+                  // Omitted rather than sent empty: the server's own default is the root, and an
+                  // empty string is a value the schema would have to decide about.
+                  ...(entryPath.trim() ? { entryPath: entryPath.trim() } : {})
+                });
                 setPreviews((current) => [created, ...current]);
                 setActiveUrl(created.url);
               } catch (cause) {

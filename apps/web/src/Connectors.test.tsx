@@ -51,4 +51,14 @@ describe('what the connect screen opens on', () => {
     expect(markup).toContain('type="password"');
     expect(markup).not.toContain('autocomplete="current-password"');
   });
+
+  /*
+   * The catalogue is fetched, so on the very first paint there is nothing to say about the
+   * connection yet. A box that predates a field says less for the same reason. Neither may leave
+   * an empty paragraph behind: a heading with nothing under it reads as "there is nothing to say".
+   */
+  it('leaves no empty line where the box has not yet said what a connection reaches', () => {
+    expect(markup).not.toContain('<p class="subtle"></p>');
+    expect(markup).not.toContain('What leaves this box:</p>');
+  });
 });

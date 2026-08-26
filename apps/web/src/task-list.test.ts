@@ -443,3 +443,28 @@ describe('what the search field lists', () => {
     ).toEqual([]);
   });
 });
+
+/**
+ * The conversations the owner put out of the way, asked back.
+ *
+ * Archiving took a conversation off every screen this client draws and `include=archived` had no
+ * caller, so the only route back was remembering a word in it. They come back into the same date
+ * buckets rather than a list of their own: they are ordinary conversations that were filed, and the
+ * row says which it is.
+ */
+describe('showing the archived conversations', () => {
+  const now = Date.parse('2026-07-31T15:00:00.000Z');
+  const filed = {
+    ...task('filed', '2026-07-31T09:00:00.000Z'),
+    archivedAt: '2026-07-31T10:00:00.000Z'
+  } as Task;
+  const open = task('open', '2026-07-31T08:00:00.000Z');
+
+  it('leaves them out by default, which is what the sidebar has always drawn', () => {
+    expect(groupConversations([filed, open], now).flatMap(ids)).toEqual(['open']);
+  });
+
+  it('files them by the same recency as everything else when they are asked for', () => {
+    expect(groupConversations([filed, open], now, true).flatMap(ids)).toEqual(['filed', 'open']);
+  });
+});

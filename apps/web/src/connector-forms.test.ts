@@ -7,10 +7,14 @@ import {
   connectReady,
   emptyCalendarForm,
   emptyMailForm,
+  githubAccessChoices,
+  githubScopes,
   mailConnectFailure,
   mailConnectRequest,
   splitHost,
   usesBrowserSignIn,
+  webdavAccessChoices,
+  webdavScopes,
   type CalendarConnectForm,
   type ConnectDraft,
   type MailConnectForm
@@ -200,8 +204,42 @@ describe('mailConnectFailure', () => {
       )
     ).toContain('no server called imap.exmaple.com');
     expect(mailConnectFailure(fail('mail_timeout', 'no answer'), endpoints)).toContain(
-      'No answer within 30 seconds'
+      'ran out of time'
     );
+  });
+
+  /*
+   * Two bounds arrive under `mail_timeout`: a read that goes 30 seconds without a byte, and a
+   * whole session that runs past five minutes however steadily it drips. The sentence said "within
+   * 30 seconds", which is false for the second and sends a slow-server owner hunting a firewall.
+   */
+  it('covers both ways a mailbox runs out of time, not only the one that is 30 seconds', () => {
+    const sentence = mailConnectFailure(
+      fail(
+        'mail_timeout',
+        'The mail server did not finish within the time allowed for one session'
+      ),
+      endpoints
+    );
+    expect(sentence).toContain('30 seconds');
+    expect(sentence).toContain('five minutes');
+    expect(sentence).toContain('never finishes');
+  });
+
+  /* SMTP writes the reply code into two different sentences and the number matters in both. */
+  it('reads the submission reply code out of either sentence SMTP writes it into', () => {
+    expect(
+      mailConnectFailure(
+        fail('mail_send_failed', 'The SMTP server answered 535: authentication failed'),
+        endpoints
+      )
+    ).toContain('with 535');
+    expect(
+      mailConnectFailure(
+        fail('mail_send_failed', 'The SMTP server refused the message with 550: relay denied'),
+        endpoints
+      )
+    ).toContain('with 550');
   });
 
   it('says a mailbox that only offers a provider sign-in cannot be connected', () => {
@@ -219,6 +257,80 @@ describe('mailConnectFailure', () => {
   it('keeps the network sentence when the box itself is unreachable', () => {
     const dropped = new TypeError('Failed to fetch');
     expect(mailConnectFailure(dropped, endpoints)).toContain('not reachable right now');
+  });
+});
+
+/*
+ * The three scopes the box enforces, catalogues and describes in its own GitHub blurb — "create
+ * issues or pull requests when explicitly granted" — and that no client could explicitly grant.
+ * POST /v1/connectors filters the requested list against the catalogue for the kind, so a scope
+ * that does not belong to the connector is refused rather than quietly dropped; every string here
+ * is asserted against the same table the agent's scope gate reads.
+ */
+describe('what a GitHub or WebDAV connection is allowed to do', () => {
+  it('grants nothing that writes when the owner asked to read', () => {
+    expect(githubScopes('read')).toEqual([
+      'github:profile.read',
+      'github:repository.read',
+      'github:issues.read'
+    ]);
+    expect(webdavScopes('read')).toEqual(['webdav:files.read']);
+  });
+
+  it('can produce the issue scope, which nothing in this client could send before', () => {
+    expect(githubScopes('issues')).toContain('github:issues.write');
+    expect(githubScopes('issues')).not.toContain('github:pull_requests.write');
+  });
+
+  /* GitHub treats a pull request as an issue with a branch, so one without the other cannot
+     comment on the thing it just opened. */
+  it('carries the issue scope along with the pull request scope, never on its own', () => {
+    expect(githubScopes('pull_requests')).toContain('github:pull_requests.write');
+    expect(githubScopes('pull_requests')).toContain('github:issues.write');
+  });
+
+  it('reaches webdav_delete, the third gated operation with no control anywhere', () => {
+    expect(webdavScopes('write')).toEqual(['webdav:files.read', 'webdav:files.write']);
+    expect(webdavScopes('delete')).toEqual([
+      'webdav:files.read',
+      'webdav:files.write',
+      'webdav:files.delete'
+    ]);
+  });
+
+  /*
+   * The copy and the grant sit in the same file so they cannot drift, and this is the assertion
+   * that keeps them there: a level the owner can pick with no sentence describing it is exactly
+   * the lying control this work exists to remove, only inverted.
+   */
+  it('has a sentence for every level a connection can be granted, and no spare ones', () => {
+    expect(githubAccessChoices.map((choice) => choice.level)).toEqual([
+      'read',
+      'issues',
+      'pull_requests'
+    ]);
+    expect(webdavAccessChoices.map((choice) => choice.level)).toEqual(['read', 'write', 'delete']);
+    for (const choice of [...githubAccessChoices, ...webdavAccessChoices]) {
+      expect(choice.title).not.toBe('');
+      expect(choice.detail).not.toBe('');
+    }
+  });
+
+  it('warns that deleting a file is the file service to answer for, not athanor', () => {
+    expect(webdavAccessChoices.at(-1)?.detail).toContain('recovered');
+  });
+
+  /* Reading is always granted: a connection that may open an issue and not find the repository
+     is not a thing anybody asked for. */
+  it('always grants reading, at every level', () => {
+    for (const scopes of [
+      githubScopes('read'),
+      githubScopes('issues'),
+      githubScopes('pull_requests')
+    ])
+      expect(scopes).toContain('github:repository.read');
+    for (const scopes of [webdavScopes('read'), webdavScopes('write'), webdavScopes('delete')])
+      expect(scopes).toContain('webdav:files.read');
   });
 });
 
@@ -264,6 +376,8 @@ const draft = (overrides: Partial<ConnectDraft> = {}): ConnectDraft => ({
   password: '',
   mcpAuth: 'oauth_dynamic',
   clientId: '',
+  githubAccess: 'read',
+  webdavAccess: 'write',
   ...overrides
 });
 

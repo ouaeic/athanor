@@ -14,6 +14,24 @@ type MailAccess = 'read' | 'send';
 type CalendarAccess = 'read' | 'write';
 
 /**
+ * The two access decisions that had no control at all.
+ *
+ * `packages/core/src/connectors.ts` binds `github_create_issue` to `github:issues.write`,
+ * `github_create_pull_request` to `github:pull_requests.write` and `webdav_delete` to
+ * `webdav:files.delete`; the catalogue labels all three for the owner and the GitHub description
+ * says the agent may "create issues or pull requests when explicitly granted". Nothing could
+ * explicitly grant them: this screen sent a hardcoded array and those three scopes appeared
+ * nowhere in the client, so three implemented, scope-gated operations were dead on every
+ * connection the owner could make.
+ *
+ * Opening a pull request needs the issue scope too — GitHub's own model is that a pull request is
+ * an issue with a branch — so the third level grants both rather than pretending they are
+ * independent.
+ */
+export type GithubAccess = 'read' | 'issues' | 'pull_requests';
+export type WebdavAccess = 'read' | 'write' | 'delete';
+
+/**
  * Everything the connect screen can be pointed at. A mailbox and a calendar are first because they
  * are what most work needs; the other three are a URL and a credential.
  */
@@ -88,6 +106,8 @@ export interface ConnectDraft {
   password: string;
   mcpAuth: McpAuthMode;
   clientId: string;
+  githubAccess: GithubAccess;
+  webdavAccess: WebdavAccess;
 }
 
 /** Whether this connection is made by signing in through a browser window rather than by a field. */
@@ -181,6 +201,87 @@ const calendarScopes = (access: CalendarAccess): ConnectorScope[] =>
   access === 'read'
     ? ['calendar:calendars.read']
     : ['calendar:calendars.read', 'calendar:events.write'];
+
+/**
+ * Reading is always granted, because a connection that can write and not read is not a thing
+ * anyone wants: opening an issue means finding the repository first.
+ *
+ * `POST /v1/connectors` filters the requested scopes against the catalogue for the kind
+ * (`apps/api/src/routes/connectors.ts:56-69`) and refuses anything that does not belong to it, so
+ * these lists are checked against the same table the agent's scope gate reads.
+ */
+const GITHUB_READ: ConnectorScope[] = [
+  'github:profile.read',
+  'github:repository.read',
+  'github:issues.read'
+];
+
+export const githubScopes = (access: GithubAccess): ConnectorScope[] =>
+  access === 'read'
+    ? // Copied rather than handed out: this goes straight into a request body, and a caller that
+      // pushed onto it would widen the grant on every connection made afterwards.
+      [...GITHUB_READ]
+    : access === 'issues'
+      ? [...GITHUB_READ, 'github:issues.write']
+      : [...GITHUB_READ, 'github:issues.write', 'github:pull_requests.write'];
+
+export const webdavScopes = (access: WebdavAccess): ConnectorScope[] =>
+  access === 'read'
+    ? ['webdav:files.read']
+    : access === 'write'
+      ? ['webdav:files.read', 'webdav:files.write']
+      : ['webdav:files.read', 'webdav:files.write', 'webdav:files.delete'];
+
+/**
+ * The words on the two access choices that had no control at all, held here beside the scopes they
+ * grant so a level cannot gain a scope without gaining a sentence that says so.
+ *
+ * The mailbox and the calendar write their two choices out in the screen, because two is not a
+ * list. Three is, and writing three levels twice by hand is how the copy and the grant drift.
+ */
+export interface AccessChoice<Level extends string> {
+  level: Level;
+  title: string;
+  detail: string;
+}
+
+export const githubAccessChoices: AccessChoice<GithubAccess>[] = [
+  {
+    level: 'read',
+    title: 'Read only',
+    detail: 'Read your repositories, files and issues. It cannot write anything.'
+  },
+  {
+    level: 'issues',
+    title: 'Read and open issues',
+    detail: 'Also opens issues on the repositories this token reaches.'
+  },
+  {
+    level: 'pull_requests',
+    title: 'Read, open issues and open pull requests',
+    detail:
+      'Also opens pull requests. It never pushes a branch of its own; a pull request is proposed from work that is already there.'
+  }
+];
+
+export const webdavAccessChoices: AccessChoice<WebdavAccess>[] = [
+  {
+    level: 'read',
+    title: 'Read only',
+    detail: 'List and read your files. It cannot change or remove anything.'
+  },
+  {
+    level: 'write',
+    title: 'Read and write',
+    detail: 'Also creates files and replaces the contents of existing ones.'
+  },
+  {
+    level: 'delete',
+    title: 'Read, write and delete',
+    detail:
+      'Also deletes files. Whether a deleted file can be recovered is your file service to answer, not athanor.'
+  }
+];
 
 /**
  * @param ownerName the display name this athanor already knows the owner by, so mail goes out as a
@@ -308,6 +409,23 @@ const endpointFromMessage = (
   return imap;
 };
 
+/**
+ * The three-digit reply the far end sent, taken back out of the sentence it was written into.
+ *
+ * `AthanorError` does carry it structurally — `packages/core/src/caldav.ts:188-195` sets
+ * `details: { status }` and its comment says the owner-facing copy scrapes it back out of the
+ * prose — but `details` never crosses the wire. The error envelope at
+ * `apps/api/src/http/errors.ts:65-75` sends `{ code, message, requestId }` and nothing else, so in
+ * a browser the sentence is the only copy of the number there is; reading `details.status` here
+ * would be a branch that cannot fire, which is the shape of dead guard this client keeps deleting.
+ *
+ * Both phrasings are matched because SMTP writes two of them: `answered 535` when a command is
+ * refused (`mail-protocol.ts:893-898`) and `refused the message with 550` when the body is
+ * (`:945-950`).
+ */
+const statusFromMessage = (message: string): number =>
+  Number(/(?:answered|with)\s+(\d{3})\b/.exec(message)?.[1] ?? 0);
+
 const hostFromLookup = (message: string): string => {
   const found = /(?:ENOTFOUND|EAI_AGAIN)\s+([a-z0-9.-]+)/i.exec(message);
   return found?.[1] ?? '';
@@ -330,8 +448,16 @@ export const mailConnectFailure = (cause: unknown, endpoints: MailEndpoints): st
   const side = smtpSide ? smtp : imap;
   const both = `${imap.host}:${imap.port} for reading and ${smtp.host}:${smtp.port} for sending`;
 
+  /*
+   * Two different bounds arrive under this one code and the sentence has to cover both.
+   * `ByteChannel` in packages/core/src/mail-protocol.ts refuses a read that goes 30 seconds
+   * without a byte, and separately refuses a whole session that runs past five minutes however
+   * steadily it drips; its own comment says the code is deliberately the same because the next
+   * move is the same. "Within 30 seconds" was false for the second one, and sent an owner whose
+   * server is merely slow looking for a firewall that was never in the way.
+   */
   if (code === 'mail_timeout')
-    return `No answer within 30 seconds. Check ${both} — a port nothing is listening on looks exactly like this.`;
+    return `The exchange ran out of time: 30 seconds with no answer, or five minutes in total. Check ${both} — a port nothing is listening on looks exactly like this, and so does a server that answers and never finishes.`;
   if (code === 'mail_greeting_invalid')
     return `Something is listening on ${side.host}:${side.port}, but it did not answer as ${smtpSide ? 'an SMTP submission server. Submission over TLS is usually port 465' : 'an IMAP server. IMAP over TLS is usually port 993'}.`;
   if (code === 'mail_command_failed')
@@ -339,7 +465,7 @@ export const mailConnectFailure = (cause: unknown, endpoints: MailEndpoints): st
       ? `${imap.host} refused that username and password. If your provider uses two-factor sign-in, this needs an app password rather than your account password.`
       : `${imap.host} refused a command: ${message.replace(/^The IMAP server refused the command:\s*/i, '')}`;
   if (code === 'mail_send_failed') {
-    const answered = /answered (\d{3})/.exec(message)?.[1] ?? '';
+    const answered = statusFromMessage(message);
     return `Reading worked. Sending did not: ${smtp.host} refused the sign-in${answered ? ` with ${answered}` : ''}. Some providers need a separate app password for submission, or need submission switched on for the account.`;
   }
   if (code === 'mail_authentication_unsupported')
@@ -377,7 +503,7 @@ export const calendarConnectFailure = (cause: unknown, url: string): string => {
     // An unparseable URL never reached the server; the code below still says something true.
   }
   if (code === 'caldav_request_failed') {
-    const status = Number(/answered (\d{3})/.exec(message)?.[1] ?? 0);
+    const status = statusFromMessage(message);
     if (status === 401 || status === 403)
       return `${host} refused that username and password. If your provider uses two-factor sign-in, this needs an app password rather than your account password.`;
     if (status === 404)

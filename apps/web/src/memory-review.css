@@ -1,0 +1,77 @@
+/*
+ * The review queue's own four additions, and nothing else.
+ *
+ * Co-located and imported from `MemoryReview.tsx` rather than added to `styles.css`, which is
+ * parsed before first paint: this queue is inside a settings page nobody sees until they open it.
+ * Every shape it needs already exists - `.settings-list`, `.settings-row-actions`, `.form-error`,
+ * the muted note above a list - so what is here is only what those do not have: a summary that
+ * carries the stored text, and the disclosure that lets it run to its full length.
+ */
+
+/*
+  The expander item #59 asked for, done without a line of script.
+
+  `<details>` renders its content whether it is open or shut, so the only thing that changes is how
+  much of it is on screen: closed, the excerpt is held to two lines; open, it runs its length and
+  the provenance follows underneath. The marker is removed because the row is already a control -
+  a triangle beside a sentence of stored text reads as decoration on the sentence.
+*/
+.memory-review-detail > summary {
+  cursor: pointer;
+  list-style: none;
+}
+.memory-review-detail > summary::-webkit-details-marker {
+  display: none;
+}
+.memory-review-detail > summary:hover .memory-review-excerpt {
+  color: #c9c9c9;
+}
+
+.memory-review-excerpt {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  white-space: pre-wrap;
+}
+.memory-review-detail[open] > summary .memory-review-excerpt {
+  display: block;
+  overflow: visible;
+}
+
+/* Why the row is here, which is the sentence the decision is actually made on. */
+.memory-review-reason {
+  margin-top: 6px;
+  color: #b4b4b4;
+}
+
+/* The other side of a dispute, indented off the line that names it as one. */
+.memory-review-against {
+  margin-top: 4px;
+  padding-left: 9px;
+  border-left: 1px solid var(--line);
+}
+
+/* Said only when the server actually cut the text, so it is never a claim about a whole row. */
+.memory-review-clipped {
+  margin-top: 6px;
+  color: #8a8a8a;
+  font-style: italic;
+}
+
+/* The conversation that wrote the row, styled as the sentence it sits among rather than a button. */
+.memory-review-source {
+  margin-top: 6px;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.memory-review-source:hover {
+  color: var(--text);
+}

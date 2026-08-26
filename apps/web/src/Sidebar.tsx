@@ -80,6 +80,17 @@ export function Sidebar(props: {
    */
   onEarlier?: (() => void) | undefined;
   loadingEarlier?: boolean;
+  /**
+   * Whether the conversations the owner filed away are in the list.
+   *
+   * `include=archived` is the only mechanism anywhere that can list one, and nothing asked for it,
+   * so the Archive control on every row was a one-way door: the conversation left the sidebar and
+   * the only route back was remembering a word in it and searching. The toggle is here rather than
+   * on a settings page because this is the list it is about.
+   */
+  showArchived?: boolean;
+  onShowArchived?: (next: boolean) => void;
+  loadingArchived?: boolean;
   onSearch: (query: string, thisComputerOnly?: boolean) => Promise<ConversationSearchResult[]>;
   onRename?: (id: string, title: string) => void;
   onDelete?: (task: Task) => void;
@@ -164,9 +175,11 @@ export function Sidebar(props: {
       isSearching
         ? []
         : groupConversations(
-            props.tasks.filter((task) => !workspace || task.workspaceId === workspace.id)
+            props.tasks.filter((task) => !workspace || task.workspaceId === workspace.id),
+            Date.now(),
+            props.showArchived
           ),
-    [isSearching, props.tasks, workspace]
+    [isSearching, props.tasks, workspace, props.showArchived]
   );
   /**
    * Read across every computer, not the one in view: this line only ever replaces the invitation
@@ -218,7 +231,10 @@ export function Sidebar(props: {
             screen reader, so the name is stated rather than inferred. */}
         <button
           className="task-open"
-          aria-label={`${task.title}, ${task.status.replace('_', ' ')}`}
+          aria-label={`${task.title}, ${task.archivedAt ? 'archived, ' : ''}${task.status.replace(
+            '_',
+            ' '
+          )}`}
           onClick={() => props.onTask(task.id)}
         >
           <span className={`status-dot ${task.status}`} />
@@ -230,7 +246,12 @@ export function Sidebar(props: {
                   <Monitor size={11} /> {elsewhere.name}
                 </em>
               )}
-              {excerpt || `${task.status.replace('_', ' ')} · ${relative(task.updatedAt)}`}
+              {/* A filed conversation reappearing in the same date bucket as the rest has to say
+                  which it is, or the toggle silently changes what the list means. */}
+              {excerpt ||
+                `${task.archivedAt ? 'archived · ' : ''}${task.status.replace('_', ' ')} · ${relative(
+                  task.updatedAt
+                )}`}
               {/* What this conversation has actually cost, next to the conversation it
                   cost it on. A total in a separate pane never reaches the person deciding
                   whether to keep going. */}
@@ -480,6 +501,22 @@ export function Sidebar(props: {
             onClick={props.onEarlier}
           >
             {props.loadingEarlier ? 'Loading…' : 'Earlier conversations'}
+          </button>
+        )}
+        {/* Beside "Earlier conversations" and drawn the same way, because it answers the same
+            question: where the rest of the list went. */}
+        {!isSearching && props.onShowArchived && (
+          <button
+            className="earlier-conversations"
+            aria-pressed={Boolean(props.showArchived)}
+            disabled={props.loadingArchived}
+            onClick={() => props.onShowArchived?.(!props.showArchived)}
+          >
+            {props.loadingArchived
+              ? 'Loading…'
+              : props.showArchived
+                ? 'Hide archived'
+                : 'Show archived'}
           </button>
         )}
         {searching && (

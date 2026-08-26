@@ -9,15 +9,29 @@ import {
   connectorKinds,
   emptyCalendarForm,
   emptyMailForm,
+  githubAccessChoices,
+  githubScopes,
   mailConnectFailure,
   mailConnectRequest,
   usesBrowserSignIn,
+  webdavAccessChoices,
+  webdavScopes,
   type CalendarConnectForm,
   type ConnectorKind,
+  type GithubAccess,
   type MailConnectForm,
-  type McpAuthMode
+  type McpAuthMode,
+  type WebdavAccess
 } from './connector-forms.js';
-import { connectorAccess, connectorCallLine, connectorCheckMessage } from './connector-access.js';
+import {
+  connectorAccess,
+  connectorCallLine,
+  connectorCheckMessage,
+  connectorDisclosure,
+  connectorLastCheck,
+  connectorStatusLine,
+  type ConnectorCheck
+} from './connector-access.js';
 import { formatBytes } from './timeline-state.js';
 import type { Connector, ConnectorAuditEvent, ConnectorDefinition } from './types.js';
 
@@ -76,6 +90,13 @@ export function Connectors({
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [mcpAuth, setMcpAuth] = useState<McpAuthMode>('oauth_dynamic');
+  /*
+   * Both open on what this screen already sent without asking — GitHub read-only, WebDAV read and
+   * write — so an owner who never touches the choice gets exactly the connection they got before,
+   * and the two write levels that had no control at all are now something they can reach.
+   */
+  const [githubAccess, setGithubAccess] = useState<GithubAccess>('read');
+  const [webdavAccess, setWebdavAccess] = useState<WebdavAccess>('write');
   const [oauthScopes, setOauthScopes] = useState('');
   const [clientId, setClientId] = useState('');
   const [clientSecret, setClientSecret] = useState('');
@@ -83,6 +104,14 @@ export function Connectors({
   const [testing, setTesting] = useState(false);
   /** Which connected row is being re-checked, so only that row's control goes quiet. */
   const [checking, setChecking] = useState('');
+  /**
+   * What the last check the owner ran on this device said, keyed by connector.
+   *
+   * The timestamp itself survives a reload through the audit record, but the sentence does not —
+   * `failure.message` is minted by the test route and stored nowhere — so a failed check keeps its
+   * reason on screen here rather than only in the notice that scrolls away.
+   */
+  const [checks, setChecks] = useState<Record<string, ConnectorCheck>>({});
 
   const load = () =>
     void Promise.all([api.connectors(), api.connectorAudit()])
@@ -133,8 +162,23 @@ export function Connectors({
     return () => window.removeEventListener('message', receiveMcpOAuth);
   }, [setError, setNotice]);
 
+  // Read once per render rather than held in state: nothing on this screen animates, and every
+  // change that moves a row — a check, a connect, a disconnect — rerenders it anyway.
+  const now = Date.now();
   const definition = catalog.find((entry) => entry.kind === kind);
-  const draft = { kind, mail, calendar, token, url, username, password, mcpAuth, clientId };
+  const draft = {
+    kind,
+    mail,
+    calendar,
+    token,
+    url,
+    username,
+    password,
+    mcpAuth,
+    clientId,
+    githubAccess,
+    webdavAccess
+  };
   const oauth = usesBrowserSignIn(draft);
 
   /*
@@ -226,7 +270,7 @@ export function Connectors({
                 kind: 'github',
                 label: 'GitHub',
                 token,
-                scopes: ['github:profile.read', 'github:repository.read', 'github:issues.read']
+                scopes: githubScopes(githubAccess)
               }
             : kind === 'webdav'
               ? {
@@ -235,7 +279,7 @@ export function Connectors({
                   baseUrl: url,
                   username,
                   password,
-                  scopes: ['webdav:files.read', 'webdav:files.write']
+                  scopes: webdavScopes(webdavAccess)
                 }
               : {
                   kind: 'mcp_http',
@@ -546,9 +590,56 @@ export function Connectors({
           </label>
         </div>
       )}
-      {/* The box's own words about what the owner must already have. This is where the cost of
-          using open protocols instead of a provider sign-in is stated, so it is not paraphrased. */}
-      {definition?.requirements && <p className="subtle">{definition.requirements}</p>}
+      {/*
+        The same choice, for the two connections that never had one. Three levels rather than two
+        because there is a useful third answer: `github_create_issue` and
+        `github_create_pull_request` are separately scope-gated in packages/core/src/connectors.ts,
+        and so is `webdav_delete`. The copy lives beside the scopes it grants in connector-forms.ts
+        so a level cannot gain a capability without gaining the sentence that admits to it.
+      */}
+      {kind === 'github' && (
+        <div className="access-choice">
+          {githubAccessChoices.map((choice) => (
+            <label className="toggle-row" key={choice.level}>
+              <input
+                type="radio"
+                name="github-access"
+                checked={githubAccess === choice.level}
+                onChange={() => setGithubAccess(choice.level)}
+              />
+              <strong>{choice.title}</strong>
+              <small>{choice.detail}</small>
+            </label>
+          ))}
+        </div>
+      )}
+      {kind === 'webdav' && (
+        <div className="access-choice">
+          {webdavAccessChoices.map((choice) => (
+            <label className="toggle-row" key={choice.level}>
+              <input
+                type="radio"
+                name="webdav-access"
+                checked={webdavAccess === choice.level}
+                onChange={() => setWebdavAccess(choice.level)}
+              />
+              <strong>{choice.title}</strong>
+              <small>{choice.detail}</small>
+            </label>
+          ))}
+        </div>
+      )}
+      {/*
+        The box's own statement of what this connection reaches, where its credential lives and
+        what the far end keeps — three sentences the catalogue has served on every open of this
+        screen and nothing rendered. They belong here, next to the requirements line, because this
+        is the moment the owner is about to type a password into the form above.
+      */}
+      {connectorDisclosure(definition).map((line) => (
+        <p className="subtle" key={line}>
+          {line}
+        </p>
+      ))}
       {kind === 'mcp_http' && (
         <p className="subtle">
           athanor verifies the service, encrypts its credentials, and asks before every MCP tool
@@ -568,67 +659,87 @@ export function Connectors({
         <Plus /> {connectActionLabel(draft, testing)}
       </button>
       <div className="settings-list">
-        {connectors.map((item) => (
-          <div key={item.id}>
-            <span>
-              <strong>
-                {item.label} · {connectedKindLabel(item.kind)}
-              </strong>
-              {/* What was granted, said the way it was granted. This was the stored scope ids. */}
-              <small>
-                {connectorAccess(item.scopes)} · {authModeLabel(item.authMode)}
-              </small>
-            </span>
-            {/* One cell, two controls: the row is a two-column grid and a third child would drop
-                the disconnect button onto a line of its own. */}
-            <div className="settings-row-actions">
-              {/*
-                A credential is verified once, when it is added, and then trusted. Passwords change,
-                servers move and authorizations expire, and none of those announce themselves — so
-                this is the answer to "is this still good", asked rather than found out by a task
-                that failed at three in the morning.
-              */}
-              <button
-                className="icon-btn"
-                aria-label={`Check ${item.label}`}
-                title="Ask this account whether the connection still works"
-                disabled={busy || checking === item.id}
-                onClick={() =>
-                  void act(async () => {
-                    setChecking(item.id);
-                    try {
-                      const result = connectorCheckMessage(
-                        item.label,
-                        await api.testConnector(item.id)
-                      );
-                      if (!result.ok) throw new Error(result.message);
-                      setNotice(result.message);
+        {connectors.map((item) => {
+          // The check this device just ran wins over the recorded one, because only it still has
+          // the sentence: `failure.message` is minted by the test route and stored nowhere.
+          const fresh = checks[item.id];
+          const check = fresh ?? connectorLastCheck(audit, item.id);
+          return (
+            <div key={item.id}>
+              <span>
+                <strong>
+                  {item.label} · {connectedKindLabel(item.kind)}
+                </strong>
+                {/* What was granted, said the way it was granted. This was the stored scope ids. */}
+                <small>
+                  {connectorAccess(item.scopes)} · {authModeLabel(item.authMode)}
+                </small>
+                {/*
+                  What the disconnect button beside it needs answered: is this credential still
+                  live, and is it still good. Both were served on every load and neither was
+                  drawn, so the only way to find out which of five connections mattered was to
+                  remove one and see what broke.
+                */}
+                <small>{connectorStatusLine({ lastUsedAt: item.lastUsedAt, check }, now)}</small>
+                {fresh && !fresh.ok && <small>{fresh.message}</small>}
+              </span>
+              {/* One cell, two controls: the row is a two-column grid and a third child would
+                  drop the disconnect button onto a line of its own. */}
+              <div className="settings-row-actions">
+                {/*
+                  A credential is verified once, when it is added, and then trusted. Passwords
+                  change, servers move and authorizations expire, and none of those announce
+                  themselves — so this is the answer to "is this still good", asked rather than
+                  found out by a task that failed at three in the morning.
+                */}
+                <button
+                  className="icon-btn"
+                  aria-label={`Check ${item.label}`}
+                  title="Ask this account whether the connection still works"
+                  disabled={busy || checking === item.id}
+                  onClick={() =>
+                    void act(async () => {
+                      setChecking(item.id);
+                      try {
+                        const result = connectorCheckMessage(
+                          item.label,
+                          await api.testConnector(item.id)
+                        );
+                        // Kept on the row before it is thrown, because `act` turns a throw into a
+                        // notice that scrolls away and the row is where the question was asked.
+                        setChecks((current) => ({ ...current, [item.id]: result }));
+                        // Reloaded whichever way it went: a check that failed is recorded on the
+                        // box exactly like one that worked, and the list below this one says it
+                        // shows every call. Only reloading on success made it say so falsely.
+                        load();
+                        if (!result.ok) throw new Error(result.message);
+                        setNotice(result.message);
+                      } finally {
+                        setChecking('');
+                      }
+                    })
+                  }
+                >
+                  <Stethoscope />
+                </button>
+                <button
+                  className="icon-btn"
+                  aria-label={`Disconnect ${item.label} · asks for your passkey`}
+                  title="Disconnecting cannot be undone; the stored credential is destroyed"
+                  onClick={() =>
+                    void act(async () => {
+                      await api.stepUp();
+                      await api.revokeConnector(item.id);
                       load();
-                    } finally {
-                      setChecking('');
-                    }
-                  })
-                }
-              >
-                <Stethoscope />
-              </button>
-              <button
-                className="icon-btn"
-                aria-label={`Disconnect ${item.label} · asks for your passkey`}
-                title="Disconnecting cannot be undone; the stored credential is destroyed"
-                onClick={() =>
-                  void act(async () => {
-                    await api.stepUp();
-                    await api.revokeConnector(item.id);
-                    load();
-                  })
-                }
-              >
-                <Trash2 />
-              </button>
+                    })
+                  }
+                >
+                  <Trash2 />
+                </button>
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
       {unavailable && (
         <p className="connector-unavailable">
@@ -644,8 +755,8 @@ export function Connectors({
             <div>
               <strong>What the agent did with them</strong>
               <span>
-                Every connector call is recorded with its outcome and size. The record never
-                contains the request or the response.
+                Every connector call is recorded with its outcome and with how much went each way.
+                The record never contains the request or the response.
               </span>
             </div>
           </div>

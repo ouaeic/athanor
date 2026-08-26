@@ -1,4 +1,14 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  lazy,
+  memo,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -27,7 +37,6 @@ import {
   XCircle
 } from 'lucide-react';
 import type { BotWall, FileRequest, Task, TaskEvent } from './types.js';
-import { TaskPlanPanel } from './TaskPlanPanel.js';
 import { CopyButton, Markdown } from './Markdown.js';
 import { DiffView } from './DiffView.js';
 import {
@@ -60,6 +69,22 @@ import { queuedMessagesCanRun, taskIsGenerating } from './task-status.js';
 import { formatUsd } from './usage-model.js';
 import { fileKindLabel, inlineMediaKind, splitAttachments } from './attachments.js';
 import { AttachmentStrip } from './AttachmentTray.js';
+
+/**
+ * The plan editor is rendered on the one group that is live, which means a conversation the owner
+ * is only reading — every archived turn, every finished task, the whole of the history they scroll
+ * — pays for it and never shows it. Behind `lazy` it leaves the first paint entirely, and the turn
+ * that does want it is generating, so the chunk arrives while the agent is still working.
+ *
+ * This could not be done until `planProgress` and `useTaskPlan` left that module: `Timeline` had to
+ * import them eagerly, which dragged the component in with them. `TaskPlanPanel.tsx:17-30` records
+ * their removal, and this is what the removal was for. Measured: 148.2 kB eager to 146.9 kB, which
+ * is a kilobyte less than `BUNDLE-BUDGET-2026-08-12.md` estimated — a module compresses worse alone
+ * than in company, and the `Check` icon the panel shares with the transcript stayed behind.
+ */
+const TaskPlanPanel = lazy(() =>
+  import('./TaskPlanPanel.js').then(({ TaskPlanPanel: Panel }) => ({ default: Panel }))
+);
 
 type Surface = 'files' | 'computer' | 'terminal' | 'preview';
 
@@ -1131,7 +1156,11 @@ function ActivityLog({
         today's plan as its own; above the rows rather than among them, because it is the one thing
         here that is about what happens next.
       */}
-      {live && <TaskPlanPanel task={task} refreshKey={planSequence} />}
+      {live && (
+        <Suspense fallback={null}>
+          <TaskPlanPanel task={task} refreshKey={planSequence} />
+        </Suspense>
+      )}
       {/* eslint-disable-next-line jsx-a11y/no-redundant-roles -- It is redundant everywhere except
           the browser this product's owner reads it in on a train. Safari drops list semantics from
           any list whose marker is removed, and `.ledger` removes the marker; a countable list of

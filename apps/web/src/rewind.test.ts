@@ -7,7 +7,9 @@ import {
   rewindOffer,
   rewindResultNotice,
   rewindScopeChoices,
-  rewindScopeNote
+  rewindScopeNote,
+  trajectoryModelFields,
+  type TrajectoryDraft
 } from './rewind.js';
 
 const preview = (overrides: Partial<TaskRewindPreview> = {}): TaskRewindPreview => ({
@@ -71,6 +73,42 @@ describe('rewindOffer', () => {
     expect(offer.computerAvailable).toBe(false);
     expect(offer.computerReason).toBe(NO_CHECKPOINT_REASON);
     expect(offer.checkpointId).toBeUndefined();
+  });
+
+  /*
+   * The incident this whole field exists for: a workspace holding two `node_modules` trees crosses
+   * the runner's file ceiling, automatic checkpoints stop from that turn on, and the dialog told
+   * the owner every turn afterwards had "changed nothing on the computer". The runner's own
+   * sentence names the remedy, so it is shown as it arrived rather than reworded into a guess.
+   */
+  it('states the refusal the box carried instead of guessing why there is no undo point', () => {
+    const refusal =
+      'This workspace holds more than 250000 files, which is more than automatic checkpoints cover. Take a named recovery point instead.';
+    const offer = rewindOffer({
+      ...preview({ checkpoint: null, computer: null }),
+      checkpointFailure: { code: 'checkpoint_workspace_too_large', message: refusal, owner: true }
+    });
+    expect(offer.computerAvailable).toBe(false);
+    expect(offer.computerReason).toContain(refusal);
+    expect(offer.computerReason).not.toContain('changed nothing on the computer');
+  });
+
+  /* With nothing carried it may not name a cause, but it may not invent a harmless one either. */
+  it('names the possibility it used to leave out when the box said nothing', () => {
+    const offer = rewindOffer(preview({ checkpoint: null, computer: null }));
+    expect(offer.computerReason).toContain('automatic undo points may have stopped');
+    expect(offer.computerReason).toContain('says so in a warning');
+    expect(offer.computerReason).not.toContain('That turn changed nothing on the computer');
+  });
+
+  /* A checkpoint that exists is described by the preview; a carried refusal is old news then. */
+  it('says what the rewind would do even when an earlier turn lost its undo point', () => {
+    const offer = rewindOffer({
+      ...preview(),
+      checkpointFailure: { message: 'Host disk is too full to take an automatic checkpoint.' }
+    });
+    expect(offer.computerAvailable).toBe(true);
+    expect(offer.computerReason).toBe('');
   });
 
   it('refuses rather than rolling back blind when the computer cannot describe the restore', () => {
@@ -150,6 +188,25 @@ describe('what the rewind dialog says it will do', () => {
       expect(choice.label).not.toBe('');
       expect(choice.hint).not.toBe('');
     }
+  });
+
+  /*
+   * "That answer was weak, try the stronger model" is what the contract says this field is for, and
+   * the empty string is what a `<select>` gives back for "the same one as before". Sending it would
+   * name a model with no id, which the server answers with `model_unavailable`.
+   */
+  it('sends a named model and sends nothing at all for the same one', () => {
+    const draft: TrajectoryDraft = {
+      operation: 'retry',
+      eventId: '00000000-0000-4000-8000-000000000010',
+      stopSource: false,
+      rewind: 'conversation'
+    };
+    expect(trajectoryModelFields({ ...draft, modelId: 'model-strong' })).toEqual({
+      modelId: 'model-strong'
+    });
+    expect(trajectoryModelFields({ ...draft, modelId: '' })).toEqual({});
+    expect(trajectoryModelFields(draft)).toEqual({});
   });
 
   /* Stopping the source keeps two agents off one machine; only a fork creates a second one. */

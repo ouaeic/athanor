@@ -6,9 +6,10 @@
  * the message actually says once its files are attached, and which of the four things that can be
  * wrong the owner is told about. All of that is decided here so it can be exercised.
  */
-import { withAttachments, type Attachment } from './attachments.js';
+import { isImageAttachment, withAttachments, type Attachment } from './attachments.js';
 import { modelDisplayName, type NamedModel } from './model-names.js';
 import { securityModeCopy } from './security-mode.js';
+import type { ModelTaskKind } from './api.js';
 import type { SecurityMode } from './types.js';
 
 export type SendBlockCode =
@@ -100,10 +101,63 @@ export const sendsOnKey = (event: {
 export const hasSomethingToSend = (prompt: string, attachments: Attachment[]): boolean =>
   prompt.trim().length > 0 || attachments.some((item) => item.status === 'ready');
 
+/**
+ * The kind of work this draft is, where the client is the only one who can know.
+ *
+ * `/v1/models/recommend` has accepted `taskKind` all along and this client never sent one, so every
+ * ranking it asked for fell through to general work and the router's five profiles were unreachable
+ * from the only entry point that ranks anything.
+ *
+ * Exactly one signal is claimed here, and it is claimed because it is certain: an image on the tray
+ * is `hasImages`, which is the first thing `classifyModelTask` looks at after a declared kind. The
+ * rest of that classifier reads the prompt, and the server runs it on the prompt already — copying
+ * its patterns into the browser would be two heuristics drifting apart, which is the defect this
+ * whole sweep is about. Undefined means "you decide", which is what omitting the parameter has
+ * always meant.
+ */
+export const composerTaskKind = (attachments: readonly Attachment[]): ModelTaskKind | undefined =>
+  attachments.some((item) => item.status === 'ready' && isImageAttachment(item.path))
+    ? 'vision'
+    : undefined;
+
+/**
+ * The ceiling the owner typed for this run, or the reason it cannot be read.
+ *
+ * Every layer below this has carried `maxSpendUsd` since the contract named it — the create route,
+ * the follow-up route, both trajectory arms, the schedule — and `grep maxSpendUsd apps/web/src`
+ * found nothing at all. The account-wide per-conversation cap is editable, but its own comment
+ * explains that it reserves its whole value on queue, so raising it for one big job penalises every
+ * other conversation started that morning. This is the per-run answer.
+ *
+ * Empty is not zero: it means "use the account default", which is what omitting the field does. The
+ * upper bound is deliberately not repeated here — `MAX_TASK_SPEND_USD` is copied once in this
+ * client, in `usage-model.ts`, where `scripts/check-repository.mjs` holds it against the contract,
+ * and a second copy in a placeholder is exactly the drift that check exists to catch. A figure over
+ * the contract's ceiling is refused by the route and the refusal is shown.
+ */
+export const runCapUsd = (
+  raw: string
+): { ok: true; value: number | null } | { ok: false; message: string } => {
+  const typed = raw.trim();
+  if (!typed) return { ok: true, value: null };
+  const value = Number(typed);
+  if (!Number.isFinite(value) || value <= 0)
+    return {
+      ok: false,
+      message:
+        'A ceiling for this run has to be more than zero. Leave it empty to use your account’s per-conversation cap.'
+    };
+  return { ok: true, value };
+};
+
 export type ComposerSubmission =
   /** Nothing to send, or a send already in flight. The keystroke is simply absorbed. */
   | { kind: 'nothing' }
-  /** An upload is still running; sending now would attach a path with no bytes behind it. */
+  /**
+   * Something on the composer has to settle or be corrected first, and the sentence says which:
+   * an upload still running (sending now would attach a path with no bytes behind it), or a
+   * ceiling for this run that is not a number the route would accept.
+   */
   | { kind: 'wait'; message: string }
   /**
    * Something must be repaired first. The keystroke is never a no-op: the draft is kept and the
@@ -116,6 +170,8 @@ export type ComposerSubmission =
       text: string;
       /** Kept apart so a failed send can put exactly these back on the tray. */
       attachments: Attachment[];
+      /** The ceiling for this run, or null to use the account's per-conversation cap. */
+      maxSpendUsd: number | null;
     };
 
 /**
@@ -130,12 +186,18 @@ export const composerSubmission = (input: {
   attachments: Attachment[];
   block: SendBlock | undefined;
   busy: boolean;
+  /** Exactly what is in the ceiling field, unparsed. Omitted is the same as empty. */
+  capUsd?: string;
 }): ComposerSubmission => {
   const typed = input.prompt.trim();
   const ready = input.attachments.filter((item) => item.status === 'ready');
   if ((!typed && !ready.length) || input.busy) return { kind: 'nothing' };
   if (input.attachments.some((item) => item.status === 'uploading'))
     return { kind: 'wait', message: 'One of the attachments is still uploading.' };
+  // Before the configuration block, because this one is a typo in a field two inches away and the
+  // block is a trip to another screen.
+  const cap = runCapUsd(input.capUsd ?? '');
+  if (!cap.ok) return { kind: 'wait', message: cap.message };
   if (input.block) return { kind: 'blocked', block: input.block };
   return {
     kind: 'send',
@@ -143,7 +205,8 @@ export const composerSubmission = (input: {
       typed,
       ready.map((item) => item.path)
     ),
-    attachments: ready
+    attachments: ready,
+    maxSpendUsd: cap.value
   };
 };
 
@@ -227,13 +290,22 @@ export interface ModelSheetGroup {
  * model held back for a licence review and one with no private route read the same in a privacy
  * build. A model that cannot answer is still listed, disabled, with the reason beside it: dropping
  * it silently is what makes an owner think athanor has lost their model.
+ *
+ * `reasons` is the other half of that: the ranking route returns the argument for the top eight
+ * placements — its own comment says "what it needs from the front is the argument" — and the client
+ * mapped the answer to a list of ids and threw every sentence away. So the picker silently reordered
+ * itself and never said why. One sentence per model, in the `note` field that was already here and
+ * always empty for a model that can answer.
  */
 export const modelSheetGroups = (input: {
   models: readonly SheetModel[];
   unavailableModels: readonly SheetModel[];
   enforceZeroDataRetention: boolean;
+  /** Model id to the first reason the router gave for its placement. Absent ids simply say nothing. */
+  reasons?: Readonly<Record<string, string>>;
 }): ModelSheetGroup[] => {
   const empty = input.models.length === 0;
+  const reasonFor = (id: string | undefined): string => (id && input.reasons?.[id]) || '';
   const groups: ModelSheetGroup[] = [
     {
       label: 'Automatic',
@@ -241,7 +313,9 @@ export const modelSheetGroups = (input: {
         {
           value: 'auto:balanced',
           label: empty ? 'No model available' : 'Recommended',
-          note: '',
+          // The head of the ranking is what "Recommended" resolves to right now, so the router's
+          // own argument for it belongs on this row more than on any other.
+          note: empty ? '' : reasonFor(input.models[0]?.id),
           disabled: empty
         },
         { value: 'auto:fast', label: 'Faster', note: '', disabled: empty },
@@ -255,7 +329,7 @@ export const modelSheetGroups = (input: {
       options: input.models.map((model) => ({
         value: model.id,
         label: model.displayName,
-        note: '',
+        note: reasonFor(model.id),
         disabled: false
       }))
     });

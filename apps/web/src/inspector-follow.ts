@@ -20,6 +20,18 @@ import type { Task, TaskEvent } from './types.js';
  * them would be following the transcript rather than the work. The browser tools point at Computer
  * because the agent's browser is launched onto the workspace display that pane already streams —
  * see the note above `inspectorTabs` in Inspector.tsx.
+ *
+ * `shell` is absent, and Terminal is not a destination here at all, because it never was one. The
+ * agent's commands run through `POST …/exec`; the Terminal pane opens `GET …/terminal`, which
+ * spawns a fresh pty with its own pipes. So a turn that ran a build put the owner in front of their
+ * own idle `$` — the work they had just been told about running somewhere the pane could not show —
+ * and, because a pane is built the first time it is looked at, it also started a real second shell
+ * on their server and renewed a capability token to keep it alive. That is precisely the cost
+ * Inspector.tsx says "nobody should be paying for on a tab they have never opened". A foreground
+ * command needs no pane in any case: its output is written into the transcript already on screen.
+ *
+ * `process` points at Running instead. That is the tool the agent inspects background sessions
+ * with, and the Running pane is the one surface that lists them.
  */
 const toolPanes: Record<string, InspectorTab> = {
   browser_action: 'computer',
@@ -28,8 +40,7 @@ const toolPanes: Record<string, InspectorTab> = {
   desktop_launch: 'computer',
   desktop_observe: 'computer',
   read_elements: 'computer',
-  process: 'terminal',
-  shell: 'terminal'
+  process: 'preview'
 };
 
 const toolOf = (event: TaskEvent): string => {

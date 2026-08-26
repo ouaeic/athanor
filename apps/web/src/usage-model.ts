@@ -16,6 +16,17 @@ import type {
 const MAX_SPEND_CAP_USD = 1_000_000;
 const MAX_TASK_SPEND_USD = 10_000;
 
+/*
+ * Mirrors MAX_PRICE_CEILING_USD_PER_MILLION in @athanor/contracts, copied for the same reason as
+ * the two above and measuring something else: those are dollars per window, this is the published
+ * rate of a route, and the dearest routes on the catalogue are tens of dollars per million tokens.
+ *
+ * `scripts/check-repository.mjs` holds the three constants above against the files that own them,
+ * and this one too: a copied bound nothing compares is exactly the drift that check exists to
+ * catch.
+ */
+const MAX_PRICE_CEILING_USD_PER_MILLION = 100;
+
 export interface UsageEntry {
   id: string;
   workspaceId?: string;
@@ -41,7 +52,7 @@ export interface UsageResponse {
 }
 
 export interface SpendMeter {
-  id: 'today' | 'week' | 'month';
+  id: 'task' | 'today' | 'week' | 'month';
   label: string;
   spentUsd: number;
   /** Null when the owner has set no ceiling for this window, so it can only ever report. */
@@ -151,15 +162,21 @@ export const hostStorageBlocksWork = (workspace: {
 /** A provider-qualified model id is unreadable in a table; the tail is the part people know. */
 export const modelLabel = (key: string): string => key.split('/').pop() || key;
 
-const meterPercent = (spentUsd: number, capUsd: number | null): number | null =>
+/**
+ * Exported for the pane's own conversation window, which is built in a module the first paint
+ * never reaches. One rounding rule for every meter drawn, wherever the meter is assembled.
+ */
+export const meterPercent = (spentUsd: number, capUsd: number | null): number | null =>
   capUsd && capUsd > 0 ? Math.min(100, Math.round((spentUsd / capUsd) * 100)) : null;
 
 /**
- * The three windows the owner actually asks about, from whichever source can answer.
+ * The three wall-clock windows the owner actually asks about, from whichever source can answer.
  *
  * `/v1/usage` always carries the real settled spend for today, this week and this month. The caps
  * that spend is measured against live on the newer spend summary, so a box without it still gets
- * honest figures — just no ceilings drawn on them.
+ * honest figures — just no ceilings drawn on them. The conversation's own window is a fourth, and
+ * it is assembled in `spend-pane.ts` rather than here: only the pane ever draws it, and everything
+ * in this module is reached by the first paint.
  */
 export const spendMeters = (usage: UsageResponse, spend: SpendSummary | null): SpendMeter[] => {
   const windows = usage.providerSpend.windows;
@@ -308,6 +325,15 @@ export interface SpendLimitsDraft {
   defaultTaskCapUsd: string;
   warnAtPercent: string;
   timeZone: string;
+  /**
+   * The price ceiling, as the two published rates it is made of, and the only fields here that are
+   * optional. A form that does not offer them has to leave them alone rather than clear them, and
+   * the two are told apart below: absent is "this form does not edit that", blank is the owner
+   * saying there is no ceiling. Collapsing them would let a screen with no such field wipe a
+   * ceiling set from somewhere else - and, at the route, ask for a passkey to do it.
+   */
+  maxInputUsdPerMillionTokens?: string;
+  maxOutputUsdPerMillionTokens?: string;
 }
 
 export const spendLimitsDraft = (limits: SpendLimits): SpendLimitsDraft => ({
@@ -315,7 +341,11 @@ export const spendLimitsDraft = (limits: SpendLimits): SpendLimitsDraft => ({
   monthlyCapUsd: limits.monthlyCapUsd === null ? '' : String(limits.monthlyCapUsd),
   defaultTaskCapUsd: limits.defaultTaskCapUsd === null ? '' : String(limits.defaultTaskCapUsd),
   warnAtPercent: String(limits.warnAtPercent),
-  timeZone: limits.timeZone
+  timeZone: limits.timeZone,
+  // `String(x ?? '')` and not a null check, because zero is a real ceiling here - it admits only a
+  // route that publishes no charge - and an older box answers with neither field at all.
+  maxInputUsdPerMillionTokens: String(limits.maxInputUsdPerMillionTokens ?? ''),
+  maxOutputUsdPerMillionTokens: String(limits.maxOutputUsdPerMillionTokens ?? '')
 });
 
 /**
@@ -328,20 +358,41 @@ export const spendLimitsDraft = (limits: SpendLimits): SpendLimitsDraft => ({
 export const spendLimitsPatch = (
   draft: SpendLimitsDraft
 ): { ok: true; body: UpdateSpendLimitsRequest } | { ok: false; message: string } => {
+  /*
+   * One parser for every ceiling on this form. They differ only in what they are counted in, and
+   * the words for that travel with the bound rather than being a second copy of the arithmetic.
+   */
   const cap = (
     raw: string,
     label: string,
     max: number,
-    allowZero: boolean
+    allowZero: boolean,
+    words = { unit: 'an amount in dollars', blank: 'no cap', per: '' }
   ): number | null | string => {
     const text = raw.trim();
     if (!text) return null;
     const value = Number(text);
     if (!Number.isFinite(value) || value < 0 || (!allowZero && value <= 0))
-      return `${label} must be an amount in dollars, or blank for no cap.`;
-    if (value > max) return `${label} cannot be more than $${max.toLocaleString('en-US')}.`;
+      return `${label} must be ${words.unit}, or blank for ${words.blank}.`;
+    if (value > max)
+      return `${label} cannot be more than $${max.toLocaleString('en-US')}${words.per}.`;
     return value;
   };
+
+  /*
+   * A rate rather than an amount, so it says so and is bounded as one. Zero is admitted
+   * deliberately: the contract's own comment says a ceiling of zero admits only a route that
+   * publishes no charge, which is a setting and not the absence of one. `undefined` travels through
+   * untouched - see `SpendLimitsDraft`.
+   */
+  const rate = (raw: string | undefined, label: string): number | null | string | undefined =>
+    raw === undefined
+      ? undefined
+      : cap(raw, label, MAX_PRICE_CEILING_USD_PER_MILLION, true, {
+          unit: 'a rate in dollars per million tokens',
+          blank: 'no ceiling',
+          per: ' per million tokens'
+        });
 
   const daily = cap(draft.dailyCapUsd, 'The daily cap', MAX_SPEND_CAP_USD, true);
   if (typeof daily === 'string') return { ok: false, message: daily };
@@ -356,6 +407,10 @@ export const spendLimitsPatch = (
   if (typeof perTask === 'string') return { ok: false, message: perTask };
   if (daily !== null && monthly !== null && daily > monthly)
     return { ok: false, message: 'The daily cap cannot be higher than the monthly cap.' };
+  const maxInput = rate(draft.maxInputUsdPerMillionTokens, 'The input price ceiling');
+  if (typeof maxInput === 'string') return { ok: false, message: maxInput };
+  const maxOutput = rate(draft.maxOutputUsdPerMillionTokens, 'The output price ceiling');
+  if (typeof maxOutput === 'string') return { ok: false, message: maxOutput };
 
   const warnAtPercent = Number(draft.warnAtPercent.trim());
   if (!Number.isInteger(warnAtPercent) || warnAtPercent < 1 || warnAtPercent > 99)
@@ -370,7 +425,15 @@ export const spendLimitsPatch = (
       monthlyCapUsd: monthly,
       defaultTaskCapUsd: perTask,
       warnAtPercent,
-      timeZone
+      timeZone,
+      /*
+       * Omitted, not nulled, when the draft carried no field at all: the route reads an absent key
+       * as "leave this alone" and an explicit null as "remove the ceiling", and removing one is
+       * the escalation it asks for a passkey over. A screen that never showed the field does not
+       * get to do either.
+       */
+      ...(maxInput === undefined ? {} : { maxInputUsdPerMillionTokens: maxInput }),
+      ...(maxOutput === undefined ? {} : { maxOutputUsdPerMillionTokens: maxOutput })
     }
   };
 };

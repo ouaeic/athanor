@@ -1,0 +1,33 @@
+/*
+ * Two rules, for the two things a settings row has never had to hold before.
+ *
+ * Co-located and imported from `ConnectionRow.tsx` rather than added to `styles.css`: this section
+ * draws in the packaged app alone, inside a settings page nobody sees until they open it, and it
+ * has no business in a stylesheet that is parsed before the first frame of a conversation.
+ *
+ * Everything else the section needs is already there - `.settings-list` for the rows,
+ * `.settings-row-actions` for the buttons, `.section-heading.compact` for the title, `.form-error`
+ * for the sentence when the gateway will not answer.
+ */
+
+/*
+  A pinned identity is a digest and an endpoint is a URL, and neither has a space in it to break at.
+  Without this a 64-character identity pushes the row wider than the phone it is on - the same fix
+  `.enrollment-card code` already carries, for the same kind of value.
+*/
+.connection-list code,
+.connection-list .connection-identity {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+/*
+  The addresses read as a list of machine values rather than as prose, so they are set as one -
+  quiet, and monospaced like the identity above them, because what matters about two addresses that
+  differ is exactly where they differ.
+*/
+.connection-list .connection-identity {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}

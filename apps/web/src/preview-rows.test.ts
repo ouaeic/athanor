@@ -35,10 +35,46 @@ describe('what a port will not be accepted for', () => {
 });
 
 describe('what a preview row says about itself', () => {
-  it('says what it is and how long it lasts, without printing the ordinary status', () => {
-    expect(previewSummary(preview())).toBe('Private preview · stays available');
-    expect(previewSummary(preview({ status: 'expired' }))).toBe(
-      'Private preview · expired · stays available'
+  /* Read once, so a row and its assertion cannot disagree about what "now" is. */
+  const now = Date.parse('2026-08-10T09:00:00.000Z');
+
+  it('says what it is, which port it publishes, how long it lasts and whether anyone uses it', () => {
+    expect(previewSummary(preview(), now)).toBe(
+      'Private preview · port 3000 · stays available · never opened'
+    );
+    expect(previewSummary(preview({ status: 'expired' }), now)).toBe(
+      'Private preview · expired · port 3000 · stays available · never opened'
+    );
+  });
+
+  /*
+   * A computer may hold a hundred of these and "App preview" is the default name for every one of
+   * them, so without the port two rows for two different services are the same row - and revoking
+   * one of them is a guess. The port is the only thing on a preview that is certainly distinct.
+   */
+  it('names the port, so two previews of two services are two rows', () => {
+    expect(previewSummary(preview({ port: 3000 }), now)).toContain('port 3000');
+    expect(previewSummary(preview({ port: 8080 }), now)).toContain('port 8080');
+    expect(previewSummary(preview({ port: 3000 }), now)).not.toBe(
+      previewSummary(preview({ port: 8080 }), now)
+    );
+  });
+
+  /*
+   * The idle expiry is driven by the last visit, so a row reporting the deadline and not whether
+   * anything is using the link was reporting half of one rule. "Never opened" is the row that can
+   * be revoked without asking anybody.
+   */
+  it('says when the link was last opened, and says so plainly when it never was', () => {
+    expect(previewSummary(preview({ lastAccessedAt: null }), now)).toContain('never opened');
+    expect(previewSummary(preview({ lastAccessedAt: '2026-08-10T08:00:00.000Z' }), now)).toContain(
+      'opened today'
+    );
+    expect(previewSummary(preview({ lastAccessedAt: '2026-08-09T08:00:00.000Z' }), now)).toContain(
+      'opened yesterday'
+    );
+    expect(previewSummary(preview({ lastAccessedAt: '2026-08-01T09:00:00.000Z' }), now)).toContain(
+      'opened 9 days ago'
     );
   });
 
@@ -47,12 +83,14 @@ describe('what a preview row says about itself', () => {
    * is the last place that sentence lived — so this pins the absence rather than trusting a grep.
    */
   it('never claims a published site keeps the computer awake', () => {
-    expect(previewSummary(preview({ visibility: 'public' }))).toBe('Public link · stays available');
-    expect(previewSummary(preview({ visibility: 'public' }))).not.toContain('awake');
+    expect(previewSummary(preview({ visibility: 'public' }), now)).toBe(
+      'Public link · port 3000 · stays available · never opened'
+    );
+    expect(previewSummary(preview({ visibility: 'public' }), now)).not.toContain('awake');
   });
 
   it('reports an idle deadline as the deadline it is', () => {
-    expect(previewSummary(preview({ expiresAt: '2026-09-03T09:00:00.000Z' }))).toContain(
+    expect(previewSummary(preview({ expiresAt: '2026-09-03T09:00:00.000Z' }), now)).toContain(
       'closes if unused by'
     );
   });

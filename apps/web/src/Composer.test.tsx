@@ -55,6 +55,8 @@ const render = (
       unavailableModels={[]}
       modelChoice={choice}
       onModelChoice={() => undefined}
+      capUsd=""
+      onCapUsd={() => undefined}
       {...patch}
     />
   );

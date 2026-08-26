@@ -1,0 +1,258 @@
+/**
+ * The facts behind the settings screen, held to what the routes actually answer.
+ *
+ * Three of the things asserted here were controls that lied rather than controls that were missing:
+ * a form that wrote a default over the owner's own number on every save, a row that told an owner
+ * to enable something they had already enabled, and an expiry column nothing could fill. A lie of
+ * that shape survives because nothing ever asserted the round trip, so the round trip is what these
+ * cases are about — the value the server sends, back out as the value the form shows.
+ */
+import { describe, expect, it } from 'vitest';
+import type { ModelRelease } from '@athanor/contracts';
+import type { ProviderSettings } from './api.js';
+import {
+  backupTimerLine,
+  DEFAULT_CONTEXT_TOKENS,
+  enrollmentLine,
+  enrollmentRevocable,
+  memoryExpiryField,
+  memoryExpiryIso,
+  memoryPatch,
+  memoryProvenance,
+  memoryScope,
+  modelDetailLine,
+  modelOpennessLine,
+  providerModelFields,
+  timerStateKnown,
+  updateTimerLine,
+  workspaceDeletionArmed
+} from './settings-facts.js';
+
+const saved: ProviderSettings = {
+  configured: true,
+  source: 'encrypted_database',
+  provider: 'openai-compatible',
+  baseUrl: 'https://models.example/v1',
+  modelId: 'big-one',
+  hasApiKey: true,
+  enforceZeroDataRetention: true
+};
+
+describe('the two provider fields that used to be write-only', () => {
+  /*
+   * The regression this whole item exists for. Rotating a key is a save, and every save re-sent
+   * whatever the form was holding: 128,000 and no vision, because nothing had put the real answer
+   * back. The owner saw no error at all; the first symptom was an image refused weeks later.
+   */
+  it('puts a saved 200k context window back into the form after a reload', () => {
+    expect(
+      providerModelFields({
+        ...saved,
+        contextTokens: 200_000,
+        capabilities: ['chat', 'tools', 'reasoning', 'vision'],
+        modalities: ['text', 'image']
+      })
+    ).toEqual({ contextTokens: 200_000, vision: true });
+  });
+
+  it('does not invent vision for a model whose capabilities do not name it', () => {
+    expect(
+      providerModelFields({
+        ...saved,
+        contextTokens: 32_000,
+        capabilities: ['chat', 'tools']
+      })
+    ).toEqual({ contextTokens: 32_000, vision: false });
+  });
+
+  /* A box older than the route that returns these keeps what this screen has always assumed. */
+  it('falls back to the old defaults when the server says nothing about the model', () => {
+    expect(providerModelFields(saved)).toEqual({
+      contextTokens: DEFAULT_CONTEXT_TOKENS,
+      vision: false
+    });
+  });
+
+  /* Both halves of the same answer are written by the save; either alone is enough to read it. */
+  it('reads vision off the modality list when a server sends only that half', () => {
+    expect(providerModelFields({ ...saved, modalities: ['text', 'image'] }).vision).toBe(true);
+  });
+});
+
+describe('the expiry a durable memory could never be given', () => {
+  it('carries a stored instant into the control and back out again unchanged', () => {
+    const iso = new Date('2027-03-04T15:30:00.000Z').toISOString();
+    const field = memoryExpiryField(iso);
+    expect(field).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/u);
+    expect(memoryExpiryIso(field)).toBe(iso);
+  });
+
+  it('shows an empty control for a fact that was never given an expiry', () => {
+    expect(memoryExpiryField(null)).toBe('');
+    expect(memoryExpiryIso('')).toBeUndefined();
+  });
+
+  /*
+   * The route tells "leave this alone" from "there should be no expiry" and so does this: an owner
+   * looking at an empty box has just said the fact is permanent, and omitting the key would keep
+   * whatever expiry they were trying to remove.
+   */
+  it('clears an expiry with an explicit null rather than by staying silent', () => {
+    expect(memoryPatch({ content: 'Reports open with a summary', expiry: '' })).toEqual({
+      ok: true,
+      body: { content: 'Reports open with a summary', validUntil: null }
+    });
+  });
+
+  it('sends the chosen instant when there is one', () => {
+    const patch = memoryPatch({ content: 'Contract ends soon', expiry: '2030-01-02T09:00' });
+    expect(patch.ok).toBe(true);
+    if (patch.ok) expect(Date.parse(patch.body.validUntil ?? '')).toBeGreaterThan(Date.now());
+  });
+
+  /* Said here rather than after a round trip, because the failure is the owner's typo. */
+  it('refuses an expiry that has already gone by, and says why', () => {
+    const patch = memoryPatch({ content: 'Anything', expiry: '2001-01-02T09:00' });
+    expect(patch.ok).toBe(false);
+    if (!patch.ok) expect(patch.message).toContain('already passed');
+  });
+
+  it('refuses an empty memory', () => {
+    expect(memoryPatch({ content: '   ', expiry: '' }).ok).toBe(false);
+  });
+});
+
+describe('who put a memory in the box, and who it is about', () => {
+  /* The row printed the scope where a reader looks for provenance, so the two read identically. */
+  it('tells a fact the owner typed from one the agent decided', () => {
+    expect(memoryProvenance({ source: 'owner' })).toBe('you wrote this');
+    expect(memoryProvenance({ source: 'agent' })).toBe('the agent decided this');
+  });
+
+  it('says the scope as a scope rather than as a person', () => {
+    expect(memoryScope({ target: 'user' })).toBe('About you, everywhere');
+    expect(memoryScope({ target: 'workspace' })).toBe('About this computer');
+  });
+});
+
+describe('the two timers the box runs on its own', () => {
+  /*
+   * The row was static copy telling every owner to run `sudo athanor auto-update on`, including
+   * the ones who already had. The diagnostics route carried no timer state at all, which is what
+   * let a description stand in for a reading.
+   */
+  it('says the weekly update timer is on when the box says it is', () => {
+    const line = updateTimerLine('on');
+    expect(line).toContain('Weekly automatic updates are on');
+    expect(line).not.toContain('auto-update on');
+  });
+
+  it('tells the owner how to enable it only when it is actually off', () => {
+    expect(updateTimerLine('off')).toContain('sudo athanor auto-update on');
+    expect(updateTimerLine('off')).toContain('Nothing installs itself');
+  });
+
+  /* A host that is not Linux has no verdict to give, and "we could not tell" is not "off". */
+  it('says it could not tell rather than guessing, on a host with no systemd', () => {
+    expect(updateTimerLine('unknown')).toContain('could not say');
+    expect(updateTimerLine(undefined)).toContain('could not say');
+    expect(timerStateKnown('unknown')).toBe(false);
+    expect(timerStateKnown(undefined)).toBe(false);
+    expect(timerStateKnown('off')).toBe(true);
+  });
+
+  /* The evidence line next door reports the last copy taken; this is whether a next one is due. */
+  it('separates a backup that happened from a backup that is scheduled', () => {
+    expect(backupTimerLine('on')).toContain('another copy is due');
+    expect(backupTimerLine('off')).toContain('only when you run');
+    expect(backupTimerLine(undefined)).toContain('could not say');
+  });
+});
+
+describe('the device links that are still out there', () => {
+  const grant = {
+    createdAt: '2026-08-01T09:00:00.000Z',
+    expiresAt: '2026-08-01T09:10:00.000Z',
+    status: 'pending' as const
+  };
+
+  it('says an open link is open, and when it stops being one', () => {
+    expect(enrollmentLine(grant)).toContain('Still open');
+    expect(enrollmentRevocable(grant)).toBe(true);
+  });
+
+  /* Only a live grant can be taken back; the rest of the list is the record of what happened. */
+  it('offers no kill switch on a link that has already been used or has lapsed', () => {
+    expect(enrollmentLine({ ...grant, status: 'used' })).toContain('Redeemed');
+    expect(enrollmentLine({ ...grant, status: 'expired' })).toContain('Expired unused');
+    expect(enrollmentLine({ ...grant, status: 'revoked' })).toContain('Cancelled');
+    expect(enrollmentRevocable({ status: 'used' })).toBe(false);
+    expect(enrollmentRevocable({ status: 'expired' })).toBe(false);
+  });
+});
+
+describe('the catalogue record no client has ever read', () => {
+  const model: ModelRelease = {
+    id: 'vendor/one',
+    providerModelId: 'one',
+    displayName: 'One',
+    provider: 'vendor',
+    revision: '2026-01',
+    availability: 'available',
+    openness: 'permissive_open_weight',
+    license: 'Apache-2.0',
+    commercialUse: true,
+    privacyRoute: 'provider_zdr',
+    contextTokens: 200_000,
+    modalities: ['text'],
+    capabilities: ['chat', 'tools'],
+    usageClass: 'medium',
+    recommendationTags: [],
+    measuredQuality: 0.82,
+    measuredLatencyMs: 900,
+    inputUsdPerMillionTokens: 3,
+    outputUsdPerMillionTokens: 15,
+    benchmarkRank: 4,
+    updatedAt: '2026-08-01T00:00:00.000Z'
+  };
+
+  /* The media picker one section above prints a price beside every option; this printed none. */
+  it('puts a price, a size and a licence beside a chat model', () => {
+    const line = modelDetailLine(model);
+    expect(line).toContain('$3 in / $15 out per million tokens');
+    expect(line).toContain('200k context');
+    expect(line).toContain('quality 82/100');
+    expect(line).toContain('ranked #4');
+    expect(line).toContain('Apache-2.0');
+    expect(line).toContain('commercial use allowed');
+  });
+
+  /* A price athanor could not read is said as that and never as zero. */
+  it('says a price is unpublished rather than showing nothing', () => {
+    expect(
+      modelDetailLine({
+        ...model,
+        inputUsdPerMillionTokens: null,
+        outputUsdPerMillionTokens: null
+      })
+    ).toContain('price not published');
+  });
+
+  it('reports all four openness grades as what they mean rather than as their enum', () => {
+    expect(modelOpennessLine({ openness: 'osaid_open_source' })).toContain('Open source');
+    expect(modelOpennessLine({ openness: 'permissive_open_weight' })).toContain('Open weights —');
+    expect(modelOpennessLine({ openness: 'restricted_open_weight' })).toContain(
+      'restricted licence'
+    );
+    expect(modelOpennessLine({ openness: 'remote_proprietary' })).toContain('Proprietary');
+  });
+});
+
+describe('deleting the computer without deleting the account', () => {
+  /* The route matches the name exactly, so the control has to arm on the same rule the route uses. */
+  it('stays inert until the computer’s own name is typed', () => {
+    expect(workspaceDeletionArmed('', 'Athanor')).toBe(false);
+    expect(workspaceDeletionArmed('athanor', 'Athanor')).toBe(false);
+    expect(workspaceDeletionArmed('  Athanor  ', 'Athanor')).toBe(true);
+  });
+});

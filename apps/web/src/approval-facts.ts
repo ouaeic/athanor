@@ -73,6 +73,24 @@ const DIRECTIONAL = /[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069
 /** Long enough to judge by, short enough that the buttons stay on screen. */
 const CLAMP = 400;
 
+/**
+ * How many addresses the card names, and therefore how many it does not.
+ *
+ * Read by the walk below and by the `parallel_web_read` row, which is what makes the card honest
+ * about the difference: one call may carry twelve URLs, the walk stops at six, and a card showing
+ * six of twelve without saying so is a smaller claim wearing the shape of a complete one.
+ */
+const DESTINATION_LIMIT = 6;
+
+/*
+ * Mirrors AUDIO_READ_MAX_SECONDS in @athanor/contracts — ninety minutes, the most one call reads.
+ * Copied rather than imported for the reason `usage-model.ts` gives about the two spend ceilings:
+ * every other use of that package here is `import type`, and pulling a runtime value in would drag
+ * the whole schema library into the first paint to state one number. `approval-facts.test.ts`
+ * imports the real constant and holds this against it, so the copy cannot drift in silence.
+ */
+const AUDIO_READ_MAX_SECONDS = 5_400;
+
 // Stripped before the length is measured, so the limit counts characters the owner can actually see
 // and the ellipsis lands where the text really stops.
 const clamp = (value: string, limit = CLAMP): string => {
@@ -114,7 +132,8 @@ const address = (raw: string): ApprovalDestination | undefined => {
 export const approvalDestinations = (approval: Approval): ApprovalDestination[] => {
   const found = new Map<string, ApprovalDestination>();
   const visit = (value: unknown, depth: number): void => {
-    if (found.size >= 6 || depth > 5 || value === null || value === undefined) return;
+    if (found.size >= DESTINATION_LIMIT || depth > 5 || value === null || value === undefined)
+      return;
     if (typeof value === 'string') {
       for (const candidate of value.split(/\s+/)) {
         if (!/^https?:\/\//i.test(candidate)) continue;
@@ -275,6 +294,53 @@ export const approvalFacts = (approval: Approval): ApprovalFact[] => {
       ];
     case 'browser_action':
       return browserFacts(args);
+    /*
+     * The count, because the list below it is not the whole list.
+     *
+     * A read of twelve public sources raises a card only when the turn has already read untrusted
+     * content and one of those addresses is a sink — which is to say, when the question is how much
+     * is leaving and by which door. `approvalDestinations` names six of them, so the number of
+     * doors is the one fact the card could not otherwise state.
+     */
+    case 'parallel_web_read': {
+      const urls = list(args.urls);
+      if (!urls.length) return [];
+      return fact(
+        'Reads',
+        urls.length > DESTINATION_LIMIT
+          ? `${urls.length} addresses, of which the first ${DESTINATION_LIMIT} are named below`
+          : `${urls.length} address${urls.length === 1 ? '' : 'es'}`
+      );
+    }
+    /*
+     * Minutes, because minutes are what this call is billed in.
+     *
+     * The whole subject of an `audio_read` card is provider spend, and until now the card said so
+     * only inside the quotation it attributes to the model — the half it teaches the owner to
+     * discount. The window is what the call asks for rather than what the file turns out to hold,
+     * so like the worker's own estimate this can only overstate, which is the right direction.
+     *
+     * The dollar figure is deliberately not lifted out of the sentence below. That sentence is the
+     * worker's, but it is interpolated with the model's own `path`, so a path carrying a plausible
+     * "about $0.001 …" clause would be read back as the estimate. Matching prose the worker owns is
+     * the mistake `needsComputer` records at the bottom of `approval-copy.ts`.
+     */
+    case 'audio_read': {
+      const start = Math.max(0, Number(args.startSeconds) || 0);
+      const end = Number(args.endSeconds);
+      const seconds = Math.min(
+        AUDIO_READ_MAX_SECONDS,
+        Number.isFinite(end) && end > start ? end - start : AUDIO_READ_MAX_SECONDS
+      );
+      return [
+        ...fact('Recording', text(args.path)),
+        ...fact(
+          'Reads',
+          `up to ${Math.ceil(seconds / 60)} minutes${start > 0 ? `, starting ${Math.floor(start / 60)} minutes in` : ''}`
+        ),
+        ...fact('Cost', 'billed by the minute of recording, to your own provider account')
+      ];
+    }
     case 'desktop_action':
     case 'desktop_launch':
       return desktopFacts(args);

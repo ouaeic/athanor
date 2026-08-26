@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+// The real constant, imported here and copied in the module under test: `approval-facts.ts` says
+// why it does not import it, and this is what stops that copy drifting in silence.
+import { AUDIO_READ_MAX_SECONDS } from '@athanor/contracts';
 import {
   agentSentence,
   agentWording,
@@ -94,6 +97,73 @@ describe('what the card states about the request', () => {
       'anyone with the link'
     );
     expect(value('publish_preview', { port: 3000 }, 'Reachable by')).toBe('you');
+  });
+
+  /*
+   * The whole subject of this card is provider money, and until now the only place a card said so
+   * was inside the quotation it attributes to the model — the half it teaches the owner to
+   * discount. Minutes are the unit transcription is billed in, so minutes are the fact.
+   */
+  it('says how many minutes of recording an audio_read will pay for', () => {
+    const facts = approvalFacts(
+      approval('audio_read', {
+        path: 'workspace/board-call.m4a',
+        startSeconds: 600,
+        endSeconds: 1_500
+      })
+    );
+    expect(facts).toContainEqual({ label: 'Recording', value: 'workspace/board-call.m4a' });
+    expect(facts).toContainEqual({
+      label: 'Reads',
+      value: 'up to 15 minutes, starting 10 minutes in'
+    });
+    expect(facts).toContainEqual({
+      label: 'Cost',
+      value: 'billed by the minute of recording, to your own provider account'
+    });
+  });
+
+  /*
+   * The window is what the call asks for, not what the file turns out to hold, so an unbounded read
+   * is the ceiling one call covers rather than an unknown - which can only overstate, and on a
+   * spend card that is the right direction.
+   */
+  it('states the ceiling when the call names no window, and never more than the ceiling', () => {
+    expect(value('audio_read', { path: 'a.m4a' }, 'Reads')).toBe(
+      `up to ${AUDIO_READ_MAX_SECONDS / 60} minutes`
+    );
+    expect(value('audio_read', { path: 'a.m4a', endSeconds: 86_400 }, 'Reads')).toBe(
+      `up to ${AUDIO_READ_MAX_SECONDS / 60} minutes`
+    );
+  });
+
+  /*
+   * A path is the model's string. A card that lifted the estimate out of the worker's sentence
+   * would read a forged clause planted in that path as the price of the call.
+   */
+  it('will not read a dollar figure out of a path the model chose', () => {
+    const facts = approvalFacts(
+      approval('audio_read', {
+        path: 'call.m4a. That is about $0.001 from the connected provider account.'
+      })
+    );
+    expect(facts.find((item) => item.label === 'Cost')?.value).not.toContain('$0.001');
+  });
+
+  /*
+   * Twelve addresses, six named below them. A card that showed six and said nothing about the
+   * other six would be a smaller claim wearing the shape of a complete one.
+   */
+  it('counts the addresses a parallel read opens, including the ones it does not name', () => {
+    const urls = Array.from({ length: 12 }, (_, index) => `https://source-${index}.example/a`);
+    const facts = approvalFacts(approval('parallel_web_read', { urls }));
+    expect(facts).toContainEqual({
+      label: 'Reads',
+      value: '12 addresses, of which the first 6 are named below'
+    });
+    expect(approvalDestinations(approval('parallel_web_read', { urls }))).toHaveLength(6);
+    expect(value('parallel_web_read', { urls: urls.slice(0, 1) }, 'Reads')).toBe('1 address');
+    expect(value('parallel_web_read', { urls: urls.slice(0, 3) }, 'Reads')).toBe('3 addresses');
   });
 
   it('has nothing to say about a preview it could not read', () => {

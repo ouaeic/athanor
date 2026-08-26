@@ -42,12 +42,10 @@ import {
 } from './notification-settings.js';
 import { readNotices, type AgentNotification } from './notice-log.js';
 import type { BuildIdentity, SecurityMode } from '@athanor/contracts';
-import {
-  startAuthentication,
-  startRegistration,
-  type PublicKeyCredentialRequestOptionsJSON
+import type {
+  PublicKeyCredentialCreationOptionsJSON,
+  PublicKeyCredentialRequestOptionsJSON
 } from '@simplewebauthn/browser';
-import type { PublicKeyCredentialCreationOptionsJSON } from '@simplewebauthn/browser';
 import { ApiFailure } from './api-failure.js';
 
 export { ApiFailure } from './api-failure.js';
@@ -78,6 +76,86 @@ export interface MemoryItem {
   observedAt: string;
 }
 
+/**
+ * The same row with everything a decision about it would rest on: which conversation wrote it, how
+ * far it is trusted, when it was last confirmed, and what it has been worth in use.
+ */
+export interface MemoryReviewItem extends MemoryItem {
+  taskId: string | null;
+  /** Whether the owner said this or the box worked it out, which decides how firmly it is put. */
+  trust: 'stated' | 'derived';
+  validFrom: string;
+  validTo: string | null;
+  lastVerified: string | null;
+  okCount: number;
+  failCount: number;
+  useCount: number;
+  pin: boolean;
+}
+
+/** What the box has stopped being sure of, in the two shapes that being unsure comes in. */
+export interface MemoryReview {
+  procedures: Array<
+    MemoryReviewItem & {
+      /**
+       * Why it is here, and the three cases mean different things to whoever reads them: nobody
+       * has confirmed it in a season (`unverified`) may be a good procedure that is merely unused,
+       * `failing` is broken now, and `both` is both.
+       */
+      reason: 'unverified' | 'failing' | 'both';
+      recentOkCount: number;
+      recentGradedCount: number;
+    }
+  >;
+  disputed: Array<MemoryReviewItem & { contradicts: string[] }>;
+}
+
+/**
+ * The router's own vocabulary for what a turn is going to be, which `/v1/models/recommend` has
+ * accepted all along and this client never sent. Copied rather than imported: `@athanor/core` is
+ * a server package and this list is eight strings, so the alternative is a dependency edge for a
+ * type that erases.
+ */
+export type ModelTaskKind =
+  | 'general'
+  | 'coding'
+  | 'agentic'
+  | 'conversation'
+  | 'reasoning'
+  | 'vision'
+  | 'long_context'
+  | 'bulk_summarisation';
+
+/**
+ * What starting a conversation says, written out rather than `unknown`.
+ *
+ * `maxSpendUsd` is the reason it is written out: the route has taken a per-conversation ceiling
+ * since the contract did, and a body typed `unknown` is a body no compiler can tell you is missing
+ * a field. Omitted means "use the account default", which is not the same as no ceiling.
+ */
+export interface CreateTaskBody {
+  workspaceId: string;
+  prompt: string;
+  title?: string;
+  modelId?: string;
+  privacyRoute?: 'provider_zdr' | 'external';
+  maxComputeCredits?: number;
+  maxSpendUsd?: number;
+  attachments?: string[];
+}
+
+/** The same, for the next message in a conversation that already exists. */
+export interface ContinueTaskBody {
+  prompt: string;
+  modelId?: string;
+  privacyRoute?: 'provider_zdr' | 'external';
+  maxComputeCredits?: number;
+  maxSpendUsd?: number;
+  attachments?: string[];
+  /** Apply this to the turn already running rather than the one after it. */
+  interrupt?: boolean;
+}
+
 let nativeGateway = false;
 
 /**
@@ -90,6 +168,16 @@ let nativeGateway = false;
  * passes its own signal, which wins.
  */
 const REQUEST_TIMEOUT_MS = 45_000;
+
+/**
+ * The passkey ceremony, fetched at the moment one is actually run.
+ *
+ * `@simplewebauthn/browser` is 2.4 kB gzipped and it was the largest single thing in the first
+ * paint: every caller of it — the sign-in screen and the security page — is already behind `lazy`,
+ * and this module's static import was the one edge keeping it in the eager graph. Both call sites
+ * were already `async`, so nothing above them changes and no Suspense boundary is involved.
+ */
+const webauthn = () => import('@simplewebauthn/browser');
 
 const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(path, {
@@ -110,14 +198,18 @@ const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
     const body = (await response
       .json()
       .catch(() => ({ error: { code: 'request_failed', message: 'Request failed' } }))) as {
-      error?: { code?: string; message?: string };
+      error?: { code?: string; message?: string; requestId?: string };
     };
     // A route this server does not implement answers in Fastify's own shape, which carries no
     // athanor error envelope at all; the status is then the only thing worth trusting.
     throw new ApiFailure(
       body.error?.code ?? 'request_failed',
       body.error?.message ?? `Request failed (${response.status})`,
-      response.status
+      response.status,
+      // Carried only when the box actually minted one. An envelope without it came from something
+      // that is not this API, and inventing a blank id would make the log line unfindable rather
+      // than absent.
+      body.error?.requestId
     );
   }
   if (response.status === 204) return undefined as T;
@@ -260,6 +352,7 @@ export const api = {
     if (pending.verified) return;
     if (!pending.challengeId || !pending.options)
       throw new ApiFailure('step_up_failed', 'Passkey verification could not start');
+    const { startAuthentication } = await webauthn();
     const response = await startAuthentication({ optionsJSON: pending.options });
     await request('/v1/auth/step-up/verify', {
       method: 'POST',
@@ -329,6 +422,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(webauthnContext())
     });
+    const { startRegistration } = await webauthn();
     const response = await startRegistration({ optionsJSON: pending.options });
     return request<{
       id: string;
@@ -389,21 +483,35 @@ export const api = {
       `/v1/workspaces/${workspaceId}/snapshots/${snapshotId}/restore`,
       mutation('POST', { confirmName })
     ),
-  createTask: (body: unknown) => request<Task>('/v1/tasks', mutation('POST', body)),
+  createTask: (body: CreateTaskBody) => request<Task>('/v1/tasks', mutation('POST', body)),
   /**
    * The next page of conversations, from where the bootstrap left off.
    *
    * The bootstrap carries the newest page and the cursor that resumes it, and the cursor had no
    * caller: a box with more conversations than one page could only reach the older ones through
    * search, which needs the owner to remember something about them.
+   *
+   * `include` is the second half of archiving. `updateTask` has filed a conversation away since
+   * this client learned to, and the list route has answered `archived` and `all` for as long — so
+   * a conversation the owner put out of the way became one they could only reach by remembering a
+   * word in it. Omitted means `active`, which is what the sidebar wants and what the route
+   * defaults to, so the query string is left off entirely rather than saying so.
    */
-  tasks: (cursor: string) =>
-    request<{
+  tasks: (cursor: string | null, include?: 'active' | 'archived' | 'all') => {
+    const query = new URLSearchParams();
+    // Null is the top of the list, not a position. `TaskPageQuery` types the cursor as
+    // `z.string().min(1)`, so sending an empty one is a 400 - and the archived list has to be asked
+    // for from the start: the bootstrap's cursor is a position in the *active* list, and the filed
+    // conversation the owner is looking for is usually a recent one.
+    if (cursor) query.set('cursor', cursor);
+    if (include !== undefined && include !== 'active') query.set('include', include);
+    return request<{
       tasks: Task[];
       nextCursor: string | null;
       hasMore: boolean;
       scheduleRunCounts?: Record<string, number>;
-    }>(`/v1/tasks?cursor=${encodeURIComponent(cursor)}`),
+    }>(`/v1/tasks?${query}`);
+  },
   search: (query: string, workspaceId?: string) =>
     request<ConversationSearchResult[]>(
       `/v1/search?q=${encodeURIComponent(query)}${
@@ -413,7 +521,7 @@ export const api = {
   saveDraft: (body: unknown) => request<{ saved: boolean }>('/v1/drafts', mutation('PUT', body)),
   savePreferences: (body: unknown) =>
     request<{ preferences: User['preferences'] }>('/v1/account/preferences', mutation('PUT', body)),
-  continueTask: (id: string, body: unknown) =>
+  continueTask: (id: string, body: ContinueTaskBody) =>
     request<Task>(`/v1/tasks/${id}/messages`, mutation('POST', body)),
   /**
    * What rewinding the computer to a point in this conversation would do, before it is done.
@@ -433,11 +541,27 @@ export const api = {
    * task with a line appended to its transcript, because the machine goes back while the
    * conversation carries on. The checkpoint is named rather than left to be resolved, so what is
    * restored is what the preview described.
+   *
+   * `modelId` and `privacyRoute` are on all three because the contract has carried them on all
+   * three since forking existed, and omitting them means "the model the source task used" — which
+   * is what made "that answer was weak, try the stronger one" a retype rather than a retry. The
+   * route refuses a model whose route does not match rather than downgrading it quietly.
+   *
+   * `maxSpendUsd` is on `edit` and `retry` and deliberately not on `branch`: branching runs
+   * nothing, and the server's discriminated union has no such field there, so a ceiling sent with
+   * a branch would be stripped in silence — a control that reports success and does nothing.
    */
   createTaskTrajectory: (
     id: string,
     body:
-      | { operation: 'branch'; eventId: string; rewind: RewindScope; checkpointId?: string }
+      | {
+          operation: 'branch';
+          eventId: string;
+          rewind: RewindScope;
+          checkpointId?: string;
+          modelId?: string;
+          privacyRoute?: 'provider_zdr' | 'external';
+        }
       | {
           operation: 'edit';
           eventId: string;
@@ -446,6 +570,9 @@ export const api = {
           stopSource: boolean;
           rewind: RewindScope;
           checkpointId?: string;
+          modelId?: string;
+          privacyRoute?: 'provider_zdr' | 'external';
+          maxSpendUsd?: number;
         }
       | {
           operation: 'retry';
@@ -454,6 +581,9 @@ export const api = {
           stopSource: boolean;
           rewind: RewindScope;
           checkpointId?: string;
+          modelId?: string;
+          privacyRoute?: 'provider_zdr' | 'external';
+          maxSpendUsd?: number;
         }
   ) => request<Task>(`/v1/tasks/${id}/trajectory`, mutation('POST', body)),
   createSchedule: (body: unknown) => request<TaskSchedule>('/v1/schedules', mutation('POST', body)),
@@ -461,13 +591,45 @@ export const api = {
     request<TaskSchedule>(`/v1/schedules/${id}/${action}`, mutation('POST', {})),
   deleteSchedule: (id: string) =>
     request<{ deleted: boolean }>(`/v1/schedules/${id}`, mutation('DELETE', {})),
+  /**
+   * Change a watcher without recreating it: its title, its instruction, its timing, or what one
+   * run of it may spend. The model and privacy route are the two it keeps — the route refuses a
+   * change to either with `schedule_model_immutable` rather than answering 200 and ignoring it —
+   * so they are not on this body at all.
+   *
+   * The server refuses a patch that would change nothing, which is why every field is optional and
+   * a caller is expected to name at least one.
+   */
+  updateSchedule: (
+    id: string,
+    patch: {
+      title?: string;
+      prompt?: string;
+      spec?: TaskSchedule['spec'];
+      maxComputeCredits?: number;
+      /** An explicit null clears the per-run ceiling; omitting it leaves the current one alone. */
+      maxSpendUsd?: number | null;
+    }
+  ) => request<TaskSchedule>(`/v1/schedules/${id}`, mutation('PATCH', patch)),
+  /**
+   * The catalogue in the order it should be tried, and the argument for the front of it.
+   *
+   * `taskKind` is the router's five profiles — vision, long context, reasoning, bulk
+   * summarisation, conversation — which were written, weighted and tested and which this client
+   * never named, so every ranking it asked for fell through to general work. Omitted still means
+   * general, so a caller that does not know what the turn will be does not have to guess.
+   */
   recommendModels: (
     privacyRoute: 'provider_zdr' | 'external',
-    preference: 'fast' | 'balanced' | 'best'
-  ) =>
-    request<Array<{ modelId: string; displayName: string; score: number; reasons?: string[] }>>(
-      `/v1/models/recommend?privacyRoute=${encodeURIComponent(privacyRoute)}&preference=${encodeURIComponent(preference)}`
-    ),
+    preference: 'fast' | 'balanced' | 'best',
+    taskKind?: ModelTaskKind
+  ) => {
+    const query = new URLSearchParams({ privacyRoute, preference });
+    if (taskKind !== undefined) query.set('taskKind', taskKind);
+    return request<
+      Array<{ modelId: string; displayName: string; score: number; reasons?: string[] }>
+    >(`/v1/models/recommend?${query}`);
+  },
   task: (id: string) => request<Task>(`/v1/tasks/${id}`),
   taskPlan: (id: string) => request<TaskPlan | null>(`/v1/tasks/${id}/plan`),
   taskPlans: (id: string) => request<TaskPlan[]>(`/v1/tasks/${id}/plans`),
@@ -509,6 +671,24 @@ export const api = {
       '/v1/devices/enrollments',
       mutation('POST', { label })
     ),
+  /**
+   * The device links minted in the last week and what became of each.
+   *
+   * Minting one and revoking one were both reachable and the list between them was not, so an
+   * owner who made a link and walked away had no way to see whether it was still open, whether it
+   * had been redeemed, or by which of the several they made. A grant that adds a credential to this
+   * account is exactly the thing that should be countable.
+   */
+  enrollments: () =>
+    request<
+      Array<{
+        id: string;
+        label: string;
+        createdAt: string;
+        expiresAt: string;
+        status: 'pending' | 'used' | 'expired' | 'revoked';
+      }>
+    >('/v1/devices/enrollments'),
   revokeEnrollment: (id: string) =>
     request<{ revoked: boolean }>(`/v1/devices/enrollments/${id}`, mutation('DELETE', {})),
   /**
@@ -525,7 +705,29 @@ export const api = {
     request<{ deleted: boolean }>(`/v1/tasks/${id}`, mutation('DELETE', {})),
   updateTaskSecurityMode: (id: string, securityMode: SecurityMode) =>
     request<Task>(`/v1/tasks/${id}/security-mode`, mutation('PATCH', { securityMode })),
-  approvals: () => request<Approval[]>('/v1/approvals'),
+  /**
+   * The questions the agent stopped to ask, and — asked for by status — the answers already given.
+   *
+   * Pending is the default and stays the default, because that is the list with something to
+   * answer and it is what every existing caller means. The other three are the record: an approval
+   * that lapsed is exactly what a returning owner is looking for, since it explains why a task is
+   * paused and the wording of what was asked is the only account of it that exists.
+   *
+   * `cursor` is the `cursor` field of the last row of the previous page, not a count: approvals
+   * raised by one turn share a timestamp, so a position made of the timestamp alone would skip
+   * every row that tied with the last one shown.
+   */
+  approvals: (
+    status?: 'pending' | 'approved' | 'denied' | 'expired',
+    limit?: number,
+    cursor?: string
+  ) => {
+    const query = new URLSearchParams();
+    if (status !== undefined) query.set('status', status);
+    if (limit !== undefined) query.set('limit', String(limit));
+    if (cursor !== undefined) query.set('cursor', cursor);
+    return request<Approval[]>(`/v1/approvals${query.size ? `?${query}` : ''}`);
+  },
   resolveApproval: (id: string, decision: 'approve' | 'deny') =>
     request(`/v1/approvals/${id}/${decision}`, mutation('POST', {})),
   files: (workspaceId: string, path = 'workspace') =>
@@ -534,12 +736,80 @@ export const api = {
     ),
   file: (workspaceId: string, path: string) =>
     request<ArrayBuffer>(`/v1/workspaces/${workspaceId}/file?path=${encodeURIComponent(path)}`),
-  writeFile: (workspaceId: string, path: string, content: Uint8Array) =>
-    request(`/v1/workspaces/${workspaceId}/file?path=${encodeURIComponent(path)}`, {
-      method: 'PUT',
-      body: content.buffer as ArrayBuffer,
-      headers: { 'idempotency-key': crypto.randomUUID() }
-    }),
+  /**
+   * The same read as `file`, plus what the machine says it read.
+   *
+   * A separate method rather than a wider return from `file`, because `file` has callers that want
+   * the bytes and nothing else, and widening what they already destructure is how a shape change
+   * becomes eight of them. What this adds is `sha256`: the digest of what was on disk at the
+   * moment of the read, which is the value `writeFile` sends back as `expectSha256` so the write
+   * can be refused if the agent changed the file in between.
+   *
+   * Null when the answer was a window rather than the whole file: the runner computes the digest
+   * over what it read, and a digest of lines 40-80 is not a claim about the file. A caller asking
+   * for a window is reading, not preparing to overwrite.
+   */
+  readFile: async (
+    workspaceId: string,
+    path: string,
+    window: { startLine?: number; endLine?: number; maxBytes?: number } = {}
+  ) => {
+    const query = new URLSearchParams();
+    for (const key of ['startLine', 'endLine', 'maxBytes'] as const)
+      if (window[key] !== undefined) query.set(key, String(window[key]));
+    const response = await fetch(
+      `/v1/workspaces/${workspaceId}/file?path=${encodeURIComponent(path)}${
+        query.size ? `&${query}` : ''
+      }`,
+      {
+        credentials: 'include',
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+      }
+    );
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({}))) as {
+        error?: { code?: string; message?: string; requestId?: string };
+      };
+      throw new ApiFailure(
+        body.error?.code ?? 'request_failed',
+        body.error?.message ?? `Request failed (${response.status})`,
+        response.status,
+        body.error?.requestId
+      );
+    }
+    const number = (header: string): number | null => {
+      const value = response.headers.get(header);
+      return value === null || value === '' || Number.isNaN(Number(value)) ? null : Number(value);
+    };
+    return {
+      bytes: await response.arrayBuffer(),
+      sha256: response.headers.get('x-content-sha256'),
+      startLine: number('x-start-line'),
+      endLine: number('x-end-line'),
+      fileBytes: number('x-file-bytes'),
+      totalLines: number('x-total-lines'),
+      nextStartLine: number('x-next-start-line'),
+      truncated: response.headers.get('x-truncated') === 'true'
+    };
+  },
+  /**
+   * `expectSha256` is the digest `readFile` returned, sent back as a claim about what is being
+   * replaced. The runner checks it under the write's own descriptor and refuses with `file_changed`
+   * if the file moved underneath — which on this computer is the ordinary case, not the edge, since
+   * the agent is usually still working in the tree the owner is editing. Without it the later write
+   * wins in silence and the agent's work is simply gone.
+   */
+  writeFile: (workspaceId: string, path: string, content: Uint8Array, expectSha256?: string) =>
+    request(
+      `/v1/workspaces/${workspaceId}/file?path=${encodeURIComponent(path)}${
+        expectSha256 === undefined ? '' : `&expectSha256=${encodeURIComponent(expectSha256)}`
+      }`,
+      {
+        method: 'PUT',
+        body: content.buffer as ArrayBuffer,
+        headers: { 'idempotency-key': crypto.randomUUID() }
+      }
+    ),
   /**
    * The same write as `writeFile`, reported as it goes and cancellable while it runs.
    *
@@ -576,7 +846,7 @@ export const api = {
         const body = (() => {
           try {
             return JSON.parse(transfer.responseText) as {
-              error?: { code?: string; message?: string };
+              error?: { code?: string; message?: string; requestId?: string };
             };
           } catch {
             return {};
@@ -586,7 +856,8 @@ export const api = {
           new ApiFailure(
             body.error?.code ?? 'request_failed',
             body.error?.message ?? `Upload failed (${transfer.status})`,
-            transfer.status
+            transfer.status,
+            body.error?.requestId
           )
         );
       };
@@ -629,6 +900,23 @@ export const api = {
     workspaceId: string,
     body: { target: 'workspace' | 'user'; content: string; validUntil?: string }
   ) => request<WorkspaceMemory>(`/v1/workspaces/${workspaceId}/memories`, mutation('POST', body)),
+  /**
+   * Correct a line the box holds about the owner, rather than deleting it and typing it again.
+   *
+   * The route has taken this patch for as long as the list has existed and nothing in this client
+   * called it, so the only way to fix a wrong word in a remembered instruction was to remove the
+   * line and lose the record that it had ever been there. An explicit `null` on `validUntil` makes
+   * the line permanent; omitting it keeps whatever expiry it already had.
+   */
+  updateMemory: (
+    workspaceId: string,
+    memoryId: string,
+    patch: { content: string; validUntil?: string | null }
+  ) =>
+    request<WorkspaceMemory>(
+      `/v1/workspaces/${workspaceId}/memories/${memoryId}`,
+      mutation('PATCH', patch)
+    ),
   deleteMemory: (workspaceId: string, memoryId: string) =>
     request<{ deleted: boolean }>(
       `/v1/workspaces/${workspaceId}/memories/${memoryId}`,
@@ -636,6 +924,44 @@ export const api = {
     ),
   memoryItems: (workspaceId: string, limit: number) =>
     request<MemoryItem[]>(`/v1/workspaces/${workspaceId}/memory-items?limit=${limit}`),
+  /**
+   * The review queue: what the box has stopped being sure of, and why.
+   *
+   * Two lists because they are two questions. `procedures` is "this remembered command may no
+   * longer work" — either nobody has confirmed it in a season (`unverified`) or it lost more of its
+   * last five uses than it won (`failing`), with `recentOkCount` of `recentGradedCount` as the
+   * evidence. `disputed` is "two things you said contradict each other", and carries `contradicts`
+   * because naming a dispute without naming the other side is not something a person can act on.
+   *
+   * The projection is wider than `memoryItems` on purpose: which conversation wrote it, how far it
+   * is trusted, when it was last confirmed and what it has been worth are exactly the fields a
+   * decision rests on, and the narrower route drops all of them.
+   */
+  memoryReview: (workspaceId: string, options: { staleDays?: number; limit?: number } = {}) => {
+    const query = new URLSearchParams();
+    if (options.staleDays !== undefined) query.set('staleDays', String(options.staleDays));
+    if (options.limit !== undefined) query.set('limit', String(options.limit));
+    return request<MemoryReview>(
+      `/v1/workspaces/${workspaceId}/memory-review${query.size ? `?${query}` : ''}`
+    );
+  },
+  /** "This is still right." Moves the procedure out of the queue by moving the clock it reads. */
+  verifyMemoryItem: (workspaceId: string, itemId: string) =>
+    request<{ verified: boolean }>(
+      `/v1/workspaces/${workspaceId}/memory-items/${itemId}/verify`,
+      mutation('POST', {})
+    ),
+  /**
+   * "Stop believing this", which is not "delete this". `deleteMemoryItem` next door removes the row
+   * and every trace of it, which is what an owner means when they say a line is gone; retracting
+   * keeps the row, stops it being recalled, and records that it stopped being true. Both exist
+   * because they are different decisions.
+   */
+  retractMemoryItem: (workspaceId: string, itemId: string) =>
+    request<{ retracted: boolean }>(
+      `/v1/workspaces/${workspaceId}/memory-items/${itemId}/retract`,
+      mutation('POST', {})
+    ),
   deleteMemoryItem: (workspaceId: string, itemId: string) =>
     request<{ deleted: boolean }>(
       `/v1/workspaces/${workspaceId}/memory-items/${itemId}`,
@@ -645,6 +971,25 @@ export const api = {
     request<WorkspaceSkill[]>(`/v1/workspaces/${workspaceId}/skills`),
   saveSkill: (workspaceId: string, body: { name: string; description: string; content: string }) =>
     request<WorkspaceSkill>(`/v1/workspaces/${workspaceId}/skills`, mutation('POST', body)),
+  /**
+   * Pin a learned procedure above the curation that would archive it, file it away, or turn it off.
+   *
+   * `pinned` and `status` are what the route has always taken. `enabled` is the one the owner has
+   * needed and never had: the column has a reader — a disabled skill is dropped from the model's
+   * own index — and until the server half of this lands it has no writer, so the approval card that
+   * says "You had turned X off. Approving this switches it back on" describes a state nothing could
+   * reach. It is named here because the door is the same door, and a client that sends it against
+   * a box that has not caught up is refused rather than answered 200 and ignored.
+   */
+  setSkillState: (
+    workspaceId: string,
+    skillId: string,
+    patch: { enabled?: boolean; pinned?: boolean; status?: 'active' | 'stale' | 'archived' }
+  ) =>
+    request<WorkspaceSkill>(
+      `/v1/workspaces/${workspaceId}/skills/${skillId}`,
+      mutation('PATCH', patch)
+    ),
   deleteSkill: (workspaceId: string, skillId: string) =>
     request<{ deleted: boolean }>(
       `/v1/workspaces/${workspaceId}/skills/${skillId}`,
@@ -670,19 +1015,15 @@ export const api = {
       `${baseUrl}/v1/workspaces/${workspaceId}/browser/action`,
       window.location.href
     );
-    if (target.origin !== window.location.origin) {
-      if (
-        typeof action === 'object' &&
-        action !== null &&
-        (action as { type?: string }).type === 'text_input'
-      ) {
-        throw new ApiFailure(
-          'secure_input_unavailable',
-          'Private text requires the same-origin runner route; this deployment must configure /runner'
-        );
-      }
+    // A cross-origin runner is proxied through this API rather than reached directly. It used to
+    // refuse `text_input` here, on the ground that private text wants a same-origin route — but
+    // the Inspector sends over the surface socket whenever one is open and only falls back to this
+    // when it has dropped, and that socket goes to the same cross-origin runner with no such
+    // check. The refusal therefore protected nothing: it fired on a reconnect and never on the
+    // path the text actually took. Removed rather than mirrored onto the socket, because the
+    // restriction it stated was not one this client was keeping.
+    if (target.origin !== window.location.origin)
       return request(`/v1/workspaces/${workspaceId}/browser/action`, mutation('POST', action));
-    }
     const response = await fetch(target, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
@@ -748,18 +1089,11 @@ export const api = {
       `${baseUrl}/v1/workspaces/${workspaceId}/desktop/action`,
       window.location.href
     );
-    if (target.origin !== window.location.origin) {
-      if (
-        typeof action === 'object' &&
-        action !== null &&
-        (action as { type?: string }).type === 'text_input'
-      )
-        throw new ApiFailure(
-          'secure_input_unavailable',
-          'Private text requires the same-origin runner route; this deployment must configure /runner'
-        );
+    // The same removal as the browser surface above, for the same reason: the refusal could only
+    // ever fire on the fallback, and the socket it falls back from carried the identical text to
+    // the identical cross-origin runner unchecked.
+    if (target.origin !== window.location.origin)
       return request(`/v1/workspaces/${workspaceId}/desktop/action`, mutation('POST', action));
-    }
     const response = await fetch(target, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },

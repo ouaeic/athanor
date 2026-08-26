@@ -205,6 +205,79 @@ describe('the card that asks before something irreversible', () => {
     );
   });
 
+  /*
+   * The origin recorded on the request itself, which had a column, a store parameter and a contract
+   * and no reader anywhere. The derived note can only be computed for the conversation on screen,
+   * so the card was silent about provenance for exactly the requests raised somewhere else - which
+   * `nextApproval` makes the ordinary case.
+   */
+  it('names the outside source recorded on the request, wherever it was raised', () => {
+    const markup = render(
+      [approval({ taskId: 'elsewhere', origin: 'invoices.example' })],
+      'watching'
+    );
+    expect(markup).toContain('had read content from invoices.example');
+    expect(markup).toContain('could be the one asking for this');
+  });
+
+  it('prefers the recorded origin to the one worked out from the conversation on screen', () => {
+    const markup = render(
+      [approval({ taskId: 'watching', origin: 'invoices.example' })],
+      'watching',
+      [event(1, {}), crossing('news.example')]
+    );
+    expect(markup).toContain('invoices.example');
+    expect(markup).not.toContain('news.example');
+  });
+
+  /*
+   * The headline used to be the tool phrase alone, so `sideEffect` - the one thing the box records
+   * about every approval - never reached the card at all once a tool was known.
+   */
+  it('says both what the tool touches and how far the effect reaches', () => {
+    const markup = render([approval({ preview: { tool: 'desktop_action' } })]);
+    expect(markup).toContain('Uses an application on your computer');
+    expect(markup).toContain('may not be undoable');
+    expect(render([approval({ sideEffect: 'external_reversible' })])).not.toContain(
+      'may not be undoable'
+    );
+  });
+
+  /*
+   * A lapse is a silent skip: the action is not run and the agent carries on. The countdown said
+   * how long was left and never which way it failed, so a request that would quietly be abandoned
+   * read as one that would wait.
+   */
+  it('says what happens if the owner never answers', () => {
+    const markup = render([approval()]);
+    expect(markup).toContain('expires in');
+    expect(markup).toContain('if it lapses it is not run');
+    expect(markup).toContain('athanor carries on without it');
+  });
+
+  /*
+   * The card's own table claimed to cover every tool that can raise an approval and did not cover
+   * this one, so a request whose entire subject is provider money fell through to a generic reach
+   * phrase over a JSON dump, with the money mentioned only inside the model's quotation.
+   */
+  it('states the spend an audio_read is asking for outside the model&apos;s own quotation', () => {
+    const markup = render([
+      approval({
+        action: 'Approve continued provider spend on reading recordings',
+        sideEffect: 'external_reversible',
+        preview: {
+          preview: 'Read up to 90 minutes of workspace/board-call.m4a.',
+          tool: 'audio_read',
+          arguments: { path: 'workspace/board-call.m4a' }
+        }
+      })
+    ]);
+    expect(markup).toContain('Spends money at a provider to read a recording');
+    expect(markup).toContain('up to 90 minutes');
+    expect(markup).toContain('billed by the minute of recording');
+    expect(markup).not.toContain('approval-request');
+  });
+
   it('offers exactly one way to allow it and one to refuse it', () => {
     const markup = render([approval()]);
     expect(markup).toContain('>Approve<');

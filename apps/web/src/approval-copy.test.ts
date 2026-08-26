@@ -1,8 +1,12 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   approvalAnnouncement,
   approvalDiffState,
+  approvalProvenance,
   approvalReach,
+  approvalToolPhrases,
+  expiryNote,
   expiryPhrase,
   needsComputer,
   nextApproval
@@ -35,17 +39,63 @@ describe('approval wording', () => {
     }
   });
 
-  it('prefers what the tool touches over how far the effect reaches', () => {
+  it('says what the tool touches and how far the effect reaches, never only one of them', () => {
     expect(approvalReach(approval({ preview: { tool: 'publish_site' } }))).toBe(
-      'Puts something on the public internet'
+      'Puts something on the public internet · reaches outside your computer, and may not be undoable'
     );
     expect(approvalReach(approval({ preview: { tool: 'connector_action' } }))).toBe(
-      'Uses a connected account'
+      'Uses a connected account · reaches outside your computer, and may not be undoable'
     );
     // Same reach, different tools: the sentence is about the request, not about its class.
     expect(approvalReach(approval({ preview: { tool: 'publish_site' } }))).not.toBe(
       approvalReach(approval({ preview: { tool: 'shell' } }))
     );
+  });
+
+  /*
+   * The defect this composition exists to remove. `approvalReach` returned the tool phrase when it
+   * had one and only fell back to the reach, so `sideEffect` — the single fact the box records
+   * about every approval — was discarded for sixteen of the eighteen tools that can raise one. A
+   * coordinate click that may not be undoable and a scroll that can be read as the same six words.
+   */
+  it('tells one desktop_action from another when only the reversibility differs', () => {
+    const consequential = approvalReach(
+      approval({ sideEffect: 'external_consequential', preview: { tool: 'desktop_action' } })
+    );
+    const reversible = approvalReach(
+      approval({ sideEffect: 'external_reversible', preview: { tool: 'desktop_action' } })
+    );
+    expect(consequential).not.toBe(reversible);
+    expect(consequential).toContain('may not be undoable');
+    expect(reversible).not.toContain('may not be undoable');
+    // Both still name the tool: composing did not cost the specific answer.
+    expect(consequential).toContain('Uses an application on your computer');
+    expect(reversible).toContain('Uses an application on your computer');
+  });
+
+  /*
+   * The comment above `approvalToolPhrases` claims the table covers every tool that can raise an
+   * approval. It claimed that while missing two of them — `audio_read`, whose entire subject is
+   * provider spend, and `parallel_web_read`, whose entire subject is addresses data leaves by — so
+   * both degraded to a bare reach phrase over a JSON dump of the call.
+   *
+   * Read out of the worker's own floor rather than from a list kept beside the table, because a
+   * list kept beside the table is what drifted. Step 5 promotes this to a repository check, so a
+   * new branch in the worker fails the build rather than one client's test suite.
+   */
+  it('has a phrase for every tool the worker can raise an approval for', () => {
+    const floor = readFileSync(
+      new URL('../../worker/src/approval-policy.ts', import.meta.url),
+      'utf8'
+    );
+    const raised = new Set(
+      [...floor.matchAll(/\bname === '([a-z_]+)'/g)].flatMap((match) => match[1] ?? [])
+    );
+    // A regex that stopped matching would otherwise pass this test by covering nothing.
+    expect(raised.size).toBeGreaterThanOrEqual(18);
+    expect([...raised].filter((tool) => !(tool in approvalToolPhrases))).toEqual([]);
+    expect([...raised]).toContain('audio_read');
+    expect([...raised]).toContain('parallel_web_read');
   });
 
   it('falls back to the reach when the tool is one this client has never heard of', () => {
@@ -72,6 +122,72 @@ describe('approval wording', () => {
     const now = Date.parse('2026-08-02T01:00:00.000Z');
     expect(expiryPhrase('2026-08-02T00:59:00.000Z', now)).toBe('expired');
     expect(expiryPhrase('not a date', now)).toBe('no time limit');
+  });
+});
+
+/*
+ * A lapse is not a block and not a denial: the worker records the request as expired, skips the
+ * action and carries the turn on. The countdown never said which way it failed, so twenty-three
+ * hours of "expires in 23 hours" read as a request that would wait.
+ */
+describe('what the countdown says happens if nobody answers', () => {
+  const now = Date.parse('2026-08-02T01:00:00.000Z');
+
+  it('names the consequence of doing nothing beside the time left', () => {
+    const note = expiryNote('2026-08-03T00:00:00.000Z', now);
+    expect(note).toContain('expires in 23 hours');
+    expect(note).toContain('if it lapses it is not run');
+    expect(note).toContain('athanor carries on without it');
+  });
+
+  it('says a lapsed request was skipped rather than refused', () => {
+    const note = expiryNote('2026-08-02T00:59:00.000Z', now);
+    expect(note).toContain('expired');
+    expect(note).toContain('it was not run');
+    expect(note).not.toContain('if it lapses');
+    expect(note).not.toMatch(/denied|refused|blocked/);
+  });
+
+  it('promises nothing about a window it cannot read', () => {
+    expect(expiryNote('not a date', now)).toBe('no time limit');
+  });
+});
+
+/*
+ * `origin` is written onto the approval by the turn that raised it. The card had no reader for it
+ * at all, and the provenance line it did draw was computed from the open conversation's trajectory
+ * — so it was silent for a request raised somewhere else, which `nextApproval` makes the ordinary
+ * case.
+ */
+describe('where the card says the instruction came from', () => {
+  const derived = { exposed: true, text: 'This conversation has read content from example.com.' };
+
+  it('prefers the origin recorded on the request over the one derived from the timeline', () => {
+    const note = approvalProvenance(approval({ origin: 'mail.example.com' }), derived);
+    expect(note?.exposed).toBe(true);
+    expect(note?.text).toContain('mail.example.com');
+    expect(note?.text).toContain('could be the one asking for this');
+  });
+
+  it('falls back to the timeline when the turn carried no taint', () => {
+    expect(approvalProvenance(approval({ origin: null }), derived)).toBe(derived);
+    expect(approvalProvenance(approval(), derived)).toBe(derived);
+  });
+
+  /* An older box has no column to send, and a card that invented a line would be inventing a fact. */
+  it('says nothing at all when neither answer is available', () => {
+    expect(approvalProvenance(approval(), undefined)).toBeUndefined();
+    expect(approvalProvenance(approval({ origin: '   ' }), undefined)).toBeUndefined();
+  });
+
+  /*
+   * The origin is derived from content that came from outside. A right-to-left override inside it
+   * renders as a different host, which is the one trick this card cannot afford to fall for.
+   */
+  it('strips the characters that would let an origin render as another host', () => {
+    const note = approvalProvenance(approval({ origin: 'bank\u202Eelpmaxe.evil' }), undefined);
+    expect(note?.text).not.toMatch(/[\u202a-\u202e]/);
+    expect(note?.text).toContain('bankelpmaxe.evil');
   });
 });
 

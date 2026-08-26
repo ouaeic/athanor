@@ -1,0 +1,117 @@
+/*
+  What the scheduled-work dialog needed once the row started telling the truth.
+
+  This ships in the same lazy chunk as `ScheduleModal`, which is the whole reason it is its own
+  file: the dialog is already behind `lazy()` and none of these rules are worth a byte of the eager
+  stylesheet for a surface most sessions never open. Everything the row already had - the card, the
+  three-column grid, the muted `small` lines - stays in `styles.css`; only the parts that are new
+  are here, and each one overrides by being more specific rather than by arriving later.
+*/
+
+/*
+  A fourth button. The base rule budgets three fixed 30px columns for run, pause and delete, and an
+  edit button pushed the delete onto a line of its own - which is the same wrap the comment above
+  the base rule records fixing once already. Wrapping the buttons in their own flex box means the
+  row does not have to be recounted the next time one is added.
+*/
+.schedule-row.schedule-row-full {
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: start;
+}
+.schedule-row.schedule-row-full > svg {
+  margin-top: 3px;
+}
+.schedule-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+/*
+  The standing instruction, folded.
+
+  It is the one thing the box will act on unattended and the one thing no client could show, so it
+  is on the row - but open by default it would bury the timing under a paragraph on every schedule
+  at once. Folded, it is one click from the row that describes it.
+*/
+.schedule-prompt {
+  margin-top: 6px;
+}
+.schedule-prompt > summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  list-style: none;
+}
+.schedule-prompt > summary::-webkit-details-marker {
+  display: none;
+}
+.schedule-prompt > summary::before {
+  content: '▸ ';
+}
+.schedule-prompt[open] > summary::before {
+  content: '▾ ';
+}
+.schedule-prompt > p {
+  margin: 5px 0 0;
+  border-left: 2px solid #2f2f2f;
+  padding-left: 8px;
+  color: #c8c8c8;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+/* An instruction this server cannot decrypt is still a schedule that will run. Say so, plainly. */
+.schedule-prompt > p.unreadable {
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* The run that fired last, opened from the row that reports it. */
+.schedule-run-link {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.schedule-run-link:hover {
+  color: #e6e6e6;
+}
+
+/*
+  Editing. The form is the same form; these are the two things that only exist while it is open -
+  the pair of buttons, and the sentence explaining the one field that has gone read-only.
+*/
+.schedule-form-actions {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+.schedule-fixed {
+  border: 1px solid #2f2f2f;
+  border-radius: 9px;
+  padding: 9px;
+  background: #141414;
+}
+.schedule-fixed strong {
+  display: block;
+  font-size: 13px;
+}
+.schedule-fixed small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.schedule-row.editing {
+  border-color: #565656;
+}
+
+@media (max-width: 800px) {
+  /* The same breakpoint the dialog's own layout collapses at, for the same reason. */
+  .schedule-form-actions {
+    grid-template-columns: 1fr;
+  }
+}

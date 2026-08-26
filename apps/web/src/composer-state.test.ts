@@ -4,11 +4,13 @@ import {
   composerMenuItems,
   composerPlaceholder,
   composerSubmission,
+  composerTaskKind,
   hasSomethingToSend,
   modelChoiceFromValue,
   modelSelectValue,
   modelSheetGroups,
   privacyLine,
+  runCapUsd,
   sendBlock,
   sendsOnKey,
   type SendBlock,
@@ -347,6 +349,30 @@ describe('the model list inside the sheet', () => {
     });
     expect(result[2]?.options.every((option) => option.disabled)).toBe(true);
   });
+
+  /*
+   * The ranking route returns the argument for its top eight placements - "what it needs from the
+   * front is the argument" - and the client mapped the answer to a list of ids and dropped every
+   * sentence. So the picker reordered itself in silence and the owner had no way to ask why.
+   */
+  it('carries the router’s reason for a placement into the note beside it', () => {
+    const result = groups({
+      reasons: { 'openrouter/z-ai/glm-5.2': 'Leads on tool use in a 200K window' }
+    });
+    expect(result[1]?.options[0]?.note).toBe('Leads on tool use in a 200K window');
+    // "Recommended" is whatever the head of the ranking currently resolves to, so the argument for
+    // the head model belongs on that row too.
+    expect(result[0]?.options[0]?.note).toBe('Leads on tool use in a 200K window');
+    expect(result[0]?.options[1]?.note).toBe('');
+  });
+
+  it('says nothing rather than something empty for a model the route did not explain', () => {
+    expect(
+      groups()
+        .flatMap((group) => group.options)
+        .every((option) => option.note === '')
+    ).toBe(true);
+  });
 });
 
 describe('where inference goes, said once, inside the sheet that changes it', () => {
@@ -402,5 +428,88 @@ describe('what the one + offers', () => {
 
   it('holds the camera back while a send is in flight', () => {
     expect(items({ busy: true }).find((item) => item.action === 'photo')?.disabled).toBe(true);
+  });
+});
+
+/**
+ * The kind of work a draft is, where the browser is the only party that can know.
+ *
+ * `/v1/models/recommend` has taken `taskKind` all along and this client never sent one, so five
+ * written, weighted and tested router profiles were unreachable from the only entry point that
+ * ranks anything. Only the certain signal is claimed: an image on the tray is `hasImages`, which is
+ * the first thing the server's own classifier reads after a declared kind. Everything else in that
+ * classifier reads the prompt, which the server already has.
+ */
+describe('what the composer can tell the router about this turn', () => {
+  it('says vision when there is a picture on the tray', () => {
+    expect(composerTaskKind([attachment({ path: 'workspace/uploads/a1-chart.png' })])).toBe(
+      'vision'
+    );
+  });
+
+  it('says nothing at all for a document, rather than guessing at the prompt', () => {
+    expect(composerTaskKind([attachment()])).toBeUndefined();
+    expect(composerTaskKind([])).toBeUndefined();
+  });
+
+  it('ignores a picture that has not finished uploading, because it is not on the turn yet', () => {
+    expect(
+      composerTaskKind([
+        attachment({ path: 'workspace/uploads/a1-chart.png', status: 'uploading' })
+      ])
+    ).toBeUndefined();
+  });
+});
+
+/**
+ * The per-run ceiling, which every layer below the client has carried since the contract named it
+ * and which no control anywhere ever sent.
+ */
+describe('the ceiling on one run', () => {
+  it('reads an empty field as the account default rather than as zero', () => {
+    expect(runCapUsd('')).toEqual({ ok: true, value: null });
+    expect(runCapUsd('   ')).toEqual({ ok: true, value: null });
+  });
+
+  it('reads a figure the route would accept', () => {
+    expect(runCapUsd('12.50')).toEqual({ ok: true, value: 12.5 });
+  });
+
+  it('refuses a ceiling of nothing, and says which way out there is', () => {
+    for (const raw of ['0', '-3', 'lots']) {
+      const answer = runCapUsd(raw);
+      expect(answer.ok).toBe(false);
+      if (!answer.ok) expect(answer.message).toContain('per-conversation cap');
+    }
+  });
+
+  it('rides out on the send, so the field is what the route is actually told', () => {
+    const submission = composerSubmission({
+      prompt: 'Book the flights',
+      attachments: [],
+      block: undefined,
+      busy: false,
+      capUsd: '4'
+    });
+    expect(submission).toMatchObject({ kind: 'send', maxSpendUsd: 4 });
+  });
+
+  it('omitted, sends nothing, which is not the same as sending no ceiling', () => {
+    expect(
+      composerSubmission({ prompt: 'Hello', attachments: [], block: undefined, busy: false })
+    ).toMatchObject({ kind: 'send', maxSpendUsd: null });
+  });
+
+  /* A typo in a field two inches away is answered before a block that is a trip to another screen. */
+  it('stops the send with the sentence, before the configuration block', () => {
+    expect(
+      composerSubmission({
+        prompt: 'Hello',
+        attachments: [],
+        block,
+        busy: false,
+        capUsd: '-1'
+      })
+    ).toMatchObject({ kind: 'wait' });
   });
 });

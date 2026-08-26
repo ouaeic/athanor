@@ -69,8 +69,19 @@ export interface ConversationBucket {
  *
  * Pinning still wins. A run the owner pinned is a conversation they singled out, so it is held above
  * the dates on its own and the count beside its schedule no longer includes it.
+ *
+ * `includeArchived` is the sidebar asking for the filed ones back. Archiving is the one filing
+ * decision that took a conversation off every screen this client draws, and `include=archived` on
+ * the list route — implemented on all three arms since the day the contract named them — had no
+ * caller, so "Archive" meant "hide for ever unless you remember a word in it". They come back into
+ * the same date buckets rather than into a separate list: they are ordinary conversations that were
+ * put away, and the row says so.
  */
-export const groupConversations = (tasks: Task[], now = Date.now()): ConversationBucket[] => {
+export const groupConversations = (
+  tasks: Task[],
+  now = Date.now(),
+  includeArchived = false
+): ConversationBucket[] => {
   const startOfToday = new Date(now);
   startOfToday.setHours(0, 0, 0, 0);
   const today = startOfToday.getTime();
@@ -84,7 +95,7 @@ export const groupConversations = (tasks: Task[], now = Date.now()): Conversatio
     { label: 'Earlier', entries: [] }
   ];
   const ordered = [...tasks]
-    .filter((task) => !task.archivedAt)
+    .filter((task) => includeArchived || !task.archivedAt)
     .sort((left, right) => lastActivityAt(right) - lastActivityAt(left));
   const runs = new Map<string, Task[]>();
   for (const task of ordered) {

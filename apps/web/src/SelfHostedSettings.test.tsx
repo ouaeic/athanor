@@ -7,9 +7,18 @@
  */
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { RememberedList, SpendCeilingField, spendCeilingRequest } from './SelfHostedSettings.js';
+import {
+  ContextWindowField,
+  MemoryList,
+  RememberedList,
+  SkillList,
+  SpendCeilingField,
+  spendCeilingRequest
+} from './SelfHostedSettings.js';
 import { BASE_MONTHLY_CEILING_USD } from './usage-model.js';
-import type { MemoryItem } from './api.js';
+import { providerModelFields } from './settings-facts.js';
+import type { MemoryItem, ProviderSettings } from './api.js';
+import type { WorkspaceMemory, WorkspaceSkill } from './types.js';
 
 const items: MemoryItem[] = [
   {
@@ -112,5 +121,194 @@ describe('the spending ceiling asked for with the key', () => {
   it('withholds an answer it cannot read as money', () => {
     expect(spendCeilingRequest('later', 'UTC')).toBeUndefined();
     expect(spendCeilingRequest('-5', 'UTC')).toBeUndefined();
+  });
+});
+
+/*
+ * The durable facts: the list that is read back into every task.
+ *
+ * It was add-and-delete. Correcting one word meant deleting the row and typing it again, losing
+ * `createdAt` and any expiry with it — and it printed the row's *scope* where a reader looks for its
+ * provenance, so a fact the agent decided about the owner and one the owner typed read identically.
+ * Both of those facts have been served and typed since the list existed and were drawn by nothing.
+ */
+describe('the durable memory list', () => {
+  const memories: WorkspaceMemory[] = [
+    {
+      id: 'm1',
+      target: 'workspace',
+      content: 'Deploys go out on Thursdays',
+      status: 'active',
+      validFrom: '2026-01-01T00:00:00.000Z',
+      validUntil: null,
+      source: 'agent',
+      sourceTaskId: 't-99',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z'
+    },
+    {
+      id: 'm2',
+      target: 'user',
+      content: 'Call me Dan',
+      status: 'active',
+      validFrom: '2026-01-01T00:00:00.000Z',
+      validUntil: '2026-11-03T00:00:00.000Z',
+      source: 'owner',
+      sourceTaskId: null,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z'
+    }
+  ];
+
+  const list = (props: Partial<Parameters<typeof MemoryList>[0]> = {}): string =>
+    renderToStaticMarkup(
+      <MemoryList
+        items={memories}
+        onEdit={() => undefined}
+        onForget={() => undefined}
+        onOpenTask={() => undefined}
+        {...props}
+      />
+    );
+
+  /* The whole edit path is opening the row into the form above, exactly as a skill row does. */
+  it('offers every row as something to open and change', () => {
+    const markup = list();
+    expect(markup.match(/class="settings-list-open"/gu)).toHaveLength(2);
+    expect(markup).toContain('Open this memory to change it');
+  });
+
+  it('says where the form’s contents came from while a row is being edited', () => {
+    expect(list({ editingId: 'm1' })).toContain('being edited above');
+    expect(list()).not.toContain('being edited above');
+  });
+
+  /* Two different questions that had one answer between them on the row. */
+  it('tells a fact the agent decided from one the owner typed, apart from the scope', () => {
+    const markup = list();
+    expect(markup).toContain('About this computer');
+    expect(markup).toContain('the agent decided this');
+    expect(markup).toContain('About you, everywhere');
+    expect(markup).toContain('you wrote this');
+  });
+
+  it('says plainly when a fact has no expiry, and shows the date when it has one', () => {
+    const markup = list();
+    expect(markup).toContain('no expiry');
+    expect(markup).toContain('used until');
+  });
+
+  /* Judging a fact used to mean deleting it blind: the id was served and read by nothing. */
+  it('offers the conversation that wrote a row, and only where there is one', () => {
+    expect(list().match(/aria-label="Open the conversation that wrote this"/gu)).toHaveLength(1);
+  });
+
+  it('offers no link at all when the screen has nowhere to send the reader', () => {
+    expect(list({ onOpenTask: undefined })).not.toContain('Open the conversation that wrote this');
+  });
+});
+
+/*
+ * The learned procedures, and the timer that retires them.
+ *
+ * Curation runs at every task start: thirty days unused makes a skill stale, ninety archives it,
+ * and anything not active and not pinned is dropped from the index the model sees. The row printed
+ * the resulting word and offered nothing, so the only recovery was to re-open the skill in the
+ * editor and press Save — which resets the status through the upsert by accident.
+ */
+describe('the learned skills list', () => {
+  const skill = (over: Partial<WorkspaceSkill> = {}): WorkspaceSkill => ({
+    id: 's1',
+    name: 'release-a-website',
+    description: 'Ship the static site',
+    content: '## When to use',
+    version: 3,
+    enabled: true,
+    status: 'active',
+    pinned: false,
+    useCount: 2,
+    lastUsedAt: '2026-06-01T00:00:00.000Z',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-06-01T00:00:00.000Z',
+    ...over
+  });
+
+  const list = (items: WorkspaceSkill[]): string =>
+    renderToStaticMarkup(
+      <SkillList
+        items={items}
+        busy={false}
+        onOpen={() => undefined}
+        onSetState={() => undefined}
+        onDelete={() => undefined}
+      />
+    );
+
+  it('offers a pin on every row and says what pinning is for', () => {
+    const markup = list([skill()]);
+    expect(markup).toContain('aria-label="Pin the release-a-website skill"');
+    expect(markup).toContain('never retired for going unused');
+  });
+
+  it('shows a pinned skill as pinned, and offers to unpin it', () => {
+    const markup = list([skill({ pinned: true })]);
+    expect(markup).toContain('· pinned');
+    expect(markup).toContain('aria-label="Unpin the release-a-website skill"');
+  });
+
+  /* The one thing an archived row could not do, on the row that says it was archived. */
+  it('offers a retired skill a way back, with the reason it went', () => {
+    const markup = list([skill({ status: 'archived' })]);
+    expect(markup).toContain('Make active');
+    expect(markup).toContain('· archived');
+    expect(markup).toContain('Retired for not being used');
+  });
+
+  it('does not offer to reactivate a skill that is already active', () => {
+    expect(list([skill()])).not.toContain('Make active');
+  });
+});
+
+/*
+ * The context window, which was write-only.
+ *
+ * Saved into the model catalogue, never returned by the provider read, and re-initialised to
+ * 128,000 on every open — so the next save of anything, a key rotation included, silently wrote
+ * that default back over a 200k model. This is the round trip, end to end: what the server holds,
+ * through the restore, into the number the field actually shows.
+ */
+describe('the provider form after a reload', () => {
+  const saved: ProviderSettings = {
+    configured: true,
+    source: 'encrypted_database',
+    provider: 'openai-compatible',
+    baseUrl: 'https://models.example/v1',
+    modelId: 'big-one',
+    hasApiKey: true,
+    enforceZeroDataRetention: true
+  };
+
+  it('re-renders a saved 200k context window rather than the default', () => {
+    const fields = providerModelFields({
+      ...saved,
+      contextTokens: 200_000,
+      capabilities: ['chat', 'tools', 'vision']
+    });
+    const markup = renderToStaticMarkup(
+      <ContextWindowField value={fields.contextTokens} onChange={() => undefined} />
+    );
+    expect(markup).toContain('value="200000"');
+    expect(markup).not.toContain('value="128000"');
+    expect(fields.vision).toBe(true);
+  });
+
+  it('falls back to 128k only when the server genuinely said nothing', () => {
+    const markup = renderToStaticMarkup(
+      <ContextWindowField
+        value={providerModelFields(saved).contextTokens}
+        onChange={() => undefined}
+      />
+    );
+    expect(markup).toContain('value="128000"');
   });
 });

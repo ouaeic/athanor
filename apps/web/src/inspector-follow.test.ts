@@ -25,10 +25,31 @@ describe('the pane that is showing the work', () => {
     ).toBe('computer');
   });
 
-  it('names the Terminal while the agent is running a command', () => {
+  // The Terminal pane opens `GET .../terminal`, which spawns a *fresh* pty with its own pipes; the
+  // agent's shell runs through `POST .../exec` (agent.ts). Following a shell call to the Terminal
+  // therefore showed the owner their own idle `$` while the build they were told about ran
+  // somewhere they could not see - and started a second shell on the box to do it, renewing a
+  // capability token for a pane they had never opened.
+  it('does not send the owner to a terminal that is not the one the agent is using', () => {
     expect(
       followedPane(task('running'), [event(1, 'user_message'), event(2, 'tool_started', 'shell')])
-    ).toBe('terminal');
+    ).not.toBe('terminal');
+  });
+
+  // `process` is how the agent inspects what it left running in the background, and the Running
+  // pane is the one surface that lists those sessions.
+  it('names the Running pane while the agent is inspecting a background session', () => {
+    expect(
+      followedPane(task('running'), [event(1, 'user_message'), event(2, 'tool_started', 'process')])
+    ).toBe('preview');
+  });
+
+  // The whole of a foreground command's output is written into the transcript the owner is already
+  // reading, so there is no second surface for this to point at.
+  it('says nothing at all for a foreground command, whose output is already on screen', () => {
+    expect(
+      followedPane(task('running'), [event(1, 'user_message'), event(2, 'tool_started', 'shell')])
+    ).toBeUndefined();
   });
 
   it('treats the agent browser as the computer, because it is the same screen', () => {
@@ -44,7 +65,7 @@ describe('the pane that is showing the work', () => {
     expect(
       followedPane(task('running'), [
         event(1, 'user_message'),
-        event(2, 'tool_started', 'shell'),
+        event(2, 'tool_started', 'process'),
         event(3, 'tool_started', 'desktop_observe')
       ])
     ).toBe('computer');
@@ -56,11 +77,11 @@ describe('the pane that is showing the work', () => {
     expect(
       followedPane(task('running'), [
         event(1, 'user_message'),
-        event(2, 'tool_started', 'shell'),
-        event(3, 'tool_result', 'shell'),
+        event(2, 'tool_started', 'process'),
+        event(3, 'tool_result', 'process'),
         event(4, 'assistant_delta')
       ])
-    ).toBe('terminal');
+    ).toBe('preview');
   });
 
   it('says nothing for work that leaves no pane to watch', () => {
@@ -86,8 +107,8 @@ describe('the pane that is showing the work', () => {
   it('keeps following while the conversation waits on the owner or the box', () => {
     for (const status of ['queued', 'planning', 'awaiting_user', 'awaiting_resource', 'paused'])
       expect(
-        followedPane(task(status), [event(1, 'user_message'), event(2, 'tool_started', 'shell')])
-      ).toBe('terminal');
+        followedPane(task(status), [event(1, 'user_message'), event(2, 'tool_started', 'process')])
+      ).toBe('preview');
   });
 
   // A conversation resumed an hour after a shell command would otherwise snap to the Terminal the
@@ -96,7 +117,7 @@ describe('the pane that is showing the work', () => {
     expect(
       followedPane(task('running'), [
         event(1, 'user_message'),
-        event(2, 'tool_started', 'shell'),
+        event(2, 'tool_started', 'process'),
         event(3, 'completed'),
         event(4, 'user_message')
       ])

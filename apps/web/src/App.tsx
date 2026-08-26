@@ -42,7 +42,10 @@ import type {
   TaskEvent,
   TaskRewindPreview
 } from './types.js';
-import { nativeBridge, nativeTarget } from './native.js';
+import { nativeBridge, ringsNatively } from './native.js';
+import { nativeNotificationsEnabled } from './native-notifications.js';
+import { approvalReach } from './approval-copy.js';
+import type { NotificationKind, NotificationSettings } from './notification-settings.js';
 import { computerChangeLine, turnComputerQuery } from './completion-card.js';
 import { consumeSharedPayload } from './share-target.js';
 import {
@@ -60,7 +63,12 @@ import {
   windowAfterPage,
   type EventWindow
 } from './event-window.js';
-import { composerSubmission, hasSomethingToSend, sendBlock } from './composer-state.js';
+import {
+  composerSubmission,
+  composerTaskKind,
+  hasSomethingToSend,
+  sendBlock
+} from './composer-state.js';
 import { removeTask, upsertTask } from './task-list.js';
 import {
   isLiveTask,
@@ -90,7 +98,12 @@ import { describeFailure } from './failure-text.js';
 import { followedPane } from './inspector-follow.js';
 import { modelDisplayName } from './model-names.js';
 import type { AgentNotification } from './notice-log.js';
-import { rewindOffer, rewindResultNotice, type TrajectoryDraft } from './rewind.js';
+import {
+  rewindOffer,
+  rewindResultNotice,
+  trajectoryModelFields,
+  type TrajectoryDraft
+} from './rewind.js';
 import { paneId, panes, shortcutRows, stepPane, windowShortcut, type Pane } from './shortcuts.js';
 import {
   formatUsd,
@@ -186,6 +199,51 @@ export const computerHeldBy = (task: Task | undefined, tasks: Task[]): Task | un
       )
     : undefined;
 
+/** One thing the packaged shell could raise with the operating system. */
+export interface NativeNotice {
+  /** Stable for the thing being reported, so it is announced once and never again. */
+  id: string;
+  kind: NotificationKind;
+  title: string;
+  body: string;
+}
+
+/**
+ * What a packaged shell should ring about, out of everything a poll has just seen.
+ *
+ * Two defects meet here. The native path served two of the five kinds — `agent_message` and
+ * `takeover_needed` — and not `approval_required`, which is the agent stopped waiting on a person
+ * and which the store itself ranks priority 0; and the quiet hours and per-kind switches the owner
+ * sets were stored and then applied only on the Web Push delivery path, which is the one path a
+ * packaged shell has no subscription on. So the installed application could not be told the one
+ * thing that matters, and rang anyway at 3 a.m. for the things it could.
+ *
+ * Seen is seen, whether or not it rang. A notice suppressed by quiet hours is still on the screen
+ * and still in the notice log; holding it here to ring the moment the window ends would make this a
+ * delivery queue, which it is not — the box's own push path is the thing that holds and re-delivers,
+ * and the alternative is a burst of eight notifications at 07:01.
+ */
+export const nativeNoticesToRaise = (input: {
+  candidates: NativeNotice[];
+  /** Mutated: the ids this poll has now accounted for. */
+  seen: Set<string>;
+  settings: NotificationSettings | null;
+  at?: Date;
+}): NativeNotice[] => {
+  const raise: NativeNotice[] = [];
+  for (const candidate of input.candidates) {
+    if (input.seen.has(candidate.id)) continue;
+    input.seen.add(candidate.id);
+    const decision = {
+      kind: candidate.kind,
+      settings: input.settings,
+      ...(input.at ? { at: input.at } : {})
+    };
+    if (ringsNatively(decision)) raise.push(candidate);
+  }
+  return raise;
+};
+
 /**
  * Whether the offer to reload can be made without asking the owner to lose something for it.
  *
@@ -243,9 +301,30 @@ export function App() {
   );
   const [modelAutomatic, setModelAutomatic] = useState(storedModel.current?.automatic ?? true);
   const [recommendedModelIds, setRecommendedModelIds] = useState<string[]>([]);
+  /**
+   * The router's argument for the placements it explains, which this client used to discard.
+   *
+   * `/v1/models/recommend` returns `reasons` for the top eight — its comment says "what it needs
+   * from the front is the argument" — and the only caller mapped the answer to `entry.modelId` and
+   * threw the rest away. So the picker silently reordered itself and never said why.
+   */
+  const [modelReasons, setModelReasons] = useState<Record<string, string>>({});
+  /** What is in the composer's ceiling field, exactly as typed. Empty is the account's own cap. */
+  const [capUsd, setCapUsd] = useState('');
   const [modelId, setModelId] = useState(storedModel.current?.modelId ?? '');
   const [busy, setBusy] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  /**
+   * The conversations the owner filed away, kept apart from the bootstrap's list.
+   *
+   * Apart rather than merged into `data.tasks` because the bootstrap is re-read on focus, on
+   * regaining the network and once a minute, and every one of those replaces the list wholesale —
+   * merged, the archived rows would blink out of the sidebar while the toggle still said they were
+   * showing.
+   */
+  const [archivedTasks, setArchivedTasks] = useState<Task[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
+  const [loadingArchived, setLoadingArchived] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [offline, setOffline] = useState(false);
@@ -418,9 +497,6 @@ export function App() {
   const pendingShareId = useRef(new URLSearchParams(window.location.search).get('share'));
   const consumingShare = useRef(false);
   const currentData = useRef<Bootstrap | undefined>(undefined);
-  const pendingNativeTarget = useRef<{ kind: 'task' | 'workspace'; id: string } | undefined>(
-    undefined
-  );
   const trajectoryPrompt = useRef<HTMLTextAreaElement>(null);
 
   // The composer grows with the draft up to the CSS max-height, then scrolls. Without this a
@@ -590,24 +666,6 @@ export function App() {
     window.location.reload();
   };
 
-  const applyNativeTarget = (
-    target: { kind: 'task' | 'workspace'; id: string },
-    source = currentData.current
-  ): boolean => {
-    if (!source) return false;
-    if (target.kind === 'task') {
-      const linkedTask = source.tasks.find((item) => item.id === target.id);
-      if (!linkedTask) return false;
-      setWorkspaceId(linkedTask.workspaceId);
-      setTaskId(linkedTask.id);
-      return true;
-    }
-    if (!source.workspaces.some((item) => item.id === target.id)) return false;
-    setWorkspaceId(target.id);
-    setTaskId(undefined);
-    return true;
-  };
-
   const load = useCallback(async () => {
     try {
       const response = await api.bootstrap();
@@ -739,32 +797,152 @@ export function App() {
    * show them, not raise four notifications about things that happened while it was closed.
    */
   const announcedNotices = useRef<Set<string> | null>(null);
+  /*
+   * One seen-set per source, deliberately: they arrive from three different polls, and a single set
+   * would let whichever list answered second skip its own seeding and ring for everything already
+   * waiting. Each is null until its source has answered once, which is what makes the seeding
+   * honest — seeded from an empty initial state instead, the first real answer would look like news
+   * and a shell opening to four waiting approvals would raise four notifications about them.
+   */
+  const announcedApprovals = useRef<Set<string> | null>(null);
+  const announcedEndings = useRef<Set<string> | null>(null);
+  /** The owner's notification policy, read by the one client it was never applied to. */
+  const [notificationPolicy, setNotificationPolicy] = useState<NotificationSettings | null>(null);
+  const announce = useCallback(
+    (seen: { current: Set<string> | null }, candidates: NativeNotice[]) => {
+      // The first sight of a list is not news. A shell opening to four waiting approvals should
+      // show them, not raise four notifications about things that happened while it was closed.
+      if (!seen.current) {
+        seen.current = new Set(candidates.map((candidate) => candidate.id));
+        return;
+      }
+      // Only in a packaged shell - a browser has Web Push, which the box drives - only once the
+      // owner has pressed the button in Settings that stores the preference, and only when nobody
+      // is looking at the window: a notification about something already on screen is noise.
+      //
+      // The middle clause is what stops `notify` raising an OS permission dialog from a timer, at a
+      // moment the owner did not choose, under a screen that told them it could not happen at all.
+      if (
+        !nativeBridge.available() ||
+        !nativeNotificationsEnabled() ||
+        document.visibilityState === 'visible'
+      ) {
+        for (const candidate of candidates) seen.current.add(candidate.id);
+        return;
+      }
+      for (const notice of nativeNoticesToRaise({
+        candidates,
+        seen: seen.current,
+        settings: notificationPolicy
+      }))
+        void nativeBridge.notify(notice.title, notice.body);
+    },
+    [notificationPolicy]
+  );
   const loadNotices = useCallback(() => {
     void api
       .agentNotifications()
       .then((list) => {
         const next = list ?? [];
         setNotices(next);
-        if (!announcedNotices.current) {
-          announcedNotices.current = new Set(next.map((notice) => notice.id));
-          return;
-        }
-        // Web Push cannot reach a packaged shell - it has no subscription and never will - so the
-        // one client that is an installed application was the one the box could tell nothing. It
-        // is already polling for these, so it raises them itself, and only when nobody is looking
-        // at the window: a notification about something already on screen is noise.
-        if (!nativeBridge.available() || document.visibilityState === 'visible') {
-          announcedNotices.current = new Set(next.map((notice) => notice.id));
-          return;
-        }
-        for (const notice of next) {
-          if (announcedNotices.current.has(notice.id)) continue;
-          announcedNotices.current.add(notice.id);
-          void nativeBridge.notify(notice.taskTitle || 'athanor', notice.message);
-        }
+        announce(
+          announcedNotices,
+          next.map((notice) => ({
+            id: notice.id,
+            kind: notice.kind === 'takeover_needed' ? 'takeoverNeeded' : 'agentMessage',
+            title: notice.taskTitle || 'athanor',
+            body: notice.message
+          }))
+        );
       })
       .catch(() => undefined);
-  }, []);
+  }, [announce]);
+  /*
+   * Read whenever Settings has been open, because that is the only screen that can change it, and
+   * only on a packaged shell: a browser's copy of this policy is applied by the box on the delivery
+   * path and asking for it here would buy nothing. A box too old to have the route answers null,
+   * which `ringsNatively` reads as "has never been told otherwise".
+   */
+  useEffect(() => {
+    if (auth !== 'ready' || settingsPage || !nativeBridge.available()) return;
+    void api
+      .notificationSettings()
+      .then(setNotificationPolicy)
+      .catch(() => undefined);
+  }, [auth, settingsPage]);
+  /*
+   * The approval queue is the one the box ranks priority 0 — the agent has stopped and is waiting
+   * on a person — and it was the one kind the native path could not carry. The list is already
+   * here; this is the seen-set treatment the notice poll has always had, applied to it.
+   *
+   * Announced from the answer rather than from an effect on the state it lands in: an empty first
+   * poll is indistinguishable from the empty initial state, so an effect would seed from the state
+   * before anything had been asked and then ring for every request already waiting.
+   */
+  const receiveApprovals = useCallback(
+    (pending: Approval[]) => {
+      setApprovals(pending);
+      announce(
+        announcedApprovals,
+        pending.map((approval) => ({
+          id: approval.id,
+          kind: 'approvalRequired' as const,
+          title:
+            currentData.current?.tasks.find((item) => item.id === approval.taskId)?.title ??
+            'athanor',
+          // The same sentence the card and the live region use, so what wakes the phone and what
+          // is on the screen when they pick it up are the same words.
+          body: `Your confirmation is required. ${approvalReach(approval)}.`
+        }))
+      );
+    },
+    [announce]
+  );
+  /*
+   * A conversation reaching an end, which is `task_finished` — a kind the settings screen has always
+   * offered a switch for and which nothing on this client could ever raise.
+   *
+   * The id carries the status, so the transition is what is announced rather than the conversation:
+   * a task that is already finished when the app opens seeds the set and says nothing.
+   */
+  useEffect(() => {
+    if (!data) return;
+    announce(
+      announcedEndings,
+      data.tasks
+        .filter((item) => terminalTaskStatuses.has(item.status))
+        .map((item) => ({
+          id: `${item.id}:${item.status}`,
+          kind: 'taskFinished' as const,
+          // The sentence already names the conversation, so the title does not say it twice.
+          title: 'athanor',
+          body: taskStateAnnouncement(item.title, item.status)
+        }))
+    );
+  }, [data?.tasks, announce]);
+  /*
+   * The poll that runs while nobody is looking, which only a packaged shell has.
+   *
+   * Every other refresh in this file is gated on `visibilityState === 'visible'`, for good reasons:
+   * a backgrounded phone should not be asking a box for anything. But that gate is also why the one
+   * `notify` call site in the product could never fire — the only paths that reached it ran when the
+   * window was visible, and it declines to interrupt anyone over a window they are looking at. A
+   * shell with no push subscription has no other way of being told, so it keeps asking, slowly, and
+   * only while it is in the background.
+   */
+  useEffect(() => {
+    if (auth !== 'ready' || !nativeBridge.available()) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') return;
+      loadNotices();
+      void api
+        .approvals()
+        .then(receiveApprovals)
+        .catch(() => undefined);
+      void load();
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, [auth, load, loadNotices, receiveApprovals]);
   useEffect(() => {
     /*
      * The service worker refuses to raise a notification over a window that is already open, and
@@ -778,14 +956,14 @@ export function App() {
       if (!message || message.source !== 'athanor-push') return;
       void api
         .approvals()
-        .then(setApprovals)
+        .then(receiveApprovals)
         .catch(() => undefined);
       loadNotices();
       void load();
     };
     navigator.serviceWorker.addEventListener('message', receivePush);
     return () => navigator.serviceWorker.removeEventListener('message', receivePush);
-  }, [load, loadNotices]);
+  }, [load, loadNotices, receiveApprovals]);
   /**
    * Whether what is on screen is a release the box has already replaced.
    *
@@ -1039,32 +1217,23 @@ export function App() {
   }, [workspace?.id]);
   useEffect(() => {
     currentData.current = data;
-    if (
-      data &&
-      pendingNativeTarget.current &&
-      applyNativeTarget(pendingNativeTarget.current, data)
-    ) {
-      pendingNativeTarget.current = undefined;
-    }
   }, [data]);
+  /*
+   * What the shell can do, asked once and answered from build facts rather than guessed.
+   *
+   * The in-page deep-link listener that used to be installed here is gone. It read
+   * `window.__TAURI__.deepLink`, which does not exist in this app — `withGlobalTauri` is false and
+   * no deep-link plugin is bundled — so it could never fire, and the shell now says as much
+   * (`deepLinkEvents: false`) rather than leaving the page to find out by never being called. Deep
+   * links themselves still work: the shell navigates the window to `origin/?task=<id>` and `load()`
+   * reads that query. What it costs is a document reload, which is a fact about the shell.
+   */
   useEffect(() => {
     if (!nativeBridge.available()) return;
-    let unlisten: (() => void) | undefined;
     void nativeBridge
       .capabilities()
       .then((capabilities) => setNativeFolderPicker(capabilities.folderPicker))
       .catch(() => setNativeFolderPicker(false));
-    void nativeBridge
-      .onDeepLinks((raw) => {
-        const target = nativeTarget(raw);
-        if (!target) return;
-        if (!applyNativeTarget(target)) pendingNativeTarget.current = target;
-      })
-      .then((stop) => {
-        unlisten = stop;
-      })
-      .catch(() => undefined);
-    return () => unlisten?.();
   }, []);
 
   /**
@@ -1147,6 +1316,18 @@ export function App() {
   const namedModel = useCallback(
     (id: string): string => modelDisplayName(data?.models ?? [], id),
     [data?.models]
+  );
+  /*
+   * The bootstrap's list wins wherever the two hold the same conversation: un-archiving one puts a
+   * fresh copy in `data.tasks`, and folding the other way would let the stale archived copy of it
+   * overwrite that and file it away again on screen.
+   */
+  const sidebarTasks = useMemo(
+    () =>
+      showArchived && archivedTasks.length
+        ? (data?.tasks ?? []).reduce(upsertTask, archivedTasks)
+        : (data?.tasks ?? []),
+    [showArchived, archivedTasks, data?.tasks]
   );
   const blocked = sendBlock({
     workspaceAvailable: Boolean(workspace),
@@ -1256,23 +1437,40 @@ export function App() {
     if (task && task.status !== 'awaiting_user')
       setAnnouncement(taskStateAnnouncement(task.title, task.status));
   }, [task?.id, task?.status, task?.title]);
+  /* Derived rather than computed inside the effect below, so re-ranking is triggered by the answer
+     changing and not by the tray being a new array on every render. */
+  const attachmentTaskKind = composerTaskKind(attachments);
   useEffect(() => {
     if (auth !== 'ready') return;
     let active = true;
     void api
-      .recommendModels(privacyRoute, modelPreference)
+      // What this turn is going to be, where this client is the only party that can know it. The
+      // route's five profiles were unreachable from the only entry point that ranks anything
+      // because nothing ever named one; an image on the tray is the signal the browser holds and
+      // the prompt does not carry, and it is the first thing the server's own classifier reads.
+      .recommendModels(privacyRoute, modelPreference, attachmentTaskKind)
       .then((ranked) => {
         if (!active) return;
         setRecommendedModelIds(ranked.map((entry) => entry.modelId));
+        setModelReasons(
+          Object.fromEntries(
+            ranked.flatMap((entry) =>
+              entry.reasons?.[0] ? [[entry.modelId, entry.reasons[0]]] : []
+            )
+          )
+        );
         if (modelAutomatic) setModelId(ranked[0]?.modelId ?? '');
       })
       .catch(() => {
-        if (active) setRecommendedModelIds([]);
+        if (active) {
+          setRecommendedModelIds([]);
+          setModelReasons({});
+        }
       });
     return () => {
       active = false;
     };
-  }, [auth, privacyRoute, modelPreference, modelAutomatic, data?.models]);
+  }, [auth, privacyRoute, modelPreference, modelAutomatic, data?.models, attachmentTaskKind]);
   useEffect(() => {
     if (!workspace) return;
     let active = true;
@@ -1366,7 +1564,7 @@ export function App() {
       void api
         .approvals()
         .then((pending) => {
-          if (active) setApprovals(pending);
+          if (active) receiveApprovals(pending);
         })
         .catch(() => undefined);
     };
@@ -1378,7 +1576,7 @@ export function App() {
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', refresh);
     };
-  }, [auth, taskIsActive]);
+  }, [auth, taskIsActive, receiveApprovals]);
   /**
    * A conversation started somewhere else, on a device nobody has touched.
    *
@@ -1695,7 +1893,7 @@ export function App() {
   }, []);
 
   const send = async (options: { interrupt?: boolean } = {}) => {
-    const submission = composerSubmission({ prompt, attachments, block: blocked, busy });
+    const submission = composerSubmission({ prompt, attachments, block: blocked, busy, capUsd });
     if (submission.kind === 'nothing') return;
     if (submission.kind === 'wait') {
       setError(submission.message);
@@ -1709,7 +1907,7 @@ export function App() {
     if (!workspace) return;
     // The paths ride behind the message rather than inside the sentence, so what the transcript
     // shows, what search indexes and what the sidebar quotes is what the owner actually wrote.
-    const { text, attachments: ready } = submission;
+    const { text, attachments: ready, maxSpendUsd } = submission;
     const typed = prompt.trim();
     const optimistic: PendingUserMessage = {
       id: `pending-${crypto.randomUUID()}`,
@@ -1741,6 +1939,9 @@ export function App() {
           modelId,
           privacyRoute,
           maxComputeCredits: 5,
+          // Omitted, not null: the route reads an absent ceiling as "use the account default",
+          // which is not the same as no ceiling at all.
+          ...(maxSpendUsd === null ? {} : { maxSpendUsd }),
           ...(options.interrupt ? { interrupt: true } : {})
         });
         setData((current) =>
@@ -1758,7 +1959,8 @@ export function App() {
           prompt: text,
           modelId,
           privacyRoute,
-          maxComputeCredits: 5
+          maxComputeCredits: 5,
+          ...(maxSpendUsd === null ? {} : { maxSpendUsd })
         });
         setData((current) =>
           current ? { ...current, tasks: upsertTask(current.tasks, created) } : current
@@ -1772,7 +1974,20 @@ export function App() {
         // choice made seconds earlier.
         setTabHeldFor((current) => (current === '' ? created.id : current));
         setEvents([]);
+        // The ceiling read back off the conversation the box actually made, rather than the number
+        // that was typed into the field. A control that reports what it sent, instead of what
+        // landed, is how a setting comes to be believed for months without ever having been stored.
+        if (maxSpendUsd !== null)
+          setNotice(
+            created.maxSpendUsd
+              ? `This conversation stops at ${formatUsd(created.maxSpendUsd)}.`
+              : 'This box did not record a ceiling for this conversation; your account caps still apply.'
+          );
       }
+      // Cleared only on the way out of a successful send, so "cap this run" means this run: a
+      // ceiling left in the field would quietly govern every later turn from a control that had
+      // scrolled out of sight. A failed send keeps it, because the retry is the same send.
+      setCapUsd('');
       for (const item of ready) if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
     } catch (cause) {
       setPendingSend(undefined);
@@ -1841,6 +2056,33 @@ export function App() {
       setError(describeFailure(cause, 'Could not load earlier conversations'));
     } finally {
       setLoadingEarlier(false);
+    }
+  };
+
+  /**
+   * The conversations the owner put out of the way, fetched the one way there is to reach them.
+   *
+   * `include=archived` has been implemented on all three arms of the list route since the contract
+   * named them, and nothing ever asked for it. So Archive — a control on every row in the sidebar —
+   * took a conversation off every screen this client draws, and the only route back was remembering
+   * a word in it and searching for that. Asked for from the top of the list rather than from the
+   * bootstrap's cursor: that cursor is a position in the *active* list, and the archived ones the
+   * owner is looking for are usually the recent ones.
+   */
+  const revealArchived = async (next: boolean) => {
+    setShowArchived(next);
+    if (!next || archivedTasks.length || loadingArchived) return;
+    setLoadingArchived(true);
+    try {
+      const page = await api.tasks(null, 'archived');
+      setArchivedTasks(page.tasks);
+    } catch (cause) {
+      // Back off the toggle as well as saying so: leaving it on over a list that never arrived
+      // would read as "you have archived nothing", which is the opposite of the truth.
+      setShowArchived(false);
+      setError(describeFailure(cause, 'Could not load your archived conversations'));
+    } finally {
+      setLoadingArchived(false);
     }
   };
 
@@ -2027,14 +2269,16 @@ export function App() {
               prompt: trajectory.prompt.trim(),
               maxComputeCredits: 5,
               stopSource: trajectory.stopSource,
-              ...machine
+              ...machine,
+              ...trajectoryModelFields(trajectory)
             }
           : {
               operation: 'retry',
               eventId: trajectory.eventId,
               maxComputeCredits: 5,
               stopSource: trajectory.stopSource,
-              ...machine
+              ...machine,
+              ...trajectoryModelFields(trajectory)
             }
       );
       setTrajectory(undefined);
@@ -2258,13 +2502,13 @@ export function App() {
     }
     void wholeMarkdown.then((markdown) => {
       const name = `${title.replace(/[^a-zA-Z0-9 _-]+/g, ' ').trim() || 'conversation'}.md`;
-      const url = URL.createObjectURL(new Blob([markdown], { type: 'text/markdown' }));
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = name;
-      anchor.rel = 'noopener';
-      anchor.click();
-      URL.revokeObjectURL(url);
+      // Through the bridge rather than straight onto an anchor. Six flows in the product are an
+      // `<a download>` on a blob, and on a packaged shell that reports no download support - wry
+      // registers none on Android, and iOS has no Downloads directory to write into - the click
+      // does nothing at all and says nothing. There is a way out of this one, and it is two
+      // millimetres away on the same menu.
+      if (!nativeBridge.save(name, new Blob([markdown], { type: 'text/markdown' })))
+        setError('This app cannot save files on this device. Copy the conversation instead.');
     });
   };
 
@@ -2680,7 +2924,7 @@ export function App() {
             user={data.user}
             fire={fireState}
             workspaces={data.workspaces}
-            tasks={data.tasks}
+            tasks={sidebarTasks}
             scheduleRunCounts={data.scheduleRunCounts}
             schedules={data.schedules}
             selectedWorkspaceId={workspaceId}
@@ -2706,6 +2950,9 @@ export function App() {
             onDelete={deleteConversation}
             onEarlier={data.tasksCursor ? () => void loadEarlierConversations() : undefined}
             loadingEarlier={loadingEarlier}
+            showArchived={showArchived}
+            onShowArchived={(next) => void revealArchived(next)}
+            loadingArchived={loadingArchived}
           />
         </div>
         {mobileNav && (
@@ -2726,7 +2973,7 @@ export function App() {
           user={data.user}
           fire={fireState}
           workspaces={data.workspaces}
-          tasks={data.tasks}
+          tasks={sidebarTasks}
           scheduleRunCounts={data.scheduleRunCounts}
           schedules={data.schedules}
           selectedWorkspaceId={workspaceId}
@@ -2746,6 +2993,9 @@ export function App() {
           onDelete={deleteConversation}
           onEarlier={data.tasksCursor ? () => void loadEarlierConversations() : undefined}
           loadingEarlier={loadingEarlier}
+          showArchived={showArchived}
+          onShowArchived={(next) => void revealArchived(next)}
+          loadingArchived={loadingArchived}
         />
         <main className="workbench">
           <header className="workbench-header">
@@ -2961,6 +3211,10 @@ export function App() {
             onOpenAiSettings={() => openSettings('ai')}
             models={models}
             unavailableModels={unavailableModels}
+            modelReasons={modelReasons}
+            capUsd={capUsd}
+            onCapUsd={setCapUsd}
+            taskCapUsd={task?.maxSpendUsd ?? null}
             modelChoice={
               modelAutomatic
                 ? { automatic: true, preference: modelPreference }
@@ -3023,6 +3277,14 @@ export function App() {
               promptRef={trajectoryPrompt}
               taskIsActive={taskIsActive}
               busy={busy}
+              /*
+                The catalogue and the model this conversation is already on. The dialog draws no
+                model row without both, deliberately: it would rather offer nothing than offer a
+                choice this caller then drops, which is what happened until `runTrajectory` below
+                learned to carry `modelId`.
+              */
+              models={models}
+              currentModelId={task.modelId}
               onConfirm={() => void runTrajectory()}
               onCancel={() => setTrajectory(undefined)}
               onOpenRecoveryPoints={() => openSettings('server')}

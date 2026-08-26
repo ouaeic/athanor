@@ -4,8 +4,9 @@ import { api } from './api.js';
 import {
   approvalAnnouncement,
   approvalDiffState,
+  approvalProvenance,
   approvalReach,
-  expiryPhrase,
+  expiryNote,
   needsComputer,
   nextApproval
 } from './approval-copy.js';
@@ -261,6 +262,7 @@ export function Approvals({
   // `action` on its own and the body `preview`, which repeats it — so a compromised agent got the
   // top line, the body, and the last word.
   const wording = agentSentence(item);
+  const provenance = approvalProvenance(item, context);
   const elsewhere = Boolean(openTaskId) && item.taskId !== openTaskId;
   const elsewhereTitle = elsewhere ? (taskTitles?.[item.taskId] ?? '') : '';
   return (
@@ -298,11 +300,15 @@ export function Approvals({
         <strong id="approval-headline">{approvalReach(item)}</strong>
         <RequestFacts approval={item} />
         {/* Where the request came from, as against what it does. Both answers are drawn, because a
-            line that only appears when something is wrong teaches its own absence to mean safety. */}
-        {context && (
-          <p className={`approval-context ${context.exposed ? 'exposed' : 'clean'}`}>
-            {context.exposed ? <BookOpen /> : <ShieldCheck />}
-            <span>{context.text}</span>
+            line that only appears when something is wrong teaches its own absence to mean safety.
+
+            The origin recorded on the request itself outranks the one derived from the trajectory
+            on screen: it is written by the turn that raised the card, so it is the only one there
+            is for a request raised in a conversation the owner is not looking at. */}
+        {provenance && (
+          <p className={`approval-context ${provenance.exposed ? 'exposed' : 'clean'}`}>
+            {provenance.exposed ? <BookOpen /> : <ShieldCheck />}
+            <span>{provenance.text}</span>
           </p>
         )}
         {changes.length > 0 && ready && (
@@ -328,11 +334,12 @@ export function Approvals({
           </blockquote>
         )}
         {/* An absolute timestamp answers a question nobody asked. What decides whether to get up
-            and answer this is how long is left.
+            and answer this is how long is left — and, since a lapse is a silent skip rather than a
+            block or a denial, what happens if they do not.
 
             How far the request reaches is the card's headline, above; repeating it here said the
             same sentence twice on a card already fighting to keep its buttons on screen. */}
-        <small>{expiryPhrase(item.expiresAt)}</small>
+        <small>{expiryNote(item.expiresAt)}</small>
         {failure?.approvalId === item.id && (
           <p className="approval-failure" role="alert">
             {failure.message}

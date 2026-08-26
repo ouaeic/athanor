@@ -124,8 +124,26 @@ export interface Approval {
   id: string;
   taskId: string;
   action: string;
+  /**
+   * Where the instruction behind this request came from, when it did not come from the owner.
+   *
+   * The column and the writer are older than any reader of them: an approval raised on a turn that
+   * had read a web page, an email or a connector's answer carries the origin of that content, and
+   * the card that asks about it was showing the tool and the arguments and not the one fact that
+   * decides the answer. Absent from a box older than the field, and null on a turn with no taint —
+   * which is the ordinary case, and is not the same as an unknown origin.
+   */
+  origin?: string | null;
   sideEffect: string;
   expiresAt: string;
+  /**
+   * Which way this one went. Pending is what the card asks about; the other three are the record,
+   * and `/v1/approvals?status=…` is how a returning owner reads it back.
+   */
+  status?: 'pending' | 'approved' | 'denied' | 'expired';
+  createdAt?: string;
+  /** The position of the row after this one, which is what the next page is asked for by. */
+  cursor?: string;
   preview: { preview?: string; tool?: string; arguments?: unknown } | string;
 }
 

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { MAX_PRICE_CEILING_USD_PER_MILLION, UpdateSpendLimitsRequest } from '@athanor/contracts';
 import type { SpendLimits, SpendSummary } from './types.js';
 import {
   anyCapInForce,
@@ -64,6 +65,8 @@ const summary = (overrides: Partial<SpendSummary> = {}): SpendSummary => ({
     defaultTaskCapUsd: 2,
     warnAtPercent: 80,
     timeZone: 'Europe/London',
+    maxInputUsdPerMillionTokens: 3,
+    maxOutputUsdPerMillionTokens: 15,
     updatedAt: '2026-07-20T00:00:00.000Z'
   },
   windows: [
@@ -237,7 +240,11 @@ describe('spend limits form', () => {
   };
 
   it('round-trips the stored limits into editable text', () => {
-    expect(spendLimitsDraft(summary().limits)).toEqual(draft);
+    expect(spendLimitsDraft(summary().limits)).toEqual({
+      ...draft,
+      maxInputUsdPerMillionTokens: '3',
+      maxOutputUsdPerMillionTokens: '15'
+    });
     expect(
       spendLimitsDraft({ ...summary().limits, dailyCapUsd: null, defaultTaskCapUsd: null })
     ).toMatchObject({ dailyCapUsd: '', defaultTaskCapUsd: '', monthlyCapUsd: '60' });
@@ -266,6 +273,109 @@ describe('spend limits form', () => {
     expect(spendLimitsPatch({ ...draft, defaultTaskCapUsd: '0' })).toMatchObject({ ok: false });
     expect(spendLimitsPatch({ ...draft, warnAtPercent: '120' })).toMatchObject({ ok: false });
     expect(spendLimitsPatch({ ...draft, timeZone: '' })).toMatchObject({ ok: false });
+  });
+
+  it('round-trips both price ceilings, which are rates rather than amounts', () => {
+    expect(
+      spendLimitsPatch({
+        ...draft,
+        maxInputUsdPerMillionTokens: '3',
+        maxOutputUsdPerMillionTokens: '15'
+      })
+    ).toMatchObject({
+      ok: true,
+      body: { maxInputUsdPerMillionTokens: 3, maxOutputUsdPerMillionTokens: 15 }
+    });
+  });
+
+  it('refuses a rate that is not one, and one no route on the catalogue could be', () => {
+    expect(spendLimitsPatch({ ...draft, maxInputUsdPerMillionTokens: '-1' })).toEqual({
+      ok: false,
+      message:
+        'The input price ceiling must be a rate in dollars per million tokens, or blank for no ceiling.'
+    });
+    expect(spendLimitsPatch({ ...draft, maxInputUsdPerMillionTokens: 'cheap' })).toMatchObject({
+      ok: false
+    });
+    expect(spendLimitsPatch({ ...draft, maxOutputUsdPerMillionTokens: '250' })).toEqual({
+      ok: false,
+      message: 'The output price ceiling cannot be more than $100 per million tokens.'
+    });
+  });
+
+  /* Zero is a ceiling and not the absence of one: it admits only a route that publishes no
+     charge, which is a setting an owner can mean. */
+  it('keeps a ceiling of zero, which the amount fields would have refused', () => {
+    expect(spendLimitsPatch({ ...draft, maxInputUsdPerMillionTokens: '0' })).toMatchObject({
+      ok: true,
+      body: { maxInputUsdPerMillionTokens: 0 }
+    });
+  });
+
+  it('clears a ceiling the owner blanked and leaves alone one no form offered', () => {
+    expect(spendLimitsPatch({ ...draft, maxInputUsdPerMillionTokens: ' ' })).toMatchObject({
+      ok: true,
+      body: { maxInputUsdPerMillionTokens: null }
+    });
+    /* The caps form as it stands carries neither field. An absent key is the route's "leave this
+       alone"; sending null instead would wipe a ceiling this screen never showed - and ask for a
+       passkey to do it, because removing a ceiling is the escalation the route steps up over. */
+    const untouched = spendLimitsPatch(draft);
+    expect(untouched.ok && 'maxInputUsdPerMillionTokens' in untouched.body).toBe(false);
+    expect(untouched.ok && 'maxOutputUsdPerMillionTokens' in untouched.body).toBe(false);
+  });
+
+  /*
+   * What stands in for the `copiedConstants` entry this file's price ceiling bound still needs:
+   * the number spelled out in `usage-model.ts` is measured against the contract that owns it, and
+   * the body the form builds is handed to the schema the route parses it with rather than to a
+   * shape written down a second time here. `scripts/check-repository.mjs` is where the constant
+   * belongs permanently, and the step that owns that script is the one that puts it there.
+   */
+  it('refuses at exactly the bound the contract that owns it sets', () => {
+    const at = String(MAX_PRICE_CEILING_USD_PER_MILLION);
+    const over = String(MAX_PRICE_CEILING_USD_PER_MILLION + 1);
+    expect(spendLimitsPatch({ ...draft, maxInputUsdPerMillionTokens: at })).toMatchObject({
+      ok: true
+    });
+    expect(spendLimitsPatch({ ...draft, maxInputUsdPerMillionTokens: over })).toMatchObject({
+      ok: false
+    });
+    expect(() =>
+      UpdateSpendLimitsRequest.parse({
+        maxInputUsdPerMillionTokens: MAX_PRICE_CEILING_USD_PER_MILLION + 1
+      })
+    ).toThrow();
+  });
+
+  it('builds a body the route parses, with the ceilings still on it', () => {
+    const patch = spendLimitsPatch({
+      ...draft,
+      maxInputUsdPerMillionTokens: '3',
+      maxOutputUsdPerMillionTokens: '7.5'
+    });
+    if (!patch.ok) throw new Error(patch.message);
+    expect(UpdateSpendLimitsRequest.parse(patch.body)).toEqual({
+      dailyCapUsd: 5,
+      monthlyCapUsd: 60,
+      defaultTaskCapUsd: 2,
+      warnAtPercent: 80,
+      timeZone: 'Europe/London',
+      maxInputUsdPerMillionTokens: 3,
+      maxOutputUsdPerMillionTokens: 7.5
+    });
+  });
+
+  /* The whole loop, in the order an owner does it: what the server answered with, back into the
+     form, and out again as the request that saves it - which is where a ceiling silently going
+     missing would show. */
+  it('saves back what the server last answered with, unchanged', () => {
+    const patch = spendLimitsPatch(spendLimitsDraft(summary().limits));
+    if (!patch.ok) throw new Error(patch.message);
+    expect(UpdateSpendLimitsRequest.parse(patch.body)).toMatchObject({
+      maxInputUsdPerMillionTokens: 3,
+      maxOutputUsdPerMillionTokens: 15
+    });
   });
 
   it('catches a daily cap that can never bind because it exceeds the monthly one', () => {
@@ -403,6 +513,8 @@ const unanswered: SpendLimits = {
   defaultTaskCapUsd: null,
   warnAtPercent: 80,
   timeZone: 'UTC',
+  maxInputUsdPerMillionTokens: null,
+  maxOutputUsdPerMillionTokens: null,
   updatedAt: new Date(0).toISOString()
 };
 

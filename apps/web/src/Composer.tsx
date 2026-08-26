@@ -84,8 +84,12 @@ export function Composer({
   onOpenAiSettings,
   models,
   unavailableModels,
+  modelReasons,
   modelChoice,
-  onModelChoice
+  onModelChoice,
+  capUsd,
+  onCapUsd,
+  taskCapUsd
 }: {
   /** Whatever must appear directly above the composer: a storage warning, a block, a notice. */
   banners?: ReactNode;
@@ -119,8 +123,20 @@ export function Composer({
   onOpenAiSettings: () => void;
   models: CatalogueModel[];
   unavailableModels: CatalogueModel[];
+  /** Why the router placed each model where it did, for the eight it explains. */
+  modelReasons?: Readonly<Record<string, string>>;
   modelChoice: ModelChoice;
   onModelChoice: (choice: ModelChoice) => void;
+  /**
+   * The ceiling for the next send, exactly as typed. Empty means the account's per-conversation cap.
+   *
+   * A string rather than a number because a half-typed "1." is a real state of this field and
+   * rounding it away under the cursor is how a number input eats what somebody is writing.
+   */
+  capUsd: string;
+  onCapUsd: (value: string) => void;
+  /** The ceiling the open conversation was started under, when it has one of its own. */
+  taskCapUsd?: number | null;
 }) {
   const [dragging, setDragging] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -424,33 +440,65 @@ export function Composer({
               </button>
             ))}
           </div>
+          {/*
+            The one thing about money that nothing in this product ever asked.
+
+            `maxSpendUsd` is on the create route, the follow-up route, both trajectory arms and the
+            schedule, and honoured by `resolveSpendCeiling` at every one of them — and no control
+            anywhere sent it. The account-wide per-conversation cap is the only door there was, and
+            its own comment explains that it reserves its whole value the moment work is queued, so
+            raising it for one big job charges every other conversation started that morning for it.
+          */}
+          <div className="composer-sheet-group">
+            <h3>{taskOpen ? 'What this turn may cost' : 'What this conversation may cost'}</h3>
+            <label className="composer-sheet-row">
+              <span className="composer-sheet-label">Stop at (USD)</span>
+              <input
+                type="number"
+                inputMode="decimal"
+                min="0.01"
+                step="0.01"
+                placeholder="Account default"
+                value={capUsd}
+                onChange={(event) => onCapUsd(event.target.value)}
+              />
+              <span className="composer-sheet-note">
+                {taskCapUsd
+                  ? `Left empty, this turn runs under your account’s per-conversation cap. This conversation was started with a ceiling of $${taskCapUsd.toFixed(2)}.`
+                  : 'Left empty, your account’s per-conversation cap applies. Work stops when the ceiling is reached.'}
+              </span>
+            </label>
+          </div>
           {providerConfigured ? (
-            modelSheetGroups({ models, unavailableModels, enforceZeroDataRetention }).map(
-              (group) => (
-                <div className="composer-sheet-group" key={group.label}>
-                  <h3>{group.label}</h3>
-                  {group.options.map((option) => (
-                    <button
-                      key={option.value}
-                      className={`composer-sheet-row ${
-                        option.value === selectedModel ? 'chosen' : ''
-                      }`}
-                      aria-pressed={option.value === selectedModel}
-                      disabled={option.disabled}
-                      onClick={() => {
-                        onModelChoice(modelChoiceFromValue(option.value));
-                        setSheetOpen(false);
-                      }}
-                    >
-                      <span className="composer-sheet-label">{option.label}</span>
-                      {option.note ? (
-                        <span className="composer-sheet-note">{option.note}</span>
-                      ) : undefined}
-                    </button>
-                  ))}
-                </div>
-              )
-            )
+            modelSheetGroups({
+              models,
+              unavailableModels,
+              enforceZeroDataRetention,
+              ...(modelReasons ? { reasons: modelReasons } : {})
+            }).map((group) => (
+              <div className="composer-sheet-group" key={group.label}>
+                <h3>{group.label}</h3>
+                {group.options.map((option) => (
+                  <button
+                    key={option.value}
+                    className={`composer-sheet-row ${
+                      option.value === selectedModel ? 'chosen' : ''
+                    }`}
+                    aria-pressed={option.value === selectedModel}
+                    disabled={option.disabled}
+                    onClick={() => {
+                      onModelChoice(modelChoiceFromValue(option.value));
+                      setSheetOpen(false);
+                    }}
+                  >
+                    <span className="composer-sheet-label">{option.label}</span>
+                    {option.note ? (
+                      <span className="composer-sheet-note">{option.note}</span>
+                    ) : undefined}
+                  </button>
+                ))}
+              </div>
+            ))
           ) : (
             <button
               className="composer-sheet-connect"
