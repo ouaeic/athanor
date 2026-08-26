@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
@@ -25,13 +25,49 @@ const temporaryDirectory = async (prefix: string): Promise<string> => {
   return directory;
 };
 
+/**
+ * Waits until the supervisor's reaction to a status is actually on disk.
+ *
+ * The supervisor is told about a status through a callback that returns `void` - `relay.ts` does
+ * `void this.#onStatus(status)` - so a caller has no promise to await, and the reaction is three
+ * awaited filesystem operations deep: an mkdir, a writeFile and a rename, in `#recordRevocation`
+ * and again in `#publishStatus`. This waits for the result of that work rather than for a fixed
+ * number of ticks, and it also waits for the atomic writes' temporary files to be gone, because a
+ * `.tmp` still in flight when `afterEach` removes the directory is what produced the second half
+ * of the failure ("ENOTEMPTY: directory not empty").
+ */
+const settled = async (
+  directory: string,
+  done: (settings: Awaited<ReturnType<typeof readRelaySettings>>) => boolean
+): Promise<void> => {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const pending = (await readdir(directory).catch(() => [])).some((name) =>
+      name.endsWith('.tmp')
+    );
+    if (!pending && done(await readRelaySettings(directory))) return;
+    if (Date.now() > deadline)
+      throw new Error('the supervisor never wrote the revocation to the settings file');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+};
+
 /** A dialer that records what it was asked to do instead of opening a connection. */
 class FakeLink implements RelayLink {
   started = 0;
   stopped = 0;
   status: RelayStatus;
+  readonly #onStatus: (status: RelayStatus) => void;
+  readonly #settle: () => Promise<void>;
 
-  constructor(label: string | null, host: string | null) {
+  constructor(
+    label: string | null,
+    host: string | null,
+    onStatus: (status: RelayStatus) => void = () => undefined,
+    settle: () => Promise<void> = async () => undefined
+  ) {
+    this.#onStatus = onStatus;
+    this.#settle = settle;
     this.status = {
       state: 'off',
       label,
@@ -53,6 +89,31 @@ class FakeLink implements RelayLink {
     this.stopped += 1;
     this.status = { ...this.status, state: 'off' };
   }
+
+  /**
+   * What a real dialer reports when the relay answers `goaway reason=revoked`: the operator has
+   * dropped this box, so the connection is gone and is deliberately never retried.
+   */
+  async revoke(): Promise<void> {
+    this.status = {
+      ...this.status,
+      state: 'revoked',
+      lastError: 'relay sent goaway (revoked)',
+      nextAttemptAtMs: null
+    };
+    this.#onStatus(this.status);
+    /*
+     * This used to be one `setTimeout(…, 0)`, under a comment saying it gave the supervisor's file
+     * writes "a turn". One macrotask is not a turn: the write is two filesystem round trips past
+     * where the tick returns, so the assertion below it read the settings file before the
+     * revocation reached it. On an idle machine the write happened to win the race and the suite
+     * was green; run beside the other eleven packages it lost, and the red read as "the supervisor
+     * does not persist a revocation" - a defect in shipped code - rather than as "the test looked
+     * too early". Reproduced deliberately by putting eight writer processes on the same temporary
+     * filesystem, which fails it every time.
+     */
+    await this.#settle();
+  }
 }
 
 const supervisorOn = (
@@ -66,8 +127,10 @@ const supervisorOn = (
     localPort: 8443,
     localHttpPort: 8080,
     log: silentLogger,
-    createLink: async (config) => {
-      const link = new FakeLink(config.label, config.host);
+    createLink: async (config, onStatus) => {
+      const link = new FakeLink(config.label, config.host, onStatus, () =>
+        settled(directory, (settings) => settings.revokedAt !== null)
+      );
       links.push(link);
       return link;
     },
@@ -101,6 +164,26 @@ describe('a box ships with no relay', () => {
     await relay.start();
     expect(relay.report().enabled).toBe(false);
     expect(links).toHaveLength(0);
+  });
+
+  test('will not dial an enrollment that carries no pinned relay key', async () => {
+    const directory = await temporaryDirectory('athanor-relay-unpinned-');
+    // Exactly what a settings file written before pinning existed, or edited by hand through the
+    // `jq` path in `scripts/athanor`, parses to: enabled, addressable, and trusting nobody.
+    await writeFile(
+      join(directory, 'settings.json'),
+      JSON.stringify({ enabled: true, host: 'relay.example.com', label: 'abc' })
+    );
+    const links: FakeLink[] = [];
+    const relay = supervisorOn(directory, links);
+    await relay.start();
+
+    // The identity key is this box's address. Presenting it to whoever currently answers for the
+    // hostname, with no CA and no pin, hands that party every client connection.
+    expect(links).toHaveLength(0);
+    expect(relay.status.state).toBe('off');
+    // And nothing is advertised, because nothing is connected.
+    expect(relay.publicHostname()).toBeNull();
   });
 });
 
@@ -200,6 +283,55 @@ describe('turning the relay off', () => {
     // the owner switched off that carries on answering.
     const live = links.filter((link) => link.started > link.stopped);
     expect(live).toHaveLength(relay.settings.enabled ? 1 : 0);
+  });
+
+  test('a revoked enrollment stops being advertised, on disk as well as in memory', async () => {
+    const directory = await temporaryDirectory('athanor-relay-revoked-');
+    const links: FakeLink[] = [];
+    const relay = supervisorOn(directory, links);
+    await relay.start();
+    await relay.enroll({ host: 'relay.example.com', token: 'arly1_token' });
+    expect(relay.publicHostname()).toBe('label-for-relay.example.com.relay.example.com');
+
+    await links[0]!.revoke();
+
+    // The relay has dropped this box and the dialer will never retry, so every client that tries
+    // the relay address pays a connection attempt for a name that cannot answer again.
+    expect(relay.status.state).toBe('revoked');
+    expect(relay.publicHostname()).toBeNull();
+    expect(withRelayEndpoint(['https://203.0.113.9'], relay.publicHostname())).toEqual([
+      'https://203.0.113.9'
+    ]);
+
+    // `athanor-network-refresh` reads the settings file and nothing else, so a revocation that
+    // lived only in memory would leave the address in the connection manifest anyway.
+    expect((await readRelaySettings(directory)).revokedAt).not.toBeNull();
+    // And it survives a restart: the status file has not been read yet at that point, so without
+    // the settings file the box would advertise the dead address until the first goaway arrived.
+    const restarted = supervisorOn(directory, []);
+    await restarted.start();
+    expect(restarted.publicHostname()).toBeNull();
+
+    // `athanor doctor` still has to be able to say revoked rather than "off, and that is fine",
+    // and that branch is only reached while the settings say the relay is switched on.
+    expect(restarted.report().enabled).toBe(true);
+    expect(restarted.report().label).toBe('label-for-relay.example.com');
+  });
+
+  test('enrolling again with a fresh token clears the revocation', async () => {
+    const directory = await temporaryDirectory('athanor-relay-reenroll-');
+    const links: FakeLink[] = [];
+    const relay = supervisorOn(directory, links);
+    await relay.start();
+    await relay.enroll({ host: 'relay.example.com', token: 'arly1_token' });
+    await links[0]!.revoke();
+    expect(relay.publicHostname()).toBeNull();
+
+    // A fresh token is the operator putting this box back in the registry, so the address it hands
+    // out is live again and refusing to advertise it would strand the owner.
+    await relay.enroll({ host: 'relay.example.com', token: 'arly1_second_token' });
+    expect(relay.publicHostname()).toBe('label-for-relay.example.com.relay.example.com');
+    expect((await readRelaySettings(directory)).revokedAt).toBeNull();
   });
 
   test('forgetting the relay clears the host, the label and the pin', async () => {

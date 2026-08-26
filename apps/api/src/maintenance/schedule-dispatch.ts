@@ -1,0 +1,304 @@
+/**
+ * Turning a due schedule into a queued conversation, and finishing one the box died in the
+ * middle of.
+ *
+ * Creating the task and waking its workspace cannot be one transaction - the second half is an
+ * HTTP round-trip to the runner - so a task is created `awaiting_resource` and promoted to
+ * `queued` only after the workspace answers. `promoteScheduledTask` is that second half, and
+ * `recoverStrandedScheduledTasks` is the same steps run again for a task the window closed on.
+ */
+
+import { randomUUID } from 'node:crypto';
+import { encryptJson, unwrapDataKey } from '@athanor/core';
+import type { WorkspaceRecord } from '@athanor/data';
+import type { SupportedContext } from '../http/server-context.js';
+import { errorFields } from '../log.js';
+import { advanceScheduleRun } from '../schedule-advance.js';
+
+const scheduleErrorMessage = (code: string): string =>
+  ({
+    workspace_unavailable: 'The agent computer is unavailable.',
+    workspace_missing: 'The agent computer data no longer exists.',
+    model_unavailable: 'The selected model is not currently available.',
+    spend_cap_reached: 'The run would have gone past your spending cap.'
+  })[code] ?? 'The scheduled run could not start safely.';
+
+export const createScheduleDispatch = (context: SupportedContext) => {
+  const { log, database, store, masterKey, runner, modelsForUser, config } = context;
+  /**
+   * The second half of dispatching a scheduled run: the workspace has to be awake before the task
+   * is worth queueing, and that is an HTTP round-trip outside the transaction that created it. It
+   * lives in its own function because a process death inside that window leaves the task parked in
+   * `awaiting_resource`, and the recovery sweep finishes the job with exactly these steps.
+   */
+  const promoteScheduledTask = async (input: {
+    scheduleId: string;
+    taskId: string;
+    userId: string;
+    workspace: WorkspaceRecord;
+    key: ReturnType<typeof unwrapDataKey>;
+  }): Promise<'queued' | 'failed'> => {
+    const { scheduleId, taskId, userId, workspace, key } = input;
+    try {
+      if (workspace.status !== 'running') {
+        await runner.request({
+          workspaceId: workspace.id,
+          userId,
+          role: 'control',
+          scopes: ['workspace.manage'],
+          path: `/v1/workspaces/${workspace.id}/resume`,
+          method: 'POST',
+          body: '{}',
+          contentType: 'application/json'
+        });
+        await store.updateWorkspaceStatus(workspace.id, 'running');
+      }
+      await store.setTaskStatusForUser(userId, taskId, 'queued');
+      await store.appendTaskEvent({
+        taskId,
+        kind: 'status',
+        summary: 'Encrypted schedule status event',
+        payloadCiphertext: encryptJson(
+          {
+            __athanorEventVersion: 1,
+            summary: 'Scheduled run queued',
+            payload: { scheduleId }
+          },
+          key,
+          `task-event:${taskId}`
+        )
+      });
+      log.info('schedule.run_queued', { scheduleId, taskId, workspaceId: workspace.id });
+      return 'queued';
+    } catch (error) {
+      /**
+       * Releasing the reservation comes first, for the reason `sweepExpiredApprovals` states forty
+       * lines below: a death in between leaves the task in `awaiting_resource`, which is exactly
+       * what the recovery sweep selects, where the opposite order leaves it `failed` - a status no
+       * sweep examines - with its credits still `reserved` against the monthly allowance for the
+       * life of the box. The runner being down is the ordinary way into this catch, so the window
+       * is not a rare one.
+       */
+      await store.transitionUsage(`task:${taskId}:reservation`, 'reserved', 'released');
+      await store.setTaskStatusForUser(userId, taskId, 'failed');
+      await store.failMaterializedTaskSchedule(scheduleId, taskId, 'workspace_unavailable');
+      await store.appendTaskEvent({
+        taskId,
+        kind: 'error',
+        summary: 'Encrypted schedule error event',
+        payloadCiphertext: encryptJson(
+          {
+            __athanorEventVersion: 1,
+            summary: scheduleErrorMessage('workspace_unavailable'),
+            // `owner` is what keeps a warning or an error out on the page rather than folded into
+            // the collapsed work log with the machinery the agent recovered from. A scheduled run
+            // that never started has no other evidence in its transcript at all: without this the
+            // whole conversation is a closed disclosure reading "2 steps".
+            payload: { owner: true, code: 'workspace_unavailable', scheduleId }
+          },
+          key,
+          `task-event:${taskId}`
+        )
+      });
+      log.warn('schedule.run_failed', {
+        scheduleId,
+        taskId,
+        workspaceId: workspace.id,
+        ...errorFields(error)
+      });
+      return 'failed';
+    }
+  };
+
+  /**
+   * A scheduled task is created `awaiting_resource` and promoted to `queued` only after its
+   * workspace answers, so a restart inside that window leaves a run nothing will ever lease,
+   * holding a reservation, while its schedule has already moved on. `attempt = 0` is what
+   * separates it from a task that ran and then hit a provider wall: only a leased task has ever
+   * been counted. The age gate keeps this clear of a dispatch that is merely still in progress.
+   */
+  const recoverStrandedScheduledTasks = async (): Promise<number> => {
+    const stranded = await database.query<{
+      schedule_id: string;
+      task_id: string;
+      user_id: string;
+      workspace_id: string;
+    }>(
+      `SELECT r.schedule_id, r.task_id, t.user_id, t.workspace_id
+       FROM task_schedule_runs r
+       JOIN tasks t ON t.id = r.task_id
+       WHERE r.outcome = 'queued' AND t.status = 'awaiting_resource' AND t.attempt = 0
+         AND t.updated_at < NOW() - INTERVAL '2 minutes'
+       ORDER BY r.created_at, r.task_id
+       LIMIT 20`
+    );
+    let recovered = 0;
+    for (const row of stranded.rows) {
+      const taskId = String(row.task_id);
+      const scheduleId = String(row.schedule_id);
+      const workspace = await store.getWorkspaceById(String(row.workspace_id));
+      if (!workspace?.wrappedKey) continue;
+      log.info('schedule.dispatch_recovered', { scheduleId, taskId, workspaceId: workspace.id });
+      await promoteScheduledTask({
+        scheduleId,
+        taskId,
+        userId: String(row.user_id),
+        workspace,
+        key: unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id)
+      });
+      recovered += 1;
+    }
+    return recovered;
+  };
+
+  const schedulerOwner = `${config.WORKER_ID}:scheduler:${process.pid}`;
+  let schedulerBusy = false;
+  /**
+   * How many due schedules one poll will carry.
+   *
+   * A tick used to lease exactly one, which made the real dispatch rate `1 / SCHEDULER_POLL_MS` -
+   * fifteen seconds - against a `serverLimits.maxSchedules` of a thousand that `plans.ts` calls
+   * "deliberately generous". Forty watchers set for nine in the morning meant the fortieth started
+   * at 09:09:45, and nothing said so, because `next_run_at` has already advanced by then and the
+   * schedule reads as on time. The budget is here rather than absent so that a box waking to a
+   * long backlog still yields the event loop to the requests the owner is making, instead of
+   * holding it for a thousand consecutive dispatches.
+   */
+  const SCHEDULE_DISPATCH_BUDGET = 25;
+  /** Leases and dispatches one due schedule. False means there was nothing due left to take. */
+  const dispatchOneDueSchedule = async (): Promise<boolean> => {
+    const schedule = await store.leaseDueTaskSchedule(schedulerOwner, 120);
+    if (!schedule) return false;
+    const [user, workspace] = await Promise.all([
+      store.getUserById(schedule.userId),
+      store.getWorkspace(schedule.userId, schedule.workspaceId)
+    ]);
+    if (!user) return true;
+    const catalog = await modelsForUser(user);
+    const selected = catalog.find((model) => model.id === schedule.modelId);
+    if (
+      ['provisioning', 'resizing'].includes(workspace?.status ?? '') ||
+      selected?.availability === 'degraded'
+    ) {
+      const code =
+        selected?.availability === 'degraded'
+          ? 'model_temporarily_unavailable'
+          : 'workspace_starting';
+      await store.deferTaskSchedule(schedule.id, schedulerOwner, code);
+      log.info('schedule.deferred', { scheduleId: schedule.id, code });
+      return true;
+    }
+    const forceFailureCode = !workspace
+      ? 'workspace_missing'
+      : ['failed', 'deleting'].includes(workspace.status)
+        ? 'workspace_unavailable'
+        : !selected ||
+            selected.availability !== 'available' ||
+            selected.privacyRoute !== schedule.privacyRoute
+          ? 'model_unavailable'
+          : undefined;
+    const nextRunAt = advanceScheduleRun(
+      schedule.spec,
+      schedule.nextRunAt ? new Date(schedule.nextRunAt) : null
+    );
+    const taskId = randomUUID();
+    if (!workspace?.wrappedKey) {
+      // A workspace cascade normally removes its schedules. A concurrently deleted
+      // workspace leaves this lease to expire without exposing schedule content.
+      log.warn('schedule.workspace_gone', {
+        scheduleId: schedule.id,
+        workspaceId: schedule.workspaceId
+      });
+      return true;
+    }
+    const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
+    const preparingEventCiphertext = encryptJson(
+      {
+        __athanorEventVersion: 1,
+        summary: 'Scheduled run is starting the computer',
+        payload: { scheduleId: schedule.id, scheduledFor: schedule.nextRunAt }
+      },
+      key,
+      `task-event:${taskId}`
+    );
+    const failureEventCiphertext = encryptJson(
+      {
+        __athanorEventVersion: 1,
+        summary: 'Scheduled run could not start',
+        payload: { owner: true, scheduleId: schedule.id }
+      },
+      key,
+      `task-event:${taskId}`
+    );
+    const materialized = await store.materializeTaskSchedule({
+      scheduleId: schedule.id,
+      workerId: schedulerOwner,
+      taskId,
+      nextRunAt,
+      resourceClass: selected?.usageClass ?? 'unknown',
+      preparingEventCiphertext,
+      failureEventCiphertext,
+      ...(forceFailureCode ? { forceFailureCode } : {})
+    });
+    if (!materialized) return true;
+    if (materialized.outcome === 'failed') {
+      await store.appendTaskEvent({
+        taskId,
+        kind: 'error',
+        summary: 'Encrypted schedule error event',
+        payloadCiphertext: encryptJson(
+          {
+            __athanorEventVersion: 1,
+            summary: scheduleErrorMessage(materialized.errorCode ?? 'schedule_failed'),
+            payload: { owner: true, code: materialized.errorCode, scheduleId: schedule.id }
+          },
+          key,
+          `task-event:${taskId}`
+        )
+      });
+      log.warn('schedule.run_rejected', {
+        scheduleId: schedule.id,
+        taskId,
+        code: materialized.errorCode ?? 'schedule_failed'
+      });
+      return true;
+    }
+    await promoteScheduledTask({
+      scheduleId: schedule.id,
+      taskId,
+      userId: user.id,
+      workspace,
+      key
+    });
+    return true;
+  };
+  const dispatchDueSchedule = async (): Promise<void> => {
+    if (schedulerBusy) return;
+    schedulerBusy = true;
+    try {
+      for (let dispatched = 0; dispatched < SCHEDULE_DISPATCH_BUDGET; dispatched += 1) {
+        if (!(await dispatchOneDueSchedule())) return;
+      }
+      // `count` rather than a name of its own: the journal's field allowlist lives in
+      // `apps/worker/src/agent.ts` and drops anything it does not already know.
+      log.info('schedule.dispatch_budget_spent', { count: SCHEDULE_DISPATCH_BUDGET });
+    } finally {
+      schedulerBusy = false;
+    }
+  };
+  const dispatchDueScheduleSafely = (): void => {
+    void dispatchDueSchedule().catch((error: unknown) => {
+      log.error('schedule.dispatch_failed', errorFields(error));
+    });
+  };
+  dispatchDueScheduleSafely();
+  const schedulerTimer = setInterval(dispatchDueScheduleSafely, config.SCHEDULER_POLL_MS);
+  schedulerTimer.unref();
+
+  return {
+    recoverStrandedScheduledTasks,
+    dispatchDueSchedule,
+    dispatchDueScheduleSafely,
+    schedulerTimer
+  };
+};

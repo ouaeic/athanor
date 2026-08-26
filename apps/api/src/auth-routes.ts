@@ -38,8 +38,41 @@ const validDisplayName = (value: string | undefined): string => {
   return displayName;
 };
 
-const deviceLabel = (userAgent: string | undefined): string => {
-  const value = userAgent ?? '';
+/**
+ * The packaged clients, named from what they say they are rather than from the webview they are.
+ *
+ * A Tauri shell renders in the platform webview and forwards its User-Agent unchanged, so the
+ * macOS app was labelled "Safari on macOS" - byte-identical to the owner's real Safari in the
+ * Devices list, which is also the revoke-a-session control. The shell now stamps
+ * `x-athanor-client: athanor-<platform>/<version>` on every request it proxies
+ * (`apps/desktop/src-tauri/src/proxy.rs`).
+ *
+ * Matched against a closed list rather than echoed. Any caller can set a header, and a device
+ * label that can be dictated is one that can be made to read like somebody else's row on the
+ * screen the owner uses to decide what to sign out.
+ */
+const NATIVE_CLIENT_PLATFORMS: Record<string, string> = {
+  macos: 'macOS',
+  windows: 'Windows',
+  linux: 'Linux',
+  ios: 'iOS',
+  android: 'Android'
+};
+
+const nativeClientLabel = (value: string | string[] | undefined): string | undefined => {
+  if (typeof value !== 'string') return undefined;
+  const platform = /^athanor-([a-z]{3,10})\/[0-9A-Za-z.+-]{1,32}$/.exec(value.trim())?.[1];
+  const named = platform ? NATIVE_CLIENT_PLATFORMS[platform] : undefined;
+  return named ? `athanor app on ${named}` : undefined;
+};
+
+export const deviceLabel = (headers: {
+  'user-agent'?: string | undefined;
+  'x-athanor-client'?: string | string[] | undefined;
+}): string => {
+  const native = nativeClientLabel(headers['x-athanor-client']);
+  if (native) return native;
+  const value = headers['user-agent'] ?? '';
   const browser = value.includes('Firefox/')
     ? 'Firefox'
     : value.includes('Edg/')
@@ -281,14 +314,7 @@ export const registerAuthRoutes = (
       deviceType: credentialDeviceType,
       backedUp: credentialBackedUp
     });
-    await createSession(
-      store,
-      reply,
-      user.id,
-      secure,
-      deviceLabel(request.headers['user-agent']),
-      true
-    );
+    await createSession(store, reply, user.id, secure, deviceLabel(request.headers), true);
     return { user, recoveryCode };
   });
 
@@ -352,14 +378,7 @@ export const registerAuthRoutes = (
     });
     if (!verification.verified) throw new Error('Passkey verification failed');
     await store.updatePasskeyCounter(key.id, verification.authenticationInfo.newCounter);
-    await createSession(
-      store,
-      reply,
-      user.id,
-      secure,
-      deviceLabel(request.headers['user-agent']),
-      true
-    );
+    await createSession(store, reply, user.id, secure, deviceLabel(request.headers), true);
     return { user };
   });
 
@@ -469,14 +488,7 @@ export const registerAuthRoutes = (
         backedUp: credentialBackedUp
       }
     });
-    await createSession(
-      store,
-      reply,
-      user.id,
-      secure,
-      deviceLabel(request.headers['user-agent']),
-      true
-    );
+    await createSession(store, reply, user.id, secure, deviceLabel(request.headers), true);
     await recordSecurityEvent(store, {
       userId: user.id,
       kind: 'account_recovery',
@@ -686,7 +698,7 @@ export const registerAuthRoutes = (
       reply,
       owner.id,
       config.PUBLIC_APP_URL.startsWith('https://'),
-      deviceLabel(request.headers['user-agent']),
+      deviceLabel(request.headers),
       true
     );
     reply.status(201);
@@ -833,14 +845,7 @@ export const registerAuthRoutes = (
           username,
           displayName: request.body.displayName?.trim() || 'Local User'
         }));
-      await createSession(
-        store,
-        reply,
-        user.id,
-        secure,
-        deviceLabel(request.headers['user-agent']),
-        true
-      );
+      await createSession(store, reply, user.id, secure, deviceLabel(request.headers), true);
       return { user, warning: 'Development authentication is enabled' };
     }
   );

@@ -1,0 +1,359 @@
+/**
+ * The account this box calls a model with.
+ *
+ * Saving a key is the one write that takes a wall down: everything parked in `awaiting_resource`
+ * goes back in the queue from here rather than waiting out a backoff that was measuring the wrong
+ * thing. Saving the first key is also where a spending ceiling is put in place, because a box with
+ * a key and no ceiling is a box that can spend a month's allowance overnight.
+ */
+
+import { MediaModelSelection } from '@athanor/contracts';
+import {
+  AthanorError,
+  assertTimeZone,
+  decryptJson,
+  encryptJson,
+  inferenceCredentialAad
+} from '@athanor/core';
+import {
+  OpenAICompatibleAdapter,
+  configuredModelCatalog,
+  refreshOpenRouterCatalog,
+  seedModels,
+  verifyOpenRouterKey
+} from '@athanor/model-gateway';
+import { z } from 'zod';
+import type { InferenceSecret } from '../context.js';
+import { requireUser } from '../http/auth-hook.js';
+import type { RouteContext } from '../http/server-context.js';
+import { recordSecurityEvent } from '../security-events.js';
+
+/**
+ * The two ceilings a first connection puts in place, from the one number the owner was asked for.
+ *
+ * A month is the unit a provider bill arrives in and the only one worth asking for at a keyboard.
+ * The day is what makes a monthly ceiling mean anything overnight: a loop that has gone wrong can
+ * spend a month's allowance between two and six in the morning without ever crossing a monthly cap.
+ * A quarter of the month in a single day is far above ordinary use and far below a runaway, and the
+ * agent asks the guard again at every step, against money that has actually changed hands - so a
+ * run that goes wrong at 2am is stopped by the day's ceiling within a step of reaching it.
+ *
+ * A per-conversation ceiling is deliberately NOT seeded, and it is the one number here that cannot
+ * be chosen well without knowing what the owner does. Unlike the other two it is enforced by
+ * reservation: a conversation that is queued or running holds its whole ceiling against the day
+ * whether or not it spends a penny of it. Seed a tenth of the month and the third conversation of
+ * the morning is refused for money nobody has spent, which reads as the product being broken rather
+ * than as a setting. It remains under Spending caps for an owner who wants one, sized to the way
+ * they work.
+ */
+const seededSpendCaps = (
+  monthlyCapUsd: number
+): { monthlyCapUsd: number; dailyCapUsd: number; defaultTaskCapUsd: null } => ({
+  monthlyCapUsd,
+  dailyCapUsd: Math.round(monthlyCapUsd * 25) / 100,
+  defaultTaskCapUsd: null
+});
+
+export const registerProviderRoutes = (context: RouteContext): void => {
+  const {
+    app,
+    store,
+    masterKey,
+    providerSettings,
+    mediaRoutesFor,
+    config,
+    overrides,
+    requireRecentStepUp,
+    idempotent,
+    resumeTasksWaitingOnAProvider
+  } = context;
+  app.get('/v1/providers', async (request) => providerSettings(requireUser(request.user).id));
+
+  app.put('/v1/providers', async (request, reply) => {
+    const user = requireUser(request.user);
+    await requireRecentStepUp(request, user);
+    return idempotent(request, reply, user, async () => {
+      const existingCredential = await store.getManagedProviderCredential(user.id, 'inference');
+      const existingSecret =
+        existingCredential?.status === 'active'
+          ? decryptJson<InferenceSecret>(
+              existingCredential.secretCiphertext,
+              masterKey,
+              inferenceCredentialAad(user.id)
+            )
+          : undefined;
+      const input = z
+        .object({
+          provider: z.enum(['openrouter', 'ollama-cloud', 'openai-compatible']),
+          baseUrl: z.string().url().optional(),
+          apiKey: z.string().max(2_000).optional(),
+          modelId: z.string().trim().min(1).max(300).optional(),
+          enforceZeroDataRetention: z.boolean().default(true),
+          contextTokens: z.number().int().min(4_096).max(10_000_000).default(128_000),
+          capabilities: z
+            .array(z.enum(['chat', 'vision', 'tools', 'reasoning', 'embedding']))
+            .min(1)
+            .default(['chat', 'tools', 'reasoning']),
+          modalities: z
+            .array(z.enum(['text', 'image', 'audio', 'video']))
+            .min(1)
+            .default(['text']),
+          /**
+           * Which model generates an image and which speaks. Absent leaves whatever was saved
+           * before, so the screen can save a key without also having to restate a media choice it
+           * did not touch.
+           */
+          mediaModels: MediaModelSelection.optional(),
+          /**
+           * The answer to the one question about money worth asking at this moment, and the only
+           * moment it is worth asking: saving a key is when spending becomes possible at all, and
+           * the owner is already thinking about a bill. Absent means this save was not about money;
+           * an explicit null is the owner declining a ceiling, which is theirs to decline on their
+           * own computer - what is not acceptable is a cap system that is off because nobody asked.
+           */
+          spendCeiling: z
+            .object({
+              monthlyCapUsd: z.number().positive().max(1_000_000).nullable(),
+              timeZone: z.string().min(1).max(100).optional()
+            })
+            .optional()
+        })
+        .superRefine((value, context) => {
+          // Ollama Cloud is exempt because it no longer needs one: the catalogue below lists every
+          // model that account can reach, the same way OpenRouter's does, so naming a single model
+          // by hand went from a requirement to an optional pin.
+          if (value.provider === 'openai-compatible' && !value.modelId)
+            context.addIssue({
+              code: 'custom',
+              path: ['modelId'],
+              message: 'Choose the model ID exposed by this endpoint'
+            });
+          // Checked here rather than where the caps are written, which is after the credential has
+          // been stored: a zone this server cannot resolve should cost the owner a corrected form,
+          // not a saved key reported as a failure.
+          if (value.spendCeiling?.timeZone !== undefined) {
+            try {
+              assertTimeZone(value.spendCeiling.timeZone);
+            } catch {
+              context.addIssue({
+                code: 'custom',
+                path: ['spendCeiling', 'timeZone'],
+                message: 'Choose a valid IANA time zone'
+              });
+            }
+          }
+        })
+        .parse(request.body);
+      const apiKey =
+        input.apiKey?.trim() ||
+        (existingSecret?.provider === input.provider ? existingSecret.apiKey : undefined) ||
+        (config.AI_PROVIDER === input.provider
+          ? (config.AI_API_KEY ?? config.OPENROUTER_API_KEY)
+          : undefined);
+      if (['openrouter', 'ollama-cloud'].includes(input.provider) && !apiKey)
+        throw new AthanorError(
+          'provider_key_required',
+          `${input.provider === 'openrouter' ? 'OpenRouter' : 'Ollama Cloud'} requires an API key`,
+          422
+        );
+      const baseUrl =
+        input.provider === 'openrouter'
+          ? 'https://openrouter.ai/api/v1'
+          : input.provider === 'ollama-cloud'
+            ? 'https://ollama.com/v1'
+            : (input.baseUrl ?? config.AI_BASE_URL);
+      const url = new URL(baseUrl);
+      if (url.username || url.password || url.search || url.hash)
+        throw new AthanorError(
+          'provider_url_invalid',
+          'Provider URLs cannot contain credentials, query parameters, or fragments'
+        );
+      const privateHttp =
+        url.protocol === 'http:' &&
+        (url.hostname === 'localhost' ||
+          url.hostname === '127.0.0.1' ||
+          url.hostname === '::1' ||
+          /^10\./.test(url.hostname) ||
+          /^192\.168\./.test(url.hostname) ||
+          /^172\.(?:1[6-9]|2\d|3[01])\./.test(url.hostname));
+      if (url.protocol !== 'https:' && !(config.ALLOW_INSECURE_PROVIDER_URLS && privateHttp))
+        throw new AthanorError(
+          'provider_url_insecure',
+          'Use HTTPS, or explicitly allow private HTTP provider URLs on this server'
+        );
+      /*
+       * The key is proven before any of the work below reports success.
+       *
+       * Everything this route did for an OpenRouter key - `adapter.list()`, then the catalogue
+       * refresh's `/models` and `/endpoints/zdr` - is a public route that answers 200 anonymously.
+       * So the screen's "Verify and save" verified the provider was reachable and nothing about the
+       * credential, and a mistyped or revoked key was stored, encrypted, under a green success
+       * message. `/key` is the one call the provider gates, and it is made first so a refusal costs
+       * one request and leaves the previously saved credential untouched.
+       */
+      if (input.provider === 'openrouter')
+        await verifyOpenRouterKey({
+          baseUrl,
+          apiKey: apiKey!,
+          ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
+        });
+      const adapter = new OpenAICompatibleAdapter({
+        baseUrl,
+        ...(apiKey ? { apiKey } : {}),
+        provider: input.provider === 'openrouter' ? 'openrouter' : 'custom',
+        privacyRoute: input.enforceZeroDataRetention ? 'provider_zdr' : 'external',
+        appUrl: config.PUBLIC_APP_URL,
+        appTitle: 'athanor',
+        enforceZeroDataRetention: input.provider === 'openrouter' && input.enforceZeroDataRetention
+      });
+      if (input.provider === 'openrouter') {
+        // The `adapter.list()` that used to run here for every provider is gone from this arm: its
+        // answer was only ever read by the branch below, so an OpenRouter save spent a whole extra
+        // round trip on a list it discarded before asking for the catalogue it actually wanted.
+        const liveModels = await refreshOpenRouterCatalog(seedModels(), {
+          baseUrl,
+          apiKey: apiKey!,
+          scope: config.MODEL_CATALOG_SCOPE,
+          ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
+        });
+        await store.upsertModels(liveModels);
+      } else {
+        /*
+         * One request, read twice as hard.
+         *
+         * `describe` asks the same `/models` route `list` did and keeps the context windows,
+         * output limits, prices and supported parameters the endpoint published, instead of
+         * throwing them away and having the owner type a context window in a form. It is also the
+         * only credential check available here: OpenRouter has `/key`, a route it gates and this
+         * server calls above, and no equivalent is confirmed anywhere in this repository for
+         * Ollama Cloud - so a 401 or 403 from the models route is treated as a rejected key, and
+         * anything else that fails is reported as unreachable rather than as verified.
+         */
+        const described = await adapter.describe(AbortSignal.timeout(15_000)).catch((error) => {
+          const status = error instanceof AthanorError ? /\b(\d{3})$/.exec(error.message)?.[1] : '';
+          if (status === '401' || status === '403')
+            throw new AthanorError(
+              'provider_key_rejected',
+              'The provider did not accept this key. Paste it again whole — a trailing space or a missing character is enough — and check it has not been revoked.',
+              422
+            );
+          throw error;
+        });
+        if (input.modelId && !described.some((model) => model.id === input.modelId))
+          throw new AthanorError(
+            'provider_model_not_found',
+            `The endpoint did not list model ${input.modelId}`,
+            422
+          );
+        /*
+         * A subscription is a catalogue, not a model.
+         *
+         * An Ollama Cloud account reaches every cloud model on the plan, so all of them are written
+         * and the owner picks in the composer like any other provider. A directly configured
+         * endpoint keeps the single named row: those are usually one served model, the owner has
+         * told this screen its context window and capabilities, and writing that description across
+         * every id a gateway happens to front would attach one model's facts to all of them.
+         */
+        const catalogue =
+          input.provider === 'ollama-cloud'
+            ? described
+            : described.filter((model) => model.id === input.modelId);
+        if (!catalogue.length)
+          throw new AthanorError(
+            'provider_model_not_found',
+            'The endpoint listed no models for this key',
+            422
+          );
+        await store.upsertModels(
+          configuredModelCatalog(catalogue, {
+            privacyRoute: input.enforceZeroDataRetention ? 'provider_zdr' : 'external',
+            contextTokens: input.contextTokens,
+            capabilities: input.capabilities,
+            modalities: input.modalities,
+            tag: input.provider === 'ollama-cloud' ? 'Ollama Cloud' : 'Configured endpoint'
+          })
+        );
+      }
+      /*
+       * Carried forward when this save did not mention it, and dropped when the provider changes.
+       * A media id only means something against the account that listed it, so keeping an image
+       * model pinned across a move to another provider would leave the choice pointing at a route
+       * the new key cannot reach - and the first anyone would hear of it is a failed generation
+       * mid-task.
+       */
+      const mediaModels =
+        input.mediaModels ??
+        (existingSecret?.provider === input.provider ? existingSecret.mediaModels : undefined);
+      const saved: InferenceSecret = {
+        provider: input.provider,
+        baseUrl,
+        ...(apiKey ? { apiKey } : {}),
+        ...(input.modelId ? { modelId: input.modelId } : {}),
+        enforceZeroDataRetention: input.enforceZeroDataRetention,
+        ...(mediaModels ? { mediaModels } : {})
+      };
+      /*
+       * Resolved against the credential as it is about to be stored, not as it was: a save that
+       * switches on private routes only, or moves to another account, changes which media routes
+       * exist, and the worker reads the answer rather than working it out again.
+       *
+       * Only when there is a choice to resolve. Resolving costs the same two provider requests the
+       * chat catalogue above just made, and an owner who has never opened the media section has
+       * nothing to resolve - they get the reviewed routes, which is what they had before any of
+       * this existed. Connecting a provider is already the slowest thing this screen does; it does
+       * not also get to pay for a question nobody asked.
+       */
+      const mediaRoutes = mediaModels ? await mediaRoutesFor(saved, mediaModels) : undefined;
+      await store.upsertManagedProviderCredential({
+        userId: user.id,
+        provider: 'inference',
+        secretCiphertext: encryptJson(
+          { ...saved, ...(mediaRoutes ? { mediaRoutes } : {}) },
+          masterKey,
+          inferenceCredentialAad(user.id)
+        ),
+        externalRef: 'self-hosted',
+        monthlyLimitUsd: 0,
+        status: 'active'
+      });
+      await recordSecurityEvent(store, {
+        userId: user.id,
+        kind: 'inference_provider_configured',
+        outcome: 'completed',
+        metadata: { provider: input.provider }
+      });
+      /*
+       * A ceiling only ever gets put in place here, never moved.
+       *
+       * Without this every cap ships null, the guard builds no window for a null cap, and the whole
+       * DST-correct, commitment-aware machinery refuses nothing until the owner goes looking for a
+       * setting they do not know exists. The answer given at the keyboard is written once, and only
+       * onto a box that has never had spending limits of any kind - so re-saving a key years later
+       * cannot quietly undo caps the owner has since chosen, and declining is a decision this
+       * records rather than a question it asks again.
+       */
+      if (input.spendCeiling && !(await store.getSpendLimits(user.id))) {
+        const { monthlyCapUsd, timeZone } = input.spendCeiling;
+        await store.setSpendLimits({
+          userId: user.id,
+          ...(monthlyCapUsd === null
+            ? { dailyCapUsd: null, monthlyCapUsd: null, defaultTaskCapUsd: null }
+            : seededSpendCaps(monthlyCapUsd)),
+          ...(timeZone ? { timeZone } : {})
+        });
+      }
+      // A key is the one wall a person takes down by hand, so the work behind it goes now rather
+      // than on the retry sweep's clock.
+      await resumeTasksWaitingOnAProvider(user.id);
+      return providerSettings(user.id);
+    });
+  });
+
+  app.delete('/v1/providers', async (request, reply) => {
+    const user = requireUser(request.user);
+    await requireRecentStepUp(request, user);
+    return idempotent(request, reply, user, async () => ({
+      deleted: await store.deleteManagedProviderCredential(user.id, 'inference')
+    }));
+  });
+};

@@ -36,6 +36,16 @@ export const MAX_SPEND_CAP_USD = 1_000_000;
 export const MAX_TASK_SPEND_USD = 10_000;
 
 /**
+ * The largest per-million-token rate an owner may name as their price ceiling.
+ *
+ * It is a different scale from the spend caps above, which are dollars per window: this is the
+ * published rate of a route, and the dearest routes on the catalogue are tens of dollars per
+ * million. A hundred is comfortably above every one of them and still refuses a typo that meant
+ * dollars per task.
+ */
+export const MAX_PRICE_CEILING_USD_PER_MILLION = 100;
+
+/**
  * How much one task may spend generating media before every further generation asks.
  *
  * The owner's spend caps are the ceiling on a runaway, and they are optional - an owner who has set
@@ -67,6 +77,8 @@ export const AUDIO_READ_MAX_SECONDS = 5_400;
 
 const CapUsd = z.number().nonnegative().max(MAX_SPEND_CAP_USD);
 const TaskSpendUsd = z.number().positive().max(MAX_TASK_SPEND_USD);
+/** Zero is a ceiling, not the absence of one: it admits only a route that publishes no charge. */
+const PriceCeilingUsd = z.number().nonnegative().max(MAX_PRICE_CEILING_USD_PER_MILLION);
 
 export const Workspace = z.object({
   id: Id,
@@ -457,16 +469,17 @@ export const PublishWorkspacePreviewRequest = z.object({
 });
 export type PublishWorkspacePreviewRequest = z.input<typeof PublishWorkspacePreviewRequest>;
 
-export const SetWorkspacePreviewDomainRequest = z.object({
-  domain: z
-    .string()
-    .trim()
-    .toLowerCase()
-    .min(4)
-    .max(253)
-    .regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/)
-});
-export type SetWorkspacePreviewDomainRequest = z.input<typeof SetWorkspacePreviewDomainRequest>;
+/*
+ * There is no `SetWorkspacePreviewDomainRequest`, and there is deliberately no note here about one
+ * arriving. A schema of that name stood here validating a hostname for a route that was never
+ * written, against three columns on `workspace_previews` that no statement ever wrote, mapped onto
+ * a record that served `customDomain: null` on every preview response. Migration 69 dropped the
+ * columns; this went with them, because a published request schema is the loudest way this package
+ * says a capability exists, and it was the last thing still saying it.
+ *
+ * `PublishWorkspacePreviewRequest` above is what publishing actually is here: a preview is reached
+ * on its own slug under the box's own hostname, and that is the whole of the addressing story.
+ */
 
 export const Task = z.object({
   id: Id,
@@ -1065,6 +1078,25 @@ export const SpendLimits = z.object({
   warnAtPercent: z.number().int().min(1).max(99),
   /** The IANA zone the daily and monthly windows roll over in, so "today" means the owner's day. */
   timeZone: z.string().min(1).max(100),
+  /**
+   * The owner's price ceiling, as two published rates, and the pre-flight half of the brake the
+   * caps above are the running half of. A cap stops a task that is already spending; this stops an
+   * over-priced route being chosen in the first place, which is the only one of the two that works
+   * while the owner is asleep. `@athanor/core`'s `priceCeilingFields` turns these into the
+   * `ModelRequest` fields `selectModel` reads; either may be null on its own.
+   *
+   * Still optional, and the reason is written down here because it looks like an oversight and is
+   * not. Making them required is what sends the compiler round every producer of this shape, and
+   * that was done: the only producer that omits them is `apps/web/src/usage-model.test.ts`, at its
+   * two `SpendLimits` fixtures (around lines 61 and 400). The server's producer -
+   * `effectiveSpendLimits` - has answered with both, as `number | null` and never `undefined`,
+   * since the migration that added the columns. So the `.optional()` here now costs nothing at
+   * runtime and buys one thing: `pnpm check` stays green in a wave where no lane may write under
+   * `apps/web`. Drop it in the wave that owns that file, in the same commit that fills in the two
+   * fixtures - it is a one-line change and this comment is the whole of the work.
+   */
+  maxInputUsdPerMillionTokens: PriceCeilingUsd.nullable().optional(),
+  maxOutputUsdPerMillionTokens: PriceCeilingUsd.nullable().optional(),
   updatedAt: IsoDate
 });
 export type SpendLimits = z.infer<typeof SpendLimits>;
@@ -1074,7 +1106,9 @@ export const UpdateSpendLimitsRequest = z.object({
   monthlyCapUsd: CapUsd.nullable().optional(),
   defaultTaskCapUsd: TaskSpendUsd.nullable().optional(),
   warnAtPercent: z.number().int().min(1).max(99).optional(),
-  timeZone: z.string().min(1).max(100).optional()
+  timeZone: z.string().min(1).max(100).optional(),
+  maxInputUsdPerMillionTokens: PriceCeilingUsd.nullable().optional(),
+  maxOutputUsdPerMillionTokens: PriceCeilingUsd.nullable().optional()
 });
 export type UpdateSpendLimitsRequest = z.input<typeof UpdateSpendLimitsRequest>;
 
@@ -1186,6 +1220,16 @@ export const TaskSchedule = z.object({
   id: Id,
   workspaceId: Id,
   title: z.string().min(1).max(160),
+  /**
+   * The standing instruction this box will carry out unattended.
+   *
+   * It was written at creation, sealed under the workspace key, and never answered with again - so
+   * the one thing an owner most needs to read about a watcher that runs at three in the morning was
+   * the one thing no client could show them. The title is a nine-word slug of it, which is a label
+   * and not the instruction. A schedule whose prompt this server cannot decrypt answers with an
+   * empty string rather than disappearing, for the same reason an unreadable notice is still listed.
+   */
+  prompt: z.string().max(200_000),
   modelId: z.string(),
   privacyRoute: PrivacyRoute,
   maxComputeCredits: z.number().positive(),
@@ -1212,6 +1256,27 @@ export const CreateTaskScheduleRequest = z.object({
   spec: TaskScheduleSpec
 });
 export type CreateTaskScheduleRequest = z.input<typeof CreateTaskScheduleRequest>;
+
+/**
+ * Editing a schedule that already exists, which the README has promised since before this schema.
+ *
+ * Every key is optional and an omitted one is left exactly as it was: this is the only way to move
+ * a watcher from nine o'clock to seven without retyping the instruction, and retyping it is how the
+ * prompt gets shortened by accident. `modelId` and `privacyRoute` are declared and refused rather
+ * than quietly dropped - `updateTaskSchedule` does not write those columns, and a request that says
+ * "run this on the bigger model" and answers 200 having changed nothing is the defect this whole
+ * pass exists to remove. They become editable when the store learns to write them.
+ */
+export const UpdateTaskScheduleRequest = z.object({
+  title: z.string().min(1).max(160).optional(),
+  prompt: z.string().min(1).max(200_000).optional(),
+  spec: TaskScheduleSpec.optional(),
+  maxComputeCredits: z.number().min(0.01).max(10_000).optional(),
+  maxSpendUsd: TaskSpendUsd.nullable().optional(),
+  modelId: z.string().min(1).max(200).optional(),
+  privacyRoute: PrivacyRoute.optional()
+});
+export type UpdateTaskScheduleRequest = z.input<typeof UpdateTaskScheduleRequest>;
 
 /**
  * A tab identity handed out by the runner. It is bound to the page itself, so it survives

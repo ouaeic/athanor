@@ -43,7 +43,19 @@ const relayFields = (fields: Record<string, unknown> | undefined): LogFields => 
  * outbound connection and appears in no operator's registry.
  */
 export const RelaySettingsSchema = RelayClientConfigSchema.extend({
-  enrolledAt: z.string().nullable().default(null)
+  enrolledAt: z.string().nullable().default(null),
+  /**
+   * When the relay operator dropped this box, or null.
+   *
+   * The dialer learns this from a `goaway reason=revoked` and deliberately never retries, but it
+   * only ever knew it in memory. `athanor-network-refresh` reads this file and nothing else, so
+   * without the fact written down the relay hostname stayed in the connection manifest and in every
+   * pairing ticket handed out, and every client on every device paid a connection attempt to a name
+   * that could not answer again - until the owner noticed and ran `athanor relay off`. It is also
+   * what closes the window after a restart, where nothing has dialled yet and the status file still
+   * describes the last run.
+   */
+  revokedAt: z.string().nullable().default(null)
 });
 
 export type RelaySettings = z.infer<typeof RelaySettingsSchema>;
@@ -218,6 +230,11 @@ export class RelaySupervisor {
    */
   publicHostname(): string | null {
     if (!relayIsUsable(this.#settings)) return null;
+    // A revoked enrollment is a complete one - host, label and pin are all still there - so the
+    // settings alone cannot tell it apart from a working relay. The operator has dropped this box
+    // and the dialer will never retry, so the address is now exactly the unreachable endpoint this
+    // rule exists to keep out.
+    if (this.#settings.revokedAt !== null || this.status.state === 'revoked') return null;
     return `${this.#settings.label}.${this.#settings.host}`;
   }
 
@@ -246,7 +263,10 @@ export class RelaySupervisor {
       port,
       label,
       pinnedRelaySpkiSha256,
-      enrolledAt: new Date().toISOString()
+      enrolledAt: new Date().toISOString(),
+      // A fresh token is the operator putting this box back in the registry, so whatever the last
+      // enrollment ended as, this one starts clean and the address may be advertised again.
+      revokedAt: null
     });
   }
 
@@ -343,18 +363,44 @@ export class RelaySupervisor {
     await this.#publishStatus();
   }
 
-  #onStatus(status: RelayStatus): Promise<void> {
+  async #onStatus(status: RelayStatus): Promise<void> {
     // `openStreams` moves with every client connection and says nothing an operator reads later, so
     // it is deliberately not a reason to rewrite the file.
     const previous = this.#status;
     this.#status = status;
+    await this.#recordRevocation(status);
     const unchanged =
       previous.state === status.state &&
       previous.label === status.label &&
       previous.usedBytes === status.usedBytes &&
       previous.quota === status.quota &&
       previous.lastError === status.lastError;
-    return unchanged ? Promise.resolve() : this.#publishStatus();
+    if (!unchanged) await this.#publishStatus();
+  }
+
+  /**
+   * Writes a revocation, and the end of one, into the settings file.
+   *
+   * Only `online` clears it: a revoked box that is switched off and on again goes through
+   * `connecting` on its way to being told `revoked` a second time, and advertising the address for
+   * the length of that doomed attempt is the thing this is here to stop. The write is deliberately
+   * not routed through `apply`, which tears the connection down - reacting to a status by dropping
+   * the connection that reported it would take a box offline every time the relay pinged it.
+   */
+  async #recordRevocation(status: RelayStatus): Promise<void> {
+    const revokedAt =
+      status.state === 'revoked'
+        ? (this.#settings.revokedAt ?? new Date().toISOString())
+        : status.state === 'online'
+          ? null
+          : this.#settings.revokedAt;
+    if (revokedAt === this.#settings.revokedAt) return;
+    this.#settings = { ...this.#settings, revokedAt };
+    try {
+      await writeRelaySettings(this.#options.directory, this.#settings);
+    } catch (error) {
+      this.#options.log.warn('relay.revocation_not_recorded', errorFields(error));
+    }
   }
 
   /**

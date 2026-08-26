@@ -12,6 +12,7 @@ import {
   decryptJson,
   encryptJson,
   generateDataKey,
+  inferenceCredentialAad,
   memoryIndexKey,
   sha256,
   unwrapDataKey,
@@ -1176,44 +1177,17 @@ describe('API production boundaries', () => {
     const branchPoint = events
       .json<Array<{ id: string; kind: string }>>()
       .find((event) => event.kind === 'user_message')!;
-    const branched = await app.inject({
-      method: 'POST',
-      url: `/v1/tasks/${taskId}/branch`,
-      headers: { cookie: cookie!, 'idempotency-key': 'task-branch-0001' },
-      payload: { eventId: branchPoint.id }
-    });
-    expect(branched.statusCode, branched.body).toBe(200);
-    const branch = branched.json<{
-      id: string;
-      parentTaskId: string;
-      branchedFromEventId: string;
-      status: string;
-      title: string;
-    }>();
-    expect(branch).toMatchObject({
-      parentTaskId: taskId,
-      branchedFromEventId: branchPoint.id,
-      status: 'completed',
-      title: 'Prepare a concise report · branch'
-    });
-    const branchEvents = await app.inject({
-      method: 'GET',
-      url: `/v1/tasks/${branch.id}/events`,
-      headers: { cookie: cookie! }
-    });
-    expect(branchEvents.json()).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: 'user_message',
-          payload: { markdown: 'Prepare a concise report' }
-        })
-      ])
-    );
-    const storedBranch = await database.query(
-      'SELECT title,prompt_ciphertext,agent_state_ciphertext FROM tasks WHERE id=$1',
-      [branch.id]
-    );
-    expect(JSON.stringify(storedBranch.rows)).not.toContain('Prepare a concise report');
+    /*
+     * `POST /v1/tasks/:taskId/branch` was exercised here until Wave 6 deleted the route.
+     *
+     * It was one of two ways to fork a conversation and the weaker one: it could only rewind the
+     * transcript, never the computer, and no client has ever called it - the app, the desktop
+     * shell and the contracts package all reach `POST /v1/tasks/:taskId/trajectory` with
+     * `operation: 'branch'`, which does the same fork and can also put the filesystem back. That
+     * route is asserted below and again in "rewinding the computer, not only the conversation", so
+     * what this paragraph proved - a fork carries the parent transcript and stores no plaintext -
+     * is still proved, on the surface that is actually reachable.
+     */
     const edited = await app.inject({
       method: 'POST',
       url: `/v1/tasks/${taskId}/trajectory`,
@@ -1718,6 +1692,86 @@ describe('workspace authorization boundaries', () => {
     });
     expect(shown.headers['content-type']).toContain('image/png');
     expect(String(shown.headers['content-disposition'])).toContain('inline');
+  }, 30_000);
+
+  /**
+   * The same boundary as the test above, asked of the router instead of a list.
+   *
+   * The pre-handler in `http/auth-hook.ts` is the ONLY place a `workspaceId` is checked against
+   * its owner, and Wave 6 moved every workspace-scoped route out of `server.ts` and into a
+   * `registerXRoutes` call. Fastify decides a route's hooks when the route is registered, so a
+   * group registered above `registerAuthHooks` - or a future group whose registrar someone puts
+   * in the wrong place - is readable by anyone signed in, and nothing else in this file would
+   * fail.
+   *
+   * The hand-written list in the test above cannot catch that, because a route added later is not
+   * on it. This one asks the built server what GETs it actually serves and refuses to pass until
+   * every one of them that names a workspace has been refused to a stranger.
+   */
+  test('refuses every GET the router serves under a workspace id, not only a listed few', async () => {
+    // The runner is not the subject here; every workspace-scoped GET is refused before its
+    // handler runs, so a bare "yes" from the machine is enough to get one made.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+      )
+    );
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-authz-all-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+
+    const owner = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const stranger = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'reader' } })
+    );
+    const workspace = await app.inject({
+      method: 'POST',
+      url: '/v1/workspaces',
+      headers: { cookie: owner, 'idempotency-key': 'authz-every-get-0001' },
+      payload: { name: 'The computer', storageLimitBytes: 10_000_000_000, region: 'auto' }
+    });
+    expect(workspace.statusCode, workspace.body).toBe(200);
+    const workspaceId = workspace.json<{ id: string }>().id;
+
+    /*
+     * `printRoutes` prints a tree, not a list: a child node carries only the segment its parent
+     * did not, so the full path has to be rebuilt from the indentation. Four characters of prefix
+     * per level, whichever box-drawing glyph fills them.
+     */
+    const segments: string[] = [];
+    const routes: string[] = [];
+    for (const line of app.printRoutes({ commonPrefix: false }).split('\n')) {
+      const node = /^((?:[│ ][ ]{3})*)[├└]── (\S*)(?: \(([^)]+)\))?$/.exec(line);
+      if (!node) continue;
+      const depth = node[1]!.length / 4;
+      segments.length = depth;
+      segments[depth] = node[2]!;
+      if (!node[3]?.split(', ').includes('GET')) continue;
+      const path = segments.join('');
+      if (path.includes(':workspaceId')) routes.push(path);
+    }
+    expect(routes.length).toBeGreaterThanOrEqual(12);
+
+    for (const pattern of routes) {
+      const url = pattern
+        .replace(':workspaceId', workspaceId)
+        .replace(/:(\w*[Ii]d)\b/g, randomUUID())
+        .replace(/:\w+/g, 'placeholder');
+      const refused = await app.inject({ method: 'GET', url, headers: { cookie: stranger } });
+      expect({ pattern, status: refused.statusCode }).toEqual({ pattern, status: 404 });
+      expect(refused.json<{ error: { code: string } }>().error.code).toBe('workspace_not_found');
+      // A refusal must never carry what it refused - the capability routes mint a live credential
+      // for the machine and the export streams the whole of it.
+      expect(refused.body).not.toContain('token');
+    }
   }, 30_000);
 
   test('throttles repeated passkey ceremonies from one caller', async () => {
@@ -2941,7 +2995,13 @@ describe('operator-facing logs', () => {
 });
 
 /** The provider catalogue, workspace metering and runner calls a task-creating test needs. */
-const stubProviderAndRunner = (): void => {
+/**
+ * What each route costs, per token, as OpenRouter publishes it. Absent means the seed's own null,
+ * which is what every test that does not care about money gets.
+ */
+const stubProviderAndRunner = (
+  pricing: Record<string, { prompt: string; completion: string }> = {}
+): void => {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: string | URL | Request) => {
@@ -2957,7 +3017,8 @@ const stubProviderAndRunner = (): void => {
             id: model.providerModelId,
             context_length: model.contextTokens,
             architecture: { input_modalities: model.modalities },
-            supported_parameters: ['tools', 'reasoning']
+            supported_parameters: ['tools', 'reasoning'],
+            ...(pricing[model.providerModelId] ? { pricing: pricing[model.providerModelId] } : {})
           }))
         });
       if (requestUrl.endsWith('/endpoints/zdr'))
@@ -3395,6 +3456,218 @@ describe('spending caps', () => {
     expect(refused.statusCode).toBe(402);
     expect(refused.json<{ error: { code: string } }>().error.code).toBe('spend_cap_reached');
   }, 40_000);
+
+  /**
+   * The other half of the brake: what may be chosen at all, rather than what may be spent.
+   *
+   * Every piece of this existed and none of it was reachable. `hasPriceCeiling`,
+   * `priceCeilingBreach` and the `isModelEligible` filter inside `rankModels` have been correct for
+   * two releases, and every `ModelRequest` this repository built carried no ceiling - so a probe of
+   * the real routes could report, truthfully, that the apparatus excludes the $75 per million route
+   * and that production reaches it anyway. This is that probe, as a test.
+   *
+   * The membership assertion is the point and the ordering assertion is the trap: `balanced` already
+   * prefers the cheaper of two comparable models, so "the cheap one was chosen" passes on a box with
+   * no ceiling at all. What proves enforcement is that the expensive route is *not in the answer*,
+   * and that the model the router actually picked is priced under the number the owner set.
+   */
+  test('refuses to choose a route priced above the ceiling, and asks for a passkey to raise it', async () => {
+    // $0.50 and $0.40 per million in, against $2 and $75. One ceiling of $1 splits them two and two.
+    stubProviderAndRunner({
+      'deepseek/deepseek-v4-flash': { prompt: '0.0000005', completion: '0.0000015' },
+      'qwen/qwen3.6-35b-a3b': { prompt: '0.0000004', completion: '0.0000012' },
+      'openai/gpt-oss-120b': { prompt: '0.000002', completion: '0.000006' },
+      'z-ai/glm-5.2': { prompt: '0.000075', completion: '0.00015' }
+    });
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-price-ceiling-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'ceiling-workspace' },
+        payload: { name: 'Computer', storageLimitBytes: 10_000_000_000, region: 'auto' }
+      })
+    ).json<{ id: string }>().id;
+    expect(
+      (
+        await app.inject({
+          method: 'PUT',
+          url: '/v1/providers',
+          headers: { cookie, 'idempotency-key': 'ceiling-provider' },
+          payload: { provider: 'openrouter', apiKey: 'test-key', enforceZeroDataRetention: true }
+        })
+      ).statusCode
+    ).toBe(200);
+
+    const catalogue = new Map(
+      (await app.inject({ method: 'GET', url: '/v1/models', headers: { cookie } }))
+        .json<Array<{ id: string; inputUsdPerMillionTokens: number | null }>>()
+        .map((model) => [model.id, model.inputUsdPerMillionTokens])
+    );
+    // The fixture is only a fixture if the prices arrived: without them every model reads as
+    // "no published price", which the ceiling refuses for a reason that is not the one under test.
+    expect(catalogue.get('openrouter/z-ai/glm-5.2')).toBe(75);
+    expect(catalogue.get('openrouter/deepseek/deepseek-v4-flash')).toBe(0.5);
+
+    // With no ceiling the dear route is in the answer. This is the control: the assertion below is
+    // about the ceiling removing it, not about it never having been there.
+    const openRanking = await app.inject({
+      method: 'GET',
+      url: '/v1/models/recommend',
+      headers: { cookie }
+    });
+    expect(openRanking.json<Array<{ modelId: string }>>().map((entry) => entry.modelId)).toContain(
+      'openrouter/z-ai/glm-5.2'
+    );
+
+    // It round-trips. This is the assertion that failed at 200-with-no-change for two waves: the
+    // route parsed the field, never forwarded it, and answered with the record it had not written.
+    const set = await app.inject({
+      method: 'PUT',
+      url: '/v1/spend-limits',
+      headers: { cookie, 'idempotency-key': 'ceiling-set' },
+      payload: { maxInputUsdPerMillionTokens: 1 }
+    });
+    expect(set.statusCode, set.body).toBe(200);
+    expect(set.json()).toMatchObject({ maxInputUsdPerMillionTokens: 1 });
+    expect(
+      (await app.inject({ method: 'GET', url: '/v1/spend-limits', headers: { cookie } })).json<{
+        maxInputUsdPerMillionTokens: number | null;
+      }>().maxInputUsdPerMillionTokens
+    ).toBe(1);
+
+    // Zero is a ceiling, not an absence: it admits only a route that publishes no charge. The
+    // round-trip has to keep them apart, because `?? null` anywhere on this path collapses them.
+    expect(
+      (
+        await app.inject({
+          method: 'PUT',
+          url: '/v1/spend-limits',
+          headers: { cookie, 'idempotency-key': 'ceiling-zero' },
+          payload: { maxOutputUsdPerMillionTokens: 0 }
+        })
+      ).json<{ maxOutputUsdPerMillionTokens: number | null }>().maxOutputUsdPerMillionTokens
+    ).toBe(0);
+    await app.inject({
+      method: 'PUT',
+      url: '/v1/spend-limits',
+      headers: { cookie, 'idempotency-key': 'ceiling-zero-cleared' },
+      payload: { maxOutputUsdPerMillionTokens: null }
+    });
+
+    const ranked = await app.inject({
+      method: 'GET',
+      url: '/v1/models/recommend',
+      headers: { cookie }
+    });
+    const offered = ranked.json<Array<{ modelId: string }>>().map((entry) => entry.modelId);
+    expect(offered).not.toContain('openrouter/z-ai/glm-5.2');
+    expect(offered).not.toContain('openrouter/openai/gpt-oss-120b');
+    expect(offered.length).toBeGreaterThan(0);
+
+    // A conversation that names no model. Whatever the router reaches for, its published input
+    // price is under the number the owner set - which is the whole claim, and the one that was
+    // false before this wave.
+    const started = await app.inject({
+      method: 'POST',
+      url: '/v1/tasks',
+      headers: { cookie, 'idempotency-key': 'ceiling-task' },
+      payload: {
+        workspaceId,
+        prompt: 'Summarise the quarterly numbers',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 5
+      }
+    });
+    expect(started.statusCode, started.body).toBe(200);
+    const chosen = started.json<{ modelId: string }>().modelId;
+    expect(catalogue.get(chosen)).not.toBeNull();
+    expect(catalogue.get(chosen)!).toBeLessThanOrEqual(1);
+
+    // Naming the dear route by hand still works. The ceiling governs what athanor chooses for the
+    // owner, never what the owner chooses for themselves.
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/v1/tasks',
+          headers: { cookie, 'idempotency-key': 'ceiling-task-named' },
+          payload: {
+            workspaceId,
+            prompt: 'Use the expensive one, I know what it costs',
+            modelId: 'openrouter/z-ai/glm-5.2',
+            privacyRoute: 'provider_zdr',
+            maxComputeCredits: 5
+          }
+        })
+      ).statusCode
+    ).toBe(200);
+
+    // Direction decides the passkey, exactly as it does for the caps: a ceiling that was $1 and is
+    // now $50 admits routes that were refused a second ago, and clearing it admits everything.
+    await database.query("UPDATE sessions SET step_up_at=NOW()-INTERVAL '10 minutes'");
+    for (const [key, payload] of [
+      ['ceiling-raise', { maxInputUsdPerMillionTokens: 50 }],
+      ['ceiling-clear', { maxInputUsdPerMillionTokens: null }]
+    ] as const) {
+      const loosened = await app.inject({
+        method: 'PUT',
+        url: '/v1/spend-limits',
+        headers: { cookie, 'idempotency-key': key },
+        payload
+      });
+      expect(loosened.statusCode, loosened.body).toBe(403);
+      expect(loosened.json<{ error: { code: string } }>().error.code).toBe('step_up_required');
+    }
+    const tightened = await app.inject({
+      method: 'PUT',
+      url: '/v1/spend-limits',
+      headers: { cookie, 'idempotency-key': 'ceiling-lower' },
+      payload: { maxInputUsdPerMillionTokens: 0.45 }
+    });
+    expect(tightened.statusCode, tightened.body).toBe(200);
+    expect(tightened.json()).toMatchObject({ maxInputUsdPerMillionTokens: 0.45 });
+
+    /*
+     * And a ceiling nothing can meet refuses the work rather than falling through to "the model is
+     * unavailable for this privacy route" - which is a true sentence about the wrong setting, and
+     * would send the owner to change their privacy route to fix a spending limit.
+     */
+    await database.query('UPDATE sessions SET step_up_at=NOW()');
+    expect(
+      (
+        await app.inject({
+          method: 'PUT',
+          url: '/v1/spend-limits',
+          headers: { cookie, 'idempotency-key': 'ceiling-impossible' },
+          payload: { maxInputUsdPerMillionTokens: 0.01 }
+        })
+      ).statusCode
+    ).toBe(200);
+    const blocked = await app.inject({
+      method: 'POST',
+      url: '/v1/tasks',
+      headers: { cookie, 'idempotency-key': 'ceiling-task-blocked' },
+      payload: {
+        workspaceId,
+        prompt: 'Anything at all',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 5
+      }
+    });
+    expect(blocked.statusCode, blocked.body).toBe(402);
+    const refusal = blocked.json<{ error: { code: string; message: string } }>();
+    expect(refusal.error.code).toBe('price_ceiling_blocked');
+    // It names the cheapest route that could have done the work, so the owner knows what the
+    // ceiling would have to be rather than being told only that nothing fits.
+    expect(refusal.error.message).toContain('Qwen 3.6 Vision');
+  }, 40_000);
 });
 
 describe('capability and preview boundaries', () => {
@@ -3634,7 +3907,22 @@ describe('authentication posture', () => {
     // this has to start with, and it is the only way to read it without a terminal.
     const { build } = healthy.json<{ build: { version: string; commit: string | null } }>();
     expect(build.version).toMatch(/^\d+\.\d+\.\d+$/);
-    expect(healthy.json()).toEqual({ certificate: null, dynamicDns: null, backup: null, build });
+    /*
+     * The two timers are reported alongside the two error files, and reported as `unknown` off a
+     * systemd host - which a test run is. The Updates and Backups rows used to be static copy
+     * telling an owner who switched weekly updates on a year ago to go and switch them on, and the
+     * Backups row could only show the last run, which says nothing about whether a next one is
+     * coming. `unknown` is a state the screen has to be able to say; reporting `off` for a box this
+     * process cannot ask would send the owner to enable a timer that is already running.
+     */
+    expect(healthy.json()).toEqual({
+      certificate: null,
+      dynamicDns: null,
+      backup: null,
+      autoUpdate: 'unknown',
+      backupTimer: 'unknown',
+      build
+    });
 
     await writeFile(
       join(directory, 'certificate.error'),
@@ -4387,6 +4675,44 @@ describe('rewinding the computer, not only the conversation', () => {
       `POST /v1/workspaces/${workspaceId}/checkpoints/${checkpoint.id}/restore`
     );
 
+    /*
+     * Which model the new path runs on.
+     *
+     * `TaskTrajectoryRequest` has carried `modelId` and `privacyRoute` on all three operations since
+     * they were written - "that answer was weak, try the stronger model", without retyping the
+     * request - and this handler read neither, so every fork silently ran the parent's model and the
+     * two fields were parsed and dropped. The refusal is the one `/messages` gives: a model belongs
+     * to a route, and a route it does not serve is refused rather than quietly downgraded.
+     */
+    const onAnotherModel = await app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/trajectory`,
+      headers: { cookie, 'idempotency-key': 'rewind-model' },
+      payload: {
+        operation: 'branch',
+        eventId: firstMessage.id,
+        modelId: 'openrouter/z-ai/glm-5.2'
+      }
+    });
+    expect(onAnotherModel.statusCode, onAnotherModel.body).toBe(200);
+    expect(onAnotherModel.json<{ id: string; modelId: string }>().modelId).toBe(
+      'openrouter/z-ai/glm-5.2'
+    );
+    expect(onAnotherModel.json<{ id: string }>().id).not.toBe(taskId);
+    const wrongRoute = await app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/trajectory`,
+      headers: { cookie, 'idempotency-key': 'rewind-model-route' },
+      payload: {
+        operation: 'branch',
+        eventId: firstMessage.id,
+        modelId: 'openrouter/z-ai/glm-5.2',
+        privacyRoute: 'external'
+      }
+    });
+    expect(wrongRoute.statusCode).toBe(400);
+    expect(wrongRoute.json<{ error: { code: string } }>().error.code).toBe('model_unavailable');
+
     // `computer` alone forks nothing: the transcript carries on, with a note about the files.
     const machineOnly = await app.inject({
       method: 'POST',
@@ -5013,6 +5339,74 @@ describe('where web searches are answered', () => {
     expect(settings.webSearch).toMatchObject({
       mode: 'server',
       reason: 'provider_search_available'
+    });
+  }, 30_000);
+
+  /**
+   * The facts an endpoint cannot publish about itself, read back from the screen that took them.
+   *
+   * `PUT /v1/providers` has always accepted `contextTokens`, `capabilities` and `modalities` for a
+   * directly configured endpoint - the three things an OpenAI-compatible server behind somebody's
+   * own hardware has no way to state - and written them into the catalogue row. `GET /v1/providers`
+   * never answered with them, so the settings form had nothing to re-populate from and filled in
+   * the schema's own defaults; the next save of anything at all, a key rotation included, then
+   * wrote 128K / chat-tools-reasoning / text over whatever the owner had entered. A field that is
+   * write-only and silently resets is worse than a field that was never offered.
+   *
+   * Asserted here rather than left to the read-back arm above because that arm only ever looks at
+   * `webSearch`: the three fields were repaired with no test naming them, which is the same shape
+   * as the defect - a thing that works today and nothing that notices when it stops. `vision` and
+   * `image` are deliberately not the defaults, so a regression to the schema's own values reads as
+   * a failure rather than as a coincidence.
+   */
+  test('reads back the facts the owner typed about a directly configured endpoint', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ data: [{ id: 'local-llm', name: 'Local LLM' }] }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+      )
+    );
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-provider-facts-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer({
+      ...isolatedConfig(directory),
+      // A configured endpoint on the owner's own network is the whole subject of this test.
+      ALLOW_INSECURE_PROVIDER_URLS: true
+    });
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const saved = await app.inject({
+      method: 'PUT',
+      url: '/v1/providers',
+      headers: { cookie, 'idempotency-key': 'provider-facts-save' },
+      payload: {
+        provider: 'openai-compatible',
+        baseUrl: 'http://127.0.0.1:11434/v1',
+        apiKey: 'test-key',
+        modelId: 'local-llm',
+        enforceZeroDataRetention: false,
+        contextTokens: 262_144,
+        capabilities: ['chat', 'tools', 'vision'],
+        modalities: ['text', 'image']
+      }
+    });
+    expect(saved.statusCode, saved.body).toBe(200);
+    expect(
+      (await app.inject({ method: 'GET', url: '/v1/providers', headers: { cookie } })).json<{
+        contextTokens: number | null;
+        capabilities: string[] | null;
+        modalities: string[] | null;
+      }>()
+    ).toMatchObject({
+      contextTokens: 262_144,
+      capabilities: ['chat', 'tools', 'vision'],
+      modalities: ['text', 'image']
     });
   }, 30_000);
 });
@@ -5919,4 +6313,1587 @@ describe('what the computer wrote down about its owner', () => {
     });
     expect(after.json<Array<{ id: string }>>().map((row) => row.id)).toEqual([older.id]);
   });
+
+  /**
+   * The review queue, which was built at three layers and reached nobody.
+   *
+   * The store has computed which procedures have gone stale or started failing since the schema
+   * had a `last_verified` column; the consolidation pass calls it and keeps the ids; and there was
+   * no route, so "verify or delete" was a decision this computer made about the owner's own notes
+   * without ever asking them. The queue has two halves because they are two different questions,
+   * and each carries the evidence for its own answer.
+   */
+  test('lists the memory a person has to settle, and verifying one takes it off the list', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-memory-review-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'memory-review',
+      'Deploy the site'
+    );
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspaceId);
+    const indexKey = memoryIndexKey(key);
+    const write = async (
+      title: string,
+      body: string,
+      extra: { observedAt?: string; lastVerified?: string } = {}
+    ) => {
+      const content = { title, tags: [], body };
+      return store.createMemoryItem({
+        userId: workspace.userId,
+        workspaceId,
+        kind: 'procedure',
+        trust: 'derived',
+        documentCiphertext: encryptJson(content, key, `memory-item:${workspaceId}`),
+        index: buildMemoryItemIndex(content, indexKey),
+        taskId,
+        ...extra
+      });
+    };
+    /*
+     * A fact is a subject, a predicate and an object by construction - `mem.item`'s own check
+     * constraint and a foreign key onto the predicate registry both say so - so the two rows that
+     * will disagree below are minted through the path that mints facts, not assembled by hand.
+     * `located_at` is a `many` predicate, so the second does not supersede the first: they stand
+     * side by side, which is exactly the state a contradiction is.
+     */
+    const fact = async (title: string, body: string, object: string) => {
+      const content = { title, tags: [], body, subject: 'desk', object };
+      return (
+        await store.recordMemoryFact({
+          userId: workspace.userId,
+          workspaceId,
+          trust: 'derived',
+          predicate: 'located_at',
+          documentCiphertext: encryptJson(content, key, `memory-item:${workspaceId}`),
+          index: buildMemoryItemIndex(content, indexKey),
+          taskId
+        })
+      ).item;
+    };
+    // Confirmed a year ago and never since: unused, not broken, and the owner is the only one who
+    // can tell those apart.
+    const stale = await write('Deploy', 'Run the deploy script from the project root.', {
+      observedAt: '2025-06-01T09:00:00.000Z',
+      lastVerified: '2025-06-01T09:00:00.000Z'
+    });
+    // Verified this morning, so it is nobody's business but the agent's.
+    const fresh = await write('Back up', 'Copy the database nightly.', {
+      lastVerified: new Date().toISOString()
+    });
+    const left = await fact('Standing desk', 'The desk is in the study.', 'study');
+    const right = await fact('Standing desk', 'The desk is in the spare room.', 'spare-room');
+    expect(await store.markMemoryFactsDisputed(workspaceId, [left.id, right.id])).toBe(2);
+
+    const queue = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memory-review`,
+      headers: { cookie }
+    });
+    expect(queue.statusCode, queue.body).toBe(200);
+    const first = queue.json<{
+      procedures: Array<{
+        id: string;
+        reason: string;
+        recentOkCount: number;
+        recentGradedCount: number;
+        excerpt: string;
+        taskId: string | null;
+        trust: string;
+        lastVerified: string | null;
+        okCount: number;
+        failCount: number;
+      }>;
+      disputed: Array<{ id: string; contradicts: string[]; excerpt: string }>;
+    }>();
+    expect(first.procedures.map((row) => row.id)).toEqual([stale.id]);
+    expect(first.procedures[0]).toMatchObject({
+      reason: 'unverified',
+      recentGradedCount: 0,
+      taskId,
+      trust: 'derived',
+      excerpt: 'Run the deploy script from the project root.'
+    });
+    expect(first.procedures[0]!.lastVerified).not.toBeNull();
+    // Both sides of the contradiction, in one read, each naming the other. The status alone -
+    // "this is disputed", with no answer to "with what" - is not something a person can act on.
+    expect(first.disputed.map((row) => row.id).sort()).toEqual([left.id, right.id].sort());
+    expect(first.disputed.find((row) => row.id === left.id)!.contradicts).toEqual([right.id]);
+    expect(first.disputed.find((row) => row.id === right.id)!.contradicts).toEqual([left.id]);
+    expect(first.disputed.map((row) => row.excerpt)).toContain('The desk is in the study.');
+    expect(first.procedures.map((row) => row.id)).not.toContain(fresh.id);
+
+    /*
+     * A procedure that lost more of its last five uses than it won is a different sentence: it is
+     * broken now, rather than merely unconfirmed, and the counts are the evidence for saying so.
+     */
+    await store.recordMemoryUse({ workspaceId, itemIds: [fresh.id], outcome: 'fail' });
+    await store.recordMemoryUse({ workspaceId, itemIds: [fresh.id], outcome: 'fail' });
+    await store.recordMemoryUse({ workspaceId, itemIds: [fresh.id], outcome: 'ok' });
+    const failing = (
+      await app.inject({
+        method: 'GET',
+        url: `/v1/workspaces/${workspaceId}/memory-review`,
+        headers: { cookie }
+      })
+    ).json<{ procedures: Array<{ id: string; reason: string; recentOkCount: number }> }>();
+    expect(failing.procedures.find((row) => row.id === fresh.id)).toMatchObject({
+      reason: 'failing',
+      recentOkCount: 1,
+      recentGradedCount: 3
+    });
+
+    const stranger = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'stranger' } })
+    );
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: `/v1/workspaces/${workspaceId}/memory-review`,
+          headers: { cookie: stranger }
+        })
+      ).statusCode
+    ).toBe(404);
+
+    // "This is still right", which is the whole point of the queue: it moves the clock the queue
+    // reads, and the row leaves the list.
+    const verified = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/memory-items/${stale.id}/verify`,
+      headers: { cookie, 'idempotency-key': 'memory-review-verify' },
+      payload: {}
+    });
+    expect(verified.statusCode, verified.body).toBe(200);
+    expect(verified.json()).toEqual({ verified: true });
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: `/v1/workspaces/${workspaceId}/memory-review`,
+          headers: { cookie }
+        })
+      )
+        .json<{ procedures: Array<{ id: string }> }>()
+        .procedures.map((row) => row.id)
+    ).not.toContain(stale.id);
+
+    /*
+     * Retracting is not deleting, and the difference is the reason the queue is not a delete
+     * button: the row stops being recalled and every word of it stays on disk, which is the audit
+     * trail. `DELETE …/memory-items/:id` next door is the other decision.
+     */
+    const retracted = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/memory-items/${right.id}/retract`,
+      headers: { cookie, 'idempotency-key': 'memory-review-retract' },
+      payload: {}
+    });
+    expect(retracted.json()).toEqual({ retracted: true });
+    expect(
+      (
+        await database.query<{ status: string }>('SELECT status FROM mem.item WHERE id=$1', [
+          right.id
+        ])
+      ).rows[0]
+    ).toEqual({ status: 'retracted' });
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: `/v1/workspaces/${workspaceId}/memory-review`,
+          headers: { cookie }
+        })
+      )
+        .json<{ disputed: Array<{ id: string }> }>()
+        .disputed.map((row) => row.id)
+    ).toEqual([left.id]);
+
+    // A second retraction of the same row, and a verify of something that is not a procedure, are
+    // both the caller naming something that is not there.
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/v1/workspaces/${workspaceId}/memory-items/${right.id}/retract`,
+          headers: { cookie, 'idempotency-key': 'memory-review-retract-again' },
+          payload: {}
+        })
+      ).statusCode
+    ).toBe(404);
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/v1/workspaces/${workspaceId}/memory-items/${left.id}/verify`,
+          headers: { cookie, 'idempotency-key': 'memory-review-verify-fact' },
+          payload: {}
+        })
+      ).statusCode
+    ).toBe(404);
+  }, 30_000);
+});
+
+/**
+ * Editing a watcher, which the README promised and no route could do.
+ *
+ * The agent has been able to do this from inside a conversation since the `schedule` tool was
+ * written; the owner had to delete the schedule and retype the whole standing instruction, which is
+ * how a standing instruction quietly gets shorter. And they could not read the instruction at all:
+ * `TaskSchedule` carried a nine-word title slug and never the prompt the box acts on unattended.
+ */
+/**
+ * Four routes that were shipped, wired to a client, and never once exercised by a test - and the
+ * doors on the runner that this side had bolted shut.
+ */
+/**
+ * Capabilities the runner has always had, reachable only by the agent, because this side of the
+ * connection hard-coded one action and dropped four query parameters on the floor.
+ */
+/**
+ * Three reads that answer in pages, and the three callers that could not ask for the second one.
+ */
+describe('reading past the first page', () => {
+  test('hands back a timeline window with its cursor, a second page of approvals, and an export longer than one read', async () => {
+    stubProviderAndRunner();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-paging-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'paging',
+      'Prepare the quarterly numbers'
+    );
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspaceId);
+
+    /*
+     * More frames than one read of the export takes. A streamed model call writes `assistant_delta`
+     * in the hundreds, which is the whole reason the export cannot be one array: this is the case
+     * where a paged read that forgot to ask for the second page would quietly truncate an owner's
+     * own data on the one route that exists so they can take it with them.
+     */
+    const FRAMES = 620;
+    const rows: string[] = [];
+    for (let index = 0; index < FRAMES; index += 1)
+      rows.push(
+        `('${randomUUID()}','${taskId}',${index + 100},'assistant_delta','Encrypted assistant delta',NULL)`
+      );
+    await database.query(
+      `INSERT INTO task_events(id,task_id,sequence,kind,summary,payload_ciphertext)
+       VALUES ${rows.join(',')}`
+    );
+
+    // The default is unchanged: a bare array, which is what every client reading this route today
+    // is typed for. The envelope is opt-in until the client that reads it moves over.
+    const plain = await app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${taskId}/events?limit=5`,
+      headers: { cookie }
+    });
+    expect(Array.isArray(plain.json())).toBe(true);
+    const paged = await app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${taskId}/events?after=0&limit=5&page=1`,
+      headers: { cookie }
+    });
+    expect(paged.statusCode, paged.body).toBe(200);
+    const window = paged.json<{
+      events: Array<{ sequence: number }>;
+      hasMore: boolean;
+      oldestSequence: number | null;
+      nextCursor: number;
+    }>();
+    expect(window.events).toHaveLength(5);
+    expect(window.hasMore).toBe(true);
+    // The cursor the store computed, rather than one the reader has to infer from the last row it
+    // happened to receive - and the answer to "is this the beginning", which a short page cannot
+    // give on its own.
+    expect(window.nextCursor).toBe(window.events.at(-1)!.sequence);
+    expect(window.oldestSequence).toBe(window.events[0]!.sequence);
+    // `page=0` is not the envelope. `z.coerce.boolean()` would have read the string "0" as true.
+    expect(
+      Array.isArray(
+        (
+          await app.inject({
+            method: 'GET',
+            url: `/v1/tasks/${taskId}/events?limit=5&page=0`,
+            headers: { cookie }
+          })
+        ).json()
+      )
+    ).toBe(true);
+
+    /*
+     * Approvals. The store has taken a page and a cursor since the read was bounded, and every row
+     * carries the cursor for the row after it - the route passed neither, so an owner going back
+     * through what they approved last month reached the store's ceiling and stopped, with no way to
+     * say "keep going".
+     */
+    for (const action of ['send the email', 'delete the folder', 'publish the site'])
+      await store.createApproval({
+        userId: workspace.userId,
+        taskId,
+        action,
+        sideEffect: 'external',
+        previewCiphertext: encryptJson({ action }, key, `approval:${taskId}`),
+        previewHash: sha256(action),
+        expiresAt: new Date(Date.now() + 60 * 60_000)
+      });
+    const firstPage = await app.inject({
+      method: 'GET',
+      url: '/v1/approvals?status=pending&limit=2',
+      headers: { cookie }
+    });
+    expect(firstPage.statusCode, firstPage.body).toBe(200);
+    const page = firstPage.json<Array<{ id: string; cursor: string }>>();
+    expect(page).toHaveLength(2);
+    const secondPage = (
+      await app.inject({
+        method: 'GET',
+        url: `/v1/approvals?status=pending&limit=2&cursor=${encodeURIComponent(page[1]!.cursor)}`,
+        headers: { cookie }
+      })
+    ).json<Array<{ id: string }>>();
+    expect(secondPage).toHaveLength(1);
+    expect(page.map((row) => row.id)).not.toContain(secondPage[0]!.id);
+
+    /*
+     * And the export, which used to decrypt every frame of every conversation into one array and
+     * serialise the array into one string. It is written out as it is read now; the document is the
+     * same, and the assertion that matters is that nothing was dropped at the page boundary.
+     */
+    const exported = await app.inject({
+      method: 'GET',
+      url: '/v1/privacy/export',
+      headers: { cookie }
+    });
+    expect(exported.statusCode, exported.body).toBe(200);
+    const document = exported.json<{
+      schemaVersion: number;
+      taskContents: Array<{ taskId: string; prompt: string; events: Array<{ sequence: number }> }>;
+    }>();
+    const conversation = document.taskContents.find((entry) => entry.taskId === taskId)!;
+    expect(conversation.prompt).toBe('Prepare the quarterly numbers');
+    expect(conversation.events.length).toBeGreaterThan(FRAMES);
+    // Oldest first and every sequence present exactly once: a paged read that re-read a page, or
+    // skipped one, shows up here and nowhere else.
+    expect(new Set(conversation.events.map((event) => event.sequence)).size).toBe(
+      conversation.events.length
+    );
+    expect(
+      conversation.events.every(
+        (event, index) => index === 0 || event.sequence > conversation.events[index - 1]!.sequence
+      )
+    ).toBe(true);
+    expect(typeof document.schemaVersion).toBe('number');
+  }, 60_000);
+});
+
+describe('the doors the runner already had', () => {
+  test('reads a background process, a window of a file, and refuses a write onto changed bytes', async () => {
+    const processActions: string[] = [];
+    let fileQuery = '';
+    let writeQuery = '';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const requestUrl = input instanceof Request ? input.url : input.toString();
+        const method = init?.method ?? 'GET';
+        const json = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), {
+            status,
+            headers: { 'content-type': 'application/json' }
+          });
+        if (requestUrl.endsWith('/models'))
+          return json({
+            data: seedModels().map((model) => ({
+              id: model.providerModelId,
+              context_length: model.contextTokens,
+              architecture: { input_modalities: model.modalities },
+              supported_parameters: ['tools', 'reasoning']
+            }))
+          });
+        if (requestUrl.endsWith('/endpoints/zdr'))
+          return json({
+            data: seedModels().map((model) => ({ model_id: model.providerModelId, status: 0 }))
+          });
+        if (requestUrl.includes('/benchmarks?')) return json({ data: [] });
+        if (requestUrl.includes('/processes/') && method === 'POST') {
+          const sent = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as {
+            action?: string;
+          };
+          processActions.push(sent.action ?? '');
+          return json({ id: 'proc_1', status: 'running', output: 'boot: listening on 4000' });
+        }
+        if (requestUrl.includes('/file?') && method === 'PUT') {
+          writeQuery = requestUrl.split('/file?')[1]!;
+          if (writeQuery.includes('expectSha256'))
+            return json(
+              { error: { code: 'file_changed', message: 'This file changed after you read it' } },
+              409
+            );
+          return json({ sha256: 'b'.repeat(64), sizeBytes: 4 });
+        }
+        if (requestUrl.includes('/file?') && method === 'GET') {
+          fileQuery = requestUrl.split('/file?')[1]!;
+          return new Response('line 41\nline 42\n', {
+            status: 200,
+            headers: {
+              'content-type': 'text/plain',
+              'x-start-line': '41',
+              'x-end-line': '42',
+              'x-file-bytes': '4096',
+              'x-truncated': 'true',
+              'x-total-lines': '900',
+              'x-next-start-line': '43'
+            }
+          });
+        }
+        return json({
+          storageBytes: 0,
+          hostStorageTotalBytes: 1_000_000_000,
+          hostStorageAvailableBytes: 900_000_000,
+          available: true,
+          ok: true
+        });
+      })
+    );
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-runner-doors-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'runner-doors-workspace' },
+        payload: { name: 'Computer', storageLimitBytes: 10_000_000_000, region: 'auto' }
+      })
+    ).json<{ id: string }>().id;
+
+    /*
+     * A service that is failing could be seen in the panel and stopped, and never read: the action
+     * was hard-coded to `kill`, so the runner's `log` arm - the only way to see what a background
+     * process has written - was reachable by the agent and by nothing the owner has.
+     */
+    const log = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/processes/proc_1`,
+      headers: { cookie },
+      payload: { action: 'log' }
+    });
+    expect(log.statusCode, log.body).toBe(200);
+    expect(log.json<{ output: string }>().output).toContain('listening on 4000');
+    // The default is still stop, so every caller that predates this keeps working.
+    await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/processes/proc_1`,
+      headers: { cookie },
+      payload: {}
+    });
+    expect(processActions).toEqual(['log', 'kill']);
+    // And the two arms that are the agent's business stay the agent's business: `write` puts bytes
+    // on the stdin of a process the owner is watching rather than driving.
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/v1/workspaces/${workspaceId}/processes/proc_1`,
+          headers: { cookie },
+          payload: { action: 'write', data: 'rm -rf /' }
+        })
+      ).statusCode
+    ).toBe(400);
+
+    // A window of a large file, and the numbers that say where it came from and where to go next.
+    const window = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/file?path=workspace%2Flog.txt&startLine=41&endLine=42&maxBytes=2048`,
+      headers: { cookie }
+    });
+    expect(window.statusCode, window.body).toBe(200);
+    expect(fileQuery).toContain('startLine=41');
+    expect(fileQuery).toContain('endLine=42');
+    expect(fileQuery).toContain('maxBytes=2048');
+    expect(window.headers['x-start-line']).toBe('41');
+    expect(window.headers['x-next-start-line']).toBe('43');
+    expect(window.headers['x-truncated']).toBe('true');
+    expect(window.headers['x-total-lines']).toBe('900');
+
+    /*
+     * The claim about what is being replaced. Without it the later write wins silently: the Files
+     * pane's save discarded work the agent had just done, with nothing recording that it had. And
+     * the refusal arrives as its own 409 rather than as a 500 quoting the runtime, because it is a
+     * disagreement the owner resolves by re-reading the file.
+     */
+    const clash = await app.inject({
+      method: 'PUT',
+      url: `/v1/workspaces/${workspaceId}/file?path=workspace%2Fnotes.md&expectSha256=${'a'.repeat(64)}`,
+      headers: {
+        cookie,
+        'content-type': 'application/octet-stream',
+        'idempotency-key': 'runner-doors-write-clash'
+      },
+      payload: Buffer.from('new\n')
+    });
+    expect(clash.statusCode, clash.body).toBe(409);
+    expect(clash.json<{ error: { code: string } }>().error.code).toBe('file_changed');
+    expect(writeQuery).toContain(`expectSha256=${'a'.repeat(64)}`);
+    // A write that makes no claim is unchanged: it goes through and reports what it wrote.
+    const written = await app.inject({
+      method: 'PUT',
+      url: `/v1/workspaces/${workspaceId}/file?path=workspace%2Fnotes.md`,
+      headers: {
+        cookie,
+        'content-type': 'application/octet-stream',
+        'idempotency-key': 'runner-doors-write-plain'
+      },
+      payload: Buffer.from('new\n')
+    });
+    expect(written.statusCode, written.body).toBe(200);
+    expect(written.json<{ sizeBytes: number }>().sizeBytes).toBe(4);
+    expect(writeQuery).not.toContain('expectSha256');
+  }, 30_000);
+});
+
+describe('the routes nothing had ever asked', () => {
+  test('reports readiness, changes a security mode, rotates a private link and remembers a media choice', async () => {
+    // The runner stub that answers the preview port check, which is what stands between a request
+    // for a private link and a 400 saying nothing is listening.
+    stubProviderAndRunner();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-untested-routes-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database } = await buildServer(isolatedConfig(directory), { masterKey });
+    // This test takes the database away on purpose at the end, so the shutdown that closes it again
+    // is allowed to find it already gone.
+    disposers.push(() => app.close().catch(() => undefined));
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'untested-routes',
+      'Prepare the quarterly numbers'
+    );
+
+    // A security mode is the setting an owner reaches for most, and no test had ever moved one.
+    const relaxed = await app.inject({
+      method: 'PATCH',
+      url: `/v1/tasks/${taskId}/security-mode`,
+      headers: { cookie, 'idempotency-key': 'untested-security-mode' },
+      payload: { securityMode: 'autonomous' }
+    });
+    expect(relaxed.statusCode, relaxed.body).toBe(200);
+    expect(relaxed.json<{ securityMode: string }>().securityMode).toBe('autonomous');
+    // Written into the conversation as well as onto the row: a change of what the agent may do
+    // without asking belongs in the record of what happened.
+    expect(
+      (
+        await database.query<{ kind: string; summary: string }>(
+          "SELECT kind,summary FROM task_events WHERE task_id=$1 AND summary='Security mode changed'",
+          [taskId]
+        )
+      ).rows
+    ).toHaveLength(1);
+    const stranger = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'stranger' } })
+    );
+    expect(
+      (
+        await app.inject({
+          method: 'PATCH',
+          url: `/v1/tasks/${taskId}/security-mode`,
+          headers: { cookie: stranger, 'idempotency-key': 'untested-security-mode-stranger' },
+          payload: { securityMode: 'autonomous' }
+        })
+      ).statusCode
+    ).toBe(404);
+
+    // The private link, rotated. This is what an owner does when a link has been somewhere it
+    // should not have been, and it has to actually invalidate the old one.
+    const preview = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/previews`,
+      headers: { cookie, 'idempotency-key': 'untested-preview' },
+      payload: { port: 3000, label: 'The app' }
+    });
+    expect(preview.statusCode, preview.body).toBe(201);
+    // The token rides in the address rather than in a field of its own: the link *is* the
+    // credential, which is the whole reason rotating it has to work.
+    const accessOf = (body: { url: string }) => new URL(body.url).searchParams.get('access');
+    const before = preview.json<{ id: string; url: string }>();
+    expect(accessOf(before)).not.toBeNull();
+    const rotated = await app.inject({
+      method: 'POST',
+      url: `/v1/previews/${before.id}/access`,
+      headers: { cookie, 'idempotency-key': 'untested-preview-rotate' },
+      payload: {}
+    });
+    expect(rotated.statusCode, rotated.body).toBe(200);
+    const after = rotated.json<{ id: string; url: string }>();
+    expect(after.id).toBe(before.id);
+    expect(accessOf(after)).not.toBe(accessOf(before));
+    // The stored hash moved with it, which is the half that makes the old link stop working.
+    expect(
+      (
+        await database.query<{ access_token_hash: string }>(
+          'SELECT access_token_hash FROM workspace_previews WHERE id=$1',
+          [before.id]
+        )
+      ).rows[0]!.access_token_hash
+    ).toBe(sha256(accessOf(after)!));
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/v1/previews/${randomUUID()}/access`,
+          headers: { cookie, 'idempotency-key': 'untested-preview-missing' },
+          payload: {}
+        })
+      ).statusCode
+    ).toBe(404);
+
+    // A media choice has to survive the request that made it: it is written into the same encrypted
+    // credential the provider key lives in, and read back from there by the worker.
+    const chosen = await app.inject({
+      method: 'PUT',
+      url: '/v1/media/models',
+      headers: { cookie, 'idempotency-key': 'untested-media' },
+      payload: { image: { automatic: false, preference: 'best', modelId: 'test/image-model' } }
+    });
+    expect(chosen.statusCode, chosen.body).toBe(200);
+    const credential = (await store.getManagedProviderCredential(
+      (await store.getWorkspaceById(workspaceId))!.userId,
+      'inference'
+    ))!;
+    expect(
+      decryptJson<{ apiKey?: string; mediaModels?: { image?: { modelId: string } } }>(
+        credential.secretCiphertext,
+        masterKey,
+        inferenceCredentialAad((await store.getWorkspaceById(workspaceId))!.userId)
+      ).mediaModels?.image
+    ).toMatchObject({ automatic: false, preference: 'best', modelId: 'test/image-model' });
+
+    /*
+     * Readiness, which is the gate an update should be checking and the one route that reports a
+     * dead database. Last, because proving it says 503 means taking the database away.
+     */
+    expect((await app.inject({ method: 'GET', url: '/readyz' })).json<{ ok: boolean }>().ok).toBe(
+      true
+    );
+    await database.close();
+    const notReady = await app.inject({ method: 'GET', url: '/readyz' });
+    expect(notReady.statusCode).toBe(503);
+    expect(notReady.json()).toEqual({ ok: false, service: 'api' });
+  }, 30_000);
+});
+
+describe('editing a standing instruction', () => {
+  test('moves a schedule to a new time without losing its instruction, its ceiling or its history', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-schedule-edit-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'schedule-edit-workspace' },
+        payload: { name: 'Computer', storageLimitBytes: 10_000_000_000, region: 'auto' }
+      })
+    ).json<{ id: string }>().id;
+    expect(
+      (
+        await app.inject({
+          method: 'PUT',
+          url: '/v1/providers',
+          headers: { cookie, 'idempotency-key': 'schedule-edit-provider' },
+          payload: { provider: 'openrouter', apiKey: 'test-key', enforceZeroDataRetention: true }
+        })
+      ).statusCode
+    ).toBe(200);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/schedules',
+      headers: { cookie, 'idempotency-key': 'schedule-edit-create' },
+      payload: {
+        workspaceId,
+        title: 'Morning report',
+        prompt: 'Read the overnight logs and write up anything that went wrong.',
+        modelId: 'openrouter/openai/gpt-oss-120b',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 1,
+        maxSpendUsd: 3,
+        spec: { kind: 'daily', localTime: '09:00', timeZone: 'Europe/Lisbon' }
+      }
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    const schedule = created.json<{ id: string; prompt: string; nextRunAt: string }>();
+    // The standing instruction comes back. Until now the owner could not read the one thing their
+    // computer will act on while they are asleep.
+    expect(schedule.prompt).toBe('Read the overnight logs and write up anything that went wrong.');
+
+    // A run happened, so there is history for the edit to preserve.
+    await database.query(
+      'UPDATE task_schedules SET last_task_id=$2,last_run_at=NOW() WHERE id=$1',
+      [
+        schedule.id,
+        (
+          await app.inject({
+            method: 'POST',
+            url: '/v1/tasks',
+            headers: { cookie, 'idempotency-key': 'schedule-edit-task' },
+            payload: {
+              workspaceId,
+              prompt: 'A run of the morning report',
+              modelId: 'openrouter/openai/gpt-oss-120b',
+              privacyRoute: 'provider_zdr',
+              maxComputeCredits: 1
+            }
+          })
+        ).json<{ id: string }>().id
+      ]
+    );
+
+    const moved = await app.inject({
+      method: 'PATCH',
+      url: `/v1/schedules/${schedule.id}`,
+      headers: { cookie, 'idempotency-key': 'schedule-edit-move' },
+      payload: { spec: { kind: 'daily', localTime: '07:00', timeZone: 'Europe/Lisbon' } }
+    });
+    expect(moved.statusCode, moved.body).toBe(200);
+    const edited = moved.json<{
+      prompt: string;
+      title: string;
+      nextRunAt: string;
+      lastTaskId: string | null;
+      maxSpendUsd: number | null;
+      spec: { localTime: string };
+    }>();
+    expect(edited.spec.localTime).toBe('07:00');
+    expect(new Date(edited.nextRunAt).getTime()).not.toBe(new Date(schedule.nextRunAt).getTime());
+    // What the edit did not touch. `updateTaskSchedule` writes `max_spend_usd` on every call from
+    // whatever it is handed, so a route that left it out would have cleared the money ceiling on an
+    // unattended run as a side effect of moving it two hours earlier.
+    expect(edited.maxSpendUsd).toBe(3);
+    expect(edited.title).toBe('Morning report');
+    expect(edited.prompt).toBe('Read the overnight logs and write up anything that went wrong.');
+    expect(edited.lastTaskId).not.toBeNull();
+
+    // The instruction alone, with the timing left where it is.
+    const reworded = await app.inject({
+      method: 'PATCH',
+      url: `/v1/schedules/${schedule.id}`,
+      headers: { cookie, 'idempotency-key': 'schedule-edit-reword' },
+      payload: { prompt: 'Read the overnight logs and page me only if a service is down.' }
+    });
+    expect(reworded.statusCode, reworded.body).toBe(200);
+    expect(reworded.json<{ prompt: string; nextRunAt: string }>()).toMatchObject({
+      prompt: 'Read the overnight logs and page me only if a service is down.',
+      nextRunAt: edited.nextRunAt
+    });
+    // And it is still sealed on disk: the route reads it, the database does not hold it.
+    expect(
+      JSON.stringify(
+        (
+          await database.query('SELECT prompt_ciphertext FROM task_schedules WHERE id=$1', [
+            schedule.id
+          ])
+        ).rows
+      )
+    ).not.toContain('page me only if');
+
+    // Refused rather than dropped. `updateTaskSchedule` does not write the model or the route, and
+    // zod strips a key it does not declare - so this would have been 200 with nothing changed.
+    const rerouted = await app.inject({
+      method: 'PATCH',
+      url: `/v1/schedules/${schedule.id}`,
+      headers: { cookie, 'idempotency-key': 'schedule-edit-model' },
+      payload: { modelId: 'openrouter/z-ai/glm-5.2' }
+    });
+    expect(rerouted.statusCode).toBe(409);
+    expect(rerouted.json<{ error: { code: string } }>().error.code).toBe(
+      'schedule_model_immutable'
+    );
+
+    // An enabled one-time schedule cannot be moved into the past, the same refusal the agent's own
+    // edit gives - a schedule that quietly disabled itself is a watcher that stopped watching.
+    const intoThePast = await app.inject({
+      method: 'PATCH',
+      url: `/v1/schedules/${schedule.id}`,
+      headers: { cookie, 'idempotency-key': 'schedule-edit-past' },
+      payload: { spec: { kind: 'once', runAt: '2020-01-01T09:00:00.000Z' } }
+    });
+    expect(intoThePast.statusCode).toBe(400);
+    expect(intoThePast.json<{ error: { code: string } }>().error.code).toBe('schedule_in_past');
+
+    // Nothing to change is a request that meant something and did not say it.
+    expect(
+      (
+        await app.inject({
+          method: 'PATCH',
+          url: `/v1/schedules/${schedule.id}`,
+          headers: { cookie, 'idempotency-key': 'schedule-edit-empty' },
+          payload: {}
+        })
+      ).json<{ error: { code: string } }>().error.code
+    ).toBe('schedule_update_empty');
+
+    const stranger = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'stranger' } })
+    );
+    expect(
+      (
+        await app.inject({
+          method: 'PATCH',
+          url: `/v1/schedules/${schedule.id}`,
+          headers: { cookie: stranger, 'idempotency-key': 'schedule-edit-stranger' },
+          payload: { title: 'Mine now' }
+        })
+      ).json<{ error: { code: string } }>().error.code
+    ).toBe('schedule_not_found');
+  }, 30_000);
+});
+
+describe('scheduled dispatch', () => {
+  /**
+   * The number the poll interval is really made of. `SCHEDULER_POLL_MS` is fifteen seconds and
+   * `serverLimits.maxSchedules` is a thousand, so "one run per tick" prices the documented ceiling
+   * at four hours to drain - and nothing reports the drift, because `next_run_at` has already
+   * advanced by the time the run is late.
+   */
+  test('dispatches every schedule that is already due on a single poll', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-schedule-drain-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database, runScheduler } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'drain-workspace' },
+        payload: { name: 'Watched' }
+      })
+    ).json<{ id: string }>().id;
+    await app.inject({
+      method: 'PUT',
+      url: '/v1/providers',
+      headers: { cookie, 'idempotency-key': 'drain-provider' },
+      payload: { provider: 'openrouter', apiKey: 'test-key', enforceZeroDataRetention: true }
+    });
+    await database.query(
+      "UPDATE model_releases SET availability='available' WHERE id='openrouter/openai/gpt-oss-120b'"
+    );
+    for (let watcher = 0; watcher < 3; watcher += 1) {
+      const created = await app.inject({
+        method: 'POST',
+        url: '/v1/schedules',
+        headers: { cookie, 'idempotency-key': `drain-schedule-${watcher}` },
+        payload: {
+          workspaceId,
+          title: `Watcher ${watcher}`,
+          prompt: `Read the ${watcher} report and say what changed`,
+          modelId: 'openrouter/openai/gpt-oss-120b',
+          privacyRoute: 'provider_zdr',
+          maxComputeCredits: 1,
+          spec: { kind: 'interval', everyMinutes: 60 }
+        }
+      });
+      expect(created.statusCode, created.body).toBe(201);
+    }
+    // Nine o'clock: every watcher the owner set for the morning comes due in the same second.
+    await database.query('UPDATE task_schedules SET next_run_at=NOW()');
+
+    await runScheduler();
+
+    const dispatched = await database.query<{ last_task_id: string | null }>(
+      'SELECT last_task_id FROM task_schedules'
+    );
+    expect(dispatched.rows.filter((row) => row.last_task_id !== null)).toHaveLength(3);
+    expect(
+      (await database.query<{ status: string }>("SELECT status FROM tasks WHERE status='queued'"))
+        .rows
+    ).toHaveLength(3);
+  });
+
+  /**
+   * The ordering the file already argues for forty lines above `sweepExpiredApprovals`: release the
+   * reservation first, because a death in between then leaves a task the sweep can still find,
+   * where the opposite order strands the credits against the monthly allowance for good. This
+   * test is that death - `setTaskStatusForUser` refuses at the exact statement that records the
+   * failure - and it only passes if the release already happened.
+   */
+  test('releases a failed scheduled run from its reservation before it records the failure', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const requestUrl = input instanceof Request ? input.url : input.toString();
+        const json = (body: unknown) =>
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          });
+        if (requestUrl.endsWith('/models'))
+          return json({
+            data: seedModels().map((model) => ({
+              id: model.providerModelId,
+              context_length: model.contextTokens,
+              architecture: { input_modalities: model.modalities },
+              supported_parameters: ['tools', 'reasoning']
+            }))
+          });
+        if (requestUrl.endsWith('/endpoints/zdr'))
+          return json({
+            data: seedModels().map((model) => ({ model_id: model.providerModelId, status: 0 }))
+          });
+        if (requestUrl.includes('/benchmarks?')) return json({ data: [] });
+        // The runner is down, which is the whole of this incident: the workspace cannot be woken,
+        // so the dispatch that already reserved the credits can never queue.
+        if (requestUrl.endsWith('/resume'))
+          return new Response('{}', {
+            status: 503,
+            headers: { 'content-type': 'application/json' }
+          });
+        return json({
+          storageBytes: 0,
+          hostStorageTotalBytes: 1_000_000_000,
+          hostStorageAvailableBytes: 900_000_000,
+          ok: true
+        });
+      })
+    );
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-schedule-strand-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database, runScheduler } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'strand-workspace' },
+        payload: { name: 'Watched' }
+      })
+    ).json<{ id: string }>().id;
+    await app.inject({
+      method: 'PUT',
+      url: '/v1/providers',
+      headers: { cookie, 'idempotency-key': 'strand-provider' },
+      payload: { provider: 'openrouter', apiKey: 'test-key', enforceZeroDataRetention: true }
+    });
+    await database.query(
+      "UPDATE model_releases SET availability='available' WHERE id='openrouter/openai/gpt-oss-120b'"
+    );
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/schedules',
+      headers: { cookie, 'idempotency-key': 'strand-schedule' },
+      payload: {
+        workspaceId,
+        title: 'Nightly watcher',
+        prompt: 'Read the overnight mail and say what needs an answer',
+        modelId: 'openrouter/openai/gpt-oss-120b',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 1,
+        spec: { kind: 'interval', everyMinutes: 60 }
+      }
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    await database.query("UPDATE workspaces SET status='paused' WHERE id=$1", [workspaceId]);
+    await database.query('UPDATE task_schedules SET next_run_at=NOW()');
+
+    const setTaskStatusForUser = store.setTaskStatusForUser.bind(store);
+    store.setTaskStatusForUser = async (userId: string, taskId: string, status: string) => {
+      if (status === 'failed') throw new Error('the process died recording the failure');
+      return setTaskStatusForUser(userId, taskId, status);
+    };
+    // The dispatch is expected to die; what is asserted is the state it died in.
+    await runScheduler().catch(() => undefined);
+
+    const reservation = await database.query<{ state: string; idempotency_key: string }>(
+      "SELECT state,idempotency_key FROM usage_entries WHERE idempotency_key LIKE 'task:%:reservation'"
+    );
+    expect(reservation.rows).toHaveLength(1);
+    expect(reservation.rows[0]?.state).toBe('released');
+  });
+});
+
+describe('control-plane gates', () => {
+  /**
+   * `/v1/legal` is public, is not rate limited, and the sign-in screen calls it on every load, so
+   * the count it reports twice is a query the box answers twice for every visit to the one page a
+   * machine that cannot answer has no other way to explain itself from.
+   */
+  test('answers the public licence route from a single user count', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-legal-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const countUsers = store.countUsers.bind(store);
+    let counts = 0;
+    store.countUsers = async () => {
+      counts += 1;
+      return countUsers();
+    };
+
+    const legal = await app.inject({ method: 'GET', url: '/v1/legal' });
+
+    expect(legal.statusCode, legal.body).toBe(200);
+    expect(legal.json()).toMatchObject({ registrationAvailable: true, singleOwner: false });
+    expect(counts).toBe(1);
+  });
+
+  /**
+   * `?after=500&after=600` used to make `request.query.after` an array, `Number([…])` `NaN`, and
+   * `|| 0` a cursor of zero - so a query the server could not read opened a stream that replayed
+   * the entire conversation. One measured turn wrote 1,015 `assistant_delta` rows.
+   */
+  test('refuses a repeated cursor on the event stream instead of replaying the conversation', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-stream-cursor-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const { cookie, taskId } = await seedOwnerWithTask(
+      app,
+      'stream-cursor',
+      'Read the overnight mail and say what needs an answer'
+    );
+
+    const repeated = await app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${taskId}/events/stream?after=500&after=600`,
+      headers: { cookie }
+    });
+
+    expect(repeated.statusCode).toBe(400);
+    expect(repeated.json<{ error: { code: string } }>().error.code).toBe('invalid_request');
+    /*
+     * Asserted on the refusal alone, not on the accepting case: the route hijacks its reply, so an
+     * injected request that opens the stream never returns and would hang this file rather than
+     * fail it. `event-stream.test.ts` drives that half over a real socket.
+     */
+  });
+
+  /**
+   * `request.body` is a `Buffer` only for the one content type this file registers a raw parser
+   * for. A JSON body parsed to an object, whose `byteLength` is `undefined`, and `storageBytes +
+   * undefined > limit` is `false` - so the guard that exists to stop the disk filling was skipped
+   * by anything that did not declare itself.
+   */
+  test('will not take a file write that is not bytes, rather than skipping the storage guard', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-file-guard-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'file-guard-workspace' },
+        payload: { name: 'Computer' }
+      })
+    ).json<{ id: string }>().id;
+    // Already full, so a write that reaches the guard is refused and a write that skips it is not.
+    await database.query('UPDATE workspaces SET storage_bytes=storage_limit_bytes WHERE id=$1', [
+      workspaceId
+    ]);
+
+    const asJson = await app.inject({
+      method: 'PUT',
+      url: `/v1/workspaces/${workspaceId}/file?path=workspace/notes.txt`,
+      headers: { cookie, 'idempotency-key': 'file-guard-json', 'content-type': 'application/json' },
+      payload: { 0: 65, 1: 66, length: 2 }
+    });
+    expect(asJson.statusCode, asJson.body).toBe(415);
+
+    const asBytes = await app.inject({
+      method: 'PUT',
+      url: `/v1/workspaces/${workspaceId}/file?path=workspace/notes.txt`,
+      headers: {
+        cookie,
+        'idempotency-key': 'file-guard-bytes',
+        'content-type': 'application/octet-stream'
+      },
+      payload: Buffer.from('AB')
+    });
+    expect(asBytes.json<{ error: { code: string } }>().error.code).toBe('storage_limit');
+  });
+
+  /**
+   * The other door to replacing the workspace tree - `POST /v1/workspaces/:id/snapshots/:sid/
+   * restore` - needs `workspaces:write`, a passkey confirmation and the workspace name typed out.
+   * This one is a `/v1/tasks` write, and the scope table keys on the route, so a `tasks:write`
+   * token issued for a bot that files conversations could roll the machine back weeks.
+   */
+  test('refuses an automation token that asks to put the computer back', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-token-rewind-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const { cookie, taskId } = await seedOwnerWithTask(
+      app,
+      'token-rewind',
+      'File the overnight mail'
+    );
+    const token = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/api-tokens',
+        headers: { cookie },
+        payload: { label: 'Filing bot', scopes: ['tasks:read', 'tasks:write'], expiresInDays: 7 }
+      })
+    ).json<{ token: string }>().token;
+    const events = (
+      await app.inject({ method: 'GET', url: `/v1/tasks/${taskId}/events`, headers: { cookie } })
+    ).json<Array<{ id: string; kind: string }>>();
+    const eventId = events.find((event) => event.kind === 'user_message')?.id;
+    expect(eventId).toBeTruthy();
+
+    const rewind = await app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/trajectory`,
+      headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'token-rewind-both' },
+      payload: { operation: 'branch', eventId, rewind: 'both' }
+    });
+
+    expect(rewind.statusCode, rewind.body).toBe(403);
+    expect(rewind.json<{ error: { code: string } }>().error.code).toBe('api_token_scope_required');
+    /*
+     * The positive control: the conversation-only fork is still a task write and the same token
+     * still reaches the handler with it. It fails further in, on this fixture's own missing
+     * conversation checkpoint - which is the point, because that is a refusal from the route and
+     * not from the credential.
+     */
+    const branched = await app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/trajectory`,
+      headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'token-rewind-talk' },
+      payload: { operation: 'branch', eventId, rewind: 'conversation' }
+    });
+    expect(branched.json<{ error: { code: string } }>().error.code).not.toBe(
+      'api_token_scope_required'
+    );
+  });
+
+  /**
+   * The recheck route is documented as answering 200 whether or not the account replied, so its
+   * failure never passes the error handler - which is the only other place a message built from an
+   * upstream response is scrubbed. What the account writes reaches Connectors unaltered otherwise.
+   */
+  test('bounds and scrubs what a connector says when a recheck fails', async () => {
+    stubProviderFetch();
+    const failing = { now: false };
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-connector-recheck-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(
+      { ...isolatedConfig(directory), CONNECTOR_ALLOWED_HOST_SUFFIXES: 'example.test' },
+      {
+        connectorTransport: async (input) => {
+          if (failing.now)
+            throw new Error(
+              `PROPFIND failed for https://owner:the-app-password@calendar.example.test/dav/ ${'x'.repeat(400)}`
+            );
+          return calendarTransport(input);
+        }
+      }
+    );
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const connected = await app.inject({
+      method: 'POST',
+      url: '/v1/connectors',
+      headers: { cookie, 'idempotency-key': 'recheck-connect' },
+      payload: {
+        kind: 'caldav',
+        label: 'My calendar',
+        baseUrl: 'https://calendar.example.test/dav/',
+        username: 'owner',
+        password: 'the-app-password',
+        address: 'owner@example.test',
+        scopes: ['calendar:calendars.read']
+      }
+    });
+    expect(connected.statusCode, connected.body).toBe(200);
+    const connectorId = connected.json<{ id: string }>().id;
+
+    failing.now = true;
+    const rechecked = await app.inject({
+      method: 'POST',
+      url: `/v1/connectors/${connectorId}/test`,
+      headers: { cookie },
+      payload: {}
+    });
+
+    expect(rechecked.statusCode, rechecked.body).toBe(200);
+    const failure = rechecked.json<{ ok: boolean; failure: { message: string } }>();
+    expect(failure.ok).toBe(false);
+    expect(failure.failure.message).not.toContain('the-app-password');
+    expect(failure.failure.message).toContain('[REDACTED]');
+    expect(failure.failure.message.length).toBeLessThanOrEqual(200);
+  });
+
+  /**
+   * `privateTaskResponse` and `privateScheduleResponse` both take the workspace they should use and
+   * both fetch it themselves when they are not given one - a query and an `unwrapDataKey` per row.
+   * `/v1/bootstrap` has always passed it; the two list routes did not, so a page of two hundred
+   * conversations was two hundred and one queries on a box whose PostgreSQL is a real socket.
+   */
+  test('draws the sidebar without one workspace read per row', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-list-fanout-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'fanout-workspace' },
+        payload: { name: 'Computer' }
+      })
+    ).json<{ id: string }>().id;
+    await app.inject({
+      method: 'PUT',
+      url: '/v1/providers',
+      headers: { cookie, 'idempotency-key': 'fanout-provider' },
+      payload: { provider: 'openrouter', apiKey: 'test-key', enforceZeroDataRetention: true }
+    });
+    await database.query(
+      "UPDATE model_releases SET availability='available' WHERE id='openrouter/openai/gpt-oss-120b'"
+    );
+    for (let conversation = 0; conversation < 6; conversation += 1) {
+      await app.inject({
+        method: 'POST',
+        url: '/v1/tasks',
+        headers: { cookie, 'idempotency-key': `fanout-task-${conversation}` },
+        payload: {
+          workspaceId,
+          prompt: `Read report ${conversation}`,
+          modelId: 'openrouter/openai/gpt-oss-120b',
+          privacyRoute: 'provider_zdr',
+          maxComputeCredits: 5
+        }
+      });
+      await app.inject({
+        method: 'POST',
+        url: '/v1/schedules',
+        headers: { cookie, 'idempotency-key': `fanout-schedule-${conversation}` },
+        payload: {
+          workspaceId,
+          title: `Watcher ${conversation}`,
+          prompt: `Read report ${conversation} every hour`,
+          modelId: 'openrouter/openai/gpt-oss-120b',
+          privacyRoute: 'provider_zdr',
+          maxComputeCredits: 1,
+          spec: { kind: 'interval', everyMinutes: 60 }
+        }
+      });
+    }
+    const getWorkspaceById = store.getWorkspaceById.bind(store);
+    let perRowReads = 0;
+    store.getWorkspaceById = async (id: string) => {
+      perRowReads += 1;
+      return getWorkspaceById(id);
+    };
+
+    const tasks = await app.inject({ method: 'GET', url: '/v1/tasks', headers: { cookie } });
+    const schedules = await app.inject({
+      method: 'GET',
+      url: '/v1/schedules',
+      headers: { cookie }
+    });
+
+    expect(tasks.json<{ tasks: unknown[] }>().tasks).toHaveLength(6);
+    expect(schedules.json<unknown[]>()).toHaveLength(6);
+    expect(perRowReads).toBe(0);
+  });
+
+  /**
+   * The incident ATH-034 is about, driven from the server's side.
+   *
+   * `request()` in the web client aborts at 45 s. The owner sends a message on a phone that changes
+   * network; the box already created the task; the client throws and offers the retry. Whether that
+   * retry creates a second task, a second reservation and a second model run is decided entirely by
+   * whether the second attempt carries the same `Idempotency-Key` - so this asserts the server half
+   * of that: reusing the key replays the first answer and starts nothing, and reusing it for a
+   * different body is refused rather than silently treated as the same intent.
+   *
+   * The client half is not here and is not fixed here: `apps/web/src/api.ts:130` mints a fresh
+   * `crypto.randomUUID()` inside `mutation()` on every call, so no shipped request can reach either
+   * branch below. The layer is correct and inert.
+   */
+  test('replays a retried mutation that reuses its key and refuses one that reuses it for something else', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-idempotency-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspaceId = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/workspaces',
+        headers: { cookie, 'idempotency-key': 'retry-workspace' },
+        payload: { name: 'Computer' }
+      })
+    ).json<{ id: string }>().id;
+    await app.inject({
+      method: 'PUT',
+      url: '/v1/providers',
+      headers: { cookie, 'idempotency-key': 'retry-provider' },
+      payload: { provider: 'openrouter', apiKey: 'test-key', enforceZeroDataRetention: true }
+    });
+    const headers = { cookie, 'idempotency-key': 'the-message-the-owner-sent-once' };
+    const payload = {
+      workspaceId,
+      prompt: 'Read the overnight mail and say what needs an answer',
+      modelId: 'openrouter/openai/gpt-oss-120b',
+      privacyRoute: 'provider_zdr',
+      maxComputeCredits: 5
+    };
+
+    const sent = await app.inject({ method: 'POST', url: '/v1/tasks', headers, payload });
+    const retried = await app.inject({ method: 'POST', url: '/v1/tasks', headers, payload });
+
+    expect(sent.statusCode, sent.body).toBe(200);
+    expect(retried.statusCode, retried.body).toBe(200);
+    expect(retried.headers['idempotency-replayed']).toBe('true');
+    expect(retried.json<{ id: string }>().id).toBe(sent.json<{ id: string }>().id);
+    expect((await database.query('SELECT id FROM tasks')).rows).toHaveLength(1);
+    // And one reservation, which is the half of this that is the owner's money.
+    expect(
+      (await database.query("SELECT id FROM usage_entries WHERE state='reserved'")).rows
+    ).toHaveLength(1);
+
+    const different = await app.inject({
+      method: 'POST',
+      url: '/v1/tasks',
+      headers,
+      payload: { ...payload, prompt: 'Something else entirely' }
+    });
+    expect(different.statusCode).toBe(409);
+    expect(different.json<{ error: { code: string } }>().error.code).toBe('idempotency_conflict');
+    expect((await database.query('SELECT id FROM tasks')).rows).toHaveLength(1);
+  });
+
+  /**
+   * On a deployment the cookie is `__Host-athanor_session`, and the prefix rules discard a
+   * `Set-Cookie` that carries the prefix without `Secure` - so the header that was supposed to
+   * clear it did nothing at all. `preview-gateway.ts` records what a prefix mismatch cost here once
+   * already.
+   */
+  test('clears the session cookie on account deletion with the attributes it was set with', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-account-delete-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer({
+      ...isolatedConfig(directory),
+      PUBLIC_APP_URL: 'https://box.example'
+    });
+    disposers.push(() => app.close());
+    const signIn = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/dev',
+      payload: { username: 'owner' }
+    });
+    const setCookie = signIn.headers['set-cookie'];
+    const issued = (Array.isArray(setCookie) ? setCookie[0] : setCookie) as string;
+    expect(issued).toContain('__Host-athanor_session=');
+    const cookie = issued.split(';', 1)[0]!;
+
+    const deleted = await app.inject({
+      method: 'DELETE',
+      url: '/v1/account',
+      headers: { cookie, 'idempotency-key': 'account-delete' },
+      payload: { confirmUsername: 'owner' }
+    });
+
+    expect(deleted.statusCode, deleted.body).toBe(200);
+    const cleared = deleted.headers['set-cookie'];
+    const header = (Array.isArray(cleared) ? cleared[0] : cleared) as string;
+    expect(header).toContain('__Host-athanor_session=');
+    expect(header).toContain('Secure');
+    expect(header).toContain('Path=/');
+    expect(header).toContain('SameSite=Lax');
+    expect(header).not.toContain('Domain=');
+  });
+});
+
+/**
+ * The one spend path that had no accounting at all.
+ *
+ * Every other provider call on this box asks the caps before it spends and writes a ledger row
+ * after: a task, a follow-up, a conversation title, the agent reading a recording. Dictation into
+ * the composer did neither. `GET /v1/spend` and `GET /v1/usage` reported task inference and nothing
+ * else, so an owner dictating long notes all month watched a cap that could never fire against a
+ * provider bill it could not explain.
+ */
+describe('what dictation costs', () => {
+  test('prices a voice note before sending it and records what it cost', async () => {
+    let transcriptionCalls = 0;
+    let dictationReachedProvider = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const requestUrl = input instanceof Request ? input.url : input.toString();
+        const json = (body: unknown) =>
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          });
+        if (requestUrl.includes('output_modalities=transcription')) {
+          dictationReachedProvider += 1;
+          return json({ data: [{ id: 'test/ears' }] });
+        }
+        if (requestUrl.endsWith('/audio/transcriptions')) {
+          transcriptionCalls += 1;
+          dictationReachedProvider += 1;
+          // Two minutes of speech at thirty cents a minute, stated by the provider - which is the
+          // only figure this box may call a price rather than a guess.
+          return json({ text: 'A private voice note', usage: { seconds: 120, cost: 0.6 } });
+        }
+        if (requestUrl.endsWith('/models'))
+          return json({
+            data: seedModels().map((model) => ({
+              id: model.providerModelId,
+              context_length: model.contextTokens,
+              architecture: { input_modalities: model.modalities },
+              supported_parameters: ['tools', 'reasoning']
+            }))
+          });
+        if (requestUrl.endsWith('/endpoints/zdr'))
+          return json({
+            data: seedModels().map((model) => ({ model_id: model.providerModelId, status: 0 }))
+          });
+        if (requestUrl.includes('/benchmarks?')) return json({ data: [] });
+        return json({ ok: true, storageBytes: 0 });
+      })
+    );
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-dictation-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    expect(
+      (
+        await app.inject({
+          method: 'PUT',
+          url: '/v1/providers',
+          headers: { cookie, 'idempotency-key': 'dictation-provider' },
+          payload: { provider: 'openrouter', apiKey: 'test-key', enforceZeroDataRetention: true }
+        })
+      ).statusCode
+    ).toBe(200);
+    const capped = await app.inject({
+      method: 'PUT',
+      url: '/v1/spend-limits',
+      headers: { cookie, 'idempotency-key': 'dictation-cap' },
+      payload: { dailyCapUsd: 1 }
+    });
+    expect(capped.statusCode, capped.body).toBe(200);
+
+    const shortNote = Buffer.from('test voice bytes').toString('base64');
+    const first = await app.inject({
+      method: 'POST',
+      url: '/v1/audio/transcriptions',
+      headers: { cookie },
+      payload: { data: shortNote, format: 'webm' }
+    });
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.json()).toMatchObject({ text: 'A private voice note', model: 'test/ears' });
+
+    const userId = (await database.query('SELECT id FROM users')).rows[0]!.id as string;
+    const ledger = await database.query(
+      `SELECT idempotency_key,kind,resource_class,quantity,unit,cost_usd,model_id,state
+       FROM usage_entries WHERE resource_class='media:transcription'`
+    );
+    expect(ledger.rows).toHaveLength(1);
+    expect(ledger.rows[0]).toMatchObject({
+      idempotency_key: `audio:${userId}:${sha256(shortNote)}:transcription`,
+      kind: 'model_inference',
+      resource_class: 'media:transcription',
+      quantity: 120,
+      unit: 'second',
+      cost_usd: 0.6,
+      model_id: 'test/ears',
+      state: 'settled'
+    });
+
+    // And the owner's own summary now carries it, which is the whole point of the row.
+    const spend = await app.inject({ method: 'GET', url: '/v1/spend', headers: { cookie } });
+    expect(spend.statusCode, spend.body).toBe(200);
+    expect(
+      spend
+        .json<{ windows: Array<{ name: string; spentUsd: number }> }>()
+        .windows.find((window) => window.name === 'daily')
+    ).toMatchObject({ spentUsd: 0.6 });
+
+    /*
+     * A long recording is refused before a byte of it leaves the box.
+     *
+     * Sixty-five seconds of Opus at the floor rate is two billing minutes, and two minutes at the
+     * thirty cents the provider has already charged on this route is sixty cents on top of the
+     * sixty already spent - past a one-dollar day. Duration billing means the money is gone the
+     * moment the request is accepted, so a guard that ran afterwards would be a report.
+     */
+    const callsBefore = transcriptionCalls;
+    const reachedBefore = dictationReachedProvider;
+    const longNote = Buffer.alloc(130_000, 7).toString('base64');
+    const refused = await app.inject({
+      method: 'POST',
+      url: '/v1/audio/transcriptions',
+      headers: { cookie },
+      payload: { data: longNote, format: 'webm' }
+    });
+    expect(refused.statusCode, refused.body).toBe(402);
+    expect(refused.json<{ error: { code: string } }>().error.code).toBe('spend_cap_reached');
+    // Not the transcription and not the catalogue lookup in front of it: a refused dictation costs
+    // the owner's provider account nothing at all.
+    expect(transcriptionCalls).toBe(callsBefore);
+    expect(dictationReachedProvider).toBe(reachedBefore);
+
+    // The same cap, the same instant, a note short enough to fit: the refusal above is the
+    // estimate doing its job and not the cap having simply closed.
+    const stillAllowed = await app.inject({
+      method: 'POST',
+      url: '/v1/audio/transcriptions',
+      headers: { cookie },
+      payload: { data: Buffer.from('a second short note').toString('base64'), format: 'webm' }
+    });
+    expect(stillAllowed.statusCode, stillAllowed.body).toBe(200);
+    expect(transcriptionCalls).toBe(callsBefore + 1);
+  }, 40_000);
 });

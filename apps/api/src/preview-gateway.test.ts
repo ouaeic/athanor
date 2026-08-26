@@ -20,11 +20,6 @@ const preview: WorkspacePreviewRecord = {
   accessTokenHash: sha256(accessToken),
   entryPath: null,
   visibility: 'private',
-  // Still on the row: the columns stay for now so a rollback to the previous release can read its
-  // own data. Nothing in the product writes or reads them any more.
-  customDomain: null,
-  domainStatus: null,
-  domainVerificationHash: null,
   status: 'active',
   expiresAt: null,
   lastAccessedAt: null,

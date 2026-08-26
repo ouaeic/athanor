@@ -243,12 +243,21 @@ describe('the shapes the clients are promised', () => {
     conforms('Task', Task, created.json());
     const taskId = created.json<{ id: string }>().id;
 
-    // Let the embedded worker take the task and fail against the absent provider, so the event
+    // Let the embedded worker take the task and turn away from the absent provider, so the event
     // list under test carries real encrypted payloads rather than being empty.
+    //
+    // `awaiting_resource` is where a box with no provider connected now lands, and that is the
+    // point of the change that put it there: the wall has a notice, a Settings switch and a sweep
+    // that resumes everything parked behind it the moment a key is saved. It used to be `failed`,
+    // because the worker threw a code the wall table had never heard of.
     const deadline = Date.now() + 20_000;
     for (;;) {
       const current = await get(`/v1/tasks/${taskId}`);
-      if (['completed', 'failed', 'cancelled'].includes((current as { status: string }).status))
+      if (
+        ['completed', 'failed', 'cancelled', 'awaiting_resource'].includes(
+          (current as { status: string }).status
+        )
+      )
         break;
       if (Date.now() > deadline) throw new Error('the task never reached a terminal state');
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -287,7 +296,32 @@ describe('the shapes the clients are promised', () => {
       ConnectorAuditEvent.array(),
       await get('/v1/connectors/audit')
     );
-    conforms('TaskSchedule[]', TaskSchedule.array(), await get('/v1/schedules'));
+    /*
+     * A row, so the shape is actually checked.
+     *
+     * `TaskSchedule.array()` over an empty list conforms to anything, which is how a schema and the
+     * route that answers it can disagree indefinitely - the exact failure this whole suite exists to
+     * catch. It matters now because `TaskSchedule` gained a required `prompt`: the standing
+     * instruction the box acts on unattended, which the owner previously could not read at all.
+     */
+    const schedule = await app.inject({
+      method: 'POST',
+      url: '/v1/schedules',
+      headers: { cookie, 'idempotency-key': 'contract-schedule' },
+      payload: {
+        workspaceId,
+        prompt: 'Check the overnight logs',
+        modelId: MODEL_ID,
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 1,
+        spec: { kind: 'interval', everyMinutes: 60 }
+      }
+    });
+    expect(schedule.statusCode, schedule.body).toBe(201);
+    conforms('TaskSchedule', TaskSchedule, schedule.json());
+    const schedules = await get('/v1/schedules');
+    expect(schedules as unknown[]).toHaveLength(1);
+    conforms('TaskSchedule[]', TaskSchedule.array(), schedules);
     conforms('ApiToken[]', ApiToken.array(), await get('/v1/api-tokens'));
     conforms(
       'AgentNotification[]',
