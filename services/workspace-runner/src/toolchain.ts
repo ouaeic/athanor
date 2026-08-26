@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { agentSearchPath } from './execution.js';
+import { fileURLToPath } from 'node:url';
+import { agentSearchPath, packageInstallCommandLine } from './execution.js';
 import { resolveExecutable } from './command-policy.js';
 
 /**
@@ -14,7 +15,37 @@ export interface ToolchainCapability {
   binaries: readonly string[];
   pythonModules: readonly string[];
   fonts: readonly string[];
+  /**
+   * Capability keys in the host package table (`scripts/athanor-host.sh`), resolved to the names
+   * this host's own distribution uses at report time.
+   *
+   * They were command lines - `apt-get install -y imagemagick graphviz python3-pil` - which is one
+   * of the four families this computer installs on. On the other three the one sentence telling an
+   * agent how to close a gap named a binary the host has never had, and named packages under
+   * spellings its repositories do not carry. The table is where those names already live, for the
+   * installer and for `athanor doctor`; naming a capability rather than a package is what lets
+   * this report read the same list they do.
+   */
+  packages?: readonly string[];
+  /** The half of a repair no package name expresses, said after the command line. */
+  beyondPackages?: string;
+  /**
+   * What a host whose package table cannot be read is told, which is every host that is not this
+   * product installed on a distribution - a developer's laptop, a container without an
+   * /etc/os-release. Host-neutral on purpose: a sentence that guesses apt here would be the same
+   * defect one layer down.
+   */
   install: string;
+}
+
+/** What this host's distribution calls the things the toolchain needs. */
+export interface HostPackages {
+  /** The package manager this host actually has, probed the way the installer probes it. */
+  manager: string;
+  /** Capability key to the package name this family uses. */
+  packages: Map<string, string>;
+  /** Capability keys this family has no package for, so the report can say so rather than lie. */
+  unavailable: Set<string>;
 }
 
 /**
@@ -32,11 +63,14 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
     binaries: [ATHANOR_PYTHON],
     pythonModules: ['pptx', 'docx', 'openpyxl'],
     fonts: [],
+    packages: ['python-docx', 'python-openpyxl'],
     // python-pptx is not the distribution's any more: Ubuntu packaged it up to 24.04 and stopped,
     // so it is pinned in infra/native/athanor-python-requirements.txt and installed into the one
-    // interpreter above. Naming the reinstall rather than an apt line that would not work.
+    // interpreter above. Naming the reinstall rather than a package line that would not work.
+    beyondPackages:
+      're-run the athanor installer to restore the pinned Python environment, which is where python-pptx comes from',
     install:
-      'apt-get install -y python3-docx python3-openpyxl, then re-run the athanor installer to restore the pinned Python environment'
+      "install this host's python-docx and python-openpyxl packages, then re-run the athanor installer to restore the pinned Python environment"
   },
   {
     id: 'office-conversion',
@@ -53,8 +87,9 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
     ],
     pythonModules: [],
     fonts: [],
+    packages: ['office-writer', 'office-impress', 'office-calc', 'poppler'],
     install:
-      'apt-get install -y libreoffice-writer libreoffice-impress libreoffice-calc poppler-utils'
+      "install this host's LibreOffice writer, impress and calc packages and its poppler utilities"
   },
   {
     id: 'document-fonts',
@@ -63,8 +98,16 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
     binaries: ['fc-list'],
     pythonModules: [],
     fonts: ['Carlito', 'Caladea', 'Liberation Sans', 'Liberation Serif', 'DejaVu Sans'],
+    packages: [
+      'fontconfig',
+      'font-carlito',
+      'font-caladea',
+      'font-liberation',
+      'font-dejavu',
+      'font-noto'
+    ],
     install:
-      'apt-get install -y fontconfig fonts-crosextra-carlito fonts-crosextra-caladea fonts-liberation fonts-dejavu-core fonts-noto-core'
+      "install this host's fontconfig and its Carlito, Caladea, Liberation, DejaVu and Noto font packages"
   },
   {
     id: 'pdf-assembly',
@@ -73,7 +116,8 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
     binaries: ['qpdf', 'img2pdf'],
     pythonModules: [],
     fonts: [],
-    install: 'apt-get install -y qpdf img2pdf'
+    packages: ['qpdf', 'img2pdf'],
+    install: "install this host's qpdf and img2pdf packages"
   },
   {
     id: 'pdf-forms',
@@ -104,7 +148,9 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
     pythonModules: [],
     fonts: [],
     // ghostscript arrives as a dependency of ocrmypdf, and is what compresses an oversized PDF.
-    install: 'apt-get install -y poppler-utils ocrmypdf tesseract-ocr tesseract-ocr-eng'
+    packages: ['poppler', 'ocrmypdf', 'tesseract', 'tesseract-english'],
+    install:
+      "install this host's poppler utilities, ocrmypdf, and tesseract with its English language data"
   },
   {
     id: 'typeset-pdf',
@@ -124,7 +170,8 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
     // that leaves out what the work actually calls is the list that sends an agent guessing.
     pythonModules: ['pandas', 'numpy', 'matplotlib'],
     fonts: [],
-    install: 'apt-get install -y python3-pandas python3-numpy python3-matplotlib'
+    packages: ['python-pandas', 'python-matplotlib'],
+    install: "install this host's pandas and matplotlib packages, which bring numpy with them"
   },
   {
     /**
@@ -151,7 +198,8 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
     binaries: [ATHANOR_PYTHON],
     pythonModules: ['scipy', 'statsmodels'],
     fonts: [],
-    install: 'apt-get install -y python3-scipy python3-statsmodels'
+    packages: ['python-scipy', 'python-statsmodels'],
+    install: "install this host's scipy and statsmodels packages"
   },
   {
     id: 'image-work',
@@ -159,7 +207,8 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
     binaries: [ATHANOR_PYTHON, 'magick', 'dot'],
     pythonModules: ['PIL'],
     fonts: [],
-    install: 'apt-get install -y imagemagick graphviz python3-pil'
+    packages: ['imagemagick', 'graphviz', 'python-pillow'],
+    install: "install this host's ImageMagick, graphviz and Pillow packages"
   },
   {
     id: 'media',
@@ -170,7 +219,8 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
     binaries: ['ffmpeg', 'ffprobe'],
     pythonModules: [],
     fonts: [],
-    install: 'apt-get install -y ffmpeg'
+    packages: ['ffmpeg'],
+    install: "install this host's ffmpeg package"
   }
 ];
 
@@ -192,10 +242,40 @@ export interface ToolchainReport {
   summary: string;
 }
 
+/**
+ * The sentence a missing capability is closed with, on this host.
+ *
+ * Three shapes, and each of them is a fact rather than a guess. With the host table readable it is
+ * a command line this computer's own package manager accepts and this computer's own policy will
+ * carry out. Without it - a laptop, a container with no release file - it is the capability's
+ * host-neutral sentence, which says what to install without naming a manager that may not be
+ * there. And a capability whose family genuinely packages nothing for part of it says so, because
+ * "install ocrmypdf" on a host with no ocrmypdf is an instruction that cannot be followed and an
+ * agent will spend a turn discovering that.
+ */
+export const installAdvice = (capability: ToolchainCapability, host?: HostPackages): string => {
+  const keys = capability.packages ?? [];
+  if (!host || !keys.length) return capability.install;
+  const names = keys.map((key) => host.packages.get(key)).filter((name): name is string => !!name);
+  const unavailable = keys.filter((key) => host.unavailable.has(key));
+  const parts = [
+    packageInstallCommandLine(host.manager, names),
+    unavailable.length
+      ? `this host's distribution packages nothing for ${unavailable.join(', ')}`
+      : undefined,
+    capability.beyondPackages
+  ].filter((part): part is string => !!part);
+  // Everything the table could have said about this capability came back empty, which is not the
+  // same as the table saying there is nothing to install. Falling back keeps the report from
+  // answering a real gap with an empty sentence.
+  return parts.length ? parts.join('; ') : capability.install;
+};
+
 /** Present binaries and modules are the inputs; what is missing per capability is the answer. */
 export const reportToolchain = (
   capabilities: readonly ToolchainCapability[],
-  available: { binaries: Set<string>; pythonModules: Set<string>; fonts: Set<string> }
+  available: { binaries: Set<string>; pythonModules: Set<string>; fonts: Set<string> },
+  host?: HostPackages
 ): ToolchainCapabilityReport[] =>
   capabilities.map((capability) => {
     const missingBinaries = capability.binaries.filter((name) => !available.binaries.has(name));
@@ -216,7 +296,7 @@ export const reportToolchain = (
       missingBinaries,
       missingPythonModules,
       missingFonts,
-      ...(ready ? {} : { install: capability.install })
+      ...(ready ? {} : { install: installAdvice(capability, host) })
     };
   });
 
@@ -343,6 +423,69 @@ export const probePythonModules = async (
   return output === null ? new Set() : parseImportableModules(output, wanted);
 };
 
+/**
+ * The one file that knows what a capability is called on this distribution, and the same one the
+ * installer sources and `athanor-system-packages` dispatches through. Reached by a path relative
+ * to this module, which lands on the checkout root from `src/` and from `dist/` alike.
+ */
+const HOST_DEFINITIONS = fileURLToPath(
+  new URL('../../../scripts/athanor-host.sh', import.meta.url)
+);
+
+/**
+ * Asked of the host table itself rather than reimplemented here.
+ *
+ * The whole point of that table is that the package names live in one place; parsing it in
+ * TypeScript would make this the fifth reader with its own idea of what a family is and how a
+ * derivative maps onto one. So the shell answers, using its own detection, and this reads the
+ * two-column result.
+ */
+const HOST_PACKAGE_PROBE = `. "$1" >/dev/null 2>&1 || exit 1
+shift
+athanor_detect_host >/dev/null 2>&1 || exit 1
+printf 'manager\t%s\n' "$athanor_pm"
+for capability in "$@"; do
+  printf '%s\t%s\n' "$capability" "$(athanor_package_for "$capability" "$athanor_family")"
+done
+`;
+
+/**
+ * What this host calls the packages behind a list of capabilities, or nothing at all.
+ *
+ * Nothing at all is an ordinary answer, not a failure: a developer's laptop and a container
+ * without /etc/os-release both reach it, and both are told the host-neutral sentence instead. What
+ * would be a failure is guessing - which is what naming apt unconditionally was.
+ */
+export const hostPackages = async (
+  capabilities: readonly string[],
+  // Overridable so that the table can be read as a host this one is not. Every family's column has
+  // to be answerable somewhere, and a probe that can only ever be asked about the machine running
+  // it is a probe that is only ever tested on one of the four.
+  definitions: string = HOST_DEFINITIONS
+): Promise<HostPackages | undefined> => {
+  const wanted = [...new Set(capabilities)];
+  if (!wanted.length) return undefined;
+  const output = await runProbe('/bin/sh', [
+    '-c',
+    HOST_PACKAGE_PROBE,
+    'athanor-host',
+    definitions,
+    ...wanted
+  ]);
+  if (output === null) return undefined;
+  let manager = '';
+  const packages = new Map<string, string>();
+  const unavailable = new Set<string>();
+  for (const line of output.split('\n')) {
+    const [key, value = ''] = line.split('\t');
+    if (!key) continue;
+    if (key === 'manager') manager = value.trim();
+    else if (value.trim()) packages.set(key, value.trim());
+    else if (wanted.includes(key)) unavailable.add(key);
+  }
+  return manager ? { manager, packages, unavailable } : undefined;
+};
+
 export const probeFonts = async (root: string, fonts: readonly string[]): Promise<Set<string>> => {
   if (!fonts.length) return new Set();
   const listing = await resolveExecutable('fc-list', agentSearchPath(root), root);
@@ -357,7 +500,7 @@ export const probeFonts = async (root: string, fonts: readonly string[]): Promis
  * package it just installed is still absent.
  */
 export const toolchainReport = async (root: string): Promise<ToolchainReport> => {
-  const [binaries, pythonModules, fonts] = await Promise.all([
+  const [binaries, pythonModules, fonts, host] = await Promise.all([
     probeBinaries(
       root,
       DOCUMENT_TOOLCHAIN.flatMap((capability) => capability.binaries)
@@ -369,9 +512,14 @@ export const toolchainReport = async (root: string): Promise<ToolchainReport> =>
     probeFonts(
       root,
       DOCUMENT_TOOLCHAIN.flatMap((capability) => capability.fonts)
-    )
+    ),
+    hostPackages(DOCUMENT_TOOLCHAIN.flatMap((capability) => capability.packages ?? []))
   ]);
-  const capabilities = reportToolchain(DOCUMENT_TOOLCHAIN, { binaries, pythonModules, fonts });
+  const capabilities = reportToolchain(
+    DOCUMENT_TOOLCHAIN,
+    { binaries, pythonModules, fonts },
+    host
+  );
   return {
     capabilities,
     ready: capabilities.filter((report) => report.ready).map((report) => report.id),

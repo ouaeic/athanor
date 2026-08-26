@@ -377,6 +377,16 @@ describe('documents this computer produces, measured', () => {
     // A machine with no document toolchain at all is a machine where this suite is meaningless,
     // and silence is how that goes unnoticed.
     expect(report.passed.length + report.failed.length).toBeGreaterThan(0);
+    // On a laptop "something" is the honest floor: LibreOffice is a gigabyte nobody should have to
+    // install to fix a typo. On the runner the floor is everything. This assertion used to read
+    // `> 0` there too, and three of the six jobs - cv, report, tables - skipped themselves on
+    // every CI run this repository has had, because .github/workflows/verify.yml installed no
+    // packages at all. The job that installs them is the reason this can be an equality now.
+    if (process.env.GITHUB_ACTIONS)
+      expect(
+        report.skipped,
+        'a document job skipped itself on CI: install what it names in the `application` job of .github/workflows/verify.yml'
+      ).toEqual([]);
     for (const job of report.jobs.filter((entry) => entry.status === 'passed'))
       expect(job.checks.length).toBeGreaterThan(0);
   });

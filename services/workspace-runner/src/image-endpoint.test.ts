@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { signCapabilityToken } from '@athanor/core';
+import { capabilityAudience, signCapabilityToken } from '@athanor/core';
 import type { RunnerConfig } from './config.js';
 import { ensureWorkspace } from './files.js';
 import { buildServer } from './server.js';
@@ -87,6 +87,7 @@ const serve = async (files: Record<string, string>) => {
             workspaceId: WORKSPACE,
             role: 'agent',
             scopes: ['files.read'],
+            aud: capabilityAudience('GET', `/v1/workspaces/${WORKSPACE}/image`),
             nonce: randomUUID()
           },
           secret

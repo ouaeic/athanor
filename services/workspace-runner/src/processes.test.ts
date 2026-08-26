@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -208,6 +208,55 @@ describe('background process manager', () => {
   );
 
   it(
+    'runs a background command through the agent sandbox, as a foreground one is',
+    async () => {
+      /*
+       * The one guard on this path that had no test of its own.
+       *
+       * The limiter above was covered and the sandbox was not, and the sandbox is the guard that
+       * decides which Unix account a command runs as - so a background session and a service, the
+       * two things on this box that outlive the turn that asked for them, could have been running
+       * as the runner's own account with nothing saying so. Written here because both routes now
+       * compute their invocation in one place: a unification that quietly dropped the sandbox from
+       * this side would otherwise have passed every test in the package.
+       */
+      const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
+      roots.push(root);
+      await mkdir(path.join(root, 'workspace'));
+      // Stands in for sudo: records what it was asked to run, then runs it.
+      const record = path.join(root, 'elevated');
+      const elevate = path.join(root, 'elevate');
+      await writeFile(elevate, `#!/bin/sh\nprintf '%s\\n' "$*" >"${record}"\nshift\nexec "$@"\n`);
+      await chmod(elevate, 0o700);
+      // Stands in for athanor-sandbox: drops its own two leading arguments the way the real helper
+      // consumes `run <network mode>`, then applies the environment and execs, as `env -i` does.
+      const helper = path.join(root, 'sandbox');
+      await writeFile(helper, '#!/bin/sh\nshift 2\nexec /usr/bin/env -i "$@"\n');
+      await chmod(helper, 0o700);
+      const manager = new ProcessManager();
+      const started = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        { executable: '/bin/sh', args: ['-c', 'printf "%s" "$HOME"'], timeoutSeconds: 5 },
+        5,
+        true,
+        { sandbox: { elevate, helper } }
+      );
+      const finished = await settledStatus(manager, started.sessionId);
+      expect(finished.status).toBe('completed');
+      // The environment reached the process, which is only true if the helper was handed it as
+      // arguments - the spawn itself passes an empty one, because sudo resets it anyway.
+      expect(finished.stdout).toBe(root);
+      const elevated = await readFile(record, 'utf8');
+      expect(elevated).toContain(`-n ${helper} run isolated`);
+      expect(elevated).toContain(`HOME=${root}`);
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
     'carries the coding CLI permission policy into the background process',
     async () => {
       // The deny-list and the auto-share opt-out only exist as environment variables, and the
@@ -318,6 +367,94 @@ describe('background process manager', () => {
     manager.close();
   });
 
+  /*
+   * What the Stop button reaches.
+   *
+   * Cancelling a task aborted whatever runner request was in flight, which is the whole of the
+   * foreground story and none of the background one: `processes/start` returns in milliseconds, so
+   * by the time the owner presses Stop there is no request left to abort and the scraper the model
+   * started runs on for the rest of its hour, writing into the workspace and making outbound
+   * requests attributed to this box. A service is the deliberate exception - it was declared to
+   * outlive the turn - and the two must be told apart here, because a confirmation that says
+   * "stopped" about a service nobody stopped is the failure this route was added to end.
+   */
+  it(
+    "a cancelled task's background sessions are stopped and its declared services are not",
+    async () => {
+      const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
+      roots.push(root);
+      await mkdir(path.join(root, 'workspace'));
+      await mkdir(path.join(root, '.athanor'), { recursive: true });
+      const manager = new ProcessManager();
+      const sleeping = { executable: '/bin/sh', args: ['-c', 'sleep 30'], timeoutSeconds: 30 };
+      const scraper = await manager.start(root, 'workspace-1', 'task-1', sleeping, 30, false);
+      const dashboard = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        { ...sleeping, service: 'invoice dashboard' },
+        30,
+        false
+      );
+      const otherTask = await manager.start(root, 'workspace-1', 'task-2', sleeping, 30, false);
+
+      const outcome = manager.stopOwner('workspace-1', 'task-1', {});
+      expect(outcome.stopped).toEqual([scraper.sessionId]);
+      expect(outcome.services).toEqual(['invoice dashboard']);
+      // The sentence the cancel confirmation carries: naming the service is the whole point, since
+      // the owner is being told the task ended while something it declared is still serving.
+      expect(outcome.note).toContain('invoice dashboard');
+
+      expect(await settledStatus(manager, scraper.sessionId)).toMatchObject({ status: 'stopped' });
+      // Declared to outlive the turn, so it does.
+      expect(
+        manager.action('workspace-1', 'task-1', dashboard.sessionId, { action: 'poll' })
+      ).toMatchObject({ status: 'running', service: { name: 'invoice dashboard' } });
+      // Another turn's session is not this cancellation's business.
+      expect(
+        manager.action('workspace-1', 'task-2', otherTask.sessionId, { action: 'poll' }).status
+      ).toBe('running');
+
+      // Nothing to stop is not an error: cancel runs on every task, and most have no background
+      // work at all.
+      expect(manager.stopOwner('workspace-1', 'task-3', {})).toMatchObject({
+        stopped: [],
+        services: []
+      });
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  /*
+   * A capability subject cannot name somebody else's.
+   *
+   * `list` and `action` narrow an agent to the sessions its own task started, and this route would
+   * be the way round that if the owner in the body were believed: one turn could stop another
+   * turn's work by asking. The person driving the box passes `null` and names the task, which is
+   * the same split those two make.
+   */
+  it('refuses to let one task stop the background work of another', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
+    roots.push(root);
+    await mkdir(path.join(root, 'workspace'));
+    const manager = new ProcessManager();
+    const sleeping = { executable: '/bin/sh', args: ['-c', 'sleep 30'], timeoutSeconds: 30 };
+    const victim = await manager.start(root, 'workspace-1', 'task-2', sleeping, 30, false);
+    expect(() => manager.stopOwner('workspace-1', 'task-1', { owner: 'task-2' })).toThrow(
+      'only stop the background processes it started'
+    );
+    expect(
+      manager.action('workspace-1', 'task-2', victim.sessionId, { action: 'poll' }).status
+    ).toBe('running');
+    // The owner of the computer is not subject to a task, and says which one they mean.
+    expect(manager.stopOwner('workspace-1', null, { owner: 'task-2' }).stopped).toEqual([
+      victim.sessionId
+    ]);
+    expect(() => manager.stopOwner('workspace-1', null, {})).toThrow('which task');
+    manager.close();
+  });
+
   it('does not allow background privilege or package operations in host-native mode', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
     roots.push(root);
@@ -335,4 +472,157 @@ describe('background process manager', () => {
     ).rejects.toThrow('cannot run as background processes');
     manager.close();
   });
+
+  it('refuses a background command that names a privileged helper directly', async () => {
+    /*
+     * The background counterpart of execution.test.ts's "refuses a command that names a privileged
+     * helper directly", which had no counterpart here for as long as the helper has existed.
+     *
+     * The refusal is one check reading one list, and the list is built from the two root-owned
+     * helpers this computer has: the system-package helper and the sandbox's elevator. Only the
+     * foreground path ever knew where the package helper was, so on this path the list held the
+     * sandbox helper alone - and with AGENT_SANDBOX_HELPER unset, which config.ts documents as the
+     * supported shape of a host with no second account to drop to, it held nothing at all and the
+     * check had nothing to match against. The package helper reaches root through NOPASSWD sudo,
+     * so a background start naming it got there with no capability scope and no approval, which is
+     * precisely what the foreground refusal exists to prevent.
+     *
+     * Both spellings, because a wrapper hides the executable in its arguments; and the service
+     * spelling too, because a service is the one background job that never stops on its own.
+     */
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
+    roots.push(root);
+    await mkdir(path.join(root, 'workspace'));
+    const packageHelper = path.join(root, 'package-helper');
+    await writeFile(packageHelper, '#!/bin/sh\nexit 0\n');
+    await chmod(packageHelper, 0o755);
+    const manager = new ProcessManager();
+    const attempts = [
+      { executable: packageHelper, args: ['install', 'openssh-server'] },
+      { executable: 'sh', args: ['-c', `${packageHelper} install openssh-server`] },
+      { executable: packageHelper, args: ['install', 'openssh-server'], service: 'installer' }
+    ];
+    for (const attempt of attempts)
+      await expect(
+        // No sandbox: the laptop-shaped configuration, and the one this was reachable on.
+        manager.start(root, 'workspace-1', 'task-1', attempt, 30, false, {
+          systemPackageHelper: packageHelper
+        })
+      ).rejects.toThrow('cannot run as background processes');
+    manager.close();
+  });
+});
+
+/*
+ * The one execution path that had no disk guard was the one defined as running unattended.
+ *
+ * `execute()` has polled free space while a foreground command ran ever since a `dd` took the box
+ * down; the background path got the pre-flight check and nothing else, and the pre-flight check
+ * only proves the disk was healthy at the moment the command started. A background `dd`, a service
+ * that logs to a file, an `npm ci` in a service wrapper: each runs for up to an hour - and a
+ * service has no deadline at all - with nothing watching. The last free byte stops PostgreSQL,
+ * which stops the interface and every other task on the computer.
+ */
+describe('the host disk floor on the background path', () => {
+  const failingDisk = (healthyPolls: number) => {
+    let reads = 0;
+    return async () => ({
+      hostStorageTotalBytes: 100 * 1024 ** 3,
+      hostStorageAvailableBytes: ++reads > healthyPolls ? 64 * 1024 ** 2 : 50 * 1024 ** 3
+    });
+  };
+
+  it(
+    'stops a background session that is consuming the last of the host disk',
+    async () => {
+      const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
+      roots.push(root);
+      await mkdir(path.join(root, 'workspace'));
+      const manager = new ProcessManager();
+      const started = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        { executable: '/bin/sh', args: ['-c', 'sleep 30'], timeoutSeconds: 30 },
+        30,
+        false,
+        { hostStoragePollMs: 25, hostStorage: failingDisk(2) }
+      );
+      const settled = await settledStatus(manager, started.sessionId);
+      expect(settled.status).toBe('stopped');
+      // Said on the session's own stderr, because `poll` is the only place the agent ever finds
+      // out why a background job it started is no longer running.
+      expect(settled.stderr).toContain('last of the host disk');
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it('leaves a background session on a healthy disk alone', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
+    roots.push(root);
+    await mkdir(path.join(root, 'workspace'));
+    const manager = new ProcessManager();
+    const started = await manager.start(
+      root,
+      'workspace-1',
+      'task-1',
+      { executable: process.execPath, args: ['-e', "process.stdout.write('fine')"] },
+      30,
+      false,
+      {
+        hostStoragePollMs: 25,
+        hostStorage: async () => ({
+          hostStorageTotalBytes: 100 * 1024 ** 3,
+          hostStorageAvailableBytes: 60 * 1024 ** 3
+        })
+      }
+    );
+    expect(await settledStatus(manager, started.sessionId)).toMatchObject({
+      status: 'completed',
+      stdout: 'fine'
+    });
+    manager.close();
+  });
+
+  it(
+    'does not put a service straight back into the disk it just filled',
+    async () => {
+      const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
+      roots.push(root);
+      await mkdir(path.join(root, 'workspace'));
+      await mkdir(path.join(root, '.athanor'), { recursive: true });
+      const manager = new ProcessManager(undefined, {
+        baseDelayMs: 10,
+        ceilingDelayMs: 40,
+        healthyAfterMs: 2_000,
+        maxRapidFailures: 3
+      });
+      const started = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        { executable: '/bin/sh', args: ['-c', 'sleep 30'], service: 'log writer' },
+        30,
+        false,
+        { hostStoragePollMs: 25, hostStorage: failingDisk(2) }
+      );
+      const settled = await settledStatus(manager, started.sessionId);
+      expect(settled.status).toBe('stopped');
+      const view = manager.action('workspace-1', 'task-1', started.sessionId, { action: 'poll' });
+      expect(view.service).toMatchObject({
+        name: 'log writer',
+        state: 'crash_looped',
+        restarts: 0
+      });
+      // The backoff is the thing under test: it must not count, and the record must not gain a
+      // restart while the disk is still full.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(
+        manager.action('workspace-1', 'task-1', started.sessionId, { action: 'poll' }).service
+      ).toMatchObject({ state: 'crash_looped', restarts: 0 });
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
 });

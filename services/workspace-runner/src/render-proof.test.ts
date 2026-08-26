@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { signCapabilityToken } from '@athanor/core';
+import { capabilityAudience, signCapabilityToken } from '@athanor/core';
 import type { RunnerConfig } from './config.js';
 import { ensureWorkspace } from './files.js';
 import {
@@ -287,7 +287,26 @@ describe('measuring a document this computer rendered', () => {
     pdftoppm,
     officeConvert: undefined
   };
-  const withPoppler = it.skipIf(!pdftotext || !pdftoppm);
+  const missingPoppler = [...(pdftotext ? [] : ['pdftotext']), ...(pdftoppm ? [] : ['pdftoppm'])];
+  const withPoppler = it.skipIf(missingPoppler.length > 0);
+
+  /**
+   * Every case guarded by `withPoppler` measures a page this computer actually rendered, and on a
+   * host without poppler all seven of them disappeared silently into a green run. That host was
+   * every CI runner: the workflow installed no packages, so the whole of this half had never once
+   * executed. `scripts/check-repository.mjs:115-120` settled the shape - optional on a laptop,
+   * mandatory on the runner - and this is that arm. The `application` job installs poppler-utils
+   * so the assertion below is a statement about the workflow rather than about the machine.
+   */
+  it.runIf(process.env.GITHUB_ACTIONS)(
+    'has the page reader on this CI runner, rather than skipping every measurement below',
+    () => {
+      expect(
+        missingPoppler,
+        'install poppler-utils in the `application` job of .github/workflows/verify.yml'
+      ).toEqual([]);
+    }
+  );
 
   const write = async (name: string, pages: readonly string[]): Promise<string> => {
     await writeFile(path.join(root, 'workspace', name), buildPdf(pages));
@@ -417,7 +436,14 @@ describe('the route the acceptance record calls', () => {
         url: `/v1/workspaces/${WORKSPACE}/document/render-proof`,
         headers: {
           authorization: `Bearer ${signCapabilityToken(
-            { sub: 'task', workspaceId: WORKSPACE, role: 'agent', scopes, nonce: randomUUID() },
+            {
+              sub: 'task',
+              workspaceId: WORKSPACE,
+              role: 'agent',
+              scopes,
+              aud: capabilityAudience('POST', `/v1/workspaces/${WORKSPACE}/document/render-proof`),
+              nonce: randomUUID()
+            },
             secret
           )}`,
           'content-type': 'application/json'

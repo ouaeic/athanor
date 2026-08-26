@@ -1,18 +1,57 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import type * as fsPromises from 'node:fs/promises';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { gzipSync } from 'node:zlib';
-import { afterEach, describe, expect, it } from 'vitest';
+import { gunzipSync, gzipSync } from 'node:zlib';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  CheckpointRefusedError,
   WorkspaceCheckpoints,
   parseInstalledPackages,
   type CheckpointConfig,
   type CheckpointRunner
 } from './checkpoints.js';
 
+/**
+ * The one seam this file needs that the module does not otherwise offer: a way to change a file
+ * *between* the walk that stats it and the pass that hashes it.
+ *
+ * A checkpoint create deliberately does not stop the workspace, so that window is real on any box
+ * running a watch build - but it is hundreds of milliseconds wide and nothing about it is
+ * deterministic, so reproducing it by timing would be a test that fails one run in fifty and
+ * proves nothing on the other forty-nine. Module-level rather than hoisted, following
+ * `desktop-perform.test.ts`: the factory only dereferences it when an lstat actually happens,
+ * which is inside a test and long after this module has evaluated.
+ */
+const midScan: {
+  /** The workspace-relative path whose stat is the trigger, or null for the pass-through. */
+  path: string | null;
+  /** Runs once, after the walk has stat'd that path and before anything else can read it. */
+  write: (() => Promise<void>) | null;
+} = { path: null, write: null };
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof fsPromises>();
+  return {
+    ...actual,
+    lstat: async (target: string) => {
+      const details = await actual.lstat(target);
+      const write = midScan.path && target.endsWith(midScan.path) ? midScan.write : null;
+      if (write) {
+        midScan.path = null;
+        midScan.write = null;
+        await write();
+      }
+      return details;
+    }
+  };
+});
+
 const temporary: string[] = [];
 afterEach(async () => {
+  midScan.path = null;
+  midScan.write = null;
   await Promise.all(
     temporary.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))
   );
@@ -29,6 +68,33 @@ const workspace = async (): Promise<{ workspaceRoot: string; root: string }> => 
   return { workspaceRoot, root };
 };
 
+/**
+ * A host with room on it, stated rather than measured.
+ *
+ * Every case in this file used to read the real disk of whatever machine ran it, because
+ * `#create` called the module-level `hostStorage(root)` directly. Wave 3's gate exited 1 on
+ * sixteen of them for one reason: the laptop was at 99 % and the floor is
+ * `min(20 GiB, max(2 GiB, total x 0.02))`, so the refusal fired and the failure read exactly
+ * like broken code. A build whose result depends on the free space of the machine running it
+ * cannot be trusted in either direction, so the probe is injected here and the number below is
+ * the only disk these tests ever see.
+ */
+const ROOMY_HOST = async () => ({
+  hostStorageTotalBytes: 100 * 1024 ** 3,
+  hostStorageAvailableBytes: 50 * 1024 ** 3
+});
+
+/** The refusal a create raised, insisting it is the typed one rather than any old failure. */
+const refusalFrom = async (work: Promise<unknown>): Promise<CheckpointRefusedError> => {
+  const cause = await work.then(
+    () => null,
+    (error: unknown) => error
+  );
+  if (!(cause instanceof CheckpointRefusedError))
+    throw new Error(`expected a checkpoint refusal, got ${String(cause)}`);
+  return cause;
+};
+
 const config = (
   workspaceRoot: string,
   overrides: Partial<CheckpointConfig> = {}
@@ -42,6 +108,7 @@ const config = (
   retainDailyDays: 14,
   maxFiles: 250_000,
   maxFileBytes: 2 * 1024 ** 3,
+  hostStorage: ROOMY_HOST,
   ...overrides
 });
 
@@ -59,6 +126,26 @@ const storeSize = async (workspaceRoot: string): Promise<number> => {
   }
   return total;
 };
+
+/** What the checkpoint actually wrote down, which is the only thing a restore has to go on. */
+const manifestFiles = async (
+  workspaceRoot: string,
+  id: string
+): Promise<Array<[string, number, number, number, string]>> => {
+  const raw = gunzipSync(
+    await readFile(
+      path.join(workspaceRoot, '.athanor-checkpoints', WORKSPACE_ID, `${id}.manifest.json.gz`)
+    )
+  );
+  return (
+    JSON.parse(raw.toString('utf8')) as {
+      files: Array<[string, number, number, number, string]>;
+    }
+  ).files;
+};
+
+const blobPath = (workspaceRoot: string, hash: string): string =>
+  path.join(workspaceRoot, '.athanor-checkpoints', WORKSPACE_ID, 'blobs', hash.slice(0, 2), hash);
 
 const blobCount = async (workspaceRoot: string): Promise<number> => {
   let count = 0;
@@ -171,6 +258,69 @@ describe('turn checkpoints', () => {
     expect(third.changedFileCount).toBe(1);
     expect(third.storedBytes).toBe(0);
     expect(await storeSize(workspaceRoot)).toBe(body.length);
+  });
+
+  it('records the size and mtime of the bytes it hashed, not of an earlier instant', async () => {
+    // The walk stats the tree and a second pass hashes what changed, and between the two the
+    // workspace is still running: a checkpoint create does not stop the services, because a turn
+    // cannot afford to pause a watch build. A build that rewrote a file in that window used to
+    // leave the manifest carrying the *old* size and mtime against the *new* content's hash. A
+    // restore then wrote back bytes produced after the moment the owner asked to return to, and
+    // set the mtime to the older stamp - so the next checkpoint saw the file as unchanged and the
+    // wrong content was pinned for good.
+    const { workspaceRoot, root } = await workspace();
+    const checkpoints = new WorkspaceCheckpoints(config(workspaceRoot));
+    const target = path.join(root, 'workspace', 'app.js');
+    await writeFile(target, 'the bytes the walk saw\n');
+    const rewritten = 'the bytes the build wrote while the walk was still going\n';
+    midScan.path = path.join('workspace', 'app.js');
+    midScan.write = () => writeFile(target, rewritten);
+
+    const created = await checkpoints.create(WORKSPACE_ID, root, { checkpointId: randomUUID() });
+    expect(midScan.write).toBeNull();
+
+    const entry = (await manifestFiles(workspaceRoot, created.id)).find(
+      ([relative]) => relative === 'workspace/app.js'
+    )!;
+    const onDisk = await stat(target);
+    expect(entry[2]).toBe(Buffer.byteLength(rewritten));
+    expect(entry[3]).toBe(Math.floor(onDisk.mtimeMs));
+    expect(entry[4]).toBe(createHash('sha256').update(rewritten).digest('hex'));
+    await expect(readFile(blobPath(workspaceRoot, entry[4]), 'utf8')).resolves.toBe(rewritten);
+    expect(created.totalBytes).toBe(Buffer.byteLength(rewritten));
+    // And the manifest agrees with the tree it was taken from, so the next turn hashes nothing.
+    const after = await checkpoints.preview(WORKSPACE_ID, root, created.id);
+    expect([after.addedCount, after.modifiedCount, after.deletedCount]).toEqual([0, 0, 0]);
+  });
+
+  it('refuses a restore whose stored content has gone, before it deletes anything', async () => {
+    // A restore used to unlink everything made since the checkpoint and only then start cloning
+    // content back, and the blob store can be short an object - a collection that skipped a
+    // manifest it could not read, an interrupted delete between the manifest and the metadata.
+    // The clone threw ENOENT into a tree that had already lost the work of the last turn, the
+    // route answered a bare failure, and the only way back was a recovery point the owner was
+    // never told about. Nothing is destroyed now until every blob the restore will read is there.
+    const { workspaceRoot, root } = await workspace();
+    const checkpoints = new WorkspaceCheckpoints(config(workspaceRoot));
+    await writeFile(path.join(root, 'workspace', 'report.md'), 'first draft\n');
+    const created = await checkpoints.create(WORKSPACE_ID, root, { checkpointId: randomUUID() });
+
+    await writeFile(path.join(root, 'workspace', 'report.md'), 'rewritten by the agent\n');
+    await writeFile(path.join(root, 'workspace', 'stray.log'), 'an hour of work since\n');
+    const [, , , , hash] = (await manifestFiles(workspaceRoot, created.id)).find(
+      ([relative]) => relative === 'workspace/report.md'
+    )!;
+    await rm(blobPath(workspaceRoot, hash));
+
+    await expect(checkpoints.restore(WORKSPACE_ID, root, created.id)).rejects.toThrow(
+      'Nothing has been rewound'
+    );
+    await expect(readFile(path.join(root, 'workspace', 'stray.log'), 'utf8')).resolves.toBe(
+      'an hour of work since\n'
+    );
+    await expect(readFile(path.join(root, 'workspace', 'report.md'), 'utf8')).resolves.toBe(
+      'rewritten by the agent\n'
+    );
   });
 
   it('survives a turn whose new files hold identical content, which share one blob', async () => {
@@ -380,8 +530,9 @@ describe('turn checkpoints', () => {
     await writeFile(path.join(root, 'workspace', 'note.txt'), 'before\n');
     await writeFile(path.join(root, '.athanor', 'browser', 'Cookies'), 'session=before\n');
 
-    expect(await checkpoints.mechanism(root)).toBe('btrfs');
     const created = await checkpoints.create(WORKSPACE_ID, root, { checkpointId: randomUUID() });
+    // Read off the checkpoint that was taken rather than off a probe run for its own sake: this is
+    // the mechanism that actually stored these bytes, which is the thing worth asserting.
     expect(created.mechanism).toBe('btrfs');
     // A filesystem snapshot does not walk the tree, which is the whole reason it is instant.
     expect(created.fileCount).toBeNull();
@@ -418,7 +569,10 @@ describe('turn checkpoints', () => {
       config(workspaceRoot, { btrfsExecutable: '/usr/bin/btrfs' }),
       run
     );
-    expect(await checkpoints.mechanism(root)).toBe('content');
+    // Falls all the way through to the content store, which asks nothing of the filesystem.
+    expect(
+      (await checkpoints.create(WORKSPACE_ID, root, { checkpointId: randomUUID() })).mechanism
+    ).toBe('content');
   });
 
   it('uses a ZFS snapshot only when the workspace is the dataset itself', async () => {
@@ -429,10 +583,12 @@ describe('turn checkpoints', () => {
       throw new Error('unexpected');
     };
     expect(
-      await new WorkspaceCheckpoints(
-        config(workspaceRoot, { zfsExecutable: '/usr/sbin/zfs' }),
-        higher
-      ).mechanism(root)
+      (
+        await new WorkspaceCheckpoints(
+          config(workspaceRoot, { zfsExecutable: '/usr/sbin/zfs' }),
+          higher
+        ).create(WORKSPACE_ID, root, { checkpointId: randomUUID() })
+      ).mechanism
     ).toBe('content');
 
     const exact: CheckpointRunner = async (executable, args) => {
@@ -442,10 +598,12 @@ describe('turn checkpoints', () => {
       throw new Error('unexpected');
     };
     expect(
-      await new WorkspaceCheckpoints(
-        config(workspaceRoot, { zfsExecutable: '/usr/sbin/zfs' }),
-        exact
-      ).mechanism(root)
+      (
+        await new WorkspaceCheckpoints(
+          config(workspaceRoot, { zfsExecutable: '/usr/sbin/zfs' }),
+          exact
+        ).create(WORKSPACE_ID, root, { checkpointId: randomUUID() })
+      ).mechanism
     ).toBe('zfs');
   });
 
@@ -481,6 +639,96 @@ describe('turn checkpoints', () => {
     await expect(checkpoints.restore(WORKSPACE_ID, root, created.id)).rejects.toThrow(
       'workspace-relative'
     );
+  });
+
+  /**
+   * The disk floor, exercised without filling a disk - and the pair of refusals said in a way
+   * something other than a person can read.
+   *
+   * `apps/worker/src/agent.ts ownerFixableCheckpointFailure` decides whether a turn that lost its
+   * undo point says so in the conversation or only in the work log. It used to decide it by running
+   * a regular expression over the runner's prose, which matched the disk sentence and never matched
+   * this one - so a workspace over the file ceiling (two `node_modules` trees is enough) lost every
+   * automatic checkpoint from then on, silently, and the rewind dialog told the owner the turn
+   * "changed nothing on the computer". It now keys on these codes, and this is the end of the wire
+   * that produces them; `agent-run.test.ts` holds the other end.
+   *
+   * The ceiling is reached with `maxFiles: 2` rather than by writing a thousand files. A thousand
+   * writes to a temporary directory to prove a comparison bought nothing but seconds on every run,
+   * and the comparison does not know how large the number is.
+   */
+  it('refuses on a full host and on an oversized tree, each with a code a program can read', async () => {
+    const { workspaceRoot, root } = await workspace();
+    await writeFile(path.join(root, 'workspace', 'note.txt'), 'content\n');
+
+    const full = new WorkspaceCheckpoints(
+      config(workspaceRoot, {
+        hostStorage: async () => ({
+          hostStorageTotalBytes: 100 * 1024 ** 3,
+          hostStorageAvailableBytes: 1024 ** 3
+        })
+      })
+    );
+    const starved = await refusalFrom(
+      full.create(WORKSPACE_ID, root, { checkpointId: randomUUID() })
+    );
+    expect(starved.code).toBe('checkpoint_host_disk_full');
+    expect(starved.message).toContain('too full');
+
+    const crowded = new WorkspaceCheckpoints(config(workspaceRoot, { maxFiles: 2 }));
+    for (const name of ['a.js', 'b.js', 'c.js'])
+      await writeFile(path.join(root, 'workspace', name), 'x');
+    const oversized = await refusalFrom(
+      crowded.create(WORKSPACE_ID, root, { checkpointId: randomUUID() })
+    );
+    expect(oversized.code).toBe('checkpoint_workspace_too_large');
+    expect(oversized.message).toContain('more than 2 files');
+
+    // And the same tree, on the same host, with the ceiling where it ships: no refusal at all.
+    const ordinary = new WorkspaceCheckpoints(config(workspaceRoot));
+    expect(
+      (await ordinary.create(WORKSPACE_ID, root, { checkpointId: randomUUID() })).mechanism
+    ).toBe('content');
+  });
+
+  /**
+   * The ceiling bounds taking a checkpoint. It must not bound using one. (#136)
+   *
+   * The file count is a bound on the cost of the walk, and the walk is what taking a checkpoint
+   * does. Preview and restore walked the tree with the same limit, so the moment a workspace grew
+   * past the ceiling every checkpoint it already held - every one of them taken under the ceiling,
+   * complete, and perfectly restorable - became unreachable. That is the exact turn an owner wants
+   * to rewind: something unpacked a dependency tree into the workspace, and the way back out is the
+   * checkpoint from before it did. Refusing the restore left them holding the remedy and told them
+   * to apply it by hand first.
+   */
+  it('restores a checkpoint into a workspace that has since crossed the file ceiling', async () => {
+    const { workspaceRoot, root } = await workspace();
+    const checkpoints = new WorkspaceCheckpoints(config(workspaceRoot, { maxFiles: 2 }));
+    await writeFile(path.join(root, 'workspace', 'note.txt'), 'the good version\n');
+    const created = await checkpoints.create(WORKSPACE_ID, root, { checkpointId: randomUUID() });
+
+    // What an install does: the tree is now over the ceiling, and the note is wrong as well.
+    await mkdir(path.join(root, 'workspace', 'node_modules'), { recursive: true });
+    for (const name of ['a.js', 'b.js', 'c.js'])
+      await writeFile(path.join(root, 'workspace', 'node_modules', name), 'x');
+    await writeFile(path.join(root, 'workspace', 'note.txt'), 'the bad version\n');
+
+    // Taking a new one is still refused, which is the ceiling doing its job.
+    expect(
+      (await refusalFrom(checkpoints.create(WORKSPACE_ID, root, { checkpointId: randomUUID() })))
+        .code
+    ).toBe('checkpoint_workspace_too_large');
+
+    // Using the one already taken is not.
+    const preview = await checkpoints.preview(WORKSPACE_ID, root, created.id);
+    expect(preview.addedCount).toBe(3);
+    const restored = await checkpoints.restore(WORKSPACE_ID, root, created.id);
+    expect(restored.removedFileCount).toBe(3);
+    await expect(readFile(path.join(root, 'workspace', 'note.txt'), 'utf8')).resolves.toBe(
+      'the good version\n'
+    );
+    await expect(stat(path.join(root, 'workspace', 'node_modules', 'a.js'))).rejects.toThrow();
   });
 
   it('forgets a workspace completely when it is deleted', async () => {

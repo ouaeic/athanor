@@ -36,6 +36,7 @@ import {
   type SearchRoute,
   type WebSearchResult
 } from './search.js';
+import { DesktopControl } from './holder.js';
 
 export interface BrowserStreamState {
   url: string;
@@ -50,6 +51,15 @@ export interface BrowserStreamState {
    * they are: without it the agent stops on a page nobody is looking at and nothing says so.
    */
   botWall: BotWallReport | null;
+  /**
+   * The dialog stopping this page, if one is. It rides here for the same reason `botWall` does,
+   * and with more urgency: parking a Playwright `Dialog` handle suppresses the auto-dismiss, so
+   * the page is *blocked* until something answers - and nothing outside the agent's own `dialog`
+   * action ever could. An owner who had taken the browser over and clicked something raising
+   * `confirm()` watched the page stop, with no native dialog (Playwright had intercepted it), no
+   * error, and no way out but hibernating the browser.
+   */
+  pendingDialog: { type: string; message: string } | null;
 }
 
 interface BrowserStreamSubscriber {
@@ -83,10 +93,40 @@ interface Session {
    */
   tabs: Map<string, Page>;
   nextTabId: number;
-  holder: 'agent' | 'user' | 'secure_input';
+  /**
+   * Who holds the screen this browser is drawn on, which is not a fact this file owns any more.
+   *
+   * It used to be a `holder` field here, set by `setHolder` and read by every gate below - while
+   * the desktop kept a `DesktopControl` of its own for the same screen. Two answers, two takeovers,
+   * and no relation between them: an owner who took the Computer pane and an agent that still held
+   * the browser could both act on the same X server. When a desktop session exists this is that
+   * session's control object, so there is one answer and one queue.
+   */
+  control: DesktopControl;
+  /**
+   * Serializes the screencast's lifecycle, the way `bridgeQueue` serializes the desktop's bridge.
+   *
+   * Attaching and detaching a CDP session is several awaits long and three separate callers reach
+   * it - a subscriber joining, the last one leaving, and every retarget a tab switch causes. Run
+   * concurrently they interleave: two subscribers arriving together each saw no stream and each
+   * attached one, the second overwrote `session.stream`, and the first went on acking screencast
+   * frames nobody read for the life of the browser.
+   */
+  streamQueue: Promise<unknown>;
+  /** Takes this browser back off its screen's control when the session closes; see `#controlOf`. */
+  detachControl?: () => void;
   /** The challenges standing in this browser: which tab is stopped, and which sites are closed. */
   walls: BotWallLedger;
   pendingDialog?: Dialog;
+  /**
+   * The last title read off the watched page.
+   *
+   * Cached because `page.title()` is a CDP round trip into the page's own main thread, and the
+   * stream used to make one per frame with the frame's ack waiting behind it. Refreshed on the
+   * events that can change it - a navigation, a tab switch - which is every case a person would
+   * notice, at a cost of one read each instead of thirty a second.
+   */
+  streamTitle: string;
   consoleMessages: Array<{ level: string; text: string; url: string; at: string }>;
   stream?: BrowserStream;
   downloadsDirectory: string;
@@ -198,6 +238,32 @@ const DOWNLOAD_START_GRACE_MS = 250;
 const DOWNLOAD_HISTORY_LIMIT = 25;
 const SNAPSHOT_FRAME_LIMIT = 12;
 const SNAPSHOT_ELEMENT_LIMIT = 250;
+/** Matches the `innerText` bound beside the scans this covers (`browser.ts` `#scanPage`). */
+const PAGE_SCRIPT_TIMEOUT_MS = 5_000;
+/** Short, because a stale title in the pane is cosmetic and a stalled one used to be a freeze. */
+const STREAM_TITLE_TIMEOUT_MS = 250;
+
+/**
+ * A deadline for a promise that has none of its own.
+ *
+ * `page.evaluate` and `frame.evaluate` take no `timeout` option and inherit none from
+ * `setDefaultTimeout` - unlike `locator.evaluate`, which is why the calls beside them look bounded
+ * and these were not. On a page whose main thread is blocked the promise never settles, so
+ * `browser_snapshot` sat there until the worker's own 65-minute tool ceiling, indistinguishable
+ * from a slow page. Nothing here can abort the page's script; what it bounds is how long this
+ * process is willing to wait for it, which is the part that was missing.
+ */
+const withDeadline = async <T>(work: Promise<T>, milliseconds: number, fallback: T): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = await Promise.race([
+    work.catch(() => fallback),
+    new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(fallback), milliseconds);
+    })
+  ]);
+  if (timer) clearTimeout(timer);
+  return settled;
+};
 
 /**
  * Ref numbers are handed out from a counter that never rewinds, so a number names one control until
@@ -417,132 +483,138 @@ const scanFrameElements = async (
   limit: number,
   rootSelector?: string
 ): Promise<ScannedElement[]> => {
-  const raw = await frame
-    .evaluate<
-      RawScannedElement[],
-      { query: string; prefix: string; limit: number; root: string | null; seed: number }
-    >(
-      // Extraction only, and deliberately written without a single named inner function: the
-      // development transpiler rewrites those into calls to a helper that does not exist inside
-      // a page, and the whole scan then fails silently. Text arrives unnormalised; the runner
-      // tidies and judges it, where that can be tested without a browser.
-      ({ query, prefix, limit: budget, root, seed }) => {
-        const scope: ParentNode | null = root ? document.querySelector(root) : document;
-        if (!scope) return [];
-        const visible = Array.from(scope.querySelectorAll<HTMLElement>(query))
-          .filter((element) => {
-            const rect = element.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0;
-          })
-          .slice(0, budget);
-        // Every ref is assigned before anything is read, so a label can report the ref of the
-        // control it names even when that control comes later in document order. An element that
-        // already carries one keeps it: that is what makes a ref survive a scoped re-read, which
-        // used to renumber the whole page from zero. Only a number belonging to another frame is
-        // replaced, which can happen when a document is moved between frames.
-        let offset = 0;
-        const taken = new Set<string>();
-        for (const element of visible) {
-          const existing = element.getAttribute('data-athanor-ref') ?? '';
-          if (existing.startsWith(`${prefix}-`) && !taken.has(existing)) {
-            taken.add(existing);
-            continue;
+  const raw = await withDeadline(
+    frame
+      .evaluate<
+        RawScannedElement[],
+        { query: string; prefix: string; limit: number; root: string | null; seed: number }
+      >(
+        // Extraction only, and deliberately written without a single named inner function: the
+        // development transpiler rewrites those into calls to a helper that does not exist inside
+        // a page, and the whole scan then fails silently. Text arrives unnormalised; the runner
+        // tidies and judges it, where that can be tested without a browser.
+        ({ query, prefix, limit: budget, root, seed }) => {
+          const scope: ParentNode | null = root ? document.querySelector(root) : document;
+          if (!scope) return [];
+          const visible = Array.from(scope.querySelectorAll<HTMLElement>(query))
+            .filter((element) => {
+              const rect = element.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            })
+            .slice(0, budget);
+          // Every ref is assigned before anything is read, so a label can report the ref of the
+          // control it names even when that control comes later in document order. An element that
+          // already carries one keeps it: that is what makes a ref survive a scoped re-read, which
+          // used to renumber the whole page from zero. Only a number belonging to another frame is
+          // replaced, which can happen when a document is moved between frames.
+          let offset = 0;
+          const taken = new Set<string>();
+          for (const element of visible) {
+            const existing = element.getAttribute('data-athanor-ref') ?? '';
+            if (existing.startsWith(`${prefix}-`) && !taken.has(existing)) {
+              taken.add(existing);
+              continue;
+            }
+            const assigned = `${prefix}-${seed + offset}`;
+            offset += 1;
+            taken.add(assigned);
+            element.setAttribute('data-athanor-ref', assigned);
           }
-          const assigned = `${prefix}-${seed + offset}`;
-          offset += 1;
-          taken.add(assigned);
-          element.setAttribute('data-athanor-ref', assigned);
-        }
-        return visible.map((element) => {
-          const field = element as HTMLInputElement;
-          const select = element instanceof HTMLSelectElement ? element : null;
-          const labels = field.labels ? Array.from(field.labels) : [];
-          const wrapping = element.closest('label');
-          const named = labels[0] ?? (wrapping === element ? null : wrapping);
-          const control = element instanceof HTMLLabelElement ? element.control : null;
-          const valueBearing =
-            element instanceof HTMLInputElement ||
-            element instanceof HTMLTextAreaElement ||
-            element instanceof HTMLSelectElement ||
-            element.isContentEditable;
-          return {
-            // Read back rather than recomputed: the element may be carrying a ref from an earlier
-            // scan, which is the whole point of not clearing them.
-            ref: element.getAttribute('data-athanor-ref') ?? '',
-            tag: element.tagName.toLowerCase(),
-            role: element.getAttribute('role'),
-            ariaLabel: element.getAttribute('aria-label') ?? '',
-            labelledByText: (element.getAttribute('aria-labelledby') ?? '')
-              .split(/\s+/)
-              .filter(Boolean)
-              .map((id) => document.getElementById(id)?.innerText ?? '')
-              .filter(Boolean)
-              .join(' '),
-            labelText: named?.innerText ?? '',
-            placeholder: element.getAttribute('placeholder') ?? '',
-            title: element.getAttribute('title') ?? '',
-            text: (element.innerText ?? '').slice(0, 400),
-            type: element.getAttribute('type'),
-            href: element instanceof HTMLAnchorElement ? element.href : null,
-            elementId: element.id,
-            fieldName: element.getAttribute('name') ?? '',
-            valueBearing,
-            value: valueBearing
-              ? element.isContentEditable && !select
-                ? (element.innerText ?? '')
-                : (field.value ?? '')
-              : '',
-            password: element instanceof HTMLInputElement && element.type === 'password',
-            checked:
-              element instanceof HTMLInputElement && ['checkbox', 'radio'].includes(element.type)
-                ? element.checked
-                : element.getAttribute('aria-checked') === null
-                  ? null
-                  : element.getAttribute('aria-checked') === 'true',
-            disabled: field.disabled === true || element.getAttribute('aria-disabled') === 'true',
-            required: field.required === true || element.getAttribute('aria-required') === 'true',
-            maxLength:
-              element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
-                ? element.maxLength
+          return visible.map((element) => {
+            const field = element as HTMLInputElement;
+            const select = element instanceof HTMLSelectElement ? element : null;
+            const labels = field.labels ? Array.from(field.labels) : [];
+            const wrapping = element.closest('label');
+            const named = labels[0] ?? (wrapping === element ? null : wrapping);
+            const control = element instanceof HTMLLabelElement ? element.control : null;
+            const valueBearing =
+              element instanceof HTMLInputElement ||
+              element instanceof HTMLTextAreaElement ||
+              element instanceof HTMLSelectElement ||
+              element.isContentEditable;
+            return {
+              // Read back rather than recomputed: the element may be carrying a ref from an earlier
+              // scan, which is the whole point of not clearing them.
+              ref: element.getAttribute('data-athanor-ref') ?? '',
+              tag: element.tagName.toLowerCase(),
+              role: element.getAttribute('role'),
+              ariaLabel: element.getAttribute('aria-label') ?? '',
+              labelledByText: (element.getAttribute('aria-labelledby') ?? '')
+                .split(/\s+/)
+                .filter(Boolean)
+                .map((id) => document.getElementById(id)?.innerText ?? '')
+                .filter(Boolean)
+                .join(' '),
+              labelText: named?.innerText ?? '',
+              placeholder: element.getAttribute('placeholder') ?? '',
+              title: element.getAttribute('title') ?? '',
+              text: (element.innerText ?? '').slice(0, 400),
+              type: element.getAttribute('type'),
+              href: element instanceof HTMLAnchorElement ? element.href : null,
+              elementId: element.id,
+              fieldName: element.getAttribute('name') ?? '',
+              valueBearing,
+              value: valueBearing
+                ? element.isContentEditable && !select
+                  ? (element.innerText ?? '')
+                  : (field.value ?? '')
+                : '',
+              password: element instanceof HTMLInputElement && element.type === 'password',
+              checked:
+                element instanceof HTMLInputElement && ['checkbox', 'radio'].includes(element.type)
+                  ? element.checked
+                  : element.getAttribute('aria-checked') === null
+                    ? null
+                    : element.getAttribute('aria-checked') === 'true',
+              disabled: field.disabled === true || element.getAttribute('aria-disabled') === 'true',
+              required: field.required === true || element.getAttribute('aria-required') === 'true',
+              maxLength:
+                element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
+                  ? element.maxLength
+                  : null,
+              pattern: element instanceof HTMLInputElement ? element.pattern : '',
+              invalid: element.getAttribute('aria-invalid') === 'true',
+              description: [
+                ...(element.getAttribute('aria-describedby') ?? '').split(/\s+/),
+                ...(element.getAttribute('aria-errormessage') ?? '').split(/\s+/)
+              ]
+                .filter(Boolean)
+                .map((id) => document.getElementById(id)?.innerText ?? '')
+                .filter(Boolean)
+                .join(' '),
+              options: select
+                ? Array.from(select.options).map((option) => ({
+                    value: option.value,
+                    label: option.label || option.text,
+                    selected: option.selected
+                  }))
                 : null,
-            pattern: element instanceof HTMLInputElement ? element.pattern : '',
-            invalid: element.getAttribute('aria-invalid') === 'true',
-            description: [
-              ...(element.getAttribute('aria-describedby') ?? '').split(/\s+/),
-              ...(element.getAttribute('aria-errormessage') ?? '').split(/\s+/)
-            ]
-              .filter(Boolean)
-              .map((id) => document.getElementById(id)?.innerText ?? '')
-              .filter(Boolean)
-              .join(' '),
-            options: select
-              ? Array.from(select.options).map((option) => ({
-                  value: option.value,
-                  label: option.label || option.text,
-                  selected: option.selected
-                }))
-              : null,
-            labelFor: control?.getAttribute('data-athanor-ref') ?? null
-          };
-        });
-      },
-      {
-        query: INTERACTIVE_ELEMENT_QUERY,
-        prefix: `oc-${ordinal}`,
-        limit: limit + LABEL_FOLD_OVERSCAN,
-        root: rootSelector ?? null,
-        // Reserved before the page is touched, so two scans can never hand out the same number even
-        // if one of them fails part-way through.
-        seed: reserveRefBlock(limit + LABEL_FOLD_OVERSCAN)
-      }
-    )
-    // A frame can navigate or detach mid-scan; losing one frame must not lose the snapshot. Said
-    // out loud because the failure is otherwise indistinguishable from a page with no controls,
-    // which is exactly how a broken scan stayed invisible while the agent kept working blind.
-    .catch((cause: unknown) => {
-      runnerLogger.warn('browser.frame_scan_failed', { code: failureCode(cause) });
-      return [];
-    });
+              labelFor: control?.getAttribute('data-athanor-ref') ?? null
+            };
+          });
+        },
+        {
+          query: INTERACTIVE_ELEMENT_QUERY,
+          prefix: `oc-${ordinal}`,
+          limit: limit + LABEL_FOLD_OVERSCAN,
+          root: rootSelector ?? null,
+          // Reserved before the page is touched, so two scans can never hand out the same number even
+          // if one of them fails part-way through.
+          seed: reserveRefBlock(limit + LABEL_FOLD_OVERSCAN)
+        }
+      )
+      // A frame can navigate or detach mid-scan; losing one frame must not lose the snapshot. Said
+      // out loud because the failure is otherwise indistinguishable from a page with no controls,
+      // which is exactly how a broken scan stayed invisible while the agent kept working blind.
+      // The `.catch` handles a rejection; it does not handle a frame whose main thread never comes
+      // back to run this at all, which is what the deadline around it is for.
+      .catch((cause: unknown) => {
+        runnerLogger.warn('browser.frame_scan_failed', { code: failureCode(cause) });
+        return [] as RawScannedElement[];
+      }),
+    PAGE_SCRIPT_TIMEOUT_MS,
+    []
+  );
   return foldScannedElements(raw, limit);
 };
 
@@ -839,8 +911,30 @@ const DOWNLOAD_TRIGGERING_ACTIONS: BrowserAction['type'][] = [
   'press'
 ];
 
+/**
+ * The words that make activating a control consequential - the destructive half of the safety floor
+ * three documents promise. ATHANOR_BLUEPRINT.md:104, docs/AGENT_RUNTIME.md:416 and
+ * docs/CAPABILITIES.md:97 all say destructive operations still require confirmation in every mode.
+ *
+ * The list used to be only the transactional verbs, so it kept that promise for a control named
+ * "Delete" and broke it for every other way an application spells the same thing. That was
+ * invisible while a separate defect carded every browser and desktop action regardless of the
+ * verdict here (ATH-001): once a benign verdict was allowed to mean "no card", a click on a control
+ * named Erase, Format, Reset, Overwrite, Empty Trash, Revoke or Deactivate went through untouched
+ * in Balanced and Autonomous. Repairing the first defect is what made the second one reachable,
+ * which is why the vocabulary is widened in the same wave.
+ *
+ * Confirmation words - OK, Yes, Continue - are deliberately absent. What they do depends on the
+ * dialog around them, which no classifier here can see, and carding all of them is precisely the
+ * ceremony ATH-001 was fixed to remove. The floor promises destructive operations and ambiguous
+ * coordinates; a bare coordinate is separately and unconditionally consequential.
+ *
+ * `desktop.ts` holds the same list for the same promise and scripts/check-repository.mjs compares
+ * them, because a word added to one and not the other is how one surface silently stops keeping a
+ * floor the other still keeps.
+ */
 const consequentialText =
-  /\b(submit|apply|purchase|buy|pay|send|publish|delete|remove|confirm|place order|sign|accept offer|post|save changes)\b/i;
+  /\b(submit|apply|purchase|buy|pay|send|publish|delete|remove|confirm|place order|sign|accept offer|post|save changes|install|uninstall|erase|wipe|destroy|discard|overwrite|revoke|deactivate|terminate|format|reset|empty trash|empty bin|move to trash|move to bin)\b/i;
 const sensitiveFieldText =
   /\b(password|passcode|one.?time|otp|verification code|credit.?card|card number|cvv|cvc|social security|ssn|passport number|bank account)\b/i;
 
@@ -1098,6 +1192,25 @@ export const stepDestinations = (action: BrowserPrimitiveAction): string[] => {
   return [];
 };
 
+/**
+ * Every modifier and mouse button Playwright can be holding down on a page.
+ *
+ * Chromium tracks these per input dispatcher, not per action: a `keyboard.down('Control')` or a
+ * drag that threw between `mouse.down` and `mouse.up` leaves them latched for the life of the
+ * page. The desktop already lifted its own (`releaseAllInputCommand`) on every handover and the
+ * browser lifted nothing, so an agent interrupted mid-chord handed the owner a screen where every
+ * later keystroke was silently a chord and the next click finished a selection they never started.
+ */
+const BROWSER_HELD_MODIFIERS = ['Control', 'Shift', 'Alt', 'Meta'] as const;
+const BROWSER_HELD_BUTTONS = ['left', 'middle', 'right'] as const;
+
+export const releaseBrowserInput = async (page: Page): Promise<void> => {
+  // Tolerant per key: a page that navigated or closed while the takeover was in flight must not be
+  // the reason the remaining modifiers stay down.
+  for (const key of BROWSER_HELD_MODIFIERS) await page.keyboard.up(key).catch(() => undefined);
+  for (const button of BROWSER_HELD_BUTTONS) await page.mouse.up({ button }).catch(() => undefined);
+};
+
 export class BrowserManager {
   readonly #sessions = new Map<string, Session>();
   /**
@@ -1106,6 +1219,8 @@ export class BrowserManager {
    * browser the agent drives, and a wall the browser hit must not take searching away.
    */
   readonly #searchWalls = new Map<string, { wall: BotWall; at: number }>();
+  /** Sessions already registered with their screen's control; see `#controlOf`. */
+  readonly #attached = new WeakSet<Session>();
 
   constructor(
     private readonly options: {
@@ -1125,12 +1240,70 @@ export class BrowserManager {
         | ((workspaceId: string, root: string) => Promise<NodeJS.ProcessEnv | undefined>)
         | undefined;
       /**
+       * The control object for that same screen. Wired wherever `desktopDisplay` is, because the
+       * two are the same fact: a browser drawn on the workspace's X server is one more surface
+       * onto a machine the owner may take, not a second machine with a takeover of its own.
+       * Absent on a host with no desktop runtime, where the browser arbitrates itself.
+       */
+      desktopControl?:
+        | ((workspaceId: string, root: string) => Promise<DesktopControl | undefined>)
+        | undefined;
+      /**
        * The same ceiling the file routes apply, because an upload and a printed page are the file
        * API arriving by another door and must not be a way around its limits.
        */
       maxFileBytes: number;
     }
   ) {}
+
+  /**
+   * The desktop's control for this workspace, if this runner has a desktop at all.
+   *
+   * Allowed to fail for the same reason `#displayEnvironment` is: a desktop that is configured and
+   * will not come up must not be the reason the browser refuses to work. A browser with no shared
+   * control falls back to arbitrating its own session, which is what a headless host has anyway.
+   */
+  async #sharedControl(workspaceId: string, root: string): Promise<DesktopControl | undefined> {
+    return this.options.desktopControl?.(workspaceId, root).catch(() => undefined);
+  }
+
+  /**
+   * Registers this browser with the control that arbitrates its screen, once per session.
+   *
+   * Attached rather than passed in at construction because the control may be the desktop's, and
+   * a shared control has to release both surfaces: xdotool's latched keysyms *and* the modifiers
+   * Playwright is holding on the page. Doing it here rather than in `ensure` is deliberate - the
+   * suites that stand a session in for a launched Chromium never reach `ensure`, and the gate the
+   * owner's takeover rests on must be the shipped one on both paths.
+   */
+  /**
+   * Re-points a session at the control that arbitrates its screen *now*.
+   *
+   * A desktop session that died and was restarted mints a new control, and a browser still holding
+   * the old one is back to two answers for one screen - the defect this lane exists to close,
+   * arriving by the back door. So the shared control is resolved on every entry rather than once
+   * at launch, and a browser whose screen changed hands to a new object moves with it.
+   */
+  #adopt(session: Session, shared: DesktopControl | undefined): DesktopControl {
+    if (shared && shared !== session.control) {
+      session.detachControl?.();
+      delete session.detachControl;
+      this.#attached.delete(session);
+      session.control = shared;
+    }
+    return this.#controlOf(session);
+  }
+
+  #controlOf(session: Session): DesktopControl {
+    if (!this.#attached.has(session)) {
+      this.#attached.add(session);
+      session.detachControl = session.control.attach({
+        release: () => releaseBrowserInput(session.page),
+        onChange: () => this.#notifyStreamState(session)
+      });
+    }
+    return session.control;
+  }
 
   async ensure(workspaceId: string, root: string): Promise<Session> {
     const existing = this.#sessions.get(workspaceId);
@@ -1191,7 +1364,14 @@ export class BrowserManager {
       context,
       page,
       root,
-      holder: 'agent',
+      // The desktop was started a few lines above, by `#displayEnvironment`, precisely so this
+      // browser could run on its screen - so if this workspace has a desktop at all its control
+      // exists by now and this browser joins it rather than minting a rival.
+      control:
+        (await this.#sharedControl(workspaceId, root)) ??
+        new DesktopControl({ subject: 'Browser control' }),
+      streamQueue: Promise.resolve(),
+      streamTitle: '',
       consoleMessages: [],
       // One directory per browser session keeps a re-download of the same file from silently
       // overwriting the copy an earlier session handed the user.
@@ -1234,7 +1414,23 @@ export class BrowserManager {
       });
       candidate.on('dialog', (dialog) => {
         session.pendingDialog = dialog;
+        // Parking the handle suppresses Playwright's auto-dismiss, so the page is stopped from
+        // here until something answers. Telling the pane is the whole of the owner's way out.
+        this.#notifyStreamState(session);
       });
+      /*
+       * The two events that can change what the pane is showing without anything here asking.
+       *
+       * The title used to be re-read per frame, which paid for freshness thirty times a second
+       * and gated the frame ack on it. Reading it when the page says it has one costs two bounded
+       * reads per navigation instead - and only for the tab actually being watched, because
+       * background tabs are not on the stream.
+       */
+      const republish = () => {
+        if (candidate === session.page) void this.#refreshStreamState(session);
+      };
+      candidate.on('domcontentloaded', republish);
+      candidate.on('load', republish);
       candidate.on('download', (download) => {
         const saving = this.#saveDownload(session, root, download);
         session.pendingDownloads.add(saving);
@@ -1256,6 +1452,9 @@ export class BrowserManager {
     // the one exposed for. Sites that refuse automation are recognised and handed to the owner.
     this.#sessions.set(workspaceId, session);
     context.on('close', () => this.#sessions.delete(workspaceId));
+    // Registered the moment the session exists rather than at its first action, so a handover that
+    // arrives while this browser has only ever been watched still lifts what it is holding down.
+    this.#controlOf(session);
     return session;
   }
 
@@ -1308,14 +1507,14 @@ export class BrowserManager {
 
   async snapshot(workspaceId: string, root: string, actor: 'agent' | 'user') {
     const session = await this.ensure(workspaceId, root);
-    if (session.holder === 'secure_input' && actor === 'agent') {
+    if (session.control.holder === 'secure_input' && actor === 'agent') {
       throw new Error('Browser is in secure input mode');
     }
-    if (session.holder === 'secure_input') {
+    if (session.control.holder === 'secure_input') {
       return composeBrowserSnapshot({
         url: session.page.url(),
         title: await session.page.title(),
-        holder: session.holder,
+        holder: session.control.holder,
         botWall: null,
         elements: [],
         tabs: [],
@@ -1327,7 +1526,7 @@ export class BrowserManager {
         text: ''
       });
     }
-    if (session.holder === 'user' && actor === 'agent')
+    if (session.control.holder === 'user' && actor === 'agent')
       throw new Error('Browser is held by the user');
     const page = session.page;
     this.#assertReadablePage(page, actor);
@@ -1354,7 +1553,7 @@ export class BrowserManager {
       return composeBrowserSnapshot({
         url: page.url(),
         title,
-        holder: session.holder,
+        holder: session.control.holder,
         botWall: wall,
         elements: [],
         tabs: await sessionTabs(session),
@@ -1367,21 +1566,25 @@ export class BrowserManager {
       });
     }
     const screenshot = await page.screenshot({ type: 'jpeg', quality: 72 });
-    const images = await page.evaluate(() =>
-      Array.from(document.images)
-        .filter((image) => image.currentSrc || image.src)
-        .slice(0, 100)
-        .map((image) => ({
-          url: image.currentSrc || image.src,
-          alt: image.alt.slice(0, 500),
-          width: image.naturalWidth,
-          height: image.naturalHeight
-        }))
+    const images = await withDeadline(
+      page.evaluate(() =>
+        Array.from(document.images)
+          .filter((image) => image.currentSrc || image.src)
+          .slice(0, 100)
+          .map((image) => ({
+            url: image.currentSrc || image.src,
+            alt: image.alt.slice(0, 500),
+            width: image.naturalWidth,
+            height: image.naturalHeight
+          }))
+      ),
+      PAGE_SCRIPT_TIMEOUT_MS,
+      []
     );
     return composeBrowserSnapshot({
       url: page.url(),
       title,
-      holder: session.holder,
+      holder: session.control.holder,
       botWall: null,
       elements: await this.#scanPage(page),
       tabs: await sessionTabs(session),
@@ -1430,8 +1633,9 @@ export class BrowserManager {
     actor: 'agent' | 'user'
   ) {
     const session = await this.ensure(workspaceId, root);
-    if (session.holder === 'secure_input') throw new Error('Browser is in secure input mode');
-    if (session.holder !== actor) throw new Error(`Browser control is held by ${session.holder}`);
+    if (session.control.holder === 'secure_input')
+      throw new Error('Browser is in secure input mode');
+    session.control.authorize(actor);
     const page = resolveTab(session, input.tabId);
     if (actor === 'agent') await this.#assertNoWall(session, page);
     this.#assertReadablePage(page, actor);
@@ -1451,7 +1655,7 @@ export class BrowserManager {
    */
   #raiseWall(session: Session, page: Page, wall: BotWall): BotWallReport {
     const report = session.walls.raise(tabIdFor(session, page), wall);
-    void this.#notifyStreamState(session).catch(() => undefined);
+    this.#notifyStreamState(session);
     return report;
   }
 
@@ -1475,7 +1679,7 @@ export class BrowserManager {
     });
     if (current) return session.walls.raise(tabId, current);
     session.walls.clear(tabId, standing.url);
-    void this.#notifyStreamState(session).catch(() => undefined);
+    this.#notifyStreamState(session);
     return null;
   }
 
@@ -1582,7 +1786,7 @@ export class BrowserManager {
     if (remembered !== undefined && !backingOff) this.#searchWalls.delete(workspaceId);
     const plan = searchRoutePlan({
       actor,
-      sessionHolder: session?.holder ?? null,
+      sessionHolder: session?.control.holder ?? null,
       sessionHostClosed: session ? session.walls.hostClosed(searchUrl) !== null : false,
       isolatedBackoffActive: backingOff
     });
@@ -1812,22 +2016,60 @@ export class BrowserManager {
     }
   }
 
-  async #streamState(session: Session): Promise<BrowserStreamState> {
+  /**
+   * Everything the pane needs, read without touching the page.
+   *
+   * Deliberately synchronous. This used to await `page.title()`, and it was called once per
+   * screencast frame from inside the handler that acks them - so the frame rate was bounded by a
+   * round trip to the page's main thread, and a page that blocked its main thread (a long
+   * synchronous parse, an un-yielded WASM loop, a stray `debugger`) never resolved it, never
+   * acked, and froze the pane permanently with the socket still open and no error anywhere. The
+   * one field that genuinely needs the page is cached on the session and refreshed on the events
+   * that change it.
+   */
+  #streamState(session: Session): BrowserStreamState {
     return {
       url: session.page.url(),
-      title: await session.page.title().catch(() => ''),
-      holder: session.holder,
+      title: session.streamTitle,
+      holder: session.control.holder,
       width: BROWSER_VIEWPORT.width,
       height: BROWSER_VIEWPORT.height,
       transport: 'chromium_screencast',
-      botWall: session.walls.latest()
+      botWall: session.walls.latest(),
+      pendingDialog: session.pendingDialog
+        ? { type: session.pendingDialog.type(), message: session.pendingDialog.message() }
+        : null
     };
   }
 
-  async #notifyStreamState(session: Session): Promise<void> {
+  /** Takes a title an action has already read, rather than asking the page for it again. */
+  #adoptStreamTitle(session: Session, tabId: string | null, title: string): void {
+    if (!session.stream || tabId !== tabIdFor(session, session.page)) return;
+    session.streamTitle = title;
+    this.#notifyStreamState(session);
+  }
+
+  #notifyStreamState(session: Session): void {
     if (!session.stream) return;
-    const state = await this.#streamState(session);
+    const state = this.#streamState(session);
     for (const subscriber of session.stream.subscribers) subscriber.state(state);
+  }
+
+  /**
+   * Re-reads the one thing only the page can answer, then publishes.
+   *
+   * Bounded, because `page.title()` has no timeout of its own and does not acquire one from
+   * `setDefaultTimeout`: on a blocked main thread it simply never settles. A stale title in the
+   * pane is a cosmetic loss; a promise that never resolves on the stream path was the freeze.
+   */
+  async #refreshStreamState(session: Session): Promise<void> {
+    if (!session.stream) return;
+    session.streamTitle = await withDeadline(
+      session.page.title(),
+      STREAM_TITLE_TIMEOUT_MS,
+      session.streamTitle
+    );
+    this.#notifyStreamState(session);
   }
 
   async #startStream(
@@ -1838,18 +2080,16 @@ export class BrowserManager {
     const stream: BrowserStream = { cdp, subscribers };
     session.stream = stream;
     cdp.on('Page.screencastFrame', (frame: { data: string; sessionId: number }) => {
-      void (async () => {
-        try {
-          if (session.holder === 'secure_input') return;
-          const state = await this.#streamState(session);
-          const image = Buffer.from(frame.data, 'base64');
-          for (const current of stream.subscribers) current.frame(image, state);
-        } finally {
-          await cdp
-            .send('Page.screencastFrameAck', { sessionId: frame.sessionId })
-            .catch(() => undefined);
-        }
-      })();
+      // Acked first, and without waiting for it: Chromium sends no further frame until the
+      // previous one is acknowledged, so anything between arrival and ack is a cap on the frame
+      // rate. It used to be an awaited `page.title()`.
+      void cdp
+        .send('Page.screencastFrameAck', { sessionId: frame.sessionId })
+        .catch(() => undefined);
+      if (session.control.holder === 'secure_input') return;
+      const state = this.#streamState(session);
+      const image = Buffer.from(frame.data, 'base64');
+      for (const current of stream.subscribers) current.frame(image, state);
     });
     try {
       await cdp.send('Page.startScreencast', {
@@ -1866,14 +2106,37 @@ export class BrowserManager {
     }
   }
 
+  /**
+   * One screencast lifecycle operation at a time, the way `session.bridgeQueue` serializes the
+   * desktop's AT-SPI bridge.
+   *
+   * Attaching a CDP session, starting the screencast, stopping it and detaching are four awaits
+   * with `session.stream` read at the top and written at the bottom, and three callers reach them:
+   * a subscriber joining, the last subscriber leaving, and the retarget every tab switch causes.
+   * Interleaved they lose sessions - two joiners each saw no stream and each attached one, the
+   * second's assignment won, and the first went on acking frames for the life of the browser with
+   * nothing reading them. Chromium sends no further frame until the previous one is acked, so a
+   * stray session is not merely a leak: it is a second consumer of the same frame budget.
+   */
+  #onStreamQueue<T>(session: Session, work: () => Promise<T>): Promise<T> {
+    const run = session.streamQueue.then(work);
+    session.streamQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
   async #retargetStream(session: Session): Promise<void> {
-    const previous = session.stream;
-    if (!previous) return;
-    delete session.stream;
-    await previous.cdp.send('Page.stopScreencast').catch(() => undefined);
-    await previous.cdp.detach().catch(() => undefined);
-    await this.#startStream(session, previous.subscribers);
-    await this.#notifyStreamState(session);
+    await this.#onStreamQueue(session, async () => {
+      const previous = session.stream;
+      if (!previous) return;
+      delete session.stream;
+      await previous.cdp.send('Page.stopScreencast').catch(() => undefined);
+      await previous.cdp.detach().catch(() => undefined);
+      await this.#startStream(session, previous.subscribers);
+    });
+    await this.#refreshStreamState(session);
   }
 
   async subscribeStream(
@@ -1882,20 +2145,30 @@ export class BrowserManager {
     subscriber: BrowserStreamSubscriber
   ): Promise<() => Promise<void>> {
     const session = await this.ensure(workspaceId, root);
-    if (!session.stream) await this.#startStream(session);
-    const stream = session.stream;
-    if (!stream) throw new Error('Browser stream did not start');
-    stream.subscribers.add(subscriber);
-    subscriber.state(await this.#streamState(session));
-    return async () => {
-      const current = session.stream;
-      if (!current) return;
-      current.subscribers.delete(subscriber);
-      if (current.subscribers.size > 0) return;
-      delete session.stream;
-      await current.cdp.send('Page.stopScreencast').catch(() => undefined);
-      await current.cdp.detach().catch(() => undefined);
-    };
+    await this.#onStreamQueue(session, async () => {
+      if (!session.stream) await this.#startStream(session);
+      const started = session.stream;
+      if (!started) throw new Error('Browser stream did not start');
+      started.subscribers.add(subscriber);
+    });
+    // The one place a title read is unavoidable: nothing has happened yet to have refreshed it,
+    // and this may be the first subscriber the session has ever had.
+    session.streamTitle = await withDeadline(
+      session.page.title(),
+      STREAM_TITLE_TIMEOUT_MS,
+      session.streamTitle
+    );
+    subscriber.state(this.#streamState(session));
+    return () =>
+      this.#onStreamQueue(session, async () => {
+        const current = session.stream;
+        if (!current) return;
+        current.subscribers.delete(subscriber);
+        if (current.subscribers.size > 0) return;
+        delete session.stream;
+        await current.cdp.send('Page.stopScreencast').catch(() => undefined);
+        await current.cdp.detach().catch(() => undefined);
+      });
   }
 
   async preflight(
@@ -1905,9 +2178,7 @@ export class BrowserManager {
     actor: 'agent' | 'user'
   ): Promise<BrowserActionPreflight> {
     const session = await this.ensure(workspaceId, root);
-    if (session.holder !== actor && !(session.holder === 'secure_input' && actor === 'user')) {
-      throw new Error(`Browser control is held by ${session.holder}`);
-    }
+    session.control.authorize(actor);
     if (action.type !== 'batch') return this.#classify(session, action);
     // A step later in the batch may target a control an earlier step reveals, so it cannot be
     // resolved yet. Those are classified again at the moment they run; what can be judged now is
@@ -1968,6 +2239,18 @@ export class BrowserManager {
       throw new Error(`A browser consequential-action approval capability is required${where}`);
   }
 
+  /**
+   * Every browser action, through the one queue that arbitrates the screen.
+   *
+   * Three things sit on this path that did not before. The holder is checked once before the
+   * session is ensured, so an owner who has taken the desktop refuses the agent's next browser
+   * call without a Chromium being launched to be refused by. The work then runs inside a
+   * `submit` slot, which re-checks the holder inside the slot: a call admitted a moment before a
+   * takeover used to go on driving the page the owner had just taken. And the slot's abort signal
+   * ends the action when the takeover arrives mid-flight - a `pressSequentially` of a long string
+   * paces itself at 30 ms a character and had a full minute to keep typing into a page whose
+   * owner was already using it.
+   */
   async act(
     workspaceId: string,
     root: string,
@@ -1975,10 +2258,38 @@ export class BrowserManager {
     actor: 'agent' | 'user',
     consequentialApproved = false
   ) {
+    const shared = await this.#sharedControl(workspaceId, root);
+    shared?.authorize(actor);
     const session = await this.ensure(workspaceId, root);
-    if (session.holder !== actor && !(session.holder === 'secure_input' && actor === 'user')) {
-      throw new Error(`Browser control is held by ${session.holder}`);
-    }
+    return this.#adopt(session, shared).submit(actor, (signal) =>
+      this.#raceTakeover(signal, this.#act(session, root, action, actor, consequentialApproved))
+    );
+  }
+
+  /**
+   * Playwright has no per-call cancellation, so the abort ends the *action*: the caller stops
+   * waiting and no result is reported for work the owner did not authorise. What the takeover can
+   * do to the page itself it has already done - `release` lifts every modifier and mouse button
+   * this session was holding before the new holder's first event.
+   */
+  async #raceTakeover<T>(signal: AbortSignal, work: Promise<T>): Promise<T> {
+    const takenOver = () => new Error('The browser was taken over while this action was running');
+    if (signal.aborted) throw takenOver();
+    return Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(takenOver()), { once: true });
+      })
+    ]);
+  }
+
+  async #act(
+    session: Session,
+    root: string,
+    action: BrowserAction,
+    actor: 'agent' | 'user',
+    consequentialApproved: boolean
+  ) {
     const startedDownloads = session.downloads.length;
     if (action.type === 'batch') {
       const steps: Array<{
@@ -2027,6 +2338,10 @@ export class BrowserManager {
       this.#enforce(await this.#classify(session, action), consequentialApproved, '');
     }
     const performed = await this.#perform(session, root, action);
+    // `#perform` has already paid for the title of the tab it acted on, so the pane gets it for
+    // nothing. The page's own `load` events cover a navigation nobody here asked for; this covers
+    // the far more common case of one that something here did.
+    this.#adoptStreamTitle(session, performed.tabId, performed.title);
     if (DOWNLOAD_TRIGGERING_ACTIONS.includes(action.type) || session.pendingDownloads.size)
       await this.#settleDownloads(session);
     return { ...performed, downloads: session.downloads.slice(startedDownloads) };
@@ -2212,7 +2527,7 @@ export class BrowserManager {
         // Reads a tab without making it active, so the agent can check a background page
         // without stealing focus from the one a human may be watching.
         const inspected = resolveTab(session, action.tabId);
-        this.#assertReadablePage(inspected, session.holder === 'agent' ? 'agent' : 'user');
+        this.#assertReadablePage(inspected, session.control.holder === 'agent' ? 'agent' : 'user');
         return {
           url: inspected.url(),
           title: await inspected.title().catch(() => ''),
@@ -2248,6 +2563,9 @@ export class BrowserManager {
         const dialog = session.pendingDialog;
         if (!dialog) throw new Error('No page dialog is waiting for a response');
         delete session.pendingDialog;
+        // Published before the answer is delivered: the page resumes the moment it is, and a
+        // banner left standing over a running page is the same lie in the other direction.
+        this.#notifyStreamState(session);
         if (action.response === 'accept') await dialog.accept(action.promptText);
         else await dialog.dismiss();
         break;
@@ -2317,7 +2635,7 @@ export class BrowserManager {
     page: Page,
     response: PageResponse | null
   ): Promise<void> {
-    if (session.holder === 'agent') {
+    if (session.control.holder === 'agent') {
       if (!agentReachablePage(page.url())) throw agentDestinationRefused(page.url());
       // Absent for a page answered from the browser's own cache, where nothing left the machine.
       const server = response ? await response.serverAddr().catch(() => null) : null;
@@ -2354,7 +2672,11 @@ export class BrowserManager {
     actor: 'agent' | 'user'
   ) {
     const session = await this.ensure(workspaceId, root);
-    if (session.holder !== actor) throw new Error(`Browser control is held by ${session.holder}`);
+    // Deliberately stricter than `authorize`: printing is a copy of the page onto disk, where the
+    // agent can read it, so it stays refused during secure input even for the owner - who is at
+    // that moment typing the one thing on the page that must not be written down.
+    if (session.control.holder !== actor)
+      throw new Error(`Browser control is held by ${session.control.holder}`);
     const page = resolveTab(session, input.tabId);
     if (actor === 'agent') await this.#assertNoWall(session, page);
     this.#assertReadablePage(page, actor);
@@ -2372,14 +2694,25 @@ export class BrowserManager {
     return { path: relativePath, url: page.url(), title: await page.title().catch(() => '') };
   }
 
+  /**
+   * Hands the browser over, through the same transfer the Computer pane's Take over button uses.
+   *
+   * It used to be an assignment to a field, which is every ordering defect a takeover can have at
+   * once: work already in flight kept running against the page, work already queued ran after the
+   * handover, and nothing lifted the modifiers the outgoing side was holding. `transfer` discards
+   * the queue, aborts the over-running action, releases every surface and only then admits the new
+   * holder - and when this browser is drawn on the workspace's desktop it is the *same* transfer
+   * the Computer pane performs, so the two surfaces cannot disagree about who is driving.
+   */
   async setHolder(workspaceId: string, root: string, holder: 'agent' | 'user' | 'secure_input') {
     const session = await this.ensure(workspaceId, root);
-    session.holder = holder;
+    const shared = await this.#sharedControl(workspaceId, root);
+    const state = await this.#adopt(session, shared).transfer(holder);
     // Handing the browser back is the owner saying the challenge is dealt with, and they are the
     // only one who can say it: nothing the model does clears a wall that has not passed by itself.
     if (holder === 'agent') session.walls.clearAll();
-    await this.#notifyStreamState(session);
-    return { holder };
+    this.#notifyStreamState(session);
+    return { holder: state.holder };
   }
 
   async close(workspaceId: string): Promise<void> {
@@ -2389,6 +2722,12 @@ export class BrowserManager {
     this.#searchWalls.delete(workspaceId);
     const session = this.#sessions.get(workspaceId);
     if (!session) return;
+    // Off the control first: a shared control outlives this browser, and releasing a page that has
+    // gone on every later desktop handover is a failure raised at the owner taking their own
+    // machine back.
+    session.detachControl?.();
+    delete session.detachControl;
+    this.#attached.delete(session);
     await session.context.close();
     await clearStagedUploads(session.root);
   }

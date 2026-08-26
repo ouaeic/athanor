@@ -36,15 +36,21 @@ export type DeliveryDecision =
  * Kinds that are still worth sending after the moment has passed, so being at the keyboard when
  * they are raised holds them rather than writing them off.
  *
- * The other two report that work is over: if the owner is at the screen they have already read it,
- * and a phone that buzzes for something they are looking at is the thing owners switch off. These
- * three are not reports. An approval and a takeover have stopped the agent until a person acts, and
- * a notice is the one push the owner asked for by name - being at the keyboard is not the same as
- * being in that conversation, and dropping it means it is never delivered at all.
+ * `task_finished` is the only one left out, because it reports that work is over: if the owner is
+ * at the screen they have already read it, and a phone that buzzes for something they are looking
+ * at is the thing owners switch off. These four are not reports. An approval and a takeover have
+ * stopped the agent until a person acts, a spend pause is the box itself refusing to spend more
+ * and waiting for a ceiling only the owner can raise, and a notice is the one push the owner asked
+ * for by name - being at the keyboard is not the same as being in that conversation, and dropping
+ * it settles the ledger row, which means it is never delivered at all.
+ *
+ * The data layer sorts the candidates on the same line: approval, takeover, spend pause, "and the
+ * rest is news".
  */
 const HELD_WHILE_PRESENT: readonly NotificationKind[] = [
   'approval_required',
   'takeover_needed',
+  'spend_paused',
   'agent_message'
 ];
 
@@ -98,18 +104,19 @@ export const deliveryDecision = (input: {
 }): DeliveryDecision => {
   const { kind, settings, ownerPresent, eventAt, now } = input;
   if (!settings.kinds[kind]) return { action: 'drop', reason: 'kind_disabled' };
+  const stale = now.getTime() - eventAt.getTime() >= MAX_HOLD_MS;
 
   if (ownerPresent) {
-    return HELD_WHILE_PRESENT.includes(kind)
-      ? { action: 'hold', reason: 'foreground' }
-      : { action: 'drop', reason: 'foreground' };
+    if (!HELD_WHILE_PRESENT.includes(kind)) return { action: 'drop', reason: 'foreground' };
+    // The horizon belongs to holding, not to quiet hours, and it was only on the quiet arm. So an
+    // owner who simply keeps a tab open kept every held item alive for the fourteen days it stays
+    // a candidate, and the whole fortnight would have arrived at once the moment they walked away.
+    return stale ? { action: 'drop', reason: 'stale' } : { action: 'hold', reason: 'foreground' };
   }
 
   const quiet =
     inQuietHours(settings.quietHours, settings.timeZone, now) &&
     !(kind === 'approval_required' && settings.quietHoursAllowApprovals);
   if (!quiet) return { action: 'send' };
-  return now.getTime() - eventAt.getTime() >= MAX_HOLD_MS
-    ? { action: 'drop', reason: 'stale' }
-    : { action: 'hold', reason: 'quiet_hours' };
+  return stale ? { action: 'drop', reason: 'stale' } : { action: 'hold', reason: 'quiet_hours' };
 };

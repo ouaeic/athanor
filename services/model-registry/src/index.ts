@@ -1,11 +1,10 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
-import { ModelRelease } from '@athanor/contracts';
 import { decodeMasterKey } from '@athanor/core';
 import { createDatabase, DataStore, migrateDatabase } from '@athanor/data';
-import { refreshOpenRouterCatalog, seedModels } from '@athanor/model-gateway';
-import { catalogCredential } from './catalog-credential.js';
-import { refreshFailureReason, refreshLogLine } from './refresh-log.js';
+import { epochSeconds, readCatalogRecord, writeCatalogRecord } from './catalog-state.js';
+import { catalogueFrozenLine, refreshFailureReason, refreshLogLine } from './refresh-log.js';
+import { refreshOnce } from './refresh-once.js';
 
 const Config = z.object({
   DATABASE_DRIVER: z.enum(['pglite', 'postgres']).default('postgres'),
@@ -28,7 +27,14 @@ const Config = z.object({
   ),
   MODEL_CATALOG_SCOPE: z
     .enum(['provider_catalog', 'reviewed_open_weight'])
-    .default('provider_catalog')
+    .default('provider_catalog'),
+  /**
+   * Where each pass writes down what it did, for `athanor doctor` to read. The default is inside
+   * /var/lib/athanor-control because that is the one directory `athanor@.service` may write to.
+   * `doctor` reads the same variable out of control.env, so an operator who moves the file moves
+   * both halves at once.
+   */
+  MODEL_CATALOG_STATE_PATH: z.string().default('/var/lib/athanor-control/model-catalog.state')
 });
 const config = Config.parse(process.env);
 const database = createDatabase({
@@ -58,69 +64,74 @@ process.once('SIGINT', stop);
 process.once('SIGTERM', stop);
 
 let consecutiveFailures = 0;
+let frozenSaid = false;
+let stateWriteSaid = false;
+/*
+ * When a provider last answered, held here as well as in the record on disk. The file is the
+ * durable copy and survives the restart this process gets on every update; this one covers the
+ * hour after a pass that could not write it, so a directory that was briefly unwritable does not
+ * make the next pass report a catalogue that has never refreshed.
+ */
+let lastRefreshEpoch = 0;
 
 while (running) {
-  // The default scope offers whatever the owner's own provider account can reach, so a model
-  // released after this build still appears without a code change. `reviewed_open_weight`
-  // restores the stricter allowlist. A refresh failure preserves the previous catalog rather
-  // than weakening privacy requirements or emptying the model picker.
-  let reason: string | null = null;
-  try {
-    const credential = await catalogCredential({
-      store,
-      masterKey,
-      environmentKey: config.OPENROUTER_REGISTRY_KEY
-    });
-    const existing = await store.listModels();
-    if (credential) {
-      // A real refresh, and a replace rather than an upsert: a model the provider has withdrawn
-      // should leave the picker rather than sit in it until somebody tries to use it.
-      await store.replaceModelCatalog(
-        await refreshOpenRouterCatalog(seedModels(), {
-          baseUrl: credential.baseUrl ?? config.OPENROUTER_BASE_URL,
-          apiKey: credential.apiKey,
-          scope: config.MODEL_CATALOG_SCOPE,
-          /*
-           * What the catalogue said an hour ago, so one failing request cannot withdraw the owner's
-           * private routes. Zero-retention is a fact about live endpoints and it arrives on its own
-           * request; when that request alone fails, the answer carried forward is the last one this
-           * box actually observed rather than "not verified", which the privacy projection would
-           * read as a reason to take every private model out of the picker.
-           */
-          previous: existing.flatMap((model) => {
-            const parsed = ModelRelease.safeParse(model);
-            return parsed.success ? [parsed.data] : [];
-          })
-        })
-      );
-    } else if (!existing.length) {
-      /*
-       * No key, so there is nothing to refresh from — but an empty catalogue still needs something
-       * in it, and this is the only thing that puts it there on a new box.
-       *
-       * It used to write the seed on every pass regardless. No shipped path sets a registry key, so
-       * within an hour of finishing setup the static seed landed on top of the catalogue the API
-       * had enriched from the owner's own provider account: the curated models went back to
-       * availability 'review' and lost their prices, which took them out of the picker and made any
-       * task or schedule pinned to one fail with model_unavailable. The owner's fix was to re-save
-       * their provider key, and an hour later it happened again.
-       */
-      await store.upsertModels(seedModels());
-    }
-  } catch (error) {
-    reason = refreshFailureReason(error);
-  }
+  const previous = await readCatalogRecord(config.MODEL_CATALOG_STATE_PATH);
+  const outcome = await refreshOnce({
+    store,
+    masterKey,
+    environmentKey: config.OPENROUTER_REGISTRY_KEY,
+    baseUrl: config.OPENROUTER_BASE_URL,
+    scope: config.MODEL_CATALOG_SCOPE
+  });
   // The journal is the whole of the observation this box has: one owner, no alerting, and this
   // service has no endpoint to ask. Silence would make a catalogue that stopped changing
   // indistinguishable from a provider that shipped nothing, so the first failure and the recovery
-  // are both said once, in `athanor logs`.
+  // are both said once, in `athanor logs registry` - and so is the state where there is nothing to
+  // refresh from at all, which used to be the one silence nobody could tell from health.
   const line = refreshLogLine({
     previousFailures: consecutiveFailures,
-    reason,
+    reason: outcome.reason,
     intervalSeconds: config.REGISTRY_REFRESH_SECONDS
   });
   if (line) process.stderr.write(line);
-  consecutiveFailures = reason === null ? 0 : consecutiveFailures + 1;
+  consecutiveFailures = outcome.reason === null ? 0 : consecutiveFailures + 1;
+  const previousRefresh = Math.max(previous?.lastRefreshEpoch ?? 0, lastRefreshEpoch);
+  const frozen = catalogueFrozenLine({
+    alreadySaid: frozenSaid,
+    state: outcome.state,
+    models: outcome.models,
+    lastRefreshAt: previousRefresh ? new Date(previousRefresh * 1000) : null
+  });
+  if (frozen) process.stderr.write(frozen);
+  frozenSaid = outcome.state === 'refreshed' ? false : frozenSaid || frozen !== null;
+  const checkedAtEpoch = epochSeconds(new Date());
+  // Only a provider answering moves this. A pass that failed, or had no key to try, leaves it
+  // where it was - that is the whole point of recording it, and it is what tells the owner how
+  // long the catalogue in front of them has actually been standing still.
+  lastRefreshEpoch = outcome.state === 'refreshed' ? checkedAtEpoch : previousRefresh;
+  try {
+    await writeCatalogRecord(config.MODEL_CATALOG_STATE_PATH, {
+      checkedAtEpoch,
+      lastRefreshEpoch,
+      state: outcome.state,
+      models: outcome.models,
+      intervalSeconds: config.REGISTRY_REFRESH_SECONDS,
+      reason: outcome.reason
+    });
+    stateWriteSaid = false;
+  } catch (error) {
+    // Once, at the same cadence as everything else here. A refresh loop must not stop refreshing
+    // because it could not write a file it keeps only for somebody else to read, but a silent
+    // failure here is a `doctor` check that reports a stale catalogue for ever after.
+    if (!stateWriteSaid) {
+      process.stderr.write(
+        `athanor model registry: the refresh record could not be written to ` +
+          `${config.MODEL_CATALOG_STATE_PATH} (${refreshFailureReason(error)}), so ` +
+          `sudo athanor doctor cannot tell a current catalogue from one that stopped refreshing.\n`
+      );
+      stateWriteSaid = true;
+    }
+  }
   await delay(config.REGISTRY_REFRESH_SECONDS * 1000, undefined, {
     signal: shutdown.signal
   }).catch(() => undefined);

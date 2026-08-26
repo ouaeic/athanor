@@ -33,6 +33,8 @@ import {
   resolveExecutable
 } from './command-policy.js';
 import { resolveInside } from './files.js';
+import { DesktopControl } from './holder.js';
+import { failureCode, runnerLogger } from './log.js';
 import { awaitChildExit } from './subprocess.js';
 
 export interface DesktopNode {
@@ -88,6 +90,25 @@ export interface DesktopSnapshot {
 }
 
 /**
+ * The AT-SPI state names this file matches on, in the spelling `athanor-desktop-bridge.py` emits.
+ *
+ * Written down because both of them had been wrong, in the same way, for the life of the file: the
+ * selection ranked on `'disabled'` and the classifier looked for `'read-only'`, and AT-SPI has
+ * neither string. The vocabulary is `ATSPI_STATE_*` with the prefix removed and lowercased, so
+ * `ATSPI_STATE_SENSITIVE` is `sensitive` and `ATSPI_STATE_READ_ONLY` is `read_only` - one word,
+ * underscore, no hyphen. `state_name` in the bridge is the function that produces them and
+ * `athanor-desktop-bridge.test.py` is what pins it; a name invented here rather than read from
+ * there is a predicate that silently never fires, which is exactly what happened twice.
+ */
+export const DESKTOP_STATE = {
+  /** The toolkit's word for "not greyed out" - a control the user can operate. */
+  sensitive: 'sensitive',
+  /** A field that displays a value and refuses to take one. */
+  readOnly: 'read_only',
+  focused: 'focused'
+} as const;
+
+/**
  * How many characters of accessibility nodes one observation may carry.
  *
  * The window bounds a tool result at twenty-four thousand characters, and the rest of the snapshot
@@ -111,8 +132,18 @@ export const selectDesktopNodes = (
 ): { kept: DesktopNode[]; omitted: number } => {
   const onScreen = (node: DesktopNode): boolean =>
     node.bounds !== null && node.bounds.width > 0 && node.bounds.height > 0;
+  /**
+   * A control the user could actually operate: it has an accessibility action, and AT-SPI says it
+   * is sensitive - which is the toolkit's own word for "not greyed out".
+   *
+   * This used to read `!node.states.includes('disabled')`, and no AT-SPI node has ever carried
+   * `'disabled'`; the vocabulary has `sensitive` and its absence. So the test was constant-true for
+   * anything with an action, the top tier filled with greyed-out menu items and toolbar buttons,
+   * and the named labels that say what the screen is were dropped underneath them - out of a
+   * budget that only holds about seventy nodes.
+   */
   const actionable = (node: DesktopNode): boolean =>
-    node.actions.length > 0 && !node.states.includes('disabled');
+    node.actions.length > 0 && node.states.includes(DESKTOP_STATE.sensitive);
   const tier = (node: DesktopNode): number => {
     if (actionable(node) && onScreen(node)) return 0;
     if (actionable(node)) return 1;
@@ -170,6 +201,17 @@ export interface DesktopSubscriber {
    * back to the bounded queue alone.
    */
   bufferedBytes?: () => number;
+  /**
+   * Whether this client has a `VideoDecoder` for the H.264 stream, read live because the answer
+   * arrives in the client's `hello` a moment after it subscribes.
+   *
+   * Read as a callback rather than a value for the same reason `bufferedBytes` is: the route owns
+   * the fact and the encoder needs it whenever it next reconsiders, not once at join. A client
+   * that says no drags the whole session down to JPEG, which is the honest consequence of one
+   * encoder per desktop - and far better than the alternative it replaces, which was a viewer
+   * with no `VideoDecoder` receiving access units it could not decode and showing nothing at all.
+   */
+  canDecodeVideo?: () => boolean;
   /** Viewport of the pane that is subscribing, so the display resizes to fit it on join. */
   viewport?: DisplayViewport;
 }
@@ -191,6 +233,16 @@ interface DesktopSession {
   codec: DisplayCodec;
   encoder: DisplayEncoder;
   congested: boolean;
+  /**
+   * Whether this session's accessibility stack answered its readiness probe.
+   *
+   * The bridge's `ping` has always reported it and nothing has ever read it, so a session whose
+   * toolkit never joined the accessibility bus was discovered one failed `observe` at a time -
+   * each of them a python round trip that could only fail, and each reported to the model as
+   * "accessibility bridge failed", which reads like a crash rather than like a desktop that has
+   * no semantic layer to offer.
+   */
+  atspi: boolean;
   bridge?: BridgeChannel;
   bridgeServe: boolean;
   bridgeQueue: Promise<unknown>;
@@ -257,8 +309,16 @@ const ENCODER_POLL_MS = 250;
 const RESTORE_GRACE_MS = 60_000;
 const DRAG_THRESHOLD_PX = 12;
 
+/**
+ * The vocabulary `browser.ts` owns, applied to an accessibility node's name rather than to an
+ * element's. Kept byte-identical on purpose and compared by scripts/check-repository.mjs: the two
+ * had already drifted - this file carried `install|uninstall` and the browser did not - and that is
+ * exactly how one surface stops keeping a documented floor while the other still keeps it. The
+ * argument for which words belong here, and for the confirmation words that deliberately do not,
+ * is written once beside the owner.
+ */
 const consequentialText =
-  /\b(submit|apply|purchase|buy|pay|send|publish|delete|remove|confirm|place order|sign|accept offer|post|save changes|install|uninstall)\b/i;
+  /\b(submit|apply|purchase|buy|pay|send|publish|delete|remove|confirm|place order|sign|accept offer|post|save changes|install|uninstall|erase|wipe|destroy|discard|overwrite|revoke|deactivate|terminate|format|reset|empty trash|empty bin|move to trash|move to bin)\b/i;
 const sensitiveText =
   /\b(password|passcode|one.?time|otp|verification code|credit.?card|cvv|cvc|social security|ssn|passport|bank account|secret|token)\b/i;
 
@@ -593,6 +653,29 @@ export const nodeUnderPoint = (
   return best;
 };
 
+/**
+ * Which observation a coordinate action was computed from, when it says.
+ *
+ * `DesktopSnapshot.generation` is stamped on every snapshot, every still and every frame, and
+ * `DesktopControl.authorize` has always refused work that names a generation which is no longer
+ * current. Nothing supplied it: the route passed five arguments and the action contract had no
+ * field for the model to echo, so the entire staleness mechanism was reachable only from a test.
+ * The owner closes a dialog, the queued `click_at(820, 410)` the agent computed from the screen
+ * before it lands on whatever is under those pixels now, and nothing refuses it.
+ *
+ * Read off the action rather than added to the signature so the existing routes forward it for
+ * free: `DesktopAction.parse` is what the runner is handed, so a `generation` on the
+ * coordinate-bearing variants arrives here without any route changing. Read defensively because
+ * it is optional by design - a human dragging in the Computer pane is looking at the live screen
+ * and has nothing to be stale about.
+ */
+export const desktopActionGeneration = (action: DesktopAction): number | undefined => {
+  const declared = (action as { generation?: unknown }).generation;
+  return typeof declared === 'number' && Number.isInteger(declared) && declared > 0
+    ? declared
+    : undefined;
+};
+
 export const classifyDesktopAction = (
   action: DesktopAction,
   node?: DesktopNode
@@ -651,7 +734,11 @@ export const classifyDesktopAction = (
   if (action.type === 'text_input') {
     const focusedLabel =
       `${node?.name ?? ''} ${node?.description ?? ''} ${node?.role ?? ''}`.trim();
-    const knownField = Boolean(node) && !node?.states.includes('read-only');
+    // A field that refuses input is not one to name in a handoff card: telling the owner to type
+    // into a read-only control is worse than telling them a field is focused and letting them look.
+    // The state is `read_only` - `ATSPI_STATE_READ_ONLY` with the prefix off - and this asked for
+    // `'read-only'`, a spelling AT-SPI does not use, so the branch had never once been taken.
+    const knownField = Boolean(node) && !node?.states.includes(DESKTOP_STATE.readOnly);
     const secret = !node || Boolean(node.sensitive) || sensitiveText.test(focusedLabel);
     return {
       consequential: false,
@@ -671,159 +758,6 @@ export const classifyDesktopAction = (
     preview: `${action.type === 'invoke' ? 'Invoke' : action.type === 'set_text' ? 'Edit' : 'Focus'} “${node?.name || node?.role || 'desktop control'}”`
   };
 };
-
-export interface DesktopControlState {
-  holder: DesktopHolder;
-  holderSince: number;
-  generation: number;
-}
-
-interface PendingInput {
-  actor: DesktopHolder;
-  execute: () => Promise<void>;
-  cancel: (error: Error) => void;
-}
-
-export interface DesktopControlOptions {
-  /** Releases every latched key and button. Runs on every holder transition, no exceptions. */
-  release: () => Promise<void>;
-  onChange: (state: DesktopControlState) => void;
-  now?: () => number;
-  /** How long an in-flight atomic transaction (a drag) may finish before it is aborted. */
-  settleMs?: number;
-}
-
-/**
- * The single serialization point for desktop input.
- *
- * Authorization is checked inside the queue slot rather than by the caller, so
- * check-then-act is atomic: a transaction admitted before a takeover cannot execute after
- * it. Takeover is preemptive - queued work from the outgoing holder is discarded, an
- * over-running transaction is aborted, and every held key and button is released before the
- * new holder's first event.
- */
-export class DesktopControl {
-  #holder: DesktopHolder = 'agent';
-  #holderSince: number;
-  #generation = 1;
-  #queue: PendingInput[] = [];
-  #active: AbortController | null = null;
-  #draining = false;
-  #idle: Array<() => void> = [];
-  #transfers: Promise<unknown> = Promise.resolve();
-
-  constructor(private readonly options: DesktopControlOptions) {
-    this.#holderSince = (options.now ?? Date.now)();
-  }
-
-  get holder(): DesktopHolder {
-    return this.#holder;
-  }
-
-  get holderSince(): number {
-    return this.#holderSince;
-  }
-
-  get generation(): number {
-    return this.#generation;
-  }
-
-  get pending(): number {
-    return this.#queue.length;
-  }
-
-  get state(): DesktopControlState {
-    return { holder: this.#holder, holderSince: this.#holderSince, generation: this.#generation };
-  }
-
-  /** Every RandR change invalidates coordinates taken from an earlier observation. */
-  bumpGeneration(): number {
-    this.#generation += 1;
-    this.options.onChange(this.state);
-    return this.#generation;
-  }
-
-  authorize(actor: 'agent' | 'user', generation?: number): void {
-    if (this.#holder !== actor && !(this.#holder === 'secure_input' && actor === 'user'))
-      throw new Error(`Desktop control is held by ${this.#holder}`);
-    if (generation !== undefined && generation !== this.#generation)
-      throw new Error(
-        `Desktop display generation ${generation} is stale; observe the desktop again`
-      );
-  }
-
-  submit<T>(
-    actor: 'agent' | 'user',
-    task: (signal: AbortSignal) => Promise<T>,
-    options: { generation?: number } = {}
-  ): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      this.#queue.push({
-        actor,
-        cancel: reject,
-        execute: async () => {
-          try {
-            this.authorize(actor, options.generation);
-            const controller = new AbortController();
-            this.#active = controller;
-            try {
-              resolve(await task(controller.signal));
-            } finally {
-              this.#active = null;
-            }
-          } catch (cause) {
-            reject(cause instanceof Error ? cause : new Error(String(cause)));
-          }
-        }
-      });
-      void this.#drain();
-    });
-  }
-
-  async transfer(holder: DesktopHolder): Promise<DesktopControlState> {
-    const run = this.#transfers.then(async () => {
-      const discarded = this.#queue.splice(0, this.#queue.length);
-      for (const task of discarded)
-        task.cancel(new Error(`Desktop control was handed to ${holder}`));
-      if (!(await this.settle(this.options.settleMs ?? 500))) this.#active?.abort();
-      await this.options.release();
-      this.#holder = holder;
-      this.#holderSince = (this.options.now ?? Date.now)();
-      this.#generation += 1;
-      this.options.onChange(this.state);
-      return this.state;
-    });
-    this.#transfers = run.catch(() => undefined);
-    return run;
-  }
-
-  /** Resolves true when nothing is executing, false if the timeout expired first. */
-  async settle(timeoutMs: number): Promise<boolean> {
-    if (!this.#draining) return true;
-    return Promise.race([
-      new Promise<boolean>((resolve) => this.#idle.push(() => resolve(true))),
-      new Promise<boolean>((resolve) => {
-        const timeout = setTimeout(() => resolve(false), timeoutMs);
-        timeout.unref();
-      })
-    ]);
-  }
-
-  async #drain(): Promise<void> {
-    if (this.#draining) return;
-    this.#draining = true;
-    try {
-      for (;;) {
-        const next = this.#queue.shift();
-        if (!next) break;
-        await next.execute();
-      }
-    } finally {
-      this.#draining = false;
-      for (const waiter of this.#idle.splice(0, this.#idle.length)) waiter();
-    }
-  }
-}
 
 const parseGeometry = (value: string | undefined, fallback: DisplayGeometry): DisplayGeometry => {
   const parsed = /^(\d{2,5})x(\d{2,5})$/.exec((value ?? '').trim());
@@ -862,6 +796,22 @@ export class DesktopManager {
       XDG_RUNTIME_DIR: session.env.XDG_RUNTIME_DIR,
       DBUS_SESSION_BUS_ADDRESS: session.env.DBUS_SESSION_BUS_ADDRESS
     };
+  }
+
+  /**
+   * The control object for this workspace's screen, which the browser shares.
+   *
+   * There is one screen and there must be one answer to who holds it. Before this, the browser
+   * kept a `holder` field of its own while the desktop kept a `DesktopControl`, so an owner who
+   * pressed Take over on the Computer pane and an agent that had been handed the browser could
+   * both believe they held the machine - and both send input to the same X server. The browser
+   * asks for this the same way and at the same moment it asks for `displayEnvironment`, which is
+   * the point at which the desktop it is about to run on has been started.
+   */
+  async controlFor(workspaceId: string, root: string): Promise<DesktopControl | undefined> {
+    if (!this.configured) return undefined;
+    const session = await this.ensure(workspaceId, root);
+    return session.control;
   }
 
   async ensure(workspaceId: string, root: string): Promise<DesktopSession> {
@@ -972,6 +922,7 @@ export class DesktopManager {
       currentMode: null,
       codec: 'avc1',
       congested: false,
+      atspi: true,
       bridgeServe: true,
       bridgeQueue: Promise.resolve(),
       pointer: { x: Math.round(boot.width / 2), y: Math.round(boot.height / 2) },
@@ -985,6 +936,21 @@ export class DesktopManager {
           }),
         onFrame: (frame) => {
           if (session) this.#publish(session, frame);
+        },
+        /**
+         * An encoder that cannot run is the pane going still, and it used to be silent.
+         *
+         * `onFailure` was declared, documented and never supplied, so a host with no
+         * `/usr/bin/ffmpeg` restarted the child every half second for as long as anybody watched,
+         * wrote nothing to the journal, and left the owner looking at a frozen screenshot with a
+         * healthy socket. The encoder now backs off, and this is the line that says why - which is
+         * the whole difference between "the Computer pane is broken" and "install ffmpeg".
+         */
+        onFailure: (cause) => {
+          runnerLogger.warn('desktop.encoder_failed', {
+            code: failureCode(cause),
+            executable: '/usr/bin/ffmpeg'
+          });
         }
       })
     };
@@ -1085,7 +1051,11 @@ export class DesktopManager {
     try {
       // Doubles as a readiness handshake: a bridge that does not understand --serve waits for
       // end-of-input and never answers, which is exactly what this detects.
-      await this.#sendToBridge(session, channel, { operation: 'ping' }, 8_000);
+      const ready = await this.#sendToBridge(session, channel, { operation: 'ping' }, 8_000);
+      // The answer the probe was always giving and nobody was reading. A bridge that starts but
+      // cannot import pyatspi can serve nothing semantic, so the session records it once here
+      // rather than rediscovering it on every observation.
+      session.atspi = (ready.result as { atspi?: boolean } | undefined)?.atspi !== false;
     } catch (cause) {
       this.#closeBridge(session);
       throw new BridgeChannelError(
@@ -1260,12 +1230,17 @@ export class DesktopManager {
     // what tells a reader the difference between a bridge that crashed and a toolkit that never
     // joined the accessibility bus.
     let reason = '';
-    try {
-      observation = await this.#bridge(session, { operation: 'observe', maxNodes: 900 });
-    } catch (error) {
+    if (!session.atspi) {
       mode = 'visual_fallback';
-      reason = `accessibility bridge failed: ${error instanceof Error ? error.message : String(error)}`;
-    }
+      reason =
+        'this desktop session has no accessibility stack, so only the screenshot is readable';
+    } else
+      try {
+        observation = await this.#bridge(session, { operation: 'observe', maxNodes: 900 });
+      } catch (error) {
+        mode = 'visual_fallback';
+        reason = `accessibility bridge failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
     let windows = observation.windows ?? [];
     if (!(observation.nodes?.length ?? 0)) {
       mode = 'visual_fallback';
@@ -1361,19 +1336,37 @@ export class DesktopManager {
     actor: 'agent' | 'user'
   ): Promise<DesktopActionPreflight> {
     const session = await this.ensure(workspaceId, root);
-    session.control.authorize(actor);
+    session.control.authorize(actor, desktopActionGeneration(action));
+    return this.#classify(session, action);
+  }
+
+  /**
+   * What this action would do, judged against the tree as it is now.
+   *
+   * Split out of `preflight` so `act` can reach it with the session it already has. `act` used to
+   * call the public `preflight`, which resolved the workspace a second time, took the control
+   * authorization a second time, and left the judgement and the action holding two different
+   * views of the machine between them. One session, one lookup, and the node id the lookup
+   * returned is the one the bridge then verifies before it acts - which is what makes the card
+   * and the action refer to the same widget.
+   */
+  async #classify(session: DesktopSession, action: DesktopAction): Promise<DesktopActionPreflight> {
     // A coordinate click is looked up against the tree before it is judged, so a click that lands
     // on a control the computer can name is treated as what it is rather than as a blind one.
     if (action.type === 'click_at' || action.type === 'text_input') {
-      const observed = await this.#bridge(session, { operation: 'observe', maxNodes: 900 }).catch(
-        () => ({}) as BridgeResult
-      );
+      // With no accessibility stack there is nothing to look it up against, and the round trip
+      // could only time out. The conservative answer is the one the rule was written for.
+      const observed = session.atspi
+        ? await this.#bridge(session, { operation: 'observe', maxNodes: 900 }).catch(
+            () => ({}) as BridgeResult
+          )
+        : ({} as BridgeResult);
       const image = agentImageGeometry(session.geometry, AGENT_IMAGE_LIMIT);
       const scaled = scaleNodeBounds(observed.nodes ?? [], session.geometry, image);
       const target =
         action.type === 'click_at'
           ? nodeUnderPoint(scaled, action.x, action.y)
-          : scaled.find((candidate) => candidate.states.includes('focused'));
+          : scaled.find((candidate) => candidate.states.includes(DESKTOP_STATE.focused));
       return classifyDesktopAction(action, target);
     }
     if (!['invoke', 'focus', 'set_text'].includes(action.type))
@@ -1394,18 +1387,21 @@ export class DesktopManager {
     expectedGeneration?: number
   ) {
     const session = await this.ensure(workspaceId, root);
-    session.control.authorize(actor, expectedGeneration);
+    // The action's own answer, when it carries one. `generation` reaches this method as an
+    // argument for the WebSocket path and on the action itself for the tool call, and the two
+    // mean the same thing: which observation these coordinates were read off.
+    const generation = expectedGeneration ?? desktopActionGeneration(action);
+    session.control.authorize(actor, generation);
     if (actor === 'agent') {
-      const policy = await this.preflight(workspaceId, root, action, actor);
+      const policy = await this.#classify(session, action);
       if (policy.sensitiveInput) throw new Error('Secure desktop input takeover is required');
       if (policy.consequential && !consequentialApproved)
         throw new Error('A desktop consequential-action approval capability is required');
     }
-    const generation = expectedGeneration === undefined ? {} : { generation: expectedGeneration };
     return session.control.submit(
       actor,
       async (signal) => this.#perform(session, action, actor, signal),
-      generation
+      generation === undefined ? {} : { generation }
     );
   }
 
@@ -1620,6 +1616,27 @@ export class DesktopManager {
    */
   #syncEncoder(session: DesktopSession): void {
     const subscribers = [...session.subscribers.keys()];
+    // One encoder serves every viewer, so the transport is the lowest common denominator: one
+    // client without a `VideoDecoder` puts the session on JPEG rather than leaving that client
+    // staring at a blank pane. `session.codec` was set to `avc1` at creation and never assigned
+    // again, so the whole JPEG half of the encoder, the frame reader, the wire format and the
+    // state's `transport` field were unreachable - shipped, tested in isolation, and impossible
+    // to arrive at from a running system.
+    const wantedCodec: DisplayCodec = subscribers.every(
+      (subscriber) => subscriber.canDecodeVideo?.() ?? true
+    )
+      ? 'avc1'
+      : 'jpeg';
+    if (subscribers.length > 0 && session.codec !== wantedCodec) {
+      session.codec = wantedCodec;
+      // A generation bump for the same reason a resize takes one: frames already in flight were
+      // produced by the old encoder in the old format, and `#publish` drops anything stamped with
+      // a generation that is no longer current. Without it the first JPEG-era frames would be run
+      // through `encodeVideoAccessUnit`, or the reverse.
+      session.control.bumpGeneration();
+      this.#broadcastState(session);
+      this.#announceVideoConfig(session);
+    }
     // Hysteresis: production stops at the high watermark and only resumes once somebody has
     // drained back below the low one, so a bufferbloat stall is a brief freeze rather than
     // an oscillation.
@@ -1663,6 +1680,18 @@ export class DesktopManager {
       session.congested = true;
       session.encoder.stop();
     } else if (starved) session.encoder.requestKeyframe();
+  }
+
+  /**
+   * Reconsiders the encoder for a workspace whose viewers have changed what they can take.
+   *
+   * The stream socket learns a client's decoding ability from its `hello`, which arrives after
+   * the subscription is already live. Without a door back in, the answer would not be acted on
+   * until the next 250 ms heartbeat - and on a client that cannot decode video, every frame
+   * until then is one it discards.
+   */
+  async refreshStream(workspaceId: string, root: string): Promise<void> {
+    this.#syncEncoder(await this.ensure(workspaceId, root));
   }
 
   async subscribeStream(

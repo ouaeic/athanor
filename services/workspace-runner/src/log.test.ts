@@ -145,8 +145,8 @@ describe('the identity of a failure without its wording', () => {
  * The two directions the last eleven of these were found in.
  *
  * A journal line that nothing raises is a fiction, and a degradation still printed as prose is the
- * defect this module was written to close - the runner has said all five of these out loud for
- * months and `journalctl -p warning` never returned one of them.
+ * defect this module was written to close - the runner had said all of these out loud for months
+ * and `journalctl -p warning` never returned one of them.
  */
 describe('the wiring at both ends', () => {
   it('raises every event it defines from somewhere this process runs', async () => {
@@ -160,7 +160,11 @@ describe('the wiring at both ends', () => {
       (event) => !sources.some(({ text }) => text.includes(`'${event}'`))
     );
     expect(orphaned).toEqual([]);
-    expect(declared).toHaveLength(5);
+    // The count is the other direction: an event added here and raised nowhere is caught above,
+    // and one raised somewhere without being declared here cannot compile. This catches the third
+    // case - a declaration quietly removed while its `warn` call stays, which typechecks only
+    // until the map is read again.
+    expect(declared).toHaveLength(6);
   });
 
   it('leaves no degradation still going out as unprioritised prose', async () => {

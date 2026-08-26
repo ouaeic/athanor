@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { signCapabilityToken } from '@athanor/core';
+import { capabilityAudience, signCapabilityToken } from '@athanor/core';
 import type { RunnerConfig } from './config.js';
 import { ensureWorkspace } from './files.js';
 import { buildServer } from './server.js';
@@ -77,23 +77,42 @@ describe('hibernating the computer and waking it again', () => {
     const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'athanor-hibernate-'));
     disposers.push(() => rm(workspaceRoot, { recursive: true, force: true }));
     const secret = 'runner-hibernate-test-secret-at-least-32-chars';
-    const app = await buildServer(runnerConfig(workspaceRoot, secret));
+    const app = await buildServer(runnerConfig(workspaceRoot, secret), {
+      // Stated, not measured. Writing `.athanor/services.json` passes the host disk floor, so on
+      // any machine under two per cent free this test used to answer 507 where it expects 200 -
+      // a failure about the build machine wearing the costume of a failure about the code.
+      // `checkpoints.test.ts` says the rest of it.
+      hostStorage: async () => ({
+        hostStorageTotalBytes: 100 * 1024 ** 3,
+        hostStorageAvailableBytes: 50 * 1024 ** 3
+      })
+    });
     disposers.push(() => app.close());
     const id = '00000000-0000-4000-8000-0000000000b1';
     const root = path.join(workspaceRoot, id);
     await ensureWorkspace(root);
     // A nonce is spent on first use, so every request in a test needs its own.
     let issued = 0;
-    const token = (scopes: string[]): string =>
+    // A capability names the one request it is for, so the route is part of minting one.
+    const token = (scopes: string[], method: string, route: string): string =>
       signCapabilityToken(
-        { sub: 'user', workspaceId: id, role: 'user', scopes, nonce: `hibernate-${(issued += 1)}` },
+        {
+          sub: 'user',
+          workspaceId: id,
+          role: 'user',
+          scopes,
+          aud: capabilityAudience(method, route),
+          nonce: `hibernate-${(issued += 1)}`
+        },
         secret
       );
     const services = async (): Promise<ServiceView[]> => {
       const listed = await app.inject({
         method: 'GET',
         url: `/v1/workspaces/${id}/processes`,
-        headers: { authorization: `Bearer ${token(['exec'])}` }
+        headers: {
+          authorization: `Bearer ${token(['exec'], 'GET', `/v1/workspaces/${id}/processes`)}`
+        }
       });
       return listed.json<{ processes: ServiceView[] }>().processes;
     };
@@ -115,7 +134,9 @@ describe('hibernating the computer and waking it again', () => {
       const started = await app.inject({
         method: 'POST',
         url: `/v1/workspaces/${id}/processes/start`,
-        headers: { authorization: `Bearer ${token(['exec'])}` },
+        headers: {
+          authorization: `Bearer ${token(['exec'], 'POST', `/v1/workspaces/${id}/processes/start`)}`
+        },
         payload: {
           executable: '/bin/sh',
           args: ['-c', `echo up >> ${marks}; sleep 30`],
@@ -140,7 +161,9 @@ describe('hibernating the computer and waking it again', () => {
       const hibernated = await app.inject({
         method: 'POST',
         url: `/v1/workspaces/${id}/hibernate`,
-        headers: { authorization: `Bearer ${token(['workspace.manage'])}` }
+        headers: {
+          authorization: `Bearer ${token(['workspace.manage'], 'POST', `/v1/workspaces/${id}/hibernate`)}`
+        }
       });
       expect(hibernated.json()).toEqual({ id, state: 'hibernated' });
 
@@ -157,7 +180,9 @@ describe('hibernating the computer and waking it again', () => {
       const resumed = await app.inject({
         method: 'POST',
         url: `/v1/workspaces/${id}/resume`,
-        headers: { authorization: `Bearer ${token(['workspace.manage'])}` }
+        headers: {
+          authorization: `Bearer ${token(['workspace.manage'], 'POST', `/v1/workspaces/${id}/resume`)}`
+        }
       });
       expect(resumed.json()).toEqual({ id, state: 'running' });
 
@@ -196,7 +221,9 @@ describe('hibernating the computer and waking it again', () => {
         const response = await app.inject({
           method: 'POST',
           url: `/v1/workspaces/${id}/${action}`,
-          headers: { authorization: `Bearer ${token(['exec'])}` }
+          headers: {
+            authorization: `Bearer ${token(['exec'], 'POST', `/v1/workspaces/${id}/${action}`)}`
+          }
         });
         expect(response.statusCode).toBe(403);
       }

@@ -35,11 +35,20 @@ export const workspacePath = (root: string, workspaceId: string): string => {
   return path.join(path.resolve(root), workspaceId.toLowerCase());
 };
 
+/**
+ * A step upwards is `..` on its own or `..` followed by a separator - it is not "the name begins
+ * with two dots". `path.relative` answers `..gitignore` for a file of that name sitting in the
+ * root, and reading that as an escape refused every top-level entry whose name happens to start
+ * that way: `..backup`, a `cwd` called `..build`, `..gitignore` itself. The agent creates
+ * `workspace/..backup/` from a shell command, asks to list it, and is told its path escapes the
+ * workspace - an accusation instead of a correction, and `assertUserDataPath` runs this check
+ * before the fold that exists precisely to stop the agent guessing at prefixes.
+ */
 export const resolveInside = (root: string, requested = '.'): string => {
   const resolvedRoot = path.resolve(root);
   const resolved = path.resolve(resolvedRoot, requested);
   const relative = path.relative(resolvedRoot, resolved);
-  if (relative.startsWith('..') || path.isAbsolute(relative))
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
     throw new Error('Path escapes workspace');
   return resolved;
 };
@@ -366,9 +375,15 @@ export const clearStagedUploads = async (root: string): Promise<void> => {
  * `file_write` is a read-modify-write with the read done in a previous step, and at least three
  * other writers share this tree: the agent's own shell, a second slot of the same worker, and the
  * owner in the file browser. Between the read and the write, any of them can land - and a whole-
- * file write does not fail, it silently discards what they wrote. `file_patch` already has the
- * stronger version of this guard (it re-reads at apply time and requires an exactly-once match),
- * which is why this is the tool that needed one and that one is left alone.
+ * file write does not fail, it silently discards what they wrote.
+ *
+ * `file_patch` reaches this same route, and this guard is not armed for it: the worker reads the
+ * file without asking for its hash and writes the result back without claiming one, so the
+ * exactly-once match it makes on `oldText` proves the text it replaced was there and proves
+ * nothing about the file still being the one it read. That is the caller's to close, by reading
+ * with the hash and passing it here; the parameter it needs already exists on both sides. Until it
+ * does, this comment says which of the two tools is actually guarded, because the sentence that
+ * claimed both were is what let the gap survive a review.
  *
  * The hash rather than a modification time: it is exact, it says the content is what was read
  * rather than that nothing touched the inode, and both sides already compute it. Absent means the

@@ -89,6 +89,13 @@ describe('deliveryDecision', () => {
         now
       })
     ).toEqual({ action: 'drop', reason: 'foreground' });
+  });
+
+  it('holds a spend pause at a busy keyboard rather than writing it off', () => {
+    // The one pause nobody chose. It is not a report that something finished - the box has stopped
+    // and waits forever until a person raises the ceiling - so being at the screen is no reason to
+    // decide the owner has already seen it. The data layer orders it on the same side: approval,
+    // takeover, spend pause, "and the rest is news".
     expect(
       deliveryDecision({
         kind: 'spend_paused',
@@ -97,7 +104,24 @@ describe('deliveryDecision', () => {
         eventAt,
         now
       })
-    ).toEqual({ action: 'drop', reason: 'foreground' });
+    ).toEqual({ action: 'hold', reason: 'foreground' });
+  });
+
+  it('gives up on a foreground hold once it has stopped being news, as quiet hours already did', () => {
+    // A hold writes nothing, so it is reconsidered on every pass for as long as the row is a
+    // candidate - fourteen days. Only the quiet-hours arm had a horizon, so an owner who simply
+    // keeps a tab open kept every held notice alive, and all of them would arrive at once.
+    for (const kind of ['approval_required', 'takeover_needed', 'agent_message'] as const) {
+      expect(
+        deliveryDecision({
+          kind,
+          settings: settings(),
+          ownerPresent: true,
+          eventAt: new Date(now.getTime() - MAX_HOLD_MS),
+          now
+        })
+      ).toEqual({ action: 'drop', reason: 'stale' });
+    }
   });
 
   it('holds a foreground approval instead of writing it off, so it still arrives once they leave', () => {

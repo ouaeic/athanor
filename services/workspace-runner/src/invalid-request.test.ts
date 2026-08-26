@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
+import { ExecRequest } from './execution.js';
 import { sayWhatIsWrong } from './server.js';
 
 const failureOf = (schema: z.ZodType, value: unknown): z.ZodError => {
@@ -37,6 +38,21 @@ describe('what the owner is told when a request does not fit its schema', () => 
     expect(sayWhatIsWrong(failureOf(z.object({ a: z.string() }), 'not an object'))).toContain(
       'body:'
     );
+  });
+
+  /**
+   * The other real one, and the reason a refusal is worth two lines here. `shell` tells the model
+   * that declaring a service needs `background: true`; a model that names the service and forgets
+   * the flag sent `service` to the foreground route, where the schema did not know the key and
+   * dropped it. The command ran for five minutes and returned an ordinary result: no error, no
+   * service, no record, and a model that went on believing it had started one.
+   */
+  it('tells a model that named a service in the foreground what it left out', () => {
+    const message = sayWhatIsWrong(
+      failureOf(ExecRequest, { executable: 'python3', args: ['serve.py'], service: 'dashboard' })
+    );
+    expect(message).toContain('service:');
+    expect(message).toContain('background');
   });
 
   it('keeps a badly wrong request to a few issues and counts the rest', () => {

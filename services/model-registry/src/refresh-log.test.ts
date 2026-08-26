@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { refreshFailureReason, refreshLogLine } from './refresh-log.js';
+import { catalogueFrozenLine, refreshFailureReason, refreshLogLine } from './refresh-log.js';
 
 describe('refreshFailureReason', () => {
   it('reads the message off an Error and keeps it to one line', () => {
@@ -51,5 +51,41 @@ describe('refreshLogLine', () => {
     expect(refreshLogLine({ previousFailures: 7, reason: null, intervalSeconds: 3600 })).toContain(
       'after 7 failed attempts.'
     );
+  });
+});
+
+describe('catalogueFrozenLine', () => {
+  const frozen = {
+    alreadySaid: false,
+    state: 'frozen' as const,
+    models: 312,
+    lastRefreshAt: new Date('2026-02-14T04:00:00.000Z')
+  };
+
+  it('says once that there is nothing to refresh from, which was the one silence indistinguishable from health', () => {
+    const line = catalogueFrozenLine(frozen);
+    expect(line).toContain('no provider key');
+    expect(line).toContain('312 models');
+    expect(line).toContain('2026-02-14T04:00:00.000Z');
+  });
+
+  it('names the box rather than a date when a provider has never answered here at all', () => {
+    expect(catalogueFrozenLine({ ...frozen, lastRefreshAt: null })).toContain('never refreshed');
+  });
+
+  it('stays quiet while it goes on being true, so months of it cannot bury the log', () => {
+    expect(catalogueFrozenLine({ ...frozen, alreadySaid: true })).toBeNull();
+  });
+
+  it('leaves a failure to the line that already reports one, and a new box to its seed', () => {
+    expect(catalogueFrozenLine({ ...frozen, state: 'failed' })).toBeNull();
+    expect(catalogueFrozenLine({ ...frozen, state: 'seeded', models: 0 })).toBeNull();
+  });
+
+  it('closes the loop when a key appears, and says nothing when one was there all along', () => {
+    expect(catalogueFrozenLine({ ...frozen, state: 'refreshed', alreadySaid: true })).toContain(
+      'provider key again'
+    );
+    expect(catalogueFrozenLine({ ...frozen, state: 'refreshed' })).toBeNull();
   });
 });

@@ -44,7 +44,9 @@ const events = {
   'browser.frame_scan_failed': 'a frame could not be scanned for controls',
   'browser.reduced_launch': 'the browser started after the preferred configuration was refused',
   'browser.isolated_sandbox_off':
-    'the isolated browser started with the renderer sandbox off after the preferred configuration was refused'
+    'the isolated browser started with the renderer sandbox off after the preferred configuration was refused',
+  'desktop.encoder_failed':
+    'the desktop display encoder could not run, so the Computer pane is frozen. Install ffmpeg to restore the stream.'
 } as const;
 
 export type RunnerEvent = keyof typeof events;

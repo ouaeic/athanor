@@ -1,9 +1,15 @@
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import WebSocket from 'ws';
+import { capabilityAudience, signCapabilityToken } from '@athanor/core';
+import type { RunnerConfig } from './config.js';
+import type { DisplayViewport } from './desktop-stream.js';
+import { buildServer } from './server.js';
 import {
-  DesktopControl,
   DesktopManager,
   classifyDesktopAction,
   clickCommand,
@@ -17,8 +23,50 @@ import {
   splitBridgeLines,
   toX11Keysym,
   typeCommand,
-  type DesktopNode
+  type DesktopNode,
+  type DesktopSubscriber
 } from './desktop.js';
+
+/**
+ * The words AT-SPI actually uses, copied off a real tree rather than invented.
+ *
+ * Every state fixture in this file used to be written from memory - `['enabled']`, `['enabled',
+ * 'showing']`, an `interfaces` list in title case - and none of those sets is a thing the bridge
+ * can emit. That is why two predicates could be dead for as long as they were: `selectDesktopNodes`
+ * ranked on `!states.includes('disabled')` and `classifyDesktopAction` looked for `'read-only'`,
+ * and neither string exists in the AT-SPI vocabulary at all. A fixture built from invented names
+ * agrees with an implementation built from invented names, and the suite stays green while the
+ * screen the agent is looking at is described by neither.
+ *
+ * The vocabulary is `ATSPI_STATE_*` with the prefix removed and lowercased, which is what
+ * `athanor-desktop-bridge.py` emits and what `athanor-desktop-bridge.test.py` pins. Note the two
+ * that matter here: a control the user can operate is `sensitive`, and one they cannot simply
+ * lacks it - there is no `disabled`; and a field that refuses input is `read_only`, one word with
+ * an underscore, because the C name is `ATSPI_STATE_READ_ONLY`.
+ */
+const ENABLED_BUTTON = ['enabled', 'focusable', 'sensitive', 'showing', 'visible'];
+/** Greyed out: the toolkit leaves it on screen and takes `sensitive` and `enabled` away. */
+const GREYED_BUTTON = ['focusable', 'showing', 'visible'];
+const FOCUSED_ENTRY = [
+  'editable',
+  'enabled',
+  'focusable',
+  'focused',
+  'sensitive',
+  'showing',
+  'single_line',
+  'visible'
+];
+/** A field that displays a value and refuses to take one - an account number, a computed total. */
+const READ_ONLY_ENTRY = [
+  'enabled',
+  'focusable',
+  'read_only',
+  'sensitive',
+  'showing',
+  'single_line',
+  'visible'
+];
 
 const node = (overrides: Partial<DesktopNode> = {}): DesktopNode => ({
   id: '0/1',
@@ -26,7 +74,7 @@ const node = (overrides: Partial<DesktopNode> = {}): DesktopNode => ({
   name: 'Open document',
   description: '',
   role: 'push button',
-  states: ['enabled'],
+  states: ENABLED_BUTTON,
   actions: ['click'],
   interfaces: ['action', 'component'],
   bounds: { x: 10, y: 20, width: 100, height: 30 },
@@ -36,6 +84,57 @@ const node = (overrides: Partial<DesktopNode> = {}): DesktopNode => ({
 
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+/** A runner with nothing on it: no X server, no ffmpeg, no snapshots - just the routes. */
+const runnerConfig = (workspaceRoot: string, secret: string): RunnerConfig => ({
+  RUNNER_HOST: '127.0.0.1',
+  RUNNER_PORT: 0,
+  RUNNER_SHARED_SECRET: secret,
+  WORKSPACE_ROOT: workspaceRoot,
+  TAR_EXECUTABLE: '/usr/bin/tar',
+  SNAPSHOT_EXECUTABLE: path.resolve('../../scripts/athanor-snapshot'),
+  BROWSER_USE_DESKTOP_DISPLAY: false,
+  MAX_EXECUTION_SECONDS: 30,
+  RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
+  IMAGE_CONVERT_EXECUTABLE: 'magick',
+  COMMAND_FILE_LIMIT_BYTES: 4 * 1024 ** 3,
+  COMMAND_PROCESS_LIMIT: 1024,
+  COMMAND_OPEN_FILE_LIMIT: 4096,
+  MAX_FILE_BYTES: 1024 * 1024,
+  RESERVED_PREVIEW_PORTS: [],
+  CHECKPOINT_BTRFS_EXECUTABLE: '/nonexistent/btrfs',
+  CHECKPOINT_ZFS_EXECUTABLE: '/nonexistent/zfs',
+  CHECKPOINT_PACKAGE_MANIFEST: '/nonexistent/status',
+  CHECKPOINT_INCLUDE_BROWSER_PROFILE: false,
+  CHECKPOINT_RETAIN_TURNS: 20,
+  CHECKPOINT_RETAIN_DAILY_DAYS: 14,
+  CHECKPOINT_MAX_FILES: 250_000,
+  CHECKPOINT_MAX_FILE_BYTES: 2 * 1024 ** 3,
+  ISOLATE_AGENT_NETWORK: false
+});
+
+/**
+ * The accessibility bridge is python, and it decides what the agent believes is on the screen and
+ * which widget an approved action lands on. It had no test of any kind - which is how a node id
+ * could be an unverified positional path resolved twice, and a state name could be truncated to
+ * its last word, for as long as they were.
+ *
+ * Its own suite is python because the code is; this runs it, so a change to the bridge fails the
+ * runner's suite rather than waiting for a box with a desktop on it. `/usr/bin/python3` is the
+ * interpreter the runner spawns in production, so it is the one measured here.
+ */
+describe('the accessibility bridge, in the language it is written in', () => {
+  const interpreter = '/usr/bin/python3';
+  const suite = path.resolve('../../infra/native/athanor-desktop-bridge.test.py');
+
+  it.runIf(existsSync(interpreter))('passes its own suite', () => {
+    const result = spawnSync(interpreter, [suite], { encoding: 'utf8' });
+    // stderr, because unittest reports there; printed whole so a failure here reads like a
+    // failure rather than like an exit code.
+    expect(`${result.stdout}${result.stderr}`).toContain('OK');
+    expect(result.status).toBe(0);
+  });
+});
 
 describe('what the pixel path may do without stopping the owner', () => {
   /**
@@ -57,9 +156,9 @@ describe('what the pixel path may do without stopping the owner', () => {
     name: 'Save',
     description: '',
     role: 'push button',
-    states: ['enabled', 'showing'],
+    states: ENABLED_BUTTON,
     actions: ['click'],
-    interfaces: ['Action'],
+    interfaces: ['action'],
     bounds: { x, y, width, height },
     sensitive: false,
     ...over
@@ -120,6 +219,34 @@ describe('what the pixel path may do without stopping the owner', () => {
     expect(classifyDesktopAction({ type: 'text_input', text: 'x' }).sensitiveInput).toBe(true);
   });
 
+  /**
+   * A handoff card names the field the owner is being asked to type into, and `knownField` decides
+   * whether it can. It asked for the state `'read-only'`, which AT-SPI does not have - the name is
+   * `ATSPI_STATE_READ_ONLY`, so the bridge emits `read_only` - so the branch was unreachable and a
+   * secure-input handoff for a field that refuses input still told the owner to type into it.
+   */
+  it('does not name a field the owner cannot type into', () => {
+    const editable = classifyDesktopAction(
+      { type: 'text_input', text: 'hunter2' },
+      at(0, 0, 200, 24, { name: 'Password', role: 'password text', states: FOCUSED_ENTRY })
+    );
+    expect(editable.sensitiveInput).toBe(true);
+    expect(editable.preview).toContain('the password text "Password"');
+
+    const readOnly = classifyDesktopAction(
+      { type: 'text_input', text: '4242' },
+      at(0, 0, 200, 24, {
+        name: 'Account number',
+        role: 'text',
+        states: READ_ONLY_ENTRY,
+        sensitive: true
+      })
+    );
+    expect(readOnly.sensitiveInput).toBe(true);
+    expect(readOnly.preview).toContain('the focused desktop field');
+    expect(readOnly.preview).not.toContain('Account number');
+  });
+
   it('treats looking closely as a read', () => {
     const zoom = classifyDesktopAction({ type: 'zoom', x: 100, y: 100, width: 200, height: 120 });
     expect(zoom.consequential).toBe(false);
@@ -142,9 +269,9 @@ describe('which accessibility nodes an observation carries', () => {
     name: `control ${id}`,
     description: 'a control with a reasonably long description so the budget is realistic',
     role: 'push button',
-    states: ['enabled', 'showing', 'visible'],
+    states: ENABLED_BUTTON,
     actions: ['click'],
-    interfaces: ['Action', 'Component'],
+    interfaces: ['action', 'component'],
     bounds: { x: 10, y: 10, width: 80, height: 24 },
     sensitive: false,
     ...over
@@ -175,6 +302,27 @@ describe('which accessibility nodes an observation carries', () => {
     expect(kept.length).toBeGreaterThan(20);
   });
 
+  /**
+   * `actionable` ranked a node above named furniture whenever it had an action and did not carry
+   * the state `'disabled'`. No AT-SPI node carries `'disabled'`: a control the user cannot operate
+   * is one that lacks `sensitive`. So the predicate was constant-true for everything with an
+   * action, and the top of the budget filled with greyed-out menu items and toolbar buttons while
+   * the labels that say what the screen is were dropped underneath them.
+   */
+  it('ranks a control the user could actually operate above one that is greyed out', () => {
+    const greyed = node('greyed', { name: '', states: GREYED_BUTTON });
+    const named = node('named', { name: 'Recipient', actions: [], states: ENABLED_BUTTON });
+    // Room for exactly one of them, so the ranking is the whole of what decides which survives.
+    const budget = Math.max(JSON.stringify(greyed).length, JSON.stringify(named).length) + 1;
+    expect(selectDesktopNodes([greyed, named], budget).kept.map((entry) => entry.id)).toEqual([
+      'named'
+    ]);
+    // And the live one still outranks the label, which is the tier order this is not disturbing.
+    const live = node('live', { name: 'Send', states: ENABLED_BUTTON });
+    const pair = Math.max(JSON.stringify(named).length, JSON.stringify(live).length) + 1;
+    expect(selectDesktopNodes([named, live], pair).kept.map((entry) => entry.id)).toEqual(['live']);
+  });
+
   it('emits in tree order, so parentId still reads', () => {
     const nodes = [node('a'), node('b', { parentId: 'a' }), node('c', { parentId: 'b' })];
     expect(selectDesktopNodes(nodes).kept.map((entry) => entry.id)).toEqual(['a', 'b', 'c']);
@@ -189,6 +337,43 @@ describe('desktop action policy', () => {
         node({ name: 'Submit job application' })
       )
     ).toMatchObject({ consequential: true, sensitiveInput: false });
+  });
+
+  /**
+   * The destructive half of the floor ATHANOR_BLUEPRINT.md:104, docs/AGENT_RUNTIME.md:416 and
+   * docs/CAPABILITIES.md:97 all promise. Until ATH-001 was repaired, `#approvalForCall` turned every
+   * verdict here into an approval row, so a benign answer for a control named "Erase" cost nothing
+   * and nobody could see that this list only ever knew the transactional verbs. It costs something
+   * now, which is why the words are here.
+   */
+  it('calls a control consequential for every way an application spells destruction', () => {
+    for (const name of [
+      'Erase',
+      'Format Disk',
+      'Reset to factory settings',
+      'Overwrite existing file',
+      'Empty Trash',
+      'Revoke access',
+      'Deactivate account',
+      'Move to Bin',
+      'Discard changes'
+    ])
+      expect(
+        classifyDesktopAction({ type: 'invoke', nodeId: '0/1', actionIndex: 0 }, node({ name }))
+      ).toMatchObject({ consequential: true });
+  });
+
+  /**
+   * The other side of the same decision. What "OK" does is a property of the dialog around it, which
+   * nothing on this path can read, and stopping for all of them is the ceremony that made the pixel
+   * path unusable before ATH-001. The floor's other promise - that an ambiguous coordinate always
+   * confirms - is kept unconditionally by the worker instead, which is where it belongs.
+   */
+  it('does not stop for a confirmation word, whose meaning it cannot see', () => {
+    for (const name of ['OK', 'Yes', 'Continue', 'Save', 'Read documentation'])
+      expect(
+        classifyDesktopAction({ type: 'invoke', nodeId: '0/1', actionIndex: 0 }, node({ name }))
+      ).toMatchObject({ consequential: false });
   });
 
   it('routes password fields to secure user input', () => {
@@ -458,110 +643,148 @@ describe('desktop session lifecycle', () => {
   }, 20_000);
 });
 
-describe('desktop control arbitration', () => {
-  const build = (settleMs?: number) => {
-    const release = vi.fn(async () => undefined);
-    const changes: number[] = [];
-    const control = new DesktopControl({
-      release,
-      onChange: (state) => changes.push(state.generation),
-      ...(settleMs === undefined ? {} : { settleMs })
+/**
+ * What the stream socket hands the desktop, which for three separate capabilities was nothing.
+ *
+ * Every defect this covers is the same shape: the runner grew a mechanism, the one route that
+ * could reach it did not pass the argument, and nothing failed - the pane simply froze, stayed at
+ * 1280x800, or showed a blank rectangle. So these cases drive the real route over a real socket
+ * with the desktop itself replaced, because the argument list is the thing under test.
+ */
+describe('the desktop stream socket', () => {
+  const disposers: Array<() => Promise<unknown>> = [];
+  afterEach(async () => {
+    while (disposers.length) await disposers.pop()!();
+  });
+
+  class RecordingDesktop extends DesktopManager {
+    subscriber: DesktopSubscriber | undefined;
+    readonly resized: DisplayViewport[] = [];
+    readonly refreshed: string[] = [];
+
+    constructor() {
+      super('/nonexistent/bridge.py', '/nonexistent/session.sh');
+    }
+
+    override async subscribeStream(
+      _workspaceId: string,
+      _root: string,
+      subscriber: DesktopSubscriber
+    ): Promise<() => Promise<void>> {
+      this.subscriber = subscriber;
+      return async () => undefined;
+    }
+
+    override async resize(_workspaceId: string, _root: string, viewport: DisplayViewport) {
+      this.resized.push(viewport);
+      return { width: viewport.cssWidth, height: viewport.cssHeight, generation: 2, applied: true };
+    }
+
+    override async refreshStream(workspaceId: string): Promise<void> {
+      this.refreshed.push(workspaceId);
+    }
+  }
+
+  const WORKSPACE = '00000000-0000-4000-8000-0000000000d1';
+  const SECRET = 'runner-desktop-stream-secret-at-least-32-chars';
+
+  const openStream = async (): Promise<{ socket: WebSocket; desktop: RecordingDesktop }> => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'athanor-desktop-stream-'));
+    disposers.push(() => rm(workspaceRoot, { recursive: true, force: true }));
+    const desktop = new RecordingDesktop();
+    const app = await buildServer(runnerConfig(workspaceRoot, SECRET), {
+      desktop,
+      // The disk this suite reads is stated, not measured: see `checkpoints.test.ts`.
+      hostStorage: async () => ({
+        hostStorageTotalBytes: 100 * 1024 ** 3,
+        hostStorageAvailableBytes: 50 * 1024 ** 3
+      })
     });
-    return { control, release, changes };
+    disposers.push(() => app.close());
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const token = signCapabilityToken(
+      {
+        sub: 'user',
+        workspaceId: WORKSPACE,
+        role: 'user',
+        scopes: ['desktop.read', 'desktop.control', 'desktop.takeover'],
+        nonce: 'desktop-stream-test',
+        // One audience covers the whole socket: the holder, action and viewport frames are all
+        // authorized against the upgrade request that opened it, not against routes of their own.
+        aud: capabilityAudience('GET', `/v1/workspaces/${WORKSPACE}/desktop/stream`)
+      },
+      SECRET,
+      120
+    );
+    const socket = new WebSocket(
+      `${address.replace('http://', 'ws://')}/v1/workspaces/${WORKSPACE}/desktop/stream`,
+      ['athanor-capability', token]
+    );
+    disposers.push(async () => socket.close());
+    await new Promise<void>((resolve, reject) => {
+      socket.once('open', () => resolve());
+      socket.once('error', reject);
+    });
+    // The subscription is established off the upgrade, one microtask turn behind the handshake.
+    for (let attempt = 0; attempt < 200 && !desktop.subscriber; attempt += 1) await delay(10);
+    return { socket, desktop };
   };
 
-  it('serializes input so two transactions never interleave', async () => {
-    const { control } = build();
-    const order: string[] = [];
-    const first = control.submit('agent', async () => {
-      order.push('first:start');
-      await delay(20);
-      order.push('first:end');
-      return 1;
+  /** Sends one control message and resolves with the ack or the error the route answers with. */
+  const send = async (socket: WebSocket, message: unknown): Promise<Record<string, unknown>> => {
+    const reply = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const onMessage = (raw: Buffer, binary: boolean) => {
+        if (binary) return;
+        socket.off('message', onMessage);
+        resolve(JSON.parse(raw.toString('utf8')) as Record<string, unknown>);
+      };
+      socket.on('message', onMessage);
+      socket.once('error', reject);
     });
-    const second = control.submit('agent', async () => {
-      order.push('second:start');
-      return 2;
+    socket.send(JSON.stringify({ requestId: 'r1', ...(message as object) }));
+    return reply;
+  };
+
+  /**
+   * The frozen pane. `server.ts` built the subscriber with `{state, frame}` and kept a rule of its
+   * own - drop the frame above 2 MiB buffered, tell nobody - so `bufferedBytes`, `session.congested`,
+   * the bounded queue's `starved` flag and `requestKeyframe()` were all unreachable. The encoder
+   * runs an infinite GOP by design, so a dropped delta stranded the client's `VideoDecoder` and no
+   * keyframe ever followed: a still photograph of the agent's screen, a healthy socket, no error,
+   * no spinner, for the rest of the session.
+   */
+  it('hands the desktop the socket depth instead of dropping frames behind its back', async () => {
+    const { desktop } = await openStream();
+    expect(typeof desktop.subscriber?.bufferedBytes).toBe('function');
+    expect(desktop.subscriber?.bufferedBytes?.()).toBe(0);
+  }, 20_000);
+
+  it('resizes the display to the viewport the pane reports', async () => {
+    const { socket, desktop } = await openStream();
+    // Shaped like the `holder` and `action` messages beside it: a type, and the payload under a
+    // key of its own name.
+    const ack = await send(socket, {
+      type: 'viewport',
+      viewport: { cssWidth: 1600, cssHeight: 900, devicePixelRatio: 2, mode: 'native' }
     });
-    expect(await Promise.all([first, second])).toEqual([1, 2]);
-    expect(order).toEqual(['first:start', 'first:end', 'second:start']);
-  });
-
-  it('refuses input from anyone but the holder, and stale coordinates from the holder', async () => {
-    const { control } = build();
-    await expect(control.submit('user', async () => 'nope')).rejects.toThrow(
-      'Desktop control is held by agent'
-    );
-    await expect(control.submit('agent', async () => 'nope', { generation: 99 })).rejects.toThrow(
-      'stale'
-    );
-    await expect(control.submit('agent', async () => 'ok', { generation: 1 })).resolves.toBe('ok');
-  });
-
-  it('takes over preemptively: queued agent work is discarded and input is released', async () => {
-    const { control, release, changes } = build();
-    let ran = 0;
-    const inFlight = control.submit('agent', async () => {
-      ran += 1;
-      await delay(20);
-      return 'in-flight';
-    });
-    const queued = control.submit('agent', async () => {
-      ran += 1;
-      return 'queued';
-    });
-    const takeover = control.transfer('user');
-    await expect(queued).rejects.toThrow('Desktop control was handed to user');
-    await expect(inFlight).resolves.toBe('in-flight');
-    const state = await takeover;
-    expect(ran).toBe(1);
-    expect(release).toHaveBeenCalledTimes(1);
-    expect(state.holder).toBe('user');
-    expect(state.generation).toBe(2);
-    expect(changes).toEqual([2]);
-    await expect(control.submit('agent', async () => 'nope')).rejects.toThrow(
-      'Desktop control is held by user'
-    );
-    await expect(control.submit('user', async () => 'mine')).resolves.toBe('mine');
-  });
-
-  it('force-completes a transaction that overruns the settle window', async () => {
-    const { control, release } = build(5);
-    const drag = control.submit(
-      'agent',
-      async (signal) =>
-        new Promise<string>((resolve) => {
-          signal.addEventListener('abort', () => resolve('forced'));
-        })
-    );
-    await control.transfer('user');
-    expect(await drag).toBe('forced');
-    expect(release).toHaveBeenCalledTimes(1);
-  });
-
-  it('invalidates cached coordinates on handback and on resize', async () => {
-    const { control, changes } = build();
-    await control.transfer('user');
-    await control.transfer('agent');
-    expect(control.holder).toBe('agent');
-    expect(control.generation).toBe(3);
-    control.bumpGeneration();
-    expect(control.generation).toBe(4);
-    expect(changes).toEqual([2, 3, 4]);
-    await expect(control.submit('agent', async () => 'x', { generation: 3 })).rejects.toThrow(
-      'stale'
-    );
-  });
-
-  it('serializes concurrent handovers instead of racing them', async () => {
-    const { control, release } = build();
-    const [first, second] = await Promise.all([
-      control.transfer('user'),
-      control.transfer('secure_input')
+    expect(ack).toMatchObject({ type: 'control_ack', requestId: 'r1' });
+    expect(desktop.resized).toEqual([
+      { cssWidth: 1600, cssHeight: 900, devicePixelRatio: 2, mode: 'native' }
     ]);
-    expect(first.generation).toBe(2);
-    expect(second.generation).toBe(3);
-    expect(control.holder).toBe('secure_input');
-    expect(release).toHaveBeenCalledTimes(2);
-  });
+  }, 20_000);
+
+  it('carries a hello through to the encoder, so a client without a decoder can be served', async () => {
+    const { socket, desktop } = await openStream();
+    expect(desktop.subscriber?.canDecodeVideo?.()).toBe(true);
+    const ack = await send(socket, { type: 'hello', canDecodeVideo: false });
+    expect(ack).toMatchObject({ type: 'control_ack' });
+    expect(desktop.subscriber?.canDecodeVideo?.()).toBe(false);
+    expect(desktop.refreshed).toEqual([WORKSPACE]);
+  }, 20_000);
+
+  it('still refuses a message it does not know, rather than acking it', async () => {
+    const { socket } = await openStream();
+    const answer = await send(socket, { type: 'teleport' });
+    expect(answer).toMatchObject({ type: 'control_error', requestId: 'r1' });
+  }, 20_000);
 });

@@ -707,6 +707,17 @@ export interface DisplayEncoderProcess {
   stderr: NodeJS.ReadableStream | null;
   kill(signal?: NodeJS.Signals): boolean;
   on(event: 'exit', listener: (code: number | null) => void): unknown;
+  /**
+   * Declared because node emits it and the supervisor has to be listening.
+   *
+   * `spawn` does not throw when the executable is missing - it returns a child and reports ENOENT
+   * asynchronously on `'error'` - so the `try` around the spawn call catches nothing, and an
+   * `'error'` with no listener is the one event node re-raises as an uncaught exception. On a host
+   * without `/usr/bin/ffmpeg` the first viewer to open the Computer pane therefore took the whole
+   * runner process down, killing every command, terminal and turn on the box, because a video
+   * encoder was not installed.
+   */
+  on(event: 'error', listener: (error: Error) => void): unknown;
 }
 
 export type DisplayEncoderSpawn = (
@@ -723,7 +734,17 @@ export interface DisplayEncoderOptions {
   /** ffmpeg cannot emit an IDR on demand, so a keyframe request is an encoder restart.
    *  Rate-limit it or a congested client restarts the encoder continuously. */
   minRestartIntervalMs?: number;
+  /** First wait after a failure. Each consecutive failure doubles it, up to `maxRestartDelayMs`. */
   restartDelayMs?: number;
+  /**
+   * The ceiling that wait backs off to.
+   *
+   * A failure that will not clear - no ffmpeg on the host, a display that is gone - used to be
+   * retried twice a second for as long as anybody was watching, each attempt spawning a process
+   * and writing a line. Backing off means a transient failure still recovers within a frame or
+   * two and a permanent one costs a poll a minute instead of a hundred and twenty.
+   */
+  maxRestartDelayMs?: number;
   /** Quiet period after which a still-pending access unit is released anyway. */
   idleFlushMs?: number;
 }
@@ -756,6 +777,8 @@ export class DisplayEncoder {
   #keyframeTimer: NodeJS.Timeout | undefined;
   #restartTimer: NodeJS.Timeout | undefined;
   #idleTimer: NodeJS.Timeout | undefined;
+  /** Consecutive failures with no frame in between; reset by the first frame that arrives. */
+  #failures = 0;
 
   constructor(private readonly options: DisplayEncoderOptions) {}
 
@@ -776,8 +799,18 @@ export class DisplayEncoder {
 
   stop(): void {
     this.#config = null;
+    // Nobody is watching, so the next `apply` is a fresh start rather than a continuation of
+    // whatever was failing when the last viewer left.
+    this.#failures = 0;
     this.#clearTimers();
     this.#kill();
+  }
+
+  /** How long the next restart waits, in the ms the caller configured. */
+  get retryDelayMs(): number {
+    const base = this.options.restartDelayMs ?? 500;
+    const ceiling = this.options.maxRestartDelayMs ?? 30_000;
+    return Math.min(ceiling, base * 2 ** Math.max(0, this.#failures - 1));
   }
 
   requestKeyframe(): void {
@@ -817,6 +850,10 @@ export class DisplayEncoder {
 
   #emit(config: DisplayEncoderConfig, frames: readonly DisplayFrame[]): void {
     const captureUs = BigInt(Math.round(this.#now())) * 1000n;
+    // A frame is the only evidence the encoder is working, so it is what clears the backoff. An
+    // encoder that starts, emits and then dies is a transient failure and gets the short wait
+    // again; one that dies before producing anything keeps doubling.
+    if (frames.length > 0) this.#failures = 0;
     for (const frame of frames) {
       this.#sequence += 1;
       this.options.onFrame({
@@ -845,6 +882,14 @@ export class DisplayEncoder {
       return;
     }
     this.#child = child;
+    // Attached before anything else can be, because `'error'` may already be queued: node reports
+    // a missing executable asynchronously, and an `'error'` with no listener is re-raised as an
+    // uncaught exception that ends the process.
+    child.on('error', (cause: Error) => {
+      if (token !== this.#token) return;
+      this.#child = null;
+      this.#fail(cause);
+    });
     let diagnostics = '';
     child.stderr?.on('data', (chunk: Buffer) => {
       diagnostics = `${diagnostics}${chunk.toString('utf8')}`.slice(-2_048);
@@ -868,18 +913,29 @@ export class DisplayEncoder {
     child.on('exit', (code) => {
       if (token !== this.#token) return;
       this.#child = null;
-      if (!this.#config) return;
-      this.options.onFailure?.(
+      this.#fail(
         new Error(
           `Desktop encoder exited with ${code ?? 'signal'}${diagnostics ? `: ${diagnostics.trim()}` : ''}`
         )
       );
-      if (this.#restartTimer) return;
-      this.#restartTimer = setTimeout(() => {
-        this.#restartTimer = undefined;
-        if (this.#config) this.#spawn();
-      }, this.options.restartDelayMs ?? 500);
-      this.#restartTimer.unref();
     });
+  }
+
+  /**
+   * Reports one failure and schedules the retry, for both the ways an encoder can fail.
+   *
+   * Shared so a child that never started is handled exactly like one that died: the caller hears
+   * about it, and the wait before the next attempt grows while the failures keep coming.
+   */
+  #fail(cause: Error): void {
+    if (!this.#config) return;
+    this.#failures += 1;
+    this.options.onFailure?.(cause);
+    if (this.#restartTimer) return;
+    this.#restartTimer = setTimeout(() => {
+      this.#restartTimer = undefined;
+      if (this.#config) this.#spawn();
+    }, this.retryDelayMs);
+    this.#restartTimer.unref();
   }
 }

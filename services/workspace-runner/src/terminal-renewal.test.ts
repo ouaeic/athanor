@@ -5,6 +5,9 @@ import {
   signCapabilityToken,
   verifyCapabilityToken
 } from '@athanor/core';
+// The branch itself, not a restatement of it. These four cases used to compare against a local
+// copy of the predicate, so removing a clause from the runner left every one of them green.
+import { renewalExtendsSession } from './server.js';
 
 /**
  * The check the terminal socket applies to a renewal.
@@ -42,22 +45,12 @@ const token = (
     ttlSeconds
   );
 
-/** Exactly the predicate in the socket's `renew` branch. */
-const extendsTheSameSession = (
-  renewed: ReturnType<typeof verifyCapabilityToken>,
-  opened: ReturnType<typeof verifyCapabilityToken>
-): boolean =>
-  renewed.workspaceId === opened.workspaceId &&
-  renewed.sub === opened.sub &&
-  renewed.role === opened.role &&
-  renewed.scopes.includes('terminal');
-
 describe('renewing a terminal capability', () => {
   const opened = verifyCapabilityToken(token(), SECRET, AUDIENCE);
 
   it('accepts a fresh capability for the same session, and it buys real time', () => {
     const renewed = verifyCapabilityToken(token(), SECRET, AUDIENCE);
-    expect(extendsTheSameSession(renewed, opened)).toBe(true);
+    expect(renewalExtendsSession(renewed, opened)).toBe(true);
     // The point of the exercise: the deadline actually moves out.
     expect(renewed.exp).toBeGreaterThanOrEqual(opened.exp);
   });
@@ -74,7 +67,7 @@ describe('renewing a terminal capability', () => {
       // the predicate. Either way the renewal must not extend this session.
       let matched = false;
       try {
-        matched = extendsTheSameSession(verifyCapabilityToken(other, SECRET, AUDIENCE), opened);
+        matched = renewalExtendsSession(verifyCapabilityToken(other, SECRET, AUDIENCE), opened);
       } catch {
         matched = false;
       }

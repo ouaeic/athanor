@@ -41,10 +41,30 @@ describe('workspace files', () => {
 
   it('rejects path traversal', () => {
     expect(() => resolveInside(root, '../escape')).toThrow('escapes workspace');
+    expect(() => resolveInside(root, '..')).toThrow('escapes workspace');
+    expect(() => resolveInside(root, 'workspace/../../escape')).toThrow('escapes workspace');
     expect(() => workspacePath(root, '..')).toThrow('Invalid workspace ID');
     expect(() => workspacePath(root, 'release-drill')).toThrow('Invalid workspace ID');
     expect(workspacePath(root, '00000000-0000-4000-8000-000000000001')).toBe(
       path.join(root, '00000000-0000-4000-8000-000000000001')
+    );
+  });
+
+  /*
+   * A step upwards is `..` followed by a separator, or `..` alone. It is not "the name begins with
+   * two dots": `..gitignore` and `..backup` are ordinary files inside the tree, and refusing them
+   * as an escape answered the agent with an accusation instead of a correction - which is exactly
+   * the failure the bare-name fold below exists to stop, arriving through the check that runs
+   * before it. The agent creates `workspace/..backup/` from a shell command and then cannot list it.
+   */
+  it('treats a name that merely starts with two dots as a name, not as a step upwards', () => {
+    expect(resolveInside(root, '..gitignore')).toBe(path.join(root, '..gitignore'));
+    expect(resolveInside(root, 'workspace/..backup')).toBe(
+      path.join(root, 'workspace', '..backup')
+    );
+    expect(assertUserDataPath(root, '..backup')).toBe(path.join('workspace', '..backup'));
+    expect(assertUserDataPath(root, 'workspace/..gitignore')).toBe(
+      path.join('workspace', '..gitignore')
     );
   });
 

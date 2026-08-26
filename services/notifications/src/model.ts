@@ -94,6 +94,12 @@ export const defaultNotificationSettings = (timeZone = 'UTC'): OwnerNotification
  * The exact sentence the approval card shows lives inside the encrypted preview, which this
  * service holds no key for. The tool name and the side-effect class are enough to say truthfully
  * what class of thing is about to happen, which is what a lock screen has room for anyway.
+ *
+ * Every case below is a name `agentToolsFor()` actually publishes, or `secure_input_handoff`, which
+ * is the one action the worker writes on an approval row without a tool behind it. `http_request`
+ * had a case here and has never been a tool in this catalogue - so the phrase was unreachable, and
+ * an unreachable phrase reads to the next person as evidence that a tool by that name exists.
+ * `scripts/check-repository.mjs` holds this list against the catalogue.
  */
 export const approvalPhrase = (
   action: string | null,
@@ -102,8 +108,6 @@ export const approvalPhrase = (
   switch (action) {
     case 'shell':
       return 'run a command on your computer';
-    case 'http_request':
-      return 'send a request to another site';
     case 'connector_action':
       return 'use one of your connected accounts';
     case 'publish_site':

@@ -3,15 +3,15 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { z } from 'zod';
 import {
-  packageManagerInvocation,
-  privilegeEscalationBinary,
-  privilegedHelperInvocation,
-  resolveExecutable
-} from './command-policy.js';
-import { agentEnvironment, agentSearchPath } from './execution.js';
-import { ensureWorkspace, resolveInside } from './files.js';
-import { limitedInvocation, type CommandLimits } from './limits.js';
-import { sandboxedInvocation, type AgentSandbox } from './sandbox.js';
+  DISK_FLOOR_POLL_MS,
+  HOST_DISK_FLOOR_NOTE,
+  prepareInvocation,
+  stopProcessTree,
+  type ExecutionGuards
+} from './execution.js';
+import { ensureWorkspace } from './files.js';
+import { belowHostStorageFloor, hostStorage as probeHostStorage } from './host-storage.js';
+import { type AgentSandbox } from './sandbox.js';
 import {
   DEFAULT_SERVICE_POLICY,
   givenUp,
@@ -27,7 +27,7 @@ import {
   type ServicePolicy,
   type ServiceRecord
 } from './services.js';
-import { awaitChildExit, DEFAULT_FLUSH_GRACE_MS, killProcessTree } from './subprocess.js';
+import { awaitChildExit, DEFAULT_FLUSH_GRACE_MS } from './subprocess.js';
 
 const BackgroundRequest = z.object({
   executable: z.string().min(1).max(4096),
@@ -68,6 +68,8 @@ interface Session {
   exitCode?: number | null;
   signal?: string | null;
   timeout?: NodeJS.Timeout;
+  /** The host-disk floor watch, cleared the moment the process is no longer writing to it. */
+  diskFloor?: NodeJS.Timeout;
 }
 
 /** Everything needed to put a service's process back, held once per supervised service. */
@@ -82,11 +84,60 @@ interface Supervised {
   retiring: boolean;
 }
 
-export interface Guards {
-  limits?: CommandLimits | undefined;
-  limiter?: string | undefined;
+/**
+ * The same guards the foreground path carries, plus the sandbox this path installs itself.
+ *
+ * They were two declarations, and the background copy was the one missing the host-disk floor -
+ * which is the guard that matters most here, because this is the path with no deadline. A
+ * background command runs for up to an hour and a service runs for ever, and the only disk check
+ * either of them had was the pre-flight in the route, which proves the disk was healthy at the
+ * moment the command started and says nothing about the command that is filling it.
+ */
+export interface Guards extends ExecutionGuards {
   sandbox?: AgentSandbox | undefined;
+  /**
+   * Where the root-owned system-package helper lives, so this path can refuse a command that names
+   * it. Not so this path can use it: an install is refused here outright. The field exists because
+   * the refusal is a check against a list of helper names, and for as long as this list was built
+   * only from the arm of the policy that rewrites onto the helper, the background path did not know
+   * the name to refuse. On a host with no sandbox helper - a laptop, which config.ts documents as
+   * supported - the list was empty and `POST /processes/start` would happily run the helper, which
+   * install-native.sh grants NOPASSWD sudo. Root, from a background start, with no capability scope
+   * and no approval. The foreground path had refused exactly this since the helper existed.
+   */
+  systemPackageHelper?: string | undefined;
 }
+
+const StopOwnerRequest = z.object({ owner: z.string().min(1).max(256).optional() });
+
+/**
+ * Written into the stopped session's own log, because `process(poll)` is the only place an agent
+ * ever finds out why a job it started is no longer running - the same reason the disk-floor stop
+ * above states itself there. A process that simply dies on a signal reads to a model as a crash
+ * worth retrying, and this one must not be retried: whoever it was working for has gone.
+ */
+export const OWNER_STOPPED_NOTE =
+  'stopped: the task that started this background command is no longer running';
+
+/**
+ * What a cancellation confirmation says about the background work it just ended.
+ *
+ * The sentence belongs here rather than in the caller because the exemption is this file's rule. A
+ * service is declared precisely so it outlives the turn, so cancelling a task deliberately leaves
+ * it serving - and an owner who is told only "cancelled" reads that as everything having stopped.
+ * They then close the tab on a dashboard that is still up, or wonder why a port they thought they
+ * had freed is busy. Naming the services that are still running is the difference between an
+ * exemption and a surprise.
+ */
+export const ownerStopNote = (stopped: number, services: string[]): string => {
+  const ended =
+    stopped === 0
+      ? 'No background commands were running for this task.'
+      : `Stopped ${stopped} background command${stopped === 1 ? '' : 's'}.`;
+  if (services.length === 0) return ended;
+  const named = services.map((name) => `"${name}"`).join(', ');
+  return `${ended} The declared service${services.length === 1 ? '' : 's'} ${named} ${services.length === 1 ? 'is' : 'are'} still running: a service is meant to outlive the task that started it, so stopping one is its own action.`;
+};
 
 const appendBounded = (current: Buffer, chunk: Buffer, limit: number): Buffer => {
   const combined = Buffer.concat([current, chunk]);
@@ -159,38 +210,22 @@ export class ProcessManager {
     }
   ): Promise<Session> {
     const guards = options.guards;
-    const searchPath = agentSearchPath(workspaceRoot);
-    // Asked first, so a policy the caller believes it is applying is refused before anything runs.
-    const environment = agentEnvironment(workspaceRoot, searchPath, request.env);
-    const cwd = resolveInside(workspaceRoot, request.cwd);
-    const resolved = await resolveExecutable(request.executable, searchPath, cwd);
-    const asResolved = resolved ? { executable: resolved, args: request.args } : request;
-    if (
-      privilegeEscalationBinary(request) ??
-      privilegeEscalationBinary(asResolved) ??
-      packageManagerInvocation(request) ??
-      packageManagerInvocation(asResolved) ??
-      privilegedHelperInvocation(request, [guards.sandbox?.helper]) ??
-      privilegedHelperInvocation(asResolved, [guards.sandbox?.helper])
-    ) {
-      throw new Error('Privilege and system-package operations cannot run as background processes');
-    }
-    // Outermost so the limits are inherited by the sandbox and everything it execs.
-    const { executable, args } = limitedInvocation(
-      guards.sandbox
-        ? sandboxedInvocation(
-            { executable: request.executable, args: request.args },
-            environment,
-            guards.sandbox,
-            options.isolateNetwork && !request.network
-          )
-        : { executable: request.executable, args: request.args },
-      guards.limits,
-      guards.limiter
-    );
-    const child = spawn(executable, args, {
-      cwd,
-      env: guards.sandbox ? {} : environment,
+    // The refusals, the sandbox and the resource limiter, shared with the foreground path so a
+    // service is subject to the same rules as a command an agent runs in front of you. The one
+    // difference is stated in the policy rather than left implicit in a second copy of the checks:
+    // a package manager is refused here, not rewritten onto the approved helper.
+    const prepared = await prepareInvocation(workspaceRoot, request, {
+      isolateNetwork: options.isolateNetwork,
+      sandbox: guards.sandbox,
+      limits: guards.limits,
+      limiter: guards.limiter,
+      // Refused, and named: refusing an install is not the same statement as refusing to be the
+      // helper, and this path owes both.
+      systemPackages: { mode: 'refused', helper: guards.systemPackageHelper }
+    });
+    const child = spawn(prepared.executable, prepared.args, {
+      cwd: prepared.cwd,
+      env: prepared.env,
       stdio: ['pipe', 'pipe', 'pipe'],
       // Leads its own process group so stopping the session reaches grandchildren too.
       detached: true,
@@ -207,8 +242,7 @@ export class ProcessManager {
             const session = this.#sessions.get(id);
             if (!session || session.status !== 'running') return;
             session.status = 'timed_out';
-            killProcessTree(child, 'SIGTERM');
-            setTimeout(() => killProcessTree(child, 'SIGKILL'), 2_000).unref();
+            stopProcessTree(child);
           },
           Math.min(request.timeoutSeconds, options.maximumSeconds ?? request.timeoutSeconds) * 1_000
         );
@@ -227,6 +261,35 @@ export class ProcessManager {
       ...(timeout ? { timeout } : {})
     };
     this.#sessions.set(id, session);
+    /*
+     * The floor, watched for as long as this process can write to the disk.
+     *
+     * The foreground path has polled free space since a `dd` took the box down; this path had the
+     * pre-flight check in the route and nothing else, which only ever proved the disk was healthy
+     * at the moment the command started - and the command is what fills it. A background `dd`, a
+     * service that logs to a file, an `npm ci` in a service wrapper: each of them runs for up to an
+     * hour, and a service runs with no deadline at all, with nothing watching. PostgreSQL shares
+     * this filesystem, so reaching the last free byte stops the database, the interface and every
+     * other task on the computer, not just the command that caused it.
+     */
+    const storageProbe = guards.hostStorage ?? probeHostStorage;
+    let probing = false;
+    const diskFloor = setInterval(() => {
+      const current = this.#sessions.get(id);
+      if (probing || !current || current.status !== 'running') return;
+      probing = true;
+      void storageProbe(workspaceRoot)
+        .then((storage) => {
+          if (!belowHostStorageFloor(storage) || current.status !== 'running') return;
+          this.#stopOnDiskFloor(id, current);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          probing = false;
+        });
+    }, guards.hostStoragePollMs ?? DISK_FLOOR_POLL_MS);
+    diskFloor.unref();
+    session.diskFloor = diskFloor;
     child.stdout.on('data', (chunk: Buffer) => {
       session.stdout = appendBounded(session.stdout, chunk, session.maxOutputBytes);
     });
@@ -240,6 +303,7 @@ export class ProcessManager {
     // has always waited for the drain; this is the same rule for a background session.
     const settle = (status: Status, exitCode: number | null, signal: NodeJS.Signals | null) => {
       if (timeout) clearTimeout(timeout);
+      clearInterval(diskFloor);
       session.exitCode = exitCode;
       session.signal = signal;
       session.finishedAt = new Date().toISOString();
@@ -261,6 +325,47 @@ export class ProcessManager {
     );
     if (request.stdin) child.stdin.write(request.stdin);
     return session;
+  }
+
+  /**
+   * What the runner does about a background process that is taking the last of the host disk.
+   *
+   * The session is stopped and the reason is appended to its own stderr, because `process(poll)` is
+   * the only place the agent ever finds out why a job it started is no longer running - a process
+   * that simply dies on a signal reads to the model as an unexplained crash it should retry, and
+   * retrying is the one thing that must not happen while the disk is still full.
+   *
+   * A supervised service is retired first. Otherwise the death goes round the ordinary backoff and
+   * the supervisor puts the thing that filled the disk straight back into the disk it filled,
+   * every second or two, for as long as the owner takes to notice. The record stays on disk in
+   * `crash_looped`, which is the state that means supervision has stopped and is telling the owner
+   * so: they see what it was and how it ended, and the service comes back when the runner is next
+   * restarted with room on the disk, rather than never.
+   */
+  #stopOnDiskFloor(id: string, session: Session): void {
+    const supervised = this.#supervised.get(id);
+    if (supervised) {
+      supervised.retiring = true;
+      if (supervised.restart) clearTimeout(supervised.restart);
+      delete supervised.restart;
+      const record = supervised.record;
+      record.state = 'crash_looped';
+      record.pid = undefined;
+      record.lastExit = {
+        at: new Date().toISOString(),
+        exitCode: null,
+        signal: null,
+        reason: 'stopped: the host disk was down to its last free bytes'
+      };
+      void supervised.registry.put(record);
+    }
+    session.status = 'stopped';
+    session.stderr = appendBounded(
+      session.stderr,
+      Buffer.from(`\n${HOST_DISK_FLOOR_NOTE}`),
+      session.maxOutputBytes
+    );
+    this.#stop(session);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -550,8 +655,7 @@ export class ProcessManager {
       if (supervised) this.#retireService(supervised);
       if (session.status === 'running') {
         session.status = 'stopped';
-        killProcessTree(session.child, 'SIGTERM');
-        setTimeout(() => killProcessTree(session.child, 'SIGKILL'), 2_000).unref();
+        this.#stop(session);
       }
     }
     if (request.action === 'write') {
@@ -575,6 +679,7 @@ export class ProcessManager {
     this.#supervised.clear();
     for (const session of this.#sessions.values()) {
       if (session.timeout) clearTimeout(session.timeout);
+      if (session.diskFloor) clearInterval(session.diskFloor);
       if (session.status === 'running') this.#stop(session);
     }
     this.#sessions.clear();
@@ -597,14 +702,73 @@ export class ProcessManager {
     for (const [id, session] of this.#sessions) {
       if (session.workspaceId !== workspaceId) continue;
       if (session.timeout) clearTimeout(session.timeout);
+      if (session.diskFloor) clearInterval(session.diskFloor);
       if (session.status === 'running') this.#stop(session);
       this.#sessions.delete(id);
     }
   }
 
+  /**
+   * Everything one task left running in the background, stopped - and everything it declared to
+   * outlive itself, left alone and named.
+   *
+   * Cancelling a task aborts whatever runner request is in flight, which covers `/exec` completely
+   * and covers this path not at all: `processes/start` answers in milliseconds, so by the time the
+   * owner presses Stop there is no request left to abort. The scraper the model started ran on for
+   * the rest of its hour, writing into the workspace and making outbound requests attributed to
+   * this computer, with the interface saying the task was cancelled. `coding_agent` had to poll
+   * the task row and issue its own kill, which is the proof this general mechanism was missing.
+   *
+   * `subject` is the task a capability is subject to, or null for the person who owns the box - the
+   * same split `list`/`listWorkspace` and `action` make. A task may only ever name itself: this
+   * route would otherwise be the way round the boundary those two hold, letting one turn stop
+   * another turn's work by asking. The owner is subject to no task and so must say which one they
+   * mean, rather than having "everything" quietly assumed.
+   *
+   * Sessions are stopped where they stand rather than forgotten, unlike `stopWorkspace`: the row
+   * stays so a poll reads `stopped` with the reason in its log, instead of the session vanishing.
+   */
+  stopOwner(workspaceId: string, subject: string | null, value: unknown) {
+    const request = StopOwnerRequest.parse(value ?? {});
+    if (subject !== null && request.owner !== undefined && request.owner !== subject)
+      throw new Error('A task can only stop the background processes it started');
+    const owner = subject ?? request.owner;
+    if (owner === undefined)
+      throw new Error('Stopping background processes requires which task they belong to');
+    /*
+     * Read from the supervision map rather than from the sessions, so a service counts as exempt
+     * even in the window where it has no live session at all - between a death and its restart, or
+     * after a resumed record whose first launch threw. Those are exactly the moments an owner is
+     * most likely to be pressing Stop, and reporting nothing there would say the service was
+     * stopped when supervision is still holding it.
+     */
+    const services = [...this.#supervised.values()]
+      .filter(
+        (supervised) =>
+          supervised.record.workspaceId === workspaceId && supervised.record.owner === owner
+      )
+      .map((supervised) => supervised.record.name);
+    const stopped: string[] = [];
+    for (const [id, session] of this.#sessions) {
+      if (session.workspaceId !== workspaceId || session.owner !== owner) continue;
+      if (this.#supervised.has(id)) continue;
+      if (session.status !== 'running') continue;
+      if (session.timeout) clearTimeout(session.timeout);
+      if (session.diskFloor) clearInterval(session.diskFloor);
+      session.status = 'stopped';
+      session.stderr = appendBounded(
+        session.stderr,
+        Buffer.from(`\n${OWNER_STOPPED_NOTE}`),
+        session.maxOutputBytes
+      );
+      this.#stop(session);
+      stopped.push(id);
+    }
+    return { stopped, services, note: ownerStopNote(stopped.length, services) };
+  }
+
   #stop(session: Session): void {
-    killProcessTree(session.child, 'SIGTERM');
-    setTimeout(() => killProcessTree(session.child, 'SIGKILL'), 2_000).unref();
+    stopProcessTree(session.child);
   }
 
   #view(session: Session, includeLogs: boolean) {

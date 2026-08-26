@@ -18,7 +18,7 @@ import {
 } from 'node:fs/promises';
 import path from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
-import { belowHostStorageFloor, hostStorage } from './host-storage.js';
+import { belowHostStorageFloor, hostStorage, type HostStorage } from './host-storage.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_OUTPUT_BYTES = 8 * 1024;
@@ -50,6 +50,40 @@ export interface CheckpointConfig {
   retainDailyDays: number;
   maxFiles: number;
   maxFileBytes: number;
+  /**
+   * How free space on the host is measured, overridable for the same reason `ExecutionGuards`
+   * makes it overridable (`execution.ts:181`): so the floor can be exercised without filling a
+   * real filesystem.
+   *
+   * It is also what makes this file's own suite hermetic. Reading the real disk here meant
+   * sixteen checkpoint tests failed on any machine under two per cent free - Wave 3's gate hit
+   * exactly that at 99 % - and the failure was a sentence about a full disk, indistinguishable
+   * from genuine breakage. A build whose verdict depends on the free space of the machine
+   * running it is not evidence either way.
+   */
+  hostStorage?: ((root: string) => Promise<HostStorage>) | undefined;
+}
+
+/**
+ * Why an automatic checkpoint could not be taken, said in a way a program can read.
+ *
+ * The worker decides whether a turn that lost its undo point mentions it to the owner or leaves
+ * it in the work log, and it decided by matching a regular expression against this file's prose
+ * (`apps/worker/src/agent.ts:639`). That regex knows the disk sentence and nothing else, so the
+ * over-ceiling refusal below - which the owner absolutely can act on, by taking a named recovery
+ * point or clearing the tree - reached them as silence, every turn, once a workspace grew past
+ * `maxFiles`. Prose belongs to whoever is reading it; this reader is a program, so it gets a code.
+ */
+export type CheckpointRefusalCode = 'checkpoint_host_disk_full' | 'checkpoint_workspace_too_large';
+
+export class CheckpointRefusedError extends Error {
+  constructor(
+    readonly code: CheckpointRefusalCode,
+    message: string
+  ) {
+    super(message);
+    this.name = 'CheckpointRefusedError';
+  }
 }
 
 export interface CheckpointSummary {
@@ -276,17 +310,57 @@ const readPackages = async (
   };
 };
 
-const hashFile = async (target: string): Promise<string> => {
+/**
+ * How many times a file that moves under the hash is re-read before its last reading is taken.
+ *
+ * A file being appended to on every tick cannot be captured exactly by anything short of stopping
+ * the workspace, and failing the checkpoint over one busy log would cost the turn its whole undo.
+ * Three is enough for a build that rewrites a file once.
+ */
+const HASH_ATTEMPTS = 3;
+
+/**
+ * The content hash and the stat recorded beside it, taken from one descriptor.
+ *
+ * A checkpoint create deliberately does not stop the workspace - a turn cannot afford to pause a
+ * watch build - so the walk's stat and this pass are hundreds of milliseconds apart on a large
+ * tree. Recording the walk's size and mtime against these bytes was a durable lie: a restore wrote
+ * back content produced *after* the moment the owner asked to return to and then set the older
+ * timestamp, so the next checkpoint saw the file as unchanged and kept the wrong pairing for good.
+ * Statting the descriptor that was just read closes that window; bracketing the read closes the
+ * narrower one where the file moves during the read itself, which would otherwise pin the hash of
+ * a torn read against a stat that matches it perfectly.
+ */
+const hashFile = async (
+  target: string
+): Promise<{ hash: string; size: number; mtimeMs: number }> => {
   const handle = await open(target, 'r');
   try {
-    const hash = createHash('sha256');
     const buffer = Buffer.allocUnsafe(1024 * 1024);
-    for (;;) {
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
-      hash.update(buffer.subarray(0, bytesRead));
+    for (let attempt = 1; ; attempt += 1) {
+      const opened = await handle.stat();
+      const hash = createHash('sha256');
+      // Positional reads rather than the descriptor's own cursor, so a re-read starts at the top.
+      let position = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+        if (bytesRead === 0) break;
+        hash.update(buffer.subarray(0, bytesRead));
+        position += bytesRead;
+      }
+      const settled = await handle.stat();
+      if (
+        attempt < HASH_ATTEMPTS &&
+        (settled.size !== opened.size || settled.mtimeMs !== opened.mtimeMs)
+      )
+        continue;
+      return {
+        hash: hash.digest('hex'),
+        size: settled.size,
+        // Whole milliseconds for the reason scanTree floors: it is the finest a restore puts back.
+        mtimeMs: Math.floor(settled.mtimeMs)
+      };
     }
-    return hash.digest('hex');
   } finally {
     await handle.close();
   }
@@ -362,7 +436,8 @@ const scanTree = async (
         })
       );
       if (scan.files.size > limits.maxFiles)
-        throw new Error(
+        throw new CheckpointRefusedError(
+          'checkpoint_workspace_too_large',
           `This workspace holds more than ${limits.maxFiles} files, which is more than automatic checkpoints cover. Take a named recovery point instead.`
         );
     });
@@ -497,8 +572,27 @@ export class WorkspaceCheckpoints {
       : CHECKPOINT_CONTENT;
   }
 
-  #limits(): { maxFiles: number; maxFileBytes: number } {
-    return { maxFiles: this.#config.maxFiles, maxFileBytes: this.#config.maxFileBytes };
+  /**
+   * The scan bounds, and the one place the two callers differ.
+   *
+   * `maxFiles` bounds *taking* a checkpoint: past it the walk costs more than the checkpoint is
+   * worth, so the owner is told to take a named recovery point instead. It never bounded *using*
+   * one, and applying it to the preview and the restore closed the only way back out of the state
+   * that crossed it. A workspace over the ceiling is the ordinary shape of a workspace that has
+   * just had an `npm install` unpack forty thousand files into it - which is exactly the turn an
+   * owner wants to rewind - and every checkpoint taken before that moment was under the ceiling
+   * and perfectly restorable. Refusing to restore it left them holding a valid checkpoint they
+   * were not allowed to use, with the only remedy being to delete by hand the very files the
+   * rewind was going to remove for them.
+   *
+   * `maxFileBytes` still applies on every path, because it is not a refusal: a file larger than it
+   * was never in the checkpoint, so the scan records it as uncovered and carries on.
+   */
+  #limits(purpose: 'create' | 'use'): { maxFiles: number; maxFileBytes: number } {
+    return {
+      maxFiles: purpose === 'create' ? this.#config.maxFiles : Number.POSITIVE_INFINITY,
+      maxFileBytes: this.#config.maxFileBytes
+    };
   }
 
   /**
@@ -509,11 +603,13 @@ export class WorkspaceCheckpoints {
    * snapshot and refuse to delete it, and a mechanism that cannot prune is worse than not having
    * one: it fills the disk one turn at a time. Anything that fails, for any reason, falls through
    * to the content store, which asks nothing of the filesystem and works on plain ext4.
+   *
+   * Private, and it stays private. There was a public `mechanism(root)` in front of this whose only
+   * callers were the tests that asserted the probe's answer; nothing in the product ever asked the
+   * host what it could do, because everything that needs to know is already told by the checkpoint
+   * it just took. Those tests now read `create(...).mechanism`, which is the same answer taken from
+   * the operation that actually used it rather than from a probe run for the question's own sake.
    */
-  async mechanism(root: string): Promise<CheckpointMechanism> {
-    return (await this.#resolve(root)).mechanism;
-  }
-
   async #resolve(
     root: string
   ): Promise<{ mechanism: CheckpointMechanism; dataset: string | null }> {
@@ -590,8 +686,9 @@ export class WorkspaceCheckpoints {
     const id = safeId(input.checkpointId, 'checkpoint ID');
     const directory = this.#directory(workspaceId);
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    if (belowHostStorageFloor(await hostStorage(root)))
-      throw new Error(
+    if (belowHostStorageFloor(await (this.#config.hostStorage ?? hostStorage)(root)))
+      throw new CheckpointRefusedError(
+        'checkpoint_host_disk_full',
         'Host disk is too full to take an automatic checkpoint, so this turn cannot be rewound.'
       );
 
@@ -629,7 +726,7 @@ export class WorkspaceCheckpoints {
       await this.#run(this.#config.zfsExecutable, ['snapshot', snapshot]);
       meta.source = snapshot;
     } else {
-      const scan = await scanTree(root, this.#roots(), this.#limits());
+      const scan = await scanTree(root, this.#roots(), this.#limits('create'));
       const priorManifest =
         previous?.mechanism === 'content'
           ? await readManifest(directory, previous.id).catch(() => null)
@@ -639,27 +736,30 @@ export class WorkspaceCheckpoints {
       const changed: Array<[string, ScannedFile]> = [];
       let totalBytes = 0;
       for (const [relative, details] of scan.files) {
-        totalBytes += details.size;
         // An unchanged file costs one lstat and nothing else: no read, no hash, no copy. That is
         // what makes a per-turn checkpoint of a tree with a node_modules in it affordable.
         const known = prior.get(relative);
-        if (known && known.size === details.size && known.mtimeMs === details.mtimeMs)
+        if (known && known.size === details.size && known.mtimeMs === details.mtimeMs) {
+          totalBytes += details.size;
           files.push([relative, details.mode, details.size, details.mtimeMs, known.hash]);
-        else changed.push([relative, details]);
+        } else changed.push([relative, details]);
       }
       changedFileCount = changed.length;
       await inParallel(changed, async ([relative, details]) => {
-        const hash = await hashFile(path.join(root, relative));
-        const blob = blobPath(directory, hash);
+        // The stat recorded here is the one `hashFile` took from the descriptor it hashed, not the
+        // walk's: those are two different instants and the workspace keeps running between them.
+        const hashed = await hashFile(path.join(root, relative));
+        totalBytes += hashed.size;
+        const blob = blobPath(directory, hashed.hash);
         // The store holds one copy per distinct content, so a file the agent rewrote back to a
         // version it already had - or a dependency reinstalled unchanged - costs nothing.
         if (!(await lstat(blob).catch(() => null))) {
           await cloneFile(path.join(root, relative), blob);
           // Read-only, because a blob is shared by every checkpoint that names that content.
           await chmod(blob, 0o400).catch(() => undefined);
-          meta.storedBytes += details.size;
+          meta.storedBytes += hashed.size;
         }
-        files.push([relative, details.mode, details.size, details.mtimeMs, hash]);
+        files.push([relative, details.mode, hashed.size, hashed.mtimeMs, hashed.hash]);
       });
       uncoveredFileCount = scan.uncovered.size;
       const manifest: CheckpointManifest = {
@@ -757,7 +857,7 @@ export class WorkspaceCheckpoints {
         ? (meta.source ?? path.join(directory, meta.id))
         : path.join(root, '.zfs', 'snapshot', `athanor-${meta.id}`);
     return {
-      scan: await scanTree(base, this.#roots(), this.#limits()),
+      scan: await scanTree(base, this.#roots(), this.#limits('use')),
       content: (relative) => path.join(base, safeRelative(relative))
     };
   }
@@ -790,7 +890,7 @@ export class WorkspaceCheckpoints {
     const meta = await readMeta(directory, safeId(checkpointId, 'checkpoint ID'));
     const source = await this.#source(directory, meta, root);
     const before = source.scan;
-    const now = await scanTree(root, this.#roots(), this.#limits());
+    const now = await scanTree(root, this.#roots(), this.#limits('use'));
     const added: CheckpointChange[] = [];
     const modified: CheckpointChange[] = [];
     const deleted: CheckpointChange[] = [];
@@ -878,10 +978,41 @@ export class WorkspaceCheckpoints {
     const meta = await readMeta(directory, safeId(checkpointId, 'checkpoint ID'));
     const source = await this.#source(directory, meta, root);
     const before = source.scan;
-    const now = await scanTree(root, this.#roots(), this.#limits());
+    const now = await scanTree(root, this.#roots(), this.#limits('use'));
     let restoredFileCount = 0;
     let removedFileCount = 0;
     let restoredBytes = 0;
+
+    const outdated = [...before.files].filter(([relative, details]) => {
+      const current = now.files.get(relative);
+      return !current || current.size !== details.size || current.mtimeMs !== details.mtimeMs;
+    });
+    // Everything this restore is going to read, proven to be there before anything is destroyed.
+    // The removal pass used to run first, and the blob store can be short an object - a collection
+    // that skipped a manifest it could not read, an interrupted delete between the manifest and
+    // the metadata. The clone then threw ENOENT into a tree that had already lost every file made
+    // since the checkpoint, the route answered a bare failure, and the services were restarted
+    // against the mixture. `restoreSnapshot` next door does the rename-aside dance; this is the
+    // cheaper half of it, and it is what turns that loss into a refusal.
+    //
+    // Only the outdated set, because those are exactly the files a restore opens. Refusing a
+    // rewind over content it was never going to read would cost the owner an undo they could have
+    // had - the file is already correct on disk.
+    const missing: string[] = [];
+    await inParallel(outdated, async ([relative]) => {
+      const held = await Promise.resolve()
+        .then(() => lstat(source.content(relative)))
+        .catch(() => null);
+      if (!held) missing.push(relative);
+    });
+    if (missing.length) {
+      const [first] = missing.sort();
+      const others =
+        missing.length > 1 ? ` and ${missing.length - 1} other file(s) from that turn` : '';
+      throw new Error(
+        `This checkpoint can no longer produce ${first}${others}. Nothing has been rewound. Choose another recovery point.`
+      );
+    }
 
     await inParallel(
       [...now.files.keys()].filter((relative) => !before.files.has(relative)),
@@ -899,10 +1030,6 @@ export class WorkspaceCheckpoints {
     for (const relative of [...before.directories.keys()].sort())
       await mkdir(path.join(root, safeRelative(relative)), { recursive: true, mode: 0o770 });
 
-    const outdated = [...before.files].filter(([relative, details]) => {
-      const current = now.files.get(relative);
-      return !current || current.size !== details.size || current.mtimeMs !== details.mtimeMs;
-    });
     await inParallel(outdated, async ([relative, details]) => {
       const target = path.join(root, safeRelative(relative));
       // A directory or a symlink where the checkpoint holds a file: replaced outright rather than
@@ -992,18 +1119,6 @@ export class WorkspaceCheckpoints {
     return typeof parsed.pending === 'number' && Number.isFinite(parsed.pending)
       ? Math.max(0, parsed.pending)
       : 0;
-  }
-
-  async delete(workspaceId: string, checkpointId: string): Promise<void> {
-    return this.#serialize(workspaceId, async () => {
-      const directory = this.#directory(workspaceId);
-      const meta = await readMeta(directory, safeId(checkpointId, 'checkpoint ID')).catch(
-        () => null
-      );
-      if (!meta) return;
-      await this.#deleteCheckpoint(directory, meta);
-      await this.#collectBlobs(directory).catch(() => undefined);
-    });
   }
 
   async #deleteCheckpoint(directory: string, meta: CheckpointMeta): Promise<void> {

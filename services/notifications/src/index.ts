@@ -4,15 +4,13 @@ import { createDatabase, DataStore, migrateDatabase } from '@athanor/data';
 import webpush from 'web-push';
 import {
   loadConfig,
+  masterKeyBytes,
   NOTIFICATION_HEALTH_HOST,
   NOTIFICATION_HEALTH_PORT,
   pushConfigured
 } from './config.js';
-import { notificationSubject, ownerPresent, ownerSettings, type PendingRow } from './context.js';
-import type { OwnerNotificationSettings } from './model.js';
-import { notificationPayload } from './payload.js';
-import { deliveryDecision } from './policy.js';
-import { backoffMs, EndpointHealth, endpointHost, isGone, RETRY_HORIZON_MS } from './retry.js';
+import { EndpointHealth } from './retry.js';
+import { runSweep } from './sweep.js';
 
 const config = loadConfig();
 const database = createDatabase({
@@ -23,6 +21,22 @@ const database = createDatabase({
 });
 await migrateDatabase(database);
 const store = new DataStore(database);
+/*
+ * Held for the length of the process and handed to exactly one call: the query that selects what
+ * is waiting to be sent. Nothing else in this service touches it, and no ciphertext is unwrapped
+ * here - the data layer is the only place holding both the envelope and the key.
+ */
+const masterKey = masterKeyBytes(config);
+if (!masterKey) {
+  // Not fatal, and worth saying once. Without it every notification this box sends is titled
+  // "Untitled conversation", which looks to an owner like a bug in the wording rather than a
+  // missing line in control.env.
+  process.stdout.write(
+    'athanor notifications: no DATA_MASTER_KEY is configured, so notifications cannot name the ' +
+      'conversation they are about and will be titled "Untitled conversation". Set DATA_MASTER_KEY ' +
+      'in /etc/athanor/control.env to the same value the API and worker use.\n'
+  );
+}
 const deliveryEnabled = pushConfigured(config);
 if (deliveryEnabled) {
   webpush.setVapidDetails(
@@ -45,6 +59,7 @@ let failed = 0;
 let suppressed = 0;
 let retired = 0;
 let deferred = 0;
+let held = 0;
 const endpoints = new EndpointHealth();
 const health = createServer((request, response) => {
   if (request.url === '/metrics') {
@@ -55,7 +70,12 @@ const health = createServer((request, response) => {
         `athanor_notifications_suppressed_total ${suppressed}\n` +
         `athanor_notifications_endpoints_retired_total ${retired}\n` +
         `athanor_notifications_endpoints_failing ${endpoints.failingCount}\n` +
-        `athanor_notifications_deferred ${deferred}\n`
+        `athanor_notifications_deferred ${deferred}\n` +
+        // Told apart from `deferred` deliberately: a deferral is a device that will not take a
+        // push right now, a hold is the owner being at the keyboard or asleep. A rising
+        // `suppressed_total` beside a flat `held` is the service dropping notifications on
+        // purpose; beside a standing `held` it is the same few items waiting for a person.
+        `athanor_notifications_held ${held}\n`
     );
     return;
   }
@@ -70,6 +90,12 @@ const health = createServer((request, response) => {
       ok: true,
       service: 'notifications',
       deliveryEnabled,
+      // Served for the same reason as `deliveryEnabled`: the symptom on the phone - every
+      // notification titled "Untitled conversation" - looks like a wording bug rather than the
+      // missing line in control.env that it is, so it has to be answerable without a push.
+      // `athanor doctor` reads `deliveryEnabled` and `endpointsFailing` from here today and does
+      // not yet read this one; the journal line at startup is the record until it does.
+      titlesReadable: Boolean(masterKey),
       endpointsFailing: endpoints.failingCount,
       endpointsRetired: retired
     })
@@ -82,43 +108,14 @@ const shutdown = () => {
 };
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);
-
-/**
- * The ledger row that stops a notification firing twice is keyed by subscription, kind and
- * resource, so it is also the only way to record "this one will never be sent". Writing it for a
- * dropped item is deliberate: without it, a message the owner has already read on screen — or has
- * switched off entirely — would be re-examined on every pass for as long as the row exists.
- */
-const settle = async (row: PendingRow): Promise<void> => {
-  await store.recordNotificationDelivery(row.id, row.kind, row.resourceId);
-};
-
-/**
- * A write that records a failure must not be able to end the loop.
+/*
+ * One pass, then the decision whether to wait.
  *
- * These run inside the handler for a delivery that already went wrong, and an exception thrown
- * there escapes the batch, escapes the while, and stops the service - turning one refusing push
- * service into no notifications at all. The journal line beside each of them is the record that
- * survives a database that will not take the write.
+ * A sweep that could not attempt anything - every endpoint inside its backoff, or every item held
+ * because the owner is at the keyboard or asleep - has nothing to show for the four-branch UNION it
+ * just ran, so asking again immediately re-runs it as fast as the database will answer. Everything
+ * else falls straight through to the next batch, which is what drains a backlog quickly.
  */
-const bestEffort = (work: Promise<unknown>): Promise<void> =>
-  work.then(
-    () => undefined,
-    () => undefined
-  );
-
-/**
- * How far past the batch size a sweep may reach to get round endpoints that are waiting.
- *
- * The wait lives in this process and the batch is chosen by a query, which cannot see it - so a
- * hundred items belonging to one refusing endpoint still fill the page they are ordered to the
- * front of, and skipping them cheaply is not the same as getting past them. Asking for as many
- * extra rows as were skipped last time restores a full batch of deliverable work behind them. It is
- * bounded because the honest version of this is a predicate in the query, which is in the handoff;
- * this is what keeps the queue moving until that lands.
- */
-const MAX_DEFERRED_PAGE_ROOM = 400;
-
 while (running) {
   // With no signing keys there is nothing that could be delivered, so the loop idles rather than
   // querying the database twice a second forever.
@@ -126,159 +123,36 @@ while (running) {
     await delay(config.NOTIFICATION_POLL_MS);
     continue;
   }
-  const pending: PendingRow[] = await store
-    .listPendingNotifications(
-      config.NOTIFICATION_BATCH_SIZE + Math.min(deferred, MAX_DEFERRED_PAGE_ROOM)
-    )
-    .catch(() => []);
-  if (!pending.length) {
-    deferred = 0;
-    await delay(config.NOTIFICATION_POLL_MS);
-    continue;
-  }
-  const now = new Date();
-  let deferredThisSweep = 0;
-  // One owner, one set of switches, one presence answer — resolved once per pass rather than once
-  // per subscription, which for a household of devices is the difference between one query and ten.
-  const settingsByUser = new Map<string, OwnerNotificationSettings>();
-  const presenceByUser = new Map<string, boolean>();
-  for (const item of pending) {
-    // An endpoint inside its wait costs nothing here: no request, no ten-second timeout, and no
-    // place at the front of the queue. Nothing is settled and nothing is lost - the item is simply
-    // considered again once the wait is over.
-    if (endpoints.waiting(item.id, new Date())) {
-      deferredThisSweep += 1;
-      continue;
-    }
-    let sending = false;
-    try {
-      let settings = settingsByUser.get(item.userId);
-      if (!settings) {
-        settings = await ownerSettings(store, item.userId);
-        settingsByUser.set(item.userId, settings);
-      }
-      let present = presenceByUser.get(item.userId);
-      if (present === undefined) {
-        present = await ownerPresent(store, item.userId, now);
-        presenceByUser.set(item.userId, present);
-      }
-
-      const { subject, eventAt } = await notificationSubject(store, item);
-      const decision = deliveryDecision({
-        kind: item.kind,
-        settings,
-        ownerPresent: present,
-        eventAt,
-        now
-      });
-      if (decision.action === 'hold') {
-        suppressed += 1;
-        continue;
-      }
-      if (decision.action === 'drop') {
-        suppressed += 1;
-        await settle(item);
-        continue;
-      }
-
-      // Only what the push service does counts against the push service. Everything above this
-      // point is a database read of the owner's own rows, and a failure there says nothing about
-      // the far end and must not put a working device into a wait.
-      sending = true;
+  const sweep = await runSweep({
+    store,
+    masterKey,
+    endpoints,
+    batchSize: config.NOTIFICATION_BATCH_SIZE,
+    deferredLastSweep: deferred,
+    send: (row, payload) =>
       // Bounded. A push endpoint is a third party's server on the far side of the internet, and
       // without a timeout one that accepts the connection and then says nothing holds this loop -
       // and therefore every other device's notification behind it - until the socket gives up on
       // its own, which can be minutes.
-      await webpush.sendNotification(
-        { endpoint: item.endpoint, keys: { p256dh: item.p256dh, auth: item.auth } },
-        JSON.stringify(notificationPayload(subject)),
-        {
-          TTL: 600,
-          urgency: item.kind === 'approval_required' ? 'high' : 'normal',
-          timeout: 10_000
-        }
-      );
-      sending = false;
-      await settle(item);
-      delivered += 1;
-      // One delivery is proof the endpoint is back, so it starts again from no failures at all.
-      endpoints.succeeded(item.id);
-    } catch (error) {
-      failed += 1;
-      // Not the endpoint's doing: retried on the next sweep, holding nothing against the device.
-      if (!sending) continue;
-      const statusCode =
-        typeof error === 'object' && error !== null && 'statusCode' in error
-          ? Number(error.statusCode)
-          : 0;
-      const host = endpointHost(item.endpoint);
-      // The far end saying the subscription is gone. Nothing to wait for and nothing to tell the
-      // owner: a device that unsubscribed, or a browser profile that was cleared, is ordinary.
-      if (isGone(statusCode)) {
-        endpoints.forget(item.id);
-        await bestEffort(store.deletePushSubscriptionById(item.id));
-        continue;
-      }
-
-      const outcome = endpoints.failed(item.id, statusCode, new Date());
-      const status = statusCode ? ` (HTTP ${statusCode})` : '';
-      if (outcome.exhausted) {
-        /*
-         * A day of refusals, so this endpoint is not coming back and every notification queued
-         * behind it has been waiting on something that cannot happen. Retiring it removes its
-         * candidates; it writes no delivery record, so nothing is marked sent that was not, and
-         * everything the owner should have been told is still in the conversation it belongs to
-         * and in the standing list of what the agent has raised.
-         */
-        endpoints.forget(item.id);
-        await bestEffort(store.deletePushSubscriptionById(item.id));
-        retired += 1;
-        await bestEffort(
-          store.recordSecurityEvent({
-            userId: item.userId,
-            kind: 'push_endpoint_retired',
-            outcome: 'failure',
-            // The push service and the code it answered with. The rest of the endpoint is the
-            // secret that authorises sending to that device and never leaves this process.
-            metadata: { host, statusCode, attempts: outcome.state.attempts }
-          })
-        );
-        process.stderr.write(
-          `athanor-notifications: ${host} has refused every notification for ${Math.round(RETRY_HORIZON_MS / 3_600_000)}h${status}; that device has been retired and will not be tried again. Turn notifications on again on the device to restore it\n`
-        );
-        continue;
-      }
-
-      if (outcome.first) {
-        /*
-         * Said out loud once, when an endpoint starts failing rather than on every refusal.
-         *
-         * The only record of a failure was `failed`, a counter on a metrics port bound to loopback
-         * - so a device whose notifications had silently stopped working looked exactly like a
-         * device nothing had happened on, and the owner's first clue was noticing they had stopped
-         * arriving. A push cannot report that pushes are not arriving, so it is written where the
-         * owner can find it without one: the journal for whoever is at the box, and the security
-         * record, which is theirs and travels in the privacy export.
-         */
-        await bestEffort(
-          store.recordSecurityEvent({
-            userId: item.userId,
-            kind: 'push_delivery_failing',
-            outcome: 'failure',
-            metadata: { host, statusCode }
-          })
-        );
-        process.stderr.write(
-          `athanor-notifications: ${host} refused a notification${status}; nothing is lost and it will be tried again in ${Math.round(backoffMs(outcome.state.attempts) / 60_000)} min, backing off to ${Math.round(RETRY_HORIZON_MS / 3_600_000)}h before that device is retired\n`
-        );
-      }
-    }
-  }
-  deferred = deferredThisSweep;
-  // A sweep with nothing left to attempt waits, rather than reselecting the same waiting rows as
-  // fast as the database will answer. Everything else falls straight through to the next batch,
-  // which is what drains a backlog quickly.
-  if (deferredThisSweep === pending.length) await delay(config.NOTIFICATION_POLL_MS);
+      webpush
+        .sendNotification(
+          { endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } },
+          JSON.stringify(payload),
+          {
+            TTL: 600,
+            urgency: row.kind === 'approval_required' ? 'high' : 'normal',
+            timeout: 10_000
+          }
+        )
+        .then(() => undefined)
+  });
+  delivered += sweep.delivered;
+  failed += sweep.failed;
+  suppressed += sweep.suppressed;
+  retired += sweep.retired;
+  deferred = sweep.deferred;
+  held = sweep.held;
+  if (sweep.idle) await delay(config.NOTIFICATION_POLL_MS);
 }
 
 await new Promise<void>((resolve) => health.close(() => resolve()));

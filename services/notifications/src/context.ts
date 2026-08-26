@@ -72,10 +72,12 @@ export const ownerPresent = async (
 /**
  * Everything the wording needs, gathered from rows this service can already read.
  *
- * The approval's tool name and side-effect class are plaintext columns, and the task carries its
- * own settled spend and ceiling, so an approval and a spend pause are fully worded today. The
+ * The approval's tool name and side-effect class are plaintext columns, so an approval is fully
+ * worded here. A spend pause is worded from the task's own settled spend and ceiling, which is the
+ * right pair of numbers only when that is the ceiling it hit - see the branch below. The
  * conversation title and anything the agent asked to have said are encrypted with a workspace key
- * this service does not hold, which is why they arrive on the pending row instead.
+ * this service does not hold, which is why they arrive on the pending row instead, already
+ * unwrapped by the only layer that holds both the envelope and the key.
  */
 export const notificationSubject = async (
   store: DataStore,
@@ -112,6 +114,27 @@ export const notificationSubject = async (
     : Number.isFinite(endedAt)
       ? new Date(endedAt)
       : new Date();
+
+  if (row.kind === 'spend_paused') {
+    /*
+     * Three different ceilings stop a task, and only one of them is on the task row.
+     *
+     * The spending guard blocks on the task's own cap, on the daily cap or on the monthly cap, and
+     * it also pauses when it could not answer at all - and the pending row carries none of that,
+     * only `spend_paused_at`. So the task's spend and the task's ceiling are the right pair of
+     * numbers exactly when the task's spend has reached the task's ceiling. Otherwise it is a
+     * household cap, and "Paused at your $5.00 limit after spending $0.31" would name a limit that
+     * was never reached and a figure that is not what stopped anything. The payload's other
+     * sentence says the same true thing without the numbers.
+     */
+    const ownCapReached =
+      subject.spentUsd !== null && subject.capUsd !== null && subject.spentUsd >= subject.capUsd;
+    if (!ownCapReached) {
+      subject.spentUsd = null;
+      subject.capUsd = null;
+    }
+    subject.durationMs = null;
+  }
 
   if (row.kind === 'approval_required') {
     const approvals = await store.listApprovals(row.userId, 'pending').catch(() => []);

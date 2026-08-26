@@ -188,6 +188,29 @@ describe('notificationSubject', () => {
     expect(subject.durationMs).toBeNull();
   });
 
+  it('prices a spend pause from the task’s own ceiling only when that is the ceiling it reached', async () => {
+    const { subject } = await notificationSubject(
+      store({ getTask: async () => task({ status: 'paused', spentUsd: 5, maxSpendUsd: 5 }) }),
+      row({ kind: 'spend_paused', taskStatus: 'paused', eventAt: '2026-07-31T12:00:00.000Z' })
+    );
+    expect(subject.spentUsd).toBe(5);
+    expect(subject.capUsd).toBe(5);
+  });
+
+  it('names no figure for a pause the household caps caused, rather than naming the wrong one', async () => {
+    // Three different things stop a task at a ceiling: its own cap, the daily or monthly cap, and
+    // a spending guard that would not answer. Only the first is the pair of numbers on the task
+    // row, and the row does not say which it was - so a task 31 cents into a $5 ceiling, stopped
+    // by a $20 daily cap, would have read "Paused at your $5.00 limit after spending $0.31". A
+    // sentence about the owner's money has to be true or absent.
+    const { subject } = await notificationSubject(
+      store({ getTask: async () => task({ status: 'paused', spentUsd: 0.31, maxSpendUsd: 5 }) }),
+      row({ kind: 'spend_paused', taskStatus: 'paused', eventAt: '2026-07-31T12:00:00.000Z' })
+    );
+    expect(subject.spentUsd).toBeNull();
+    expect(subject.capUsd).toBeNull();
+  });
+
   it('carries the agent’s own sentence and the moment it raised it', async () => {
     const { subject, eventAt } = await notificationSubject(
       store({ getTask: async () => task({ status: 'running' }) }),

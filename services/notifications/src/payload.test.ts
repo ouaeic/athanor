@@ -145,8 +145,8 @@ describe('approvalPhrase', () => {
     expect(approvalPhrase('shell', 'external_consequential')).toBe(
       'run a command on your computer'
     );
-    expect(approvalPhrase('http_request', 'external_consequential')).toBe(
-      'send a request to another site'
+    expect(approvalPhrase('connector_action', 'external_consequential')).toBe(
+      'use one of your connected accounts'
     );
     expect(approvalPhrase('secure_input_handoff', 'external_consequential')).toBe(
       'hand control back so you can type something private'
@@ -155,6 +155,11 @@ describe('approvalPhrase', () => {
 
   it('falls back to the side-effect class for a tool it has never met', () => {
     expect(approvalPhrase('some_future_tool', 'external_consequential')).toBe(
+      'do something outside this computer that cannot be undone'
+    );
+    // `http_request` had a case of its own and has never been a tool in this catalogue, so the
+    // phrase was unreachable. It goes down the same road as any other name nothing publishes.
+    expect(approvalPhrase('http_request', 'external_consequential')).toBe(
       'do something outside this computer that cannot be undone'
     );
     expect(approvalPhrase(null, 'workspace_write')).toBe('change something in your workspace');

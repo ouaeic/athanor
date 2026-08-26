@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { totalmem } from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
+import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import helmet from '@fastify/helmet';
 import websocket from '@fastify/websocket';
@@ -16,15 +18,20 @@ import {
   DesktopLaunchRequest,
   WebFetchRequest
 } from '@athanor/contracts';
-import { reservedPreviewPorts, verifyCapabilityToken } from '@athanor/core';
+import {
+  deriveCapabilityNonce,
+  reservedPreviewPorts,
+  verifyCapabilityToken,
+  type CapabilityTokenClaims
+} from '@athanor/core';
 import { prepareAudio } from './audio.js';
 import { authenticateRunnerRequest, requireScope } from './auth.js';
 import { BotWallError, BrowserManager, type BrowserStreamState } from './browser.js';
-import { WorkspaceCheckpoints } from './checkpoints.js';
+import { CheckpointRefusedError, WorkspaceCheckpoints } from './checkpoints.js';
 import type { RunnerConfig } from './config.js';
 import { DesktopManager, type DesktopStreamState } from './desktop.js';
 import { agentSearchPath, execute } from './execution.js';
-import { assertHostStorageWrite, hostStorage } from './host-storage.js';
+import { assertHostStorageWrite, hostStorage, type HostStorage } from './host-storage.js';
 import {
   conversionTargetFor,
   convertImageForModel,
@@ -118,6 +125,26 @@ export const terminalSize = (cols: unknown, rows: unknown, current: TerminalSize
   };
 };
 
+/**
+ * Whether a renewal capability may extend the session a given capability opened.
+ *
+ * Exported because a copy of it in the test proved nothing about this branch. `terminal-renewal.
+ * test.ts` used to restate these four comparisons by hand, so its four cases measured a
+ * reimplementation: drop a clause here and every one of them stayed green.
+ *
+ * It cannot widen anything. Same owner, same workspace, same role, still carrying `terminal` - and
+ * the audience is checked before this is reached, by the verifier. The most a renewal can do is
+ * move out a deadline on a connection that is already this owner's.
+ */
+export const renewalExtendsSession = (
+  renewed: Pick<CapabilityTokenClaims, 'workspaceId' | 'sub' | 'role' | 'scopes'>,
+  opened: Pick<CapabilityTokenClaims, 'workspaceId' | 'sub' | 'role'>
+): boolean =>
+  renewed.workspaceId === opened.workspaceId &&
+  renewed.sub === opened.sub &&
+  renewed.role === opened.role &&
+  renewed.scopes.includes('terminal');
+
 const WorkspaceRelativePath = z.string().min(1).max(1_024);
 
 const FolderRequest = z.object({ path: WorkspaceRelativePath });
@@ -177,21 +204,66 @@ const contentTypeFor = (requestedPath: string): string =>
     '.txt': 'text/plain; charset=utf-8'
   })[path.extname(requestedPath).toLowerCase()] ?? 'application/octet-stream';
 
-export const buildServer = async (config: RunnerConfig) => {
+/**
+ * The two things a desktop viewer says about itself, rather than about the machine.
+ *
+ * They live here rather than in `@athanor/contracts` because nothing but this socket sends them:
+ * they are the client half of a transport negotiation, not part of the tool surface the model or
+ * the control plane sees. `DisplayViewport`'s own shape is `desktop-stream.ts:341`; this is that
+ * shape with the bounds a stranger's message needs.
+ */
+const DesktopHello = z.object({
+  type: z.literal('hello'),
+  /** False on a client with no `VideoDecoder`, which is what the JPEG transport exists for. */
+  canDecodeVideo: z.boolean().default(true)
+});
+
+const DesktopViewport = z.object({
+  cssWidth: z.number().finite().min(1).max(20_000),
+  cssHeight: z.number().finite().min(1).max(20_000),
+  devicePixelRatio: z.number().finite().min(0.5).max(8).default(1),
+  mode: z.enum(['native', 'css']).default('css')
+});
+
+/**
+ * The seams a test needs and production never sets.
+ *
+ * Both exist for the same reason `ExecutionGuards` has one (`execution.ts:181`): the two things
+ * below are the runner's contact with the machine underneath it, and a suite that has to own a
+ * real disk or a real X server to say anything is a suite that reports the state of the build
+ * machine rather than the state of the code.
+ */
+export interface RunnerServerOptions {
+  /** Free-space probe. Injected so the disk floor can be exercised without filling a filesystem. */
+  hostStorage?: ((root: string) => Promise<HostStorage>) | undefined;
+  /** The desktop, so the stream route can be driven without an Xvfb and an ffmpeg on the box. */
+  desktop?: DesktopManager | undefined;
+}
+
+export const buildServer = async (config: RunnerConfig, options: RunnerServerOptions = {}) => {
   const app = Fastify({ logger: false, bodyLimit: config.MAX_FILE_BYTES });
   const sandbox = await resolveAgentSandbox(config.AGENT_SANDBOX_HELPER);
   const privilegedHelpers = [config.SYSTEM_PACKAGE_HELPER, sandbox?.helper];
-  const desktop = new DesktopManager(
-    config.DESKTOP_BRIDGE_EXECUTABLE,
-    config.DESKTOP_SESSION_EXECUTABLE,
-    privilegedHelpers
-  );
+  const probeHostStorage = options.hostStorage ?? hostStorage;
+  const desktop =
+    options.desktop ??
+    new DesktopManager(
+      config.DESKTOP_BRIDGE_EXECUTABLE,
+      config.DESKTOP_SESSION_EXECUTABLE,
+      privilegedHelpers
+    );
   // The browser runs on the workspace's own X server when there is one, so a page sees an
   // ordinary desktop and a person taking over finds the browser on the screen they are watching.
   const browser = new BrowserManager({
     executablePath: config.BROWSER_EXECUTABLE_PATH,
     desktopDisplay: config.BROWSER_USE_DESKTOP_DISPLAY
       ? (workspaceId, root) => desktop.displayEnvironment(workspaceId, root)
+      : undefined,
+    // Same screen, same arbiter. Wired with the display and not separately: a browser drawn on the
+    // workspace's own X server must answer the Computer pane's Take over button, and before this
+    // the two surfaces each kept their own holder and neither knew about the other's.
+    desktopControl: config.BROWSER_USE_DESKTOP_DISPLAY
+      ? (workspaceId, root) => desktop.controlFor(workspaceId, root)
       : undefined,
     maxFileBytes: config.MAX_FILE_BYTES
   });
@@ -205,12 +277,43 @@ export const buildServer = async (config: RunnerConfig) => {
     retainTurns: config.CHECKPOINT_RETAIN_TURNS,
     retainDailyDays: config.CHECKPOINT_RETAIN_DAILY_DAYS,
     maxFiles: config.CHECKPOINT_MAX_FILES,
-    maxFileBytes: config.CHECKPOINT_MAX_FILE_BYTES
+    maxFileBytes: config.CHECKPOINT_MAX_FILE_BYTES,
+    hostStorage: probeHostStorage
   });
   const authenticate = authenticateRunnerRequest(config.RUNNER_SHARED_SECRET);
+  /*
+   * The renewal frames this runner has already spent.
+   *
+   * SECURITY.md says a capability is single-use, and on the HTTP path it is: every verified request
+   * leaves its nonce in `authenticateRunnerRequest`'s ledger. A terminal renewal arrives inside an
+   * already-open socket, so it never goes through that hook - and so one renewal frame, captured
+   * off the wire, could be replayed for its whole lifetime, to that socket and to every other
+   * terminal the same owner had open. This is the ledger for that path.
+   *
+   * Server-wide rather than per-socket on purpose: a per-socket set would still let one captured
+   * frame re-arm every open terminal exactly once each. Keyed through `deriveCapabilityNonce` so
+   * each entry is 43 characters whatever the token said - the nonce is arbitrary text inside a
+   * signed blob, so a ledger bounded only by entry count is not bounded in bytes - and so the
+   * ledger holds a name for the credential rather than the credential's own nonce.
+   */
+  const spentRenewals = new Map<string, number>();
+  const spendRenewal = (nonce: string, exp: number): boolean => {
+    const key = deriveCapabilityNonce(nonce, config.RUNNER_SHARED_SECRET);
+    if (spentRenewals.has(key)) return false;
+    if (spentRenewals.size >= 10_000) {
+      const now = Math.floor(Date.now() / 1000);
+      for (const [spent, expiry] of spentRenewals) if (expiry <= now) spentRenewals.delete(spent);
+      if (spentRenewals.size >= 10_000) return false;
+    }
+    spentRenewals.set(key, exp);
+    return true;
+  };
   const limits = commandLimits(config, totalmem());
   const limiter = await resolveCommandLimiter(config.RESOURCE_LIMIT_EXECUTABLE);
-  const guards = { limits, limiter, sandbox };
+  // The package helper travels with the guards so the background path can refuse a command that
+  // names it. It used to be handed to `execute()` alone, at the exec route, which meant the value
+  // existed here and never reached `processes.start`.
+  const guards = { limits, limiter, sandbox, systemPackageHelper: config.SYSTEM_PACKAGE_HELPER };
   const reservedPorts = reservedPreviewPorts({
     ports: [config.RUNNER_PORT, ...config.RESERVED_PREVIEW_PORTS]
   });
@@ -273,6 +376,17 @@ export const buildServer = async (config: RunnerConfig) => {
     if (error instanceof BotWallError) {
       void reply.status(409).send({
         error: { code: 'browser_bot_wall', message, requestId, botWall: error.wall }
+      });
+      return;
+    }
+    // A checkpoint refusal carries its reason as a code, because the reader is the worker rather
+    // than a person: it decides whether a turn that lost its undo point says so in the
+    // conversation, and it used to decide by pattern-matching this service's prose. The two
+    // statuses are unchanged - a full disk is 507, an oversized tree is a 400 the caller can act
+    // on - so only the name of the failure is new.
+    if (error instanceof CheckpointRefusedError) {
+      void reply.status(error.code === 'checkpoint_host_disk_full' ? 507 : 400).send({
+        error: { code: error.code, message, requestId }
       });
       return;
     }
@@ -469,14 +583,6 @@ export const buildServer = async (config: RunnerConfig) => {
     return { ...created, pruned: deleted };
   });
 
-  app.get<{ Params: { workspaceId: string } }>(
-    '/v1/workspaces/:workspaceId/checkpoints',
-    async (request) => {
-      requireScope(request, 'workspace.manage');
-      return { checkpoints: await checkpoints.list(request.params.workspaceId) };
-    }
-  );
-
   app.get<{ Params: { workspaceId: string; checkpointId: string } }>(
     '/v1/workspaces/:workspaceId/checkpoints/:checkpointId/preview',
     async (request) => {
@@ -509,14 +615,16 @@ export const buildServer = async (config: RunnerConfig) => {
     }
   );
 
-  app.delete<{ Params: { workspaceId: string; checkpointId: string } }>(
-    '/v1/workspaces/:workspaceId/checkpoints/:checkpointId',
-    async (request, reply) => {
-      requireScope(request, 'workspace.manage');
-      await checkpoints.delete(request.params.workspaceId, request.params.checkpointId);
-      return reply.status(204).send();
-    }
-  );
+  /*
+   * There is no `GET /checkpoints` and no `DELETE /checkpoints/:id`, and that is deliberate.
+   *
+   * Both were written, tested here, and never called. The worker reads the checkpoint rows from
+   * the database, which is where the rewind dialog gets its list; the runner's own view of the
+   * same set never left this file. Deletion is not a thing anyone asks for one at a time either:
+   * `create` prunes on the retention policy, and deleting the workspace takes the rest through
+   * `deleteAll`. Two authenticated routes that reached the checkpoint store on behalf of nobody
+   * are two more ways in than this computer needs.
+   */
 
   app.post<{ Params: { workspaceId: string } }>(
     '/v1/workspaces/:workspaceId/exec',
@@ -527,7 +635,7 @@ export const buildServer = async (config: RunnerConfig) => {
       // Every byte a command writes used to bypass the disk guard, which only covered the file
       // upload route. Refusing to start is the cheap half; execute() also watches the floor while
       // the command runs, because a command that fills the disk does it after this check.
-      await assertHostStorageWrite(root);
+      await assertHostStorageWrite(root, 0, probeHostStorage);
       // A worker that abandons the request has been cancelled or has died. Either way nobody will
       // ever read this command's result, so it must not keep running - and keep acting on the box.
       const disconnected = new AbortController();
@@ -552,7 +660,7 @@ export const buildServer = async (config: RunnerConfig) => {
       requireScope(request, 'exec');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await ensureRuntimeWorkspace(root);
-      await assertHostStorageWrite(root);
+      await assertHostStorageWrite(root, 0, probeHostStorage);
       return processes.start(
         root,
         request.params.workspaceId,
@@ -579,6 +687,34 @@ export const buildServer = async (config: RunnerConfig) => {
             ? processes.list(request.params.workspaceId, request.capability.sub)
             : processes.listWorkspace(request.params.workspaceId)
       };
+    }
+  );
+
+  /*
+   * The Stop button reaching the background.
+   *
+   * Cancelling a task aborts the runner request in flight, and `processes/start` has none: it
+   * answered in milliseconds and left its child running for the rest of its hour. Nothing in the
+   * worker, the API or this runner ended those sessions, so a cancelled task went on writing into
+   * the workspace and making requests attributed to this computer while the interface said it had
+   * stopped. Declared services are exempt on purpose - that is what declaring one means - and the
+   * answer names them so the confirmation the owner reads can say which things are still up.
+   *
+   * A static segment outranks `:sessionId` below in the router whichever order they are declared
+   * in, and no session id can collide with it in any case: they are minted as `proc_`/`svc_` plus
+   * a uuid.
+   */
+  app.post<{ Params: { workspaceId: string } }>(
+    '/v1/workspaces/:workspaceId/processes/stop-owner',
+    async (request) => {
+      requireScope(request, 'exec');
+      return processes.stopOwner(
+        request.params.workspaceId,
+        // The same split the list and action routes make: an agent may only ever stop what its own
+        // task started, and the person driving the computer names the task they mean.
+        request.capability.role === 'agent' ? request.capability.sub : null,
+        request.body
+      );
     }
   );
 
@@ -615,7 +751,7 @@ export const buildServer = async (config: RunnerConfig) => {
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await ensureRuntimeWorkspace(root);
       const storageBytes = await storageUsage(root);
-      return { storageBytes, ...(await hostStorage(root)) };
+      return { storageBytes, ...(await probeHostStorage(root)) };
     }
   );
 
@@ -770,7 +906,7 @@ export const buildServer = async (config: RunnerConfig) => {
     const body = Buffer.isBuffer(request.body)
       ? request.body
       : Buffer.from(typeof request.body === 'string' ? request.body : JSON.stringify(request.body));
-    await assertHostStorageWrite(root, body.length);
+    await assertHostStorageWrite(root, body.length, probeHostStorage);
     // The caller's claim about what it is replacing, checked under the write's own descriptor.
     const expected = (request.query.expectSha256 ?? '').trim();
     return writeWorkspaceFile(
@@ -956,13 +1092,40 @@ export const buildServer = async (config: RunnerConfig) => {
     }
     reply.status(response.status);
     const cookies: string[] = [];
+    /*
+     * `fetch` hands back a *decoded* body while leaving the upstream's own `content-encoding` in
+     * the headers - measured, not assumed: an upstream answering `content-encoding: gzip` with 53
+     * bytes yields a 6 000-byte body here and a header still saying gzip. Forwarding that pair
+     * tells the browser to inflate plaintext, which is `ERR_CONTENT_DECODING_FAILED` on every
+     * preview of a dev server that compresses. The header is dropped here rather than in
+     * `previewResponseHeaders` because the decoding is done by this file, so the header that
+     * describes it is this file's to withdraw.
+     */
+    const encoding = response.headers.get('content-encoding');
     for (const [name, value] of previewResponseHeaders(response.headers)) {
       if (name.toLowerCase() === 'set-cookie') cookies.push(value);
-      else reply.header(name, value);
+      else if (name.toLowerCase() !== 'content-encoding') reply.header(name, value);
     }
     if (cookies.length) reply.header('set-cookie', cookies);
     if (request.method === 'HEAD' || !response.body) return reply.send();
-    return reply.send(Buffer.from(await response.arrayBuffer()));
+    /*
+     * Streamed, not buffered. `Buffer.from(await response.arrayBuffer())` held the entire response
+     * in the runner's heap before a byte of it moved: a preview of a dev server serving a 400 MB
+     * video, or an artifact download, was a 400 MB allocation in the process that also runs every
+     * agent's tools, and the owner saw nothing until the last byte had arrived.
+     *
+     * `content-length` is only forwarded when there was nothing to decode, because that is the one
+     * case where the upstream's count still describes the bytes leaving here; `previewResponseHeaders`
+     * strips it unconditionally, which is right for the request direction and too blunt for this one.
+     */
+    if (!encoding) {
+      const length = response.headers.get('content-length');
+      if (length) reply.header('content-length', length);
+    }
+    // `fetch`'s body is typed as the DOM `ReadableStream`; `Readable.fromWeb` wants the
+    // `node:stream/web` one. They are the same object at run time - Node's fetch returns exactly
+    // this - and the two declarations differ only in whether they carry the async iterator.
+    return reply.send(Readable.fromWeb(response.body as NodeReadableStream<Uint8Array>));
   };
   const proxyPreviewSocket = (socket: WebSocket, request: FastifyRequest) => {
     const params = request.params as { workspaceId: string; port: string; '*': string };
@@ -1046,7 +1209,7 @@ export const buildServer = async (config: RunnerConfig) => {
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await ensureRuntimeWorkspace(root);
       const input = PrintPdfRequest.parse(request.body);
-      await assertHostStorageWrite(root);
+      await assertHostStorageWrite(root, 0, probeHostStorage);
       return browser.printPdf(
         request.params.workspaceId,
         root,
@@ -1289,16 +1452,36 @@ export const buildServer = async (config: RunnerConfig) => {
     };
     const expiresIn = Math.max(1, request.capability.exp * 1000 - Date.now());
     const expiry = setTimeout(() => socket.close(1008, 'Capability expired'), expiresIn);
+    /*
+     * What this client can take, which it says in its `hello`. Until it does, it is assumed to
+     * have a `VideoDecoder`, because every shipped pane does and the alternative - opening every
+     * session in JPEG and upgrading - spends bandwidth on a case that is rare.
+     */
+    let canDecodeVideo = true;
     void ensureRuntimeWorkspace(root)
       .then(() =>
         desktop.subscribeStream(workspaceId, root, {
           state: sendState,
           frame: (frame, state) => {
-            if (socket.readyState !== socket.OPEN || socket.bufferedAmount >= 2 * 1024 * 1024)
-              return;
+            if (socket.readyState !== socket.OPEN) return;
             sendState(state);
             socket.send(frame, { binary: true });
-          }
+          },
+          /*
+           * The congestion signal, which this route used to keep to itself.
+           *
+           * It had its own rule instead - drop the frame above 2 MiB buffered and tell nobody -
+           * and because the runner never saw `bufferedBytes`, `session.congested`, the bounded
+           * queue's `starved` flag, the high/low watermark hysteresis and `requestKeyframe()`
+           * were all unreachable. The encoder runs an infinite GOP on purpose, so keyframes come
+           * only on demand; a dropped delta stranded the client's decoder and no keyframe ever
+           * followed. The owner watched a still photograph of the agent's screen, with a healthy
+           * socket, no error and no spinner, until they reloaded. Handing the depth over makes
+           * the queue and the keyframe request the mechanism, which is what they were written to
+           * be - and having two mechanisms is how the drop stayed invisible for so long.
+           */
+          bufferedBytes: () => socket.bufferedAmount,
+          canDecodeVideo: () => canDecodeVideo
         })
       )
       .then((stop) => {
@@ -1313,6 +1496,8 @@ export const buildServer = async (config: RunnerConfig) => {
           requestId?: string;
           holder?: 'agent' | 'user' | 'secure_input';
           action?: unknown;
+          canDecodeVideo?: unknown;
+          viewport?: unknown;
         } = {};
         try {
           const serialized = Array.isArray(raw)
@@ -1327,6 +1512,18 @@ export const buildServer = async (config: RunnerConfig) => {
           } else if (message.type === 'action') {
             requireScope(request, 'desktop.control');
             await desktop.act(workspaceId, root, DesktopAction.parse(message.action), 'user');
+          } else if (message.type === 'hello') {
+            // Reading the stream is all this says anything about, so `desktop.read` is the whole
+            // gate: a viewer declaring what it can decode is not asking to touch the machine.
+            canDecodeVideo = DesktopHello.parse(message).canDecodeVideo;
+            await desktop.refreshStream(workspaceId, root);
+          } else if (message.type === 'viewport') {
+            // The display has been stuck at ATHANOR_BOOT_RES since it was written: `resize` had
+            // exactly one caller, `subscribeStream`'s optional viewport, which no route ever set.
+            // A pane that is not 1280x800 was therefore either letterboxed or scaled, and a human
+            // being asked to click accurately on a scaled image is the one case the geometry code
+            // says out loud it will not accept.
+            await desktop.resize(workspaceId, root, DesktopViewport.parse(message.viewport));
           } else throw new Error('Unsupported desktop control message');
           if (socket.readyState === socket.OPEN)
             socket.send(JSON.stringify({ type: 'control_ack', requestId: message.requestId }));
@@ -1449,23 +1646,23 @@ export const buildServer = async (config: RunnerConfig) => {
          * A fresh capability for the socket that is already open.
          *
          * Checked against what opened it rather than merely being well-signed: same owner, same
-         * workspace, same role, same scope, same audience. A renewal cannot widen anything - the
-         * most a replayed one can do is re-arm a deadline on a connection that is already this
-         * owner's - and a bad one is ignored, so the session simply closes on the deadline it
-         * already had.
+         * workspace, same role, same scope, same audience - `renewalExtendsSession`, which the
+         * renewal test now imports instead of restating. A renewal cannot widen anything, and a bad
+         * one is ignored, so the session simply closes on the deadline it already had.
+         *
+         * And spent once. Everything above says what a renewal may be; without the ledger nothing
+         * said how many times it may be one, so a single captured frame re-armed this shell - and
+         * every other terminal this owner had open - for as long as it lived.
          */
         try {
           const renewed = verifyCapabilityToken(message.token, config.RUNNER_SHARED_SECRET, {
             method: request.method,
             path: request.url
           });
-          if (
-            renewed.workspaceId !== opened.workspaceId ||
-            renewed.sub !== opened.sub ||
-            renewed.role !== opened.role ||
-            !renewed.scopes.includes('terminal')
-          )
+          if (!renewalExtendsSession(renewed, opened))
             throw new Error('Renewal does not match the session it would extend');
+          if (!spendRenewal(renewed.nonce, renewed.exp))
+            throw new Error('Renewal capability has already been spent');
           armExpiry(renewed.exp);
           socket.send(JSON.stringify({ type: 'renewed', exp: renewed.exp }));
         } catch {

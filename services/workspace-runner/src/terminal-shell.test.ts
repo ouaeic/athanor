@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
-import { signCapabilityToken } from '@athanor/core';
+import { capabilityAudience, signCapabilityToken } from '@athanor/core';
 import type { RunnerConfig } from './config.js';
 import { buildServer, terminalSize, TERMINAL_DEFAULT_SIZE } from './server.js';
 
@@ -76,7 +76,14 @@ describe('a terminal session and the capability behind it', () => {
     const id = '00000000-0000-4000-8000-000000000042';
     const mint = (ttlSeconds: number, nonce: string): string =>
       signCapabilityToken(
-        { sub: 'user', workspaceId: id, role: 'user', scopes: ['terminal'], nonce },
+        {
+          sub: 'user',
+          workspaceId: id,
+          role: 'user',
+          scopes: ['terminal'],
+          aud: capabilityAudience('GET', `/v1/workspaces/${id}/terminal`),
+          nonce
+        },
         secret,
         ttlSeconds
       );
@@ -134,6 +141,60 @@ describe('a terminal session and the capability behind it', () => {
     await waitFor(() => output.includes('still-here'));
   }, 40_000);
 
+  /**
+   * Single-use, which is what SECURITY.md has always said a capability is and what this frame was
+   * not. A renewal arrives inside an open socket, so it never passes the HTTP hook that spends a
+   * nonce - one captured frame therefore re-armed this shell, and every other terminal the same
+   * owner had open, for as long as it lived.
+   */
+  it('spends a renewal frame once, so a captured one cannot re-arm the shell again', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'athanor-terminal-replay-'));
+    disposers.push(() => rm(workspaceRoot, { recursive: true, force: true }));
+    const secret = 'runner-terminal-replay-secret-at-least-32-chars-ok';
+    const app = await buildServer(runnerConfig(workspaceRoot, secret));
+    disposers.push(() => app.close());
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const id = '00000000-0000-4000-8000-000000000044';
+    const mint = (ttlSeconds: number, nonce: string): string =>
+      signCapabilityToken(
+        {
+          sub: 'user',
+          workspaceId: id,
+          role: 'user',
+          scopes: ['terminal'],
+          aud: capabilityAudience('GET', `/v1/workspaces/${id}/terminal`),
+          nonce
+        },
+        secret,
+        ttlSeconds
+      );
+    const socket = new WebSocket(
+      `${address.replace('http://', 'ws://')}/v1/workspaces/${id}/terminal`,
+      ['athanor-capability', mint(60, 'replay-open')]
+    );
+    let renewals = 0;
+    socket.on('message', (raw: Buffer) => {
+      if ((JSON.parse(raw.toString('utf8')) as { type: string }).type === 'renewed') renewals += 1;
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.once('open', resolve);
+      socket.once('error', reject);
+    });
+    disposers.push(async () => socket.close());
+
+    const captured = mint(900, 'replay-renew');
+    socket.send(JSON.stringify({ type: 'renew', token: captured }));
+    await expect.poll(() => renewals, { interval: 20, timeout: 8_000 }).toBe(1);
+    // The same frame again. A bad renewal is ignored rather than answered, so the count is what
+    // says it was refused - and the session keeps the deadline the first one bought.
+    socket.send(JSON.stringify({ type: 'renew', token: captured }));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(renewals).toBe(1);
+    // A different frame still works, so what was refused was the replay and not renewal itself.
+    socket.send(JSON.stringify({ type: 'renew', token: mint(900, 'replay-renew-2') }));
+    await expect.poll(() => renewals, { interval: 20, timeout: 8_000 }).toBe(2);
+  }, 30_000);
+
   it('does not renew on a token minted for a different owner', async () => {
     const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'athanor-terminal-other-'));
     disposers.push(() => rm(workspaceRoot, { recursive: true, force: true }));
@@ -147,7 +208,14 @@ describe('a terminal session and the capability behind it', () => {
       [
         'athanor-capability',
         signCapabilityToken(
-          { sub: 'user', workspaceId: id, role: 'user', scopes: ['terminal'], nonce: 'other-open' },
+          {
+            sub: 'user',
+            workspaceId: id,
+            role: 'user',
+            scopes: ['terminal'],
+            aud: capabilityAudience('GET', `/v1/workspaces/${id}/terminal`),
+            nonce: 'other-open'
+          },
           secret,
           3
         )
@@ -166,6 +234,7 @@ describe('a terminal session and the capability behind it', () => {
                 workspaceId: id,
                 role: 'user',
                 scopes: ['terminal'],
+                aud: capabilityAudience('GET', `/v1/workspaces/${id}/terminal`),
                 nonce: 'other-renew'
               },
               secret,

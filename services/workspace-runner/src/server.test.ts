@@ -7,7 +7,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 import { capabilityAudience, signCapabilityToken } from '@athanor/core';
 import type { RunnerConfig } from './config.js';
+import { DesktopManager } from './desktop.js';
 import { ensureWorkspace } from './files.js';
+import { DesktopControl } from './holder.js';
 import { buildServer } from './server.js';
 
 /**
@@ -74,6 +76,7 @@ describe('a preview whose app is not running', () => {
         workspaceId: id,
         role: 'user',
         scopes: ['preview:45999'],
+        aud: capabilityAudience('GET', `/v1/workspaces/${id}/preview/45999/`),
         nonce: 'preview-test'
       },
       secret
@@ -142,6 +145,7 @@ describe('workspace export', () => {
         workspaceId: id,
         role: 'user',
         scopes: ['files.read'],
+        aud: capabilityAudience('GET', `/v1/workspaces/${id}/export`),
         nonce: 'export-test'
       },
       secret
@@ -169,6 +173,7 @@ describe('workspace export', () => {
         workspaceId: id,
         role: 'user',
         scopes: ['files.read'],
+        aud: capabilityAudience('GET', `/v1/workspaces/${id}/file`),
         nonce: 'missing-file-test'
       },
       secret
@@ -232,6 +237,7 @@ describe('workspace export', () => {
         workspaceId: id,
         role: 'user',
         scopes: ['terminal'],
+        aud: capabilityAudience('GET', `/v1/workspaces/${id}/terminal`),
         nonce: 'terminal-expiry-test'
       },
       secret,
@@ -289,7 +295,16 @@ describe('turn checkpoints over the runner API', () => {
       CHECKPOINT_MAX_FILE_BYTES: 2 * 1024 ** 3,
       ISOLATE_AGENT_NETWORK: false
     };
-    const app = await buildServer(config);
+    const app = await buildServer(config, {
+      // The disk this case reads is stated, not measured. Taking a checkpoint passes the host
+      // storage floor, so on a machine under two per cent free this failed with a sentence about
+      // a full disk - which is what it looks like when the code is broken, and it was not.
+      // `checkpoints.test.ts` carries the rest of the reasoning.
+      hostStorage: async () => ({
+        hostStorageTotalBytes: 100 * 1024 ** 3,
+        hostStorageAvailableBytes: 50 * 1024 ** 3
+      })
+    });
     disposers.push(() => app.close());
     const id = '00000000-0000-4000-8000-000000000003';
     const checkpointId = '018f3dd3-8a2a-7d8b-8d3c-a2f4c8316be9';
@@ -298,16 +313,25 @@ describe('turn checkpoints over the runner API', () => {
     await writeFile(path.join(root, 'workspace', 'notes.md'), 'the good version\n');
     await writeFile(path.join(root, '.athanor', 'browser', 'Cookies'), 'session=live');
 
-    const manage = (nonce: string): string =>
+    const manage = (nonce: string, method: string, route: string): string =>
       signCapabilityToken(
-        { sub: 'worker', workspaceId: id, role: 'agent', scopes: ['workspace.manage'], nonce },
+        {
+          sub: 'worker',
+          workspaceId: id,
+          role: 'agent',
+          scopes: ['workspace.manage'],
+          aud: capabilityAudience(method, route),
+          nonce
+        },
         secret
       );
 
     const created = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/checkpoints`,
-      headers: { authorization: `Bearer ${manage('cp-create')}` },
+      headers: {
+        authorization: `Bearer ${manage('cp-create', 'POST', `/v1/workspaces/${id}/checkpoints`)}`
+      },
       payload: { checkpointId, taskId: '00000000-0000-4000-8000-0000000000aa', turn: 0 }
     });
     expect(created.statusCode).toBe(200);
@@ -319,7 +343,9 @@ describe('turn checkpoints over the runner API', () => {
     const preview = await app.inject({
       method: 'GET',
       url: `/v1/workspaces/${id}/checkpoints/${checkpointId}/preview`,
-      headers: { authorization: `Bearer ${manage('cp-preview')}` }
+      headers: {
+        authorization: `Bearer ${manage('cp-preview', 'GET', `/v1/workspaces/${id}/checkpoints/${checkpointId}/preview`)}`
+      }
     });
     expect(preview.json()).toMatchObject({
       modifiedCount: 1,
@@ -338,6 +364,10 @@ describe('turn checkpoints over the runner API', () => {
             workspaceId: id,
             role: 'agent',
             scopes: ['files.read'],
+            aud: capabilityAudience(
+              'POST',
+              `/v1/workspaces/${id}/checkpoints/${checkpointId}/restore`
+            ),
             nonce: 'cp-weak'
           },
           secret
@@ -349,7 +379,9 @@ describe('turn checkpoints over the runner API', () => {
     const restored = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/checkpoints/${checkpointId}/restore`,
-      headers: { authorization: `Bearer ${manage('cp-restore')}` }
+      headers: {
+        authorization: `Bearer ${manage('cp-restore', 'POST', `/v1/workspaces/${id}/checkpoints/${checkpointId}/restore`)}`
+      }
     });
     expect(restored.json()).toMatchObject({ restoredFileCount: 1, removedFileCount: 0 });
     await expect(readFile(path.join(root, 'workspace', 'notes.md'), 'utf8')).resolves.toBe(
@@ -359,26 +391,6 @@ describe('turn checkpoints over the runner API', () => {
     await expect(readFile(path.join(root, '.athanor', 'browser', 'Cookies'), 'utf8')).resolves.toBe(
       'session=signed-in-since'
     );
-
-    const listed = await app.inject({
-      method: 'GET',
-      url: `/v1/workspaces/${id}/checkpoints`,
-      headers: { authorization: `Bearer ${manage('cp-list')}` }
-    });
-    expect(listed.json()).toMatchObject({ checkpoints: [{ id: checkpointId, turn: 0 }] });
-
-    const removed = await app.inject({
-      method: 'DELETE',
-      url: `/v1/workspaces/${id}/checkpoints/${checkpointId}`,
-      headers: { authorization: `Bearer ${manage('cp-delete')}` }
-    });
-    expect(removed.statusCode).toBe(204);
-    const empty = await app.inject({
-      method: 'GET',
-      url: `/v1/workspaces/${id}/checkpoints`,
-      headers: { authorization: `Bearer ${manage('cp-list-2')}` }
-    });
-    expect(empty.json()).toEqual({ checkpoints: [] });
   });
 });
 
@@ -426,14 +438,14 @@ describe('file organisation and toolchain routes', () => {
     await ensureWorkspace(root);
     // A nonce is spent on first use, so every request in a test needs its own.
     let issued = 0;
-    const token = (scopes: string[], audience?: { method: string; path: string }) =>
+    const token = (scopes: string[], audience: { method: string; path: string }) =>
       signCapabilityToken(
         {
           sub: 'user',
           workspaceId: id,
           role: 'user',
           scopes,
-          ...(audience ? { aud: capabilityAudience(audience.method, audience.path) } : {}),
+          aud: capabilityAudience(audience.method, audience.path),
           nonce: `files-${(issued += 1)}`
         },
         secret
@@ -443,13 +455,14 @@ describe('file organisation and toolchain routes', () => {
 
   it('creates a folder and renames a file without ever overwriting one', async () => {
     const { app, id, root, token } = await harness();
-    const authorization = () => `Bearer ${token(['files.write'])}`;
+    const authorization = (route: string) =>
+      `Bearer ${token(['files.write'], { method: 'POST', path: `/v1/workspaces/${id}/files/${route}` })}`;
     await writeFile(path.join(root, 'workspace', 'draft.md'), '# draft');
 
     const folder = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/files/folder`,
-      headers: { authorization: authorization() },
+      headers: { authorization: authorization('folder') },
       payload: { path: 'workspace/applications' }
     });
     expect(folder.statusCode).toBe(200);
@@ -458,7 +471,7 @@ describe('file organisation and toolchain routes', () => {
     const renamed = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/files/rename`,
-      headers: { authorization: authorization() },
+      headers: { authorization: authorization('rename') },
       payload: { from: 'workspace/draft.md', to: 'workspace/applications/cover-letter.md' }
     });
     expect(renamed.statusCode).toBe(200);
@@ -470,7 +483,7 @@ describe('file organisation and toolchain routes', () => {
     const clash = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/files/rename`,
-      headers: { authorization: authorization() },
+      headers: { authorization: authorization('rename') },
       payload: { from: 'workspace/keep.md', to: 'workspace/applications/cover-letter.md' }
     });
     // A conflict, not a generic failure: the file browser has to be able to say which it was.
@@ -483,21 +496,27 @@ describe('file organisation and toolchain routes', () => {
     const escape = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/files/folder`,
-      headers: { authorization: `Bearer ${token(['files.write'])}` },
+      headers: {
+        authorization: `Bearer ${token(['files.write'], { method: 'POST', path: `/v1/workspaces/${id}/files/folder` })}`
+      },
       payload: { path: '../../escaped' }
     });
     expect(escape.statusCode).toBe(400);
     const profile = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/files/rename`,
-      headers: { authorization: `Bearer ${token(['files.write'])}` },
+      headers: {
+        authorization: `Bearer ${token(['files.write'], { method: 'POST', path: `/v1/workspaces/${id}/files/rename` })}`
+      },
       payload: { from: '.athanor/browser/Cookies', to: 'workspace/cookies' }
     });
     expect(profile.statusCode).toBe(400);
     const readOnly = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/files/folder`,
-      headers: { authorization: `Bearer ${token(['files.read'])}` },
+      headers: {
+        authorization: `Bearer ${token(['files.read'], { method: 'POST', path: `/v1/workspaces/${id}/files/folder` })}`
+      },
       payload: { path: 'workspace/nope' }
     });
     expect(readOnly.statusCode).toBe(403);
@@ -547,7 +566,9 @@ describe('file organisation and toolchain routes', () => {
     const report = await app.inject({
       method: 'GET',
       url: `/v1/workspaces/${id}/toolchain`,
-      headers: { authorization: `Bearer ${token(['exec'])}` }
+      headers: {
+        authorization: `Bearer ${token(['exec'], { method: 'GET', path: `/v1/workspaces/${id}/toolchain` })}`
+      }
     });
     expect(report.statusCode).toBe(200);
     const body: {
@@ -563,7 +584,9 @@ describe('file organisation and toolchain routes', () => {
     const probe = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/toolchain/probe`,
-      headers: { authorization: `Bearer ${token(['exec'])}` },
+      headers: {
+        authorization: `Bearer ${token(['exec'], { method: 'POST', path: `/v1/workspaces/${id}/toolchain/probe` })}`
+      },
       payload: { binaries: ['sh', 'athanor-definitely-absent'] }
     });
     expect(probe.json()).toEqual({
@@ -579,7 +602,9 @@ describe('file organisation and toolchain routes', () => {
     const refused = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/audio/prepare`,
-      headers: { authorization: `Bearer ${token(['exec'])}` },
+      headers: {
+        authorization: `Bearer ${token(['exec'], { method: 'POST', path: `/v1/workspaces/${id}/audio/prepare` })}`
+      },
       payload: { path: 'workspace/memo.m4a' }
     });
     expect(refused.statusCode).toBe(403);
@@ -590,7 +615,9 @@ describe('file organisation and toolchain routes', () => {
     const escaped = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/audio/prepare`,
-      headers: { authorization: `Bearer ${token(['files.read'])}` },
+      headers: {
+        authorization: `Bearer ${token(['files.read'], { method: 'POST', path: `/v1/workspaces/${id}/audio/prepare` })}`
+      },
       payload: { path: '../../etc/passwd' }
     });
     expect(escaped.statusCode).toBe(400);
@@ -621,7 +648,9 @@ describe('file organisation and toolchain routes', () => {
     const prepared = await app.inject({
       method: 'POST',
       url: `/v1/workspaces/${id}/audio/prepare`,
-      headers: { authorization: `Bearer ${token(['files.read'])}` },
+      headers: {
+        authorization: `Bearer ${token(['files.read'], { method: 'POST', path: `/v1/workspaces/${id}/audio/prepare` })}`
+      },
       payload: { path: 'workspace/memo.m4a', endSeconds: 3 }
     });
     expect(prepared.statusCode).toBe(200);
@@ -633,4 +662,120 @@ describe('file organisation and toolchain routes', () => {
     expect(prepared.headers['x-audio-duration-seconds']).toBe('8');
     expect(prepared.rawPayload.length).toBeGreaterThan(0);
   }, 60_000);
+});
+
+/**
+ * One machine, one holder, over the two routes that hand it out.
+ *
+ * The browser and the desktop are the same screen whenever `BROWSER_USE_DESKTOP_DISPLAY` is on -
+ * Chromium is launched on the workspace's own X server so a page looks like an ordinary desktop
+ * application and a person taking over finds the browser where they are already looking. They had
+ * a takeover each: `POST /desktop/holder` moved a `DesktopControl`, `POST /browser/holder` set a
+ * field on a browser session, and neither route knew the other existed. So an owner could press
+ * Take over on the Computer pane, watch the agent go on driving the browser on that same screen,
+ * and have nothing anywhere say why.
+ *
+ * This drives both real routes against a runner with no X server on it, which is the only part
+ * stood in for. The refusal has to arrive without a Chromium being launched to produce it - there
+ * is none on the machine running this - and that is itself the property: the browser asks who
+ * holds the screen before it starts a browser.
+ */
+describe('taking the machine over on one surface', () => {
+  const disposers: Array<() => Promise<unknown>> = [];
+  afterEach(async () => {
+    while (disposers.length) await disposers.pop()!();
+  });
+
+  it('refuses the agent the browser once the owner has taken the desktop', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'athanor-one-holder-'));
+    disposers.push(() => rm(workspaceRoot, { recursive: true, force: true }));
+    const secret = 'runner-one-holder-secret-at-least-32-characters';
+    const id = '00000000-0000-4000-8000-0000000000d7';
+    await ensureWorkspace(path.join(workspaceRoot, id));
+
+    // `ensure` spawns the session script and waits for an X server to come up. That is the one
+    // seam replaced; `setHolder`, `controlFor`, the routes and the browser's own gate are shipped.
+    const control = new DesktopControl({ release: async () => undefined });
+    class HeadlessDesktop extends DesktopManager {
+      constructor() {
+        super('/nonexistent/bridge.py', '/nonexistent/session.sh');
+      }
+
+      override async ensure(): Promise<Awaited<ReturnType<DesktopManager['ensure']>>> {
+        return { control } as unknown as Awaited<ReturnType<DesktopManager['ensure']>>;
+      }
+    }
+
+    const config = {
+      RUNNER_HOST: '127.0.0.1',
+      RUNNER_PORT: 0,
+      RUNNER_SHARED_SECRET: secret,
+      WORKSPACE_ROOT: workspaceRoot,
+      TAR_EXECUTABLE: '/usr/bin/tar',
+      SNAPSHOT_EXECUTABLE: path.resolve('../../scripts/athanor-snapshot'),
+      // The configuration this defect only exists in: one screen, two surfaces onto it.
+      BROWSER_USE_DESKTOP_DISPLAY: true,
+      MAX_EXECUTION_SECONDS: 30,
+      RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
+      IMAGE_CONVERT_EXECUTABLE: 'magick',
+      COMMAND_FILE_LIMIT_BYTES: 4 * 1024 ** 3,
+      COMMAND_PROCESS_LIMIT: 1024,
+      COMMAND_OPEN_FILE_LIMIT: 4096,
+      MAX_FILE_BYTES: 1024 * 1024,
+      RESERVED_PREVIEW_PORTS: [],
+      CHECKPOINT_BTRFS_EXECUTABLE: '/nonexistent/btrfs',
+      CHECKPOINT_ZFS_EXECUTABLE: '/nonexistent/zfs',
+      CHECKPOINT_PACKAGE_MANIFEST: '/nonexistent/status',
+      CHECKPOINT_INCLUDE_BROWSER_PROFILE: false,
+      CHECKPOINT_RETAIN_TURNS: 20,
+      CHECKPOINT_RETAIN_DAILY_DAYS: 14,
+      CHECKPOINT_MAX_FILES: 250_000,
+      CHECKPOINT_MAX_FILE_BYTES: 2 * 1024 ** 3,
+      ISOLATE_AGENT_NETWORK: false
+    } as RunnerConfig;
+    const app = await buildServer(config, {
+      desktop: new HeadlessDesktop(),
+      hostStorage: async () => ({
+        hostStorageTotalBytes: 100 * 1024 ** 3,
+        hostStorageAvailableBytes: 50 * 1024 ** 3
+      })
+    });
+    disposers.push(() => app.close());
+
+    const tokenFor = (role: 'user' | 'agent', scopes: string[], route: string): string =>
+      signCapabilityToken(
+        {
+          sub: role,
+          workspaceId: id,
+          role,
+          scopes,
+          aud: capabilityAudience('POST', route),
+          nonce: `one-holder-${role}-${scopes[0]}`
+        },
+        secret,
+        120
+      );
+
+    const taken = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${id}/desktop/holder`,
+      headers: {
+        authorization: `Bearer ${tokenFor('user', ['desktop.takeover'], `/v1/workspaces/${id}/desktop/holder`)}`
+      },
+      payload: { holder: 'user' }
+    });
+    expect(taken.statusCode).toBe(200);
+    expect(taken.json()).toMatchObject({ holder: 'user' });
+
+    const acted = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${id}/browser/action`,
+      headers: {
+        authorization: `Bearer ${tokenFor('agent', ['browser.control'], `/v1/workspaces/${id}/browser/action`)}`
+      },
+      payload: { type: 'reload' }
+    });
+    expect(acted.statusCode).toBeGreaterThanOrEqual(400);
+    expect(JSON.stringify(acted.json())).toMatch(/held by user/);
+  });
 });

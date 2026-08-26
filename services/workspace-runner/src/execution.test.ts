@@ -67,6 +67,67 @@ describe('bounded execution output', () => {
     expect(result.stdout).toBe('install inkscape');
   });
 
+  /*
+   * This computer runs on four distribution families and the reader of a package command knew one
+   * of them. `dnf install -y nmap` yielded `install` and was rewritten onto a helper that ran
+   * apt-get, so the owner approved a dnf install and got ENOENT; `pacman -S nmap` yielded `nmap`
+   * as its operation and was refused one step earlier with a sentence about apt. Two families,
+   * two different wrong answers, both after the owner had said yes.
+   */
+  it("reads each family's own spelling of update and install, not only apt's", async () => {
+    const root = await workspaceRoot();
+    const helper = path.join(root, 'package-helper');
+    await writeFile(helper, '#!/bin/sh\nprintf "%s" "$*"\n');
+    await chmod(helper, 0o700);
+    const asked = async (executable: string, args: string[]): Promise<string> =>
+      (
+        await execute(
+          root,
+          { executable, args, network: true },
+          { maximumSeconds: 30, allowSystemPackages: true, systemPackageHelper: helper }
+        )
+      ).stdout;
+
+    expect(await asked('dnf', ['install', '-y', 'nmap'])).toBe('install nmap');
+    expect(await asked('dnf5', ['install', 'nmap', 'jq'])).toBe('install nmap jq');
+    expect(await asked('zypper', ['--non-interactive', 'install', 'nmap'])).toBe('install nmap');
+    expect(await asked('apk', ['add', 'nmap'])).toBe('install nmap');
+    expect(await asked('pacman', ['-S', '--noconfirm', 'nmap'])).toBe('install nmap');
+    expect(await asked('pacman', ['-Sy'])).toBe('update');
+    expect(await asked('dnf', ['makecache'])).toBe('update');
+    expect(await asked('apt-get', ['update'])).toBe('update');
+  });
+
+  /*
+   * The helper does two things. An operation that is not one of them is refused rather than being
+   * quietly rounded down to the nearest one that is: `dnf upgrade` and `pacman -Syu` rewrite every
+   * package on the machine, and answering them with an index refresh would report success for
+   * something the owner asked for and did not get.
+   */
+  it('refuses a package operation the approved helper cannot perform, and says so once', async () => {
+    const root = await workspaceRoot();
+    const refusals = [
+      { executable: 'dnf', args: ['upgrade', '-y'] },
+      { executable: 'pacman', args: ['-Syu', '--noconfirm'] },
+      { executable: 'apt-get', args: ['upgrade'] },
+      { executable: 'emerge', args: ['nmap'] },
+      { executable: 'rpm', args: ['-i', 'nmap.rpm'] },
+      // An install with nothing to install: the helper would refuse it a layer further down, as
+      // root, which is the wrong place to discover that an argument list was empty.
+      { executable: 'dnf', args: ['install', '-y'] },
+      // An index refresh does not take operands; one here means the model meant something else.
+      { executable: 'apt-get', args: ['update', 'nmap'] }
+    ];
+    for (const attempt of refusals)
+      await expect(
+        execute(root, attempt, {
+          maximumSeconds: 30,
+          allowSystemPackages: true,
+          systemPackageHelper: '/usr/local/sbin/athanor-system-packages'
+        })
+      ).rejects.toThrow('Host-native package management supports approved update and install only');
+  });
+
   it('rejects escalation spelled with a path or hidden behind a wrapper', async () => {
     const root = await workspaceRoot();
     const attempts = [
@@ -99,7 +160,7 @@ describe('bounded execution output', () => {
           systemPackageHelper: '/usr/local/sbin/athanor-system-packages'
         }
       )
-    ).rejects.toThrow('Host-native package management supports approved apt update and install');
+    ).rejects.toThrow('Host-native package management supports approved update and install only');
   });
 
   it('captures output a grandchild writes after the direct child exits', async () => {
@@ -409,6 +470,44 @@ describe('cancellation', () => {
     expect(result.timedOut).toBe(false);
   });
 
+  /*
+   * The assertion above only proves the wrapper stopped. What a cancelled turn has to leave behind
+   * is nothing at all, and a shell's background job is the ordinary case - `npm run dev &`, a
+   * scraper, a `tail -f`. Commands are spawned detached so that the whole group can be signalled;
+   * this is the test that says the group, and not only the leader, actually goes.
+   */
+  it('takes the whole process group with it, not only the command it started', async () => {
+    const root = await workspaceRoot();
+    const controller = new AbortController();
+    const running = execute(
+      root,
+      {
+        executable: '/bin/sh',
+        args: ['-c', 'sleep 30 & echo $!; sleep 30'],
+        timeoutSeconds: 60
+      },
+      { maximumSeconds: 120, abortSignal: controller.signal }
+    );
+    setTimeout(() => controller.abort(), 400);
+    const result = await running;
+    expect(result.timedOut).toBe(false);
+    const grandchild = Number(result.stdout.trim());
+    expect(Number.isInteger(grandchild)).toBe(true);
+    await expect
+      .poll(
+        () => {
+          try {
+            process.kill(grandchild, 0);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        { interval: 25, timeout: 5_000 }
+      )
+      .toBe(false);
+  });
+
   it('does not start a command that was already cancelled before it ran', async () => {
     const root = await workspaceRoot();
     const result = await execute(
@@ -421,5 +520,23 @@ describe('cancellation', () => {
       { maximumSeconds: 120, abortSignal: AbortSignal.abort() }
     );
     expect(result.exitCode === null || result.exitCode !== 0).toBe(true);
+  });
+});
+
+describe('a service declared without a background', () => {
+  /*
+   * `shell(service: 'dev server')` without `background: true` used to run in the foreground for
+   * five minutes and return an ordinary exec result. The key was not in the schema, so it was
+   * stripped: no error, no service, no record, and a model that believed it had declared one.
+   */
+  it('is refused rather than run as an ordinary command', async () => {
+    const root = await workspaceRoot();
+    await expect(
+      execute(
+        root,
+        { executable: process.execPath, args: ['-e', ''], service: 'dev server' },
+        { maximumSeconds: 30 }
+      )
+    ).rejects.toThrow(/background/);
   });
 });
