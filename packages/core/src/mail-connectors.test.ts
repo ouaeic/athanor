@@ -10,9 +10,11 @@ import {
   type ConnectorSecret,
   type ConnectorTransport
 } from './connectors.js';
+import { findFirst, parseXml } from './caldav.js';
+import { AthanorError } from './errors.js';
 import { parseImapEndpoint } from './mail-connectors.js';
-import type { MailSocketFactory } from './mail-protocol.js';
-import { parseMessage } from './mime.js';
+import { ImapSession, SmtpSession, type MailSocketFactory } from './mail-protocol.js';
+import { extractPart, parseMessage } from './mime.js';
 
 /**
  * A mail server that speaks the line protocol back. Literals are handled the way a real server
@@ -478,6 +480,57 @@ const invitation = [
   'END:VCALENDAR'
 ].join('\r\n');
 
+/**
+ * The realistic shape of an event athanor is asked to move: a repeat, a reminder, a named zone
+ * with the VTIMEZONE that defines it, a status, a category, and two people who have already said
+ * yes. Everything here is something a rebuild-from-scalars update silently threw away, so the
+ * fixture is deliberately larger than anything `buildEventComponent` can express.
+ */
+const standup = [
+  'BEGIN:VCALENDAR',
+  'VERSION:2.0',
+  'PRODID:-//Example Calendar//EN',
+  'CALSCALE:GREGORIAN',
+  'BEGIN:VTIMEZONE',
+  'TZID:Europe/London',
+  'BEGIN:DAYLIGHT',
+  'TZOFFSETFROM:+0000',
+  'TZOFFSETTO:+0100',
+  'TZNAME:BST',
+  'DTSTART:19700329T010000',
+  'END:DAYLIGHT',
+  'BEGIN:STANDARD',
+  'TZOFFSETFROM:+0100',
+  'TZOFFSETTO:+0000',
+  'TZNAME:GMT',
+  'DTSTART:19701025T020000',
+  'END:STANDARD',
+  'END:VTIMEZONE',
+  'BEGIN:VEVENT',
+  'UID:standup@example.test',
+  'DTSTAMP:20260701T120000Z',
+  'SUMMARY:Weekly standup',
+  'DESCRIPTION:Fifteen minutes.',
+  'LOCATION:Room 2',
+  'DTSTART;TZID=Europe/London:20260714T090000',
+  'DTEND;TZID=Europe/London:20260714T091500',
+  'RRULE:FREQ=WEEKLY;BYDAY=TU',
+  'STATUS:CONFIRMED',
+  'CATEGORIES:Work',
+  'URL:https://example.test/standup',
+  'SEQUENCE:2',
+  'ORGANIZER;CN=Owner:mailto:owner@example.test',
+  'ATTENDEE;CN=Owner;ROLE=CHAIR;PARTSTAT=ACCEPTED:mailto:owner@example.test',
+  'ATTENDEE;CN=Bob;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:bob@example.test',
+  'BEGIN:VALARM',
+  'ACTION:DISPLAY',
+  'DESCRIPTION:Standup in ten minutes',
+  'TRIGGER:-PT10M',
+  'END:VALARM',
+  'END:VEVENT',
+  'END:VCALENDAR'
+].join('\r\n');
+
 const runCalendar = async (action: Record<string, unknown>, transport: ConnectorTransport) =>
   executeConnectorAction({
     kind: 'caldav',
@@ -584,6 +637,163 @@ describe('calendar connector', () => {
     expect(executed.result).toMatchObject({ updated: true, etag: '"e2"' });
   });
 
+  /**
+   * The incident this guards: "move my Tuesday standup to 10 am". The update used to rebuild the
+   * VEVENT from six scalar fields, so the repeat, the reminder, the zone and every accepted RSVP
+   * were replaced by a one-off UTC event that re-invited everybody. A PUT with If-Match over a
+   * CalDAV server is not covered by any checkpoint, so there is nothing to restore from.
+   */
+  const updateStandup = async (action: Record<string, unknown>) => {
+    const calls: ConnectorRequestInput[] = [];
+    const executed = await runCalendar(
+      {
+        action: 'calendar_update_event',
+        eventUrl: 'https://cloud.example.test/remote.php/dav/calendars/owner/personal/s1.ics',
+        ...action
+      },
+      async (input) => {
+        calls.push(input);
+        if (input.method === 'GET')
+          return {
+            status: 200,
+            headers: { etag: '"e1"' },
+            body: Buffer.from(standup, 'utf8'),
+            durationMs: 1
+          };
+        return { status: 204, headers: { etag: '"e2"' }, body: Buffer.alloc(0), durationMs: 1 };
+      }
+    );
+    return { executed, written: Buffer.from(calls[1]?.body ?? []).toString('utf8') };
+  };
+
+  it('changes a title without touching the repeat, the alarm, the zone or anyone who accepted', async () => {
+    const { executed, written } = await updateStandup({ summary: 'Weekly standup (short)' });
+    expect(written).toContain('SUMMARY:Weekly standup (short)');
+    expect(written).toContain('RRULE:FREQ=WEEKLY');
+    expect(written).toContain('BEGIN:VALARM');
+    expect(written).toContain('TRIGGER:-PT10M');
+    expect(written).toContain('BEGIN:VTIMEZONE');
+    expect(written).toContain('TZID:Europe/London');
+    expect(written).toContain('STATUS:CONFIRMED');
+    expect(written).toContain('CATEGORIES:Work');
+    expect(written).toContain('URL:https://example.test/standup');
+    // A title change moves nothing, so the start is the same line it arrived as - zone included.
+    expect(written).toContain('DTSTART;TZID=Europe/London:20260714T090000');
+    expect(written).toContain('DTEND;TZID=Europe/London:20260714T091500');
+    // Two people had already said yes. Neither is re-asked.
+    expect(written.match(/PARTSTAT=ACCEPTED/g)).toHaveLength(2);
+    expect(written).not.toContain('PARTSTAT=NEEDS-ACTION');
+    expect(written).not.toContain('RSVP=TRUE');
+    expect(written).toContain('ROLE=CHAIR');
+    expect(written).toContain('SEQUENCE:3');
+    expect(executed.result).toMatchObject({ updated: true, uid: 'standup@example.test' });
+  });
+
+  it('moves a zoned event by re-expressing the start in its own zone and keeping its length', async () => {
+    const { written } = await updateStandup({ start: '2026-07-14T09:00:00Z' });
+    // 09:00 UTC is 10:00 in London in July. Writing the instant as UTC instead would strip the
+    // TZID and stop every future occurrence following the next DST change.
+    expect(written).toContain('DTSTART;TZID=Europe/London:20260714T100000');
+    // The caller named no end, which means the meeting moves - not that it now ends before it
+    // starts. The fifteen minutes it already had are kept.
+    expect(written).toContain('DTEND;TZID=Europe/London:20260714T101500');
+    expect(written).toContain('RRULE:FREQ=WEEKLY');
+    expect(written).toContain('BEGIN:VALARM');
+    expect(written.match(/PARTSTAT=ACCEPTED/g)).toHaveLength(2);
+    expect(written).toContain('SEQUENCE:3');
+  });
+
+  it('moves an all-day event as dates rather than demoting it to a timed one', async () => {
+    const calls: ConnectorRequestInput[] = [];
+    await runCalendar(
+      {
+        action: 'calendar_update_event',
+        eventUrl: 'https://cloud.example.test/remote.php/dav/calendars/owner/personal/h1.ics',
+        start: '2026-08-03'
+      },
+      async (input) => {
+        calls.push(input);
+        if (input.method === 'GET')
+          return {
+            status: 200,
+            headers: { etag: '"e1"' },
+            body: Buffer.from(
+              standup
+                .replace(
+                  'DTSTART;TZID=Europe/London:20260714T090000',
+                  'DTSTART;VALUE=DATE:20260714'
+                )
+                .replace('DTEND;TZID=Europe/London:20260714T091500', 'DTEND;VALUE=DATE:20260716'),
+              'utf8'
+            ),
+            durationMs: 1
+          };
+        return { status: 204, headers: { etag: '"e2"' }, body: Buffer.alloc(0), durationMs: 1 };
+      }
+    );
+    const written = Buffer.from(calls[1]?.body ?? []).toString('utf8');
+    expect(written).toContain('DTSTART;VALUE=DATE:20260803');
+    // Two days long before, two days long after; DTEND on an all-day event is exclusive.
+    expect(written).toContain('DTEND;VALUE=DATE:20260805');
+    expect(written).not.toContain('DTSTART:2026');
+    expect(written).toContain('BEGIN:VALARM');
+  });
+
+  it('does not tell every attendee client to re-read an event the update named nothing on', async () => {
+    const { executed, written } = await updateStandup({});
+    expect(written).toContain('SEQUENCE:2');
+    expect(written).toContain('DTSTAMP:20260701T120000Z');
+    expect(executed.result).toMatchObject({ updated: false, sequence: 2 });
+  });
+
+  /**
+   * `serializeIcalendar` escaped ';' and ',' in every value, but RRULE, EXDATE, RDATE, CATEGORIES,
+   * GEO and REQUEST-STATUS are structured values where those characters are separators, not text.
+   * So a preserved `RRULE:FREQ=WEEKLY;BYDAY=TU` went back out as `FREQ=WEEKLY\;BYDAY=TU`.
+   * athanor's own parser unescapes it again, which is why nothing here saw it, but a CalDAV server
+   * or another client reads one malformed rule part - and the answer to a repeating invitation
+   * writes the whole VCALENDAR back, so this reached servers on the accept path too.
+   */
+  it('writes a structured RRULE value back without escaping its separators', async () => {
+    const { written } = await updateStandup({ summary: 'Weekly standup (short)' });
+    expect(written).toContain('RRULE:FREQ=WEEKLY;BYDAY=TU');
+    expect(written).not.toContain('\\;');
+    // The reminder's own text is not structured, so it still goes out escaped where it must.
+    expect(written).toContain('DESCRIPTION:Standup in ten minutes');
+  });
+
+  /**
+   * Same class of defect one layer along: a parameter value was written through raw and then
+   * wrapped in quotes if it held a separator, so an attendee whose name carries a nickname came
+   * back as `CN="Doe, "JJ" Jane"` - a line no conforming reader can parse, PUT at the server on
+   * every update and every accept. Parameter values escape with carets (RFC 6868), not quotes.
+   */
+  it('writes an attendee name containing a quote in a form a server can parse', async () => {
+    const calls: ConnectorRequestInput[] = [];
+    await runCalendar(
+      {
+        action: 'calendar_update_event',
+        eventUrl: 'https://cloud.example.test/remote.php/dav/calendars/owner/personal/s1.ics',
+        summary: 'Weekly standup (short)'
+      },
+      async (input) => {
+        calls.push(input);
+        if (input.method === 'GET')
+          return {
+            status: 200,
+            headers: { etag: '"e1"' },
+            body: Buffer.from(standup.replace('CN=Bob;', 'CN=Doe, "JJ" Jane;'), 'utf8'),
+            durationMs: 1
+          };
+        return { status: 204, headers: { etag: '"e2"' }, body: Buffer.alloc(0), durationMs: 1 };
+      }
+    );
+    const written = Buffer.from(calls[1]?.body ?? []).toString('utf8');
+    expect(written).toContain('CN="Doe, ^\'JJ^\' Jane"');
+    // The old output opened a quote, closed it on the nickname and left the rest of the line loose.
+    expect(written).not.toContain('CN="Doe, "JJ" Jane"');
+  });
+
   it('refuses to answer an invitation the owner is not on', async () => {
     await expect(
       runCalendar(
@@ -603,5 +813,364 @@ describe('calendar connector', () => {
         })
       )
     ).rejects.toThrow('is not an attendee');
+  });
+});
+
+/**
+ * A socket that answers, byte by byte, and never finishes a line. This is the shape ATH-117 is
+ * about: every drip clears the per-read timer and arms a fresh one, so a 30-second per-read budget
+ * is never spent and the session runs for as long as the far side keeps dripping.
+ */
+const dripFeedSocket = (everyMs: number): Duplex => {
+  const socket = new Duplex({
+    read() {},
+    write(_chunk, _encoding, callback) {
+      callback();
+    }
+  });
+  const timer = setInterval(() => socket.push(Buffer.from('.', 'binary')), everyMs);
+  timer.unref();
+  socket.once('close', () => clearInterval(timer));
+  return socket;
+};
+
+describe('mail session bounds', () => {
+  it('abandons a server that drips a byte at a time instead of finishing its greeting', async () => {
+    const socket = dripFeedSocket(5);
+    const started = Date.now();
+    await expect(
+      ImapSession.open({
+        endpoint: { host: 'mail.example.test', port: 993 },
+        username: 'owner@example.test',
+        password: 'app-password',
+        socketFactory: () => socket,
+        timeoutMs: 30_000,
+        deadlineMs: 300
+      })
+    ).rejects.toThrow('did not finish within the time allowed');
+    // Without the session deadline this never returns at all: each drip clears the 30-second
+    // per-read timer, so the budget that exists is spent and re-armed forever.
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(socket.destroyed).toBe(true);
+  }, 4_000);
+
+  it('abandons a submission server that drips instead of finishing its greeting', async () => {
+    const socket = dripFeedSocket(5);
+    await expect(
+      SmtpSession.open({
+        endpoint: { host: 'mail.example.test', port: 465 },
+        username: 'owner@example.test',
+        password: 'app-password',
+        clientDomain: 'example.test',
+        socketFactory: () => socket,
+        timeoutMs: 30_000,
+        deadlineMs: 300
+      })
+    ).rejects.toThrow('did not finish within the time allowed');
+  }, 4_000);
+
+  it('spends the session deadline across many reads, not once per read', async () => {
+    // The greeting and the capability exchange succeed; the deadline is consumed by the drip that
+    // follows, which is the case a per-read timeout cannot see.
+    const socket = new Duplex({
+      read() {},
+      write(chunk: Buffer, _encoding, callback) {
+        const command = chunk.toString('binary');
+        const tag = command.split(' ')[0] ?? '';
+        if (/AUTHENTICATE|CAPABILITY/.test(command))
+          socket.push(Buffer.from(`* CAPABILITY IMAP4rev1 SASL-IR AUTH=PLAIN\r\n${tag} OK\r\n`));
+        callback();
+      }
+    });
+    socket.push(Buffer.from('* OK [CAPABILITY IMAP4rev1 SASL-IR AUTH=PLAIN] ready\r\n'));
+    const session = await ImapSession.open({
+      endpoint: { host: 'mail.example.test', port: 993 },
+      username: 'owner@example.test',
+      password: 'app-password',
+      socketFactory: () => socket,
+      timeoutMs: 30_000,
+      deadlineMs: 400
+    });
+    const timer = setInterval(() => socket.push(Buffer.from('* 1 EXPUNGE ', 'binary')), 5);
+    timer.unref();
+    await expect(session.listMailboxes()).rejects.toThrow('did not finish within the time allowed');
+    clearInterval(timer);
+  }, 4_000);
+
+  it('lets the session deadline cut a read short when it is nearer than the read timeout', async () => {
+    // The clamped-timer branch: nothing ever arrives, so the wait ends in an expiry rather than a
+    // wake, and it has to be the session budget that names the failure rather than the read one.
+    const socket = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+      }
+    });
+    const started = Date.now();
+    await expect(
+      ImapSession.open({
+        endpoint: { host: 'mail.example.test', port: 993 },
+        username: 'owner@example.test',
+        password: 'app-password',
+        socketFactory: () => socket,
+        timeoutMs: 30_000,
+        deadlineMs: 200
+      })
+    ).rejects.toThrow('did not finish within the time allowed');
+    expect(Date.now() - started).toBeLessThan(3_000);
+  }, 4_000);
+
+  it('closes an expired session quietly instead of throwing over the failure that caused it', async () => {
+    // withImap closes in a finally, so a close that threw would replace the timeout the owner
+    // needs to see with whatever LOGOUT hit on an already-destroyed socket.
+    const socket = new Duplex({
+      read() {},
+      write(chunk: Buffer, _encoding, callback) {
+        const tag = chunk.toString('binary').split(' ')[0] ?? '';
+        if (/CAPABILITY|AUTHENTICATE/.test(chunk.toString('binary')))
+          socket.push(Buffer.from(`* CAPABILITY IMAP4rev1 SASL-IR AUTH=PLAIN\r\n${tag} OK\r\n`));
+        callback();
+      }
+    });
+    socket.push(Buffer.from('* OK [CAPABILITY IMAP4rev1 SASL-IR AUTH=PLAIN] ready\r\n'));
+    const session = await ImapSession.open({
+      endpoint: { host: 'mail.example.test', port: 993 },
+      username: 'owner@example.test',
+      password: 'app-password',
+      socketFactory: () => socket,
+      timeoutMs: 30_000,
+      deadlineMs: 60
+    });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    await expect(session.listMailboxes()).rejects.toThrow('did not finish within the time allowed');
+    await expect(session.close()).resolves.toBeUndefined();
+  }, 4_000);
+
+  it('gives up on a server that says nothing at all', async () => {
+    const socket = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+      }
+    });
+    await expect(
+      ImapSession.open({
+        endpoint: { host: 'mail.example.test', port: 993 },
+        username: 'owner@example.test',
+        password: 'app-password',
+        socketFactory: () => socket,
+        timeoutMs: 100
+      })
+    ).rejects.toThrow('did not answer in time');
+  }, 4_000);
+
+  it('gives up on a server that hangs up before it greets', async () => {
+    const socket = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+      }
+    });
+    queueMicrotask(() => socket.push(null));
+    await expect(
+      ImapSession.open({
+        endpoint: { host: 'mail.example.test', port: 993 },
+        username: 'owner@example.test',
+        password: 'app-password',
+        socketFactory: () => socket,
+        timeoutMs: 1_000
+      })
+    ).rejects.toThrow('closed the connection');
+  }, 4_000);
+
+  it('gives up on a server sending more bytes than the session was told to accept', async () => {
+    const socket = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+      }
+    });
+    socket.push(Buffer.alloc(5_000, 0x61));
+    await expect(
+      ImapSession.open({
+        endpoint: { host: 'mail.example.test', port: 993 },
+        username: 'owner@example.test',
+        password: 'app-password',
+        socketFactory: () => socket,
+        timeoutMs: 1_000,
+        maxBytes: 1_000
+      })
+    ).rejects.toThrow('more than was asked for');
+  }, 4_000);
+});
+
+const attachmentNamed = (filename: string): Buffer =>
+  Buffer.from(
+    message([
+      'Content-Type: multipart/mixed; boundary="b"',
+      '',
+      '--b',
+      'Content-Type: text/plain',
+      '',
+      'See attached.',
+      '--b',
+      'Content-Type: application/octet-stream',
+      `Content-Disposition: attachment; filename="${filename}"`,
+      '',
+      'payload',
+      '--b--'
+    ]),
+    'binary'
+  );
+
+describe('attachment names crossing into the workspace', () => {
+  it('sanitises the name on the download as well as on the inventory', () => {
+    // These two disagreed: mail_read_message listed ".._.._.ssh_authorized_keys" while
+    // mail_read_attachment - the call that arrives holding the bytes, and so the one whose name a
+    // caller writes to disk - handed back the separators untouched.
+    const raw = attachmentNamed('../../.ssh/authorized_keys');
+    const parsed = parseMessage(raw);
+    expect(parsed.attachments[0]?.filename).toBe('.._.._.ssh_authorized_keys');
+    expect(extractPart(raw, parsed.attachments[0]!.partId)?.filename).toBe(
+      '.._.._.ssh_authorized_keys'
+    );
+  });
+
+  it('refuses a name that is only a directory hop, on both paths', () => {
+    const raw = attachmentNamed('..');
+    const parsed = parseMessage(raw);
+    expect(parsed.attachments[0]?.filename).toBe('attachment');
+    expect(extractPart(raw, parsed.attachments[0]!.partId)?.filename).toBe('attachment');
+  });
+
+  it('caps an overlong name on both paths', () => {
+    const raw = attachmentNamed('x'.repeat(400));
+    const parsed = parseMessage(raw);
+    expect(parsed.attachments[0]?.filename).toHaveLength(200);
+    expect(extractPart(raw, parsed.attachments[0]!.partId)?.filename).toHaveLength(200);
+  });
+
+  it('replaces a delete character, which is as much a control character as the low ones', () => {
+    const raw = attachmentNamed('report\u007f.pdf');
+    const parsed = parseMessage(raw);
+    expect(parsed.attachments[0]?.filename).toBe('report_.pdf');
+    expect(extractPart(raw, parsed.attachments[0]!.partId)?.filename).toBe('report_.pdf');
+  });
+
+  it('leaves an ordinary name alone', () => {
+    const raw = attachmentNamed('rapport final.pdf');
+    const parsed = parseMessage(raw);
+    expect(parsed.attachments[0]?.filename).toBe('rapport final.pdf');
+    expect(extractPart(raw, parsed.attachments[0]!.partId)?.filename).toBe('rapport final.pdf');
+  });
+
+  it('decodes a large quoted-printable part without turning it into a byte-per-object array', () => {
+    // The array form cost 487 MB of resident memory for a 20 MB part; mail_read_attachment will
+    // fetch 25 MB of bytes an attacker wrote. Bounded output, same answer.
+    const body = Buffer.alloc(2_000_000, 0x61);
+    const raw = Buffer.concat([
+      Buffer.from(
+        'Content-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n'
+      ),
+      Buffer.from('=41=42'),
+      body
+    ]);
+    const parsed = parseMessage(raw, { maxTextCharacters: 10 });
+    expect(parsed.text).toBe('ABaaaaaaaa');
+    expect(parsed.textTruncated).toBe(true);
+  });
+});
+
+describe('caldav transport bounds', () => {
+  it('tells a lost update apart from a broken server', async () => {
+    // If-Match exists to produce a 412 and nothing else. Reported as "answered 412" it was
+    // indistinguishable from a 500, so the one recovery that works - re-read and decide again -
+    // was never the obvious next step.
+    await expect(
+      runCalendar(
+        {
+          action: 'calendar_update_event',
+          eventUrl: 'https://cloud.example.test/remote.php/dav/calendars/owner/personal/i1.ics',
+          summary: 'Quarterly review (moved)'
+        },
+        async (input) =>
+          input.method === 'GET'
+            ? {
+                status: 200,
+                headers: { etag: '"e1"' },
+                body: Buffer.from(invitation, 'utf8'),
+                durationMs: 1
+              }
+            : { status: 412, headers: {}, body: Buffer.alloc(0), durationMs: 1 }
+      )
+    ).rejects.toThrow('changed on the server since athanor read it');
+  });
+
+  it('does not send a second report after a failure that says nothing about expand', async () => {
+    // Measured before this: a blocked redirect produced two full REPORTs, and the second one's
+    // failure replaced the first. On a stalled server the same path doubles a 30-second wait.
+    let calls = 0;
+    await expect(
+      runCalendar(
+        {
+          action: 'calendar_read_range',
+          calendarUrl: 'https://cloud.example.test/remote.php/dav/calendars/owner/personal/',
+          start: '2026-07-13T00:00:00Z',
+          end: '2026-07-20T00:00:00Z'
+        },
+        async () => {
+          calls += 1;
+          throw new AthanorError(
+            'connector_redirect_blocked',
+            'Connector redirects are blocked to prevent credential forwarding'
+          );
+        }
+      )
+    ).rejects.toThrow('redirects are blocked');
+    expect(calls).toBe(1);
+  });
+
+  it('still drops the expansion when the server refuses that one request', async () => {
+    let calls = 0;
+    const executed = await runCalendar(
+      {
+        action: 'calendar_read_range',
+        calendarUrl: 'https://cloud.example.test/remote.php/dav/calendars/owner/personal/',
+        start: '2026-07-13T00:00:00Z',
+        end: '2026-07-20T00:00:00Z'
+      },
+      async () => {
+        calls += 1;
+        if (calls === 1) return { status: 400, headers: {}, body: Buffer.alloc(0), durationMs: 1 };
+        return {
+          status: 207,
+          headers: {},
+          body: Buffer.from(
+            `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/remote.php/dav/calendars/owner/personal/i1.ics</d:href><d:propstat><d:prop><d:getetag>"e1"</d:getetag><c:calendar-data>${invitation}</c:calendar-data></d:prop></d:propstat></d:response></d:multistatus>`,
+            'utf8'
+          ),
+          durationMs: 1
+        };
+      }
+    );
+    expect(calls).toBe(2);
+    expect(executed.result).toMatchObject({ content: { recurrenceExpandedByServer: false } });
+  });
+
+  it('keeps the rest of a document that is deeper than the reader will follow', () => {
+    // Over the depth limit the reader used to append the node but not push it, so the node's own
+    // closing tag popped a still-open ancestor and everything after it reattached one level up.
+    const deep = (depth: number, inner: string): string => {
+      let out = inner;
+      for (let level = depth; level > 0; level -= 1) out = `<d:n${level}>${out}</d:n${level}>`;
+      return out;
+    };
+    const document = parseXml(
+      `<d:multistatus>${deep(30, '<d:deep>DEEP</d:deep>')}<d:sibling>SIBLING</d:sibling></d:multistatus>`
+    );
+    const top = document.children[0]!;
+    expect(top.name).toBe('multistatus');
+    expect(top.children.map((child) => child.name)).toContain('sibling');
+    expect(findFirst(document, 'sibling')?.text).toBe('SIBLING');
   });
 });

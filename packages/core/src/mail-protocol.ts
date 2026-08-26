@@ -52,6 +52,17 @@ export type MailSocketFactory = (
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 /**
+ * The per-read timeout above bounds silence; it does not bound the session. Every byte that
+ * arrives clears the timer and arms a fresh one, so a server that answers one byte every
+ * twenty-nine seconds is never late by that measure and the session runs forever - holding a
+ * worker slot open while the lease keeps renewing, which is the shape of the stall that ate a
+ * turn. Five minutes is far longer than any mailbox operation athanor performs (the largest
+ * fetch it will ask for is 25 MB) and far shorter than the fifteen-minute model-request deadline
+ * it sits underneath, so a session that trips this is stuck rather than slow.
+ */
+const DEFAULT_DEADLINE_MS = 5 * 60 * 1000;
+
+/**
  * The endpoint the owner typed is a name they control, so it gets the same treatment as any other
  * address the agent is pointed at: every answer has to be on the public internet, and the socket
  * is opened against the address that was checked rather than a second lookup that could differ.
@@ -102,7 +113,9 @@ class ByteChannel {
   constructor(
     private readonly stream: Duplex,
     private readonly timeoutMs: number,
-    private readonly maxBytes: number
+    private readonly maxBytes: number,
+    /** Absolute wall-clock instant the whole session must be finished by. */
+    private readonly deadlineAt: number
   ) {
     stream.on('data', (chunk: Buffer) => {
       this.#chunks.push(chunk);
@@ -139,22 +152,64 @@ class ByteChannel {
     notify?.();
   }
 
+  #expired(): AthanorError {
+    this.#notify = null;
+    this.stream.destroy();
+    return new AthanorError(
+      'mail_timeout',
+      // Deliberately the same code as the per-read timeout: both mean "the server did not finish",
+      // both are answered by checking the host and port, and the owner-facing copy that routes on
+      // this code is already right about what to do next.
+      'The mail server did not finish within the time allowed for one session'
+    );
+  }
+
   async #waitForData(): Promise<void> {
     const pending = this.#failure;
     if (pending) throw pending;
     if (this.#ended)
       throw new AthanorError('mail_connection_closed', 'The mail server closed the connection');
+    // Checked before waiting rather than only inside the timer, because the drip case never
+    // reaches a timer expiry: the wait always ends in data, and it is the accumulation of waits
+    // that has to be refused.
+    const remaining = this.deadlineAt - Date.now();
+    if (remaining <= 0) throw this.#expired();
+    /*
+     * Which of the two bounds armed the timer, decided here rather than re-derived when it fires.
+     *
+     * Re-reading the clock inside the callback made the *reported* bound a race. Node's timers run
+     * off libuv's own millisecond clock, not `Date.now()`, and the two disagree by up to a
+     * millisecond - so a timer armed to the session deadline could fire with `deadlineAt -
+     * Date.now()` still reading 1, take the per-read arm, and tell the owner the server "did not
+     * answer in time" when what actually ran out was the session. Both carry `mail_timeout` and both
+     * are answered the same way, so nothing about the failure changed; the sentence did, in a
+     * one-millisecond window, under load. It surfaced as an intermittent red in this package's own
+     * drip test, which is the only place the distinction is observable at all.
+     *
+     * `Math.min` has already made the decision. Recording it is what makes the sentence follow the
+     * bound that was actually spent.
+     */
+    const deadlineIsTheBound = remaining <= this.timeoutMs;
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.#notify = null;
-        this.stream.destroy();
-        reject(new AthanorError('mail_timeout', 'The mail server did not answer in time'));
-      }, this.timeoutMs);
+      const timer = setTimeout(
+        () => {
+          if (deadlineIsTheBound || this.deadlineAt - Date.now() <= 0) {
+            reject(this.#expired());
+            return;
+          }
+          this.#notify = null;
+          this.stream.destroy();
+          reject(new AthanorError('mail_timeout', 'The mail server did not answer in time'));
+        },
+        Math.min(this.timeoutMs, remaining)
+      );
       this.#notify = () => {
         clearTimeout(timer);
         resolve();
       };
     });
+    // A drip that lands a microsecond before the deadline must not buy another whole read budget.
+    if (this.deadlineAt - Date.now() <= 0) throw this.#expired();
     const failure = this.#failure;
     if (failure) throw failure;
   }
@@ -411,6 +466,8 @@ export interface ImapSessionOptions {
   password: string;
   socketFactory?: MailSocketFactory;
   timeoutMs?: number;
+  /** Total budget for the whole session, connect included. See DEFAULT_DEADLINE_MS. */
+  deadlineMs?: number;
   maxBytes?: number;
 }
 
@@ -424,6 +481,9 @@ export class ImapSession {
   ) {}
 
   static async open(options: ImapSessionOptions): Promise<ImapSession> {
+    // Started before the connect so that DNS, TLS and the handshake are inside the budget rather
+    // than an unbounded prelude to it.
+    const deadlineAt = Date.now() + (options.deadlineMs ?? DEFAULT_DEADLINE_MS);
     const socket = await (options.socketFactory ?? secureMailSocket)(
       options.endpoint,
       options.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -431,7 +491,8 @@ export class ImapSession {
     const channel = new ByteChannel(
       socket,
       options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      options.maxBytes ?? 32 * 1024 * 1024
+      options.maxBytes ?? 32 * 1024 * 1024,
+      deadlineAt
     );
     const greeting = await channel.readLine();
     if (!/^\* (OK|PREAUTH)/i.test(greeting)) {
@@ -772,6 +833,8 @@ export interface SmtpSessionOptions {
   clientDomain: string;
   socketFactory?: MailSocketFactory;
   timeoutMs?: number;
+  /** Total budget for the whole session, connect included. See DEFAULT_DEADLINE_MS. */
+  deadlineMs?: number;
 }
 
 export class SmtpSession {
@@ -781,11 +844,17 @@ export class SmtpSession {
   ) {}
 
   static async open(options: SmtpSessionOptions): Promise<SmtpSession> {
+    const deadlineAt = Date.now() + (options.deadlineMs ?? DEFAULT_DEADLINE_MS);
     const socket = await (options.socketFactory ?? secureMailSocket)(
       options.endpoint,
       options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     );
-    const channel = new ByteChannel(socket, options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 1024 * 1024);
+    const channel = new ByteChannel(
+      socket,
+      options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      1024 * 1024,
+      deadlineAt
+    );
     const greeting = await SmtpSession.#reply(channel);
     if (greeting.code !== 220) {
       channel.destroy();

@@ -15,9 +15,11 @@ import {
   modelFit,
   modelTaskKinds,
   priceCeilingBreach,
+  priceCeilingFields,
   qualityScore,
   rankModels,
   readRoutingMetadata,
+  selectModel,
   taskProfile,
   type ModelRequest,
   type RoutableModel,
@@ -523,6 +525,75 @@ describe('latency and reliability', () => {
     expect(ranked[0]?.breakdown.latency).toEqual({ value: 0.99, source: 'measured' });
   });
 
+  it('does not rank an untimed model as the slowest thing on the box because one route published a latency', () => {
+    // The switch used to be pool-wide: the moment any candidate carried a `measuredLatencyMs`,
+    // every candidate that did not was scored `0` on the latency term while still carrying its
+    // full weight - "slower than the 30-second ceiling" rather than "not measured". Measured
+    // against the shipped build: adding a single `measuredLatencyMs: 800` to the weaker of two
+    // models moved it from last to first. `openrouter-catalog.ts` fills `measuredLatencyMs` only
+    // for the routes that appear in the `/endpoints/zdr` feed, so a mixed pool is the ordinary
+    // case on a box that never asked for zero retention, not an edge one.
+    const untimedStrong: RoutableModel = {
+      ...opus,
+      id: 'strong',
+      displayName: 'Strong',
+      measuredLatencyMs: null,
+      inputUsdPerMillionTokens: 0.5,
+      outputUsdPerMillionTokens: 1.5
+    };
+    const timedWeak: RoutableModel = {
+      ...base,
+      id: 'weak',
+      displayName: 'Weak',
+      measuredQuality: 0.3,
+      intelligenceQuality: 0.3,
+      agenticQuality: 0.3,
+      inputUsdPerMillionTokens: 5,
+      outputUsdPerMillionTokens: 25,
+      measuredLatencyMs: 800
+    };
+    const fast: ModelRequest = { ...request, preference: 'fast', taskKind: 'conversation' };
+
+    const mixed = rankModels([untimedStrong, timedWeak], fast);
+    expect(mixed.map((item) => item.model.id)).toEqual(['strong', 'weak']);
+    expect(mixed.every((item) => item.breakdown.weights.latency === 0)).toBe(true);
+
+    // The order the pool has when nothing is timed at all is the order it must keep when one
+    // member starts publishing: a latency is evidence about that route, never about the others.
+    const untimed = rankModels([untimedStrong, { ...timedWeak, measuredLatencyMs: null }], fast);
+    expect(untimed.map((item) => item.model.id)).toEqual(mixed.map((item) => item.model.id));
+  });
+
+  it('admits the latency term only once most of the pool carries one', () => {
+    // Four fifths is the floor. `scoreModel` on its own assumes the pool is comparable, which is
+    // what makes a single-model score readable outside a ranking.
+    const timed = (id: string): RoutableModel => ({ ...sonnet, id, measuredLatencyMs: 300 });
+    const untimed: RoutableModel = { ...sonnet, id: 'untimed', measuredLatencyMs: null };
+
+    const belowFloor = rankModels([timed('a'), timed('b'), timed('c'), untimed], {
+      ...request,
+      preference: 'fast'
+    });
+    expect(belowFloor.every((item) => item.breakdown.weights.latency === 0)).toBe(true);
+
+    const atFloor = rankModels([timed('a'), timed('b'), timed('c'), timed('d'), untimed], {
+      ...request,
+      preference: 'fast'
+    });
+    const straggler = atFloor.find((item) => item.model.id === 'untimed');
+    // The one row nobody timed is dropped from the term rather than scored zero on it, and the
+    // sentence `buildReasons` has always printed for a null sub-score is finally true of the maths.
+    expect(straggler?.breakdown.latency).toBeNull();
+    expect(straggler?.breakdown.weights.latency).toBe(0);
+    const { quality, price, context } =
+      straggler?.breakdown.weights ?? taskProfile('general').weights;
+    expect(quality + price + context).toBeCloseTo(1, 10);
+    expect(straggler?.reasons.join(' ')).toContain('Latency not measured on this server');
+    expect(
+      atFloor.find((item) => item.model.id === 'a')?.breakdown.weights.latency
+    ).toBeGreaterThan(0);
+  });
+
   it('routes around a model whose endpoints were failing yesterday, unless it is all there is', () => {
     const flaky = { ...sonnet, id: 'flaky', uptimeLast1dPercent: 42, intelligenceQuality: 1 };
     const steady = { ...sonnet, id: 'steady', uptimeLast1dPercent: 99.99 };
@@ -864,5 +935,145 @@ describe('model fit', () => {
         signals: { prompt: 'Refactor this TypeScript repository' }
       }).headline
     ).toBeNull();
+  });
+});
+
+/**
+ * A model priced above the ceiling, which is also the *better* model.
+ *
+ * The gate probe that specified this step said the discriminating property out loud: `balanced`
+ * already prefers the cheaper of two models on its own, so a test that only checks which model came
+ * first passes identically whether the ceiling is wired or not. Every test below asserts
+ * membership - who is in the pool at all - and where it asserts an order it does so under
+ * `preference: 'best'`, where the expensive model wins unless something excludes it.
+ */
+const unbenchmarkedCheap: RoutableModel = {
+  ...base,
+  id: 'unbenchmarked-cheap',
+  displayName: 'Unbenchmarked Cheap',
+  measuredQuality: null,
+  inputUsdPerMillionTokens: 1,
+  outputUsdPerMillionTokens: 4
+};
+
+describe('selecting a model under the owner price ceiling', () => {
+  it('excludes an over-priced model from the pool even when it is the better model', () => {
+    // Without the ceiling and asked for the best, the expensive model wins - so its absence below
+    // is the ceiling and cannot be the scoring.
+    const open = { ...request, taskKind: 'agentic' as const, preference: 'best' as const };
+    expect(rankModels([opus, sonnet], open)[0]?.model.id).toBe('opus');
+
+    const selection = selectModel([opus, sonnet], { ...ceiling, preference: 'best' });
+    expect(selection.ranked.map((entry) => entry.model.id)).toEqual(['sonnet']);
+    expect(selection.choice?.model.id).toBe('sonnet');
+    expect(selection.ceilingOutcome).toBe('within');
+    expect(selection.message).toBeNull();
+  });
+
+  it('picks nothing at all when the whole catalogue is above the ceiling, and says which and why', () => {
+    const selection = selectModel([opus], ceiling);
+    expect(selection.choice).toBeNull();
+    expect(selection.ranked).toEqual([]);
+    expect(selection.ceilingOutcome).toBe('blocked');
+    expect(selection.cheapestAboveCeiling?.id).toBe('opus');
+    expect(selection.message).toContain('$5.00 per million input is above the $2.00 ceiling');
+    expect(selection.message).toContain('Claude Opus 5');
+  });
+
+  it('names the cheapest of the excluded models, not whichever came first in the catalogue', () => {
+    const dearer: RoutableModel = {
+      ...opus,
+      id: 'dearer',
+      displayName: 'Dearer',
+      inputUsdPerMillionTokens: 40,
+      outputUsdPerMillionTokens: 200
+    };
+    expect(selectModel([dearer, opus], ceiling).cheapestAboveCeiling?.id).toBe('opus');
+    expect(selectModel([opus, dearer], ceiling).cheapestAboveCeiling?.id).toBe('opus');
+  });
+
+  it('judges cheapness at the price tier the task will actually reach', () => {
+    // Cheap at the head of the catalogue and dear past 200K, against a rival that is flat. Blaming
+    // the flat one for being expensive would send the owner to raise a ceiling for the wrong route.
+    const tiered: RoutableModel = {
+      ...opus,
+      id: 'tiered',
+      displayName: 'Tiered',
+      contextTokens: 1_000_000,
+      inputUsdPerMillionTokens: 3,
+      outputUsdPerMillionTokens: 12,
+      priceTiers: [
+        { minPromptTokens: 200_000, inputUsdPerMillionTokens: 60, outputUsdPerMillionTokens: 240 }
+      ]
+    };
+    const wide = { ...ceiling, minContextTokens: 250_000 };
+    expect(
+      selectModel([tiered, { ...opus, contextTokens: 1_000_000 }], wide).cheapestAboveCeiling?.id
+    ).toBe('opus');
+  });
+
+  it('does not blame the ceiling for an empty pool the ceiling had no part in', () => {
+    // A catalogue with nothing that can do the work is not a ceiling problem. Reporting `blocked`
+    // here would send the owner to raise the one setting that excluded nothing.
+    const wrongRoute: RoutableModel = { ...sonnet, privacyRoute: 'external' };
+    const selection = selectModel([wrongRoute], ceiling);
+    expect(selection.choice).toBeNull();
+    expect(selection.ceilingOutcome).toBe('no_ceiling');
+    expect(selection.cheapestAboveCeiling).toBeNull();
+    expect(selection.message).toBeNull();
+  });
+
+  it('never blocks a model the owner named, and says it is over the ceiling rather than hiding it', () => {
+    const selection = selectModel([opus, sonnet], { ...ceiling, requestedId: 'opus' });
+    expect(selection.choice?.model.id).toBe('opus');
+    expect(selection.ceilingOutcome).toBe('no_ceiling');
+    expect(selection.message).toContain('$5.00 per million input is above the $2.00 ceiling');
+  });
+
+  it('says so when the only model under the ceiling is one nobody has benchmarked', () => {
+    const selection = selectModel([opus, unbenchmarkedCheap], ceiling);
+    expect(selection.choice?.model.id).toBe('unbenchmarked-cheap');
+    expect(selection.ceilingOutcome).toBe('relaxed_unbenchmarked');
+    expect(selection.message).toContain('Unbenchmarked Cheap');
+    // ...and it is only said when a benchmarked model was in fact excluded. An unbenchmarked pick
+    // on a catalogue where nothing is benchmarked has nothing to do with the ceiling.
+    const alone = selectModel([unbenchmarkedCheap], ceiling);
+    expect(alone.ceilingOutcome).toBe('within');
+    expect(alone.message).toBeNull();
+  });
+
+  it('reports no ceiling at all when the request carries none', () => {
+    const selection = selectModel([opus, sonnet], { ...request, taskKind: 'agentic' });
+    expect(selection.ceilingOutcome).toBe('no_ceiling');
+    expect(selection.message).toBeNull();
+    expect(selection.cheapestAboveCeiling).toBeNull();
+    expect(selection.choice).not.toBeNull();
+  });
+});
+
+describe('the stored ceiling as request fields', () => {
+  it('carries a ceiling of zero through, and drops one that was never set', () => {
+    // `null` is "no ceiling" and `0` is "only a route that publishes a price of zero". Spreading
+    // the record with `??` collapses the second into the first, which is why this conversion has
+    // one home rather than one per call site.
+    expect(priceCeilingFields(null)).toEqual({});
+    expect(priceCeilingFields({ maxInputUsdPerMillionTokens: null })).toEqual({});
+    expect(priceCeilingFields({ maxInputUsdPerMillionTokens: 0 })).toEqual({
+      maxInputUsdPerMillionTokens: 0
+    });
+    expect(
+      priceCeilingFields({ maxInputUsdPerMillionTokens: 2, maxOutputUsdPerMillionTokens: 10 })
+    ).toEqual({ maxInputUsdPerMillionTokens: 2, maxOutputUsdPerMillionTokens: 10 });
+  });
+
+  it('produces exactly the request a ceiling-bearing caller has to build', () => {
+    const built: ModelRequest = {
+      ...request,
+      taskKind: 'agentic',
+      ...priceCeilingFields({ maxInputUsdPerMillionTokens: 2, maxOutputUsdPerMillionTokens: 10 })
+    };
+    expect(selectModel([opus, sonnet], built).ranked.map((entry) => entry.model.id)).toEqual([
+      'sonnet'
+    ]);
   });
 });

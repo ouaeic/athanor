@@ -255,6 +255,25 @@ const usageClassPricePrior: Record<ModelUsageClass, number> = {
 /** A latency at or beyond this reads as "slow"; the sub-score floors at zero there. */
 const LATENCY_CEILING_MS = 30_000;
 
+/**
+ * How much of a ranking pool has to carry a measured latency before the term is allowed to decide
+ * anything.
+ *
+ * The ceiling above is thirty seconds, so every plausible route - 200 ms to 2 s - scores between
+ * 0.93 and 0.99. The sub-score barely separates two timed models; what it separates sharply is
+ * timed from untimed. That makes "does this row happen to carry a number" a stronger signal than
+ * anything the number says, and on the `fast` dial for a conversation the term carries 0.64 of the
+ * weight. `openrouter-catalog.ts` fills `measuredLatencyMs` only for the routes the
+ * `/endpoints/zdr` feed happens to cover, while the ranking pool on a box that never asked for
+ * zero retention is the whole catalogue - so a thin scatter of timed rows across an untimed
+ * catalogue is the ordinary shape, not an edge case.
+ *
+ * Below this coverage the term is dropped for the whole pool and every candidate is scored on
+ * identical weights, which is what the pool-wide switch was always reaching for; it just admitted
+ * the term when *any* model carried a figure rather than when nearly all of them did.
+ */
+const LATENCY_COVERAGE_FLOOR = 0.8;
+
 /** Blended dollars per million tokens at which the price sub-score is exactly one half. */
 const PRICE_HALF_POINT_USD = 1;
 
@@ -433,9 +452,15 @@ export const blendWeights = (profile: TaskProfile, preference: ModelPreference):
 /**
  * Drops the latency term and shares its weight out across the rest.
  *
- * Nothing publishes a usable latency for these routes today, so the sub-score used to fall back to
- * a table indexed by price - which made two thirds of the "fast" dial a price lookup wearing a
- * latency label. A sub-score that is honestly absent is better than one that is silently price.
+ * The sub-score used to fall back to a table indexed by price when nothing had timed the route,
+ * which made two thirds of the "fast" dial a price lookup wearing a latency label. A sub-score
+ * that is honestly absent is better than one that is silently price.
+ *
+ * Latency is published for some routes and withheld for others rather than absent everywhere:
+ * `openrouter-catalog.ts` fills `measuredLatencyMs` from `latency_last_30m`, but only for the
+ * models carried by the `/endpoints/zdr` feed, while the ranking pool on a box that never asked
+ * for zero retention is the whole catalogue. A mixed pool is therefore the ordinary case, which is
+ * why `scoreModel` applies this per candidate rather than once per ranking.
  */
 export const withoutLatency = (weights: TaskWeights): TaskWeights =>
   normaliseWeights({ ...weights, latency: 0 }, weights);
@@ -794,11 +819,11 @@ const buildReasons = (
 
 export interface ScoreOptions {
   /**
-   * Whether the latency term takes part. `rankModels` decides this once for a whole ranking so
-   * every candidate is scored on identical weights; on its own, `scoreModel` drops the term for a
-   * model nothing has timed.
+   * Whether the pool this model is being ranked inside carries enough measured latencies for the
+   * term to compare anything. `rankModels` decides it once per ranking; on its own `scoreModel`
+   * assumes it is, and still drops the term for a model nothing has timed.
    */
-  readonly rankLatency?: boolean;
+  readonly latencyComparable?: boolean;
 }
 
 export const scoreModel = (
@@ -807,12 +832,17 @@ export const scoreModel = (
   options: ScoreOptions = {}
 ): { score: number; breakdown: ScoreBreakdown; reasons: string[]; explanation: string } => {
   const profile = taskProfile(request.taskKind ?? 'general');
-  const measuredLatency = latencyScore(model);
-  const rankLatency = options.rankLatency ?? measuredLatency !== null;
+  // Two separate reasons to drop the term, and the old code had neither right. It scored an
+  // untimed model as `0` on a term still carrying its full weight - "slower than the 30-second
+  // ceiling" rather than "not measured" - and it admitted the term whenever *any* member of the
+  // pool carried a figure. Measured on the shipped build: publishing a single 800 ms latency for a
+  // 30th-percentile route at $5/M moved it above an untimed 99th-percentile route at $0.50/M, from
+  // last place to first. Now the term takes part only where the pool can actually compare on it,
+  // and never turns a missing measurement into a number.
+  const latency = options.latencyComparable === false ? null : latencyScore(model);
   const blended = blendWeights(profile, request.preference);
-  const weights = rankLatency ? blended : withoutLatency(blended);
+  const weights = latency === null ? withoutLatency(blended) : blended;
   const quality = qualityScore(model, profile.benchmark);
-  const latency = rankLatency ? measuredLatency : null;
   const price = priceScore(model, profile);
   const context = contextHeadroomScore(
     model.contextTokens,
@@ -869,11 +899,12 @@ export const rankModels = (models: RoutableModel[], request: ModelRequest): Rank
   const asOf = asOfDate(request);
   const healthy = eligible.filter((model) => !isRetiringSoon(model, asOf) && !isDegraded(model));
   const pool = healthy.length > 0 ? healthy : eligible;
-  const rankLatency = pool.some((model) => typeof model.measuredLatencyMs === 'number');
+  const timed = pool.filter((model) => typeof model.measuredLatencyMs === 'number').length;
+  const latencyComparable = pool.length > 0 && timed / pool.length >= LATENCY_COVERAGE_FLOOR;
 
   return pool
     .map((model) => {
-      const scored = scoreModel(model, request, { rankLatency });
+      const scored = scoreModel(model, request, { latencyComparable });
       return {
         model,
         score: scored.score,
@@ -894,9 +925,14 @@ export const rankModels = (models: RoutableModel[], request: ModelRequest): Rank
 /**
  * What the owner's ceiling did to this selection.
  *
- * - `no_ceiling` - no ceiling was set, so nothing was constrained.
- * - `within` - the pick is the best benchmarked model under the ceiling, which is the whole promise.
- * - `relaxed_unbenchmarked` - nothing benchmarked fits, so an unmeasured model was used and said so.
+ * Read it as a statement about the *ceiling*, not about the pool: the question a caller has is
+ * "did my ceiling cause this", and only `blocked` answers yes.
+ *
+ * - `no_ceiling` - the ceiling took no part. No ceiling was set; or the owner named the model, which
+ *   the ceiling never overrides; or nothing was eligible for reasons the ceiling had no hand in.
+ * - `within` - a model was picked and the ceiling did not have to give anything up to pick it.
+ * - `relaxed_unbenchmarked` - every benchmarked model that could do the work is above the ceiling, so
+ *   an unmeasured one was used and said so.
  * - `blocked` - nothing fits at all. Nothing is picked, because silently spending over a ceiling the
  *   owner set while they are asleep is the one outcome a ceiling exists to prevent.
  */
@@ -912,6 +948,162 @@ export interface ModelSelection {
   /** When blocked, the cheapest model that could have done the work with the ceiling lifted. */
   readonly cheapestAboveCeiling: RoutableModel | null;
 }
+
+/**
+ * The owner's price ceiling as it is stored, either rate optional.
+ *
+ * It is a type of its own because it crosses three boundaries - the `spend_limits` row, the
+ * `SpendLimits` contract and `ModelRequest` - and it is `priceCeilingFields` below that takes the
+ * last step, so the conversion has one home rather than one per call site.
+ *
+ * The step *is* taken now, and the comment that used to stand here said the opposite: it read that
+ * "every `ModelRequest` this repository builds today carries no ceiling at all", which was true
+ * when the apparatus was written and stopped being true when it was threaded. Every producer of a
+ * `ModelRequest` on the live path now reads the owner's stored limits and spreads them in:
+ *
+ * - `apps/api/src/routes/models.ts` - `/v1/models/recommend`, so a recommendation is never a route
+ *   the box is not allowed to take.
+ * - `apps/api/src/routes/support.ts` - the support picker, through `selectModel` rather than
+ *   `rankModels(...)[0]`, because `blocked` is an answer and an empty array is not.
+ * - `apps/api/src/routes/tasks.ts` - `modelFit`, which spreads the request through unchanged, so
+ *   the "you could have used X" line never names a route the ceiling forbids.
+ * - `apps/worker/src/vision.ts` - the vision specialist, which ranks under the ceiling and then
+ *   asks `selectModel` which of the two refusals it is looking at.
+ *
+ * Anything that stops spreading it is a silent regression, because a request with no ceiling is
+ * indistinguishable from an owner who set none. `model-policy.test.ts` holds the negative control.
+ */
+export interface OwnerPriceCeiling {
+  readonly maxInputUsdPerMillionTokens?: number | null;
+  readonly maxOutputUsdPerMillionTokens?: number | null;
+}
+
+/**
+ * The stored ceiling as `ModelRequest` fields, ready to spread into a request.
+ *
+ * `null` means no ceiling and `0` means a ceiling of zero, which admits only a route that publishes
+ * a price of zero and is a thing an owner may legitimately want on a box that must never bill. A
+ * caller spreading the record through `??` turns the second into the first, so the conversion has
+ * one home rather than one per call site.
+ */
+export const priceCeilingFields = (
+  ceiling: OwnerPriceCeiling | null | undefined
+): Pick<ModelRequest, 'maxInputUsdPerMillionTokens' | 'maxOutputUsdPerMillionTokens'> => {
+  if (!ceiling) return {};
+  return {
+    ...(typeof ceiling.maxInputUsdPerMillionTokens === 'number'
+      ? { maxInputUsdPerMillionTokens: ceiling.maxInputUsdPerMillionTokens }
+      : {}),
+    ...(typeof ceiling.maxOutputUsdPerMillionTokens === 'number'
+      ? { maxOutputUsdPerMillionTokens: ceiling.maxOutputUsdPerMillionTokens }
+      : {})
+  };
+};
+
+/** Whether this request carries a price ceiling of any of the three shapes. */
+const carriesPriceCeiling = (request: ModelRequest): boolean =>
+  hasPriceCeiling(request) || typeof request.maxUsdPerMillionTokens === 'number';
+
+/**
+ * What the work costs per million tokens at the tier this request will actually reach.
+ *
+ * `blendedPricePerMillionTokens` cannot answer this: it reads the headline rates and ignores
+ * `priceTiers`, so on a route that is cheap to 200K and dear past it, it would name the wrong model
+ * as the cheapest one over the ceiling - and send the owner to raise a ceiling for a route that was
+ * never the expensive one. Unpriced routes sort last, because "unknown" is not "free".
+ */
+const ceilingCostAt = (model: RoutableModel, request: ModelRequest): number => {
+  const { input, output } = pricesAtPromptSize(model, request.minContextTokens);
+  if (input === null && output === null) return Number.POSITIVE_INFINITY;
+  return (input ?? output ?? 0) * 0.75 + (output ?? input ?? 0) * 0.25;
+};
+
+const isBenchmarked = (model: RoutableModel, request: ModelRequest): boolean =>
+  qualityScore(model, taskProfile(request.taskKind ?? 'general').benchmark).source !==
+  'usage_class';
+
+/**
+ * Rank, then say what the owner's ceiling did to the answer - including refusing to answer.
+ *
+ * `rankModels` has always applied the ceiling correctly; what did not exist was a producer of this
+ * verdict, so its `blocked` arm - the only arm that refuses - had no way to reach a caller. A
+ * ranking that comes back empty is indistinguishable from a catalogue that is still loading, and a
+ * caller that reads `[0]?.model` and falls through to a default is how a ceiling becomes a
+ * suggestion. This returns the reason with the result so the caller has to handle it.
+ *
+ * Two callers handle it today, and both turn `blocked` into something the owner can act on: the
+ * support picker answers 402 with `message`, and the vision path posts the same sentence into the
+ * transcript *and* to the owner, because a model cannot raise a price ceiling and an owner cannot
+ * read a system message. A third caller that reads `.choice` and ignores `.ceilingOutcome` would
+ * compile and would put the refusal back where it started.
+ */
+export const selectModel = (models: RoutableModel[], request: ModelRequest): ModelSelection => {
+  const ranked = rankModels(models, request);
+  const choice = ranked[0] ?? null;
+  const none = {
+    ranked,
+    choice,
+    ceilingOutcome: 'no_ceiling',
+    message: null,
+    cheapestAboveCeiling: null
+  } as const;
+  if (!carriesPriceCeiling(request)) return none;
+
+  if (request.requestedId) {
+    // An explicit pick is never constrained by the ceiling - it governs what athanor chooses for
+    // the owner, never what the owner chooses for themselves - but it is not silent about it
+    // either. A model the owner named that is over their own ceiling is worth one sentence.
+    const breach = choice ? priceCeilingBreach(choice.model, request) : null;
+    return breach === null
+      ? none
+      : {
+          ...none,
+          message: `You chose ${choice?.model.displayName ?? request.requestedId}, which is above your price ceiling: ${breach}.`
+        };
+  }
+
+  const relaxed = withoutCeiling(request);
+  const excluded = models
+    .filter((model) => isModelEligible(model, relaxed) && !isModelEligible(model, request))
+    .sort(
+      (left, right) =>
+        ceilingCostAt(left, request) - ceilingCostAt(right, request) ||
+        left.id.localeCompare(right.id)
+    );
+
+  if (!choice) {
+    const cheapest = excluded[0];
+    // Nothing was eligible - but the ceiling is only to blame when lifting it would have produced
+    // something. A catalogue with no model that can do the work at any price is a different
+    // problem, and calling it `blocked` sends the owner to change the one setting that cannot help.
+    if (!cheapest) return none;
+    const breach = priceCeilingBreach(cheapest, request);
+    return {
+      ranked,
+      choice: null,
+      ceilingOutcome: 'blocked',
+      message: `No model can do this work under your price ceiling. The cheapest that could is ${cheapest.displayName}, and ${breach ?? 'it is above the ceiling'}.`,
+      cheapestAboveCeiling: cheapest
+    };
+  }
+
+  // Only worth saying when the ceiling is what cost the measurement. An unmeasured pick on a
+  // catalogue where nothing is measured is a catalogue that has not been benchmarked, not a
+  // ceiling that gave something up.
+  if (
+    !isBenchmarked(choice.model, request) &&
+    excluded.some((model) => isBenchmarked(model, request))
+  )
+    return {
+      ranked,
+      choice,
+      ceilingOutcome: 'relaxed_unbenchmarked',
+      message: `${choice.model.displayName} is under your price ceiling but nobody has benchmarked it; every measured model that could do this work is above the ceiling.`,
+      cheapestAboveCeiling: null
+    };
+
+  return { ranked, choice, ceilingOutcome: 'within', message: null, cheapestAboveCeiling: null };
+};
 
 export interface TaskSignals {
   readonly prompt: string;

@@ -101,6 +101,42 @@ describe('ModelGateway.chat retries', () => {
     expect(deltas).toEqual(['half an answer']);
   });
 
+  /*
+   * The shape that got past the text-only watch: a high-effort step on a full window streams a
+   * minute and a half of thinking - published to the owner's timeline frame by frame, live - and
+   * then the socket drops before the first content token. No text delta ever ran, so the request
+   * was replayed three more times: the owner watched the same reasoning appear four times, each
+   * discarded attempt's reasoning tokens were billed by the provider and recorded nowhere, and the
+   * sequence could eat most of the caller's deadline before the attempt that would have worked.
+   */
+  it('never replays a request that already streamed reasoning to the caller', async () => {
+    const waits: number[] = [];
+    const reasoning: string[] = [];
+    let attempts = 0;
+    const gateway = new ModelGateway({ retry: instantPolicy(waits) }).register(
+      'test',
+      stubAdapter(async (input) => {
+        attempts += 1;
+        await input.onReasoningDelta?.('weighing the two approaches');
+        throw new AthanorError('provider_unavailable', 'stream cut', 503);
+      })
+    );
+
+    await expect(
+      gateway.chat('test', {
+        ...baseRequest,
+        onTextDelta: () => {
+          throw new Error('no content token ever arrived');
+        },
+        onReasoningDelta: (delta) => {
+          reasoning.push(delta);
+        }
+      })
+    ).rejects.toThrow('stream cut');
+    expect(attempts).toBe(1);
+    expect(reasoning).toEqual(['weighing the two approaches']);
+  });
+
   it('does not retry a request the owner cancelled', async () => {
     const controller = new AbortController();
     let attempts = 0;

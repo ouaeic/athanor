@@ -47,8 +47,16 @@ export const GENERATION_CHARS_PER_TOKEN = 8;
 /** Where the ceiling lands when a caller declared no output cap at all: far past any real answer. */
 export const DEFAULT_GENERATION_MAX_CHARS = 400_000;
 
-/** Why this side ended a generation the model had not finished. */
-export type GenerationCutoff = 'stalled' | 'timeout' | 'overrun';
+/**
+ * Why this side ended a generation the model had not finished.
+ *
+ * `cancelled` is the caller's own signal rather than a clock: the repetition watch aborting a model
+ * that has stopped saying anything new, or the owner pressing Stop. It is here because those tokens
+ * were generated and billed exactly like the other three - the abort used to escape as an exception
+ * and take the whole step's billing with it, so the one generation the box stops on purpose was the
+ * one generation nobody ever paid for on paper.
+ */
+export type GenerationCutoff = 'stalled' | 'timeout' | 'overrun' | 'cancelled';
 
 export const generationCharCeiling = (maxTokens: number | undefined): number =>
   maxTokens === undefined
@@ -84,6 +92,8 @@ export interface GenerationBudget {
   /** Adds to the running total and answers whether the character ceiling has now been passed. */
   produced: (characters: number) => boolean;
   characters: () => number;
+  /** The ceiling the budget was started with, for a caller bounding something alongside it. */
+  maxChars: () => number;
   elapsedMs: () => number;
 }
 
@@ -104,6 +114,7 @@ export const startGenerationBudget = (options: {
       return options.maxChars > 0 && characters > options.maxChars;
     },
     characters: () => characters,
+    maxChars: () => options.maxChars,
     elapsedMs: () => clock() - startedAt
   };
 };
@@ -113,11 +124,14 @@ export const startGenerationBudget = (options: {
  * stopped being productive.
  *
  * An overrun never is: it has already written more than twice the longest answer the request
- * allowed for, so the one thing it does not need is more room. The other two are judged on the only
- * evidence that separates a long answer from a stuck one, which is how fast it arrived.
+ * allowed for, so the one thing it does not need is more room. A cancellation never is either, and
+ * for a stronger reason - something on this side decided this generation should stop, so asking the
+ * same route to carry on from where it stopped is asking it to undo the decision. The other two are
+ * judged on the only evidence that separates a long answer from a stuck one, which is how fast it
+ * arrived.
  */
 export const worthContinuing = (cutoff: GenerationCutoff, budget: GenerationBudget): boolean => {
-  if (cutoff === 'overrun') return false;
+  if (cutoff === 'overrun' || cutoff === 'cancelled') return false;
   const seconds = budget.elapsedMs() / 1000;
   return seconds > 0 && budget.characters() / seconds >= MIN_CONTINUABLE_CHARS_PER_SECOND;
 };
@@ -139,5 +153,7 @@ export const describeCutoff = (
     return `${provider} went quiet mid-answer after ${written}; what had arrived was kept`;
   if (cutoff === 'overrun')
     return `${provider} wrote past the output ceiling this request asked for, ${written}; the answer was cut there`;
+  if (cutoff === 'cancelled')
+    return `the request was stopped here after ${provider} produced ${written}; what had arrived was kept`;
   return `${provider} was still writing after ${written} and the generation was cut there`;
 };

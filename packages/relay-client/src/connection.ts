@@ -56,6 +56,10 @@ export interface RelayConnectionOptions {
 
 const spkiSha256 = (der: Buffer): string => createHash('sha256').update(der).digest('base64');
 
+/** Said in one place because the dial gate and the pre-dial gate have to say the same thing. */
+const UNPINNED_REASON =
+  'this box has no pinned key for its relay; enroll again to record one, or switch the relay off';
+
 /**
  * Dials a relay and answers for this box.
  *
@@ -115,7 +119,20 @@ export class RelayConnection {
 
   start(): void {
     if (!relayIsUsable(this.#options.config)) {
-      this.#publish({ state: 'off', nextAttemptAtMs: null });
+      // An enrollment with everything but the pin is the one half-configured state that looks
+      // complete from the outside - the box has an address it could print - so it says why rather
+      // than going quiet, which an owner reads as "I turned it off".
+      const { config } = this.#options;
+      const unpinned =
+        config.enabled &&
+        config.host !== null &&
+        config.label !== null &&
+        config.pinnedRelaySpkiSha256 === null;
+      this.#publish({
+        state: 'off',
+        nextAttemptAtMs: null,
+        lastError: unpinned ? UNPINNED_REASON : this.#status.lastError
+      });
       return;
     }
     this.#stopped = false;
@@ -179,6 +196,22 @@ export class RelayConnection {
     this.#timer.unref();
   }
 
+  /**
+   * Stops for good without calling it a revocation.
+   *
+   * `#retry` has two endings and neither fits a box that is misconfigured rather than unwelcome:
+   * scheduling an attempt would dial a relay this box has already decided it cannot trust, and
+   * `revoked` would tell `athanor doctor` to send the owner to the relay operator for a fresh
+   * invite when the operator has done nothing wrong.
+   */
+  #refuse(reason: string, generation: number): void {
+    if (generation !== this.#generation) return;
+    this.#generation += 1;
+    this.#teardown();
+    this.#log('error', reason);
+    this.#publish({ state: 'off', lastError: reason, openStreams: 0, nextAttemptAtMs: null });
+  }
+
   #dial(): void {
     const { config, identity } = this.#options;
     if (!config.host) return;
@@ -213,7 +246,16 @@ export class RelayConnection {
       const fingerprint = spkiSha256(
         Buffer.from(presented.publicKey.export({ type: 'spki', format: 'der' }))
       );
-      if (config.pinnedRelaySpkiSha256 && config.pinnedRelaySpkiSha256 !== fingerprint) {
+      if (!config.pinnedRelaySpkiSha256) {
+        // Reached only if something dialled past `relayIsUsable`. Skipping the check when there is
+        // no pin - which is what this used to do - turns the strongest gate in the client into a
+        // no-op in exactly the state where it is the only thing standing between the box's identity
+        // key and whoever currently answers for the hostname. A retry cannot help: nothing changes
+        // until the settings do, and every settings change builds a new connection.
+        this.#refuse(UNPINNED_REASON, generation);
+        return;
+      }
+      if (config.pinnedRelaySpkiSha256 !== fingerprint) {
         // Refusing here is the point of pinning: whoever now controls the hostname is not who this
         // box enrolled with, and continuing would hand them every client connection.
         this.#retry(

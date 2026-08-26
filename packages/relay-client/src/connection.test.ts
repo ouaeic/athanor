@@ -34,9 +34,48 @@ describe('relay is off unless it is deliberately turned on', () => {
     ).toBe(false);
     expect(
       relayIsUsable(
-        RelayClientConfigSchema.parse({ enabled: true, host: 'relay.example', label: 'abc' })
+        RelayClientConfigSchema.parse({
+          enabled: true,
+          host: 'relay.example',
+          label: 'abc',
+          pinnedRelaySpkiSha256: 'a-relay-key'
+        })
       )
     ).toBe(true);
+  });
+
+  it('treats an enrollment with no pinned relay key as off, because there is nothing to trust', () => {
+    // A settings file written by a build that predates pinning, or hand-edited by the `jq` path in
+    // `scripts/athanor`, parses cleanly with a host, a label and a null pin. Dialling on that means
+    // presenting the private key that is this box's address to whoever now answers for the name.
+    expect(
+      relayIsUsable(
+        RelayClientConfigSchema.parse({ enabled: true, host: 'relay.example', label: 'abc' })
+      )
+    ).toBe(false);
+  });
+
+  it('refuses to dial an enrollment with no pinned relay key, and says why', () => {
+    const connection = new RelayConnection({
+      config: RelayClientConfigSchema.parse({
+        enabled: true,
+        host: 'relay.example',
+        label: 'abc'
+      }),
+      identity: {
+        keyPem: '',
+        certPem: '',
+        spkiDer: Buffer.alloc(0),
+        rawPublicKey: Buffer.alloc(0),
+        labelFor: () => 'abc'
+      }
+    });
+    connection.start();
+    cleanups.push(() => connection.stop());
+    expect(connection.status.state).toBe('off');
+    // Off with no reason reads as "the owner turned it off". This one needs a new enrollment.
+    expect(connection.status.lastError).toMatch(/enroll/i);
+    expect(connection.status.nextAttemptAtMs).toBeNull();
   });
 
   it('makes no connection at all when it is off', () => {

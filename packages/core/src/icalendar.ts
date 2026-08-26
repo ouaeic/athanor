@@ -41,6 +41,43 @@ const escapeValue = (value: string): string =>
     .replaceAll(',', '\\,')
     .replaceAll(/\r?\n/g, '\\n');
 
+/**
+ * Properties whose value is structured rather than text: ';' and ',' inside them are RFC 5545
+ * separators, not characters, so escaping them corrupts the value. `RRULE:FREQ=WEEKLY;BYDAY=TU`
+ * went out as `FREQ=WEEKLY\;BYDAY=TU` and `CATEGORIES:Work,Planning` as `Work\,Planning`. Our own
+ * parser unescaped both again, which is why no round-trip test ever saw it - but answering a
+ * repeating invitation writes the whole VCALENDAR back to a CalDAV server, and that server reads
+ * one malformed rule part. A line break is still impossible in any of these values, so writing
+ * them through unescaped costs nothing; `escapeValue` stays exactly as it was for text.
+ */
+const STRUCTURED_VALUE_PROPERTIES = new Set([
+  'RRULE',
+  'EXRULE',
+  'RDATE',
+  'EXDATE',
+  'CATEGORIES',
+  'RESOURCES',
+  'FREEBUSY',
+  'GEO',
+  'REQUEST-STATUS'
+]);
+
+/**
+ * Parameter values carry the caret escapes of RFC 6868 rather than the backslash escapes of a
+ * property value, and a quoted parameter value cannot contain a '"' at all. Writing one through
+ * raw produced `CN="Doe, "JJ" Jane"` from an ordinary attendee whose name has a nickname in it -
+ * a line no conforming reader can parse, PUT straight back at the server on accept or update.
+ * Encoding on the way out only stays honest if we decode on the way in, so both directions live
+ * here together; without the pair, a `^'` a server sent would go back out as `^^'`.
+ */
+const decodeParameterValue = (value: string): string =>
+  value.replaceAll(/\^([n^'])/g, (_, character: string) =>
+    character === 'n' ? '\n' : character === "'" ? '"' : '^'
+  );
+
+const encodeParameterValue = (value: string): string =>
+  value.replaceAll('^', '^^').replaceAll('"', "^'").replaceAll(/\r?\n/g, '^n');
+
 const unfoldLines = (text: string): string[] => {
   const lines: string[] = [];
   for (const line of text.split(/\r?\n/)) {
@@ -83,10 +120,12 @@ const parseContentLine = (line: string): IcalProperty | null => {
     if (equals <= 0) continue;
     parameters.set(
       segment.slice(0, equals).toUpperCase(),
-      segment
-        .slice(equals + 1)
-        .trim()
-        .replace(/^"(.*)"$/, '$1')
+      decodeParameterValue(
+        segment
+          .slice(equals + 1)
+          .trim()
+          .replace(/^"(.*)"$/, '$1')
+      )
     );
   }
   return {
@@ -144,9 +183,18 @@ export const serializeIcalendar = (component: IcalComponent): string => {
   const lines: string[] = [`BEGIN:${component.name}`];
   for (const property of component.properties) {
     const parameters = [...property.parameters]
-      .map(([name, value]) => `;${name}=${/[;:,]/.test(value) ? `"${value}"` : value}`)
+      .map(([name, value]) => {
+        const encoded = encodeParameterValue(value);
+        return `;${name}=${/[;:,]/.test(encoded) ? `"${encoded}"` : encoded}`;
+      })
       .join('');
-    lines.push(foldLine(`${property.name}${parameters}:${escapeValue(property.value)}`));
+    // Structured values go out verbatim, minus any line break. Nothing legitimate puts one there,
+    // but a parsed value can hold one - `\n` in an incoming line is unescaped on the way in - and
+    // writing it raw would end the content line early and let the rest of it pose as a property.
+    const value = STRUCTURED_VALUE_PROPERTIES.has(property.name)
+      ? property.value.replaceAll(/\r?\n/g, ' ')
+      : escapeValue(property.value);
+    lines.push(foldLine(`${property.name}${parameters}:${value}`));
   }
   for (const child of component.components) lines.push(serializeIcalendar(child));
   lines.push(`END:${component.name}`);

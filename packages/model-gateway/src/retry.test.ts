@@ -2,6 +2,7 @@ import { AthanorError } from '@athanor/core';
 import { describe, expect, it } from 'vitest';
 import {
   backoffDelayMs,
+  isProviderWall,
   isRetryableError,
   retryAfterMsOf,
   withRetry,
@@ -183,5 +184,43 @@ describe('provider status classification', () => {
         new AthanorError('provider_quota_exhausted', 'rate limited', 429, { retryAfter: '30' })
       )
     ).toBe(30_000);
+  });
+});
+
+/**
+ * The same question at the other horizon: retry asks about the next ten seconds inside one step,
+ * this asks whether a task that has run for hours should be parked and asked again tomorrow or
+ * marked failed and left for a person to find in the morning.
+ */
+describe('whether waiting is any use', () => {
+  it('calls every status the provider turns work away with a wall', () => {
+    for (const status of [408, 429, 500, 502, 503, 504, 529])
+      expect(
+        isProviderWall(new AthanorError('provider_request_failed', `refused (${status})`, status))
+      ).toBe(true);
+  });
+
+  it('leaves a request the provider refused terminal', () => {
+    // A rejected prompt, an unknown model and a malformed tool schema fail identically however
+    // often they are asked. Parking a task behind one of them is parking it behind nothing.
+    for (const status of [400, 401, 403, 404, 413, 422])
+      expect(
+        isProviderWall(new AthanorError('provider_request_failed', `refused (${status})`, status))
+      ).toBe(false);
+  });
+
+  it('reads the codes that are thrown without a status of their own', () => {
+    // `list()` raises this one with AthanorError's default of 400, and the request deadline raises
+    // `model_request_timeout` the same way. A status-only reading calls both client mistakes.
+    expect(isProviderWall(new AthanorError('provider_unavailable', 'could not be reached'))).toBe(
+      true
+    );
+    expect(isProviderWall(new AthanorError('model_request_timeout', 'no answer in 900s'))).toBe(
+      true
+    );
+    expect(isProviderWall(new AthanorError('provider_not_connected', 'add a provider', 503))).toBe(
+      true
+    );
+    expect(isProviderWall(new Error('socket hang up'))).toBe(false);
   });
 });

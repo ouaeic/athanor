@@ -1,8 +1,9 @@
 import { resolveWebToolPlan } from '@athanor/contracts';
 import { AthanorError } from '@athanor/core';
 import { describe, expect, it, vi } from 'vitest';
+import { ModelGateway } from './gateway.js';
 import { OpenAICompatibleAdapter } from './openai-compatible.js';
-import { isRetryableError, retryAfterMsOf } from './retry.js';
+import { isProviderWall, isRetryableError, retryAfterMsOf } from './retry.js';
 
 describe('OpenAICompatibleAdapter', () => {
   it('calls a managed OpenRouter model with tools and fail-closed privacy routing', async () => {
@@ -338,9 +339,14 @@ describe('OpenAICompatibleAdapter', () => {
       []
     ).catch((error: unknown) => error);
 
-    expect((failure as AthanorError).code).toBe('provider_request_failed');
+    // Deliberately moved from `provider_request_failed`. A 502 is the provider turning the work
+    // away, and the name it leaves under is the one the layers above park a task behind; the old
+    // name was retried inside the step and then failed the whole task, which is the opposite
+    // outcome to the same outage arriving as a dropped socket.
+    expect((failure as AthanorError).code).toBe('provider_unavailable');
     expect((failure as AthanorError).statusCode).toBe(502);
     expect(isRetryableError(failure)).toBe(true);
+    expect(isProviderWall(failure)).toBe(true);
   });
 
   it('raises an error object that arrives in an otherwise successful body', async () => {
@@ -430,6 +436,115 @@ describe('OpenAICompatibleAdapter', () => {
     expect((failure as AthanorError).statusCode).toBe(504);
     expect(isRetryableError(failure)).toBe(true);
     expect(deltas).toEqual([]);
+  });
+
+  /*
+   * `stream: true` is a request, not a guarantee, and the four shapes below are what came back from
+   * a route that did not honour it. Every one of them used to return `{text: '', toolCalls: [],
+   * finishReason: 'stop', usage: {0, 0, 0}}` as a success, because the SSE reader discards every
+   * line that does not begin with `data:` and then synthesises a `choices` array whatever it read.
+   * An owner behind a buffering proxy got a completed task with no answer in it and a ledger
+   * reading $0.00 for every call the provider billed, and nothing anywhere was an error.
+   */
+  const unstreamedAdapter = (body: BodyInit, contentType: string): OpenAICompatibleAdapter =>
+    new OpenAICompatibleAdapter({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'managed-key',
+      provider: 'openrouter',
+      privacyRoute: 'provider_zdr',
+      streamIdleTimeoutMs: 200,
+      fetch: (async () =>
+        new Response(body, { headers: { 'content-type': contentType } })) as typeof fetch
+    });
+
+  const bufferedCompletion = JSON.stringify({
+    model: 'z-ai/glm-5.2',
+    choices: [
+      {
+        finish_reason: 'tool_calls',
+        message: {
+          content: 'Listing the workspace.',
+          tool_calls: [
+            { id: 'call-7', function: { name: 'shell', arguments: '{"executable":"ls"}' } }
+          ]
+        }
+      }
+    ],
+    usage: { prompt_tokens: 120, completion_tokens: 18, total_tokens: 138, cost: 0.004 }
+  });
+
+  it('keeps the answer a gateway gave when it buffered the stream away and replied as JSON', async () => {
+    const deltas: string[] = [];
+
+    const result = await streamRequest(
+      unstreamedAdapter(bufferedCompletion, 'application/json'),
+      deltas
+    );
+
+    expect(result).toMatchObject({
+      text: 'Listing the workspace.',
+      toolCalls: [{ id: 'call-7', name: 'shell', arguments: { executable: 'ls' } }],
+      finishReason: 'tool_calls',
+      usage: { inputTokens: 120, outputTokens: 18, totalTokens: 138, costUsd: 0.004 }
+    });
+    // Nothing was streamed, so nothing was handed out delta by delta - but the turn is the turn the
+    // provider billed for, not an empty one.
+    expect(deltas).toEqual([]);
+  });
+
+  it('recovers a completion from a reply that called itself a stream and sent none', async () => {
+    const deltas: string[] = [];
+
+    const result = await streamRequest(
+      unstreamedAdapter(bufferedCompletion, 'text/event-stream'),
+      deltas
+    );
+
+    expect(result).toMatchObject({
+      text: 'Listing the workspace.',
+      usage: { costUsd: 0.004 }
+    });
+    expect(deltas).toEqual([]);
+  });
+
+  it('raises an error object a streamed request was answered with at 200', async () => {
+    const failure = await streamRequest(
+      unstreamedAdapter(
+        JSON.stringify({ error: { code: 503, message: 'no instances available' } }),
+        'application/json'
+      ),
+      []
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AthanorError);
+    expect((failure as AthanorError).message).toContain('no instances available');
+    expect((failure as AthanorError).statusCode).toBe(503);
+    expect(isRetryableError(failure)).toBe(true);
+  });
+
+  it('refuses a stream that closed cleanly without sending one frame', async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      }
+    });
+
+    const failure = await streamRequest(unstreamedAdapter(body, 'text/event-stream'), []).catch(
+      (error: unknown) => error
+    );
+
+    expect((failure as AthanorError).code).toBe('provider_stream_unparsed');
+    expect((failure as AthanorError).statusCode).toBe(502);
+  });
+
+  it('refuses a stream whose only frame was the end-of-stream marker', async () => {
+    const failure = await streamRequest(
+      unstreamedAdapter('data: [DONE]\n\n', 'text/event-stream'),
+      []
+    ).catch((error: unknown) => error);
+
+    expect((failure as AthanorError).code).toBe('provider_stream_unparsed');
+    expect((failure as AthanorError).statusCode).toBe(502);
   });
 
   /*
@@ -1321,6 +1436,93 @@ describe('OpenAICompatibleAdapter', () => {
     ]);
   });
 
+  /*
+   * Every bound written for the fifteen-minute incident lived inside the stream reader, so the five
+   * call sites that do not stream - the delegate step, the provider web search, the compaction
+   * summariser, the vision specialist and the API titler - had none of them.
+   */
+  describe('bounds that used to apply to the streamed path only', () => {
+    it('stops waiting on a non-streamed reply that never arrives', async () => {
+      const adapter = new OpenAICompatibleAdapter({
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: 'managed-key',
+        provider: 'openrouter',
+        privacyRoute: 'provider_zdr',
+        generationTimeoutMs: 40,
+        fetch: (async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                // Headers, then silence. Without a deadline on this read the worker's slot is held
+                // for the caller's whole fifteen minutes, sixteen times over inside one delegate.
+                controller.enqueue(encode('{"choices":[{"message":{"content":"'));
+              }
+            }),
+            { headers: { 'content-type': 'application/json' } }
+          )) as typeof fetch
+      });
+
+      const failure = await adapter
+        .chat({
+          model: 'z-ai/glm-5.2',
+          messages: [{ role: 'user', content: 'Summarise this' }],
+          tools: [],
+          temperature: 0.2
+        })
+        .catch((error: unknown) => error);
+
+      expect((failure as AthanorError).code).toBe('provider_stream_stalled');
+      // A wall rather than a client mistake, so the layers above wait rather than fail the task.
+      expect(isProviderWall(failure)).toBe(true);
+    });
+
+    it('stops a stream that sends bytes without ever sending a line', async () => {
+      // Measured before the cap: 4 KB of newline-free bytes per pull against a ceiling of fifty
+      // characters read 593 chunks and 2.4 MB in four hundred milliseconds, with the ceiling never
+      // once consulted - `budget.produced` is only reached from a parsed line.
+      const deltas: string[] = [];
+      let pulls = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pulls += 1;
+          controller.enqueue(encode('x'.repeat(200_000)));
+        }
+      });
+
+      const result = (await streamRequest(
+        streamingAdapter(body, { generationTimeoutMs: 30_000, generationMaxChars: 5_000_000 }),
+        deltas
+      ).catch((error: unknown) => error)) as AthanorError;
+
+      // Nothing was generated, so it is the provider fault it is rather than a partial answer.
+      expect(result.code).toBe('provider_stream_stalled');
+      // Bounded by the megabyte rather than by the clock or by V8's string length.
+      expect(pulls).toBeLessThan(12);
+    });
+
+    it('stops a stream that sends frames without ever sending an answer', async () => {
+      // The other half the character ceiling cannot see: every line parses, none of them carries a
+      // token, so nothing is ever counted as produced and the stream runs until the clock.
+      const deltas: string[] = [];
+      let pulls = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pulls += 1;
+          controller.enqueue(encode('data: {"choices":[{"delta":{}}]}\n\n'.repeat(500)));
+        }
+      });
+
+      const result = (await streamRequest(
+        streamingAdapter(body, { generationTimeoutMs: 30_000, generationMaxChars: 200 }),
+        deltas
+      ).catch((error: unknown) => error)) as AthanorError;
+
+      expect(result.code).toBe('provider_stream_stalled');
+      // 200 characters of answer allowed, sixteen times that in envelope: a few hundred frames.
+      expect(pulls).toBeLessThan(5);
+    });
+  });
+
   it('does not re-send on a 400 that is not about a reasoning signature', async () => {
     let calls = 0;
     const request = vi.fn(async (input: string | URL | Request) => {
@@ -1354,5 +1556,409 @@ describe('OpenAICompatibleAdapter', () => {
       })
     ).rejects.toThrow('unknown model');
     expect(calls).toBe(1);
+  });
+
+  /**
+   * The other 400 with the signed-reasoning refusal's property: the same bytes fail identically for
+   * ever, and a refused request appends nothing, so the window never advances past the message that
+   * overflowed it. Nothing anywhere recognised it, and a resumed task died at the same step until
+   * the owner stopped replying.
+   */
+  const refusingWith = (status: number, message: string): OpenAICompatibleAdapter =>
+    new OpenAICompatibleAdapter({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'managed-key',
+      provider: 'openrouter',
+      privacyRoute: 'external',
+      fetch: (async () =>
+        new Response(JSON.stringify({ error: { message } }), {
+          status,
+          headers: { 'content-type': 'application/json' }
+        })) as typeof fetch
+    });
+
+  const refusal = async (adapter: OpenAICompatibleAdapter): Promise<AthanorError> =>
+    (await adapter
+      .chat({
+        model: 'z-ai/glm-5.2',
+        messages: [{ role: 'user', content: 'hello' }],
+        tools: [],
+        temperature: 0.2
+      })
+      .catch((error: unknown) => error)) as AthanorError;
+
+  it('names a window the route will not take, and the sizes it named', async () => {
+    const failure = await refusal(
+      refusingWith(
+        400,
+        "This model's maximum context length is 200000 tokens, however you requested 214113 tokens"
+      )
+    );
+
+    expect(failure.code).toBe('provider_context_overflow');
+    // The route's own ceiling, not the catalogue's number for the model: those differ, and it is
+    // the difference that puts a request over the line.
+    expect(failure.details).toMatchObject({
+      contextLimitTokens: 200_000,
+      requestedTokens: 214_113
+    });
+    // Repairable, but never by sending the identical bytes again.
+    expect(isRetryableError(failure)).toBe(false);
+    expect(isProviderWall(failure)).toBe(false);
+  });
+
+  it("recognises the same refusal at 413 and in another vendor's wording", async () => {
+    expect(
+      (await refusal(refusingWith(413, 'prompt is too long: 214113 tokens > 200000'))).code
+    ).toBe('provider_context_overflow');
+    expect(
+      (await refusal(refusingWith(400, 'input length exceeds context window; reduce the length')))
+        .code
+    ).toBe('provider_context_overflow');
+  });
+
+  it('leaves an ordinary refusal terminal under its own name', async () => {
+    // Both halves of the match have to hold: "too long" about something that is not a window is
+    // still an ordinary refusal, and a request the provider disliked for any other reason must not
+    // start a compaction that throws away the owner's transcript.
+    expect((await refusal(refusingWith(400, 'unknown model'))).code).toBe(
+      'provider_request_failed'
+    );
+    expect((await refusal(refusingWith(400, 'tool name is too long'))).code).toBe(
+      'provider_request_failed'
+    );
+  });
+
+  /*
+   * Reasoning fields, on the endpoint family this adapter names by name.
+   *
+   * The recorded incident is a turn that streamed 1,015 `assistant_delta` frames and made no tool
+   * call, where the model's deliberation was published as the answer and its own operating contract
+   * came back into the reading column. A route that puts its thinking somewhere this file does not
+   * read is that defect's supply line: `reasoning_content` is what DeepSeek's own API and vLLM's
+   * reasoning parsers send, and a `<think>` span inline in `content` is what every unparsed
+   * self-hosted R1-family route sends.
+   */
+  describe('reasoning fields', () => {
+    /** Drives one stream and reports both channels separately, which is the whole question here. */
+    const splitStream = async (
+      body: BodyInit,
+      options: { generationMaxChars?: number; generationTimeoutMs?: number } = {}
+    ): Promise<{
+      text: string;
+      reasoning?: string;
+      textDeltas: string[];
+      reasoningDeltas: string[];
+    }> => {
+      const textDeltas: string[] = [];
+      const reasoningDeltas: string[] = [];
+      const result = (await streamingAdapter(body, options).chat({
+        model: 'deepseek/deepseek-r1',
+        messages: [{ role: 'user', content: 'Summarise the workspace' }],
+        tools: [],
+        temperature: 0.2,
+        onTextDelta: (delta) => {
+          textDeltas.push(delta);
+        },
+        onReasoningDelta: (delta) => {
+          reasoningDeltas.push(delta);
+        }
+      })) as { text: string; reasoning?: string };
+      return { ...result, textDeltas, reasoningDeltas };
+    };
+
+    const framesOf = (...frames: unknown[]): string =>
+      frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('') + 'data: [DONE]\n\n';
+
+    const jsonAdapter = (body: unknown): OpenAICompatibleAdapter =>
+      new OpenAICompatibleAdapter({
+        baseUrl: 'https://vllm.internal/v1',
+        provider: 'self-hosted',
+        privacyRoute: 'local',
+        fetch: (async () => new Response(JSON.stringify(body), { status: 200 })) as typeof fetch
+      });
+
+    const jsonAnswer = (
+      message: Record<string, unknown>
+    ): Promise<{ text: string; reasoning?: string }> =>
+      jsonAdapter({
+        choices: [{ finish_reason: 'stop', message }],
+        usage: { prompt_tokens: 9, completion_tokens: 5, total_tokens: 14 }
+      }).chat({
+        model: 'deepseek-r1',
+        messages: [{ role: 'user', content: 'Summarise the workspace' }],
+        tools: [],
+        temperature: 0.2
+      }) as Promise<{ text: string; reasoning?: string }>;
+
+    it('reads reasoning a route streams as reasoning_content rather than dropping it', async () => {
+      const result = await splitStream(
+        framesOf(
+          { choices: [{ delta: { reasoning_content: 'deliberating hard' } }] },
+          { choices: [{ finish_reason: 'stop', delta: { content: 'answer' } }] }
+        )
+      );
+
+      expect(result.text).toBe('answer');
+      expect(result.reasoning).toBe('deliberating hard');
+      expect(result.reasoningDeltas).toEqual(['deliberating hard']);
+      expect(result.textDeltas).toEqual(['answer']);
+    });
+
+    it('sends a leading think span to the reasoning channel instead of publishing it as the answer', async () => {
+      const result = await splitStream(
+        framesOf({
+          choices: [
+            { finish_reason: 'stop', delta: { content: '<think>secret plan</think>final' } }
+          ]
+        })
+      );
+
+      expect(result.text).toBe('final');
+      expect(result.reasoning).toBe('secret plan');
+      expect(result.textDeltas).toEqual(['final']);
+      expect(result.reasoningDeltas).toEqual(['secret plan']);
+    });
+
+    it('recognises a think span whose tags are split across stream frames', async () => {
+      const result = await splitStream(
+        framesOf(
+          { choices: [{ delta: { content: '<thi' } }] },
+          { choices: [{ delta: { content: 'nk>step one' } }] },
+          { choices: [{ delta: { content: ' step two</thi' } }] },
+          { choices: [{ finish_reason: 'stop', delta: { content: 'nk>the answer' } }] }
+        )
+      );
+
+      expect(result.text).toBe('the answer');
+      expect(result.reasoning).toBe('step one step two');
+      expect(result.textDeltas.join('')).toBe('the answer');
+    });
+
+    it('leaves a think-free streamed answer byte-identical, delta for delta', async () => {
+      const result = await splitStream(
+        framesOf(
+          { choices: [{ delta: { content: 'I will ' } }] },
+          { choices: [{ delta: { content: 'check.' } }] },
+          { choices: [{ finish_reason: 'stop', delta: {} }] }
+        )
+      );
+
+      expect(result.textDeltas).toEqual(['I will ', 'check.']);
+      expect(result.text).toBe('I will check.');
+      expect(result.reasoning).toBeUndefined();
+      expect(result.reasoningDeltas).toEqual([]);
+    });
+
+    it('leaves markup that only starts like a think tag alone', async () => {
+      // `<p>` shares a first character with `<think>` and nothing else. The answer has to come back
+      // whole: a hold-back that guesses wrong here eats the beginning of every HTML reply.
+      const result = await splitStream(
+        framesOf(
+          { choices: [{ delta: { content: '<p' } }] },
+          { choices: [{ finish_reason: 'stop', delta: { content: '>hello</p>' } }] }
+        )
+      );
+
+      expect(result.text).toBe('<p>hello</p>');
+      expect(result.reasoning).toBeUndefined();
+    });
+
+    it('leaves a think tag that is not at the start of the answer where the model put it', async () => {
+      const result = await splitStream(
+        framesOf({
+          choices: [{ finish_reason: 'stop', delta: { content: 'here: <think>x</think>' } }]
+        })
+      );
+
+      expect(result.text).toBe('here: <think>x</think>');
+      expect(result.reasoning).toBeUndefined();
+    });
+
+    it('counts reasoning_content against the generation ceiling like any other output', async () => {
+      // Row one of the measured probe: thinking that is never read is thinking no bound can see, so
+      // a route that loops inside its own deliberation runs to the clock rather than to the ceiling.
+      const body = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          controller.enqueue(
+            encode('data: {"choices":[{"delta":{"reasoning_content":"0123456789"}}]}\n\n')
+          );
+        }
+      });
+
+      const result = (await splitStream(body, {
+        generationMaxChars: 25,
+        generationTimeoutMs: 300
+      })) as { reasoning?: string } & { truncated?: { reason: string } };
+
+      expect((result as { truncated?: { reason: string } }).truncated?.reason).toBe('overrun');
+      expect(result.reasoning?.length ?? 0).toBeGreaterThan(25);
+    });
+
+    it('reads reasoning_content off a non-streamed message too', async () => {
+      await expect(
+        jsonAnswer({ content: 'answer', reasoning_content: 'deliberating hard' })
+      ).resolves.toMatchObject({ text: 'answer', reasoning: 'deliberating hard' });
+    });
+
+    it('splits a leading think span out of a non-streamed answer', async () => {
+      await expect(
+        jsonAnswer({ content: '<think>secret plan</think>final' })
+      ).resolves.toMatchObject({ text: 'final', reasoning: 'secret plan' });
+    });
+
+    it('keeps an unterminated think span in the thinking column rather than reopening it as prose', async () => {
+      // The stream ended inside the span. The fragments went out over `onReasoningDelta` as they
+      // arrived and the owner has already read them there; publishing the same words a second time
+      // as the answer is the whole of the defect. What is held back when the reader stops has to
+      // land, though - a silent truncation on the paths that already have the least to show would
+      // be a worse trade than the one being made.
+      const result = await splitStream(
+        framesOf(
+          { choices: [{ delta: { content: '<think>halfway through a plan' } }] },
+          { choices: [{ finish_reason: 'stop', delta: { content: ' and then</thi' } }] }
+        )
+      );
+
+      expect(result.text).toBe('');
+      expect(result.reasoning).toBe('halfway through a plan and then</thi');
+      expect(result.textDeltas).toEqual([]);
+    });
+
+    it('leaves an unterminated think tag in a complete answer exactly where the model put it', async () => {
+      // The opposite ruling to the streamed one above, and deliberately: the whole answer is in
+      // hand here, so an opening tag with no closing one is prose, not a span.
+      await expect(jsonAnswer({ content: '<think>this never closes' })).resolves.toMatchObject({
+        text: '<think>this never closes'
+      });
+    });
+
+    it('drops the blank line the templates put after the closing tag', async () => {
+      await expect(
+        jsonAnswer({ content: '<think>planning</think>\n\nThe answer.' })
+      ).resolves.toMatchObject({ text: 'The answer.', reasoning: 'planning' });
+    });
+
+    it('reads a span the model opened after a newline, and not one buried behind an indent', async () => {
+      await expect(
+        jsonAnswer({ content: '\n<think>planning</think>answer' })
+      ).resolves.toMatchObject({ text: 'answer', reasoning: 'planning' });
+      // Nine spaces is past the bound on both splitters, so the two agree that this is prose.
+      const streamed = await splitStream(
+        framesOf({
+          choices: [{ finish_reason: 'stop', delta: { content: '         <think>x</think>y' } }]
+        })
+      );
+      expect(streamed.text).toBe('         <think>x</think>y');
+      await expect(jsonAnswer({ content: '         <think>x</think>y' })).resolves.toMatchObject({
+        text: '         <think>x</think>y'
+      });
+    });
+
+    it('still refuses to replay a turn whose every delta went to the thinking column', async () => {
+      // The retry rule refuses to replay a request whose words the owner has already seen, and it
+      // learns that from the two delta callbacks. Routing a leading think span away from
+      // `onTextDelta` must not quietly make a turn replayable that was not replayable before - the
+      // owner would watch the same deliberation arrive twice, and every discarded attempt's
+      // reasoning tokens were billed by the provider and recorded nowhere.
+      let attempts = 0;
+      let textDeltas = 0;
+      const reasoningDeltas: string[] = [];
+      const gateway = new ModelGateway({
+        retry: {
+          maxAttempts: 3,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+          random: () => 0,
+          sleep: async () => undefined
+        }
+      }).register('self-hosted', {
+        provider: 'self-hosted',
+        privacyRoute: 'local',
+        list: async () => [],
+        chat: async (request) => {
+          attempts += 1;
+          let delivered = false;
+          const body = new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (!delivered) {
+                delivered = true;
+                controller.enqueue(
+                  encode('data: {"choices":[{"delta":{"content":"<think>deliberating hard"}}]}\n\n')
+                );
+                return;
+              }
+              controller.error(
+                Object.assign(new TypeError('terminated'), { cause: { code: 'UND_ERR_SOCKET' } })
+              );
+            }
+          });
+          return streamingAdapter(body).chat(request);
+        }
+      });
+
+      const failure = await gateway
+        .chat('self-hosted', {
+          model: 'deepseek-r1',
+          messages: [{ role: 'user', content: 'go' }],
+          tools: [],
+          temperature: 0.2,
+          onTextDelta: () => {
+            textDeltas += 1;
+          },
+          onReasoningDelta: (delta) => {
+            reasoningDeltas.push(delta);
+          }
+        })
+        .catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(AthanorError);
+      expect(reasoningDeltas.join('')).toBe('deliberating hard');
+      // Nothing at all reached the text channel, so `attempts` is the reasoning watch on its own.
+      expect(textDeltas).toBe(0);
+      expect(attempts).toBe(1);
+    });
+
+    it('splits the span out of a stream a buffering proxy turned back into JSON', async () => {
+      // The third way into the assembly, and the one that is easy to forget: a proxy that swallowed
+      // `stream: true` answers with an ordinary completion body, no frame parses, and the reply is
+      // read once as a completion rather than thrown away. Nothing was published delta by delta on
+      // that path, so this is the only chance the span gets.
+      const textDeltas: string[] = [];
+      const answer = (await new OpenAICompatibleAdapter({
+        baseUrl: 'https://litellm.internal/v1',
+        provider: 'self-hosted',
+        privacyRoute: 'local',
+        fetch: (async () =>
+          new Response(
+            JSON.stringify({
+              choices: [
+                { finish_reason: 'stop', message: { content: '<think>secret plan</think>final' } }
+              ],
+              usage: { prompt_tokens: 9, completion_tokens: 5, total_tokens: 14 }
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          )) as typeof fetch
+      }).chat({
+        model: 'deepseek-r1',
+        messages: [{ role: 'user', content: 'go' }],
+        tools: [],
+        temperature: 0.2,
+        onTextDelta: (delta) => {
+          textDeltas.push(delta);
+        }
+      })) as { text: string; reasoning?: string };
+
+      expect(answer.text).toBe('final');
+      expect(answer.reasoning).toBe('secret plan');
+      expect(textDeltas).toEqual([]);
+    });
+
+    it('leaves a think-free non-streamed answer byte-identical', async () => {
+      const answer = await jsonAnswer({ content: 'The importer reads all three columns.' });
+      expect(answer.text).toBe('The importer reads all three columns.');
+      expect(answer.reasoning).toBeUndefined();
+    });
   });
 });

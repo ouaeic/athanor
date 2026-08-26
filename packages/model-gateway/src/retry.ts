@@ -90,11 +90,52 @@ export const retryAfterMsOf = (error: unknown): number | undefined => {
   );
 };
 
+/**
+ * A status that means the provider turned the work away rather than refusing it.
+ *
+ * The same three numbers `isRetryableError` reads, named once so the two horizons cannot drift: a
+ * fault worth asking about again in ten seconds is a fault worth waiting behind for an hour, and
+ * they were being decided by two copies of one expression. Everything at 4xx other than 408 and 429
+ * is the request itself being wrong - an unknown model, a rejected prompt, a malformed tool schema -
+ * and asking again at any interval only spends the owner's money on the identical refusal.
+ */
+export const isProviderWallStatus = (status: number): boolean =>
+  status === 408 || status === 429 || (status >= 500 && status < 600);
+
 export const isRetryableError = (error: unknown): boolean => {
   if (error instanceof AthanorError && RETRYABLE_CODES.has(error.code)) return true;
   const status = httpStatusOf(error);
   if (status === undefined) return false;
-  return status === 408 || status === 429 || (status >= 500 && status < 600);
+  return isProviderWallStatus(status);
+};
+
+/**
+ * Codes that name a wall whatever status they arrived with.
+ *
+ * Two of them are thrown without one at all - `list()` raises `provider_unavailable` with
+ * AthanorError's default of 400, and the request deadline raises `model_request_timeout` the same
+ * way - so a status-only reading calls the most obvious walls on the box client mistakes.
+ */
+const PROVIDER_WALL_CODES = new Set([
+  'provider_unavailable',
+  'provider_quota_exhausted',
+  'provider_not_connected',
+  'model_request_timeout'
+]);
+
+/**
+ * Whether waiting is any use: the provider turned this work away, rather than refusing it.
+ *
+ * The same question `isRetryableError` asks, at the other horizon. Retry asks it about the next ten
+ * seconds inside one step; this asks it about the next day, on behalf of the caller deciding
+ * whether a task that has run for hours should be parked and picked up again or marked failed and
+ * left for a person to notice. Getting it wrong in the terminal direction is what turned a
+ * ninety-second load-shedding 503 into a dead scheduled run with eighteen steps of work on disk.
+ */
+export const isProviderWall = (error: unknown): boolean => {
+  if (error instanceof AthanorError && PROVIDER_WALL_CODES.has(error.code)) return true;
+  const status = httpStatusOf(error);
+  return status === undefined ? false : isProviderWallStatus(status);
 };
 
 const isAbortError = (error: unknown): boolean => {

@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AthanorError } from '@athanor/core';
 import type { ModelRelease } from '@athanor/contracts';
 import { seedModels } from './catalog.js';
+import { currentCommercialLicenseReview } from './license-manifest.js';
 import {
   applyOpenRouterPrivacyPolicy,
+  MAX_CREDIBLE_CONTEXT_TOKENS,
   refreshOpenRouterCatalog,
   refreshOpenRouterMediaCatalog,
   verifyOpenRouterKey
@@ -376,17 +378,34 @@ describe('OpenRouter live catalog', () => {
     ).toBe(true);
   });
 
-  it('fails closed in strict scope when the independent model-license review expires', async () => {
-    const result = await refreshOpenRouterCatalog(seedModels(), {
+  /*
+   * Strict scope's fail-closed contract, tested on a condition that can actually occur.
+   *
+   * This used to read the clock forward to a review's `reviewExpiresAt` and assert the model went
+   * to `review` on that day. Reviews no longer expire - a published licence is a fact about a
+   * published artefact, not a subscription - so what remains is the disagreement the review exists
+   * to catch: the catalogue declaring one licence while the manifest reviewed another. That is what
+   * a relicensing upstream looks like from here, and unlike a date it is a real event.
+   */
+  it('fails closed in strict scope when the catalogue declares a licence the review does not confirm', async () => {
+    const relicensed = seedModels().map((model) =>
+      model.providerModelId === 'z-ai/glm-5.2'
+        ? { ...model, license: 'Apache-2.0' as const }
+        : model
+    );
+    expect(currentCommercialLicenseReview('z-ai/glm-5.2', 'MIT')).toBeDefined();
+    expect(currentCommercialLicenseReview('z-ai/glm-5.2', 'Apache-2.0')).toBeUndefined();
+
+    const result = await refreshOpenRouterCatalog(relicensed, {
       baseUrl: 'https://openrouter.ai/api/v1',
       apiKey: 'registry-key',
       fetch: liveFetch() as typeof fetch,
-      now: new Date('2026-10-21T00:00:00.000Z'),
+      now: NOW,
       scope: 'reviewed_open_weight'
     });
-    expect(result.find((model) => model.providerModelId === 'z-ai/glm-5.2')?.availability).toBe(
-      'review'
-    );
+    const glm = result.find((model) => model.providerModelId === 'z-ai/glm-5.2');
+    expect(glm?.availability).toBe('review');
+    expect(glm?.providerAvailable).toBe(false);
   });
 
   it('offers the provider catalogue by default so new models need no code change', async () => {
@@ -467,12 +486,23 @@ describe('OpenRouter live catalog', () => {
     expect(omni?.capabilities).toContain('vision');
   });
 
-  it('keeps a model selectable after its weight-licence review lapses, without the open-weight claim', async () => {
-    const result = await refreshOpenRouterCatalog(seedModels(), {
+  /*
+   * The other half of the same contract: outside strict scope an unreviewed model is still offered,
+   * it just does not get to claim open weights. Degrading the claim rather than withdrawing the
+   * model is what keeps the default catalogue usable, and it is the arm that would silently stop
+   * mattering if the reviewed set ever covered everything.
+   */
+  it('keeps a model whose review does not confirm its licence selectable, without the open-weight claim', async () => {
+    const relicensed = seedModels().map((model) =>
+      model.providerModelId === 'z-ai/glm-5.2'
+        ? { ...model, license: 'Apache-2.0' as const }
+        : model
+    );
+    const result = await refreshOpenRouterCatalog(relicensed, {
       baseUrl: 'https://openrouter.ai/api/v1',
       apiKey: 'registry-key',
       fetch: liveFetch() as typeof fetch,
-      now: new Date('2026-10-21T00:00:00.000Z')
+      now: NOW
     });
 
     expect(result.find((model) => model.providerModelId === 'z-ai/glm-5.2')).toMatchObject({
@@ -480,6 +510,57 @@ describe('OpenRouter live catalog', () => {
       openness: 'remote_proprietary',
       license: 'provider-hosted'
     });
+  });
+
+  /*
+   * Two columns describing one fact, and they used to disagree.
+   *
+   * `privacyRoute` was the literal `'provider_zdr'` on every live entry, written three lines below
+   * the honest per-model answer the endpoint feed had just produced. So a model the provider serves
+   * from no zero-retention endpoint at all was stored as `zeroDataRetentionAvailable: false` *and*
+   * `privacyRoute: 'provider_zdr'`, and `privacyRoute` is the routing input - it is what
+   * `isPrivacyRouteEligible` matches on and what the worker's delegate picker compares a task
+   * against. That picker reads the catalogue raw and checks the route alone, so on a zero-retention
+   * task the strongest specialist available was chosen from models with no private route.
+   */
+  it('offers a model on the zero-retention route only where the endpoint feed found one', async () => {
+    const result = await refreshOpenRouterCatalog(seedModels(NOW), {
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'registry-key',
+      fetch: liveFetch() as typeof fetch,
+      now: NOW
+    });
+    const byId = new Map(result.map((model) => [model.providerModelId, model]));
+
+    // Served by a live ZDR endpoint, so the route it is offered on is the private one.
+    expect(byId.get('openai/gpt-5.6-terra')).toMatchObject({
+      zeroDataRetentionAvailable: true,
+      privacyRoute: 'provider_zdr'
+    });
+    // No ZDR endpoint in the feed. The two columns now say the same thing.
+    expect(byId.get('unreviewed/new-model')).toMatchObject({
+      zeroDataRetentionAvailable: false,
+      privacyRoute: 'external'
+    });
+    expect(byId.get('designer/pixel-1')?.privacyRoute).toBe('external');
+  });
+
+  /*
+   * Unknown is not false, here as everywhere else in this file. With the endpoint feed unread the
+   * flag is left absent, and `isPrivacyRouteEligible` and `usableCapabilities` both admit an absent
+   * flag on the private route deliberately - so nothing new may be claimed here and nothing already
+   * offered may be withdrawn on the strength of one failed request.
+   */
+  it('claims nothing new about the route when the endpoint feed could not be read', async () => {
+    const result = await refreshOpenRouterCatalog(seedModels(NOW), {
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'registry-key',
+      fetch: liveFetch({ zdrStatus: 401 }) as typeof fetch,
+      now: NOW
+    });
+    const unknown = result.find((model) => model.providerModelId === 'unreviewed/new-model');
+    expect(unknown?.zeroDataRetentionAvailable).toBeUndefined();
+    expect(unknown?.privacyRoute).toBe('provider_zdr');
   });
 
   it('keeps non-ZDR models visible but unavailable until the owner permits provider policy', () => {
@@ -648,6 +729,194 @@ describe('benchmark populations', () => {
     expect(
       result.find((model) => model.providerModelId === 'unreviewed/new-model')?.benchmarkPopulations
     ).toBeNull();
+  });
+});
+
+/*
+ * Nothing arriving from the provider used to be bounded on the way in.
+ *
+ * `contextTokens` was `context_length` or a 128,000 default, `maxOutputTokens` was whatever
+ * `top_provider.max_completion_tokens` said, and `perMillion` refused only negatives and
+ * non-finites. Every one of those numbers is read by something that acts on it: the context builder
+ * packs a window to `contextTokens` and subtracts `maxOutputTokens` from it, and a price decides
+ * both the model's usage class and whether the owner's spending ceiling lets it be picked at all.
+ * A single mistyped figure in a feed nobody here controls therefore reached the arithmetic intact.
+ */
+describe('bounds on what the feed is allowed to say', () => {
+  /** One entry per way the feed can state a number that cannot be true. */
+  const unbelievable = {
+    data: [
+      {
+        id: 'vendor/impossible-window',
+        name: 'Vendor: Impossible Window',
+        context_length: 100_000_000,
+        architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+        pricing: { prompt: '0.000001', completion: '0.000004' },
+        supported_parameters: ['tools']
+      },
+      {
+        id: 'vendor/no-window',
+        name: 'Vendor: No Window',
+        context_length: 0,
+        architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+        pricing: { prompt: '0.000001', completion: '0.000004' },
+        supported_parameters: ['tools']
+      },
+      {
+        id: 'vendor/reply-longer-than-window',
+        name: 'Vendor: Reply Longer Than Window',
+        context_length: 200_000,
+        architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+        pricing: { prompt: '0.000001', completion: '0.000004' },
+        supported_parameters: ['tools'],
+        top_provider: { max_completion_tokens: 900_000_000 }
+      },
+      {
+        id: 'vendor/zero-reply',
+        name: 'Vendor: Zero Reply',
+        context_length: 200_000,
+        architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+        pricing: { prompt: '0.000001', completion: '0.000004' },
+        supported_parameters: ['tools'],
+        top_provider: { max_completion_tokens: 0 }
+      },
+      {
+        /* A per-token decimal published as a whole number: one million dollars per million tokens. */
+        id: 'vendor/priced-per-million-by-mistake',
+        name: 'Vendor: Priced By Mistake',
+        context_length: 200_000,
+        architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+        pricing: { prompt: '1', completion: '4' },
+        supported_parameters: ['tools']
+      },
+      {
+        /* The route itself is priced sanely; the tier it grows into is not. */
+        id: 'vendor/absurd-tier',
+        name: 'Vendor: Absurd Tier',
+        context_length: 200_000,
+        architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+        pricing: {
+          prompt: '0.000001',
+          completion: '0.000004',
+          overrides: [{ min_prompt_tokens: 100_000, prompt: '2', completion: '9' }]
+        },
+        supported_parameters: ['tools']
+      }
+    ]
+  };
+
+  /** The second feed, so both halves of the refresh are exercised by these fixtures. */
+  const unbelievableZdr = {
+    data: [
+      {
+        model_id: 'vendor/impossible-window',
+        status: 0,
+        latency_last_30m: null,
+        uptime_last_1d: 99.1
+      },
+      { model_id: 'vendor/no-window', status: 0, latency_last_30m: null, uptime_last_1d: 99.1 },
+      {
+        model_id: 'vendor/reply-longer-than-window',
+        status: 0,
+        latency_last_30m: null,
+        uptime_last_1d: 99.1,
+        max_completion_tokens: 900_000_000
+      },
+      {
+        model_id: 'vendor/priced-per-million-by-mistake',
+        status: 0,
+        latency_last_30m: null,
+        uptime_last_1d: 99.1
+      }
+    ]
+  };
+
+  const boundedFetch = () =>
+    vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.endsWith('/models')) return respondWith(unbelievable);
+      return respondWith(unbelievableZdr);
+    });
+
+  const refresh = async (allowlist: ModelRelease[] = []) =>
+    refreshOpenRouterCatalog(allowlist, {
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'registry-key',
+      fetch: boundedFetch() as typeof fetch,
+      now: NOW
+    });
+
+  it('clamps a context window too large to be true, and falls back where the feed states none', async () => {
+    const byId = new Map((await refresh()).map((model) => [model.providerModelId, model]));
+    // A hundred million tokens is not a window; the context builder would pack against it.
+    expect(byId.get('vendor/impossible-window')?.contextTokens).toBe(MAX_CREDIBLE_CONTEXT_TOKENS);
+    // Zero is not a window either, and the contract refuses it: `contextTokens` is a positive int,
+    // so this row used to be dropped by the parse at the API boundary rather than corrected here.
+    expect(byId.get('vendor/no-window')?.contextTokens).toBe(128_000);
+  });
+
+  it('never lets the stated reply length exceed the window the reply is written into', async () => {
+    const byId = new Map((await refresh()).map((model) => [model.providerModelId, model]));
+    // `modelInputBudget` subtracts this from the window. Left alone it made the budget negative.
+    expect(byId.get('vendor/reply-longer-than-window')?.maxOutputTokens).toBe(200_000);
+    // A stated zero is not a limit, it is the absence of one.
+    expect(byId.get('vendor/zero-reply')?.maxOutputTokens).toBeNull();
+  });
+
+  it('leaves out a route whose stated price cannot be a price, and says so once in the journal', async () => {
+    const written: string[] = [];
+    const stderr = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: string | Uint8Array) => {
+        written.push(String(chunk));
+        return true;
+      });
+    try {
+      const ids = (await refresh()).map((model) => model.providerModelId);
+      // Kept out rather than kept with a null price: a null price reads as "unpriced", which
+      // `usageClassForPrice` calls 'medium' and the owner's ceiling waves straight through - so
+      // believing nothing about the number would have made the absurd route look like a cheap one.
+      expect(ids).not.toContain('vendor/priced-per-million-by-mistake');
+      expect(ids).not.toContain('vendor/absurd-tier');
+      expect(ids).toContain('vendor/impossible-window');
+    } finally {
+      stderr.mockRestore();
+    }
+    // One line for the whole refresh, naming the routes. This service has no listener and no
+    // metrics endpoint; a route that silently stopped being offered is otherwise unaccountable.
+    const journal = written.filter((line) => line.includes('model catalogue'));
+    expect(journal).toHaveLength(1);
+    expect(journal[0]).toContain('vendor/priced-per-million-by-mistake');
+    expect(journal[0]).toContain('vendor/absurd-tier');
+  });
+
+  it('refuses the absurd price without withdrawing a reviewed model from the catalogue', async () => {
+    const reviewed = seedModels(NOW).map((model) => ({
+      ...model,
+      providerModelId: 'vendor/priced-per-million-by-mistake'
+    }));
+    const result = await refresh([reviewed[0]!]);
+    const curated = result.find((model) => model.id === reviewed[0]!.id);
+    // The allowlist is the curated set; dropping one of four would empty the strict catalogue. So
+    // here the price is refused rather than the entry, and the usage class stays the seed's own.
+    expect(curated).toBeDefined();
+    expect(curated?.inputUsdPerMillionTokens).toBeNull();
+    expect(curated?.usageClass).toBe(reviewed[0]!.usageClass);
+  });
+
+  it('says nothing in the journal when every stated price is believable', async () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await refreshOpenRouterCatalog(seedModels(NOW), {
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: 'registry-key',
+        fetch: liveFetch() as typeof fetch,
+        now: NOW
+      });
+      expect(stderr).not.toHaveBeenCalled();
+    } finally {
+      stderr.mockRestore();
+    }
   });
 });
 

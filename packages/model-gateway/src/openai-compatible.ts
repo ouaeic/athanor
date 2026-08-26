@@ -8,6 +8,7 @@ import type {
   ModelResponse,
   ProviderModel
 } from './protocol.js';
+import { isProviderWallStatus } from './retry.js';
 import {
   MAX_CACHE_BREAKPOINTS,
   promptCacheStyle,
@@ -21,6 +22,7 @@ import {
   generationCharCeiling,
   startGenerationBudget,
   worthContinuing,
+  type GenerationBudget,
   type GenerationCutoff
 } from './generation-budget.js';
 
@@ -58,6 +60,12 @@ interface CompletionBody {
     message?: {
       content?: string | null;
       reasoning?: string | null;
+      /**
+       * What DeepSeek's own API and vLLM's reasoning parsers call the same field. OpenRouter
+       * normalises it to `reasoning`; nothing normalises it on a directly configured endpoint, and
+       * this file names that family by name three hundred lines down.
+       */
+      reasoning_content?: string | null;
       reasoning_details?: unknown[];
       /** Where a provider attaches the sources a server-side search or fetch grounded the answer in. */
       annotations?: unknown[];
@@ -105,6 +113,8 @@ interface StreamChunk {
     delta?: {
       content?: string | null;
       reasoning?: string | null;
+      /** See the note on the non-streamed message above: the same field, one token at a time. */
+      reasoning_content?: string | null;
       reasoning_details?: unknown[];
       annotations?: unknown[];
       tool_calls?: Array<{
@@ -121,10 +131,220 @@ interface StreamChunk {
 interface StreamedBody extends CompletionBody {
   generatedChars: number;
   cutoff?: { reason: GenerationCutoff; detail: string };
+  /**
+   * How many `data:` frames parsed as JSON. Zero is the whole of the diagnosis for a reply that was
+   * not a stream at all, and it is the only thing that distinguishes one from a stream whose every
+   * frame happened to be empty - the synthesised `choices` array below looks identical either way.
+   */
+  frames: number;
+  /**
+   * The reply's own bytes, kept only while no frame has parsed, for the one recovery attempt. A
+   * route that honoured `stream: true` never fills this in.
+   */
+  unstreamed?: string;
 }
+
+/**
+ * How much of a reply that ignored `stream: true` is held back for that one recovery parse. A JSON
+ * completion carrying a whole file inside a `file_write` call runs to a few hundred kilobytes; past
+ * this the reply is not a completion, and holding more of it only spends the worker's memory.
+ */
+const MAX_UNSTREAMED_RECOVERY_CHARS = 1_000_000;
+
+/**
+ * The longest a single un-terminated SSE line may grow before the reply stops being a stream.
+ *
+ * The line buffer had no bound at all, and it is the one place in this file where a provider
+ * chooses how much of this box's memory to spend: bytes that never form a line are never consumed,
+ * never counted, and never released. A megabyte is far past the longest frame this product
+ * produces - a `file_write` carrying a whole file inside a tool call's arguments - and far short of
+ * anything that threatens the worker.
+ */
+const MAX_STREAM_LINE_CHARS = 1_000_000;
+
+/**
+ * How much more raw stream than generated answer is allowed before the stream is called a runaway.
+ *
+ * A route that frames one token per event spends about fifty characters of envelope on four
+ * characters of content, so the raw reply is legitimately an order of magnitude larger than the
+ * answer inside it. Sixteen leaves that whole range alone and still bounds a producer that is
+ * sending keep-alives, comments or repeated `[DONE]` markers and no answer at all - the shape the
+ * generated-character ceiling cannot see, because nothing it counts is arriving.
+ *
+ * **Measured, and the fifty is wrong.** Fifty characters is the frame this repository's own eval
+ * harness writes - `{"choices":[{"delta":{"content":"abcd"}}]}` and nothing else - and it is the
+ * only frame shape anywhere in the tree, which is why every test and all 52 eval fixtures pass with
+ * room to spare (308 streams measured through this function: aggregate raw/generated 1.11, worst
+ * single stream 10.1). A provider's own chunk carries `id`, `object`, `created`, `model`,
+ * `system_fingerprint`, `index`, `logprobs` and `finish_reason` beside the token: 276 characters on
+ * a vLLM/OpenAI chunk and 295 on an OpenRouter one, for the same four characters of content. That
+ * is a ratio of 69 to 74, not 12.5.
+ *
+ * Driven through this function with a real OpenRouter-shaped chunk, one token per event, the raw
+ * ceiling cuts the answer at **21.7%** of the character ceiling the request asked for and labels it
+ * `overrun` - the same label a genuine runaway gets, after which `worthContinuing` may ask the
+ * model to write the whole thing again. It is left at sixteen here rather than raised in passing:
+ * the number bounds a real failure mode and moving it is a decision about how much of the owner's
+ * money a silent producer may spend, not a typo. See `wave4/4E.md`.
+ */
+const STREAM_ENVELOPE_ALLOWANCE = 16;
+
+/**
+ * The tags an unparsed reasoning route writes its deliberation between, inside `content`.
+ *
+ * Routes in the R1 family emit these as ordinary content tokens unless the endpoint was started
+ * with a reasoning parser in front of them. Read as prose - which is what happens when nothing
+ * looks for them - the model's private planning is published to the owner's timeline as the
+ * answer, stored as the assistant's own prior turn, and handed back to the model on every
+ * subsequent step as something it already said. That is the recorded incident: a turn that streamed
+ * a thousand deltas and made no tool call, with its own operating contract in the reading column.
+ */
+const THINK_OPEN = '<think>';
+const THINK_CLOSE = '</think>';
+
+/**
+ * How much whitespace may sit in front of an opening `<think>` before the answer is taken at its
+ * word and passed through untouched.
+ *
+ * A bound rather than `trimStart` because this runs on a stream: everything held back waiting to
+ * find out whether it is the start of a tag is an answer the owner is not yet reading. Two or three
+ * newlines is what the chat templates put there; eight is past every one of them and still short
+ * enough that nobody sees the delay.
+ */
+const MAX_THINK_LEAD_WHITESPACE = 8;
+
+/** How much of `text` is a whitespace run at the front. */
+const leadingWhitespaceOf = (text: string): number => text.length - text.trimStart().length;
+
+/**
+ * Splits a leading `<think>…</think>` span off a **complete** answer.
+ *
+ * Both tags are required. On a finished string the whole answer is in hand, so an opening tag with
+ * no closing one is not a span - it is prose that happens to start with an angle bracket - and it
+ * is left exactly where the model put it. The streamed splitter below cannot make that check and
+ * deliberately decides the other way; see the note there.
+ *
+ * Whitespace immediately after the closing tag goes with the span rather than with the answer: the
+ * templates that emit these tags put a blank line after them, and it is framing, not content.
+ */
+export const splitLeadingThinkSpan = (text: string): { text: string; reasoning?: string } => {
+  const lead = leadingWhitespaceOf(text);
+  if (lead > MAX_THINK_LEAD_WHITESPACE || !text.startsWith(THINK_OPEN, lead)) return { text };
+  const close = text.indexOf(THINK_CLOSE, lead + THINK_OPEN.length);
+  if (close < 0) return { text };
+  return {
+    text: text.slice(close + THINK_CLOSE.length).trimStart(),
+    reasoning: text.slice(lead + THINK_OPEN.length, close)
+  };
+};
+
+/** The longest suffix of `text` that is also a proper prefix of `tag`, so a split tag is not missed. */
+const straddledPrefixOf = (text: string, tag: string): number => {
+  for (let length = Math.min(tag.length - 1, text.length); length > 0; length -= 1)
+    if (text.endsWith(tag.slice(0, length))) return length;
+  return 0;
+};
+
+/** One content delta, routed to the channel it belongs in. Either half may be empty. */
+interface ThinkSplitDelta {
+  text: string;
+  reasoning: string;
+}
+
+/**
+ * The same split, incrementally, over a stream whose tags arrive in pieces.
+ *
+ * Three phases, and the whole design is about what may be held back. While *deciding*, only a
+ * prefix of `<think>` (after at most `MAX_THINK_LEAD_WHITESPACE` characters of whitespace) is held,
+ * so an answer that does not start like the tag is passed through delta for delta, byte for byte,
+ * exactly as it was before this existed - that identity is the guard that keeps this from being a
+ * content change. While *thinking*, at most seven characters are held - one short of `</think>` -
+ * which is what it takes to recognise a closing tag split across two frames. Afterwards nothing is
+ * held at all.
+ *
+ * A stream that ends still inside the span commits what it has to the reasoning channel. That is
+ * the one place this disagrees with the complete-string version above, and it is not a choice: the
+ * fragments were handed to `onReasoningDelta` as they arrived and the owner has already seen them
+ * in the thinking column. Publishing the same words again as the answer is the defect this closes.
+ */
+const createThinkSplitter = (): {
+  push: (delta: string) => ThinkSplitDelta;
+  finish: () => ThinkSplitDelta;
+} => {
+  let phase: 'deciding' | 'thinking' | 'answering' = 'deciding';
+  let pending = '';
+  const drainThinking = (): ThinkSplitDelta => {
+    const close = pending.indexOf(THINK_CLOSE);
+    if (close < 0) {
+      const held = straddledPrefixOf(pending, THINK_CLOSE);
+      const reasoning = pending.slice(0, pending.length - held);
+      pending = pending.slice(pending.length - held);
+      return { text: '', reasoning };
+    }
+    const reasoning = pending.slice(0, close);
+    phase = 'answering';
+    const text = pending.slice(close + THINK_CLOSE.length).trimStart();
+    pending = '';
+    return { text, reasoning };
+  };
+  return {
+    push: (delta: string): ThinkSplitDelta => {
+      if (phase === 'answering') return { text: delta, reasoning: '' };
+      pending += delta;
+      if (phase === 'deciding') {
+        const lead = leadingWhitespaceOf(pending);
+        const rest = pending.slice(lead);
+        // The whitespace bound is checked on both arms, not only on the one that holds back. A
+        // single delta can arrive carrying more leading whitespace than was ever held, and the two
+        // splitters have to agree about what counts as a leading span or the same answer is read
+        // one way streamed and the other way buffered.
+        if (lead <= MAX_THINK_LEAD_WHITESPACE && rest.startsWith(THINK_OPEN)) {
+          phase = 'thinking';
+          pending = rest.slice(THINK_OPEN.length);
+        } else if (lead <= MAX_THINK_LEAD_WHITESPACE && THINK_OPEN.startsWith(rest)) {
+          // Still could become the tag - `rest` is empty when nothing but whitespace has arrived.
+          return { text: '', reasoning: '' };
+        } else {
+          phase = 'answering';
+          const text = pending;
+          pending = '';
+          return { text, reasoning: '' };
+        }
+      }
+      return drainThinking();
+    },
+    finish: (): ThinkSplitDelta => {
+      const held = pending;
+      pending = '';
+      if (phase === 'thinking') return { text: '', reasoning: held };
+      return { text: held, reasoning: '' };
+    }
+  };
+};
 
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined;
+
+/**
+ * A reply read as an ordinary completion, or `null` when it is not one. Deliberately strict: an
+ * object carrying neither `choices` nor `error` is some gateway's interstitial or health page, and
+ * treating it as a completion is how a 200 became a turn with nothing in it.
+ */
+const completionFromJson = (text: string): CompletionBody | null => {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{')) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  const record = asRecord(parsed);
+  if (!record) return null;
+  return Array.isArray(record.choices) || record.error !== undefined
+    ? (record as CompletionBody)
+    : null;
+};
 
 /** Gateways put the upstream status in `code` as often as in `status`, and sometimes as a string. */
 const httpStatusLike = (value: unknown): number | undefined => {
@@ -147,6 +367,50 @@ const retryAfterOf = (metadata: unknown): string | undefined => {
     )
       return String(value);
   return undefined;
+};
+
+/**
+ * Whether a refusal is the provider saying the window it was sent will not fit.
+ *
+ * Read the way the signed-reasoning refusal above it is read: two matches on the body rather than
+ * one, and ungated on provider name, because OpenRouter proxies each upstream's own wording
+ * verbatim and there are as many spellings of this sentence as there are vendors. The first half is
+ * what the complaint is about and the second is what the complaint is - either alone matches
+ * ordinary refusals that have nothing to do with size.
+ *
+ * It matters because this refusal has the same property the signed-reasoning one does, and nothing
+ * anywhere recognised it: the same bytes fail identically for ever, and because a refused request
+ * appends nothing the window never advances past the message that overflowed it. A resumed task
+ * rebuilds the identical window, sends the identical request and dies at the identical step, for as
+ * long as the owner is willing to keep replying.
+ */
+const isContextOverflowText = (text: string): boolean =>
+  /context|prompt|input|window|token/i.test(text) &&
+  /context[_ ]?length|context window|maximum.{0,24}tokens|too many tokens|too long|reduce the (length|number|size)/i.test(
+    text
+  );
+
+/**
+ * The sizes the refusal named, when it named any.
+ *
+ * The canonical sentence carries both - "maximum context length is 200000 tokens, however you
+ * requested 214113 tokens" - and the smaller of the two is the ceiling by construction. It is worth
+ * having because it is the one honest number in the exchange: the catalogue's window is what the
+ * provider published for the model and this is what the route that answered will actually take.
+ */
+const contextOverflowSizes = (
+  text: string
+): { contextLimitTokens?: number; requestedTokens?: number } => {
+  const numbers = [...text.matchAll(/\d[\d,_]{2,}/g)]
+    .map((match) => Number(match[0].replace(/[,_]/g, '')))
+    .filter((value) => Number.isFinite(value) && value >= 1_000);
+  if (!numbers.length) return {};
+  const limit = Math.min(...numbers);
+  const requested = Math.max(...numbers);
+  return {
+    contextLimitTokens: limit,
+    ...(requested > limit ? { requestedTokens: requested } : {})
+  };
 };
 
 /**
@@ -178,6 +442,28 @@ const providerFault = (
     ...(retryAfter ? { retryAfter } : {})
   };
 };
+
+/**
+ * One name for a walled provider.
+ *
+ * Every non-429 refusal used to leave here as `provider_request_failed`, whatever the status. The
+ * retry loop still read the status and retried the 5xx four times, which was right; what escaped
+ * afterwards was a code nothing above recognised as a wall, so a 503 "no instance available" - a
+ * routine, minutes-long gateway condition - failed the task outright, released its reservation and
+ * stranded the follow-up message, while *connection refused* - the same outage one layer lower -
+ * came back `provider_unavailable`, parked the task and was retried for a day. Two expressions of
+ * one fault with opposite outcomes, and the harder-failing one is the commoner.
+ *
+ * 400s keep the terminal name. A rejected prompt, an unknown model or a malformed tool schema fails
+ * identically however often it is asked, and calling that a wall would park a task behind a
+ * condition that never lifts.
+ */
+const providerFaultCode = (status: number): string =>
+  status === 429
+    ? 'provider_quota_exhausted'
+    : isProviderWallStatus(status)
+      ? 'provider_unavailable'
+      : 'provider_request_failed';
 
 /**
  * A request for more output than the route will write is refused outright by some gateways and
@@ -349,7 +635,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     const fault = providerFault(frame);
     if (!fault) return null;
     return new AthanorError(
-      fault.status === 429 ? 'provider_quota_exhausted' : 'provider_request_failed',
+      providerFaultCode(fault.status),
       `${this.provider} reported an error ${where} (${fault.status}): ${fault.message}`,
       fault.status,
       fault.retryAfter ? { retryAfter: fault.retryAfter } : {}
@@ -541,6 +827,24 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     return /signature|cannot be modified|must remain|invalid.*block/i.test(text);
   }
 
+  /**
+   * The one recovery attempt on a reply to a streamed request that was not a stream. A completion
+   * is kept and used; anything else is a fault rather than the silent empty turn it used to be.
+   * `502` because the request was accepted and the thing that answered it is not what was asked
+   * for - a different instance, or the same one without the proxy in front of it, may well work.
+   */
+  #unstreamedCompletion(text: string): CompletionBody {
+    const body = completionFromJson(text);
+    if (body) return body;
+    throw new AthanorError(
+      'provider_stream_unparsed',
+      `${this.provider} answered a streamed request with ${
+        text.trim() ? 'neither a stream nor a completion' : 'an empty body'
+      }`,
+      502
+    );
+  }
+
   async chat(input: ModelRequest): Promise<ModelResponse> {
     const started = performance.now();
     const serverTools = this.#serverToolPayload(input);
@@ -649,19 +953,54 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       // The provider's own account of what it disliked, which is the whole of the diagnosis when a
       // request is refused. A bare "(400)" says a request was malformed without saying which part,
       // and the body is the only thing that does. Bounded, because this is an error path.
-      const explanation = await response
-        .text()
-        .then((text) => {
-          const parsed: unknown = text.trim().startsWith('{') ? JSON.parse(text) : text;
-          const fault = providerFault(asRecord(parsed)?.error ?? parsed);
-          return fault ? `: ${fault.message}` : text.trim() ? `: ${text.trim().slice(0, 400)}` : '';
-        })
-        .catch(() => '');
+      const body = await response.text().catch(() => '');
+      /*
+       * What the provider actually said, unwrapped from whatever it wrapped it in.
+       *
+       * Read once and used twice, and the unwrapping is load-bearing rather than tidy: matching the
+       * refusal against the raw body means matching against the envelope's own field names, and
+       * `{"error":{"message":"tool name is too long"}}` reads as a complaint about a message being
+       * too long. The sentence is the evidence; the JSON around it is not.
+       */
+      const complaint = ((): string => {
+        try {
+          const parsed: unknown = body.trim().startsWith('{') ? JSON.parse(body) : body;
+          return providerFault(asRecord(parsed)?.error ?? parsed)?.message ?? body.trim();
+        } catch {
+          return body.trim();
+        }
+      })();
+      const explanation = complaint ? `: ${complaint.slice(0, 400)}` : '';
+      /*
+       * The window will not fit, said in the provider's own words.
+       *
+       * Named separately from every other refusal because it is the only 400 the caller can repair:
+       * everything else at this status fails identically however it is re-sent, and this one stops
+       * failing the moment the window is smaller. It travels with the sizes the provider named so
+       * the repair is aimed at the number the route actually enforces rather than at the one the
+       * catalogue published for the model - those differ, and it is the difference that puts a
+       * request over the line. Still non-retryable: the identical bytes are refused identically, so
+       * the repair has to happen a layer up, before the next attempt exists.
+       */
+      // The signed-reasoning repair above has already had its one shot at this response, so a body
+      // that reaches here is not that refusal however it reads.
+      if (
+        (response.status === 400 || response.status === 413) &&
+        isContextOverflowText(complaint)
+      ) {
+        const sizes = contextOverflowSizes(complaint);
+        throw new AthanorError(
+          'provider_context_overflow',
+          `${this.provider} refused the request because the window is larger than the route will take (${response.status})${explanation}`,
+          response.status,
+          sizes
+        );
+      }
       // The status has to travel with the error. Without it every 5xx inherits AthanorError's
       // default of 400, `isRetryableError` reads that as a client mistake, and a task that has run
       // for hours dies on one upstream blip that a single retry would have absorbed.
       throw new AthanorError(
-        response.status === 429 ? 'provider_quota_exhausted' : 'provider_request_failed',
+        providerFaultCode(response.status),
         `${this.provider} request failed (${response.status})${explanation}`,
         response.status,
         { retryAfter: response.headers.get('retry-after') ?? undefined }
@@ -670,20 +1009,104 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     // Nothing publishes a usable latency for these routes, so the only honest number is the one
     // measured here: on this owner's network, from this box, on this owner's prompts.
     const firstToken: { at?: number } = {};
-    const streamed = input.onTextDelta
-      ? await this.#streamCompletion(
-          response,
-          this.#generationMaxChars ?? generationCharCeiling(maxTokensFor(input)),
-          input.onTextDelta,
-          firstToken,
-          input.onReasoningDelta
-        )
-      : undefined;
-    const body: CompletionBody = streamed ?? ((await response.json()) as CompletionBody);
-    if (!body.choices?.length) {
-      const fault = this.#fault(body.error, 'in its response');
-      if (fault) throw fault;
+    /*
+     * One generation budget, started here, for whichever way the answer arrives.
+     *
+     * It used to live inside the stream reader, so five of this product's seven model call sites -
+     * the delegate step, the provider web search, the compaction summariser, the vision specialist
+     * and the API titler, none of which stream - had no idle clock, no generation deadline, no
+     * character ceiling, no `truncated` marking and no estimated usage. A specialist mission is
+     * sixteen model calls, each able to hold a worker for the caller's whole fifteen minutes
+     * against a provider that has gone quiet, inside one unanswered tool call of a lead whose own
+     * step is bounded to ten. Every bound written for the fifteen-minute incident applied to the
+     * cheap path only.
+     *
+     * Started from the response headers rather than from the request, which is what the comment on
+     * the constant has always said: a route that is slow to accept the connection is not charged
+     * for the waiting.
+     */
+    const budget = startGenerationBudget({
+      timeoutMs: this.#generationTimeoutMs,
+      maxChars: this.#generationMaxChars ?? generationCharCeiling(maxTokensFor(input))
+    });
+    /**
+     * A whole-body read held to the same deadline the streamed path is held to. The body is torn
+     * down rather than left outstanding: a socket the provider is still writing into holds this
+     * worker's slot for as long as it feels like writing.
+     */
+    const withinBudget = async <T>(read: () => Promise<T>): Promise<T> => {
+      // Zero, negative or non-finite all mean the same thing here in different words: a deadline of
+      // `Infinity` is the escape hatch for an unusual route and is the only one that waits.
+      const remainingMs = Math.max(0, budget.remainingMs());
+      const pending = read();
+      if (!Number.isFinite(remainingMs)) return pending;
+      pending.catch(() => undefined);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const expired = Symbol('expired');
+      const outcome = await Promise.race([
+        pending,
+        new Promise<typeof expired>((resolve) => {
+          timer = setTimeout(() => resolve(expired), remainingMs);
+          timer.unref();
+        })
+      ]).finally(() => clearTimeout(timer));
+      if (outcome !== expired) return outcome as T;
+      await response.body?.cancel().catch(() => undefined);
+      throw new AthanorError(
+        'provider_stream_stalled',
+        `${this.provider} accepted the request and then sent nothing back for ${Math.round(
+          budget.elapsedMs() / 1000
+        )} seconds, so the response was abandoned`,
+        504
+      );
+    };
+    /*
+     * `stream: true` is a request, not a guarantee.
+     *
+     * A buffering proxy - LiteLLM, a corporate egress gateway - answers it with an ordinary JSON
+     * completion, and the SSE reader discards every line of it because none begins with `data:`.
+     * Since the reader synthesises a `choices` array whatever it read, that came back as a
+     * *success* carrying no text, no tool calls and no usage: the turn completed with nothing in
+     * it, the loop's completion nag fired its three times, and the ledger recorded $0.00 for every
+     * call the provider billed. The catalogue path has carried a defence against this exact shape
+     * since `provider_catalog_empty` - an empty list is an outage wearing a 200 - and the inference
+     * path had none.
+     *
+     * A reply that declares itself JSON is read as JSON. Anything else, including a reply that
+     * declares nothing, is still read as a stream, because that is what every honouring route sends
+     * and a route with an unusual content type must not lose its answer to this check; the frame
+     * count below catches it either way.
+     */
+    const contentType = response.headers.get('content-type') ?? '';
+    const declaredJson = /\bjson\b/i.test(contentType) && !/event-stream/i.test(contentType);
+    let streamed: StreamedBody | undefined;
+    let body: CompletionBody;
+    if (input.onTextDelta && !declaredJson) {
+      const reply = await this.#streamCompletion(
+        response,
+        budget,
+        input.onTextDelta,
+        firstToken,
+        input.onReasoningDelta,
+        input.signal
+      );
+      // Not one frame parsed, so nothing about this reply was a stream. It is read once as an
+      // ordinary completion before it is called a fault: the gateway that buffered the stream away
+      // gave a perfectly good answer, and throwing it away is what made a billed call an empty turn.
+      if (reply.frames > 0) {
+        streamed = reply;
+        body = reply;
+      } else body = this.#unstreamedCompletion(reply.unstreamed ?? '');
+    } else if (input.onTextDelta) {
+      body = this.#unstreamedCompletion(await withinBudget(() => response.text()));
+    } else {
+      body = (await withinBudget(() => response.json())) as CompletionBody;
     }
+    // Hoisted above `choices`, which used to gate it: `#streamCompletion` returns a `choices` array
+    // of length one however the stream went, so on the streamed path this guard was unreachable -
+    // and the streamed path is where a 200 carrying only an `error` object most often arrives.
+    const fault = this.#fault(body.error, 'in its response');
+    if (fault) throw fault;
     const choice = body.choices?.[0];
     // A failed parse used to become `{}` and run anyway: `file_write` cut off mid-JSON was
     // dispatched with no path and no content, failed on a validation error that named neither the
@@ -737,9 +1160,30 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     const outputTokens = estimated ? countedOutputTokens : (reportedOutputTokens ?? 0);
     const citations = webCitationsFrom(choice?.message?.annotations);
     const serverToolUse = serverToolUseFrom(body.usage?.server_tool_use);
+    /*
+     * The two ways a route hands back its thinking, and the third way it fails to.
+     *
+     * A stream has already been through the splitter by the time it reaches here, so `inline` is a
+     * no-op on that path and this is the non-streamed reply's only chance. Both are read because a
+     * route that answers `stream: false` - the title and memory workloads do - takes exactly the
+     * same detour through its own deliberation, and there is nothing downstream that can tell
+     * thinking from prose after the fact.
+     *
+     * If a route ever sends both, neither is dropped: the span was removed from the answer, so
+     * throwing it away would lose text nothing else carries.
+     */
+    const inline = splitLeadingThinkSpan(choice?.message?.content ?? '');
+    const wireReasoning = choice?.message?.reasoning_content ?? choice?.message?.reasoning;
+    // Concatenated only where there is something to concatenate. With no inline span - which is
+    // every reply this route has ever produced until one of them has one - the field is handed
+    // through exactly as it arrived, unread and uncoerced, which is what keeps this half of the
+    // change provably content-neutral.
+    const reasoning = inline.reasoning
+      ? `${inline.reasoning}${wireReasoning ?? ''}`
+      : wireReasoning;
     return {
-      text: choice?.message?.content ?? '',
-      ...(choice?.message?.reasoning ? { reasoning: choice.message.reasoning } : {}),
+      text: inline.text,
+      ...(reasoning ? { reasoning } : {}),
       ...(choice?.message?.reasoning_details?.length
         ? { reasoningDetails: choice.message.reasoning_details }
         : {}),
@@ -819,14 +1263,21 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
 
   async #streamCompletion(
     response: Response,
-    maxChars: number,
+    /** Started by `chat` from the response headers, so both ways of reading a reply share one. */
+    budget: GenerationBudget,
     onTextDelta: (delta: string) => void | Promise<void>,
     firstToken: { at?: number } = {},
-    onReasoningDelta?: (delta: string) => void | Promise<void>
+    onReasoningDelta?: (delta: string) => void | Promise<void>,
+    /**
+     * The caller's own signal, so an abort it raised itself can be told apart from a socket that
+     * died. What the caller does about it is the caller's business; what this side owes it is the
+     * text and the token count, which is the difference between a stopped generation costing what
+     * it cost and costing nothing at all.
+     */
+    signal?: AbortSignal
   ): Promise<StreamedBody> {
     if (!response.body)
       throw new AthanorError('provider_request_failed', `${this.provider} returned no stream`);
-    const budget = startGenerationBudget({ timeoutMs: this.#generationTimeoutMs, maxChars });
     let cutoff: GenerationCutoff | undefined;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -835,8 +1286,16 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       { id: string; function: { name: string; arguments: string } }
     >();
     let buffer = '';
+    let frames = 0;
+    // Raw decoded characters, envelopes and keep-alives included, against their own ceiling.
+    let rawChars = 0;
+    const rawCeiling = budget.maxChars() * STREAM_ENVELOPE_ALLOWANCE;
+    // Held back only until the first frame parses, and only to a bound. A route that honoured
+    // `stream: true` never reads this; a route that ignored it wrote its whole answer in here.
+    let unstreamed = '';
     let content = '';
     let reasoning = '';
+    const think = createThinkSplitter();
     const reasoningDetails: unknown[] = [];
     // Kept raw and deduplicated once at the end: a route that resends the whole list on each chunk
     // would otherwise be deduplicated against a growing list on every frame of a long answer.
@@ -855,6 +1314,10 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       } catch {
         return;
       }
+      frames += 1;
+      // One frame proves the reply is a stream, so the bytes kept for the recovery parse are of no
+      // further use and the memory goes back.
+      if (frames === 1) unstreamed = '';
       const fault = this.#fault(chunk.error, 'mid-response');
       if (fault) throw fault;
       model = chunk.model ?? model;
@@ -863,23 +1326,42 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       const choice = chunk.choices?.[0];
       finishReason = choice?.finish_reason ?? finishReason;
       const delta = choice?.delta;
+      // `reasoning_content` first, because a route that sends it is a route that means it; the
+      // OpenRouter-normalised spelling is the fallback. No route sends both, and if one ever does
+      // the one it named itself wins.
+      const reasoningDelta = delta?.reasoning_content ?? delta?.reasoning;
       // Reasoning counts: it is the first token the model produced, and on a reasoning route it is
       // most of the wait. The callback runs after, so the reading is not charged for our own work.
-      if (firstToken.at === undefined && (delta?.content || delta?.reasoning))
+      if (firstToken.at === undefined && (delta?.content || reasoningDelta))
         firstToken.at = performance.now();
       if (delta?.content) {
-        content += delta.content;
-        await onTextDelta(delta.content);
+        // Split before publishing, never after. Once a `<think>` fragment has gone out over
+        // `onTextDelta` it is on the owner's screen and in the timeline, and no repair afterwards
+        // can take it back - which is exactly how deliberation came to be published as an answer.
+        const split = think.push(delta.content);
+        if (split.text) {
+          content += split.text;
+          await onTextDelta(split.text);
+        }
+        if (split.reasoning) {
+          reasoning += split.reasoning;
+          if (onReasoningDelta) await onReasoningDelta(split.reasoning);
+        }
         // Handed over first, then counted. The characters are already on the owner's screen, and a
         // ceiling that swallowed the fragment that crossed it would be hiding its own evidence.
+        //
+        // Counted at the delta's full length rather than at the two halves' - the tags and anything
+        // still held back included. The model generated them, the provider billed them, and a route
+        // that never closes its span would otherwise generate forever against a count that never
+        // moves. This is also what keeps the ceiling byte-identical to what it was before the split.
         if (budget.produced(delta.content.length)) cutoff ??= 'overrun';
       }
-      if (delta?.reasoning) {
-        reasoning += delta.reasoning;
-        if (onReasoningDelta) await onReasoningDelta(delta.reasoning);
+      if (reasoningDelta) {
+        reasoning += reasoningDelta;
+        if (onReasoningDelta) await onReasoningDelta(reasoningDelta);
         // Thinking counts against the ceiling as well: it is generated, it is billed as output, and
         // a route that loops inside its own reasoning produces no content at all to measure.
-        if (budget.produced(delta.reasoning.length)) cutoff ??= 'overrun';
+        if (budget.produced(reasoningDelta.length)) cutoff ??= 'overrun';
       }
       if (delta?.reasoning_details?.length) reasoningDetails.push(...delta.reasoning_details);
       if (delta?.annotations?.length) annotations.push(...delta.annotations);
@@ -911,10 +1393,36 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
           break;
         }
         const { done, value } = step.read;
-        buffer += decoder.decode(value, { stream: !done });
+        const text = decoder.decode(value, { stream: !done });
+        if (frames === 0 && unstreamed.length < MAX_UNSTREAMED_RECOVERY_CHARS) unstreamed += text;
+        /*
+         * What arrived, as opposed to what parsed out of it.
+         *
+         * The character ceiling is only ever consulted from `consume`, and `consume` only runs on a
+         * complete line - so bytes that never form one are invisible to it. Measured: 4 KB of
+         * newline-free bytes per pull against a ceiling of fifty characters read 593 chunks and
+         * 2.4 MB in four hundred milliseconds without the ceiling being asked once, and at the
+         * ten-minute default the same producer accumulates gigabytes inside one worker slot. It
+         * ends as V8's maximum string length, thrown as a `RangeError`, wrapped as
+         * `provider_unavailable` - which is retryable, so the gateway does the whole thing again.
+         *
+         * Counted separately from the generated characters rather than into them: this number
+         * includes every `data:` envelope and every keep-alive, so billing an answer by it would
+         * charge two or three times what the model wrote. The allowance is generous because a route
+         * that frames one token per event genuinely sends an order of magnitude more envelope than
+         * content; what it bounds is a producer that is not sending an answer at all.
+         */
+        rawChars += text.length;
+        if (rawChars > rawCeiling) cutoff ??= 'overrun';
+        buffer += text;
         const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() ?? '';
         for (const line of lines) await consume(line);
+        // One line longer than this is not a frame of anything: the longest legitimate frame on this
+        // product carries a whole file inside a tool call's arguments, and a few hundred kilobytes
+        // covers that with room to spare. Past it the reply is a producer with no newline in it, and
+        // holding more of it only spends the worker's memory waiting for a line that is not coming.
+        if (buffer.length > MAX_STREAM_LINE_CHARS) cutoff ??= 'overrun';
         if (done || cutoff) break;
         /*
          * The clock is read again here, and not only raced against the read above, because a race
@@ -938,16 +1446,51 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       if (cutoff) await reader.cancel().catch(() => undefined);
     } catch (cause) {
       await reader.cancel().catch(() => undefined);
+      /*
+       * An abort the caller raised itself, on a generation that had already produced something.
+       *
+       * This is the repetition watch stopping a model that has stopped saying anything new, and it
+       * is the owner pressing Stop. Both used to escape as an exception, and the caller's handler
+       * for them jumped the whole billing block: a quarter of an hour of output the provider
+       * charged for, recorded as a step that never happened. What was generated is returned marked
+       * `cancelled` instead, exactly as the three clocks below already return theirs, so the
+       * caller's own accounting runs on it unchanged and the decision about what a stopped answer
+       * is worth stays where it was made.
+       *
+       * `AthanorError` is checked first and deliberately: the request deadline aborts with one as
+       * its reason, and that is a fault the caller must still see as a throw.
+       */
+      if (cause instanceof AthanorError) throw cause;
+      if (isAbort(cause) && signal?.aborted && (content || reasoning || toolCalls.size > 0))
+        cutoff = 'cancelled';
       // A connection that dies a few bytes into the body is the same fault as one that dies before
       // the headers, and the caller already refuses to replay a request whose text the owner has
       // seen - so it is classified the same way instead of escaping as a bare TypeError that no
       // retry rule recognises. An abort and a fault the provider named for itself pass through.
-      if (cause instanceof AthanorError || isAbort(cause)) throw cause;
-      throw new AthanorError(
-        'provider_unavailable',
-        `${this.provider} dropped the response stream: ${transportDetail(cause)}`,
-        503
-      );
+      else if (isAbort(cause)) throw cause;
+      else
+        throw new AthanorError(
+          'provider_unavailable',
+          `${this.provider} dropped the response stream: ${transportDetail(cause)}`,
+          503
+        );
+    }
+    /*
+     * Whatever the splitter was still holding when the stream ended, however it ended.
+     *
+     * Placed after the catch and not inside the loop deliberately: a stall, a deadline, an overrun
+     * and the owner pressing Stop all leave the reader here, and every one of them can land in the
+     * middle of a held-back fragment. Losing those few characters would be a silent truncation of
+     * the answer on exactly the paths that already have the least to show.
+     */
+    const held = think.finish();
+    if (held.text) {
+      content += held.text;
+      await onTextDelta(held.text);
+    }
+    if (held.reasoning) {
+      reasoning += held.reasoning;
+      if (onReasoningDelta) await onReasoningDelta(held.reasoning);
     }
     /*
      * A cutoff with nothing to show for it is a different fault from a cutoff with an answer in it,
@@ -970,6 +1513,8 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       ...(model ? { model } : {}),
       ...(upstreamProvider ? { provider: upstreamProvider } : {}),
       generatedChars: budget.characters(),
+      frames,
+      ...(frames === 0 ? { unstreamed } : {}),
       ...(cutoff
         ? { cutoff: { reason: cutoff, detail: describeCutoff(this.provider, cutoff, budget) } }
         : {}),

@@ -50,12 +50,22 @@ export type RelayClientConfig = z.infer<typeof RelayClientConfigSchema>;
 export const disabledRelayConfig = (): RelayClientConfig => RelayClientConfigSchema.parse({});
 
 /**
- * A relay is only usable once it has somewhere to dial and an identity the relay has accepted.
- * Treating a half-configured relay as off is what keeps a failed enrollment from turning into a
- * reconnect loop against a host that will never answer.
+ * A relay is only usable once it has somewhere to dial, an identity the relay has accepted, and a
+ * key it recorded for that relay. Treating a half-configured relay as off is what keeps a failed
+ * enrollment from turning into a reconnect loop against a host that will never answer.
+ *
+ * The pin is part of "configured" and not an optional extra, because the dial deliberately carries
+ * no CA check: the box authenticates the relay by the key it pinned at enrollment and by nothing
+ * else. A settings file with a host and a label but no pin - one written by a build that predates
+ * pinning, hand-edited through the `jq` path in `scripts/athanor`, or produced by any future writer
+ * that forgets the field - parses cleanly and would otherwise dial, present the private key that is
+ * this box's address, and accept whatever certificate answered for the name.
  */
 export const relayIsUsable = (config: RelayClientConfig): boolean =>
-  config.enabled && config.host !== null && config.label !== null;
+  config.enabled &&
+  config.host !== null &&
+  config.label !== null &&
+  config.pinnedRelaySpkiSha256 !== null;
 
 /**
  * Which of the box's own listeners a bound stream belongs to.

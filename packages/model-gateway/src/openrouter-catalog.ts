@@ -111,6 +111,27 @@ const checkedJson = async <T>(response: Response, label: string): Promise<T> => 
   return response.json() as Promise<T>;
 };
 
+/**
+ * The bounds this refresh puts on numbers it did not produce.
+ *
+ * Nothing from the feed used to be checked on the way in, and every one of these figures is read by
+ * something that immediately acts on it: the context builder packs a request up to `contextTokens`
+ * and subtracts `maxOutputTokens` from it, and a price sets the model's usage class and decides
+ * whether the owner's spending ceiling admits the model at all. One mistyped field in a catalogue
+ * this software does not control therefore reached the arithmetic intact.
+ *
+ * These are ceilings on belief, not statements about what exists. Each sits an order of magnitude
+ * above anything a provider has published, so a real release passes through untouched and only a
+ * figure that cannot be a figure is caught.
+ */
+export const MAX_CREDIBLE_CONTEXT_TOKENS = 10_000_000;
+const MAX_CREDIBLE_OUTPUT_TOKENS = 1_000_000;
+const MAX_CREDIBLE_USD_PER_MILLION_TOKENS = 10_000;
+/** What a chat route is assumed to hold when the feed states no window at all. */
+const DEFAULT_CONTEXT_TOKENS = 128_000;
+/** How many dropped routes the journal line names before it counts the rest. */
+const JOURNALLED_DROP_LIMIT = 5;
+
 /** Price per million input tokens decides how a run is weighed against the owner's usage windows. */
 const usageClassForPrice = (inputUsdPerMillion: number | null): ModelRelease['usageClass'] => {
   if (inputUsdPerMillion === null || !Number.isFinite(inputUsdPerMillion)) return 'medium';
@@ -123,12 +144,70 @@ const usageClassForPrice = (inputUsdPerMillion: number | null): ModelRelease['us
 /**
  * Prices arrive as per-token decimals; scaling by a million in binary floating point leaves noise in
  * the last bits, and a ceiling of exactly $2.00 has to admit a model priced at exactly $2.00.
+ *
+ * A rate above the credible ceiling is not read as a price. It is not treated as a cheap one
+ * either - `pricedAbsurdly` below is what the caller asks before it decides what to do with the
+ * route, because an unpriced route is `usageClass: 'medium'` and walks through a spending ceiling
+ * untouched, which is the wrong answer to give about a number that was too large to believe.
  */
 const perMillion = (value: string | undefined): number | null => {
   if (value === undefined) return null;
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) return null;
-  return Math.round(parsed * 1_000_000 * 1e6) / 1e6;
+  const scaled = Math.round(parsed * 1_000_000 * 1e6) / 1e6;
+  return scaled > MAX_CREDIBLE_USD_PER_MILLION_TOKENS ? null : scaled;
+};
+
+/**
+ * Whether any rate this route publishes - including the tier it grows into part-way through a long
+ * task - is a number no inference has ever cost. A per-token decimal published as a whole number is
+ * the ordinary way this happens: `"1"` is one million dollars per million tokens.
+ */
+const pricedAbsurdly = (pricing: OpenRouterPricing | undefined): boolean =>
+  [
+    pricing?.prompt,
+    pricing?.completion,
+    pricing?.input_cache_read,
+    pricing?.input_cache_write,
+    ...(pricing?.overrides ?? []).flatMap((tier) => [tier.prompt, tier.completion])
+  ].some((value) => {
+    if (value === undefined) return false;
+    const parsed = Number(value);
+    return (
+      Number.isFinite(parsed) &&
+      parsed >= 0 &&
+      parsed * 1_000_000 > MAX_CREDIBLE_USD_PER_MILLION_TOKENS
+    );
+  });
+
+/**
+ * A window this software will pack a request against, or nothing.
+ *
+ * `ModelRelease.contextTokens` is a positive integer, so a feed stating `0` did not merely produce a
+ * bad number - it produced a row the contract parse drops at the API boundary, taking the model out
+ * of the picker with nothing said.
+ */
+const credibleContextTokens = (value: number | null | undefined): number | null => {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 1) return null;
+  return Math.min(Math.floor(value), MAX_CREDIBLE_CONTEXT_TOKENS);
+};
+
+/**
+ * A reply cannot be longer than the window it is written into. `modelInputBudget` subtracts this
+ * figure from the context window, so a `max_completion_tokens` larger than `context_length` - the
+ * two arriving from the same feed entry - leaves no room for the conversation and `contextShortfall`
+ * refuses the model outright. A stated zero is the absence of a limit, not a limit of nothing.
+ */
+const credibleOutputTokens = (
+  value: number | null | undefined,
+  contextTokens: number | null
+): number | null => {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 1) return null;
+  return Math.min(
+    Math.floor(value),
+    contextTokens ?? MAX_CREDIBLE_OUTPUT_TOKENS,
+    MAX_CREDIBLE_OUTPUT_TOKENS
+  );
 };
 
 const titleCase = (value: string): string =>
@@ -485,6 +564,7 @@ export const refreshOpenRouterCatalog = async (
     const zeroDataRetentionAvailable: boolean | undefined = zdrBody
       ? endpoints.length > 0
       : previous.get(catalogueId)?.zeroDataRetentionAvailable;
+    const contextTokens = credibleContextTokens(live?.context_length);
     return {
       live,
       endpoints,
@@ -492,6 +572,7 @@ export const refreshOpenRouterCatalog = async (
       inputModalities,
       inputUsdPerMillionTokens,
       zeroDataRetentionAvailable,
+      contextTokens,
       expiresAt,
       shared: {
         // Text and pictures, whatever else the provider says the model can be fed. The gateway
@@ -534,10 +615,10 @@ export const refreshOpenRouterCatalog = async (
           catalogued: live !== undefined
         }) satisfies PromptCacheStyle,
         supportsReasoningEffort: supported.has('reasoning_effort'),
-        maxOutputTokens:
-          typeof live?.top_provider?.max_completion_tokens === 'number'
-            ? live.top_provider.max_completion_tokens
-            : null,
+        maxOutputTokens: credibleOutputTokens(
+          live?.top_provider?.max_completion_tokens,
+          contextTokens
+        ),
         knowledgeCutoff: live?.knowledge_cutoff ?? null,
         expiresAt,
         metadataSource: 'measured' as const,
@@ -554,17 +635,13 @@ export const refreshOpenRouterCatalog = async (
   };
 
   const reviewedEntries = allowlist.map((entry): CatalogModelRelease => {
-    const { live, shared, zeroDataRetentionAvailable, expiresAt } = enrich(
+    const { live, shared, zeroDataRetentionAvailable, contextTokens, expiresAt } = enrich(
       entry.providerModelId,
       entry.id
     );
     const livePrivateRoute = Boolean(live) && zeroDataRetentionAvailable === true;
-    const licenseReview = currentCommercialLicenseReview(
-      entry.providerModelId,
-      entry.license,
-      options.now ?? new Date()
-    );
-    // Strict scope keeps the original fail-closed contract: a lapsed review withdraws the model
+    const licenseReview = currentCommercialLicenseReview(entry.providerModelId, entry.license);
+    // Strict scope keeps the original fail-closed contract: a model with no review is withdrawn
     // from selection. Provider scope only withdraws the open-weight claim, because the review
     // describes the weights rather than the owner's right to call a hosted endpoint.
     const reviewGated = scope === 'reviewed_open_weight';
@@ -580,7 +657,7 @@ export const refreshOpenRouterCatalog = async (
           ? ('review' as const)
           : ('available' as const)
         : ('unavailable' as const),
-      contextTokens: live?.context_length ?? entry.contextTokens,
+      contextTokens: contextTokens ?? entry.contextTokens,
       recommendationTags: retiring
         ? [
             ...entry.recommendationTags.filter((tag) => !tag.startsWith('Retires ')),
@@ -600,25 +677,37 @@ export const refreshOpenRouterCatalog = async (
 
   const reviewedIds = new Set(allowlist.map((entry) => entry.providerModelId));
   const liveEntries: CatalogModelRelease[] = [];
+  /** Routes left out of the answer because their stated price could not be one. */
+  const unbelievablyPriced: string[] = [];
   for (const [providerModelId, live] of models) {
     if (reviewedIds.has(providerModelId)) continue;
     const outputModalities = live.architecture?.output_modalities;
     // Image, audio and video generators are reached through the media service, not the chat loop.
     if (outputModalities?.length && !outputModalities.includes('text')) continue;
+    /*
+     * A route whose price cannot be a price is left out rather than offered with the price removed.
+     * `perMillion` has already refused the figure, and an entry carrying no price is not a cautious
+     * entry: `usageClassForPrice` calls it 'medium' and the owner's two-rate ceiling has nothing to
+     * compare, so believing nothing about the number would present the most expensive thing in the
+     * catalogue as one of the cheapest. The reviewed allowlist above is deliberately not treated
+     * this way - it is the curated set, and dropping one of four would empty the strict catalogue -
+     * so there the price alone is refused and the seed's own usage class stands.
+     */
+    if (pricedAbsurdly(live.pricing)) {
+      unbelievablyPriced.push(providerModelId);
+      continue;
+    }
     const catalogueId = `openrouter/${providerModelId}`;
     const {
       supported,
       inputModalities,
       inputUsdPerMillionTokens,
       zeroDataRetentionAvailable,
+      contextTokens: statedContextTokens,
       shared
     } = enrich(providerModelId, catalogueId);
-    const contextTokens = live.context_length ?? 128_000;
-    const review = currentCommercialLicenseReview(
-      providerModelId,
-      'Apache-2.0',
-      options.now ?? new Date()
-    );
+    const contextTokens = statedContextTokens ?? DEFAULT_CONTEXT_TOKENS;
+    const review = currentCommercialLicenseReview(providerModelId, 'Apache-2.0');
     const expiresAt = live.expiration_date ?? null;
     const retiring = expiresAt !== null && Date.parse(expiresAt) <= retirementHorizon;
     liveEntries.push({
@@ -633,7 +722,24 @@ export const refreshOpenRouterCatalog = async (
       // The owner licenses a hosted service from their own provider account; Athanor neither
       // redistributes weights nor resells inference.
       commercialUse: true,
-      privacyRoute: 'provider_zdr',
+      /*
+       * The same fact as `zeroDataRetentionAvailable`, said in the field that routes on it.
+       *
+       * This was the literal `'provider_zdr'`, three lines below the honest per-model answer the
+       * endpoint feed had just produced - so a model served from no zero-retention endpoint was
+       * written `zeroDataRetentionAvailable: false` *and* `privacyRoute: 'provider_zdr'`, two
+       * columns describing one fact and disagreeing. `privacyRoute` is the routing input:
+       * `isPrivacyRouteEligible` matches on it, and the worker's delegate picker reads the
+       * catalogue raw and compares the route alone, with no second look at the flag. On a
+       * zero-retention task that picker was choosing the strongest specialist it could find from
+       * models with no private route at all.
+       *
+       * Unknown is not false, here as everywhere else in this file. When the endpoint feed could
+       * not be read the flag is absent and nothing new is claimed - the route stays what it was
+       * offered as, and the `!== false` guards in `isPrivacyRouteEligible` and the worker's
+       * `usableCapabilities` keep deciding the absent case, as they already did.
+       */
+      privacyRoute: zeroDataRetentionAvailable === false ? 'external' : 'provider_zdr',
       contextTokens,
       usageClass: usageClassForPrice(inputUsdPerMillionTokens),
       recommendationTags: derivedTags(
@@ -646,6 +752,26 @@ export const refreshOpenRouterCatalog = async (
       ...(zeroDataRetentionAvailable === undefined ? {} : { zeroDataRetentionAvailable })
     });
   }
+
+  /*
+   * One line for the whole refresh, at the same cadence and in the same place as the registry's own
+   * failure line: the journal, read through `athanor logs`. A route that quietly stopped being
+   * offered is otherwise unaccountable - this service has one owner, no listener and no metrics
+   * endpoint - and a line per dropped route would bury the rest of the unit's log the first time a
+   * provider shipped a broken price column across a vendor's whole range.
+   */
+  if (unbelievablyPriced.length)
+    process.stderr.write(
+      `[athanor] model catalogue: ${unbelievablyPriced.length} live ${
+        unbelievablyPriced.length === 1 ? 'route was' : 'routes were'
+      } left out because the provider stated a rate above $${MAX_CREDIBLE_USD_PER_MILLION_TOKENS} per million tokens: ${unbelievablyPriced
+        .slice(0, JOURNALLED_DROP_LIMIT)
+        .join(', ')}${
+        unbelievablyPriced.length > JOURNALLED_DROP_LIMIT
+          ? ` and ${unbelievablyPriced.length - JOURNALLED_DROP_LIMIT} more`
+          : ''
+      }\n`
+    );
 
   return [...reviewedEntries, ...liveEntries];
 };
@@ -671,8 +797,17 @@ const mediaPriceTags = (
 ): string[] => {
   const unit =
     modality === 'image' ? 'per-image' : modality === 'audio' ? 'per-character' : 'per-minute';
-  const pricedPerToken =
-    perMillion(pricing?.prompt) !== null || perMillion(pricing?.completion) !== null;
+  /*
+   * Asked of the raw fields rather than through `perMillion`, because the question here is only
+   * whether the provider priced this route at all. `perMillion` now refuses a rate too large to
+   * believe, and reading that refusal as "published nothing" would put this path back where it
+   * started - claiming the provider had said nothing on the strength of not having looked.
+   */
+  const pricedPerToken = [pricing?.prompt, pricing?.completion].some((value) => {
+    if (value === undefined) return false;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0;
+  });
   return [
     `No ${unit} price published`,
     ...(pricedPerToken ? ['Provider prices this route per token'] : [])

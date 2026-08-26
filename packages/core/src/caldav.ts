@@ -47,6 +47,12 @@ export const parseXml = (input: string): XmlNode => {
     throw new AthanorError('caldav_response_too_large', 'The calendar server sent too much XML');
   const root: XmlNode = { name: '#document', children: [], text: '' };
   const stack: XmlNode[] = [root];
+  // Opens that were refused a place on the stack because the document is deeper than we will
+  // follow. Their closing tags have to be swallowed here rather than popping a real ancestor:
+  // popping one closes an element that is still open, and every element after it reattaches to
+  // the wrong parent. Measured on a 30-deep document, a top-level sibling of the deep subtree
+  // ended up inside it, and a <response>'s calendar-data came back empty.
+  let suppressed = 0;
   let nodes = 0;
   let index = 0;
   while (index < input.length) {
@@ -79,7 +85,8 @@ export const parseXml = (input: string): XmlNode => {
     const tag = input.slice(open + 1, close);
     index = close + 1;
     if (tag.startsWith('/')) {
-      if (stack.length > 1) stack.pop();
+      if (suppressed > 0) suppressed -= 1;
+      else if (stack.length > 1) stack.pop();
       continue;
     }
     nodes += 1;
@@ -87,7 +94,11 @@ export const parseXml = (input: string): XmlNode => {
       throw new AthanorError('caldav_response_too_large', 'The calendar server sent too much XML');
     const node: XmlNode = { name: localName(tag), children: [], text: '' };
     stack[stack.length - 1]!.children.push(node);
-    if (!tag.endsWith('/') && stack.length < MAX_XML_DEPTH) stack.push(node);
+    if (tag.endsWith('/')) continue;
+    // Over the depth limit the subtree is flattened onto the deepest node we did keep - less,
+    // rather than a guess - but the stack stays balanced so the rest of the document is intact.
+    if (stack.length < MAX_XML_DEPTH) stack.push(node);
+    else suppressed += 1;
   }
   return root;
 };
@@ -160,11 +171,29 @@ const request = async (
     maxResponseBytes: input.maxResponseBytes ?? 2_000_000
   });
   const allowed = input.allowedStatuses ?? [200, 207];
-  if (!allowed.includes(response.status))
+  if (!allowed.includes(response.status)) {
+    // If-Match and If-None-Match exist to produce exactly this answer, and until it had its own
+    // code it was indistinguishable from the server being broken: "answered 412" told the owner
+    // nothing about the one thing that is true and actionable - somebody else changed this event
+    // since athanor read it, so re-read and decide again. 409 and 423 are the same conversation.
+    if ([409, 412, 423].includes(response.status))
+      throw new AthanorError(
+        'caldav_precondition_failed',
+        response.status === 423
+          ? 'The calendar server has this event locked by another client'
+          : 'This event changed on the server since athanor read it, so the change was not applied',
+        409,
+        { status: response.status }
+      );
+    // The status stays spelled out in the message because the owner-facing copy scrapes it back
+    // out with /answered (\d{3})/; details carries it in a form that does not depend on prose.
     throw new AthanorError(
       'caldav_request_failed',
-      `The calendar server answered ${response.status}`
+      `The calendar server answered ${response.status}`,
+      400,
+      { status: response.status }
     );
+  }
   return response;
 };
 
@@ -278,14 +307,20 @@ export interface CalDavObject {
 
 const objectsFrom = (context: CalDavContext, document: XmlNode, limit: number): CalDavObject[] =>
   findAll(document, 'response')
-    .filter((entry) => responseHref(entry) && findFirst(entry, 'calendar-data')?.text)
+    // Everything a response has to have is checked before the limit is applied. It used to be
+    // checked after, so a multistatus whose first entries carry no VCALENDAR - a 404 propstat,
+    // a collection listed alongside its members - spent the caller's budget on rows that were
+    // then dropped, and a range that did contain `limit` events came back short.
+    .filter((entry) => {
+      const data = findFirst(entry, 'calendar-data')?.text;
+      return Boolean(responseHref(entry) && data && data.includes('BEGIN:VCALENDAR'));
+    })
     .slice(0, limit)
     .map((entry) => ({
       url: resolveHref(context, responseHref(entry)).toString(),
       etag: findFirst(entry, 'getetag')?.text.trim().replace(/^W\//, '') || null,
       calendarData: findFirst(entry, 'calendar-data')?.text ?? ''
-    }))
-    .filter((object) => object.calendarData.includes('BEGIN:VCALENDAR'));
+    }));
 
 /**
  * The server-side expansion is asked for first because an unexpanded weekly meeting comes back
@@ -316,7 +351,19 @@ export const readEventRange = async (
       expanded: true
     };
   } catch (error) {
-    if (!(error instanceof AthanorError)) throw error;
+    // Only "the server refused this request", and only in the 4xx range, is evidence that expand
+    // is the thing it will not do. Retrying on every AthanorError sent a second full REPORT after
+    // a blocked redirect, a response that was already too large, and a transport timeout - which
+    // on a stalled server doubles a 30-second wait into a minute and then reports the second
+    // failure in place of the first. Measured: a blocked redirect produced two transport calls.
+    const status = error instanceof AthanorError ? Number(error.details?.['status'] ?? 0) : 0;
+    if (
+      !(error instanceof AthanorError) ||
+      error.code !== 'caldav_request_failed' ||
+      status < 400 ||
+      status >= 500
+    )
+      throw error;
     return {
       objects: objectsFrom(context, parseXml((await report(false)).body.toString('utf8')), limit),
       expanded: false

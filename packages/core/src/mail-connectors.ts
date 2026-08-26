@@ -713,8 +713,81 @@ const eventSummary = (event: CalendarEvent, url: string) => ({
 
 const setProperty = (component: IcalComponent, name: string, property: IcalProperty | null) => {
   const index = component.properties.findIndex((entry) => entry.name === name);
-  if (index >= 0) component.properties.splice(index, 1);
-  if (property) component.properties.push(property);
+  // Replaced where it already sat rather than appended. Order carries no meaning to a parser, but
+  // an ICS the owner opens should still read like the one their calendar server wrote.
+  if (index >= 0) component.properties.splice(index, 1, ...(property ? [property] : []));
+  else if (property) component.properties.push(property);
+};
+
+const findProperty = (component: IcalComponent, name: string): IcalProperty | undefined =>
+  component.properties.find((entry) => entry.name === name);
+
+const icalUtcStamp = (instant: Date): string =>
+  `${instant.toISOString().replaceAll(/[-:]/g, '').slice(0, 15)}Z`;
+
+/**
+ * One instant written as the wall clock a named zone shows at it. Needed only on the update path:
+ * an event that arrived carrying a TZID has to leave carrying it, because re-anchoring a weekly
+ * repeat to UTC stops every future occurrence following the zone's own DST change and quietly
+ * moves the meeting an hour twice a year.
+ */
+const wallClockInZone = (instant: Date, timeZone: string): string | null => {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hour12: false,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    }).formatToParts(instant);
+    const field = (type: string) => parts.find((part) => part.type === type)?.value ?? '';
+    // Some ICU builds render midnight as hour 24 under hour12:false, as icalendar.ts also guards.
+    const hour = String(Number(field('hour')) % 24).padStart(2, '0');
+    return `${field('year')}${field('month')}${field('day')}T${hour}${field('minute')}${field('second')}`;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * A DTSTART or DTEND moved to a new moment while keeping the form the server already used: a
+ * VALUE=DATE for an all-day event, the event's own TZID for a zoned one, and a bare UTC instant
+ * only when there was nothing to keep.
+ */
+const rewrittenMoment = (
+  previous: IcalProperty | undefined,
+  name: 'DTSTART' | 'DTEND',
+  value: string,
+  allDay: boolean
+): IcalProperty => {
+  if (allDay) {
+    if (!/^\d{4}-\d{2}-\d{2}/.test(value))
+      throw new AthanorError(
+        'calendar_value_invalid',
+        `An all-day event needs ${name} as YYYY-MM-DD`
+      );
+    return {
+      name,
+      parameters: new Map([['VALUE', 'DATE']]),
+      value: value.slice(0, 10).replaceAll('-', '')
+    };
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed))
+    throw new AthanorError('calendar_value_invalid', `${name} is not a valid date and time`);
+  const instant = new Date(parsed);
+  const timeZone =
+    previous?.parameters.get('VALUE') === 'DATE'
+      ? null
+      : (previous?.parameters.get('TZID') ?? null);
+  const local = timeZone ? wallClockInZone(instant, timeZone) : null;
+  if (!local) return { name, parameters: new Map(), value: icalUtcStamp(instant) };
+  const parameters = new Map(previous?.parameters);
+  parameters.delete('VALUE');
+  return { name, parameters, value: local };
 };
 
 const loadEvent = async (
@@ -833,35 +906,108 @@ const executeCalendarAction = async (input: MailExecutionInput): Promise<MailExe
         written.statusCode
       );
     }
+    /**
+     * Changed in place, never rebuilt. An event living on somebody else's CalDAV server carries
+     * far more than the six fields this action can name - a repeat rule, alarms, a VTIMEZONE, a
+     * status, categories, and every attendee's answer - and the write is a PUT with If-Match, so
+     * anything dropped on the way out is gone with nothing to restore it from: no checkpoint and
+     * no snapshot covers a calendar server. This used to rebuild the VEVENT from those six
+     * scalars, which turned "move my Tuesday standup to 10 am" into a one-off UTC event with no
+     * reminder that re-invited everyone who had already accepted. So the loaded component is
+     * mutated and `loaded.calendar` is what goes back, exactly as answering an invitation does
+     * below. ATTENDEE lines are never touched at all: this action cannot name an attendee, so
+     * re-emitting one could only ever discard an answer it had no business changing.
+     */
     case 'calendar_update_event': {
       const loaded = await loadEvent(context, action.eventUrl);
       const existing = eventFromComponent(loaded.event);
-      const allDay = action.allDay ?? existing.start?.allDay ?? false;
-      const rewritten = buildEventComponent({
-        uid: existing.uid,
-        summary: action.summary ?? existing.summary,
-        ...((action.description ?? existing.description)
-          ? { description: action.description ?? existing.description ?? '' }
-          : {}),
-        ...((action.location ?? existing.location)
-          ? { location: action.location ?? existing.location ?? '' }
-          : {}),
-        start: action.start ?? existing.start?.value ?? '',
-        end: action.end ?? existing.end?.value ?? existing.start?.value ?? '',
-        allDay,
-        attendees: existing.attendees.map((attendee) => ({
-          address: attendee.address,
-          ...(attendee.name ? { name: attendee.name } : {})
-        })),
-        ...(existing.organizer ? { organizer: { address: existing.organizer.address } } : {}),
-        // A changed event must advertise a higher SEQUENCE or attendees' clients ignore the update.
-        sequence: existing.sequence + 1
-      });
-      const written = await writeEvent(context, loaded.url, serializeIcalendar(rewritten), {
+      const previousStart = findProperty(loaded.event, 'DTSTART');
+      const previousEnd = findProperty(loaded.event, 'DTEND');
+      const wasAllDay = existing.start?.allDay ?? false;
+      const allDay = action.allDay ?? wasAllDay;
+      let changed = false;
+      const setText = (name: string, value: string | undefined) => {
+        if (value === undefined) return;
+        setProperty(loaded.event, name, { name, parameters: new Map(), value });
+        changed = true;
+      };
+      setText('SUMMARY', action.summary);
+      setText('DESCRIPTION', action.description);
+      setText('LOCATION', action.location);
+      if (action.start !== undefined || action.allDay !== undefined) {
+        const start = action.start ?? existing.start?.value;
+        if (start === undefined)
+          throw new AthanorError(
+            'calendar_value_invalid',
+            'That event has no start, so athanor cannot move it'
+          );
+        setProperty(
+          loaded.event,
+          'DTSTART',
+          rewrittenMoment(previousStart, 'DTSTART', start, allDay)
+        );
+        changed = true;
+      }
+      /**
+       * A caller who moves the start without naming an end means the meeting moved, not that it
+       * now ends before it begins - the old code carried the stale DTEND across and produced
+       * exactly that. So the length the event already had is carried instead. An event that
+       * states its length as DURATION rather than DTEND already gets this for free and is left
+       * alone, and a change of all-day-ness is not a move, so it does not shift anything.
+       */
+      const shifted =
+        action.end === undefined &&
+        action.start !== undefined &&
+        allDay === wasAllDay &&
+        previousEnd &&
+        existing.start &&
+        existing.end
+          ? Date.parse(action.start) +
+            (Date.parse(existing.end.value) - Date.parse(existing.start.value))
+          : null;
+      const end =
+        action.end ??
+        (shifted !== null && Number.isFinite(shifted)
+          ? allDay
+            ? new Date(shifted).toISOString().slice(0, 10)
+            : new Date(shifted).toISOString()
+          : undefined);
+      if (end !== undefined) {
+        setProperty(loaded.event, 'DTEND', rewrittenMoment(previousEnd, 'DTEND', end, allDay));
+        changed = true;
+      }
+      if (changed) {
+        // A changed event must advertise a higher SEQUENCE or attendees' clients ignore the
+        // update - and an update that named nothing must not, or every client is told to
+        // re-read an event that did not move.
+        setProperty(loaded.event, 'SEQUENCE', {
+          name: 'SEQUENCE',
+          parameters: new Map(),
+          value: String(existing.sequence + 1)
+        });
+        const stamp = icalUtcStamp(new Date());
+        setProperty(loaded.event, 'DTSTAMP', {
+          name: 'DTSTAMP',
+          parameters: new Map(),
+          value: stamp
+        });
+        setProperty(loaded.event, 'LAST-MODIFIED', {
+          name: 'LAST-MODIFIED',
+          parameters: new Map(),
+          value: stamp
+        });
+      }
+      const written = await writeEvent(context, loaded.url, serializeIcalendar(loaded.calendar), {
         ifMatch: loaded.etag
       });
       return finish(
-        { url: loaded.url.toString(), uid: existing.uid, etag: written.etag, updated: true },
+        {
+          url: loaded.url.toString(),
+          uid: existing.uid,
+          etag: written.etag,
+          updated: changed,
+          sequence: changed ? existing.sequence + 1 : existing.sequence
+        },
         written.statusCode
       );
     }
@@ -893,7 +1039,7 @@ const executeCalendarAction = async (input: MailExecutionInput): Promise<MailExe
       setProperty(loaded.event, 'LAST-MODIFIED', {
         name: 'LAST-MODIFIED',
         parameters: new Map(),
-        value: `${new Date().toISOString().replaceAll(/[-:]/g, '').slice(0, 15)}Z`
+        value: icalUtcStamp(new Date())
       });
       const written = await writeEvent(context, loaded.url, serializeIcalendar(loaded.calendar), {
         ifMatch: loaded.etag

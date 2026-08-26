@@ -6,16 +6,74 @@ import {
   modelLicenseManifest
 } from './license-manifest.js';
 
+/**
+ * What this suite is for, now that a review does not expire.
+ *
+ * It used to assert against a clock, and the clock was the whole problem: first pinned to the issue
+ * date of the very records it checked, so the expiry could never fail; then pinned to `now`, so a
+ * checkout nobody had touched went red on a calendar date and the repair was a person re-reading
+ * six licences. Neither version tested anything about the licences themselves.
+ *
+ * A published licence is a fact about a published artefact. So these assertions are about coverage
+ * and agreement - every route the catalogue can offer has a review, every review names a real
+ * upstream and a real revision, and nothing non-commercial is in the set - which is what the
+ * manifest exists to guarantee and what would actually be wrong if somebody added a model without
+ * reading its licence.
+ */
 describe('independent model-license manifest', () => {
-  it('covers every chat and media route with a current official review', () => {
-    const at = new Date('2026-07-23T00:00:00.000Z');
-    for (const model of seedModels(at)) {
+  it('covers every chat and media route the catalogue can offer', () => {
+    const missing: string[] = [];
+    for (const model of seedModels(new Date()))
+      if (!currentCommercialLicenseReview(model.providerModelId, model.license))
+        missing.push(`${model.providerModelId} (${model.license})`);
+    for (const media of Object.values(managedMediaModels))
+      if (!currentCommercialLicenseReview(media.modelId, media.license))
+        missing.push(`${media.modelId} (${media.license})`);
+    expect(
+      missing,
+      `these routes are offered with no licence review: ${missing.join('; ')}. Add one to license-manifest.ts after reading the model's licence`
+    ).toEqual([]);
+  });
+
+  it('answers nothing for a model it has never reviewed', () => {
+    expect(currentCommercialLicenseReview('someone/unreviewed-model', 'MIT')).toBeUndefined();
+  });
+
+  /*
+   * The licence a review claims has to match the licence the catalogue declares, or the review is
+   * about a different artefact than the one being offered. This is the check that catches a model
+   * relicensed upstream: the catalogue's declaration moves and the review's does not.
+   */
+  it('answers nothing when the declared licence disagrees with the review', () => {
+    const reviewed = [...modelLicenseManifest.values()][0];
+    if (!reviewed) throw new Error('the manifest is empty, so there is nothing to disagree with');
+    const disagreeing = reviewed.license === 'MIT' ? 'Apache-2.0' : 'MIT';
+    expect(currentCommercialLicenseReview(reviewed.providerModelId, disagreeing)).toBeUndefined();
+    expect(
+      currentCommercialLicenseReview(reviewed.providerModelId, reviewed.license)
+    ).toBeDefined();
+  });
+
+  /*
+   * `upstreamRevision` is what replaces the expiry: it records exactly which revision was read, so
+   * a licence that changes upstream is caught by the revision no longer matching rather than by a
+   * timer. A blank one would make the review unfalsifiable.
+   */
+  it('records the upstream revision each reading was made against', () => {
+    for (const review of modelLicenseManifest.values()) {
       expect(
-        currentCommercialLicenseReview(model.providerModelId, model.license, at)
-      ).toBeDefined();
-    }
-    for (const media of Object.values(managedMediaModels)) {
-      expect(currentCommercialLicenseReview(media.modelId, media.license, at)).toBeDefined();
+        review.upstreamRevision,
+        `${review.providerModelId} has no upstream revision`
+      ).toBeTruthy();
+      expect(review.upstreamModelUrl, `${review.providerModelId} has no upstream url`).toMatch(
+        /^https:\/\//
+      );
+      expect(review.licenseUrl, `${review.providerModelId} has no licence url`).toMatch(
+        /^https:\/\//
+      );
+      expect(review.reviewedAt, `${review.providerModelId} has no reviewed date`).toMatch(
+        /^\d{4}-\d{2}-\d{2}T/
+      );
     }
   });
 

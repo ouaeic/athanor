@@ -224,6 +224,26 @@ export type MemoryKind = 'source' | 'episode' | 'fact' | 'procedure';
  */
 export type MemoryTrust = 'stated' | 'derived';
 
+/**
+ * The five states a remembered row can be in. All five are written or read on a live path, and this
+ * list says where, because two of them were once proposed for deletion as unreachable members:
+ *
+ * - `active` - the column default; everything recall returns by default.
+ * - `superseded` - written by `recordMemoryFact` when a functional predicate gets a second current
+ *   value. This is the deterministic half of contradiction resolution and needs no model call.
+ * - `disputed` - written by `markMemoryFactsDisputed`, read by `listDisputedMemoryItems`, and
+ *   served to the owner by `GET /v1/workspaces/:id/memory-review`. It means "two things you said
+ *   conflict, and neither is being recalled until you say which".
+ * - `archived` - reached by recall's `scope: 'archive'`, which is the only way to read past it.
+ * - `retracted` - written by `retractMemoryItem` behind
+ *   `POST /v1/workspaces/:id/memory-items/:id/retract`. It is deliberately not deletion: the row
+ *   stops being recalled and the audit trail survives, which is the difference between "stop
+ *   believing this" and `DELETE`.
+ *
+ * The one gap worth writing down rather than discovering: the `disputed` *writer* has no production
+ * caller yet. The review queue serves and clears disputes; nothing on the turn path raises one, so
+ * `resolveMemoryContradiction` below decides a verdict nobody currently produces. See its comment.
+ */
 export type MemoryStatus = 'active' | 'superseded' | 'disputed' | 'archived' | 'retracted';
 
 export const MEMORY_KINDS: readonly MemoryKind[] = ['source', 'episode', 'fact', 'procedure'];
@@ -1051,7 +1071,14 @@ export const MEMORY_PACK_BUDGET_TOKENS = 6_000;
  * bought with the tokens of a long tool result rather than the tokens of a second pack.
  */
 export const MEMORY_RECALL_BUDGET_TOKENS = 1_500;
-export const MEMORY_RECALL_MAX_BUDGET_TOKENS = 4_000;
+/**
+ * There was a `MEMORY_RECALL_MAX_BUDGET_TOKENS = 4_000` here, the ceiling of a clamp on a
+ * `budgetTokens` the tool schema never declared and `additionalProperties: false` therefore
+ * refused. No model has ever been able to ask for more than the figure above, so the ceiling was
+ * a tuned-looking number governing nothing - and a maintainer reading it would have taken the
+ * recall budget for something the agent negotiates. Deleted rather than wired: `maxItems` below is
+ * already the dial for how much recall costs (ATH-164).
+ */
 export const MEMORY_RECALL_MAX_ITEMS = 12;
 export const MEMORY_RECALL_ITEM_CEILING = 40;
 
@@ -1177,6 +1204,21 @@ export interface MemoryContradictionSide {
  * The resolution half of section 4.3: deterministic given a verdict, so the only thing a model is ever
  * asked for is the verdict itself. Two things the owner stated that genuinely conflict are never
  * auto-resolved - single-owner is exactly why asking is affordable.
+ *
+ * What is wired, and what is not, because the difference decides whether this is dead code:
+ *
+ * The `dispute` arm has a destination. `markMemoryFactsDisputed` writes the status and the
+ * `contradicts` links as one statement, `listDisputedMemoryItems` reads them back, and the review
+ * queue at `GET /v1/workspaces/:id/memory-review` serves them to the owner beside the stale
+ * procedures, with `retract` and `verify` as the two answers. That path is tested end to end.
+ *
+ * What does not exist is *path B* - the nightly pass that pairs candidate facts and asks a model
+ * for a verdict per pair (docs/design/memory.md 4.3). Path A, the deterministic engine, is live:
+ * `recordMemoryFact` retires the previous value of a `cardinality: 'one'` predicate on the write
+ * path without a model call, which is `supersede` reached by a different and cheaper route. So this
+ * function is not dead - it is the half that path B will call, and it is kept rather than deleted
+ * because deleting it while `docs/design/memory.md` and `docs/AGENT_RUNTIME.md` both describe the
+ * queue would leave the sentence and remove the answer. Wiring it is one caller, not a rebuild.
  */
 export const resolveMemoryContradiction = (
   left: MemoryContradictionSide,

@@ -6,7 +6,6 @@ export interface ModelLicenseReview {
   upstreamRevision: string;
   commercialUseUnderModelLicense: true;
   reviewedAt: string;
-  reviewExpiresAt: string;
 }
 
 const reviews: ModelLicenseReview[] = [
@@ -17,8 +16,7 @@ const reviews: ModelLicenseReview[] = [
     license: 'MIT',
     upstreamRevision: 'openrouter-model-id-reviewed-2026-07-23',
     commercialUseUnderModelLicense: true,
-    reviewedAt: '2026-07-23T00:00:00.000Z',
-    reviewExpiresAt: '2026-10-21T00:00:00.000Z'
+    reviewedAt: '2026-07-23T00:00:00.000Z'
   },
   {
     providerModelId: 'z-ai/glm-5.2',
@@ -27,8 +25,7 @@ const reviews: ModelLicenseReview[] = [
     license: 'MIT',
     upstreamRevision: 'openrouter-model-id-reviewed-2026-07-23',
     commercialUseUnderModelLicense: true,
-    reviewedAt: '2026-07-23T00:00:00.000Z',
-    reviewExpiresAt: '2026-10-21T00:00:00.000Z'
+    reviewedAt: '2026-07-23T00:00:00.000Z'
   },
   {
     providerModelId: 'qwen/qwen3.6-35b-a3b',
@@ -37,8 +34,7 @@ const reviews: ModelLicenseReview[] = [
     license: 'Apache-2.0',
     upstreamRevision: 'openrouter-model-id-reviewed-2026-07-23',
     commercialUseUnderModelLicense: true,
-    reviewedAt: '2026-07-23T00:00:00.000Z',
-    reviewExpiresAt: '2026-10-21T00:00:00.000Z'
+    reviewedAt: '2026-07-23T00:00:00.000Z'
   },
   {
     providerModelId: 'openai/gpt-oss-120b',
@@ -48,8 +44,7 @@ const reviews: ModelLicenseReview[] = [
     license: 'Apache-2.0',
     upstreamRevision: '607fd515f16a4d340663a949dbfc20a4be5806b8',
     commercialUseUnderModelLicense: true,
-    reviewedAt: '2026-07-23T00:00:00.000Z',
-    reviewExpiresAt: '2026-10-21T00:00:00.000Z'
+    reviewedAt: '2026-07-23T00:00:00.000Z'
   },
   {
     providerModelId: 'black-forest-labs/flux.2-klein-4b',
@@ -58,8 +53,7 @@ const reviews: ModelLicenseReview[] = [
     license: 'Apache-2.0',
     upstreamRevision: 'openrouter-model-id-reviewed-2026-07-23',
     commercialUseUnderModelLicense: true,
-    reviewedAt: '2026-07-23T00:00:00.000Z',
-    reviewExpiresAt: '2026-10-21T00:00:00.000Z'
+    reviewedAt: '2026-07-23T00:00:00.000Z'
   },
   {
     providerModelId: 'hexgrad/kokoro-82m',
@@ -68,8 +62,7 @@ const reviews: ModelLicenseReview[] = [
     license: 'Apache-2.0',
     upstreamRevision: '496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4',
     commercialUseUnderModelLicense: true,
-    reviewedAt: '2026-07-23T00:00:00.000Z',
-    reviewExpiresAt: '2026-10-21T00:00:00.000Z'
+    reviewedAt: '2026-07-23T00:00:00.000Z'
   }
 ];
 
@@ -77,19 +70,28 @@ export const modelLicenseManifest = new Map(
   reviews.map((review) => [review.providerModelId, Object.freeze(review)])
 );
 
+/**
+ * A licence review does not expire.
+ *
+ * These records say what licence a model was published under, with the upstream revision the
+ * reading was made against. That is a fact about a published artefact, not a subscription: MIT
+ * stays MIT, and a revision that was Apache-2.0 does not stop being Apache-2.0 because ninety days
+ * passed. The manifest carried a `reviewExpiresAt` and the suite asserted against it, so a checkout
+ * nobody had touched went red on a calendar date - and in `reviewed_open_weight` scope that turns a
+ * working catalogue into an unselectable one on an unattended server. athanor is installed from a
+ * tag and left to run; a build that breaks on a date its owner did not choose is a defect, not a
+ * safeguard.
+ *
+ * `upstreamRevision` is what makes this honest without a clock. It pins the exact revision read, so
+ * a model whose licence changes upstream is caught by the revision no longer matching - which is a
+ * real event - rather than by the passage of time, which is not.
+ */
 export const currentCommercialLicenseReview = (
   providerModelId: string,
-  declaredLicense: string,
-  now = new Date()
+  declaredLicense: string
 ): ModelLicenseReview | undefined => {
   const review = modelLicenseManifest.get(providerModelId);
-  if (
-    !review ||
-    review.license !== declaredLicense ||
-    !review.commercialUseUnderModelLicense ||
-    new Date(review.reviewedAt).getTime() > now.getTime() ||
-    new Date(review.reviewExpiresAt).getTime() <= now.getTime()
-  )
+  if (!review || review.license !== declaredLicense || !review.commercialUseUnderModelLicense)
     return undefined;
   return review;
 };

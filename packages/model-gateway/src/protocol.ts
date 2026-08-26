@@ -109,7 +109,20 @@ export interface ModelToolCall {
 }
 
 export interface ModelResponse {
+  /**
+   * The answer, and only the answer.
+   *
+   * A route that writes its deliberation between `<think>` tags inside the completion has it taken
+   * out here and put in `reasoning`, because no caller can tell thinking from prose after the fact:
+   * published as text it goes onto the owner's timeline, is stored as the assistant's own prior
+   * turn, and is handed back to the model on every later step as something it already said.
+   */
   text: string;
+  /**
+   * Everything the route produced that is not the answer, whichever of the three ways it said so:
+   * `reasoning`, `reasoning_content`, or a leading `<think>…</think>` span inside the completion.
+   * The adapter normalises all three; nothing downstream should have to know which arrived.
+   */
   reasoning?: string;
   reasoningDetails?: unknown[];
   toolCalls: ModelToolCall[];
@@ -145,7 +158,6 @@ export interface ModelResponse {
     inputTokens: number;
     outputTokens: number;
     totalTokens: number;
-    computeSeconds?: number;
     costUsd?: number;
     /**
      * Set when the counts here were worked out from the text rather than reported by the provider.
@@ -192,10 +204,15 @@ export interface ModelAdapter {
   chat(request: ModelRequest): Promise<ModelResponse>;
 }
 
+/**
+ * A model a configured provider says it serves.
+ *
+ * It carried `sizeBytes` and `modifiedAt` for a local-weights arrangement this product does not
+ * have: no adapter has ever set either, nothing has ever read either, and a catalogue field that
+ * exists on neither side of the wire is an invitation to write code against a fact nobody supplies.
+ */
 export interface ProviderModel {
   id: string;
   provider: string;
   revision: string;
-  sizeBytes?: number;
-  modifiedAt?: string;
 }
