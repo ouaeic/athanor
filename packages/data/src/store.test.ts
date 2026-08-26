@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  CONVERSATION_NAME_INDEX_STAMP,
   MEMORY_KINDS,
   MEMORY_PREDICATES,
   buildConversationNameIndex,
@@ -25,13 +26,35 @@ import {
   wrapDataKey
 } from '@athanor/core';
 import type { EncryptedEnvelope, MemoryItemContent, MemoryKind } from '@athanor/core';
-import { MAX_AGENT_NOTIFICATIONS_PER_TASK, PREVIEW_IDLE_EXPIRY_DAYS } from '@athanor/contracts';
+import {
+  MAX_AGENT_NOTIFICATIONS_PER_TASK,
+  PREVIEW_IDLE_EXPIRY_DAYS,
+  TaskStatus
+} from '@athanor/contracts';
 import { createDatabase, migrateDatabase, type Database } from './database.js';
 import { migrations } from './migrations.js';
+/*
+ * The domain modules, named directly.
+ *
+ * `DataStore` forwards the surface every other package reaches, and a forward with no caller
+ * outside `packages/data` is a line that exists only because this file asked for it. Fourteen were
+ * in exactly that state; they are gone from the facade and the calls below name the module that
+ * owns the table instead. Nothing about what is being tested changed - the same method, the same
+ * statement, the same `Database` handle - which is why every test name in this file is unchanged.
+ */
+import { BillingStore } from './store/billing.js';
+import { ConnectorStore } from './store/connectors.js';
+import { MemoryStore } from './store/memory.js';
+import { TaskSignals, TaskStore } from './store/tasks.js';
+import { WorkspaceStore } from './store/workspaces.js';
 import {
   agentNotificationAad,
   DataStore,
+  LIVE_TASK_STATUSES,
+  MAX_APPROVAL_PAGE,
+  MAX_TASK_EVENT_PAGE,
   MEMORY_SOURCE_SEARCH_PER_TASK,
+  SETTLED_TASK_STATUSES,
   TASK_MAX_ATTEMPTS,
   type RecallMemoryInput
 } from './store.js';
@@ -68,11 +91,21 @@ const taskInput = (
 describe('DataStore', () => {
   let database: Database;
   let store: DataStore;
+  let billing: BillingStore;
+  let connectors: ConnectorStore;
+  let tasks: TaskStore;
+  let workspaces: WorkspaceStore;
 
   beforeEach(async () => {
     database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
     await migrateDatabase(database);
     store = new DataStore(database);
+    // The same handle the facade holds, over the same connection. `TaskSignals` opens nothing until
+    // something subscribes, so a second one costs a test nothing.
+    billing = new BillingStore(database);
+    connectors = new ConnectorStore(database);
+    tasks = new TaskStore(database, new TaskSignals(database));
+    workspaces = new WorkspaceStore(database);
   });
 
   afterEach(async () => database.close());
@@ -140,6 +173,43 @@ describe('DataStore', () => {
     await expect(store.authenticateApiToken('one-way-hash')).resolves.toBeNull();
   });
 
+  /*
+   * A workspace and the key that opens it are one thing written as two rows, and every read path
+   * inner-joins them - so a workspaces row whose key never landed is invisible to the owner, to
+   * `deleteWorkspace` (only ever called with an id the owner can see) and to the create route,
+   * which mints another. On a box with a single workspace that is the whole product gone, from one
+   * connection dropping between two statements while the installer restarts services back to back.
+   *
+   * The injection is the point: replayed against a healthy database this passes either way.
+   */
+  it('leaves no workspace behind when the key that opens it never lands', async () => {
+    const user = await store.createUser({ username: 'installer', displayName: 'Installer' });
+    /** The store's database with one statement taken out from under it, transactions included. */
+    const failingOn = (real: Database, statement: RegExp): Database => ({
+      query: async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+        if (statement.test(sql)) throw new Error('connection terminated unexpectedly');
+        return real.query<T>(sql, params);
+      },
+      exec: (sql: string) => real.exec(sql),
+      transaction: (callback) =>
+        real.transaction((scoped) => callback(failingOn(scoped, statement))),
+      withAdvisoryLock: <T>(lock: number, callback: () => Promise<T>) =>
+        real.withAdvisoryLock(lock, callback),
+      notify: (channel, payload) => real.notify(channel, payload),
+      listen: (channel, handler) => real.listen(channel, handler),
+      close: async () => undefined
+    });
+    const dropped = new DataStore(failingOn(database, /INSERT INTO workspace_keys/));
+
+    await expect(dropped.createWorkspace(workspaceInput(user.id, 'Home'))).rejects.toThrow(
+      /connection terminated/
+    );
+
+    await expect(store.listWorkspaces(user.id)).resolves.toEqual([]);
+    const stranded = await database.query('SELECT id FROM workspaces');
+    expect(stranded.rows).toEqual([]);
+  });
+
   it('keeps reviewed memory and skills in encrypted workspace records', async () => {
     const user = await store.createUser({ username: 'knowledge-user', displayName: 'Knowledge' });
     const workspace = await store.createWorkspace({
@@ -173,7 +243,9 @@ describe('DataStore', () => {
     });
     expect(revised).toMatchObject({ id: skill.id, version: 2, nameHash: 'opaque-name-hash' });
     await store.markWorkspaceSkillUsed(user.id, workspace.id, skill.id);
-    await expect(store.getWorkspaceSkill(user.id, workspace.id, skill.id)).resolves.toMatchObject({
+    await expect(
+      workspaces.getWorkspaceSkill(user.id, workspace.id, skill.id)
+    ).resolves.toMatchObject({
       useCount: 1,
       status: 'active'
     });
@@ -188,7 +260,9 @@ describe('DataStore', () => {
       [skill.id]
     );
     await store.curateWorkspaceSkills(workspace.id);
-    await expect(store.getWorkspaceSkill(user.id, workspace.id, skill.id)).resolves.toMatchObject({
+    await expect(
+      workspaces.getWorkspaceSkill(user.id, workspace.id, skill.id)
+    ).resolves.toMatchObject({
       status: 'archived'
     });
     await store.setWorkspaceSkillState({
@@ -226,9 +300,9 @@ describe('DataStore', () => {
       "UPDATE workspace_skills SET last_used_at=NULL,updated_at=NOW()-INTERVAL '400 days' WHERE id=$1",
       [skill.id]
     );
-    const before = await store.getWorkspaceSkill(user.id, workspace.id, skill.id);
+    const before = await workspaces.getWorkspaceSkill(user.id, workspace.id, skill.id);
     await store.curateWorkspaceSkills(workspace.id);
-    const after = await store.getWorkspaceSkill(user.id, workspace.id, skill.id);
+    const after = await workspaces.getWorkspaceSkill(user.id, workspace.id, skill.id);
     expect(after).toMatchObject({ status: 'active' });
     // A true no-op: the row is not even rewritten, so updated_at keeps meaning "when this changed".
     expect(after?.updatedAt).toBe(before?.updatedAt);
@@ -501,6 +575,62 @@ describe('DataStore', () => {
   });
 
   /**
+   * Nothing in this repository has ever built a conversation longer than a handful of events, so
+   * the paging the timeline and its stream rest on has only ever been read at a size where one page
+   * held everything - and a bound nobody has ever crossed is a bound nobody has ever tested.
+   *
+   * Real transcripts do cross it. A streamed turn writes an `assistant_delta` several times a
+   * second, and a turn that ends without an `assistant_message` - cancelled, or failed mid-stream -
+   * keeps every one of them: `appendTaskEvent` supersedes deltas only when the closing message
+   * lands, and `cleanupExpired`'s sweep looks for that same closing message before it deletes
+   * anything. So the whole of a transcript has to stay assemblable by a reader that is only ever
+   * given a page at a time, in either direction, with no row seen twice and none skipped.
+   */
+  it('assembles a transcript longer than one page by paging it in both directions', async () => {
+    const user = await store.createUser({ username: 'pager', displayName: 'Pager' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Pager'));
+    const task = await store.createTask(taskInput(user.id, workspace.id));
+    const total = MAX_TASK_EVENT_PAGE * 2 + 7;
+    // One statement rather than `appendTaskEvent` per row, which takes the task's row lock each
+    // time: what is under test here is the size of the read, and the writer has its own tests.
+    await database.query(
+      `INSERT INTO task_events(id, task_id, sequence, kind, summary)
+       SELECT gen_random_uuid(), $1, g, 'assistant_delta', 'Encrypted delta event'
+       FROM generate_series(1, $2::int) AS g`,
+      [task.id, total]
+    );
+    const everySequence = Array.from({ length: total }, (_, index) => index + 1);
+
+    // Forwards, the way a live stream resumes: each page starts where the last one stopped.
+    const forward: number[] = [];
+    let cursor = 0;
+    for (let page = 0; page < 20; page += 1) {
+      const window = await store.listTaskEventPage(task.id, { after: cursor });
+      forward.push(...window.events.map((event) => event.sequence));
+      cursor = window.nextCursor;
+      if (!window.hasMore) break;
+    }
+    expect(forward).toEqual(everySequence);
+
+    // Backwards, the way a reader walks into the history the first load deliberately did not send.
+    const backward: number[] = [];
+    let older = await store.listRecentTaskEvents(task.id);
+    for (let page = 0; page < 20; page += 1) {
+      backward.unshift(...older.events.map((event) => event.sequence));
+      if (!older.hasMore) break;
+      older = await store.listTaskEventPage(task.id, { before: older.oldestSequence ?? 0 });
+    }
+    expect(backward).toEqual(everySequence);
+
+    // And no caller reaches the whole transcript in one breath by naming a large enough number.
+    await expect(
+      store
+        .listTaskEventPage(task.id, { after: 0, limit: total })
+        .then((window) => window.events.length)
+    ).resolves.toBe(MAX_TASK_EVENT_PAGE);
+  });
+
+  /**
    * The turn the owner corrected died before it could read the correction.
    *
    * Everything here is about one question: whether a message they sent is still going to happen.
@@ -629,7 +759,7 @@ describe('DataStore', () => {
       ]);
       expect(await store.getTask(userId, taskId)).toMatchObject({ queuedMessageCount: 0 });
       // And the ceiling it was holding against work nobody is going to do comes back.
-      await expect(store.reservedUsageForTask(taskId)).resolves.toBe(0);
+      await expect(billing.reservedUsageForTask(taskId)).resolves.toBe(0);
       // Said once. A second sweep of the same conversation has nothing left to report.
       await expect(store.strandQueuedTaskMessages(taskId)).resolves.toEqual([]);
     });
@@ -1242,7 +1372,7 @@ describe('DataStore', () => {
       }
     ]);
     expect((await store.getTask(user.id, task.id))?.status).toBe('failed');
-    await expect(store.reservedUsageForTask(task.id)).resolves.toBe(0);
+    await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(0);
     // Exactly once, so the owner is told once: the statement that finds the rows is the statement
     // that moves them out of the statuses it looks at.
     await expect(store.failTasksAtAttemptLimit()).resolves.toEqual([]);
@@ -1621,6 +1751,147 @@ describe('DataStore', () => {
     ]);
     await store.deleteSessionForUser(user.id, (await store.listSessions(user.id))[0]!.id as string);
     await expect(store.listPendingNotifications()).resolves.toEqual([]);
+  });
+
+  /**
+   * A box run in Balanced mode answers approvals all day and keeps every answer it has ever given.
+   * The list read was the whole table - months of settled decisions handed to a caller that then
+   * issues two more queries and a decrypt for each row it was given.
+   *
+   * So the read is a page, and what falls off the end stays reachable by asking again from where
+   * the page stopped. That has to hold when a run of approvals share a timestamp, which approvals
+   * written by one turn do: the position is the row, not the clock.
+   */
+  it('bounds an approval list months of answers have grown, and reaches the rest by cursor', async () => {
+    const user = await store.createUser({ username: 'approver', displayName: 'Approver' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Approvals'));
+    const task = await store.createTask(taskInput(user.id, workspace.id));
+    const total = MAX_APPROVAL_PAGE + 37;
+    // Two to a timestamp, so paging has to break a tie rather than trust the clock to do it.
+    await database.query(
+      `INSERT INTO approvals(id,user_id,task_id,action,side_effect,preview_ciphertext,
+         preview_hash,status,expires_at,created_at)
+       SELECT gen_random_uuid(), $1, $2, 'browser.submit', 'external_write',
+         '{"v":1,"iv":"a","tag":"b","ciphertext":"c"}'::jsonb, 'hash', 'pending',
+         NOW() + INTERVAL '1 hour', NOW() - ((g / 2) * INTERVAL '1 second')
+       FROM generate_series(1, $3::int) AS g`,
+      [user.id, task.id, total]
+    );
+
+    const first = await store.listApprovals(user.id, 'pending');
+    expect(first).toHaveLength(MAX_APPROVAL_PAGE);
+    const rest = await store.listApprovals(user.id, 'pending', {
+      cursor: String(first.at(-1)!.cursor)
+    });
+    expect(rest).toHaveLength(total - MAX_APPROVAL_PAGE);
+    // Every approval exactly once: none shown twice by the page boundary, none skipped past it.
+    expect(new Set([...first, ...rest].map((approval) => String(approval.id))).size).toBe(total);
+    // Newest first the whole way through. A page boundary is not a place where a list may re-sort.
+    const stamps = [...first, ...rest].map((approval) => String(approval.createdAt));
+    expect([...stamps].sort().reverse()).toEqual(stamps);
+    // A limit is honoured, and is not a way to ask for the whole table back.
+    await expect(store.listApprovals(user.id, 'pending', { limit: 5 })).resolves.toHaveLength(5);
+    await expect(
+      store.listApprovals(user.id, 'pending', { limit: total }).then((rows) => rows.length)
+    ).resolves.toBe(MAX_APPROVAL_PAGE);
+  });
+
+  /**
+   * Whether this conversation is stopped on an approval is one indexed question, and the send path
+   * answered it by reading every pending approval the owner has and scanning them in JavaScript -
+   * on the hot path, for every follow-up message sent to a waiting task.
+   *
+   * The answer here has to be the same answer, or converting that caller changes when a follow-up
+   * unparks a conversation. That includes an approval whose deadline has passed but which the
+   * expiry sweep has not reached yet: it is still `pending`, and it still holds the task.
+   */
+  it('answers whether one conversation is stopped on an approval without reading them all', async () => {
+    const user = await store.createUser({ username: 'parked', displayName: 'Parked' });
+    const stranger = await store.createUser({ username: 'stranger', displayName: 'Stranger' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Parked'));
+    const parked = await store.createTask(taskInput(user.id, workspace.id));
+    const working = await store.createTask(taskInput(user.id, workspace.id));
+    const approvalId = await store.createApproval({
+      userId: user.id,
+      taskId: parked.id,
+      action: 'browser.submit',
+      sideEffect: 'external_write',
+      previewCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+      previewHash: 'hash',
+      expiresAt: new Date(Date.now() + 60_000)
+    });
+    /** The read this replaces, kept beside it so the two can be held against each other. */
+    const byScanning = async (taskId: string): Promise<boolean> =>
+      (await store.listApprovals(user.id, 'pending')).some(
+        (approval) => String(approval.taskId) === taskId
+      );
+
+    await expect(connectors.hasPendingApproval(user.id, parked.id)).resolves.toBe(true);
+    await expect(connectors.hasPendingApproval(user.id, working.id)).resolves.toBe(false);
+    expect(await byScanning(parked.id)).toBe(true);
+    expect(await byScanning(working.id)).toBe(false);
+    // Somebody else's approval is not an answer about this owner's conversation.
+    await expect(connectors.hasPendingApproval(stranger.id, parked.id)).resolves.toBe(false);
+    // An approval past its deadline that the sweep has not reached is still holding the task.
+    await database.query('UPDATE approvals SET expires_at = NOW() - $1::interval WHERE id = $2', [
+      '1 hour',
+      approvalId
+    ]);
+    await expect(connectors.hasPendingApproval(user.id, parked.id)).resolves.toBe(true);
+    expect(await byScanning(parked.id)).toBe(true);
+    // Answered is not pending, which is what lets a follow-up move the conversation back to work.
+    await store.cleanupExpired();
+    await expect(connectors.hasPendingApproval(user.id, parked.id)).resolves.toBe(false);
+    expect(await byScanning(parked.id)).toBe(false);
+  });
+
+  /**
+   * Whether a computer still has work running on it decides whether the owner may put its files
+   * back. It was answered by reading every conversation in the workspace - each row carrying two
+   * correlated subqueries for its live counts - and testing them in JavaScript, to establish a
+   * fact that one indexed row proves.
+   */
+  it('answers whether a workspace still has live work without reading its conversations', async () => {
+    const user = await store.createUser({ username: 'busy', displayName: 'Busy' });
+    const stranger = await store.createUser({ username: 'onlooker', displayName: 'Onlooker' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Busy'));
+    const quiet = await store.createWorkspace(workspaceInput(user.id, 'Quiet'));
+    const task = await store.createTask(taskInput(user.id, workspace.id));
+    const executing = ['queued', 'planning', 'running'] as const;
+    const settled = SETTLED_TASK_STATUSES;
+
+    // The two lists are complements, and a status nobody has classified is live rather than
+    // settled: the refusal they feed has to fail towards saying no while an agent is working.
+    expect([...LIVE_TASK_STATUSES, ...SETTLED_TASK_STATUSES].sort()).toEqual(
+      [...TaskStatus.options].sort()
+    );
+    expect(LIVE_TASK_STATUSES.filter((status) => SETTLED_TASK_STATUSES.includes(status))).toEqual(
+      []
+    );
+    await expect(
+      tasks.workspaceHasTasksInStatus(user.id, workspace.id, LIVE_TASK_STATUSES)
+    ).resolves.toBe(true);
+
+    await expect(tasks.workspaceHasTasksInStatus(user.id, workspace.id, executing)).resolves.toBe(
+      true
+    );
+    await expect(tasks.workspaceHasTasksInStatus(user.id, workspace.id, settled)).resolves.toBe(
+      false
+    );
+    await store.setTaskStatusForUser(user.id, task.id, 'completed');
+    await expect(tasks.workspaceHasTasksInStatus(user.id, workspace.id, executing)).resolves.toBe(
+      false
+    );
+    await expect(tasks.workspaceHasTasksInStatus(user.id, workspace.id, settled)).resolves.toBe(
+      true
+    );
+    // Scoped to the owner, and to the one computer being asked about.
+    await expect(tasks.workspaceHasTasksInStatus(stranger.id, workspace.id, settled)).resolves.toBe(
+      false
+    );
+    await expect(tasks.workspaceHasTasksInStatus(user.id, quiet.id, settled)).resolves.toBe(false);
+    // Nothing to look for is not a reason to go looking.
+    await expect(tasks.workspaceHasTasksInStatus(user.id, workspace.id, [])).resolves.toBe(false);
   });
 
   it('wakes a reader on the write rather than making it ask again a second later', async () => {
@@ -2056,6 +2327,78 @@ describe('DataStore', () => {
     await expect(
       database.query('SELECT COUNT(*) AS count FROM notification_deliveries')
     ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+  });
+
+  /*
+   * A run the box started on its own is not news, and the notifier has to be able to say so from
+   * the conversation rather than from the ledger of due slots.
+   *
+   * `task_schedule_runs` is pruned - the same thirty days as the delivery ledger - and asking
+   * `NOT EXISTS` of a pruned table means a scheduled run whose row has gone reads as a conversation
+   * the owner started. Today that never happens only because the candidate horizon is fourteen days
+   * and the prune is thirty, so a run has always fallen out of consideration before its row is
+   * removed. That is an accident of two constants, not a property: a run that parks - `awaiting_user`
+   * after an ask, or paused at a spend cap - and is resumed five weeks later completes inside the
+   * fourteen-day window with its ledger row already gone, and the owner is told a task they never
+   * started has finished. `tasks.schedule_id` answers it from the row itself and cannot be pruned.
+   */
+  it('still knows a resumed scheduled run was scheduled after its ledger row has been pruned', async () => {
+    const user = await store.createUser({ username: 'watcher', displayName: 'Watcher' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Watching'));
+    const subscription = await store.upsertPushSubscription({
+      userId: user.id,
+      sessionPublicId: await store.createSession(
+        user.id,
+        'session-hash',
+        new Date(Date.now() + 60_000)
+      ),
+      endpoint: 'https://push.example/resumed',
+      p256dh: 'key-material-for-the-device',
+      auth: 'auth-secret'
+    });
+    expect(subscription.endpoint).toContain('resumed');
+
+    const envelope = { v: 1 as const, iv: 'a', tag: 'b', ciphertext: 'c' };
+    const schedule = await store.createTaskSchedule({
+      userId: user.id,
+      workspaceId: workspace.id,
+      titleCiphertext: envelope,
+      promptCiphertext: envelope,
+      modelId: 'qwen',
+      privacyRoute: 'provider_zdr',
+      maxComputeCredits: 1,
+      spec: { kind: 'interval', everyMinutes: 15 },
+      nextRunAt: new Date(Date.now() + 60_000)
+    });
+    await database.query("UPDATE task_schedules SET next_run_at=NOW()-INTERVAL '1 minute'");
+    await store.leaseDueTaskSchedule('scheduler');
+    const runId = '00000000-0000-4000-8000-0000000000c7';
+    await store.materializeTaskSchedule({
+      scheduleId: schedule.id,
+      workerId: 'scheduler',
+      taskId: runId,
+      nextRunAt: new Date(Date.now() + 900_000),
+      resourceClass: 'medium',
+      preparingEventCiphertext: envelope,
+      failureEventCiphertext: envelope
+    });
+    await store.setTaskStatusForUser(user.id, runId, 'completed');
+    // The property while the ledger row is still there, which is what holds today.
+    await expect(store.listPendingNotifications()).resolves.toEqual([]);
+
+    // The run parked and was resumed five weeks later: `cleanupExpired` removed its ledger row
+    // while it was parked, and the completion is fresh.
+    await database.query(
+      "UPDATE task_schedule_runs SET created_at=NOW()-INTERVAL '40 days' WHERE schedule_id=$1",
+      [schedule.id]
+    );
+    await store.cleanupExpired();
+    await expect(
+      database.query('SELECT COUNT(*) AS count FROM task_schedule_runs')
+    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    expect((await store.getTask(user.id, runId))!.scheduleId).toBe(schedule.id);
+
+    await expect(store.listPendingNotifications()).resolves.toEqual([]);
   });
 
   it('replaces the recovery code for an owner who still holds a passkey', async () => {
@@ -2657,6 +3000,7 @@ describe('DataStore', () => {
 describe('tiered agent memory', () => {
   let database: Database;
   let store: DataStore;
+  let memory: MemoryStore;
   let userId: string;
   let workspaceId: string;
 
@@ -2718,6 +3062,7 @@ describe('tiered agent memory', () => {
     database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
     await migrateDatabase(database);
     store = new DataStore(database);
+    memory = new MemoryStore(database);
     await store.syncMemoryPredicates();
     const user = await store.createUser({ username: 'owner', displayName: 'Owner' });
     userId = user.id;
@@ -2730,7 +3075,7 @@ describe('tiered agent memory', () => {
   it('runs the whole lexical floor with no extensions installed', async () => {
     // PGlite ships without pg_trgm, which is exactly the degraded case the design requires to keep
     // working: fuzzy recall and fused ranking must not need it.
-    await expect(store.memoryCapabilities()).resolves.toEqual({ trigram: false });
+    await expect(memory.memoryCapabilities()).resolves.toEqual({ trigram: false });
 
     await addItem(
       'fact',
@@ -2857,7 +3202,7 @@ describe('tiered agent memory', () => {
     expect(retired?.status).toBe('superseded');
     expect(retired?.validTo).toBe(at(1).toISOString());
     expect(retired?.retiredAt).not.toBeNull();
-    await expect(store.listMemoryLinks(second.item.id)).resolves.toEqual([
+    await expect(memory.listMemoryLinks(second.item.id)).resolves.toEqual([
       expect.objectContaining({ srcId: second.item.id, dstId: first.item.id, rel: 'supersedes' })
     ]);
 
@@ -2891,6 +3236,186 @@ describe('tiered agent memory', () => {
     await expect(store.syncMemoryPredicates()).resolves.toBe(MEMORY_PREDICATES.length);
   });
 
+  /**
+   * `pred_functional` is a cache of the predicate's cardinality, written by `mem.index_row()` on a
+   * trigger that fires on mem.item and on nothing else - so a release that changes a cardinality in
+   * `MEMORY_PREDICATES` used to leave every stored row carrying the previous answer forever. It is
+   * the sole predicate of the `mem_fact_current_one` unique index, so a stale value is not a stale
+   * statistic: it decides whether the one-current-value-per-functional-predicate rule applies to a
+   * row at all.
+   *
+   * The registry is edited directly in these three, because that is the only way to stand in the
+   * position a release leaves a box in: `#recordMemoryFact` re-upserts the shipped definition on
+   * every fact write, so a fact written the ordinary way can never disagree with the registry.
+   */
+  const cardinalityWas = async (name: string, cardinality: 'one' | 'many') =>
+    database.query('UPDATE mem.predicate SET cardinality=$2 WHERE name=$1', [name, cardinality]);
+
+  /**
+   * The cached cardinality of every stored fact, in the keyed order of the values they carry - which
+   * is a hash, so a caller that needs to know which value is which asks about the flags as a set.
+   */
+  const functionalFlags = async (): Promise<boolean[]> =>
+    (
+      await database.query<{ pred_functional: boolean }>(
+        `SELECT pred_functional FROM mem.item WHERE kind='fact' ORDER BY object_key`
+      )
+    ).rows.map((row) => row.pred_functional);
+
+  it('stops refusing a legitimate second value once a predicate has widened to many', async () => {
+    // The box as a release that narrowed related_to to `one` left it: the row was written while the
+    // registry said so, so the trigger cached TRUE and the unique index governs it.
+    await cardinalityWas('related_to', 'one');
+    const first = await addItem(
+      'fact',
+      { title: 'deploy host', body: 'Deploys go to alpha.', subject: 'deploys', object: 'alpha' },
+      { predicate: 'related_to' }
+    );
+    expect(await functionalFlags()).toEqual([true]);
+
+    // The symptom, before anything is fixed: the registry has since gone back to `many`, but the
+    // stored row still says otherwise, and a second perfectly legal value is refused by a constraint
+    // the agent reports to the owner as a failed memory write.
+    const second = {
+      title: 'deploy host',
+      body: 'Deploys also go to beta.',
+      subject: 'deploys',
+      object: 'beta'
+    };
+    await expect(addItem('fact', second, { predicate: 'related_to' })).rejects.toThrow(
+      /mem_fact_current_one/
+    );
+
+    await store.syncMemoryPredicates();
+
+    expect(await functionalFlags()).toEqual([false]);
+    const added = await addItem('fact', second, { predicate: 'related_to' });
+    expect(added.id).not.toBe(first.id);
+  });
+
+  it('brings the rows a narrowed predicate now governs back under the unique index', async () => {
+    await cardinalityWas('default_shell', 'many');
+    await addItem(
+      'fact',
+      { title: 'shell', body: 'The bot uses bash.', subject: 'deploybot', object: 'bash' },
+      { predicate: 'default_shell' }
+    );
+    expect(await functionalFlags()).toEqual([false]);
+
+    await store.syncMemoryPredicates();
+
+    expect(await functionalFlags()).toEqual([true]);
+    // And the rule is now really enforced on that row, rather than only recorded against it.
+    await expect(
+      addItem(
+        'fact',
+        { title: 'shell', body: 'The bot uses zsh.', subject: 'deploybot', object: 'zsh' },
+        { predicate: 'default_shell' }
+      )
+    ).rejects.toThrow(/mem_fact_current_one/);
+  });
+
+  it('leaves a subject that already holds two current values alone rather than failing the upgrade', async () => {
+    // The case that decides the shape of the backfill. Under `many` a subject may legitimately hold
+    // several current values; the moment the registry says `one`, promoting all of them collides in
+    // the unique index. A plain UPDATE would abort - inside an unattended 3am `athanor update`,
+    // against the owner's only copy of their memory. The contested subject stays outside the index
+    // and stays retrievable; the uncontested one is converted in the same pass.
+    await cardinalityWas('default_shell', 'many');
+    for (const object of ['zsh', 'fish'])
+      await addItem(
+        'fact',
+        { title: 'shell', body: `The owner uses ${object}.`, subject: 'owner', object },
+        { predicate: 'default_shell' }
+      );
+    await addItem(
+      'fact',
+      { title: 'shell', body: 'The bot uses bash.', subject: 'deploybot', object: 'bash' },
+      { predicate: 'default_shell' }
+    );
+
+    await expect(store.syncMemoryPredicates()).resolves.toBe(MEMORY_PREDICATES.length);
+
+    const bySubject = (
+      await database.query<{ subject_key: string; pred_functional: boolean }>(
+        `SELECT subject_key, pred_functional FROM mem.item WHERE kind='fact'`
+      )
+    ).rows;
+    const contested = memorySubjectKey('owner', key);
+    expect(bySubject.filter((row) => row.subject_key === contested)).toEqual([
+      { subject_key: contested, pred_functional: false },
+      { subject_key: contested, pred_functional: false }
+    ]);
+    expect(bySubject.filter((row) => row.subject_key !== contested)).toEqual([
+      { subject_key: memorySubjectKey('deploybot', key), pred_functional: true }
+    ]);
+    // Both contested values are still there and still findable - nothing was retired to make room.
+    const found = await recall('which shell does the owner use');
+    expect(found.filter((hit) => hit.subjectKey === contested)).toHaveLength(2);
+  });
+
+  /*
+   * Why a stale flag is a dormant inconsistency rather than a refused memory - written down because
+   * the fix above is easy to over-claim, and because the property that makes it true is one line of
+   * `#recordMemoryFact` that a later reader could take for redundant.
+   *
+   * `syncMemoryPredicates` has no caller outside this file and the eval harness; neither service
+   * runs anything after `migrateDatabase`. So the *only* thing that moves `mem.predicate` on a live
+   * box is the upsert `#recordMemoryFact` does before every fact it writes - and because that upsert
+   * lands before the insert, `mem.index_row()` computes the new row's flag from the definition that
+   * has just arrived. A fact minted after a cardinality change therefore carries the current answer
+   * whatever the rows beside it still claim, and the write is not refused.
+   *
+   * If that upsert ever moves after the insert, or is dropped as duplicated work, this goes red.
+   */
+  it('writes a fact under a widened predicate without being refused by the rows that came before', async () => {
+    // The box as the release before last left it: related_to was functional, and the fact recorded
+    // then still carries the cache that says so. `addItem` rather than `recordMemoryFact`, because
+    // the latter would put the shipped definition back before writing and there would be nothing
+    // stale to find.
+    await cardinalityWas('related_to', 'one');
+    const first = await addItem(
+      'fact',
+      { title: 'deploy host', body: 'Deploys go to alpha.', subject: 'deploys', object: 'alpha' },
+      { predicate: 'related_to' }
+    );
+    expect(await functionalFlags()).toEqual([true]);
+
+    // The write the audit expected to be refused: a second legitimate value for the same subject,
+    // arriving on the release that widened the predicate back to `many`.
+    const second = await store.recordMemoryFact({
+      userId,
+      workspaceId,
+      trust: 'stated',
+      predicate: 'related_to',
+      documentCiphertext: sealed('Deploys also go to beta.'),
+      index: buildMemoryItemIndex(
+        {
+          title: 'deploy host',
+          body: 'Deploys also go to beta.',
+          subject: 'deploys',
+          object: 'beta'
+        },
+        key
+      )
+    });
+    // Both current, neither retired: that is what cardinality `many` means. The new row sits outside
+    // `mem_fact_current_one` because the upsert refreshed the registry the trigger reads, so the old
+    // row's stale claim on that slot never comes up.
+    expect(second.supersededIds).toEqual([]);
+    // One of each: the row written under the old definition still claims the slot, the new one does
+    // not ask for it. (Sorted rather than positional - `functionalFlags` orders by the keyed object,
+    // which is a hash and so tells you nothing about which value was written first.)
+    expect([...(await functionalFlags())].sort()).toEqual([false, true]);
+    const current = await recall('where do deploys go');
+    expect(
+      current
+        .filter((hit) => hit.status === 'active')
+        .map((hit) => hit.id)
+        .sort()
+    ).toEqual([first.id, second.item.id].sort());
+  });
+
   it('marks two conflicting owner statements disputed rather than picking a winner', async () => {
     const left = await addItem(
       'fact',
@@ -2918,9 +3443,37 @@ describe('tiered agent memory', () => {
     await expect(recall('where do deploys go')).resolves.toEqual([]);
     const disputed = await recall('where do deploys go', { includeSuperseded: true });
     expect(disputed.map((hit) => hit.status)).toEqual(['disputed', 'disputed']);
-    await expect(store.listMemoryLinks(left.id)).resolves.toEqual([
+    await expect(memory.listMemoryLinks(left.id)).resolves.toEqual([
       expect.objectContaining({ rel: 'contradicts' })
     ]);
+
+    /*
+     * And the shape a review surface needs, in one read rather than one per row. "This is disputed"
+     * with no answer to "with what" is not something a person can act on, and the pair is the whole
+     * point of the status - `markMemoryFactsDisputed` writes the status and the links as one
+     * statement of one fact precisely so that half of it is never shown on its own.
+     */
+    const queue = await store.listDisputedMemoryItems(workspaceId);
+    expect(queue.map((item) => item.id).sort()).toEqual([left.id, right.id].sort());
+    expect(queue.find((item) => item.id === left.id)!.contradicts).toEqual([right.id]);
+    expect(queue.find((item) => item.id === right.id)!.contradicts).toEqual([left.id]);
+    // The fields the owner is deciding on come back with it, so the route projects rather than
+    // fetches: who said it, when it was true, and which conversation it came from.
+    expect(queue[0]).toMatchObject({
+      status: 'disputed',
+      trust: 'stated',
+      taskId: null,
+      okCount: 0,
+      failCount: 0,
+      validTo: null
+    });
+    expect(Date.parse(queue[0]!.validFrom)).not.toBeNaN();
+
+    // Retracting one is how the owner settles it, and it leaves the queue.
+    await expect(store.retractMemoryItem(workspaceId, left.id)).resolves.toBe(true);
+    await expect(
+      store.listDisputedMemoryItems(workspaceId).then((rows) => rows.map((row) => row.id))
+    ).resolves.toEqual([right.id]);
   });
 
   it('holds a repeated observation back until two episodes a day apart have seen it', async () => {
@@ -2964,7 +3517,7 @@ describe('tiered agent memory', () => {
       store.listPromotableMemoryFactCandidates(workspaceId, { minGapHours: 72 })
     ).resolves.toEqual([]);
     await expect(
-      store.deleteMemoryFactCandidate(workspaceId, 'subject-owner', 'prefers', 'object-ripgrep')
+      memory.deleteMemoryFactCandidate(workspaceId, 'subject-owner', 'prefers', 'object-ripgrep')
     ).resolves.toBe(true);
   });
 
@@ -3022,7 +3575,7 @@ describe('tiered agent memory', () => {
 
     // ...and the episodes that vouched for it are cited, which is also what exempts them from
     // the archive sweep that would otherwise take the evidence away from a live fact.
-    const links = await store.listMemoryLinks(promoted[0]!.item.id);
+    const links = await memory.listMemoryLinks(promoted[0]!.item.id);
     expect(links.map((link) => link.rel)).toEqual(['derived_from', 'derived_from']);
     expect(links.map((link) => link.dstId).sort()).toEqual([episodeOne.id, episodeTwo.id].sort());
 
@@ -3190,10 +3743,10 @@ describe('tiered agent memory', () => {
     expect(stable.map((hit) => hit.id).sort()).toEqual(ranked.map((hit) => hit.id).sort());
 
     const itemHit = ranked.find((hit) => hit.layer === 'item')!;
-    const fetched = await store.getMemoryItems(workspaceId, [itemHit.id, 'not-a-uuid', '']);
+    const fetched = await memory.getMemoryItems(workspaceId, [itemHit.id, 'not-a-uuid', '']);
     expect(fetched.map((item) => item.id)).toEqual([itemHit.id]);
     // An id the model quoted back imprecisely must be an empty result, never a failed turn.
-    await expect(store.getMemoryItems(workspaceId, ['mem.item#3'])).resolves.toEqual([]);
+    await expect(memory.getMemoryItems(workspaceId, ['mem.item#3'])).resolves.toEqual([]);
   });
 
   it('stops injecting a procedure that keeps failing without ever deleting it', async () => {
@@ -3208,14 +3761,79 @@ describe('tiered agent memory', () => {
       await store.recordMemoryUse({ workspaceId, itemIds: [procedure.id], outcome });
 
     await expect(recall('rebuild the search index')).resolves.toEqual([]);
+    // Listed, and with the reason it is listed. "Nobody has confirmed this in a season" and "it
+    // lost more than it won across its last five uses" are different things to tell an owner
+    // deciding whether to keep a remembered command, and the statement has always computed both
+    // and returned neither - so the queue could be listed and not explained.
     await expect(store.listStaleMemoryProcedures(workspaceId, { now })).resolves.toMatchObject([
-      { id: procedure.id, status: 'active' }
+      {
+        id: procedure.id,
+        status: 'active',
+        reason: 'failing',
+        recentOkCount: 1,
+        recentGradedCount: 3,
+        lastVerified: null,
+        okCount: 1,
+        failCount: 2
+      }
     ]);
+    // Verifying it is the owner's other answer, and it moves it out of the queue.
+    await expect(store.verifyMemoryProcedure(workspaceId, procedure.id, now)).resolves.toBe(true);
+    await expect(
+      store
+        .listStaleMemoryProcedures(workspaceId, { now })
+        .then((rows) => rows.map((row) => row.reason))
+    ).resolves.toEqual(['failing']);
 
     // It comes back the moment it succeeds again - nothing was thrown away.
     for (const outcome of ['ok', 'ok', 'ok', 'ok'] as const)
       await store.recordMemoryUse({ workspaceId, itemIds: [procedure.id], outcome });
     await expect(recall('rebuild the search index')).resolves.toHaveLength(1);
+  });
+
+  /*
+   * The two halves of "this item was used" are read by two different things: procedure health
+   * counts the mem.item_use rows, and salience is recomputed from the counters on the item. They
+   * were written as two statements with nothing holding them together, so a crash or a dropped
+   * connection between them left an item_use row whose counters were never incremented - and the
+   * two views of the same event then disagreed permanently, because nothing ever recomputes either
+   * from the other.
+   */
+  it('records neither half of a use when the counters it belongs with cannot be written', async () => {
+    const procedure = await addItem('procedure', {
+      title: 'Roll the log files',
+      body: 'Run logrotate against the nginx logs.'
+    });
+    /** The store's database with the counter update taken out from under it. */
+    const failingOn = (real: Database, statement: RegExp): Database => ({
+      query: async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+        if (statement.test(sql)) throw new Error('connection terminated unexpectedly');
+        return real.query<T>(sql, params);
+      },
+      exec: (sql: string) => real.exec(sql),
+      transaction: (callback) =>
+        real.transaction((scoped) => callback(failingOn(scoped, statement))),
+      withAdvisoryLock: <T>(lock: number, callback: () => Promise<T>) =>
+        real.withAdvisoryLock(lock, callback),
+      notify: (channel, payload) => real.notify(channel, payload),
+      listen: (channel, handler) => real.listen(channel, handler),
+      close: async () => undefined
+    });
+    const dropped = new DataStore(failingOn(database, /SET\s+\n?\s*use_count=use_count\+1/));
+
+    await expect(
+      dropped.recordMemoryUse({ workspaceId, itemIds: [procedure.id], outcome: 'ok' })
+    ).rejects.toThrow(/connection terminated/);
+
+    const uses = await database.query('SELECT id FROM mem.item_use WHERE item_id=$1', [
+      procedure.id
+    ]);
+    expect(uses.rows).toEqual([]);
+    const counters = await database.query<{ use_count: number; ok_count: number }>(
+      'SELECT use_count, ok_count FROM mem.item WHERE id=$1',
+      [procedure.id]
+    );
+    expect(counters.rows[0]).toMatchObject({ use_count: 0, ok_count: 0 });
   });
 
   /**
@@ -3346,7 +3964,7 @@ describe('tiered agent memory', () => {
   });
 
   it('drops a procedure that has not been verified inside the staleness window', async () => {
-    await addItem(
+    const procedure = await addItem(
       'procedure',
       { title: 'Rotate the keys', tags: ['keys'], body: 'Rotate the signing keys yearly.' },
       { observedAt: at(400), validFrom: at(400), lastVerified: at(400) }
@@ -3355,6 +3973,21 @@ describe('tiered agent memory', () => {
     await expect(
       recall('rotate the signing keys', { procedureStaleDays: 500 })
     ).resolves.toHaveLength(1);
+
+    // The queue's own docstring: a procedure that stops being injected is never deleted for the
+    // owner, it is listed as "verify or delete". This one is only old - it has never failed - so
+    // saying it still works is enough to take it out of the queue and put it back in recall.
+    await expect(store.listStaleMemoryProcedures(workspaceId, { now })).resolves.toMatchObject([
+      {
+        id: procedure.id,
+        reason: 'unverified',
+        recentGradedCount: 0,
+        lastVerified: at(400).toISOString()
+      }
+    ]);
+    await expect(store.verifyMemoryProcedure(workspaceId, procedure.id, now)).resolves.toBe(true);
+    await expect(store.listStaleMemoryProcedures(workspaceId, { now })).resolves.toEqual([]);
+    await expect(recall('rotate the signing keys')).resolves.toHaveLength(1);
   });
 
   it('packs to a fixed budget with per-kind quotas instead of taking the top scores', async () => {
@@ -3529,7 +4162,7 @@ describe('tiered agent memory', () => {
 
     // Compaction takes the row out of the lexical index without deleting a byte of it.
     await store.consolidateMemory(workspaceId, { now });
-    const compacted = await store.listMemorySourcesByOrigin(
+    const compacted = await memory.listMemorySourcesByOrigin(
       workspaceId,
       memoryOriginKey(locator, key)
     );
@@ -3582,6 +4215,62 @@ describe('tiered agent memory', () => {
     expect(df.rows.some((row) => Number(row.df) > 1)).toBe(true);
     // The statistics table holds keyed tokens, never words.
     expect(df.rows.every((row) => /^[a-p]{16}$/.test(row.lexeme))).toBe(true);
+  });
+
+  /*
+   * The monthly rebuild empties mem.lexeme_df for the workspace and fills it again, and the AFTER
+   * INSERT trigger on every memory write writes to the same table with the same key. A single
+   * memory landing between the two - the agent recording one episode during the rebuild - put a
+   * row back, and the unguarded INSERT met a unique violation that rolled the whole transaction
+   * back, leaving the workspace with **no** document frequencies at all until the next monthly
+   * attempt. Every term's df then defaults to 1, BM25 IDF goes uniform, and recall ranking is
+   * silently flat for a month with nothing anywhere reporting it.
+   *
+   * The competing write is injected through the rebuild's own handle because PGlite is one backend
+   * and cannot hold a second session; what reaches the INSERT is the row, which is the whole test.
+   */
+  it('survives a memory landing between emptying the corpus statistics and refilling them', async () => {
+    await addItem('episode', { body: 'The owner uses fish and fish for scripting.' });
+    await addItem('episode', { body: 'A second episode mentioning fish once.' });
+    const lexeme = (
+      await database.query<{ lexeme: string }>(
+        'SELECT lexeme FROM mem.lexeme_df WHERE workspace_id=$1 ORDER BY df DESC, lexeme LIMIT 1',
+        [workspaceId]
+      )
+    ).rows[0]!.lexeme;
+
+    /** The rebuild's database, with one memory write committing in the gap after the DELETE. */
+    const raced = (real: Database): Database => ({
+      query: async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+        const result = await real.query<T>(sql, params);
+        if (sql.includes('DELETE FROM mem.lexeme_df'))
+          await real.query('INSERT INTO mem.lexeme_df(workspace_id, lexeme, df) VALUES ($1,$2,1)', [
+            workspaceId,
+            lexeme
+          ]);
+        return result;
+      },
+      exec: (sql: string) => real.exec(sql),
+      transaction: (callback) => real.transaction((scoped) => callback(raced(scoped))),
+      withAdvisoryLock: <T>(lock: number, callback: () => Promise<T>) =>
+        real.withAdvisoryLock(lock, callback),
+      notify: (channel, payload) => real.notify(channel, payload),
+      listen: (channel, handler) => real.listen(channel, handler),
+      close: async () => undefined
+    });
+
+    await new DataStore(raced(database)).rebuildMemoryCorpusStats(workspaceId);
+
+    const df = await database.query<{ lexeme: string; df: string }>(
+      'SELECT lexeme, df FROM mem.lexeme_df WHERE workspace_id=$1 AND lexeme=$2',
+      [workspaceId, lexeme]
+    );
+    // The counted value, not the 1 the racing write left behind, and above all not an empty table.
+    expect(Number(df.rows[0]?.df)).toBe(2);
+    const all = await database.query('SELECT lexeme FROM mem.lexeme_df WHERE workspace_id=$1', [
+      workspaceId
+    ]);
+    expect(all.rows.length).toBeGreaterThan(1);
   });
 
   it('returns what the caller does not already hold, not a second copy of it', async () => {
@@ -3754,11 +4443,374 @@ describe('tiered agent memory', () => {
     );
     expect(type.rows).toEqual([]);
   });
+
+  /**
+   * The delete an owner is promised, asserted where the statements live rather than where the
+   * route happened to hold them.
+   *
+   * This repository's own record of the incident is that *a delete must find every copy -
+   * including `mem.pack`, the copy that actually reaches the model*, and until this test there was
+   * nothing anywhere that would notice if one of the six statements stopped running. Retirement is
+   * a status; this is removal, and the four things it has to reach are all things the row was
+   * copied into: the verbatim chunks that hang off the episode, the links pointing at it from
+   * either side, every sealed bundle quoting the row *or one of its chunks*, and the vote the
+   * episode cast for a fact nothing has promoted yet.
+   *
+   * The bundle is the one that decides whether any of this is true from where the agent stands: a
+   * parked conversation re-uses those bytes for weeks without reading a row again, so a delete that
+   * leaves the bundle is a computer that goes on reciting the line the owner just deleted.
+   */
+  it('forgets an episode everywhere the box had copied it', async () => {
+    const addChunk = async (body: string, episodeId: string | null) => {
+      const index = buildMemorySourceIndex(body, key);
+      return store.createMemorySource({
+        userId,
+        workspaceId,
+        channel: 'chat',
+        bodyCiphertext: sealed(body),
+        bodyTokens: index.bodyTokens,
+        tokensEst: index.tokensEst,
+        indexed: index.indexed,
+        occurredAt: now,
+        episodeId
+      });
+    };
+    const packFor = async (itemIds: string[]) => {
+      const task = await store.createTask(taskInput(userId, workspaceId));
+      await store.saveMemoryPack({
+        taskId: task.id,
+        workspaceId,
+        bodyCiphertext: sealed('rendered brief'),
+        sha256: `sha-${itemIds.join('-')}`,
+        itemIds,
+        tokensEst: 12
+      });
+      return task.id;
+    };
+
+    const episode = await addItem('episode', {
+      title: 'the deploy',
+      body: 'owner: deploy this with pnpm, never npm.',
+      subject: 'owner',
+      object: 'pnpm'
+    });
+    const survivor = await addItem('episode', {
+      title: 'the other deploy',
+      body: 'owner: the staging box is deployed the same way.',
+      subject: 'owner',
+      object: 'pnpm'
+    });
+    const keeper = await addItem(
+      'fact',
+      {
+        title: 'deploy tool',
+        body: 'The owner deploys with pnpm.',
+        subject: 'owner',
+        object: 'pnpm'
+      },
+      { predicate: 'uses_tool' }
+    );
+
+    const chunkA = await addChunk('owner: deploy this with pnpm', episode.id);
+    const chunkB = await addChunk('assistant: deploying with pnpm', episode.id);
+    const looseChunk = await addChunk('owner: unrelated, about the printer', null);
+
+    // Both directions, because only one of them is reached by the foreign key: `src_id` cascades
+    // from `mem.item` and `dst_id` does not reference anything at all.
+    await memory.linkMemoryItems({ srcId: episode.id, dstId: keeper.id, rel: 'about' });
+    await memory.linkMemoryItems({ srcId: keeper.id, dstId: episode.id, rel: 'derived_from' });
+    await memory.linkMemoryItems({ srcId: keeper.id, dstId: looseChunk.id, rel: 'about' });
+
+    const packCitingItem = await packFor([episode.id]);
+    const packCitingChunk = await packFor([chunkA.id]);
+    const packCitingNeither = await packFor([keeper.id, looseChunk.id]);
+
+    const candidate = {
+      workspaceId,
+      subjectKey: memorySubjectKey('owner', key),
+      predicate: 'uses_tool',
+      objectKey: memorySubjectKey('pnpm', key)
+    };
+    // Two turns vouched for this one, so forgetting one leaves a draft with a turn behind it.
+    await store.observeMemoryFactCandidate({ ...candidate, episodeId: episode.id });
+    await store.observeMemoryFactCandidate({ ...candidate, episodeId: survivor.id });
+    // This one is the deleted turn's word alone: a draft with nothing behind it is not a draft.
+    const soleWitness = {
+      workspaceId,
+      subjectKey: memorySubjectKey('owner', key),
+      predicate: 'default_shell',
+      objectKey: memorySubjectKey('fish', key)
+    };
+    await store.observeMemoryFactCandidate({ ...soleWitness, episodeId: episode.id });
+    const untouched = {
+      workspaceId,
+      subjectKey: memorySubjectKey('staging box', key),
+      predicate: 'located_at',
+      objectKey: memorySubjectKey('rack 3', key)
+    };
+    await store.observeMemoryFactCandidate({ ...untouched, episodeId: survivor.id });
+
+    await expect(store.forgetMemoryItem(workspaceId, episode.id)).resolves.toBe(true);
+
+    // The item itself, and nothing beside it.
+    await expect(store.getMemoryItem(workspaceId, episode.id)).resolves.toBeNull();
+    await expect(store.getMemoryItem(workspaceId, survivor.id)).resolves.not.toBeNull();
+    await expect(store.getMemoryItem(workspaceId, keeper.id)).resolves.not.toBeNull();
+
+    // The verbatim chunks that hung off it, and only those.
+    const sources = await database.query<{ id: string }>(
+      'SELECT id FROM mem.source WHERE workspace_id=$1 ORDER BY id',
+      [workspaceId]
+    );
+    expect(sources.rows.map((row) => row.id)).toEqual([looseChunk.id]);
+    expect([chunkA.id, chunkB.id]).not.toContain(looseChunk.id);
+
+    // Every link that named it, from either end.
+    await expect(memory.listMemoryLinks(episode.id)).resolves.toEqual([]);
+    await expect(memory.listMemoryLinks(keeper.id)).resolves.toMatchObject([
+      { srcId: keeper.id, dstId: looseChunk.id, rel: 'about' }
+    ]);
+
+    // Every sealed bundle that quoted the row or one of its chunks - and no other.
+    await expect(store.getMemoryPack(packCitingItem)).resolves.toBeNull();
+    await expect(store.getMemoryPack(packCitingChunk)).resolves.toBeNull();
+    await expect(store.getMemoryPack(packCitingNeither)).resolves.not.toBeNull();
+
+    // The votes: one decremented, one emptied and swept, one never touched.
+    const candidates = await database.query<{
+      predicate: string;
+      n_episodes: number;
+      episode_ids: string[];
+    }>(
+      'SELECT predicate,n_episodes,episode_ids FROM mem.fact_candidate WHERE workspace_id=$1 ORDER BY predicate',
+      [workspaceId]
+    );
+    expect(candidates.rows).toEqual([
+      { predicate: 'located_at', n_episodes: 1, episode_ids: [survivor.id] },
+      { predicate: 'uses_tool', n_episodes: 1, episode_ids: [survivor.id] }
+    ]);
+
+    // Removal reports what it removed, so a second attempt is not a silent success.
+    await expect(store.forgetMemoryItem(workspaceId, episode.id)).resolves.toBe(false);
+  });
+
+  /**
+   * The pair above is one machine, and this is the assertion that says so out loud.
+   *
+   * `forgetMemoryItem` drops the sole-witness drafts first and only then decrements the survivors.
+   * Written the other way round - decrement first, sweep the emptied rows a line later - the two
+   * statements produce exactly the same final state, so no test of the outcome can tell them apart.
+   * What differs is the state *between* them: a draft whose only witness was just deleted, floored
+   * at `n_episodes = 1` by `GREATEST(n_episodes - 1, 1)` with an EMPTY `episode_ids`, which is
+   * precisely what `listPromotableMemoryFactCandidates(minEpisodes: 1)` selects for.
+   *
+   * So the property under test is not the outcome but the guard: with the decrement standing alone,
+   * `CHECK (n_episodes > 0)` refuses it. The floor was never a safety net; it was the thing that
+   * kept the constraint quiet. Remove the DELETE from `forgetMemoryItem` and this is what happens
+   * instead of a silent promotion.
+   */
+  it('lets the column constraint refuse the vote-removal that is not preceded by the sweep', async () => {
+    const witness = await addItem('episode', {
+      title: 'the shell',
+      body: 'owner: my shell is fish',
+      subject: 'owner',
+      object: 'fish'
+    });
+    const draft = {
+      workspaceId,
+      subjectKey: memorySubjectKey('owner', key),
+      predicate: 'default_shell',
+      objectKey: memorySubjectKey('fish', key)
+    };
+    await store.observeMemoryFactCandidate({ ...draft, episodeId: witness.id });
+
+    // The decrement on its own, which is what statement 5 would be if statement 4 were removed.
+    await expect(
+      database.query(
+        `UPDATE mem.fact_candidate
+            SET episode_ids = array_remove(episode_ids, $2::uuid),
+                n_episodes = n_episodes - 1
+          WHERE workspace_id=$1 AND $2::uuid = ANY(episode_ids)`,
+        [workspaceId, witness.id]
+      )
+    ).rejects.toThrow(/n_episodes/);
+
+    // And through the real path the draft is gone rather than left at one with nothing behind it.
+    await expect(store.forgetMemoryItem(workspaceId, witness.id)).resolves.toBe(true);
+    const left = await database.query<{ n_episodes: number; episode_ids: string[] }>(
+      'SELECT n_episodes,episode_ids FROM mem.fact_candidate WHERE workspace_id=$1',
+      [workspaceId]
+    );
+    expect(left.rows).toEqual([]);
+  });
+});
+
+/**
+ * Which of mem.item's indexes the recall statement can actually reach.
+ *
+ * Not which ones it chooses on a fixture this size - a planner takes a sequential scan over a couple
+ * of hundred rows whatever indexes exist, and a test asserting the choice would be committing a cost
+ * estimate that moves with the corpus. `enable_seqscan = off` takes the choice away, and what is
+ * left is the property worth holding: given no alternative, can the plan reach the index at all?
+ *
+ * Until migration 67 the answer was no, in every channel and for every caller. `MEMORY_ITEM_ADMISSIBLE`
+ * reaches status through a disjunction whose other two arms are bound parameters arriving from a CTE,
+ * so PostgreSQL cannot prove `status = 'active'` of any row the statement might want and pushes the
+ * relaxation of the whole disjunction down to the scan instead. Three partial indexes carried that
+ * predicate and none of them was usable - including for a plain recall with no widening option set,
+ * which is the one every task does. Measured on 50,000 items the lexical channel sequentially
+ * scanned all of them, at 296 ms a call against 80 ms once the predicate came off.
+ */
+describe('the indexes the recall statement can reach', () => {
+  let database: Database;
+  let store: DataStore;
+  let workspaceId: string;
+  let lastSql = '';
+  let lastParams: unknown[] = [];
+
+  const key = memoryIndexKey(Buffer.alloc(32, 9));
+  const now = new Date('2026-07-31T08:00:00.000Z');
+
+  beforeEach(async () => {
+    database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+    await migrateDatabase(database);
+    // Every statement the store issues, kept so the recall can be replayed under EXPLAIN with the
+    // parameters it was actually given. A hand-written imitation of the query is exactly what let
+    // this defect be measured as innocent: the audit's own probe used one, saw a bitmap index scan,
+    // and concluded only the two widening options were paying for a table scan.
+    const recorded: Database = {
+      query: (sql, params) => {
+        lastSql = sql;
+        lastParams = params ?? [];
+        return database.query(sql, params);
+      },
+      exec: (sql) => database.exec(sql),
+      transaction: (callback) => database.transaction(callback),
+      withAdvisoryLock: (lock, callback) => database.withAdvisoryLock(lock, callback),
+      notify: (channel, payload) => database.notify(channel, payload),
+      listen: (channel, handler) => database.listen(channel, handler),
+      close: () => database.close()
+    };
+    store = new DataStore(recorded);
+    await store.syncMemoryPredicates();
+    const user = await store.createUser({ username: 'owner', displayName: 'Owner' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'computer'));
+    workspaceId = workspace.id;
+
+    // Enough rows, and enough spread between a common word and a rare one, that a GIN probe is a
+    // meaningfully different plan from a scan. The retirements are named rather than derived from
+    // the same modulus that decides the rare word: two rows carrying it are superseded and two are
+    // archived, so each widened arm has something of its own to find instead of agreeing with the
+    // default one by having nowhere else to look.
+    // Facts, deliberately: the per-kind quota fills its episode slots from the active rows before a
+    // retired one is reached, so retiring episodes here would have proved only that the quota works.
+    const retired = new Map<number, 'superseded' | 'archived'>([
+      [24, 'superseded'],
+      [72, 'superseded'],
+      [48, 'archived'],
+      [96, 'archived'],
+      [7, 'superseded'],
+      [21, 'archived']
+    ]);
+    for (let index = 0; index < 160; index += 1) {
+      const body =
+        `deploy pipeline log entry ${index} routine chatter ` +
+        (index % 8 === 0 ? 'chinstrap' : 'ordinary');
+      const item = await store.createMemoryItem({
+        userId: user.id,
+        workspaceId,
+        kind: index % 3 === 0 ? 'fact' : 'episode',
+        trust: 'stated',
+        documentCiphertext: { v: 1, iv: 'iv', tag: 'tag', ciphertext: 'x' },
+        index: buildMemoryItemIndex(
+          {
+            title: `entry ${index}`,
+            tags: ['pipeline'],
+            body,
+            subject: `service-${index}`,
+            object: 'somewhere'
+          },
+          key
+        ),
+        observedAt: now,
+        validFrom: now,
+        ...(index % 3 === 0 ? { predicate: 'related_to' } : {})
+      });
+      const status = retired.get(index);
+      if (status)
+        await database.query(`UPDATE mem.item SET status=$2::mem.status, valid_to=$3 WHERE id=$1`, [
+          item.id,
+          status,
+          now
+        ]);
+    }
+    await store.rebuildMemoryCorpusStats(workspaceId);
+    await database.exec('VACUUM ANALYZE mem.item');
+  });
+
+  afterEach(async () => database.close());
+
+  /** The plan the real statement takes with a sequential scan ruled out. */
+  const planFor = async (options: Partial<RecallMemoryInput> = {}): Promise<string> => {
+    await store.recallMemoryCandidates({
+      workspaceId,
+      plan: planMemoryQuery('chinstrap service-3', key),
+      now,
+      order: 'relevance',
+      ...options
+    });
+    await database.exec('SET enable_seqscan = off');
+    try {
+      const explained = await database.query<Record<string, unknown>>(
+        `EXPLAIN (COSTS OFF) ${lastSql}`,
+        lastParams
+      );
+      return explained.rows.map((row) => String(Object.values(row)[0])).join('\n');
+    } finally {
+      await database.exec('SET enable_seqscan = on');
+    }
+  };
+
+  it('drives an ordinary recall from the indexes rather than reading every memory the box holds', async () => {
+    const plan = await planFor();
+    expect(plan).toContain('mem_item_tsv_gin');
+    expect(plan).toContain('mem_item_subject_idx');
+    expect(plan).not.toMatch(/Seq Scan on item\b/);
+  });
+
+  it('reaches them just the same when the caller asks for what a later observation replaced', async () => {
+    // The two switches the tool hands the model. The audit read these as the cause of the scan; they
+    // are not, and the point of asserting them is that no arm may be the one that loses the index.
+    const plan = await planFor({ includeSuperseded: true });
+    expect(plan).toContain('mem_item_tsv_gin');
+    expect(plan).not.toMatch(/Seq Scan on item\b/);
+  });
+
+  it('reaches them just the same when the caller opens the archive', async () => {
+    const plan = await planFor({ scope: 'archive' });
+    expect(plan).toContain('mem_item_tsv_gin');
+    expect(plan).not.toMatch(/Seq Scan on item\b/);
+  });
+
+  it('returns the same rows it always did, because an index predicate decides storage and not results', async () => {
+    // The whole safety argument for widening three indexes in one migration, stated as a test: the
+    // status filter is still in the statement, so the archived and superseded rows stay out of a
+    // default recall exactly as before, and only the widened arms see them.
+    const query = { workspaceId, plan: planMemoryQuery('chinstrap', key), now };
+    const statusOf = async (options: Partial<RecallMemoryInput>) => {
+      const rows = await store.recallMemoryCandidates({ ...query, ...options });
+      return [...new Set(rows.map((row) => row.status))].sort();
+    };
+    expect(await statusOf({})).toEqual(['active']);
+    expect(await statusOf({ includeSuperseded: true })).toEqual(['active', 'superseded']);
+    expect(await statusOf({ scope: 'archive' })).toEqual(['active', 'archived']);
+  });
 });
 
 describe('spending caps in real currency', () => {
   let database: Database;
   let store: DataStore;
+  let billing: BillingStore;
   let userId: string;
   let workspaceId: string;
 
@@ -3798,6 +4850,7 @@ describe('spending caps in real currency', () => {
     database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
     await migrateDatabase(database);
     store = new DataStore(database);
+    billing = new BillingStore(database);
     const user = await store.createUser({ username: 'payer', displayName: 'Payer' });
     userId = user.id;
     const workspace = await store.createWorkspace(workspaceInput(user.id, 'Spending'));
@@ -3842,13 +4895,13 @@ describe('spending caps in real currency', () => {
       { key: 'anthropic/claude', costUsd: 2, calls: 1 }
     ]);
     await expect(
-      store.spendByTask(userId, bounds.monthly.start, bounds.monthly.end)
+      billing.spendByTask(userId, bounds.monthly.start, bounds.monthly.end)
     ).resolves.toEqual([
       { key: other.id, costUsd: 6, calls: 2 },
       { key: task.id, costUsd: 0.75, calls: 2 }
     ]);
     await expect(
-      store.spendByDay(userId, bounds.monthly.start, bounds.monthly.end, 'UTC')
+      billing.spendByDay(userId, bounds.monthly.start, bounds.monthly.end, 'UTC')
     ).resolves.toEqual([
       { key: '2026-07-02', costUsd: 4, calls: 1 },
       { key: '2026-07-15', costUsd: 2.75, calls: 3 }
@@ -3892,7 +4945,7 @@ describe('spending caps in real currency', () => {
     await bill({ key: 'partial', costUsd: 1, taskId: running.id });
 
     // $4 promised minus $1 already billed leaves $3 that this task may still spend.
-    await expect(store.openSpendCommitment(userId)).resolves.toBeCloseTo(3, 6);
+    await expect(billing.openSpendCommitment(userId)).resolves.toBeCloseTo(3, 6);
     await expect(
       store.spendGuard({ userId, estimateUsd: 2, includeOpenCommitments: true, now })
     ).resolves.toMatchObject({ outcome: 'deny', blockedBy: 'daily' });
@@ -3910,7 +4963,7 @@ describe('spending caps in real currency', () => {
 
     // A finished task releases what it never spent.
     await database.query("UPDATE tasks SET status='completed' WHERE id=$1", [running.id]);
-    await expect(store.openSpendCommitment(userId)).resolves.toBe(0);
+    await expect(billing.openSpendCommitment(userId)).resolves.toBe(0);
     await expect(
       store.spendGuard({ userId, estimateUsd: 2, includeOpenCommitments: true, now })
     ).resolves.toMatchObject({ outcome: 'allow' });
@@ -3928,7 +4981,7 @@ describe('spending caps in real currency', () => {
 
     for (const status of ['awaiting_user', 'awaiting_resource', 'paused']) {
       await database.query('UPDATE tasks SET status=$2 WHERE id=$1', [task.id, status]);
-      await expect(store.openSpendCommitment(userId)).resolves.toBe(0);
+      await expect(billing.openSpendCommitment(userId)).resolves.toBe(0);
       await expect(
         store.spendGuard({ userId, estimateUsd: 2, includeOpenCommitments: true, now })
       ).resolves.toMatchObject({ outcome: 'allow' });
@@ -3938,7 +4991,7 @@ describe('spending caps in real currency', () => {
     // spend it, and two starts in the same second must not both fit under the same cap.
     for (const status of ['queued', 'planning', 'running']) {
       await database.query('UPDATE tasks SET status=$2 WHERE id=$1', [task.id, status]);
-      await expect(store.openSpendCommitment(userId)).resolves.toBeCloseTo(3, 6);
+      await expect(billing.openSpendCommitment(userId)).resolves.toBeCloseTo(3, 6);
       await expect(
         store.spendGuard({ userId, estimateUsd: 2, includeOpenCommitments: true, now })
       ).resolves.toMatchObject({ outcome: 'deny', blockedBy: 'daily' });
@@ -3975,7 +5028,7 @@ describe('spending caps in real currency', () => {
     expect(blocked?.task.status).toBe('failed');
     expect(blocked?.task.maxSpendUsd).toBe(5);
     // Nothing was reserved for a run that never started.
-    await expect(store.reservedUsageForTask(blocked!.task.id)).resolves.toBe(0);
+    await expect(billing.reservedUsageForTask(blocked!.task.id)).resolves.toBe(0);
 
     // Raising the cap lets the very same schedule through.
     await store.setSpendLimits({ userId, dailyCapUsd: 50 });
@@ -4012,7 +5065,7 @@ describe('spending caps in real currency', () => {
     await expect(claim('exceeded', bounds.daily.start)).resolves.toBe(true);
     // Tomorrow starts over.
     await expect(claim('warning', bounds.daily.end)).resolves.toBe(true);
-    await expect(store.listSpendAlerts(userId)).resolves.toHaveLength(3);
+    await expect(billing.listSpendAlerts(userId)).resolves.toHaveLength(3);
   });
 
   it('updates only the caps it was given and validates the zone the windows roll over in', async () => {
@@ -4038,6 +5091,135 @@ describe('spending caps in real currency', () => {
     await expect(store.setSpendLimits({ userId, timeZone: 'Mars/Olympus' })).rejects.toThrow(
       /Unknown IANA time zone/
     );
+  });
+
+  /*
+   * The pre-flight half of the brake. The three caps above stop a task that is already spending;
+   * these stop an over-priced route being chosen at all, which is the only one of the two that
+   * works while the owner is asleep. They carry the same contract as the caps for the same reason
+   * the caps have it: a ceiling is set once and a cap is adjusted when a run gets away from you, so
+   * "I did not mention it" and "remove it" cannot be the same message.
+   */
+  it('leaves a price ceiling alone when the key is omitted and clears it on an explicit null', async () => {
+    await store.setSpendLimits({
+      userId,
+      maxInputUsdPerMillionTokens: 1.5,
+      maxOutputUsdPerMillionTokens: 7.5
+    });
+    await expect(store.effectiveSpendLimits(userId)).resolves.toMatchObject({
+      maxInputUsdPerMillionTokens: 1.5,
+      maxOutputUsdPerMillionTokens: 7.5
+    });
+
+    // A daily cap edit that says nothing about the ceilings must not remove them.
+    await store.setSpendLimits({ userId, dailyCapUsd: 3 });
+    await expect(store.getSpendLimits(userId)).resolves.toMatchObject({
+      dailyCapUsd: 3,
+      maxInputUsdPerMillionTokens: 1.5,
+      maxOutputUsdPerMillionTokens: 7.5
+    });
+
+    // One cleared, the other untouched - the two are separate ceilings and are cleared separately.
+    await store.setSpendLimits({ userId, maxInputUsdPerMillionTokens: null });
+    await expect(store.getSpendLimits(userId)).resolves.toMatchObject({
+      dailyCapUsd: 3,
+      maxInputUsdPerMillionTokens: null,
+      maxOutputUsdPerMillionTokens: 7.5
+    });
+
+    // Zero is a ceiling, not an absence: it admits only a route that publishes no charge.
+    await store.setSpendLimits({ userId, maxInputUsdPerMillionTokens: 0 });
+    await expect(store.effectiveSpendLimits(userId)).resolves.toMatchObject({
+      maxInputUsdPerMillionTokens: 0
+    });
+  });
+
+  it('writes a price ceiling for an owner who has no spend_limits row at all', async () => {
+    // The state of the live box: `spend_limits` holds no row, so the first ceiling the owner sets
+    // has to arrive through the INSERT arm rather than through the ON CONFLICT arm.
+    await expect(store.getSpendLimits(userId)).resolves.toBeNull();
+    await store.setSpendLimits({ userId, maxOutputUsdPerMillionTokens: 12 });
+    await expect(store.effectiveSpendLimits(userId)).resolves.toMatchObject({
+      maxInputUsdPerMillionTokens: null,
+      maxOutputUsdPerMillionTokens: 12,
+      warnAtPercent: 80,
+      timeZone: 'UTC'
+    });
+  });
+
+  /*
+   * Nothing has ever removed a usage_entries row, and `exportAccount` dumps the whole table. The
+   * horizon is the easy half; which rows it may take is the half with a trap in it.
+   *
+   * Three reads sum this table with no window at all, all per task: `taskSpend`, the `spent_usd`
+   * every conversation carries into the sidebar, and the `COALESCE(max_spend_usd, SUM(...))` that
+   * re-baselines a follow-up's ceiling. Pruning a settled row that still belongs to a conversation
+   * would make the first two under-report and the third *raise* a spend ceiling - a retention sweep
+   * that loosens a brake. So the cut is the rows whose conversation is already gone, which is what
+   * a null task_id means here: the column is ON DELETE SET NULL.
+   */
+  it('takes the ledger of conversations that are gone and leaves the ones still being counted', async () => {
+    const task = await store.createTask(taskInput(userId, workspaceId));
+    const older = "NOW()-INTERVAL '500 days'";
+    const age = async (key: string) =>
+      database.query(`UPDATE usage_entries SET created_at=${older} WHERE idempotency_key=$1`, [
+        key
+      ]);
+
+    await bill({ key: 'ancient-and-still-open', costUsd: 4, taskId: task.id });
+    await age('ancient-and-still-open');
+    await bill({ key: 'ancient-and-orphaned', costUsd: 9 });
+    await age('ancient-and-orphaned');
+    await bill({ key: 'recent-and-orphaned', costUsd: 2 });
+
+    // A reservation nothing settled. Old, unattached, and deliberately not this sweep's business:
+    // an open reservation is a claim on the allowance and releasing it is a different decision.
+    await store.recordUsage({
+      userId,
+      kind: 'model_call',
+      resourceClass: 'medium',
+      quantity: 1,
+      unit: 'call',
+      credits: 1,
+      state: 'reserved',
+      idempotencyKey: 'ancient-reservation'
+    });
+    await age('ancient-reservation');
+
+    await store.cleanupExpired();
+
+    const left = await database.query<{ idempotency_key: string }>(
+      'SELECT idempotency_key FROM usage_entries ORDER BY idempotency_key'
+    );
+    expect(left.rows.map((row) => row.idempotency_key)).toEqual([
+      'ancient-and-still-open',
+      'ancient-reservation',
+      'recent-and-orphaned'
+    ]);
+    // The figure the owner reads on that conversation is untouched, which is the point.
+    await expect(store.taskSpend(task.id)).resolves.toBeCloseTo(4, 6);
+  });
+
+  it('forgets that it warned about a window that closed more than a year ago', async () => {
+    const bounds = spendWindowBounds('UTC', now);
+    await expect(
+      store.claimSpendAlert({
+        userId,
+        windowName: 'daily',
+        windowStart: bounds.daily.start,
+        level: 'warning',
+        spentUsd: 4,
+        capUsd: 5
+      })
+    ).resolves.toBe(true);
+    await store.cleanupExpired();
+    // Still there while it could still matter: the row is how a second warning about the same day
+    // is refused, and the sweep must not hand the owner a duplicate.
+    await expect(billing.listSpendAlerts(userId)).resolves.toHaveLength(1);
+
+    await database.query(`UPDATE spend_alerts SET created_at=NOW()-INTERVAL '500 days'`);
+    await store.cleanupExpired();
+    await expect(billing.listSpendAlerts(userId)).resolves.toEqual([]);
   });
 
   it('reports defaults for an owner who never opened the settings', async () => {
@@ -4357,6 +5539,1173 @@ describe('schema migrations against a populated database', () => {
   });
 });
 
+/*
+ * The describe above replays the whole chain over rows written in today's shape, which is what
+ * proves the migrations are idempotent. It is not the path `athanor update` takes at three in the
+ * morning. That path is rows an older build wrote, in the shape that build's schema had, meeting a
+ * migration that has never seen them - and a backfill can only ever be wrong there, because on a
+ * replay every column it fills is already filled: the statement matches nothing and passes whatever
+ * it says. Twenty of the twenty-one row-rewriting statements in the migration list had only ever
+ * been run that way, against a database that was already at the newest version when they ran.
+ *
+ * Each of these therefore applies the migrations below N and nothing above, writes the rows the way
+ * the box wrote them at that version - raw SQL against the columns that existed then, never the
+ * store, which would write them in the shape the migration is trying to produce - applies N on its
+ * own, and reads back what the owner is left holding.
+ */
+describe('the upgrade path onto rows an older athanor wrote', () => {
+  let database: Database;
+
+  const OWNER_ID = '00000000-0000-4000-8000-0000000000a1';
+  const SPACE_ID = '00000000-0000-4000-8000-0000000000b1';
+  const sealed = JSON.stringify({ v: 1, iv: 'a', tag: 'b', ciphertext: 'c' });
+
+  /** One migration, applied and recorded the way `migrateDatabase` applies and records it. */
+  const apply = async (version: number) => {
+    const migration = migrations.find((entry) => entry.version === version)!;
+    await database.transaction(async (transaction) => {
+      await transaction.exec(migration.sql);
+      await transaction.query('INSERT INTO schema_migrations(version, name) VALUES ($1, $2)', [
+        migration.version,
+        migration.name
+      ]);
+    });
+  };
+
+  /**
+   * The box as it stood the moment before version N shipped. The recording matters as much as the
+   * applying: migration 18 reads schema_migrations to decide whether to stand down, so a fixture
+   * that applied the SQL without filing it would be testing an arm no live database takes.
+   */
+  const migrateBelow = async (version: number) => {
+    for (const migration of migrations.filter((entry) => entry.version < version))
+      await apply(migration.version);
+  };
+
+  /**
+   * Asked of the schema in front of us rather than of the one this file was written against - both
+   * to write a row the old way, and to state before each migration runs that the thing it is about
+   * to fill is genuinely not there yet. A test that only reads the column afterwards passes just as
+   * happily against a database that already had it, which is the whole defect being paid off here.
+   */
+  const hasColumn = async (table: string, column: string) => {
+    const [schema, name] = table.includes('.') ? table.split('.') : ['public', table];
+    const found = await database.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema=$1 AND table_name=$2 AND column_name=$3`,
+      [schema, name, column]
+    );
+    return found.rows.length > 0;
+  };
+
+  /** `workspaces.shape` was NOT NULL until migration 44 dropped it. */
+  const addWorkspace = async (id: string, name: string) =>
+    database.query(
+      (await hasColumn('workspaces', 'shape'))
+        ? `INSERT INTO workspaces(id,user_id,name,shape,status,storage_limit_bytes,image_revision,region)
+           VALUES ($1,$2,$3,'standard','running',1073741824,'dev','auto')`
+        : `INSERT INTO workspaces(id,user_id,name,status,storage_limit_bytes,image_revision,region)
+           VALUES ($1,$2,$3,'running',1073741824,'dev','auto')`,
+      [id, OWNER_ID, name]
+    );
+
+  const seedOwner = async () => {
+    await database.query('INSERT INTO users(id,username,display_name) VALUES ($1,$2,$3)', [
+      OWNER_ID,
+      'resident',
+      'Resident'
+    ]);
+    await addWorkspace(SPACE_ID, 'Long lived');
+  };
+
+  const addTask = async (id: string, route: string, title = 'A conversation') =>
+    database.query(
+      `INSERT INTO tasks(id,user_id,workspace_id,title,status,model_id,privacy_route,
+         max_compute_credits,prompt_ciphertext)
+       VALUES ($1,$2,$3,$4,'queued','qwen',$5,1,$6::jsonb)`,
+      [id, OWNER_ID, SPACE_ID, title, route, sealed]
+    );
+
+  /** `provider_model_id` arrives, and becomes NOT NULL, at migration 21. */
+  const addModel = async (id: string, route: string) => {
+    const named = await hasColumn('model_releases', 'provider_model_id');
+    await database.query(
+      `INSERT INTO model_releases(id,display_name,provider,revision,availability,openness,license,
+         commercial_use,privacy_route,context_tokens,modalities,capabilities,usage_class,
+         recommendation_tags${named ? ',provider_model_id' : ''})
+       VALUES ($1,'A model','openrouter','live','available','permissive_open_weight','MIT',TRUE,
+         $2,200000,'["text"]'::jsonb,'["chat"]'::jsonb,'high','[]'::jsonb${named ? ',$1' : ''})`,
+      [id, route]
+    );
+  };
+
+  const routes = async (table: string) =>
+    (
+      await database.query<{ id: string; privacy_route: string }>(
+        `SELECT id,privacy_route FROM ${table} ORDER BY id`
+      )
+    ).rows;
+
+  beforeEach(() => {
+    database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+  });
+
+  afterEach(async () => database.close());
+
+  /*
+   * A statement that writes rows the migration did not create, as opposed to one that only reshapes
+   * the table around them. Function bodies come out first - what a trigger does runs when the
+   * application writes, not when the migration does - and `setval` counts, because a sequence left
+   * behind the rows it numbers is the same class of half-finished upgrade as an unfilled column.
+   */
+  const backfills = (sql: string) =>
+    sql
+      .replace(/CREATE OR REPLACE FUNCTION[\s\S]*?\$ath\$;/g, '')
+      .split(';')
+      .filter(
+        (statement) =>
+          /^\s*(UPDATE|DELETE\s+FROM|INSERT\s+INTO)\b/i.test(statement) ||
+          /\bsetval\s*\(/i.test(statement)
+      );
+
+  /*
+   * Every migration that rewrites existing rows, and how many statements it does it with. Each has
+   * a test below, and a new one arriving with no entry here fails this rather than shipping with a
+   * replay - which reaches a backfill only after the column it fills is already filled - as the
+   * only proof it works. That is the state twenty of these twenty-one statements were in.
+   */
+  const REWRITING_MIGRATIONS = {
+    17: 1,
+    18: 4,
+    21: 5,
+    36: 1,
+    37: 1,
+    42: 1,
+    51: 1,
+    53: 3,
+    55: 1,
+    57: 2,
+    62: 1
+  };
+
+  it('has an upgrade test for every migration that rewrites rows rather than reshaping them', () => {
+    const rewriting = Object.fromEntries(
+      migrations
+        .map((migration) => [migration.version, backfills(migration.sql).length] as const)
+        .filter(([, statements]) => statements > 0)
+    );
+    expect(rewriting).toEqual(REWRITING_MIGRATIONS);
+  });
+
+  /*
+   * Migration 17 narrows wrapping_mode to two values and normalises whatever else is in the column
+   * first. The key material itself must come through untouched: a migration that rewrote a wrapped
+   * key would lock the owner out of every workspace it touched, and no later statement could tell.
+   */
+  it('settles a key wrapped under a mode the narrowed constraint has never heard of', async () => {
+    await migrateBelow(17);
+    await seedOwner();
+    const second = '00000000-0000-4000-8000-0000000000b2';
+    const third = '00000000-0000-4000-8000-0000000000b3';
+    await addWorkspace(second, 'Second');
+    await addWorkspace(third, 'Third');
+    await database.exec(`
+      INSERT INTO workspace_keys(workspace_id,wrapped_key,wrapping_mode) VALUES
+        ('${SPACE_ID}','wrapped-a','hosted'),
+        ('${second}','wrapped-b','attested'),
+        ('${third}','wrapped-c','hardware');
+    `);
+    // The state the migration has to find. Asserting it first is what stops this passing against a
+    // database where nothing needed doing.
+    const modes = async () =>
+      (
+        await database.query<{ wrapping_mode: string }>(
+          'SELECT wrapping_mode FROM workspace_keys ORDER BY workspace_id'
+        )
+      ).rows.map((row) => row.wrapping_mode);
+    expect(await modes()).toEqual(['hosted', 'attested', 'hardware']);
+
+    await apply(17);
+
+    const keys = await database.query<{ workspace_id: string; wrapping_mode: string }>(
+      'SELECT workspace_id,wrapping_mode,wrapped_key FROM workspace_keys ORDER BY workspace_id'
+    );
+    expect(keys.rows).toEqual([
+      { workspace_id: SPACE_ID, wrapping_mode: 'hosted', wrapped_key: 'wrapped-a' },
+      { workspace_id: second, wrapping_mode: 'attested', wrapped_key: 'wrapped-b' },
+      { workspace_id: third, wrapping_mode: 'hosted', wrapped_key: 'wrapped-c' }
+    ]);
+    // And the constraint the backfill was clearing the way for is now actually on the table.
+    await expect(
+      database.query(`UPDATE workspace_keys SET wrapping_mode='hardware' WHERE workspace_id=$1`, [
+        third
+      ])
+    ).rejects.toThrow();
+  });
+
+  /*
+   * Migration 18 is the one that deletes rows rather than rewriting them, and writing this test is
+   * what showed that it cannot: all four of its data statements look for a privacy_route outside
+   * ('ollama_zdr','external'), and migration 4 put exactly that CHECK on tasks, model_releases and
+   * provider_connections while migration 11 declared it on task_schedules. Nothing between 4 and 18
+   * can store a value any of them would match, so the two UPDATEs and the two DELETEs are reached
+   * on every upgrade and select nothing on all of them.
+   *
+   * That is recorded here rather than removed. The statements are harmless where they stand, the
+   * constraint half of the migration is not, and the thing worth holding is the proof that no box
+   * taking this update can lose its catalogue to them - which is what the inserts below establish
+   * by being refused.
+   */
+  it('cannot reach the rows migration 18 rewrites: the check it enforces has been on since 4', async () => {
+    await migrateBelow(18);
+    await seedOwner();
+    await addTask('00000000-0000-4000-8000-0000000000e1', 'ollama_zdr');
+    await addTask('00000000-0000-4000-8000-0000000000e2', 'external');
+    await addModel('openrouter/kept', 'ollama_zdr');
+    await database.query(
+      `INSERT INTO provider_connections(id,user_id,provider,label,secret_ciphertext,privacy_route)
+       VALUES ($1,$2,'openrouter','Kept',$3::jsonb,'external')`,
+      ['00000000-0000-4000-8000-0000000000c1', OWNER_ID, sealed]
+    );
+    // The state the four statements were written for, on all three tables that still accept a
+    // route today. A version-17 database refuses to hold any of it.
+    await expect(addTask('00000000-0000-4000-8000-0000000000e3', 'hosted_zdr')).rejects.toThrow(
+      /tasks_cloud_privacy_route/
+    );
+    await expect(addModel('openrouter/dropped', 'hosted_zdr')).rejects.toThrow(
+      /models_cloud_privacy_route/
+    );
+    await expect(
+      database.query(
+        `INSERT INTO provider_connections(id,user_id,provider,label,secret_ciphertext,privacy_route)
+         VALUES ($1,$2,'hosted','Dropped',$3::jsonb,'hosted_zdr')`,
+        ['00000000-0000-4000-8000-0000000000c2', OWNER_ID, sealed]
+      )
+    ).rejects.toThrow(/providers_cloud_privacy_route/);
+
+    await apply(18);
+
+    expect(await routes('tasks')).toEqual([
+      { id: '00000000-0000-4000-8000-0000000000e1', privacy_route: 'ollama_zdr' },
+      { id: '00000000-0000-4000-8000-0000000000e2', privacy_route: 'external' }
+    ]);
+    expect(await routes('model_releases')).toEqual([
+      { id: 'openrouter/kept', privacy_route: 'ollama_zdr' }
+    ]);
+    expect(await routes('provider_connections')).toEqual([
+      { id: '00000000-0000-4000-8000-0000000000c1', privacy_route: 'external' }
+    ]);
+  });
+
+  /*
+   * The stand-down arm, tested from the state it was written for: a database that has already been
+   * past 21, where every route reads 'provider_zdr' and the un-guarded statements would rewrite
+   * every task to 'external' and empty the catalogue. This is the one re-application in the file
+   * whose cost is measured in the owner's data rather than in wasted work.
+   */
+  it('stands down rather than emptying a catalogue a later migration already renamed', async () => {
+    await migrateDatabase(database);
+    await seedOwner();
+    await addTask('00000000-0000-4000-8000-0000000000e1', 'provider_zdr');
+    await addModel('openrouter/kept', 'provider_zdr');
+
+    const eighteen = migrations.find((entry) => entry.version === 18)!;
+    await database.transaction(async (transaction) => transaction.exec(eighteen.sql));
+
+    expect(await routes('tasks')).toEqual([
+      { id: '00000000-0000-4000-8000-0000000000e1', privacy_route: 'provider_zdr' }
+    ]);
+    expect(await routes('model_releases')).toEqual([
+      { id: 'openrouter/kept', privacy_route: 'provider_zdr' }
+    ]);
+  });
+
+  /*
+   * Five backfilling statements in one migration: the rename across four tables, and the column
+   * that becomes NOT NULL immediately after being filled - which is the statement that decides
+   * whether the update completes at all, because a single unfilled row aborts it.
+   */
+  it('renames the route every row already carried and gives each model an id at the provider', async () => {
+    await migrateBelow(21);
+    await seedOwner();
+    await addTask('00000000-0000-4000-8000-0000000000e1', 'ollama_zdr');
+    await addTask('00000000-0000-4000-8000-0000000000e2', 'external');
+    await addModel('openrouter/z-ai/glm-5.2', 'ollama_zdr');
+    await database.query(
+      `INSERT INTO provider_connections(id,user_id,provider,label,secret_ciphertext,privacy_route)
+       VALUES ($1,$2,'openrouter','Owner key',$3::jsonb,'ollama_zdr')`,
+      ['00000000-0000-4000-8000-0000000000c1', OWNER_ID, sealed]
+    );
+    await database.query(
+      `INSERT INTO task_schedules(id,user_id,workspace_id,title_ciphertext,prompt_ciphertext,
+         model_id,privacy_route,max_compute_credits,spec)
+       VALUES ($1,$2,$3,$4::jsonb,$4::jsonb,'qwen','ollama_zdr',1,$5::jsonb)`,
+      [
+        '00000000-0000-4000-8000-0000000000f1',
+        OWNER_ID,
+        SPACE_ID,
+        sealed,
+        JSON.stringify({ kind: 'interval', everyMinutes: 15 })
+      ]
+    );
+
+    expect(await hasColumn('model_releases', 'provider_model_id')).toBe(false);
+    expect((await routes('tasks')).map((row) => row.privacy_route)).toContain('ollama_zdr');
+
+    await apply(21);
+
+    expect(await routes('tasks')).toEqual([
+      { id: '00000000-0000-4000-8000-0000000000e1', privacy_route: 'provider_zdr' },
+      { id: '00000000-0000-4000-8000-0000000000e2', privacy_route: 'external' }
+    ]);
+    expect(await routes('model_releases')).toEqual([
+      { id: 'openrouter/z-ai/glm-5.2', privacy_route: 'provider_zdr' }
+    ]);
+    expect(await routes('provider_connections')).toEqual([
+      { id: '00000000-0000-4000-8000-0000000000c1', privacy_route: 'provider_zdr' }
+    ]);
+    expect(await routes('task_schedules')).toEqual([
+      { id: '00000000-0000-4000-8000-0000000000f1', privacy_route: 'provider_zdr' }
+    ]);
+    // The id at the provider, for a catalogue that predates athanor ever recording one separately.
+    const models = await database.query<{ id: string; provider_model_id: string }>(
+      'SELECT id,provider_model_id FROM model_releases'
+    );
+    expect(models.rows).toEqual([
+      { id: 'openrouter/z-ai/glm-5.2', provider_model_id: 'openrouter/z-ai/glm-5.2' }
+    ]);
+  });
+
+  /*
+   * The per-model spend breakdown is a GROUP BY over a column that did not exist when the ledger
+   * rows were written, so every figure the owner is shown for the months before the update comes
+   * out of this one statement's reading of provider_ref.
+   */
+  it('reads the model out of a provider reference the ledger wrote before the column existed', async () => {
+    await migrateBelow(36);
+    await seedOwner();
+    const entry = (key: string, providerRef: string | null) =>
+      database.query(
+        `INSERT INTO usage_entries(id,user_id,workspace_id,kind,resource_class,quantity,unit,
+           credits,state,provider_ref,idempotency_key)
+         VALUES ($1,$2,$3,'model_inference','high',1000,'tokens',0.5,'settled',$4,$5)`,
+        [randomUUID(), OWNER_ID, SPACE_ID, providerRef, key]
+      );
+    await entry('split-1', 'openrouter:z-ai/glm-5.2');
+    // A model id with its own colon in it: the split is on the first one, not the last.
+    await entry('split-2', 'openrouter:vendor/model:free');
+    // Two shapes the statement is written to leave alone rather than to mangle into a model id.
+    await entry('no-colon', 'local-inference');
+    await entry('no-ref', null);
+
+    expect(await hasColumn('usage_entries', 'model_id')).toBe(false);
+
+    await apply(36);
+
+    const priced = await database.query<{ idempotency_key: string; model_id: string | null }>(
+      'SELECT idempotency_key,model_id FROM usage_entries ORDER BY idempotency_key'
+    );
+    expect(priced.rows).toEqual([
+      { idempotency_key: 'no-colon', model_id: null },
+      { idempotency_key: 'no-ref', model_id: null },
+      { idempotency_key: 'split-1', model_id: 'z-ai/glm-5.2' },
+      { idempotency_key: 'split-2', model_id: 'vendor/model:free' }
+    ]);
+  });
+
+  /*
+   * trigram_len is the cheap bound that decides whether a stored entry could clear the Jaccard
+   * threshold at all. A row left at the column default of zero is one the fuzzy channel can never
+   * return, so an unfilled backfill here reads as memory the agent has quietly lost.
+   */
+  it('counts the trigrams on memory entries written before the count was stored', async () => {
+    await migrateBelow(37);
+    await seedOwner();
+    const remember = async (id: string, trigrams: string) =>
+      database.query(
+        `INSERT INTO mem.item(id,user_id,workspace_id,kind,trust,document_ciphertext,dedupe_key,
+           trigrams)
+         VALUES ($1,$2,$3,'episode'::mem.kind,'stated'::mem.trust,$4::jsonb,$5,$6::text[])`,
+        [id, OWNER_ID, SPACE_ID, sealed, id, trigrams]
+      );
+    await remember('00000000-0000-4000-8000-0000000000d1', '{ath,tha,han,ano,nor}');
+    await remember('00000000-0000-4000-8000-0000000000d2', '{}');
+
+    expect(await hasColumn('mem.item', 'trigram_len')).toBe(false);
+
+    await apply(37);
+
+    const counted = await database.query<{ id: string; trigram_len: number }>(
+      'SELECT id,trigram_len FROM mem.item ORDER BY id'
+    );
+    expect(counted.rows).toEqual([
+      { id: '00000000-0000-4000-8000-0000000000d1', trigram_len: 5 },
+      { id: '00000000-0000-4000-8000-0000000000d2', trigram_len: 0 }
+    ]);
+  });
+
+  /*
+   * expires_at stopped being a countdown from creation and started being an idle window, which
+   * means the number already in the column measures a different thing on either side of the update.
+   * The owner's live private links are handed the full window rather than whatever minutes were
+   * left of the old one - and the ones that had already lapsed stay lapsed, because restoring a
+   * bearer token the owner has already lost is not a repair.
+   */
+  it('hands a live private preview the idle window instead of the minutes left of its countdown', async () => {
+    await migrateBelow(42);
+    await seedOwner();
+    const publish = async (slug: string, visibility: string, status: string, expiresIn: string) =>
+      database.query(
+        `INSERT INTO workspace_previews(id,user_id,workspace_id,label,port,slug,access_token_hash,
+           visibility,status,expires_at)
+         VALUES ($1,$2,$3,'Site',5173,$4,'preview-hash',$5,$6,NOW() + $7::interval)`,
+        [randomUUID(), OWNER_ID, SPACE_ID, slug, visibility, status, expiresIn]
+      );
+    await publish('live-private', 'private', 'active', '10 minutes');
+    await publish('live-public', 'public', 'active', '10 minutes');
+    await publish('revoked-private', 'private', 'revoked', '10 minutes');
+    await publish('lapsed-private', 'private', 'active', '-1 day');
+
+    await apply(42);
+
+    const windows = await database.query<{ slug: string; extended: boolean; live: boolean }>(
+      `SELECT slug, expires_at > NOW() + INTERVAL '29 days' AS extended, expires_at > NOW() AS live
+       FROM workspace_previews ORDER BY slug`
+    );
+    expect(windows.rows).toEqual([
+      // Already gone before the update, and still gone after it.
+      { slug: 'lapsed-private', extended: false, live: false },
+      { slug: 'live-private', extended: true, live: true },
+      // A published site never had the countdown, and a revoked link is not brought back.
+      { slug: 'live-public', extended: false, live: true },
+      { slug: 'revoked-private', extended: false, live: true }
+    ]);
+  });
+
+  /*
+   * Migration 51 narrows wrapping_mode to the single value the code can mint. The rows it has to
+   * settle first are the ones migration 17 deliberately left alone, so this is the only statement
+   * standing between an owner who once ran attested key release and a failed constraint at 3am.
+   */
+  it('settles an attested key before the mode is narrowed to the one thing that mints it', async () => {
+    await migrateBelow(51);
+    await seedOwner();
+    await database.query(
+      `INSERT INTO workspace_keys(workspace_id,wrapped_key,wrapping_mode)
+       VALUES ($1,'wrapped-a','attested')`,
+      [SPACE_ID]
+    );
+
+    expect(await hasColumn('tasks', 'reserved_compute_credits')).toBe(true);
+
+    await apply(51);
+
+    // Five columns nothing ever wrote go with it, one of which was served on every task as a
+    // measured reservation of zero.
+    expect(await hasColumn('tasks', 'reserved_compute_credits')).toBe(false);
+    const keys = await database.query<{ wrapping_mode: string; wrapped_key: string }>(
+      'SELECT wrapping_mode,wrapped_key FROM workspace_keys'
+    );
+    expect(keys.rows).toEqual([{ wrapping_mode: 'hosted', wrapped_key: 'wrapped-a' }]);
+    await expect(
+      database.query(`UPDATE workspace_keys SET wrapping_mode='attested' WHERE workspace_id=$1`, [
+        SPACE_ID
+      ])
+    ).rejects.toThrow();
+  });
+
+  /*
+   * The order two checkpoints were taken in, made into a fact. The backfill has to reproduce what
+   * the old query answered - created_at, then id - or an owner's existing undo points silently
+   * change which one an undo picks, which is the defect the migration exists to stop.
+   */
+  it('numbers existing checkpoints the way the old query read them and carries on above them', async () => {
+    await migrateBelow(53);
+    await seedOwner();
+    const taken = async (id: string, at: string) =>
+      database.query(
+        `INSERT INTO workspace_checkpoints(id,user_id,workspace_id,mechanism,created_at)
+         VALUES ($1,$2,$3,'btrfs',$4::timestamptz)`,
+        [id, OWNER_ID, SPACE_ID, at]
+      );
+    // Written out of order, and two of them share a timestamp, which is the tie the sequence exists
+    // to break: a clock at transaction resolution gives two checkpoints in one turn the same NOW().
+    await taken('00000000-0000-4000-8000-000000000c03', '2026-01-03T00:00:00Z');
+    await taken('00000000-0000-4000-8000-000000000c02', '2026-01-01T00:00:00Z');
+    await taken('00000000-0000-4000-8000-000000000c01', '2026-01-01T00:00:00Z');
+
+    expect(await hasColumn('workspace_checkpoints', 'taken_seq')).toBe(false);
+
+    await apply(53);
+
+    const ordered = await database.query<{ id: string; taken_seq: string }>(
+      'SELECT id,taken_seq FROM workspace_checkpoints ORDER BY taken_seq'
+    );
+    expect(ordered.rows.map((row) => row.id)).toEqual([
+      '00000000-0000-4000-8000-000000000c01',
+      '00000000-0000-4000-8000-000000000c02',
+      '00000000-0000-4000-8000-000000000c03'
+    ]);
+    expect(ordered.rows.map((row) => Number(row.taken_seq))).toEqual([1, 2, 3]);
+
+    // setval is the half that decides whether the box works after the update: a sequence left at 1
+    // hands the next checkpoint a number an existing one already holds, and the undo picks between
+    // them by id again.
+    await database.query(
+      `INSERT INTO workspace_checkpoints(id,user_id,workspace_id,mechanism)
+       VALUES ($1,$2,$3,'btrfs')`,
+      ['00000000-0000-4000-8000-000000000c04', OWNER_ID, SPACE_ID]
+    );
+    const next = await database.query<{ taken_seq: string }>(
+      'SELECT taken_seq FROM workspace_checkpoints WHERE id=$1',
+      ['00000000-0000-4000-8000-000000000c04']
+    );
+    expect(Number(next.rows[0]!.taken_seq)).toBeGreaterThan(3);
+  });
+
+  /*
+   * Every undo point the owner already has, re-pointed at the message whose turn it holds. Getting
+   * this wrong on existing rows is the whole finding: rewinding resolves on
+   * `event_sequence <= the message you picked`, so a point left where it was taken is one the
+   * client can offer and never match.
+   */
+  it('moves an existing undo point back to the message whose turn it holds', async () => {
+    await migrateBelow(55);
+    await seedOwner();
+    const conversation = '00000000-0000-4000-8000-0000000000e1';
+    const scheduled = '00000000-0000-4000-8000-0000000000e2';
+    await addTask(conversation, 'provider_zdr', 'Asked for something');
+    await addTask(scheduled, 'provider_zdr', 'Ran on a timer');
+    const event = async (taskId: string, sequence: number, kind: string) =>
+      database.query(
+        `INSERT INTO task_events(id,task_id,sequence,kind,summary) VALUES ($1,$2,$3,$4,'')`,
+        [randomUUID(), taskId, sequence, kind]
+      );
+    await event(conversation, 1, 'user_message');
+    await event(conversation, 2, 'agent_message');
+    await event(conversation, 3, 'user_message');
+    await event(conversation, 4, 'tool_call');
+    // A scheduled run opens without a message, which is the row the COALESCE is there for.
+    await event(scheduled, 1, 'status');
+    await event(scheduled, 2, 'tool_call');
+
+    const taken = async (id: string, taskId: string | null, sequence: number | null) =>
+      database.query(
+        `INSERT INTO workspace_checkpoints(id,user_id,workspace_id,task_id,mechanism,event_sequence)
+         VALUES ($1,$2,$3,$4,'btrfs',$5)`,
+        [id, OWNER_ID, SPACE_ID, taskId, sequence]
+      );
+    await taken('00000000-0000-4000-8000-000000000c01', conversation, 4);
+    await taken('00000000-0000-4000-8000-000000000c02', conversation, 2);
+    await taken('00000000-0000-4000-8000-000000000c03', scheduled, 2);
+    await taken('00000000-0000-4000-8000-000000000c04', null, 9);
+
+    const sequences = async () =>
+      (
+        await database.query<{ event_sequence: number }>(
+          'SELECT event_sequence FROM workspace_checkpoints ORDER BY id'
+        )
+      ).rows.map((row) => row.event_sequence);
+    // Where the checkpoints were taken, which is the position the client could never match.
+    expect(await sequences()).toEqual([4, 2, 2, 9]);
+
+    await apply(55);
+
+    const anchored = await database.query<{ id: string; event_sequence: number }>(
+      'SELECT id,event_sequence FROM workspace_checkpoints ORDER BY id'
+    );
+    expect(anchored.rows).toEqual([
+      // Taken after the second turn's tool call; moves back to the message that started it.
+      { id: '00000000-0000-4000-8000-000000000c01', event_sequence: 3 },
+      { id: '00000000-0000-4000-8000-000000000c02', event_sequence: 1 },
+      // No user message before it, and no user message anywhere: it keeps the number it has.
+      { id: '00000000-0000-4000-8000-000000000c03', event_sequence: 2 },
+      // A checkpoint on no conversation is outside the WHERE and must not be touched at all.
+      { id: '00000000-0000-4000-8000-000000000c04', event_sequence: 9 }
+    ]);
+  });
+
+  /*
+   * "Delete this conversation" has to have meant it, retrospectively. The rows this removes are the
+   * owner's own words held verbatim in mem.source for conversations they deleted before the foreign
+   * key existed, which is the half of the promise that had already been broken by the time the
+   * migration was written.
+   */
+  it('takes memory of a conversation the owner already deleted with it', async () => {
+    await migrateBelow(57);
+    await seedOwner();
+    const living = '00000000-0000-4000-8000-0000000000e1';
+    const gone = '00000000-0000-4000-8000-0000000000e9';
+    await addTask(living, 'provider_zdr');
+    const remember = async (id: string, taskId: string | null) => {
+      await database.query(
+        `INSERT INTO mem.item(id,user_id,workspace_id,kind,trust,document_ciphertext,dedupe_key,
+           task_id)
+         VALUES ($1,$2,$3,'episode'::mem.kind,'stated'::mem.trust,$4::jsonb,$5,$6)`,
+        [id, OWNER_ID, SPACE_ID, sealed, id, taskId]
+      );
+      await database.query(
+        `INSERT INTO mem.source(id,user_id,workspace_id,channel,body_ciphertext,task_id)
+         VALUES ($1,$2,$3,'chat',$4::jsonb,$5)`,
+        [id, OWNER_ID, SPACE_ID, sealed, taskId]
+      );
+    };
+    await remember('00000000-0000-4000-8000-0000000000d1', living);
+    await remember('00000000-0000-4000-8000-0000000000d2', gone);
+    // A promoted fact carries no conversation and survives the deletion of the one that saw it.
+    await remember('00000000-0000-4000-8000-0000000000d3', null);
+
+    const surviving = async (table: string) =>
+      (await database.query<{ id: string }>(`SELECT id FROM ${table} ORDER BY id`)).rows.map(
+        (row) => row.id
+      );
+    // The verbatim chunk of an already-deleted conversation, still on the box.
+    expect(await surviving('mem.source')).toContain('00000000-0000-4000-8000-0000000000d2');
+
+    await apply(57);
+
+    expect(await surviving('mem.item')).toEqual([
+      '00000000-0000-4000-8000-0000000000d1',
+      '00000000-0000-4000-8000-0000000000d3'
+    ]);
+    expect(await surviving('mem.source')).toEqual([
+      '00000000-0000-4000-8000-0000000000d1',
+      '00000000-0000-4000-8000-0000000000d3'
+    ]);
+
+    // And the foreign key the migration installed means the next deletion needs no sweep at all.
+    await database.query('DELETE FROM tasks WHERE id=$1', [living]);
+    expect(await surviving('mem.item')).toEqual(['00000000-0000-4000-8000-0000000000d3']);
+    expect(await surviving('mem.source')).toEqual(['00000000-0000-4000-8000-0000000000d3']);
+  });
+
+  /*
+   * The last statement in the chain, checked the same way as the rest: migration 62 read the
+   * pairing out of task_schedule_runs, and the describe above already proves it on a database that
+   * was dropped back a column by hand. This one proves it from a database that never had the
+   * column, which is the state a box two versions behind is actually in.
+   */
+  it('gives a run that already existed the schedule it came from', async () => {
+    await migrateBelow(62);
+    await seedOwner();
+    const fromSchedule = '00000000-0000-4000-8000-0000000000e1';
+    const fromOwner = '00000000-0000-4000-8000-0000000000e2';
+    await addTask(fromSchedule, 'provider_zdr', 'Ran on a timer');
+    await addTask(fromOwner, 'provider_zdr', 'Asked for something');
+    const scheduleId = '00000000-0000-4000-8000-0000000000f1';
+    await database.query(
+      `INSERT INTO task_schedules(id,user_id,workspace_id,title_ciphertext,prompt_ciphertext,
+         model_id,privacy_route,max_compute_credits,spec)
+       VALUES ($1,$2,$3,$4::jsonb,$4::jsonb,'qwen','provider_zdr',1,$5::jsonb)`,
+      [
+        scheduleId,
+        OWNER_ID,
+        SPACE_ID,
+        sealed,
+        JSON.stringify({ kind: 'interval', everyMinutes: 15 })
+      ]
+    );
+    await database.query(
+      `INSERT INTO task_schedule_runs(schedule_id,scheduled_for,task_id,outcome)
+       VALUES ($1,NOW(),$2,'queued')`,
+      [scheduleId, fromSchedule]
+    );
+
+    expect(await hasColumn('tasks', 'schedule_id')).toBe(false);
+
+    await apply(62);
+
+    const filed = await database.query<{ id: string; schedule_id: string | null }>(
+      'SELECT id,schedule_id FROM tasks ORDER BY id'
+    );
+    expect(filed.rows).toEqual([
+      { id: fromSchedule, schedule_id: scheduleId },
+      { id: fromOwner, schedule_id: null }
+    ]);
+  });
+
+  /*
+   * Migration 66 rewrites no rows, so what it has to be tested against is the state it changes: a
+   * box that already has conversations, approvals and checkpoints on it, where six referencing
+   * columns have no index and one index is a duplicate of another. Asserting that before applying
+   * it is the part that matters - every one of these CREATE INDEX statements is IF NOT EXISTS and
+   * would pass just as happily against a database that already had them.
+   */
+  it('gives the cascades their indexes and takes away the checkpoint index that was a duplicate', async () => {
+    await migrateBelow(66);
+    await seedOwner();
+    const conversation = '00000000-0000-4000-8000-0000000000f1';
+    await addTask(conversation, 'external');
+    await database.query(
+      `INSERT INTO approvals(id,user_id,task_id,action,side_effect,preview_ciphertext,preview_hash,
+         expires_at)
+       VALUES ($1,$2,$3,'browser.click','write',$4::jsonb,'hash',NOW()+INTERVAL '1 hour')`,
+      ['00000000-0000-4000-8000-0000000000f2', OWNER_ID, conversation, sealed]
+    );
+    await database.query(
+      `INSERT INTO workspace_checkpoints(id,user_id,workspace_id,task_id,event_sequence,mechanism)
+       VALUES ($1,$2,$3,$4,1,'content')`,
+      ['00000000-0000-4000-8000-0000000000f3', OWNER_ID, SPACE_ID, conversation]
+    );
+
+    const indexes = async (): Promise<string[]> =>
+      (
+        await database.query<{ indexname: string }>(
+          `SELECT indexname FROM pg_indexes
+           WHERE schemaname IN ('public','mem') ORDER BY indexname`
+        )
+      ).rows.map((row) => row.indexname);
+    const arriving = [
+      'approvals_task_idx',
+      'mem_item_task_idx',
+      'mem_source_task_cascade_idx',
+      'tasks_branched_from_idx',
+      'tasks_restored_checkpoint_idx',
+      'tasks_workspace_idx'
+    ];
+    const before = await indexes();
+    expect(arriving.filter((name) => before.includes(name))).toEqual([]);
+    expect(before).toContain('workspace_checkpoints_task_idx');
+    expect(before).toContain('workspace_checkpoints_undo_idx');
+
+    await apply(66);
+
+    const after = await indexes();
+    expect(arriving.filter((name) => after.includes(name))).toEqual(arriving);
+    expect(after).not.toContain('workspace_checkpoints_task_idx');
+    // The one that made it redundant is still there, which is the whole reason it could go.
+    expect(after).toContain('workspace_checkpoints_undo_idx');
+
+    // And the constraints those indexes are read through still mean what migration 57 made them
+    // mean: deleting the conversation takes its approvals with it and detaches the checkpoint.
+    await database.query('DELETE FROM tasks WHERE id=$1', [conversation]);
+    await expect(
+      database.query('SELECT id FROM approvals').then((result) => result.rows)
+    ).resolves.toEqual([]);
+    const checkpoint = await database.query<{ task_id: string | null }>(
+      'SELECT task_id FROM workspace_checkpoints'
+    );
+    expect(checkpoint.rows).toEqual([{ task_id: null }]);
+  });
+
+  /*
+   * Migration 67 drops and re-creates three indexes on a table that already holds the owner's
+   * memory, so the risk it carries is not the definitions - it is the rows. The DROP and the CREATE
+   * are two statements inside one transaction, and anything that fell out between them would fall
+   * out silently: a GIN index re-created from a table whose tsv column had been touched would come
+   * back missing exactly the entries nothing else can find.
+   *
+   * The rows are therefore written the way a version-66 box holds them, before the migration runs,
+   * and read back afterwards through the index itself rather than through a sequential scan - which
+   * is what `SET enable_seqscan = off` is here for. A test that only read them back would pass on a
+   * database whose new index was empty.
+   */
+  it('re-indexes the memory that was already on the box without losing an entry', async () => {
+    await migrateBelow(67);
+    await seedOwner();
+
+    const predicates = async (): Promise<string[]> =>
+      (
+        await database.query<{ indexname: string; indexdef: string }>(
+          `SELECT indexname, indexdef FROM pg_indexes
+           WHERE schemaname='mem' AND indexname IN
+             ('mem_item_tsv_gin','mem_item_subject_idx','mem_item_pin_idx')
+           ORDER BY indexname`
+        )
+      ).rows.map((row) => `${row.indexname}: ${/WHERE (.+)$/.exec(row.indexdef)?.[1] ?? 'none'}`);
+
+    // The state the migration has to find, asserted rather than assumed: three partial indexes, all
+    // three predicated on a status the recall statement can never prove.
+    expect(await predicates()).toEqual([
+      "mem_item_pin_idx: (pin AND (status = 'active'::mem.status))",
+      "mem_item_subject_idx: ((kind = 'fact'::mem.kind) AND (status = 'active'::mem.status))",
+      "mem_item_tsv_gin: (status = 'active'::mem.status)"
+    ]);
+
+    // The registry row a real box has by the time it holds any facts at all; nothing here reads it
+    // except the foreign key, and `many` keeps pred_functional false so the unique index stays out
+    // of a test that is about three other indexes.
+    await database.query(
+      `INSERT INTO mem.predicate(name,cardinality,is_temporal,description)
+       VALUES ('related_to','many',FALSE,'An untyped association between two entities.')`
+    );
+    /*
+     * A hundred and twenty rows rather than three, because the assertion below is about which plan
+     * the database can afford, and over three rows every plan costs the same. A fifth of them carry
+     * the term the lookup asks for, spread across all three statuses.
+     */
+    const rowId = (index: number) => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+    const wanted: string[] = [];
+    for (let index = 1; index <= 120; index += 1) {
+      // Every seventh row is retired and every fifth carries the term, so every thirty-fifth is
+      // both - a row the old index could not hold and the lookup below insists on finding.
+      const status =
+        index % 7 === 0 ? (index % 14 === 0 ? 'archived' : 'superseded') : ('active' as const);
+      const carries = index % 5 === 0;
+      if (carries) wanted.push(rowId(index));
+      await database.query(
+        `INSERT INTO mem.item(id,user_id,workspace_id,kind,status,trust,document_ciphertext,
+           title_tokens,body_tokens,tags_hashed,trigrams,dedupe_key,subject_key,predicate,
+           object_key,pin,indexed)
+         VALUES ($1,$2,$3,'fact',$4::mem.status,'stated',$5::jsonb,'aaaa',$6,'{}'::text[],
+           '{}'::text[],$7,$8,'related_to','oooo',$9,TRUE)`,
+        [
+          rowId(index),
+          OWNER_ID,
+          SPACE_ID,
+          status,
+          sealed,
+          carries ? 'bbbb cccc' : 'dddd cccc',
+          `dedupe-${index}`,
+          `subj-${index}`,
+          index === 1
+        ]
+      );
+    }
+    await database.exec('VACUUM ANALYZE mem.item');
+
+    /**
+     * A lexical lookup with no status predicate of its own, reported as both the rows it found and
+     * whether it reached the lexical index to find them. The rows alone would say nothing: a
+     * sequential scan answers the same question correctly and more slowly, which is exactly how a
+     * partial index that fits no query goes unnoticed for eight migrations.
+     */
+    const indexed = async (): Promise<{ ids: string[]; viaIndex: boolean }> => {
+      const sql = `SELECT id FROM mem.item WHERE tsv @@ to_tsquery('simple', 'bbbb') ORDER BY id`;
+      const found = await database.query<{ id: string }>(sql);
+      // Both scan kinds that can answer this without an index predicate are switched off, so what
+      // is left is a question about applicability rather than about cost: the only bitmap qual on
+      // offer is the tsvector match, and the plan reaches it or falls back to the scan it was told
+      // not to take. Asserting the planner's unconstrained choice instead would be committing a
+      // cost estimate that moves with the size of the fixture.
+      await database.exec('SET enable_seqscan = off; SET enable_indexscan = off');
+      try {
+        const explained = await database.query<Record<string, unknown>>(
+          `EXPLAIN (COSTS OFF) ${sql}`
+        );
+        return {
+          ids: found.rows.map((row) => row.id),
+          viaIndex: explained.rows.some((row) =>
+            String(Object.values(row)[0]).includes('mem_item_tsv_gin')
+          )
+        };
+      } finally {
+        await database.exec('SET enable_seqscan = on; SET enable_indexscan = on');
+      }
+    };
+    // The state the migration has to find: the right answer, read the long way round.
+    expect(await indexed()).toEqual({ ids: wanted, viaIndex: false });
+
+    /** Every column the migration could disturb, including the one the index is built over. */
+    const everyRow = async () =>
+      (
+        await database.query<Record<string, unknown>>(
+          `SELECT id, status::text AS status, body_tokens, tsv::text AS tsv, tsv_len, pin,
+                  subject_key, predicate, pred_functional
+           FROM mem.item ORDER BY id`
+        )
+      ).rows;
+    const before = await everyRow();
+    expect(before).toHaveLength(120);
+
+    await apply(67);
+    await database.exec('VACUUM ANALYZE mem.item');
+
+    expect(await predicates()).toEqual([
+      'mem_item_pin_idx: pin',
+      "mem_item_subject_idx: (kind = 'fact'::mem.kind)",
+      'mem_item_tsv_gin: none'
+    ]);
+    // The same answer, now through the index the migration rebuilt - including the retired rows the
+    // old predicate had kept out of it, which is the entry a DROP-then-CREATE could have lost.
+    expect(await indexed()).toEqual({ ids: wanted, viaIndex: true });
+    // Nothing was rewritten on the way past: this migration reshapes storage and touches no row.
+    expect(await everyRow()).toEqual(before);
+    // And the unique index the recall's correctness rests on is untouched by all three swaps.
+    const unique = await database.query<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes WHERE indexname='mem_fact_current_one'`
+    );
+    expect(unique.rows).toHaveLength(1);
+  });
+
+  /*
+   * Migration 68 is the one the owner has been waiting two releases for, and the row it has to
+   * meet is the awkward one: a `spend_limits` row an older athanor wrote, with three caps set and
+   * no notion of a price ceiling. What must survive is the caps - a migration that touched them
+   * would silently raise or remove the brake the owner is relying on - and what must arrive is two
+   * columns that are NULL, because NULL is "no ceiling" and any other value would be this box
+   * refusing routes nobody asked it to refuse.
+   */
+  it('gives an owner who already set three caps two price ceilings they have not set', async () => {
+    await migrateBelow(68);
+    await seedOwner();
+    expect(await hasColumn('spend_limits', 'max_input_usd_per_million_tokens')).toBe(false);
+    await database.query(
+      `INSERT INTO spend_limits(user_id,daily_cap_usd,monthly_cap_usd,default_task_cap_usd,
+         warn_at_percent,time_zone)
+       VALUES ($1,5,60,2.5,65,'Europe/Berlin')`,
+      [OWNER_ID]
+    );
+
+    await apply(68);
+
+    const stored = await new DataStore(database).getSpendLimits(OWNER_ID);
+    expect(stored).toMatchObject({
+      dailyCapUsd: 5,
+      monthlyCapUsd: 60,
+      defaultTaskCapUsd: 2.5,
+      warnAtPercent: 65,
+      timeZone: 'Europe/Berlin',
+      maxInputUsdPerMillionTokens: null,
+      maxOutputUsdPerMillionTokens: null
+    });
+
+    // And the constraint the column carries is on the table, not just in the comment: a ceiling
+    // cannot be negative, while zero is a real ceiling that admits only a free route.
+    await expect(
+      database.query(
+        'UPDATE spend_limits SET max_input_usd_per_million_tokens=-1 WHERE user_id=$1',
+        [OWNER_ID]
+      )
+    ).rejects.toThrow();
+    await expect(
+      database.query(
+        'UPDATE spend_limits SET max_input_usd_per_million_tokens=0 WHERE user_id=$1',
+        [OWNER_ID]
+      )
+    ).resolves.toBeTruthy();
+  });
+
+  /*
+   * The three indexes 68 adds, against a table an older athanor filled. Nothing is rewritten, so
+   * what is worth proving is that the reads they exist for actually reach them afterwards - an
+   * index that is registered and never chosen is the defect this whole band is made of.
+   *
+   * `tasks_unindexed_name_idx` is the one with a trap in it. Its predicate holds a constant, so the
+   * planner has to prove the statement's predicate is covered by it - and bound as a parameter that
+   * proof holds only while the plan is a custom one. Both arms are asserted below, because they are
+   * different failures: the plan assertion catches a stamp bump that forgot this migration, and the
+   * generic-plan assertion catches the day something names a prepared statement here.
+   */
+  it('leaves the conversations alone and lets the three reads that scanned them use an index', async () => {
+    await migrateBelow(68);
+    await seedOwner();
+    for (let index = 0; index < 40; index += 1)
+      await addTask(
+        `00000000-0000-4000-8000-0000000${(index + 100).toString().padStart(5, '0')}`,
+        'external',
+        `Conversation ${index}`
+      );
+    const rows = async () =>
+      (
+        await database.query<{ id: string; title: string }>(
+          'SELECT id,title FROM tasks ORDER BY id'
+        )
+      ).rows;
+    const before = await rows();
+    expect(before).toHaveLength(40);
+
+    await apply(68);
+    await database.exec('VACUUM ANALYZE tasks');
+
+    // A schema change, not a rewrite: every conversation is exactly as it was.
+    expect(await rows()).toEqual(before);
+
+    const store = new DataStore(database);
+    const captured: Array<{ sql: string; params: unknown[] }> = [];
+    const probe: Database = {
+      query: async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+        captured.push({ sql, params });
+        return database.query<T>(sql, params);
+      },
+      exec: (sql: string) => database.exec(sql),
+      transaction: (callback) => database.transaction(callback),
+      withAdvisoryLock: <T>(lock: number, callback: () => Promise<T>) =>
+        database.withAdvisoryLock(lock, callback),
+      notify: (channel, payload) => database.notify(channel, payload),
+      listen: (channel, handler) => database.listen(channel, handler),
+      close: async () => undefined
+    };
+    await new DataStore(probe).listTasksMissingNameIndex(500);
+    const statement = captured.find((entry) => entry.sql.includes('name_tsv'))!;
+    expect(statement.params).toEqual([500]);
+    expect(statement.sql).toContain(CONVERSATION_NAME_INDEX_STAMP);
+
+    // Asked with sequential scans disabled, like the sibling assertion on tasks_activity_idx: what
+    // is being measured is whether the predicate can be proven covered at all, not which plan is
+    // cheapest on a fixture of forty rows.
+    await database.exec('SET enable_seqscan = off');
+    const planOf = async (sql: string, params: unknown[]) =>
+      (await database.query<{ 'QUERY PLAN': string }>(`EXPLAIN (COSTS OFF) ${sql}`, params)).rows
+        .map((row) => row['QUERY PLAN'])
+        .join('\n');
+
+    const plan = await planOf(statement.sql, statement.params);
+    expect(plan).toContain('Index Scan using tasks_unindexed_name_idx');
+    // Which is also the assertion that the migration's copy of the stamp is the live one: a bump
+    // that forgot the migration leaves the predicate unprovable and this plan falls back to a sort.
+    expect(plan).not.toContain('Sort Key');
+
+    // And it holds when the server plans without the values in hand. Bound as a parameter the same
+    // read cannot reach this index at all under a generic plan - it falls back to the sort over
+    // every conversation it did before the migration, and would do again the day anything here is
+    // prepared by name. Both are asked with sequential scans still disabled, so the difference is
+    // provability rather than cost.
+    await database.exec('SET plan_cache_mode = force_generic_plan');
+    await database.exec(`PREPARE drain(int) AS ${statement.sql}`);
+    await database.exec(
+      `PREPARE drain_bound(int, text) AS
+       SELECT id, workspace_id, title, prompt_ciphertext FROM tasks
+       WHERE name_tsv IS NULL OR NOT (name_tsv @@ $2::text::tsquery)
+       ORDER BY created_at, id LIMIT $1`
+    );
+    expect(await planOf('EXECUTE drain(500)', [])).toContain(
+      'Index Scan using tasks_unindexed_name_idx'
+    );
+    expect(
+      await planOf(`EXECUTE drain_bound(500, '${CONVERSATION_NAME_INDEX_STAMP}')`, [])
+    ).not.toContain('tasks_unindexed_name_idx');
+    await database.exec('DEALLOCATE drain; DEALLOCATE drain_bound');
+    await database.exec('SET plan_cache_mode = auto');
+
+    // The other two, on the statements they were built for. The notifier's arm enumerated every
+    // terminal conversation the owner has ever had, once per subscribed device, every two seconds;
+    // the sidebar's fold counted every run of every schedule on every page load.
+    const terminal = await planOf(
+      `SELECT t.id FROM tasks t
+       WHERE t.user_id=$1 AND t.status IN ('completed','failed','cancelled')
+         AND COALESCE(t.completed_at,t.updated_at) > NOW() - INTERVAL '14 days'
+         AND (t.status='failed' OR t.schedule_id IS NULL)`,
+      [OWNER_ID]
+    );
+    expect(terminal).toContain('tasks_recent_terminal_idx');
+
+    const fold = await planOf(
+      `SELECT r.schedule_id, COUNT(*)::int FROM tasks r
+       WHERE r.user_id=$1 AND r.schedule_id IS NOT NULL AND NOT r.pinned
+         AND r.archived_at IS NULL
+       GROUP BY r.schedule_id`,
+      [OWNER_ID]
+    );
+    expect(fold).toContain('tasks_schedule_fold_idx');
+    // Index-only, which is the whole of why it is worth having: the fold reads no heap page at all.
+    expect(fold).toContain('Index Only Scan');
+    await database.exec('SET enable_seqscan = on');
+
+    // The rows the drain has to reach are still all of them - the index changed the plan and not
+    // the answer.
+    await expect(store.listTasksMissingNameIndex(500)).resolves.toHaveLength(40);
+  });
+
+  /*
+   * Migration 69 drops five columns and one unique index. A drop has no backfill, so the upgrade
+   * test cannot be "did the statement fill this in" - it is "did the owner lose anything", and the
+   * only way to ask that honestly is to put something in the columns first.
+   *
+   * A replay could not ask it at all. Every row this file's other describes write is written in
+   * today's shape, where these columns do not exist to be filled, so a dropped column is dropped
+   * from an empty place and the test passes whatever the rest of the row does. Here the columns are
+   * written the way a box that ran migration 25 could have had them written - by hand, since no
+   * code path ever did - and the assertion after the drop is that everything beside them survived.
+   *
+   * The unique index is checked separately from the column, because `DROP COLUMN` takes its indexes
+   * with it silently: a migration that dropped only the index, or only the column, would leave the
+   * other half standing and this is the pair of assertions that can tell those apart.
+   */
+  it('drops five columns nothing ever wrote without disturbing the rows that carried them', async () => {
+    await migrateBelow(69);
+    await seedOwner();
+
+    const indexNames = async (table: string) =>
+      (
+        await database.query<{ indexname: string }>(
+          `SELECT indexname FROM pg_indexes WHERE tablename=$1 ORDER BY indexname`,
+          [table]
+        )
+      ).rows.map((row) => row.indexname);
+
+    // Every one of them is there to be lost, and the index is there to police one of them.
+    expect(await hasColumn('workspace_previews', 'custom_domain')).toBe(true);
+    expect(await hasColumn('workspace_previews', 'domain_status')).toBe(true);
+    expect(await hasColumn('workspace_previews', 'domain_verification_hash')).toBe(true);
+    expect(await hasColumn('mem.item', 'trigger_key')).toBe(true);
+    expect(await indexNames('workspace_previews')).toContain(
+      'workspace_previews_custom_domain_idx'
+    );
+
+    await database.query(
+      `INSERT INTO workspace_previews(id,user_id,workspace_id,label,port,slug,access_token_hash,
+         visibility,status,custom_domain,domain_status,domain_verification_hash)
+       VALUES ($1,$2,$3,'Agent app',3000,$4,'hash-a','public','active',
+         'notes.example',  'active','sha-of-a-txt-record')`,
+      ['00000000-0000-4000-8000-0000000000c1', OWNER_ID, SPACE_ID, 'a'.repeat(32)]
+    );
+    await database.query(
+      `INSERT INTO mem.predicate(name,cardinality,is_temporal,description)
+       VALUES ('related_to','many',FALSE,'An untyped association between two entities.')`
+    );
+    await database.query(
+      `INSERT INTO mem.item(id,user_id,workspace_id,kind,status,trust,document_ciphertext,
+         title_tokens,body_tokens,tags_hashed,trigrams,dedupe_key,subject_key,predicate,object_key,
+         trigger_key,indexed)
+       VALUES ($1,$2,$3,'procedure','active','stated',$4::jsonb,'aaaa','bbbb','{}'::text[],
+         '{}'::text[],'dedupe-a','subj-a','related_to','oooo','a-trigger-nobody-minted',TRUE)`,
+      ['00000000-0000-4000-8000-0000000000d1', OWNER_ID, SPACE_ID, sealed]
+    );
+
+    await apply(69);
+
+    expect(await hasColumn('workspace_previews', 'custom_domain')).toBe(false);
+    expect(await hasColumn('workspace_previews', 'domain_status')).toBe(false);
+    expect(await hasColumn('workspace_previews', 'domain_verification_hash')).toBe(false);
+    expect(await hasColumn('mem.item', 'trigger_key')).toBe(false);
+    expect(await indexNames('workspace_previews')).not.toContain(
+      'workspace_previews_custom_domain_idx'
+    );
+
+    // The published site is still published, still reachable by its slug, and still the owner's.
+    const previews = await database.query<{
+      slug: string;
+      label: string;
+      visibility: string;
+      status: string;
+      port: number;
+      user_id: string;
+    }>('SELECT slug,label,visibility,status,port,user_id FROM workspace_previews');
+    expect(previews.rows).toEqual([
+      {
+        slug: 'a'.repeat(32),
+        label: 'Agent app',
+        visibility: 'public',
+        status: 'active',
+        port: 3000,
+        user_id: OWNER_ID
+      }
+    ]);
+
+    // And the remembered procedure is still remembered, still indexed, still on its predicate.
+    const items = await database.query<{ id: string; kind: string; predicate: string }>(
+      'SELECT id,kind,predicate FROM mem.item'
+    );
+    expect(items.rows).toEqual([
+      {
+        id: '00000000-0000-4000-8000-0000000000d1',
+        kind: 'procedure',
+        predicate: 'related_to'
+      }
+    ]);
+
+    // The store agrees with the schema: a record built from the row after the drop no longer
+    // carries the three fields that used to be served as nulls.
+    const store = new DataStore(database);
+    const [preview] = await store.listWorkspacePreviews(OWNER_ID, SPACE_ID);
+    expect(preview).toBeDefined();
+    expect(Object.keys(preview!)).not.toContain('customDomain');
+    expect(Object.keys(preview!)).not.toContain('domainStatus');
+    expect(Object.keys(preview!)).not.toContain('domainVerificationHash');
+  });
+});
+
 describe('task spend on the owner-facing reads', () => {
   let database: Database;
   let store: DataStore;
@@ -4403,6 +6752,139 @@ describe('task spend on the owner-facing reads', () => {
     await expect(store.listTasks(user.id, workspace.id)).resolves.toMatchObject([
       { id: task.id, spentUsd: 0.4 }
     ]);
+  });
+
+  /*
+   * Pinning, filing and renaming return the conversation, and the client writes what comes back
+   * straight into the sidebar row. Both statements used to answer `0 AS queued_message_count` and
+   * to not select spend at all, so `mapTask` produced a record that said no follow-ups were waiting
+   * and nothing had been spent - which the sidebar then believed until the next full reload. The
+   * assertion is against `getTask` rather than against literals, because getTask is where the
+   * correct shape was already written down.
+   */
+  it('answers a pin, a filing and a rename with the counts getTask would give', async () => {
+    const user = await store.createUser({ username: 'filer', displayName: 'Filer' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Filing'));
+    const task = await store.createTask(taskInput(user.id, workspace.id));
+    await store.recordUsage({
+      userId: user.id,
+      workspaceId: workspace.id,
+      taskId: task.id,
+      kind: 'model_inference',
+      resourceClass: 'medium',
+      quantity: 900,
+      unit: 'tokens',
+      credits: 0.2,
+      state: 'settled',
+      idempotencyKey: 'filed-1',
+      costUsd: 3.4
+    });
+    for (const messageId of [
+      '2c0b3b7e-3d4c-4c1e-9f52-2b0f8b9a1d01',
+      '2c0b3b7e-3d4c-4c1e-9f52-2b0f8b9a1d02'
+    ])
+      await store.enqueueTaskMessage({
+        id: messageId,
+        taskId: task.id,
+        userId: user.id,
+        modelId: 'qwen',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 1,
+        resourceClass: 'medium',
+        reservationKey: `task:${task.id}:message:${messageId}:reservation`,
+        promptCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+        queuedEventCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' }
+      });
+    // What the owner is actually looking at, established before anything is asked to reproduce it.
+    await expect(store.getTask(user.id, task.id)).resolves.toMatchObject({
+      queuedMessageCount: 2,
+      spentUsd: 3.4
+    });
+
+    await expect(store.updateTaskFiling(user.id, task.id, { pinned: true })).resolves.toMatchObject(
+      {
+        pinned: true,
+        queuedMessageCount: 2,
+        spentUsd: 3.4
+      }
+    );
+    await expect(
+      store.renameTask(
+        user.id,
+        task.id,
+        { v: 1, iv: 'a', tag: 'b', ciphertext: 'renamed' },
+        UNINDEXED_NAME
+      )
+    ).resolves.toMatchObject({ titleSource: 'owner', queuedMessageCount: 2, spentUsd: 3.4 });
+
+    // Two more statements the same client writes into the same row. The audit named three; these
+    // were found by asking which other statements hand a task back to a caller who then treats it
+    // as the whole record - the security-mode toggle is written into the sidebar list by id, and
+    // the follow-up route returns the row the queue statement produced.
+    await expect(
+      store.updateTaskSecurityMode(user.id, task.id, 'autonomous')
+    ).resolves.toMatchObject({
+      securityMode: 'autonomous',
+      queuedMessageCount: 2,
+      spentUsd: 3.4
+    });
+    const messageId = '2c0b3b7e-3d4c-4c1e-9f52-2b0f8b9a1d03';
+    await expect(
+      store.enqueueTaskMessage({
+        id: messageId,
+        taskId: task.id,
+        userId: user.id,
+        modelId: 'qwen',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 1,
+        resourceClass: 'medium',
+        reservationKey: `task:${task.id}:message:${messageId}:reservation`,
+        promptCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+        queuedEventCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' }
+      })
+    ).resolves.toMatchObject({ queuedMessageCount: 3, spentUsd: 3.4 });
+  });
+
+  /*
+   * The same defect on the third statement, which the owner reaches by writing again to a finished
+   * conversation. Its follow-up queue is empty by construction - a completed task cannot hold one -
+   * so what it has to carry forward is the spend, and it carried zero.
+   */
+  it('answers a follow-up on a finished conversation with the spend it already has', async () => {
+    const user = await store.createUser({ username: 'resumer', displayName: 'Resumer' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Resuming'));
+    const task = await store.createTask(taskInput(user.id, workspace.id));
+    await store.recordUsage({
+      userId: user.id,
+      workspaceId: workspace.id,
+      taskId: task.id,
+      kind: 'model_inference',
+      resourceClass: 'medium',
+      quantity: 400,
+      unit: 'tokens',
+      credits: 0.1,
+      state: 'settled',
+      idempotencyKey: 'resumed-1',
+      costUsd: 1.25
+    });
+    await store.updateTask({ id: task.id, status: 'completed', clearLease: true });
+
+    const continued = await store.continueTask({
+      id: task.id,
+      userId: user.id,
+      modelId: 'qwen',
+      privacyRoute: 'provider_zdr',
+      additionalComputeCredits: 1,
+      agentStateCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'state' },
+      reservationKey: `task:${task.id}:turn:1:reservation`,
+      resourceClass: 'medium',
+      userMessageCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'message' }
+    });
+    expect(continued).toMatchObject({ status: 'queued', queuedMessageCount: 0, spentUsd: 1.25 });
+    await expect(store.getTask(user.id, task.id)).resolves.toMatchObject({
+      queuedMessageCount: continued!.queuedMessageCount,
+      spentUsd: continued!.spentUsd
+    });
   });
 
   /*
@@ -4484,6 +6966,124 @@ describe('task spend on the owner-facing reads', () => {
     const pinned = await store.listTaskPage(user.id, { limit: 10 });
     expect(pinned.tasks.map((task) => task.id)).toContain(runs[0]);
     expect(pinned.scheduleRunCounts).toEqual({ [scheduleId]: 11 });
+  });
+
+  /*
+   * `tasks_activity_idx` carries the sidebar's exact ordering, GREATEST() expression and all, and
+   * migration 51 says in as many words that because of it "the owner's first page never sorts the
+   * whole table". It could not: the index leads on `tasks.user_id` and the statement bound the
+   * owner on the *joined* `workspaces.user_id`, so nothing ever fixed the index's leading column
+   * and the ordering was never satisfiable from it. Page one read and sorted every row the owner
+   * had to return fifty-one of them.
+   *
+   * The plan is asked for with sequential scans disabled, so what is being measured is whether the
+   * ordering can come out of the index at all rather than which plan is cheapest on a table of
+   * twelve rows.
+   */
+  /*
+   * The scoping and the fold index both change how page one is *found* and neither may change what
+   * it *returns*. The owner has conversations in more than one workspace, some of them runs of a
+   * schedule, some pinned, some archived - which is the fixture where an owner filter asked of the
+   * conversation rather than of the workspace it sits in could quietly differ from one asked of the
+   * join, and where an index-only fold could count a different set than the sequential scan did.
+   *
+   * So the page is read once the way the planner wants to read it and once with every index taken
+   * out of its hands, and the two must be the same rows in the same order with the same run counts.
+   */
+  it('returns the same page in the same order however the planner chooses to find it', async () => {
+    const user = await store.createUser({ username: 'spread', displayName: 'Spread' });
+    const other = await store.createUser({ username: 'neighbour', displayName: 'Neighbour' });
+    const spaces = [
+      await store.createWorkspace(workspaceInput(user.id, 'First')),
+      await store.createWorkspace(workspaceInput(user.id, 'Second'))
+    ];
+    const theirs = await store.createWorkspace(workspaceInput(other.id, 'Theirs'));
+    const envelope = { v: 1 as const, iv: 'a', tag: 'b', ciphertext: 'c' };
+    const schedule = await store.createTaskSchedule({
+      userId: user.id,
+      workspaceId: spaces[0]!.id,
+      titleCiphertext: envelope,
+      promptCiphertext: envelope,
+      modelId: 'qwen',
+      privacyRoute: 'provider_zdr',
+      maxComputeCredits: 1,
+      spec: { kind: 'interval', everyMinutes: 15 },
+      nextRunAt: new Date(Date.now() + 60_000)
+    });
+
+    const mine: string[] = [];
+    for (let index = 0; index < 24; index += 1) {
+      const workspace = spaces[index % 2]!;
+      const task = await store.createTask(taskInput(user.id, workspace.id));
+      mine.push(task.id);
+      if (index % 3 === 0)
+        await database.query('UPDATE tasks SET schedule_id=$2 WHERE id=$1', [task.id, schedule.id]);
+      if (index === 5) await store.updateTaskFiling(user.id, task.id, { pinned: true });
+      if (index === 7) await store.updateTaskFiling(user.id, task.id, { archived: true });
+    }
+    // A neighbour's conversation, which must not appear in either reading.
+    const notMine = await store.createTask(taskInput(other.id, theirs.id));
+
+    const page = async () => {
+      const read = await store.listTaskPage(user.id, { limit: 10 });
+      return {
+        ids: read.tasks.map((task) => task.id),
+        counts: read.scheduleRunCounts,
+        cursor: read.nextCursor !== null
+      };
+    };
+    const planned = await page();
+    await database.exec('SET enable_indexscan = off; SET enable_bitmapscan = off');
+    const scanned = await page();
+    await database.exec('SET enable_indexscan = on; SET enable_bitmapscan = on');
+
+    expect(planned.ids).toHaveLength(10);
+    expect(planned.ids).not.toContain(notMine.id);
+    expect(scanned).toEqual(planned);
+    // And the second page agrees too, because the cursor is a position in this exact ordering.
+    const first = await store.listTaskPage(user.id, { limit: 10 });
+    const second = await store.listTaskPage(user.id, { limit: 10, cursor: first.nextCursor });
+    expect(new Set([...first.tasks, ...second.tasks].map((task) => task.id)).size).toBe(20);
+  });
+
+  it('draws the first page of the sidebar from the index that was built for it', async () => {
+    const user = await store.createUser({ username: 'planner', displayName: 'Planner' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Planning'));
+    for (let index = 0; index < 12; index += 1)
+      await store.createTask(taskInput(user.id, workspace.id));
+    await database.exec('ANALYZE tasks');
+
+    let captured: { sql: string; params: unknown[] } | null = null;
+    const probe: Database = {
+      query: async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+        if (sql.includes('schedule_ceiling')) captured = { sql, params };
+        return database.query<T>(sql, params);
+      },
+      exec: (sql: string) => database.exec(sql),
+      transaction: (callback) => database.transaction(callback),
+      withAdvisoryLock: <T>(lock: number, callback: () => Promise<T>) =>
+        database.withAdvisoryLock(lock, callback),
+      notify: (channel, payload) => database.notify(channel, payload),
+      listen: (channel, handler) => database.listen(channel, handler),
+      close: async () => undefined
+    };
+    await new DataStore(probe).listTaskPage(user.id, { limit: 50 });
+
+    await database.exec('SET enable_seqscan = off');
+    const explained = await database.query<{ 'QUERY PLAN': string }>(
+      `EXPLAIN (COSTS OFF) ${captured!.sql}`,
+      captured!.params
+    );
+    await database.exec('SET enable_seqscan = on');
+    const plan = explained.rows.map((row) => row['QUERY PLAN']).join('\n');
+    expect(plan).toMatch(
+      /Index Scan using tasks_activity_idx on tasks t\n\s+Index Cond: \(user_id/
+    );
+    // And the half that costs the owner their opening second: with the ordering coming out of the
+    // index there is nothing left to sort. Before the scope was fixed this plan carried
+    // "Sort Key: t.pinned DESC, (GREATEST(t.updated_at, t.created_at)) DESC, t.id DESC" over a
+    // sequential scan of every conversation on the box.
+    expect(plan).not.toContain('Sort Key: t.pinned');
   });
 
   /**

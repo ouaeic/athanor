@@ -287,9 +287,15 @@ export interface WorkspacePreviewRecord {
   /** Where inside the served port the owner should land; null when its root is the app. */
   entryPath: string | null;
   visibility: 'private' | 'public';
-  customDomain: string | null;
-  domainStatus: 'pending' | 'active' | 'failed' | null;
-  domainVerificationHash: string | null;
+  /*
+   * There is no `customDomain` here, and there are no `domainStatus` or `domainVerificationHash`
+   * beside it. All three were columns on `workspace_previews` from migration 25 that no statement
+   * in this repository ever wrote, lifted onto this record and served on every preview response as
+   * a null - which reads as "no custom domain is configured" rather than as "this build does not do
+   * custom domains". Migration 69 drops the columns, the same way migration 51 dropped
+   * `hosting_mode` from this table for the same reason. If custom domains are built, they arrive
+   * with a writer, a route and a contract field, not with three fields that were already here.
+   */
   status: 'active' | 'revoked';
   expiresAt: string | null;
   lastAccessedAt: string | null;
@@ -348,6 +354,13 @@ export interface SpendLimitsRecord {
   defaultTaskCapUsd: number | null;
   warnAtPercent: number;
   timeZone: string;
+  /**
+   * The owner's price ceiling, as two published rates. The caps above stop a task that is already
+   * spending; these stop an over-priced route being chosen at all. Null is "no ceiling" and zero is
+   * "only a route that publishes no charge", and they are different states.
+   */
+  maxInputUsdPerMillionTokens: number | null;
+  maxOutputUsdPerMillionTokens: number | null;
   updatedAt: string;
 }
 

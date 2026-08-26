@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { MEMORY_KINDS, MEMORY_PACK_QUOTAS, memoryIndexKey, planMemoryQuery } from '@athanor/core';
 import { createDatabase, migrateDatabase, type Database } from './database.js';
@@ -5,7 +6,11 @@ import { DataStore } from './store.js';
 import {
   ALWAYS_ON_REFS,
   MEMORY_EVAL_ITEMS,
+  MEMORY_EVAL_CORPUS_PRESSURE,
   MEMORY_EVAL_PACK_CAPACITY,
+  MEMORY_EVAL_PADDED_PRESSURE,
+  MEMORY_EVAL_PADDING_ITEMS,
+  MEMORY_EVAL_PADDING_SOURCES,
   MEMORY_EVAL_PROBES,
   MEMORY_EVAL_SESSION_PROBES,
   MEMORY_EVAL_SESSION_SEARCH_K,
@@ -13,10 +18,12 @@ import {
   MEMORY_EVAL_UNBOUNDED_QUOTAS,
   formatMemoryEvalReport,
   formatMemoryEvalSearchReport,
+  measureMemoryChannelPressure,
   runMemoryRecallEval,
   runMemorySessionSearchEval,
   runSubstringSessionSearchEval,
   seedMemoryEvalCorpus,
+  seedMemoryEvalPadding,
   type MemoryEvalReport,
   type MemoryEvalSearchReport,
   type MemoryEvalSeed
@@ -41,16 +48,16 @@ import {
  */
 const MIN_PACK_RECALL = 1;
 const MIN_CANDIDATE_RECALL = 1;
-/** Today's 0.445: the answer is around second or third of everything the pack came back with. */
+/** Today's 0.469: the answer is around second or third of everything the pack came back with. */
 const MIN_MRR = 0.43;
-/** Today's 410, against a 6,000 token budget. The budget is not what is keeping this small. */
+/** Today's 364, against a 6,000 token budget. The budget is not what is keeping this small. */
 const MAX_PACK_TOKENS = 450;
 
 /**
  * The controls, which are what make every number above a measurement rather than a statistic.
  *
- * Today: ranked scores 100.0% at MRR 0.445; the same budget filled from the same reachable rows in
- * a seeded arbitrary order scores 16.3% at 0.030; an empty pack scores 7.0%, which is exactly the
+ * Today: ranked scores 100.0% at MRR 0.469; the same budget filled from the same reachable rows in
+ * a seeded arbitrary order scores 12.5% at 0.020; an empty pack scores 7.5%, which is exactly the
  * abstention probes whose correct answer is no pack at all.
  *
  * Committed as ceilings. A control drifting upward means it has stopped controlling - the corpus
@@ -59,14 +66,9 @@ const MAX_PACK_TOKENS = 450;
  */
 const MAX_RANDOM_RECALL = 0.25;
 
-/**
- * Measured, so it is not argued about again: the `entity` and `procedure` quotas reserve 8% and 15%
- * of the pack budget for kinds nothing currently writes, and removing them moves recall not at all,
- * MRR not at all, and the pack by six tokens. Shares only bind when the corpus presses on the
- * budget, and a 410-token pack against 6,000 does not. The quotas are not the reason to write those
- * kinds, and they are not worth deleting either.
- */
+/** Today's 0.020, against the ranked arm's 0.469. */
 const MAX_RANDOM_MRR = 0.08;
+/** Today's 0.075, which is the three abstention probes and nothing else. */
 const MAX_EMPTY_RECALL = 0.12;
 
 describe('memory retrieval eval', () => {
@@ -170,6 +172,7 @@ describe('memory retrieval eval', () => {
     expect(MEMORY_EVAL_ITEMS.length + MEMORY_EVAL_SOURCES.length).toBeGreaterThan(
       MEMORY_EVAL_PACK_CAPACITY
     );
+    expect(packRun.pressure).toBe(MEMORY_EVAL_CORPUS_PRESSURE);
     expect(packRun.pressure).toBeGreaterThan(1);
   });
 
@@ -351,9 +354,27 @@ describe('memory retrieval eval', () => {
         expect(refs.has(ref), `${probe.id} references unknown ${ref}`).toBe(true);
   });
 
+  /**
+   * Which half of a quota is actually deciding anything, measured rather than argued about.
+   *
+   * `MEMORY_PACK_QUOTAS` gives each kind three numbers: a `share` of the token budget, a `cap` on
+   * rows, and a `perSubject` cap. Today they are fact 0.35/25/4, procedure 0.15/5/5, episode
+   * 0.30/8/6 and source 0.20/6/6 - four kinds, because `entity` was removed and is not a
+   * `MemoryKind` any more.
+   *
+   * The shares do not bind, and the padded run is what settles that: at 92x pressure the pack is
+   * 758 tokens of a 6,000 budget, so no kind ever reaches its fraction of it. What selects is the
+   * row caps, which total 44 and are reached on nearly every probe. That is the honest reading of
+   * these four rows - `share` is a ceiling nothing has yet touched, `cap` and `perSubject` are the
+   * pack - and it is the reason the pressured numbers below are worth having: without them this
+   * paragraph would still be describing a corpus that never made any of the three decide.
+   */
   it('gives every declared memory kind a quota, so none can be ranked and then dropped', () => {
     const quota = new Set(MEMORY_PACK_QUOTAS.map((entry) => entry.kind));
     for (const kind of MEMORY_KINDS) expect(quota.has(kind), `no quota for ${kind}`).toBe(true);
+    // The shares are a budget fraction, so they only mean anything while they sum to about one.
+    const shares = MEMORY_PACK_QUOTAS.reduce((total, entry) => total + entry.share, 0);
+    expect(shares).toBeCloseTo(1, 5);
   });
 
   /* --- searching past conversations --------------------------------------- *
@@ -429,4 +450,257 @@ describe('memory retrieval eval', () => {
       }
     }
   });
+});
+
+/* --- the same corpus, under pressure ------------------------------------- *
+ *
+ * Everything above is measured on fifty-one rows against a pack that holds forty-four. That makes
+ * quotas and fusion weights decide something and leaves the three per-channel candidate caps
+ * decided nothing: `MEMORY_LEXICAL_CANDIDATES` takes the top 120 rows a GIN probe matched and
+ * `MEMORY_FUZZY_SCAN_CANDIDATES` scores the top 600, and on fifty-one rows neither can be reached.
+ * A cap that never binds is a selection step nobody has measured - a row cut at the cap is
+ * unreachable at any k, exactly like a row no channel admitted - so every number above was taken
+ * with two of them switched off.
+ *
+ * This block seeds four thousand more rows a workspace of the same age would be carrying and takes
+ * the same measurements again. The corpus, the probes and the gold sets are identical; the only
+ * difference is what the padding does to the ranking.
+ *
+ * What it says, committed below:
+ *
+ *   recall       100%   -> 100%     (40/40 either way)
+ *   mrr          0.469  -> 0.425
+ *   pack tokens  364    -> 758      for the same forty answers
+ *   gold share   13%    -> 6%
+ *   deepest hit  rank 10 -> rank 28
+ *   abstention   3/3    -> 3/3
+ *
+ * The headline is that recall does not move: nothing the padding contributed displaced an answer
+ * out of the pack, and the two caps that finally bind cut rows that were never going to be
+ * returned. What moves is the price and the depth. The pack doubles for the same answers, the share
+ * of it that answers anything halves, and the worst-ranked answer goes from tenth to twenty-eighth
+ * - which is past where an agent reading from the top would have stopped. That is the number this
+ * whole block exists to put a floor under, and it is invisible at fifty-one rows.
+ *
+ * The controls are re-run too, and they separate further rather than less: the random arm falls
+ * from 12.5% to 5.0% because arbitrary rows drawn from four thousand answer even less than
+ * arbitrary rows drawn from fifty-one. A control that got easier to beat as the corpus grew would
+ * have meant the padding was scoring the probes, which is the one way this could have been wrong.
+ */
+describe('memory retrieval eval under pressure', () => {
+  /**
+   * The caps, read out of the statement that owns them rather than copied.
+   *
+   * A literal here would pass forever: raise `MEMORY_FUZZY_SCAN_CANDIDATES` to five thousand and an
+   * assertion that the channel matched more than 600 rows still holds while the cap it was standing
+   * for stopped binding entirely. Reading them means a rename fails loudly - which is the failure
+   * this wants, because a cap that has been renamed is a cap nobody is measuring here any more.
+   */
+  const caps = (() => {
+    const source = readFileSync(new URL('./store/sql/memory.ts', import.meta.url), 'utf8');
+    const read = (name: string): number => {
+      const match = source.match(new RegExp(`const ${name} = ([\\d_]+);`));
+      if (!match)
+        throw new Error(
+          `${name} is no longer declared in store/sql/memory.ts, so the padded run is no longer ` +
+            `measuring the cap it says it measures`
+        );
+      return Number(match[1]!.replace(/_/g, ''));
+    };
+    return {
+      lexical: read('MEMORY_LEXICAL_CANDIDATES'),
+      fuzzyScan: read('MEMORY_FUZZY_SCAN_CANDIDATES')
+    };
+  })();
+
+  /** Recall does not move under pressure, so this is committed at the same place as the unpadded. */
+  const MIN_PADDED_RECALL = 1;
+  /** Today's 0.425, down from 0.469 unpadded: the answer sits a little deeper for the same hit. */
+  const MIN_PADDED_MRR = 0.41;
+  /** Today's 758, against 364 unpadded. The padding is bought entirely in tokens. */
+  const MAX_PADDED_PACK_TOKENS = 800;
+  /** Today's 28, against 12 unpadded - and 28 is past where a reader stops. */
+  const MAX_PADDED_RANK = 30;
+  /** Today's 0.050 and 0.003, both further from the ranked arm than they were unpadded. */
+  const MAX_PADDED_RANDOM_RECALL = 0.12;
+  const MAX_PADDED_RANDOM_MRR = 0.02;
+  /** Today's 0.075: unchanged, because a probe that answers itself does not care how big the store is. */
+  const MAX_PADDED_EMPTY_RECALL = 0.12;
+
+  const paddingRows = MEMORY_EVAL_PADDING_ITEMS + MEMORY_EVAL_PADDING_SOURCES;
+
+  let database: Database;
+  let store: DataStore;
+  let seed: MemoryEvalSeed;
+  let workspaceId: string;
+  let packRun: MemoryEvalReport;
+
+  const key = memoryIndexKey(Buffer.alloc(32, 11));
+  const now = new Date('2026-07-31T08:00:00.000Z');
+
+  const run = async (
+    options: {
+      budgetTokens?: number;
+      maxItems?: number;
+      quotas?: typeof MEMORY_PACK_QUOTAS;
+      pack?: 'ranked' | 'empty' | 'random';
+    } = {}
+  ): Promise<MemoryEvalReport> =>
+    runMemoryRecallEval({ store, workspaceId, key, now, seed, paddingRows, ...options });
+
+  // A second database rather than more rows in the first one: the unpadded numbers above are the
+  // comparison, and they have to be taken on a store the padding never touched.
+  beforeAll(async () => {
+    database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+    await migrateDatabase(database);
+    store = new DataStore(database);
+    const user = await store.createUser({ username: 'eval-owner', displayName: 'Owner' });
+    const workspace = await store.createWorkspace({
+      userId: user.id,
+      name: 'computer',
+      storageLimitBytes: 10 * 1024 ** 3,
+      imageRevision: 'dev',
+      region: 'auto',
+      wrappedKey: 'wrapped'
+    });
+    workspaceId = workspace.id;
+    seed = await seedMemoryEvalCorpus({ store, userId: user.id, workspaceId, key, now });
+    await seedMemoryEvalPadding({ store, userId: user.id, workspaceId, key, now });
+    packRun = await run();
+  }, 300_000);
+
+  afterAll(async () => database.close());
+
+  it('presses the candidate caps that fifty-one rows cannot reach', async () => {
+    // The whole premise. If this fails, the padded numbers below are a second measurement of the
+    // unpadded system and say nothing the block above did not already say.
+    let lexicalItems = 0;
+    let lexicalSources = 0;
+    let fuzzy = 0;
+    let deepest = { lexicalItems: 0, lexicalSources: 0, fuzzyCandidates: 0 };
+    for (const probe of MEMORY_EVAL_PROBES) {
+      const pressure = await measureMemoryChannelPressure({
+        database,
+        workspaceId,
+        plan: planMemoryQuery(probe.question, key)
+      });
+      if (pressure.lexicalItems > caps.lexical) lexicalItems += 1;
+      if (pressure.lexicalSources > caps.lexical) lexicalSources += 1;
+      if (pressure.fuzzyCandidates > caps.fuzzyScan) fuzzy += 1;
+      deepest = {
+        lexicalItems: Math.max(deepest.lexicalItems, pressure.lexicalItems),
+        lexicalSources: Math.max(deepest.lexicalSources, pressure.lexicalSources),
+        fuzzyCandidates: Math.max(deepest.fuzzyCandidates, pressure.fuzzyCandidates)
+      };
+    }
+    const report = JSON.stringify({ caps, over: { lexicalItems, lexicalSources, fuzzy }, deepest });
+    // Today 20 probes press the item lexical channel past 120, 7 press the source channel past it,
+    // and 4 press the fuzzy scan past 600 - the deepest at 1,551, 1,074 and 2,446 rows. Committed
+    // as floors well under those, because what matters is that the caps are reached at all.
+    expect(lexicalItems, report).toBeGreaterThanOrEqual(15);
+    expect(lexicalSources, report).toBeGreaterThanOrEqual(5);
+    expect(fuzzy, report).toBeGreaterThanOrEqual(3);
+    // The fuzzy channel is the one with no other guard: its GIN probe supplies no selectivity, so
+    // without the scan cap this is the number of rows a per-row `unnest` would score per recall.
+    expect(deepest.fuzzyCandidates, report).toBeGreaterThan(caps.fuzzyScan * 2);
+  }, 300_000);
+
+  it('reports the padded corpus it was actually measured on', () => {
+    expect(packRun.pressure).toBe(MEMORY_EVAL_PADDED_PRESSURE(paddingRows));
+    // Fifty times what the unpadded run was measured at, which is the point of the whole block.
+    expect(packRun.pressure).toBeGreaterThan(MEMORY_EVAL_CORPUS_PRESSURE * 50);
+    // `writeCost` stays the corpus's: it is the price of writing the rows the probes ask about, and
+    // adding four thousand rows nobody asks about to it would report a slower write path than the
+    // one the unpadded run measured, for no change to the write path at all.
+    expect(packRun.writeCost.items).toBe(MEMORY_EVAL_ITEMS.length);
+    expect(packRun.writeCost.sources).toBe(MEMORY_EVAL_SOURCES.length);
+  });
+
+  it('keeps every answer it had, and pays about twice as much for them', () => {
+    expect(packRun.recall, formatMemoryEvalReport(packRun)).toBeGreaterThanOrEqual(
+      MIN_PADDED_RECALL
+    );
+    expect(packRun.leaks).toEqual([]);
+    expect(packRun.packTokens, formatMemoryEvalReport(packRun)).toBeLessThanOrEqual(
+      MAX_PADDED_PACK_TOKENS
+    );
+    // And it really is more expensive than the unpadded pack, or the two runs are the same run and
+    // one of these blocks is measuring the other's corpus.
+    expect(packRun.packTokens, formatMemoryEvalReport(packRun)).toBeGreaterThan(MAX_PACK_TOKENS);
+  });
+
+  it('ranks the answer deeper, which is the cost that recall alone hides', () => {
+    expect(packRun.mrr, formatMemoryEvalReport(packRun)).toBeGreaterThanOrEqual(MIN_PADDED_MRR);
+    for (const probe of packRun.probes)
+      if (probe.hit && probe.rank !== null)
+        expect(probe.rank, `${probe.id} answered at rank ${probe.rank}`).toBeLessThanOrEqual(
+          MAX_PADDED_RANK
+        );
+    // The regression the small corpus could not have caught: the owner's nine facts are still
+    // separated by the words of the question and not by four thousand rows of noise.
+    const language = packRun.probes.find((entry) => entry.id === 'owner-language');
+    expect(language?.missed).toEqual([]);
+    expect(language?.rank ?? Infinity).toBeLessThanOrEqual(4);
+  });
+
+  it('still answers nothing to a question the store cannot answer', () => {
+    // The failure mode padding is most likely to cause, and the one that would be worst: four
+    // thousand plausible rows are four thousand near misses, and a pack that starts returning them
+    // for "what is the capital city of Peru" costs the owner tokens on every unanswerable question.
+    const abstentions = packRun.probes.filter((probe) => probe.type === 'abstention');
+    expect(abstentions.length).toBeGreaterThan(0);
+    for (const probe of abstentions) {
+      expect(probe.hit, `${probe.id} returned ${probe.returned} rows`).toBe(true);
+      expect(probe.returned).toBeLessThanOrEqual(ALWAYS_ON_REFS.size);
+    }
+  });
+
+  it('holds the known gap open at scale too', () => {
+    const known = MEMORY_EVAL_PROBES.filter((probe) => probe.expectedMiss);
+    expect(packRun.expectedMisses).toEqual(known.map((probe) => probe.id));
+    const byId = new Map(packRun.probes.map((probe) => [probe.id, probe]));
+    for (const probe of known)
+      expect(
+        byId.get(probe.id)?.hit,
+        `${probe.id} now hits under pressure - drop its expectedMiss`
+      ).toBe(false);
+  });
+
+  it('beats an unranked pack by more at four thousand rows than at fifty-one', async () => {
+    const empty = await run({ pack: 'empty' });
+    const random = await run({ pack: 'random' });
+    const answerable = MEMORY_EVAL_PROBES.filter((probe) => probe.gold.length > 0).map(
+      (probe) => probe.id
+    );
+    expect(
+      empty.probes.filter((result) => result.hit && answerable.includes(result.id)),
+      'a probe that scores with no pack is measuring its own question'
+    ).toEqual([]);
+    expect(random.recall).toBeLessThan(packRun.recall);
+    expect(random.mrr).toBeLessThan(packRun.mrr);
+    expect(random.recall).toBeLessThan(MAX_PADDED_RANDOM_RECALL);
+    expect(random.mrr).toBeLessThan(MAX_PADDED_RANDOM_MRR);
+    expect(empty.recall).toBeLessThan(MAX_PADDED_EMPTY_RECALL);
+    // The separation has to widen with the corpus, not narrow: a random arm that improved as rows
+    // were added would mean the padding is answering the probes rather than competing with them.
+    expect(random.recall).toBeLessThan(MAX_RANDOM_RECALL);
+  }, 300_000);
+
+  it('admits every gold row into some channel with the caps binding', async () => {
+    // The ceiling run, repeated under pressure, because this is where the caps could actually cost
+    // an answer: quotas and the budget are lifted, so anything missing here was cut by a candidate
+    // cap or by admission, and the two are the same kind of loss from the pack's point of view.
+    const result = await run({
+      budgetTokens: 1_000_000,
+      maxItems: 200,
+      quotas: MEMORY_EVAL_UNBOUNDED_QUOTAS
+    });
+    expect(result.recall, formatMemoryEvalReport(result)).toBeGreaterThanOrEqual(
+      MIN_CANDIDATE_RECALL
+    );
+    const admitted = new Map(result.probes.map((probe) => [probe.id, probe]));
+    for (const probe of MEMORY_EVAL_PROBES.filter((probe) => probe.expectedMiss))
+      expect(admitted.get(probe.id)?.found, formatMemoryEvalReport(result)).toEqual([]);
+    expect(result.packTokens).toBeGreaterThan(packRun.packTokens);
+  }, 300_000);
 });

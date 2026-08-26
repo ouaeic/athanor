@@ -6,7 +6,15 @@ import {
   buildMemorySourceIndex,
   planMemoryQuery
 } from '@athanor/core';
-import type { EncryptedEnvelope, MemoryKind, MemoryPackQuota, MemoryTrust } from '@athanor/core';
+import { MEMORY_FUZZY_SIMILARITY_THRESHOLD } from '@athanor/core';
+import type {
+  EncryptedEnvelope,
+  MemoryKind,
+  MemoryPackQuota,
+  MemoryQueryPlan,
+  MemoryTrust
+} from '@athanor/core';
+import type { Database } from './database.js';
 import type { DataStore, RecallMemoryInput } from './store.js';
 
 /* ------------------------------------------------------------------------ *
@@ -1169,6 +1177,16 @@ export const MEMORY_EVAL_PACK_CAPACITY = MEMORY_PACK_QUOTAS.reduce(
 export const MEMORY_EVAL_CORPUS_PRESSURE =
   (MEMORY_EVAL_ITEMS.length + MEMORY_EVAL_SOURCES.length) / MEMORY_EVAL_PACK_CAPACITY;
 
+/**
+ * The same ratio with the padding corpus counted, which is the one that reaches the candidate caps.
+ *
+ * Kept as a separate constant rather than folded into the one above: the unpadded number is what
+ * the committed unpressured figures were measured at, and a reader comparing the two runs needs
+ * both denominators visible rather than one that changed underneath them.
+ */
+export const MEMORY_EVAL_PADDED_PRESSURE = (paddingRows: number): number =>
+  MEMORY_EVAL_CORPUS_PRESSURE + paddingRows / MEMORY_EVAL_PACK_CAPACITY;
+
 /** Wide enough that no quota selects anything out, so a run under them measures admission alone. */
 export const MEMORY_EVAL_UNBOUNDED_QUOTAS: readonly MemoryPackQuota[] = MEMORY_PACK_QUOTAS.map(
   (quota) => ({ ...quota, share: 1, cap: 1_000, perSubject: 1_000 })
@@ -1300,6 +1318,330 @@ export const seedMemoryEvalCorpus = async (input: {
   };
 };
 
+/* ------------------------------------------------------------------------ *
+ * Padding: the same corpus, under pressure
+ *
+ * The corpus above is fifty-one rows. That is enough to make quotas, the prior and the fusion
+ * weights decide something - the pack holds forty-four - and it is nowhere near enough to make the
+ * three per-channel candidate caps decide anything at all. `MEMORY_LEXICAL_CANDIDATES` takes the
+ * top 120 rows a GIN probe matched and `MEMORY_FUZZY_SCAN_CANDIDATES` scores the top 600 a trigram
+ * probe matched; on fifty-one rows neither can ever be reached, so every number the eval commits is
+ * measured with the two caps switched off. They are the mitigation for "ranking gets slow at scale"
+ * and they are also a selection step: a row cut at the cap is unreachable at any k, exactly like a
+ * row no channel admitted, and nothing above would notice the difference.
+ *
+ * So the corpus is seeded a second time with several thousand rows that a real workspace of the
+ * same age would be carrying - other services, other ports, other paths, other incidents - and the
+ * committed numbers are measured twice. The padding is plausible and irrelevant on purpose: it is
+ * written in the register the probes are asked in, so it competes for the caps and for the pack,
+ * and it answers nothing, so a probe it displaces is a probe the retrieval genuinely lost.
+ *
+ * Every string here is a pure function of its index. A padding corpus drawn from a random source
+ * would move the committed numbers between runs, which is the same defect `evalRowId` was written
+ * to fix one level down.
+ * ------------------------------------------------------------------------ */
+
+/** Invented, and deliberately sharing no name with anything the probes ask about. */
+const PADDING_SERVICES: readonly string[] = [
+  'ingest',
+  'shipper',
+  'collector',
+  'warden',
+  'ledger',
+  'courier',
+  'beacon',
+  'tallier',
+  'sifter',
+  'harbour',
+  'anvil',
+  'loom',
+  'quarry',
+  'trellis',
+  'lantern',
+  'ferry',
+  'kiln',
+  'orchard',
+  'pantry',
+  'mill'
+];
+
+const PADDING_HOSTS: readonly string[] = [
+  '10.4.2.11',
+  '10.4.2.12',
+  '10.4.7.3',
+  '10.9.1.40',
+  '192.168.14.6',
+  '127.0.0.1',
+  '10.4.2.31',
+  '10.11.0.2'
+];
+
+const PADDING_ROOTS: readonly string[] = [
+  '/var/lib',
+  '/var/log',
+  '/opt/local/share',
+  '/srv/data',
+  '/var/spool',
+  '/opt/state'
+];
+
+/**
+ * Only predicates `MEMORY_PREDICATES` declares, because `mem.item.predicate` is a foreign key into
+ * the predicate table. An invented one is rejected by the schema, which is the schema working.
+ */
+const PADDING_PREDICATES: readonly string[] = [
+  'runs_on',
+  'located_at',
+  'uses_tool',
+  'related_to',
+  'project_status'
+];
+
+const PADDING_TEAMS: readonly string[] = ['team-blue', 'team-amber', 'team-slate', 'team-fern'];
+
+const PADDING_STATUSES: readonly string[] = [
+  'still being drained',
+  'waiting on a rebuild',
+  'running in one region only',
+  'paused until the next window'
+];
+
+/**
+ * Index-driven selection with coprime strides rather than a generator.
+ *
+ * A pseudorandom stream would be reproducible too, but only as long as nobody inserts a row above
+ * it; strides keep every padding row a function of its own index alone, so the corpus can be grown
+ * or shrunk and the rows that remain are the rows that were there before.
+ */
+const pick = <T>(values: readonly T[], index: number, stride: number): T =>
+  values[(index * stride + stride) % values.length]!;
+
+/**
+ * How much padding. Sized off the caps rather than picked for roundness: the fuzzy scan cap is 600,
+ * and a cap only measures something once the channel it caps has more rows than it will take, so
+ * the item count is several times that. The source count is what puts `lex_src`'s 120 out of reach.
+ */
+export const MEMORY_EVAL_PADDING_ITEMS = 2_400;
+export const MEMORY_EVAL_PADDING_SOURCES = 1_600;
+export const MEMORY_EVAL_PADDING_CONVERSATIONS = 40;
+
+const pad3 = (value: number): string => String(value % 1000).padStart(3, '0');
+
+/**
+ * Five consecutive indices are one service: three facts under three different predicates, a
+ * runbook and an incident.
+ *
+ * The grouping is what makes the padding press on the parts of the pack that select rather than
+ * only on the parts that rank. `mem.item` carries a unique index over (workspace, subject,
+ * predicate) for current facts, so a subject repeated under one predicate is rejected outright; a
+ * subject repeated under different ones is what the per-subject cap exists for.
+ */
+const paddingGroup = (index: number): number => Math.floor(index / 5);
+
+/** A padding service's name, which is what its rows are about and what nothing asks for. */
+const paddingUnit = (index: number): string => {
+  const group = paddingGroup(index);
+  return `svc-${pick(PADDING_SERVICES, group, 7)}-${String(group % 10_000).padStart(4, '0')}`;
+};
+
+/**
+ * One padding item. Facts outnumber the rest roughly as they do in a store that has been written
+ * to by the extraction path, because the quota that has to decide under pressure is the fact quota.
+ */
+export const memoryEvalPaddingItem = (index: number): MemoryEvalItem => {
+  const unit = paddingUnit(index);
+  const host = pick(PADDING_HOSTS, index, 3);
+  const port = 9000 + (index % 900);
+  const root = pick(PADDING_ROOTS, index, 5);
+  const path = `${root}/${pick(PADDING_SERVICES, index, 11)}/${pad3(index % 89)}`;
+  const ref = `pad-${pad3(Math.floor(index / 1000))}${pad3(index)}`;
+  const daysAgo = 5 + (index % 700);
+  const shape = index % 5;
+  if (shape <= 2) {
+    // Rotated by group so the three facts a service carries differ from each other and the corpus
+    // as a whole still gets every predicate, rather than three of the five appearing everywhere.
+    const predicate =
+      PADDING_PREDICATES[(shape + paddingGroup(index)) % PADDING_PREDICATES.length]!;
+    const object =
+      predicate === 'runs_on'
+        ? `${host}:${port}`
+        : predicate === 'located_at'
+          ? path
+          : predicate === 'uses_tool'
+            ? paddingUnit(index + 13)
+            : predicate === 'related_to'
+              ? pick(PADDING_TEAMS, index, 3)
+              : pick(PADDING_STATUSES, index, 3);
+    const body =
+      predicate === 'runs_on'
+        ? `${unit} listens on ${host}:${port} and is restarted by the supervisor when its ` +
+          `health probe fails twice in a row.`
+        : predicate === 'located_at'
+          ? `${unit} writes its working set to ${path} and prunes anything older than ` +
+            `${14 + (index % 60)} days.`
+          : predicate === 'uses_tool'
+            ? `${unit} will not start until ${object} is accepting connections on its socket.`
+            : predicate === 'related_to'
+              ? `${unit} is looked after by ${object}; changes to its unit file go through ` +
+                `them first.`
+              : `${unit} is ${object}: the migration off the old queue format is what is left.`;
+    return {
+      ref,
+      kind: 'fact',
+      title: `${unit} ${predicate === 'runs_on' ? 'listen address' : 'storage'}`,
+      subject: unit,
+      object,
+      predicate,
+      body,
+      daysAgo
+    };
+  }
+  if (shape === 3)
+    return {
+      ref,
+      kind: 'procedure',
+      title: `restart ${unit}`,
+      tags: [pick(PADDING_SERVICES, index, 11), 'runbook'],
+      body:
+        `To restart ${unit}: drain its queue, stop the unit, wait for ${path} to settle, then ` +
+        `start it again and confirm the health probe on ${host}:${port} answers within ` +
+        `${5 + (index % 25)} seconds.`,
+      daysAgo
+    };
+  return {
+    ref,
+    kind: 'episode',
+    title: `${unit} stalled`,
+    body:
+      `${unit} stopped accepting work for ${3 + (index % 40)} minutes after the host clock ` +
+      `stepped backwards. The queue at ${path} drained once the unit was restarted, and nothing ` +
+      `downstream of ${host}:${port} noticed.`,
+    daysAgo
+  };
+};
+
+/** One padding turn, grouped into conversations so the verbatim channel is under pressure too. */
+export const memoryEvalPaddingSource = (index: number): MemoryEvalSource => {
+  const unit = paddingUnit(index);
+  const host = pick(PADDING_HOSTS, index, 3);
+  const port = 9000 + (index % 900);
+  const root = pick(PADDING_ROOTS, index, 5);
+  const role = index % 3 === 0 ? 'user' : index % 3 === 1 ? 'assistant' : 'tool';
+  const body =
+    role === 'user'
+      ? `${unit} looks slow again, can you see what it is waiting on`
+      : role === 'assistant'
+        ? `${unit} was blocked on ${root} filling up. I pruned the oldest ${10 + (index % 50)} ` +
+          `files and it started answering on ${host}:${port} again.`
+        : `systemctl status ${unit}\n  active (running) since ${1 + (index % 28)}h ago\n  ` +
+          `listening on ${host}:${port}`;
+  return {
+    ref: `padsrc-${pad3(Math.floor(index / 1000))}${pad3(index)}`,
+    body,
+    role,
+    conversation: `pad-conversation-${pad3(index % MEMORY_EVAL_PADDING_CONVERSATIONS)}`,
+    daysAgo: 5 + (index % 700)
+  };
+};
+
+export interface MemoryEvalPadding {
+  readonly items: number;
+  readonly sources: number;
+  readonly millis: number;
+}
+
+/**
+ * Writes the padding into a store that already holds the corpus, through the same public methods.
+ *
+ * Facts go in through `createMemoryItem` rather than `recordMemoryFact`: every padding subject is
+ * distinct, so there is nothing for supersession to retire, and 2,400 transactions to prove that is
+ * most of a minute of test time for no assertion.
+ */
+export const seedMemoryEvalPadding = async (input: {
+  store: DataStore;
+  userId: string;
+  workspaceId: string;
+  key: Uint8Array;
+  now: Date;
+  items?: number;
+  sources?: number;
+}): Promise<MemoryEvalPadding> => {
+  const started = process.hrtime.bigint();
+  const items = input.items ?? MEMORY_EVAL_PADDING_ITEMS;
+  const sources = input.sources ?? MEMORY_EVAL_PADDING_SOURCES;
+
+  for (let index = 0; index < items; index += 1) {
+    const item = memoryEvalPaddingItem(index);
+    const observedAt = daysBefore(input.now, item.daysAgo);
+    await input.store.createMemoryItem({
+      id: evalRowId(item.ref),
+      userId: input.userId,
+      workspaceId: input.workspaceId,
+      kind: item.kind,
+      trust: 'stated',
+      documentCiphertext: seal(item.body),
+      index: buildMemoryItemIndex(
+        {
+          title: item.title ?? null,
+          tags: item.tags ?? [],
+          body: item.body,
+          subject: item.subject ?? null,
+          object: item.object ?? null
+        },
+        input.key
+      ),
+      predicate: item.predicate ?? null,
+      observedAt,
+      validFrom: observedAt,
+      lastVerified: item.kind === 'procedure' ? observedAt : null
+    });
+  }
+
+  const conversations = new Map<string, string>();
+  const turnsSoFar = new Map<string, number>();
+  for (let index = 0; index < sources; index += 1) {
+    const source = memoryEvalPaddingSource(index);
+    let taskId = conversations.get(source.conversation);
+    if (!taskId) {
+      const conversationTask = await input.store.createTask({
+        userId: input.userId,
+        workspaceId: input.workspaceId,
+        modelId: 'eval-model',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 0,
+        titleCiphertext: { v: 1, iv: 'eval', tag: 'eval', ciphertext: source.conversation },
+        promptCiphertext: { v: 1, iv: 'eval', tag: 'eval', ciphertext: source.conversation },
+        nameIndex: { nameTokens: '', openingTokens: '' }
+      });
+      taskId = conversationTask.id;
+      conversations.set(source.conversation, taskId);
+    }
+    const turn = turnsSoFar.get(source.conversation) ?? 0;
+    turnsSoFar.set(source.conversation, turn + 1);
+    const sourceIndex = buildMemorySourceIndex(source.body, input.key);
+    await input.store.createMemorySource({
+      id: evalRowId(source.ref),
+      userId: input.userId,
+      workspaceId: input.workspaceId,
+      channel: source.role === 'tool' ? 'terminal' : 'chat',
+      role: source.role,
+      taskId,
+      bodyCiphertext: seal(source.body),
+      bodyTokens: sourceIndex.bodyTokens,
+      tokensEst: sourceIndex.tokensEst,
+      indexed: sourceIndex.indexed,
+      occurredAt: new Date(daysBefore(input.now, source.daysAgo).getTime() + turn * 60_000)
+    });
+  }
+
+  // Document frequency drives every BM25 weight in the recall query, and the padding is most of the
+  // corpus now: reading unreconciled counts would score the probes against a workspace that does
+  // not exist.
+  await input.store.rebuildMemoryCorpusStats(input.workspaceId);
+
+  return { items, sources, millis: Number(process.hrtime.bigint() - started) / 1e6 };
+};
+
 /**
  * A row's id, derived from its ref rather than minted.
  *
@@ -1352,6 +1694,14 @@ export const runMemoryRecallEval = async (input: {
    * decoration.
    */
   pack?: 'ranked' | 'empty' | 'random';
+  /**
+   * Padding rows sharing the workspace, counted into `pressure` and nothing else.
+   *
+   * The probes and the gold sets are identical across a padded and an unpadded run - that is what
+   * makes the two sets of numbers comparable - so the only thing the report can say about the
+   * padding is how much of it there was.
+   */
+  paddingRows?: number;
 }): Promise<MemoryEvalReport> => {
   const byRef = input.seed.ids;
   const refOf = new Map([...byRef].map(([ref, id]) => [id, ref]));
@@ -1497,7 +1847,7 @@ export const runMemoryRecallEval = async (input: {
     mrr: mean(costed.map((result) => (result.rank === null ? 0 : 1 / result.rank))),
     packTokens: spent,
     goldShare: spent === 0 ? 0 : mean(costed.map((result) => result.goldTokens)) / spent,
-    pressure: MEMORY_EVAL_CORPUS_PRESSURE,
+    pressure: MEMORY_EVAL_PADDED_PRESSURE(input.paddingRows ?? 0),
     byType,
     misses: scored.filter((result) => !result.hit).map((result) => result.id),
     expectedMisses: [...expectedMisses],
@@ -1775,4 +2125,68 @@ export const formatMemoryEvalSearchReport = (
   const missed = report.probes.filter((probe) => probe.found.length === 0).map((probe) => probe.id);
   if (missed.length > 0) lines.push(`  missed: ${missed.join(', ')}`);
   return lines.join('\n');
+};
+
+/* ------------------------------------------------------------------------ *
+ * Do the candidate caps bind?
+ *
+ * The three caps inside `MEMORY_RECALL_SQL` are invisible from outside it: a channel that took the
+ * top 120 of 40,000 rows and a channel that took all 40 it matched return the same shape, and the
+ * only difference is that the first one silently dropped rows the second one would have ranked. So
+ * the padded run needs a way to say "the cap was reached" that is not "the numbers got worse".
+ *
+ * This counts, per probe, how many rows each capped channel's admission predicate matches before
+ * its LIMIT applies. It restates three WHERE clauses rather than sharing them, which is the one
+ * thing this file otherwise refuses to do - but the statements are constants that the eval exists
+ * to police, and a diagnostic that imported the same expression it is measuring would report that
+ * the caps bind whatever the statement said. If the counts drift from the recall query's own
+ * admission, that is a divergence worth failing on, not a duplication worth removing.
+ * ------------------------------------------------------------------------ */
+
+export interface MemoryChannelPressure {
+  /** Rows `lex_item` would rank before `MEMORY_LEXICAL_CANDIDATES` cuts it. */
+  readonly lexicalItems: number;
+  /** Rows `lex_src` would rank before the same cap cuts it. */
+  readonly lexicalSources: number;
+  /** Rows `trg_cand` would score before `MEMORY_FUZZY_SCAN_CANDIDATES` cuts it. */
+  readonly fuzzyCandidates: number;
+}
+
+export const measureMemoryChannelPressure = async (input: {
+  database: Database;
+  workspaceId: string;
+  plan: MemoryQueryPlan;
+}): Promise<MemoryChannelPressure> => {
+  const result = await input.database.query<{
+    lexical_items: string | number;
+    lexical_sources: string | number;
+    fuzzy_candidates: string | number;
+  }>(
+    `WITH q AS (
+       SELECT $1::uuid AS ws,
+              NULLIF(array_to_string($2::text[], ' | '), '')::tsquery AS ts,
+              $3::text[] AS q_trg,
+              $4::float8 AS threshold
+     )
+     SELECT
+       (SELECT count(*) FROM mem.item i, q
+          WHERE i.workspace_id = q.ws AND i.status = 'active' AND i.trust <> 'inferred'
+            AND i.tsv @@ q.ts) AS lexical_items,
+       (SELECT count(*) FROM mem.source s, q
+          WHERE s.workspace_id = q.ws AND s.indexed AND s.tsv @@ q.ts) AS lexical_sources,
+       (SELECT count(*) FROM mem.item i, q
+          WHERE i.workspace_id = q.ws AND i.status = 'active' AND i.trust <> 'inferred'
+            AND cardinality(q.q_trg) > 0
+            AND i.trigrams && q.q_trg
+            AND i.trigram_len >= q.threshold * cardinality(q.q_trg)
+            AND i.trigram_len * q.threshold <= cardinality(q.q_trg)) AS fuzzy_candidates
+     FROM q`,
+    [input.workspaceId, input.plan.lexemes, input.plan.trigrams, MEMORY_FUZZY_SIMILARITY_THRESHOLD]
+  );
+  const row = result.rows[0]!;
+  return {
+    lexicalItems: Number(row.lexical_items),
+    lexicalSources: Number(row.lexical_sources),
+    fuzzyCandidates: Number(row.fuzzy_candidates)
+  };
 };

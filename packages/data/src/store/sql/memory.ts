@@ -1,0 +1,387 @@
+/**
+ * The three statements the tiered memory layer runs, and the caps written into them.
+ *
+ * Recall, verbatim search and the window around a hit are one enormous piece of SQL each, on
+ * purpose - fusion, quotas and the token budget are all evaluated in the database, so nothing is
+ * sorted or trimmed in the application. That makes them the longest and least readable stretch of
+ * `store.ts` and simultaneously the part of it least connected to the rest: they are constants.
+ *
+ * They are also the part where a single altered character would still be valid SQL and would
+ * simply answer differently, which nothing in the type system can see. What sees it is
+ * `memory-eval.test.ts`: it commits recall, MRR and pack tokens for a fixed corpus against these
+ * exact statements through the real `DataStore`, so a transcription error here moves a committed
+ * number rather than passing quietly.
+ */
+
+/** Retrieval never invents a scope: everything a caller can widen is a bound parameter. */
+const MEMORY_ITEM_ADMISSIBLE = `
+      i.workspace_id = q.ws
+      AND (i.status = 'active'
+           OR (q.want_superseded AND i.status IN ('superseded','disputed'))
+           OR (q.scope = 'archive' AND i.status = 'archived'))
+      AND (q.want_inferred OR i.trust <> 'inferred') -- want_inferred is pinned false
+      AND (q.kinds IS NULL OR i.kind::text = ANY(q.kinds))
+      -- Rows the caller already holds. An agent-initiated recall passes the ids its frozen pack
+      -- printed, so the answer it did not get the first time is not paid for a second time - and it
+      -- is excluded here, before a channel spends one of its capped slots on it, rather than after.
+      AND NOT (i.id = ANY(q.exclude))
+      AND (q.as_of IS NULL
+           OR (i.valid_from <= q.as_of AND (i.valid_to IS NULL OR i.valid_to > q.as_of)))`;
+
+// Each channel is capped before anything is sorted: BM25 is only ever evaluated over the rows a
+// GIN probe already matched, which is the entire mitigation for "ranking gets slow at scale".
+const MEMORY_LEXICAL_CANDIDATES = 120;
+const MEMORY_FUZZY_CANDIDATES = 40;
+/**
+ * How many rows the fuzzy channel may compute an exact Jaccard score for. Array overlap is
+ * satisfied by a single shared trigram, so the GIN probe generates candidates but no selectivity;
+ * without this cap the per-row `unnest` scored the whole corpus on every recall and grew linearly
+ * with it. Fifteen times the number of rows the channel can contribute is ample headroom.
+ */
+const MEMORY_FUZZY_SCAN_CANDIDATES = 600;
+const MEMORY_STRUCTURAL_CANDIDATES = 40;
+/** Sources older than this stop competing with the curated overlay for the lexical slot. */
+const MEMORY_SOURCE_HORIZON_YEARS = 3;
+
+/**
+ * How many of the request's terms become tsquery branches.
+ *
+ * Every branch is its own GIN posting-list probe, so this is the one place recall cost is linear in
+ * question length. The client now hands over the whole request rather than a pseudorandom sample of
+ * it (see `planMemoryQuery`), which is what makes choosing here worth doing: the database is the
+ * only party that knows document frequency, so it keeps the rarest - most discriminative - terms
+ * and drops the ones a hundred rows already share.
+ */
+const MEMORY_QUERY_TERMS = 32;
+
+/**
+ * The `terms` CTE, shared by item recall and verbatim search.
+ *
+ * `mem.lexeme_df` holds one row per lexeme the workspace has ever indexed, so a term missing from
+ * it appears in no document and cannot match anything. Those terms sort last rather than being
+ * filtered out: they cost nothing (a tsquery branch that matches no row) and never displace a term
+ * that could match. Among terms that do exist, ascending document frequency is exactly the
+ * discriminative order.
+ */
+const MEMORY_TERMS_CTE = `
+terms AS (
+  SELECT t.lexeme, COALESCE(d.df, 1)::float8 AS df
+  FROM q CROSS JOIN unnest($2::text[]) AS t(lexeme)
+  LEFT JOIN mem.lexeme_df d ON d.workspace_id = q.ws AND d.lexeme = t.lexeme
+  ORDER BY (d.df IS NULL) ASC, COALESCE(d.df, 1) ASC, t.lexeme ASC
+  LIMIT ${MEMORY_QUERY_TERMS}
+),
+qq AS (
+  SELECT array_agg(t.lexeme ORDER BY t.lexeme) AS q_lex,
+         array_agg(ln(1 + GREATEST(s.n_docs - t.df + 0.5, 0.0) / (t.df + 0.5))
+                   ORDER BY t.lexeme) AS q_idf,
+         NULLIF(string_agg(t.lexeme, ' | ' ORDER BY t.lexeme), '')::tsquery AS q_ts
+  FROM terms t CROSS JOIN stats s
+)`;
+
+/**
+ * One statement: five capped recall channels, weighted reciprocal-rank fusion, a multiplicative
+ * provenance/recency/salience prior, per-kind quotas and the token budget. Nothing is sorted in
+ * the application, and the result already respects the budget it was asked for.
+ *
+ * The final ORDER BY is (kind, id), not score: the pack sits behind a prompt-cache breakpoint, so
+ * the same set of rows must always render to the same bytes. `score` is returned for callers that
+ * want relevance order for an interactive recall.
+ */
+export const MEMORY_RECALL_SQL = `
+WITH q AS (
+  SELECT $1::uuid AS ws, $3::text[] AS q_trg, $4::text[] AS q_ents, $5::text[] AS q_tags,
+         $6::timestamptz AS t_now, $7::bool AS temporal_intent, $8::bool AS want_inferred,
+         $9::bool AS want_superseded, $12::timestamptz AS as_of, $13::text[] AS kinds,
+         $14::text AS scope, $23::uuid[] AS exclude
+),
+stats AS (
+  SELECT GREATEST(COALESCE(c.n_docs, 1), 1)::float8 AS n_docs,
+         GREATEST(COALESCE(c.sum_len::float8 / NULLIF(c.n_docs, 0), 1), 1)::float8 AS avg_len
+  FROM q LEFT JOIN mem.corpus_stats c ON c.workspace_id = q.ws
+),
+${MEMORY_TERMS_CTE},
+lex_item AS (
+  SELECT id, row_number() OVER (ORDER BY s DESC, id) AS r FROM (
+    SELECT i.id, mem.bm25(qq.q_lex, qq.q_idf, i.tsv, i.tsv_len, st.avg_len) AS s
+    FROM mem.item i CROSS JOIN q CROSS JOIN qq CROSS JOIN stats st
+    WHERE ${MEMORY_ITEM_ADMISSIBLE}
+      AND i.tsv @@ qq.q_ts
+    ORDER BY s DESC, i.id
+    LIMIT ${MEMORY_LEXICAL_CANDIDATES}
+  ) t
+),
+lex_src AS (
+  SELECT id, row_number() OVER (ORDER BY s DESC, id) AS r FROM (
+    SELECT sc.id, mem.bm25(qq.q_lex, qq.q_idf, sc.tsv, sc.tsv_len, st.avg_len) AS s
+    FROM mem.source sc CROSS JOIN q CROSS JOIN qq CROSS JOIN stats st
+    WHERE sc.workspace_id = q.ws AND sc.indexed AND sc.tsv @@ qq.q_ts
+      AND (q.kinds IS NULL OR 'source' = ANY(q.kinds))
+      AND NOT (sc.id = ANY(q.exclude))
+      AND sc.occurred_at > q.t_now - make_interval(years => ${MEMORY_SOURCE_HORIZON_YEARS})
+    ORDER BY s DESC, sc.id
+    LIMIT ${MEMORY_LEXICAL_CANDIDATES}
+  ) t
+),
+-- The array GIN index generates the candidates, but overlap is satisfied by one shared trigram,
+-- so it supplies no selectivity: the cap has to come from the channel itself.
+--
+-- Jaccard bounds the two set sizes against each other. shared <= LEAST(n_item, n_query) and the
+-- union is at least GREATEST(n_item, n_query), so sim <= LEAST/GREATEST for any pair. That makes
+-- the size ratio both an exact admissibility test (anything outside it cannot reach the threshold
+-- however many trigrams it shares) and the tightest score bound obtainable without touching the
+-- arrays - which is what makes it a sound key to take the top candidates by. Recency breaks ties,
+-- because that is what the prior prefers among rows the bound cannot separate.
+trg_cand AS (
+  SELECT i.id, i.trigram_len AS n_trg
+  FROM mem.item i CROSS JOIN q
+  WHERE ${MEMORY_ITEM_ADMISSIBLE}
+    AND cardinality(q.q_trg) > 0
+    AND i.trigrams && q.q_trg
+    AND i.trigram_len >= $18::float8 * cardinality(q.q_trg)
+    AND i.trigram_len * $18::float8 <= cardinality(q.q_trg)
+  ORDER BY LEAST(i.trigram_len, cardinality(q.q_trg))::float8
+             / GREATEST(i.trigram_len, cardinality(q.q_trg)) DESC,
+           i.observed_at DESC, i.id
+  LIMIT ${MEMORY_FUZZY_SCAN_CANDIDATES}
+),
+-- The threshold is what pg_trgm's % operator applies before a row counts as similar at all.
+trg_raw AS (
+  SELECT c.id,
+         x.shared::float8 / NULLIF(c.n_trg + cardinality(q.q_trg) - x.shared, 0) AS sim
+  FROM trg_cand c
+  JOIN mem.item i ON i.id = c.id
+  CROSS JOIN q
+  CROSS JOIN LATERAL (
+    SELECT count(*) AS shared FROM unnest(i.trigrams) g WHERE g = ANY($3::text[])
+  ) x
+),
+trg AS (
+  SELECT id, row_number() OVER (ORDER BY sim DESC, id) AS r FROM (
+    SELECT id, sim FROM trg_raw WHERE sim >= $18::float8
+    ORDER BY sim DESC, id
+    LIMIT ${MEMORY_FUZZY_CANDIDATES}
+  ) t
+),
+-- What this channel admits is structural - a fact about a subject the request named, a procedure
+-- carrying one of its tags, a row the owner pinned - but the order inside it is not, and it used to
+-- be pure recency fused at 1.30, the heaviest weight of any channel. For a subject with more facts
+-- than this ladder is long that decided the whole result: the spread across the structural ladder
+-- is wider than the entire lexical channel's, so recency chose which facts came back and the
+-- request's own words chose nothing. "which programming language does the owner work in" ranked the
+-- one row titled "working languages" eighth of the owner's nine facts, behind five that match only
+-- the word "owner", and the per-subject cap then cut it - a hard zero at every k, on a question the
+-- store held a titled, single-document-frequency answer to.
+--
+-- The candidate set is still taken by recency, which is the right bound when a subject has thousands
+-- of facts. The fusion rank is taken by how well the row answers the request, over the forty rows
+-- that survived - and when none of them match, every score is zero and this is exactly the old
+-- order, which is what keeps the channel doing its original job for a request with no lexical grip.
+struct AS (
+  SELECT id, row_number() OVER (ORDER BY pr, s DESC, observed_at DESC, id) AS r FROM (
+    SELECT c.id, c.pr, c.observed_at,
+           mem.bm25(qq.q_lex, qq.q_idf, c.tsv, c.tsv_len, st.avg_len) AS s
+    FROM (
+      SELECT i.id, i.observed_at, i.tsv, i.tsv_len,
+             CASE WHEN i.pin THEN 0 WHEN i.kind = 'fact' THEN 1 ELSE 2 END AS pr
+      FROM mem.item i CROSS JOIN q
+      WHERE ${MEMORY_ITEM_ADMISSIBLE}
+        AND (i.pin
+             OR (i.kind = 'fact' AND i.subject_key = ANY(q.q_ents))
+             OR (i.kind = 'procedure' AND i.tags_hashed && q.q_tags))
+      ORDER BY pr, i.observed_at DESC, i.id
+      LIMIT ${MEMORY_STRUCTURAL_CANDIDATES}
+    ) c CROSS JOIN qq CROSS JOIN stats st
+  ) t
+),
+fused AS (
+  SELECT id, SUM(w / (60.0 + r)) AS rrf FROM (
+    SELECT id, r, 1.00::float8 AS w FROM lex_item
+    UNION ALL SELECT id, r, 0.70 FROM lex_src
+    UNION ALL SELECT id, r, 0.40 FROM trg
+    UNION ALL SELECT id, r, 1.30 FROM struct
+  ) u GROUP BY id
+),
+scored AS (
+  SELECT i.id, 'item'::text AS layer, i.kind, i.trust, i.status, i.observed_at, i.valid_from,
+         i.valid_to, i.subject_key, i.predicate, i.tokens_est, i.dedupe_key,
+         i.document_ciphertext,
+         f.rrf * mem.prior(i.kind, i.trust, i.valid_to, i.observed_at, i.salience, i.pin,
+                           q.t_now, q.temporal_intent) AS score
+  FROM fused f
+  JOIN mem.item i ON i.id = f.id
+  CROSS JOIN q
+  LEFT JOIN LATERAL (
+    SELECT count(*) FILTER (WHERE r.outcome = 'ok')::float8 AS ok_recent,
+           count(*) FILTER (WHERE r.outcome <> 'unknown')::float8 AS graded_recent
+    FROM (
+      SELECT u.outcome FROM mem.item_use u
+      WHERE u.item_id = i.id ORDER BY u.used_at DESC, u.id LIMIT 5
+    ) r
+  ) health ON TRUE
+  WHERE ${MEMORY_ITEM_ADMISSIBLE}
+    -- A wrong remembered command is worse than no command: an unverified or failing procedure
+    -- stops being injected here, but the row itself is never deleted.
+    AND (i.kind <> 'procedure'
+         OR (COALESCE(i.last_verified, i.observed_at) > q.t_now - make_interval(days => $16::int)
+             AND (health.graded_recent = 0
+                  OR health.ok_recent / health.graded_recent >= $17::float8)))
+  UNION ALL
+  SELECT sc.id, 'source'::text, 'source'::mem.kind, 'stated'::mem.trust, 'active'::mem.status,
+         sc.occurred_at, sc.occurred_at, NULL::timestamptz, NULL::text, NULL::text,
+         sc.tokens_est, sc.id::text, sc.body_ciphertext,
+         f.rrf * mem.prior('source'::mem.kind, 'stated'::mem.trust, NULL::timestamptz,
+                           sc.occurred_at, 0::real, FALSE, q.t_now, q.temporal_intent)
+  FROM fused f
+  JOIN mem.source sc ON sc.id = f.id
+  CROSS JOIN q
+  WHERE sc.workspace_id = q.ws
+),
+quota AS (
+  SELECT (v->>'kind')::mem.kind AS kind, (v->>'share')::float8 AS share,
+         (v->>'cap')::int AS cap, (v->>'perSubject')::int AS per_subject
+  FROM jsonb_array_elements($11::jsonb) v
+),
+-- LEFT JOIN, not JOIN: an inner join here silently deleted every row whose kind had no quota
+-- entry, after ranking it: 'entity' was declared in MemoryKind, exported in MEMORY_KINDS and given
+-- the first heading in the rendered pack, and could never reach one. A kind the quota table has
+-- not heard of now degrades to a small allowance instead of disappearing.
+deduped AS (
+  SELECT DISTINCT ON (s.dedupe_key) s.*,
+         COALESCE(qt.share, $20::float8) AS share,
+         COALESCE(qt.cap, $21::int) AS cap,
+         COALESCE(qt.per_subject, $22::int) AS per_subject
+  FROM scored s LEFT JOIN quota qt ON qt.kind = s.kind
+  ORDER BY s.dedupe_key, s.score DESC, s.id
+),
+windowed AS (
+  SELECT d.*,
+         row_number() OVER (PARTITION BY d.kind ORDER BY d.score DESC, d.id) AS kind_rank,
+         -- Current and retired values of the same subject are ranked in separate windows. Sharing
+         -- one meant that "which shell did I use before?" - the only question a retired row can
+         -- answer - lost that row to four unrelated live facts about the same subject, because the
+         -- prior deliberately discounts a retired row and the per-subject cap then cut from the
+         -- bottom. Retired rows only enter this query when the caller asked for them at all.
+         row_number() OVER (PARTITION BY d.kind, COALESCE(d.subject_key, d.id::text),
+                                         (d.status <> 'active')
+                            ORDER BY d.score DESC, d.id) AS subject_rank,
+         SUM(d.tokens_est) OVER (PARTITION BY d.kind ORDER BY d.score DESC, d.id
+                                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS kind_tokens
+  FROM deduped d
+),
+eligible AS (
+  SELECT w.* FROM windowed w
+  WHERE w.kind_rank <= w.cap AND w.subject_rank <= w.per_subject
+    AND w.kind_tokens <= GREATEST(floor(w.share * $10::int), 1)
+),
+-- Both cuts are taken in score order. The item limit used to be a trailing LIMIT after the
+-- (kind, id) sort, so whenever more rows fitted the budget than the caller asked for, the ones
+-- discarded were the alphabetically last - not the least relevant.
+budgeted AS (
+  SELECT e.*, SUM(e.tokens_est) OVER (ORDER BY e.score DESC, e.id
+                                      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running,
+         row_number() OVER (ORDER BY e.score DESC, e.id) AS score_rank
+  FROM eligible e
+)
+SELECT id, layer, kind, trust, status, observed_at, valid_from, valid_to, subject_key,
+       predicate, tokens_est, score, document_ciphertext
+FROM budgeted
+WHERE running <= $10::int AND score_rank <= $15::int
+-- Stable order by default: the pack sits behind a cache breakpoint and the same rows must render
+-- to the same bytes. An interactive recall asks for relevance instead, where "best first" is the
+-- whole point and nothing is being cached.
+ORDER BY CASE WHEN $19::bool THEN score END DESC NULLS LAST, kind, id`;
+
+/**
+ * How many scored rows the diversification window may choose from.
+ *
+ * Wide enough that the per-conversation cap has something to promote from behind a dominant thread,
+ * bounded so a two-word query never sorts the whole verbatim layer.
+ */
+const MEMORY_SOURCE_SEARCH_CANDIDATES = 200;
+
+/**
+ * Rows one conversation may contribute to a result list that spans conversations. Three is a
+ * question, its answer and the command that proved it - the shape a turn actually has here.
+ */
+export const MEMORY_SOURCE_SEARCH_PER_TASK = 3;
+
+/**
+ * Verbatim search: the same blind index, the same BM25, restricted to `mem.source`.
+ *
+ * This is the query behind "search my past conversations". The rows are already here - every turn
+ * is chunked, sealed and indexed on the write path - so searching them costs one bounded GIN probe
+ * instead of decrypting a workspace's entire history in the worker and matching substrings over it.
+ * Stemming, document frequency and field length normalisation all come along for free, which is
+ * what makes "restarted" find "restart".
+ *
+ * The per-conversation cap is what makes a result list worth reading. Turns inside one thread all
+ * share its vocabulary, so the top of a raw BM25 list over a transcript is nearly always the same
+ * conversation several times over: the question "when did we last change this" gets one answer,
+ * repeated, and the other four threads that also touched it never appear. The cap is applied after
+ * scoring and only ever moves a row down, so a conversation that genuinely holds the best rows
+ * still leads - it just stops holding all of them.
+ */
+export const MEMORY_SOURCE_SEARCH_SQL = `
+WITH q AS (
+  SELECT $1::uuid AS ws, $3::uuid AS task, $4::timestamptz AS since, $5::timestamptz AS until,
+         $7::int AS per_task
+),
+stats AS (
+  SELECT GREATEST(COALESCE(c.n_docs, 1), 1)::float8 AS n_docs,
+         GREATEST(COALESCE(c.sum_len::float8 / NULLIF(c.n_docs, 0), 1), 1)::float8 AS avg_len
+  FROM q LEFT JOIN mem.corpus_stats c ON c.workspace_id = q.ws
+),
+${MEMORY_TERMS_CTE},
+hits AS (
+  SELECT sc.id, sc.task_id, mem.bm25(qq.q_lex, qq.q_idf, sc.tsv, sc.tsv_len, st.avg_len) AS s
+  FROM mem.source sc CROSS JOIN q CROSS JOIN qq CROSS JOIN stats st
+  WHERE sc.workspace_id = q.ws AND sc.indexed AND sc.tsv @@ qq.q_ts
+    AND (q.task IS NULL OR sc.task_id = q.task)
+    AND (q.since IS NULL OR sc.occurred_at >= q.since)
+    AND (q.until IS NULL OR sc.occurred_at <= q.until)
+  ORDER BY s DESC, sc.id
+  LIMIT ${MEMORY_SOURCE_SEARCH_CANDIDATES}
+),
+-- A row with no task_id is a standalone capture rather than part of a thread, so each one is its
+-- own conversation and none of them crowds out another.
+spread AS (
+  SELECT h.id, h.s,
+         row_number() OVER (PARTITION BY COALESCE(h.task_id::text, h.id::text)
+                            ORDER BY h.s DESC, h.id) AS thread_rank
+  FROM hits h
+)
+SELECT sc.*, r.s AS score
+FROM (
+  SELECT id, s FROM spread CROSS JOIN q
+  WHERE thread_rank <= q.per_task
+  ORDER BY s DESC, id
+  LIMIT $6::int
+) r JOIN mem.source sc ON sc.id = r.id
+ORDER BY r.s DESC, sc.id`;
+
+/**
+ * The rows either side of a hit.
+ *
+ * A search result on its own is a fragment: the answer is very often in the reply to the message
+ * that matched. A chunked document's siblings all carry `chunk_of` pointing at chunk zero, so
+ * `COALESCE(chunk_of, id)` names the document; a turn inside a task is surrounded by the rest of
+ * that task's transcript. Both are the same ordered stream, so one window serves both.
+ */
+export const MEMORY_SOURCE_WINDOW_SQL = `
+WITH anchor AS (
+  SELECT * FROM mem.source WHERE workspace_id = $1::uuid AND id = $2::uuid
+),
+neighbours AS (
+  SELECT s.*, row_number() OVER (ORDER BY s.occurred_at, s.chunk_ix, s.id) AS rn
+  FROM mem.source s CROSS JOIN anchor a
+  WHERE s.workspace_id = a.workspace_id
+    AND (COALESCE(s.chunk_of, s.id) = COALESCE(a.chunk_of, a.id)
+         OR (a.task_id IS NOT NULL AND s.task_id = a.task_id))
+),
+pivot AS (
+  SELECT n.rn FROM neighbours n CROSS JOIN anchor a WHERE n.id = a.id
+)
+SELECT n.* FROM neighbours n CROSS JOIN pivot p
+WHERE n.rn BETWEEN p.rn - $3::int AND p.rn + $4::int
+ORDER BY n.rn`;

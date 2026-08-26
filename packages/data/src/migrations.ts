@@ -1,3 +1,5 @@
+import { CONVERSATION_NAME_INDEX_STAMP } from '@athanor/core';
+
 export const migrations = [
   {
     version: 1,
@@ -2256,6 +2258,257 @@ export const migrations = [
       ALTER TABLE task_message_queue DROP CONSTRAINT IF EXISTS task_message_queue_status_check;
       ALTER TABLE task_message_queue ADD CONSTRAINT task_message_queue_status_check
         CHECK (status IN ('queued','promoted','cancelled','undelivered'));
+    `
+  },
+  {
+    version: 66,
+    name: 'the_indexes_the_cascades_were_always_going_to_need',
+    // Migration 57 made "delete this conversation" mean it, by putting ON DELETE CASCADE on the
+    // memory rows a conversation produced. It did not bring the indexes those cascades are read
+    // through, and a referential-integrity check with no index on the referencing column is a
+    // sequential scan - one per deleted row.
+    //
+    // What that costs is not theoretical on a computer that has been lived in. Deleting a
+    // conversation with four thousand events scans `tasks` four thousand times for the
+    // branched_from_event_id check, once per event, and scans all of mem.item and mem.source once
+    // each for theirs. The client's delete is optimistic with an Undo, so the row leaves the
+    // sidebar instantly and the transaction goes on holding row locks on `tasks` behind it for as
+    // long as it takes - which is the whole box unable to start a turn, with nothing on screen
+    // saying why. `deleteWorkspaceCheckpoints` has the same shape against restored_checkpoint_id,
+    // once per pruned checkpoint, on a retention sweep nobody is watching.
+    //
+    // Partial where the column is mostly null, which is all of them except workspace_id and
+    // approvals.task_id: a promoted fact carries no task deliberately, most conversations are not
+    // forks, and almost none were restored from a checkpoint. The predicate keeps the index the
+    // size of the set that can actually be pointed at.
+    //
+    // Not CONCURRENTLY: every migration here runs inside the transaction migrateDatabase opens,
+    // and CREATE INDEX CONCURRENTLY cannot. The lock is a SHARE on one table at a time, held for
+    // as long as one owner's rows take to sort, against an installer that has already stopped the
+    // services.
+    //
+    // The drop is the same argument backwards. workspace_checkpoints_task_idx leads on task_id and
+    // orders by event_sequence; workspace_checkpoints_undo_idx (migration 53) leads on the same
+    // column, orders by the same one, and breaks the tie with taken_seq. Every query the first can
+    // answer the second answers too, so it was two index writes per checkpoint with one of them
+    // reaching nothing.
+    sql: `
+      CREATE INDEX IF NOT EXISTS mem_item_task_idx
+        ON mem.item (task_id) WHERE task_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS mem_source_task_cascade_idx
+        ON mem.source (task_id) WHERE task_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS tasks_branched_from_idx
+        ON tasks (branched_from_event_id) WHERE branched_from_event_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS tasks_restored_checkpoint_idx
+        ON tasks (restored_checkpoint_id) WHERE restored_checkpoint_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS tasks_workspace_idx ON tasks (workspace_id);
+      CREATE INDEX IF NOT EXISTS approvals_task_idx ON approvals (task_id);
+
+      DROP INDEX IF EXISTS workspace_checkpoints_task_idx;
+    `
+  },
+  {
+    version: 67,
+    name: 'the_recall_statement_can_finally_reach_its_own_indexes',
+    // Three of mem.item's partial indexes carried `status = 'active'` in their predicate, and not
+    // one of them could ever be used by the statement they were built for.
+    //
+    // `MEMORY_RECALL_SQL` admits rows with a disjunction whose other two arms are bound parameters
+    // the caller chooses - `q.want_superseded` and `q.scope` - and those arrive through a CTE, so
+    // their values are not known when the plan is made. PostgreSQL therefore cannot prove
+    // `status = 'active'` of any row the query might want, and pushes down the *relaxation* of the
+    // disjunction instead. The plan says so in as many words, on a 50,000-row corpus:
+    //
+    //   ->  Seq Scan on item i_1  (rows=50000)
+    //         Filter: ((status = 'active') OR (status = ANY ('{superseded,disputed}'))
+    //                  OR (status = 'archived'))
+    //
+    // That is the *active-only* arm - the ordinary recall every task does, with no widening option
+    // set. The audit recorded this as a cost the two model-facing switches impose (`includeSuperseded`,
+    // `scope: 'archive'`); measured against the real statement rather than a hand-written one, the
+    // switches are innocent and every recall was paying it. The lexical channel sequentially scanned
+    // the whole memory table on every turn of every conversation.
+    //
+    // Measured, 50,000 items (40,000 active / 10,000 retired), two selective terms, pglite:
+    //
+    //   today                                  296.1 ms   lex_item: Seq Scan, 50,000 rows
+    //   + a second partial index over the
+    //     retired statuses                     295.1 ms   unchanged, and +2,160 kB on disk
+    //   predicate dropped from the tsv index    80.0 ms   lex_item: Bitmap Heap Scan, 85 rows
+    //   + subject and pin widened too           58.6 ms   struct: BitmapOr of all three
+    //
+    // The second partial index is the option this migration was written to consider and it is the
+    // one the measurement rules out: it changes no plan and no timing, because its predicate is
+    // exactly as unprovable as the one it was meant to complement. The disjunction has to become
+    // provable, and the only way to do that without rewriting the statement into a UNION is to stop
+    // asking the planner to prove anything about status.
+    //
+    // What it costs. At those 50,000 items the tsv index grows from 6,144 kB to 7,368 kB - the
+    // retired fifth of the corpus, which is the whole of the price. mem_item_subject_idx goes
+    // 672 -> 856 kB; mem_item_pin_idx does not move off 8 kB. The write path does not notice: 400
+    // fresh rows into the populated table cost 4.6-5.2 ms each under every index shape, measured in
+    // both orders, because an insert here is dominated by mem.index_row() building the tsvector and
+    // the trigram array rather than by index maintenance.
+    //
+    // Nothing about which rows come back changes. An index predicate decides what is *in* an index,
+    // never what a query returns; the status filter stays in the statement exactly as written, and
+    // the retrieval eval scores identically on both sides of this migration.
+    //
+    // Not CONCURRENTLY, for migration 66's reason: these run inside migrateDatabase's transaction.
+    // The DROP/CREATE pair leaves a window with no lexical index at all, which is the same window
+    // the rest of the upgrade already occupies with the services stopped.
+    sql: `
+      DROP INDEX IF EXISTS mem.mem_item_tsv_gin;
+      CREATE INDEX IF NOT EXISTS mem_item_tsv_gin ON mem.item USING gin (tsv)
+        WITH (fastupdate = off);
+
+      DROP INDEX IF EXISTS mem.mem_item_subject_idx;
+      CREATE INDEX IF NOT EXISTS mem_item_subject_idx
+        ON mem.item (workspace_id, subject_key, predicate, valid_from DESC)
+        WHERE kind = 'fact';
+
+      DROP INDEX IF EXISTS mem.mem_item_pin_idx;
+      CREATE INDEX IF NOT EXISTS mem_item_pin_idx ON mem.item (workspace_id) WHERE pin;
+    `
+  },
+  {
+    version: 68,
+    name: 'a_price_ceiling_to_store_and_three_reads_that_stop_scanning',
+    // Two unrelated things that both belong to one upgrade, because both are columns and indexes
+    // rather than rewrites and there is no reason to stop the box twice.
+    //
+    // ── The price ceiling ─────────────────────────────────────────────────────────────────────
+    //
+    // The three caps on this table are the running half of the brake: they stop a task that is
+    // already spending. These two are the pre-flight half - they stop an over-priced route being
+    // chosen in the first place, which is the only one of the two that works while the owner is
+    // asleep. The whole apparatus for applying them has existed for two releases (`selectModel`,
+    // `priceCeilingFields`, `CeilingOutcome`, `pricesAtPromptSize`) and `athanor spend-ceiling set`
+    // validates the number, refuses a bad one, and then exits 1 - because there has never been a
+    // column to put it in. This is that column.
+    //
+    // DOUBLE PRECISION and `>= 0` rather than `> 0`, matching the two caps above rather than
+    // `default_task_cap_usd` below them: null is "no ceiling" and zero is "only a route that
+    // publishes no charge", and those are different states an owner can mean. No upper bound in the
+    // SQL - the contract owns that, and a number here would be an eighth copied constant.
+    //
+    // ── Three statements that read the whole table to answer a bounded question ───────────────
+    //
+    // `tasks_unindexed_name_idx` is `listTasksMissingNameIndex`'s missing index. Its predicate is
+    // the statement's WHERE clause, character for character, which is what lets the planner prove
+    // the index covers it: the shape question is asked with an immutable operator against a
+    // constant, so it can live in an index predicate the way `tasks_untitled_idx` (migration 33)
+    // and `tasks_legacy_title_idx` do for their sibling backfills. Measured at 20,000
+    // conversations: Seq Scan + top-N heapsort, 14.1 ms, on every API boot for the life of the box
+    // - to discover there is nothing to do.
+    //
+    // The stamp is interpolated from `@athanor/core` rather than written out, so it is the same
+    // value the statement and every write use and cannot drift from them. A future stamp bump makes
+    // this predicate stop matching, at which point the read falls back to the sequential scan it
+    // does today and is correct but slow until a migration rebuilds the index - which is the right
+    // failure direction, and `store.test.ts` holds the assertion that says so.
+    //
+    // `tasks_recent_terminal_idx` is the notifier's. `listPendingNotifications` runs every two
+    // seconds per subscribed device and its `task_finished` arm enumerated every terminal
+    // conversation the owner has ever had: measured, Seq Scan, "Rows Removed by Filter: 20000",
+    // 23.5 ms, ~43,200 times a day, to deliver on average nothing. The horizon is already pushed
+    // into the branch by the planner - it is visible in the plan - so what was missing was only
+    // somewhere for it to land. `status` and `schedule_id` ride along as index columns so the
+    // "is this a scheduled run" test is answered without a heap visit.
+    //
+    // `tasks_schedule_fold_idx` is the sidebar's. The fold that decides how many runs of each
+    // schedule a page may show sequentially scanned every conversation on the box - 14,400 rows,
+    // 9.1 ms of page one's 11.5 ms. The index carries the four columns the fold filters and groups
+    // on and nothing else, so the aggregate is answered with Heap Fetches: 0.
+    //
+    // It carries no timestamp deliberately, and the reason is the whole of why it is cheap. With
+    // `created_at` in it the index is 1,144 kB and the planner declines it - 957 against the
+    // sequential scan's 1,011 was too close to be worth the risk it took. Without it there are only
+    // as many distinct keys as the owner has schedules, so btree deduplication folds the whole thing
+    // into 136 kB and the estimate drops to 437. Measured on 20,000 conversations of which 14,400
+    // are runs of ten schedules: 10.06 ms sequential -> 6.45 ms index-only, at a twenty-eighth of
+    // the size. `tasks_schedule_idx` (migration 62) already carries the timestamp for the LATERAL
+    // that finds where each schedule's newest few runs stop, and still does.
+    //
+    // What is NOT here, and must not be added later without reading this: a `runs` counter on
+    // `task_schedules`, which is what the refactor plan asked for. It cannot work. Migration 62
+    // made `tasks.schedule_id` deliberately not a foreign key so that a run outlives the schedule
+    // that minted it - turning a watcher off must not spill its past runs back into the sidebar as
+    // separate lines. A counter on the schedule row counts nothing once that row is gone, so the
+    // fold has to keep being derived from the conversations themselves. This index is what makes
+    // deriving it cheap.
+    sql: `
+      ALTER TABLE spend_limits
+        ADD COLUMN IF NOT EXISTS max_input_usd_per_million_tokens DOUBLE PRECISION
+          CHECK (max_input_usd_per_million_tokens IS NULL
+                 OR max_input_usd_per_million_tokens >= 0),
+        ADD COLUMN IF NOT EXISTS max_output_usd_per_million_tokens DOUBLE PRECISION
+          CHECK (max_output_usd_per_million_tokens IS NULL
+                 OR max_output_usd_per_million_tokens >= 0);
+
+      CREATE INDEX IF NOT EXISTS tasks_unindexed_name_idx
+        ON tasks (created_at, id)
+        WHERE name_tsv IS NULL OR NOT (name_tsv @@ '${CONVERSATION_NAME_INDEX_STAMP}'::tsquery);
+
+      CREATE INDEX IF NOT EXISTS tasks_recent_terminal_idx
+        ON tasks (user_id, (COALESCE(completed_at, updated_at)) DESC, status, schedule_id)
+        WHERE status IN ('completed','failed','cancelled');
+
+      CREATE INDEX IF NOT EXISTS tasks_schedule_fold_idx
+        ON tasks (user_id, schedule_id, pinned, archived_at)
+        WHERE schedule_id IS NOT NULL;
+    `
+  },
+  {
+    version: 69,
+    name: 'drop_five_more_columns_no_code_writes',
+    // The second sweep of the class migration 51 opened: columns that were declared, mapped onto a
+    // record, served on a response, and never once written. Five of them, plus the unique index
+    // that exists only to police one of them.
+    //
+    // ── workspace_previews.custom_domain, domain_status, domain_verification_hash ─────────────
+    //
+    // Custom domains for a published preview. Migration 25 added all three together with
+    // `hosting_mode`, which migration 51 has already dropped for exactly this reason. No statement
+    // in this repository has ever set any of them: `createWorkspacePreview` does not name them,
+    // `publishWorkspacePreview` does not name them, and there is no route, no contract field and no
+    // client control that could reach them. What existed was the read half - `mapWorkspacePreview`
+    // lifted all three onto `WorkspacePreviewRecord`, so every preview response carried
+    // `customDomain: null` and `domainStatus: null` as though they had been looked up.
+    //
+    // That is worse than a missing column rather than merely equal to one. A null that is served
+    // reads as "no custom domain is configured"; a field that does not exist reads as "this build
+    // does not do custom domains", which is the true statement. The verification hash is the one
+    // that matters most: a field named `domain_verification_hash` sitting on the row is a claim
+    // that this box can prove ownership of a domain, and it cannot.
+    //
+    // The index goes with them and is not merely tidy. `workspace_previews_custom_domain_idx` is
+    // UNIQUE on `LOWER(custom_domain)` and would be the constraint enforcing "one preview per
+    // domain" if the feature existed. It has never had a non-NULL row to compare, so it has never
+    // been tested against the thing it guards, and leaving a untested uniqueness constraint behind
+    // for whoever builds this later is how the second implementation inherits the first one's
+    // assumptions without being told.
+    //
+    // ── mem.item.trigger_key ──────────────────────────────────────────────────────────────────
+    //
+    // Declared in the memory schema and carried through the insert as `input.triggerKey ?? null`,
+    // with no caller anywhere supplying a `triggerKey`. It was the blind-index handle for
+    // trigger-based procedure recall - "when you are about to do X, remember Y" - which the recall
+    // planner does not implement: `planMemoryQuery` has no trigger channel, and every recall path
+    // reaches procedures through the lexical, structural and fuzzy channels only.
+    //
+    // The insert parameter goes with the column in the same commit, because an input field that
+    // silently writes nowhere is the half of this defect that survives a column drop.
+    //
+    // Nothing is rewritten here. Every statement below reshapes the table around rows that are
+    // already correct, so this migration adds no entry to `REWRITING_MIGRATIONS` - and the test
+    // that holds that table is what says so rather than this comment.
+    sql: `
+      DROP INDEX IF EXISTS workspace_previews_custom_domain_idx;
+      ALTER TABLE workspace_previews DROP COLUMN IF EXISTS custom_domain;
+      ALTER TABLE workspace_previews DROP COLUMN IF EXISTS domain_status;
+      ALTER TABLE workspace_previews DROP COLUMN IF EXISTS domain_verification_hash;
+      ALTER TABLE mem.item DROP COLUMN IF EXISTS trigger_key;
     `
   }
 ] as const;
