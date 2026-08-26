@@ -7,9 +7,12 @@ import {
 } from '@athanor/data';
 import { deriveServiceSecret, resolveDataMasterKey } from '@athanor/core';
 import { buildLabel } from '@athanor/contracts';
-import { AgentWorker, buildIdentity, failureFields, workerLogger } from './agent.js';
+import { AgentWorker } from './agent.js';
+import { buildIdentity } from './build-identity.js';
 import { loadConfig } from './config.js';
+import { failureFields } from './failure-record.js';
 import { runLeaseLoops, type WorkerCounters } from './lease.js';
+import { workerLogger } from './log.js';
 
 const config = loadConfig();
 const database = createDatabase({

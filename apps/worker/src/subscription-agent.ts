@@ -9,6 +9,21 @@ interface SubscriptionAgentRun {
 
 const CLAUDE_TOOLS = 'Read,Edit,Write,Glob,Grep,Bash';
 
+/** Every specialist this computer can hand a repository task to, in the order the schema offers. */
+export const SUBSCRIPTION_AGENTS: readonly SubscriptionAgent[] = ['codex', 'claude', 'opencode'];
+
+/**
+ * The specialists whose CLI takes a turn bound.
+ *
+ * `coding_agent.maxTurns` is declared for all three and `buildSubscriptionAgentArgs` emits it on
+ * one branch, so a model that bounded a risky refactor at three turns bounded nothing and the only
+ * remaining stop was `timeoutSeconds`, up to an hour of somebody's subscription. Codex `exec` and
+ * OpenCode `run` publish no equivalent flag, and inventing one would fail the run outright - so the
+ * honest repair is for the schema to say who honours the field, and for that sentence to be
+ * derived from this list rather than written a second time beside it.
+ */
+export const SUBSCRIPTION_AGENTS_HONOURING_MAX_TURNS: readonly SubscriptionAgent[] = ['claude'];
+
 export const subscriptionAgentName = (agent: SubscriptionAgent): string => {
   if (agent === 'codex') return 'Codex';
   if (agent === 'claude') return 'Claude Code';

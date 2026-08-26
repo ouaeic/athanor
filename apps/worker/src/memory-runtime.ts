@@ -21,7 +21,6 @@ import {
   MEMORY_PACK_BUDGET_TOKENS,
   MEMORY_RECALL_BUDGET_TOKENS,
   MEMORY_RECALL_ITEM_CEILING,
-  MEMORY_RECALL_MAX_BUDGET_TOKENS,
   MEMORY_RECALL_MAX_ITEMS,
   MEMORY_RECALL_QUOTAS,
   type MemoryKind,
@@ -193,6 +192,26 @@ export const buildTaskMemoryPack = async (input: {
     workspaceId: input.workspaceId,
     plan: planMemoryQuery(input.query, memoryIndexKey(input.dataKey)),
     now: input.clockAnchor,
+    // The bitemporal clause, finally armed for the one query that fills the prompt.
+    //
+    // `now` and `asOf` are different parameters answering different questions: `now` anchors the
+    // decayed recency and salience scores, `asOf` is what the admissibility predicate compares
+    // `valid_from`/`valid_to` against. This call passed only the first, so `q.as_of` was NULL on
+    // every pack ever built and the validity half of the predicate short-circuited to true - a
+    // fact whose validity had already ended stayed `active`, stayed admissible, and was ranked
+    // into the block at the top of the window as a current fact. The only thing holding it back
+    // was a x0.12 soft prior, which reciprocal-rank fusion over four channels leaves well above
+    // the noise floor on a request with little lexical grip. A dead end recorded with
+    // `validTo = observedAt + 14 days` was still being told to the next turn a month later, which
+    // is precisely what `memory.ts` says a remembered belief must never do, and what
+    // `docs/AGENT_RUNTIME.md` asserts is a hard filter (ATH-045).
+    //
+    // The task's start instant, the same one the ranking is anchored to, and for the same reason:
+    // a resumed task must re-rank against the clock it opened with or it rewrites bytes the
+    // provider has already cached. It also makes the pack answer the question the task actually
+    // asked - what was true when the owner asked it - rather than what is true at whatever moment
+    // a worker happens to rebuild it.
+    asOf: input.clockAnchor,
     budgetTokens: input.budgetTokens ?? MEMORY_PACK_BUDGET_TOKENS
   });
   const rendered = renderMemoryPack(
@@ -294,7 +313,6 @@ export interface MemoryRecallInput {
   readonly asOf?: string | null;
   readonly includeSuperseded?: boolean;
   readonly maxItems?: number;
-  readonly budgetTokens?: number;
   /** Ranking clock. Unlike the pack this is `now`: a recall is not re-emitted and nothing caches it. */
   readonly now?: Date;
 }
@@ -332,12 +350,16 @@ export const recallMemory = async (input: MemoryRecallInput): Promise<MemoryReca
     workspaceId: input.workspaceId,
     plan: planMemoryQuery(query, memoryIndexKey(input.dataKey)),
     now: input.now ?? new Date(),
-    budgetTokens: clamp(
-      input.budgetTokens,
-      MEMORY_RECALL_BUDGET_TOKENS,
-      256,
-      MEMORY_RECALL_MAX_BUDGET_TOKENS
-    ),
+    // A fixed budget, not a clamped request. There used to be a `budgetTokens` input clamped
+    // between 256 and a 4,000 ceiling, and nothing could ever set it: the tool schema is
+    // `additionalProperties: false` and never declared the field, so every recall this computer
+    // has ever answered was answered at exactly `MEMORY_RECALL_BUDGET_TOKENS`. Two tuned-looking
+    // numbers in `packages/core` read to the next maintainer as live controls - raise the ceiling
+    // and no model can reach it, lower it and `clamp` silently halves what nobody asked for - and
+    // `pnpm check` passed either way. The clamp and its ceiling are gone rather than wired: the
+    // model already chooses how much recall it gets through `maxItems`, and a second, overlapping
+    // budget dial is a way to ask the same question twice (ATH-164).
+    budgetTokens: MEMORY_RECALL_BUDGET_TOKENS,
     maxItems: clamp(input.maxItems, MEMORY_RECALL_MAX_ITEMS, 1, MEMORY_RECALL_ITEM_CEILING),
     quotas: MEMORY_RECALL_QUOTAS,
     order: 'relevance',

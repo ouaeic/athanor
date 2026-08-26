@@ -18,9 +18,11 @@ import {
   MAX_NOTICES_PER_TURN,
   silentLogger,
   startTurnState,
-  UNTRUSTED_NOTICE_MARKER
+  UNTRUSTED_NOTICE_MARKER,
+  WORKSPACE_BRIEF_MARKER
 } from './agent.js';
 import { compactionTargetTail, modelInputBudget, RUNTIME_CONTEXT_MARKER } from './context.js';
+import { TURN_WALL_CLOCK_MS } from './handoff.js';
 import { managedMediaCatalog } from './media.js';
 import { memoryItemAad, MEMORY_PACK_MARKER } from './memory-runtime.js';
 import { agentTools } from './tools.js';
@@ -387,6 +389,63 @@ const toolFrame = (id: string, name: string, args: Record<string, unknown>): str
     ]
   })}\n\ndata: [DONE]\n\n`;
 
+/** Several calls in one reply, which is how every gate below is actually reached. */
+const batchFrame = (
+  calls: Array<{ id: string; name: string; args: Record<string, unknown> }>
+): string =>
+  `data: ${JSON.stringify({
+    choices: [
+      {
+        finish_reason: 'tool_calls',
+        delta: {
+          tool_calls: calls.map((call, index) => ({
+            index,
+            id: call.id,
+            function: { name: call.name, arguments: JSON.stringify(call.args) }
+          }))
+        }
+      }
+    ]
+  })}\n\ndata: [DONE]\n\n`;
+
+const readPath = (url: string): string =>
+  decodeURIComponent(new URL(url).searchParams.get('path') ?? '');
+
+/** A runner response whose body arrives only when `until` settles, and dies if torn down first. */
+const heldBody = (body: string, until: Promise<void>, signal?: AbortSignal | null): Response =>
+  new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        let settled = false;
+        const tearDown = (): void => {
+          if (settled) return;
+          settled = true;
+          controller.error(new Error('the connection was torn down'));
+        };
+        if (signal?.aborted) {
+          tearDown();
+          return;
+        }
+        signal?.addEventListener('abort', tearDown, { once: true });
+        void until.then(() => {
+          if (settled) return;
+          settled = true;
+          controller.enqueue(encode(body));
+          controller.close();
+        });
+      }
+    }),
+    { headers: { 'content-type': 'application/json' } }
+  );
+
+const toolMessages = (probe: StoreProbe): Array<{ toolCallId?: string; content: string }> => {
+  const state = decryptCheckpoints(probe.checkpoints).at(-1);
+  return (state?.messages ?? []).filter((message) => message.role === 'tool');
+};
+
+const jsonResponse = (body: unknown): Response =>
+  new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } });
+
 const makeTask = (agentState?: unknown): TaskRecord => ({
   id: taskId,
   userId,
@@ -509,7 +568,31 @@ const installFetch = (
             headers: { 'content-type': 'application/json' }
           })
         : new Response('', { status: 404 });
-    return new Response(JSON.stringify({ ok: true, storageBytes: 2_048 }), {
+    /*
+     * Everything else is 404, and the list above it is the whole of what this stub will answer
+     * blind.
+     *
+     * It used to answer *any* unmatched runner URL with `{ok:true, storageBytes:2048}`, and that is
+     * how the worst live defect in this file's subject stayed invisible: a `/browser/preflight`
+     * answered that way comes back `consequential: undefined, sensitiveInput: undefined`, which is
+     * the benign verdict, and the branch that turned a benign verdict into an approval card was
+     * never once executed by a green suite. A stub that says yes to a route nobody modelled is a
+     * stub that tests the harness instead of the code - the same lesson `evals/harness.ts` learnt
+     * when its unstubbed routes started 404ing. The three below are answered because a real turn
+     * asks for them on the way past and no test here is about them; a new route has to be declared
+     * by the test that needs it.
+     */
+    const { pathname } = new URL(url);
+    if (
+      pathname.endsWith('/toolchain') ||
+      pathname.endsWith('/toolchain/probe') ||
+      pathname.endsWith('/usage')
+    )
+      return new Response(JSON.stringify({ ok: true, storageBytes: 2_048 }), {
+        headers: { 'content-type': 'application/json' }
+      });
+    return new Response(JSON.stringify({ error: `no stub for ${pathname}` }), {
+      status: 404,
       headers: { 'content-type': 'application/json' }
     });
   }) as typeof fetch);
@@ -518,6 +601,52 @@ const installFetch = (
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
+});
+
+describe('the turn wall clock', () => {
+  /**
+   * Nothing in the product bounded a turn on time. The credit ceiling is what stops a frontier
+   * model, and it is a proxy: on a cheap route credits accumulate slowly while the clock does not,
+   * so a turn that is inexpensive per step and never satisfied could hold a worker for hours. This
+   * drives a turn whose steps cost nothing and whose clock has run out, and asks for the exit that
+   * already exists for the other two ceilings.
+   */
+  it('writes the owner a handoff when the turn has been running longer than the harness holds it', async () => {
+    vi.useFakeTimers();
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        // A step that costs nothing and finishes nothing, then the closing handoff call.
+        () => {
+          vi.setSystemTime(Date.now() + TURN_WALL_CLOCK_MS);
+          return toolFrame('call-1', 'files_list', { path: 'workspace' });
+        },
+        textFrame('Out of time - the listing is done, the tidy-up is not.')
+      ],
+      log
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 40 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const warning = probe.events.find(
+      (entry) =>
+        entry.kind === 'warning' &&
+        entry.summary === 'This turn ran for its whole time budget before the work was finished'
+    );
+    expect(warning).toBeDefined();
+    // The owner is told, because only they can start it again.
+    expect((warning?.payload as { owner?: boolean }).owner).toBe(true);
+    // And the turn ends the way the other two ceilings end: a handoff the owner can reply to,
+    // rather than a red error halfway through the work.
+    expect(probe.events.some((entry) => entry.kind === 'completed')).toBe(true);
+    const spoken = probe.events.filter((entry) => entry.kind === 'assistant_message');
+    expect(spoken).toHaveLength(1);
+    expect(spoken[0]?.summary).toContain('Out of time');
+  });
 });
 
 describe('the model call and the task lease', () => {
@@ -658,6 +787,120 @@ describe('the model call and the task lease', () => {
     expect(closing).toMatchObject({ status: 'cancelled', clearLease: true });
     expect(closing?.agentStateCiphertext).toBeDefined();
     expect(closing?.workerId).toBeUndefined();
+  });
+
+  it('bills what a stopped generation had already produced', async () => {
+    /*
+     * The other half of the same defect the repetition watch had: the tokens were generated and the
+     * provider billed them, whoever ended the generation. The abort used to escape as an exception
+     * and the handler for it returned from above the whole billing block, so a Stop pressed on a
+     * long answer settled at $0.00 - and `lastStepUsd`, which is what the spending guard prices the
+     * next step from, kept the figure from the step before.
+     */
+    vi.useFakeTimers();
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const billed: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      recordUsage: async (input: Record<string, unknown>) => {
+        if (input.kind === 'model_inference') billed.push(input);
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    let requested = (): void => undefined;
+    const modelRequested = new Promise<void>((resolve) => {
+      requested = resolve;
+    });
+    installFetch(
+      [
+        (init) =>
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                encode(
+                  `data: ${JSON.stringify({
+                    choices: [{ delta: { content: 'A long answer the owner stopped reading. ' } }]
+                  })}\n\n`
+                )
+              );
+              requested();
+              // As undici tears one down: the read rejects with an AbortError rather than with an
+              // anonymous fault, which is the only thing that tells a cancel from a dead socket.
+              init?.signal?.addEventListener('abort', () =>
+                controller.error(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+              );
+            }
+          })
+      ],
+      log
+    );
+    const worker = new AgentWorker(probe.store, config(), masterKey, runnerSecret);
+
+    const running = worker.run(task);
+    await modelRequested;
+    task.status = 'paused';
+    task.leaseOwner = null;
+    await vi.advanceTimersByTimeAsync(4_000);
+    await running;
+
+    const row = billed.find((entry) => entry.idempotencyKey === `task:${taskId}:step:0`);
+    expect(row, 'the stopped generation left no ledger row at all').toBeDefined();
+    expect(Number(row?.costUsd)).toBeGreaterThan(0);
+    // And the owner is still told the turn stopped, in the same words, last.
+    expect(probe.events.at(-1)).toMatchObject({ kind: 'status', summary: 'Task paused by user' });
+    expect(log.modelRequests).toHaveLength(1);
+  });
+
+  it('writes nothing at all, ledger included, when another claimant holds the task', async () => {
+    // The counterpart to the row above, and the reason billing is on the `stopped` arm only: every
+    // write a disowned run makes lands on a trajectory somebody else is in the middle of.
+    vi.useFakeTimers();
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const billed: unknown[] = [];
+    Object.assign(probe.store, {
+      recordUsage: async (input: Record<string, unknown>) => {
+        if (input.kind === 'model_inference') billed.push(input);
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    let requested = (): void => undefined;
+    const modelRequested = new Promise<void>((resolve) => {
+      requested = resolve;
+    });
+    installFetch(
+      [
+        (init) =>
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                encode(
+                  `data: ${JSON.stringify({
+                    choices: [{ delta: { content: "Half of somebody else's answer. " } }]
+                  })}\n\n`
+                )
+              );
+              requested();
+              init?.signal?.addEventListener('abort', () =>
+                controller.error(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+              );
+            }
+          })
+      ],
+      log
+    );
+    const worker = new AgentWorker(probe.store, config(), masterKey, runnerSecret);
+
+    const running = worker.run(task);
+    await modelRequested;
+    task.leaseOwner = 'another-worker';
+    await vi.advanceTimersByTimeAsync(4_000);
+    await running;
+
+    expect(billed).toHaveLength(0);
+    expect(probe.events.some((entry) => entry.kind === 'cost')).toBe(false);
+    expect(probe.checkpoints.some((entry) => entry.status === 'paused')).toBe(false);
+    expect(log.modelRequests).toHaveLength(1);
   });
 
   it('stands down in silence when another worker has taken the task', async () => {
@@ -1004,6 +1247,53 @@ describe('the undo point a turn leaves behind', () => {
     expect(warning?.kind).toBe('warning');
     expect((warning?.payload as { owner?: boolean })?.owner).toBeUndefined();
   });
+
+  /**
+   * The other refusal the owner can clear, and the one prose never reached.
+   *
+   * A workspace over the runner's file ceiling - two `node_modules` trees is enough - loses every
+   * automatic undo point from then on. The disk refusal above was already caught by the sentence
+   * regex; this one never was, so the rewind dialog told the owner the turn "changed nothing on the
+   * computer" about turns that changed a great deal. Nothing in the message says disk, or space, or
+   * quota, which is the whole point: prose belongs to whoever is reading it, and this reader is a
+   * program.
+   *
+   * Both halves of that path are under this one test. `AgentRunnerClient.checkpoint` used to be the
+   * one runner call that flattened the runner's `{error:{code,message}}` envelope into a sentence
+   * of its own instead of going through `runnerFailure`, so the code arrived only as text inside a
+   * string; and `OWNER_FIXABLE_CHECKPOINT_CODES` then rejected it even once it was dug back out.
+   */
+  it('raises an over-ceiling workspace to the owner, in the runner’s own words', async () => {
+    const refusal =
+      'This workspace holds more than 250000 files, which is more than automatic checkpoints cover. Take a named recovery point instead.';
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([toolFrame('call-f', 'shell', { executable: 'ls' })], log, {
+      checkpoint: () =>
+        new Response(
+          JSON.stringify({
+            error: { code: 'checkpoint_workspace_too_large', message: refusal }
+          }),
+          { status: 413, headers: { 'content-type': 'application/json' } }
+        )
+    });
+
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const warning = probe.events.find(
+      (entry) => entry.summary === 'This turn has no undo point for the computer'
+    );
+    expect(warning?.kind).toBe('warning');
+    // Theirs to fix: delete something, or take a named recovery point. Neither happens if nobody
+    // is told, and the code is the only thing here that says so - the sentence matches no pattern.
+    expect((warning?.payload as { owner?: boolean })?.owner).toBe(true);
+    // And what they are shown is the runner's sentence, which names the remedy, rather than this
+    // package's own `Checkpoint failed (413): {"error":{…}}` wrapped around a JSON blob.
+    expect((warning?.payload as { message?: string })?.message).toBe(refusal);
+  });
 });
 
 describe('what actually reaches the provider', () => {
@@ -1305,7 +1595,21 @@ describe('what a delegated specialist is sent', () => {
         completion({ role: 'assistant', content: '{"answer":"The vendor lists three tiers."}' }),
         textFrame('Reported.')
       ],
-      log
+      log,
+      {
+        route: (url) =>
+          url.includes('/browser/search')
+            ? jsonResponse({
+                results: [
+                  {
+                    url: 'https://vendor.test/pricing',
+                    title: 'Pricing',
+                    snippet: 'Three tiers.'
+                  }
+                ]
+              })
+            : undefined
+      }
     );
 
     await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
@@ -1581,6 +1885,64 @@ describe('the web route a run is pinned to', () => {
         'spend_guard_unavailable'
     );
     expect(stated?.summary).toContain('could not check this against your spending caps');
+    // The column that separates a pause the ceiling imposed from one the owner asked for. Every
+    // consumer of the `spend_paused` notification reads it and neither of the two writes that
+    // should set it ever did, so the whole kind - its query, its Settings switch, its notice - was
+    // reachable by nothing.
+    expect(updates.find((update) => update.status === 'paused')?.spendPausedAt).toBeInstanceOf(
+      Date
+    );
+  });
+
+  it('marks the pause a spending pause when a ceiling is what stopped it, and says it once', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const updates: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      spendGuard: async () => ({
+        outcome: 'deny' as const,
+        estimateUsd: 0.01,
+        blockedBy: 'daily' as const,
+        warnedBy: [],
+        reason: null,
+        windows: [
+          {
+            name: 'daily' as const,
+            spentUsd: 5,
+            pendingUsd: 0,
+            capUsd: 5,
+            warnAtUsd: 4,
+            projectedUsd: 5.01,
+            state: 'exceeded' as const,
+            startsAt: '2026-07-01T00:00:00.000Z',
+            endsAt: '2026-07-02T00:00:00.000Z'
+          }
+        ]
+      }),
+      claimSpendAlert: async () => true,
+      updateTask: async (input: Record<string, unknown>) => {
+        updates.push(input);
+        return task;
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('should never be asked for')], log);
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(log.modelRequests).toHaveLength(0);
+    expect(updates.find((update) => update.status === 'paused')?.spendPausedAt).toBeInstanceOf(
+      Date
+    );
+    /*
+     * And exactly one notification, of the kind the pause actually is.
+     *
+     * The halt raises `spend_paused`, which has its own switch in Settings. Raising an
+     * `agent_message` beside it for the same event made both switches lie: turning agent messages
+     * off silenced spend-cap alerts, and the spending switch governed nothing the owner could see.
+     */
+    expect(probe.notifications.filter((entry) => entry.kind === 'agent_message')).toHaveLength(0);
   });
 
   it('keeps the whole web in house on an endpoint with no search service to offer', async () => {
@@ -2319,7 +2681,13 @@ describe('finding things on the internet', () => {
         toolFrame('call-r', 'parallel_web_read', { urls, maxCharactersPerPage: 20_000 }),
         textFrame('Read them.')
       ],
-      log
+      log,
+      {
+        route: (url) =>
+          url.includes('/browser/read-many')
+            ? jsonResponse({ sources: urls.map((page) => ({ url: page, text: 'a page' })) })
+            : undefined
+      }
     );
     await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
       .run(task)
@@ -2597,7 +2965,7 @@ describe('handing a repository to a subscription coding CLI', () => {
       getApproval: async () => ({
         id: 'approval-1',
         status: 'approved',
-        previewHash: approvalPreviewHash(dataKey, approved),
+        previewHash: approvalPreviewHash(dataKey, 'coding_agent', approved),
         expiresAt: '2099-01-01T00:00:00.000Z'
       })
     });
@@ -2675,7 +3043,7 @@ describe('handing a repository to a subscription coding CLI', () => {
       getApproval: async () => ({
         id: 'approval-1',
         status: 'approved',
-        previewHash: approvalPreviewHash(dataKey, approved),
+        previewHash: approvalPreviewHash(dataKey, 'coding_agent', approved),
         expiresAt: '2099-01-01T00:00:00.000Z'
       })
     });
@@ -3206,6 +3574,84 @@ describe('reaching the built-in skill library', () => {
     // procedure; a machine that really lacked one would carry it into the model's context.
     expect(result.missingBinaries).toBeUndefined();
     expect(String(result.content)).not.toContain('skill_missing_binaries');
+  });
+
+  it('sends the procedure once and a stub the second time, and records which are open', async () => {
+    /*
+     * `openSkill` has always taken an `active` list and answered a repeat view with a short
+     * `state="already_open"` stub, and nothing ever supplied it - the only caller passed
+     * `missingBinaries` and nothing else. So a model that viewed a skill at step 4 and viewed it
+     * again at step 30 was handed the whole procedure a second time, up to five thousand tokens of
+     * it, with nothing in the answer saying it was a duplicate. Its one test passed the option the
+     * product never passed.
+     */
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-1', 'skill', { action: 'view', id: 'untrusted-content' }),
+        toolFrame('call-2', 'skill', { action: 'view', id: 'untrusted-content' }),
+        textFrame('Read it.')
+      ],
+      log
+    );
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 3 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const answers = toolMessages(probe);
+    const first = answers.find((message) => message.toolCallId === 'call-1')?.content ?? '';
+    const second = answers.find((message) => message.toolCallId === 'call-2')?.content ?? '';
+    expect(first).toContain('untrusted-content');
+    expect(first.length).toBeGreaterThan(1_000);
+    expect(second).toContain('already_open');
+    // The saving is the point, so it is asserted as a size and not only as a marker.
+    expect(second.length).toBeLessThan(first.length / 4);
+
+    const saved = decryptCheckpoints(probe.checkpoints).at(-1) as unknown as {
+      openedSkills?: string[];
+    };
+    expect(saved.openedSkills).toEqual(['untrusted-content']);
+  });
+
+  it('sends the whole procedure again when the window no longer holds it', async () => {
+    /*
+     * The other half, and it is why the record is checked against the window rather than trusted.
+     * A compaction drops whole messages, so the body of a skill opened twenty steps ago can be gone
+     * while the state still says it is open - and `compactContext` names exactly those skills in
+     * the running brief and tells the model to reopen them. Answering that reopen with a stub would
+     * strand the turn on instructions nothing in its window holds.
+     */
+    const condensed = {
+      messages: [
+        { role: 'user', content: 'Summarise the page I saved' },
+        {
+          role: 'system',
+          content:
+            "CONDENSED HISTORY BRIEF\nInstructions no longer in the window: untrusted-content. Reopen a skill with skill(action: 'view') before relying on it again."
+        }
+      ],
+      step: 0,
+      credits: 0,
+      turn: 0,
+      openedSkills: ['untrusted-content']
+    };
+    const task = makeTask(condensed);
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [toolFrame('call-1', 'skill', { action: 'view', id: 'untrusted-content' }), textFrame('Ok.')],
+      log
+    );
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const answer =
+      toolMessages(probe).find((message) => message.toolCallId === 'call-1')?.content ?? '';
+    expect(answer).not.toContain('already_open');
+    expect(answer.length).toBeGreaterThan(1_000);
   });
 
   it('still reports an unknown skill as missing', async () => {
@@ -4162,6 +4608,136 @@ describe('what would prove the job is done', () => {
       passed: true,
       detail: '48000 bytes (needs at least 1024)'
     });
+  });
+
+  /**
+   * The suite ran twice on a completing turn, and the test that covers the hold could not see it.
+   *
+   * The order is the whole defect: the expensive gate is asked before the free one. A turn that has
+   * changed something and not spoken declares its checks, calls finish, has the suite run - a build
+   * and a test run, up to fifteen minutes of the owner's computer - and is then held for the one
+   * thing it costs nothing to ask, whether it has said anything to the user. It answers, finishes
+   * again, and the same suite runs a second time against a workspace nothing has touched since.
+   *
+   * The existing case above (`answers with the finish summary when the turn never said anything
+   * itself`) drives exactly this hold with no acceptance record at all, so the doubling has never
+   * been in front of a test.
+   */
+  it('runs the acceptance suite once when the answer hold sends the same finish round again', async () => {
+    const task = makeTask(
+      acceptanceState({
+        // Declared by this turn, so the finish gate reads it as evidence about this turn's work
+        // rather than as an inherited record - which is the shape that reaches the suite at all.
+        acceptanceTurn: 0,
+        acceptance: {
+          checks: [
+            {
+              id: 'check-1',
+              kind: 'command',
+              label: 'the importer test passes',
+              executable: 'pytest',
+              args: ['-q'],
+              cwd: 'workspace',
+              expectExit: 0,
+              timeoutSeconds: 900
+            }
+          ],
+          revisions: 1,
+          declaredAtStep: 0
+        }
+      })
+    );
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [], runnerRequests: [] };
+    installFetch(
+      [
+        // A finish with no prose in the frame and none before it: the turn has done the work
+        // through tools and said nothing, which is what the answer hold exists for.
+        finishCall('call-1'),
+        // The answer the hold asked for, and the same finish behind it.
+        `${textFrame('The importer now reads all three columns.')}`,
+        finishCall('call-2'),
+        textFrame('Done.')
+      ],
+      log,
+      { route: execRoute(0) }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 4 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    // The hold really fired, so this is a test about the doubling rather than about a turn that
+    // never reached it.
+    expect(probe.events.some((entry) => entry.summary === 'Asked for the answer itself')).toBe(
+      true
+    );
+    const suiteRuns = (log.runnerRequests ?? []).filter(
+      (request) =>
+        request.url.includes('/exec') &&
+        (request.body as { executable?: string }).executable === 'pytest'
+    );
+    expect(suiteRuns).toHaveLength(1);
+  });
+
+  /**
+   * At the size the record is allowed to be, which is the only size that measures anything.
+   *
+   * `MAX_ACCEPTANCE_CHECKS` is eight and `ACCEPTANCE_COMMAND_TIMEOUT_SECONDS` is 900, so eight
+   * checks that each wedge compose to two hours of a turn nobody is watching - and every per-check
+   * ceiling in the file is correct while that is true. A deadline test written with one check
+   * measures the per-check timeout a second time and calls it a suite bound.
+   */
+  it('stops the suite at the aggregate deadline rather than letting eight checks compose', async () => {
+    vi.useFakeTimers();
+    const checks = Array.from({ length: 8 }, (_, index) => ({
+      id: `check-${index + 1}`,
+      kind: 'command' as const,
+      label: `suite part ${index + 1}`,
+      executable: 'pytest',
+      args: [`--shard=${index + 1}`],
+      cwd: 'workspace',
+      expectExit: 0,
+      timeoutSeconds: 900
+    }));
+    const task = makeTask(
+      acceptanceState({
+        acceptanceTurn: 0,
+        acceptance: { checks, revisions: 1, declaredAtStep: 0 }
+      })
+    );
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [], runnerRequests: [] };
+    installFetch([finishCall('call-1'), textFrame('Done.')], log, {
+      route: (url: string): Response | undefined => {
+        if (!url.includes('/exec')) return undefined;
+        // Every check burns the whole per-check ceiling. Eight of them is two hours, which is the
+        // composition the aggregate deadline exists to refuse.
+        vi.setSystemTime(Date.now() + 900_000);
+        return new Response(
+          JSON.stringify({
+            exitCode: 0,
+            stdout: '',
+            stderr: '',
+            durationMs: 900_000,
+            timedOut: false
+          }),
+          { headers: { 'content-type': 'application/json' } }
+        );
+      }
+    });
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const attempted = (log.runnerRequests ?? []).filter((request) => request.url.includes('/exec'));
+    // The first check may spend the whole budget; nothing after it may spend another.
+    expect(attempted.length).toBeLessThan(8);
+    const results = acceptanceResults(probe);
+    expect(results).toHaveLength(8);
+    expect(results.filter((result) => !result.passed).length).toBeGreaterThan(0);
+    expect(results.at(-1)?.detail).toContain('the acceptance suite ran out of time');
   });
 });
 
@@ -5137,6 +5713,245 @@ describe('the prompt prefix a follow-up turn re-sends', () => {
     expect(knowledge(first)).toContain('workspace/archive');
     expect(knowledge(second)).toBe(knowledge(first));
   });
+  it('freezes the reviewed block against the wall clock, not only against the ranking', async () => {
+    /*
+     * The header says "frozen for this run", and the ranking beneath it was anchored to
+     * `task.createdAt` to make that true. The filter above the ranking was not: it took the wall
+     * clock, so an entry whose `validUntil` fell between the task starting and the current step was
+     * in the block on one request and gone from the next - the whole preamble rewritten mid-task by
+     * a boundary nobody crossed on purpose, and every byte behind it re-billed. Two builds either
+     * side of that instant, asserted byte-identical.
+     */
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const expiring = {
+      id: 'memory-expiring',
+      target: 'workspace',
+      validUntil: '2026-07-01T06:00:00.000Z',
+      contentCiphertext: encryptJson(
+        {
+          content: 'Tidy the notes into workspace/archive before the loan laptop goes back',
+          validFrom: '2026-06-01T00:00:00.000Z',
+          validUntil: '2026-07-01T06:00:00.000Z'
+        },
+        dataKey,
+        `workspace-memory:${workspaceId}`
+      ),
+      updatedAt: '2026-06-01T00:00:00.000Z'
+    };
+    const knowledgeAt = async (wallClock: string): Promise<string> => {
+      vi.setSystemTime(new Date(wallClock));
+      const task = makeTask();
+      const probe = probeStore(() => task);
+      const store = {
+        ...(probe.store as unknown as Record<string, unknown>),
+        listWorkspaceMemories: async () => [expiring]
+      } as unknown as DataStore;
+      const log: FetchLog = { calls: [], modelRequests: [] };
+      installFetch([textFrame('Tidied.')], log);
+      await new AgentWorker(store, config(), masterKey, runnerSecret)
+        .run(task)
+        .catch(() => undefined);
+      return (
+        requestMessages(log, 0).find((message) =>
+          message.content.startsWith('CURATED ENCRYPTED KNOWLEDGE')
+        )?.content ?? ''
+      );
+    };
+
+    // The task was created at 00:00 and the entry expires at 06:00, so these two straddle it.
+    const before = await knowledgeAt('2026-07-01T05:59:00.000Z');
+    const after = await knowledgeAt('2026-07-01T06:01:00.000Z');
+
+    // Vacuous unless the entry reached the block at all at the anchored instant.
+    expect(before).toContain('Tidy the notes into workspace/archive');
+    expect(after).toBe(before);
+  });
+
+  it('survives the workspace brief being rewritten between turns, because the brief sits last', async () => {
+    /*
+     * The brief is a plain workspace file and any turn may write it - the agent keeping its own
+     * journal is the commonest writer of all. It used to be spliced in as the FIRST preamble block,
+     * ahead of the reviewed knowledge block and the memory pack, so one appended line to
+     * `workspace/ATHANOR.md` moved the divergence point to the second message of the prompt and
+     * re-billed everything behind it at the write premium on the next turn. Those other two blocks
+     * are frozen for the life of the task by design; the brief is the one preamble block that is
+     * not, which is exactly why it belongs behind them.
+     */
+    let briefBody = '# Study\n- Notes live under workspace/notes\n';
+    let task = makeTask();
+    const probe = probeStore(() => task);
+    probe.recallPack(['memory-item-1']);
+    const route = (url: string): Response | undefined =>
+      readPath(url) === 'workspace/ATHANOR.md' ? jsonResponse({ content: briefBody }) : undefined;
+
+    const first: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Tidied.')], first, { route });
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const opening = requestMessages(first, 0);
+    const knowledgeAt = opening.findIndex((message) =>
+      message.content.startsWith('CURATED ENCRYPTED KNOWLEDGE')
+    );
+    const packAt = opening.findIndex((message) => message.content.startsWith(MEMORY_PACK_MARKER));
+    const briefAt = opening.findIndex((message) =>
+      message.content.startsWith(WORKSPACE_BRIEF_MARKER)
+    );
+    // Vacuous unless all three blocks are in the window, with the brief behind the two frozen ones.
+    expect(knowledgeAt).toBeGreaterThan(0);
+    expect(packAt).toBeGreaterThan(knowledgeAt);
+    expect(briefAt).toBeGreaterThan(packAt);
+
+    // What the first turn did to it: appended a line, the way a turn keeping the journal does.
+    briefBody = `${briefBody}- Receipts go in workspace/receipts\n`;
+    const saved = decryptCheckpoints(probe.checkpoints).at(-1);
+    task = makeTask(
+      startTurnState(saved as unknown as Record<string, unknown>, {
+        prompt: 'Now archive last year’s notes too',
+        turn: 1,
+        reservationKey: 'reservation-2'
+      })
+    );
+    const second: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Archived.')], second, { route });
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const resumed = requestMessages(second, 0);
+    // Vacuous unless the brief genuinely changed, which is the premise of the whole test.
+    expect(resumed[briefAt]?.content).not.toBe(opening[briefAt]?.content);
+    expect(resumed[briefAt]?.content).toContain('workspace/receipts');
+
+    // The prefix the provider cached for the first turn still covers the operating contract, the
+    // reviewed knowledge block and the memory pack, and stops exactly at the brief.
+    const shared = sharedPrefix(opening, resumed);
+    // Measured on this fixture: 3 messages and 14,999 of the opening request's 17,004 characters,
+    // against 1 message and 12,353 characters with the brief spliced in first.
+    expect(shared).toBe(briefAt);
+    const cached = opening.slice(0, shared).map((message) => message.content);
+    expect(cached.some((content) => content.startsWith('CURATED ENCRYPTED KNOWLEDGE'))).toBe(true);
+    expect(cached.some((content) => content.startsWith(MEMORY_PACK_MARKER))).toBe(true);
+    // Not merely still ahead of the brief - still at the same indices, so the bytes the provider
+    // holds are addressed the same way on the second turn as on the first.
+    expect(resumed.findIndex((message) => message.content.startsWith(MEMORY_PACK_MARKER))).toBe(
+      packAt
+    );
+  });
+
+  it('keeps the cached prefix across a republished plan, rather than shifting the trajectory', async () => {
+    /*
+     * `set_plan` is the tool the operating contract asks for most often - once per status change,
+     * and the user watches those statuses live - so a republish is one of the commonest events in a
+     * long turn. Republishing used to splice the old plan message out of wherever it sat in the
+     * trajectory and push a new one at the tail, which moves every message behind the old position
+     * by one and diverges the prompt there. Written over where it already sits, the divergence is
+     * the plan message itself and nothing else.
+     */
+    let planVersion = 0;
+    let planRecord: Record<string, unknown> | null = null;
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const store = {
+      ...(probe.store as unknown as Record<string, unknown>),
+      getLatestTaskPlan: async () => planRecord,
+      createTaskPlan: async (input: Record<string, unknown>) => {
+        if (input.expectedVersion !== planVersion) throw new Error('plan_version_conflict');
+        planVersion += 1;
+        planRecord = {
+          id: `plan-${planVersion}`,
+          taskId,
+          version: planVersion,
+          branchName: input.branchName,
+          stepsCiphertext: input.stepsCiphertext,
+          createdBy: 'agent',
+          createdAt: '2026-07-01T00:00:00.000Z'
+        };
+        return planRecord;
+      }
+    } as unknown as DataStore;
+    const plan = (...steps: Array<[string, string]>): Record<string, unknown> => ({
+      branchName: 'Main',
+      steps: steps.map(([title, status]) => ({ title, status }))
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame(
+          'call-1',
+          'set_plan',
+          plan(['Read the notes directory', 'in_progress'], ['File anything older', 'pending'])
+        ),
+        toolFrame('call-2', 'files_list', { path: 'workspace' }),
+        toolFrame(
+          'call-3',
+          'set_plan',
+          plan(['Read the notes directory', 'completed'], ['File anything older', 'in_progress'])
+        ),
+        toolFrame('call-4', 'files_list', { path: 'workspace/notes' }),
+        toolFrame(
+          'call-5',
+          'set_plan',
+          plan(['Read the notes directory', 'completed'], ['File anything older', 'completed'])
+        ),
+        toolFrame('call-6', 'files_list', { path: 'workspace/archive' }),
+        textFrame('Filed.')
+      ],
+      log,
+      {
+        route: (url) =>
+          url.includes('/files?path=')
+            ? jsonResponse({ entries: [{ name: 'march.md', kind: 'file', bytes: 120 }] })
+            : undefined
+      }
+    );
+
+    await new AgentWorker(store, config({ TASK_MAX_STEPS: 8 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    // Vacuous unless the run got far enough to republish twice on top of the first publication.
+    expect(planVersion).toBe(3);
+
+    /** The header line of the plan block one request carried, or '' when it carried none. */
+    const planHeader = (request: number): string =>
+      requestMessages(log, request)
+        .find((message) => message.content.startsWith('ACTIVE USER-VISIBLE PLAN'))
+        ?.content.split('\n')[0] ?? '';
+    const republished = log.modelRequests
+      .map((_request, index) => index)
+      .filter(
+        (index) =>
+          index > 0 && planHeader(index) !== '' && planHeader(index) !== planHeader(index - 1)
+      );
+    // The first arrival and the two republishes, found by the block's own version rather than by
+    // counting steps - a fixture that silently stopped republishing would otherwise pass.
+    expect(republished).toHaveLength(3);
+
+    // One per step, in step order. The extra cost row with no context is the closing handoff call,
+    // which prepares its own window and is not a step of the loop.
+    const breakpoints = probe.events
+      .filter((entry) => entry.kind === 'cost' && (entry.payload as { context?: unknown }).context)
+      .map(
+        (entry) =>
+          (entry.payload as { context: { cacheBreakpoints: number } }).context.cacheBreakpoints
+      );
+    expect(breakpoints).toHaveLength(log.modelRequests.length - 1);
+    for (const index of republished) {
+      // A republish must not cost a breakpoint. Marking fewer prefixes on the one step whose prefix
+      // just moved is how a cache stops being read at exactly the moment it matters.
+      expect(breakpoints[index]).toBeGreaterThanOrEqual(breakpoints[index - 1] ?? 0);
+      // And the divergence is at the plan message and nowhere ahead of it: everything the previous
+      // request sent before the old plan block is re-sent byte for byte.
+      const previous = requestMessages(log, index - 1);
+      const planAt = previous.findIndex((message) =>
+        message.content.startsWith('ACTIVE USER-VISIBLE PLAN')
+      );
+      if (planAt < 0) continue;
+      expect(sharedPrefix(previous, requestMessages(log, index))).toBe(planAt);
+    }
+  });
 });
 
 /*
@@ -5174,7 +5989,7 @@ describe('the warnings that are the owner’s business', () => {
       getApproval: async () => ({
         id: 'approval-1',
         status: 'approved',
-        previewHash: approvalPreviewHash(dataKey, approved),
+        previewHash: approvalPreviewHash(dataKey, 'shell', approved),
         expiresAt: '2099-01-01T00:00:00.000Z'
       })
     });
@@ -5419,24 +6234,6 @@ describe('a correction the turn it was sent to did not survive', () => {
  * that cannot be reproduced.
  */
 describe('reads proposed together', () => {
-  const batchFrame = (
-    calls: Array<{ id: string; name: string; args: Record<string, unknown> }>
-  ): string =>
-    `data: ${JSON.stringify({
-      choices: [
-        {
-          finish_reason: 'tool_calls',
-          delta: {
-            tool_calls: calls.map((call, index) => ({
-              index,
-              id: call.id,
-              function: { name: call.name, arguments: JSON.stringify(call.args) }
-            }))
-          }
-        }
-      ]
-    })}\n\ndata: [DONE]\n\n`;
-
   const reads = (
     ...names: string[]
   ): Array<{ id: string; name: string; args: Record<string, unknown> }> =>
@@ -5445,41 +6242,6 @@ describe('reads proposed together', () => {
       name: 'file_read',
       args: { path: `workspace/${name}.txt` }
     }));
-
-  const readPath = (url: string): string =>
-    decodeURIComponent(new URL(url).searchParams.get('path') ?? '');
-
-  /** A runner response whose body arrives only when `until` settles, and dies if torn down first. */
-  const heldBody = (body: string, until: Promise<void>, signal?: AbortSignal | null): Response =>
-    new Response(
-      new ReadableStream<Uint8Array>({
-        start(controller) {
-          let settled = false;
-          const tearDown = (): void => {
-            if (settled) return;
-            settled = true;
-            controller.error(new Error('the connection was torn down'));
-          };
-          if (signal?.aborted) {
-            tearDown();
-            return;
-          }
-          signal?.addEventListener('abort', tearDown, { once: true });
-          void until.then(() => {
-            if (settled) return;
-            settled = true;
-            controller.enqueue(encode(body));
-            controller.close();
-          });
-        }
-      }),
-      { headers: { 'content-type': 'application/json' } }
-    );
-
-  const toolMessages = (probe: StoreProbe): Array<{ toolCallId?: string; content: string }> => {
-    const state = decryptCheckpoints(probe.checkpoints).at(-1);
-    return (state?.messages ?? []).filter((message) => message.role === 'tool');
-  };
 
   it('holds all four open at once and still answers them in the declared order', async () => {
     const task = makeTask();
@@ -5669,7 +6431,7 @@ describe('reads proposed together', () => {
     for (const message of answered) expect(message.content).toContain('Tool failed');
     expect(probe.checkpoints.at(-1)).toMatchObject({ status: 'paused', clearLease: true });
     expect(probe.events.some((entry) => entry.summary === 'Task paused by user')).toBe(true);
-  }, 15_000);
+  });
 });
 
 /**
@@ -5788,7 +6550,7 @@ describe('a turn that finishes the job rather than the budget', () => {
       (entry) => entry.kind === 'warning' && entry.summary.includes('whole step budget')
     );
     expect(ceiling?.payload).toMatchObject({ owner: true, maxSteps: 4, continuations: 1 });
-  }, 15_000);
+  });
 
   it('stops the moment its own definition of done is satisfied', async () => {
     const task = makeTask(workingState());
@@ -5824,7 +6586,7 @@ describe('a turn that finishes the job rather than the budget', () => {
       )
     ).toBe(true);
     expect(log.modelRequests).toHaveLength(3);
-  }, 15_000);
+  });
 
   it('is stopped by the same Stop, on the last step of the budget it would have renewed', async () => {
     const task = makeTask(workingState());
@@ -5863,13 +6625,30 @@ describe('a turn that finishes the job rather than the budget', () => {
     expect(log.modelRequests).toHaveLength(2);
     expect(probe.events.some((entry) => entry.summary === 'Task paused by user')).toBe(true);
     expect(probe.checkpoints.at(-1)).toMatchObject({ status: 'paused', clearLease: true });
-  }, 15_000);
+  });
 
   it('never renews a turn this worker no longer holds', async () => {
-    // The lease moved while the budget was being spent. Renewing here would have this worker
-    // announce a continuation on a conversation another one is running, and then save its own stale
-    // trajectory over theirs - so the ceiling asks who holds the task before it asks anything about
-    // the work.
+    /*
+     * The lease moved while the budget was being spent, and this run stands down without saying a
+     * word about it.
+     *
+     * This case used to reach the step ceiling and assert the refusal `renewStepBudget` writes
+     * (`Stopping at the step limit: another worker holds the task`). Wave 7.2's #140 arm in
+     * `honorUserControl` gets there first and deliberately gets there in silence: timeline events
+     * carry no lease guard, so the refusal this test used to demand is itself the harm - the
+     * owner's conversation would gain a stray line about a turn ending, from a worker that is no
+     * longer running the task, beside the live output of the one that is. Standing down silently
+     * is the repair, so the assertion moved with it.
+     *
+     * Silence here means about the turn's own ending. The two preamble events this run has already
+     * written by the time the arm fires are written before the loop and before any ownership
+     * question is asked - see the note in 7.2's report, which lists that preamble as a residue of
+     * #140 rather than something this arm was asked to cover.
+     *
+     * The refusal arm inside `renewStepBudget` is still live and still tested, one level down in
+     * `handoff.test.ts` - it guards the narrower window this test can no longer reach, where the
+     * lease is lost after the last step boundary rather than before the first.
+     */
     const task = makeTask(workingState());
     task.leaseOwner = 'worker-other';
     const probe = probeStore(() => task);
@@ -5891,18 +6670,19 @@ describe('a turn that finishes the job rather than the budget', () => {
       .run(task)
       .catch(() => undefined);
 
+    // Not one line about how this turn ended, on a conversation another worker is writing.
     expect(
-      probe.events.some(
-        (entry) => entry.summary === 'Stopping at the step limit: another worker holds the task'
-      )
-    ).toBe(true);
+      probe.events.some((entry) => entry.summary.startsWith('Stopping at the step limit'))
+    ).toBe(false);
     expect(probe.events.some((entry) => entry.summary.startsWith('Continuing on its own'))).toBe(
       false
     );
     // Nothing was run to work that out, either: who holds the task is a free read and it comes
     // before the checks, which can be a full build.
     expect(log.calls.some((call) => call.includes('/exec'))).toBe(false);
-  }, 15_000);
+    // And nothing was billed. The old behaviour spent the whole budget first and only then noticed.
+    expect(log.modelRequests).toHaveLength(0);
+  });
 
   it('does not spend a check run establishing what the free reads already refused', async () => {
     const task = makeTask(
@@ -5943,7 +6723,7 @@ describe('a turn that finishes the job rather than the budget', () => {
       )
     ).toBe(true);
     expect(log.calls.some((call) => call.includes('/exec'))).toBe(false);
-  }, 15_000);
+  });
 
   it('will not renew itself on the checks an earlier turn declared', async () => {
     /*
@@ -5982,7 +6762,7 @@ describe('a turn that finishes the job rather than the budget', () => {
     // Nothing was run to establish it: the turn a record belongs to is a free read, and it comes in
     // front of the checks, which can be a whole build.
     expect(log.calls.some((call) => call.includes('/exec'))).toBe(false);
-  }, 15_000);
+  });
 });
 
 describe('what a tainted turn is charged for sending', () => {
@@ -6072,7 +6852,7 @@ describe('what a tainted turn is charged for sending', () => {
     // it is exactly what the turn is charged. Asserted as the figure rather than as "more than
     // nothing": a charge of the whole URL would be a different bug wearing the same assertion.
     expect(noveltySpent(probe)).toBe('changelog'.length);
-  }, 15_000);
+  });
 
   it('charges nothing for an answer the harness wrote, because nothing was sent', async () => {
     /*
@@ -6147,7 +6927,7 @@ describe('what a tainted turn is charged for sending', () => {
     ).toBe(true);
     // Nothing was ever added, so the running total is still untouched rather than merely small.
     expect(noveltySpent(probe) ?? 0).toBe(0);
-  }, 15_000);
+  });
 });
 
 /**
@@ -6231,7 +7011,7 @@ describe('a generation the box cut short', () => {
     // not a rounding error: it filed the prompt at nothing and the output at the provider's silence.
     expect(billed[0]?.unit).toBe('tokens');
     expect(Number(billed[0]?.credits)).toBeGreaterThan(0);
-  }, 20_000);
+  });
 
   it('says why the answer stops there, and does not ask for the rest of it', async () => {
     const { probe, log } = await run([cutOffStream, finishFrame]);
@@ -6254,5 +7034,792 @@ describe('a generation the box cut short', () => {
     expect(windows.at(-1)).toContain('COMPLETION CHECK');
     expect(log.modelRequests).toHaveLength(2);
     expect(probe.events.some((entry) => entry.kind === 'completed')).toBe(true);
-  }, 20_000);
+  });
+});
+
+/**
+ * The refusal that used to kill a conversation for good.
+ *
+ * A window larger than the route will take comes back 400, which is not retryable and was not a
+ * wall either: the task was marked failed with the oversized trajectory saved. The owner replies,
+ * the resumed turn rebuilds the identical window, sends the identical request and dies at the
+ * identical step - for as long as they are willing to keep trying. Nothing anywhere recognised the
+ * shape, though the file already carried the argument for it, written above the one other 400 it
+ * does repair.
+ */
+describe('a window the route will not take', () => {
+  const refusal = (): Response =>
+    new Response(
+      JSON.stringify({
+        error: {
+          message:
+            "This model's maximum context length is 40000 tokens, however you requested 214113 tokens"
+        }
+      }),
+      { status: 400, headers: { 'content-type': 'application/json' } }
+    );
+
+  it('condenses the window to the size the route named and sends the step again', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    let refused = 0;
+    installFetch(
+      [
+        () => {
+          refused += 1;
+          return '';
+        },
+        textFrame('Carried on with a smaller window.'),
+        toolFrame('call-1', 'finish', {
+          summary: 'Finished after the window was condensed.',
+          verification: { status: 'not_applicable', evidence: [] }
+        })
+      ],
+      log
+    );
+    // The provider bodies above cannot express a status, so the refusal is served by hand for the
+    // first inference call only and the stub answers everything after it.
+    const inner = globalThis.fetch;
+    vi.stubGlobal('fetch', (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.startsWith(PROVIDER_URL) && url.includes('/chat/completions') && refused === 0) {
+        refused = 1;
+        if (typeof init?.body === 'string')
+          log.modelRequests.push(JSON.parse(init.body) as Record<string, unknown>);
+        return refusal();
+      }
+      return inner(input as string, init);
+    }) as typeof fetch);
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 3 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    // Said to the owner, once, as the repair it is rather than as a failure.
+    const said = probe.events.find((entry) => entry.summary.includes('too large for it'));
+    expect(said?.kind).toBe('warning');
+    expect((said?.payload as { contextLimitTokens?: number } | undefined)?.contextLimitTokens).toBe(
+      40_000
+    );
+    // The step was sent again rather than the task being failed on a refusal it could answer.
+    expect(log.modelRequests.length).toBeGreaterThanOrEqual(2);
+    expect(probe.events.some((entry) => entry.kind === 'error')).toBe(false);
+  });
+});
+
+/**
+ * The generation this watch was written for, and what it costs.
+ *
+ * Twice in one evening a model answered correctly and then repeated one sentence until the
+ * provider's own ceiling stopped it - seventeen thousand output tokens, a quarter of an hour, all
+ * of it billed by the provider. The watch that stops it aborts the request, and the abort used to
+ * take a `continue` straight past the whole billing block: no ledger row, no credit, no cost event,
+ * and `state.lastStepUsd` left at the previous step's figure so the spend guard priced the next
+ * step from a number it already knew was short. The one path that most needs a brake was the one
+ * path that bypassed it.
+ */
+describe('a generation the repetition watch stopped', () => {
+  /** The incident's own sentence, at a period long enough for `degenerateRepeat` to see it. */
+  const repeatedSentence = 'The user is not watching the screen right now. ';
+
+  /**
+   * The repeat as it actually arrives: one frame at a time, on a connection that dies when the
+   * request's signal aborts. A body handed over whole cannot be interrupted, and a stub that
+   * ignores the signal cannot tell a request that was torn down from one that ran to its end -
+   * which is the difference this test is entirely about.
+   */
+  const repeatingStream =
+    (frames = 40) =>
+    (init?: RequestInit): BodyInit =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          let settled = false;
+          const tearDown = (): void => {
+            if (settled) return;
+            settled = true;
+            controller.error(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          };
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            tearDown();
+            return;
+          }
+          signal?.addEventListener('abort', tearDown, { once: true });
+          for (let index = 0; index < frames; index += 1)
+            controller.enqueue(
+              encode(
+                `data: ${JSON.stringify({
+                  choices: [{ delta: { content: repeatedSentence } }]
+                })}\n\n`
+              )
+            );
+          if (!settled) controller.close();
+        }
+      });
+
+  const run = async (): Promise<{
+    probe: StoreProbe;
+    log: FetchLog;
+    billed: Array<Record<string, unknown>>;
+  }> => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const billed: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      recordUsage: async (input: Record<string, unknown>) => {
+        if (input.kind === 'model_inference') billed.push(input);
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        repeatingStream(),
+        toolFrame('call-1', 'finish', {
+          summary: 'The repeat was stopped and the work stands.',
+          verification: { status: 'not_applicable', evidence: [] }
+        })
+      ],
+      log
+    );
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 3 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+    return { probe, log, billed };
+  };
+
+  it('bills the tokens the stopped repeat had already generated', async () => {
+    const { probe, log, billed } = await run();
+
+    // The watch fired at all, which is the precondition for everything below it.
+    const stopped = probe.events.find((entry) => entry.summary === 'Stopped a repeating answer');
+    expect(stopped?.kind).toBe('warning');
+    expect((stopped?.payload as { repeated?: string } | undefined)?.repeated).toContain(
+      'not watching the screen'
+    );
+    // The turn carried on after the repeat rather than dying on it.
+    expect(log.modelRequests.length).toBeGreaterThanOrEqual(2);
+
+    // The provider billed every one of the stopped call's tokens, so the ledger has to carry its
+    // own row for them. The row is keyed by step, which is what makes "the step is missing"
+    // distinguishable from "the step was cheap" - the defect is the former.
+    const row = billed.find((entry) => entry.idempotencyKey === `task:${taskId}:step:0`);
+    expect(row, 'the stopped generation left no ledger row at all').toBeDefined();
+    expect(Number(row?.costUsd)).toBeGreaterThan(0);
+    expect(Number(row?.credits)).toBeGreaterThan(0);
+    // Estimated, because the usage frame is the last frame of a stream this side cut short.
+    expect(String(row?.unit)).toBe('tokens');
+
+    // And the running total the compute ceiling is compared against actually moved, on the step
+    // that spent it rather than only on the one after it.
+    const cost = probe.events.find((entry) => entry.kind === 'cost');
+    expect(cost?.summary).toBe('Step 1 completed');
+    expect(
+      Number((cost?.payload as { cumulativeCredits?: number } | undefined)?.cumulativeCredits)
+    ).toBeGreaterThan(0);
+  });
+
+  it('supersedes the frames the owner watched arrive with one row that carries them', async () => {
+    const { probe } = await run();
+
+    // Without this the delta frames are kept and re-decrypted on every reopen of the conversation,
+    // for ever: nothing else in the turn writes the row that replaces them.
+    const closing = probe.events.filter(
+      (entry) => entry.kind === 'assistant_message' && entry.replacesEarlierFrames
+    );
+    expect(closing).toHaveLength(1);
+    expect(String((closing[0]?.payload as { markdown?: string } | undefined)?.markdown)).toContain(
+      'not watching the screen'
+    );
+  });
+});
+
+/**
+ * The five gates that decide whether a turn has been anywhere, and what stopping means.
+ *
+ * Every one of them was a control wired to something slightly wrong: a call athanor answered
+ * itself recorded as a call the computer answered, a call that never ran holding the key that
+ * refuses the re-issue, a broker's "this is harmless" arriving as a card, Stop reaching every tool
+ * except the one the owner was asked about, and a notice the model composed standing in as proof
+ * that the work is done. None of the five had a test on either side of it.
+ */
+describe('what athanor answered itself, and what the computer answered', () => {
+  const readRoute = (path: string, content: string) => (url: string) =>
+    url.includes('/file?') && readPath(url) === path ? jsonResponse({ content }) : undefined;
+
+  it('refuses a finish that cites a call athanor answered without running it', async () => {
+    // The exact shape from the incident: a read is answered by the harness - here as an exact
+    // repeat, in the field usually as arguments cut off at the output ceiling - and the same reply
+    // finishes on it. Nothing ran, and the turn used to complete `status:'verified'` on it.
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        batchFrame([
+          { id: 'call-1', name: 'file_read', args: { path: 'workspace/report.md' } },
+          { id: 'call-2', name: 'file_read', args: { path: 'workspace/report.md' } },
+          {
+            id: 'call-3',
+            name: 'finish',
+            args: {
+              summary: 'The report is written.',
+              verification: {
+                status: 'verified',
+                evidence: [
+                  {
+                    claim: 'the report is written',
+                    source: 'tool_result',
+                    toolCallId: 'call-2'
+                  }
+                ],
+                remainingRisks: []
+              }
+            }
+          }
+        ]),
+        textFrame('Still working.')
+      ],
+      log,
+      { route: readRoute('workspace/report.md', '# Report') }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const held = probe.events.find((entry) => entry.summary === 'Completion needs verification');
+    expect(held, 'the finish was accepted on a call that never ran').toBeDefined();
+    // Said as what it is. "Did not complete successfully" sends a model looking for a neighbour to
+    // cite; "never ran" sends it to run the call.
+    expect((held?.payload as { reason?: string } | undefined)?.reason).toContain('never ran');
+    expect(
+      toolMessages(probe).find((message) => message.toolCallId === 'call-3')?.content
+    ).toContain('never ran');
+  });
+
+  it('refuses a finish that cites a notice the agent composed', async () => {
+    // `notify` reaches the owner's lock screen with a sentence the model wrote. It carries nothing
+    // back about the world, and the set that says so - `AGENT_SPEECH` - existed and was read in one
+    // place only. Every "cite something that read the outcome back" refusal in the loop was one
+    // notify call away from being satisfied.
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        batchFrame([
+          { id: 'call-1', name: 'notify', args: { headline: 'The report is ready' } },
+          {
+            id: 'call-2',
+            name: 'finish',
+            args: {
+              summary: 'The report is written.',
+              verification: {
+                status: 'verified',
+                evidence: [
+                  { claim: 'the report is ready', source: 'tool_result', toolCallId: 'call-1' }
+                ],
+                remainingRisks: []
+              }
+            }
+          }
+        ]),
+        textFrame('Still working.')
+      ],
+      log
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const held = probe.events.find((entry) => entry.summary === 'Completion needs verification');
+    expect(held, 'a delivered sentence was accepted as proof the work is done').toBeDefined();
+    expect((held?.payload as { reason?: string } | undefined)?.reason).toContain(
+      'something you said rather than something you observed'
+    );
+    // And it is not offered as a citation either, which is the same rule read from the front.
+    expect(
+      toolMessages(probe).find((message) => message.toolCallId === 'call-2')?.content
+    ).toContain('No successful tool call this turn can be cited');
+  });
+
+  it('runs the re-issued read that the plan change told it to send again', async () => {
+    /*
+     * The owner edits the plan mid-step. Every call in flight is answered "replan before acting" -
+     * none of them ran - and the agent does exactly what it was told: it replans and sends the same
+     * read again. That re-issue used to come back "which already ran this turn and would return the
+     * same result. Read that result again", pointing at a call whose only trace is the skip notice.
+     */
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    let planVersion = 1;
+    Object.assign(probe.store, {
+      getLatestTaskPlan: async () => ({
+        id: 'plan-1',
+        taskId,
+        version: planVersion,
+        branchName: 'Main',
+        stepsCiphertext: encryptJson(
+          { steps: [{ id: 'step-1', title: 'Read the notes', status: 'in_progress' }] },
+          dataKey,
+          `task-plan:${taskId}`
+        ),
+        createdBy: 'user',
+        createdAt: '2026-07-01T00:00:00.000Z'
+      })
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    const read = { path: 'workspace/notes.md' };
+    installFetch(
+      [
+        // Republished while the first reply is being generated, which is the only window in which
+        // the gate below can fire: the plan is re-read at the step boundary and again per call.
+        () => {
+          planVersion = 2;
+          return toolFrame('call-1', 'file_read', read);
+        },
+        toolFrame('call-2', 'file_read', read),
+        textFrame('Read it.')
+      ],
+      log,
+      { route: readRoute('workspace/notes.md', 'the notes as they stand') }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 3 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const answered = toolMessages(probe);
+    expect(answered.find((message) => message.toolCallId === 'call-1')?.content).toContain(
+      'changed the active plan'
+    );
+    const reissued = answered.find((message) => message.toolCallId === 'call-2')?.content ?? '';
+    expect(
+      reissued,
+      'the re-issue was refused as a duplicate of a call that never ran'
+    ).not.toContain('already ran this turn');
+    expect(reissued).toContain('the notes as they stand');
+  });
+
+  it('lets Stop reach the one call the owner was asked about by name', async () => {
+    // `#withCancellationWatch` exists for exactly this and was wired to the loop's own dispatch and
+    // to the parallel run, and not to the approved resume - the one path where the owner has most
+    // reason to expect Stop to work, because they were just asked about it. An approved shell runs
+    // to the runner's ceiling, and nothing observed the stop until it returned.
+    const approved = {
+      executable: 'bash',
+      args: ['-lc', 'sleep 3600'],
+      cwd: 'workspace',
+      timeoutSeconds: 3_600
+    };
+    const task = makeTask({
+      messages: [
+        { role: 'user', content: 'Run the importer' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call-1', name: 'shell', arguments: approved }]
+        }
+      ],
+      step: 1,
+      credits: 0,
+      pending: {
+        approvalId: 'approval-1',
+        toolCall: { id: 'call-1', name: 'shell', arguments: approved }
+      }
+    });
+    const probe = probeStore(() => task);
+    Object.assign(probe.store, {
+      getApproval: async () => ({
+        id: 'approval-1',
+        status: 'approved',
+        previewHash: approvalPreviewHash(dataKey, 'shell', approved),
+        expiresAt: '2099-01-01T00:00:00.000Z'
+      })
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    const never = new Promise<void>(() => undefined);
+    let started = 0;
+    installFetch([textFrame('Stopped.')], log, {
+      route: (url, init) => {
+        if (!url.endsWith('/exec')) return undefined;
+        started += 1;
+        // Stopped with the approved command out on the wire and nothing to answer it. A pause
+        // clears the lease in the same statement that sets the status.
+        task.status = 'paused';
+        task.leaseOwner = null;
+        return heldBody('never arrives', never, init?.signal);
+      }
+    });
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(started).toBe(1);
+    expect(
+      toolMessages(probe).find((message) => message.toolCallId === 'call-1')?.content,
+      'Stop never reached the running command'
+    ).toContain('Tool failed');
+    expect(probe.checkpoints.at(-1)).toMatchObject({ status: 'paused', clearLease: true });
+  });
+
+  it('raises no card when the browser broker says the action is harmless', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const raised: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      createApproval: async (input: Record<string, unknown>) => {
+        raised.push(input);
+        return 'approval-1';
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-1', 'browser_action', {
+          action: 'navigate',
+          url: 'https://example.test/',
+          purpose: 'Open the page'
+        }),
+        textFrame('Opened it.')
+      ],
+      log,
+      {
+        route: (url) =>
+          url.includes('/browser/preflight')
+            ? jsonResponse({ consequential: false, sensitiveInput: false, preview: 'navigate' })
+            : url.includes('/browser/action')
+              ? jsonResponse({ ok: true, url: 'https://example.test/' })
+              : undefined
+      }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    // `navigate` is on the hand-written list of verbs `ordinaryRequirement` refuses to card even in
+    // Review, so there is no declared requirement for the broker to lighten - and a broker that
+    // finds nothing may not invent one.
+    expect(raised, 'a plain navigate raised an approval').toHaveLength(0);
+    expect(probe.events.some((entry) => entry.kind === 'approval_requested')).toBe(false);
+    expect(probe.checkpoints.some((entry) => entry.status === 'awaiting_user')).toBe(false);
+    expect(log.calls.some((entry) => entry.includes('/browser/action'))).toBe(true);
+  });
+
+  it('still raises one when the broker calls the same shape consequential', async () => {
+    // The same call, the same null declared requirement, and the opposite verdict from the page
+    // itself: this is the half of the branch that has to keep working, and it is what makes the
+    // test above a statement about the broker rather than about the browser being ungated.
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const raised: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      createApproval: async (input: Record<string, unknown>) => {
+        raised.push(input);
+        return 'approval-1';
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-1', 'browser_action', {
+          action: 'click',
+          selector: '#next',
+          purpose: 'Continue'
+        }),
+        textFrame('Waiting on you.')
+      ],
+      log,
+      {
+        route: (url) =>
+          url.includes('/browser/preflight')
+            ? jsonResponse({
+                consequential: true,
+                sensitiveInput: false,
+                preview: 'Place order'
+              })
+            : url.includes('/browser/action')
+              ? jsonResponse({ ok: true, url: 'https://shop.test/' })
+              : undefined
+      }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(raised).toHaveLength(1);
+    expect(raised[0]).toMatchObject({
+      action: 'browser_action',
+      sideEffect: 'external_consequential'
+    });
+    expect(probe.events.some((entry) => entry.kind === 'approval_requested')).toBe(true);
+    expect(probe.checkpoints.at(-1)).toMatchObject({ status: 'awaiting_user', clearLease: true });
+    expect(log.calls.some((entry) => entry.includes('/browser/action'))).toBe(false);
+  });
+
+  it('still confirms an ambiguous coordinate click the desktop broker calls harmless', async () => {
+    /*
+     * The decision the fix above forces, made here rather than left implicit.
+     *
+     * `classifyDesktopAction` relaxes a `click_at` that resolves to a named control to whatever
+     * its label reads as, and the label list matches none of OK, Yes, Continue, Erase, Format or
+     * Empty Trash - so the broker calls a click on "OK" in a "Discard unsaved changes?" dialog
+     * harmless. Three documents and the tool description say an ambiguous coordinate action is
+     * always confirmed. Both stay true, because the floor's own `click_at` rule is not conditional
+     * on the security mode and the broker may only soften a requirement, never remove one: the
+     * card still appears, and what the verdict buys is its severity.
+     */
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const raised: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      createApproval: async (input: Record<string, unknown>) => {
+        raised.push(input);
+        return 'approval-1';
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-1', 'desktop_action', {
+          action: 'click_at',
+          x: 412,
+          y: 288,
+          purpose: 'Dismiss the dialog'
+        }),
+        textFrame('Waiting on you.')
+      ],
+      log,
+      {
+        route: (url) =>
+          url.includes('/desktop/preflight')
+            ? jsonResponse({ consequential: false, sensitiveInput: false, preview: 'click OK' })
+            : url.includes('/desktop/action')
+              ? jsonResponse({ ok: true })
+              : undefined
+      }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    expect(raised).toHaveLength(1);
+    // Softened, not withdrawn: this is the whole of what the broker's verdict is allowed to do.
+    expect(raised[0]).toMatchObject({
+      action: 'desktop_action',
+      sideEffect: 'external_reversible'
+    });
+    expect(log.calls.some((entry) => entry.includes('/desktop/action'))).toBe(false);
+  });
+
+  it('records the ninth origin that tainted the turn, and drops the first', async () => {
+    /*
+     * The record is the whole point of writing origins down: a repeat origin across tasks is the
+     * strongest residual attack against a provenance model, and it is only visible if every
+     * transition is written. `slice(0, 8)` kept the openers, so a turn that read eight ordinary
+     * sources and then the attacker's recorded everything except the one that mattered - and the
+     * length-based `changed` meant no warning was written for it either.
+     */
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    const attachments = Array.from({ length: 9 }, (_unused, index) => `downloads/${index + 1}.pdf`);
+    installFetch(
+      [
+        batchFrame(
+          attachments.map((path, index) => ({
+            id: `call-${index + 1}`,
+            name: 'file_read',
+            args: { path }
+          }))
+        ),
+        textFrame('Read them.')
+      ],
+      log,
+      {
+        route: (url) =>
+          url.includes('/file?') ? jsonResponse({ content: 'a fetched page' }) : undefined
+      }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const saved = decryptCheckpoints(probe.checkpoints).at(-1) as unknown as {
+      taint?: { sources: string[] };
+    };
+    expect(saved.taint?.sources).toHaveLength(8);
+    expect(saved.taint?.sources).toContain('downloaded file downloads/9.pdf');
+    expect(saved.taint?.sources).not.toContain('downloaded file downloads/1.pdf');
+    // And the arrival is on the timeline, which is the record the owner reads.
+    expect(
+      probe.events.some(
+        (entry) =>
+          entry.kind === 'warning' && entry.summary.includes('downloaded file downloads/9.pdf')
+      )
+    ).toBe(true);
+  });
+});
+
+/**
+ * The fifth ranking site, and the only one that chooses a model while the owner is asleep.
+ *
+ * Wave 4 landed the pre-flight price ceiling at the four sites an owner reaches by hand and proved
+ * each by negative control. This one - the vision specialist an image is handed to when the lead
+ * cannot see - was left open with the reason written down: spreading the ceiling in without a
+ * refusal that names it recreates the defect the API's 402 removed, because an emptied pool falls
+ * through to a sentence saying no specialist is available, which is true about the wrong setting.
+ *
+ * Both tests assert **membership** - what was offered - and never ordering. Wave 4 measured that an
+ * assertion of the shape "the chosen model is under the ceiling" is green over a dead feature,
+ * because `balanced` prefers the cheaper route unaided.
+ */
+describe('who reads a picture the lead model cannot', () => {
+  /** A lead with no `vision` capability, which is what sends an image to a specialist at all. */
+  const blindLead: ModelRelease = { ...model, capabilities: ['chat', 'tools', 'reasoning'] };
+
+  const eyes = (
+    id: string,
+    displayName: string,
+    inputUsdPerMillionTokens: number
+  ): ModelRelease => ({
+    ...model,
+    id,
+    providerModelId: `vendor/${id}`,
+    displayName,
+    capabilities: ['chat', 'vision'],
+    modalities: ['text', 'image'],
+    inputUsdPerMillionTokens,
+    outputUsdPerMillionTokens: inputUsdPerMillionTokens * 2
+  });
+
+  const dear = eyes('dear-eyes', 'Dear Eyes', 75);
+  const cheap = eyes('cheap-eyes', 'Cheap Eyes', 0.5);
+
+  /** A one-pixel PNG. Nothing reads the pixels; what matters is that the mime type is a picture. */
+  const picture = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64'
+  );
+
+  const readAnImage = async (options: {
+    catalog: ModelRelease[];
+    /** The owner's price ceiling on input tokens, or null for a box that has never set one. */
+    ceilingUsd: number | null;
+  }): Promise<{ probe: StoreProbe; log: FetchLog; specialists: string[]; systemText: string }> => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    Object.assign(probe.store, {
+      listModels: async () => options.catalog,
+      effectiveSpendLimits: async () => ({
+        dailyCapUsd: null,
+        monthlyCapUsd: null,
+        defaultTaskCapUsd: null,
+        warnAtPercent: 80,
+        timeZone: 'Europe/London',
+        maxInputUsdPerMillionTokens: options.ceilingUsd,
+        maxOutputUsdPerMillionTokens: null,
+        updatedAt: '2026-07-01T00:00:00.000Z'
+      })
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-i', 'image_read', { path: 'shots/button.png' }),
+        completion({ role: 'assistant', content: 'A red button, top right.' }),
+        textFrame('Described.')
+      ],
+      log,
+      {
+        route: (url) =>
+          url.includes('/image?')
+            ? new Response(picture, { headers: { 'content-type': 'image/png' } })
+            : undefined
+      }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const state = decryptCheckpoints(probe.checkpoints).at(-1);
+    return {
+      probe,
+      log,
+      // Every model the provider was asked for that is not the lead: the whole of what the ceiling
+      // is allowed to change.
+      specialists: log.modelRequests
+        .map((request) => String(request.model))
+        .filter((id) => id !== blindLead.providerModelId),
+      systemText: (state?.messages ?? [])
+        .filter((message) => message.role === 'system')
+        .map((message) => message.content)
+        .join('\n')
+    };
+  };
+
+  it('does not offer a route priced above the owner’s ceiling, and names the ceiling when it refuses', async () => {
+    // The control first: with no ceiling set, the $75/M route is the one the image goes to. Without
+    // this arm the test below could pass because the apparatus never ran at all.
+    const open = await readAnImage({ catalog: [blindLead, dear], ceilingUsd: null });
+    expect(open.specialists).toEqual(['vendor/dear-eyes']);
+
+    const capped = await readAnImage({ catalog: [blindLead, dear], ceilingUsd: 1 });
+    // Membership, not ordering: the dear route is not offered. `dear` is the only vision route in
+    // this catalogue, so nothing cheaper can make this green by being preferred unaided.
+    expect(capped.specialists).toEqual([]);
+
+    /*
+     * And the refusal names the ceiling rather than saying no specialist is available. That
+     * sentence is true about the wrong setting: an owner who reads it changes their privacy route,
+     * or buys nothing, and every image keeps failing for a reason nothing on the box has named.
+     */
+    expect(capped.systemText).toContain('price ceiling');
+    expect(capped.systemText).toContain('Dear Eyes');
+    expect(capped.systemText).not.toContain('is currently available');
+    // Told to the owner too, on the timeline, flagged as theirs to fix - a price ceiling is not
+    // something the model can raise and a system message is not something the owner can read.
+    const warning = capped.probe.events.find(
+      (entry) => entry.summary === 'An image could not be read under your price ceiling'
+    );
+    expect(warning?.kind).toBe('warning');
+    expect(warning?.payload).toMatchObject({
+      owner: true,
+      code: 'price_ceiling_blocked',
+      cheapestAboveCeiling: 'dear-eyes'
+    });
+  });
+
+  it('reads the picture on a cheaper route when the ceiling admits one, and says nothing', async () => {
+    /*
+     * The other half of the outcome, and the reason `blocked` is a verdict rather than an empty
+     * list: a turn that cannot continue and a turn that picked something cheaper are different
+     * things to have happened, and the owner is entitled to know which. Here the ceiling costs the
+     * turn nothing, so it costs the owner no notice either.
+     */
+    const { specialists, systemText, probe } = await readAnImage({
+      catalog: [blindLead, dear, cheap],
+      ceilingUsd: 1
+    });
+
+    expect(specialists).toEqual(['vendor/cheap-eyes']);
+    expect(systemText).toContain('VISION SPECIALIST HANDOFF');
+    expect(systemText).not.toContain('price ceiling');
+    expect(
+      probe.events.some((entry) => entry.summary.includes('could not be read under your price'))
+    ).toBe(false);
+    // The handoff is on the timeline as the ordinary thing it is.
+    expect(
+      probe.events.some(
+        (entry) => entry.summary === 'Vision handled by Cheap Eyes; returned to Model One'
+      )
+    ).toBe(true);
+  });
 });

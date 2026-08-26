@@ -1,0 +1,652 @@
+import { AthanorError } from '@athanor/core';
+import type { ModelMessage, ModelToolCall } from '@athanor/model-gateway';
+import { describe, expect, it } from 'vitest';
+import {
+  HOST_DISK_FULL_CHECKPOINT_CODE,
+  LATE_STEP_EFFORT_FLOOR,
+  MAX_COMPLETION_NAGS,
+  MAX_PARALLEL_TOOL_CALLS,
+  MAX_REPEATED_FAILURES,
+  PARALLEL_SAFE_TOOLS,
+  REPEATED_FAILURES_BEFORE_STOP,
+  STEP_BUDGET_HANDOFF_STEPS,
+  STEP_BUDGET_MARKER,
+  STEP_HANDOFF_MARKER,
+  WORKSPACE_TOO_LARGE_CHECKPOINT_CODE,
+  acceptanceBaselineNote,
+  acceptanceBaselineRefusal,
+  approvalOrigin,
+  cancelConfirmation,
+  effortFloorEarned,
+  failingCallKey,
+  failureSignature,
+  ownerFixableCheckpointFailure,
+  parallelToolRun,
+  reasoningEffortForStep,
+  repeatedFailureBreak,
+  repeatedFailureKey,
+  repeatedFailureRise,
+  repeatedFailuresAfter,
+  spendHalt,
+  spendWarning,
+  stepBudgetNotice
+} from './turn-bounds.js';
+
+describe('a failure that keeps happening', () => {
+  type Call = { name: string; arguments: Record<string, unknown> };
+  /** The observed shape: the same hunk sent again against a file it does not match. */
+  const patch = (oldText: string, path = 'workspace/importer.py'): Call => ({
+    name: 'file_patch',
+    arguments: { patches: [{ path, oldText, newText: 'return rows or []' }] }
+  });
+  const conflict = (): unknown =>
+    new AthanorError('patch_conflict', 'oldText appears 0 times in workspace/importer.py');
+  const threw = (call: Call, error: unknown): { call: string; failure: string } => ({
+    call: failingCallKey(call),
+    failure: repeatedFailureKey(call, error)
+  });
+  const answered = (call: Call): { call: string; failure: null } => ({
+    call: failingCallKey(call),
+    failure: null
+  });
+  const counted = (
+    call: Call,
+    error: unknown,
+    times: number,
+    from: Record<string, number> = {}
+  ): Record<string, number> => {
+    let counts = from;
+    for (let attempt = 0; attempt < times; attempt += 1)
+      counts = repeatedFailuresAfter(counts, threw(call, error));
+    return counts;
+  };
+
+  it('counts one call failing one way, and only when it is the same both times', () => {
+    const call = patch('def load(rows):');
+    expect(Object.values(counted(call, conflict(), 1))).toEqual([1]);
+    expect(Object.values(counted(call, conflict(), MAX_REPEATED_FAILURES))).toEqual([
+      MAX_REPEATED_FAILURES
+    ]);
+    // The wording of the error moves and the failure does not: the same conflict reported with a
+    // different line number, a different byte count or a different request id is the same refusal.
+    const noisy = new AthanorError('patch_conflict', 'oldText appears 0 times, request 4f9c2a1b8e');
+    expect(Object.values(counted(call, noisy, 1, counted(call, conflict(), 2)))).toEqual([3]);
+  });
+
+  it('leaves a search that misses in four different places alone', () => {
+    /*
+     * The hardest honest case, and the one that decides what "the same failure" means.
+     *
+     * An agent looking for where a project keeps its config reads four candidate paths and gets the
+     * same "no such file" four times. Keyed on the error alone that is a pattern and the turn gets
+     * interrupted; keyed on the call it is what a search looks like from outside - every miss rules
+     * a path out, and the next call is the one that finds it. Nothing here may reach even the first
+     * pushback, let alone the stop.
+     */
+    const missing = new AthanorError('not_found', 'File not found');
+    let counts: Record<string, number> = {};
+    for (const path of ['.eslintrc', '.eslintrc.json', 'config/eslint.json', 'eslint.config.js'])
+      counts = repeatedFailuresAfter(counts, threw(patch('module.exports', path), missing));
+    expect(Object.values(counts)).toEqual([1, 1, 1, 1]);
+    expect(repeatedFailureRise({}, counts)).toEqual({ tool: 'file_patch', count: 1 });
+  });
+
+  it('treats a retry that works, or that breaks differently, as the correction it is', () => {
+    /*
+     * The ordinary rhythm this must never fire on. A command fails because the thing it needs is
+     * not up yet, the agent starts it, and the same command succeeds - the count for it is gone,
+     * because the count only ever meant "this produced identical bytes to last time".
+     *
+     * Note what is not tested here, because it cannot happen: a suite that fails, is fixed and
+     * passes never reaches any of this. A non-zero exit is a tool result, not a thrown call, and
+     * only a thrown call is counted. `evals/fixtures.ts` runs that end to end.
+     */
+    const call = patch('def load(rows):');
+    expect(repeatedFailuresAfter(counted(call, conflict(), 2), answered(call))).toEqual({});
+    // A second attempt that fails for a new reason is new information, so the old count goes with
+    // the old reason rather than being added to.
+    const unreachable = new Error('The workspace runner could not be reached');
+    expect(
+      Object.values(repeatedFailuresAfter(counted(call, conflict(), 2), threw(call, unreachable)))
+    ).toEqual([1]);
+    // And the same file patched with a different hunk is a different call, whatever it fails with.
+    expect(
+      Object.values(
+        repeatedFailuresAfter(
+          counted(call, conflict(), 2),
+          threw(patch('    return rows'), conflict())
+        )
+      )
+    ).toEqual([2, 1]);
+  });
+
+  it('reads what this step did rather than what the counts stand at', () => {
+    // A call that failed three times and was then left alone keeps its three. Judged on the
+    // standing maximum, the loop would push the same sentence back on every step afterwards, about
+    // something the model had already stopped doing.
+    const abandoned = counted(patch('def load(rows):'), conflict(), 3);
+    expect(repeatedFailureRise(abandoned, abandoned)).toBeNull();
+    const other = repeatedFailuresAfter(abandoned, threw(patch('    return rows'), conflict()));
+    expect(repeatedFailureRise(abandoned, other)).toEqual({ tool: 'file_patch', count: 1 });
+  });
+
+  it('keeps no arguments and no error text in what it stores', () => {
+    // The counts outlive the call and are written to task state on every step. The owner's file
+    // body goes into a file_patch and their own code comes back in the conflict, so what is kept
+    // has to prove only that two attempts were the same attempt.
+    const secret = patch('const apiToken = "the owner private value";');
+    const key = repeatedFailureKey(
+      secret,
+      new AthanorError('patch_conflict', 'the owner private value')
+    );
+    expect(key.startsWith('file_patch:')).toBe(true);
+    expect(key).not.toContain('owner');
+    expect(key.split(':').slice(1).join('')).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it('says the number, the tool and the two ways out, three times before it ends anything', () => {
+    const said = repeatedFailureBreak(MAX_REPEATED_FAILURES, 'file_patch');
+    expect(said).toContain(`FAILED ${MAX_REPEATED_FAILURES} TIMES`);
+    expect(said).toContain('file_patch');
+    expect(said).toContain('take a different action');
+    expect(said).toContain('finish');
+    // The stop is the half that costs the owner a turn, so it is never the first thing the model
+    // hears - the same three-warnings shape the idle guard was given.
+    expect(REPEATED_FAILURES_BEFORE_STOP - MAX_REPEATED_FAILURES).toBe(3);
+  });
+
+  it('keeps a bounded number of failing calls', () => {
+    let counts: Record<string, number> = {};
+    for (let index = 0; index < 40; index += 1)
+      counts = repeatedFailuresAfter(counts, threw(patch(`hunk ${index}`), conflict()));
+    expect(Object.keys(counts)).toHaveLength(16);
+    // What survives is what the turn is still failing at, not what it failed at first.
+    expect(counts[repeatedFailureKey(patch('hunk 39'), conflict())]).toBe(1);
+  });
+
+  it('reads a plain error by its shape and an athanor error by its code', () => {
+    expect(failureSignature(new AthanorError('patch_conflict', 'anything at all'))).toBe(
+      'patch_conflict'
+    );
+    expect(failureSignature(new Error('Workspace tool failed (503): upstream 8f2c91ab0d'))).toBe(
+      failureSignature(new Error('Workspace tool failed (500): upstream 41bd77e9c3'))
+    );
+    expect(failureSignature(new Error('Connection refused'))).not.toBe(
+      failureSignature(new Error('Permission denied'))
+    );
+  });
+});
+
+describe('knowing how far through a long turn it is', () => {
+  const notices = (maxSteps: number): Array<[number, string]> =>
+    Array.from({ length: maxSteps }, (_, step) => [step, stepBudgetNotice(step, maxSteps)] as const)
+      .filter((entry): entry is [number, string] => entry[1] !== null)
+      .map(([step, notice]) => [step, notice.split(':')[0] ?? '']);
+
+  it('says nothing while there is plenty of budget left', () => {
+    expect(stepBudgetNotice(0, 60)).toBeNull();
+    expect(stepBudgetNotice(20, 60)).toBeNull();
+  });
+
+  it('warns once with time to change course, then once when only a handoff fits', () => {
+    expect(notices(60)).toEqual([
+      [42, STEP_BUDGET_MARKER],
+      [56, STEP_HANDOFF_MARKER],
+      [57, STEP_HANDOFF_MARKER],
+      [58, STEP_HANDOFF_MARKER],
+      [59, STEP_HANDOFF_MARKER]
+    ]);
+  });
+
+  it('names the steps that are left rather than saying the budget is nearly gone', () => {
+    expect(stepBudgetNotice(42, 60)).toContain("42 of this turn's 60 steps");
+    expect(stepBudgetNotice(42, 60)).toContain('18 remain');
+    expect(stepBudgetNotice(58, 60)).toContain('2 of this turn');
+  });
+
+  it('tells a turn that is out of steps that the work carries over rather than ending', () => {
+    const notice = stepBudgetNotice(59, 60) ?? '';
+    expect(notice).toContain('call finish');
+    expect(notice).toContain('fresh budget');
+  });
+
+  it('still gives the handoff notice on a budget too small for two', () => {
+    const marks = notices(STEP_BUDGET_HANDOFF_STEPS).map(([, marker]) => marker);
+    expect(marks).not.toContain(STEP_BUDGET_MARKER);
+    expect(marks).toContain(STEP_HANDOFF_MARKER);
+  });
+});
+
+describe('a task the model never completes', () => {
+  it('bounds prose-only replies well inside the step budget', () => {
+    // A model that answers and never calls finish used to be nagged once per step until the step
+    // limit, spending the whole budget on the same exchange and then failing with an error that
+    // named nothing.
+    expect(MAX_COMPLETION_NAGS).toBeLessThanOrEqual(5);
+  });
+});
+
+describe('spending limits the owner can read', () => {
+  const window = (name: 'task' | 'daily' | 'monthly', spentUsd: number, capUsd: number | null) => ({
+    name,
+    spentUsd,
+    pendingUsd: 0,
+    capUsd,
+    warnAtUsd: capUsd === null ? null : capUsd * 0.8,
+    projectedUsd: spentUsd,
+    state: 'ok' as const,
+    startsAt: '2026-08-01T00:00:00.000Z',
+    endsAt: '2026-08-02T00:00:00.000Z'
+  });
+
+  it('names the amount, the limit and the window it belongs to', () => {
+    // A ceiling the owner cannot see themselves approaching reads as a random interruption, so the
+    // halt has to carry the numbers rather than say "budget exceeded".
+    const message = spendHalt({
+      outcome: 'deny',
+      estimateUsd: 0.5,
+      blockedBy: 'daily',
+      warnedBy: [],
+      reason: null,
+      windows: [window('task', 1, 4), window('daily', 9.9, 10)]
+    });
+    expect(message).toContain('$9.90');
+    expect(message).toContain('$10.00');
+    expect(message).toContain('today');
+    expect(message).toContain('Raise the limit');
+  });
+
+  it('still says something useful when the blocking window has no cap to quote', () => {
+    expect(
+      spendHalt({
+        outcome: 'deny',
+        estimateUsd: 0.5,
+        blockedBy: 'monthly',
+        warnedBy: [],
+        reason: 'The monthly limit is already spent.',
+        windows: [window('monthly', 20, null)]
+      })
+    ).toContain('The monthly limit is already spent.');
+  });
+
+  it('reports sub-cent spend without rounding it away to zero', () => {
+    // A cheap model can run a long way below a cent a step; "$0.00 of $5.00" reads as a bug.
+    expect(
+      spendWarning({
+        outcome: 'warn',
+        estimateUsd: 0.001,
+        blockedBy: null,
+        warnedBy: ['task'],
+        reason: null,
+        windows: [window('task', 0.0042, 5)]
+      })
+    ).toContain('$0.0042');
+  });
+});
+
+describe('how hard the model thinks about a step', () => {
+  const step = (over: Partial<Parameters<typeof reasoningEffortForStep>[0]>) =>
+    reasoningEffortForStep({ step: 3, messages: [], planVersion: 2, ...over });
+
+  const after = (name: string, result = 'ok'): ModelMessage[] => [
+    { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name, arguments: {} }] },
+    { role: 'tool', toolCallId: 'c1', content: result }
+  ];
+
+  it('spends the full budget on the opening step', () => {
+    expect(step({ step: 0 })).toBe('high');
+  });
+
+  it('does not let a call that threw decide the whole turn is hard', () => {
+    const threw = { step: 3, messages: after('shell', 'Tool failed: runner unreachable') };
+    // Worth thinking about on the step that recovers from it...
+    expect(reasoningEffortForStep(threw)).toBe('high');
+    // ...but `Tool failed:` is written when a tool threw, which is a fact about the network. One
+    // such shell call on step 4 of a measured run pinned all sixteen remaining steps to maximum
+    // reasoning on a task whose entire output was two lines of verse.
+    expect(effortFloorEarned(threw)).toBe(false);
+  });
+
+  it('lets evidence about the work itself pin the floor', () => {
+    for (const hard of [
+      { finishRejections: 1 },
+      { acceptanceFailures: 1 },
+      { completionNags: 1 },
+      { step: LATE_STEP_EFFORT_FLOOR },
+      { compactedAtStep: 3 },
+      { estimatedInputTokens: 900, inputBudgetTokens: 1000 }
+    ]) {
+      const state = { step: 3, messages: [], planVersion: 2, ...hard };
+      expect(effortFloorEarned(state)).toBe(true);
+      expect(reasoningEffortForStep(state)).toBe('high');
+    }
+  });
+
+  it('spends it again when the last step went wrong', () => {
+    expect(step({ messages: after('shell', 'Tool failed: no such file') })).toBe('high');
+    expect(step({ messages: after('finish', 'Finish rejected (attempt 1 of 3)') })).toBe('high');
+    expect(step({ finishRejections: 1, messages: after('code_search') })).toBe('high');
+    expect(step({ completionNags: 1, messages: after('code_search') })).toBe('high');
+  });
+
+  it('does not spend less on the step that has to interpret what it just read', () => {
+    // This is the inversion the effort rule used to have. `REPEATABLE_TOOLS` is a replay-safety
+    // set - tools whose second run after a restart cannot surprise anyone - and effort was taken
+    // from it, so the step after a file_read, an image_read or a parallel_web_read ran at 'low':
+    // the cheapest thinking in the task landed on the step holding the material it had just
+    // fetched.
+    expect(step({ messages: after('code_search') })).toBe('medium');
+    expect(step({ messages: after('file_read') })).toBe('medium');
+    expect(step({ messages: after('parallel_web_read') })).toBe('medium');
+    expect(step({ messages: after('set_plan') })).toBe('medium');
+  });
+
+  it('settles at medium once work is underway', () => {
+    expect(step({ messages: after('file_write') })).toBe('medium');
+    expect(reasoningEffortForStep({ step: 3, messages: after('file_write') })).toBe('medium');
+  });
+
+  it('raises the floor where the long-horizon evidence puts the failures, and keeps it there', () => {
+    expect(step({ step: LATE_STEP_EFFORT_FLOOR })).toBe('high');
+    expect(step({ compactedAtStep: 3 })).toBe('high');
+    expect(step({ step: 9, compactedAtStep: 8 })).toBe('high');
+    expect(step({ estimatedInputTokens: 60_000, inputBudgetTokens: 100_000 })).toBe('high');
+    expect(step({ acceptanceFailures: 1 })).toBe('high');
+    // Ratcheted rather than recomputed: a turn that has become hard does not stop being hard, and
+    // a reasoning field that flips ten times in twenty-three steps discards the cached trajectory
+    // under it on every flip.
+    expect(step({ reasoningFloor: 'high', messages: after('file_write') })).toBe('high');
+  });
+
+  it('stops spending on a compaction two steps after it happened', () => {
+    expect(step({ step: 12, compactedAtStep: 8 })).toBe('medium');
+  });
+
+  /**
+   * The second half of why the ratchet exists, and the half a per-step assertion cannot see.
+   *
+   * Replayed over a trajectory shaped like a real research task, the rule this replaced changed the
+   * `reasoning` field six times in seventeen steps - every change discarding the provider's cached
+   * trajectory below the system prefix, on a window that only grows. The field now moves at most
+   * twice: down once when the opening step is over, and up if the turn becomes hard.
+   */
+  it('keeps the request field steady across a whole trajectory', () => {
+    const trajectory = [
+      'set_plan',
+      'web_search',
+      'parallel_web_read',
+      'document_read',
+      'file_write',
+      'shell',
+      'image_read',
+      'file_write',
+      'publish_file',
+      'finish'
+    ];
+    const messages: ModelMessage[] = [{ role: 'user', content: 'Write me the report' }];
+    let floor: 'medium' | 'high' | undefined;
+    const efforts = trajectory.map((tool, index) => {
+      const effort = reasoningEffortForStep({
+        step: index,
+        messages,
+        planVersion: 1,
+        ...(floor ? { reasoningFloor: floor } : {})
+      });
+      if (index > 0 && effort === 'high') floor = 'high';
+      messages.push({
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: `c${index}`, name: tool, arguments: {} }]
+      });
+      messages.push({ role: 'tool', toolCallId: `c${index}`, content: `${tool} ok` });
+      return effort;
+    });
+    const changes = efforts.filter((effort, index) => index > 0 && effort !== efforts[index - 1]);
+    expect(changes).toHaveLength(1);
+    expect(efforts[0]).toBe('high');
+    expect(efforts.filter((effort) => effort === 'medium')).toHaveLength(trajectory.length - 1);
+  });
+});
+
+describe('a check the harness could never watch fail', () => {
+  const result = (id: string, label: string, passed: boolean, detail: string) => ({
+    id,
+    label,
+    passed,
+    detail
+  });
+
+  it('sends back a record that already passes, with what the harness saw', () => {
+    const refusal = acceptanceBaselineRefusal(
+      [
+        result('check-1', 'the report exists', true, '18 bytes (needs at least 1)'),
+        result('check-2', 'the notes are there', true, 'exit 0')
+      ],
+      1,
+      2
+    );
+    expect(refusal).toContain('all 2 of these');
+    expect(refusal).toContain('before the work');
+    // The correction has to be actionable: which check, what the harness observed, and what a
+    // check that means something would look like instead.
+    expect(refusal).toContain('check-1 (the report exists): 18 bytes');
+    expect(refusal).toContain('fails right now');
+    expect(refusal).toContain('guards against breaking something');
+  });
+
+  it('names which check is the proof and which one only guards what already works', () => {
+    const note = acceptanceBaselineNote([
+      result('check-1', 'the new endpoint answers', false, 'exit 7: connection refused'),
+      result('check-2', 'the existing suite still passes', true, 'exit 0')
+    ]);
+    expect(note).toContain('check-1 fails now');
+    expect(note).toContain('check-2 already passes');
+    expect(note).toContain('guards what already works');
+  });
+});
+
+/*
+ * The Stop button reaching the background.
+ *
+ * `processes/start` answers in milliseconds and leaves its child running for the rest of its hour,
+ * so a cancelled task went on writing into the workspace and making requests attributed to this
+ * computer while the interface said it had stopped. The runner has always had the route to end
+ * them; nothing called it.
+ */
+describe('what the owner is told when they stop a conversation', () => {
+  // Verbatim, because the exemption is the runner's rule to state. Rewording it here is how a
+  // service that is still up comes to be described by a side that does not know the rule.
+  it('repeats the runner’s own account of what is still running', () => {
+    expect(
+      cancelConfirmation(
+        'Stopped 2 background commands. The declared service "web" is still running: a service is meant to outlive the task that started it, so stopping one is its own action.'
+      )
+    ).toBe(
+      'Task cancelled by user. Stopped 2 background commands. The declared service "web" is still running: a service is meant to outlive the task that started it, so stopping one is its own action.'
+    );
+  });
+
+  // A computer that is not answering is one of the reasons somebody presses Stop. Cancelling still
+  // has to complete, and a guess about what is still running is worse than saying nothing.
+  it('says only what it knows when the computer did not answer', () => {
+    expect(cancelConfirmation()).toBe('Task cancelled by user');
+    expect(cancelConfirmation('')).toBe('Task cancelled by user');
+  });
+});
+
+/*
+ * The one field on an approval row that outlives the turn.
+ *
+ * `approvals.origin` has been a column, a store parameter and a projection in the route since the
+ * table was created, and nothing has ever written it: every row on every box carries NULL. The
+ * reason to write it is stated in this file beside the taint transition - a repeat origin across
+ * tasks is the strongest residual attack in this design, buying the ranking for a query the owner
+ * will plausibly run - and a repeat is only visible if the origin is on the row somebody can look
+ * back through.
+ */
+describe('where an approval was raised from', () => {
+  const tainted = (...sources: string[]) => ({
+    taint: { level: 'untrusted' as const, sources, sinceStep: 0 }
+  });
+
+  it('names the untrusted source that was in the turn when the card went up', () => {
+    expect(approvalOrigin(tainted('https://evil.example'))).toBe('https://evil.example');
+  });
+
+  // The newest, not the first. The turn read eight ordinary sources and then the attacker's page,
+  // and it is the arrival that raised the floor this card is standing on.
+  it('names the newest source when the turn has read several', () => {
+    expect(approvalOrigin(tainted('https://a.example', 'https://b.example'))).toBe(
+      'https://b.example'
+    );
+  });
+
+  // A clean turn has no origin, and saying so as an absence rather than as a string is what lets a
+  // reader tell "raised while untrusted content was in the room" from "raised on the owner's own
+  // work". A placeholder would make every row look equally suspicious, which is the same as making
+  // none of them look suspicious.
+  it('says nothing at all when nothing untrusted has entered the turn', () => {
+    expect(approvalOrigin(undefined)).toBeUndefined();
+    expect(approvalOrigin({})).toBeUndefined();
+    expect(approvalOrigin(tainted())).toBeUndefined();
+  });
+});
+
+describe('a turn that lost its undo point', () => {
+  it('tells the owner only when the reason is theirs to clear', () => {
+    // The runner's own refusal, verbatim, is what reaches the worker through the checkpoint call.
+    expect(
+      ownerFixableCheckpointFailure(
+        'Checkpoint failed (507): {"error":{"message":"Host disk is too full to take an automatic checkpoint, so this turn cannot be rewound."}}'
+      )
+    ).toBe(true);
+    expect(ownerFixableCheckpointFailure('EACCES: permission denied, mkdir')).toBe(false);
+    expect(ownerFixableCheckpointFailure('workspace is not its own dataset')).toBe(false);
+  });
+
+  // The prose belongs to the runner and the runner may reword it whenever it likes. The code does
+  // not, which is the whole reason it exists: a refusal that says so in a field survives being
+  // rephrased, translated or shortened, and the sentence-matching below survives only by luck.
+  it('reads the refusal code the runner sends rather than the sentence around it', () => {
+    expect(
+      ownerFixableCheckpointFailure('Something the runner will reword next release', {
+        code: HOST_DISK_FULL_CHECKPOINT_CODE
+      })
+    ).toBe(true);
+    expect(
+      ownerFixableCheckpointFailure(
+        `Checkpoint failed (507): {"error":{"code":"${HOST_DISK_FULL_CHECKPOINT_CODE}","message":"There is not enough room."}}`
+      )
+    ).toBe(true);
+  });
+
+  // `runner_request_failed` is the runner's generic code, carried by every refusal that is not one
+  // of the two it names specially. Treating a generic code as owner-fixable would put the loudest
+  // card in the transcript in front of somebody who can do nothing at all about it.
+  it('does not read the runner’s generic failure code as something the owner can clear', () => {
+    expect(
+      ownerFixableCheckpointFailure(
+        'Checkpoint failed (400): {"error":{"code":"runner_request_failed","message":"workspace is not its own dataset"}}',
+        { code: 'runner_request_failed' }
+      )
+    ).toBe(false);
+  });
+
+  // The regex stays underneath, because the code only exists in the runner from this release on and
+  // a worker is routinely a version ahead of the box it is talking to.
+  it('still reads the sentence when the refusal carries no code at all', () => {
+    expect(ownerFixableCheckpointFailure('No space left on device')).toBe(true);
+  });
+
+  /*
+   * The second owner-fixable refusal, and the one the sentence-matching never reached.
+   *
+   * A workspace over the runner's file ceiling - two `node_modules` trees is enough - loses every
+   * automatic undo point from then on, and the refusal names no disk, no space and no quota, so
+   * nothing in the regex above can see it. Until this code was in the set, the rewind dialog told
+   * the owner the turn "changed nothing on the computer" about turns that changed a great deal.
+   *
+   * Asserted from both directions on purpose: the code is admitted, and the sentence on its own
+   * still is not - which is what says the code is doing the work rather than a lucky word.
+   */
+  it('raises the workspace the runner will not checkpoint, on the code and not on the prose', () => {
+    const refusal =
+      'This workspace holds more than 250000 files, which is more than automatic checkpoints cover. Take a named recovery point instead.';
+    expect(
+      ownerFixableCheckpointFailure(refusal, { code: WORKSPACE_TOO_LARGE_CHECKPOINT_CODE })
+    ).toBe(true);
+    expect(
+      ownerFixableCheckpointFailure(
+        `Checkpoint failed (413): {"error":{"code":"${WORKSPACE_TOO_LARGE_CHECKPOINT_CODE}","message":"${refusal}"}}`
+      )
+    ).toBe(true);
+    expect(ownerFixableCheckpointFailure(refusal)).toBe(false);
+  });
+});
+
+describe('the reads a batch may run at the same time', () => {
+  const read = (id: string, path: string): ModelToolCall => ({
+    id,
+    name: 'file_read',
+    arguments: { path }
+  });
+
+  it('leaves out the members that write, and the one whose approval verdict moves', () => {
+    for (const name of ['file_read', 'code_search', 'repo_overview', 'web_search'])
+      expect(PARALLEL_SAFE_TOOLS.has(name)).toBe(true);
+    // The two writers. A plan published beside the read that decides its next step is a plan
+    // nobody chose.
+    expect(PARALLEL_SAFE_TOOLS.has('set_plan')).toBe(false);
+    expect(PARALLEL_SAFE_TOOLS.has('set_acceptance')).toBe(false);
+    // The exfiltration floor's per-turn novelty budget is charged when a result is recorded, so two
+    // web reads judged against the same spent total can jointly pass a bound that would have
+    // carded the second. Replay safety does not imply that, which is why this set is not simply
+    // inherited from the replay-safety one.
+    expect(PARALLEL_SAFE_TOOLS.has('parallel_web_read')).toBe(false);
+    // And nothing that changes the computer ever gets in.
+    for (const name of ['shell', 'file_write', 'browser_action', 'publish_artifact', 'finish'])
+      expect(PARALLEL_SAFE_TOOLS.has(name)).toBe(false);
+  });
+
+  it('takes the maximal run and stops at the first call that is not one of them', () => {
+    const calls = [
+      read('a', 'workspace/a.txt'),
+      { id: 'b', name: 'code_search', arguments: { query: 'handler' } },
+      { id: 'c', name: 'file_write', arguments: { path: 'workspace/c.txt', content: 'x' } },
+      read('d', 'workspace/d.txt')
+    ];
+    expect(parallelToolRun(calls, 0)).toBe(2);
+    // The writer itself is never a run, so the caller falls through to the ordinary path.
+    expect(parallelToolRun(calls, 2)).toBe(0);
+    expect(parallelToolRun(calls, 3)).toBe(1);
+  });
+
+  it('never runs more than the cap at once, and runs the rest behind them', () => {
+    const calls = Array.from({ length: MAX_PARALLEL_TOOL_CALLS + 3 }, (_, index) =>
+      read(`call-${index}`, `workspace/${index}.txt`)
+    );
+    expect(parallelToolRun(calls, 0)).toBe(MAX_PARALLEL_TOOL_CALLS);
+    expect(parallelToolRun(calls, MAX_PARALLEL_TOOL_CALLS)).toBe(3);
+  });
+
+  it('ends in front of a call the loop answers instead of running', () => {
+    // Cut off mid-JSON at the output cap: it is answered with the message that says so, and that
+    // message has to keep its place in the declared order.
+    expect(
+      parallelToolRun([read('a', 'workspace/a.txt'), { ...read('b', ''), parseFailed: true }], 0)
+    ).toBe(1);
+    // An exact repeat of a read this turn already answered, whether the earlier one was in a
+    // previous batch or in this one.
+    expect(
+      parallelToolRun([read('a', 'workspace/a.txt'), read('b', 'workspace/b.txt')], 0, {
+        'file_read:{"path":"workspace/b.txt"}': 'call-earlier'
+      })
+    ).toBe(1);
+    expect(
+      parallelToolRun(
+        [read('a', 'workspace/a.txt'), read('b', 'workspace/a.txt'), read('c', 'workspace/c.txt')],
+        0
+      )
+    ).toBe(1);
+  });
+});

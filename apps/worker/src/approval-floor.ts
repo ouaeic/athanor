@@ -1,0 +1,267 @@
+/**
+ * The approval floor: what a tool call has to be asked about before it runs, and the three lookups
+ * a card needs before it can name what it is asking about.
+ *
+ * Lifted out of `AgentWorker` in Wave 7.2, carrying defect #80 (loop F12) - the floor was evaluated
+ * twice for the first call of every candidate parallel run. Each evaluation builds the destination
+ * context, which joins up to forty thousand characters of the owner's own words and copies two
+ * origin arrays, and it can reach the store three times besides. `approvalForCallOnce` is where the
+ * second evaluation went.
+ */
+import { createHmac } from 'node:crypto';
+import { unwrapDataKey } from '@athanor/core';
+import type { DataStore, TaskRecord } from '@athanor/data';
+import type { ModelToolCall } from '@athanor/model-gateway';
+import type { AgentState, InferenceCredential } from './agent-state.js';
+import type { AgentApprovalRequirement } from './approval-state.js';
+import type { DestinationContext } from './egress.js';
+import {
+  resolvedMediaModel,
+  resolvedTranscriptionRoute,
+  transcriptionRouteWithMeasuredRate,
+  type ResolvedMediaModel
+} from './media.js';
+import type { AgentRunnerClient } from './runner-client.js';
+import { approvalRequirement, surfaceActionRequest, type ApprovalContext } from './tools.js';
+import { textValue } from './values.js';
+
+/** What the floor needs from the worker that owns the turn. */
+export interface ApprovalFloorDeps {
+  readonly store: DataStore;
+  readonly masterKey: Buffer;
+  readonly runner: AgentRunnerClient;
+  inferenceCredential(task: TaskRecord): Promise<InferenceCredential>;
+  destinationContext(state?: AgentState): DestinationContext;
+}
+
+/**
+ * One evaluation of the floor per call, per state of the world.
+ *
+ * The loop asks twice about the first call of every candidate parallel run: once while deciding
+ * whether the run can go together, and again on the sequential path the run falls through to when
+ * it collapses to a single call. Nothing executes between those two asks - every gate in between
+ * either answers the call and `continue`s or registers an idempotency key, and the floor reads
+ * neither - so the second ask could only ever return what the first did. It was not free: each
+ * evaluation joins up to forty thousand characters of the owner's own words into a destination
+ * context and can reach the store three times besides.
+ *
+ * `at` is what makes reuse safe rather than merely cheap. A verdict depends on the turn's taint,
+ * its known origins and its novelty budget, and all three move when a tool runs; `toolsStarted` is
+ * incremented immediately before every dispatch on both the sequential and the parallel path, so a
+ * verdict taken at a different count is discarded rather than trusted. That is stricter than the
+ * defect required, and it is the clause that keeps this a memo rather than a cache.
+ */
+export interface ApprovalFloorMemo {
+  at: number;
+  readonly verdicts: Map<string, AgentApprovalRequirement | null>;
+}
+
+export const createApprovalFloorMemo = (): ApprovalFloorMemo => ({ at: -1, verdicts: new Map() });
+
+export const approvalForCallOnce = async (
+  deps: ApprovalFloorDeps,
+  memo: ApprovalFloorMemo,
+  task: TaskRecord,
+  call: ModelToolCall,
+  state?: AgentState
+): Promise<AgentApprovalRequirement | null> => {
+  const at = state?.toolsStarted ?? 0;
+  if (memo.at !== at) {
+    memo.verdicts.clear();
+    memo.at = at;
+  }
+  // `has` rather than truthiness: `null` is the answer for a call the floor does not ask about, and
+  // reading it as "not yet evaluated" would reinstate the double evaluation on precisely the calls
+  // a parallel run is made of.
+  if (memo.verdicts.has(call.id)) return memo.verdicts.get(call.id) ?? null;
+  const requirement = await approvalForCall(deps, task, call, state);
+  memo.verdicts.set(call.id, requirement);
+  return requirement;
+};
+
+/**
+ * The saved skill an upsert would land on, keyed exactly as the upsert keys it. Absent when the
+ * name is new, when the workspace key cannot be opened, or when the lookup fails - a card that
+ * cannot prove a replacement says nothing rather than guessing, because the wrong half of that
+ * guess reads as "this is new" on a call that destroys the owner's own text.
+ */
+export const existingSkillFor = async (
+  deps: ApprovalFloorDeps,
+  task: TaskRecord,
+  name: string
+): Promise<ApprovalContext['existingSkill']> => {
+  if (!name) return undefined;
+  try {
+    const workspace = await deps.store.getWorkspaceById(task.workspaceId);
+    if (!workspace?.wrappedKey) return undefined;
+    const key = unwrapDataKey(workspace.wrappedKey, deps.masterKey, workspace.id);
+    const nameHash = createHmac('sha256', key).update(`athanor-skill:${name}`).digest('hex');
+    const saved = (await deps.store.listWorkspaceSkills(task.userId, task.workspaceId)).find(
+      (skill) => skill.nameHash === nameHash
+    );
+    return saved
+      ? {
+          version: saved.version,
+          enabled: saved.enabled,
+          useCount: saved.useCount,
+          updatedAt: saved.updatedAt
+        }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+export const approvalForCall = async (
+  deps: ApprovalFloorDeps,
+  task: TaskRecord,
+  call: ModelToolCall,
+  state?: AgentState
+): Promise<AgentApprovalRequirement | null> => {
+  // What this task has already put on the provider bill for media. One generation is a cent or
+  // two at the reviewed prices, so a per-call ceiling could never fire and the card would have
+  // been a branch that never runs; a run that keeps re-rolling is the thing worth stopping, and
+  // it is only visible in the total.
+  // Whether this name already belongs to something. An upsert replaces the saved body outright,
+  // so the difference between "save this procedure" and "throw away the one you wrote" is the
+  // whole of what the reviewer needs, and the arguments cannot carry it.
+  const existingSkill =
+    call.name === 'skill' && textValue(call.arguments.action) === 'upsert'
+      ? await existingSkillFor(deps, task, textValue(call.arguments.name))
+      : undefined;
+  const declared = approvalRequirement(call.name, call.arguments, task.securityMode, {
+    ...(call.name === 'generate_media'
+      ? {
+          mediaCommittedUsd: await mediaCommittedUsd(deps, task),
+          // The card has to name and price the route the call will really take. Without this it
+          // quoted the reviewed default's figure at an owner who had chosen something ten times
+          // the price, and it applied a cumulative threshold to a route whose price nobody
+          // published - which is the one case that has to ask every time instead.
+          ...(await mediaModelForCall(deps, task, textValue(call.arguments.kind)))
+        }
+      : {}),
+    // Reading a recording lands on the same bill as making one, so it meets the same cumulative
+    // card. The duration is what it is priced on, and the only honest number available before the
+    // encode is what the model asked for - which is why the card says "up to" and the ledger is
+    // settled afterwards from what the provider actually billed.
+    ...(call.name === 'audio_read'
+      ? {
+          mediaCommittedUsd: await mediaCommittedUsd(deps, task),
+          ...(await transcriptionModelForCall(deps, task, state))
+        }
+      : {}),
+    ...(existingSkill ? { existingSkill } : {}),
+    ...(state?.taint ? { taintSources: state.taint.sources } : {}),
+    ...deps.destinationContext(state)
+  });
+  if (!['browser_action', 'desktop_action'].includes(call.name)) return declared;
+  const surface = call.name === 'browser_action' ? 'browser' : 'desktop';
+  try {
+    const policy = await deps.runner.call<{
+      consequential: boolean;
+      sensitiveInput: boolean;
+      preview: string;
+    }>(
+      task.workspaceId,
+      task.id,
+      `${surface}.read`,
+      `/v1/workspaces/${task.workspaceId}/${surface}/preflight`,
+      surfaceActionRequest(call.arguments)
+    );
+    if (policy.sensitiveInput) {
+      return {
+        sideEffect: 'external_consequential',
+        action: `Secure ${surface} input required`,
+        preview: `${policy.preview}\nTake over the ${surface === 'browser' ? 'Browser' : 'Computer'} pane, enable Secure input, enter the private value, return control, then approve this handoff. The agent will not replay the typed value.`,
+        handoffOnly: true
+      };
+    }
+    if (policy.consequential) {
+      return {
+        sideEffect: 'external_consequential',
+        action: declared?.action ?? `Confirm ${surface} action`,
+        preview: `${declared?.preview ?? policy.preview}\nThe ${surface} broker identified the actual control as consequential.`
+      };
+    }
+    /*
+     * The broker looked and said it is harmless, so that is the answer - and for a call the floor
+     * was not going to ask about anyway, the answer is nothing at all.
+     *
+     * `desktop_action` declares every `click_at` and `drag` as consequential because a bare
+     * coordinate is ambiguous - which is right when nothing can resolve it. Here something did:
+     * the preflight identified the actual control under that coordinate and found it benign, so
+     * the requirement is softened rather than dropped. That softening was written as an
+     * unconditional `return`, which every caller reads as "park the turn and raise a card": a
+     * plain `navigate`, whose `declared` is null in every mode and which `ordinaryRequirement`
+     * carries on a hand-written list of verbs that must never card even in Review, came back as a
+     * card reading "Use the browser". Every browser and desktop action parked the turn, cleared
+     * the lease and deferred the rest of the batch. Null in, null out: the broker may lighten a
+     * requirement and may not invent one.
+     */
+    if (!declared) return null;
+    return { ...declared, sideEffect: 'external_reversible' };
+  } catch {
+    // The execution call will return the browser's authoritative error if preflight is unavailable.
+  }
+  return declared;
+};
+
+/**
+ * What this task has already spent generating media, which is what the cumulative approval
+ * threshold is measured against. Unavailable is priced as zero rather than as a failure -
+ * refusing to generate because the ledger could not be read is a worse answer than generating
+ * one more image.
+ */
+export const mediaCommittedUsd = async (
+  deps: ApprovalFloorDeps,
+  task: TaskRecord
+): Promise<number> => {
+  return deps.store.mediaSpendForTask(task.id).catch(() => 0);
+};
+
+/**
+ * The route this generation will take, for the card that asks about it.
+ *
+ * Absent for a `kind` that is not a modality, and absent when the credential cannot be read at
+ * all: an unconfigured provider is a thing the dispatch below reports properly a moment later,
+ * with its own 503 and its own wording, and turning that into a throw from inside the approval
+ * check would replace a clear "add a provider in Settings" with a failed turn. Falling back
+ * prices exactly as this card always did, against the reviewed default.
+ */
+export const mediaModelForCall = async (
+  deps: ApprovalFloorDeps,
+  task: TaskRecord,
+  kind: string
+): Promise<{ mediaModel?: ResolvedMediaModel }> => {
+  if (kind !== 'image' && kind !== 'audio') return {};
+  const secret = await deps.inferenceCredential(task).catch(() => undefined);
+  return { mediaModel: resolvedMediaModel(kind, secret?.mediaRoutes) };
+};
+
+/**
+ * The route a reading will take, for the card that asks about it.
+ *
+ * Absent where the owner has pinned nothing: the model is then whatever their provider offers,
+ * discovered a moment later in the dispatch arm, and a card that named one before it was chosen
+ * would be naming a guess. Absent also prices nothing, which is what makes the card ask on every
+ * reading until a route with a published per-minute price is chosen - the same treatment an
+ * unpriced image route already gets, for the same reason.
+ *
+ * A route this task has already been billed for is no longer one of unknown price, so the rate
+ * measured from the provider's own first invoice is carried onto it here. Without that the card
+ * would go on saying the cost cannot be known while the dispatch arm below priced the very same
+ * reading from a figure it was holding.
+ */
+export const transcriptionModelForCall = async (
+  deps: ApprovalFloorDeps,
+  task: TaskRecord,
+  state?: AgentState
+): Promise<{ mediaModel?: ResolvedMediaModel }> => {
+  const secret = await deps.inferenceCredential(task).catch(() => undefined);
+  const chosen = resolvedTranscriptionRoute(secret?.mediaRoutes);
+  const route = transcriptionRouteWithMeasuredRate(
+    chosen,
+    chosen ? state?.transcriptionRates?.[chosen.modelId] : null
+  );
+  return route ? { mediaModel: route } : {};
+};

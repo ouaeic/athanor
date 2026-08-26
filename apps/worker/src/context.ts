@@ -355,6 +355,45 @@ const TOOL_OUTPUT_SQUEEZE_SHARE = 0.5;
  */
 const TOOL_OUTPUT_FLOOR_STEP = 0.75;
 
+/**
+ * The lowest the curve above will ask for, which is NOT the same number as the hard floor.
+ *
+ * `OLDER_TOOL_OUTPUT_CHARS` is where the terminal pass at the end of `prepareModelContext` cuts
+ * every non-newest result when the prepared window genuinely will not fit. That pass is
+ * unconditional and it is the safety property; the curve is a policy about how much older evidence
+ * to keep while there is still room, and the two were the same constant only because nobody had
+ * separated them.
+ *
+ * Ending the curve at 2,000 spends the whole descent solving a problem the tier above it is about
+ * to solve properly. Traced on `long-a-full-window-condenses-rather-than-stubbing-itself`: over
+ * four consecutive requests the floor went 24,000 -> 16,000 -> 11,000 -> 6,000 -> 2,000 while the
+ * prepared window stood at 48,229, 53,727, 61,224 and 63,721 tokens against a budget of 91,320 -
+ * that is, every older result on the task was cut to a 2,000-character stub while the request was
+ * at seventy per cent of what it was allowed, and one step later the loop condensed the trajectory
+ * and freed half the window in one move. Each of those four moves re-cuts every older result at
+ * once, ahead of every breakpoint, which is the most expensive single thing this file does.
+ *
+ * 4,000 rather than lower because it is roughly where a truncated result stops being a stub - the
+ * head and tail of a file read, a search hit with its surrounding lines, the top of a stack trace
+ * and its cause - and it doubles what an older result keeps for about a third of a point of extra
+ * prompt across the eval suite.
+ *
+ * Rather than higher, and this is the part that was measured rather than argued: 6,000 was tried
+ * first and it is WORSE, on quality and on cache both. `evals/context-quality`'s uncompacted
+ * 131,072-token trajectory scores the artifact probe 5.00 at 4,000 and 1.00 at 6,000, with mean
+ * availability 5.00 against 4.67 and 43,003 characters of rework where there had been none; the
+ * compacted trajectory's cache-read share reads 73.0% at 4,000 and 70.8% at 6,000. The cause is the
+ * pass ORDER below. The hard pass runs before the terminal tool-result pass, so a curve held high
+ * enough that the prepared window overruns does not degrade into "every older result cut to
+ * OLDER_TOOL_OUTPUT_CHARS" - it degrades into "every older message replaced by one line", which
+ * loses the whole message instead of the middle of it. The comment on TOOL_OUTPUT_FLOOR_STEP above
+ * says a band held too high degrades into the terminal pass; that is true of the band and not of
+ * this constant, and the difference is which pass the window reaches first. Raising this number
+ * again means moving the terminal pass ahead of the hard pass, and that is a change with its own
+ * measurement to do.
+ */
+const TOOL_OUTPUT_SQUEEZE_FLOOR_CHARS = 4_000;
+
 export const olderToolOutputChars = (
   estimatedTokens: number,
   inputBudget: number,
@@ -366,16 +405,19 @@ export const olderToolOutputChars = (
   const pressure = (estimatedTokens - start) / Math.max(1, floored - start);
   const scaled =
     RECENT_TOOL_OUTPUT_CHARS -
-    (RECENT_TOOL_OUTPUT_CHARS - OLDER_TOOL_OUTPUT_CHARS) * Math.min(1, Math.max(0, pressure));
-  const wanted = Math.max(OLDER_TOOL_OUTPUT_CHARS, Math.round(scaled / 1_000) * 1_000);
+    (RECENT_TOOL_OUTPUT_CHARS - TOOL_OUTPUT_SQUEEZE_FLOOR_CHARS) *
+      Math.min(1, Math.max(0, pressure));
+  const wanted = Math.max(TOOL_OUTPUT_SQUEEZE_FLOOR_CHARS, Math.round(scaled / 1_000) * 1_000);
   if (wanted >= appliedFloor) return appliedFloor;
-  // The hard floor is never worth holding out against: it is where every descent ends, so a band
-  // that refuses the last rung is a band that never arrives. Without this the rule is only total
-  // because of an accident of arithmetic - the curve is read in thousands, so an applied floor is
-  // always a multiple of a thousand, and 2,000 is the only one from which a quarter off is not a
-  // move worth taking. Any floor a task carried in between 2,000 and 2,667 would hold there
-  // forever, which is a trap laid for whoever next changes that resolution.
-  if (wanted > OLDER_TOOL_OUTPUT_CHARS && wanted > appliedFloor * TOOL_OUTPUT_FLOOR_STEP)
+  // The end of the curve is never worth holding out against: it is where every descent ends, so a
+  // band that refuses the last rung is a band that never arrives. Without this the rule is only
+  // total because of an accident of arithmetic - the curve is read in thousands, so an applied
+  // floor is always a multiple of a thousand, and the bottom rung is the only one from which a
+  // quarter off is not a move worth taking. Any floor a task carried in between the bottom and
+  // four thirds of it would hold there forever, which is a trap laid for whoever next changes that
+  // resolution. Keyed on the curve's own end and not on OLDER_TOOL_OUTPUT_CHARS, because those are
+  // now two different numbers and this rule is about the one the curve can reach.
+  if (wanted > TOOL_OUTPUT_SQUEEZE_FLOOR_CHARS && wanted > appliedFloor * TOOL_OUTPUT_FLOOR_STEP)
     return appliedFloor;
   return wanted;
 };
@@ -452,6 +494,22 @@ const estimatedTokens = (messages: ModelMessage[]): number =>
     }, 0) / 4
   );
 
+/**
+ * The opening of the deterministic working summary, published for the same reason
+ * `BASE_PROMPT_MARKER` and `CONDENSED_HISTORY_MARKER` are: two other places match on it.
+ *
+ * `prepareModelContext` pushes this block at the tail when the soft threshold is crossed, and
+ * `compactContext` writes the same opening INSIDE the running brief when no summariser was
+ * available - so a reader that matches anywhere in the content cannot tell the two mechanisms
+ * apart. `evals/harness.ts` counts soft-pass windows with `startsWith` for exactly that reason, and
+ * held this string as a literal until it was exported here.
+ */
+export const COMPRESSED_TRAJECTORY_MARKER = 'COMPRESSED TRAJECTORY';
+
+/** Whether a message is the block the soft pass pushes; matched the way the marker's note says. */
+const isCompressedTrajectory = (message: ModelMessage): boolean =>
+  message.role === 'system' && message.content.startsWith(COMPRESSED_TRAJECTORY_MARKER);
+
 const trajectorySummary = (messages: ModelMessage[], indexes: number[]): string => {
   const lines = indexes.map((index) => {
     const message = messages[index];
@@ -467,7 +525,7 @@ const trajectorySummary = (messages: ModelMessage[], indexes: number[]): string 
     return `- ${message.role === 'user' ? 'User' : 'Agent'}${toolNames ? ` used ${toolNames}` : ''}: ${content || 'no prose response'}`;
   });
   return truncateMiddle(
-    `COMPRESSED TRAJECTORY (deterministic working summary; original encrypted events remain authoritative)\n${lines.filter(Boolean).join('\n')}`,
+    `${COMPRESSED_TRAJECTORY_MARKER} (deterministic working summary; original encrypted events remain authoritative)\n${lines.filter(Boolean).join('\n')}`,
     12_000,
     'trajectory summary'
   );
@@ -548,6 +606,36 @@ export const declaredCompactionTargetTail = (inputBudget: number, windowTokens: 
     compactionTargetTail(inputBudget),
     Math.floor(windowTokens * (COMPACTION_TARGET_SHARE / COMPACTION_TRIGGER_SHARE))
   );
+/**
+ * Where the deterministic soft pass engages, as a share of the same input budget.
+ *
+ * It was 0.72, written as a bare multiplication at its one use site, and two points above a
+ * compaction trigger that fires at 0.70 is not a tier below compaction - it is a tier that fires
+ * INSTEAD of it, and then hides the reason.
+ *
+ * The order the loop is designed around is: bound old tool output, then condense superseded turns
+ * into the durable brief, and only if neither was enough start replacing message bodies with stubs.
+ * The agent loop reads the size of the request it last prepared to decide whether to condense, so a
+ * soft pass that fires first does not merely arrive out of turn - it shreds the window, the smaller
+ * number is what the trigger reads on the next step, and the compaction never fires at all.
+ *
+ * Measured on `long-a-full-window-condenses-rather-than-stubbing-itself`, an eighteen-request turn
+ * on a 128,000-token window with a budget of 91,320 and a trigger at 63,924. One step adds a tool
+ * result of up to 24,000 characters, so the window moves in jumps of several thousand tokens while
+ * the old gap between the two tiers was 1,826. Requests 15, 16 and 17 crossed 65,750, were shredded
+ * to 52,206 / 47,183 / 47,359, and reported those numbers to a trigger they were now far below -
+ * while the untrimmed trajectory behind them stood at 84,644, 94,699 and 104,860 tokens. The turn
+ * never condensed again after its first compaction, and the cached share of each request settled at
+ * 44%.
+ *
+ * 0.9 leaves a whole step of headroom above the trigger on any window large enough for the two
+ * tiers to be distinguishable, and the two passes below it are unchanged: the hard pass still runs
+ * at the budget itself and the terminal tail pass behind that, so nothing here can produce a
+ * request a provider refuses. It must stay above `COMPACTION_TRIGGER_SHARE`, which is what the
+ * assertion in `context.test.ts` holds it to.
+ */
+export const SOFT_PASS_SHARE = 0.9;
+
 /** Never condense so far forward that the model loses the turns it is actively working through. */
 export const MIN_PROTECTED_TAIL_MESSAGES = 8;
 /**
@@ -1162,8 +1250,27 @@ const stablePrefixEnd = (
  * provider looking backwards past the marker to find an older entry. Snapping removes that
  * dependency for one of the breakpoints, and marking the previous grid position as well covers the
  * step on which the checkpoint moves.
+ *
+ * Four rather than eight, and four rather than two or one, because it is the peak of a curve and
+ * not an extrapolation. Swept over the sixty-step harness in `context.test.ts` at 1, 2, 3, 4, 6 and
+ * 8, reading the share a provider could actually serve at the marks each request carries:
+ *
+ *     stride       8       6       4       3       2       1
+ *     131,072   69.7%   70.3%   70.4%   67.3%   65.4%   59.3%
+ *     1,000,000 75.8%   76.9%   77.9%   77.2%   77.0%   77.0%
+ *
+ * The fall below four is the grid colliding with itself: the two checkpoints are one stride apart,
+ * so a short stride puts them both within a message or two of each other and of the edge, the
+ * duplicates collapse (marks per request 3.69 at eight, 2.41 at one) and the deepest position that
+ * two consecutive requests both mark ends up further back, not nearer. Eight is on the other side
+ * of the same trade - the grid is coarse enough that the checkpoint can sit most of a stride behind
+ * where the request stopped being identical to its predecessor.
+ *
+ * Nothing the model sees changes here, which is the whole reason this is the change that was made:
+ * the byte-common prefix of consecutive requests is 74.77% and 80.11% before and after, to four
+ * figures, on both windows.
  */
-const CACHE_CHECKPOINT_STRIDE = 8;
+const CACHE_CHECKPOINT_STRIDE = 4;
 
 /**
  * Block content is only well defined for these roles, and an image message carries its own blocks.
@@ -1175,12 +1282,21 @@ const CACHE_CHECKPOINT_STRIDE = 8;
  * that still carries the block near its head (a saved one from before it moved, or a fork that
  * hoisted every system message) would then cache nothing at all, which is far worse than marking
  * one message too far.
+ *
+ * The soft-pass summary is refused on the same grounds. It is rebuilt from scratch on every step
+ * that crosses the threshold, over a set of condensed indexes that grows as the window does, so its
+ * bytes never repeat and a breakpoint on it is a write that can never be read. Refused by content
+ * rather than by position, because the position is the thing that just changed: it now goes in at
+ * the tail, and a rule keyed on where it sits would have to be rewritten the next time it moves.
+ * The block lives only in the copy `prepareModelContext` returns and never in the persisted
+ * trajectory, so there is no saved window to be compatible with - only this function's own output.
  */
 const cacheEligible = (message: ModelMessage | undefined): boolean =>
   !!message &&
   (message.role === 'system' || message.role === 'user' || message.role === 'tool') &&
   !message.images?.length &&
-  !isRuntimeContext(message);
+  !isRuntimeContext(message) &&
+  !isCompressedTrajectory(message);
 
 /**
  * Marks the prompt prefixes worth caching.
@@ -1196,6 +1312,25 @@ const cacheEligible = (message: ModelMessage | undefined): boolean =>
  *   bytes - for several steps running, and the previous grid position marked alongside so the step
  *   that advances the grid still reads. A provider that only looks for a hit at the breakpoints the
  *   request itself carries needs that; one that looks further back is served by the edge.
+ *
+ * The edge is deliberately a *forward* statement and not a retrospective one. Placing it instead at
+ * the last eligible index inside the run identical to the PREVIOUS prepared window was specified
+ * and then measured, and it is worse on both shipped windows: the share a provider could serve
+ * falls 69.7% to 68.3% on the 131,072-token window and 75.8% to 73.0% on the 1,000,000-token one,
+ * and on a cache that keeps every prefix it has ever written rather than only the ones the current
+ * request marks, 72.7% to 70.4% and 79.3% to 76.3%. The reason is arithmetic: a step appends an
+ * assistant turn and its result, so the window grows by two, and `stablePrefixEnd` lands two
+ * positions AHEAD of where this request stopped matching the last one on 26 of 59 steps on the
+ * small window and 46 of 59 on the large. Two ahead is exactly where the next request stops
+ * matching this one - which is what the edge is for. A retrospective edge gives those two positions
+ * back on every step of the run to buy a mark that was already going to be readable.
+ *
+ * What a retrospective edge would be worth is an ADDITIONAL mark rather than a replacement one:
+ * spending the older grid checkpoint's slot on it measures 72.7% and 79.2% against today's 70.4%
+ * and 77.9% at the stride below. It is not taken here because it cannot be computed from one
+ * window - it needs the previous prepared window carried across the step by the caller, and the
+ * caller is `agent.ts`. `context.test.ts` holds the measurement so the case can be reopened with a
+ * number rather than re-derived from the plan.
  *
  * Nothing is marked past `stablePrefixEnd`. Everything at or after the recency boundaries in
  * `prepareModelContext` is rewritten as those boundaries slide forward, so a breakpoint there is
@@ -1248,12 +1383,33 @@ export const markCacheBreakpoints = (
     preamble +
     1 +
     Math.floor((edge - preamble - 1) / CACHE_CHECKPOINT_STRIDE) * CACHE_CHECKPOINT_STRIDE;
-  for (const candidate of [
-    lastEligibleAtOrBefore(checkpoint - CACHE_CHECKPOINT_STRIDE),
-    lastEligibleAtOrBefore(checkpoint),
-    lastEligibleAtOrBefore(edge)
-  ]) {
-    if (candidate > preamble && chosen.size < MAX_CACHE_BREAKPOINTS) chosen.add(candidate);
+  /*
+   * The edge, then the grid, nearest position first, walking back only when two candidates land on
+   * the same message.
+   *
+   * Two grid positions one stride apart do not always resolve to two different marks: the newest
+   * cache-eligible message at or before each of them can be the same one, because an assistant turn
+   * is not eligible and a run of them swallows a whole stride. That used to spend two of the four
+   * breakpoints a request may carry on one index and send three where four were allowed - silently,
+   * since the set that de-duplicated them was also the set that counted them. It became visible
+   * when the stride halved: `agent-run.test.ts`'s republished-plan case reads the count per step and
+   * saw it fall from four to three at the step whose prefix had just moved, which is the one step
+   * where a lost breakpoint costs the most.
+   *
+   * Nearest first because a mark is worth the prefix it covers, so the deeper grid positions are
+   * the fallback, taken only when a nearer one collided.
+   */
+  const candidates = [lastEligibleAtOrBefore(edge)].filter((candidate) => candidate > preamble);
+  for (
+    let position = checkpoint;
+    position > preamble && chosen.size + candidates.length < MAX_CACHE_BREAKPOINTS;
+    position -= CACHE_CHECKPOINT_STRIDE
+  ) {
+    const candidate = lastEligibleAtOrBefore(position);
+    if (candidate > preamble && !candidates.includes(candidate)) candidates.push(candidate);
+  }
+  for (const candidate of candidates) {
+    if (chosen.size < MAX_CACHE_BREAKPOINTS) chosen.add(candidate);
   }
 
   for (const index of chosen) {
@@ -1393,7 +1549,7 @@ export const prepareModelContext = (
   // Soft threshold: retain a structured account of goals, decisions, tool names, and outcomes
   // before the model reaches its hard context limit. This is deliberately deterministic, so
   // compaction adds no hidden inference call, provider cost, or new retention surface.
-  if (estimatedTokens(messages) > inputBudget * 0.72) {
+  if (estimatedTokens(messages) > inputBudget * SOFT_PASS_SHARE) {
     const protectedCount = Math.min(14, Math.max(6, Math.floor(inputBudget / 8_000)));
     const protectedTail = Math.max(0, messages.length - protectedCount);
     const firstUser = messages.findIndex((message) => message.role === 'user');
@@ -1409,7 +1565,7 @@ export const prepareModelContext = (
       for (const index of indexes) {
         const message = messages[index];
         if (!message) continue;
-        const replacement = `[Earlier ${message.role} content represented in the compressed trajectory above.]`;
+        const replacement = `[Earlier ${message.role} content represented in the compressed trajectory at the end of this window.]`;
         omittedCharacters += Math.max(0, message.content.length - replacement.length);
         message.content = replacement;
         if (message.images) {
@@ -1426,11 +1582,26 @@ export const prepareModelContext = (
           delete message.reasoningDetails;
         }
       }
-      const stablePrefixEnd = messages.findIndex((message) => message.role !== 'system');
-      messages.splice(stablePrefixEnd < 0 ? messages.length : stablePrefixEnd, 0, {
-        role: 'system',
-        content: summary
-      });
+      /*
+       * Pushed at the tail, not spliced into the leading system run.
+       *
+       * It used to go in at the first non-system index - through a local that shadowed the module's
+       * own `stablePrefixEnd`, which is the function whose whole job is to say where the prompt
+       * stops being rewritten. The two names meant opposite things at that line, and the code did
+       * what the name it shadowed forbids: `markCacheBreakpoints` puts the anchor at the end of the
+       * leading system run, so splicing a block that is REWRITTEN ON EVERY STEP into that run moves
+       * the anchor onto changing bytes and takes every breakpoint behind it down with it. Measured
+       * on `long-a-full-window-condenses-rather-than-stubbing-itself`: from the first soft pass on,
+       * the leading preamble stopped being byte-identical and the turn's cached share settled at
+       * 44%.
+       *
+       * At the tail it is free. The tail is rewritten every step anyway - the runtime block sits
+       * there for that exact reason - so a summary that changes as more of the window is condensed
+       * costs nothing it was not already costing, and the stubs it explains now read forward to it
+       * rather than backwards. It is also the last thing the model reads before answering, which is
+       * where a note about what is missing from the window belongs.
+       */
+      messages.push({ role: 'system', content: summary });
     }
   }
 

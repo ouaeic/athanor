@@ -19,6 +19,13 @@
  * only insists that "done" means something it can execute, and executes it.
  */
 
+import {
+  COMMAND_RUNNERS,
+  commandInterpreters,
+  inlineScriptBody,
+  isDestructiveScript
+} from './command-classification.js';
+
 /** A command the harness runs itself, with the arguments fixed before the work started. */
 export interface AcceptanceCommandCheck {
   readonly id: string;
@@ -120,13 +127,6 @@ const textValue = (value: unknown, fallback = ''): string =>
  * a check earns its place by being repeatable and by not changing anything the owner would want to
  * know about.
  */
-import {
-  COMMAND_RUNNERS,
-  commandInterpreters,
-  inlineScriptBody,
-  isDestructiveScript
-} from './tools.js';
-
 const REFUSED_EXECUTABLES = new Set([
   'rm',
   'rmdir',

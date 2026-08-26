@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  buildMemoryItemIndex,
   decryptJson,
   encryptJson,
   memoryIndexKey,
   memoryObjectKey,
   memorySubjectKey,
+  MEMORY_RECALL_BUDGET_TOKENS,
+  MEMORY_RECALL_ITEM_CEILING,
+  MEMORY_RECALL_MAX_ITEMS,
   type EncryptedEnvelope,
   type MemoryKind
 } from '@athanor/core';
@@ -478,7 +482,14 @@ describe('agent-initiated recall', () => {
     expect(probe.uses[0]).not.toHaveProperty('outcome');
   });
 
-  it('holds the budget and the item count inside their bounds however it is asked', async () => {
+  it('spends a fixed budget and holds the item count inside the bound the schema states', async () => {
+    // The budget is not negotiable and no longer pretends to be. It used to be a `budgetTokens`
+    // input clamped between 256 and a 4,000 ceiling in `packages/core`, and the tool schema is
+    // `additionalProperties: false` and never declared the field - so the clamp's own test was the
+    // only caller that had ever reached it, and every recall the product has answered was answered
+    // at MEMORY_RECALL_BUDGET_TOKENS. Both the input and the ceiling are gone (ATH-164); what the
+    // model does control is `maxItems`, and these are the bounds the schema now interpolates from
+    // the same constants this asserts against.
     const probe = recallStore(() => []);
     await recallMemory({
       store: probe.store,
@@ -486,11 +497,10 @@ describe('agent-initiated recall', () => {
       dataKey,
       taskId,
       query: 'anything',
-      budgetTokens: 500_000,
       maxItems: 4_000
     });
-    expect(probe.calls[0]?.budgetTokens).toBe(4_000);
-    expect(probe.calls[0]?.maxItems).toBe(40);
+    expect(probe.calls[0]?.budgetTokens).toBe(MEMORY_RECALL_BUDGET_TOKENS);
+    expect(probe.calls[0]?.maxItems).toBe(MEMORY_RECALL_ITEM_CEILING);
 
     await recallMemory({
       store: probe.store,
@@ -498,11 +508,14 @@ describe('agent-initiated recall', () => {
       dataKey,
       taskId,
       query: 'anything',
-      budgetTokens: Number.NaN,
       maxItems: -3
     });
-    expect(probe.calls[1]?.budgetTokens).toBe(1_500);
+    expect(probe.calls[1]?.budgetTokens).toBe(MEMORY_RECALL_BUDGET_TOKENS);
     expect(probe.calls[1]?.maxItems).toBe(1);
+
+    // Omitted entirely, the model gets the number the schema advertises as its default.
+    await recallMemory({ store: probe.store, workspaceId, dataKey, taskId, query: 'anything' });
+    expect(probe.calls[2]?.maxItems).toBe(MEMORY_RECALL_MAX_ITEMS);
   });
 
   it('refuses a question it cannot ask rather than asking a different one', async () => {
@@ -1176,6 +1189,79 @@ describe('against the real store', () => {
     await expect(store.listPromotableMemoryFactCandidates(realWorkspaceId)).resolves.toEqual([]);
     const facts = await store.listMemoryItems(realWorkspaceId, { kind: 'fact' });
     expect(facts).toHaveLength(1);
+  });
+
+  it('leaves a fact out of the pack once its validity has ended, and still reaches it as of a date', async () => {
+    /*
+     * The bitemporal clause, on the one query that fills the prompt.
+     *
+     * `store.test.ts` covers `asOf` at the store layer and has since it was written. The pack never
+     * passed it: `buildTaskMemoryPack` sent `now` and stopped, `q.as_of` was NULL, and the validity
+     * half of `MEMORY_ITEM_ADMISSIBLE` short-circuited to true for every pack this computer has
+     * ever built - so the clause was covered everywhere except where it decides what the model is
+     * told (ATH-045). A fact still `active` with a `valid_to` a day before the task opened was
+     * ranked into the block at the top of the window as a current fact, held back by nothing but a
+     * x0.12 prior that fusion leaves well above the noise floor on a request with little grip.
+     *
+     * The second half is what makes this test about `asOf` rather than about the row happening not
+     * to match: anchored inside its own validity window, the same row comes back.
+     */
+    const content = {
+      title: 'certificate rotation',
+      body: 'The certificate rotation is blocked until the registrar answers.',
+      subject: 'certificate rotation',
+      object: 'blocked'
+    };
+    const expired = await store.createMemoryItem({
+      userId: realUserId,
+      workspaceId: realWorkspaceId,
+      kind: 'fact',
+      trust: 'stated',
+      predicate: 'project_status',
+      documentCiphertext: encryptJson(content, dataKey, memoryItemAad(realWorkspaceId)),
+      index: buildMemoryItemIndex(content, indexKey),
+      observedAt: new Date('2026-07-01T00:00:00.000Z'),
+      validFrom: new Date('2026-07-01T00:00:00.000Z'),
+      // Observation plus a fortnight, which is how a dead end is actually recorded - and the row is
+      // deliberately left `active`, because an expiry that has passed is not a status change. That
+      // is exactly why the status filter alone never caught it.
+      validTo: new Date('2026-07-15T00:00:00.000Z')
+    });
+    await store.rebuildMemoryCorpusStats(realWorkspaceId);
+    const query = 'what is the status of the certificate rotation';
+
+    const pack = await buildTaskMemoryPack({
+      store,
+      taskId: realTaskId,
+      workspaceId: realWorkspaceId,
+      dataKey,
+      query,
+      clockAnchor: startedAt
+    });
+    expect(pack.itemIds).not.toContain(expired.id);
+    expect(pack.body).not.toContain('blocked until the registrar answers');
+
+    // A task that opened while the fact was still true gets it, from the same store and the same
+    // query - so what changed the answer is the anchor and nothing else.
+    const earlier = await store.createTask({
+      userId: realUserId,
+      workspaceId: realWorkspaceId,
+      titleCiphertext: encryptJson({ title: 'earlier' }, dataKey, 'task-title:x'),
+      nameIndex: { nameTokens: '', openingTokens: '' },
+      modelId: 'vendor/model',
+      privacyRoute: 'provider_zdr',
+      maxComputeCredits: 1,
+      promptCiphertext: encryptJson({ prompt: query }, dataKey, 'task-prompt:x')
+    });
+    const whileValid = await buildTaskMemoryPack({
+      store,
+      taskId: earlier.id,
+      workspaceId: realWorkspaceId,
+      dataKey,
+      query,
+      clockAnchor: new Date('2026-07-08T08:00:00.000Z')
+    });
+    expect(whileValid.itemIds).toContain(expired.id);
   });
 
   it('records the pack outcome and survives a consolidation pass', async () => {

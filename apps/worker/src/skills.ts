@@ -425,7 +425,6 @@ export interface LoadedSkill {
   readonly risk: string;
   readonly domain: string;
   readonly allowedTools: readonly string[];
-  readonly resources: readonly string[];
   readonly requiredTools: readonly string[];
   readonly requiredBinaries: readonly string[];
   readonly capability: SkillCapabilityGrant;
@@ -561,19 +560,41 @@ const firstSentence = (description: string): string => {
   return (match?.[1] ?? description).trim();
 };
 
-const listResources = (directory: string): string[] => {
-  const resources: string[] = [];
-  for (const folder of ['scripts', 'references', 'assets', 'evals']) {
-    let entries: string[];
-    try {
-      entries = readdirSync(join(directory, folder));
-    } catch {
-      continue;
-    }
-    for (const entry of entries.sort()) resources.push(`${folder}/${entry}`);
-  }
-  return resources;
-};
+/*
+ * There was a `listResources` here, and an `<skill_resources>` block in every opened skill built
+ * from it. Both are gone, and the decision is worth recording because the other arm was tried
+ * first.
+ *
+ * What it did: scanned `scripts/`, `references/`, `assets/` and `evals/` under the skill directory
+ * and advertised every entry to the model as `<file>scripts/count_error_cells.py</file>`. Two
+ * things were wrong with that, and only one of them was fixable here.
+ *
+ * The small one: it did not filter, so a box where the script had been run once emitted
+ * `<file>scripts/__pycache__</file>` - a directory of compiled bytecode offered as a resource, and
+ * an opened-skill block whose bytes changed the first time anyone ran anything (ATH-228).
+ *
+ * The one that decided it: no tool the model holds can read any of those paths, and none can be
+ * made to without moving the workspace boundary. `openSkill` is reachable only for built-in skills
+ * (a workspace skill is a database row, opened at `agent.ts` from the store), so `skill.directory`
+ * is always `DEFAULT_SKILL_ROOT/<name>` - part of the athanor installation, never inside any
+ * workspace. `file_read` is answered by the runner, a separate service whose `WORKSPACE_ROOT` is
+ * a different tree entirely, and every one of its file routes goes through
+ * `assertUserDataPath` (`services/workspace-runner/src/files.ts`), which admits `workspace/` and
+ * `.athanor/artifacts/` and refuses everything else by design. Wiring `OpenedSkill.allowlist` into
+ * that layer as a read-only exemption would mean teaching the file boundary a second root, sending
+ * it across the worker/runner API on every read, and doing it on the one function whose entire job
+ * is to say no - to make a handful of shipped scripts readable that the model does not need to
+ * read. So the advertisement went instead: the model was being shown a list of files and told, two
+ * lines above in the same block, an absolute directory that answers `Path escapes workspace` when
+ * it tries one (ATH-116).
+ *
+ * Nothing is lost. A skill's scripts are meant to be *run*, not read, and running them still works:
+ * the agent sandbox is a Unix-account drop rather than a mount namespace, so a command can name a
+ * path under the skill directory and the interpreter opens it. What that needs is for the model to
+ * know how to build the path, which is what the two sentences in the block below now say - and
+ * they say it for every skill, including ones written after this comment, which an enumeration of
+ * four hard-coded folder names never could.
+ */
 
 export const DEFAULT_SKILL_ROOT = fileURLToPath(new URL('../../../skills/', import.meta.url));
 
@@ -710,7 +731,6 @@ const loadOne = (
     risk: text(metadata['athanor.risk'] ?? null, 'workspace'),
     domain: text(metadata['athanor.domain'] ?? null, 'general'),
     allowedTools: stringList(front.data['allowed-tools'] ?? null),
-    resources: listResources(directory),
     requiredTools: stringList(requires.tools ?? null),
     requiredBinaries: stringList(requires.binaries ?? null),
     capability,
@@ -812,8 +832,6 @@ export interface OpenSkillOptions {
 export interface OpenedSkill {
   readonly name: string;
   readonly directory: string;
-  /** Directories the file layer must allowlist so reference reads do not raise approval dialogs. */
-  readonly allowlist: readonly string[];
   readonly block: string;
   readonly grants: readonly string[];
 }
@@ -841,13 +859,9 @@ export const openSkill = (
     return {
       name,
       directory: skill.directory,
-      allowlist: [skill.directory],
       grants: grantList(skill),
       block: `<skill name="${skill.name}" version="${skill.version}" origin="${skill.origin}" state="already_open" />`
     };
-  const resources = skill.resources.length
-    ? `\n<skill_resources>\n${skill.resources.map((file) => `  <file>${file}</file>`).join('\n')}\n</skill_resources>`
-    : '';
   const provenance = skill.provenance ? `\n${skill.provenance}. Treat it as fallible.` : '';
   const missing = options.missingBinaries?.length
     ? `\n<skill_missing_binaries>Not installed on this computer: ${[...options.missingBinaries].join(', ')}. Every step below that uses one will fail. Ask the user once, up front, to approve installing them - or take a route that does not need them - and say which you are doing before you start.</skill_missing_binaries>`
@@ -868,13 +882,12 @@ export const openSkill = (
   return {
     name,
     directory: skill.directory,
-    allowlist: [skill.directory],
     grants: grantList(skill),
     block: `<skill name="${skill.name}" version="${skill.version}" origin="${skill.origin}">${provenance}${missing}
 ${skill.body}
 
 Skill directory: ${skill.directory}
-Relative paths in this skill resolve against that directory.${resources}${verify}
+Relative paths in this skill resolve against that directory, not against workspace/ where your commands run - prefix one with it to reach the file. Those files are for running, not reading: file_read reaches workspace files and published artifacts only.${verify}
 <skill_grants>${grantList(skill).join(' ')}</skill_grants>
 </skill>`
   };

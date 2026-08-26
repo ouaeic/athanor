@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import { AthanorError, signCapabilityToken } from '@athanor/core';
+import { AthanorError, capabilityAudience, signCapabilityToken } from '@athanor/core';
 
 /**
  * Carries the cancellation signal for whatever tool call is currently in flight.
@@ -162,6 +162,17 @@ const runnerFetch = async (
   }
 };
 
+/**
+ * The agent's side of the runner, one audience-bound capability per request.
+ *
+ * Every one of the ten signing sites below names the request it is about to make. That claim was
+ * carried by the control plane and by nothing here, and the verifier only compared it when it was
+ * present - so a token minted for a file read was good against `exec` for its whole ninety seconds,
+ * and the scope set was the only thing standing between a capability seen in flight and everything
+ * else the runner will do for an agent. The audience drops the query string on both sides: `?path=a`
+ * and `?path=b` are the same capability, and the runner's own path guards are what bound which file
+ * a read may name.
+ */
 export class AgentRunnerClient {
   constructor(
     private readonly baseUrl: string,
@@ -175,12 +186,14 @@ export class AgentRunnerClient {
     path: string,
     body?: unknown
   ): Promise<T> {
+    const method = body === undefined ? 'GET' : 'POST';
     const token = signCapabilityToken(
       {
         sub: taskId,
         workspaceId,
         role: 'agent',
         scopes: Array.isArray(scope) ? scope : [scope],
+        aud: capabilityAudience(method, path),
         nonce: randomUUID()
       },
       this.secret,
@@ -189,7 +202,7 @@ export class AgentRunnerClient {
     const response = await runnerFetch(
       `${this.baseUrl}${path}`,
       {
-        method: body === undefined ? 'GET' : 'POST',
+        method,
         headers: {
           authorization: `Bearer ${token}`,
           ...(body === undefined ? {} : { 'content-type': 'application/json' })
@@ -224,19 +237,21 @@ export class AgentRunnerClient {
     durationMs: number;
     pruned: string[];
   }> {
+    const route = `/v1/workspaces/${workspaceId}/checkpoints`;
     const token = signCapabilityToken(
       {
         sub: taskId,
         workspaceId,
         role: 'agent',
         scopes: ['workspace.manage'],
+        aud: capabilityAudience('POST', route),
         nonce: randomUUID()
       },
       this.secret,
       90
     );
     const response = await runnerFetch(
-      `${this.baseUrl}/v1/workspaces/${workspaceId}/checkpoints`,
+      `${this.baseUrl}${route}`,
       {
         method: 'POST',
         headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
@@ -245,16 +260,31 @@ export class AgentRunnerClient {
       },
       CHECKPOINT_REQUEST_TIMEOUT_MS
     );
-    if (!response.ok)
-      throw new Error(
-        `Checkpoint failed (${response.status}): ${(await response.text()).slice(0, 500)}`
-      );
+    /*
+     * The tenth of ten, brought in line with the other nine.
+     *
+     * This route alone used to hand-roll `Checkpoint failed (<status>): <body>`, flattening the
+     * runner's `{error:{code,message}}` envelope into a sentence - so the machine-readable code was
+     * on the wire, thrown away here, and then dug back out of the sentence by
+     * `agent.ts`'s `checkpointRefusalCode` with a JSON parse over a prefix. `runnerFailure` returns
+     * an `AthanorError` carrying the code as a field, which is what decides whether a lost undo
+     * point is raised to the owner or filed quietly, and `checkpointRefusalCode` stays as the
+     * fallback for a runner one release behind this worker.
+     */
+    if (!response.ok) throw await runnerFailure(response);
     return (await response.json()) as Awaited<ReturnType<AgentRunnerClient['checkpoint']>>;
   }
 
   async readFile(workspaceId: string, taskId: string, requestedPath: string): Promise<string> {
     const token = signCapabilityToken(
-      { sub: taskId, workspaceId, role: 'agent', scopes: ['files.read'], nonce: randomUUID() },
+      {
+        sub: taskId,
+        workspaceId,
+        role: 'agent',
+        scopes: ['files.read'],
+        aud: capabilityAudience('GET', `/v1/workspaces/${workspaceId}/file`),
+        nonce: randomUUID()
+      },
       this.secret,
       90
     );
@@ -277,7 +307,14 @@ export class AgentRunnerClient {
     requestedPath: string
   ): Promise<{ content: string; sha256: string | null }> {
     const token = signCapabilityToken(
-      { sub: taskId, workspaceId, role: 'agent', scopes: ['files.read'], nonce: randomUUID() },
+      {
+        sub: taskId,
+        workspaceId,
+        role: 'agent',
+        scopes: ['files.read'],
+        aud: capabilityAudience('GET', `/v1/workspaces/${workspaceId}/file`),
+        nonce: randomUUID()
+      },
       this.secret,
       90
     );
@@ -316,7 +353,14 @@ export class AgentRunnerClient {
     fileBytes: number;
   }> {
     const token = signCapabilityToken(
-      { sub: taskId, workspaceId, role: 'agent', scopes: ['files.read'], nonce: randomUUID() },
+      {
+        sub: taskId,
+        workspaceId,
+        role: 'agent',
+        scopes: ['files.read'],
+        aud: capabilityAudience('GET', `/v1/workspaces/${workspaceId}/file`),
+        nonce: randomUUID()
+      },
       this.secret,
       90
     );
@@ -370,7 +414,14 @@ export class AgentRunnerClient {
     requestedPath: string
   ): Promise<{ mimeType: string; base64: string; convertedFrom?: string }> {
     const token = signCapabilityToken(
-      { sub: taskId, workspaceId, role: 'agent', scopes: ['files.read'], nonce: randomUUID() },
+      {
+        sub: taskId,
+        workspaceId,
+        role: 'agent',
+        scopes: ['files.read'],
+        aud: capabilityAudience('GET', `/v1/workspaces/${workspaceId}/image`),
+        nonce: randomUUID()
+      },
       this.secret,
       90
     );
@@ -407,7 +458,14 @@ export class AgentRunnerClient {
     requestedPath: string
   ): Promise<{ mimeType: string; bytes: Buffer }> {
     const token = signCapabilityToken(
-      { sub: taskId, workspaceId, role: 'agent', scopes: ['files.read'], nonce: randomUUID() },
+      {
+        sub: taskId,
+        workspaceId,
+        role: 'agent',
+        scopes: ['files.read'],
+        aud: capabilityAudience('GET', `/v1/workspaces/${workspaceId}/file`),
+        nonce: randomUUID()
+      },
       this.secret,
       90
     );
@@ -450,7 +508,14 @@ export class AgentRunnerClient {
     more: boolean;
   }> {
     const token = signCapabilityToken(
-      { sub: taskId, workspaceId, role: 'agent', scopes: ['files.read'], nonce: randomUUID() },
+      {
+        sub: taskId,
+        workspaceId,
+        role: 'agent',
+        scopes: ['files.read'],
+        aud: capabilityAudience('POST', `/v1/workspaces/${workspaceId}/audio/prepare`),
+        nonce: randomUUID()
+      },
       this.secret,
       90
     );
@@ -494,7 +559,14 @@ export class AgentRunnerClient {
     content: Uint8Array
   ): Promise<unknown> {
     const token = signCapabilityToken(
-      { sub: taskId, workspaceId, role: 'agent', scopes: ['files.write'], nonce: randomUUID() },
+      {
+        sub: taskId,
+        workspaceId,
+        role: 'agent',
+        scopes: ['files.write'],
+        aud: capabilityAudience('PUT', `/v1/workspaces/${workspaceId}/file`),
+        nonce: randomUUID()
+      },
       this.secret,
       90
     );
@@ -520,7 +592,14 @@ export class AgentRunnerClient {
     expectSha256?: string
   ): Promise<unknown> {
     const token = signCapabilityToken(
-      { sub: taskId, workspaceId, role: 'agent', scopes: ['files.write'], nonce: randomUUID() },
+      {
+        sub: taskId,
+        workspaceId,
+        role: 'agent',
+        scopes: ['files.write'],
+        aud: capabilityAudience('PUT', `/v1/workspaces/${workspaceId}/file`),
+        nonce: randomUUID()
+      },
       this.secret,
       90
     );

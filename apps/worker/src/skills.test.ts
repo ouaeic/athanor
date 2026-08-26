@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -129,7 +129,7 @@ describe('skill YAML subset', () => {
 });
 
 describe('skill library loader', () => {
-  it('loads a skill with its sidecar, resources and normalised verify steps', () => {
+  it('loads a skill with its sidecar and normalised verify steps', () => {
     const root = fixtureRoot({
       alpha: {
         skill: skillFile('alpha', 'Does alpha work. Use when alpha. Do not use for beta.'),
@@ -144,7 +144,6 @@ describe('skill library loader', () => {
     expect(skill?.catalogLine).toBe('Short resident line for alpha.');
     expect(skill?.requiredBinaries).toEqual(['python3']);
     expect(skill?.capability.exec).toEqual(['python3']);
-    expect(skill?.resources).toEqual(['scripts/check.py', 'references/NOTES.md']);
     expect(skill?.verify).toEqual([
       { run: 'python3 check.py', assert: "$.status == 'success'", check: null },
       { run: null, assert: null, check: 'Someone looked at it.' }
@@ -222,14 +221,18 @@ describe('progressive disclosure', () => {
     expect(block).not.toContain('Builds spreadsheets with formulas.');
   });
 
-  it('wraps an opened skill so compaction can protect it and reads are allowlisted', () => {
+  it('wraps an opened skill so compaction can protect it, and says how its own files are reached', () => {
     const opened = openSkill(library(), 'alpha');
     expect(opened?.block).toMatch(/^<skill name="alpha" version="2\.1\.0" origin="builtin">/);
     expect(opened?.block).toContain('ALPHA_BODY_MARKER');
-    expect(opened?.block).toContain('<file>scripts/check.py</file>');
     expect(opened?.block).toContain('<skill_grants>shell file_read</skill_grants>');
     expect(opened?.block.trimEnd().endsWith('</skill>')).toBe(true);
-    expect(opened?.allowlist).toEqual([opened?.directory]);
+    // `scripts/check.py` is on disk in this fixture and is deliberately not advertised as a
+    // readable resource: the directory it sits in is outside every workspace, so `file_read`
+    // refuses it. What the model gets instead is the directory and how to use it (ATH-116).
+    expect(opened?.block).not.toContain('<file>');
+    expect(opened?.block).toContain(`Skill directory: ${opened?.directory}`);
+    expect(opened?.block).toContain('prefix one with it to reach the file');
     expect(openSkill(library(), 'nope')).toBeNull();
   });
 
@@ -237,6 +240,42 @@ describe('progressive disclosure', () => {
     const opened = openSkill(library(), 'alpha', { active: ['alpha'] });
     expect(opened?.block).toContain('state="already_open"');
     expect(opened?.block).not.toContain('ALPHA_BODY_MARKER');
+  });
+
+  it('costs nothing in the cached prefix when the probe finds nothing missing', () => {
+    /*
+     * The opened block is a tool result the provider caches, so the missing-dependency warning has
+     * to be free when there is nothing to warn about.
+     *
+     * This is the property that has to survive widening the probe. `<skill_missing_binaries>` today
+     * reports binaries only, so a skill whose real dependency is a Python module - `docx` on Arch
+     * and openSUSE, where the distribution has no package for it - opens with no warning at all
+     * and the procedure is followed until it fails. Widening the probe to modules is the fix, and
+     * the trap in it is that a widened probe which emits an empty element, a blank line or a
+     * "nothing missing" sentence changes the bytes of every opened block on every healthy box -
+     * moving the divergence point in a cached prefix for a message that says nothing.
+     *
+     * So: an empty probe result must be byte-identical to no probe result, at every spelling of
+     * empty. A non-empty one is the only thing that may add bytes, and then only its own.
+     */
+    // One library, because a fresh fixture root would move the skill directory the block prints
+    // and the comparison would be of two different blocks rather than of the probe's cost.
+    const loaded = library();
+    const baseline = openSkill(loaded, 'alpha')?.block;
+    expect(baseline).toBeTypeOf('string');
+    // Every spelling of empty: no options object at all, an options object with no probe result,
+    // and a probe result that ran and found nothing.
+    expect(openSkill(loaded, 'alpha', {})?.block).toBe(baseline);
+    expect(openSkill(loaded, 'alpha', { missingBinaries: [] })?.block).toBe(baseline);
+    expect(baseline).not.toContain('<skill_missing_binaries>');
+
+    const warned = openSkill(loaded, 'alpha', { missingBinaries: ['ocrmypdf'] })?.block;
+    expect(warned).toContain('<skill_missing_binaries>');
+    expect(warned).toContain('ocrmypdf');
+    // Everything the healthy block said, still said, in the same order: the warning is a prefix
+    // insertion rather than a rewrite, so only the bytes it adds are new.
+    expect(warned?.length).toBeGreaterThan((baseline ?? '').length);
+    expect(warned).toContain('ALPHA_BODY_MARKER');
   });
 
   it('marks a learned skill with provenance so the model can discount it', () => {
@@ -328,6 +367,65 @@ describe('the shipped built-in library', () => {
     }
   });
 
+  it('advertises no file to the model that the model has no tool able to open', () => {
+    /*
+     * The whole library, both directions, because one direction was how this was missed.
+     *
+     * `openSkill` used to scan four folders under the skill directory and print each entry as
+     * `<file>scripts/count_error_cells.py</file>`. Nothing the model holds can read one. `openSkill`
+     * is reachable only for built-in skills, so the directory is always part of the athanor
+     * installation and never inside a workspace; `file_read` is answered by the runner, whose
+     * `assertUserDataPath` admits `workspace/` and `.athanor/artifacts/` and nothing else. So the
+     * model was handed a list of readable-looking files, two lines under an absolute directory that
+     * answers "Only workspace files and published artifacts are accessible" when it tries one -
+     * a vetted procedure prescribing a step the platform refuses (ATH-116).
+     *
+     * Direction one: nothing in any opened block may offer a file as a resource.
+     */
+    for (const skill of library.skills) {
+      const opened = openSkill(library, skill.name);
+      expect(opened, skill.name).not.toBeNull();
+      expect(opened?.block, skill.name).not.toContain('<file>');
+      expect(opened?.block, skill.name).not.toContain('<skill_resources>');
+      // The directory is still printed - a command can reach it, which is what these files are for
+      // - and it must arrive with the sentence saying which tools do and which do not.
+      expect(opened?.block, skill.name).toContain(`Skill directory: ${skill.directory}`);
+      expect(opened?.block, skill.name).toContain('not against workspace/ where your commands run');
+    }
+  });
+
+  it('names no file in a procedure that does not ship with the skill that names it', () => {
+    /*
+     * Direction two, and the half that has to keep working now that the enumeration is gone.
+     *
+     * A skill's scripts are for running, not reading: the agent sandbox drops privilege to another
+     * Unix account rather than entering a mount namespace, so a command that names a path under the
+     * skill directory opens it. What the model needs is that the file is really there and that the
+     * block tells it how to build the path - which the sentence above does, for every skill,
+     * including ones written after this test.
+     *
+     * So every resource-shaped relative path the model is shown, whether it came from the procedure
+     * body or from a `verify` step, has to exist under the skill that showed it. Today exactly one
+     * does (`xlsx-authoring`'s recalculation check, named in both its body and its sidecar), and a
+     * skill that grows a second one gets the same guarantee without anyone remembering to ask.
+     */
+    const resourcePath = /(?<![\w./-])(?:scripts|references|assets|evals)\/[A-Za-z0-9._/-]+/g;
+    let checked = 0;
+    for (const skill of library.skills) {
+      const opened = openSkill(library, skill.name);
+      for (const match of new Set((opened?.block ?? '').match(resourcePath) ?? [])) {
+        checked += 1;
+        expect(
+          existsSync(join(skill.directory, match)),
+          `${skill.name} names ${match}, which is not in its directory`
+        ).toBe(true);
+      }
+    }
+    // A regex that stopped matching would pass this silently, which is the failure the check
+    // exists to prevent wearing the costume of a pass.
+    expect(checked).toBeGreaterThan(0);
+  });
+
   it('states one version, in both places a skill declares it', () => {
     // The loader prefers the sidecar and falls back to the front matter, so a skill whose two
     // numbers disagree ships a version block that contradicts the file it came from - and four of
@@ -350,16 +448,38 @@ describe('the shipped built-in library', () => {
       fileURLToPath(new URL('../../../scripts/install-native.sh', import.meta.url)),
       'utf8'
     );
-    // The package names moved into one table read by the installer, the toolchain probe and
-    // `athanor doctor` alike, so a skill's binaries are held against the table. That is the
-    // stronger claim: it covers every host family at once rather than only the apt one, and a
-    // procedure confidently naming a command is wrong on a Fedora box in exactly the way it was
-    // wrong on a Debian box before this test existed.
+    /*
+     * The package names moved into one table read by the installer, the toolchain probe and
+     * `athanor doctor` alike, so a skill's binaries are held against the table - column by column.
+     *
+     * The old check matched `\t<package>(\t|$)` anywhere in the file, which is satisfied by any one
+     * cell. Every row begins with the Debian name, so the Debian column alone kept it green:
+     * `ocrmypdf\tocrmypdf\t-\t-\t-` matched, and the failure message it would have printed - "no
+     * host's package table provides ocrmypdf" - was a claim it was not making. Three families out
+     * of four had no OCR at all and this test said so on none of them.
+     *
+     * So the header row is read for the family names and each cell is asserted individually, the
+     * way `document-toolchain.test.ts` does it for the statistics rows. A dash is an invisible
+     * degradation: the skill still loads, its procedure still names the command, and it fails on
+     * that family only, in front of the owner, one shell call at a time.
+     *
+     * `knownGaps` is the record of the families that genuinely have no package today. It is
+     * asserted exactly, in both directions - a family that gains a package fails here until it is
+     * removed from the list, and a family that loses one fails until somebody decides what to do
+     * about it - so the list can only shrink by intent and can never grow by accident.
+     */
     const hostTable = readFileSync(
       fileURLToPath(new URL('../../../scripts/athanor-host.sh', import.meta.url)),
       'utf8'
-    );
-    const aptPackage: Record<string, string> = {
+    ).split('\n');
+    const families = hostTable
+      .find((line) => line.startsWith('capability\t'))
+      ?.split('\t')
+      .slice(1);
+    expect(families?.length, 'the host table header could not be read').toBeGreaterThan(0);
+    // The capability row a binary comes from, which is the table's own key rather than any one
+    // family's package name.
+    const hostCapability: Record<string, string> = {
       curl: 'curl',
       dot: 'graphviz',
       'fc-list': 'fontconfig',
@@ -369,15 +489,32 @@ describe('the shipped built-in library', () => {
       img2pdf: 'img2pdf',
       magick: 'imagemagick',
       ocrmypdf: 'ocrmypdf',
-      pdffonts: 'poppler-utils',
-      pdfimages: 'poppler-utils',
-      pdfinfo: 'poppler-utils',
-      pdftoppm: 'poppler-utils',
-      pdftotext: 'poppler-utils',
+      pdffonts: 'poppler',
+      pdfimages: 'poppler',
+      pdfinfo: 'poppler',
+      pdftoppm: 'poppler',
+      pdftotext: 'poppler',
       qpdf: 'qpdf',
-      tesseract: 'tesseract-ocr',
+      tesseract: 'tesseract',
       unzip: 'unzip',
       zip: 'zip'
+    };
+    /*
+     * Recorded rather than closed, and each one is a decision somebody made:
+     *
+     * - `ocrmypdf` is packaged by Debian and Ubuntu and by nobody else in the supported set, so
+     *   `pdf-extraction`'s scanned-PDF route is Debian-family-only. The skill's compatibility line
+     *   says so, and the procedure tells the model to check the binary is there before promising a
+     *   searchable PDF rather than to fall back to something weaker.
+     * - `img2pdf` is absent from openSUSE only, which costs `pdf-assembly` its
+     *   image-to-PDF-without-recompression route on that one family.
+     *
+     * Both are visible degradations once the skill says so, which is why the answer here was to
+     * write them down rather than to widen the table with a package that does not exist.
+     */
+    const knownGaps: Record<string, readonly string[]> = {
+      ocrmypdf: ['rhel', 'arch', 'suse'],
+      img2pdf: ['suse']
     };
     const installedPath: Record<string, string> = {
       '/usr/local/lib/athanor/python/bin/python3': '/usr/local/lib/athanor/python',
@@ -397,20 +534,42 @@ describe('the shipped built-in library', () => {
           expect(installer.includes(path), `${skill.name} names ${binary}`).toBe(true);
           continue;
         }
-        const apt = aptPackage[binary];
+        const capability = hostCapability[binary];
         expect(
-          apt,
+          capability,
           `${skill.name} names ${binary}, which nothing here says the installer provides`
         ).toBeDefined();
-        // A cell of the host table, tab-delimited, so a package name is never satisfied by some
-        // longer name that merely contains it.
+        if (capability === undefined) continue;
+        const row = hostTable.find((line) => line.startsWith(`${capability}\t`));
+        expect(row, `the host table has no row for ${capability}`).toBeTruthy();
+        const packages = (row ?? '').split('\t').slice(1);
+        expect(packages, `${capability} does not name a cell for every family`).toHaveLength(
+          families?.length ?? 0
+        );
+        const missing = packages.flatMap((name, index) =>
+          name === '-' ? [families?.[index] ?? String(index)] : []
+        );
         expect(
-          new RegExp(`\\t${apt}(\\t|$)`, 'm').test(hostTable),
-          `${skill.name} needs ${binary}, but no host's package table provides ${apt}`
-        ).toBe(true);
+          missing,
+          `${skill.name} needs ${binary}; the host table's ${capability} row is missing on ${missing.join(', ')}, which is either a package to add or a gap to record in knownGaps`
+        ).toEqual(knownGaps[capability] ?? []);
       }
 
-    // And the one binary whose apt package does not provide it by that name.
+    // Both directions on the record itself: a gap listed for a capability no skill declares is a
+    // note about nothing, and would let the list outlive the reason it was written.
+    const declared = new Set(
+      library.skills.flatMap((skill) => [
+        ...skill.requiredBinaries.map((binary) => hostCapability[binary]),
+        ...skill.capability.exec.map((binary) => hostCapability[binary])
+      ])
+    );
+    for (const capability of Object.keys(knownGaps))
+      expect(
+        declared.has(capability),
+        `knownGaps records ${capability}, which no skill declares any more`
+      ).toBe(true);
+
+    // And the one binary whose distribution package does not provide it by that name.
     expect(installer).toContain('install_asset 0755 "$athanor_root/scripts/athanor-magick"');
   });
 
@@ -495,6 +654,29 @@ describe('the shipped built-in library', () => {
     // And it must not go on prescribing the shape that fails.
     for (const stale of ['## Routing', '## Workflow', '## Semantics', '## Attachments'])
       expect(authoring?.body).not.toContain(stale);
+
+    /*
+     * The third copy of the same list, and the one that is always in front of the model.
+     *
+     * `SKILL_BODY_HEADINGS` is the rule, `skill-authoring` teaches it, and the `skill` tool's own
+     * `content` description states it in the catalogue - which reaches every request whether or not
+     * the skill is ever opened. A rename that moved the constant and the procedure together would
+     * still leave the catalogue naming the old headings, and the catalogue is the copy the model
+     * believes first: it would compose a body against it and have the call refused by the very rule
+     * the sentence was paraphrasing.
+     */
+    const properties = agentTools.find((tool) => tool.name === 'skill')?.parameters.properties as
+      | Record<string, { description?: string }>
+      | undefined;
+    const contentDescription = properties?.content?.description;
+    expect(contentDescription, 'the skill tool no longer declares a content parameter').toBeTypeOf(
+      'string'
+    );
+    for (const heading of SKILL_BODY_HEADINGS)
+      expect(
+        contentDescription,
+        `the skill tool's content description does not name the required "${heading}" section`
+      ).toContain(heading);
   });
 
   it('describes only governance that exists', () => {
