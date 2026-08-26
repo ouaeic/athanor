@@ -1,7 +1,10 @@
 [Unit]
 Description=Record a failed athanor certificate renewal
-# Started by OnFailure= on the renewal unit, never on its own.
-RefuseManualStart=no
+# Started by OnFailure= on the renewal unit, never on its own. `no` is systemd's default and said
+# the opposite of the line above it: it let `systemctl start athanor-certificate-alert` file an
+# error about a renewal that never failed. `yes` refuses only an explicit start request; activation
+# as another unit's dependency, which is what OnFailure= is, is unaffected.
+RefuseManualStart=yes
 
 [Service]
 Type=oneshot

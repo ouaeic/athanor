@@ -19,6 +19,30 @@
 # ID_LIKE is read as well as ID, so a derivative is recognised as what it is built from. Without it
 # Mint, Pop!_OS, Raspbian and Devuan were refused as unknown while being ordinary apt hosts, and
 # every RHEL rebuild would have needed its own name.
+
+# The package manager on its own, without asking what distribution this is.
+#
+# It is probed rather than inferred, because that is the fact that actually matters and a
+# derivative can surprise the name table. It is separable from the rest of `athanor_detect_host`
+# because one caller needs only this: `athanor-system-packages` runs as root to install a package
+# and has no use for the family, the version or the architecture. Refusing to install because
+# /etc/os-release is absent - which is an ordinary container - would be an outage with a
+# distribution-shaped message on it.
+athanor_detect_package_manager() {
+  athanor_pm=""
+  for manager in apt-get dnf5 dnf zypper pacman; do
+    if command -v "$manager" >/dev/null 2>&1; then
+      athanor_pm="$manager"
+      break
+    fi
+  done
+  [ -n "$athanor_pm" ] || {
+    printf 'athanor: no supported package manager found (looked for apt-get, dnf, zypper, pacman)\n' >&2
+    return 1
+  }
+  return 0
+}
+
 athanor_detect_host() {
   [ -f /etc/os-release ] || {
     printf 'athanor: /etc/os-release is missing, so this host cannot be identified\n' >&2
@@ -39,15 +63,7 @@ athanor_detect_host() {
     [ -n "$athanor_family" ] && break
   done
 
-  # The package manager is probed rather than inferred, because that is the fact that actually
-  # matters and a derivative can surprise the name table.
-  athanor_pm=""
-  for manager in apt-get dnf5 dnf zypper pacman; do
-    if command -v "$manager" >/dev/null 2>&1; then
-      athanor_pm="$manager"
-      break
-    fi
-  done
+  athanor_detect_package_manager || return 1
   [ -n "$athanor_family" ] || case "$athanor_pm" in
   apt-get) athanor_family="debian" ;;
   dnf | dnf5) athanor_family="rhel" ;;
@@ -55,10 +71,6 @@ athanor_detect_host() {
   pacman) athanor_family="arch" ;;
   esac
 
-  [ -n "$athanor_pm" ] || {
-    printf 'athanor: no supported package manager found (looked for apt-get, dnf, zypper, pacman)\n' >&2
-    return 1
-  }
   [ -n "$athanor_family" ] || {
     printf 'athanor: %s is not a distribution athanor knows, and its ID_LIKE names none it does\n' "$athanor_os_id" >&2
     return 1
@@ -226,12 +238,4 @@ athanor_nginx_site_path() {
   else
     printf '/etc/nginx/conf.d/athanor.conf\n'
   fi
-}
-
-# The service unit name for the database, which differs by family.
-athanor_postgres_unit() {
-  case "$1" in
-  debian) printf 'postgresql\n' ;;
-  *) printf 'postgresql\n' ;;
-  esac
 }

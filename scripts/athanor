@@ -4,6 +4,10 @@ set -eu
 athanor_root="${ATHANOR_ROOT:-/opt/athanor}"
 athanor_config="${ATHANOR_CONFIG:-/etc/athanor}"
 athanor_state="${ATHANOR_STATE:-/var/lib/athanor}"
+# Where the control-plane services may write. It is the only such directory they have, so the model
+# registry's record of what its last refresh pass did lives here rather than beside the rest of the
+# state above, which athanor@.service cannot open for writing.
+athanor_control_state="${ATHANOR_CONTROL_STATE:-/var/lib/athanor-control}"
 athanor_home="${ATHANOR_HOME:-/home/athanor}"
 athanor_backup_root="${ATHANOR_BACKUP_ROOT:-/var/backups/athanor}"
 # Every update leaves a full copy of the database and every workspace behind. Unpruned, the
@@ -26,6 +30,10 @@ backup_timer="athanor-backup.timer"
 athanor_backup_status="$athanor_state/backup.status"
 # How long the unattended backup waits for the worker to go idle before standing down for the day.
 athanor_backup_idle_wait_seconds="${ATHANOR_BACKUP_IDLE_WAIT_SECONDS:-300}"
+# How long the model catalogue may go without a provider answering before `doctor` calls it a fault
+# rather than a provider having a bad afternoon. The loop retries hourly, so a week is about a
+# hundred and seventy consecutive failures - long past anything that fixes itself.
+athanor_catalog_stale_seconds="${ATHANOR_CATALOG_STALE_SECONDS:-604800}"
 last_backup_destination=""
 
 runtime_path() {
@@ -208,14 +216,33 @@ status_athanor() {
   done
 }
 
+# All six units interleaved, or one of them.
+#
+# It took no argument and the dispatch passed none, while `doctor` sent the owner here with one:
+# "run sudo athanor logs notifications to see which push service and why". The word was silently
+# discarded and they got a live tail of six units at once, in which the lines they had been sent to
+# find were a small minority, with nothing to say the filter had not applied. Naming a service is
+# what an operator wants from this command anyway, so the argument works rather than the advice
+# being withdrawn.
 logs_athanor() {
-  journalctl -f --no-hostname -n 250 \
-    -u athanor-runner.service \
-    -u athanor@api.service \
-    -u athanor@worker.service \
-    -u athanor@registry.service \
-    -u athanor@notifications.service \
-    -u nginx.service
+  requested="${1:-}"
+  case "$requested" in
+    '')
+      journalctl -f --no-hostname -n 250 \
+        -u athanor-runner.service \
+        -u athanor@api.service \
+        -u athanor@worker.service \
+        -u athanor@registry.service \
+        -u athanor@notifications.service \
+        -u nginx.service
+      return
+      ;;
+    api | worker | registry | notifications) requested_unit="athanor@$requested.service" ;;
+    runner) requested_unit="athanor-runner.service" ;;
+    nginx) requested_unit="nginx.service" ;;
+    *) fail "unknown service: athanor logs [api|worker|runner|registry|notifications|nginx]" ;;
+  esac
+  journalctl -f --no-hostname -n 250 -u "$requested_unit"
 }
 
 control_env_value() {
@@ -305,6 +332,102 @@ doctor() {
     check_ok "network reconciliation timer"
   else
     check_fail "network reconciliation timer is not running"
+  fi
+  # The registry unit being active, checked a few lines above, says the process is up and nothing
+  # more - and almost all of that process's life is the hour it spends asleep between refreshes. A
+  # revoked provider key, an owner on a provider this service cannot ask, and a feed that has been
+  # failing since Friday all look exactly like a healthy sleeping unit from out here. So each pass
+  # writes down what it did and this reads it. The catalogue in the database goes on serving the
+  # picker either way; what it must not do is look current when it is a year old, because a model
+  # the provider withdrew is still being offered and the prices a run is charged against are the
+  # ones recorded then. The record holds whole seconds, so nothing here has to parse a date - only
+  # render one, the same way `athanor ddns status` renders the stamp in ddns.state.
+  catalog_state=$(control_env_value MODEL_CATALOG_STATE_PATH)
+  [ -n "$catalog_state" ] || catalog_state="$athanor_control_state/model-catalog.state"
+  if [ -r "$catalog_state" ]; then
+    catalog_pass=$(jq -r '.state // empty' "$catalog_state" 2>/dev/null || true)
+    catalog_models=$(jq -r '.models // 0' "$catalog_state" 2>/dev/null || true)
+    catalog_reason=$(jq -r '.reason // empty' "$catalog_state" 2>/dev/null || true)
+    catalog_interval=$(jq -r '.intervalSeconds // empty' "$catalog_state" 2>/dev/null || true)
+    catalog_checked_epoch=$(jq -r '.checkedAtEpoch // empty' "$catalog_state" 2>/dev/null || true)
+    catalog_refreshed_epoch=$(jq -r '.lastRefreshEpoch // empty' "$catalog_state" 2>/dev/null || true)
+    case "$catalog_interval" in
+      ''|*[!0-9]*) catalog_interval=3600 ;;
+    esac
+    case "$catalog_checked_epoch" in
+      ''|*[!0-9]*) catalog_checked_epoch=0 ;;
+    esac
+    case "$catalog_refreshed_epoch" in
+      ''|*[!0-9]*) catalog_refreshed_epoch=0 ;;
+    esac
+    case "$catalog_models" in
+      1) catalog_models_said="1 model" ;;
+      *) catalog_models_said="$catalog_models models" ;;
+    esac
+    catalog_checked=$(date -u -d "@$catalog_checked_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+    catalog_refreshed=""
+    [ "$catalog_refreshed_epoch" -eq 0 ] ||
+      catalog_refreshed=$(date -u -d "@$catalog_refreshed_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+    catalog_now=$(date +%s)
+    if [ "$catalog_checked_epoch" -eq 0 ]; then
+      check_fail "the model registry's record at $catalog_state does not say when its last pass ran; run sudo athanor logs registry"
+    elif [ "$((catalog_now - catalog_checked_epoch))" -gt "$((catalog_interval * 4))" ]; then
+      # Four intervals, so a single slow pass or a restart in the wrong minute is not a fault. Past
+      # that the unit is running and the loop inside it is not, which nothing else here can see.
+      check_fail "the model registry has not finished a refresh pass since $catalog_checked although its unit is running; run sudo athanor logs registry"
+    else
+      case "$catalog_pass" in
+        refreshed)
+          check_ok "model catalogue: $catalog_models_said, refreshed from the provider at $catalog_refreshed"
+          ;;
+        failed)
+          if [ "$catalog_refreshed_epoch" -eq 0 ] ||
+            [ "$((catalog_now - catalog_refreshed_epoch))" -gt "$athanor_catalog_stale_seconds" ]; then
+            check_fail "the model catalogue has not refreshed since ${catalog_refreshed:-this server was installed} and the last attempt failed (${catalog_reason:-no reason recorded}); the picker is offering what it held then, at the prices it held then"
+          else
+            check_warn "the last model catalogue refresh failed (${catalog_reason:-no reason recorded}); the catalogue from $catalog_refreshed stays in use and it tries again every $catalog_interval seconds"
+          fi
+          ;;
+        seeded|frozen)
+          # A warning and not a failure, for the reason check_warn exists: an owner running their
+          # own endpoint, or a provider this service has no way to ask, is a deliberate arrangement
+          # and a `doctor` that returns non-zero for the life of that server is a `doctor` nobody
+          # reads. What is true is narrower, and it is what this says.
+          if [ "$catalog_refreshed_epoch" -eq 0 ]; then
+            check_warn "model catalogue: $catalog_models_said from the built-in list, never refreshed from a provider. Saving a provider key in Settings is what starts the hourly refresh"
+          else
+            check_warn "model catalogue: $catalog_models_said, unchanged since $catalog_refreshed - there is no provider key this server can refresh from, so a withdrawn model goes on being offered and the recorded prices are what runs are charged against"
+          fi
+          ;;
+        *)
+          check_warn "model catalogue: the registry recorded a pass this build has no name for (${catalog_pass:-nothing at all}); run sudo athanor logs registry"
+          ;;
+      esac
+    fi
+  else
+    # Not a failure. A server that finished updating a minute ago has not had a pass yet, and a
+    # registry older than this check writes nothing for it to read.
+    check_note "model catalogue: the registry has not recorded a refresh pass yet"
+  fi
+  # The pre-flight half of the spending brake, reported because a box with a ceiling and a box with
+  # none look identical from outside, and the difference is whether anything stops an expensive
+  # route being chosen while the owner is asleep. A note rather than a warning: no ceiling is a
+  # choice an owner is allowed to make, the same way no daily cap is, and a `doctor` that scolds
+  # every default box for the life of that box is a `doctor` nobody finishes reading.
+  if spend_ceiling_storable; then
+    ceiling_report=$(spend_ceiling_print)
+    if [ -n "$ceiling_report" ]; then
+      printf '%s\n' "$ceiling_report" | while IFS= read -r ceiling_line; do
+        check_note "model price ceiling - $ceiling_line"
+      done
+    else
+      # Empty is not "none set": every account comes back from the LEFT JOIN whether it has a row
+      # in spend_limits or not, so nothing at all means no accounts answered - a box before its
+      # first owner, or a database that did not reply.
+      check_note "model price ceiling: no account came back from the database, so there is none to report"
+    fi
+  else
+    check_note "model price ceiling: this release has no column to store one, so nothing limits the price of the model a task picks"
   fi
   # "It could not make my CV" is the report this exists to pre-empt. The skill library prescribes
   # these by name, so a gap here is a job that fails in front of the owner rather than here.
@@ -980,6 +1103,13 @@ backup_athanor() {
   # or was given, including its browser profile and its logins, is kept. Level 1 compression
   # roughly halves the processor time for a few per cent of size, which is the right trade when
   # the interface is offline until it finishes.
+  #
+  # The managed browser belongs on that list and was not on it: about 400 MB of Chromium, the
+  # headless shell and ffmpeg, already compressed so gzip -1 recovers almost nothing, copied into
+  # every daily backup and every pre-update rollback copy while this run printed that package caches
+  # were skipped. Five retained copies is more than a gigabyte of purely re-downloadable bytes, and
+  # the services are stopped for all of it. The runner reinstalls it at the lockfile's revision and
+  # the restore path already tolerates it being absent.
   tar -C "$athanor_home" \
     --exclude=node_modules \
     --exclude=.pnpm-store \
@@ -988,6 +1118,9 @@ backup_athanor() {
     --exclude=__pycache__ \
     --exclude=./.cache/pip \
     --exclude=./.cache/pypoetry \
+    --exclude=./.cache/ms-playwright \
+    --exclude=./.cache/puppeteer \
+    --exclude=./.cargo \
     --use-compress-program='gzip -1' \
     -cf "$destination/workspaces.tar.gz" .
   config_parent=$(dirname "$athanor_config")
@@ -1846,32 +1979,54 @@ auto_update() {
 uninstall_athanor() {
   need_root uninstall
   systemctl disable --now athanor.target >/dev/null 2>&1 || true
+  # The backup timer was missing from this line, and it is the one unit here that the installer
+  # enables with --now and that runs as root on a schedule of its own. Left enabled it went on
+  # starting every day for ever on a machine the owner had been told was uninstalled: on a fully
+  # removed box it fails against a target whose unit file this function just deleted and starts its
+  # alert companion, daily; on a partly removed one it stops and restarts the whole product and
+  # writes a fresh archive of the database, the workspaces and every server key into
+  # /var/backups/athanor until the disk fills. On a self-hosted product this command is a promise
+  # about the owner's own machine.
   systemctl disable --now athanor-network-watch.service athanor-network-refresh.timer \
     athanor-network-refresh.path athanor-auto-update.timer athanor-certificate-renew.timer \
+    "$backup_timer" \
     >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/athanor-certificate-renew.service \
-    /etc/systemd/system/athanor-certificate-renew.timer \
-    /etc/systemd/system/athanor-certificate-alert.service \
-    /etc/update-motd.d/99-athanor \
-    /etc/systemd/system/athanor@.service \
-    /etc/systemd/system/athanor-runner.service \
-    /etc/systemd/system/athanor-network-refresh.service \
-    /etc/systemd/system/athanor-network-refresh.timer \
-    /etc/systemd/system/athanor-network-refresh.path \
-    /etc/systemd/system/athanor-network-watch.service \
-    /etc/systemd/system/athanor-auto-update.service \
-    /etc/systemd/system/athanor-auto-update.timer \
-    /etc/systemd/system/athanor.target \
-    /etc/nginx/sites-enabled/athanor
+  rm -f "$(runtime_path /etc/systemd/system/athanor-certificate-renew.service)" \
+    "$(runtime_path /etc/systemd/system/athanor-certificate-renew.timer)" \
+    "$(runtime_path /etc/systemd/system/athanor-certificate-alert.service)" \
+    "$(runtime_path /etc/update-motd.d/99-athanor)" \
+    "$(runtime_path /etc/systemd/system/athanor@.service)" \
+    "$(runtime_path /etc/systemd/system/athanor-runner.service)" \
+    "$(runtime_path /etc/systemd/system/athanor-network-refresh.service)" \
+    "$(runtime_path /etc/systemd/system/athanor-network-refresh.timer)" \
+    "$(runtime_path /etc/systemd/system/athanor-network-refresh.path)" \
+    "$(runtime_path /etc/systemd/system/athanor-network-watch.service)" \
+    "$(runtime_path /etc/systemd/system/athanor-auto-update.service)" \
+    "$(runtime_path /etc/systemd/system/athanor-auto-update.timer)" \
+    "$(runtime_path /etc/systemd/system/athanor-backup.service)" \
+    "$(runtime_path /etc/systemd/system/athanor-backup.timer)" \
+    "$(runtime_path /etc/systemd/system/athanor-backup-alert.service)" \
+    "$(runtime_path /etc/systemd/system/athanor.target)"
+  # Both nginx layouts, because only the Debian one was named here: on rhel, arch and suse the site
+  # lives in conf.d and was left in place, so nginx went on proxying an application that no longer
+  # exists. The snippets go too - they are included by the site file and are ours alone.
+  rm -f "$(runtime_path /etc/nginx/sites-enabled/athanor)" \
+    "$(runtime_path /etc/nginx/sites-available/athanor)" \
+    "$(runtime_path /etc/nginx/conf.d/athanor.conf)" \
+    "$(runtime_path /etc/nginx/snippets/athanor-https-listen.conf)" \
+    "$(runtime_path /etc/nginx/snippets/athanor-security-headers.conf)" \
+    "$(runtime_path /etc/nginx/snippets/athanor-app-csp.conf)" \
+    "$(runtime_path /etc/nginx/snippets/athanor-hsts.conf)"
   # The agent account keeps passwordless root for the package helper for as long as this
   # rule exists, so it has to go with the services it was granted for.
-  rm -f /etc/sudoers.d/athanor-packages
+  rm -f "$(runtime_path /etc/sudoers.d/athanor-packages)"
   # Stop advertising a server that no longer answers, otherwise clients keep finding it.
-  rm -f /etc/avahi/services/athanor.service
+  rm -f "$(runtime_path /etc/avahi/services/athanor.service)"
   # Installed only on a host whose ImageMagick had no `magick` of its own. Matched on its own marker
   # so that a real ImageMagick 7, or anything else an operator put there, is left alone.
-  if grep -q 'athanor ImageMagick 6 compatibility' /usr/local/bin/magick 2>/dev/null; then
-    rm -f /usr/local/bin/magick
+  magick_shim=$(runtime_path /usr/local/bin/magick)
+  if grep -q 'athanor ImageMagick 6 compatibility' "$magick_shim" 2>/dev/null; then
+    rm -f "$magick_shim"
   fi
   systemctl reload avahi-daemon >/dev/null 2>&1 ||
     systemctl restart avahi-daemon >/dev/null 2>&1 || true
@@ -1879,6 +2034,161 @@ uninstall_athanor() {
   systemctl reload nginx >/dev/null 2>&1 || true
   printf 'athanor was disabled, the agent sudo rule and the local advertisement were removed.\n'
   printf '/home/athanor, /etc/athanor, the database, and backups were preserved.\n'
+}
+
+# ---------------------------------------------------------------------------
+# The pre-flight half of the spending brake.
+#
+# The caps in Settings are the running half: they watch what a task has already spent and halt it.
+# They cannot stop the box picking a $75-per-million route in the first place, and the moment that
+# matters is the one nobody is watching - "silently spending over a ceiling the owner set while they
+# are asleep is the one outcome a ceiling exists to prevent", as `model-policy.ts` has said since
+# the apparatus was written. It was written correct and never given a caller: as of this release no
+# `ModelRequest` anywhere in the repository carries a ceiling, and there was no column, no contract
+# field and no control to set one with.
+#
+# This is the control. It is a command rather than a screen because on a self-hosted box the owner
+# is root on the host, and the price of the model their computer chooses is a host setting in the
+# same sense the backup schedule is.
+spend_ceiling_max() {
+  # Read the bound out of the contract rather than restating it here. `doctor` reads the expected
+  # schema version out of migrations.ts the same way, for the same reason: a number kept in two
+  # places is a number that disagrees with itself the first time one of them moves.
+  ceiling_max=$(
+    sed -n 's/^export const MAX_PRICE_CEILING_USD_PER_MILLION = \([0-9][0-9]*\);$/\1/p' \
+      "$athanor_root/packages/contracts/src/index.ts" 2>/dev/null | sed -n '1p'
+  )
+  [ -n "$ceiling_max" ] || ceiling_max=100
+  printf '%s' "$ceiling_max"
+}
+
+# Whether this server's schema can hold a ceiling at all. It cannot yet, and a command that printed
+# a confirmation over a database that stored nothing would be worse than no command.
+spend_ceiling_storable() {
+  [ "$(
+    runuser -u postgres -- psql -tAqc \
+      "SELECT COUNT(*) FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'spend_limits'
+         AND column_name IN ('max_input_usd_per_million_tokens',
+                             'max_output_usd_per_million_tokens')" \
+      athanor 2>/dev/null | tr -d '[:space:]'
+  )" = 2 ]
+}
+
+# One rate, validated. Echoes the SQL literal - a bare number, or NULL for "no ceiling on this
+# rate". Everything that reaches the statement below has passed through here, so the interpolation
+# there is over a string this function proved is digits and at most one point.
+spend_ceiling_rate() {
+  case "$1" in
+    none|off|unset) printf 'NULL'; return 0 ;;
+  esac
+  printf '%s' "$1" | grep -Eq '^[0-9]+(\.[0-9]+)?$' ||
+    fail "a rate is dollars per million tokens, such as 2 or 0.75, or the word none - not '$1'"
+  awk -v rate="$1" -v limit="$(spend_ceiling_max)" 'BEGIN { exit !(rate <= limit) }' ||
+    fail "$1 per million tokens is above the largest ceiling this server accepts ($(spend_ceiling_max)); a per-task budget is Settings, not this"
+  printf '%s' "$1"
+}
+
+# One line per account, because `spend_limits` is keyed by user and a box may hold more than the
+# first owner. An account that has never opened the spend settings has no row at all, which reads
+# as "none" here rather than as a missing account.
+spend_ceiling_rows() {
+  runuser -u postgres -- psql -tAqc \
+    "SELECT u.username || '|' ||
+            COALESCE(s.max_input_usd_per_million_tokens::text, 'none') || '|' ||
+            COALESCE(s.max_output_usd_per_million_tokens::text, 'none')
+     FROM users u LEFT JOIN spend_limits s ON s.user_id = u.id
+     ORDER BY u.created_at, u.username" \
+    athanor 2>/dev/null
+}
+
+# Nothing on stdout means no account was found - which `doctor` reads as its own answer rather
+# than as an empty ceiling, because a database that answered with no rows at all is a different
+# report from an owner who has set none.
+spend_ceiling_print() {
+  spend_ceiling_rows | while IFS='|' read -r ceiling_user ceiling_in ceiling_out; do
+    [ -n "$ceiling_user" ] || continue
+    # Said as four sentences rather than one with holes in it. A half-set ceiling is a real state -
+    # an owner may cap what a route charges to read a transcript and not care what it charges to
+    # write a reply - and "at most any price per million in" is not a sentence.
+    case "$ceiling_in|$ceiling_out" in
+      'none|none')
+        printf '%s: no price ceiling. Any model in the catalogue may be chosen, at any price.\n' \
+          "$ceiling_user"
+        ;;
+      'none|'*)
+        printf '%s: no ceiling on input; at most $%s per million tokens out.\n' \
+          "$ceiling_user" "$ceiling_out"
+        ;;
+      *'|none')
+        printf '%s: at most $%s per million tokens in; no ceiling on output.\n' \
+          "$ceiling_user" "$ceiling_in"
+        ;;
+      *)
+        printf '%s: at most $%s per million tokens in and $%s per million tokens out.\n' \
+          "$ceiling_user" "$ceiling_in" "$ceiling_out"
+        ;;
+    esac
+  done
+}
+
+spend_ceiling_command() {
+  need_root spend-ceiling "$@"
+  ceiling_action="${1:-show}"
+  case "$ceiling_action" in
+    show|'')
+      if ! spend_ceiling_storable; then
+        printf 'This server cannot store a model price ceiling: its database has no column for one.\n'
+        printf 'Nothing limits the price of the model a task picks. Run sudo athanor update once a\n'
+        printf 'release that adds it is published.\n'
+        return 0
+      fi
+      spend_ceiling_print
+      ;;
+    set)
+      shift
+      [ "$#" -eq 2 ] ||
+        fail "usage: athanor spend-ceiling set INPUT OUTPUT - dollars per million tokens, or none"
+      # `fail` exits, but inside a command substitution it exits the subshell and leaves the
+      # caller holding an empty string - which would reach the statement below as a syntax error
+      # rather than as a refusal. `set -e` would catch it; saying so is cheaper than relying on it.
+      ceiling_input=$(spend_ceiling_rate "$1") || exit 1
+      ceiling_output=$(spend_ceiling_rate "$2") || exit 1
+      # Refused rather than reported. A command that validates an owner's ceiling, prints it back
+      # and stores nothing is how a control comes to wear a brake's name while being wired to
+      # nothing, which is the one thing this command exists not to be.
+      spend_ceiling_storable || {
+        printf 'athanor: %s per million in and %s per million out is a valid ceiling, and this\n' \
+          "$1" "$2" >&2
+        printf 'server cannot store it: its database has no column for one. Nothing was changed.\n' >&2
+        printf 'Run sudo athanor update once a release that adds it is published.\n' >&2
+        exit 1
+      }
+      runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q athanor <<SQL
+INSERT INTO spend_limits (user_id, max_input_usd_per_million_tokens,
+                          max_output_usd_per_million_tokens)
+SELECT id, $ceiling_input, $ceiling_output FROM users
+ON CONFLICT (user_id) DO UPDATE SET
+  max_input_usd_per_million_tokens = EXCLUDED.max_input_usd_per_million_tokens,
+  max_output_usd_per_million_tokens = EXCLUDED.max_output_usd_per_million_tokens,
+  updated_at = NOW();
+SQL
+      spend_ceiling_print
+      ;;
+    clear)
+      spend_ceiling_command set none none
+      ;;
+    *) fail "usage: athanor spend-ceiling [show|set INPUT OUTPUT|clear]" ;;
+  esac
+}
+
+usage() {
+  printf '%s\n' \
+    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|spend-ceiling [show|set INPUT OUTPUT|clear]|backup [dir]|backup auto on|off|status|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...}' \
+    '' \
+    'Browser sign-in needs a hostname: a passkey is bound to a domain name and the WebAuthn' \
+    'standard does not allow an IP address. If this server has no name, run:' \
+    '  sudo athanor ddns configure'
 }
 
 command_name="${1:-help}"
@@ -1893,13 +2203,14 @@ case "$command_name" in
   stop) stop_athanor ;;
   restart) restart_athanor ;;
   status) status_athanor ;;
-  logs) logs_athanor ;;
+  logs) logs_athanor "${1:-}" ;;
   doctor) doctor ;;
   connect)
     need_root connect
     connection_details
     ;;
   pairing-code) pairing_code ;;
+  spend-ceiling) spend_ceiling_command "$@" ;;
   set-hostname) set_hostname "${1:-}" ;;
   backup)
     case "${1:-}" in
@@ -1939,12 +2250,15 @@ case "$command_name" in
     need_root ddns "$@"
     exec /bin/sh "$athanor_root/scripts/athanor-ddns" "$@"
     ;;
-  help|*)
-    printf '%s\n' \
-      'Usage: athanor {install|start|stop|restart|status|logs|doctor|connect|pairing-code|set-hostname HOST|backup [dir]|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...}' \
-      '' \
-      'Browser sign-in needs a hostname: a passkey is bound to a domain name and the WebAuthn' \
-      'standard does not allow an IP address. If this server has no name, run:' \
-      '  sudo athanor ddns configure'
+  help)
+    usage
+    ;;
+  # A misspelling used to print the usage line and exit 0, so a script that ran `athanor resart`
+  # carried on as though the server had been restarted, and so did the operator reading a green
+  # terminal. Asking for help is a success; asking for a command that does not exist is not.
+  *)
+    printf 'athanor: unknown command: %s\n' "$command_name" >&2
+    usage >&2
+    exit 64
     ;;
 esac

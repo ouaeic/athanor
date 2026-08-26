@@ -333,7 +333,7 @@ pub fn save_pending_pairing(
     Ok(pending)
 }
 
-pub fn clear_pending_pairing(path: &Path) -> Result<(), String> {
+fn remove_private_json(path: &Path, label: &str) -> Result<(), String> {
     match fs::remove_file(path) {
         Ok(()) => {
             #[cfg(unix)]
@@ -341,16 +341,29 @@ pub fn clear_pending_pairing(path: &Path) -> Result<(), String> {
                 fs::File::open(parent)
                     .and_then(|directory| directory.sync_all())
                     .map_err(|error| {
-                        format!("Could not make the pairing-code removal durable: {error}")
+                        format!("Could not make the {label} removal durable: {error}")
                     })?;
             }
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "Could not remove the pending pairing code: {error}"
-        )),
+        Err(error) => Err(format!("Could not remove the {label}: {error}")),
     }
+}
+
+pub fn clear_pending_pairing(path: &Path) -> Result<(), String> {
+    remove_private_json(path, "pending pairing code")
+}
+
+/*
+ * Remove the saved server, durably.
+ *
+ * The counterpart `save_profile` never had: the file is the whole of this device's relationship
+ * with a box, so forgetting a server has to survive the crash that follows it as reliably as
+ * remembering one does - otherwise "disconnect" is a promise that a power cut can quietly revoke.
+ */
+pub fn forget_profile(path: &Path) -> Result<(), String> {
+    remove_private_json(path, "server profile")
 }
 
 #[derive(Debug)]

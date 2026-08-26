@@ -40,6 +40,18 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
+# The same block the runner carries, and here it costs nothing to argue about: this unit runs no
+# agent command, reaches no helper through sudo and creates no namespace of its own. It is a Node
+# process serving loopback ports 4100, 4201 and 4203 - all above 1024 - so it needs no capability
+# at all and the bounding set can be empty rather than merely narrowed. The rest refuse a change of
+# execution domain, the system clock and a realtime scheduling class, none of which a request
+# handler has any business asking for.
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+LockPersonality=true
+ProtectHostname=true
+ProtectClock=true
+RestrictRealtime=true
 ReadWritePaths=/var/lib/athanor-control
 # The relay's identity key and settings. Under /etc because it is configuration the owner chose and
 # it has to survive an update and travel in the configuration backup; writable here because the API

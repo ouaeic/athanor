@@ -12,6 +12,27 @@ const loopbackNotifications = JSON.parse(
     'utf8'
   )
 );
+/**
+ * The desktop half of the same permission, which exists because this file pins the mobile half.
+ *
+ * A Tauri capability that names any platform applies to no other, and `loopback-notifications`
+ * names `android` and `iOS` only - so every packaged macOS, Windows and Linux client was silent.
+ * The main window is loaded from `http://localhost:<port>`, which is a remote execution context,
+ * and the only other capability holding `notification:default` has no `remote` block and therefore
+ * covers local app URLs alone. Widening the mobile file was the obvious repair and this script's
+ * exact-match on its `platforms` array refused it, so the fix landed as a sibling file instead.
+ *
+ * That left the sibling verified by nothing: it is the one file standing between a packaged client
+ * and silence, and until this read existed, deleting it broke every desktop notification without
+ * failing a single gate. The union check below is the assertion that actually matters - it is about
+ * coverage of the five shipped targets rather than about either file's own list.
+ */
+const loopbackNotificationsDesktop = JSON.parse(
+  await readFile(
+    new URL('./src-tauri/capabilities/loopback-notifications-desktop.json', import.meta.url),
+    'utf8'
+  )
+);
 const loopbackNative = JSON.parse(
   await readFile(new URL('./src-tauri/capabilities/loopback-native.json', import.meta.url), 'utf8')
 );
@@ -97,7 +118,17 @@ const desktopSchemes = config.plugins?.['deep-link']?.desktop?.schemes;
 const mobileLinks = config.plugins?.['deep-link']?.mobile;
 const permissions = capability.permissions;
 const notificationPermissions = loopbackNotifications.permissions;
+const desktopNotificationPermissions = loopbackNotificationsDesktop.permissions;
 const nativePermissions = loopbackNative.permissions;
+/**
+ * Every target athanor packages a client for, and the reason the two capability files are read as a
+ * pair rather than one at a time: what has to hold is that no shipped platform is left out of
+ * `notification:default` on the loopback origin, whichever file happens to carry it.
+ */
+const notifiedPlatforms = [
+  ...(loopbackNotifications.platforms ?? []),
+  ...(loopbackNotificationsDesktop.platforms ?? [])
+].sort();
 const requiredIosTransportPolicy = [
   '<key>NSAppTransportSecurity</key>',
   '<key>NSExceptionDomains</key>',
@@ -139,6 +170,15 @@ if (
   JSON.stringify(loopbackNotifications.remote?.urls) !== JSON.stringify(['http://localhost:*/*']) ||
   JSON.stringify(loopbackNotifications.platforms) !== JSON.stringify(['android', 'iOS']) ||
   JSON.stringify(notificationPermissions) !== JSON.stringify(['notification:default']) ||
+  loopbackNotificationsDesktop.local !== false ||
+  JSON.stringify(loopbackNotificationsDesktop.windows) !== JSON.stringify(['main']) ||
+  JSON.stringify(loopbackNotificationsDesktop.remote?.urls) !==
+    JSON.stringify(['http://localhost:*/*']) ||
+  JSON.stringify(loopbackNotificationsDesktop.platforms) !==
+    JSON.stringify(['macOS', 'windows', 'linux']) ||
+  JSON.stringify(desktopNotificationPermissions) !== JSON.stringify(['notification:default']) ||
+  JSON.stringify(notifiedPlatforms) !==
+    JSON.stringify(['android', 'iOS', 'linux', 'macOS', 'windows'].sort()) ||
   loopbackNative.local !== false ||
   JSON.stringify(loopbackNative.windows) !== JSON.stringify(['main']) ||
   JSON.stringify(loopbackNative.remote?.urls) !== JSON.stringify(['http://localhost:*/*']) ||

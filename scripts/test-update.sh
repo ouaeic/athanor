@@ -157,6 +157,11 @@ printf '#!/bin/sh\nexit 0\n' >"$seed/scripts/athanor-network-refresh"
 chmod 0755 "$seed/scripts/athanor-network-refresh"
 printf '#!/bin/sh\nexit 0\n' >"$seed/scripts/athanor-network-watch"
 chmod 0755 "$seed/scripts/athanor-network-watch"
+# The last act of install.sh is to exec this. The bootstrap cases below only need to know whether it
+# was reached, and reaching it with an unverified source is the defect they are here for.
+printf '#!/bin/sh\nprintf "the installer ran\\n" >>"$ATHANOR_TEST_COMMAND_LOG"\n' \
+  >"$seed/scripts/install-native.sh"
+chmod 0755 "$seed/scripts/install-native.sh"
 
 "$real_git" init --bare "$remote" >/dev/null
 "$real_git" -C "$seed" init -b main >/dev/null
@@ -173,6 +178,102 @@ printf 'postgres://athanor:synthetic-password@127.0.0.1:5432/athanor\n' |
   sed 's|^|DATABASE_URL=|' >"$config/control.env"
 printf 'runner=true\n' >"$config/runner.env"
 printf 'data-before-update\n' >"$home/persistent.txt"
+
+# The installer's database-password reuse, read out of the installer itself.
+#
+# One line decides whether re-running the installer on a working box keeps the PostgreSQL password
+# that box already has or invents a new one, and it was written with doubled backslashes inside
+# single quotes, so the capture group never matched and every re-install rotated the password.
+# `doctor` tells the owner to re-run the installer for two ordinary conditions; `ALTER ROLE` runs
+# hundreds of lines before `DATABASE_URL` is written back, with a dozen `fail` points in between,
+# and any of them left the role holding a password nothing on the box knew. The two pieces are
+# lifted out of the installer and run rather than restated here, because a second copy of the
+# expression is a second thing free to drift away from the one that actually executes.
+installer_source="$repository_root/scripts/install-native.sh"
+{
+  awk '
+    /^existing_control_value\(\) \{$/ { emitting = 1 }
+    emitting { print }
+    emitting && /^\}$/ { exit }
+  ' "$installer_source"
+  awk '
+    /^database_password=/ { emitting = 1 }
+    emitting { print }
+    emitting && /database_password=\$\(openssl/ { exit }
+  ' "$installer_source"
+  printf 'printf "%%s\\n" "$database_password"\n'
+} >"$test_root/installer-password-reuse.sh"
+reused_password=$(athanor_config="$config" sh "$test_root/installer-password-reuse.sh")
+if [ "$reused_password" != synthetic-password ]; then
+  printf 'the installer did not reuse the password in an existing control.env: %s\n' \
+    "$reused_password" >&2
+  exit 1
+fi
+# And the window between setting the role's password and writing it down is closed rather than
+# merely narrowed: the write happens before the next step that can fail.
+alter_role_line=$(grep -n 'ALTER ROLE athanor WITH LOGIN PASSWORD' "$installer_source" |
+  sed -n '1s/:.*//p')
+url_write_line=$(grep -n 'set_env_value "\$control_env" DATABASE_URL' "$installer_source" |
+  sed -n '1s/:.*//p')
+next_failure_line=$(grep -n 'the PostgreSQL client authentication file could not be located' \
+  "$installer_source" | sed -n '1s/:.*//p')
+if [ -z "$alter_role_line" ] || [ -z "$url_write_line" ] || [ -z "$next_failure_line" ] ||
+  [ "$url_write_line" -lt "$alter_role_line" ] || [ "$url_write_line" -gt "$next_failure_line" ]; then
+  printf 'the installer can abort between rotating the database password and writing it down\n' >&2
+  exit 1
+fi
+printf 'ok  the installer reuses an existing database password and writes it back at once\n'
+
+# The commit pin, on the box whose state is already unknown.
+#
+# `ATHANOR_EXPECTED_COMMIT` is how the packaged client pins the source it installs, and the fetch,
+# the checkout and the whole verification block sat inside `if [ ! -f scripts/install-native.sh ]`.
+# The arrangement that reaches the bootstrap a second time is not "the owner ran it twice" - the
+# client asks a working box for a pairing code instead - it is a partial install, where the source
+# is on disk and the `athanor` CLI never reached PATH. There the pin went unchecked and the
+# installer ran against whatever revision happened to be lying in /opt/athanor.
+bootstrap_root="$test_root/bootstrap-root"
+"$real_git" clone "$remote" "$bootstrap_root" >/dev/null 2>&1
+run_bootstrap() {
+  PATH="$fake_bin:$PATH" \
+    ATHANOR_TEST_COMMAND_LOG="$command_log" \
+    ATHANOR_TEST_REAL_GIT="$real_git" \
+    ATHANOR_ROOT="${2:-$bootstrap_root}" \
+    ATHANOR_REPOSITORY="$remote" \
+    ATHANOR_EXPECTED_COMMIT="$1" \
+    /bin/sh "$repository_root/install.sh"
+}
+: >"$command_log"
+if wrong_pin_output=$(run_bootstrap 0000000000000000000000000000000000000000 2>&1); then
+  printf 'a partial install accepted a source that does not match the pinned commit\n' >&2
+  exit 1
+fi
+grep -q 'does not match the client release commit' <<EOF
+$wrong_pin_output
+EOF
+if grep -q 'the installer ran' "$command_log"; then
+  printf 'the installer was handed an unverified source on a partial install\n' >&2
+  exit 1
+fi
+# And the same arrangement with the right pin reaches the installer, at the revision it names.
+: >"$command_log"
+published_head=$("$real_git" --git-dir="$remote" rev-parse HEAD)
+run_bootstrap "$published_head" >/dev/null 2>&1
+grep -q 'the installer ran' "$command_log"
+test "$("$real_git" -C "$bootstrap_root" rev-parse HEAD)" = "$published_head"
+# The path that was already covered by the verification, kept covered: a box with nothing on it at
+# all still clones, still lands on the update branch, and still checks the pin.
+make_fake apt-get '
+printf "apt-get %s\n" "$*" >>"$ATHANOR_TEST_COMMAND_LOG"'
+: >"$command_log"
+first_install_root="$test_root/first-install-root"
+run_bootstrap "$published_head" "$first_install_root" >/dev/null 2>&1
+rm -f "$fake_bin/apt-get"
+grep -q 'apt-get install' "$command_log"
+grep -q 'the installer ran' "$command_log"
+test "$("$real_git" -C "$first_install_root" rev-parse HEAD)" = "$published_head"
+test "$("$real_git" -C "$first_install_root" rev-parse --abbrev-ref HEAD)" = athanor
+printf 'ok  the bootstrap checks the commit pin on a partial install and on a fresh one\n'
 
 run_athanor() {
   PATH="$fake_bin:$PATH" \
@@ -219,6 +320,11 @@ mkdir -p "$runtime/etc/athanor/relay"
 printf 'relay-identity\n' >"$runtime/etc/athanor/relay/identity-marker"
 mkdir -p "$home/workspace/project/node_modules"
 printf 'regenerable\n' >"$home/workspace/project/node_modules/dependency.js"
+# The managed browser. Roughly 400 MB of already-compressed binaries that gzip cannot help, in a
+# tree the runner knows how to fetch again, copied into every daily backup and every pre-update
+# rollback copy while the printed line said package caches were skipped.
+mkdir -p "$home/.cache/ms-playwright/chromium-1228/chrome-linux"
+printf 'binary\n' >"$home/.cache/ms-playwright/chromium-1228/chrome-linux/chrome"
 publish_fixture v2
 expected_revision=$("$real_git" -C "$seed" rev-parse HEAD)
 
@@ -268,6 +374,10 @@ tar -tzf "$newest_backup/workspaces.tar.gz" >"$test_root/backup-listing"
 grep -q 'persistent.txt' "$test_root/backup-listing"
 if grep -q 'node_modules' "$test_root/backup-listing"; then
   printf 'the backup still archives regenerable dependency trees\n' >&2
+  exit 1
+fi
+if grep -q 'ms-playwright' "$test_root/backup-listing"; then
+  printf 'the backup still archives the managed browser\n' >&2
   exit 1
 fi
 grep -q 'Dependency trees and package caches were skipped' <<EOF
@@ -565,3 +675,39 @@ printf 'ok  a restore that would not fit refuses before it stops or wipes anythi
 run_athanor restore "$recovery_backup" --yes >/dev/null 2>&1
 test "$(cat "$home/persistent.txt")" = "data-worth-recovering"
 printf 'ok  a restore that fits still restores\n'
+
+# Uninstall, last, because it takes the runtime files every case above installed.
+#
+# On a self-hosted product "uninstall" is a promise about the owner's own machine, and the daily
+# backup timer broke it silently: the installer enabled it with --now, the removal lists never named
+# it, and it went on starting as root every day for ever. On a fully removed box it fails on a
+# target whose unit file is gone and starts its alert companion, every day; on a partly removed one
+# it stops and restarts the whole product and writes a fresh keys-bearing archive into
+# /var/backups/athanor until the disk fills. The nginx site had the same shape on the conf.d
+# layout - only the sites-enabled path was removed, so on rhel, arch and suse nginx went on serving
+# a deleted application.
+: >"$command_log"
+run_athanor uninstall >/dev/null 2>&1
+if ! grep -q 'systemctl disable --now .*athanor-backup\.timer' "$command_log"; then
+  printf 'uninstall left the daily backup timer enabled\n' >&2
+  exit 1
+fi
+backup_leftovers=$(find "$runtime" -name 'athanor-backup*' -print)
+if [ -n "$backup_leftovers" ]; then
+  printf 'uninstall left the backup units on disk:\n%s\n' "$backup_leftovers" >&2
+  exit 1
+fi
+for removed in \
+  /etc/systemd/system/athanor.target \
+  /etc/systemd/system/athanor-runner.service \
+  /etc/nginx/sites-available/athanor \
+  /etc/nginx/conf.d/athanor.conf \
+  /etc/nginx/snippets/athanor-security-headers.conf \
+  /etc/nginx/snippets/athanor-app-csp.conf \
+  /etc/update-motd.d/99-athanor; do
+  if [ -e "$runtime$removed" ]; then
+    printf 'uninstall left %s behind\n' "$removed" >&2
+    exit 1
+  fi
+done
+printf 'ok  uninstall disables the backup timer and removes what it installed\n'

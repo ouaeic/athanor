@@ -24,6 +24,40 @@ const runIn = (cwd, environment, ...args) =>
   });
 const run = (...args) => runIn(root, {}, ...args);
 
+/**
+ * Which halves of this proof actually executed.
+ *
+ * Two of the three sections below are behind an `existsSync` guard, because a developer's laptop
+ * has no recogniser and keeps poppler somewhere other than where the installer puts it. The
+ * closing line was printed outside both guards, so a host missing either one printed "checks
+ * passed" having read no PDF and recognised no page - and no CI job installed those packages, so
+ * that host was every runner this repository has ever used. A count is the smallest thing that
+ * cannot say that.
+ */
+const SECTIONS = ['extraction and private search', 'PDF text layer', 'scanned-page OCR'];
+const ran = new Set([SECTIONS[0]]);
+
+/**
+ * The shape `scripts/check-repository.mjs:115-120` settled for a tool that is optional here and
+ * mandatory there: absent on a developer's machine is a note and the section is skipped, absent on
+ * the runner that is supposed to be the floor is a failure. `.github/workflows/verify.yml` installs
+ * these packages in the `application` job for exactly this reason.
+ */
+const sectionRuns = (section, present, packages) => {
+  if (present) {
+    ran.add(section);
+    return true;
+  }
+  if (process.env.GITHUB_ACTIONS)
+    assert.fail(
+      `${packages} is not installed on this CI runner, so the ${section} checks cannot run`
+    );
+  process.stdout.write(
+    `  ${packages} is not installed here, so the ${section} checks were skipped\n`
+  );
+  return false;
+};
+
 const crc32 = (data) => {
   let value = 0xffffffff;
   for (const byte of data) {
@@ -535,7 +569,13 @@ try {
     ''
   ].join('\n');
 
-  if (existsSync(poppler.ATHANOR_PDFTOTEXT) && existsSync(poppler.ATHANOR_PDFINFO)) {
+  if (
+    sectionRuns(
+      SECTIONS[1],
+      existsSync(poppler.ATHANOR_PDFTOTEXT) && existsSync(poppler.ATHANOR_PDFINFO),
+      'poppler-utils'
+    )
+  ) {
     // Three pages carrying one stamped line each and nothing else - what a scanner that burns in a
     // header produces. Deliberately not an empty PDF: a few characters is the case a plain
     // "did it produce any text at all" test would call readable and hand back as an empty search.
@@ -731,7 +771,13 @@ try {
     // The whole thing, end to end, on a computer that has the recogniser the installer puts there.
     // The fixture is a real scan: the words are rendered to pixels and the text layer thrown away,
     // so nothing but recognition can get them back.
-    if (existsSync(poppler.ATHANOR_PDFTOPPM) && existsSync(recogniser)) {
+    if (
+      sectionRuns(
+        SECTIONS[2],
+        existsSync(poppler.ATHANOR_PDFTOPPM) && existsSync(recogniser),
+        'poppler-utils and tesseract-ocr'
+      )
+    ) {
       const contracts = path.join(scans, 'contracts');
       await mkdir(contracts, { recursive: true });
       await writeFile(path.join(scans, 'source-page.pdf'), leasePage);
@@ -790,4 +836,8 @@ try {
   await rm(scans, { recursive: true, force: true });
 }
 
-console.log('Document extraction and private search checks passed.');
+const skipped = SECTIONS.filter((section) => !ran.has(section));
+console.log(
+  `Document extraction and private search checks passed: ${ran.size} of ${SECTIONS.length} sections ran` +
+    (skipped.length ? `, ${skipped.join(' and ')} skipped.` : '.')
+);

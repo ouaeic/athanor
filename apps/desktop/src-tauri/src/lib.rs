@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Component, Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 use tauri::{Manager, State};
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -33,16 +33,51 @@ struct NativeEntry {
     size_bytes: u64,
 }
 
+/*
+ * What this shell can actually do, so the page stops guessing.
+ *
+ * It reported one boolean, so every other native surface was discovered by trying it and catching
+ * the rejection: `notify` learned it was impossible from an exception (`native.ts`), the settings
+ * screen had to assume, and a download button was offered on a shell that registered nothing to
+ * receive one. Each field below is a build fact this process knows and the page cannot.
+ */
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeCapabilities {
     folder_picker: bool,
+    notifications: bool,
+    downloads: bool,
+    deep_link_events: bool,
 }
 
 #[tauri::command]
 fn native_capabilities() -> NativeCapabilities {
     NativeCapabilities {
         folder_picker: cfg!(desktop),
+        /*
+         * True on all five targets, and it is the capability manifests that make it so: the window
+         * is loaded from http://localhost:<port>, so only a capability with a `remote` block
+         * reaches it, and only `loopback-notifications{,-desktop}.json` have one. Between them
+         * they name every platform - which is asserted by a test in this file rather than trusted,
+         * because the mobile-only half of that pair is exactly how this came to be false.
+         */
+        notifications: true,
+        /*
+         * Where a download can be received at all. `on_download` below covers the three desktop
+         * webviews; wry registers no download support on Android, and iOS has no user-visible
+         * Downloads directory to write to (`download_dir()` is `None` there), so on both the honest
+         * answer is that the six `<a download>` flows in the product have nowhere to go.
+         */
+        downloads: cfg!(desktop),
+        /*
+         * Whether the *page* can subscribe to `athanor://` links. It cannot, on any platform:
+         * `native.ts` reads `window.__TAURI__.deepLink`, `withGlobalTauri` is false, and no
+         * `@tauri-apps/plugin-deep-link` is bundled. Deep links themselves work - `run()` below
+         * navigates the window - but that costs a document reload, which is what the JS path
+         * existed to avoid. Reported so the client can stop installing a listener that can never
+         * fire.
+         */
+        deep_link_events: false,
     }
 }
 
@@ -189,6 +224,62 @@ fn read_local_file(
     fs::read(path).map_err(|error| error.to_string())
 }
 
+/*
+ * Show the owner where the file went.
+ *
+ * Not a shell: each argument is passed separately, and the path is always the Downloads directory
+ * joined with a file name, so it is absolute and cannot be read as an option.
+ */
+#[cfg(desktop)]
+fn reveal_download(path: &Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(path)
+        .spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+    #[cfg(target_os = "linux")]
+    if let Some(parent) = path.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+    }
+}
+
+/*
+ * Where a download the webview started should be written.
+ *
+ * wry pre-fills the destination from the platform Downloads directory, but only where it can find
+ * one; this insists on the directory Tauri resolves and on a plain file name, so a `Content-
+ * Disposition` from the box can never place the file anywhere but Downloads. `None` declines the
+ * download, which is what an unhandled one already did.
+ */
+fn download_destination(downloads: Option<&Path>, suggested: &Path) -> Option<PathBuf> {
+    let directory = downloads?;
+    let name = suggested.file_name().filter(|value| {
+        let value = Path::new(value);
+        value.components().count() == 1 && !value.as_os_str().is_empty()
+    })?;
+    let mut destination = directory.join(name);
+    // WebKit and WebView2 both refuse to overwrite, and so does this: the previewed file the owner
+    // saved five minutes ago is not the one they asked for now.
+    let stem = destination
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let extension = destination
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy()))
+        .unwrap_or_default();
+    let mut counter = 1;
+    while destination.exists() {
+        destination.set_file_name(format!("{stem} ({counter}){extension}"));
+        counter += 1;
+    }
+    Some(destination)
+}
+
 fn deep_link_destination(raw: &str, local_origin: &str) -> Result<Option<Url>, String> {
     let link = Url::parse(raw).map_err(|_| "This is not an athanor link")?;
     if link.scheme() != "athanor"
@@ -244,7 +335,52 @@ pub fn run() {
                 .ok_or("The athanor main window configuration is unavailable")?
                 .clone();
             window_config.url = tauri::WebviewUrl::External(origin.parse()?);
-            let window = tauri::WebviewWindowBuilder::from_config(app, &window_config)?.build()?;
+            /*
+             * Receive a download, or the six that exist in the product are cancelled in silence.
+             *
+             * The product downloads a workspace archive, a privacy export, a conversation, a
+             * previewed file, an attachment - and the recovery code, the one artefact an owner
+             * cannot regenerate. All six are an `<a download>` click, and wry answers a
+             * download-attribute navigation with `WKNavigationActionPolicy::Cancel` when no
+             * handler is registered (`wkwebview/navigation.rs`). Nothing appeared, and nothing
+             * said why.
+             */
+            let downloads = app.path().download_dir().ok();
+            let saved: Arc<Mutex<HashMap<String, PathBuf>>> = Arc::default();
+            let record = saved.clone();
+            let window = tauri::WebviewWindowBuilder::from_config(app, &window_config)?
+                .on_download(move |_webview, event| match event {
+                    tauri::webview::DownloadEvent::Requested { url, destination } => {
+                        let Some(chosen) = download_destination(downloads.as_deref(), destination)
+                        else {
+                            eprintln!("athanor has nowhere to save downloads on this platform");
+                            return false;
+                        };
+                        if let Ok(mut record) = record.lock() {
+                            record.insert(url.to_string(), chosen.clone());
+                        }
+                        *destination = chosen;
+                        true
+                    }
+                    tauri::webview::DownloadEvent::Finished { url, path, success } => {
+                        let saved = saved
+                            .lock()
+                            .ok()
+                            .and_then(|mut record| record.remove(&url.to_string()))
+                            // macOS never reports the path back, by API limitation, which is why
+                            // the destination is remembered above rather than read from here.
+                            .or(path);
+                        #[cfg(desktop)]
+                        if let (true, Some(path)) = (success, saved.as_deref()) {
+                            reveal_download(path);
+                        }
+                        #[cfg(not(desktop))]
+                        let _ = (success, saved);
+                        true
+                    }
+                    _ => true,
+                })
+                .build()?;
 
             let import_url = {
                 let client = client.clone();
@@ -338,6 +474,144 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /*
+     * The whole of G1 in one assertion.
+     *
+     * `loopback-notifications.json` carried `"platforms": ["android","iOS"]`, and a capability that
+     * names any platform applies to no other - so on macOS, Windows and Linux the only grant that
+     * could reach a window loaded from `http://localhost:<port>` was filtered out at ACL resolve
+     * time (`tauri-utils`, `resolved.rs`: `capabilities.filter(|c| c.is_active(&target))`), every
+     * notification invoke was denied, and `native.ts` swallowed the rejection and returned false.
+     * Nothing in the build failed. So the union is asserted here instead.
+     */
+    #[test]
+    fn every_platform_is_granted_notifications_by_exactly_one_capability() {
+        let files = [
+            include_str!("../capabilities/loopback-notifications.json"),
+            include_str!("../capabilities/loopback-notifications-desktop.json"),
+        ];
+        let mut covered = Vec::new();
+        for raw in files {
+            let capability: serde_json::Value = serde_json::from_str(raw).unwrap();
+            // A capability without a `remote` block applies to local app URLs only, and this window
+            // never loads one.
+            assert_eq!(
+                capability["remote"]["urls"],
+                serde_json::json!(["http://localhost:*/*"])
+            );
+            assert_eq!(capability["local"], serde_json::json!(false));
+            assert_eq!(
+                capability["permissions"],
+                serde_json::json!(["notification:default"])
+            );
+            for platform in capability["platforms"].as_array().unwrap() {
+                covered.push(platform.as_str().unwrap().to_owned());
+            }
+        }
+        covered.sort();
+        let mut expected = vec!["android", "iOS", "linux", "macOS", "windows"];
+        expected.sort();
+        assert_eq!(covered, expected);
+        // And the page is told so, from the same fact.
+        assert!(native_capabilities().notifications);
+    }
+
+    #[test]
+    fn a_download_is_written_to_the_downloads_directory_under_a_plain_name() {
+        let downloads =
+            std::env::temp_dir().join(format!("athanor-downloads-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&downloads).unwrap();
+
+        let chosen =
+            download_destination(Some(&downloads), Path::new("recovery-code.txt")).unwrap();
+        assert_eq!(chosen, downloads.join("recovery-code.txt"));
+
+        // A Content-Disposition from the box cannot place a file outside Downloads.
+        assert_eq!(
+            download_destination(Some(&downloads), Path::new("../../.ssh/authorized_keys")),
+            Some(downloads.join("authorized_keys"))
+        );
+        assert_eq!(
+            download_destination(Some(&downloads), Path::new("..")),
+            None
+        );
+        assert_eq!(download_destination(Some(&downloads), Path::new("")), None);
+
+        // The export saved five minutes ago is not the one being asked for now.
+        fs::write(&chosen, b"first").unwrap();
+        assert_eq!(
+            download_destination(Some(&downloads), Path::new("recovery-code.txt")),
+            Some(downloads.join("recovery-code (1).txt"))
+        );
+
+        // Nowhere to write is declined rather than guessed at, which is what iOS and Android get.
+        assert_eq!(download_destination(None, Path::new("export.zip")), None);
+        fs::remove_dir_all(downloads).unwrap();
+    }
+
+    /*
+     * The same resolver `tauri-build` runs, asked the question that was never asked.
+     *
+     * The union test above pins what the manifests say; this one pins what the ACL does with them.
+     * `Resolved::resolve` filters capabilities by `is_active(&target)` before anything else, which
+     * is the single line that made the packaged desktop clients silent - and it is compile-time
+     * work no test covered, on a file no build step reads back. The manifest set is the one
+     * generated for this host, so the mobile rows here prove the capability filter rather than the
+     * mobile plugin surface; the filter is the thing that was wrong.
+     */
+    #[test]
+    fn the_notification_commands_resolve_for_the_loopback_window_on_every_target() {
+        use std::collections::BTreeMap;
+        use tauri::utils::acl::{
+            capability::Capability, manifest::Manifest, resolved::Resolved, ExecutionContext,
+        };
+        use tauri::utils::platform::Target;
+
+        let acl: BTreeMap<String, Manifest> =
+            serde_json::from_str(include_str!("../gen/schemas/acl-manifests.json")).unwrap();
+        let capabilities: BTreeMap<String, Capability> = [
+            include_str!("../capabilities/default.json"),
+            include_str!("../capabilities/loopback-native.json"),
+            include_str!("../capabilities/loopback-notifications.json"),
+            include_str!("../capabilities/loopback-notifications-desktop.json"),
+        ]
+        .into_iter()
+        .map(|raw| {
+            let capability: Capability = serde_json::from_str(raw).unwrap();
+            (capability.identifier.clone(), capability)
+        })
+        .collect();
+
+        for target in [
+            Target::MacOS,
+            Target::Windows,
+            Target::Linux,
+            Target::Android,
+            Target::Ios,
+        ] {
+            let resolved = Resolved::resolve(&acl, capabilities.clone(), target).unwrap();
+            for command in [
+                "plugin:notification|is_permission_granted",
+                "plugin:notification|request_permission",
+                "plugin:notification|notify",
+            ] {
+                let allowed = resolved
+                    .allowed_commands
+                    .get(command)
+                    .unwrap_or_else(|| panic!("{command} is not allowed at all on {target:?}"));
+                // The window is loaded from http://localhost:<port>, so a Local grant never
+                // applies to it however many capabilities carry the permission.
+                assert!(
+                    allowed.iter().any(|entry| matches!(
+                        &entry.context,
+                        ExecutionContext::Remote { url } if url.as_str().contains("localhost")
+                    )),
+                    "{command} reaches no loopback window on {target:?}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

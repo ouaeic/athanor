@@ -5,14 +5,23 @@
 # browser cannot start at all - the research fan-out and the search route were the only two things
 # on the box that simply did not work, and they failed with a page of Chromium log.
 #
-# This grants exactly one permission - creating a user namespace - to exactly the two binaries
-# athanor manages. Without it the runner still works, by launching with the renderer sandbox off,
-# which is a real reduction: the process that browses arbitrary content keeps a weaker boundary.
-# The point of the profile is that the first choice succeeds instead of the fallback.
+# This grants exactly one permission - creating a user namespace - to exactly the binaries athanor
+# manages. Without it the runner still works, by launching with the renderer sandbox off, which is
+# a real reduction: the process that browses arbitrary content keeps a weaker boundary. The point
+# of the profile is that the first choice succeeds instead of the fallback.
+#
+# Three names, not two, because Playwright names the headless shell differently on each
+# architecture. Its own path table (playwright-core, EXECUTABLE_PATHS) reads
+# "linux-x64": ["chrome-headless-shell-linux64", "chrome-headless-shell"] but
+# "linux-arm64": ["chrome-linux", "headless_shell"], and arm64 is a first-class target here - the
+# host detection accepts aarch64, typst and lego both carry arm64 hashes, and the release builds
+# ubuntu-24.04-arm. Every headless launch is the research fan-out and the search route, so on an
+# arm64 box the two features this profile was written for were the two still falling back to a
+# browser with no renderer sandbox, and the only trace was one `browser.reduced_launch` warning.
 abi <abi/4.0>,
 include <tunables/global>
 
-profile athanor-chromium /home/athanor/.cache/ms-playwright/**/{chrome,chrome-headless-shell} flags=(unconfined) {
+profile athanor-chromium /home/athanor/.cache/ms-playwright/**/{chrome,chrome-headless-shell,headless_shell} flags=(unconfined) {
   userns,
   include if exists <local/athanor-chromium>
 }

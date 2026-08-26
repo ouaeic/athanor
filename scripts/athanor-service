@@ -4,15 +4,18 @@ set -eu
 root_dir="${ATHANOR_ROOT:-/opt/athanor}"
 node="${ATHANOR_NODE:-/usr/bin/node}"
 
+# One arm per instance of athanor@.service, plus the runner. The list is the one in athanor.target
+# and in the installer's `systemctl enable`, and it must stay that list: an arm naming a directory
+# that is not in this repository - `media`, which pointed at services/media-orchestrator - is not a
+# spare capability, it is a unit that would be enabled once and then crash-loop on a missing file.
 case "${1:-}" in
   api) entry="apps/api/dist/index.js" ;;
   worker) entry="apps/worker/dist/index.js" ;;
   registry) entry="services/model-registry/dist/index.js" ;;
-  media) entry="services/media-orchestrator/dist/index.js" ;;
   notifications) entry="services/notifications/dist/index.js" ;;
   runner) entry="services/workspace-runner/dist/index.js" ;;
   *)
-    echo "Usage: athanor-service {api|worker|registry|media|notifications|runner}" >&2
+    echo "Usage: athanor-service {api|worker|registry|notifications|runner}" >&2
     exit 1
     ;;
 esac

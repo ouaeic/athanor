@@ -102,6 +102,24 @@ for directory in "$root"/*/; do
   [ "$body_chars" -le "$max_body_chars" ] ||
     fail "$name" "body is $body_chars characters, over the ~5k-token review budget"
 
+  # An empty inline code span is the shape a mechanical edit leaves behind, and it is invisible in
+  # review: `code-change` shipped "find every caller with ``" and "verify the real signature with
+  # ``" for four months. Both sentences are load-bearing - they name the one tool that does the
+  # thing - and both reduced to an instruction with the instruction removed. Fenced blocks are
+  # skipped, including the indented ones inside a list item, and a run of three or more backticks
+  # is stripped before the search so a fence marker on a prose line cannot masquerade as one.
+  empty_span=$(printf '%s\n' "$body" | awk '
+    { line = $0; sub(/^[ \t]+/, "", line) }
+    line ~ /^```/ { fence = !fence; next }
+    fence == 0 {
+      probe = line
+      gsub(/```+/, "", probe)
+      if (probe ~ /``/) { print NR; exit }
+    }
+  ')
+  [ -z "$empty_span" ] ||
+    fail "$name" "body line $empty_span has an empty \`\` code span, so a named tool went missing"
+
   # --- sidecar ------------------------------------------------------------
   if [ ! -f "$sidecar" ]; then
     warn "$name" "no athanor.yaml; the skill loads with an empty capability grant"

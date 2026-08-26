@@ -119,6 +119,36 @@ if (shellcheck.error?.code === 'ENOENT') {
   fail(`shellcheck reported problems:\n${shellcheck.stdout.trim()}`);
 }
 
+/**
+ * The one shipped script whose behaviour is checked here rather than only its syntax.
+ *
+ * `athanor-system-packages` is the single root-privileged path on an owner's box: the agent asks
+ * for a package, the owner approves it, the runner rewrites the command onto one sudoers rule, and
+ * that script runs on the other side as root. Its package-name filter is a security control and
+ * its dispatch decides whether an approved install reaches a package manager this host has. Both
+ * were untested on every branch, which is how it came to know apt and nothing else while the
+ * runner in front of it had known four families for two waves.
+ *
+ * Run from here rather than left to a CI job, because the value of a fixture is the number of
+ * times it runs. It needs no root, no network and no real package manager - the managers are
+ * recorders and every absolute path the script names is rewritten in a copy - so it costs about a
+ * second and works on a developer's laptop.
+ */
+const systemPackages = spawnSync('/bin/sh', ['scripts/test-system-packages.sh'], {
+  cwd: repositoryRoot,
+  encoding: 'utf8'
+});
+if (systemPackages.status !== 0)
+  fail(
+    `the root package helper does not behave as scripts/test-system-packages.sh requires:\n${[
+      systemPackages.stdout,
+      systemPackages.stderr
+    ]
+      .join('\n')
+      .trim()}`
+  );
+else say(`Root package helper: ${(systemPackages.stdout.match(/^ok /gm) ?? []).length} checks.`);
+
 say(
   `Shipped programs: ${byInterpreter.shell.length} shell, ${byInterpreter.python.length} Python, ${byInterpreter.node.length} Node parse.`
 );
@@ -700,6 +730,25 @@ else
  * Compared as source text, because that is what has to match. Anything cleverer would need to
  * import one side, and the whole reason there are two is that importing is what nobody can do.
  */
+/**
+ * The names a table or a set declares, sorted, for the two entries below that hold the same list
+ * in two different shapes - a `Record` on one side and a `new Set([...])` on the other.
+ *
+ * Anchored to exactly two spaces of indentation, so a nested `notice:` or `clearsOnItsOwn:` is not
+ * mistaken for a member. If prettier ever reindents these declarations this stops matching and
+ * yields nothing, which the loop below treats as a failure rather than as agreement.
+ *
+ * The end of the line counts as a terminator as well as a colon or a comma, because prettier
+ * leaves no trailing comma on the last member of a set - and a rule that read every member except
+ * the last would report drift on two identical lists and, worse, agreement on two that differed
+ * only in what each one ends with.
+ */
+const keysAtTopLevel = (body) =>
+  [...body.matchAll(/^ {2}'?([a-z0-9][a-z0-9+._-]*)'?(?:\s*[:,]|\s*$)/gm)]
+    .map((match) => match[1])
+    .sort()
+    .join(',');
+
 const copiedConstants = [
   {
     what: 'the host disk floor',
@@ -733,28 +782,92 @@ const copiedConstants = [
   },
   {
     what: 'the priority journald files a line at',
-    owner: 'apps/worker/src/agent.ts',
+    owner: 'apps/worker/src/log.ts',
     copy: 'services/workspace-runner/src/log.ts',
     // Arrow to semicolon, so this covers the JOURNAL_STREAM gate as well as the map. A copy that
     // kept the numbers and dropped the gate would print `<4>` at an owner running the runner in a
     // terminal, which is the same fact drifting by the other half.
     find: /journalLevelPrefix = \(level: LogLevel\): string =>([\s\S]*?);/
+  },
+  {
+    what: 'the words that make activating a control consequential, on the desktop',
+    owner: 'services/workspace-runner/src/browser.ts',
+    copy: 'services/workspace-runner/src/desktop.ts',
+    // The alternation only. Three documents promise that destructive operations still confirm in
+    // every mode, and this list is the whole of what makes that true for a named control. The two
+    // had already drifted - the desktop carried `install|uninstall` and the browser did not - which
+    // is how one surface silently stopped keeping a floor the other still kept.
+    find: /consequentialText =\s*\/\\b\(([^)]*)\)\\b\/i;/
+  },
+  {
+    what: 'the words that make activating a control consequential, in the worker floor',
+    owner: 'services/workspace-runner/src/browser.ts',
+    copy: 'apps/worker/src/approval-policy.ts',
+    // The runner reads the control's real name and the worker reads what the model said it was
+    // doing, so the inputs differ on purpose - but the vocabulary must not, or the authoritative
+    // floor stops asking about a word the broker would have caught, and vice versa.
+    find: /consequentialText =\s*\/\\b\(([^)]*)\)\\b\/i;/
+  },
+  {
+    what: 'the package managers the privileged helper can carry out an operation for',
+    owner: 'services/workspace-runner/src/execution.ts',
+    copy: 'apps/worker/src/turn-bounds.ts',
+    // The runner decides which manager it can rewrite onto the root helper; the worker decides
+    // which command is offered the `system.packages` capability in the first place. A worker list
+    // narrower than the runner's is a command refused for a permission it would have been granted
+    // - which is exactly what `dnf install` got on every non-Debian box until the wave that
+    // widened both. They are two lists because the worker cannot import the runner, and this is
+    // the only thing that makes them one fact.
+    find: /PACKAGE_OPERATIONS: Record<[^=]*= \{([\s\S]*?)\n\};/,
+    findInCopy: /HELPER_PACKAGE_MANAGERS = new Set\(\[([\s\S]*?)\]\)/,
+    normalise: keysAtTopLevel
+  },
+  {
+    what: 'the provider walls a task may be parked under',
+    owner: 'apps/api/src/maintenance/provider-walls.ts',
+    copy: 'apps/worker/src/agent.ts',
+    // The worker parks a task under one of these codes and stops; the API's sweep is the only
+    // thing that ever wakes it. A code the worker parks under and the sweep does not recognise
+    // leaves the work in `awaiting_resource` for ever with nothing left to ask again - strictly
+    // worse than failing, which at least tells the owner. The comment on the worker's copy named
+    // the wrong file from the moment the table moved out of `server.ts` in Wave 6 until the wave
+    // that added this entry, so the drift this guards against had already begun in the prose before
+    // it could begin in the values.
+    find: /providerWalls: Record<[^=]*= \{([\s\S]*?)\n\};/,
+    findInCopy: /PARKABLE_PROVIDER_WALLS = new Set\(\[([\s\S]*?)\]\)/,
+    normalise: keysAtTopLevel
   }
 ];
 const drifted = [];
-for (const { what, owner, copy, find, normalise = (value) => value } of copiedConstants) {
+for (const {
+  what,
+  owner,
+  copy,
+  find,
+  findInCopy = find,
+  normalise = (value) => value
+} of copiedConstants) {
   const here = read(owner).match(find);
-  const there = read(copy).match(find);
+  const there = read(copy).match(findInCopy);
   // A pattern that stops matching is the failure this check exists to prevent, wearing the costume
   // of a pass. Renaming either side has to be as loud as changing the number.
-  if (!here || !there)
+  if (!here || !there) {
     drifted.push(
       `${what} could not be read from ${!here ? owner : copy}; the comparison is no longer running`
     );
-  else if (
-    normalise(here[1]).replace(/\s+/g, '').trim() !== normalise(there[1]).replace(/\s+/g, '').trim()
-  )
-    drifted.push(`${what} is "${here[1].trim()}" in ${owner} and "${there[1].trim()}" in ${copy}`);
+    continue;
+  }
+  const hereValue = normalise(here[1]).replace(/\s+/g, '').trim();
+  const thereValue = normalise(there[1]).replace(/\s+/g, '').trim();
+  // The same costume, one layer down: a `normalise` whose own pattern has stopped matching
+  // compares "" with "" and passes. Every entry here captures something, so nothing may reduce to
+  // nothing.
+  if (!hereValue || !thereValue)
+    drifted.push(
+      `${what} normalised to nothing from ${!hereValue ? owner : copy}; the comparison is no longer running`
+    );
+  else if (hereValue !== thereValue)
+    drifted.push(`${what} is "${hereValue}" in ${owner} and "${thereValue}" in ${copy}`);
 }
 if (drifted.length) for (const message of drifted) fail(message);
 else

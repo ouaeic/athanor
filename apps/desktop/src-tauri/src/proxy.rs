@@ -1,7 +1,7 @@
 use crate::connection::{
-    clear_pending_pairing, connect_profile, load_pending_pairing, load_profile, parse_pairing_uri,
-    pinned_http_client, pinned_tls_config, save_pending_pairing, save_profile, ImportedConnection,
-    NetworkPreference, PendingPairing, ServerProfile,
+    clear_pending_pairing, connect_profile, forget_profile, load_pending_pairing, load_profile,
+    parse_pairing_uri, pinned_http_client, pinned_tls_config, save_pending_pairing, save_profile,
+    ImportedConnection, NetworkPreference, PendingPairing, ServerProfile,
 };
 use crate::ssh_install::{self, InstallServerRequest};
 use axum::{
@@ -14,8 +14,9 @@ use axum::{
         header::{CONTENT_LENGTH, COOKIE, HOST, LOCATION, ORIGIN, REFERER, SET_COOKIE, UPGRADE},
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
     },
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -34,6 +35,26 @@ use tokio_tungstenite::{
 const RETRYABLE_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const SERVER_SESSION_COOKIE: &str = "__Host-athanor_session";
 const LOCAL_SESSION_COOKIE: &str = "athanor_native_session";
+/*
+ * What this program is, on the request side of the gateway.
+ *
+ * The shell already stamped `x-athanor-native-client` on every *response* so the page could learn
+ * it was talking through the gateway, and stamped nothing on the way out - so the box saw a plain
+ * WKWebView/WebView2/WebKitGTK User-Agent and labelled the owner's desktop app "Safari on macOS",
+ * byte-identical to their real Safari in the Devices list that is also the revoke-a-session
+ * control. The platform is a build fact, not a runtime one, so it is a constant.
+ */
+#[cfg(target_os = "macos")]
+const CLIENT_IDENTITY: &str = concat!("athanor-macos/", env!("CARGO_PKG_VERSION"));
+#[cfg(target_os = "windows")]
+const CLIENT_IDENTITY: &str = concat!("athanor-windows/", env!("CARGO_PKG_VERSION"));
+#[cfg(target_os = "linux")]
+const CLIENT_IDENTITY: &str = concat!("athanor-linux/", env!("CARGO_PKG_VERSION"));
+#[cfg(target_os = "ios")]
+const CLIENT_IDENTITY: &str = concat!("athanor-ios/", env!("CARGO_PKG_VERSION"));
+#[cfg(target_os = "android")]
+const CLIENT_IDENTITY: &str = concat!("athanor-android/", env!("CARGO_PKG_VERSION"));
+const CLIENT_HEADER: &str = "x-athanor-client";
 
 #[derive(Clone)]
 struct ActiveServer {
@@ -51,6 +72,14 @@ pub struct ClientState {
     pairing_code: RwLock<Option<PendingPairing>>,
     local_origin: RwLock<String>,
     installer_origin: RwLock<String>,
+    /*
+     * Why the connection last failed, for the owner rather than for stderr.
+     *
+     * `ClientStatus` shipped with an `error` field that no code path could ever set, so the one
+     * route that can tell a packaged owner why their app cannot reach their box answered `null`
+     * every time. The activation attempt is the only place that knows, so it records here.
+     */
+    last_error: RwLock<Option<String>>,
 }
 
 impl ClientState {
@@ -66,6 +95,7 @@ impl ClientState {
             pairing_code: RwLock::new(pairing_code),
             local_origin: RwLock::new(String::new()),
             installer_origin: RwLock::new(String::new()),
+            last_error: RwLock::new(None),
         }))
     }
 
@@ -103,7 +133,16 @@ impl ClientState {
             .await
             .clone()
             .ok_or("Paste the one-time connection ticket from your athanor server")?;
-        self.activate(profile).await
+        match self.activate(profile).await {
+            Ok(active) => {
+                *self.last_error.write().await = None;
+                Ok(active)
+            }
+            Err(message) => {
+                *self.last_error.write().await = Some(message.clone());
+                Err(message)
+            }
+        }
     }
 
     async fn import(self: &Arc<Self>, raw: &str) -> Result<(), String> {
@@ -131,6 +170,29 @@ impl ClientState {
             .map_err(|_| "The pending pairing-code remover stopped unexpectedly")??;
         *self.pairing_code.write().await = None;
         Ok(())
+    }
+
+    /*
+     * Disconnect this device from its server.
+     *
+     * `import` could replace a profile and nothing could remove one: pairing is reachable only from
+     * the offline page, and the offline page renders only when the connection is already broken. So
+     * moving the app to another box, or signing the app out of one, meant breaking the connection
+     * first or hand-deleting server-profile.json. The pending pairing code goes with it - it is the
+     * registration secret for the box being forgotten, and keeping it on disk after the owner has
+     * said "not this server" is the one thing that would be worse than not having this at all.
+     */
+    async fn forget(self: &Arc<Self>) -> Result<(), String> {
+        let _activation = self.activation.lock().await;
+        let profile_path = self.profile_path.clone();
+        tokio::task::spawn_blocking(move || forget_profile(&profile_path))
+            .await
+            .map_err(|_| "The client profile remover stopped unexpectedly")??;
+        *self.profile.write().await = None;
+        *self.active.write().await = None;
+        *self.last_error.write().await = None;
+        drop(_activation);
+        self.clear_pairing_code().await
     }
 
     pub async fn import_deep_link(self: &Arc<Self>, raw: &str) -> Result<(), String> {
@@ -190,6 +252,8 @@ struct ClientStatus {
     identity: Option<String>,
     endpoints: Vec<String>,
     error: Option<String>,
+    network_preference: Option<NetworkPreference>,
+    app_version: &'static str,
 }
 
 #[derive(Serialize)]
@@ -220,7 +284,13 @@ pub async fn start(state: Arc<ClientState>) -> Result<String, String> {
         .route("/install", post(install_server));
     #[cfg(desktop)]
     let installer_router = installer_router.route("/choose-key", post(choose_ssh_key));
-    let installer_router = installer_router.with_state(state.clone());
+    let installer_router =
+        installer_router
+            .with_state(state.clone())
+            .layer(middleware::from_fn_with_state(
+                installer_address.port(),
+                only_this_gateway,
+            ));
     tauri::async_runtime::spawn(async move {
         if let Err(error) = axum::serve(installer_listener, installer_router).await {
             eprintln!("athanor secure installer stopped: {error}");
@@ -259,7 +329,11 @@ pub async fn start(state: Arc<ClientState>) -> Result<String, String> {
     if remembered != Some(address.port()) {
         // Best effort: a shell that cannot write this still runs, it just starts somewhere else
         // next time, which is exactly what it did before.
-        let _ = std::fs::write(&port_path, address.port().to_string());
+        //
+        // 0600 like the profile beside it. This file names the port on which the process holding
+        // the owner's session is listening, and `std::fs::write` would have left it 0644 next to a
+        // neighbour that goes to the trouble of create-new + rename + fsync at 0600.
+        let _ = write_private_port(&port_path, address.port());
     }
     let origin = format!("http://localhost:{}", address.port());
     *state.local_origin.write().await = origin.clone();
@@ -270,9 +344,14 @@ pub async fn start(state: Arc<ClientState>) -> Result<String, String> {
             "/__athanor/client/network-preference",
             post(save_network_preference),
         )
+        .route("/__athanor/client/profile", delete(forget_server))
         .route("/__athanor/client/bootstrap", get(bootstrap))
         .fallback(proxy)
-        .with_state(state);
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            address.port(),
+            only_this_gateway,
+        ));
     tauri::async_runtime::spawn(async move {
         if let Err(error) = axum::serve(listener, router).await {
             eprintln!("athanor private client gateway stopped: {error}");
@@ -292,12 +371,91 @@ async fn client_status(State(state): State<Arc<ClientState>>) -> Json<ClientStat
             .as_ref()
             .map(|value| value.endpoints.clone())
             .unwrap_or_default(),
-        error: None,
+        // Only while disconnected. A connection that came back should not keep showing the
+        // failure that preceded it.
+        error: if connected {
+            None
+        } else {
+            state.last_error.read().await.clone()
+        },
+        network_preference: profile.as_ref().map(|value| value.network_preference),
+        app_version: env!("CARGO_PKG_VERSION"),
     })
 }
 
 fn is_local_client_origin(headers: &HeaderMap, expected: &str) -> bool {
     headers.get(ORIGIN).and_then(|value| value.to_str().ok()) == Some(expected)
+}
+
+/*
+ * A request that names an origin, and names one that is not this gateway.
+ *
+ * This is deliberately not `!is_local_client_origin`. The four named routes here are called by
+ * script and can insist on an exact `Origin`; the fallback carries every page load, every
+ * same-origin `GET` and every navigation, and a browser sends no `Origin` header on any of those.
+ * Refusing an absent origin there would refuse the app itself. So the fallback asks the weaker
+ * question the API upstream asks of its own callers (`server.ts`: `if (origin && origin !==
+ * PUBLIC_APP_URL) throw invalid_origin`) - and it has to be asked *here*, because `forwarded_headers`
+ * overwrites `Origin` with the box's canonical origin before the request leaves this process, so
+ * the upstream check can only ever see a value this gateway wrote. This is the last point at which
+ * the truth is still known.
+ */
+fn is_foreign_origin(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value != expected)
+}
+
+/*
+ * Is this request addressed to the loopback gateway, or to a name that merely resolves to it?
+ *
+ * Binding 127.0.0.1 keeps the network out; it does not keep a *web page* out. DNS rebinding points
+ * an attacker's own hostname at 127.0.0.1, after which the page's fetches to `http://their-name:PORT/`
+ * are same-origin from the browser's point of view: no `Origin` header is sent, no CORS check runs,
+ * and the response body is readable. The session cookie does not travel (it is scoped to the host
+ * `localhost`), so the proxied API stays unauthenticated - but `/__athanor/client/status` and
+ * `/__athanor/client/bootstrap` need no session, and between them they hand out the box's public
+ * endpoints and the first-owner pairing code. The port stopped being a secret when it was fixed and
+ * written to disk so that local storage would survive a restart.
+ *
+ * The `Host` header is what distinguishes the two cases, and it is the only thing that does. It is
+ * checked once, in front of every route including the fallback, rather than route by route.
+ */
+fn is_this_gateway_authority(value: &str, port: u16) -> bool {
+    // An IPv6 literal keeps its brackets, so the colons inside it are not port separators.
+    let (host, authority_port) = match value.rsplit_once(':') {
+        Some((host, tail)) if !tail.contains(']') => (host, tail.parse::<u16>().ok()),
+        _ => (value, None),
+    };
+    authority_port == Some(port) && matches!(host, "localhost" | "127.0.0.1" | "[::1]")
+}
+
+async fn only_this_gateway(State(port): State<u16>, request: Request, next: Next) -> Response {
+    let addressed_to = request
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str().to_owned())
+        });
+    match addressed_to {
+        Some(authority) if is_this_gateway_authority(&authority, port) => next.run(request).await,
+        _ => (
+            StatusCode::MISDIRECTED_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "invalid_client_host",
+                    "message": "This address is not the athanor client gateway"
+                }
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn pair(
@@ -357,6 +515,35 @@ async fn save_network_preference(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": { "code": "preference_failed", "message": message }
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn forget_server(State(state): State<Arc<ClientState>>, headers: HeaderMap) -> Response {
+    if !is_local_client_origin(&headers, &state.local_origin().await) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "invalid_client_origin",
+                    "message": "Disconnecting a server is accepted only from the athanor client"
+                }
+            })),
+        )
+            .into_response();
+    }
+    match state.forget().await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "connected": false })),
+        )
+            .into_response(),
+        Err(message) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": { "code": "disconnect_failed", "message": message }
             })),
         )
             .into_response(),
@@ -494,6 +681,19 @@ async fn install_server(
     }
 }
 
+fn write_private_port(path: &std::path::Path, port: u16) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(port.to_string().as_bytes())
+}
+
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     matches!(
         name.as_str().to_ascii_lowercase().as_str(),
@@ -515,6 +715,14 @@ fn forwarded_headers(input: &HeaderMap, canonical_origin: &str) -> HeaderMap {
             output.append(name.clone(), value.clone());
         }
     }
+    /*
+     * Insert, not append: the page may have set this header itself, and the box must read the one
+     * the shell wrote. Every session created through this gateway is labelled from it.
+     */
+    output.insert(
+        HeaderName::from_static(CLIENT_HEADER),
+        HeaderValue::from_static(CLIENT_IDENTITY),
+    );
     if input.contains_key(ORIGIN) {
         if let Ok(value) = HeaderValue::from_str(canonical_origin) {
             output.insert(ORIGIN, value);
@@ -704,6 +912,18 @@ fn gateway_error(
 }
 
 async fn proxy(State(state): State<Arc<ClientState>>, request: Request) -> Response {
+    if is_foreign_origin(request.headers(), &state.local_origin().await) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "invalid_client_origin",
+                    "message": "This request did not come from the athanor client"
+                }
+            })),
+        )
+            .into_response();
+    }
     let wants_html = request.method() == Method::GET
         && request.uri().path() == "/"
         && request
@@ -1111,6 +1331,7 @@ fn offline_page(
 mod tests {
     use super::*;
     use crate::connection::{save_profile, Discovery, ServerProfile};
+    use base64::Engine as _;
 
     #[test]
     fn strips_hop_by_hop_headers_and_rewrites_browser_origin() {
@@ -1136,6 +1357,79 @@ mod tests {
             result.get(COOKIE).unwrap(),
             &HeaderValue::from_static("theme=dark; __Host-athanor_session=private-value")
         );
+    }
+
+    /*
+     * The Devices list is also the revoke-a-session control, and before this the packaged desktop
+     * app and the owner's real Safari produced the same label from the same User-Agent.
+     */
+    #[test]
+    fn stamps_this_client_on_every_request_the_gateway_forwards() {
+        let mut input = HeaderMap::new();
+        input.insert(ORIGIN, HeaderValue::from_static("http://localhost:41000"));
+        input.insert(
+            HeaderName::from_static(CLIENT_HEADER),
+            HeaderValue::from_static("athanor-macos/999.999.999"),
+        );
+        let result = forwarded_headers(&input, "https://ai.example.test");
+        let stamped = result.get(CLIENT_HEADER).unwrap().to_str().unwrap();
+        assert_eq!(stamped, CLIENT_IDENTITY);
+        assert!(stamped.starts_with("athanor-"));
+        assert!(stamped.ends_with(concat!("/", env!("CARGO_PKG_VERSION"))));
+        // Insert, not append: a page that stamped its own value must not reach the box with two.
+        assert_eq!(result.get_all(CLIENT_HEADER).iter().count(), 1);
+        assert!(
+            forwarded_headers(&HeaderMap::new(), "https://ai.example.test")
+                .contains_key(CLIENT_HEADER)
+        );
+    }
+
+    /*
+     * The fallback carries every navigation, and a browser sends no Origin on those, so the
+     * question the gateway can ask is the upstream's own: present, and not ours.
+     */
+    #[test]
+    fn refuses_only_a_request_that_names_a_different_origin() {
+        let local = "http://localhost:41000";
+        let mut absent = HeaderMap::new();
+        absent.insert(HOST, HeaderValue::from_static("localhost:41000"));
+        assert!(!is_foreign_origin(&absent, local));
+        let mut ours = HeaderMap::new();
+        ours.insert(ORIGIN, HeaderValue::from_static("http://localhost:41000"));
+        assert!(!is_foreign_origin(&ours, local));
+        for value in [
+            "https://attacker.test",
+            "null",
+            "http://localhost:41001",
+            "http://127.0.0.1:41000",
+        ] {
+            let mut foreign = HeaderMap::new();
+            foreign.insert(ORIGIN, HeaderValue::from_str(value).unwrap());
+            assert!(is_foreign_origin(&foreign, local), "{value}");
+        }
+    }
+
+    /*
+     * DNS rebinding: the attacker's hostname resolves to 127.0.0.1, the page's fetch is
+     * same-origin, and no Origin header is sent. The Host header is the only thing that still
+     * knows which name the request was addressed to.
+     */
+    #[test]
+    fn answers_only_when_addressed_as_this_loopback_gateway() {
+        for value in ["localhost:41000", "127.0.0.1:41000", "[::1]:41000"] {
+            assert!(is_this_gateway_authority(value, 41_000), "{value}");
+        }
+        for value in [
+            "rebound.attacker.test:41000",
+            "localhost:41001",
+            "localhost",
+            "127.0.0.1",
+            "localhost:41000.attacker.test",
+            "attacker.test",
+            "[::1]",
+        ] {
+            assert!(!is_this_gateway_authority(value, 41_000), "{value}");
+        }
     }
 
     #[test]
@@ -1231,6 +1525,137 @@ mod tests {
         );
         assert!(!profile_path.with_file_name("pending-pairing.json").exists());
         assert!(pending_path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn test_profile() -> ServerProfile {
+        ServerProfile {
+            version: 1,
+            identity: format!(
+                "sha256/{}",
+                base64::engine::general_purpose::STANDARD.encode([7_u8; 32])
+            ),
+            endpoints: vec!["https://example.test".into()],
+            discovery: Discovery {
+                mdns_service: "_athanor._tcp.local".into(),
+                mdns_port: 443,
+            },
+            last_endpoint: None,
+            network_preference: NetworkPreference::Unknown,
+        }
+    }
+
+    /*
+     * There was no way to disconnect a device from its box. `import` could replace a profile;
+     * nothing could remove one, and the only pairing door renders when the connection is already
+     * broken. The pairing code goes with the profile: it is the registration secret for the box
+     * being forgotten.
+     */
+    #[tokio::test]
+    async fn forgetting_a_server_removes_the_profile_and_the_pairing_code_it_came_with() {
+        let directory =
+            std::env::temp_dir().join(format!("athanor-forget-{}", uuid::Uuid::new_v4()));
+        let profile_path = directory.join("server-profile.json");
+        let pending_path = directory.join("pending-pairing.json");
+        save_profile(&profile_path, &test_profile()).unwrap();
+        save_pending_pairing(
+            &pending_path,
+            "temporary-pairing-code-1234567890".into(),
+            u64::MAX,
+        )
+        .unwrap();
+
+        let state = ClientState::load(profile_path.clone(), pending_path.clone()).unwrap();
+        assert!(state.profile.read().await.is_some());
+        state.forget().await.unwrap();
+
+        assert!(!profile_path.exists());
+        assert!(!pending_path.exists());
+        assert!(state.profile.read().await.is_none());
+        assert!(state.pairing_code.read().await.is_none());
+        // Idempotent: the offline page can be reloaded, and a second disconnect is not an error.
+        state.forget().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /*
+     * `error` shipped hardcoded to `None` with no code path able to set it, so the one route that
+     * can tell a packaged owner why their box is unreachable always said nothing.
+     */
+    #[tokio::test]
+    async fn the_status_route_reports_why_the_connection_is_down() {
+        let directory =
+            std::env::temp_dir().join(format!("athanor-status-{}", uuid::Uuid::new_v4()));
+        let profile_path = directory.join("server-profile.json");
+        save_profile(&profile_path, &test_profile()).unwrap();
+        let state =
+            ClientState::load(profile_path, directory.join("pending-pairing.json")).unwrap();
+
+        let unexplained = client_status(State(state.clone())).await;
+        assert!(unexplained.configured);
+        assert!(!unexplained.connected);
+        assert!(unexplained.error.is_none());
+        assert_eq!(
+            unexplained.network_preference,
+            Some(NetworkPreference::Unknown)
+        );
+        assert_eq!(unexplained.app_version, env!("CARGO_PKG_VERSION"));
+
+        *state.last_error.write().await = Some("No saved address could prove the identity".into());
+        let explained = client_status(State(state.clone())).await;
+        assert_eq!(
+            explained.error.as_deref(),
+            Some("No saved address could prove the identity")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /*
+     * Both guards, on a gateway that is actually listening, with no server behind it.
+     *
+     * A rebound name and a foreign origin are both refused before any of the work a real request
+     * would do - which is the point: neither check may depend on the box being reachable, and
+     * neither may cost the app a round trip when it is not.
+     */
+    #[tokio::test]
+    async fn the_running_gateway_answers_only_its_own_name_and_its_own_origin() {
+        let directory =
+            std::env::temp_dir().join(format!("athanor-gateway-guard-{}", uuid::Uuid::new_v4()));
+        let profile_path = directory.join("server-profile.json");
+        save_profile(&profile_path, &test_profile()).unwrap();
+        let state =
+            ClientState::load(profile_path, directory.join("pending-pairing.json")).unwrap();
+        let origin = start(state).await.unwrap();
+        let port = origin.rsplit(':').next().unwrap().to_owned();
+        let client = reqwest::Client::new();
+
+        let allowed = client
+            .get(format!("{origin}/__athanor/client/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), reqwest::StatusCode::OK);
+
+        // DNS rebinding: the page's own hostname, resolved to 127.0.0.1 by the attacker's DNS.
+        let rebound = client
+            .get(format!("{origin}/__athanor/client/bootstrap"))
+            .header(HOST, format!("rebound.attacker.test:{port}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rebound.status(), reqwest::StatusCode::MISDIRECTED_REQUEST);
+
+        // A page on another origin, reaching the proxied API with the session cookie it cannot
+        // read. Refused here, where the true origin is still known - `forwarded_headers` would
+        // otherwise overwrite it with the box's own before the upstream check ever saw it.
+        let foreign = client
+            .get(format!("{origin}/v1/tasks"))
+            .header(ORIGIN, "https://attacker.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), reqwest::StatusCode::FORBIDDEN);
+
         std::fs::remove_dir_all(directory).unwrap();
     }
 

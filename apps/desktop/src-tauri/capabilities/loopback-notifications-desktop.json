@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "loopback-notifications-desktop",
+  "description": "Native notifications for the private in-app loopback gateway on macOS, Windows and Linux. Its sibling loopback-notifications names android and iOS only, and a capability that names any platform applies to no other, so every packaged desktop client was silent: the main window is loaded from http://localhost:<port>, which is a remote URL, and the only other capability holding notification:default has no remote block and therefore covers local app URLs alone. Kept as a second file rather than widening the first because apps/desktop/verify-native-config.mjs pins that file's platform list exactly.",
+  "local": false,
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://localhost:*/*"]
+  },
+  "platforms": ["macOS", "windows", "linux"],
+  "permissions": ["notification:default"]
+}

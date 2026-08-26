@@ -21,7 +21,7 @@ const SOURCE_COMMIT: &str = env!("ATHANOR_SOURCE_COMMIT");
 /// and left this pointing at the previous script, which meant the desktop app's own `sha256sum -c`
 /// refused the installer it had just fetched. That is the first thing a new owner does.
 const INSTALL_BOOTSTRAP_SHA256: &str =
-    "fa7b03a38f6b1fb63f868120b69d531a6d7b888411ea114162e562fd86b18a03";
+    "4b3fca363983264fc723a807c1292243f220377c5d3454f3565048ba61db14d3";
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const INSTALLER_PAGE: &str = include_str!("installer.html");
 

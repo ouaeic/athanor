@@ -576,8 +576,14 @@ say "Preparing the private database"
 # that reported success.
 athanor_postgres_prepare "$host_family"
 systemctl enable --now postgresql
+# Reused from the file when the box already has one. The capture group was written `\\(` inside
+# single quotes, which is a literal backslash followed by a literal parenthesis, so it never matched
+# anything and every re-install invented a new password - the one secret on this box that was not
+# reused, under a deployment document promising that all of them are. The same extraction is spelled
+# with single backslashes in the restore path, which is what showed this was a typo and not an
+# idiom.
 database_password=$(existing_control_value DATABASE_URL |
-  sed -n 's|^postgres://athanor:\\([^@]*\\)@.*|\\1|p')
+  sed -n 's|^postgres://athanor:\([^@]*\)@.*|\1|p')
 [ -n "$database_password" ] || database_password=$(openssl rand -hex 32)
 runuser -u postgres -- psql -v ON_ERROR_STOP=1 -v password="$database_password" <<'SQL'
 SELECT format('CREATE ROLE athanor LOGIN PASSWORD %L', :'password')
@@ -586,6 +592,15 @@ SELECT format('ALTER ROLE athanor WITH LOGIN PASSWORD %L', :'password')\gexec
 SELECT 'CREATE DATABASE athanor OWNER athanor'
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'athanor')\gexec
 SQL
+# Written down the instant the role holds it, and not three hundred lines later with a dozen `fail`
+# points in between. `doctor` sends the owner back through this installer for two ordinary
+# conditions, and any abort inside that window left the role holding a password nothing on the box
+# knew: the API, worker, registry and notifier all fail authentication on their next restart, and a
+# previously working server is down with no repair but another full run. control.env is the file
+# every one of those services reads, so it learns the password in the same breath the role does.
+control_env="$athanor_config/control.env"
+set_env_value "$control_env" DATABASE_URL \
+  "postgres://athanor:$database_password@127.0.0.1:5432/athanor"
 
 # Stock Debian and Ubuntu ship `local all all peer`, which maps a Unix account to the same-named
 # database role. The agent computer runs on this host under an account of its own, and the
@@ -837,7 +852,6 @@ fi
 [ -n "$push_public_key" ] && [ -n "$push_private_key" ] ||
   fail "the Web Push signing keys could not be generated"
 
-control_env="$athanor_config/control.env"
 set_env_value "$control_env" DEPLOYMENT_MODE production
 set_env_value "$control_env" REGISTRATION_BOOTSTRAP_TOKEN "$pairing_code"
 set_env_value "$control_env" REGISTRATION_BOOTSTRAP_EXPIRES_AT "$pairing_expires"
@@ -860,8 +874,8 @@ set_env_value "$control_env" API_PORT 4100
 set_env_value "$control_env" PREVIEW_GATEWAY_HOST 127.0.0.1
 set_env_value "$control_env" PREVIEW_GATEWAY_PORT 4400
 set_env_value "$control_env" DATABASE_DRIVER postgres
-set_env_value "$control_env" DATABASE_URL \
-  "postgres://athanor:$database_password@127.0.0.1:5432/athanor"
+# DATABASE_URL is not written here: it goes down beside the ALTER ROLE that sets it, so the file and
+# the role cannot disagree across the failures that sit between the two points.
 set_env_value "$control_env" DATA_MASTER_KEY "$data_master_key"
 set_env_value "$control_env" SESSION_SIGNING_KEY "$session_signing_key"
 set_env_value "$control_env" RUNNER_SHARED_SECRET "$runner_shared_secret"
@@ -979,6 +993,12 @@ else
 fi
 nginx -t
 
+# The installer creates every other directory it writes into and this heredoc assumed one. A host
+# whose avahi package had not been installed - or had been installed without its service directory -
+# aborted here under `set -eu`, after the configuration was written and the database password set
+# and before daemon-reload, enable and every service start: a box with units on disk and nothing
+# running at all.
+install -d -m 0755 /etc/avahi/services
 cat >/etc/avahi/services/athanor.service <<EOF
 <?xml version="1.0" standalone="no"?>
 <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
