@@ -39,16 +39,10 @@ import {
   usageCredit
 } from './billing.js';
 import { askOutcome, startTurnState, type CompletionVerification } from './completion.js';
-import { originOf, rememberOrigin, type DestinationContext } from './egress.js';
+import { originOf, type DestinationContext } from './egress.js';
 import {
-  COMPACT_CONTEXT_TOOL,
-  compactionTrigger,
   dropLegacyGuidance,
-  contextShortfall,
   ensureBasePrompt,
-  estimatedContextTokens,
-  modelInputBudget,
-  prepareModelContext,
   type CompactionOutcome,
   type PreparedContext
 } from './context.js';
@@ -57,32 +51,20 @@ import { workerLogger, type Logger } from './log.js';
 import {
   botWallSite,
   originsFromOwnerMessages,
-  providerWebProvenance,
   takeoverNotice,
   type BotWall
 } from './provenance.js';
 import { providerWebSearch, type WebSearchAnswer } from './provider-search.js';
 import { WEB_SEARCH_MAX_OUTPUT_TOKENS, WEB_SEARCH_REQUEST_TIMEOUT_MS, routeTo } from './routing.js';
-import { degenerateRepeat, normalizeAssistantText } from './streaming.js';
-import { applyDormantRules, toolsRunThisTurn } from './rules/index.js';
 import { executeToolCall } from './tool-dispatch.js';
 import { AgentRunnerClient, withRunnerAbort } from './runner-client.js';
 import { buildIdentity } from './build-identity.js';
-import { agentToolsFor } from './tools.js';
 import {
   CHECKPOINT_EXEMPT_TOOLS,
-  IDEMPOTENT_WITHIN_TURN,
-  MAX_ARGUMENT_TRUNCATIONS,
-  MAX_CONTEXT_OVERFLOW_REPAIRS,
   MAX_NOTICES_PER_TURN,
-  effortFloorEarned,
-  idempotentCallKey,
   ownerFixableCheckpointFailure,
-  parallelToolRun,
-  reasoningEffortForStep,
   spendHalt,
-  spendWarning,
-  tombstoneMalformedCall
+  spendWarning
 } from './turn-bounds.js';
 import {
   CANCELLATION_POLL_INTERVAL_MS,
@@ -90,14 +72,12 @@ import {
   haltReason,
   retryTurnHandoff,
   sealUnansweredToolCalls,
-  startStopWatch,
   withPeriodicRenewal,
   withRequestDeadline
 } from './turn-lifecycle.js';
 import { runAcceptanceChecks, type AcceptanceRunnerDeps } from './acceptance-runner.js';
 import {
   approvalForCallOnce,
-  createApprovalFloorMemo,
   type ApprovalFloorDeps,
   type ApprovalFloorMemo
 } from './approval-floor.js';
@@ -105,7 +85,6 @@ import { compactTurnContext, type CompactionDeps } from './compaction.js';
 import {
   drainCorrection as drainCorrection_,
   honorUserControl as honorUserControl_,
-  requestDerivationBreach,
   type TurnControlDeps
 } from './turn-control.js';
 import {
@@ -114,13 +93,7 @@ import {
   refreshRuntimeContext as refreshRuntimeContext_,
   type WindowDeps
 } from './window.js';
-import {
-  noteStepBudget,
-  renewStepBudget,
-  stepCeiling,
-  turnWallClockReached,
-  type HandoffDeps
-} from './handoff.js';
+import { renewStepBudget, stepCeiling, type HandoffDeps } from './handoff.js';
 import { captureMemory, type MemoryCaptureDeps } from './memory-capture.js';
 import {
   event,
@@ -132,17 +105,17 @@ import {
 } from './tool-recording.js';
 import { closeTurnAtCeiling, type TurnCloseContext } from './turn/close.js';
 import { claimTurn, type TurnClaimDeps } from './turn/claim.js';
-import {
-  declareAcceptance,
-  type AcceptanceDeclarationDeps
-} from './turn/acceptance-declaration.js';
+import { type AcceptanceDeclarationDeps } from './turn/acceptance-declaration.js';
 import { resolveAnswerHolds } from './turn/answer-holds.js';
-import { executeApprovedCall } from './turn/execute-call.js';
-import { parkForApproval } from './turn/approval-park.js';
-import { handleFinishCall, type TurnFinishDeps } from './turn/finish.js';
+import type { TurnFinishDeps } from './turn/finish.js';
 import { resumeParkedTurn, type TurnResumeDeps } from './turn/resume.js';
 import { enforceStepBounds, type StepBoundsDeps } from './turn/step-bounds.js';
-import { createStreamChannel } from './turn/stream-channel.js';
+import { dispatchToolCalls, type TurnDispatchDeps } from './turn/dispatch.js';
+import { generateModelStep, type TurnGenerateDeps } from './turn/generate.js';
+import type { TurnLoopControl, TurnStepBudget } from './turn/loop-context.js';
+import { recordAssistantStep, type TurnRecordStepDeps } from './turn/record-step.js';
+import { prepareStepRequest, type TurnRequestDeps } from './turn/request.js';
+import { openStep, type TurnStepOpenDeps } from './turn/step-open.js';
 import { textValue } from './values.js';
 import {
   currentCatalog,
@@ -284,6 +257,21 @@ export class AgentWorker {
   /** @see declareAcceptance in `turn/acceptance-declaration.ts`. */
   readonly #acceptance: AcceptanceDeclarationDeps;
 
+  /** @see openStep in `turn/step-open.ts`. */
+  readonly #stepOpen: TurnStepOpenDeps;
+
+  /** @see prepareStepRequest in `turn/request.ts`. */
+  readonly #request: TurnRequestDeps;
+
+  /** @see generateModelStep in `turn/generate.ts`. */
+  readonly #generate: TurnGenerateDeps;
+
+  /** @see dispatchToolCalls in `turn/dispatch.ts`. */
+  readonly #dispatch: TurnDispatchDeps;
+
+  /** @see recordAssistantStep in `turn/record-step.ts`. */
+  readonly #recordStep: TurnRecordStepDeps;
+
   constructor(
     private readonly store: DataStore,
     private readonly config: AgentWorkerConfig,
@@ -397,6 +385,49 @@ export class AgentWorker {
       runner: this.#runner,
       logger: this.logger,
       checkpoint: (task, key, state) => this.#checkpoint(task, key, state)
+    };
+    /*
+     * The four phases of one step, in the order the loop runs them. Assembled last because three of
+     * the four name a set assembled above - the handoff, the finish, the acceptance and the resume
+     * sets - and a field read before its own assignment is `undefined` at the one moment it matters.
+     */
+    this.#stepOpen = {
+      handoff: this.#handoff,
+      haltIfOutOfMoney: (task, key, state) => this.#haltIfOutOfMoney(task, key, state)
+    };
+    this.#recordStep = {
+      store,
+      raiseTaint: (task, key, state, origin, tool) =>
+        this.#raiseTaint(task, key, state, origin, tool)
+    };
+    this.#request = {
+      compactContext: (task, key, state, input) => this.#compactContext(task, key, state, input),
+      assertProviderConfigured: (task) => this.#assertProviderConfigured(task)
+    };
+    this.#generate = {
+      store,
+      config,
+      withLeaseRenewal: (task, operation) => this.#withLeaseRenewal(task, operation),
+      billModelStep: (task, key, state, input) => this.#billModelStep(task, key, state, input),
+      compactContext: (task, key, state, input) => this.#compactContext(task, key, state, input),
+      noteRepeatingAnswer: (task, key, state, repeated) =>
+        this.#noteRepeatingAnswer(task, key, state, repeated)
+    };
+    this.#dispatch = {
+      store,
+      config,
+      finish: this.#finish,
+      acceptance: this.#acceptance,
+      resume: this.#resume,
+      approvalForCallOnce: (memo, task, call, state) =>
+        this.#approvalForCallOnce(memo, task, call, state),
+      runToolCallsTogether: (task, key, state, calls, context) =>
+        this.#runToolCallsTogether(task, key, state, calls, context),
+      recordToolResult: (task, key, state, call, result, leadModel, catalog) =>
+        this.#recordToolResult(task, key, state, call, result, leadModel, catalog),
+      compactContext: (task, key, state, input) => this.#compactContext(task, key, state, input),
+      sendNotice: (task, key, state, call) => this.#sendNotice(task, key, state, call),
+      askUser: (task, key, state, call, deferred) => this.#askUser(task, key, state, call, deferred)
     };
   }
 
@@ -978,16 +1009,6 @@ export class AgentWorker {
         'Add a model provider in Settings before starting agent work',
         503
       );
-  }
-
-  /** @see noteStepBudget in `handoff.ts`, where this moved in Wave 7.2. */
-  async #noteStepBudget(
-    task: TaskRecord,
-    key: Uint8Array,
-    state: AgentState,
-    maxSteps: number
-  ): Promise<void> {
-    await noteStepBudget(this.#handoff, task, key, state, maxSteps);
   }
 
   /**
@@ -1657,9 +1678,7 @@ export class AgentWorker {
       timeZone,
       unattended,
       webPlan,
-      withdrawnTools,
       requestTools,
-      reservedTokens,
       toolchainSummary
     } = run;
     /*
@@ -1792,6 +1811,11 @@ export class AgentWorker {
       tools: requestTools,
       webPlan
     };
+    /**
+     * The same two numbers as a pair, because four of the five phases below read both and neither
+     * moves for the life of the turn. @see TurnStepBudget in `turn/loop-context.ts`.
+     */
+    const budget: TurnStepBudget = { maxOutputTokens, turn };
 
     /** @see refreshActivePlan in `window.ts`, where this moved in Wave 7.2. */
     const refreshActivePlan = async (createFallback = false): Promise<boolean> =>
@@ -1816,6 +1840,22 @@ export class AgentWorker {
      */
     const honorUserControl = async (): Promise<boolean> =>
       honorUserControl_(this.#turnControl, task, key, state);
+
+    /**
+     * The four closures, as one argument.
+     *
+     * Every phase lifted out of the loop below is a closure over this turn's own scope in exactly
+     * these four places, and each asks for the subset it uses. Bundled rather than passed one at a
+     * time because a phase taking three of the four as positional arguments is a signature nobody
+     * can read, and because all four have to mean the same thing in every phase or the ordering
+     * each phase's own comments claim stops being true. @see `turn/loop-context.ts`.
+     */
+    const control: TurnLoopControl = {
+      honorUserControl,
+      drainCorrection,
+      refreshActivePlan,
+      refreshRuntimeContext
+    };
 
     /*
      * Everything the last run left parked: a call interrupted by a restart, an approval the owner
@@ -1867,456 +1907,58 @@ export class AgentWorker {
       state.step < this.#stepCeiling(state) || (await this.#renewStepBudget(task, key, state));
       state.step += 1
     ) {
-      if (await honorUserControl()) return;
-      // Before the plan is refreshed, so a correction that changes the goal is in the window when
-      // the plan is read rather than one step behind it.
-      await drainCorrection();
-      await refreshActivePlan(state.mutated === true || state.step >= 2);
-      await this.#noteStepBudget(task, key, state, this.#stepCeiling(state));
       /*
-       * The dormant rules, read against the step the model just produced.
-       *
-       * Here rather than where the assistant message is pushed, for two reasons that are both about
-       * shape. At a step boundary every tool call has been answered, so a correction appended now
-       * cannot land between a call and its result - which is the malformed request the cut-off-reply
-       * branch below refuses for the same reason. And a rule's view of the turn includes what the
-       * step's own calls *did*, which is not known until they have run: the render-proof rule asks
-       * whether this turn has looked at a rendered page, and the answer arrives with the tool result
-       * rather than with the request for it.
-       *
-       * Ahead of the runtime block deliberately, so the block that carries the clock stays last and
-       * keeps costing nothing. @see rules/index.ts for why this is a tier of its own and why the
-       * firing rate is instrumented from the first commit.
+       * The owner, a correction, the plan, the dormant rules, the clock, the credits and the spend
+       * caps. @see openStep in `turn/step-open.ts`, where the sixty-two lines that asked all of
+       * that - including two of the three closing handoffs - now live.
        */
-      applyDormantRules(state.messages, toolsRunThisTurn(state.turnToolResults));
-      // Last of the tail blocks, and re-pushed on every step rather than once per turn: a block
-      // left where the next step's tool results bury it stops being free to change. At a step
-      // boundary every tool call has been answered, so nothing here can split a call from its
-      // result.
-      refreshRuntimeContext();
-      /*
-       * The third ceiling, checked where the other two are and priced the same way.
-       *
-       * Nothing in the product bounded a turn on the clock. Steps, self-continuations, compute
-       * credits and the owner's spend caps were the whole of it, and the per-unit ceilings compose
-       * rather than cap - six idle steps of generation is an hour, a hundred and twenty steps of
-       * tool time is days. On a frontier model the credit ceiling bites first, which is why this
-       * has been a residual rather than an open runaway; on a cheap local route credits accumulate
-       * slowly and the wall clock does not, and that is the case nothing was watching.
-       *
-       * `credits` is checked in front of it deliberately: when both ceilings are reached the money
-       * is the one the owner can do something about, and it is the sentence they should be given.
-       */
-      if (turnWallClockReached(turnStartedAt)) {
-        if (await honorUserControl()) return;
-        await closeTurnAtCeiling(this.#handoff, task, key, state, closeContext, {
-          reason: 'time',
-          code: 'task_budget_reached',
-          spent: 'ran for its whole time budget'
-        });
-        return;
-      }
-      if (state.credits >= task.maxComputeCredits) {
-        // The same closing call the step ceiling gets. A turn that stops because it ran out of
-        // money has exactly as much to hand over as one that ran out of steps, and the owner is
-        // owed the same thing: what was done, what is left, and that a reply carries on.
-        if (await honorUserControl()) return;
-        await closeTurnAtCeiling(this.#handoff, task, key, state, closeContext, {
-          reason: 'credits',
-          code: 'task_budget_reached',
-          spent: 'used its whole compute budget'
-        });
-        return;
-      }
-      if (await this.#haltIfOutOfMoney(task, key, state)) return;
-      // Cleared here, after the guard that reads it and before the calls that fill it. A step is
-      // whatever this iteration spends - the lead call plus any specialist, compaction or search
-      // that runs inside it - and each of those used to overwrite this rather than add to it, so
-      // the guard was quoted the price of whichever happened to bill last.
-      state.lastStepUsd = 0;
-      // Said once, before the first request rather than after the provider refuses it. A window
-      // that cannot hold the catalogue and still leave room to work is a fact about the model the
-      // owner chose, and it is answerable - pick another one - but only if they are told.
-      const shortfall = contextShortfall(model.contextTokens, maxOutputTokens, reservedTokens);
-      if (shortfall > 0)
-        throw new AthanorError(
-          'model_context_too_small',
-          `${model.displayName} has a ${model.contextTokens.toLocaleString()}-token window, and every request already carries about ${reservedTokens.toLocaleString()} tokens of tools before your first word. It is short by roughly ${shortfall.toLocaleString()} tokens, so this task cannot run on it - choose a model with a larger window.`
-        );
-      // Condensed before the window is prepared, not while preparing it: compaction is a durable
-      // edit to the persisted trajectory, so the request that follows it - and every request until
-      // the next one - only appends to a prefix the provider has already cached.
       if (
-        // The size the last request actually had, not the size of the untrimmed trajectory. On the
-        // first step of a turn there is no previous request, so the raw estimate stands in - it is
-        // the conservative direction, and one early compaction is cheaper than one refused request.
-        (state.preparedInputTokens ?? estimatedContextTokens(state.messages)) >
-        compactionTrigger(modelInputBudget(model.contextTokens, maxOutputTokens, reservedTokens))
-      ) {
-        const compacted = await this.#compactContext(task, key, state, {
-          model,
-          catalog,
-          maxOutputTokens,
-          reservedTokens,
-          trigger: 'budget',
-          turn
-        });
-        if (compacted) await refreshActivePlan();
-      }
-      /*
-       * Held rather than written inline, because the invariant below re-derives from exactly these
-       * and the next line overwrites one of them: `toolOutputFloor` goes in as the *previous*
-       * step's floor and comes back as this step's, so a re-derivation reading it off the state
-       * would be re-deriving a different request and would fail on every healthy step.
-       */
-      const windowOptions = {
-        precedingTokens: reservedTokens,
-        reservedTokens,
-        ...(state.toolOutputFloor === undefined ? {} : { toolOutputFloor: state.toolOutputFloor })
-      };
-      const preparedContext = prepareModelContext(
-        state.messages,
-        model.contextTokens,
-        maxOutputTokens,
-        windowOptions
-      );
-      state.toolOutputFloor = preparedContext.olderToolOutputChars;
-      state.preparedInputTokens = preparedContext.estimatedInputTokens;
-      const reasoningEffort = reasoningEffortForStep({
-        ...state,
-        estimatedInputTokens: preparedContext.estimatedInputTokens,
-        inputBudgetTokens: modelInputBudget(model.contextTokens, maxOutputTokens, reservedTokens)
-      });
-      // The ratchet, recorded rather than recomputed: once a turn has become the kind of turn that
-      // needs the full budget it does not stop being one, and pinning the field is also what keeps
-      // the provider's cached trajectory from being discarded on the next flip. The opening step is
-      // deliberately excluded - it is high because it is the opening step, not because the work is
-      // hard, and letting it set the floor would make every task high for its whole length. A tool
-      // that threw is excluded for the same reason: it raises this step and not the turn.
-      if (state.step > 0 && reasoningEffort === 'high' && effortFloorEarned(state))
-        state.reasoningFloor = 'high';
-      await this.#assertProviderConfigured(task);
-      /*
-       * The three channels this generation writes to the owner's timeline while it is still being
-       * generated. @see createStreamChannel in `turn/stream-channel.ts`, where the hundred and nine
-       * lines that used to sit here - between assembling the request and sending it - now live.
-       *
-       * The ownership question travels as an accessor because the watch that answers it is created
-       * with the request, below: `disowned` means another claimant is already running this task,
-       * and every row this run writes from that moment lands in the middle of *their* trajectory.
-       * The halt branch below already refuses to bill or to write closing state on that arm for
-       * exactly this reason; the frame channel is the loudest of the three and did not.
-       *
-       * `stopped` is the opposite case and is deliberately left alone: that is the owner's own
-       * Stop, on their own conversation, and the words they watched being written are theirs to
-       * keep.
-       */
-      const channel = createStreamChannel(
-        { store: this.store },
-        task,
-        key,
-        state,
-        () => stopWatch.halt === 'disowned'
-      );
-      // Renewed for the same reason a long tool call is: the lease is two minutes and a
-      // high-reasoning turn on a full window routinely runs longer, at which point any other worker
-      // polling for work can lease this task and run the identical trajectory a second time.
-      /*
-       * Stopped the moment it starts looping rather than at the provider's ceiling.
-       *
-       * A model that answers and then repeats one sentence spends the whole output budget on it -
-       * seventeen thousand tokens and a quarter of an hour, twice in one evening, ending in a
-       * timeout the owner is shown as a failure. Nothing here was watching the text itself. The
-       * check runs on the accumulating tail and aborts this request; the loop below then tells the
-       * model what it did, which is a correction it can act on rather than a dead turn.
-       */
-      let loopedOn = '';
-      /**
-       * The route's refusal of an oversized window, held for the repair below rather than thrown.
-       * A holder rather than a bare `let` for the reason `firstToken` above is one: the assignment
-       * happens inside a callback, which the compiler's flow analysis does not follow.
-       */
-      const refusedWindow: { error?: AthanorError } = {};
-      const looping = new AbortController();
-      let streamed = '';
-      /*
-       * The request, checked against the log it is supposed to be a function of, immediately before
-       * it is sent - and the turn failed rather than billed if it is not.
-       *
-       * @see requestDerivationBreach in `turn-control.ts` for the three classes and why the largest
-       * control in the product is the one that gets this. It is asked here, past every branch that
-       * can still edit the window - the taint notice, the overflow repair, the compaction - and in
-       * front of the one call that spends the owner's money on it.
-       */
-      const derivationBreach = requestDerivationBreach({
-        prepared: preparedContext.messages,
-        rederived: prepareModelContext(
-          state.messages,
-          model.contextTokens,
-          maxOutputTokens,
-          windowOptions
-        ).messages,
-        sent: requestTools,
-        // Rebuilt from the same two facts the run built it from, rather than compared against a
-        // remembered copy: a remembered copy proves the array did not change, and what has to be
-        // proved is that it is still the catalogue this run is entitled to send.
-        entitled: [...agentToolsFor(), COMPACT_CONTEXT_TOOL].filter(
-          (tool) => !withdrawnTools.has(tool.name)
-        ),
-        reservedTokens,
-        reservedTokensOfSent: Math.ceil(JSON.stringify(requestTools).length / 4)
-      });
-      if (derivationBreach)
-        throw new AthanorError(
-          'request_not_derivable',
-          `This turn stopped before sending a request it could not account for: ${derivationBreach}. Nothing it produced was rolled back - reply to carry on.`
-        );
-      const stopWatch = startStopWatch(() => this.store.taskClaim(task.id), this.config.WORKER_ID);
-      const response = await this.#withLeaseRenewal(task, () =>
-        withRequestDeadline((signal) =>
-          gateway.chat(provider, {
-            ...routeTo(model),
-            messages: preparedContext.messages,
-            // No provider-side tools ride here, on any route. The agent's request offers the model
-            // the tools the model calls; the provider's search is spent by `#providerWebSearch`, on
-            // a request built for it, when the model calls `web_search`. Sending it alongside would
-            // mean the same capability twice - once under a name the model can use and once under a
-            // name only the provider can - and which one answered would depend on the model's mood.
-            tools: requestTools,
-            temperature: 0.2,
-            maxTokens: maxOutputTokens,
-            reasoningEffort,
-            sessionId: sha256(`athanor-task:${task.id}`).slice(0, 64),
-            signal: AbortSignal.any([signal, looping.signal, stopWatch.signal]),
-            onTextDelta: (delta) => {
-              const frame = channel.streamFlusher.push(delta);
-              if (frame !== null) channel.emitStreamFrame(frame);
-              if (loopedOn) return;
-              streamed = (streamed + delta).slice(-4_000);
-              const repeat = degenerateRepeat(streamed);
-              if (repeat) {
-                loopedOn = repeat;
-                looping.abort();
-              }
-            },
-            onReasoningDelta: (delta) => {
-              const frame = channel.reasoningFlusher.push(delta);
-              if (frame !== null) channel.emitReasoningFrame(frame);
-            }
-          })
-        )
+        (await openStep(this.#stepOpen, task, key, state, closeContext, turnStartedAt, control)) ===
+        'closed'
       )
-        .catch((error: unknown) => {
-          /*
-           * A window the route will not take, which is the one refusal at this status a caller can
-           * do something about. It is repaired below rather than here so the repair happens with
-           * the turn's own state in hand, and it is bounded in that state rather than in a local
-           * so a resume cannot hand the same refusal a fresh allowance.
-           */
-          if (
-            error instanceof AthanorError &&
-            error.code === 'provider_context_overflow' &&
-            (state.contextOverflowRepairs ?? 0) < MAX_CONTEXT_OVERFLOW_REPAIRS
-          ) {
-            refusedWindow.error = error;
-            return null;
-          }
-          // Only the aborts this turn raised itself. Everything else - a deadline, a provider fault
-          // - is still the caller's to handle, and is rethrown untouched. The stop is recognised by
-          // the watch's own record rather than by the error, because a stop that lands before the
-          // response headers reaches here as `provider_unavailable` and would be failed as one.
-          if (!loopedOn && !stopWatch.halt) throw error;
-          return null;
-        })
-        .finally(() => stopWatch.stop());
-      /*
-       * Read off the watch and not off the response, deliberately.
-       *
-       * The gateway now hands back what a stopped generation had produced rather than throwing, so
-       * a Stop that lands after the first token arrives here with a response in hand - and gated on
-       * `response === null` this branch stopped firing for exactly the stops it was written for.
-       * That is the shape of the last defect this file learnt: a repair to one arm of a branch
-       * quietly changed what reached the other.
-       */
-      if (stopWatch.halt) {
-        // The words that had arrived are the owner's - they watched them being written - so the
-        // partial frames are flushed rather than dropped. Nothing is added to the window: half a
-        // sentence with its tool calls cut off is not a turn a resumed task can carry. On the
-        // `disowned` arm they are not the owner's and not this run's to write, and `channel.emitStreamFrame`
-        // refuses them; the drains still run so the flushers are left empty either way.
-        const stoppedFrame = channel.streamFlusher.drain();
-        if (stoppedFrame !== null) channel.emitStreamFrame(stoppedFrame);
-        const stoppedReasoning = channel.reasoningFlusher.drain();
-        if (stoppedReasoning !== null) channel.emitReasoningFrame(stoppedReasoning);
-        await channel.settle().catch(() => undefined);
-        // `stopped` is the owner, and honorUserControl is what records the trajectory and says so on
-        // the timeline. `disowned` is another claimant already running this task, and there this run
-        // ends without writing or saying anything at all - every write it could make would land on
-        // somebody else's trajectory, and the unguarded closing write would take their lease with it.
-        if (stopWatch.halt === 'stopped') {
-          // The tokens were generated and the provider billed them, whoever ended the generation.
-          // Only on this arm: a disowned run writing a ledger row would be writing it against a
-          // trajectory another claimant is in the middle of.
-          if (response)
-            await this.#billModelStep(task, key, state, {
-              response,
-              model,
-              preparedContext,
-              reservedTokens,
-              turn,
-              reasoningEffort
-            }).catch(() => undefined);
-          await honorUserControl();
-        }
         return;
-      }
       /*
-       * The window was refused as too large, so it is condensed to the size the route named and the
-       * step is sent again.
-       *
-       * The same property the signed-reasoning refusal has: the identical bytes are refused
-       * identically for ever, and a refused request appends nothing, so the window never advances
-       * past the message that overflowed it. Before this, a resumed task rebuilt the same window,
-       * sent the same request and died at the same step for as long as the owner kept replying.
+       * Everything that has to be true, and everything that has to be measured, before a request is
+       * sent: the spend counter cleared, the window checked against the model, compaction, and the
+       * window and effort this step is written against. @see prepareStepRequest in `turn/request.ts`.
        */
-      if (refusedWindow.error) {
-        state.contextOverflowRepairs = (state.contextOverflowRepairs ?? 0) + 1;
-        await channel.settle().catch(() => undefined);
-        const limit = Number(refusedWindow.error.details?.contextLimitTokens);
-        await event(
-          this.store,
-          task,
-          key,
-          'warning',
-          `${model.displayName} refused this conversation as too large for it, so earlier work was condensed and the step was sent again`,
-          {
-            code: refusedWindow.error.code,
-            ...(Number.isFinite(limit) ? { contextLimitTokens: limit } : {}),
-            attempt: state.contextOverflowRepairs
-          }
-        );
-        const compacted = await this.#compactContext(task, key, state, {
-          model,
-          catalog,
-          maxOutputTokens,
-          reservedTokens,
-          trigger: 'budget',
-          turn,
-          ...(Number.isFinite(limit) && limit > 0 ? { contextTokensLimit: limit } : {})
-        });
-        if (compacted) await refreshActivePlan();
-        // The estimate the next iteration's compaction trigger reads. Left at the number that was
-        // just refused, the trigger would fire again immediately on a window that has already been
-        // condensed; left at the pre-compaction estimate it would not fire when it should.
-        state.preparedInputTokens = estimatedContextTokens(state.messages);
-        continue;
-      }
-      // The repetition watch fired before a single character came back - a repeat detected in the
-      // reasoning channel, or an abort that landed before the response headers. There is nothing to
-      // bill and nothing to supersede; the model is told what it did and the turn carries on. The
-      // ordinary case, where the repeat is exactly what was generated, arrives with a response and
-      // is handled after the billing block, because those tokens were spent.
-      if (response === null) {
-        const finalLoopFrame = channel.streamFlusher.drain();
-        if (finalLoopFrame !== null) channel.emitStreamFrame(finalLoopFrame);
-        await channel.settle();
-        await channel.noteDroppedFrames();
-        await this.#noteRepeatingAnswer(task, key, state, loopedOn);
-        continue;
-      }
-      const finalFrame = channel.streamFlusher.drain();
-      if (finalFrame !== null) channel.emitStreamFrame(finalFrame);
-      const finalReasoning = channel.reasoningFlusher.drain();
-      // A route that streamed thinking but reports none back keeps the frame path, because dropping
-      // the tail there would lose the last of the thinking rather than consolidate it.
-      if (response.reasoning) channel.emitWholeReasoning(response.reasoning);
-      else if (finalReasoning !== null) channel.emitReasoningFrame(finalReasoning);
-      await channel.settle();
-      await channel.noteDroppedFrames();
-      await this.#billModelStep(task, key, state, {
-        response,
-        model,
-        preparedContext,
-        reservedTokens,
-        turn,
-        reasoningEffort
-      });
-      /*
-       * The repeat, now that it has been paid for.
-       *
-       * This sits after the billing block and not before it, which is the whole of the repair: the
-       * abort used to `continue` from above the block, so the one generation the box stops on
-       * purpose was the one generation that cost $0.00 on the ledger and left `lastStepUsd` at the
-       * previous step's figure - the number the spend guard prices the next step from.
-       *
-       * The words are not added to the window. Half a reply and four hundred copies of one sentence
-       * is not a turn a later request can carry, and the model is told what it did instead. They are
-       * published once, as the row that supersedes the delta frames the owner watched arrive: those
-       * frames are otherwise kept and decrypted again on every reopen of the conversation, because
-       * nothing else in this path ever writes the assistant message that replaces them.
-       */
-      if (loopedOn) {
-        const repeated = normalizeAssistantText(response.text);
-        if (repeated)
-          await event(
-            this.store,
-            task,
-            key,
-            'assistant_message',
-            repeated.slice(0, 500),
-            { markdown: repeated },
-            { replacesEarlierFrames: true }
-          ).catch(() => undefined);
-        await this.#noteRepeatingAnswer(task, key, state, loopedOn);
-        continue;
-      }
-      // What the provider fetched on the model's behalf, which arrives inside the response rather
-      // than through a tool result and would otherwise cross the boundary unlabelled. The notice
-      // goes in ahead of the assistant message rather than after it: an assistant message carrying
-      // tool calls has to be followed immediately by their results, so the only position that is
-      // shape-safe on every step is in front of the turn the content arrived in.
-      const providerWeb = providerWebProvenance(response);
-      for (const url of providerWeb.urls)
-        state.knownOrigins = rememberOrigin(state.knownOrigins ?? [], url);
-      const providerWebNotice = await this.#raiseTaint(
+      const request = await prepareStepRequest(
+        this.#request,
         task,
         key,
         state,
-        providerWeb.origin,
-        'provider_web'
+        run,
+        budget,
+        control
       );
-      if (providerWebNotice) state.messages.push({ role: 'system', content: providerWebNotice });
-      const assistantText = normalizeAssistantText(response.text);
-      state.messages.push({
-        role: 'assistant',
-        content: assistantText,
-        ...(response.reasoning ? { reasoning: response.reasoning } : {}),
-        ...(response.reasoningDetails?.length
-          ? { reasoningDetails: response.reasoningDetails }
-          : {}),
-        ...(response.toolCalls.length ? { toolCalls: response.toolCalls } : {})
-      });
       /*
-       * A step the harness asked for is not a new answer to the owner.
+       * The one call in the turn that spends the owner's money, and the four watches around it.
        *
-       * Five paths refuse a finish and send the model round again - the finish rejection, the plan
-       * hold, the acceptance hold, an acceptance check that failed, and the completion nag. Its
-       * natural reply to "finish rejected, cite something newer" is to restate the answer with an
-       * apology, and every one of those restatements used to become another bubble. That is why one
-       * answer arrived in pieces, and eleven of those rounds in the worst case is most of where a
-       * small task's tokens went. The prose still goes into the window - the model needs its own
-       * words back - it simply is not published as a fresh reply.
+       * @see generateModelStep in `turn/generate.ts`, where the two hundred and seventy-four lines
+       * between assembling the request and having an answer in hand now live - the stream channel,
+       * the repetition watch, the stop watch, the route's refusal of an oversized window, and the
+       * billing block every one of those abort paths has to reach.
        */
-      if (assistantText && !state.repairStep) {
-        state.answered = true;
-        await event(this.store, task, key, 'assistant_message', assistantText.slice(0, 500), {
-          markdown: assistantText
-        });
-      }
-      // Cleared as soon as the model does something other than ask to finish again, so an ordinary
-      // step following a repair speaks normally.
-      if (state.repairStep && response.toolCalls.some((call) => call.name !== 'finish'))
-        state.repairStep = false;
+      const generated = await generateModelStep(
+        this.#generate,
+        task,
+        key,
+        state,
+        run,
+        budget,
+        request,
+        control
+      );
+      if (generated.outcome === 'halted') return;
+      if (generated.outcome === 'retry') continue;
+      const { response } = generated;
+      /*
+       * What the step said: the provenance notice for anything the provider fetched itself, the
+       * assistant message into the window, and - only when this is a new answer rather than a round
+       * the harness asked for - the reply onto the owner's timeline. @see recordAssistantStep in
+       * `turn/record-step.ts`.
+       */
+      const assistantText = await recordAssistantStep(this.#recordStep, task, key, state, response);
       if (await honorUserControl()) return;
 
       /*
@@ -2333,294 +1975,32 @@ export class AgentWorker {
       // Read before the batch and again after it. Anything in between that starts a tool moves it,
       // and nothing else in the loop can - which is what makes the difference the guard's evidence.
       const startedBeforeBatch = state.toolsStarted ?? 0;
-      /*
-       * One evaluation of the approval floor per call, per state of the world.
-       *
-       * The first call of every candidate parallel run was asked about twice: once here while the
-       * run is chosen, and again on the sequential path the run falls through to when it collapses
-       * to a single call. Nothing between the two asks starts a tool - every gate in between either
-       * answers the call and continues or registers an idempotency key - so the second ask could
-       * only ever repeat the first, at the price of a destination context built out of forty
-       * thousand characters of the owner's own words. Held per model response, and the memo throws
-       * its own verdicts away the moment `toolsStarted` moves.
-       */
-      const approvalMemo = createApprovalFloorMemo();
       // Read the same way and for the same reason: what this step did to the counts is the
       // evidence, not what they stood at when it began.
       const failuresBeforeBatch = state.repeatedFailures;
 
-      // The last index a concurrent run has already answered. Those calls have their results in the
-      // window and their events on the timeline; walking into them again would run them twice.
-      let answeredByRun = -1;
-      for (const [callIndex, call] of response.toolCalls.entries()) {
-        if (callIndex <= answeredByRun) continue;
-        // Re-checked before every call in the batch, not once before it. A model routinely proposes
-        // several actions at a time, and the earlier single check meant a cancel landing after the
-        // first one still sent the email, published the artifact and fired the POST - minutes after
-        // the interface said the task had stopped. honorUserControl seals the calls that never ran,
-        // so the transcript stays answerable if the task is later resumed.
-        if (await honorUserControl()) return;
-        /*
-         * Reads that were proposed together stop queueing behind each other.
-         *
-         * A frontier model opens a task with four `file_read`s, or a `code_search` beside a
-         * `repo_overview`, and each of those is an HTTP round trip to the runner that the next one
-         * waited on for no reason - the product had already paid for this parallelism three times
-         * over as per-tool workarounds (`parallel_web_read`, the browser_action batch, `delegate`),
-         * which is the strongest argument that the loop itself should have it.
-         *
-         * Only the run's execution overlaps. Every decision around it stays exactly where it was:
-         * the stop check above has already run, the floor is asked about each call separately just
-         * below, and the results are recorded strictly in the order the model declared them, so the
-         * window this produces is the same window the sequential path produced.
-         */
-        const runLength = parallelToolRun(response.toolCalls, callIndex, state.seenCalls ?? {});
-        if (runLength > 1) {
-          const run: ModelToolCall[] = [];
-          for (const candidate of response.toolCalls.slice(callIndex, callIndex + runLength)) {
-            // Per call, never once for the run. A call the floor wants a card for ends the run in
-            // front of itself and is left to the sequential path below, which raises the card and
-            // defers everything behind it in writing - so the approval order the owner sees is the
-            // order the model declared. Every tool in the run is one whose verdict is a pure
-            // function of arguments and turn state, so asking early cannot change the answer.
-            if (await this.#approvalForCallOnce(approvalMemo, task, candidate, state)) break;
-            run.push(candidate);
-          }
-          if (run.length > 1) {
-            await this.#runToolCallsTogether(task, key, state, run, {
-              model,
-              catalog,
-              refreshActivePlan,
-              webPlan
-            });
-            answeredByRun = callIndex + run.length - 1;
-            continue;
-          }
-        }
-        // Arguments that did not parse mean the response was cut off mid-JSON at the output cap.
-        // Running the call anyway sent an empty object into a tool that then failed on a validation
-        // error naming neither the truncation nor the way out of it, and the turn spent its
-        // remaining steps re-proposing the same oversized call. It is answered instead, because a
-        // tool call with no tool result is a malformed turn the provider will refuse next step.
-        // An exact repeat of a read that already answered this turn. Re-running it returns the
-        // same bytes and teaches the model nothing, which is how a stuck agent spends a whole step
-        // budget looking for something in the same place. It is answered rather than refused: the
-        // call still gets a tool result, because a call without one is a malformed window, and the
-        // result names the earlier id so the model can cite or re-read that instead.
-        if (IDEMPOTENT_WITHIN_TURN.has(call.name)) {
-          const callKey = idempotentCallKey(call);
-          const earlier = state.seenCalls?.[callKey];
-          if (earlier) {
-            await this.#recordToolResult(
-              task,
-              key,
-              state,
-              call,
-              {
-                skipped: true,
-                reason: `This is the same ${call.name} call as ${earlier}, which already ran this turn and would return the same result. Read that result again, or change the arguments - a different path, different words, a wider search - if it did not answer the question.`
-              },
-              model,
-              catalog
-            );
-            continue;
-          }
-        }
-        if (call.parseFailed) {
-          const truncations = (state.argumentTruncations ?? 0) + 1;
-          state.argumentTruncations = truncations;
-          const cutOff = call.argumentsTruncated === true;
-          /*
-           * The payload that would not parse, taken back out of the window the moment it is
-           * answered. @see tombstoneMalformedCall in `turn-bounds.ts` for what keeping it cost -
-           * the short version is that the estimator sizes the window from bytes the adapter never
-           * sends, so one cut-off write made the turn compact away real history to make room for a
-           * payload that does not exist on the wire.
-           *
-           * Before the result rather than after it only so the warning below can report how much
-           * was removed; the call itself stands either way, because a tool call with no tool result
-           * is the malformed turn this whole branch exists to avoid producing.
-           */
-          const tombstoned = tombstoneMalformedCall(state.messages, call.id);
-          await event(
-            this.store,
-            task,
-            key,
-            'warning',
-            cutOff
-              ? `${call.name} was cut off mid-argument`
-              : `${call.name} arrived with arguments that would not parse`,
-            {
-              tool: call.name,
-              attempt: truncations,
-              bytes: tombstoned
-            }
-          );
-          await this.#recordToolResult(
-            task,
-            key,
-            state,
-            call,
-            {
-              skipped: true,
-              /*
-               * Which of the two it was decides what to do about it, and they used to be told
-               * apart by guesswork - every unparseable call was reported as truncation, so a model
-               * that had simply written bad JSON was advised to send less of it.
-               */
-              reason: cutOff
-                ? truncations >= MAX_ARGUMENT_TRUNCATIONS
-                  ? `The arguments for ${call.name} were cut off at the model's output limit for the ${truncations}th time, so it was not run. Stop retrying this call: do the work in smaller pieces, or finish and say what could not be written.`
-                  : `The arguments for ${call.name} were cut off at the model's output limit, so it was not run and nothing changed. Re-issue it with a smaller payload - write the file in parts with file_write then file_patch, or shorten the content.`
-                : `The arguments for ${call.name} were not valid JSON, so it was not run and nothing changed. Send the call again with well-formed arguments - the payload was ${call.rawArguments?.length ?? 0} characters, so length was not the problem.`
-            },
-            model,
-            catalog
-          );
-          continue;
-        }
-        const planChanged = await refreshActivePlan();
-        if (planChanged && call.name !== 'set_plan') {
-          await this.#recordToolResult(
-            task,
-            key,
-            state,
-            call,
-            {
-              skipped: true,
-              reason:
-                'The user changed the active plan after this tool call was proposed. Replan before acting.'
-            },
-            model,
-            catalog
-          );
-          continue;
-        }
-        /*
-         * Registered here, past every gate that answers a call instead of running it.
-         *
-         * It used to be registered at the repeat check above, which is two gates too early. The
-         * owner edits the plan mid-step, three `file_read`s are answered "replan before acting" -
-         * none of them ran - the agent replans and re-issues exactly those three, which is what it
-         * was just told to do, and each one comes back "which already ran this turn and would
-         * return the same result. Read that result again": there is no result to read, only the
-         * skip notice, and those three files are unreadable for the rest of the turn. Truncation
-         * has the same shape and a sharper edge, because `repo_overview` has no required
-         * parameters, so a valid minimal call and a call cut off mid-JSON are both `{}` - one
-         * truncated `repo_overview` retired the tool for the whole turn.
-         *
-         * Nothing between here and `#execute` answers one of these eight without running it. An
-         * approval can park one, and that is deliberate: the parked call is resumed by id rather
-         * than re-proposed, so the key belongs to the call the owner was asked about.
-         */
-        if (IDEMPOTENT_WITHIN_TURN.has(call.name))
-          state.seenCalls = {
-            ...(state.seenCalls ?? {}),
-            [idempotentCallKey(call)]: call.id
-          };
-        if (call.name === 'finish') {
-          /*
-           * Five holds and then the turn completes. @see handleFinishCall in `turn/finish.ts`,
-           * where the three hundred and four lines that ran here - at nesting depth eleven, inside
-           * the batch loop inside the step loop - now live. `held` is the model being sent round
-           * once for one named reason; every one of the five is bounded, and past its ceiling the
-           * turn ends honestly rather than being thrown away.
-           */
-          if (
-            (await handleFinishCall(this.#finish, task, key, state, call, {
-              turn,
-              assistantText
-            })) === 'held'
-          )
-            continue;
-          return;
-        }
-        if (call.name === 'compact_context') {
-          // Compaction runs while this call is still unanswered, which is precisely what keeps the
-          // assistant message that made it - and every result already pushed for its batch - out of
-          // the condensed span; the result below would otherwise have no call to attach to.
-          const outcome = await this.#compactContext(task, key, state, {
-            model,
-            catalog,
-            maxOutputTokens,
-            // The same count the budget check above used, not a second one worked out here: the
-            // catalogue this step sent is the catalogue the next step sends, and two ways of
-            // measuring it is exactly how the trigger and the target came apart.
-            reservedTokens,
-            trigger: 'agent',
-            turn,
-            note: textValue(call.arguments.finishedPhase).trim().slice(0, 2_000)
-          });
-          state.messages.push({
-            role: 'tool',
-            toolCallId: call.id,
-            content: outcome
-              ? JSON.stringify({
-                  compacted: true,
-                  condensedMessages: outcome.condensedMessages,
-                  briefParts: outcome.brief.sections.length,
-                  estimatedInputTokens: outcome.estimatedTokensAfter,
-                  note: 'The condensed turns are now recorded in the running brief above your recent messages. Re-read files or re-run checks for exact detail.'
-                })
-              : JSON.stringify({
-                  compacted: false,
-                  reason:
-                    'There is not enough superseded conversation to condense yet. Keep working; the harness compacts on its own as the window fills.'
-                })
-          });
-          state.turnToolResults ??= {};
-          state.turnToolResults[call.id] = { name: call.name, success: outcome !== null };
-          // Republished after the result, matching set_plan, so a tool call is never separated from
-          // its own result by an unrelated system message.
-          if (outcome) await refreshActivePlan();
-          continue;
-        }
-        if (call.name === 'notify') {
-          await this.#sendNotice(task, key, state, call);
-          continue;
-        }
-        if (call.name === 'ask') {
-          // The same shape as the approval park below: everything the model proposed behind the
-          // question is answered in writing before the turn is saved, so the window it resumes into
-          // is well formed and nothing behind a decision runs before the decision is made.
-          if (await this.#askUser(task, key, state, call, response.toolCalls.slice(callIndex + 1)))
-            return;
-          continue;
-        }
-        if (call.name === 'set_acceptance') {
-          // @see declareAcceptance in `turn/acceptance-declaration.ts`, where the ninety-three
-          // lines that ran here now live - including the red baseline, which is the only part of
-          // this mechanism the model cannot satisfy by deciding its own work is good.
-          await declareAcceptance(this.#acceptance, task, key, state, call, turn);
-          continue;
-        }
-        const approval = await this.#approvalForCallOnce(approvalMemo, task, call, state);
-        if (approval) {
-          // The card, the calls behind it, and the saved state, in that order and together.
-          // @see parkForApproval in `turn/approval-park.ts`.
-          await parkForApproval(
-            { store: this.store, config: this.config },
-            task,
-            key,
-            state,
-            call,
-            approval,
-            response.toolCalls.slice(callIndex + 1)
-          );
-          return;
-        }
-        // Run it, record it, and leave behind whatever a worker that died mid-call would need.
-        // @see executeApprovedCall in `turn/execute-call.ts`.
-        await executeApprovedCall(
-          this.#resume,
+      /*
+       * The batch the model proposed, and the eight gates each call passes before it runs.
+       *
+       * @see dispatchToolCalls in `turn/dispatch.ts`, where the two hundred and seventy-two lines
+       * that ran it - at nesting depth nine, inside the step loop inside `run()` - now live.
+       * `'returned'` is the turn ending inside the batch: completed, parked on a question, parked
+       * on an approval, or stood down by the owner, and everything owed already written.
+       */
+      if (
+        (await dispatchToolCalls(
+          this.#dispatch,
           task,
           key,
           state,
-          call,
-          { model, catalog, webPlan },
-          refreshActivePlan
-        );
-      }
+          response,
+          assistantText,
+          run,
+          budget,
+          control
+        )) === 'returned'
+      )
+        return;
       sealUnansweredToolCalls(state.messages, 'the step ended before this call ran');
       /*
        * The three questions asked at the end of every step: did anything happen in it, did any of

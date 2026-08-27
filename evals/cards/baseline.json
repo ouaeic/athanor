@@ -1,0 +1,158 @@
+{
+  "$stamp": {
+    "acceptedAt": "2026-08-27T13:26:44.209Z",
+    "version": "0.1.1",
+    "commit": "58eb412",
+    "rig": "3a87f7179ad0"
+  },
+  "A-calendar/review": {
+    "calls": 4,
+    "clean": 0,
+    "tainted": 0
+  },
+  "A-calendar/balanced": {
+    "calls": 4,
+    "clean": 0,
+    "tainted": 0
+  },
+  "A-calendar/autonomous": {
+    "calls": 4,
+    "clean": 0,
+    "tainted": 0
+  },
+  "B-mail-reply/review": {
+    "calls": 6,
+    "clean": 1,
+    "tainted": 1
+  },
+  "B-mail-reply/balanced": {
+    "calls": 6,
+    "clean": 1,
+    "tainted": 1
+  },
+  "B-mail-reply/autonomous": {
+    "calls": 6,
+    "clean": 1,
+    "tainted": 1
+  },
+  "C-set-up-coding/review": {
+    "calls": 7,
+    "clean": 7,
+    "tainted": 7
+  },
+  "C-set-up-coding/balanced": {
+    "calls": 7,
+    "clean": 4,
+    "tainted": 4
+  },
+  "C-set-up-coding/autonomous": {
+    "calls": 7,
+    "clean": 3,
+    "tainted": 4
+  },
+  "D-build-and-publish/review": {
+    "calls": 9,
+    "clean": 5,
+    "tainted": 5
+  },
+  "D-build-and-publish/balanced": {
+    "calls": 9,
+    "clean": 2,
+    "tainted": 3
+  },
+  "D-build-and-publish/autonomous": {
+    "calls": 9,
+    "clean": 1,
+    "tainted": 3
+  },
+  "E-path-is-wrong/review": {
+    "calls": 9,
+    "clean": 9,
+    "tainted": 9
+  },
+  "E-path-is-wrong/balanced": {
+    "calls": 9,
+    "clean": 1,
+    "tainted": 1
+  },
+  "E-path-is-wrong/autonomous": {
+    "calls": 9,
+    "clean": 1,
+    "tainted": 1
+  },
+  "F-git-identity/review": {
+    "calls": 7,
+    "clean": 7,
+    "tainted": 7
+  },
+  "F-git-identity/balanced": {
+    "calls": 7,
+    "clean": 1,
+    "tainted": 1
+  },
+  "F-git-identity/autonomous": {
+    "calls": 7,
+    "clean": 1,
+    "tainted": 1
+  },
+  "G-research-and-write/review": {
+    "calls": 8,
+    "clean": 3,
+    "tainted": 3
+  },
+  "G-research-and-write/balanced": {
+    "calls": 8,
+    "clean": 0,
+    "tainted": 0
+  },
+  "G-research-and-write/autonomous": {
+    "calls": 8,
+    "clean": 0,
+    "tainted": 0
+  },
+  "H-tidy-downloads/review": {
+    "calls": 6,
+    "clean": 4,
+    "tainted": 4
+  },
+  "H-tidy-downloads/balanced": {
+    "calls": 6,
+    "clean": 2,
+    "tainted": 2
+  },
+  "H-tidy-downloads/autonomous": {
+    "calls": 6,
+    "clean": 2,
+    "tainted": 2
+  },
+  "I-weekly-digest/review": {
+    "calls": 4,
+    "clean": 1,
+    "tainted": 2
+  },
+  "I-weekly-digest/balanced": {
+    "calls": 4,
+    "clean": 1,
+    "tainted": 2
+  },
+  "I-weekly-digest/autonomous": {
+    "calls": 4,
+    "clean": 1,
+    "tainted": 2
+  },
+  "J-deploy/review": {
+    "calls": 6,
+    "clean": 5,
+    "tainted": 5
+  },
+  "J-deploy/balanced": {
+    "calls": 6,
+    "clean": 3,
+    "tainted": 3
+  },
+  "J-deploy/autonomous": {
+    "calls": 6,
+    "clean": 3,
+    "tainted": 3
+  }
+}

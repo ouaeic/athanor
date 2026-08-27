@@ -18,34 +18,41 @@
  * gives about ordering: the failure is which statement comes before which, and a turn-level probe
  * observes it only by arranging a step boundary at exactly the right instant, which measures the
  * arrangement at least as much as the program.
+ *
+ * The three statements now sit in `turn/step-open.ts`, where the opening of a step was lifted out
+ * of `AgentWorker.run()` whole. The anchors follow them; the claims are unchanged, and the count
+ * below still spans `agent.ts` as well, so moving the call does not become a way to have two.
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-const source = readFileSync(fileURLToPath(new URL('../agent.ts', import.meta.url)), 'utf8').split(
-  '\n'
-);
+const read = (path: string): string[] =>
+  readFileSync(fileURLToPath(new URL(path, import.meta.url)), 'utf8').split('\n');
+
+const source = read('../turn/step-open.ts');
 
 /** One-based, so a failure reads against the file without arithmetic. */
 const lineOf = (needle: string): number => {
   const index = source.findIndex((line) => line.includes(needle));
-  if (index < 0) throw new Error(`anchor not found in agent.ts: ${needle}`);
+  if (index < 0) throw new Error(`anchor not found in turn/step-open.ts: ${needle}`);
   return index + 1;
 };
 
 describe('the dormant rules are read at the step boundary', () => {
   it('asks exactly once, in the step loop', () => {
-    const calls = source.filter((line) => line.includes('applyDormantRules(')).length;
+    const calls = [...source, ...read('../agent.ts')].filter((line) =>
+      line.includes('applyDormantRules(')
+    ).length;
     expect(calls).toBe(1);
   });
 
   it('asks after the step budget notice and before the runtime block', () => {
     const budget = lineOf(
-      'await this.#noteStepBudget(task, key, state, this.#stepCeiling(state));'
+      'await noteStepBudget(deps.handoff, task, key, state, stepCeiling(deps.handoff, state));'
     );
     const rules = lineOf('applyDormantRules(state.messages');
-    const runtime = lineOf('      refreshRuntimeContext();');
+    const runtime = lineOf('  refreshRuntimeContext();');
     expect(rules).toBeGreaterThan(budget);
     expect(rules).toBeLessThan(runtime);
   });

@@ -12,6 +12,17 @@ import {
   type FileHandle
 } from 'node:fs/promises';
 import path from 'node:path';
+import {
+  discloseUnseen,
+  displayedLines,
+  fileIdentity,
+  lineEdit,
+  recordDisplayedLines,
+  rememberWrite,
+  sayRanges,
+  unseenWithin,
+  type LineEdit
+} from './seen-lines.js';
 
 const WORKSPACE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -207,6 +218,22 @@ export const listFiles = async (root: string, requested = '.'): Promise<unknown[
   );
 };
 
+/**
+ * The whole file, and deliberately not a display.
+ *
+ * This route answers two callers that look identical on the wire and are opposites in meaning: an
+ * unbounded `file_read`, which puts every line in front of the model, and the read-modify-write
+ * that `file_patch` does one call before its write, which puts nothing in front of anybody. If this
+ * recorded what it returned, every patch would announce that the model had just seen the whole
+ * file - and the seen-line guard below would be inert for the one tool it exists to guard. So
+ * nothing is recorded here, and only a window read, which no internal caller makes, counts as
+ * having been shown.
+ *
+ * The cost of that choice is one case: a window read followed by an unbounded read followed by an
+ * edit outside the window is refused once, on a file the model really had seen all of. It is
+ * refused with the text inlined, so the retry lands immediately - one refusal, no extra read, and
+ * the alternative was a guard that never fires.
+ */
 export const readWorkspaceFile = async (
   root: string,
   requested: string,
@@ -312,6 +339,16 @@ export const readWorkspaceFileLines = async (
       lastKeptTerminated = false;
     }
     const content = Buffer.concat(kept);
+    /*
+     * What this read actually put in front of its caller, remembered so a later write can be held
+     * to it. A read cut short by its byte budget stopped mid-line, and that line was not displayed:
+     * counting it would vouch for the half that never arrived, which is precisely the kind of
+     * half-seen text this record exists to refuse an edit on.
+     */
+    recordDisplayedLines(target, fileIdentity(details), {
+      start: window.startLine,
+      end: truncated ? lastKept - 1 : lastKept
+    });
     return {
       content: lastKeptTerminated ? content.subarray(0, content.length - 1) : content,
       startLine: window.startLine,
@@ -369,6 +406,14 @@ export const clearStagedUploads = async (root: string): Promise<void> => {
 };
 
 /**
+ * Above this, a write is not held to the seen-line record: splitting the old file into an array of
+ * strings costs several times its size in this process, and the read that feeds the guard is a read
+ * the hash check would not otherwise have paid for. Comfortably larger than any file a model edits
+ * by hand and far below the 2 GiB read ceiling the installer sets.
+ */
+const MAX_GUARDED_FILE_BYTES = 8 * 1024 ** 2;
+
+/**
  * `expectSha256` is the caller's claim about what it is replacing, checked under the same open
  * descriptor that then does the writing.
  *
@@ -377,18 +422,20 @@ export const clearStagedUploads = async (root: string): Promise<void> => {
  * owner in the file browser. Between the read and the write, any of them can land - and a whole-
  * file write does not fail, it silently discards what they wrote.
  *
- * `file_patch` reaches this same route, and this guard is not armed for it: the worker reads the
- * file without asking for its hash and writes the result back without claiming one, so the
- * exactly-once match it makes on `oldText` proves the text it replaced was there and proves
- * nothing about the file still being the one it read. That is the caller's to close, by reading
- * with the hash and passing it here; the parameter it needs already exists on both sides. Until it
- * does, this comment says which of the two tools is actually guarded, because the sentence that
- * claimed both were is what let the gap survive a review.
+ * `file_patch` reaches this same route and now claims its read too: it keeps the runner's hash from
+ * the read it makes before matching `oldText` and passes it here. Until it did, the exactly-once
+ * match on `oldText` proved the text it replaced was there and proved nothing about the file still
+ * being the one it read.
  *
  * The hash rather than a modification time: it is exact, it says the content is what was read
  * rather than that nothing touched the inode, and both sides already compute it. Absent means the
  * caller is not claiming anything - creating a new file, or a caller that never read it - and the
  * write proceeds, because demanding it everywhere would break every first write.
+ *
+ * The hash answers "is this still the file you read". The seen-line guard beneath it answers the
+ * question that survives a clean hash: "did you ever read the part of it you are changing". A
+ * window read of lines 1-50 and a patch anchored at line 300 agree about every byte in the file and
+ * still describe an edit made blind.
  */
 export const writeWorkspaceFile = async (
   root: string,
@@ -414,12 +461,14 @@ export const writeWorkspaceFile = async (
       constants.O_NOFOLLOW,
     0o660
   );
+  let edit: LineEdit | undefined;
   try {
     await assertOpenedInPlace(root, target, handle);
-    if (expectSha256 !== undefined) {
-      // Read through the descriptor already proven to be the intended file, so nothing can swap the
-      // path between the check and the write.
-      const existing = await handle.readFile();
+    // Read through the descriptor already proven to be the intended file, so nothing can swap the
+    // path between the check and the write. One read serves both checks below.
+    const details = expectSha256 === undefined ? undefined : await handle.stat();
+    const existing = details === undefined ? undefined : await handle.readFile();
+    if (expectSha256 !== undefined && existing !== undefined) {
       const actual = createHash('sha256').update(existing).digest('hex');
       // A file that did not exist reads as empty; the caller claiming a hash for it is claiming
       // something that was true and is not, which is the same disagreement.
@@ -429,8 +478,89 @@ export const writeWorkspaceFile = async (
           409
         );
     }
+    /*
+     * The seen-line guard, and it runs second on purpose. A file that moved under the caller is a
+     * different failure with a different answer - read it again - and answering it with a lecture
+     * about anchors would send the model back to patch a version that no longer exists.
+     *
+     * It rides on the same claim rather than on the record alone, and that is what keeps it aimed
+     * at editing. A caller with no hash to offer is not editing from a read: it is an upload
+     * replacing a file, a printed document landing on a name, the first write of anything. Held to
+     * a seen-line record those would be refused for lines they never pretended to have read - the
+     * owner pressing Replace on a file the pane had once paged through, told about anchors it has
+     * no idea it has. A claim about the old bytes is exactly the caller saying "I read this", and
+     * only that caller can be asked which part of it.
+     *
+     * Binary content is skipped for the same reason: lines are not what it is made of, and a file
+     * with a zero byte in it has no anchors to have seen. A file too large to hold as lines is
+     * skipped because the ceiling is about this process's memory - and the guard's whole discipline
+     * is that losing the opinion is always allowed and losing the write never is.
+     */
+    if (
+      details !== undefined &&
+      existing !== undefined &&
+      details.size <= MAX_GUARDED_FILE_BYTES &&
+      !existing.includes(0) &&
+      !content.includes(0)
+    ) {
+      const seen = displayedLines(target, fileIdentity(details));
+      if (seen) {
+        const before = existing.toString('utf8').split('\n');
+        edit = lineEdit(before, content.toString('utf8').split('\n'));
+        if (edit.anchors) {
+          const unseen = unseenWithin(edit.anchors, seen);
+          if (unseen.length) {
+            const name = path.relative(root, target);
+            const disclosure = discloseUnseen(before, unseen);
+            if (!disclosure)
+              throw new WorkspaceFileError(
+                `This edit changes ${name} at line ${sayRanges(unseen)}, and no read has shown you those lines. That is too much unread file to hand back here. Read it with file_read using startLine and endLine over that range, then send the edit again.`,
+                428
+              );
+            /*
+             * The refusal is a display. Recording it is what stops the guard looping: the model is
+             * shown the truth once and the same edit, sent again, applies. Only the lines that
+             * actually fit in the message are recorded - a range the byte budget cut short was not
+             * shown, and the next attempt is refused again with the rest of it, which terminates
+             * because every round hands over more.
+             */
+            for (const range of disclosure.disclosed)
+              recordDisplayedLines(target, fileIdentity(details), range);
+            throw new WorkspaceFileError(
+              `This edit changes ${name} at line ${sayRanges(unseen)}, and no read has shown you those lines - so it is being made from memory of a file you have only seen part of. Here is what is actually there. Check your edit against it and send the same call again; these lines now count as read, so it will apply.\n\n${disclosure.text}`,
+              428
+            );
+          }
+        }
+      }
+    }
     await handle.truncate(0);
-    await handle.writeFile(content);
+    /*
+     * Written at an offset this function names, because a descriptor carries a position and this
+     * one has been read from.
+     *
+     * `handle.writeFile` writes at the descriptor's current position, and the compare-and-swap
+     * above leaves that position at the end of the old file: every write that claimed a hash landed
+     * after a hole, producing the old file's length in zero bytes followed by the new content. It
+     * was invisible from the outside because a corrupted file still contains every string a test
+     * looked for, and the two callers that claim a hash are the two that matter most - the owner
+     * saving in the file browser, and every `file_patch` since the patch path started claiming its
+     * read. The loop is not defensive dressing: a single `write` is allowed to take fewer bytes
+     * than it was offered, and a partial write here is a truncated file.
+     */
+    for (let written = 0; written < content.length; ) {
+      const { bytesWritten } = await handle.write(
+        content,
+        written,
+        content.length - written,
+        written
+      );
+      if (bytesWritten <= 0) throw new Error('The file could not be written in full');
+      written += bytesWritten;
+    }
+    // The record follows the file across its own write, so a second edit in the same turn is still
+    // held to what was read. A file with no record gains none - see `rememberWrite`.
+    if (edit) rememberWrite(target, fileIdentity(await handle.stat()), edit);
   } finally {
     await handle.close();
   }

@@ -713,77 +713,43 @@ export const agentTools: ModelTool[] = [
           description:
             'How much model work one run may spend before it is stopped. One credit is about a million weighted tokens on a mid-tier model; five covers an ordinary run. It is a runaway guard, not a price.'
         },
+        /*
+         * When it runs: a flat property bag discriminated by the sibling `kind`, which is the
+         * encoding browser_action and desktop_action were re-stated in for the same reason.
+         *
+         * It was a five-variant `oneOf` costing 1,727 bytes, and about two thirds of that was
+         * frame rather than capability: each variant repeated
+         * {"type":"object","additionalProperties":false,"required":[…],"description":…,
+         * "properties":{"kind":{"const":…}}}, `timeZone` was written out three times and
+         * `localTime` twice with its pattern. Flat, with the per-kind required set stated in the
+         * one description the five variants used to state theirs in, it costs 1,028 - 699 bytes
+         * back off every request. Nothing became untyped and no kind was withheld - every field
+         * keeps its type, its bounds and its pattern, and `TaskScheduleSpec` in @athanor/contracts
+         * is still the discriminated union that decides what is accepted. Its members are ordinary
+         * `z.object`s, so a field belonging to another kind is stripped rather than fatal, which
+         * is what makes the flat bag safe here: the wire says less than the union, and the union
+         * still runs.
+         */
         spec: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['kind'],
           description:
-            'When it runs. Required for create. timeZone is an IANA name such as Europe/London: use the one given in your runtime context unless the user names another.',
-          oneOf: [
-            {
-              type: 'object',
-              additionalProperties: false,
-              required: ['kind', 'runAt'],
-              description: 'A single run at one instant.',
-              properties: {
-                kind: { const: 'once' },
-                runAt: {
-                  type: 'string',
-                  description: 'ISO 8601 instant, for example 2026-03-04T09:00:00Z.'
-                }
-              }
+            'When it runs, and the fields each kind takes. Required for create. once: runAt, an ISO 8601 instant such as 2026-03-04T09:00:00Z. interval: everyMinutes, a fixed gap between runs. daily: timeZone and localTime. weekly: timeZone, localTime and weekdays, where 0 is Sunday. cron: timeZone and expression, five fields - minute hour day-of-month month day-of-week - for anything the other four cannot express. timeZone is an IANA name such as Europe/London: use the one given in your runtime context unless the user names another.',
+          properties: {
+            kind: { type: 'string', enum: ['once', 'interval', 'daily', 'weekly', 'cron'] },
+            runAt: { type: 'string' },
+            everyMinutes: { type: 'integer', minimum: 15, maximum: 10_080 },
+            timeZone: { type: 'string' },
+            localTime: { type: 'string', pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$' },
+            weekdays: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 7,
+              items: { type: 'integer', minimum: 0, maximum: 6 }
             },
-            {
-              type: 'object',
-              additionalProperties: false,
-              required: ['kind', 'everyMinutes'],
-              description: 'A fixed gap between runs.',
-              properties: {
-                kind: { const: 'interval' },
-                everyMinutes: { type: 'integer', minimum: 15, maximum: 10_080 }
-              }
-            },
-            {
-              type: 'object',
-              additionalProperties: false,
-              required: ['kind', 'timeZone', 'localTime'],
-              description: 'Every day at a local wall-clock time.',
-              properties: {
-                kind: { const: 'daily' },
-                timeZone: { type: 'string' },
-                localTime: { type: 'string', pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$' }
-              }
-            },
-            {
-              type: 'object',
-              additionalProperties: false,
-              required: ['kind', 'timeZone', 'localTime', 'weekdays'],
-              description: 'Chosen weekdays at a local wall-clock time.',
-              properties: {
-                kind: { const: 'weekly' },
-                timeZone: { type: 'string' },
-                localTime: { type: 'string', pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$' },
-                weekdays: {
-                  type: 'array',
-                  minItems: 1,
-                  maxItems: 7,
-                  items: { type: 'integer', minimum: 0, maximum: 6 },
-                  description: '0 is Sunday.'
-                }
-              }
-            },
-            {
-              type: 'object',
-              additionalProperties: false,
-              required: ['kind', 'timeZone', 'expression'],
-              description: 'Advanced: anything the four kinds above cannot express.',
-              properties: {
-                kind: { const: 'cron' },
-                timeZone: { type: 'string' },
-                expression: {
-                  type: 'string',
-                  description: 'Five fields: minute hour day-of-month month day-of-week.'
-                }
-              }
-            }
-          ]
+            expression: { type: 'string' }
+          }
         }
       }
     }
@@ -920,9 +886,17 @@ export const agentTools: ModelTool[] = [
      * states that asynchronous video generation is not eligible for zero-data-retention, so there
      * is nothing behind it. A model asked for a clip read that it was on offer, spent a call
      * finding out, and the owner watched a capability fail that was never there.
+     *
+     * The refusal stays; what went with it is the half the operating contract already states
+     * unconditionally, in the same request, a few hundred bytes earlier - that no model weights
+     * run here and that ffmpeg through shell is what edits video the user already has. That is a
+     * fact about the computer, which is the contract's job; what is left here is the fact about
+     * this tool, which is that asking it for a clip will not work. Paying for the machine fact
+     * twice bought nothing, and the ceiling test above is explicit that prose restating the
+     * system prompt is what gets trimmed.
      */
     description:
-      'Create an image or a speech asset through the user-configured provider: a logo, icon, banner, cover, thumbnail, illustration, picture, photo or diagram, or a voiceover, narration or other spoken audio. The file is written into the workspace and its path returned, and the provider cost is priced from this request and checked against the user’s spending limit before anything is spent. No model weights run in the workspace, and video cannot be generated at all - use ffmpeg through shell to edit or transcode video the user already has.',
+      'Create an image or a speech asset through the user-configured provider: a logo, icon, banner, cover, thumbnail, illustration, picture, photo or diagram, or a voiceover, narration or other spoken audio. The file is written into the workspace and its path returned, and the provider cost is priced from this request and checked against the user’s spending limit before anything is spent. Video cannot be generated at all.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1048,8 +1022,18 @@ export const agentTools: ModelTool[] = [
   },
   {
     name: 'browser_snapshot',
+    /*
+     * The botWall clause used to restate the whole anti-bot rule - what closes, for how long, what
+     * to do instead, what to tell the owner - and the operating contract states exactly that,
+     * unconditionally, in the same request: "closes that one tab and that one site until the user
+     * clears it: say which page needs them, and carry on with the rest of the work everywhere
+     * else". What the contract cannot say is the name of the field a snapshot carries it in, and
+     * what a model does wrong when it meets one is reload or reopen, so those two are what stay.
+     * Same trim as print_pdf's typst clause and generate_media's machine facts: prose that
+     * restates the system prompt is what this file gives back.
+     */
     description:
-      'Open the persistent server browser if needed and read the page in front of it, with a screenshot and the interactive elements of the page and its frames. Each element carries: its selector, accessible name, submitted field name, current value, checked state, whether it is required, disabled or currently invalid, the hint or error text the site is showing beside it, and every option of a select. This is how you read a page on the internet once you have its address: navigate browser_action to the website, then snapshot it to read what is on screen. Use web_search to find that address rather than driving this at a search engine. Snapshot once to see the page, then use read_elements for every re-check after that - it returns the same element list without the screenshot or the page text. A snapshot carrying botWall means that page is showing an anti-bot challenge: that tab and that site are closed to you until the user clears it, and nothing else is - do not reload it, open it in another tab or touch the challenge, carry on with the rest of the task elsewhere, and tell the user which page needs them.',
+      'Open the persistent server browser if needed and read the page in front of it, with a screenshot and the interactive elements of the page and its frames. Each element carries: its selector, accessible name, submitted field name, current value, checked state, whether it is required, disabled or currently invalid, the hint or error text the site is showing beside it, and every option of a select. This is how you read a page on the internet once you have its address: navigate browser_action to the website, then snapshot it to read what is on screen. Use web_search to find that address rather than driving this at a search engine. Snapshot once to see the page, then use read_elements for every re-check after that - it returns the same element list without the screenshot or the page text. A snapshot carrying botWall is that page raising an anti-bot challenge: do not reload it, open it in another tab, or touch the challenge.',
     parameters: { type: 'object', additionalProperties: false, properties: {} }
   },
   {
@@ -1107,7 +1091,16 @@ export const agentTools: ModelTool[] = [
   {
     name: 'print_pdf',
     description:
-      'Keep what the browser is showing as a PDF file in the workspace, once the network has settled: a job posting that will be taken down, an order confirmation, a statement, an article, a receipt. Navigate to it first, and pass the tab id when the page you want is not the active one. For a PDF you are authoring rather than capturing - a CV, a letter, an invoice, a report - typeset it with typst instead, which is the only route that controls where the pages break. Returns the workspace path written, plus the url and title it came from.',
+      // The authoring alternative used to be spelled out here - "typeset it with typst instead,
+      // which is the only route that controls where the pages break" - and it was both a duplicate
+      // and, on some boxes, a lie. The operating contract states it already, and states it *gated*
+      // on the document toolchain actually being installed; this copy was unconditional, so a box
+      // with no typst was told in the same request that it has no document toolchain and that
+      // typst is the route for a PDF that matters. The contract's own sentence carries the
+      // disambiguation too - "print_pdf captures a page the browser is showing, not a document you
+      // are authoring" - so nothing is lost where typst exists, and a wrong instruction goes where
+      // it does not.
+      'Keep what the browser is showing as a PDF file in the workspace, once the network has settled: a job posting that will be taken down, an order confirmation, a statement, an article, a receipt. Navigate to it first, and pass the tab id when the page you want is not the active one. Returns the workspace path written, plus the url and title it came from.',
     parameters: {
       type: 'object',
       additionalProperties: false,

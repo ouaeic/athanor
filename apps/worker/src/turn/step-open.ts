@@ -1,0 +1,124 @@
+/**
+ * Opening a step, and the three ceilings that can decide there is not going to be one.
+ *
+ * Everything here happens before a single token of the step is prepared, and the order is the whole
+ * of it:
+ *
+ *   - the owner is asked first, because a Stop pressed between two steps must not buy a fourth one;
+ *   - a correction is drained **before** the plan is refreshed, so a message that changes the goal
+ *     is in the window when the plan is read rather than one step behind it;
+ *   - the dormant rules run ahead of the runtime block, which keeps the block carrying the clock
+ *     last in the window and therefore free to change;
+ *   - then the wall clock, the compute credits and the owner's spend caps, in that order. `credits`
+ *     is checked in front of the clock deliberately: when both are reached the money is the one the
+ *     owner can do something about, and it is the sentence they should be given.
+ *
+ * The clock ceiling is the youngest of the three and the reason this reads as a set. Steps,
+ * self-continuations, credits and spend caps compose rather than cap: six idle steps of generation
+ * is an hour, a hundred and twenty steps of tool time is days. On a frontier model the credit
+ * ceiling bites first, which is why it was a residual rather than an open runaway; on a cheap local
+ * route credits accumulate slowly and the clock does not.
+ *
+ * Lifted out of `AgentWorker.run()` unchanged; the six `return`s became `'closed'`, which is the
+ * whole of the edit.
+ */
+import type { TaskRecord } from '@athanor/data';
+import type { AgentState } from '../agent-state.js';
+import { noteStepBudget, stepCeiling, turnWallClockReached, type HandoffDeps } from '../handoff.js';
+import { applyDormantRules, toolsRunThisTurn } from '../rules/index.js';
+import { closeTurnAtCeiling, type TurnCloseContext } from './close.js';
+import type { TurnLoopControl } from './loop-context.js';
+
+/** What opening a step needs from the worker that owns it. */
+export interface TurnStepOpenDeps {
+  /** The step budget and all three closing handoffs are built from this one set. */
+  readonly handoff: HandoffDeps;
+  /** The owner's own daily and monthly caps, which are neither a step nor a credit. */
+  haltIfOutOfMoney(task: TaskRecord, key: Uint8Array, state: AgentState): Promise<boolean>;
+}
+
+/**
+ * Runs the opening of one step.
+ *
+ * `'closed'` means the turn is over and has already said so on the owner's timeline - the caller
+ * returns without writing anything further. `'open'` means the step may be prepared.
+ */
+export const openStep = async (
+  deps: TurnStepOpenDeps,
+  task: TaskRecord,
+  key: Uint8Array,
+  state: AgentState,
+  /** Fixed for the life of the run; what any of the three ceilings hands over. */
+  closeContext: TurnCloseContext,
+  /** When this turn was leased, which is what the clock ceiling is measured from. */
+  turnStartedAt: number,
+  control: Pick<
+    TurnLoopControl,
+    'honorUserControl' | 'drainCorrection' | 'refreshActivePlan' | 'refreshRuntimeContext'
+  >
+): Promise<'open' | 'closed'> => {
+  const { honorUserControl, drainCorrection, refreshActivePlan, refreshRuntimeContext } = control;
+  if (await honorUserControl()) return 'closed';
+  // Before the plan is refreshed, so a correction that changes the goal is in the window when
+  // the plan is read rather than one step behind it.
+  await drainCorrection();
+  await refreshActivePlan(state.mutated === true || state.step >= 2);
+  await noteStepBudget(deps.handoff, task, key, state, stepCeiling(deps.handoff, state));
+  /*
+   * The dormant rules, read against the step the model just produced.
+   *
+   * Here rather than where the assistant message is pushed, for two reasons that are both about
+   * shape. At a step boundary every tool call has been answered, so a correction appended now
+   * cannot land between a call and its result - which is the malformed request the cut-off-reply
+   * branch below refuses for the same reason. And a rule's view of the turn includes what the
+   * step's own calls *did*, which is not known until they have run: the render-proof rule asks
+   * whether this turn has looked at a rendered page, and the answer arrives with the tool result
+   * rather than with the request for it.
+   *
+   * Ahead of the runtime block deliberately, so the block that carries the clock stays last and
+   * keeps costing nothing. @see rules/index.ts for why this is a tier of its own and why the
+   * firing rate is instrumented from the first commit.
+   */
+  applyDormantRules(state.messages, toolsRunThisTurn(state.turnToolResults));
+  // Last of the tail blocks, and re-pushed on every step rather than once per turn: a block
+  // left where the next step's tool results bury it stops being free to change. At a step
+  // boundary every tool call has been answered, so nothing here can split a call from its
+  // result.
+  refreshRuntimeContext();
+  /*
+   * The third ceiling, checked where the other two are and priced the same way.
+   *
+   * Nothing in the product bounded a turn on the clock. Steps, self-continuations, compute
+   * credits and the owner's spend caps were the whole of it, and the per-unit ceilings compose
+   * rather than cap - six idle steps of generation is an hour, a hundred and twenty steps of
+   * tool time is days. On a frontier model the credit ceiling bites first, which is why this
+   * has been a residual rather than an open runaway; on a cheap local route credits accumulate
+   * slowly and the wall clock does not, and that is the case nothing was watching.
+   *
+   * `credits` is checked in front of it deliberately: when both ceilings are reached the money
+   * is the one the owner can do something about, and it is the sentence they should be given.
+   */
+  if (turnWallClockReached(turnStartedAt)) {
+    if (await honorUserControl()) return 'closed';
+    await closeTurnAtCeiling(deps.handoff, task, key, state, closeContext, {
+      reason: 'time',
+      code: 'task_budget_reached',
+      spent: 'ran for its whole time budget'
+    });
+    return 'closed';
+  }
+  if (state.credits >= task.maxComputeCredits) {
+    // The same closing call the step ceiling gets. A turn that stops because it ran out of
+    // money has exactly as much to hand over as one that ran out of steps, and the owner is
+    // owed the same thing: what was done, what is left, and that a reply carries on.
+    if (await honorUserControl()) return 'closed';
+    await closeTurnAtCeiling(deps.handoff, task, key, state, closeContext, {
+      reason: 'credits',
+      code: 'task_budget_reached',
+      spent: 'used its whole compute budget'
+    });
+    return 'closed';
+  }
+  if (await deps.haltIfOutOfMoney(task, key, state)) return 'closed';
+  return 'open';
+};

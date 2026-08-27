@@ -90,16 +90,16 @@ is re-derived, naming the value it should now carry. The instruction is no longe
 ```baseline
 fixtures                                                                        70
 long-a-finished-phase-is-never-declared.modelCalls                              38
-long-a-finished-phase-is-never-declared.promptTokens                     1,454,342
-long-a-finished-phase-is-never-declared.catalogueTokens                    478,648
+long-a-finished-phase-is-never-declared.promptTokens                     1,443,119
+long-a-finished-phase-is-never-declared.catalogueTokens                    467,438
 long-a-finished-phase-is-never-declared.cachePrefix                             95
 long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.modelCalls      40
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.promptTokens 1,400,688
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.catalogueTokens 491,245
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.promptTokens 1,389,168
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.catalogueTokens 479,740
 long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.cachePrefix     94
 long-finished-phases-condense-rather-than-shred.cachePrefix                     66
 compaction.extraModelCalls                                                       2
-compaction.tokensSaved                                                      53,654
+compaction.tokensSaved                                                      53,951
 compaction.cachePointsGivenUp                                                    1
 floorWalk.cachePointsLost                                                       28
 ```

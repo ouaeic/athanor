@@ -141,17 +141,32 @@ describe('the request athanor is about to send', () => {
  * observe this by arranging one, which measures the arrangement rather than the program.
  */
 describe('and it is asked before the request goes out', () => {
-  const source = readFileSync(fileURLToPath(new URL('./agent.ts', import.meta.url)), 'utf8').split(
-    '\n'
-  );
-  const lineOf = (needle: string, from = 0): number => {
-    const index = source.findIndex((line, at) => at >= from && line.includes(needle));
-    if (index < 0) throw new Error(`anchor not found in agent.ts: ${needle}`);
+  /**
+   * Two files rather than one since the phase decomposition, and the ordering now spans the seam
+   * between them: the window is prepared in `turn/request.ts`, which `run()` calls strictly before
+   * `turn/generate.ts` asks this question and sends the request. So the claim is made twice - once
+   * about the order `run()` runs the two phases in, and once about where inside the second phase
+   * the question sits - which together say exactly what one file used to say on its own.
+   */
+  const read = (path: string): string[] =>
+    readFileSync(fileURLToPath(new URL(path, import.meta.url)), 'utf8').split('\n');
+  const at = (source: string[], file: string, needle: string, from = 0): number => {
+    const index = source.findIndex((line, on) => on >= from && line.includes(needle));
+    if (index < 0) throw new Error(`anchor not found in ${file}: ${needle}`);
     return index + 1;
   };
+  const source = read('./turn/generate.ts');
+  const lineOf = (needle: string, from = 0): number => at(source, 'turn/generate.ts', needle, from);
 
   it('sits between the window being prepared and the step being sent', () => {
-    const prepared = lineOf('const preparedContext = prepareModelContext(');
+    // The seam: the phase that prepares the window runs before the phase that asks the question.
+    const loop = read('./agent.ts');
+    const prepares = at(loop, 'agent.ts', 'const request = await prepareStepRequest(');
+    const generates = at(loop, 'agent.ts', 'const generated = await generateModelStep(', prepares);
+    expect(generates).toBeGreaterThan(prepares);
+    // And inside that second phase, past every branch that can still edit the window and in front
+    // of the one call that spends the owner's money.
+    const prepared = lineOf('const { preparedContext, reasoningEffort, windowOptions } = request;');
     const asked = lineOf('const derivationBreach = requestDerivationBreach({', prepared);
     const sent = lineOf('gateway.chat(provider, {', asked);
     expect(asked).toBeGreaterThan(prepared);

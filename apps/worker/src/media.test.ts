@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { AUDIO_READ_MAX_SECONDS, type MediaModelOption } from '@athanor/contracts';
 import {
+  mediaDimension,
   resolvedTranscriptionRoute,
   TRANSCRIPTION_BILLING_MINUTE_SECONDS,
   transcriptionEstimateAtRate,
@@ -225,5 +226,62 @@ describe('a ninety-minute recording on a box with a cap', () => {
     expect(transcriptionEstimateAtRate(AUDIO_READ_MAX_SECONDS, rate)).toBeGreaterThan(
       DAILY_CAP_USD
     );
+  });
+});
+
+describe('the bound applied to a dimension before anything is priced', () => {
+  /*
+   * The standing negative control for `mediaDimension`, which had none.
+   *
+   * `clamp` guards on `Number.isFinite` before it clamps, and deleting that one line left all
+   * 1,178 tests in this package green while `mediaDimension('12px')` started returning NaN and
+   * `mediaDimension(Infinity)` started returning the 4,096 ceiling. That is the incident named at
+   * the top of media.ts wearing new clothes: a number the model wrote, never checked, arriving as
+   * NaN and reaching pricing - except that this time it is the size rather than the estimate, and
+   * a NaN dimension prices a generation at NaN, which compares false against every spending limit
+   * there is.
+   *
+   * So the assertion is on the arithmetic and not on the happy path: a value that is not a finite
+   * number must come back as the stated default, and every result must be a number the ceiling can
+   * actually be compared against. `Math.min(max, Math.max(min, NaN))` is NaN, so a test that only
+   * checked the range would pass on the mutant too.
+   */
+  // Labelled rather than stringified: half of these are the shapes that have no useful `String`,
+  // which is the whole reason they reach `clamp` as something other than a number.
+  const notNumbers: readonly (readonly [string, unknown])[] = [
+    ['a string with units', '12px'],
+    ['a word', 'abc'],
+    ['an object', {}],
+    ['an array', [1, 2]],
+    ['null', null],
+    ['omitted', undefined],
+    ['NaN itself', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['-Infinity', Number.NEGATIVE_INFINITY]
+  ];
+
+  it('turns anything that is not a finite number into the stated default', () => {
+    for (const [label, written] of notNumbers) expect(mediaDimension(written), label).toBe(1_024);
+  });
+
+  it('never hands pricing a value a spending limit would compare false against', () => {
+    const priced: readonly (readonly [string, unknown])[] = [
+      ...notNumbers,
+      ['above the ceiling', 8_192],
+      ['below the floor', -5],
+      ['a numeric string', '2048'],
+      ['an ordinary number', 300]
+    ];
+    for (const [label, written] of priced)
+      expect(Number.isFinite(mediaDimension(written)), label).toBe(true);
+  });
+
+  it('still clamps a finite number to the range generate_media declares', () => {
+    // The empty string is here and not above on purpose: it coerces to a finite 0, so it is a
+    // number out of range rather than a non-number, and the floor is the right answer for it.
+    expect(mediaDimension('')).toBe(256);
+    expect(mediaDimension('2048')).toBe(2_048);
+    expect(mediaDimension(8_192)).toBe(4_096);
+    expect(mediaDimension(-5)).toBe(256);
   });
 });

@@ -119,10 +119,10 @@ jobs:
       # scripts/check-repository.mjs, which `pnpm check` runs. The lists used to live here and were
       # missing five programs that ship to an owner's box; discovery replaced them.
       - run: CI=true pnpm check
-      # The negative controls for the three measurement rigs, on every change rather than nightly.
+      # The negative controls for the four measurement rigs, on every change rather than nightly.
       #
       # `evals/` is not a workspace package, so `pnpm -r test` collects nothing in it and these
-      # three scripts - which are the only thing that checks the rigs measure what they claim -
+      # four scripts - which are the only thing that checks the rigs measure what they claim -
       # ran in no job at all. They are what catches a rig that has quietly started measuring
       # nothing: the arms rig locates the contract section it is comparing two arms across, and
       # when the cut it was written to certify landed at 28f3da6 the lookup found the one revision
@@ -135,9 +135,24 @@ jobs:
       - name: Prove the measurement rigs still measure something
         run: |
           set -eu
-          for rig in context-quality agentdojo arms; do
+          for rig in context-quality agentdojo arms cards; do
             NODE_OPTIONS=--conditions=development pnpm exec tsx "evals/$rig/selftest.ts"
           done
+      # The approval-card rig, run in full here rather than nightly with the other three.
+      #
+      # It is the only one of the four that measures a security floor rather than a cost, and the
+      # only one that is free: no key, no network, no model, five milliseconds of measurement over
+      # thirty scenario-mode rows and forty-three guard entries. The other three print a number that is
+      # worth arguing with in the morning; this one answers "does a write to `~/.bashrc` still stop
+      # for the owner", and a floor that quietly stopped firing is not a drift to argue with.
+      #
+      # It also fails on more than its baseline. `--ci` adds the baseline comparison, but the guard
+      # tables and the provenance rule fail with or without it, because neither is a number anybody
+      # should be able to accept: disabling the deferred-execution rule silences fourteen genuine
+      # writes while moving the printed total by one card, and switching provenance off moves no
+      # printed number at all.
+      - name: Check how often this computer stops and asks, against its committed baseline
+        run: NODE_OPTIONS=--conditions=development pnpm exec tsx evals/cards/run.ts --ci
       # The same question asked of the test suite itself: can a test pass by iterating nothing?
       #
       # Fifty-one can, twenty-four of them confirmed by mutation - a command-injection guard that

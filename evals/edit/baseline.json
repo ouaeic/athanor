@@ -1,0 +1,84 @@
+{
+  "rows": {
+    "one-line-repetitive": {
+      "replace": 181,
+      "lines": 110,
+      "behaved": "ql"
+    },
+    "repeated-statement": {
+      "replace": 188,
+      "lines": 64,
+      "behaved": "ql"
+    },
+    "repeated-guard": {
+      "replace": 279,
+      "lines": 127,
+      "behaved": "ql"
+    },
+    "deep-stanza": {
+      "replace": 338,
+      "lines": 72,
+      "behaved": "ql"
+    },
+    "one-line-unique": {
+      "replace": 167,
+      "lines": 95,
+      "behaved": "ql"
+    },
+    "block-replace": {
+      "replace": 355,
+      "lines": 144,
+      "behaved": "ql"
+    },
+    "insert-at-gap": {
+      "replace": 179,
+      "lines": 83,
+      "behaved": "ql"
+    },
+    "three-hunks": {
+      "replace": 531,
+      "lines": 258,
+      "behaved": "ql"
+    },
+    "move-function": {
+      "replace": 777,
+      "lines": 57,
+      "behaved": "ql"
+    },
+    "rename-file": {
+      "replace": 41,
+      "lines": 42,
+      "behaved": "ql"
+    },
+    "python-block": {
+      "replace": 615,
+      "lines": 306,
+      "behaved": "ql"
+    },
+    "duplicated-stanza": {
+      "replace": 127,
+      "lines": 65,
+      "behaved": "ql"
+    },
+    "stale-anchor": {
+      "replace": 162,
+      "lines": 91,
+      "behaved": "ql"
+    },
+    "stale-target-rewritten": {
+      "replace": 146,
+      "lines": 75,
+      "behaved": "ql"
+    },
+    "unseen-line": {
+      "replace": 141,
+      "lines": 76,
+      "behaved": "-l"
+    }
+  },
+  "totals": {
+    "replace": 4086,
+    "lines": 1589,
+    "tasks": 14
+  }
+}

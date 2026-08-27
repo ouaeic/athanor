@@ -662,6 +662,53 @@ describe('the turn wall clock', () => {
     expect(spoken).toHaveLength(1);
     expect(spoken[0]?.summary).toContain('Out of time');
   });
+
+  /**
+   * Its sibling, which nothing was driving.
+   *
+   * The compute-credit ceiling sits two lines below the clock in the same block and ends the turn
+   * the same way, and until this test it had no end-to-end proof at all: the whole of apps/worker
+   * stayed green with the credit arm reporting the step as open after it had already handed the
+   * turn over, which is a turn that carries on spending past the budget the owner set. The hole was
+   * found by attack during the Wave 8 phase decomposition - `return 'closed'` changed to
+   * `return 'open'`, 1,177 tests, none of them red - and it is the reason this file's `openStep`
+   * arm is now driven rather than read.
+   *
+   * The budget is set to a thousandth of a credit because that is `usageCredit`'s own floor, so one
+   * step of any size is guaranteed to reach it and the test does not depend on token counts.
+   */
+  it('writes the owner the same handoff when the turn has spent its whole compute budget', async () => {
+    const task = { ...makeTask(), maxComputeCredits: 0.001 };
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        // One step that does something cheap, which is enough to reach the floor of one credit
+        // charge, and then the closing handoff call the ceiling makes on the next iteration.
+        toolFrame('call-1', 'files_list', { path: 'workspace' }),
+        textFrame('Out of budget - the listing is done, the tidy-up is not.')
+      ],
+      log
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 40 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    const warning = probe.events.find(
+      (entry) =>
+        entry.kind === 'warning' &&
+        entry.summary === 'This turn used its whole compute budget before the work was finished'
+    );
+    expect(warning).toBeDefined();
+    expect((warning?.payload as { owner?: boolean }).owner).toBe(true);
+    expect(probe.events.some((entry) => entry.kind === 'completed')).toBe(true);
+    // And it stopped: two model calls, the step and the handoff, and not a third.
+    expect(log.modelRequests).toHaveLength(2);
+    const spoken = probe.events.filter((entry) => entry.kind === 'assistant_message');
+    expect(spoken).toHaveLength(1);
+    expect(spoken[0]?.summary).toContain('Out of budget');
+  });
 });
 
 describe('the model call and the task lease', () => {

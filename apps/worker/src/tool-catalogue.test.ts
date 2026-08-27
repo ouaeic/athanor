@@ -11,6 +11,7 @@ import {
   BrowserAction,
   DesktopAction,
   MAX_AGENT_NOTIFICATIONS_PER_TASK,
+  TaskScheduleSpec,
   type MediaModelOption
 } from '@athanor/contracts';
 import {
@@ -24,7 +25,7 @@ import { isMutatingToolCall } from './write-classification.js';
 import { REPEATABLE_TOOLS } from './turn-bounds.js';
 import { surfaceActionRequest } from './surface-actions.js';
 import { MAX_NOTICES_PER_TURN } from './agent.js';
-import { COMPACT_CONTEXT_TOOL } from './context.js';
+import { BASE_SYSTEM_PROMPT, COMPACT_CONTEXT_TOOL } from './context.js';
 import { MEMORY_SESSION_SEARCH_MAX_RESULTS } from './memory-runtime.js';
 import { managedMediaCatalog, resolvedMediaModel } from './media.js';
 import { CODE_SEARCH_COLLAPSE_LINES, CODE_SEARCH_FILE_CEILING } from './tools/repository.js';
@@ -187,7 +188,37 @@ describe('the size of the catalogue the model is sent', () => {
     // turn-bounds.ts is a three-part safety property, and its third part is that the approval
     // floor's verdict cannot move while the run is in flight. A model declaration would be inert
     // for every tool already in that set and a floor bypass for every tool outside it.
-    expect(bytes).toBeLessThan(56_100);
+    //
+    // Then lowered, for the second time, from 56,100 to 54,700, and every byte of it is an
+    // encoding or a duplicate rather than a capability. 55,813 to 54,632.
+    //
+    // 699 of it is `schedule.spec`, which was the last five-variant `oneOf` left in this file and
+    // failed the same test browser_action and desktop_action failed: about two thirds frame, with
+    // `timeZone` written out three times and `localTime` twice, pattern and all. Flat property bag,
+    // sibling `kind` enum, per-kind required set in the one description the five variants used to
+    // state theirs in. Every kind, field, bound and pattern still declared, and `TaskScheduleSpec`
+    // in @athanor/contracts - ordinary `z.object`s, so a foreign field is stripped rather than
+    // fatal - is still what decides what is accepted. Driven through the real dispatch arm, which
+    // was already being handed exactly this flat shape.
+    //
+    // 482 of it is three descriptions restating the operating contract, which arrives on the same
+    // request: print_pdf's typst clause, generate_media's "no model weights, use ffmpeg", and
+    // browser_snapshot's account of what an anti-bot challenge closes and for how long. The typst
+    // one was worse than a duplicate - the contract's copy is gated on the box having a document
+    // toolchain and this one was not, so a bare box read in one request both that it has no typst
+    // and that typst is the route for a PDF that matters. What stays is the part the contract
+    // cannot say: the name of the field a challenge arrives in, and that a clip cannot be made.
+    // Pinned from now on by "pays once for a machine fact" below, so it cannot grow back quietly.
+    //
+    // Three larger moves were priced against this ceiling and are NOT here, because none of them
+    // fits inside this file: conditioning the browser and desktop bags on a box that has them
+    // (~11.0 kB) needs an availability probe that does not exist anywhere yet, plus the withdrawal
+    // set in turn/claim.ts and the entitlement rebuild that has to agree with it; deferring
+    // connector_action's 48-field input bag (~4.4 kB) is held in place by a name-level pin in
+    // approval-policy.test.ts; and folding read_elements into browser_snapshot (~0.7 kB net) is
+    // named by skills/web-form-filling's front matter, which skills.test.ts checks against this
+    // catalogue. Each is a real saving and none of them is a description that grew.
+    expect(bytes).toBeLessThan(54_700);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
     // union of what twenty-four actions across mail, calendar and repositories accept. Those are
@@ -240,6 +271,41 @@ describe('the size of the catalogue the model is sent', () => {
     // do it, and said so in its own description.
     for (const tool of sent) expect(tool.description).not.toMatch(/does not unlock anything/);
     expect(sent.map((tool) => tool.name)).not.toContain('tool_search');
+  });
+
+  it('pays once for a machine fact, not once here and once in the contract', () => {
+    /*
+     * The ceiling above says that prose restating the system prompt is what gets trimmed. This is
+     * that rule as a check rather than as a paragraph, because three descriptions were restating
+     * it and only the whole-catalogue figure - which moves for forty other reasons - could see it.
+     *
+     * Three facts, each carried by the operating contract in the same request, each of which was
+     * also being paid for down here: which binary controls where a page breaks, that this computer
+     * generates no video and edits the owner's own with ffmpeg, and what an anti-bot challenge
+     * closes and for how long. The contract is message 0 of every window, so the model reads them
+     * either way; the catalogue copy bought nothing, and the typst one was worse than nothing - it
+     * was unconditional, while the contract's is gated on the box actually having a document
+     * toolchain, so a bare box was told in one request both that it has no typst and that typst is
+     * the route for a PDF that matters.
+     *
+     * What stays in a description is the part the contract cannot say: the name of the field a
+     * challenge arrives in (`botWall`), and that asking generate_media for a clip will not work.
+     * The direction of the check is deliberate - it asserts the contract still carries each fact
+     * before it forbids the duplicate, so deleting the original turns this red rather than green.
+     */
+    const paidForInTheContract: ReadonlyArray<readonly [string, RegExp]> = [
+      ['typeset with typst', /\btypst\b/i],
+      ['no video generation here at all', /\bffmpeg\b|model weights/i],
+      ['anti-bot challenge', /until the user clears it|carry on with the rest/i]
+    ];
+    for (const [carried, restated] of paidForInTheContract) {
+      expect(BASE_SYSTEM_PROMPT, `the contract stopped carrying "${carried}"`).toContain(carried);
+      for (const tool of sent)
+        expect(
+          tool.description,
+          `${tool.name} restates "${carried}", which the contract already sends on this request`
+        ).not.toMatch(restated);
+    }
   });
 });
 
@@ -690,12 +756,21 @@ describe('the catalogue as the model reads it', () => {
 
     // The other relationship: not "instead of" but "and then". These name a step rather than an
     // alternative, so they belong in the referring tool's own score and only have to be there.
+    /*
+     * `['print_pdf', 'typst']` was the third pair here and it is deleted with the clause it
+     * pinned, rather than kept as evidence the clause should have survived.
+     *
+     * What it protected - that a PDF whose pagination matters is typeset rather than captured from
+     * a browser - has a better home and already occupies it: the operating contract states it, and
+     * states it *gated* on this box actually having a document toolchain, pinned in both
+     * directions in context.test.ts ("typeset with typst" present when provisioned, absent when
+     * bare). The catalogue's copy was unconditional, so a box with no typst read in one request
+     * that it has no document toolchain and that typst is the route for a PDF that matters. A pin
+     * that holds an unconditional duplicate in place against a gated original is a ratchet.
+     */
     const thenPairs: ReadonlyArray<readonly [string, string]> = [
       ['web_search', 'parallel_web_read'],
-      ['shell', 'process'],
-      // Not a tool: the one route that controls where a page breaks is a binary, and reaching for
-      // this instead is how a CV gets captured from a browser rather than typeset.
-      ['print_pdf', 'typst']
+      ['shell', 'process']
     ];
     for (const [tool, other] of thenPairs)
       expect(clauseNaming(tool, other), `${tool} never mentions ${other}`).toBeDefined();
@@ -937,15 +1012,80 @@ describe('declared action shapes', () => {
   });
 
   it('declares each schedule kind, including the two fields the daily brief needs', () => {
+    /*
+     * Re-pointed at the flat property bag that replaced the five-variant `oneOf`, and re-pointed
+     * rather than deleted because what it pins is a capability rather than an encoding: every one
+     * of the five kinds is still reachable, and `daily` still names the two fields that decide
+     * whether "brief me at eight" can be scheduled at all. The union frame it used to read is
+     * gone; the kinds and those two fields are the part that has to survive an encoding.
+     *
+     * The per-kind required set is prose now, so it is asserted as prose - which is the honest
+     * shape of the promise, since the wire no longer carries a required list per kind and
+     * `TaskScheduleSpec` in @athanor/contracts is what refuses a spec that is missing one.
+     */
     const schedule = agentTools.find((tool) => tool.name === 'schedule');
-    const spec = (schedule?.parameters.properties as Record<string, { oneOf?: unknown }>).spec;
-    const kinds = (
-      (spec?.oneOf ?? []) as Array<{ properties?: { kind?: { const?: string } } }>
-    ).map((option) => option.properties?.kind?.const);
-    expect(kinds).toEqual(['once', 'interval', 'daily', 'weekly', 'cron']);
-    const daily = ((spec?.oneOf ?? []) as Array<{ required?: string[] }>)[2];
-    expect(daily?.required).toEqual(['kind', 'timeZone', 'localTime']);
+    const spec = (
+      schedule?.parameters.properties as Record<
+        string,
+        { description?: string; properties?: Record<string, { enum?: string[] }> }
+      >
+    ).spec;
+    expect(spec?.properties?.kind?.enum).toEqual(['once', 'interval', 'daily', 'weekly', 'cron']);
+    expect(spec?.description).toMatch(/daily: timeZone and localTime/);
+    expect(Object.keys(spec?.properties ?? {})).toEqual(
+      expect.arrayContaining([
+        'runAt',
+        'everyMinutes',
+        'timeZone',
+        'localTime',
+        'weekdays',
+        'expression'
+      ])
+    );
     expect(schedule?.description).toMatch(/time zone/i);
+  });
+
+  it('accepts every kind it declares through the schema that actually decides', () => {
+    /*
+     * The flat bag is a wire encoding, not a validator: what a schedule may be is
+     * `TaskScheduleSpec`, and this drives one spec of every declared kind through it so a kind
+     * that the catalogue offers and the contract refuses cannot ship. It is the half the byte
+     * measurement above cannot see - a saving that quietly withdrew `weekly` would pass the
+     * ceiling and fail here.
+     */
+    const specs: Record<string, Record<string, unknown>> = {
+      once: { kind: 'once', runAt: '2027-03-04T09:00:00.000Z' },
+      interval: { kind: 'interval', everyMinutes: 60 },
+      daily: { kind: 'daily', timeZone: 'Europe/London', localTime: '08:00' },
+      weekly: {
+        kind: 'weekly',
+        timeZone: 'Europe/London',
+        localTime: '08:00',
+        weekdays: [1, 2, 3, 4, 5]
+      },
+      cron: { kind: 'cron', timeZone: 'Europe/London', expression: '0 8 * * 1-5' }
+    };
+    const schedule = agentTools.find((tool) => tool.name === 'schedule');
+    const declared = (
+      schedule?.parameters.properties as Record<
+        string,
+        { properties?: { kind?: { enum?: string[] } } }
+      >
+    ).spec?.properties?.kind?.enum;
+    expect(Object.keys(specs)).toEqual(declared);
+    for (const [kind, spec] of Object.entries(specs))
+      expect(TaskScheduleSpec.parse(spec), kind).toMatchObject({ kind });
+    // And the flat bag's own hazard, stated rather than assumed: a field belonging to another kind
+    // is stripped by the union rather than fatal, which is the property that makes one bag safe
+    // where five variants used to be.
+    expect(
+      TaskScheduleSpec.parse({
+        kind: 'daily',
+        timeZone: 'Europe/London',
+        localTime: '08:00',
+        everyMinutes: 60
+      })
+    ).toEqual({ kind: 'daily', timeZone: 'Europe/London', localTime: '08:00' });
   });
 });
 

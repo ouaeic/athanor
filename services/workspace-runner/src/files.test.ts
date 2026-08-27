@@ -162,6 +162,25 @@ describe('workspace files', () => {
     expect(await readFile(path.join(root, 'workspace', 'result.txt'), 'utf8')).toBe('ok');
   });
 
+  /*
+   * A compare-and-swap write must land the bytes it was given and nothing else.
+   *
+   * `handle.writeFile` writes at the descriptor's current position, and reading the old content to
+   * check the hash leaves that position at the end of the file - so every write that claimed a hash
+   * produced the old file's length in zero bytes followed by the new content. Both callers that
+   * claim one are the ones that matter: the owner saving in the file browser, and every `file_patch`
+   * since the patch path started claiming its read. Nothing caught it because a file with a hole in
+   * front of it still contains every string a test looked for, so this one weighs the file.
+   */
+  it('replaces the file with exactly the bytes it was given, hash claimed or not', async () => {
+    await writeWorkspaceFile(root, 'workspace/notes.md', Buffer.from('the long first draft'), 100);
+    const read = await readWorkspaceFile(root, 'workspace/notes.md', 100);
+    await writeWorkspaceFile(root, 'workspace/notes.md', Buffer.from('short'), 100, read.sha256);
+    const after = await readFile(path.join(root, 'workspace', 'notes.md'));
+    expect(after.length).toBe(5);
+    expect(after.toString('utf8')).toBe('short');
+  });
+
   it('hands the browser only files the user could already see in the file browser', async () => {
     await writeWorkspaceFile(root, 'workspace/cv.pdf', Buffer.from('cv'), 10);
     const staged = await stageUserFileForUpload(root, 'workspace/cv.pdf', 1024);
@@ -500,5 +519,182 @@ describe('renaming and folders', () => {
     } finally {
       await chmod(opaque, 0o700);
     }
+  });
+});
+
+/*
+ * The line a read actually put on screen, and an edit that rests on one it never did.
+ *
+ * `file_patch` proves `oldText` occurs exactly once in the file. It does not prove the model ever
+ * read that part of the file, so a window read of lines 1-50 followed by an anchor at line 300 was
+ * indistinguishable from an anchor at line 20: both match, both apply, and one of them is an edit
+ * made from memory of a region that was never displayed. Every sequence below is the worker's real
+ * one - window read, then the whole-file read `file_patch` makes to match on, then the write that
+ * claims the hash from it.
+ */
+describe('the seen-line guard', () => {
+  let root: string;
+  const lines = Array.from({ length: 400 }, (_, index) => `line ${index + 1}`);
+  const file = 'workspace/app.ts';
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(tmpdir(), 'athanor-runner-'));
+    await ensureWorkspace(root);
+    await writeFile(path.join(root, 'workspace', 'app.ts'), `${lines.join('\n')}\n`);
+  });
+  afterEach(async () => rm(root, { recursive: true, force: true }));
+
+  const look = (startLine: number, endLine: number, maxBytes = 400_000): Promise<unknown> =>
+    readWorkspaceFileLines(root, file, { startLine, endLine, maxBytes });
+  // What `file_patch` does: read the whole file to match `oldText` on, keep the runner's hash.
+  const prepare = async (
+    find: string,
+    replace: string
+  ): Promise<{ content: Buffer; expect: string }> => {
+    const read = await readWorkspaceFile(root, file, 10_000_000);
+    return {
+      content: Buffer.from(read.content.toString('utf8').replace(find, replace)),
+      expect: read.sha256
+    };
+  };
+  const write = (patch: { content: Buffer; expect: string }): Promise<unknown> =>
+    writeWorkspaceFile(root, file, patch.content, 10_000_000, patch.expect);
+
+  it('applies an edit anchored on a line the read displayed', async () => {
+    await look(1, 50);
+    await write(await prepare('line 20', 'line 20 // touched'));
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toContain(
+      'line 20 // touched'
+    );
+  });
+
+  /*
+   * The refusal has to carry the truth with it. A refusal that costs a round trip is barely better
+   * than the wrong edit it prevented: the model re-reads, re-derives the same patch, and the owner
+   * pays for two turns to get one edit. So the real text arrives inline, the refusal counts as
+   * having shown it, and the same call sent again applies.
+   */
+  it('refuses an edit anchored on a line no read displayed, and hands back what is there', async () => {
+    await look(1, 50);
+    const patch = await prepare('line 300', 'line 300 // touched');
+    // One attempt, both assertions: the second attempt is the retry, and it is meant to succeed.
+    const refusal = await write(patch).catch((error: unknown) => error);
+    expect(refusal).toMatchObject({ status: 428 });
+    expect((refusal as Error).message).toContain('no read has shown you those lines');
+    expect((refusal as Error).message).toContain('300| line 300');
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).not.toContain('touched');
+  });
+
+  it('lets the very same call through once the refusal has shown those lines', async () => {
+    await look(1, 50);
+    const patch = await prepare('line 300', 'line 300 // touched');
+    await expect(write(patch)).rejects.toMatchObject({ status: 428 });
+    await write(patch);
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toContain(
+      'line 300 // touched'
+    );
+  });
+
+  /*
+   * A file that moved under the caller is a different failure with a different answer, and the
+   * compare-and-swap must still be the one that answers it. Telling the model about anchors here
+   * would send it back to patch a version that no longer exists, and merging silently would lose
+   * the other writer's work - which is what this tree has three other writers to worry about.
+   */
+  it('lets the compare-and-swap answer a file that changed on disk, rather than the guard', async () => {
+    await look(1, 50);
+    const patch = await prepare('line 300', 'line 300 // mine');
+    await writeFile(
+      path.join(root, 'workspace', 'app.ts'),
+      `${lines.join('\n')}\n`.replace('line 300', 'line 300 // theirs')
+    );
+    await expect(write(patch)).rejects.toMatchObject({ status: 409 });
+    await expect(write(patch)).rejects.toThrow('changed after you read it');
+    // And still, once a fresh window read has given the guard something to say about the file it
+    // is now. Both refusals are live at this point and only one of them is true: the model's read
+    // is stale, and telling it about anchors would send it back to patch a version that is gone.
+    await look(1, 50);
+    await expect(write(patch)).rejects.toThrow('changed after you read it');
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toContain('// theirs');
+  });
+
+  /* A line the byte budget cut in half was not displayed; counting it would vouch for the half
+   * that never arrived. */
+  it('does not vouch for the line a read stopped in the middle of', async () => {
+    await writeFile(
+      path.join(root, 'workspace', 'app.ts'),
+      ['aaa', 'bbb', 'c'.repeat(500), 'ddd', 'eee'].join('\n')
+    );
+    await look(1, 5, 20);
+    await expect(write(await prepare('ccc', 'xxx'))).rejects.toMatchObject({ status: 428 });
+    await write(await prepare('bbb', 'BBB'));
+  });
+
+  /*
+   * Without the record following the file across its own write, the guard is one edit deep: the
+   * write changes size and modification time, the identity stops matching, and the next patch - the
+   * one aimed at line 300 after the first one tidied line 20 - goes through unexamined.
+   */
+  it('still guards the second edit of a turn, after its own write moved the file', async () => {
+    await look(1, 50);
+    await write(await prepare('line 20', 'line 20 // touched'));
+    await expect(write(await prepare('line 300', 'line 300 // blind'))).rejects.toMatchObject({
+      status: 428
+    });
+  });
+
+  /*
+   * The file browser reads whole files and writes them back and never reads a window. It must be
+   * exactly as unguarded as it was, or the owner's second save is refused for lines the first did
+   * not touch - and `file_read` without a window is the same request on the wire, so neither can
+   * be treated as a display.
+   */
+  it('has no opinion at all about a file no window read has shown', async () => {
+    await write(await prepare('line 300', 'line 300 // from the file browser'));
+    await write(await prepare('line 7', 'line 7 // and again'));
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toContain('and again');
+  });
+
+  /*
+   * A caller with no hash to offer is not editing from a read. The owner pressing Replace on a file
+   * the pane once paged through, an upload landing on a name, a printed document: none of them
+   * claimed to have read anything, and refusing them for lines they never pretended to have seen
+   * would put a lecture about anchors in front of a person who has no idea what one is.
+   */
+  it('has nothing to say to a writer that never claimed to have read the file', async () => {
+    await look(1, 50);
+    await writeWorkspaceFile(root, file, Buffer.from('replaced wholesale\n'), 10_000_000);
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toBe(
+      'replaced wholesale\n'
+    );
+  });
+
+  /* Lines are not what binary is made of, so there are no anchors in it to have seen. */
+  it('has nothing to say about binary content', async () => {
+    const binary = Buffer.concat([Buffer.from('PDF'), Buffer.from([0]), Buffer.alloc(64, 7)]);
+    await writeFile(path.join(root, 'workspace', 'app.ts'), binary);
+    await look(1, 5);
+    const read = await readWorkspaceFile(root, file, 10_000_000);
+    await writeWorkspaceFile(
+      root,
+      file,
+      Buffer.concat([binary, Buffer.from([0, 9, 9])]),
+      10_000_000,
+      read.sha256
+    );
+  });
+
+  /*
+   * Past a glance, inlining the truth is the wrong answer: dribbling a screenful per round trip
+   * costs the owner more than the read would have. The refusal names the range instead, and
+   * discloses nothing - so it does not quietly become a pass on the retry.
+   */
+  it('sends the model to read a range too wide to hand back, and stays refused until it does', async () => {
+    await look(1, 5);
+    const patch = await prepare(lines.slice(99, 200).join('\n'), 'collapsed');
+    await expect(write(patch)).rejects.toThrow('Read it with file_read');
+    await expect(write(patch)).rejects.toMatchObject({ status: 428 });
+    await look(100, 200);
+    await write(await prepare(lines.slice(99, 200).join('\n'), 'collapsed'));
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toContain('collapsed');
   });
 });
