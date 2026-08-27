@@ -1,5 +1,5 @@
 /*
- * The review queue's own four additions, and nothing else.
+ * The review queue's own five additions, and nothing else.
  *
  * Co-located and imported from `MemoryReview.tsx` rather than added to `styles.css`, which is
  * parsed before first paint: this queue is inside a settings page nobody sees until they open it.
@@ -50,6 +50,18 @@
   margin-top: 4px;
   padding-left: 9px;
   border-left: 1px solid var(--line);
+}
+
+/*
+  The rest of a row, once the box has been asked for it.
+
+  Not `.memory-review-excerpt`: that one is clamped to two lines everywhere except inside an open
+  summary, which is exactly where this is not. What it needs from that rule is the one thing that
+  matters for stored text - the newlines the agent wrote are the newlines the owner reads.
+*/
+.memory-review-whole {
+  margin-top: 6px;
+  white-space: pre-wrap;
 }
 
 /* Said only when the server actually cut the text, so it is never a claim about a whole row. */

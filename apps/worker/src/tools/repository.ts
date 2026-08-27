@@ -27,6 +27,58 @@ import { clampNumber } from './numbers.js';
  * root first and answers in terms of it, and `coding_agent` is here rather than with the workspace
  * tools because what it drives is a subscription CLI scoped to that same root.
  */
+
+/**
+ * Where a code search stops being an answer and starts being a wall to read.
+ *
+ * A search result is not evidence, it is a decision: which file do I open next. The measured
+ * finding this pair of numbers implements is that the two are in tension - an iterative search that
+ * returned each match with its surrounding context scored six points *below* one that returned only
+ * `path (N matches)` and a total. More context about each hit made the model worse at choosing
+ * between them, which is the only thing a search result is for.
+ *
+ * It is also the cheapest context saving in the tool surface. `maxResults` defaults to 120 lines
+ * and its ceiling is 500; a ripgrep line is a whole line of source, so 500 of them is tens of
+ * kilobytes against a `RECENT_TOOL_OUTPUT_CHARS` of 24,000 - a large, cache-resident block of
+ * mostly noise, of which the model needed one path.
+ *
+ * Two numbers rather than one because they answer different questions. The line threshold is where
+ * the lines stop being readable; the file ceiling is where the *list of files* stops being a
+ * decision surface too, and no collapsing helps, so the call is refused and the model is told to
+ * narrow it.
+ *
+ * Exported because the catalogue tells the model about both of them and a description that states
+ * a bound the runtime does not apply is the defect this repository has closed twice already - once
+ * where `session_search` advertised fifty results against a retrieval of thirty. Not imported by
+ * `tool-catalogue.ts`, though, which is the shape that answer usually takes: this module reaches
+ * `agent.js`, which reaches `tools.js`, which is the catalogue, so an import the other way closes a
+ * cycle whose evaluation order decides whether `agentTools` reads an initialised constant or throws
+ * on the temporal dead zone - and it would depend on which file the process happened to load first.
+ * The binding is made in `tool-catalogue.test.ts` instead, where importing both costs nothing and
+ * catches the same drift a day earlier.
+ */
+export const CODE_SEARCH_COLLAPSE_LINES = 40;
+export const CODE_SEARCH_FILE_CEILING = 100;
+
+/**
+ * The path each ripgrep line belongs to, and how many lines landed in it.
+ *
+ * Greedy up to the last `path:line:column:` prefix rather than cutting at the first colon: a
+ * filename may legitimately contain one, and `weird:12:file.ts:3:1:text` cut at the first colon
+ * groups real matches under a directory that does not exist. Anchoring on the line-and-column pair
+ * ripgrep is being asked for by `--line-number --column` is the only part of the shape this code
+ * chose itself. A line that does not have it at all is counted under itself, so a format this does
+ * not recognise still produces a total that adds up rather than silently losing rows.
+ */
+const groupByFile = (matches: readonly string[]): Map<string, number> => {
+  const files = new Map<string, number>();
+  for (const line of matches) {
+    const file = /^(.*):\d+:\d+:/.exec(line)?.[1] ?? line;
+    files.set(file, (files.get(file) ?? 0) + 1);
+  }
+  return files;
+};
+
 export async function executeRepositoryTool(
   context: ToolContext,
   call: ModelToolCall
@@ -106,6 +158,59 @@ export async function executeRepositoryTool(
           searchedLiterally = true;
         }
       }
+      const files = groupByFile(matches);
+      /*
+       * The refusal, before any of the three answers below.
+       *
+       * Past a hundred files there is no shape this call can come back in that a model could act
+       * on: the lines are a wall, and the list of files is a wall too. So it is refused rather than
+       * answered, in the one form the model can do something with - the count it hit, and the
+       * levers that make it smaller. A refusal reaches the model as `Tool failed: <message>` and
+       * counts toward `repeatedFailures`, which is the right accounting: a model that sends the
+       * byte-identical too-broad search again has learned nothing from being told, and that is
+       * exactly the loop the repeat detector exists to end.
+       *
+       * Nothing of the model's own is interpolated. `query` is model-supplied and unbounded, and an
+       * error message is owner-facing prose in the journal as well as model-facing text here; the
+       * count and the lever names are this file's own words and say everything the model needs.
+       */
+      if (files.size > CODE_SEARCH_FILE_CEILING)
+        throw new AthanorError(
+          'code_search_too_broad',
+          `${files.size} files match, past the ${CODE_SEARCH_FILE_CEILING} this tool will list - please narrow your search: give path or glob, set wholeWord, or search for a longer string.`
+        );
+      /*
+       * Collapse when there is a file to choose, and not otherwise.
+       *
+       * `files.size > 1` is what makes the narrowing terminate, and it is the whole reason the
+       * condition is not simply a line count. Without it, a model told "pick a file and narrow to
+       * it" narrows to that file, gets 300 lines in it, and is collapsed again to the single row it
+       * already had - a loop with no exit inside this tool. With it, narrowing to one file always
+       * returns lines, so the advice the description gives is advice that can be taken.
+       *
+       * It is also the honest reading of the finding: a result in one file poses no choice, so
+       * there is no choosing for the extra context to degrade. `summary` stays available for the
+       * model that wants the surface anyway, and means what it says rather than doubling as the
+       * off switch for this collapse - a schema bound that is not the bound the runtime applies is
+       * the defect this file has been through twice already.
+       */
+      if (
+        call.arguments.summary === true ||
+        (files.size > 1 && matches.length > CODE_SEARCH_COLLAPSE_LINES)
+      )
+        return {
+          query,
+          path,
+          literal: searchedLiterally,
+          summarised: true,
+          files: [...files]
+            .sort(([leftPath, left], [rightPath, right]) =>
+              right === left ? leftPath.localeCompare(rightPath) : right - left
+            )
+            .map(([file, count]) => ({ path: file, matches: count })),
+          totalFiles: files.size,
+          totalMatches: matches.length
+        };
       return {
         query,
         path,

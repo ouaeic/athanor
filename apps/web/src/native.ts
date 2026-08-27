@@ -132,6 +132,57 @@ export const ringsNatively = (input: {
   return input.kind === 'approvalRequired' && settings.quietHoursAllowApprovals;
 };
 
+/** The one click every "hand this file over" path ends in, so the five of them cannot drift. */
+const clickAnchor = (name: string, href: string): void => {
+  const anchor = document.createElement('a');
+  anchor.href = href;
+  anchor.download = name;
+  anchor.rel = 'noopener';
+  anchor.click();
+};
+
+/**
+ * Has a shell told us there is nowhere to put a file — asking it now if nobody has yet?
+ *
+ * `save` below reads `lastCapabilities` without waiting, and for App.tsx that is right: the
+ * conversation menu is behind a running session and App probed on mount, so the answer is in hand
+ * long before the press. It is wrong for the screen that matters most. The recovery code is handed
+ * over by `Auth.tsx`, which is what the owner sees *instead of* the app shell — nothing has probed
+ * yet, `lastCapabilities` is `undefined`, and the guard whose whole purpose is to stop a silent
+ * no-op waves the click straight through into one. So the async callers ask first. It costs one
+ * IPC round trip on the first press of a packaged client and nothing at all afterwards, because
+ * `capabilities()` caches into the same variable.
+ *
+ * A browser reaches `core()` as undefined and is never blocked: this has always been an ordinary
+ * anchor click there and still is.
+ */
+const downloadsRefused = async (): Promise<boolean> => {
+  if (!core()) return false;
+  if (!lastCapabilities) await nativeBridge.capabilities();
+  return lastCapabilities?.downloads === false;
+};
+
+/**
+ * The one sentence every refused download says, so that five screens cannot each invent their own.
+ *
+ * Callers append the way out that is true of their own screen — copy the code, use a browser — and
+ * that second half is the part worth writing per site. This half is the fact: the shell registered
+ * no download handler, and no amount of pressing will change that.
+ */
+export const DOWNLOAD_UNAVAILABLE = 'This app cannot save files on this device.';
+
+/**
+ * What the two recovery-code screens say when the file cannot be written.
+ *
+ * Shared between `Auth.tsx` and `SelfHostedSettings.tsx` deliberately: they are the same fact about
+ * the same string, the string is shown exactly once, and it cannot be produced again from anywhere.
+ * Two copies of this sentence would be two chances for one of them to stop naming the way out.
+ */
+export const DOWNLOAD_UNAVAILABLE_RECOVERY_CODE = `${DOWNLOAD_UNAVAILABLE} Copy the code above and keep it somewhere safe — it is not shown again.`;
+
+/** A file the box will serve again if asked, so the way out is the browser rather than the clock. */
+export const DOWNLOAD_UNAVAILABLE_FILE = `${DOWNLOAD_UNAVAILABLE} Open athanor in a browser to download it.`;
+
 export const nativeBridge = {
   available: () => Boolean(core()),
   capabilities: async (): Promise<NativeCapabilities> => {
@@ -168,12 +219,39 @@ export const nativeBridge = {
   save: (name: string, blob: Blob): boolean => {
     if (core() && lastCapabilities?.downloads === false) return false;
     const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = name;
-    anchor.rel = 'noopener';
-    anchor.click();
+    clickAnchor(name, url);
     URL.revokeObjectURL(url);
+    return true;
+  },
+  /**
+   * `save`, having asked the shell first rather than assuming nobody has said no.
+   *
+   * The four remaining blob downloads are on screens that can be reached before `App.tsx` has ever
+   * mounted — the recovery code at first sign-in is the whole reason this exists — so the cached
+   * answer `save` reads may not have been fetched yet. On a packaged client that has never been
+   * asked, `save` would return `true`, click an anchor WKWebView and WebKitGTK ignore, and leave
+   * the caller reporting success for a file that was never written. For the recovery code that is
+   * the one mistake in this product with nothing behind it: the string is shown once and cannot be
+   * produced again.
+   */
+  saveFile: async (name: string, blob: Blob): Promise<boolean> => {
+    if (await downloadsRefused()) return false;
+    const url = URL.createObjectURL(blob);
+    clickAnchor(name, url);
+    URL.revokeObjectURL(url);
+    return true;
+  },
+  /**
+   * The same promise for a file the box will serve from a URL rather than one already in the page.
+   *
+   * The artifact card and the sent-attachment strip point an `<a download>` at a route on this
+   * origin; there is no blob to hand to `saveFile` and fetching one only to hand it back would
+   * download every artifact twice. What they need is the same question answered — is there
+   * anywhere for this to land — and the same anchor click when the answer is yes.
+   */
+  saveFromUrl: async (name: string, href: string): Promise<boolean> => {
+    if (await downloadsRefused()) return false;
+    clickAnchor(name, href);
     return true;
   },
   /**

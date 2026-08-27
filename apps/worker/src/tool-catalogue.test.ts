@@ -25,6 +25,7 @@ import { MAX_NOTICES_PER_TURN } from './agent.js';
 import { COMPACT_CONTEXT_TOOL } from './context.js';
 import { MEMORY_SESSION_SEARCH_MAX_RESULTS } from './memory-runtime.js';
 import { managedMediaCatalog, resolvedMediaModel } from './media.js';
+import { CODE_SEARCH_COLLAPSE_LINES, CODE_SEARCH_FILE_CEILING } from './tools/repository.js';
 
 /** A stored media route, as the API seals one into the credential this worker decrypts. */
 const mediaOption = (
@@ -163,6 +164,27 @@ describe('the size of the catalogue the model is sent', () => {
     // sentence, which also promised page links the runner has never returned, and
     // desktop_observe's. 237 bytes freed, 173 spent, measured at 55,873. The ceiling did not move
     // because no capability was added; a description that grows back still fails here.
+    //
+    // It held again for `code_search`'s summarised mode, and this one is worth recording because it
+    // is the first entry to pay for a capability entirely out of its own duplication. Two nested
+    // descriptions went - `literal`'s and `wholeWord`'s - which between them said the same two
+    // things the tool's own sentence already said, once where the model chooses the tool and again
+    // where it fills the field, and were charged for twice. What arrived in their place is the
+    // `summary` field and two sentences of return shape: that a result spanning several files
+    // collapses to one row per file with a count, and that a result past a hundred files is refused
+    // outright. Both are discovery-test facts - a model cannot learn either without spending a
+    // billed call to find out - and both are what the ablation behind the change is about: search
+    // that returned each match with its surrounding context scored six points below search that
+    // returned only `path (N matches)`. 284 bytes freed, 247 spent, measured at 55,813. Down 37,
+    // and the ceiling stays where it was.
+    //
+    // Priced against the same headroom and declined: #36's `wait_for_previous`, a per-tool boolean
+    // letting the model declare which of its calls may overlap. Measured at +2,170 bytes bare and
+    // +6,926 with a sentence explaining it, against 287 of headroom - but the byte count is the
+    // second reason. athanor does not batch on a guess about intent: `PARALLEL_SAFE_TOOLS` in
+    // turn-bounds.ts is a three-part safety property, and its third part is that the approval
+    // floor's verdict cannot move while the run is in flight. A model declaration would be inert
+    // for every tool already in that set and a floor bypass for every tool outside it.
     expect(bytes).toBeLessThan(56_100);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
@@ -272,6 +294,48 @@ describe('the catalogue as the model reads it', () => {
     // additionalProperties false the model could not have sent it if it had tried.
     expect(recall.additionalProperties).toBe(false);
     expect(recall.properties).not.toHaveProperty('budgetTokens');
+  });
+
+  it('states code_search’s two thresholds as the numbers the arm actually applies', () => {
+    /*
+     * The same defect class as the two above, in the one place it could not be closed the same way.
+     *
+     * `session_search` and `memory_recall` interpolate their bounds out of the modules that enforce
+     * them, so the catalogue and the runtime cannot drift. `code_search` cannot: `tools/repository.ts`
+     * imports `agent.js`, `agent.js` imports `tools.js`, and `tools.js` is this catalogue - so an
+     * import from here into the arm closes a cycle, and whether `agentTools` reads an initialised
+     * constant or throws on the temporal dead zone would come down to which module the process
+     * loaded first. A test importing both has no such ordering: nothing here is evaluated while
+     * either module is still initialising.
+     *
+     * So the drift is caught here instead. The description is the only place a model can learn what
+     * this tool refuses before it spends a call finding out, and a stated refusal that fires at a
+     * different number than the stated one is worse than no sentence at all.
+     */
+    const description = agentTools.find((tool) => tool.name === 'code_search')?.description ?? '';
+    expect(description).toContain(`Past ${CODE_SEARCH_FILE_CEILING} matching files`);
+    /*
+     * The collapse threshold is stated as "a few dozen" rather than as a figure, on purpose: it is
+     * a harness bound the model has no reason to tune against, and a model that knows the exact
+     * line it will not be collapsed under has been handed an incentive to sit just below it.
+     * Vague prose still has to be true, though, which is all this asserts - a threshold moved to
+     * two hundred makes the sentence a lie, and this is where that is noticed.
+     */
+    expect(description).toContain('more than a few dozen lines');
+    expect(CODE_SEARCH_COLLAPSE_LINES).toBeGreaterThanOrEqual(24);
+    expect(CODE_SEARCH_COLLAPSE_LINES).toBeLessThan(60);
+    /*
+     * And the field is declared as what it adds, never as what it turns off. A wide result collapses
+     * whether `summary` is set or not, so a description promising it as a switch would be the
+     * `session_search` defect again in a boolean: a bound the model believes it set.
+     */
+    const summary = (
+      agentTools.find((tool) => tool.name === 'code_search')?.parameters as {
+        properties: Record<string, { description?: string }>;
+      }
+    ).properties.summary;
+    expect(summary?.description).toMatch(/^Return the per-file rows even for/);
+    expect(String(summary?.description)).not.toMatch(/instead of|rather than|turn off|disable/i);
   });
 
   it('names nothing in a description that the schemas do not declare', () => {

@@ -46,6 +46,7 @@ import {
 } from './probes.js';
 import {
   activePlanBlock,
+  correctionAt,
   isPlanStep,
   preambleFor,
   stepAt,
@@ -209,6 +210,10 @@ export const measure = async (
   const atAsk = new Map<string, { reading: ProbeReading; window: ModelMessage[] }>();
 
   for (let step = 0; step < trajectory.steps; step += 1) {
+    // The owner interrupting, ahead of this step's tail blocks so those stay last - which is where
+    // the detail boundary is counted from and the reason their order matters here at all.
+    const correction = correctionAt(step);
+    if (correction) messages.push(correction);
     // The plan block first, then the runtime block, which is the order agent.ts:9793-9799 pushes
     // them in. A plan step therefore puts the newest assistant one position further from the tail
     // than an ordinary step does, and the detail boundary is counted from the tail.

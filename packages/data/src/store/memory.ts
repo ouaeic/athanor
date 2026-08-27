@@ -10,7 +10,8 @@ import {
   MEMORY_PROCEDURE_STALE_DAYS,
   isFunctionalMemoryPredicate,
   isMemoryToken,
-  memoryPredicate
+  memoryPredicate,
+  resolveMemoryContradiction
 } from '@athanor/core';
 import type {
   EncryptedEnvelope,
@@ -160,6 +161,22 @@ export type MemoryLinkRelation =
   | 'about'
   | 'part_of';
 
+/**
+ * Two active facts about one subject that the store cannot tell apart on its own.
+ *
+ * Produced by `listMemoryContradictionCandidates` and consumed by the resolution policy in
+ * `@athanor/core`, which is deterministic *given a verdict* - so this carries everything the
+ * policy needs (trust and observation time) plus the sealed documents, because the only thing that
+ * can supply the verdict is something holding the key.
+ */
+export interface MemoryContradictionPair {
+  readonly predicate: string;
+  /** True when the registry says this predicate has one value, which settles the verdict by itself. */
+  readonly functional: boolean;
+  readonly left: MemoryItemRecord;
+  readonly right: MemoryItemRecord;
+}
+
 export interface MemoryFactCandidateRecord {
   workspaceId: string;
   subjectKey: string;
@@ -274,6 +291,14 @@ export interface MemoryConsolidationReport {
   staleProcedureIds: string[];
   /** True when this pass also did the periodic full rebuild of the BM25 corpus statistics. */
   corpusStatsRebuilt: boolean;
+  /**
+   * What the contradiction pass did, split by outcome because they mean different things to the
+   * owner: a dispute is a question waiting in the review queue, a supersession is an answer this
+   * pass was entitled to give on its own.
+   */
+  factsDisputed: number;
+  factsSuperseded: number;
+  factsRetracted: number;
 }
 
 /**
@@ -475,8 +500,122 @@ export class MemoryStore {
     return result.rows.map(mapMemorySource);
   }
 
+  /**
+   * How alike two entries have to be before the second one is not written.
+   *
+   * Measured over the *keyed body lexemes*, which is a set of stemmed content words with the stop
+   * words already removed by the same tokenizer the index uses - so 0.9 is nine tenths of the
+   * substantive words in common, not nine tenths of the English. Two genuinely different facts
+   * about one subject do not reach it; two paraphrases of one preference do, which is exactly the
+   * pair §4.7 #112 names. Deliberately blunt: no entropy gate, no model call, and nothing that
+   * needs pg_trgm - the cheapest tier that changes the outcome, run on the one path that had no
+   * duplicate suppression at all.
+   */
+  static readonly nearDuplicateJaccard = 0.9;
+
+  /**
+   * The fewest distinct body lexemes an entry must have before similarity means anything.
+   *
+   * Under this, Jaccard is measuring a coincidence. "Ships on Friday" and "Ships on Monday" share
+   * two of three tokens and are opposite facts; the threshold above would refuse the second of
+   * them and lose the correction, which is the worst outcome this whole mechanism can produce.
+   * Short entries are written, and the pack's own exact `dedupe_key` collapse still catches the
+   * case where they are identical.
+   */
+  static readonly nearDuplicateMinTokens = 8;
+
+  /**
+   * How many recent siblings one write compares itself against.
+   *
+   * A bound, not a sample: `mem_item_kind_idx` is `(workspace_id, kind, observed_at DESC) WHERE
+   * status='active'`, so this reads a fixed prefix of one index whatever the workspace has
+   * accumulated. Unbounded, a write into a corpus of twenty thousand procedures would compute
+   * twenty thousand set intersections on the finishing path of a turn the owner is waiting on -
+   * and a duplicate that has to travel past two hundred more recent entries of the same kind and
+   * subject to find its twin is not the case this exists for.
+   */
+  static readonly nearDuplicateScan = 200;
+
+  /**
+   * Writes an entry, unless this workspace already remembers it.
+   *
+   * The tiered store had no duplicate suppression on the write path at all: two paraphrases of one
+   * preference produced two rows, two slots in the recall budget and two lines in the block at the
+   * top of every later window, and the only collapse anywhere was `DISTINCT ON (dedupe_key)` at
+   * recall time, which needs the bytes to be identical. So the corpus grew a copy per turn of
+   * everything the agent kept rediscovering, and the pack spent its budget saying one thing twice.
+   *
+   * Facts written through `recordMemoryFact` deliberately do not come this way: a second current
+   * value of a functional predicate is a *correction*, and it is already resolved there,
+   * bitemporally and with a `supersedes` link. Collapsing it into the row it corrects would delete
+   * the correction. Episodes are exempt for the opposite reason - they are the audit trail, one
+   * per turn, and two similar turns really did both happen.
+   *
+   * The existing row is returned rather than a null, so a caller cannot tell a suppressed write
+   * from a fresh one and cannot end up holding an id that is not in the table.
+   */
   async createMemoryItem(input: CreateMemoryItemInput): Promise<MemoryItemRecord> {
+    const existing = await this.#nearDuplicateMemoryItem(input);
+    if (existing) return existing;
     return this.#insertMemoryItem(this.database, input);
+  }
+
+  async #nearDuplicateMemoryItem(input: CreateMemoryItemInput): Promise<MemoryItemRecord | null> {
+    if (input.kind === 'episode' || input.status === 'retracted') return null;
+    // An unindexed body carries no tokens to compare, which is the point of the flag: whatever
+    // defeated the tokenizer would defeat this too, and a similarity of nothing to nothing is 1.
+    if (!input.index.indexed) return null;
+    const tokens = [...new Set(input.index.bodyTokens.split(' ').filter(Boolean))];
+    // The same floor the query applies to the stored side, applied here to save the round trip.
+    // It is deliberately not a second guard: with both sides tested in SQL this early return can
+    // only ever refuse work the query would have refused anyway, and writing it down as belt and
+    // braces would be the sort of duplicated policy this repository has twice paid for.
+    if (tokens.length < MemoryStore.nearDuplicateMinTokens) return null;
+    const result = await this.database.query(
+      // The first CTE is a fixed prefix of `mem_item_kind_idx` and nothing else, deliberately:
+      // moving the subject or validity filter above the LIMIT would make Postgres scan until it
+      // had found two hundred *matching* rows, which on a corpus where nothing matches is the
+      // whole table on every write - the unbounded scan this bound exists to prevent, wearing the
+      // bound's clothes.
+      `WITH recent AS (
+         SELECT i.* FROM mem.item i
+         WHERE i.workspace_id=$1 AND i.kind=$2::mem.kind AND i.status='active'
+         ORDER BY i.observed_at DESC, i.id
+         LIMIT $5::int
+       ),
+       siblings AS (
+         SELECT * FROM recent
+         WHERE valid_to IS NULL AND subject_key IS NOT DISTINCT FROM $3::text
+       )
+       SELECT r.* FROM siblings r
+       CROSS JOIN LATERAL (
+         SELECT ARRAY(
+           SELECT DISTINCT token FROM unnest(string_to_array(r.body_tokens,' ')) AS token
+           WHERE token <> ''
+         ) AS lexemes
+       ) mine
+       CROSS JOIN LATERAL (
+         SELECT cardinality(
+           ARRAY(SELECT unnest(mine.lexemes) INTERSECT SELECT unnest($4::text[]))
+         ) AS shared
+       ) overlap
+       WHERE cardinality(mine.lexemes) >= $6::int
+         AND overlap.shared::float8 / NULLIF(
+               cardinality(mine.lexemes) + cardinality($4::text[]) - overlap.shared, 0
+             ) >= $7::float8
+       ORDER BY r.observed_at DESC, r.id
+       LIMIT 1`,
+      [
+        input.workspaceId,
+        input.kind,
+        input.index.subjectKey,
+        tokens,
+        MemoryStore.nearDuplicateScan,
+        MemoryStore.nearDuplicateMinTokens,
+        MemoryStore.nearDuplicateJaccard
+      ]
+    );
+    return result.rows[0] ? mapMemoryItem(result.rows[0]) : null;
   }
 
   async #insertMemoryItem(
@@ -927,6 +1066,107 @@ export class MemoryStore {
             [left, right]
           );
       return result.rowCount;
+    });
+  }
+
+  /**
+   * Candidate pairs for the contradiction pass: two active facts that state different values of one
+   * predicate about one subject, at the same time.
+   *
+   * The reachable case is named in this file already, twelve hundred lines up.
+   * `#backfillPredicateFunctional` explains that when a release narrows a predicate from `many` to
+   * `one`, a subject that legitimately accumulated several current values *keeps them*, stays
+   * outside `mem_fact_current_one`, and waits "until the contradiction is resolved the ordinary way
+   * - by one of them being superseded". Nothing in the product had ever done that, so the wait was
+   * permanent: two current answers to a question the registry says has one, both retrievable, both
+   * ranked into the block at the top of the window, for as long as the workspace existed. That is
+   * the state this reads, and the reason `functional` is asked of `mem.predicate` rather than of
+   * `mem.item.pred_functional` - the flag is precisely what those rows do not have.
+   *
+   * Pairs already joined by a `contradicts`, `supersedes` or `supports` link are excluded: those
+   * have been answered, and re-answering them every night is how a nightly pass becomes a standing
+   * bill. `l.id < r.id` makes each pair appear once, in one orientation.
+   */
+  async listMemoryContradictionCandidates(
+    workspaceId: string,
+    options: { limit?: number; onlyFunctional?: boolean } = {}
+  ): Promise<MemoryContradictionPair[]> {
+    const result = await this.database.query<{
+      left_id: string;
+      right_id: string;
+      predicate: string;
+      functional: boolean;
+    }>(
+      `SELECT l.id AS left_id, r.id AS right_id, l.predicate AS predicate,
+              (p.cardinality = 'one') AS functional
+       FROM mem.item l
+       JOIN mem.item r
+         ON r.workspace_id = l.workspace_id
+        AND r.subject_key = l.subject_key
+        AND r.predicate = l.predicate
+        AND r.kind = 'fact' AND r.status = 'active' AND r.valid_to IS NULL
+        AND r.object_key IS DISTINCT FROM l.object_key
+        AND l.id < r.id
+       JOIN mem.predicate p ON p.name = l.predicate
+       WHERE l.workspace_id = $1 AND l.kind = 'fact' AND l.status = 'active'
+         AND l.valid_to IS NULL AND l.subject_key IS NOT NULL AND l.predicate IS NOT NULL
+         AND (NOT $3::boolean OR p.cardinality = 'one')
+         AND NOT EXISTS (
+           SELECT 1 FROM mem.link k
+           WHERE k.rel IN ('contradicts','supersedes','supports')
+             AND ((k.src_id = l.id AND k.dst_id = r.id) OR (k.src_id = r.id AND k.dst_id = l.id))
+         )
+       ORDER BY l.observed_at DESC, l.id, r.id
+       LIMIT $2::int`,
+      [workspaceId, Math.trunc(options.limit ?? 20), options.onlyFunctional === true]
+    );
+    if (result.rows.length === 0) return [];
+    const items = new Map(
+      (
+        await this.getMemoryItems(
+          workspaceId,
+          result.rows.flatMap((row) => [row.left_id, row.right_id])
+        )
+      ).map((item) => [item.id, item])
+    );
+    return result.rows.flatMap((row) => {
+      const left = items.get(row.left_id);
+      const right = items.get(row.right_id);
+      if (!left || !right) return [];
+      return [{ predicate: row.predicate, functional: row.functional === true, left, right }];
+    });
+  }
+
+  /**
+   * Retires one of two conflicting facts in favour of the other, with the link that says why.
+   *
+   * The same statement `#recordMemoryFact` makes when a functional predicate gets a new current
+   * value, reached from the other direction: there the winner is arriving, here the winner is
+   * already stored and something else has decided between them. One transaction, because a
+   * superseded row with no `supersedes` link is a value that vanished for no recorded reason, and
+   * the link without the status leaves both values live while the graph says one replaced the
+   * other.
+   */
+  async supersedeMemoryItem(input: {
+    workspaceId: string;
+    winnerId: string;
+    loserId: string;
+    at?: Date | string;
+  }): Promise<boolean> {
+    return this.database.transaction(async (transaction) => {
+      const retired = await transaction.query(
+        `UPDATE mem.item SET status='superseded', valid_to=COALESCE(valid_to,COALESCE($3,NOW())),
+                             retired_at=NOW(), updated_at=NOW()
+         WHERE workspace_id=$1 AND id=$2 AND status='active'`,
+        [input.workspaceId, input.loserId, input.at ?? null]
+      );
+      if (retired.rowCount !== 1) return false;
+      await transaction.query(
+        `INSERT INTO mem.link(src_id,dst_id,rel) VALUES ($1,$2,'supersedes')
+         ON CONFLICT DO NOTHING`,
+        [input.winnerId, input.loserId]
+      );
+      return true;
     });
   }
 
@@ -1386,6 +1626,8 @@ export class MemoryStore {
     const corpusStatsRebuilt = drifted.rows[0]?.stale === true;
     if (corpusStatsRebuilt) await this.rebuildMemoryCorpusStats(workspaceId);
 
+    const contradictions = await this.#resolveFunctionalContradictions(workspaceId, now);
+
     const stale = await this.listStaleMemoryProcedures(
       workspaceId,
       options.now ? { now: options.now } : {}
@@ -1398,8 +1640,80 @@ export class MemoryStore {
       candidatesPruned: candidates.rowCount,
       packsPruned: packs.rowCount,
       staleProcedureIds: stale.map((item) => item.id),
-      corpusStatsRebuilt
+      corpusStatsRebuilt,
+      ...contradictions
     };
+  }
+
+  /** How many pairs one pass will settle. Bounded like everything else consolidation does. */
+  static readonly contradictionPassPairs = 20;
+
+  /**
+   * The nightly half of §4.3 that had never been built, reduced to the part that needs no model.
+   *
+   * `resolveMemoryContradiction` in `@athanor/core` is the resolution table - deterministic given a
+   * verdict, so the only thing anyone ever has to supply is the verdict - and it had no production
+   * caller at all: real code, with a real reader, that nothing in the product could reach. The
+   * missing piece was never the table. It was an answer to "do these two disagree", and for one
+   * class of pair the registry has already answered: a predicate declared `cardinality: 'one'` says
+   * two different current values of it about one subject are a contradiction, by definition, with
+   * nothing left to interpret. `#backfillPredicateFunctional` is the place those pairs come from
+   * and its own comment is what promises they will be resolved this way.
+   *
+   * What is still absent, and is not smuggled in here: a verdict over pairs under a `many`
+   * predicate, where "do these disagree" is a question about meaning and wants a model. That pass
+   * would call this same table with a verdict it had bought, which is why the table takes one.
+   *
+   * Runs inside consolidation rather than beside it because consolidation *is* the nightly pass -
+   * once a day per workspace, bounded, keyed off the only timer in the product that knows a
+   * workspace has memory in it - and because a second cadence is a second thing to get wrong.
+   */
+  async #resolveFunctionalContradictions(
+    workspaceId: string,
+    now: Date | string | null
+  ): Promise<{ factsDisputed: number; factsSuperseded: number; factsRetracted: number }> {
+    const pairs = await this.listMemoryContradictionCandidates(workspaceId, {
+      onlyFunctional: true,
+      limit: MemoryStore.contradictionPassPairs
+    });
+    let factsDisputed = 0;
+    let factsSuperseded = 0;
+    let factsRetracted = 0;
+    for (const pair of pairs) {
+      const action = resolveMemoryContradiction(
+        { id: pair.left.id, trust: pair.left.trust, observedAt: pair.left.observedAt },
+        { id: pair.right.id, trust: pair.right.trust, observedAt: pair.right.observedAt },
+        // The registry's own statement about the predicate, not a guess about the sentences. This
+        // is the only verdict reachable without the workspace key, and consolidation runs without
+        // it by design: nothing in this class may need to read what a memory says.
+        'contradict'
+      );
+      if (action.action === 'dispute') {
+        factsDisputed += await this.markMemoryFactsDisputed(workspaceId, action.ids);
+        continue;
+      }
+      if (action.action === 'retract') {
+        if (await this.retractMemoryItem(workspaceId, action.loserId)) factsRetracted += 1;
+        // The link the retraction does not write. Without it the pair is answered in `mem.item` and
+        // unanswered in `mem.link`, and the next pass would offer it again.
+        await this.linkMemoryItems({
+          srcId: action.winnerId,
+          dstId: action.loserId,
+          rel: 'supersedes'
+        });
+        continue;
+      }
+      if (action.action === 'supersede') {
+        const applied = await this.supersedeMemoryItem({
+          workspaceId,
+          winnerId: action.winnerId,
+          loserId: action.loserId,
+          ...(now ? { at: now } : {})
+        });
+        if (applied) factsSuperseded += 1;
+      }
+    }
+    return { factsDisputed, factsSuperseded, factsRetracted };
   }
 
   /**

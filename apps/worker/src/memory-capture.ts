@@ -21,6 +21,7 @@ import type { AgentState } from './agent-state.js';
 import type { CompletionVerification } from './completion.js';
 import {
   extractTurn,
+  finishedAnswerText,
   memoryItemAad,
   recordMemoryPackOutcome,
   recordTurnEpisode,
@@ -121,7 +122,31 @@ export const captureMemory = async (
         store: deps.store,
         workspaceId: task.workspaceId,
         taskId: task.id,
-        outcome: 'ok'
+        outcome: 'ok',
+        // The one place in the product that knows both what was recalled and what was done with
+        // it, which is why the citation is written here and not at injection time.
+        //
+        // `cited_count` is a fifth of the salience score that decides which memories survive
+        // consolidation, and its only writer takes a `cited` flag that no production caller had
+        // ever passed - so the column was zero in every workspace that had ever run and the term
+        // was a constant for every row in the pool. What was missing was never the column: it was
+        // an answer to "which of these entries did the turn use", and the only moment that answer
+        // exists is here, with the finished work in hand.
+        dataKey: key,
+        used: [
+          finishedAnswerText(state.messages),
+          completion.summary,
+          ...completion.verification.evidence.map((item) => item.claim),
+          // The commands the harness itself watched pass. Without them a procedure that was
+          // followed to the letter grades identically to one that was ignored, because nobody
+          // writes a shell command out to the owner in prose.
+          ...(completion.verifiedCommands ?? []).map((check) =>
+            [check.executable, ...check.args].join(' ')
+          )
+        ],
+        // Excluded from attribution rather than added to it: the block was retrieved *with* this
+        // request, so an entry and the request overlap by construction.
+        request
       });
     const now = Date.now();
     if (shouldConsolidateMemory(deps.memoryConsolidatedAt.get(task.workspaceId), now)) {

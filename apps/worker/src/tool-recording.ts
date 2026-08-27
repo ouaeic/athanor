@@ -19,7 +19,12 @@ import type { ModelToolCall } from '@athanor/model-gateway';
 import type { AgentState, AgentWorkerConfig } from './agent-state.js';
 import { callDestinations } from './command-classification.js';
 import { shellObservation } from './completion.js';
-import { serializeToolResultForModel } from './context.js';
+import {
+  boundToolResultText,
+  RECENT_TOOL_OUTPUT_CHARS,
+  toolResultText,
+  type TruncationRecovery
+} from './context.js';
 import {
   chargeNovelty,
   classifyDestination,
@@ -35,6 +40,7 @@ import {
   untrustedOriginOfResult,
   untrustedTurnNotice
 } from './provenance.js';
+import { spillOverflow, spillRecovery } from './output-spill.js';
 import { sanitiseUntrusted, sanitiseUntrustedText, untrustedEnvelope } from './sanitise.js';
 import { boundedToolResultForModel } from './streaming.js';
 import type { BotWall } from './provenance.js';
@@ -538,7 +544,23 @@ export const recordToolResult = async (
    * the serialised form covers both without walking the object a second time. Fenced after
    * truncation, so the closing marker cannot be the thing the 24,000-character cut removes.
    */
-  const serialised = serializeToolResultForModel(modelResult);
+  const full = toolResultText(modelResult);
+  /*
+   * The bytes the window cannot hold, parked where the model can still go and get them.
+   *
+   * Awaited rather than fired off, because the marker is about to name the path: a notice that
+   * races the write it describes is the unperformable recovery again, one step further along.
+   * `spillOverflow` answers null when it could not write, and the marker then says exactly what it
+   * has always said - what is missing, and nothing about where to find it. @see output-spill.ts
+   * for why an untrusted result is parked inside the download quarantine and not beside a trusted
+   * one.
+   */
+  const spilled =
+    full.length > RECENT_TOOL_OUTPUT_CHARS
+      ? await spillOverflow(task, state, full, untrustedOrigin !== null)
+      : null;
+  const recovery: TruncationRecovery | undefined = spilled ? spillRecovery(spilled) : undefined;
+  const serialised = boundToolResultText(full, RECENT_TOOL_OUTPUT_CHARS, recovery);
   const forModel = untrustedOrigin
     ? untrustedEnvelope(untrustedOrigin, sanitiseUntrustedText(serialised))
     : serialised;

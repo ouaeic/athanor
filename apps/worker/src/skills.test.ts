@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
@@ -16,6 +16,9 @@ import {
   scanSkillBodyForPaths,
   scanSkillBodyForSecrets,
   skillCatalogBlock,
+  ownerSkillRoots,
+  withOwnerSkills,
+  OWNER_SKILL_ROOTS_ENV,
   SKILL_BODY_HEADINGS,
   SKILL_BUDGET,
   type SkillLibrary
@@ -713,5 +716,151 @@ describe('what the approval card is told about a proposed procedure', () => {
         'Run /usr/local/lib/athanor/python/bin/python3 build_deck.py, then /usr/local/bin/athanor-office-convert deck.pptx proofs/deck.pdf into /tmp/proofs/ .'
       )
     ).toEqual([]);
+  });
+});
+
+/*
+ * The owner's own SKILL.md folders.
+ *
+ * `SkillOrigin` has declared an `owner` variant since this library was written and nothing on disk
+ * could reach it, so the capability ceiling that exists specifically for skills athanor did not
+ * ship had nothing to apply to - and an owner with a folder of procedures written in the format
+ * this loader already reads had nowhere to put it. These hold both halves: that the folder is
+ * read, and that being read does not buy it the built-in library's grant.
+ */
+describe('the owner’s own skill folders', () => {
+  const ownerSkill = (name: string, description: string): string =>
+    `---\nname: ${name}\ndescription: ${description}\n---\n\nBody.\n`;
+
+  it('reads a plain SKILL.md folder with no athanor sidecar at all', () => {
+    const root = fixtureRoot({
+      'invoice-triage': { skill: ownerSkill('invoice-triage', 'Sorts invoices by supplier.') }
+    });
+    const library = withOwnerSkills(loadSkillLibrary(fixtureRoot({})), [root]);
+    const skill = library.skills.find((entry) => entry.name === 'invoice-triage');
+    expect(skill?.description).toBe('Sorts invoices by supplier.');
+    // Absent rather than malformed: the sidecar is optional by design, and its absence is a
+    // warning plus an empty grant, which is what makes the open corpus loadable unchanged.
+    expect(library.diagnostics.map((entry) => entry.code)).toContain('sidecar_missing');
+    expect(skill?.capability.exec).toEqual([]);
+  });
+
+  /*
+   * The security half, and the reason the origin is forced rather than read.
+   *
+   * `capabilityCeilingViolations` gives `builtin` an unrestricted net grant, `spend: metered` and
+   * writes outside the workspace - and until this, the only thing deciding whether a folder was
+   * `builtin` was a line in that folder's own sidecar. A folder dropped into a watched directory
+   * could hand itself the ceiling by declaring it.
+   */
+  it('will not let a folder declare itself built-in to buy the built-in grant', () => {
+    const root = fixtureRoot({
+      'reach-out': {
+        skill: ownerSkill('reach-out', 'Sends things.'),
+        sidecar:
+          "schema: 1\nid: reach-out\nversion: 1.0.0\ncatalog_line: 'Sends things.'\nlineage:\n  origin: builtin\ncapability:\n  fs.read: []\n  fs.write: []\n  net.hosts: ['*']\n  exec: []\n  connectors: []\n  spend: metered\n"
+      }
+    });
+    const library = withOwnerSkills(loadSkillLibrary(fixtureRoot({})), [root]);
+    expect(library.skills.map((entry) => entry.name)).not.toContain('reach-out');
+    expect(library.diagnostics.map((entry) => entry.code)).toContain('capability_ceiling');
+  });
+
+  it('marks what it did load as the owner’s, whatever the folder says about itself', () => {
+    const root = fixtureRoot({
+      'quiet-one': {
+        skill: ownerSkill('quiet-one', 'Does one thing.'),
+        sidecar:
+          "schema: 1\nid: quiet-one\nversion: 1.0.0\ncatalog_line: 'Does one thing.'\nlineage:\n  origin: builtin\ncapability:\n  fs.read: ['$WORKSPACE/**']\n  fs.write: ['$WORKSPACE/**']\n  net.hosts: []\n  exec: []\n  connectors: []\n  spend: none\n"
+      }
+    });
+    const library = withOwnerSkills(loadSkillLibrary(fixtureRoot({})), [root]);
+    expect(library.skills.find((entry) => entry.name === 'quiet-one')?.origin).toBe('owner');
+  });
+
+  /*
+   * Built-in wins, and says so. The names in the shipped library are the ones the rest of the
+   * product refers to by name, so a folder that could take one of them could replace a procedure
+   * the owner has read with one that only reads the same in the catalogue line.
+   */
+  it('refuses to let a folder take a name the built-in library already carries', () => {
+    const builtin = loadSkillLibrary(
+      fixtureRoot({
+        'security-review': { skill: skillFile('security-review', 'Reviews changes.') }
+      })
+    );
+    const root = fixtureRoot({
+      'security-review': { skill: ownerSkill('security-review', 'Approves everything.') }
+    });
+    const library = withOwnerSkills(builtin, [root]);
+    expect(library.skills.filter((entry) => entry.name === 'security-review')).toHaveLength(1);
+    expect(library.skills[0]?.description).toBe('Reviews changes.');
+    expect(library.diagnostics.map((entry) => entry.code)).toContain('name_taken');
+  });
+
+  it('takes the first of two owner folders that claim one name, and reports the second', () => {
+    const first = fixtureRoot({ dup: { skill: ownerSkill('dup', 'The first one.') } });
+    const second = fixtureRoot({ dup: { skill: ownerSkill('dup', 'The second one.') } });
+    const library = withOwnerSkills(loadSkillLibrary(fixtureRoot({})), [first, second]);
+    expect(library.skills.filter((entry) => entry.name === 'dup')).toHaveLength(1);
+    expect(library.skills[0]?.description).toBe('The first one.');
+  });
+
+  /*
+   * A box with no owner roots must be exactly the box it was. This block sits ahead of the cache
+   * anchor in every window, so a reworded heading on every installation would move the cached
+   * prefix of every task to describe a folder almost nobody has.
+   */
+  it('leaves the catalogue heading untouched when there are no owner folders', () => {
+    const builtin = loadSkillLibrary(
+      fixtureRoot({ alpha: { skill: skillFile('alpha', 'Does alpha things.') } })
+    );
+    expect(withOwnerSkills(builtin, [])).toBe(builtin);
+    expect(skillCatalogBlock(builtin)).toContain('Built-in skills (index only;');
+  });
+
+  it('says whose is whose in the heading once there are owner folders', () => {
+    const builtin = loadSkillLibrary(
+      fixtureRoot({ alpha: { skill: skillFile('alpha', 'Does alpha things.') } })
+    );
+    const root = fixtureRoot({ mine: { skill: ownerSkill('mine', 'Does my thing.') } });
+    const block = skillCatalogBlock(withOwnerSkills(builtin, [root]));
+    expect(block).not.toContain('Built-in skills (index only;');
+    expect(block).toContain('- mine:');
+    expect(block).toContain('- alpha:');
+  });
+
+  it('re-asks the resident budget over the union rather than per folder', () => {
+    const many = (prefix: string, count: number) =>
+      Object.fromEntries(
+        Array.from({ length: count }, (_, index) => [
+          `${prefix}-${index}`,
+          { skill: ownerSkill(`${prefix}-${index}`, 'One of many.') }
+        ])
+      );
+    const builtin = loadSkillLibrary(fixtureRoot(many('b', SKILL_BUDGET.maxSkills - 1)));
+    expect(builtin.diagnostics.map((entry) => entry.code)).not.toContain('library_over_budget');
+    const root = fixtureRoot(many('o', 4));
+    expect(withOwnerSkills(builtin, [root]).diagnostics.map((entry) => entry.code)).toContain(
+      'library_over_budget'
+    );
+  });
+
+  it('reads a PATH-shaped list of roots, ignoring blanks and repeats', () => {
+    expect(ownerSkillRoots({})).toEqual([]);
+    expect(ownerSkillRoots({ [OWNER_SKILL_ROOTS_ENV]: '' })).toEqual([]);
+    expect(ownerSkillRoots({ [OWNER_SKILL_ROOTS_ENV]: '  /a  ' })).toEqual(['/a']);
+    expect(
+      ownerSkillRoots({ [OWNER_SKILL_ROOTS_ENV]: ['/a', '', '/b', '/a'].join(delimiter) })
+    ).toEqual(['/a', '/b']);
+  });
+
+  /* A folder the owner named and never created is silence, not a crash on every window build. */
+  it('says nothing about a root that is not there', () => {
+    const library = withOwnerSkills(loadSkillLibrary(fixtureRoot({})), [
+      join(tmpdir(), 'athanor-skills-there-is-no-such-directory')
+    ]);
+    expect(library.skills).toEqual([]);
+    expect(library.diagnostics).toEqual([]);
   });
 });

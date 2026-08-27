@@ -101,7 +101,11 @@ import { backupLine, type BackupStatus } from './backup-evidence.js';
 import { UsagePane } from './UsagePane.js';
 import { relayAddress, relayHostProblem, relayQuotaNote, relayStatusLine } from './relay-state.js';
 import { ApiFailure } from './api-failure.js';
-import { nativeBridge } from './native.js';
+import {
+  DOWNLOAD_UNAVAILABLE_FILE,
+  DOWNLOAD_UNAVAILABLE_RECOVERY_CODE,
+  nativeBridge
+} from './native.js';
 import {
   nativeNotificationsEnabled,
   setNativeNotificationsEnabled
@@ -853,6 +857,14 @@ export function SelfHostedSettings({
     notificationSettingsDraft(defaultNotificationSettings())
   );
   const [reissuedRecoveryCode, setReissuedRecoveryCode] = useState('');
+  /**
+   * Said inside the recovery card rather than in the page banner far above it.
+   *
+   * The banner is under the nav at the top of a settings page that scrolls; the code is halfway
+   * down it. A message about a string that is displayed once, and that the owner is about to
+   * dismiss with "I have saved it", has to be beside the button that failed.
+   */
+  const [recoveryCodeSaveError, setRecoveryCodeSaveError] = useState('');
   const [enrollment, setEnrollment] = useState<{
     id: string;
     expiresAt: string;
@@ -1192,18 +1204,24 @@ export function SelfHostedSettings({
       setNotice(securityModeNotice(saved.securityMode, 'workspace'));
     });
 
+  /*
+   * The whole of what the box holds about its owner, and it went nowhere on a packaged client.
+   *
+   * A step-up passkey ceremony, a round trip that assembles every row, and then an anchor click
+   * WKWebView and WebKitGTK discard without a word — so the owner authenticated, waited, and was
+   * shown nothing at all. `act` clears the error before running this, so setting one here survives:
+   * a failure that only this operation can name is worth more than the generic sentence a throw
+   * would land in.
+   */
   const exportData = () =>
     act(async () => {
       await api.stepUp();
       const data = await api.privacyExport();
-      const href = URL.createObjectURL(
+      const written = await nativeBridge.saveFile(
+        `athanor-export-${new Date().toISOString().slice(0, 10)}.json`,
         new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
       );
-      const anchor = document.createElement('a');
-      anchor.href = href;
-      anchor.download = `athanor-export-${new Date().toISOString().slice(0, 10)}.json`;
-      anchor.click();
-      URL.revokeObjectURL(href);
+      if (!written) setError(DOWNLOAD_UNAVAILABLE_FILE);
     });
 
   const webSearch = webSearchSummary(provider?.webSearch);
@@ -2311,16 +2329,23 @@ export function SelfHostedSettings({
             <span>Shown once. The previous code no longer works.</span>
             <div className="enrollment-actions">
               <CopyButton value={reissuedRecoveryCode} label="Copy code" />
+              {/*
+                The same repair as the first-sign-in screen, on the same string, through the same
+                bridge and saying the same sentence — and it matters more here, because pressing
+                "Issue a new recovery code" has already retired whatever the owner had written down.
+                A raw anchor on a packaged client discards the click without a word, and the next
+                control along is "I have saved it".
+              */}
               <button
                 className="secondary"
                 onClick={() => {
+                  setRecoveryCodeSaveError('');
                   const file = recoveryFile(reissuedRecoveryCode);
-                  const href = URL.createObjectURL(new Blob([file.text], { type: file.type }));
-                  const anchor = document.createElement('a');
-                  anchor.href = href;
-                  anchor.download = file.name;
-                  anchor.click();
-                  URL.revokeObjectURL(href);
+                  void nativeBridge
+                    .saveFile(file.name, new Blob([file.text], { type: file.type }))
+                    .then((written) => {
+                      if (!written) setRecoveryCodeSaveError(DOWNLOAD_UNAVAILABLE_RECOVERY_CODE);
+                    });
                 }}
               >
                 <Download /> Download
@@ -2329,6 +2354,11 @@ export function SelfHostedSettings({
                 <Check /> I have saved it
               </button>
             </div>
+            {recoveryCodeSaveError ? (
+              <div className="form-error" role="alert">
+                {recoveryCodeSaveError}
+              </div>
+            ) : null}
           </div>
         ) : (
           <button
@@ -3176,8 +3206,24 @@ export function SelfHostedSettings({
             void act(async () => {
               if (!workspace) return;
               await api.stepUp();
-              api.downloadWorkspaceExport(workspace.id);
-              setNotice('The archive is downloading. It contains working files and results.');
+              /*
+               * A sixth raw anchor, found while closing the five the wave-9 gate listed:
+               * `api.downloadWorkspaceExport` builds one and returns void, and the line under it
+               * then asserts "The archive is downloading" — which on a packaged client is a
+               * sentence about something that did not happen. Handed to the same URL through the
+               * same bridge instead, so the notice is only written when the shell took the file.
+               * Still an anchor on a URL rather than a buffered blob, deliberately: a workspace
+               * archive is arbitrarily large and the response carries its own content-disposition,
+               * which is the reason the api.ts method gave for not fetching it into the tab.
+               */
+              if (
+                await nativeBridge.saveFromUrl(
+                  `athanor-workspace-${workspace.id}.tar.gz`,
+                  `/v1/workspaces/${workspace.id}/export`
+                )
+              )
+                setNotice('The archive is downloading. It contains working files and results.');
+              else setError(DOWNLOAD_UNAVAILABLE_FILE);
             })
           }
         >

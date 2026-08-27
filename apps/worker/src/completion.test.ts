@@ -4,7 +4,9 @@ import {
   citableEvidence,
   completionVerification,
   evidenceFloor,
-  startTurnState
+  parseDelegateReport,
+  startTurnState,
+  validateDelegateReport
 } from './completion.js';
 import { MAX_FINISH_REJECTIONS, MAX_QUESTIONS_PER_TURN } from './turn-bounds.js';
 
@@ -645,5 +647,173 @@ describe('what a long task remembers of its early work', () => {
       reservationKey: 'r'
     });
     expect(next.carriedArtifacts).toEqual([]);
+  });
+});
+
+describe('what the user can see, and what merely says so', () => {
+  const state = (
+    results: Record<string, { name: string; success: boolean; skipped?: boolean }>
+  ) => ({
+    messages: [],
+    step: 0,
+    credits: 0,
+    turnToolResults: results
+  });
+
+  it('refuses a user-visible claim pinned to a call athanor answered without running', () => {
+    const checked = completionVerification(
+      state({
+        'call-1': { name: 'file_write', success: true },
+        'call-2': { name: 'publish_artifact', success: false, skipped: true }
+      }),
+      {
+        status: 'verified',
+        evidence: [
+          { claim: 'Wrote it', source: 'tool_result', toolCallId: 'call-1' },
+          { claim: 'The page is up', source: 'user_visible_result', toolCallId: 'call-2' }
+        ]
+      }
+    );
+
+    expect(checked).toMatchObject({ ok: false });
+    expect(checked.ok === false && checked.reason).toContain('never ran');
+  });
+
+  it('refuses a user-visible claim pinned to a call the computer failed', () => {
+    const checked = completionVerification(
+      state({
+        'call-1': { name: 'file_write', success: true },
+        'call-2': { name: 'publish_artifact', success: false }
+      }),
+      {
+        status: 'verified',
+        evidence: [
+          { claim: 'Wrote it', source: 'tool_result', toolCallId: 'call-1' },
+          { claim: 'The page is up', source: 'user_visible_result', toolCallId: 'call-2' }
+        ]
+      }
+    );
+
+    expect(checked).toMatchObject({ ok: false });
+    expect(checked.ok === false && checked.reason).toContain('did not complete successfully');
+  });
+
+  it('still lets a user-visible claim stand on nothing at all, which is what it is for', () => {
+    const checked = completionVerification(state({ 'call-1': { name: 'shell', success: true } }), {
+      status: 'verified',
+      evidence: [
+        { claim: 'Ran it', source: 'tool_result', toolCallId: 'call-1' },
+        { claim: 'The answer is in the reply', source: 'user_visible_result' }
+      ]
+    });
+
+    expect(checked).toMatchObject({ ok: true });
+  });
+
+  it('still lets it cite a delivered notice, which the user genuinely can see', () => {
+    const checked = completionVerification(
+      state({
+        'call-1': { name: 'shell', success: true },
+        'call-2': { name: 'notify', success: true }
+      }),
+      {
+        status: 'verified',
+        evidence: [
+          { claim: 'Ran it', source: 'tool_result', toolCallId: 'call-1' },
+          { claim: 'They were told', source: 'user_visible_result', toolCallId: 'call-2' }
+        ]
+      }
+    );
+
+    expect(checked).toMatchObject({ ok: true });
+  });
+});
+
+/**
+ * §4.5 #78: the declared output schema the specialist is told up front, read back by the parent.
+ *
+ * The errors are the load-bearing half - they are interpolated into the one correction message the
+ * mission loop may send, so a wrong or vague one costs a model call and buys nothing.
+ */
+describe('reading a specialist report against its contract', () => {
+  it('reads a well-formed report and finds nothing to say about it', () => {
+    const checked = validateDelegateReport(
+      JSON.stringify({
+        answer: 'Three tiers.',
+        evidence: [{ claim: 'tiers', source: 'notes.md', quotedSpan: 'three tiers' }],
+        couldNotEstablish: ['when they take effect']
+      })
+    );
+
+    expect(checked.errors).toEqual([]);
+    expect(checked.report?.answer).toBe('Three tiers.');
+    expect(checked.report?.evidence).toHaveLength(1);
+  });
+
+  it('names prose as prose rather than as a parse failure', () => {
+    const checked = validateDelegateReport('The notes say three tiers, I am fairly sure.');
+
+    expect(checked.report).toBeNull();
+    expect(checked.errors).toEqual(['the report is prose: there is no JSON object in it at all']);
+  });
+
+  it('says which field is missing when the object is there and the answer is not', () => {
+    const checked = validateDelegateReport(JSON.stringify({ evidence: [] }));
+
+    expect(checked.report).toBeNull();
+    expect(checked.errors[0]).toContain('"answer" is missing');
+  });
+
+  it('quotes the parser when the object is nearly JSON', () => {
+    const checked = validateDelegateReport('{"answer": "Three tiers.",}');
+
+    expect(checked.report).toBeNull();
+    expect(checked.errors[0]).toContain('does not parse');
+  });
+
+  it('keeps a readable report that dropped an item, and counts what it dropped', () => {
+    const checked = validateDelegateReport(
+      JSON.stringify({
+        answer: 'Three tiers.',
+        evidence: [
+          { claim: 'tiers', source: 'notes.md', quotedSpan: 'three tiers' },
+          { claim: 'tiers', source: 'notes.md' }
+        ]
+      })
+    );
+
+    expect(checked.report?.evidence).toHaveLength(1);
+    expect(checked.errors).toEqual([
+      '1 of 2 evidence items were dropped: each needs "claim", "source" and "quotedSpan" as non-empty strings'
+    ]);
+  });
+
+  it('says so when evidence arrived as something the harness cannot re-read', () => {
+    const checked = validateDelegateReport(
+      JSON.stringify({ answer: 'Three tiers.', evidence: 'notes.md' })
+    );
+
+    expect(checked.report?.evidence).toEqual([]);
+    expect(checked.errors[0]).toContain('is not an array');
+  });
+
+  /**
+   * The forgiving half of the contract, which is the shipped guidance the whole corpus agrees on:
+   * require only the fields you will actually read. Nothing in the harness reads
+   * `couldNotEstablish`, so a report without it is not a report that missed anything.
+   */
+  it('asks for nothing the harness does not read', () => {
+    const checked = validateDelegateReport(JSON.stringify({ answer: 'Three tiers.' }));
+
+    expect(checked.errors).toEqual([]);
+    expect(checked.report).toEqual({ answer: 'Three tiers.', evidence: [] });
+  });
+
+  it('keeps the yes-or-no spelling agreeing with the reasons', () => {
+    expect(parseDelegateReport('not json')).toBeNull();
+    expect(parseDelegateReport(JSON.stringify({ answer: 'a' }))).toEqual({
+      answer: 'a',
+      evidence: []
+    });
   });
 });

@@ -44,7 +44,7 @@ import type {
 } from './types.js';
 import { nativeBridge, ringsNatively } from './native.js';
 import { nativeNotificationsEnabled } from './native-notifications.js';
-import { approvalReach } from './approval-copy.js';
+import { approvalDenialMessage, approvalReach } from './approval-copy.js';
 import type { NotificationKind, NotificationSettings } from './notification-settings.js';
 import { computerChangeLine, turnComputerQuery } from './completion-card.js';
 import { consumeSharedPayload } from './share-target.js';
@@ -2742,12 +2742,46 @@ export function App() {
               the one control where doing nothing silently is least acceptable. The wording matches
               what the lock-screen path already says for the same three outcomes.
             */
-            onResolve={async (id, decision) => {
+            onResolve={async (id, decision, note) => {
               setApprovalFailure(undefined);
+              // Read before the decision lands, because the row it is read from is about to be
+              // filtered out of the list below and the message needs the conversation it belongs
+              // to - which is routinely not the one on screen.
+              const refused = approvals.find((item) => item.id === id);
               try {
                 await api.resolveApproval(id, decision);
                 setApprovals((items) => items.filter((item) => item.id !== id));
                 setError('');
+                /*
+                  The reason, sent as what it is: the owner's own words, on the channel that
+                  already carries them.
+
+                  Second request rather than a field on the first, and deliberately so. This one
+                  is encrypted with the workspace key, lands in the transcript where the owner can
+                  read back what they said, and is owner speech everywhere it matters - the taint
+                  model and the compaction rule that never paraphrases the user. `interrupt` is
+                  the whole point of the timing: the denied turn resumes the moment the decision
+                  lands, and a message that waited for it to finish would arrive after the agent
+                  had already tried the neighbouring version of the thing it was just refused.
+
+                  Nothing is sent for an untouched box, so denying costs exactly the one request
+                  it cost before this field existed.
+                */
+                const message = refused ? approvalDenialMessage(refused, note) : '';
+                if (refused && message)
+                  await api
+                    .continueTask(refused.taskId, { prompt: message, interrupt: true })
+                    // The decision itself has landed and the card is gone, so this cannot be said
+                    // on the card. Said in the strip instead, and said specifically: an owner who
+                    // typed a reason has to know whether the agent got it.
+                    .catch((cause: unknown) =>
+                      setError(
+                        describeFailure(
+                          cause,
+                          'That request was denied, but your reason was not sent'
+                        )
+                      )
+                    );
                 // The card took focus when it appeared, so it owes it back: the control just
                 // pressed is about to unmount, and focus left on a dead node drops a keyboard onto
                 // the top of the document. Not when another request is queued — that card focuses

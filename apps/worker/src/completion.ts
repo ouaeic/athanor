@@ -451,7 +451,36 @@ export const completionVerification = (
   if (status === 'verified' && !evidence.length)
     return { ok: false, reason: 'Verified completion needs at least one evidence item.' };
   for (const item of evidence) {
-    if (item.source === 'user_visible_result') continue;
+    if (item.source === 'user_visible_result') {
+      /*
+       * The exemption this source carries is from the ordering rule, not from the existence one.
+       *
+       * `user_visible_result` is the one item that may stand on a claim alone - "the user can see
+       * the answer in the reply" cites no call because no call produced it - and it was written as
+       * a bare `continue`, so an item of this source skipped every check in this loop including
+       * the ones about the call it did cite. A finish could therefore name a call athanor answered
+       * without running, or one the computer failed, and have it rendered beside the tick as
+       * something the user can see. That is §4.5 #73's shape exactly: evidence that was claimed
+       * and never produced, counted as satisfied.
+       *
+       * Deliberately narrow. Citing nothing is still allowed, because that is what the source is
+       * for; citing a `notify` is still allowed, because a delivered notice genuinely is something
+       * the user can see even though it is not an observation; and the ordering rule is still
+       * skipped. Only a call that produced nothing at all is refused, and for a call that produced
+       * nothing there is nothing to see.
+       */
+      const cited = item.toolCallId ? state.turnToolResults?.[item.toolCallId] : undefined;
+      if (cited && (cited.skipped || !cited.success))
+        return {
+          ok: false,
+          reason: `Verification cites ${item.toolCallId} as something the user can see, but that ${cited.name} ${
+            cited.skipped
+              ? 'never ran - athanor answered it without starting it'
+              : 'did not complete successfully this turn'
+          }, so it produced nothing to see. Cite the call that did produce it, or describe what the user can see without citing a call.`
+        };
+      continue;
+    }
     if (!item.toolCallId)
       return {
         ok: false,
@@ -554,35 +583,99 @@ export interface DelegateEvidenceCheck {
 export const normalisedSpan = (value: string): string =>
   value.replace(/\s+/g, ' ').trim().toLowerCase();
 
-/**
- * Reads a specialist's report as the structured object it was asked for, or says it is prose.
- *
- * Nothing fails on a report that is prose: a specialist that answered in sentences has still done
- * the work, and the lead can still read it. Structure only buys the verification below.
- */
-export const parseDelegateReport = (
-  text: string
-): {
+/** A specialist's report, as the two fields the lead actually reads. */
+export interface DelegateReport {
   answer: string;
   evidence: Array<{ claim: string; source: string; quotedSpan: string }>;
-} | null => {
+}
+
+/**
+ * The same report weighed against the contract the specialist was given, with the reasons it missed.
+ *
+ * §4.5 #78 is a declared output schema the child is told up front, validated by the parent, with
+ * exactly one bounded correction retry. athanor had the first half and not the second: the shape is
+ * in the specialist's system prompt, `parseDelegateReport` below judged it, and the caller then did
+ * nothing at all with the verdict - the comment there said so outright. A report that arrived as
+ * prose was adopted by the lead exactly as a report that met the contract was, and nothing anywhere
+ * told the lead which it had.
+ *
+ * The schema stays forgiving, which is the shipped guidance the corpus is unanimous on: require
+ * only the fields you will actually read. `couldNotEstablish` is asked for in the prompt and is not
+ * checked here, because nothing in the harness reads it - holding a specialist to a field the
+ * parent ignores buys a retry and no information. Only `answer`, which is the report, and
+ * `evidence`, which is the half the harness re-reads, are contract.
+ *
+ * Two thresholds, deliberately different, and the caller reads both: `report === null` is "the lead
+ * has nothing structured to work with", which is what a correction pass is worth a model call for,
+ * and a non-empty `errors` on a readable report is a soft miss the lead should be told about for
+ * free. Collapsing them either spends a call on a cosmetic slip or hides one.
+ */
+export interface DelegateReportValidation {
+  readonly report: DelegateReport | null;
+  readonly errors: string[];
+}
+
+/**
+ * Reads a specialist's report as the structured object it was asked for, and says what it missed.
+ *
+ * Every error string here is addressed to the specialist rather than to the owner: it is
+ * interpolated into the one correction message the mission loop is allowed to send, so it has to
+ * name the field and the fix rather than describe a parse.
+ */
+export const validateDelegateReport = (text: string): DelegateReportValidation => {
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
-  if (start < 0 || end <= start) return null;
+  if (start < 0 || end <= start)
+    return {
+      report: null,
+      errors: ['the report is prose: there is no JSON object in it at all']
+    };
   let parsed: unknown;
   try {
     parsed = JSON.parse(text.slice(start, end + 1));
-  } catch {
-    return null;
+  } catch (error) {
+    return {
+      report: null,
+      errors: [
+        `the JSON object in the report does not parse: ${
+          error instanceof Error ? error.message : 'unknown error'
+        }`.slice(0, 200)
+      ]
+    };
   }
   const record = asRecord(parsed);
-  if (!record || typeof record.answer !== 'string') return null;
-  const evidence = (Array.isArray(record.evidence) ? record.evidence : []).flatMap((item) => {
+  if (!record)
+    return { report: null, errors: ['the report parses as JSON but is not a JSON object'] };
+  if (typeof record.answer !== 'string')
+    return { report: null, errors: ['"answer" is missing, or is not a string'] };
+  const errors: string[] = [];
+  // Absent is fine and wrong-typed is not: a report with no evidence has cited nothing, which the
+  // `unverified` notice in the mission loop is what says out loud. A report whose `evidence` is a
+  // string is one the harness could not re-read a single span from while looking like it could.
+  if (record.evidence !== undefined && !Array.isArray(record.evidence))
+    errors.push('"evidence" is present but is not an array, so no citation in it could be re-read');
+  const rawEvidence = Array.isArray(record.evidence) ? record.evidence : [];
+  const evidence = rawEvidence.flatMap((item) => {
     const entry = asRecord(item);
     const claim = textValue(entry?.claim).trim();
     const source = textValue(entry?.source).trim();
     const quotedSpan = textValue(entry?.quotedSpan).trim();
     return claim && source && quotedSpan ? [{ claim, source, quotedSpan }] : [];
   });
-  return { answer: record.answer, evidence };
+  if (evidence.length !== rawEvidence.length)
+    errors.push(
+      `${rawEvidence.length - evidence.length} of ${rawEvidence.length} evidence items were dropped: each needs "claim", "source" and "quotedSpan" as non-empty strings`
+    );
+  return { report: { answer: record.answer, evidence }, errors };
 };
+
+/**
+ * The same question asked for a yes or a no.
+ *
+ * Kept as its own export because `agent.ts` re-exports it and because most callers only want the
+ * object: nothing fails on a report that is prose, and a specialist that answered in sentences has
+ * still done the work. What changed is that the mission loop now reads the reasons as well, and
+ * gets one chance to have them fixed.
+ */
+export const parseDelegateReport = (text: string): DelegateReport | null =>
+  validateDelegateReport(text).report;

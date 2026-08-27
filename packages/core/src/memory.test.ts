@@ -21,11 +21,14 @@ import {
   MEMORY_KINDS,
   MEMORY_PACK_BUDGET_TOKENS,
   MEMORY_PACK_DEFAULT_QUOTA,
+  MEMORY_PACK_OPEN_INTERVAL,
   isFunctionalMemoryPredicate,
   memoryAliasLexemes,
   memoryExcerpt,
   memoryIndexKey,
   memoryLexemes,
+  memoryPackCitations,
+  parseMemoryPackBody,
   memoryTemporalStatus,
   memoryTrigrams,
   planMemoryQuery,
@@ -716,5 +719,201 @@ describe('recall quotas', () => {
 
   it('costs a fraction of a pack, because it buys one answer rather than a context', () => {
     expect(MEMORY_RECALL_BUDGET_TOKENS).toBeLessThan(MEMORY_PACK_BUDGET_TOKENS / 2);
+  });
+});
+
+describe('an open validity interval says what it means', () => {
+  const open: MemoryPackEntry = {
+    id: '4a000000-0000-4000-8000-000000000004',
+    kind: 'fact',
+    trust: 'stated',
+    observedAt: '2026-07-01T00:00:00.000Z',
+    validFrom: '2026-07-01T00:00:00.000Z',
+    validTo: null,
+    title: null,
+    tags: [],
+    body: 'The gateway listens on 8443.'
+  };
+
+  it('names the open end instead of trailing off after the separator', () => {
+    const rendered = renderMemoryPack([open]).body;
+    // The whole defect in one assertion: the bytes used to end `.../` and the block's own header
+    // explains only what an *ended* validity means, so the live entries - which are all of them,
+    // most of the time - were the ones rendered ambiguously.
+    expect(rendered).toContain('valid=2026-07-01T00:00:00.000Z/Present');
+    expect(rendered).not.toMatch(/valid=\S+\/(?:\s|$)/mu);
+  });
+
+  it('still renders a closed interval as two instants, because that reading was never unclear', () => {
+    const closed = renderMemoryPack([{ ...open, validTo: '2026-07-25T00:00:00.000Z' }]).body;
+    expect(closed).toContain('valid=2026-07-01T00:00:00.000Z/2026-07-25T00:00:00.000Z');
+    expect(closed).not.toContain(MEMORY_PACK_OPEN_INTERVAL);
+  });
+});
+
+/**
+ * The producer for `mem.item.cited_count` - a term of the salience formula that, before this wave,
+ * read a column nothing in the product ever wrote.
+ */
+describe('attributing a finished turn to the entries it used', () => {
+  const rate: MemoryPackEntry = {
+    id: '11111111-0000-4000-8000-000000000001',
+    kind: 'fact',
+    trust: 'stated',
+    observedAt: '2026-07-01T00:00:00.000Z',
+    validFrom: '2026-07-01T00:00:00.000Z',
+    validTo: null,
+    title: 'brochure renewal rate',
+    tags: [],
+    body: 'The renewal rate on the brochure job is 4.25 per cent for the current term.'
+  };
+  const send: MemoryPackEntry = {
+    id: '22222222-0000-4000-8000-000000000002',
+    kind: 'episode',
+    trust: 'derived',
+    observedAt: '2026-07-01T00:00:00.000Z',
+    validFrom: '2026-07-01T00:00:00.000Z',
+    validTo: null,
+    title: 'the last brochure send',
+    tags: [],
+    body: 'The last brochure send was held back until every font came back embedded.'
+  };
+  const parsed = (...entries: MemoryPackEntry[]) =>
+    parseMemoryPackBody(renderMemoryPack(entries).body);
+
+  it('reads a rendered pack back into one text per entry, metadata dropped', () => {
+    const entries = parsed(rate, send);
+    expect(entries.map((entry) => entry.id)).toEqual([rate.id, send.id]);
+    expect(entries[0]?.text).toBe(`${rate.title}\n${rate.body}`);
+    // The head line is identical in shape on every entry, so keeping it would hand every entry the
+    // same wording and make "which entry did this come from" unanswerable.
+    expect(entries[0]?.text).not.toContain('trust=');
+    expect(entries[0]?.text).not.toContain('observed=');
+  });
+
+  it('cites the entry the answer quoted and not the one it did not', () => {
+    expect(
+      memoryPackCitations({
+        entries: parsed(rate, send),
+        used: [
+          'The renewal rate on the brochure job is 4.25 per cent for the current term.',
+          'Answered from what the workspace already remembered.'
+        ],
+        request: 'What rate are we renewing the brochure job at?'
+      })
+    ).toEqual([rate.id]);
+  });
+
+  it('cites a paraphrase, because a run of four content words is not a coincidence', () => {
+    expect(
+      memoryPackCitations({
+        entries: parsed(rate, send),
+        used: ['The brochure job renews at 4.25 per cent for the current term.'],
+        request: 'What rate are we renewing the brochure job at?'
+      })
+    ).toEqual([rate.id]);
+  });
+
+  it('refuses to credit an entry for wording that came from the owner', () => {
+    // The trap this exclusion exists for, built so that it is the exclusion doing the work and not
+    // an absence of overlap: the request and the entry share the run "renewal rate brochure job"
+    // verbatim, and the answer repeats it. Without the request filter that run is a distinctive
+    // entry shingle present in the answer and the entry is credited - for wording it never
+    // supplied. The block was retrieved *with* the request, so this overlap is the normal case
+    // rather than a contrived one.
+    const request = 'What is the renewal rate on the brochure job?';
+    expect(
+      memoryPackCitations({
+        entries: parsed(rate, send),
+        used: ['The renewal rate on the brochure job has not changed.'],
+        request
+      })
+    ).toEqual([]);
+    // The same call without the owner's words to subtract, which is what the filter is subtracting.
+    expect(
+      memoryPackCitations({
+        entries: parsed(rate, send),
+        used: ['The renewal rate on the brochure job has not changed.']
+      })
+    ).toEqual([rate.id]);
+  });
+
+  it('refuses to credit either of two entries that share the wording', () => {
+    const twin: MemoryPackEntry = { ...rate, id: '33333333-0000-4000-8000-000000000003' };
+    // Two rows saying the same thing is exactly what near-duplicate detection exists to stop, and
+    // until it does the honest answer to "which one did the turn read" is neither.
+    expect(
+      memoryPackCitations({
+        entries: parsed(rate, twin),
+        used: ['The renewal rate on the brochure job is 4.25 per cent for the current term.'],
+        request: 'nothing'
+      })
+    ).toEqual([]);
+  });
+
+  it('cites nothing when the turn produced nothing to attribute', () => {
+    expect(memoryPackCitations({ entries: parsed(rate, send), used: [], request: 'x' })).toEqual(
+      []
+    );
+    expect(
+      memoryPackCitations({ entries: parsed(rate, send), used: ['   ', ''], request: 'x' })
+    ).toEqual([]);
+  });
+
+  it('takes the entry id as a citation, which is the channel a caller can be precise on', () => {
+    expect(
+      memoryPackCitations({
+        entries: parsed(rate, send),
+        used: [`Relied on id=${send.id} for the embargo.`],
+        request: 'x'
+      })
+    ).toEqual([send.id]);
+    expect(
+      memoryPackCitations({ entries: parsed(rate, send), used: ['done'], named: [rate.id] })
+    ).toEqual([rate.id]);
+  });
+
+  it('ignores a named id that is not in the block, whoever named it', () => {
+    // A citation list arriving from a model is untrusted input like any other: it may name a row
+    // this task was never shown, and crediting that row would let a turn raise the salience of a
+    // memory it never read.
+    expect(
+      memoryPackCitations({
+        entries: parsed(rate, send),
+        used: ['done'],
+        named: ['99999999-0000-4000-8000-000000000009']
+      })
+    ).toEqual([]);
+  });
+
+  it('returns citations in pack order, so the same turn always writes the same rows', () => {
+    const entries = parsed(rate, send);
+    expect(memoryPackCitations({ entries, used: ['x'], named: [send.id, rate.id] })).toEqual([
+      rate.id,
+      send.id
+    ]);
+  });
+
+  it('counts the commands the harness ran, not only the prose the owner reads', () => {
+    const procedure: MemoryPackEntry = {
+      id: '44444444-0000-4000-8000-000000000004',
+      kind: 'procedure',
+      trust: 'derived',
+      observedAt: '2026-07-01T00:00:00.000Z',
+      validFrom: '2026-07-01T00:00:00.000Z',
+      validTo: null,
+      title: 'how this workspace checks a brochure',
+      tags: [],
+      body: 'In /srv/brochure, `pnpm exec verify-fonts --embedded` is what settles it.'
+    };
+    // Nobody writes a shell command out to the owner in prose, so a procedure that was followed
+    // would be graded identically to one that was ignored if only the answer were read.
+    expect(
+      memoryPackCitations({
+        entries: parsed(procedure, send),
+        used: ['Everything checks out.', 'pnpm exec verify-fonts --embedded'],
+        request: 'Is the brochure ready?'
+      })
+    ).toEqual([procedure.id]);
   });
 });

@@ -7,13 +7,7 @@
  * inside a method whose other job is bookkeeping, and every one of the four defects the ranking
  * carried was invisible because its failure path is a system notice rather than an error.
  */
-import {
-  priceCeilingFields,
-  rankModels,
-  selectModel,
-  sha256,
-  type ModelRequest
-} from '@athanor/core';
+import { preferIncumbent, rankModels, requestForWork, selectModel, sha256 } from '@athanor/core';
 import type { ModelRelease, PrivacyRoute } from '@athanor/contracts';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import { isProviderWall, type ModelGateway, type ModelToolCall } from '@athanor/model-gateway';
@@ -51,6 +45,25 @@ export interface CatalogCache {
 }
 
 /**
+ * What the worker remembers between two images, which is the registry read and who read the last
+ * one.
+ *
+ * The two sit in one slot because they have the same owner and opposite lifetimes, and putting the
+ * second inside the first would have been the bug: the catalogue memo expires after a minute
+ * precisely so a mid-run outage is routed around, and the specialist has to outlive that or the
+ * refresh it exists to allow is the thing that changes who is reading the pictures.
+ *
+ * `specialist` is optional so the worker's existing slot - `{ current: null }` - is still a
+ * `RoutingMemo`, and it carries the task it was decided for: one worker leases one task at a time
+ * but not the same task forever, and a decision taken for a finished run must not be inherited by
+ * the next one.
+ */
+export interface RoutingMemo {
+  current: CatalogCache | null;
+  specialist?: { taskId: string; modelId: string };
+}
+
+/**
  * Registry rows as they are now. A run can last hours, and the model-registry service keeps
  * refreshing availability and route metadata underneath it, so routing decisions taken mid-run
  * read the current rows instead of the snapshot taken when the task was leased.
@@ -75,7 +88,7 @@ export const currentCatalog = async (
 export interface VisionDeps {
   readonly store: DataStore;
   /** The worker's own slot for the registry read, so the memo lives and dies with the worker. */
-  readonly catalogCache: { current: CatalogCache | null };
+  readonly catalogCache: RoutingMemo;
   /** Overridable only so a test can age the memo without sleeping through a minute. */
   now?: () => number;
   assertProviderConfigured(task: TaskRecord): Promise<void>;
@@ -166,24 +179,48 @@ export const routeImageObservation = async (
    * `.optional()` comes off the contract, both copies of this collapse to a spread.
    */
   const ownerLimits = await deps.store.effectiveSpendLimits(task.userId);
-  const visionRequest: ModelRequest = {
+  /*
+   * The caller naming the kind of work, on the one site in this worker that ranks a model.
+   *
+   * `declaredKind` has been documented as outranking every prose hint since it was written and had
+   * no producer anywhere: routing was decided by six regexes reading a prompt, and this site does
+   * not have a prompt at all - it has an image, a lead that cannot see it, and certainty about
+   * what it is asking for. It says so, and the profile answers with what vision work requires
+   * rather than this file keeping its own copy of that list beside the ranking it feeds.
+   *
+   * The prose is still passed, and `hasImages` with it, so the fallback is a real one: if a kind
+   * ever stops being a kind the router knows, this asks for the work it can see instead of dying
+   * on a profile lookup.
+   */
+  const visionRequest = requestForWork({
+    signals: { prompt: imageLabel, hasImages: true, declaredKind: 'vision' },
     privacyRoute: task.privacyRoute as PrivacyRoute,
-    taskKind: 'vision',
-    requiredCapabilities: ['chat', 'vision'],
-    requiredModalities: ['text', 'image'],
     minContextTokens: VISION_SPECIALIST_MIN_CONTEXT_TOKENS,
-    preference: 'balanced',
-    ...priceCeilingFields({
+    ceiling: {
       maxInputUsdPerMillionTokens: ownerLimits.maxInputUsdPerMillionTokens ?? null,
       maxOutputUsdPerMillionTokens: ownerLimits.maxOutputUsdPerMillionTokens ?? null
-    })
-  };
-  const ranked = rankModels(candidates, visionRequest)
-    .map((entry) => entry.model as ModelRelease)
-    // The live modality check the ranker cannot make: a catalogue row can advertise vision while
-    // the route serving it has lost the endpoint that accepts an image, and on a zero-retention
-    // task that is a refusal rather than a downgrade.
-    .filter((candidate) => usableCapabilities(candidate, task.privacyRoute).has('vision'));
+    }
+  });
+  const ranked = preferIncumbent(
+    rankModels(candidates, visionRequest)
+      .map((entry) => entry.model as ModelRelease)
+      // The live modality check the ranker cannot make: a catalogue row can advertise vision while
+      // the route serving it has lost the endpoint that accepts an image, and on a zero-retention
+      // task that is a refusal rather than a downgrade.
+      .filter((candidate) => usableCapabilities(candidate, task.privacyRoute).has('vision')),
+    /*
+     * Who read the last picture on this task, moved to the head of the pool it is still in.
+     *
+     * A browsing turn reads an image on nearly every step and the registry refreshes underneath
+     * it, so without this the second half of a turn is described by a different model than the
+     * first - re-ranked, never re-decided, and on a `sessionId` shared by every one of these calls
+     * so that the provider recognises the prefix. Applied after the filters rather than instead of
+     * them: the incumbent has to still be eligible to be preferred.
+     */
+    deps.catalogCache.specialist?.taskId === task.id
+      ? deps.catalogCache.specialist.modelId
+      : undefined
+  );
   if (!ranked.length) {
     /*
      * Which of the two refusals this is, because they have different remedies and only one of
@@ -338,6 +375,10 @@ export const routeImageObservation = async (
         role: 'system',
         content: `VISION SPECIALIST HANDOFF\nLead model: ${leadModel.displayName}\nVision model: ${specialist.displayName}\nSource: ${imageLabel}\nObservation:\n${response.text}`
       });
+      // Recorded only where it answered. A candidate that failed is not an incumbent, and the
+      // ranking is the right thing to consult for the next image rather than the memory of who
+      // could not read the last one.
+      deps.catalogCache.specialist = { taskId: task.id, modelId: specialist.id };
       observed = true;
       break;
     } catch (cause) {

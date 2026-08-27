@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   buildMemoryItemIndex,
   decryptJson,
+  renderMemoryPack,
   encryptJson,
   memoryIndexKey,
   memoryObjectKey,
@@ -29,9 +30,11 @@ import {
   episodeContent,
   episodeTitle,
   extractTurn,
+  finishedAnswerText,
   injectMemoryPack,
   memoryItemAad,
   memoryPackBudgetTokens,
+  memoryPackAad,
   memoryPackEntries,
   memoryPackMessage,
   memorySourceAad,
@@ -952,6 +955,163 @@ describe('pack outcome and consolidation cadence', () => {
     ]);
   });
 
+  /**
+   * The producer for the control that read a column nothing wrote.
+   *
+   * `mem.item.cited_count` is `0.20` of the salience score that decides what survives
+   * consolidation; `recordMemoryUse` is its only writer, behind `cited`; and until this wave both
+   * production callers left it out, so the column was zero on every box and the term was a
+   * constant for every row in the pool. These cases pin the two halves of the repair: which
+   * entries a finished turn can be shown to have used, and the grade the rest are left with.
+   */
+  describe('citing the entries the finished turn used', () => {
+    const rateId = 'aaaaaaaa-0000-4000-8000-00000000000a';
+    const sendId = 'bbbbbbbb-0000-4000-8000-00000000000b';
+    const rendered = renderMemoryPack([
+      {
+        id: rateId,
+        kind: 'fact',
+        trust: 'stated',
+        observedAt: '2026-07-01T00:00:00.000Z',
+        validFrom: '2026-07-01T00:00:00.000Z',
+        validTo: null,
+        title: 'brochure renewal rate',
+        tags: [],
+        body: 'The renewal rate on the brochure job is 4.25 per cent for the current term.'
+      },
+      {
+        id: sendId,
+        kind: 'episode',
+        trust: 'derived',
+        observedAt: '2026-07-01T00:00:00.000Z',
+        validFrom: '2026-07-01T00:00:00.000Z',
+        validTo: null,
+        title: 'the last brochure send',
+        tags: [],
+        body: 'The last brochure send was held back until every font came back embedded.'
+      }
+    ]);
+    const packedProbe = (): CaptureProbe => {
+      const probe = captureStore();
+      probe.pack = {
+        taskId,
+        workspaceId,
+        briefVersion: null,
+        bodyCiphertext: encryptJson({ body: rendered.body }, dataKey, memoryPackAad(taskId)),
+        sha256: rendered.sha256,
+        itemIds: [...rendered.itemIds],
+        tokensEst: rendered.tokensEst,
+        createdAt: '2026-07-31T00:00:00.000Z'
+      };
+      return probe;
+    };
+
+    it('records the used entry as cited and leaves the untouched one ungraded', async () => {
+      const probe = packedProbe();
+      await expect(
+        recordMemoryPackOutcome({
+          store: probe.store,
+          workspaceId,
+          taskId,
+          outcome: 'ok',
+          dataKey,
+          used: ['The renewal rate on the brochure job is 4.25 per cent for the current term.'],
+          request: 'What rate are we renewing the brochure job at?'
+        })
+      ).resolves.toBe(2);
+      expect(probe.uses).toEqual([
+        { workspaceId, itemIds: [rateId], taskId, cited: true, outcome: 'ok' },
+        // Not `ok`. An entry the finished work never touched is not evidence that the pack worked,
+        // and crediting it with the turn's success is what made `ok_count` a count of injections.
+        { workspaceId, itemIds: [sendId], taskId, cited: false, outcome: 'unknown' }
+      ]);
+    });
+
+    it('takes an explicit id list, which is the interface a citing finish feeds', async () => {
+      const probe = packedProbe();
+      await recordMemoryPackOutcome({
+        store: probe.store,
+        workspaceId,
+        taskId,
+        outcome: 'ok',
+        dataKey,
+        citedItemIds: [sendId]
+      });
+      expect(probe.uses[0]).toMatchObject({ itemIds: [sendId], cited: true });
+    });
+
+    it("cites nothing when the turn only handed back the owner's own words", async () => {
+      const probe = packedProbe();
+      await recordMemoryPackOutcome({
+        store: probe.store,
+        workspaceId,
+        taskId,
+        outcome: 'ok',
+        dataKey,
+        used: ['I checked the rate we are renewing the brochure job at.'],
+        request: 'What rate are we renewing the brochure job at?'
+      });
+      expect(probe.uses).toEqual([
+        { workspaceId, itemIds: [rateId, sendId], taskId, cited: false, outcome: 'unknown' }
+      ]);
+    });
+
+    it('writes exactly the row it always wrote when it cannot open the pack', async () => {
+      const probe = packedProbe();
+      // The fallback that keeps a memory write from ever being the thing that fails a verified
+      // turn: a key that cannot open these bytes attributes nothing, and attributing nothing must
+      // not be spelled the same way as attributing nothing *to* every entry.
+      await recordMemoryPackOutcome({
+        store: probe.store,
+        workspaceId,
+        taskId,
+        outcome: 'ok',
+        dataKey: Buffer.alloc(32, 9),
+        used: ['The renewal rate on the brochure job is 4.25 per cent for the current term.']
+      });
+      expect(probe.uses).toEqual([
+        { workspaceId, itemIds: [rateId, sendId], taskId, outcome: 'ok' }
+      ]);
+    });
+
+    it('writes the pack-wide grade when the caller offers nothing to attribute', async () => {
+      const probe = packedProbe();
+      await recordMemoryPackOutcome({
+        store: probe.store,
+        workspaceId,
+        taskId,
+        outcome: 'ok',
+        dataKey,
+        used: ['  ']
+      });
+      expect(probe.uses).toEqual([
+        { workspaceId, itemIds: [rateId, sendId], taskId, outcome: 'ok' }
+      ]);
+    });
+  });
+
+  describe('what the turn said, as attribution reads it', () => {
+    it("collects the turn's assistant prose and stops at the previous request", () => {
+      const messages: ModelMessage[] = [
+        { role: 'user', content: 'first request' },
+        { role: 'assistant', content: 'an answer from the turn before' },
+        { role: 'user', content: 'second request' },
+        { role: 'assistant', content: 'thinking out loud about the rate' },
+        { role: 'tool', content: 'a tool result' },
+        { role: 'assistant', content: 'the finished answer' }
+      ];
+      // Newest first, and the earlier turn is not this turn's evidence.
+      expect(finishedAnswerText(messages)).toBe(
+        'the finished answer\nthinking out loud about the rate'
+      );
+    });
+
+    it('is empty for a turn the model has not answered yet', () => {
+      expect(finishedAnswerText([{ role: 'user', content: 'go' }])).toBe('');
+      expect(finishedAnswerText([])).toBe('');
+    });
+  });
+
   it('records nothing when the task had no pack', async () => {
     const probe = captureStore();
     await expect(
@@ -1262,6 +1422,376 @@ describe('against the real store', () => {
       clockAnchor: new Date('2026-07-08T08:00:00.000Z')
     });
     expect(whileValid.itemIds).toContain(expired.id);
+  });
+
+  /**
+   * The column at the far end of the wire, against the real schema.
+   *
+   * Everything above this line is a probe asserting which arguments were passed. This is the one
+   * that says the argument reaches a `cited_count` on a migrated `mem.item` and moves the number
+   * the salience formula reads - which is the whole claim, because the defect was never that the
+   * SQL was wrong.
+   */
+  const rememberedFact = async (title: string, body: string) => {
+    const content = { title, body, subject: title, tags: [] };
+    return store.createMemoryItem({
+      userId: realUserId,
+      workspaceId: realWorkspaceId,
+      kind: 'fact',
+      trust: 'stated',
+      documentCiphertext: encryptJson(content, dataKey, memoryItemAad(realWorkspaceId)),
+      index: buildMemoryItemIndex(content, indexKey),
+      predicate: 'related_to',
+      observedAt: new Date('2026-07-01T00:00:00.000Z'),
+      validFrom: new Date('2026-07-01T00:00:00.000Z')
+    });
+  };
+
+  const packOf = async (...items: { id: string; title: string; body: string }[]) => {
+    const rendered = renderMemoryPack(
+      items.map((item) => ({
+        id: item.id,
+        kind: 'fact' as const,
+        trust: 'stated' as const,
+        observedAt: '2026-07-01T00:00:00.000Z',
+        validFrom: '2026-07-01T00:00:00.000Z',
+        validTo: null,
+        title: item.title,
+        tags: [],
+        body: item.body
+      }))
+    );
+    await store.saveMemoryPack({
+      taskId: realTaskId,
+      workspaceId: realWorkspaceId,
+      bodyCiphertext: encryptJson({ body: rendered.body }, dataKey, memoryPackAad(realTaskId)),
+      sha256: rendered.sha256,
+      itemIds: rendered.itemIds,
+      tokensEst: rendered.tokensEst
+    });
+    return rendered;
+  };
+
+  it('increments cited_count on the entry the answer used, and only that one', async () => {
+    const used = await rememberedFact(
+      'the brochure renewal rate',
+      'The renewal rate on the brochure job is 4.25 per cent for the current term.'
+    );
+    const ignored = await rememberedFact(
+      'the last brochure send',
+      'The last brochure send was held back until every font came back embedded.'
+    );
+    await packOf(
+      {
+        id: used.id,
+        title: 'the brochure renewal rate',
+        body: 'The renewal rate on the brochure job is 4.25 per cent for the current term.'
+      },
+      {
+        id: ignored.id,
+        title: 'the last brochure send',
+        body: 'The last brochure send was held back until every font came back embedded.'
+      }
+    );
+
+    await recordMemoryPackOutcome({
+      store,
+      workspaceId: realWorkspaceId,
+      taskId: realTaskId,
+      outcome: 'ok',
+      dataKey,
+      used: ['The renewal rate on the brochure job is 4.25 per cent for the current term.'],
+      request: 'What rate are we renewing the brochure job at?'
+    });
+
+    const citedRow = await store.getMemoryItem(realWorkspaceId, used.id);
+    const ignoredRow = await store.getMemoryItem(realWorkspaceId, ignored.id);
+    expect(citedRow?.citedCount).toBe(1);
+    expect(citedRow?.okCount).toBe(1);
+    // Both were injected, so both were used; only one was read.
+    expect(ignoredRow?.useCount).toBe(1);
+    expect(ignoredRow?.citedCount).toBe(0);
+    expect(ignoredRow?.okCount).toBe(0);
+  });
+
+  it('ranks a cited memory above an uncited one once consolidation has run', async () => {
+    const used = await rememberedFact(
+      'the brochure renewal rate',
+      'The renewal rate on the brochure job is 4.25 per cent for the current term.'
+    );
+    const ignored = await rememberedFact(
+      'the last brochure send',
+      'The last brochure send was held back until every font came back embedded.'
+    );
+    await packOf(
+      {
+        id: used.id,
+        title: 'the brochure renewal rate',
+        body: 'The renewal rate on the brochure job is 4.25 per cent for the current term.'
+      },
+      {
+        id: ignored.id,
+        title: 'the last brochure send',
+        body: 'The last brochure send was held back until every font came back embedded.'
+      }
+    );
+    await recordMemoryPackOutcome({
+      store,
+      workspaceId: realWorkspaceId,
+      taskId: realTaskId,
+      outcome: 'ok',
+      dataKey,
+      used: ['The renewal rate on the brochure job is 4.25 per cent for the current term.'],
+      request: 'What rate are we renewing the brochure job at?'
+    });
+
+    await store.consolidateMemory(realWorkspaceId, { now: startedAt });
+    const citedSalience = (await store.getMemoryItem(realWorkspaceId, used.id))?.salience ?? 0;
+    const ignoredSalience = (await store.getMemoryItem(realWorkspaceId, ignored.id))?.salience ?? 0;
+    // Both were injected the same number of times, so the usage term is identical and the citation
+    // term is the only thing separating them. Before this wave it was identical too, and these two
+    // rows scored the same forever.
+    expect(citedSalience).toBeGreaterThan(ignoredSalience);
+  });
+
+  /**
+   * §4.7 #112. The tiered store had no duplicate suppression on the write path at all: the only
+   * collapse anywhere was `DISTINCT ON (dedupe_key)` at recall time, which needs the bytes to be
+   * identical, so two paraphrases of one preference produced two rows, two slots of the recall
+   * budget and two lines in the block at the top of every later window.
+   */
+  describe('near-duplicate suppression on the write path', () => {
+    const write = async (
+      kind: 'fact' | 'procedure' | 'episode',
+      subject: string | null,
+      body: string
+    ) => {
+      const content = { title: null, tags: [], body, subject, object: null };
+      return store.createMemoryItem({
+        userId: realUserId,
+        workspaceId: realWorkspaceId,
+        kind,
+        trust: 'stated',
+        documentCiphertext: encryptJson(content, dataKey, memoryItemAad(realWorkspaceId)),
+        index: buildMemoryItemIndex(content, indexKey),
+        ...(kind === 'fact' ? { predicate: 'related_to' } : {}),
+        observedAt: new Date('2026-07-01T00:00:00.000Z'),
+        validFrom: new Date('2026-07-01T00:00:00.000Z')
+      });
+    };
+    const activeCount = async (kind: string) =>
+      Number(
+        (
+          await database.query<{ count: string }>(
+            `SELECT count(*) AS count FROM mem.item
+             WHERE workspace_id=$1 AND kind=$2::mem.kind AND status='active'`,
+            [realWorkspaceId, kind]
+          )
+        ).rows[0]!.count
+      );
+
+    const preference =
+      'The owner prefers the preview gateway reloaded rather than restarted whenever the certificate rotates.';
+    /** Same ten content words, different sentence. Jaccard 1.00 over keyed body lexemes. */
+    const paraphrase =
+      'Whenever the certificate rotates, the owner prefers that the preview gateway is reloaded rather than restarted.';
+
+    it('returns the row already remembered instead of writing the paraphrase beside it', async () => {
+      const first = await write('fact', 'gateway reload', preference);
+      const second = await write('fact', 'gateway reload', paraphrase);
+      expect(second.id).toBe(first.id);
+      expect(await activeCount('fact')).toBe(1);
+    });
+
+    it('leaves a looser restatement standing, which is what a 0.9 floor costs', async () => {
+      // Measured, not guessed: swapping "rather than" for "not" takes the same sentence from 1.00
+      // to 0.818 - nine shared lexemes over a union of eleven - and 0.818 is under the floor. The
+      // floor is set where it is because the opposite error is unrecoverable: a refused write of a
+      // fact that had genuinely changed is a correction the owner never gets back, while a
+      // duplicate that survives costs a line of the pack and is collapsed by consolidation later.
+      const first = await write('fact', 'gateway reload', preference);
+      const second = await write(
+        'fact',
+        'gateway reload',
+        'Whenever the certificate rotates the owner prefers the preview gateway reloaded, not restarted.'
+      );
+      expect(second.id).not.toBe(first.id);
+      expect(await activeCount('fact')).toBe(2);
+    });
+
+    it('writes a genuinely different statement about the same subject', async () => {
+      const first = await write('fact', 'gateway reload', preference);
+      const second = await write(
+        'fact',
+        'gateway reload',
+        'The preview gateway answers on port 8443 and the certificate is renewed by the relay itself.'
+      );
+      expect(second.id).not.toBe(first.id);
+      expect(await activeCount('fact')).toBe(2);
+    });
+
+    it('never suppresses an episode, because two similar turns both happened', async () => {
+      const first = await write('episode', null, preference);
+      const second = await write('episode', null, preference);
+      // The audit trail is one row per turn. Collapsing it would make "what did I do on Tuesday"
+      // answer with Monday's work, and deleting the conversation would no longer delete its record.
+      expect(second.id).not.toBe(first.id);
+      expect(await activeCount('episode')).toBe(2);
+    });
+
+    it('writes a short entry even when its every word is already here', async () => {
+      // Why the floor exists, in the one case that can actually reach the threshold from below it.
+      // Jaccard is a set measure and word order is not in the set: these two sentences have the
+      // identical four lexemes - deploy, relay, before, gateway - so they score 1.00 and mean
+      // opposite things. Above the floor a run of eight content words in common is a paraphrase;
+      // below it, it is a sentence rewritten backwards, and refusing the second one would lose a
+      // correction the owner had just made, which is the worst thing this mechanism could do.
+      const first = await write('fact', 'deploy order', 'Deploy the relay before the gateway.');
+      const second = await write('fact', 'deploy order', 'Deploy the gateway before the relay.');
+      expect(second.id).not.toBe(first.id);
+      expect(await activeCount('fact')).toBe(2);
+    });
+
+    it('keeps two paraphrases about different subjects apart', async () => {
+      const first = await write('fact', 'gateway reload', preference);
+      const second = await write('fact', 'relay reload', paraphrase);
+      expect(second.id).not.toBe(first.id);
+      expect(await activeCount('fact')).toBe(2);
+    });
+  });
+
+  /**
+   * The nightly half of §4.3, which had never had a caller.
+   *
+   * `resolveMemoryContradiction` is the resolution table and nothing in the product could reach it;
+   * `markMemoryFactsDisputed` writes the status the review queue serves and nothing in the product
+   * could reach that either, so the queue could clear a dispute nothing was able to raise. Both are
+   * closed by one pass, and this is the state that reaches it: a predicate that used to permit many
+   * values, narrowed to one by a release, over a subject that had already accumulated two - the
+   * case `#backfillPredicateFunctional` deliberately leaves standing and promises will be "resolved
+   * the ordinary way".
+   */
+  describe('the contradiction pass inside consolidation', () => {
+    const statedFact = async (
+      subject: string,
+      object: string,
+      observedAt: string,
+      trust: 'stated' | 'derived' = 'stated'
+    ) => {
+      const content = { title: null, tags: [], body: `${subject} is ${object}.`, subject, object };
+      return store.createMemoryItem({
+        userId: realUserId,
+        workspaceId: realWorkspaceId,
+        kind: 'fact',
+        trust,
+        documentCiphertext: encryptJson(content, dataKey, memoryItemAad(realWorkspaceId)),
+        index: buildMemoryItemIndex(content, indexKey),
+        predicate: 'related_to',
+        observedAt: new Date(observedAt),
+        validFrom: new Date(observedAt)
+      });
+    };
+    /** What a release that narrows a cardinality leaves behind, exactly. */
+    const narrowRelatedTo = async () =>
+      database.query(`UPDATE mem.predicate SET cardinality='one' WHERE name='related_to'`);
+
+    const statusOf = async (id: string) => (await store.getMemoryItem(realWorkspaceId, id))?.status;
+
+    it('does nothing at all while the predicate still permits many values', async () => {
+      await statedFact('the gateway', 'behind the relay', '2026-07-01T00:00:00.000Z');
+      await statedFact('the gateway', 'in front of the relay', '2026-07-02T00:00:00.000Z');
+      const report = await store.consolidateMemory(realWorkspaceId, { now: startedAt });
+      expect(report.factsDisputed).toBe(0);
+      expect(report.factsSuperseded).toBe(0);
+      expect(report.factsRetracted).toBe(0);
+    });
+
+    it('raises a dispute when the owner stated both, and puts it in the review queue', async () => {
+      const first = await statedFact('the gateway', 'behind the relay', '2026-07-01T00:00:00.000Z');
+      const second = await statedFact(
+        'the gateway',
+        'in front of the relay',
+        '2026-07-02T00:00:00.000Z'
+      );
+      await narrowRelatedTo();
+
+      const report = await store.consolidateMemory(realWorkspaceId, { now: startedAt });
+      expect(report.factsDisputed).toBe(2);
+      expect(await statusOf(first.id)).toBe('disputed');
+      expect(await statusOf(second.id)).toBe('disputed');
+      // The queue three documents promise, finally with something in it.
+      const queued = await store.listDisputedMemoryItems(realWorkspaceId, 10);
+      expect(queued.map((entry) => entry.id).sort()).toEqual([first.id, second.id].sort());
+      // And the link that says what each conflicts with, without which "disputed" is unactionable.
+      expect(queued.find((entry) => entry.id === first.id)?.contradicts).toEqual([second.id]);
+    });
+
+    it('keeps what the owner stated over what athanor inferred', async () => {
+      const inferred = await statedFact(
+        'the gateway',
+        'behind the relay',
+        '2026-07-02T00:00:00.000Z',
+        'derived'
+      );
+      const stated = await statedFact(
+        'the gateway',
+        'in front of the relay',
+        '2026-07-01T00:00:00.000Z'
+      );
+      await narrowRelatedTo();
+
+      const report = await store.consolidateMemory(realWorkspaceId, { now: startedAt });
+      // Newer, and it still loses: trust outranks recency, because a thing the owner said is not
+      // overturned by something athanor worked out afterwards.
+      expect(report.factsRetracted).toBe(1);
+      expect(await statusOf(inferred.id)).toBe('retracted');
+      expect(await statusOf(stated.id)).toBe('active');
+    });
+
+    it('supersedes the older of two inferred values and links the replacement', async () => {
+      const older = await statedFact(
+        'the gateway',
+        'behind the relay',
+        '2026-07-01T00:00:00.000Z',
+        'derived'
+      );
+      const newer = await statedFact(
+        'the gateway',
+        'in front of the relay',
+        '2026-07-02T00:00:00.000Z',
+        'derived'
+      );
+      await narrowRelatedTo();
+
+      const report = await store.consolidateMemory(realWorkspaceId, { now: startedAt });
+      expect(report.factsSuperseded).toBe(1);
+      expect(await statusOf(older.id)).toBe('superseded');
+      expect(await statusOf(newer.id)).toBe('active');
+      const links = await database.query<{ src_id: string; rel: string }>(
+        `SELECT src_id, rel FROM mem.link WHERE dst_id=$1`,
+        [older.id]
+      );
+      expect(links.rows).toEqual([{ src_id: newer.id, rel: 'supersedes' }]);
+    });
+
+    it('answers each pair once, so a nightly pass does not become a standing bill', async () => {
+      await statedFact('the gateway', 'behind the relay', '2026-07-01T00:00:00.000Z', 'derived');
+      await statedFact(
+        'the gateway',
+        'in front of the relay',
+        '2026-07-02T00:00:00.000Z',
+        'derived'
+      );
+      await narrowRelatedTo();
+      expect(
+        (await store.consolidateMemory(realWorkspaceId, { now: startedAt })).factsSuperseded
+      ).toBe(1);
+      // The loser is no longer active and the link records the answer, so the second night finds
+      // nothing to do rather than re-deciding what was already decided.
+      expect(
+        (await store.consolidateMemory(realWorkspaceId, { now: startedAt })).factsSuperseded
+      ).toBe(0);
+    });
   });
 
   it('records the pack outcome and survives a consolidation pass', async () => {

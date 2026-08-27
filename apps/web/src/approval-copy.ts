@@ -203,6 +203,63 @@ export const approvalDiffState = <T extends { path: string; before?: string }>(
   };
 };
 
+/*
+ * Mirrors APPROVAL_NOTE_MAX_CHARS, approvalNoteText and approvalDenialMessage in
+ * @athanor/contracts. Copied rather than imported for the reason `usage-model.ts` and
+ * `approval-facts.ts` both give: every other use of that package in this client is `import type`,
+ * and pulling a runtime value in would drag the whole schema library into the first paint - which
+ * this card cannot afford, being one of the few things that must already be built when a request
+ * arrives. `approval-copy.test.ts` imports the real ones and holds this against them across a
+ * table of inputs, so the copy cannot drift in silence.
+ */
+const APPROVAL_NOTE_MAX_CHARS = 600;
+const NOTE_UNSAFE =
+  // eslint-disable-next-line no-control-regex
+  /[\u0000-\u0008\u000b-\u001f\u007f\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g;
+
+const noteText = (value: string | null | undefined): string => {
+  if (typeof value !== 'string') return '';
+  const clean = value
+    .replace(NOTE_UNSAFE, '')
+    .replace(/[\t ]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return clean.length > APPROVAL_NOTE_MAX_CHARS
+    ? `${clean.slice(0, APPROVAL_NOTE_MAX_CHARS)}…`
+    : clean;
+};
+
+const toolWord = (value: string | null | undefined): string =>
+  typeof value === 'string' && /^[a-z][a-z0-9_]{0,39}$/.test(value) ? value : '';
+
+/**
+ * What the owner said when they refused, addressed to the agent, or nothing when they said nothing.
+ *
+ * A denial used to tell the agent only *that* it had been refused, so what it did next was try a
+ * neighbouring version of the refused thing and the owner answered the same question twice. The
+ * reason is what turns a wall into steering, and it goes back on the channel that already exists
+ * for the owner's own words - a message to the conversation, marked as a correction so the paused
+ * turn takes it at its next step boundary rather than after it has already tried something else.
+ *
+ * Empty means send nothing: a denial with the box untouched must cost exactly the one request a
+ * denial cost before this field existed.
+ */
+export const approvalDenialMessage = (approval: Approval, note: string | null | undefined) => {
+  const text = noteText(note);
+  if (!text) return '';
+  const tool = toolWord(typeof approval.preview === 'string' ? undefined : approval.preview.tool);
+  return `I did not approve that ${tool ? `${tool} ` : ''}request. Here is why:\n\n${text}`;
+};
+
+/**
+ * How much the box holds, so the browser stops the typing rather than the note being cut later.
+ *
+ * The clamp above still runs - a paste is not typing, and the sanitiser can only shorten - but a
+ * `maxLength` is the difference between an owner who can see they have reached the end and one who
+ * finds out afterwards that half their sentence was thrown away.
+ */
+export const approvalNoteLimit = APPROVAL_NOTE_MAX_CHARS;
+
 /** The tools whose request can only really be judged by looking at the screen it is about. */
 const computerTools = new Set(['browser_action', 'desktop_action', 'desktop_launch']);
 

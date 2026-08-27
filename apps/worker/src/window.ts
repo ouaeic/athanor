@@ -33,6 +33,7 @@ import {
   runtimeContext
 } from './context.js';
 import { buildTaskMemoryPack, injectMemoryPack, memoryPackBudgetTokens } from './memory-runtime.js';
+import { useOutputSpill } from './output-spill.js';
 import type { AgentRunnerClient } from './runner-client.js';
 import { builtinSkillLibrary, skillCatalogBlock } from './skills.js';
 import { event } from './tool-recording.js';
@@ -79,7 +80,11 @@ export const refreshRuntimeContext = (deps: WindowDeps, input: RuntimeContextInp
     { now: new Date(), timeZone },
     toolchainSummary,
     unattended,
-    webPlan.mode
+    webPlan.mode,
+    // The money, from the two facts that decide it: what this turn has billed so far and the
+    // ceiling the API set when the task was created. @see spendLine in `context.ts` for why it is
+    // quantised and why it says nothing below the share.
+    { credits: state.credits, maxCredits: task.maxComputeCredits }
   );
   const last = state.messages.at(-1);
   // Nothing is touched when the block is already last and already says this - a removal and a
@@ -95,13 +100,41 @@ export const refreshRuntimeContext = (deps: WindowDeps, input: RuntimeContextInp
 
 export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): Promise<void> => {
   const { task, key, state, goal, contextTokens } = input;
+  /*
+   * The turn's overflow writer, named here because this is the one function that holds both the
+   * worker's runner client and the state object every later step mutates.
+   *
+   * It is a registration rather than a value passed on, because what needs it is `recordToolResult`
+   * - which reaches the worker through `ToolRecordingDeps`, a closed interface five call sites
+   * share and of which the spill would be the only member that writes a file. @see output-spill.ts
+   * for the keying, and for why an unregistered turn simply does not spill instead of failing.
+   */
+  useOutputSpill(state, deps.runner);
   // Read here, ahead of the two frozen blocks, because it is a network call and the runner is
   // slow to say no; it is spliced into the window below them, after the pack. See the comment on
   // that splice for why the order is what it is.
+  /*
+   * Three names, most specific first, and the order is the whole of the rule.
+   *
+   * `ATHANOR.md` is what the owner wrote for THIS computer and wins outright. `OPEN_CLOUD.md` is
+   * the name it carried before the rename and is still read so a box that has one does not quietly
+   * change behaviour under its owner. `AGENTS.md` is the shared convention the surrounding tooling
+   * writes, and it is read LAST on purpose: a brief addressed to every agent that might open the
+   * repository must not outrank one addressed to this one. Where both exist the specific file is
+   * the owner's more recent and more deliberate instruction.
+   *
+   * The name was already known here - `tools/repository.ts` globs it inside `code_context` - so an
+   * owner who had written down how their project works could watch the agent read the file as a
+   * search hit and still ignore it as an instruction. That is the gap this closes.
+   */
   const brief = await deps.runner
     .readFile(task.workspaceId, task.id, 'workspace/ATHANOR.md')
     .catch(() =>
-      deps.runner.readFile(task.workspaceId, task.id, 'workspace/OPEN_CLOUD.md').catch(() => '')
+      deps.runner
+        .readFile(task.workspaceId, task.id, 'workspace/OPEN_CLOUD.md')
+        .catch(() =>
+          deps.runner.readFile(task.workspaceId, task.id, 'workspace/AGENTS.md').catch(() => '')
+        )
     );
   const knowledgeMarker = 'CURATED ENCRYPTED KNOWLEDGE';
   const memoryRecords = await deps.store.listWorkspaceMemories(task.userId, task.workspaceId);

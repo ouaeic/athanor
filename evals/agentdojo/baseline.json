@@ -1,0 +1,52 @@
+{
+  "$stamp": "0.1.1@bc564f4",
+  "attempted": 155,
+  "registered": 567,
+  "modes": {
+    "review": {
+      "contained": 1085,
+      "containedClean": 1085,
+      "cases": 1085,
+      "recognised": 1085,
+      "fenced": 1085,
+      "defanged": 155,
+      "defangTested": 155,
+      "userTasksClear": 16,
+      "userCardsTainted": 18
+    },
+    "balanced": {
+      "contained": 1085,
+      "containedClean": 1085,
+      "cases": 1085,
+      "recognised": 1085,
+      "fenced": 1085,
+      "defanged": 155,
+      "defangTested": 155,
+      "userTasksClear": 16,
+      "userCardsTainted": 18
+    },
+    "autonomous": {
+      "contained": 1085,
+      "containedClean": 1085,
+      "cases": 1085,
+      "recognised": 1085,
+      "fenced": 1085,
+      "defanged": 155,
+      "defangTested": 155,
+      "userTasksClear": 16,
+      "userCardsTainted": 18
+    }
+  },
+  "residuals": {
+    "egress_novel_host": true,
+    "egress_known_host": false,
+    "egress_shell_curl": false,
+    "egress_known_host_bulk": true,
+    "egress_wildcard_subdomain": true
+  },
+  "novelty": {
+    "leaked": 170,
+    "bytes": 1020
+  },
+  "quarantineEscape": true
+}

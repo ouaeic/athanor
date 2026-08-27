@@ -15,6 +15,7 @@
     "test": "pnpm -r test",
     "eval": "NODE_OPTIONS=--conditions=development tsx evals/run.ts",
     "eval:context": "NODE_OPTIONS=--conditions=development tsx evals/context-quality/run.ts",
+    "eval:injection": "NODE_OPTIONS=--conditions=development tsx evals/agentdojo/run.ts",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

@@ -25,6 +25,9 @@ import {
   SOFT_PASS_SHARE,
   compactionTargetTail,
   compactionTrigger,
+  CONTEXT_BUDGET_MARKER,
+  CONTEXT_BUDGET_NOTICE_SHARE,
+  contextBudgetNotice,
   contextShortfall,
   declaredCompactionTargetTail,
   MINIMUM_WORKING_TOKENS,
@@ -36,6 +39,7 @@ import {
   runtimeContext,
   RUNTIME_CONTEXT_MARKER,
   serializeToolResultForModel,
+  SPEND_NOTICE_SHARE,
   truncateMiddle,
   type ContextBrief
 } from './context.js';
@@ -85,6 +89,17 @@ const unansweredToolCalls = (messages: ModelMessage[]): string[] => {
     .flatMap((call) => (answered.has(call.id) ? [] : [call.id]));
 };
 
+/**
+ * The last message of a prepared window that is part of the trajectory.
+ *
+ * `prepareModelContext` appends a volatile CONTEXT BUDGET line past a threshold, after the cache
+ * breakpoints have been marked, so on a squeezed window `messages.at(-1)` is that line rather than
+ * the thing a case is asking about. Three cases below assert on "the last message" and mean the
+ * last one the model is being told about the work; this is that message.
+ */
+const lastTrajectoryMessage = (messages: ModelMessage[]): ModelMessage | undefined =>
+  [...messages].reverse().find((message) => !message.content.startsWith(CONTEXT_BUDGET_MARKER));
+
 describe('agent context preparation', () => {
   it('bounds tool output while preserving both useful ends', () => {
     const output = serializeToolResultForModel({ stdout: `BEGIN${'x'.repeat(30_000)}END` }, 2_000);
@@ -128,7 +143,7 @@ describe('agent context preparation', () => {
      * What is kept, and is the reason this is a fair trade rather than a preference, is asserted
      * below - the preamble and the owner's goal are untouched, and the summary is complete.
      */
-    const summary = prepared.messages.at(-1);
+    const summary = lastTrajectoryMessage(prepared.messages);
     expect(summary?.role).toBe('system');
     expect(summary?.content.startsWith(COMPRESSED_TRAJECTORY_MARKER)).toBe(true);
     expect(summary?.content).toContain('shell');
@@ -319,7 +334,7 @@ describe('agent context preparation', () => {
     // enough, and here it was, so both are whole - though both are over the floor and would have
     // been cut had the pass had to keep going.
     expect(prepared.messages[1]?.content).toBe(goal);
-    expect(prepared.messages.at(-1)?.content).toBe(newest);
+    expect(lastTrajectoryMessage(prepared.messages)?.content).toBe(newest);
   });
 });
 
@@ -1058,7 +1073,9 @@ describe('compaction and prompt caching', () => {
     // starts. The summary itself is at the tail rather than ahead of the goal: it used to go in at
     // index 2, which put a block rebuilt on every step inside the run the anchor breakpoint closes.
     const uncompacted = prepareModelContext(window, 32_000, 4_000);
-    expect(uncompacted.messages.at(-1)?.content).toContain(COMPRESSED_TRAJECTORY_MARKER);
+    expect(lastTrajectoryMessage(uncompacted.messages)?.content).toContain(
+      COMPRESSED_TRAJECTORY_MARKER
+    );
     expect(uncompacted.messages[2]?.content).toBe('Keep this original goal.');
 
     const outcome = await compactContext({
@@ -2286,7 +2303,7 @@ describe('sixty steps of one task, measured on the bytes that leave the machine'
     let brief: ContextBrief | undefined;
     let floor: number | undefined;
     let preparedTokens: number | undefined;
-    let previous: { pieces: string[]; bytes: string } | null = null;
+    let previous: { pieces: string[]; trajectory: string[]; bytes: string } | null = null;
     /** Every request as it went out, so a provider cache can be modelled across the whole run. */
     const tape: Array<{
       pieces: string[];
@@ -2394,6 +2411,21 @@ describe('sixty steps of one task, measured on the bytes that leave the machine'
        */
       const pieces = prepared.messages.map((message) => JSON.stringify(onTheWire(message, false)));
       const bytes = catalogueOnTheWire + pieces.join(',');
+      /*
+       * The divergence histogram below is measured on the trajectory WITHOUT the volatile budget
+       * line, and the prefix and cache-read shares are measured with it.
+       *
+       * That split is the honest reading of what the line is. It is appended after
+       * `markCacheBreakpoints` has run, so it can never be anchored to and never moves a
+       * breakpoint; it is real bytes on the wire that are never part of an identical prefix, which
+       * is why the shares below fall by 0.09 with it in. But counting it in "how far back does
+       * this request first differ from the last one" would put every step at one from the tail and
+       * hide the boundary this case exists to watch. Excluding it also keeps the positions the
+       * same as they were before it existed - it is always last, so no other index moves.
+       */
+      const trajectory = pieces.filter(
+        (_, index) => !prepared.messages[index]?.content.startsWith(CONTEXT_BUDGET_MARKER)
+      );
 
       const toolLengths = new Map(
         prepared.messages.flatMap((message): [string, number][] =>
@@ -2430,9 +2462,9 @@ describe('sixty steps of one task, measured on the bytes that leave the machine'
       if (previous) {
         let index = 0;
         while (
-          index < pieces.length &&
-          index < previous.pieces.length &&
-          pieces[index] === previous.pieces[index]
+          index < trajectory.length &&
+          index < previous.trajectory.length &&
+          trajectory[index] === previous.trajectory[index]
         )
           index += 1;
         for (let candidate = index - 1; candidate >= 0; candidate -= 1)
@@ -2452,7 +2484,7 @@ describe('sixty steps of one task, measured on the bytes that leave the machine'
           windowMessages: prepared.messages.length,
           firstDifferingIndex: index,
           firstDifferingRole: prepared.messages[index]?.role ?? 'assistant',
-          firstDifferingFromTail: pieces.length - index,
+          firstDifferingFromTail: trajectory.length - index,
           readableBreakpoint,
           breakpointLag: readableBreakpoint < 0 ? index : index - 1 - readableBreakpoint,
           cacheReadShare:
@@ -2478,7 +2510,7 @@ describe('sixty steps of one task, measured on the bytes that leave the machine'
         marks: marked,
         retrospectiveEdge
       });
-      previous = { pieces, bytes };
+      previous = { pieces, trajectory, bytes };
       previousFloor = floor;
       previousToolLengths = toolLengths;
       previousDetailed = detailed;
@@ -2848,5 +2880,157 @@ describe('sixty steps of one task, measured on the bytes that leave the machine'
       expect(run.budgetCompactions).toBe(0);
       expect(run.peakPreparedTokens).toBeLessThan(run.trigger);
     }
+  });
+});
+
+/**
+ * §6.1(a): every bound in this product is stated to the model except the one that costs the owner
+ * money. These are the two halves of "the model can see it" - it appears when there is a decision
+ * to make, and it is silent when there is not.
+ */
+describe('the money the model can see', () => {
+  const workspace = {
+    id: 'workspace-1',
+    name: 'athanor',
+    region: 'local',
+    storageBytes: 1_000,
+    storageLimitBytes: 100_000_000_000,
+    securityMode: 'balanced' as const
+  };
+  const at = (credits: number, maxCredits = 20) =>
+    runtimeContext(
+      workspace,
+      'https://preview.example.com',
+      { now: new Date('2026-08-02T09:41:22Z'), timeZone: 'UTC' },
+      '',
+      false,
+      'in_house',
+      { credits, maxCredits }
+    );
+
+  it('says nothing on a cheap turn and says it at the share', () => {
+    expect(at(2)).not.toContain('Compute budget');
+    expect(at(20 * SPEND_NOTICE_SHARE - 0.01)).not.toContain('Compute budget');
+    expect(at(20 * SPEND_NOTICE_SHARE)).toContain('Compute budget');
+  });
+
+  it('names the cap, what is spent and what is left', () => {
+    const line = at(15);
+    expect(line).toContain(
+      'about 15 of this task’s 20 compute credits are spent'.replace('’', "'")
+    );
+    expect(line).toContain('about 5 left');
+    // And what happens at the end of it, because that is the part a model can plan around.
+    expect(line).toContain('hands back to the user');
+  });
+
+  it('holds still while the number moves inside one twentieth of the ceiling', () => {
+    // This line rides in the volatile tail block, which is only re-pushed when its bytes differ.
+    // An exact credit figure would differ on every step of the task for a precision nobody acts on.
+    expect(at(15.01)).toBe(at(15.04));
+    expect(at(16)).not.toBe(at(15));
+  });
+
+  it('is silent when the operator set no ceiling at all', () => {
+    expect(at(50, 0)).not.toContain('Compute budget');
+  });
+
+  it('leaves every turn below the share byte-identical to the block that shipped', () => {
+    // The negative control for the whole item: adding a spend line must not have changed what a
+    // cheap turn is told, and a cheap turn is nearly every turn.
+    const without = runtimeContext(workspace, 'https://preview.example.com', {
+      now: new Date('2026-08-02T09:41:22Z'),
+      timeZone: 'UTC'
+    });
+    expect(at(1)).toBe(without);
+  });
+});
+
+/**
+ * #62: the window budget the model was never told it was working against.
+ */
+describe('the context budget the model can see', () => {
+  it('says nothing while there is nothing to say', () => {
+    expect(contextBudgetNotice(1_000, 100_000, 24_000)).toBeNull();
+    expect(contextBudgetNotice(100_000 * CONTEXT_BUDGET_NOTICE_SHARE, 100_000, 24_000)).toBeNull();
+  });
+
+  it('speaks past the share, and names the headroom and the way out', () => {
+    const line = contextBudgetNotice(80_000, 100_000, 24_000);
+    expect(line).toContain(CONTEXT_BUDGET_MARKER);
+    expect(line).toContain('about 20,000 of your 100,000 working tokens are free');
+    expect(line).toContain('about 80% used');
+    expect(line).toContain('compact_context');
+  });
+
+  it('speaks as soon as the squeeze starts, which is the case that actually happens', () => {
+    /*
+     * The trigger that matters. Measured on the sixty-step harness, a tool-heavy task never
+     * crosses a share of budget at all - the older-result squeeze holds the prepared size under
+     * every threshold above it, which is the same finding that explains why automatic compaction
+     * reads zero there. So a notice keyed only on the share would have been a mechanism nobody
+     * ever sees, which is the defect this programme has now found four times.
+     */
+    const line = contextBudgetNotice(10_000, 100_000, 6_000);
+    expect(line).not.toBeNull();
+    expect(line).toContain('being cut to 6,000 characters');
+    expect(line).toContain('detail you read earlier may no longer be in front of you');
+  });
+
+  it('reaches the prepared request, at the tail, without being written into the trajectory', async () => {
+    const messages: ModelMessage[] = [
+      { role: 'system', content: 'contract' },
+      { role: 'user', content: 'do the work' }
+    ];
+    for (let index = 0; index < 40; index += 1) {
+      messages.push({ role: 'assistant', content: `step ${index}` });
+      messages.push({
+        role: 'tool',
+        toolCallId: `call-${index}`,
+        content: `${'result '.repeat(3_000)}${index}`
+      });
+    }
+    const prepared = prepareModelContext(messages, 64_000, 4_000);
+    const tail = prepared.messages.at(-1);
+    expect(tail?.role).toBe('system');
+    expect(tail?.content.startsWith(CONTEXT_BUDGET_MARKER)).toBe(true);
+    // Volatile: it describes one request, and a copy of it in the trajectory would be a wrong
+    // number the model carries forward to every later step.
+    expect(messages.some((message) => message.content.startsWith(CONTEXT_BUDGET_MARKER))).toBe(
+      false
+    );
+    // Deterministic, because `requestDerivationBreach` re-derives this window and compares it.
+    expect(prepareModelContext(messages, 64_000, 4_000).messages).toEqual(prepared.messages);
+  });
+
+  it('leaves a window that is nowhere near its bound exactly as it was', () => {
+    const messages: ModelMessage[] = [
+      { role: 'system', content: 'contract' },
+      { role: 'user', content: 'do the work' },
+      { role: 'assistant', content: 'on it' }
+    ];
+    const prepared = prepareModelContext(messages, 128_000, 4_000);
+    expect(prepared.messages.map((message) => message.content)).toEqual(
+      messages.map((message) => message.content)
+    );
+  });
+});
+
+describe('the runtime block on a record that has no ceiling on it', () => {
+  it('renders rather than throwing when the column is absent', () => {
+    // `maxComputeCredits` is `undefined` on a record built before the column existed, and
+    // `undefined <= 0` is false - so the obvious guard let it through and the block threw while it
+    // was being assembled. A runtime block that cannot be rendered is a turn that cannot start.
+    const line = runtimeContext(
+      { name: 'athanor', securityMode: 'balanced' as const },
+      'https://preview.example.com',
+      { now: new Date('2026-08-02T09:41:22Z'), timeZone: 'UTC' },
+      '',
+      false,
+      'in_house',
+      { credits: 5, maxCredits: undefined as unknown as number }
+    );
+    expect(line).toContain(RUNTIME_CONTEXT_MARKER);
+    expect(line).not.toContain('Compute budget');
   });
 });

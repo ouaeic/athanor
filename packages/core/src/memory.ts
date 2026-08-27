@@ -240,9 +240,11 @@ export type MemoryTrust = 'stated' | 'derived';
  *   stops being recalled and the audit trail survives, which is the difference between "stop
  *   believing this" and `DELETE`.
  *
- * The one gap worth writing down rather than discovering: the `disputed` *writer* has no production
- * caller yet. The review queue serves and clears disputes; nothing on the turn path raises one, so
- * `resolveMemoryContradiction` below decides a verdict nobody currently produces. See its comment.
+ * The gap that used to be worth writing down here - the `disputed` *writer* having no production
+ * caller, so the review queue could clear a dispute nothing was able to raise - is closed:
+ * `consolidateMemory`'s contradiction pass raises one whenever a subject holds two current values
+ * of a predicate the registry declares one-valued. What remains open is narrower and is recorded on
+ * `resolveMemoryContradiction` below: no pass yet buys a verdict for pairs under a `many` predicate.
  */
 export type MemoryStatus = 'active' | 'superseded' | 'disputed' | 'archived' | 'retracted';
 
@@ -1212,13 +1214,22 @@ export interface MemoryContradictionSide {
  * queue at `GET /v1/workspaces/:id/memory-review` serves them to the owner beside the stale
  * procedures, with `retract` and `verify` as the two answers. That path is tested end to end.
  *
- * What does not exist is *path B* - the nightly pass that pairs candidate facts and asks a model
- * for a verdict per pair (docs/design/memory.md 4.3). Path A, the deterministic engine, is live:
- * `recordMemoryFact` retires the previous value of a `cardinality: 'one'` predicate on the write
- * path without a model call, which is `supersede` reached by a different and cheaper route. So this
- * function is not dead - it is the half that path B will call, and it is kept rather than deleted
- * because deleting it while `docs/design/memory.md` and `docs/AGENT_RUNTIME.md` both describe the
- * queue would leave the sentence and remove the answer. Wiring it is one caller, not a rebuild.
+ * Path A, the deterministic engine, is live on the write path: `recordMemoryFact` retires the
+ * previous value of a `cardinality: 'one'` predicate without a model call, which is `supersede`
+ * reached by a different and cheaper route.
+ *
+ * *Path B* - the nightly pass - now exists for the half of it that needs no model.
+ * `consolidateMemory` pairs the current facts a subject holds under one predicate and, where the
+ * registry declares that predicate `cardinality: 'one'`, hands this function the verdict the
+ * registry has already given: two different current values of a one-valued predicate contradict,
+ * by definition. Those pairs are real and were unreachable by any other route - a release that
+ * narrows a cardinality leaves them behind deliberately (see `#backfillPredicateFunctional`, whose
+ * own comment promises they will be resolved "the ordinary way", which until now nothing did).
+ *
+ * What is still absent is a verdict over pairs under a `many` predicate, where "do these two
+ * disagree" is a question about meaning rather than about the schema. That pass calls this same
+ * table with a verdict it has bought from a model, which is exactly why the table takes one rather
+ * than deciding for itself.
  */
 export const resolveMemoryContradiction = (
   left: MemoryContradictionSide,
@@ -1260,6 +1271,20 @@ export interface RenderedMemoryPack {
   readonly tokensEst: number;
 }
 
+/**
+ * What the open end of a validity interval is rendered as.
+ *
+ * It used to be nothing at all - `valid=2026-07-01T00:00:00.000Z/` - and the block's own header
+ * explains what an entry whose validity has *ended* means while saying nothing about the empty
+ * side. A trailing separator with nothing after it is the one shape a reader has to guess at: it
+ * reads equally as "no end recorded", "the end was lost" and "the string was truncated", and the
+ * third reading is the dangerous one because it invites the model to discount a current fact. One
+ * word settles it, costs three tokens on entries that are by definition the live ones, and is a
+ * word rather than an instant because there is no instant to write: the interval is open, and
+ * `9999-12-31` would be a fact nobody stated.
+ */
+export const MEMORY_PACK_OPEN_INTERVAL = 'Present';
+
 const PACK_SECTIONS: readonly { readonly kind: MemoryKind; readonly heading: string }[] = [
   { kind: 'fact', heading: 'Facts' },
   { kind: 'procedure', heading: 'Procedures' },
@@ -1297,7 +1322,7 @@ export const renderMemoryPack = (entries: readonly MemoryPackEntry[]): RenderedM
     for (const entry of members) {
       const validity = entry.validTo
         ? `${isoInstant(entry.validFrom)}/${isoInstant(entry.validTo)}`
-        : `${isoInstant(entry.validFrom)}/`;
+        : `${isoInstant(entry.validFrom)}/${MEMORY_PACK_OPEN_INTERVAL}`;
       const head = [
         `- id=${entry.id}`,
         `trust=${entry.trust}`,
@@ -1318,4 +1343,145 @@ export const renderMemoryPack = (entries: readonly MemoryPackEntry[]): RenderedM
     itemIds: ordered.map((entry) => entry.id),
     tokensEst: estimateMemoryTokens(body)
   };
+};
+
+/* ------------------------------------------------------------------------ *
+ * Which recalled entries the finished work actually used
+ *
+ * `mem.item.cited_count` is one of four terms of the salience formula that decides what survives
+ * consolidation - `0.20 *` the standardised citation count, in `packages/data/src/store/memory.ts`
+ * - and until this wave nothing anywhere wrote it. `recordMemoryUse` is its only writer, behind a
+ * `cited` parameter, and both production callers left it out, so the column was zero for every
+ * item in every workspace that had ever run and a fifth of the score was a constant. What was
+ * missing was not the column or the formula but an answer to "which of the twelve entries in the
+ * block did this turn actually use", and that answer has to come from the finished work rather
+ * than from the moment of injection, which is why the recall path deliberately cannot supply it.
+ *
+ * Two channels produce it, and they are deliberately different in kind:
+ *
+ * - **Named.** The finished text contains the entry's `id`. Exact, and the one a caller with a
+ *   structured citation list (a `finish` that names its memory evidence) feeds through `named`.
+ * - **Quoted.** The finished text reuses a run of the entry's own wording that no other entry in
+ *   the block and no part of the owner's request also contains. This is the channel that works
+ *   without asking the model for anything, and both of its exclusions are load-bearing: wording
+ *   two entries share cannot say which of them was read, and wording the owner supplied is the
+ *   turn echoing the request rather than the memory.
+ *
+ * The bias is deliberately towards under-counting. A missed citation loses a fraction of one term
+ * of one score; a false one credits an entry that was never read, and the whole point of the term
+ * is to tell those two apart.
+ * ------------------------------------------------------------------------ */
+
+/** One entry of a rendered pack, as text, with the head line's metadata dropped. */
+export interface MemoryPackTextEntry {
+  readonly id: string;
+  readonly text: string;
+}
+
+const PACK_ENTRY_HEAD = /^- id=(\S+)(?:\s|$)/u;
+
+/**
+ * Reads a rendered pack back into per-entry text.
+ *
+ * The inverse of `renderMemoryPack` for exactly the part attribution needs, which is the wording
+ * and not the metadata: the head line is dropped whole, because `trust=`, `observed=` and `valid=`
+ * are identical in shape on every entry and would otherwise be the only thing every entry has in
+ * common. Written against the stored pack rather than against the candidate rows because the pack
+ * is what the model was actually shown - a turn cannot have used bytes that were budgeted out.
+ */
+export const parseMemoryPackBody = (body: string): MemoryPackTextEntry[] => {
+  const entries: { id: string; lines: string[] }[] = [];
+  for (const line of body.split('\n')) {
+    const head = PACK_ENTRY_HEAD.exec(line);
+    if (head?.[1]) {
+      entries.push({ id: head[1], lines: [] });
+      continue;
+    }
+    // Continuation lines are the two-space indent `renderMemoryPack` writes; a `## ` heading or a
+    // blank line belongs to no entry and ends the one in hand only in the sense that nothing more
+    // is appended to it.
+    if (line.startsWith('  ')) entries.at(-1)?.lines.push(line.slice(2));
+  }
+  return entries.map(({ id, lines }) => ({ id, text: lines.join('\n') }));
+};
+
+/**
+ * Words in a row that must match for the quoted channel to fire.
+ *
+ * Four, over lexemes rather than over raw words - so stop words are already gone and a run of four
+ * is four *content* words, which is a far stronger coincidence than four words of English. Three
+ * fired on ordinary phrasing shared by a fact and the sentence that happened to answer it; five
+ * missed a paraphrase that had genuinely been read. An entry with fewer than four lexemes has no
+ * shingle at all and can only ever be cited by name, which is correct: "London." quoted back is
+ * not evidence that anything was read.
+ */
+export const MEMORY_CITATION_SHINGLE_LEXEMES = 4;
+
+const citationShingles = (value: string): Set<string> => {
+  const lexemes = memoryLexemes(value);
+  const shingles = new Set<string>();
+  for (let at = 0; at + MEMORY_CITATION_SHINGLE_LEXEMES <= lexemes.length; at += 1)
+    shingles.add(lexemes.slice(at, at + MEMORY_CITATION_SHINGLE_LEXEMES).join(' '));
+  return shingles;
+};
+
+export interface MemoryCitationInput {
+  /** The block as the model saw it, read back by `parseMemoryPackBody`. */
+  readonly entries: readonly MemoryPackTextEntry[];
+  /**
+   * Everything the finished turn produced: its answer, its summary, the claims its verification
+   * made, and the commands the harness itself watched pass. The last of those is why a procedure
+   * that was followed rather than quoted still counts - nobody writes a shell command out in prose
+   * to the owner, and grading a followed procedure `unknown` because of that would be the same
+   * defect one layer down.
+   */
+  readonly used: readonly string[];
+  /**
+   * The owner's own words. Wording that came from here is excluded: a turn that echoes the request
+   * has demonstrated nothing about the block, and requests overlap memory by construction because
+   * the request is what the block was retrieved with.
+   */
+  readonly request?: string;
+  /** Ids a structured citation channel named outright, if the caller has one. */
+  readonly named?: readonly string[];
+}
+
+/**
+ * The ids of the pack entries this turn can be shown to have used, in pack order.
+ *
+ * Pure and total: an empty `used` cites nothing rather than everything, which is the direction that
+ * keeps a turn nobody can attribute from inflating every counter in the workspace.
+ */
+export const memoryPackCitations = (input: MemoryCitationInput): string[] => {
+  const known = new Set(input.entries.map((entry) => entry.id));
+  const cited = new Set<string>();
+  for (const id of input.named ?? []) if (known.has(id)) cited.add(id);
+
+  const used = input.used.filter((part) => part.trim().length > 0).join('\n');
+  if (used.trim().length > 0) {
+    // The machine-parseable half. It costs one substring search and needs nothing of the model
+    // beyond the id it was already shown on the entry's own head line.
+    for (const entry of input.entries) if (used.includes(entry.id)) cited.add(entry.id);
+
+    const perEntry = input.entries.map((entry) => ({
+      id: entry.id,
+      shingles: citationShingles(entry.text)
+    }));
+    const sharing = new Map<string, number>();
+    for (const entry of perEntry)
+      for (const shingle of entry.shingles) sharing.set(shingle, (sharing.get(shingle) ?? 0) + 1);
+    const usedShingles = citationShingles(used);
+    const requestShingles = citationShingles(input.request ?? '');
+    for (const entry of perEntry) {
+      if (cited.has(entry.id)) continue;
+      for (const shingle of entry.shingles) {
+        if (sharing.get(shingle) !== 1) continue;
+        if (requestShingles.has(shingle)) continue;
+        if (!usedShingles.has(shingle)) continue;
+        cited.add(entry.id);
+        break;
+      }
+    }
+  }
+  return input.entries.map((entry) => entry.id).filter((id) => cited.has(id));
 };

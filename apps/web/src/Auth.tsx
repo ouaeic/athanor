@@ -11,6 +11,7 @@ import {
 } from './auth-form.js';
 import { deviceEnrollmentToken, grantInPairingFragment, isPairingFragment } from './device-link.js';
 import { recoveryFile } from './account-recovery.js';
+import { DOWNLOAD_UNAVAILABLE_RECOVERY_CODE, nativeBridge } from './native.js';
 import { BrandMark } from './BrandMark.js';
 import { ServerInstall } from './ServerInstall.js';
 
@@ -208,18 +209,28 @@ export function Auth({ onReady }: { onReady: () => void }) {
             >
               <Copy size={16} /> {copied ? 'Copied' : 'Copy'}
             </button>
+            {/*
+              Through the bridge, and `setSaved` only on the answer.
+
+              This was a raw `<a download>` and then an unconditional `setSaved(true)`, which on a
+              packaged client is two lies stacked: WKWebView and WebKitGTK discard the click with no
+              file, no error and no message, and the screen then took the nudge down and let the
+              owner press Continue on a code that exists nowhere. This is the one string in the
+              product that cannot be produced again — using it is the only way back into an account
+              whose passkeys are gone — so the failure is said out loud, the nudge stays up, and the
+              sentence names the control two millimetres to the left that does work.
+            */}
             <button
               className="secondary"
               onClick={() => {
                 setSaveError('');
                 const file = recoveryFile(recovery);
-                const href = URL.createObjectURL(new Blob([file.text], { type: file.type }));
-                const anchor = document.createElement('a');
-                anchor.href = href;
-                anchor.download = file.name;
-                anchor.click();
-                URL.revokeObjectURL(href);
-                setSaved(true);
+                void nativeBridge
+                  .saveFile(file.name, new Blob([file.text], { type: file.type }))
+                  .then((written) => {
+                    if (written) setSaved(true);
+                    else setSaveError(DOWNLOAD_UNAVAILABLE_RECOVERY_CODE);
+                  });
               }}
             >
               <Download size={16} /> Download

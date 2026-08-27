@@ -4,6 +4,7 @@ import { api } from './api.js';
 import {
   approvalAnnouncement,
   approvalDiffState,
+  approvalNoteLimit,
   approvalProvenance,
   approvalReach,
   expiryNote,
@@ -154,7 +155,14 @@ export function Approvals({
    * refetched every few seconds and the next card up must not inherit the last one's failure.
    */
   failure?: { approvalId: string; message: string };
-  onResolve: (id: string, decision: 'approve' | 'deny') => Promise<void>;
+  /**
+   * The third argument is the owner's reason, and it is only ever supplied with a denial.
+   *
+   * Optional rather than required because the two answers are not symmetrical: approving is
+   * agreement and needs no words, refusing is the half where the agent learns nothing and goes on
+   * to try a neighbouring version of what it was just refused.
+   */
+  onResolve: (id: string, decision: 'approve' | 'deny', note?: string) => Promise<void>;
 }) {
   const item = nextApproval(approvals, openTaskId);
   // The countdown has to move on its own; the approval list is refetched far less often than the
@@ -167,6 +175,23 @@ export function Approvals({
   }, []);
   const ownCard = useRef<HTMLDivElement | null>(null);
   const card = cardRef ?? ownCard;
+  /*
+   * The owner's half of the decision, and the one thing on this card they write rather than read.
+   *
+   * Kept per request and cleared with it below: the buttons are reused across requests, and a
+   * reason typed about a `shell` command riding along with the next card's `connector_action`
+   * would be the same defect the focus move above exists to prevent, in prose.
+   *
+   * Mirrored into a ref because the keyboard answer is bound on the element for the life of one
+   * request - see the listener below - and a closure captured at bind time would send the empty
+   * string the box held before a word of it was typed.
+   */
+  const [note, setNote] = useState('');
+  const typedNote = useRef('');
+  typedNote.current = note;
+  useEffect(() => {
+    setNote('');
+  }, [item?.id]);
   /*
    * Focus goes to the request the moment there is one, and again when a different one takes its
    * place. Both halves matter. The first is simply that it is the owner's turn: this is not a
@@ -232,7 +257,10 @@ export function Approvals({
       if (!decision) return;
       event.preventDefault();
       event.stopPropagation();
-      void resolve.current(id, decision);
+      // The reason goes with the keyboard answer as well as with the pressed button. Both keys
+      // carry a modifier, so this fires from inside the reason box too - which is exactly where
+      // the owner's hands are when they have just finished typing one.
+      void resolve.current(id, decision, decision === 'deny' ? typedNote.current : undefined);
     };
     node.addEventListener('keydown', answer);
     return () => node.removeEventListener('keydown', answer);
@@ -340,6 +368,26 @@ export function Approvals({
             How far the request reaches is the card's headline, above; repeating it here said the
             same sentence twice on a card already fighting to keep its buttons on screen. */}
         <small>{expiryNote(item.expiresAt)}</small>
+        {/* The owner's half of the answer.
+
+            Denying told the agent only that it had been refused, never why, so the next thing it
+            did was try a neighbouring version of the refused action and the owner answered the
+            same question a second time. This box is the difference between a wall and steering,
+            and it is deliberately one plain field rather than a step: the answer must never become
+            slower to give than it was, so an untouched box denies exactly as it did before.
+
+            Labelled for refusing, and only sent with Deny, because "yes" needs no reason and a
+            sentence written under "Approve" would be put in the owner's mouth as one. */}
+        <label className="approval-note">
+          <span>Why not? Optional — sent to the agent with Deny</span>
+          <textarea
+            value={note}
+            onChange={(changed) => setNote(changed.target.value)}
+            maxLength={approvalNoteLimit}
+            rows={2}
+            placeholder="Not that file — use the staging copy"
+          />
+        </label>
         {failure?.approvalId === item.id && (
           <p className="approval-failure" role="alert">
             {failure.message}
@@ -362,7 +410,7 @@ export function Approvals({
         <button
           className="ghost"
           aria-keyshortcuts="Meta+Backspace"
-          onClick={() => void onResolve(item.id, 'deny')}
+          onClick={() => void onResolve(item.id, 'deny', note)}
         >
           Deny
         </button>

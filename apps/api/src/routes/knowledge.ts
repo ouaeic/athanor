@@ -18,6 +18,7 @@ import {
   memoryTemporalStatus
 } from '@athanor/core';
 import type { MemoryDocument } from '@athanor/core';
+import type { MemoryItemBody } from '@athanor/contracts';
 import type { MemoryItemRecord } from '@athanor/data';
 import { z } from 'zod';
 import { UNREADABLE_MEMORY_ITEM } from '../context.js';
@@ -293,6 +294,53 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
       return UNREADABLE_MEMORY_ITEM;
     }
   };
+
+  /**
+   * The whole of one row, which is the half of the promise the excerpt cannot keep.
+   *
+   * Both lists clamp at 200 characters and both say on screen that they are showing an opening.
+   * That is honest and it is not "read the whole of what was remembered about you": the rest sat on
+   * the owner's own disk, under a key this request already derives, with nothing anywhere to ask
+   * for it. One row at a time and never in the list, deliberately — a review queue of fifty rows
+   * with every body inlined is a megabyte of ciphertext decrypted to answer a question about one of
+   * them, and the screen shows two lines until the owner opens something.
+   *
+   * A row this key will not open answers 200 with `readable: false` and the same standing sentence
+   * the lists use, not 500 and not an empty string. The list already shows the row; an expander
+   * that came back blank would read as "nothing was remembered here", which is the opposite of what
+   * is true, and an error would hide a row the owner would most want to reach. A row that is not in
+   * this workspace at all is a 404, which is a different fact and is said differently.
+   */
+  app.get<{ Params: { workspaceId: string; itemId: string } }>(
+    '/v1/workspaces/:workspaceId/memory-items/:itemId',
+    async (request) => {
+      const user = requireUser(request.user);
+      const workspaceId = request.params.workspaceId;
+      const { key } = await workspaceKnowledgeKey(user.id, workspaceId);
+      const record = await store.getMemoryItem(workspaceId, request.params.itemId);
+      if (!record) throw new AthanorError('memory_item_not_found', 'Memory item not found', 404);
+      try {
+        const document = decryptJson<{ title?: string | null; body: string }>(
+          record.documentCiphertext,
+          key,
+          `memory-item:${workspaceId}`
+        );
+        return {
+          id: record.id,
+          title: document.title ?? null,
+          body: document.body,
+          readable: true
+        } satisfies MemoryItemBody;
+      } catch {
+        return {
+          id: record.id,
+          title: null,
+          body: UNREADABLE_MEMORY_ITEM,
+          readable: false
+        } satisfies MemoryItemBody;
+      }
+    }
+  );
 
   /**
    * What the agent has written down for itself, which until now had no route at all.

@@ -347,3 +347,47 @@ describe('the card that asks before something irreversible', () => {
     expect(markup).not.toContain('That decision could not be sent');
   });
 });
+
+/*
+ * The half of the card the owner writes.
+ *
+ * Rendered rather than driven, because this card has no DOM here by design - what these hold is
+ * that the box exists, that it is bounded, and that it is offered without changing what pressing
+ * Deny costs. What the box turns into is held in `approval-copy.test.ts`, against the contract.
+ */
+describe('the reason box on a refusal', () => {
+  it('offers somewhere to say why, and says which answer it is sent with', () => {
+    const markup = render([approval()]);
+    expect(markup).toContain('<textarea');
+    expect(markup).toContain('Why not?');
+    expect(markup).toContain('sent to the agent with Deny');
+  });
+
+  /*
+   * The bound is on the element as well as in the clamp, so an owner reaches the end of the box
+   * rather than finding out afterwards that half their sentence was thrown away. 600 is the
+   * contract's number; `approval-copy.test.ts` is what holds it to that.
+   */
+  it('stops the typing at the bound rather than cutting it later', () => {
+    expect(render([approval()])).toContain('maxLength="600"');
+  });
+
+  /*
+   * The two answers are unchanged and stay unchanged. This box may not make refusing slower or
+   * more conditional than it was: an untouched one denies in exactly the request it always did,
+   * and both keyboard answers still say so on the controls themselves.
+   */
+  it('leaves both answers exactly where they were', () => {
+    const markup = render([approval()]);
+    expect(markup).toContain('aria-keyshortcuts="Meta+Backspace"');
+    expect(markup).toContain('aria-keyshortcuts="Meta+Enter"');
+    expect(markup).toContain('>Deny</button>');
+    expect(markup).toContain('>Approve</button>');
+  });
+
+  /* Nothing is prefilled, so the request costs what it costs unless somebody types. */
+  it('starts empty', () => {
+    expect(render([approval()])).toContain('<textarea');
+    expect(render([approval()])).not.toContain('>Not that file');
+  });
+});

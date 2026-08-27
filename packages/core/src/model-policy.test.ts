@@ -15,13 +15,16 @@ import {
   modelFit,
   modelTaskKinds,
   priceCeilingBreach,
+  preferIncumbent,
   priceCeilingFields,
   qualityScore,
   rankModels,
   readRoutingMetadata,
+  requestForWork,
   selectModel,
   taskProfile,
   type ModelRequest,
+  type ModelTaskKind,
   type RoutableModel,
   type RoutingMetadata
 } from './model-policy.js';
@@ -739,6 +742,47 @@ describe('task classification', () => {
     ).toBe('bulk_summarisation');
   });
 
+  /*
+   * The safe fallback, which the declared kind is the only signal to need one.
+   *
+   * Every other signal in `TaskSignals` is produced inside this repository and typed by it.
+   * `declaredKind` is the one that comes from wherever the caller got it - a stored schedule row, a
+   * request body, a tier some other process chose - and `ModelTaskKind` on the field is a claim
+   * about that value, not a check of it. Returned verbatim it becomes a key into `profiles`, and
+   * `taskProfile` has no entry for it: the next line in `modelFit` reads `requiredCapabilities` off
+   * `undefined` and the turn dies inside the router, on the one path whose whole job is to be the
+   * safe one. So an unrecognised label loses its precedence and the ordinary rules run.
+   */
+  it('drops a declared kind it has no profile for rather than routing on it', () => {
+    const classified = classifyModelTask({
+      prompt: 'Fix the failing unit test',
+      declaredKind: 'sql_wizard' as ModelTaskKind
+    });
+    expect(classified.kind).toBe('coding');
+    expect(taskProfile(classified.kind)).toBeDefined();
+    // Said rather than swallowed: a caller that declared something the router does not know has a
+    // bug, and a silent downgrade to the prose regexes is how it stays unfound.
+    expect(classified.signals[0]).toContain('sql_wizard');
+    // And every kind the router does know still outranks the prose, which is the point of it.
+    for (const kind of modelTaskKinds)
+      expect(
+        classifyModelTask({ prompt: 'Fix the failing unit test', declaredKind: kind }).kind
+      ).toBe(kind);
+  });
+
+  it('bounds an unknown declared kind before it reaches a line someone reads', () => {
+    // The signals list is explanation, and this one carries a value from outside. A label is a
+    // short word; anything longer or stranger than that is quoted at a length nobody scrolls.
+    const classified = classifyModelTask({
+      prompt: 'Morning!',
+      declaredKind: `${'k'.repeat(400)}\n<script>alert(1)</script>` as ModelTaskKind
+    });
+    expect(classified.kind).toBe('general');
+    const said = classified.signals.join(' ');
+    expect(said.length).toBeLessThan(120);
+    expect(said).not.toContain('<script>');
+  });
+
   it('no longer treats an artefact as a plan', () => {
     // "document" used to sit in the agentic pattern, so a short prose edit was routed to the
     // agentic benchmark with a 128K reference window.
@@ -774,6 +818,97 @@ describe('task classification', () => {
     expect(inferModelTask('Prove that this schedule is optimal')).toBe('reasoning');
     expect(inferModelTask('Refactor this TypeScript repository and run tests')).toBe('coding');
     expect(inferModelTask('Explain partial pooling')).toBe('general');
+  });
+});
+
+/*
+ * One spelling of what a kind of work requires.
+ *
+ * Every ranking site outside `model-policy.ts` used to write the profile's requirements out by hand
+ * beside its own call, which is two spellings of one rule: the profile decides how a candidate is
+ * scored for the work while the call site decides who is eligible for it, and nothing made them
+ * agree.
+ */
+describe('the request a declared piece of work asks for', () => {
+  it('takes its requirements from the profile rather than from the caller', () => {
+    const built = requestForWork({
+      signals: { prompt: 'anything at all', declaredKind: 'vision' },
+      privacyRoute: 'provider_zdr',
+      minContextTokens: 8_000
+    });
+    expect(built.taskKind).toBe('vision');
+    expect(built.requiredCapabilities).toEqual([...taskProfile('vision').requiredCapabilities]);
+    expect(built.requiredModalities).toEqual([...taskProfile('vision').requiredModalities]);
+    // An unattended site is asking for `balanced` unless it says otherwise; nothing about a
+    // background call justifies the quality-first or the latency-first dial by default.
+    expect(built.preference).toBe('balanced');
+    expect(built.minContextTokens).toBe(8_000);
+  });
+
+  it('adds what a site needs of its own without dropping what the profile needs', () => {
+    const built = requestForWork({
+      signals: { prompt: 'anything at all', declaredKind: 'bulk_summarisation' },
+      privacyRoute: 'external',
+      minContextTokens: 32_000,
+      alsoRequires: ['tools']
+    });
+    expect(new Set(built.requiredCapabilities)).toEqual(new Set(['chat', 'tools']));
+  });
+
+  it('carries the owner price ceiling, which is the field a background site forgets', () => {
+    const built = requestForWork({
+      signals: { prompt: 'anything at all', declaredKind: 'vision' },
+      privacyRoute: 'provider_zdr',
+      minContextTokens: 8_000,
+      ceiling: { maxInputUsdPerMillionTokens: 1, maxOutputUsdPerMillionTokens: null }
+    });
+    expect(built.maxInputUsdPerMillionTokens).toBe(1);
+    // `null` is "no ceiling" and `0` is a ceiling of zero, which is the distinction
+    // `priceCeilingFields` exists to keep; an absent field is not an explicit `undefined`.
+    expect('maxOutputUsdPerMillionTokens' in built).toBe(false);
+  });
+
+  it('falls back to the prose when the declared kind is not one the router has', () => {
+    const built = requestForWork({
+      signals: { prompt: 'Fix the failing unit test', declaredKind: 'tier_3' as ModelTaskKind },
+      privacyRoute: 'provider_zdr',
+      minContextTokens: 8_000
+    });
+    expect(built.taskKind).toBe('coding');
+    expect(built.requiredCapabilities).toEqual([...taskProfile('coding').requiredCapabilities]);
+  });
+});
+
+/*
+ * Sticky selection over a sequence of calls: the catalogue moves under a run that lasts hours, and
+ * a ranking recomputed from scratch each time can hand the second half of a turn to a different
+ * model than the first - a downgrade nobody chose, and a prompt prefix the provider has never seen.
+ */
+describe('the model that answered a moment ago', () => {
+  const pool = [{ id: 'best' }, { id: 'second' }, { id: 'third' }];
+
+  it('moves the incumbent to the head of a ranking it is still in', () => {
+    expect(preferIncumbent(pool, 'third').map((entry) => entry.id)).toEqual([
+      'third',
+      'best',
+      'second'
+    ]);
+  });
+
+  /*
+   * The half that makes it safe. It reorders, it never re-admits: every eligibility rule - the
+   * privacy route, the owner's ceiling, a withdrawn row - has already excluded a candidate before
+   * this is asked, so a memory of who answered last must not be a way back in.
+   */
+  it('leaves a ranking that no longer contains the incumbent exactly as it found it', () => {
+    const withdrawn = preferIncumbent(pool, 'retired');
+    expect(withdrawn).toBe(pool);
+    expect(withdrawn.map((entry) => entry.id)).toEqual(['best', 'second', 'third']);
+  });
+
+  it('is the identity when nothing is remembered or the incumbent already leads', () => {
+    expect(preferIncumbent(pool, undefined)).toBe(pool);
+    expect(preferIncumbent(pool, 'best')).toBe(pool);
   });
 });
 
@@ -935,6 +1070,25 @@ describe('model fit', () => {
         signals: { prompt: 'Refactor this TypeScript repository' }
       }).headline
     ).toBeNull();
+  });
+
+  /*
+   * The same fallback seen from the caller that would have died of it. `modelFit` is the only
+   * production reader of a classification's `kind`, and it uses it as a key into `profiles` twice
+   * before anything validates it.
+   */
+  it('survives a declared kind that is not in the vocabulary', () => {
+    expect(() =>
+      modelFit({
+        models: [strong, cheap],
+        chosen: cheap,
+        request: open,
+        signals: {
+          prompt: 'Refactor this TypeScript repository',
+          declaredKind: 'tier_3' as ModelTaskKind
+        }
+      })
+    ).not.toThrow();
   });
 });
 

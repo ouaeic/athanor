@@ -932,6 +932,97 @@ export const Approval = z.object({
 export type Approval = z.infer<typeof Approval>;
 
 /**
+ * How much of the owner's reason for a refusal travels with it.
+ *
+ * The same order as the model's own wording on the card (`agentWording`, 600), because the two are
+ * read against each other: the agent gets a paragraph to say what it wants and the owner gets a
+ * paragraph to say no to it. Longer is a conversation rather than a reason, and the channel this
+ * rides on is the one that carries conversations anyway - so nothing is lost by keeping the box
+ * the size of the thought it is for.
+ */
+export const APPROVAL_NOTE_MAX_CHARS = 600;
+
+/**
+ * Characters that let a note say one thing to the owner typing it and another to the model reading
+ * it back: bidirectional overrides, zero-width marks, and the C0 controls that are not layout.
+ *
+ * The same class `approval-facts.ts` strips before it puts a hostile string in front of the owner,
+ * pointed the other way. Tab and newline survive because a reason may reasonably be a short list.
+ */
+const APPROVAL_NOTE_UNSAFE =
+  // eslint-disable-next-line no-control-regex
+  /[\u0000-\u0008\u000b-\u001f\u007f\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g;
+
+/**
+ * The owner's reason, made safe to hand to a model, bounded, or empty if there was not one.
+ *
+ * Empty and absent are the same answer on purpose: a note of four spaces has to leave the denial
+ * exactly as it was before this field existed, byte for byte and request for request, or every
+ * owner who tabs through the card pays for a feature they did not use.
+ */
+export const approvalNoteText = (value: string | null | undefined): string => {
+  if (typeof value !== 'string') return '';
+  const clean = value
+    .replace(APPROVAL_NOTE_UNSAFE, '')
+    .replace(/[\t ]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return clean.length > APPROVAL_NOTE_MAX_CHARS
+    ? `${clean.slice(0, APPROVAL_NOTE_MAX_CHARS)}…`
+    : clean;
+};
+
+/**
+ * A tool name, kept to the shape a tool name has, before it is put in a sentence.
+ *
+ * The name comes off the approval preview, which the worker writes - but the preview is the half
+ * of the card the model's own `purpose` also lands in, and the one rule this whole card is built
+ * on is that nothing model-authored gets to write owner-attributed prose. A name that is not a
+ * name simply does not appear.
+ */
+const approvalToolWord = (value: string | null | undefined): string =>
+  typeof value === 'string' && /^[a-z][a-z0-9_]{0,39}$/.test(value) ? value : '';
+
+/**
+ * The message a refusal sends back, said once, in the one place every layer reads it from.
+ *
+ * The refusal the model saw used to be four words - "The user denied this action" - and that was
+ * the whole of what it learned. It could not tell "not that file" from "not right now" from "not
+ * ever", so the next thing it did was try a neighbouring version of the thing that had just been
+ * refused, and the owner answered the same question again wearing a slightly different costume. A
+ * refusal with a reason on it is steering; a refusal without one is a wall to walk along.
+ *
+ * This is deliberately the owner's own sentence and not a harness notice about the owner. It is
+ * carried on the channel that already exists for owner speech - a message to the conversation,
+ * marked as a correction so the paused turn takes it at its next step boundary rather than after
+ * it has already tried the neighbouring thing. That channel is encrypted with the workspace key,
+ * lands in the transcript where the owner can see what they said, and is treated as owner speech
+ * by the taint model and by the compaction rule that never paraphrases the user. A field bolted
+ * onto the approval row would have had to earn all four of those again.
+ *
+ * So nothing is appended after the note. In a tool result the harness gets the last word because
+ * the harness is speaking; here the owner is speaking, and putting instructions in their mouth is
+ * how a product ends up disagreeing with its own user in their own voice.
+ *
+ * Empty when there is no reason, and callers send nothing at all in that case: a denial with no
+ * note must cost exactly the requests a denial cost before this existed.
+ *
+ * One string in `contracts` rather than one in a client and one in the worker, for the reason
+ * `MEDIA_VIDEO_UNAVAILABLE_REASON` above gives - which is itself the audit's own finding about
+ * approvals: when a policy is written twice it is the stale copy that ends up winning.
+ */
+export const approvalDenialMessage = (input: {
+  /** The tool the refused call was bound to, when the card knew it. */
+  tool?: string | null;
+  note?: string | null;
+}): string => {
+  const note = approvalNoteText(input.note);
+  if (!note) return '';
+  const tool = approvalToolWord(input.tool);
+  return `I did not approve that ${tool ? `${tool} ` : ''}request. Here is why:\n\n${note}`;
+};
+
+/**
  * What a push to the owner's devices is about.
  *
  * The first three are derived by the server from state it can already see: an approval is pending,
@@ -1636,3 +1727,25 @@ export type BuildIdentity = z.infer<typeof BuildIdentity>;
 /** The two halves said in one breath, so the journal, the API and Settings word it the same way. */
 export const buildLabel = (build: BuildIdentity): string =>
   build.commit ? `${build.version} (${build.commit})` : build.version;
+
+/**
+ * The whole of one thing the computer wrote down about its owner.
+ *
+ * The review queue and the remembered list both show `memoryExcerpt(body, '', {maxChars: 200})`,
+ * and both said on screen that an opening is all they had — honest, and not the same promise as
+ * "read the whole of what was remembered about you". The rest was on the owner's own disk,
+ * decryptable with a key the same request already derives, and no route reached it.
+ *
+ * Declared here rather than in either half because both halves have to agree on what a row that
+ * cannot be decrypted looks like. `body` is what the route could read; `readable` is false when the
+ * key would not open the record, and then `body` carries the same standing sentence the lists use
+ * rather than an empty string, because a blank expander reads as "nothing was remembered" — the
+ * opposite of what is true.
+ */
+export const MemoryItemBody = z.object({
+  id: Id,
+  title: z.string().nullable(),
+  body: z.string(),
+  readable: z.boolean()
+});
+export type MemoryItemBody = z.infer<typeof MemoryItemBody>;

@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
@@ -574,10 +574,10 @@ const firstSentence = (description: string): string => {
  * an opened-skill block whose bytes changed the first time anyone ran anything (ATH-228).
  *
  * The one that decided it: no tool the model holds can read any of those paths, and none can be
- * made to without moving the workspace boundary. `openSkill` is reachable only for built-in skills
+ * made to without moving the workspace boundary. `openSkill` is reachable only for on-disk skills
  * (a workspace skill is a database row, opened at `agent.ts` from the store), so `skill.directory`
- * is always `DEFAULT_SKILL_ROOT/<name>` - part of the athanor installation, never inside any
- * workspace. `file_read` is answered by the runner, a separate service whose `WORKSPACE_ROOT` is
+ * is always a folder under a root the operator chose - `DEFAULT_SKILL_ROOT`, or one of the owner's
+ * own roots (see `ownerSkillRoots`) - and never inside any workspace. `file_read` is answered by the runner, a separate service whose `WORKSPACE_ROOT` is
  * a different tree entirely, and every one of its file routes goes through
  * `assertUserDataPath` (`services/workspace-runner/src/files.ts`), which admits `workspace/` and
  * `.athanor/artifacts/` and refuses everything else by design. Wiring `OpenedSkill.allowlist` into
@@ -601,7 +601,18 @@ export const DEFAULT_SKILL_ROOT = fileURLToPath(new URL('../../../skills/', impo
 const loadOne = (
   root: string,
   name: string,
-  diagnostics: SkillDiagnostic[]
+  diagnostics: SkillDiagnostic[],
+  /**
+   * The origin this root confers, when the root is the answer rather than the file.
+   *
+   * Everything below reads the skill's own declaration, which is right for a library that ships
+   * inside athanor and wrong for one the owner points at: `capabilityCeilingViolations` gives
+   * `builtin` an unrestricted net grant, `spend: metered`, and writes outside the workspace, and
+   * the declaration it reads is a line in the skill's own sidecar. A directory that can be dropped
+   * into a watched folder could therefore write itself the ceiling by declaring it. Where the
+   * origin is a fact about where the folder is, it is passed in and the declaration is ignored.
+   */
+  forcedOrigin?: SkillOrigin
 ): LoadedSkill | null => {
   const directory = join(root, name);
   let source: string;
@@ -677,12 +688,14 @@ const loadOne = (
   }
 
   const metadata = mapping(front.data.metadata ?? null);
-  const origin = ((): SkillOrigin => {
-    const declared = text(
-      mapping(sidecar.lineage ?? null).origin ?? metadata['athanor.tier'] ?? null
-    );
-    return declared === 'learned' || declared === 'owner' ? declared : 'builtin';
-  })();
+  const origin =
+    forcedOrigin ??
+    ((): SkillOrigin => {
+      const declared = text(
+        mapping(sidecar.lineage ?? null).origin ?? metadata['athanor.tier'] ?? null
+      );
+      return declared === 'learned' || declared === 'owner' ? declared : 'builtin';
+    })();
   const capability = capabilityFrom(sidecar.capability ?? null);
   const violations = capabilityCeilingViolations(origin, capability);
   if (violations.length) {
@@ -748,7 +761,10 @@ const loadOne = (
  * Loads a skill library from disk. Leniently: a single malformed skill produces a diagnostic and
  * is skipped, it never prevents the rest of the library from loading.
  */
-export const loadSkillLibrary = (root: string = DEFAULT_SKILL_ROOT): SkillLibrary => {
+export const loadSkillLibrary = (
+  root: string = DEFAULT_SKILL_ROOT,
+  options: { readonly origin?: SkillOrigin } = {}
+): SkillLibrary => {
   const diagnostics: SkillDiagnostic[] = [];
   let entries: string[];
   try {
@@ -761,7 +777,7 @@ export const loadSkillLibrary = (root: string = DEFAULT_SKILL_ROOT): SkillLibrar
   }
   const skills: LoadedSkill[] = [];
   for (const entry of entries) {
-    const skill = loadOne(root, entry, diagnostics);
+    const skill = loadOne(root, entry, diagnostics, options.origin);
     if (skill) skills.push(skill);
   }
   if (skills.length > SKILL_BUDGET.maxSkills)
@@ -774,11 +790,118 @@ export const loadSkillLibrary = (root: string = DEFAULT_SKILL_ROOT): SkillLibrar
   return { root, skills, diagnostics };
 };
 
-let cached: SkillLibrary | null = null;
+/**
+ * Where the owner may keep SKILL.md folders of their own, as a PATH-shaped list of directories.
+ *
+ * `SkillOrigin` has declared an `owner` variant since the library was written and no on-disk skill
+ * could ever reach it: `DEFAULT_SKILL_ROOT` was the only root anything loaded, and the only other
+ * way in - `skill(action=upsert)` - writes a database row rather than a folder. So the ceiling in
+ * `capabilityCeilingViolations` that exists specifically for skills athanor did not ship had
+ * nothing to apply to, and an owner with a folder of procedures had nowhere to put it.
+ *
+ * A directory rather than a marketplace, deliberately. The format this loader already reads is the
+ * one the open corpus is written in - a folder with a `SKILL.md` carrying `name` and `description`
+ * in front matter - and everything athanor asks for beyond that is a warning, not a refusal: the
+ * `athanor.yaml` sidecar is optional and its absence loads the skill with an empty capability
+ * grant, which `skills/README.md` records as the whole point of keeping it a sidecar. So this is
+ * the entire cost of reading other people's skills: a place to point at.
+ *
+ * Read from the environment rather than from `WorkerConfig` because the whole point of this
+ * function is that it needs no caller: `builtinSkillLibrary()` is called by `window.ts` and by
+ * `tools/knowledge.ts` with no arguments, and threading a config through both to deliver a string
+ * neither of them decides would be three files changed to say one thing. `log.ts` reads
+ * `JOURNAL_STREAM` the same way and for the same reason.
+ */
+export const OWNER_SKILL_ROOTS_ENV = 'OWNER_SKILL_ROOTS';
 
-/** Process-wide cached built-in library; the resident catalog must be byte-stable across a run. */
+export const ownerSkillRoots = (env: NodeJS.ProcessEnv = process.env): string[] => [
+  ...new Set(
+    (env[OWNER_SKILL_ROOTS_ENV] ?? '')
+      .split(delimiter)
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+  )
+];
+
+/**
+ * The built-in library with the owner's own folders behind it, under one budget and one namespace.
+ *
+ * Built-in wins every collision, and that is a safety rule rather than a preference. The names in
+ * `DEFAULT_SKILL_ROOT` are the ones the rest of the product refers to by name - `approval-cards.ts`
+ * says "Review owner override of built-in skill X", the preamble names them, and a box's own
+ * procedures are what an owner has read. A folder that could take one of those names is a folder
+ * that can silently replace `security-review` with something that reads the same in the catalogue
+ * line and does something else in the body. The shadowed folder is reported rather than ignored:
+ * a skill that does not load has to say so, or the owner debugs it by wondering.
+ *
+ * The budget is applied to the union, not per root, because the budget is about what fits in the
+ * resident catalogue and the catalogue is one list.
+ */
+export const withOwnerSkills = (builtin: SkillLibrary, roots: readonly string[]): SkillLibrary => {
+  if (!roots.length) return builtin;
+  const skills = [...builtin.skills];
+  const diagnostics = [...builtin.diagnostics];
+  const taken = new Map<string, string>(
+    builtin.skills.map((skill) => [skill.name, 'the built-in library'])
+  );
+  for (const root of roots) {
+    const library = loadSkillLibrary(root, { origin: 'owner' });
+    diagnostics.push(...library.diagnostics);
+    for (const skill of library.skills) {
+      const holder = taken.get(skill.name);
+      if (holder) {
+        diagnostics.push({
+          skill: skill.name,
+          level: 'warn',
+          code: 'name_taken',
+          message: `${root} declares "${skill.name}", which ${holder} already carries; the folder was not loaded`
+        });
+        continue;
+      }
+      taken.set(skill.name, root);
+      skills.push(skill);
+    }
+  }
+  // Re-asked over the union. Each root answered for itself above, and two roots inside the budget
+  // can be over it together - which is the case that actually happens, because the built-in
+  // library is most of the budget before the owner adds anything.
+  if (
+    skills.length > SKILL_BUDGET.maxSkills &&
+    !diagnostics.some((entry) => entry.code === 'library_over_budget')
+  )
+    diagnostics.push({
+      skill: '(library)',
+      level: 'warn',
+      code: 'library_over_budget',
+      message: `${skills.length} skills exceeds the ${SKILL_BUDGET.maxSkills}-skill resident catalog budget`
+    });
+  return { root: builtin.root, skills, diagnostics };
+};
+
+let cached: SkillLibrary | null = null;
+let cachedBuiltin: SkillLibrary | null = null;
+
+/**
+ * Only what athanor ships, which is what `isBuiltinSkillName` is asking about.
+ *
+ * Kept apart from the resident catalogue below on purpose. The card an upsert raises says "Review
+ * owner override of built-in skill X" and promises the built-in survives untouched, and neither
+ * sentence is true of a folder the owner pointed at - that one is theirs, and a workspace skill
+ * taking its name is an ordinary replacement, not an override of something athanor guarantees.
+ */
+const builtinOnlySkillLibrary = (): SkillLibrary => {
+  cachedBuiltin ??= loadSkillLibrary();
+  return cachedBuiltin;
+};
+
+/**
+ * Process-wide cached resident library; the resident catalog must be byte-stable across a run.
+ *
+ * Which is also why the owner's roots are read once, here, rather than per call: a folder appearing
+ * mid-run would move the cache anchor under every task already in flight.
+ */
 export const builtinSkillLibrary = (): SkillLibrary => {
-  cached ??= loadSkillLibrary();
+  cached ??= withOwnerSkills(builtinOnlySkillLibrary(), ownerSkillRoots());
   return cached;
 };
 
@@ -786,7 +909,7 @@ export const findSkillByName = (library: SkillLibrary, name: string): LoadedSkil
   library.skills.find((skill) => skill.name === name) ?? null;
 
 export const isBuiltinSkillName = (name: string): boolean =>
-  builtinSkillLibrary().skills.some((skill) => skill.name === name);
+  builtinOnlySkillLibrary().skills.some((skill) => skill.name === name);
 
 // ---------------------------------------------------------------------------
 // Progressive disclosure
@@ -815,7 +938,18 @@ export const skillCatalogBlock = (library: SkillLibrary): string => {
   const lines = skillCatalogEntries(library).map(
     (entry) => `- ${entry.name}: ${entry.catalogLine}`
   );
-  return `Built-in skills (index only; open one before doing the work it covers):\n${lines.join('\n')}`;
+  /*
+   * The heading names what the list actually is, and on a box with no owner folders that is
+   * byte-for-byte the sentence it has always been.
+   *
+   * Deliberately conditional rather than reworded outright. This block sits ahead of the cache
+   * anchor in every window, so changing its first line on every box would move the cached prefix
+   * for every task on every installation to describe a folder almost none of them have.
+   */
+  const heading = library.skills.some((skill) => skill.origin === 'owner')
+    ? 'Skills on this computer, athanor’s own and your own (index only; open one before doing the work it covers)'
+    : 'Built-in skills (index only; open one before doing the work it covers)';
+  return `${heading}:\n${lines.join('\n')}`;
 };
 
 export interface OpenSkillOptions {

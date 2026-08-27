@@ -3765,8 +3765,6 @@ export const fixtures: readonly Fixture[] = [
     shape: 'answer',
     request: 'What rate are we renewing the brochure job at?',
     why: 'A fifth of the memory salience score is a term over `mem.item.cited_count`, and nothing has ever written that column. `recordMemoryUse` is its only writer and takes `cited` as a parameter; both production callers in `apps/worker/src/memory-runtime.ts` leave it out, so every item in every workspace has a citation count of zero and the standardised term is a constant for every row in the pool. This is the observation that says so out loud: the turn is handed a remembered fact, quotes it in the answer, and records not one citation. The repair is a caller in `memory-runtime.ts` and belongs to whoever owns that file.',
-    pending:
-      'A production caller that passes `cited` to `recordMemoryUse`. `recallMemoryPack` records the use at injection time and cannot know; `recordMemoryPackOutcome` grades the pack at verification and is where the citation belongs, because by then the finish has named its evidence. Delete this line when the writer exists.',
     memory: REMEMBERING_WORKSPACE,
     model: sequence({
       text: 'The renewal rate on the brochure job is 4.25 per cent for the current term.',
@@ -3790,8 +3788,6 @@ export const fixtures: readonly Fixture[] = [
     shape: 'schema',
     request: 'None: this row runs no turn.',
     why: 'The repository’s own named signature defect is a control wired to nothing, and three of them are still live after nine waves of repair. Each is real code with a real reader - a term of a formula, a documented precedence rule, a resolution table - and no production caller anywhere that produces the value it reads. None of them can fail a test, because each half works: the reader reads what it is given and the writer would write what it was handed. What is missing is the wire, and the only thing that can see a missing wire is a check that looks for the caller. Both directions are load-bearing here. A control that acquires a writer makes this row pass and the suite then goes red on the pending marker until somebody deletes it, which is how the repair gets noticed rather than absorbed.',
-    pending:
-      'The three wires. `cited` on a `recordMemoryUse` call in apps/worker/src/memory-runtime.ts; `declaredKind` on the `TaskSignals` the turn hands `modelFit`, which is the one place the caller already knows the shape of the work; and a caller for `resolveMemoryContradiction`, which is the nightly pass that pairs candidate facts and asks for a verdict. Each is one caller and none of them is in this lane. Delete this line when all three exist.',
     model: () => ({}),
     schema: unwiredControls,
     expect: {

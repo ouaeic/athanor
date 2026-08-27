@@ -167,6 +167,45 @@ export const activePlanBlock = (step: number): ModelMessage => {
 
 export const isPlanStep = (step: number): boolean => PLAN_STEPS.has(step);
 
+/**
+ * The step the owner interrupts on, and the sentence the correction turns on.
+ *
+ * 13 rather than 12, and the one off-by-one is a measurement rather than a preference. A user
+ * message is one more thing between the newest assistant turn and the tail, and the detail
+ * boundary is `index < length - RECENT_DETAIL_MESSAGES`. On an ordinary step the newest assistant
+ * sits three from the tail and a correction puts it at four, which `detail-4` still carries; on a
+ * PLAN step it already sits four, and the correction puts it at five, which `detail-4` drops. So a
+ * correction planted on a plan step costs that configuration the current turn's own thinking on
+ * the step the owner spoke - measured, `newestReasoningSteps` 59/60 -> 58/60 on all three
+ * trajectories - which is a true fact about a four-message window and not a fact about
+ * corrections. Planted one step later it is nil, and the probe measures the thing it is named for.
+ */
+const CORRECTION_STEP = 13;
+const CORRECTION_SPAN = 'the pooled connection ceiling is now 64 and applies around the clock';
+
+/**
+ * A correction the owner types in the middle of a running task.
+ *
+ * Nothing else in this fixture is a mid-task `user` message, and that is the gap it fills. Every
+ * other probe asks about something athanor produced, so every one of them is answered by a
+ * mechanism that treats the material as recoverable tool output or as discardable reasoning. What
+ * the owner types has neither property: no tool call brings it back, nothing re-pushes it, and a
+ * window that loses it leaves the agent working to an instruction that was withdrawn.
+ *
+ * Short on purpose. Length was tried and measured: at 3,000 characters the message adds 1.14% to
+ * tokens-per-task on the small window, which is over half the 2% tolerance `check` allows for a
+ * real regression, and it buys nothing - the verbatim-user pass this length was meant to reach is
+ * never entered on any of these trajectories at any configuration (measured at 40,000 characters
+ * with `VERBATIM_USER_CHARS` patched to 400: the probe still reads 5.00). At 600 it costs 0.19%.
+ */
+export const correctionAt = (step: number): ModelMessage | null =>
+  step === CORRECTION_STEP
+    ? {
+        role: 'user',
+        content: embed(`Stopping you there. ${text(600, 'correction')}`, CORRECTION_SPAN, 0.5)
+      }
+    : null;
+
 const ARTIFACT_PATHS = [
   'workspace/infra/pooler.ini',
   'workspace/src/db/pool.ts',
@@ -327,6 +366,36 @@ export const PROBES: readonly Probe[] = [
     question: 'What is the next action, and against which port?',
     reference: 'Re-point the notifications service at the pooler on port 6432.',
     evidence: ['re-point the notifications service at the pooler on port 6432'],
+    reworkChars: 0
+  },
+  {
+    /**
+     * The owner changing their mind mid-task, asked for thirty-three steps later.
+     *
+     * A control, in the sense `recall-owner-constraint` is one: it reads 5.00 in every shipped
+     * configuration and is not expected to move, and that is the point rather than a weakness.
+     * What carries it is `context.ts`'s `if (message.role === 'user') continue;` in
+     * `condensableWindow` - a guard whose own comment names exactly this content, "the
+     * corrections, the changes of mind, the 'not that one, the other one' that is the only
+     * steering channel a running task has". Before that guard a mid-task correction went through
+     * the summariser like any other line and what survived was the model's account of it, which is
+     * the text least able to correct the model. Nothing in this rig could see that.
+     *
+     * It is a control rather than a variable because no integer can reach it. `configurations.ts`
+     * makes a configuration by substituting integer literals, and the mechanism here is a boolean
+     * guard - so the column is saturated by construction, not because the probe stopped reading
+     * the window. Verified by deleting the guard in a scratch copy of the rig: this probe drops
+     * 5.0 -> 0.0 on both compacted trajectories and holds 5.0 on the uncompacted one, where
+     * nothing is condensed and there is nothing for the guard to protect against.
+     */
+    id: 'recall-user-correction',
+    kind: 'recall',
+    plantedAtStep: 13,
+    askedAtStep: 45,
+    question: 'What did the owner change their mind about part-way through, and to what?',
+    reference: 'The pooled connection ceiling is now 64 and applies around the clock.',
+    evidence: [CORRECTION_SPAN],
+    // Nothing brings back what the owner typed. Asking again is a question, not a tool call.
     reworkChars: 0
   },
   {

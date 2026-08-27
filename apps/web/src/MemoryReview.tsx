@@ -25,6 +25,7 @@ import { BookOpenText, Trash2, X } from 'lucide-react';
 import { api, type MemoryReview as MemoryReviewQueue, type MemoryReviewItem } from './api.js';
 import { ApiFailure } from './api-failure.js';
 import { describeFailure } from './failure-text.js';
+import { memoryItemBody } from './memory-api.js';
 import './memory-review.css';
 
 /** A remembered command the queue is no longer sure of, with the reason it is here. */
@@ -118,12 +119,28 @@ export const memoryReviewContradictions = (
  * The server sends the opening of a stored row, not the whole of it.
  *
  * `memoryItemExcerpt` clamps at 200 characters and marks the cut with an ellipsis, which is the
- * only signal there is that more is held. Saying so is the honest half of "read the whole of what
- * was remembered": the rest is on the box's disk and no route reaches it yet, and an expander that
- * opened onto the same 200 characters while implying otherwise would be one more control that
- * lies.
+ * only signal there is that more is held. That was the whole of the promise until now: the rest
+ * was on the box's disk with no route reaching it, and the row said so. `GET
+ * .../memory-items/:itemId` reaches it, so a clipped row is now the cue to offer the rest rather
+ * than to apologise for not having it.
  */
 export const memoryExcerptIsClipped = (excerpt: string): boolean => excerpt.endsWith('…');
+
+/**
+ * Whether opening this row should ask the box for the rest of it.
+ *
+ * A value rather than four conditions inside a JSX handler, because there is no DOM in this
+ * package's tests and this is the whole of the behaviour: `<details>` fires `toggle` on close as
+ * loudly as on open, a row already read is still read when it is reopened, an unclipped excerpt is
+ * the whole row already, and a screen mounted without a reader has nothing to ask.
+ */
+export const shouldReadWhole = (state: {
+  open: boolean;
+  excerpt: string;
+  alreadyRead: boolean;
+  hasReader: boolean;
+}): boolean =>
+  state.open && state.hasReader && !state.alreadyRead && memoryExcerptIsClipped(state.excerpt);
 
 /** The queue without one row, whatever list it was in. */
 export const withoutMemoryItem = (queue: MemoryReviewQueue, itemId: string): MemoryReviewQueue => ({
@@ -192,6 +209,7 @@ function MemoryReviewRow({
   verbs,
   onAct,
   onOpenTask,
+  onReadWhole,
   busy
 }: {
   item: MemoryReviewItem;
@@ -202,22 +220,71 @@ function MemoryReviewRow({
   verbs: readonly MemoryReviewVerb[];
   onAct: (verb: MemoryReviewVerb, item: MemoryReviewItem) => void;
   onOpenTask?: ((taskId: string) => void) | undefined;
+  onReadWhole?: ((item: MemoryReviewItem) => Promise<string>) | undefined;
   busy: boolean;
 }) {
   const [armed, setArmed] = useState(false);
+  /** Undefined until the row is opened, which is the point: fifty bodies for one question is not. */
+  const [whole, setWhole] = useState<string>();
+  const [wholeError, setWholeError] = useState('');
+  const clipped = memoryExcerptIsClipped(item.excerpt);
   const taskId = item.taskId;
   return (
     <div>
       <span>
         <strong>{headline}</strong>
-        <details className="memory-review-detail">
+        {/*
+          The fetch hangs off `onToggle` rather than off a button, because the expander is already
+          the gesture that means "show me this one" — and `<details>` fires it on open and on close
+          alike, so the guard is on `open`. Once, too: a row read and closed and reopened does not
+          go back to the box for something it is still holding.
+        */}
+        <details
+          className="memory-review-detail"
+          onToggle={(event) => {
+            if (
+              !onReadWhole ||
+              !shouldReadWhole({
+                open: event.currentTarget.open,
+                excerpt: item.excerpt,
+                alreadyRead: whole !== undefined,
+                hasReader: true
+              })
+            )
+              return;
+            setWholeError('');
+            onReadWhole(item)
+              .then(setWhole)
+              .catch((cause: unknown) => {
+                setWholeError(
+                  memoryReviewFailure(cause, 'The rest of this could not be read from your box.')
+                );
+              });
+          }}
+        >
           <summary>
             <small className="memory-review-excerpt">{item.excerpt}</small>
           </summary>
-          {memoryExcerptIsClipped(item.excerpt) ? (
+          {/*
+            Three states and each says a different true thing. The whole body, once it has arrived,
+            replaces the excerpt's ellipsis with the text it was standing in for. A failure says so
+            and keeps the opening, because a row the owner can no longer read any of is worse than
+            one they can read the start of. And a screen mounted without a reader keeps the old
+            sentence rather than drawing an expander onto nothing.
+          */}
+          {clipped && whole !== undefined ? (
+            <small className="memory-review-whole">{whole}</small>
+          ) : null}
+          {clipped && whole === undefined && wholeError ? (
+            <small className="memory-review-clipped" role="alert">
+              {wholeError}
+            </small>
+          ) : null}
+          {clipped && whole === undefined && !wholeError ? (
             <small className="memory-review-clipped">
-              This is the opening of what is stored. The rest is on your box and no screen reaches
-              it yet.
+              {onReadWhole
+                ? 'This is the opening of what is stored; the rest is being read from your box.'
+                : 'This is the opening of what is stored. The rest is on your box and no screen reaches it yet.'}
             </small>
           ) : null}
           {memoryReviewFacts(item).map((fact) => (
@@ -290,11 +357,21 @@ export function MemoryReviewLists({
   queue,
   onAct,
   onOpenTask,
+  onReadWhole,
   busy = false
 }: {
   queue: MemoryReviewQueue;
   onAct: (verb: MemoryReviewVerb, item: MemoryReviewItem) => void;
   onOpenTask?: ((taskId: string) => void) | undefined;
+  /**
+   * How to fetch the rest of a clipped row, passed in rather than reached for.
+   *
+   * The same reason this component takes its queue instead of fetching one: what is on this screen
+   * decides whether an owner deletes a working procedure, and the whole of a row is now part of
+   * that. A stub here makes the expander assertable without a server. Optional, so a caller that
+   * has no reader draws the old sentence rather than an expander onto nothing.
+   */
+  onReadWhole?: ((item: MemoryReviewItem) => Promise<string>) | undefined;
   busy?: boolean;
 }) {
   return (
@@ -334,6 +411,7 @@ export function MemoryReviewLists({
                 verbs={['verify', 'retract', 'forget']}
                 onAct={onAct}
                 onOpenTask={onOpenTask}
+                onReadWhole={onReadWhole}
                 busy={busy}
               />
             ))}
@@ -365,6 +443,7 @@ export function MemoryReviewLists({
                 verbs={['retract', 'forget']}
                 onAct={onAct}
                 onOpenTask={onOpenTask}
+                onReadWhole={onReadWhole}
                 busy={busy}
               />
             ))}
@@ -422,6 +501,18 @@ export function MemoryReview({
       .finally(() => setBusy(false));
   };
 
+  /**
+   * The rest of one row, read from the box on the press that asks for it.
+   *
+   * A row this key will not open comes back `readable: false` carrying the same standing sentence
+   * the lists use rather than an error, and it is shown as the body it is: the row is on the
+   * owner's disk either way, and a screen that threw would hide the one row they would most want
+   * to reach. A failure to reach the box at all is different and is thrown, which the expander
+   * catches and says beside the excerpt it still has.
+   */
+  const readWhole = (item: MemoryReviewItem): Promise<string> =>
+    memoryItemBody(workspaceId, item.id).then((answer) => answer.body);
+
   return (
     <>
       <div className="section-heading compact">
@@ -446,7 +537,13 @@ export function MemoryReview({
             enough, and nothing it holds disagrees with anything else.
           </p>
         ) : (
-          <MemoryReviewLists queue={queue} onAct={act} onOpenTask={onOpenTask} busy={busy} />
+          <MemoryReviewLists
+            queue={queue}
+            onAct={act}
+            onOpenTask={onOpenTask}
+            onReadWhole={readWhole}
+            busy={busy}
+          />
         )
       ) : null}
     </>

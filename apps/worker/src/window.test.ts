@@ -38,6 +38,7 @@ import { describe, expect, it } from 'vitest';
 import type { AgentState, AgentWorkerConfig } from './agent-state.js';
 import { CONDENSED_HISTORY_MARKER, RUNTIME_CONTEXT_MARKER } from './context.js';
 import { MEMORY_PACK_MARKER, memoryItemAad, memoryPackBudgetTokens } from './memory-runtime.js';
+import { spillOverflow } from './output-spill.js';
 import type { AgentRunnerClient } from './runner-client.js';
 import { WORKSPACE_BRIEF_MARKER } from './turn-bounds.js';
 import {
@@ -638,5 +639,154 @@ describe('the active plan', () => {
     expect(await refreshActivePlan(probed.deps, task, key, state, true)).toBe(true);
     expect(state.planIsFallback).toBe(true);
     expect(shape(state.messages)).toEqual(['base', 'user', 'plan']);
+  });
+});
+
+/**
+ * The two things this file hands the rest of the turn that are not a message.
+ *
+ * Both are wiring rather than arrangement, and both are here because a mechanism nobody reaches is
+ * this programme's most-repeated finding: `spillOverflow` is a no-op until `assemblePreamble` has
+ * named the runner, and `spendLine` says nothing until `refreshRuntimeContext` has passed the
+ * money. A unit test on either would pass with the call site deleted.
+ */
+describe('what the preamble registers besides blocks', () => {
+  it('names the turn’s overflow writer, so a cut result has somewhere to go', async () => {
+    const probed = probe();
+    const state = freshState();
+    const writes: string[] = [];
+    (probed.deps as { runner: AgentRunnerClient }).runner = {
+      readFile: async () => {
+        throw new Error('no brief');
+      },
+      writeFile: async (_workspaceId: string, _taskId: string, path: string) => {
+        writes.push(path);
+        return { ok: true };
+      }
+    } as unknown as AgentRunnerClient;
+
+    // Before the preamble there is no writer, and nothing is claimed.
+    expect(await spillOverflow(task, state, 'x'.repeat(30_000), false)).toBeNull();
+    await assemblePreamble(probed.deps, { ...preamble, state });
+    const parked = await spillOverflow(task, state, 'x'.repeat(30_000), false);
+    expect(parked).not.toBeNull();
+    expect(writes).toEqual([parked]);
+  });
+
+  it('keeps two turns’ writers apart, because one worker runs several tasks', async () => {
+    const first = probe();
+    const second = probe();
+    const firstWrites: string[] = [];
+    const secondWrites: string[] = [];
+    const runner = (into: string[]): AgentRunnerClient =>
+      ({
+        readFile: async () => {
+          throw new Error('no brief');
+        },
+        writeFile: async (_workspaceId: string, _taskId: string, path: string) => {
+          into.push(path);
+          return { ok: true };
+        }
+      }) as unknown as AgentRunnerClient;
+    (first.deps as { runner: AgentRunnerClient }).runner = runner(firstWrites);
+    (second.deps as { runner: AgentRunnerClient }).runner = runner(secondWrites);
+    const stateA = freshState();
+    const stateB = freshState();
+    await assemblePreamble(first.deps, { ...preamble, state: stateA });
+    await assemblePreamble(second.deps, { ...preamble, state: stateB });
+
+    await spillOverflow(task, stateA, 'a'.repeat(30_000), false);
+    expect(firstWrites).toHaveLength(1);
+    expect(secondWrites).toHaveLength(0);
+  });
+
+  it('passes the money into the runtime block, and only past the share', () => {
+    const probed = probe();
+    const cheap = freshState();
+    const input = {
+      workspace,
+      task: { ...task, maxComputeCredits: 20 } as unknown as TaskRecord,
+      timeZone: 'UTC',
+      toolchainSummary: '',
+      unattended: false,
+      webPlan: inHouse
+    };
+    refreshRuntimeContext(probed.deps, { ...input, state: cheap });
+    expect(cheap.messages.at(-1)?.content).not.toContain('Compute budget');
+
+    const spent = freshState();
+    spent.credits = 15;
+    refreshRuntimeContext(probed.deps, { ...input, state: spent });
+    const line = spent.messages.at(-1)?.content ?? '';
+    expect(line.startsWith(RUNTIME_CONTEXT_MARKER)).toBe(true);
+    expect(line).toContain('Compute budget: about 15 of this task');
+    expect(line).toContain('about 5 left');
+  });
+});
+
+/**
+ * Which of the owner's brief files the window reads, and which one wins when there are several.
+ *
+ * `AGENTS.md` is the convention a good deal of the surrounding tooling writes, and
+ * `tools/repository.ts` already globs the name inside `code_context` - so the file was known to
+ * this codebase and simply never read into a window. That is the whole defect: an owner who has
+ * written down how their project works gets ignored, and finds out by watching the agent do the
+ * thing the file told it not to.
+ *
+ * The order is the point. `ATHANOR.md` is this product's own name for the file and is what the
+ * owner wrote FOR this computer, so it wins outright; `OPEN_CLOUD.md` is the name it used to have
+ * and is kept for the boxes that still carry one; `AGENTS.md` is the shared convention and is read
+ * last, because a brief addressed to every tool must not outrank one addressed to this one.
+ */
+describe('which brief the window reads', () => {
+  const withFiles = (files: Record<string, string>): Probe => {
+    const probed = probe();
+    (probed.deps as { runner: AgentRunnerClient }).runner = {
+      readFile: async (_workspaceId: string, _taskId: string, path: string) => {
+        const found = files[path];
+        if (found === undefined) throw new Error(`no such file: ${path}`);
+        return found;
+      }
+    } as unknown as AgentRunnerClient;
+    return probed;
+  };
+
+  const briefText = async (files: Record<string, string>): Promise<string> => {
+    const probed = withFiles(files);
+    const state = freshState();
+    await assemblePreamble(probed.deps, { ...preamble, state });
+    const brief = state.messages.find((message) => message.content.includes('BRIEF'));
+    return brief?.content ?? state.messages.map((message) => message.content).join('\n');
+  };
+
+  it('reads AGENTS.md when it is the only brief the workspace has', async () => {
+    expect(
+      await briefText({ 'workspace/AGENTS.md': 'Run the tests with pnpm, never npm.' })
+    ).toContain('Run the tests with pnpm, never npm.');
+  });
+
+  it("keeps the owner's own ATHANOR.md ahead of a shared AGENTS.md", async () => {
+    const text = await briefText({
+      'workspace/ATHANOR.md': 'This project uses uv.',
+      'workspace/AGENTS.md': 'Run the tests with pnpm, never npm.'
+    });
+    expect(text).toContain('This project uses uv.');
+    expect(text).not.toContain('Run the tests with pnpm, never npm.');
+  });
+
+  it('keeps the older OPEN_CLOUD.md ahead of AGENTS.md too, so a box that has one does not change under it', async () => {
+    const text = await briefText({
+      'workspace/OPEN_CLOUD.md': 'The staging key lives in 1Password.',
+      'workspace/AGENTS.md': 'Run the tests with pnpm, never npm.'
+    });
+    expect(text).toContain('The staging key lives in 1Password.');
+    expect(text).not.toContain('Run the tests with pnpm, never npm.');
+  });
+
+  it('carries on with no brief at all when the workspace has none of the three', async () => {
+    const probed = withFiles({});
+    const state = freshState();
+    await assemblePreamble(probed.deps, { ...preamble, state });
+    expect(shape(state.messages)).not.toContain('brief');
   });
 });

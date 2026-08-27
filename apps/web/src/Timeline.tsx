@@ -39,6 +39,7 @@ import {
 import type { BotWall, FileRequest, Task, TaskEvent } from './types.js';
 import { CopyButton, Markdown } from './Markdown.js';
 import { DiffView } from './DiffView.js';
+import { DownloadLink } from './DownloadLink.js';
 import {
   agentQuestion,
   botWallClearance,
@@ -900,10 +901,14 @@ function Event({
                 <ExternalLink /> Open
               </a>
             )}
+            {/* Through `DownloadLink` rather than a bare anchor: on a packaged client that
+                registers no download handler this element did nothing at all, silently, and the
+                only other verb on this card — Open — is offered for three media types out of
+                every file a turn can produce. */}
             {url && (
-              <a href={url} download={name}>
+              <DownloadLink href={url} name={name}>
                 <Download /> Download
-              </a>
+              </DownloadLink>
             )}
           </span>
         </div>

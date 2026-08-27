@@ -334,7 +334,8 @@ const isTurnScaffolding = (call: RunnerCall): boolean =>
   call.path === `${root}/toolchain` ||
   call.path === `${root}/checkpoints` ||
   call.path === `${root}/file?path=workspace%2FATHANOR.md` ||
-  call.path === `${root}/file?path=workspace%2FOPEN_CLOUD.md`;
+  call.path === `${root}/file?path=workspace%2FOPEN_CLOUD.md` ||
+  call.path === `${root}/file?path=workspace%2FAGENTS.md`;
 
 const json = (value: unknown, headers: Record<string, string> = {}): Response =>
   new Response(JSON.stringify(value), {
@@ -592,11 +593,18 @@ afterEach(() => {
 describe('what a turn asks the runner for on its own account', () => {
   /*
    * Written down because every other case in this file subtracts it. If the loop starts making a
-   * fourth call of its own, this is the case that says so, rather than that call quietly becoming
-   * an arm's - and if one of these three disappears, the turn has stopped reading something it
+   * call of its own that is not here, this is the case that says so, rather than that call quietly
+   * becoming an arm's - and if one of these disappears, the turn has stopped reading something it
    * reads today.
+   *
+   * The brief is three reads, not one, and they are tried most-specific first: `ATHANOR.md` is what
+   * the owner wrote for this computer, `OPEN_CLOUD.md` is the name it carried before the rename,
+   * and `AGENTS.md` is the shared convention the surrounding tooling writes. A workspace carrying
+   * none of the three pays all three round trips once per run, which is the price of reading the
+   * file an owner actually wrote; a workspace with `ATHANOR.md` pays one, because the chain stops
+   * at the first that answers.
    */
-  it('reads the toolchain and the brief once, and takes one undo point before a write', async () => {
+  it('reads the toolchain and all three brief names once, and takes one undo point before a write', async () => {
     const executed = await dispatch(
       { name: 'file_write', arguments: { path: 'workspace/new.md', content: 'hello' } },
       { route: (_url, init) => (init?.method === 'PUT' ? json({ ok: true }) : undefined) }
@@ -610,6 +618,7 @@ describe('what a turn asks the runner for on its own account', () => {
       `GET ${root}/toolchain exec`,
       `GET ${root}/file?path=workspace%2FATHANOR.md files.read`,
       `GET ${root}/file?path=workspace%2FOPEN_CLOUD.md files.read`,
+      `GET ${root}/file?path=workspace%2FAGENTS.md files.read`,
       `POST ${root}/checkpoints workspace.manage`
     ]);
   });

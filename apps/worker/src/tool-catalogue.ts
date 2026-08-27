@@ -29,6 +29,64 @@ import { browserActionProperties, desktopActionProperties } from './surface-acti
  * exactly like a measurement.
  */
 
+/*
+ * THE FOOTPRINT LADDER - read this before adding anything below.
+ *
+ * Everything in this file is paid for on every request of every turn of every task, forever, by
+ * every owner running this product. That is the only budget in athanor spent by default rather than
+ * on use, and it is the one nobody notices spending, because a tool is added once and billed a
+ * million times. "Batteries included" is the product's promise; thirty-three thousand tokens of
+ * schemas in front of every question is what that promise turns into if nothing arbitrates.
+ *
+ * This is the arbitration. Six rungs, cheapest first. **You may climb a rung only when the one
+ * below it cannot express the capability - never because climbing would be tidier.** The two
+ * cheapest rungs cost this file nothing at all, and they are where most of what has been asked for
+ * actually belongs.
+ *
+ *   0. Nothing new. An existing tool already reaches it - `shell` runs any binary the box has, and
+ *      `file_write` writes any file. Cost: zero. Most "we need a tool for X" is X being a command.
+ *
+ *   1. A skill: a directory under `skills/`. Cost: zero schema bytes. One line of index travels in
+ *      the curated knowledge block and the full procedure is fetched by `skill(action=view)` only
+ *      when the model opens it, which is progressive disclosure doing the thing it is for. A
+ *      multi-step procedure with judgement in it belongs here and nowhere else - a procedure
+ *      compressed into a tool description is a procedure the model reads a million times and
+ *      follows once.
+ *
+ *   2. A helper on the box: `scripts/athanor-*`, reached through `shell` and named by the skill or
+ *      the operating contract that needs it. Cost: zero schema bytes. This is the rung for anything
+ *      that is really a binary with an awkward invocation.
+ *
+ *   3. A field on a tool that already exists. Cost: the field, plus a nested description only if
+ *      the field's meaning is not already in the tool's own sentence - and if it is, the sentence
+ *      is the one to keep, because the model reads it when choosing the tool rather than after.
+ *
+ *   4. A value in an enum a tool already declares: `connector_action`'s action list,
+ *      `browser_action`, `desktop_action`. Cost: the value, plus its share of whatever the
+ *      per-action field map has to say. This is how a whole connected service arrives for a few
+ *      hundred bytes instead of a few thousand.
+ *
+ *   5. A new tool. Cost: the entire entry, on every request, forever. This rung is where the
+ *      ceiling in tool-catalogue.test.ts is raised, and its history is the record of what has
+ *      cleared it: memory retrieval, desktop zoom, asking the owner a question, hearing a
+ *      recording. Read that history before proposing the sixth.
+ *
+ * Two tests decide whether a rung is earned, and both are the ceiling test's own, written out here
+ * where the person adding something will meet them:
+ *
+ *   - The substitution test. Is there any wording, anywhere, that would have done instead? If yes
+ *     it is prose, and prose does not get bytes. Every raise on record passes this and says how.
+ *   - The discovery test. Could the model find this out by trying, at the cost of one call? If yes
+ *     it does not get bytes either - one wasted call once beats a paragraph a million times. The
+ *     inverse is what a description is *for*: the facts a model can only buy by spending the
+ *     owner's money to discover, such as what a tool refuses and what shape its answer comes back
+ *     in, which is why `code_search` spends two sentences on its own return shape below.
+ *
+ * And the direction that is always free: bytes come back out for an encoding, never for a
+ * capability. The ceiling has been lowered once, by eight kilobytes, without a single tool, action
+ * or field being withdrawn - it was all repeated JSON frame. Look there first.
+ */
+
 /**
  * One person on a message or an event, declared once because mail and calendar both take it.
  * `name` is what a mail client shows instead of the address; the address is what actually routes.
@@ -290,28 +348,38 @@ export const agentTools: ModelTool[] = [
   },
   {
     name: 'code_search',
+    /*
+     * What comes back is the capability here, so it is declared rather than discovered.
+     *
+     * Two of the three sentences below are the return shape, not a pitch, and they are the two a
+     * model cannot find out without spending a billed call to find out: that a wide result arrives
+     * as one row per file rather than as lines, and that a very wide one is refused outright. The
+     * per-field prose that used to sit on `literal` and `wholeWord` is gone into this sentence
+     * instead - it said the same two things twice, once where the model chooses the tool and once
+     * where it fills the field, and paid the wire twice for it.
+     */
     description:
-      'Search source code and other plain-text files with ripgrep and return grounded path:line matches. The query is a regular expression, so TODO|FIXME and function\\s+\\w+ work as written; set literal to search for text containing regex characters - [ ] ( ) { } . * + ? | ^ $ \\ - exactly as typed, such as a[0], $scope.value or config["db.host"]. Set wholeWord to find a name rather than a substring - every definition and use of one function, class or variable, without also matching the longer names it is part of. Use this before opening unfamiliar code; use document_search for PDFs and office files, and session_search for past conversations.',
+      'Search source code and other plain-text files with ripgrep and return grounded path:line matches. The query is a regular expression, so TODO|FIXME and function\\s+\\w+ work as written; set literal to take it exactly as typed instead, such as config["db.host"] or $scope.value. Set wholeWord to match a name rather than a substring, which also reads the query literally. Across more than one file and more than a few dozen lines the answer is one row per file with its match count rather than the lines: pick a file from it and narrow with path or glob to read that one. Past 100 matching files it is refused rather than answered. Use this before opening unfamiliar code; use document_search for PDFs and office files, and session_search for past conversations.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['query'],
       properties: {
         query: { type: 'string' },
-        literal: {
-          type: 'boolean',
-          default: false,
-          description:
-            'Take the query exactly as written rather than as a regular expression. Set it for a query containing brackets, parentheses, dots, dollars or backslashes.'
-        },
-        wholeWord: {
-          type: 'boolean',
-          default: false,
-          description:
-            'Match the query only where it stands as a whole word, and take it literally rather than as a pattern.'
-        },
+        literal: { type: 'boolean', default: false },
+        wholeWord: { type: 'boolean', default: false },
         path: { type: 'string', default: 'workspace' },
         glob: { type: 'string' },
+        /*
+         * Worded as what it adds and not as what it switches off, because it does not switch
+         * anything off: a wide result collapses whether this is set or not. A boolean whose false
+         * value is not the opposite of its true value is a bound the model believes it set.
+         */
+        summary: {
+          type: 'boolean',
+          default: false,
+          description: 'Return the per-file rows even for a result small enough to send as lines.'
+        },
         maxResults: { type: 'integer', minimum: 1, maximum: 500, default: 120 }
       }
     }

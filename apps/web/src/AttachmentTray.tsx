@@ -8,6 +8,7 @@ import {
   type Attachment
 } from './attachments.js';
 import { formatBytes } from './timeline-state.js';
+import { DownloadLink } from './DownloadLink.js';
 
 /**
  * The files on the message being written: what they are, how far up they are, and how to take one
@@ -151,10 +152,13 @@ export function AttachmentStrip({
             )}
             <span className="attachment-copy">
               <strong title={path}>{name}</strong>
+              {/* The same guard as the artifact card in the transcript, for the same reason and
+                  from the same component: a raw anchor is discarded without a word by the two
+                  webviews the packaged clients are built on. */}
               {href && (
-                <a href={href} download={name}>
+                <DownloadLink href={href} name={name}>
                   Download
-                </a>
+                </DownloadLink>
               )}
             </span>
           </li>

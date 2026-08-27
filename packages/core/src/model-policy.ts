@@ -416,6 +416,28 @@ export const modelTaskKinds: readonly ModelTaskKind[] = Object.freeze([
 ] as const);
 
 /**
+ * Whether a value is a kind this router has a profile for.
+ *
+ * Exported because a declared kind is the one routing signal that does not originate in this
+ * repository - it arrives from a request body, a stored row, or a tier some other process picked -
+ * and `ModelTaskKind` on a field is a claim about such a value rather than a check of it. Anything
+ * that turns an outside label into a kind runs it through here first, because the failure is not a
+ * bad route: `profiles` has no entry for an unknown key, so the very next read of
+ * `requiredCapabilities` is off `undefined` and the turn dies inside the router.
+ */
+export const isModelTaskKind = (value: unknown): value is ModelTaskKind =>
+  (modelTaskKinds as readonly unknown[]).includes(value);
+
+/**
+ * A label from outside, quoted for a line a person reads: bounded to the length of a word and
+ * stripped of everything that is not one. It is reported rather than swallowed - a caller that
+ * declared a kind this router does not know has a bug, and a silent fall-through to the prose
+ * regexes is how that bug stays unfound - but it is reported as evidence, not as prose to trust.
+ */
+const quotedLabel = (value: string): string =>
+  `"${value.replace(/[^A-Za-z0-9_. -]/g, '.').slice(0, 24)}"`;
+
+/**
  * How the preference dial bends a task profile. It multiplies rather than replaces the profile so
  * that "fast coding" still ranks on the coding benchmark, just with latency weighted harder.
  */
@@ -967,8 +989,9 @@ export interface ModelSelection {
  *   `rankModels(...)[0]`, because `blocked` is an answer and an empty array is not.
  * - `apps/api/src/routes/tasks.ts` - `modelFit`, which spreads the request through unchanged, so
  *   the "you could have used X" line never names a route the ceiling forbids.
- * - `apps/worker/src/vision.ts` - the vision specialist, which ranks under the ceiling and then
- *   asks `selectModel` which of the two refusals it is looking at.
+ * - `apps/worker/src/vision.ts` - the vision specialist, which hands the ceiling to
+ *   `requestForWork` below, ranks under it, and then asks `selectModel` which of the two refusals
+ *   it is looking at.
  *
  * Anything that stops spreading it is a silent regression, because a request with no ceiling is
  * indistinguishable from an owner who set none. `model-policy.test.ts` holds the negative control.
@@ -1173,6 +1196,25 @@ const agenticPattern =
  */
 export const classifyModelTask = (signals: TaskSignals): TaskClassification => {
   const prompt = signals.prompt;
+  /*
+   * An unrecognised label loses its precedence, before the rule that grants it.
+   *
+   * It is answered here rather than folded into the branch below so that the precedence rule stays
+   * the two lines it has always been and reads as what it is. The fallback is what makes that rule
+   * safe to grant: a kind with no profile is not a worse route, it is a `TypeError` two lines into
+   * `modelFit`, on the one path whose whole job is to be the safe one.
+   */
+  if (signals.declaredKind !== undefined && !isModelTaskKind(signals.declaredKind)) {
+    const { declaredKind: unrecognised, ...rest } = signals;
+    const inferred = classifyModelTask(rest);
+    return {
+      ...inferred,
+      signals: [
+        `Ignored an unknown declared kind ${quotedLabel(unrecognised)}`,
+        ...inferred.signals
+      ]
+    };
+  }
   if (signals.declaredKind)
     return { kind: signals.declaredKind, signals: ['The caller named the kind of work'] };
   if (signals.internalPurpose)
@@ -1214,6 +1256,79 @@ export const classifyModelTask = (signals: TaskSignals): TaskClassification => {
       signals: ['Short prompt in a live conversation, with no tools']
     };
   return { kind: 'general', signals: ['No specialised signal; treated as general work'] };
+};
+
+/**
+ * A piece of work the caller can describe, and the ceiling it has to be done under.
+ *
+ * The profiles hold what each kind of work needs - which capabilities, which modalities, which
+ * window it is judged against - and every ranking site outside this file wrote those out by hand
+ * beside its own call. That is two spellings of one rule: the profile decides how a candidate is
+ * *scored* for vision work while the call site decides who is *eligible* for it, and nothing makes
+ * them agree. Adding `reasoning` to a profile then silently fails to narrow the pool at the one
+ * place that ranks under it.
+ */
+export interface DeclaredWork {
+  /** What the caller knows about the turn, including the kind when it knows that too. */
+  readonly signals: TaskSignals;
+  readonly privacyRoute: PrivacyRoute;
+  readonly minContextTokens: number;
+  /** Defaults to `balanced`, which is the dial an unattended site should be asking for. */
+  readonly preference?: ModelPreference;
+  /** The owner's stored ceiling. Absent is not the same as none; see `priceCeilingFields`. */
+  readonly ceiling?: OwnerPriceCeiling | null;
+  /** Capabilities this site needs beyond the profile's, if it has any of its own. */
+  readonly alsoRequires?: readonly ModelCapability[];
+}
+
+/**
+ * The request the router should be asked, given what the caller knows.
+ *
+ * The classification runs even when the kind is declared, because the precedence rule is the thing
+ * being reused: a declared kind outranks the prose, an unrecognised one loses that precedence, and
+ * both answers come from one function rather than from each call site's idea of them.
+ */
+export const requestForWork = (work: DeclaredWork): ModelRequest => {
+  const profile = taskProfile(classifyModelTask(work.signals).kind);
+  return {
+    privacyRoute: work.privacyRoute,
+    taskKind: profile.kind,
+    requiredCapabilities: [
+      ...new Set([...profile.requiredCapabilities, ...(work.alsoRequires ?? [])])
+    ],
+    requiredModalities: [...profile.requiredModalities],
+    minContextTokens: work.minContextTokens,
+    preference: work.preference ?? 'balanced',
+    ...priceCeilingFields(work.ceiling)
+  };
+};
+
+/**
+ * The model that answered a moment ago, put back at the head of a ranking it is still in.
+ *
+ * A ranking is recomputed every time a sequence of calls needs a model, and the catalogue it reads
+ * moves underneath a run that lasts hours: availability, price and measured quality are all
+ * refreshed while the turn is in progress. Recomputed from scratch each time, a turn can be handed
+ * to a different model halfway through - which is a downgrade nobody chose if the newcomer is
+ * worse, a different describer of the same conversation if it is better, and in both cases a
+ * prompt prefix the provider has never seen before, on a `sessionId` whose entire purpose is that
+ * it has.
+ *
+ * It reorders, and it never re-admits: the incumbent has to still be in the ranking it is being
+ * moved up inside, so every eligibility rule - the privacy route, the owner's price ceiling, a
+ * withdrawn row, a route that lost the endpoint - has already excluded it before this is asked.
+ * Stickiness that could resurrect a candidate would be a way of routing around exactly the checks
+ * that are worth having.
+ */
+export const preferIncumbent = <T extends { readonly id: string }>(
+  ranked: readonly T[],
+  incumbentId: string | undefined
+): readonly T[] => {
+  if (incumbentId === undefined) return ranked;
+  const index = ranked.findIndex((entry) => entry.id === incumbentId);
+  // Absent, or already leading: nothing to move, and no copy of the array to make.
+  if (index <= 0) return ranked;
+  return [ranked[index]!, ...ranked.slice(0, index), ...ranked.slice(index + 1)];
 };
 
 /**
