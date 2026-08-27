@@ -1228,28 +1228,58 @@ export const reasoningEffortForStep = (state: EffortState): 'medium' | 'high' =>
   return 'medium';
 };
 
+/**
+ * Two decimals for money anyone recognises, four for the sub-cent step a cheap route bills.
+ *
+ * Zero is special-cased into the two-decimal arm and it is not cosmetic: a cap of zero is a real
+ * setting - "only a route that publishes no charge" - and it is now quotable, so `$0.0000 of the
+ * $0.0000 limit` is a sentence this can actually produce.
+ */
 const money = (value: number): string =>
-  value >= 0.01 ? `$${value.toFixed(2)}` : `$${value.toFixed(4)}`;
+  value >= 0.01 || value === 0 ? `$${value.toFixed(2)}` : `$${value.toFixed(4)}`;
 
 const windowLabel = (name: string): string =>
   ({ task: 'this task', daily: 'today', monthly: 'this month' })[name] ?? name;
 
 /**
+ * What money is committed but not yet billed, said only when there is some.
+ *
+ * `spentUsd` is money that changed hands and the contract insists it stay that way, so the figure
+ * that actually crossed the line - `projectedUsd`, which is spent plus pending plus the estimate -
+ * cannot simply replace it. But quoting the spent figure alone against the cap produced a sentence
+ * whose own arithmetic said the run should not have stopped: an open scheduled task holds its whole
+ * ceiling as `pendingUsd` from the moment it is queued, so a month with $40 spent and $65 promised
+ * blocks against a $100 cap and told its owner "Paused at $40.00 of the $100.00 limit". Naming the
+ * held part is what closes the gap between the number and the stop.
+ */
+const heldAside = (pendingUsd: number): string =>
+  pendingUsd > 0 ? `, with ${money(pendingUsd)} more promised to work already open` : '';
+
+/**
  * Says what was spent, against what, and in which window. A ceiling the owner cannot see themselves
  * approaching reads as a random interruption, so the number and the limit both belong in the line
  * the interface shows.
+ *
+ * `capUsd == null` rather than `!capUsd`, twice below, for the reason the caps route states in as
+ * many words: for a ceiling, zero is a real setting and only `null` is the absence of one. A box
+ * whose owner had capped a window at zero fell through to the sentence with no numbers in it - the
+ * one case where the number is the entire explanation.
+ *
+ * Where to change it is deliberately not in the sentence. The card that renders this already draws
+ * a "Spending caps" button beside it, and a line of prose repeating a control the reader can see is
+ * narration.
  */
 export const spendHalt = (decision: SpendDecision): string => {
   const blocked = decision.windows.find((window) => window.name === decision.blockedBy);
-  if (!blocked?.capUsd)
+  if (blocked?.capUsd == null)
     return `Paused: this task would go over its spending limit. ${decision.reason ?? ''}`.trim();
-  return `Paused at ${money(blocked.spentUsd)} of the ${money(blocked.capUsd)} limit for ${windowLabel(blocked.name)}. Raise the limit to carry on, or leave it here.`;
+  return `Paused at ${money(blocked.spentUsd)} of the ${money(blocked.capUsd)} limit for ${windowLabel(blocked.name)}${heldAside(blocked.pendingUsd)}. Raise the limit to carry on, or leave it here.`;
 };
 
 export const spendWarning = (decision: SpendDecision): string => {
   const near = decision.windows.find((window) => decision.warnedBy.includes(window.name));
-  if (!near?.capUsd) return 'Approaching a spending limit.';
-  return `${money(near.spentUsd)} of the ${money(near.capUsd)} limit for ${windowLabel(near.name)} has been spent.`;
+  if (near?.capUsd == null) return 'Approaching a spending limit.';
+  return `${money(near.spentUsd)} of the ${money(near.capUsd)} limit for ${windowLabel(near.name)} has been spent${heldAside(near.pendingUsd)}.`;
 };
 
 /**

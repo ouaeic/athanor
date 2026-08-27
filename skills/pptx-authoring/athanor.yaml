@@ -40,4 +40,10 @@ verify:
   - run: 'athanor-office-convert deck.pptx proofs/deck.pdf'
     assert: 'exits 0 and pdfinfo reports one page per slide'
   - check: 'Round-tripped text word count is within 2 percent of the placed text, so nothing was clipped.'
-  - check: 'Every slide image was inspected: no overlap, no edge-touching text, charts labelled.'
+  # Not "no edge-touching text". The render clause tolerates it on purpose - edgeCrossings defaults
+  # its margin to the page edge because "a full-bleed slide with a word deliberately touching the
+  # edge is not a defect, and a check that called it one would be refusing correct work"
+  # (services/workspace-runner/src/render-proof.ts). This block is emitted into the opened skill
+  # verbatim, so while it said otherwise the model was handed the contradiction of SKILL.md
+  # Verification 5 inside the same block.
+  - check: 'Every slide image was inspected: no overlap, charts labelled, and text at a slide edge is there because that slide is a deliberate full bleed.'

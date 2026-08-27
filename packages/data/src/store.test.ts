@@ -42,7 +42,7 @@ import { migrations } from './migrations.js';
  * owns the table instead. Nothing about what is being tested changed - the same method, the same
  * statement, the same `Database` handle - which is why every test name in this file is unchanged.
  */
-import { BillingStore } from './store/billing.js';
+import { BillingStore, DEFAULT_MONTHLY_CAP_USD } from './store/billing.js';
 import { ConnectorStore } from './store/connectors.js';
 import { MemoryStore } from './store/memory.js';
 import { TaskSignals, TaskStore } from './store/tasks.js';
@@ -5286,18 +5286,23 @@ describe('spending caps in real currency', () => {
     await expect(billing.listSpendAlerts(userId)).resolves.toEqual([]);
   });
 
-  it('reports defaults for an owner who never opened the settings', async () => {
+  it('carries the ceiling this box supplies for an owner who never opened the settings', async () => {
     await expect(store.getSpendLimits(userId)).resolves.toBeNull();
     await expect(store.effectiveSpendLimits(userId)).resolves.toMatchObject({
       dailyCapUsd: null,
-      monthlyCapUsd: null,
+      monthlyCapUsd: DEFAULT_MONTHLY_CAP_USD,
       defaultTaskCapUsd: null,
       warnAtPercent: 80,
       timeZone: 'UTC'
     });
-    // With no cap anywhere, nothing is ever refused.
+    // This used to assert the opposite - that with no cap anywhere nothing is ever refused - and it
+    // was a behaviour pin on the defect, not an asset: a self-hosted box whose key arrives as an
+    // environment variable is never asked the ceiling question, so "no cap anywhere" was the
+    // documented install rather than an edge case. The day and the conversation are still the
+    // owner's to set; the month is no longer unlimited by default.
     await expect(store.spendGuard({ userId, estimateUsd: 10_000, now })).resolves.toMatchObject({
-      outcome: 'allow'
+      outcome: 'deny',
+      blockedBy: 'monthly'
     });
   });
 

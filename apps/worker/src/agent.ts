@@ -89,6 +89,7 @@ import {
   degenerateRepeat,
   normalizeAssistantText
 } from './streaming.js';
+import { applyDormantRules, toolsRunThisTurn } from './rules/index.js';
 import { executeToolCall } from './tool-dispatch.js';
 import { AgentRunnerClient, withRunnerAbort } from './runner-client.js';
 import { buildIdentity } from './build-identity.js';
@@ -1954,7 +1955,24 @@ export class AgentWorker {
     // state on every step until something drops it.
     dropLegacyGuidance(state.messages);
     delete (state as { playbooks?: unknown }).playbooks;
-    const { removedDuplicates } = ensureBasePrompt(state.messages);
+    // The contract is built from this run's own two facts, not from the constant.
+    //
+    // `requestTools` is the array this request will carry, after every withdrawal above it, and
+    // `toolchainSummary` is the runner's probe - both already in hand, both fixed for the life of
+    // the run, which is what makes gating on them free rather than ruinous at the head of a cached
+    // prefix. Passed here rather than at the initial-state literal forty lines up, because this is
+    // the call that rewrites the head message on every turn, including a resumed one whose saved
+    // window was written on a differently provisioned box.
+    //
+    // Worth stating why this is not cosmetic: the withdrawal a few lines above removes
+    // `connector_action` and justifies itself in prose by what the contract still says about
+    // reaching a mailbox. For one wave that reasoning was unenforced and, worse, false - the
+    // contract installed here was the fully provisioned constant, so a box with nothing connected
+    // was told `connector_action` was the route to a mailbox it had just been denied.
+    const { removedDuplicates } = ensureBasePrompt(state.messages, {
+      tools: requestTools.map((tool) => tool.name),
+      toolchainSummary
+    });
     if (removedDuplicates)
       // Worth saying out loud: this ran for as long as the marker was stale, and every duplicate
       // sat at the head of the window where it moved the bytes of everything cached behind it.
@@ -2288,6 +2306,22 @@ export class AgentWorker {
       await drainCorrection();
       await refreshActivePlan(state.mutated === true || state.step >= 2);
       await this.#noteStepBudget(task, key, state, this.#stepCeiling(state));
+      /*
+       * The dormant rules, read against the step the model just produced.
+       *
+       * Here rather than where the assistant message is pushed, for two reasons that are both about
+       * shape. At a step boundary every tool call has been answered, so a correction appended now
+       * cannot land between a call and its result - which is the malformed request the cut-off-reply
+       * branch below refuses for the same reason. And a rule's view of the turn includes what the
+       * step's own calls *did*, which is not known until they have run: the render-proof rule asks
+       * whether this turn has looked at a rendered page, and the answer arrives with the tool result
+       * rather than with the request for it.
+       *
+       * Ahead of the runtime block deliberately, so the block that carries the clock stays last and
+       * keeps costing nothing. @see rules/index.ts for why this is a tier of its own and why the
+       * firing rate is instrumented from the first commit.
+       */
+      applyDormantRules(state.messages, toolsRunThisTurn(state.turnToolResults));
       // Last of the tail blocks, and re-pushed on every step rather than once per turn: a block
       // left where the next step's tool results bury it stops being free to change. At a step
       // boundary every tool call has been answered, so nothing here can split a call from its

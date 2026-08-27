@@ -18,10 +18,12 @@ import {
   commandScript,
   consequentialExecutables,
   FILE_WRITING_EXECUTABLES,
+  gitConfigWrite,
   gitSubcommand,
   packageInstallCommands,
   packageRemovalCommands,
   packageRemovalExecutables,
+  shellWriteTargets,
   WRITING_GIT_SUBCOMMANDS
 } from './command-classification.js';
 import { textValue } from './surface-actions.js';
@@ -90,7 +92,17 @@ export const isMutatingToolCall = (name: string, args: Record<string, unknown> =
     const executable = textValue(args.executable).split('/').pop() ?? '';
     const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
     const lowerArgs = commandArgs.map((argument) => argument.toLowerCase());
-    if (executable === 'git') return WRITING_GIT_SUBCOMMANDS.has(gitSubcommand(commandArgs) ?? '');
+    // `git config --global core.hooksPath …` was not a change here while the floor was calling it
+    // `external_consequential` and stopping the turn for it - two mechanisms answering the same
+    // question about the same call two different ways, which is the one defect this file exists to
+    // prevent. It writes `.gitconfig`, and every later git invocation on this computer reads what
+    // landed there, so evidence gathered before it does not cover it. A reading `git config` stays
+    // a check, which is what keeps the asymmetry above intact: nobody verifies with a write.
+    if (executable === 'git')
+      return (
+        WRITING_GIT_SUBCOMMANDS.has(gitSubcommand(commandArgs) ?? '') ||
+        gitConfigWrite(commandArgs) !== null
+      );
     if (packageRemovalExecutables.has(executable))
       return lowerArgs.some(
         (argument) =>
@@ -289,10 +301,19 @@ export const writtenPaths = (name: string, args: Record<string, unknown>): strin
   // only watched the two file tools was one `bash -lc 'echo ... >> workspace/ATHANOR.md'` away from
   // being no rule. Gated on the command already being classified as a writer, so `cat` on the same
   // path raises nothing: a card that fires on reading the brief is a card the owner stops reading.
+  //
+  // That gate was the whole of the precision for a long time, and an inline script clears it
+  // whatever it turns out to run - so every token of `bash -lc 'cat ~/.bashrc'` arrived here and the
+  // deferred-execution rule carded a read. `shellWriteTargets` resolves what the script actually
+  // writes; the wide net is what it falls back to when it cannot, which is the same fail-closed
+  // answer as before for every shape it cannot read.
   if (name === 'shell') {
     if (!isMutatingToolCall(name, args)) return [];
     const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
-    return [...commandArgs, ...commandScript(args).split(/[\s'"`>|;()]+/)].filter(Boolean);
+    return (
+      shellWriteTargets(args) ??
+      [...commandArgs, ...commandScript(args).split(/[\s'"`>|;()]+/)].filter(Boolean)
+    );
   }
   if (name !== 'file_patch') return [];
   return (Array.isArray(args.patches) ? args.patches : [])

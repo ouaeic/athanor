@@ -16,6 +16,7 @@ import {
   consequentialExecutables,
   COMMAND_RUNNERS,
   effectiveCommands,
+  gitConfigRunsCode,
   gitSubcommand,
   isDestructiveScript,
   packageInstallCommands,
@@ -467,11 +468,16 @@ const ordinaryRequirement = (
    * hostile has been read yet, and the write is the last moment anybody can be asked.
    *
    * First, ahead of the destructive-command rule, because it is the more specific statement about
-   * the call and both stop the turn either way. Deliberately over-inclusive on `shell`:
-   * `writtenPaths` casts a wide net over a script and will name a path the command only read, so
-   * `bash -lc 'cat ~/.bashrc'` raises a card it need not. That is the safe direction, and it is
-   * cheap here in a way it would not be for the brief: an agent doing ordinary work has no reason
-   * to name any of these paths at all, so the false positives are rare rather than constant.
+   * the call and both stop the turn either way.
+   *
+   * This used to say the over-inclusion on `shell` was cheap because an agent doing ordinary work
+   * has no reason to name these paths, so the false positives would be rare. They were constant:
+   * `writtenPaths` handed this every token in the script, and an owner asking why their PATH is
+   * wrong gets `cat ~/.bashrc`, `grep -n PATH ~/.zshrc`, `test -f ~/.profile` and `head .git/config`
+   * in a row - seven cards in nine calls, six of them on commands that changed nothing, all under
+   * this headline. `writtenPaths` now resolves the write targets and falls back to the wide net only
+   * where it cannot read the script, so what arrives here is over-inclusive where that is all
+   * anybody can be and precise everywhere else.
    */
   const deferred = [...new Set(writtenPaths(name, args).filter(isDeferredExecutionPath))].sort(
     // `writtenPaths` hands a shell call every token it can see, so a redirect arrives twice: once
@@ -700,17 +706,19 @@ const ordinaryRequirement = (
      * Neither shows up as a path token anywhere in the invocation.
      *
      * Reads are exempt by name rather than writes by name, so an option added to git later asks
-     * rather than passes.
+     * rather than passes - and for the same reason the settings that cannot carry a command are an
+     * exemption too, rather than the dangerous ones being a list. Naming the danger would have to
+     * name `core.hooksPath`, `alias.*`, `include.path`, `core.pager`, `credential.helper`,
+     * `filter.*.clean`, `core.fsmonitor`, `init.templateDir` and whatever git adds next, and would
+     * pass every key invented after it was written. Setting a git identity is the first thing
+     * anybody does on a fresh box and the first thing this computer's own coding path needs; it was
+     * two `external_consequential` cards under a preview describing hooks paths and aliases, which
+     * `user.name` cannot possibly carry. `gitConfigRunsCode` holds both halves, and
+     * `isMutatingToolCall` reads the same predicate so the floor and the completion clock cannot
+     * disagree about what a `git config` did.
      */
     const gitConfigWrite = commands.find(
-      ([command = '', ...rest]) =>
-        command === 'git' &&
-        gitSubcommand(rest) === 'config' &&
-        !rest.some((argument) =>
-          ['--list', '-l', '--get', '--get-all', '--get-regexp', '--get-urlmatch'].includes(
-            argument.toLowerCase()
-          )
-        )
+      ([command = '', ...rest]) => command === 'git' && gitConfigRunsCode(rest)
     );
     if (gitConfigWrite)
       return {

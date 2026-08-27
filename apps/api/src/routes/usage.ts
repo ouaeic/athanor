@@ -59,21 +59,38 @@ export const registerUsageRoutes = (context: RouteContext): void => {
        * direction is what matters: raising a ceiling or clearing it is the escalation, lowering one
        * cannot hurt. A cap that was null is already unlimited, so setting a number there is a
        * tightening even though it "changes" the value.
+       *
+       * And a ceiling nobody has chosen is not one the owner is loosening.
+       *
+       * `current` is `effectiveSpendLimits`, so since the monthly cap acquired a default, `was` on a
+       * fresh box is this box's own guess rather than the owner's decision - and the first answer to
+       * the ceiling question, which is a decline, is sent as explicit nulls. Without the exemption
+       * below that answer is a clearing, and saying "no ceiling, thank you" on a box that has never
+       * been asked anything else costs a biometric prompt. The epoch stamp is the test, and it is
+       * the same one the question itself uses to decide it is still owed.
+       *
+       * The exemption cannot cost anything, and the reason is arithmetic rather than judgement: a
+       * box that has never saved a limit had no cap at all until this default existed, and this PUT
+       * asked for no passkey then either. Waving it through cannot leave such a box worse off than
+       * the version that shipped without a default. One saved answer in either direction moves
+       * `updatedAt` off the epoch, and from then on every loosening asks, exactly as it does now.
        */
       const stored = await store.effectiveSpendLimits(user.id);
       const current = { ...stored, ...ownerPriceCeiling(stored) };
+      const everAnswered = Date.parse(stored.updatedAt) > 0;
       const loosens = (was: number | null, next: number | null | undefined): boolean =>
         next !== undefined && (next === null ? was !== null : was !== null && next > was);
       if (
-        loosens(current.dailyCapUsd, input.dailyCapUsd) ||
-        loosens(current.monthlyCapUsd, input.monthlyCapUsd) ||
-        loosens(current.defaultTaskCapUsd, input.defaultTaskCapUsd) ||
-        // The price ceiling is the same brake read the other way round, so it is the same test: a
-        // ceiling that was null admits every route already, and raising one admits routes that were
-        // refused a moment ago. Both are the escalation, and `loosens` computes exactly that
-        // without a new predicate.
-        loosens(current.maxInputUsdPerMillionTokens, input.maxInputUsdPerMillionTokens) ||
-        loosens(current.maxOutputUsdPerMillionTokens, input.maxOutputUsdPerMillionTokens)
+        everAnswered &&
+        (loosens(current.dailyCapUsd, input.dailyCapUsd) ||
+          loosens(current.monthlyCapUsd, input.monthlyCapUsd) ||
+          loosens(current.defaultTaskCapUsd, input.defaultTaskCapUsd) ||
+          // The price ceiling is the same brake read the other way round, so it is the same test: a
+          // ceiling that was null admits every route already, and raising one admits routes that were
+          // refused a moment ago. Both are the escalation, and `loosens` computes exactly that
+          // without a new predicate.
+          loosens(current.maxInputUsdPerMillionTokens, input.maxInputUsdPerMillionTokens) ||
+          loosens(current.maxOutputUsdPerMillionTokens, input.maxOutputUsdPerMillionTokens))
       )
         await requireRecentStepUp(request, user);
       try {

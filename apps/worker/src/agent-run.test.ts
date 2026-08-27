@@ -22,7 +22,12 @@ import {
   UNTRUSTED_NOTICE_MARKER,
   WORKSPACE_BRIEF_MARKER
 } from './agent.js';
-import { compactionTargetTail, modelInputBudget, RUNTIME_CONTEXT_MARKER } from './context.js';
+import {
+  baseSystemPrompt,
+  compactionTargetTail,
+  modelInputBudget,
+  RUNTIME_CONTEXT_MARKER
+} from './context.js';
 import {
   MAX_STATIONARY_STEPS,
   PUSHBACK_MARKERS,
@@ -8128,5 +8133,148 @@ describe('the build that priced a step', () => {
     const cost = probe.events.find((entry) => entry.kind === 'cost');
     expect(cost).toBeTruthy();
     expect((cost?.payload as { build?: unknown } | undefined)?.build).toEqual(buildIdentity());
+  });
+});
+
+/**
+ * The tier that costs nothing until it fires, driven end to end.
+ *
+ * `rules/rules.test.ts` proves the matchers and `rules/wiring.test.ts` proves where the loop asks.
+ * Neither proves the only thing that decides whether this mechanism is worth having: that the
+ * correction actually reaches the provider when a rule fires, and that the request is byte-for-byte
+ * what it would have been when none does. That is asserted here against the requests the run really
+ * sent, on two turns that differ in one character of one path.
+ */
+describe('dormant rules on a real turn', () => {
+  const messagesOf = (request: Record<string, unknown> | undefined): { content: string }[] =>
+    (request?.messages ?? []) as { content: string }[];
+
+  /** The same turn twice, differing only in the extension of the file it writes. */
+  const turnWriting = async (path: string): Promise<FetchLog> => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-1', 'file_write', { path, content: 'Some words.\n' }),
+        toolFrame('call-2', 'files_list', { path: 'workspace' }),
+        textFrame('Written.')
+      ],
+      log
+    );
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 3 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+    return log;
+  };
+
+  it('puts the correction in front of the model on the step after the one that earned it', async () => {
+    const log = await turnWriting('workspace/quarterly.docx');
+    // Nothing on the request that earned it: this half never interrupts.
+    expect(messagesOf(log.modelRequests[0]).some((m) => m.content.startsWith('HARNESS'))).toBe(
+      false
+    );
+    const correction = messagesOf(log.modelRequests[1]).find((m) =>
+      m.content.startsWith('HARNESS CORRECTION [office-render-proof]')
+    );
+    expect(correction?.content).toContain('athanor-office-convert');
+  });
+
+  it('sends a request with no rule byte in it when nothing fired', async () => {
+    const log = await turnWriting('workspace/quarterly.md');
+    for (const request of log.modelRequests)
+      for (const message of messagesOf(request))
+        expect(message.content).not.toContain('HARNESS CORRECTION');
+  });
+});
+
+/**
+ * The conditional contract, proved where it is actually paid for.
+ *
+ * `context.test.ts` proves `baseSystemPrompt` gates on the capabilities it is handed, and that is a
+ * different claim from the one that matters: for one wave the gate existed, was tested, and was
+ * dead, because the single production caller invoked `ensureBasePrompt(state.messages)` with no
+ * second argument and got the fully provisioned constant every time. A gate nothing passes an
+ * argument to is not a saving, it is a function with a unit test.
+ *
+ * So this reads the request the run really sent. The arm is the one the worker already decides for
+ * itself a few lines above the install - a box with no connector enabled withdraws `connector_action`
+ * - and the assertion is that the contract in that request describes THAT box. It is also the only
+ * enforcement of a cross-file dependency the withdrawal comment states in prose: it withdraws the
+ * tool on the grounds that the contract still tells the model how to reach a mailbox without it.
+ */
+describe('the contract the run actually sends', () => {
+  const contractOf = (log: FetchLog): string => {
+    const messages = (log.modelRequests[0]?.messages ?? []) as { content: string }[];
+    const head = messages.find((message) =>
+      message.content.startsWith('# athanor operating contract')
+    );
+    if (!head) throw new Error('no operating contract on the request');
+    return head.content;
+  };
+
+  /** `toolchain` is what the runner's probe answers; '' leaves the summary empty, as a dead probe does. */
+  const turn = async (toolchain = ''): Promise<FetchLog> => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Done.')], log, {
+      route: (url) =>
+        toolchain && new URL(url).pathname.endsWith('/toolchain')
+          ? new Response(JSON.stringify({ ok: true, summary: toolchain }), {
+              headers: { 'content-type': 'application/json' }
+            })
+          : undefined
+    });
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+    return log;
+  };
+
+  /** Exactly how the runner words the absence; the gate matches on the opening of this sentence. */
+  const NO_TOOLCHAIN =
+    'No document toolchain is installed; install python3, typst and libreoffice to author documents here.';
+
+  it('describes the box this run is on, not the fully provisioned one', async () => {
+    const contract = contractOf(await turn());
+    // No connector is enabled on this task, so the worker withdrew the tool. The contract has to
+    // have followed it, or the model is reading a route it was not given.
+    expect(contract).toContain('Nothing is connected to this computer as a mailbox');
+    expect(contract).not.toContain('connector_action is the route');
+  });
+
+  it('drops the document facts on a box the runner says has no toolchain', async () => {
+    const contract = contractOf(await turn(NO_TOOLCHAIN));
+    // The pinned interpreter path is the single most expensive fact in the gated span and the one
+    // that does most damage when it is wrong: it sends the model at a binary that is not there, and
+    // it finds out one failed shell call at a time in front of the owner.
+    expect(contract).not.toContain('/usr/local/lib/athanor/python/bin/python3');
+    expect(contract).not.toContain('typeset with typst');
+    expect(contract).toContain('This computer has no document toolchain');
+  });
+
+  it('is smaller on a barer box than on a provisioned one', async () => {
+    const bare = contractOf(await turn(NO_TOOLCHAIN));
+    const provisioned = contractOf(await turn('python3 3.12, typst 0.12, athanor-office-convert.'));
+    // The whole claim of a conditional contract in one assertion: two boxes, two sizes. Before the
+    // gate was wired these two were the same string, and the saving was a number in a report.
+    expect(bare.length).toBeLessThan(provisioned.length);
+  });
+
+  it('is the contract this run\u2019s own facts build, to the byte', async () => {
+    const log = await turn();
+    const request = log.modelRequests[0];
+    const sent = ((request?.tools ?? []) as { name: string }[]).map((tool) => tool.name);
+    // Both gated facts are read back off the same request rather than restated here: the tool array
+    // is what the request carried, and the toolchain is the line the runtime block states. Asserting
+    // byte-identity against `baseSystemPrompt` fed from those two catches the whole failure class -
+    // no capabilities passed, one of the two passed, or a stale copy of either passed - where a
+    // sentence-by-sentence check catches only the arm somebody thought to write down.
+    const runtime = ((request?.messages ?? []) as { content: string }[]).find((message) =>
+      message.content.startsWith(RUNTIME_CONTEXT_MARKER)
+    );
+    const toolchain = /^- Document toolchain: (.*)$/m.exec(runtime?.content ?? '')?.[1] ?? '';
+    expect(contractOf(log)).toBe(baseSystemPrompt({ tools: sent, toolchainSummary: toolchain }));
   });
 });

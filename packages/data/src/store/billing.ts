@@ -21,6 +21,60 @@ const providerRefModelId = (providerRef: string | undefined): string | null => {
 };
 
 /**
+ * What this box stops at when nobody has told it to stop anywhere.
+ *
+ * Everything under this line has been complete for four waves - a pre-flight guard, a per-step halt,
+ * an alert per window, a pane drawing all three - and every cap shipped `null`, so the whole
+ * apparatus refused nothing on a fresh install. A brake nobody sets is a brake.
+ *
+ * One number, not three, and the month rather than the day. A day cannot tell a runaway from a heavy
+ * afternoon, so a guessed daily ceiling buys its safety by stopping real work; the day is the owner's
+ * knob. The month is the window nothing else covers. One turn is already bounded four ways -
+ * `TASK_MAX_STEPS` times `TASK_MAX_SELF_CONTINUATIONS`, `TURN_WALL_CLOCK_MS`, `maxComputeCredits`,
+ * and the thrash breakers in `turn-bounds.ts` - so the runaway turn was never the exposure. The sum
+ * is: a fifteen-minute schedule, ninety-six individually reasonable runs a day, which only a window
+ * longer than a turn can see. The monthly one catches it inside the first day.
+ *
+ * `defaultTaskCapUsd` stays unset on the ruling `POST /v1/providers` reached independently: it is
+ * enforced by reserving its whole value the moment work is queued - `openSpendCommitmentIn` below -
+ * so a guess there refuses the third conversation of the morning over money nobody has spent.
+ *
+ * A hundred is a threshold, not a measurement: above a month of ordinary use, below the figure an
+ * owner would be angry to discover, and cheap to get wrong in either direction because the halt is
+ * not destructive - `spendHalt` pauses a resumable task and names the number in the line the owner
+ * reads, so a wrong guess costs one settings edit and no guess costs whatever the provider will bill.
+ *
+ * This is not the seed at `POST /v1/providers`, which asks at the keyboard and writes the answer -
+ * including the daily cap, which an owner who was asked has chosen and an owner who was never asked
+ * has not. That route only fires when a managed provider is configured through the API; a box whose
+ * key arrives as `AI_API_KEY` or `OPENROUTER_API_KEY`, which is the documented self-hosted install,
+ * is never asked and had nothing. This is the backstop for those.
+ */
+export const DEFAULT_MONTHLY_CAP_USD = 100;
+
+/**
+ * The monthly ceiling as the guard and the pane must both see it, from one place.
+ *
+ * `spendGuardIn` reads `spend_limits` for itself and `effectiveSpendLimits` reads it again two
+ * hundred lines further down, which is how a default could be added to the surface the owner looks
+ * at while the brake that stops the work carried on with `null`. Both go through here.
+ *
+ * A stored row is the owner's answer in full, nulls included: an explicit `null` is "no ceiling,
+ * thank you" and is answered for good. No row at all is nobody having asked them, and that is the
+ * only case this speaks for - `monthly_cap_usd` is NULL for both, and the row's absence is the only
+ * thing in the schema that tells them apart.
+ *
+ * ⚠ Which leaves one writer it cannot see: `athanor spend-ceiling set` inserts into `spend_limits`
+ * in raw SQL to store the two price ceilings, creating a row with all three money caps NULL. That
+ * takes this default off a box whose owner only wanted to cap the price per million tokens - and it
+ * already stamped away the epoch `updatedAt` that the first-run ceiling question keys on, before
+ * this default existed. The fix covers every writer at once and belongs in a migration: a column
+ * default on `monthly_cap_usd`. Until then this closes the fresh install and not that.
+ */
+const cappedMonthlyUsd = (stored: SpendLimitsRecord | null): number | null =>
+  stored ? stored.monthlyCapUsd : DEFAULT_MONTHLY_CAP_USD;
+
+/**
  * What a turn is about to cost and what the owner has said it may cost: the model catalogue the
  * price is read from, the `usage_entries` ledger every charge lands in, the three caps, and the one
  * round trip that answers "may this start".
@@ -463,6 +517,16 @@ export class BillingStore {
       [
         input.userId,
         input.dailyCapUsd ?? null,
+        // Deliberately still `?? null` on the INSERT arm, after the opposite was tried.
+        //
+        // Creating the row is how the monthly default stops applying, so seeding it here looked
+        // like the way to stop a first save deleting a ceiling nobody knew they had. It is not:
+        // the only production caller of this route is the caps pane, which sends all three caps on
+        // every save whether or not the owner touched them, so the seed changed nothing on the
+        // real path - and on the one path it did change, a client that deliberately sets a daily
+        // cap alone, it invented a monthly ceiling that client had not asked for. "An omitted
+        // field is left alone" is this method's contract in its own first line, and a value nobody
+        // sent is not a field.
         input.monthlyCapUsd ?? null,
         input.defaultTaskCapUsd ?? null,
         input.warnAtPercent ?? null,
@@ -612,7 +676,10 @@ export class BillingStore {
         name: 'monthly',
         spentUsd: monthly,
         pendingUsd: pending,
-        capUsd: limits?.monthlyCapUsd ?? null,
+        // The one window this box supplies a ceiling for when nobody has. Read through
+        // `cappedMonthlyUsd` rather than off the row, because the brake and the pane that draws it
+        // have to be quoting the same number - see the comment on `DEFAULT_MONTHLY_CAP_USD`.
+        capUsd: cappedMonthlyUsd(limits),
         startsAt: bounds.monthly.start,
         endsAt: bounds.monthly.end
       }
@@ -726,7 +793,7 @@ export class BillingStore {
     const stored = await this.getSpendLimits(userId);
     return {
       dailyCapUsd: stored?.dailyCapUsd ?? null,
-      monthlyCapUsd: stored?.monthlyCapUsd ?? null,
+      monthlyCapUsd: cappedMonthlyUsd(stored),
       defaultTaskCapUsd: stored?.defaultTaskCapUsd ?? null,
       warnAtPercent: stored?.warnAtPercent ?? DEFAULT_SPEND_WARN_PERCENT,
       timeZone: stored?.timeZone ?? 'UTC',

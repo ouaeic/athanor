@@ -7,6 +7,7 @@
  */
 
 import { decryptJson, unwrapDataKey } from '@athanor/core';
+import type { WorkspaceRecord } from '@athanor/data';
 import { workspaceResponse } from '../context.js';
 import type { HostStorage } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
@@ -30,59 +31,97 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
   } = context;
   app.get('/v1/bootstrap', async (request) => {
     const user = requireUser(request.user);
-    const workspaces = await ensurePrimaryWorkspace(user);
-    const [ownedWorkspaces, tasks, schedules, models, providerCredential] = await Promise.all([
-      store.listWorkspaces(user.id),
+    const { start: periodStart, end: periodEnd } = currentPeriod();
+    /**
+     * What the owner was part-way through typing, on whichever device they typed it. Opened here
+     * rather than by the client, because the client has no key and never sees one; a draft whose
+     * workspace key cannot be unwrapped is simply left out rather than failing the whole load.
+     *
+     * Takes the workspaces as a promise so it can be started in the same wave as everything else
+     * and still be the one thing that waits for them.
+     */
+    const openDrafts = async (pending: Promise<WorkspaceRecord[]>) =>
+      (
+        await Promise.all(
+          (await pending).map(async (workspace) => {
+            if (!workspace.wrappedKey) return [];
+            try {
+              const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
+              const rows = await store.listMessageDrafts(user.id, workspace.id);
+              return rows.map((row) => {
+                // `attachments` is absent from a draft written before they travelled with one, so
+                // it reads as none rather than as a decryption failure that would drop the
+                // sentence too.
+                const opened = decryptJson<{
+                  body: string;
+                  attachments?: Array<{
+                    path: string;
+                    name: string;
+                    sizeBytes: number;
+                    mimeType: string;
+                  }>;
+                }>(row.bodyCiphertext, key);
+                return {
+                  workspaceId: workspace.id,
+                  taskId: row.taskId,
+                  body: opened.body,
+                  attachments: opened.attachments ?? [],
+                  updatedAt: row.updatedAt
+                };
+              });
+            } catch {
+              return [];
+            }
+          })
+        )
+      ).flat();
+    /*
+     * Everything in one wave, because none of it was ever waiting on anything else.
+     *
+     * This request gates first paint, and it used to be twelve database round trips deep for
+     * eighteen queries - the workspaces, then the page, then the catalogue, then the totals, then
+     * the drafts, then, one at a time in the order they happened to be written in the returned
+     * object, the retention flag, the search route and the provider spend. An object literal
+     * awaits its properties in source order, so three of those hops were paid because of where the
+     * lines sat on the page. Only the drafts genuinely depend on anything: they need the owner's
+     * workspace keys, so they wait on `ensurePrimaryWorkspace` and nothing else does.
+     *
+     * The second `listWorkspaces` is gone with them. `ensurePrimaryWorkspace` already ends in that
+     * exact query and hands the rows back, so reading them again was a round trip spent to learn
+     * what the previous line had already returned - and a window in which the two copies could
+     * disagree about a computer that had just been provisioned.
+     */
+    const workspacesRead = ensurePrimaryWorkspace(user);
+    const [
+      workspaces,
+      tasks,
+      schedules,
+      models,
+      providerCredential,
+      usage,
+      drafts,
+      enforceZeroDataRetention,
+      webSearch,
+      spend
+    ] = await Promise.all([
+      workspacesRead,
       store.listTaskPage(user.id),
       store.listTaskSchedules(user.id),
       modelsForUser(user),
-      store.getManagedProviderCredential(user.id, 'inference')
+      store.getManagedProviderCredential(user.id, 'inference'),
+      store.usageTotals(user.id, periodStart, periodEnd),
+      openDrafts(workspacesRead),
+      requiresZeroDataRetention(user.id),
+      webSearchRouteFor(user.id),
+      providerSpend(user.id)
     ]);
-    const { start: periodStart, end: periodEnd } = currentPeriod();
     const hostStorage = new Map(
-      ownedWorkspaces
+      workspaces
         .map((workspace) => [workspace.id, cachedHostStorage(workspace)] as const)
         .filter((entry): entry is readonly [string, HostStorage & { storageBytes: number }] =>
           Boolean(entry[1])
         )
     );
-    const usage = await store.usageTotals(user.id, periodStart, periodEnd);
-    // What the owner was part-way through typing, on whichever device they typed it. Opened here
-    // rather than by the client, because the client has no key and never sees one; a draft whose
-    // workspace key cannot be unwrapped is simply left out rather than failing the whole load.
-    const drafts = (
-      await Promise.all(
-        ownedWorkspaces.map(async (workspace) => {
-          if (!workspace.wrappedKey) return [];
-          try {
-            const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
-            const rows = await store.listMessageDrafts(user.id, workspace.id);
-            return rows.map((row) => {
-              // `attachments` is absent from a draft written before they travelled with one, so it
-              // reads as none rather than as a decryption failure that would drop the sentence too.
-              const opened = decryptJson<{
-                body: string;
-                attachments?: Array<{
-                  path: string;
-                  name: string;
-                  sizeBytes: number;
-                  mimeType: string;
-                }>;
-              }>(row.bodyCiphertext, key);
-              return {
-                workspaceId: workspace.id,
-                taskId: row.taskId,
-                body: opened.body,
-                attachments: opened.attachments ?? [],
-                updatedAt: row.updatedAt
-              };
-            });
-          } catch {
-            return [];
-          }
-        })
-      )
-    ).flat();
     return {
       user,
       drafts,
@@ -145,12 +184,12 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
           config.OPENROUTER_API_KEY ||
           (config.AI_PROVIDER === 'openai-compatible' && config.AI_DEFAULT_MODEL)
         ),
-        enforceZeroDataRetention: await requiresZeroDataRetention(user.id),
+        enforceZeroDataRetention,
         /**
          * Where a web search on this box is answered, so the client can say "this query leaves the
          * computer" beside the box it is typed in without asking again.
          */
-        webSearch: await webSearchRouteFor(user.id)
+        webSearch
       },
       legal: {
         applicationLicense: 'AGPL-3.0-only',
@@ -162,9 +201,9 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
         periodEnd: periodEnd.toISOString(),
         consumedCredits: usage.settled,
         reservedCredits: usage.reserved,
-        storageBytes: ownedWorkspaces.reduce((sum, workspace) => sum + workspace.storageBytes, 0),
+        storageBytes: workspaces.reduce((sum, workspace) => sum + workspace.storageBytes, 0),
         storageLimitBytes: serverLimits.storageBytes,
-        providerSpend: await providerSpend(user.id)
+        providerSpend: spend
       }
     };
   });

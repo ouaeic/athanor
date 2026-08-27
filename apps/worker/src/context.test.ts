@@ -7,6 +7,7 @@ import {
   appendBriefSection,
   BASE_PROMPT_MARKER,
   BASE_SYSTEM_PROMPT,
+  baseSystemPrompt,
   compactContext,
   compactionRequest,
   anchorIndex,
@@ -751,25 +752,43 @@ describe('summarising compaction', () => {
     // caps a model brief at, and that is load-bearing rather than incidental: at an eleven-token
     // stub this passed on a message floor alone, and at the real cap the same sweep handed back
     // 7,159 tokens on a 6,547-token window. A brief is only cheap if you measure it small.
+    //
+    // Swept over the size of the head as well as the shape of the trajectory, which is the half
+    // this case was missing. Driving one fixed preamble measures one diagonal through the band:
+    // the committed module, with the committed 12,353-byte contract, handed back a window 34
+    // tokens LARGER at 400-character turns and did so at every synthetic head between 4 kB and
+    // 15 kB - the whole range this product's contract has ever occupied - and this sweep passed
+    // throughout, because its own trajectory shape put those points either side of the band. A
+    // bound that is only reachable from head sizes nobody happened to try is not a bound.
     const budget = modelInputBudget(128_000, 16_384, CATALOGUE);
-    const head: ModelMessage[] = [
-      { role: 'system', content: BASE_SYSTEM_PROMPT },
-      { role: 'user', content: 'Keep this original goal.' }
-    ];
     let compacted = 0;
-    for (const size of [40, 200, 1_200]) {
-      for (let turns = 5; turns <= 40; turns += 1) {
-        const messages = [...head, ...trajectory(turns, size).slice(3)];
-        const window = estimatedContextTokens(messages);
-        const outcome = await compactContext({
-          messages,
-          targetTailTokens: declaredCompactionTargetTail(budget, window),
-          summarise: async () => 'S'.repeat(3_000),
-          citableFooter: 'Cite: workspace/notes.md'
-        });
-        if (!outcome) continue;
-        compacted += 1;
-        expect(outcome.estimatedTokensAfter).toBeLessThan(outcome.estimatedTokensBefore);
+    const heads = [
+      BASE_SYSTEM_PROMPT,
+      ...[4_000, 6_000, 8_000, 10_000, 14_000].map((bytes) => `# head\n${'h'.repeat(bytes - 8)}`)
+    ];
+    for (const headContent of heads) {
+      const head: ModelMessage[] = [
+        { role: 'system', content: headContent },
+        { role: 'user', content: 'Keep this original goal.' }
+      ];
+      for (const size of [40, 200, 400, 1_200]) {
+        for (let turns = 5; turns <= 40; turns += 1) {
+          const messages = [...head, ...trajectory(turns, size).slice(3)];
+          const window = estimatedContextTokens(messages);
+          const outcome = await compactContext({
+            messages,
+            targetTailTokens: declaredCompactionTargetTail(budget, window),
+            summarise: async () => 'S'.repeat(3_000),
+            citableFooter: 'Cite: workspace/notes.md'
+          });
+          if (!outcome) continue;
+          compacted += 1;
+          expect(outcome.estimatedTokensAfter).toBeLessThan(outcome.estimatedTokensBefore);
+          // And the window it hands back is the one it priced, rather than a number computed off
+          // a different array - a refusal that reported the right answer while returning the
+          // wrong messages would satisfy the line above and still make the prompt bigger.
+          expect(estimatedContextTokens(outcome.messages)).toBe(outcome.estimatedTokensAfter);
+        }
       }
     }
     // Most of the sweep refuses, which is the floor doing its work; a sweep where nothing ever
@@ -1382,33 +1401,40 @@ describe('the operating contract in the window', () => {
     expect(messages[1]?.role).toBe('user');
   });
 
-  it('sends the model to the search tool rather than at a search engine', () => {
-    // The prompt used to say "navigate to a search engine", naming none, in a catalogue that had
-    // no way to search at all - so every research job began by driving a headed browser at the
-    // pages most likely to raise an interstitial.
-    expect(BASE_SYSTEM_PROMPT).toContain('Start with a search');
+  it('names no tool the run may not be holding', () => {
+    /*
+     * A tool named in the contract but withdrawn from the catalogue is not a smaller prompt, it is
+     * a prompt with a hole in it: the model is pointed at a capability this computer has not got.
+     * web_search and parallel_web_read leave the catalogue whenever the provider's own search and
+     * fetch are sent in their place, and connector_action leaves it when nothing is connected.
+     *
+     * This is the bound. What it replaced was the same rule plus four `toContain` lines pinning
+     * the method sentences those tools were named in - "Start with a search", "browser_action and
+     * browser_snapshot are for the pages themselves", "**Mail, calendars and invitations.**",
+     * "Drive webmail in the browser only when nothing is connected". Those sentences are gone
+     * because they were method, and pinning them was a ratchet holding the method in place.
+     * connector_action survives the sweep in the provisioned arm only, which is the case below.
+     */
+    for (const name of ['web_search', 'parallel_web_read'])
+      expect(BASE_SYSTEM_PROMPT).not.toContain(name);
     expect(BASE_SYSTEM_PROMPT).not.toMatch(/navigating to a search engine/);
   });
 
-  it('names no web tool the run may not be holding, because two of them can be withdrawn', () => {
-    // web_search and parallel_web_read leave the catalogue whenever the provider's own search and
-    // fetch are sent in their place - the model must never hold two descriptions of one capability.
-    // The contract is a byte-stable constant at the head of the cached prefix, so it cannot vary
-    // with the route: naming either of them here would point a whole run at a tool it has not got.
-    // The browser tools are never withdrawn, so those stay named.
-    expect(BASE_SYSTEM_PROMPT).not.toContain('web_search');
-    expect(BASE_SYSTEM_PROMPT).not.toContain('parallel_web_read');
-    expect(BASE_SYSTEM_PROMPT).toContain('browser_action');
-    expect(BASE_SYSTEM_PROMPT).toContain('browser_snapshot');
-  });
-
-  it('routes an inbox, a calendar and an invitation at the connector, not at a browser', () => {
-    // A mailbox and a calendar are the user's own server over an open protocol. Driving webmail in
-    // a headed Chromium instead means a session to keep alive and a page that can steer the agent.
-    expect(BASE_SYSTEM_PROMPT).toContain('**Mail, calendars and invitations.**');
-    expect(BASE_SYSTEM_PROMPT).toContain('connector_action is the route to it');
-    expect(BASE_SYSTEM_PROMPT).toContain('Drive webmail in the browser only when nothing is');
-    expect(BASE_SYSTEM_PROMPT).toMatch(/sending, replying and every calendar change stops/i);
+  it('states the mail route the worker leaves standing, in whichever direction it withdrew', () => {
+    /*
+     * The one sentence in the contract that `agent.ts` reasons about by name. It withdraws
+     * connector_action when the owner has nothing connected and keeps connector_list, on the
+     * argument that "the contract already tells it to drive webmail in the browser and say that
+     * connecting is the better route" - so that sentence has to exist on the withdrawn side, and
+     * must not be the one shown when the connector IS there.
+     */
+    const provisioned = baseSystemPrompt({ tools: ['connector_action', 'connector_list'] });
+    expect(provisioned).toContain('connector_action is the route to it');
+    expect(provisioned).not.toMatch(/webmail in the browser is the only route/);
+    const bare = baseSystemPrompt({ tools: ['connector_list'] });
+    expect(bare).not.toContain('connector_action');
+    expect(bare).toMatch(/webmail in the browser is the only route/);
+    expect(bare).toMatch(/connecting the mailbox is the better route/);
   });
 
   it('says a message is untrusted because of where it came from, not because it looks odd', () => {
@@ -1561,58 +1587,148 @@ describe('prompt cache breakpoints', () => {
 });
 
 /**
- * The jobs the owner named, and the phrasing they arrive in.
+ * What the contract is allowed to be, now that it is a function of the run rather than a constant.
  *
- * Guidance used to be chosen per request by keyword. Run against phrasings like these, five
- * reached the model with no guidance at all and five more with a block aimed at the wrong tools -
- * "tailor my CV and give me a PDF" carries no authoring verb, and "go through my photos" reads as
- * image generation. The contract now carries all of it, so what this fixture guards is that the
- * advice for each job is actually in there and says one thing rather than two.
+ * The fixture this replaced was `OWNER_JOBS`: eight owner phrasings, each asserting that the
+ * contract contained a term - `python-pptx`, `pandas`, `repo_overview`, `read_elements`,
+ * `primary sources`, `form`. It was written when guidance was chosen per request by keyword and it
+ * measured the right thing then: that no phrasing arrived with the wrong block. Once the block was
+ * folded in unconditionally it stopped measuring anything except that the method sentences were
+ * still there, one `toContain` per sentence - which is a ratchet, and is precisely what held
+ * 6,020 bytes of per-domain procedure resident on the turn that writes a haiku. It is deleted with
+ * the sentences it pinned rather than preserved as evidence they should have survived.
+ *
+ * What replaces it is the property those sentences were the wrong shape of: the contract states
+ * the facts about THIS computer that no tool result could tell the model, and states them only
+ * when they are true of the box the run is on.
  */
-const OWNER_JOBS: Array<{ prompt: string; needs: string[] }> = [
-  { prompt: 'Make me a presentation on our Q3 results for the board.', needs: ['python-pptx'] },
-  {
-    prompt: 'Apply for this job for me: https://example.com/careers/analyst',
-    needs: ['form', 'print_pdf', 'read_elements']
-  },
-  { prompt: 'Tailor my CV for this role and give me a PDF.', needs: ['typst'] },
-  {
-    prompt: 'Write a report on the UK heat pump market.',
-    // Named by the advice rather than by the tool. web_search and parallel_web_read leave the
-    // catalogue on the route where the provider answers searches instead, so a fixture keyed on
-    // either name would be asserting that the contract points a run at a tool it may not have.
-    needs: ['primary sources', 'Cite source URLs']
-  },
-  { prompt: 'Analyse this spreadsheet of last quarter sales.', needs: ['pandas'] },
-  { prompt: 'Go through my photos and find the whiteboard ones.', needs: ['image_read'] },
-  { prompt: 'Set up a small website for my club and put it online.', needs: ['publish_preview'] },
-  { prompt: 'Fix the failing test in the api package.', needs: ['repo_overview'] }
-];
-
-describe('the guidance every job arrives with', () => {
-  it('carries the advice for each of the owner\u2019s named jobs, whatever the wording', () => {
-    const missing = OWNER_JOBS.filter(({ needs }) =>
-      needs.some((term) => !BASE_SYSTEM_PROMPT.includes(term))
-    ).map(({ prompt }) => prompt);
-    expect(missing).toEqual([]);
+describe('the contract as a function of the box it is on', () => {
+  it('carries the machine facts no tool schema could have told the model', () => {
+    // Each of these is a fact about this computer that a model holding the whole catalogue still
+    // could not work out by trying: which interpreter, which wrapper that fails rather than
+    // exiting zero, which route controls pagination, what this box cannot do at all, and where an
+    // app has to bind for the owner to reach it.
+    for (const fact of [
+      '/usr/local/lib/athanor/python/bin/python3',
+      'athanor-office-convert',
+      'typeset with typst',
+      'print_pdf captures a page the browser is showing',
+      'pdftoppm',
+      'image_read',
+      'Document toolchain',
+      'no video generation here at all',
+      '0.0.0.0',
+      'anti-bot challenge'
+    ])
+      expect(BASE_SYSTEM_PROMPT).toContain(fact);
+    // The contract sent every document proof to a bare `libreoffice --headless --convert-to pdf`,
+    // which exits 0 on a conversion that wrote nothing, while the runner probes for, the release
+    // drill asserts, and every vetted procedure names the wrapper above.
+    expect(BASE_SYSTEM_PROMPT).not.toMatch(/libreoffice/i);
   });
 
-  it('gives one answer for an authored PDF rather than two competing ones', () => {
-    // "author it as HTML and print it" and the vetted typst-pdf skill were both shipped, so the
-    // model picked whichever it read last and CVs came out paginated by whatever Chromium decided.
-    expect(BASE_SYSTEM_PROMPT).toContain('typeset with typst');
-    expect(BASE_SYSTEM_PROMPT).toContain('print_pdf captures a page the browser is showing');
+  it('carries no method a frontier model would have done unprompted', () => {
+    /*
+     * The substitution and discovery tests, as assertions. Every phrase here was resident on every
+     * request until this wave, and every one of them is either what the model does without being
+     * told or one call away from being discovered - and eight of them summarised a skill that is
+     * already opened on demand.
+     *
+     * The desktop paragraph is the clearest case and it went whole: "prefer accessibility-node
+     * actions", "observe again after anything material" and "a web page is not a desktop
+     * application" are all in `desktop_observe` and `desktop_action`'s own descriptions, so the
+     * model was billed for them twice on every request and read them once.
+     */
+    for (const method of [
+      'Begin with repo_overview',
+      'reuse the abstractions already there',
+      'code_diagnostics before claiming success',
+      'shell(background=true)',
+      'Wait with wait_for',
+      'fill a whole form with one batch action',
+      'read_elements',
+      'Search a mailbox rather than paging',
+      'Prefer accessibility-node actions',
+      'desktop_observe',
+      'python-pptx',
+      'pandas',
+      'State the assumptions you made'
+    ])
+      expect(BASE_SYSTEM_PROMPT).not.toContain(method);
+    // And the heading they lived under, so a later wave cannot quietly refill it.
+    expect(BASE_SYSTEM_PROMPT).not.toContain('## Doing the work well');
   });
 
-  it('requires a document to be looked at before it is published', () => {
-    expect(BASE_SYSTEM_PROMPT).toContain('pdftoppm');
-    expect(BASE_SYSTEM_PROMPT).toContain('image_read');
+  it('drops the document facts on a box the runner says has no toolchain, and only then', () => {
+    const provisioned = baseSystemPrompt({
+      toolchainSummary: 'Available on this computer: office-authoring, typeset-pdf.'
+    });
+    expect(provisioned).toContain('/usr/local/lib/athanor/python/bin/python3');
+    expect(provisioned).toContain('typeset with typst');
+    const bare = baseSystemPrompt({
+      toolchainSummary: 'No document toolchain is installed on this computer.'
+    });
+    expect(bare).not.toContain('/usr/local/lib/athanor/python/bin/python3');
+    expect(bare).not.toContain('typeset with typst');
+    // The wrapper is still named, because what the bare box needs is the fact that it is ABSENT -
+    // silence would be worse than the paragraph, since a model with no toolchain line and no tool
+    // that fails early starts a .pptx build and finds out one shell call at a time. What must not
+    // survive is the instruction to run it.
+    expect(bare).not.toContain('athanor-office-convert IN OUT');
+    expect(bare).toContain('no athanor-office-convert');
+    expect(bare).toContain('no document toolchain');
+    // An unreachable runner returns no summary at all, and an unknown must never remove a fact.
+    expect(baseSystemPrompt({ toolchainSummary: '' })).toBe(BASE_SYSTEM_PROMPT);
+    expect(baseSystemPrompt()).toBe(BASE_SYSTEM_PROMPT);
   });
 
-  it('does not send a task to a binary this computer may not have', () => {
-    expect(BASE_SYSTEM_PROMPT).toContain('Document toolchain');
+  it('is smaller on a barer box, and is the same bytes for the same box every time', () => {
+    /*
+     * The mechanism's own number, and the reason it is worth having at all. The gate is on the head
+     * of the cached prefix, so it may only ever depend on facts that are fixed for the life of a
+     * run - the tool array is built once with "Nothing withdraws a tool after this line" above it,
+     * and the toolchain is probed once and folded into the frozen block. Determinism is therefore
+     * not a nicety here: a gate that flipped mid-run would move every byte behind it on the step
+     * it flipped, which is the exact disease `refreshRuntimeContext` exists to avoid.
+     */
+    const bare = {
+      tools: ['shell', 'file_read', 'file_patch', 'finish'],
+      toolchainSummary: 'No document toolchain is installed on this computer.'
+    };
+    const first = baseSystemPrompt(bare);
+    expect(baseSystemPrompt(bare)).toBe(first);
+    expect(Buffer.byteLength(first)).toBeLessThan(Buffer.byteLength(BASE_SYSTEM_PROMPT));
+    // Measured on this tree: 8,274 bytes fully provisioned, 7,413 on a box with no connector and
+    // no document toolchain, against 12,353 for the contract this replaced. The bands are wide
+    // enough to survive a sentence being reworded and tight enough that refilling the method
+    // section would fail here rather than in a byte total nobody reads.
+    expect(Buffer.byteLength(BASE_SYSTEM_PROMPT)).toBeLessThan(9_000);
+    expect(Buffer.byteLength(first)).toBeLessThan(8_000);
   });
 
+  it('installs the gated contract through the one function that rewrites the head message', () => {
+    // ensureBasePrompt is what production calls every turn, and it is where the capabilities have
+    // to arrive for any of this to be worth a byte. Passing none installs the provisioned contract
+    // rather than a guess.
+    const messages: ModelMessage[] = [
+      { role: 'system', content: BASE_SYSTEM_PROMPT },
+      { role: 'user', content: 'Carry on.' }
+    ];
+    ensureBasePrompt(messages, {
+      tools: ['shell'],
+      toolchainSummary: 'No document toolchain is installed on this computer.'
+    });
+    expect(messages[0]?.content).not.toContain('typeset with typst');
+    expect(messages[0]?.content.startsWith(BASE_PROMPT_MARKER)).toBe(true);
+    // And a window carrying the gated contract is still recognised as a preamble, so the next turn
+    // replaces it rather than unshifting a second copy in front of it.
+    expect(ensureBasePrompt(messages).removedDuplicates).toBe(0);
+    expect(messages).toHaveLength(2);
+    expect(messages[0]?.content).toBe(BASE_SYSTEM_PROMPT);
+  });
+});
+
+describe('what a saved window carries across the fold', () => {
   /**
    * Every turn pays for this prompt, including the ones that write a haiku. A bullet earns its
    * place by carrying something the model cannot work out from the tools it was handed - never by
@@ -1625,17 +1741,6 @@ describe('the guidance every job arrives with', () => {
     // the user's own record is a question, not something to fill in plausibly.
     expect(BASE_SYSTEM_PROMPT).toMatch(/never supply a fact about the user/);
     expect(BASE_SYSTEM_PROMPT).toMatch(/A missing detail is a question/);
-  });
-
-  it('names the one wrapper and the one interpreter, not the tools underneath them', () => {
-    // The contract sent every document proof to a bare `libreoffice --headless --convert-to pdf`,
-    // which exits 0 on a conversion that wrote nothing, and every analysis script to a bare
-    // `python3` - while the runner probes for, the release drill asserts, and all nineteen vetted
-    // procedures name athanor-office-convert and the pinned interpreter. Two answers to the same
-    // question is the failure mode this whole section exists to prevent.
-    expect(BASE_SYSTEM_PROMPT).toContain('athanor-office-convert');
-    expect(BASE_SYSTEM_PROMPT).not.toMatch(/libreoffice/i);
-    expect(BASE_SYSTEM_PROMPT).toContain('/usr/local/lib/athanor/python/bin/python3');
   });
 
   it('drops a guidance block a window saved before the fold still carries', () => {
@@ -2227,6 +2332,7 @@ describe('sixty steps of one task, measured on the bytes that leave the machine'
     /** Positions that were identical to the previous request and still fell outside that mark. */
     readonly breakpointLag: number;
     /** The share of this request a provider could serve from cache at the marks it carries. */
+    readonly bytesLength: number;
     readonly cacheReadShare: number;
     /** Older results this request re-cut, having sent them longer on the previous one. */
     readonly toolResultsRecut: number;
@@ -2479,6 +2585,7 @@ describe('sixty steps of one task, measured on the bytes that leave the machine'
         steps.push({
           step,
           requestBytes,
+          bytesLength: bytes.length,
           prefixShare: commonPrefix(bytes, previous.bytes) / bytes.length,
           floor,
           windowMessages: prepared.messages.length,
@@ -2879,6 +2986,56 @@ describe('sixty steps of one task, measured on the bytes that leave the machine'
       const run = await measured(contextTokens);
       expect(run.budgetCompactions).toBe(0);
       expect(run.peakPreparedTokens).toBeLessThan(run.trigger);
+    }
+  });
+
+  it('bills fewer full-price bytes per step than the head it replaced, in bytes rather than in a share', async () => {
+    /*
+     * NUMBER FIVE, and the one that had to be added before this wave's cut could be judged at all.
+     *
+     * `prefixShare` and `cacheReadShare` are ratios over the whole request, and the operating
+     * contract is a constant that sits inside BOTH halves of every one of them. Adding cached
+     * bytes to the head raises c/t mechanically, so a change that makes the resident prompt
+     * smaller reports a WORSE cache-read share while costing the owner strictly less - and a
+     * reviewer reading the share alone concludes the opposite of the truth.
+     *
+     * Measured on this tree by padding the head back to its old size and sweeping, one tree, one
+     * driver, nothing else changed. Mean full-price bytes per step, 60 steps:
+     *
+     *   head bytes     131k window        1M window
+     *   8,274 (now)      57,133            57,293
+     *   8,774            59,015            57,293
+     *   9,274            59,015            56,699
+     *  10,274            59,015            56,699
+     *  11,274            59,214            56,706
+     *  12,353 (was)      58,706            56,706
+     *  13,274            58,706            56,706
+     *  14,274            58,655            56,706
+     *
+     * Neither column is monotonic in the size of the head, and the 1M column is a step function
+     * with one 594-byte tread. That is the checkpoint grid quantising: the breakpoints are laid on
+     * a stride and the divergence point is not, so which side of a stride the divergence lands on
+     * moves the deepest readable mark by a whole message. It is worth about 600 bytes a step in
+     * either direction and it swamps the systematic effect of a four-kilobyte head cut on the
+     * cache accounting - while the four kilobytes themselves come off every request regardless.
+     *
+     * So this case asserts what is left once the grid noise is accounted for: full-price bytes per
+     * step, in bytes, under a ceiling set above the whole sweep above. It deliberately does NOT
+     * try to catch a four-kilobyte contract refill - the sweep proves it could not, because the
+     * grid moves this number further than the refill does. The size of the resident contract is
+     * bounded where it can be bounded exactly, in `the contract as a function of the box it is
+     * on`; what this catches is the window starting to rewrite something it used to leave alone,
+     * which is the failure the share metrics report as a fraction of a point and nothing else.
+     */
+    const FULL_PRICE_CEILING = 60_000;
+    for (const { contextTokens } of MEASURED) {
+      const run = await measured(contextTokens);
+      const fullPrice = mean(run.steps.map((step) => (1 - step.cacheReadShare) * step.bytesLength));
+      expect(fullPrice).toBeLessThan(FULL_PRICE_CEILING);
+      // And the arithmetic the shares are computed from, so a step that reported a share against
+      // a length it did not measure cannot pass the line above.
+      for (const step of run.steps)
+        expect(step.bytesLength).toBeGreaterThan(step.requestBytes - 1_000);
     }
   });
 });

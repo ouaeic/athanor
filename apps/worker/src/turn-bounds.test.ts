@@ -285,6 +285,63 @@ describe('spending limits the owner can read', () => {
     ).toContain('The monthly limit is already spent.');
   });
 
+  /**
+   * The sentence has to reach the cap it says was reached.
+   *
+   * `spentUsd` is money that changed hands; a queued or running task holds its whole ceiling as
+   * `pendingUsd` from the moment it is queued, and the decision blocks on the sum. So a month with
+   * $40 billed and $65 promised blocks against a $100 cap while the line the owner reads says
+   * "$40.00 of the $100.00 limit" - arithmetic that argues the run should still be going. This is
+   * the same complaint the function's own comment makes about a ceiling nobody can see themselves
+   * approaching, one level further in.
+   */
+  it('accounts for money promised to open work, not only money already billed', () => {
+    const message = spendHalt({
+      outcome: 'deny',
+      estimateUsd: 0.5,
+      blockedBy: 'monthly',
+      warnedBy: [],
+      reason: null,
+      windows: [{ ...window('monthly', 40, 100), pendingUsd: 65, projectedUsd: 105.5 }]
+    });
+    expect(message).toContain('$40.00');
+    expect(message).toContain('$65.00');
+    expect(message).toContain('$100.00');
+  });
+
+  it('says nothing about promised work when none is open', () => {
+    // The clause is conditional for a reason: on the ordinary stop there is nothing held, and a
+    // sentence that says "with $0.00 more promised" is narration about the absence of a thing.
+    expect(
+      spendWarning({
+        outcome: 'warn',
+        estimateUsd: 0.5,
+        blockedBy: null,
+        warnedBy: ['daily'],
+        reason: null,
+        windows: [window('daily', 8, 10)]
+      })
+    ).not.toContain('promised');
+  });
+
+  /**
+   * Zero is a ceiling, not the absence of one - "only a route that publishes no charge", in the
+   * caps route's own words - and `!capUsd` could not tell the two apart, so the one stop whose
+   * whole explanation is the number fell through to the sentence without any numbers in it.
+   */
+  it('quotes a ceiling of zero rather than falling through to the wordless refusal', () => {
+    const message = spendHalt({
+      outcome: 'deny',
+      estimateUsd: 0.01,
+      blockedBy: 'monthly',
+      warnedBy: [],
+      reason: 'Spending on this month would reach $0.01, past the $0.00 cap.',
+      windows: [{ ...window('monthly', 0, 0), projectedUsd: 0.01 }]
+    });
+    expect(message).toContain('$0.00 of the $0.00 limit for this month');
+    expect(message).not.toContain('$0.0000');
+  });
+
   it('reports sub-cent spend without rounding it away to zero', () => {
     // A cheap model can run a long way below a cent a step; "$0.00 of $5.00" reads as a bug.
     expect(

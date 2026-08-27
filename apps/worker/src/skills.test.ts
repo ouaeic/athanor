@@ -305,6 +305,12 @@ describe('the shipped built-in library', () => {
   });
 
   it('covers every domain the product promises', () => {
+    // `code-change` was on this list and is not a domain the library has to cover. Its orientation
+    // half was already resident verbatim (context.ts:57) and its one athanor-specific instruction -
+    // declare the project's test command as a set_acceptance command check, and see it fail first -
+    // is resident in `## How to finish` (context.ts:81). Everything else it carried was method, and
+    // the model owns method. Deleted with the skill rather than left here as an argument that the
+    // skill should come back.
     const names = library.skills.map((skill) => skill.name);
     expect(names).toEqual(
       expect.arrayContaining([
@@ -317,7 +323,6 @@ describe('the shipped built-in library', () => {
         'typst-pdf',
         'web-form-filling',
         'citation-discipline',
-        'code-change',
         'deployment',
         'media-creation',
         'background-jobs',

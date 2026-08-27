@@ -10,7 +10,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   effectiveCommands,
+  gitConfigRunsCode,
+  gitConfigWrite,
   sendsDataOverNetwork,
+  shellWriteTargets,
   untrustedShellOrigin
 } from './command-classification.js';
 
@@ -137,5 +140,98 @@ describe('what a shell call really runs', () => {
     );
     expect(sendsDataOverNetwork('curl', ['-D', 'headers.txt', 'https://x'])).toBe(false);
     expect(sendsDataOverNetwork('curl', ['-s', 'https://x'])).toBe(false);
+  });
+  /*
+   * The wrapper the model is told to reach for was the one hole the literal-URL scan never covered.
+   *
+   * `scriptCommands` read the first word of each segment, and for `timeout 30 curl -s "$U"` inside
+   * an interpreter that word was `timeout`. The bare form was unwrapped and tainted; the wrapped
+   * form - with no address written down for `shellDestinations` to find - was an unknown command
+   * running an unknown command, so an attacker-chosen page arrived with the floor reporting the
+   * turn clean. Measured before the repair on all three runners and on the shell keywords.
+   */
+  it('unwraps a runner or a keyword inside a script, not only outside one', () => {
+    const fetched = 'network command output';
+    for (const script of [
+      'timeout 30 curl -s "$U" -o page.html',
+      'env P=1 curl -s "$U"',
+      'nice -n 5 wget "$U"',
+      'xargs curl -s < urls.txt',
+      'if curl -sf "$U"; then echo ok; fi',
+      'then curl -s "$U"',
+      'while curl -s "$U"; do echo again; done'
+    ])
+      expect(untrustedShellOrigin({ executable: 'bash', args: ['-lc', script] }), script).toBe(
+        fetched
+      );
+    // And the wrapper still comes off the same way it did before, so nothing that was clean stops
+    // being clean.
+    for (const script of ['timeout 30 pnpm test', 'env CI=1 pnpm build', 'if [ -f x ]; then :; fi'])
+      expect(
+        untrustedShellOrigin({ executable: 'bash', args: ['-lc', script] }),
+        script
+      ).toBeNull();
+  });
+
+  /*
+   * What a script writes, as opposed to every word it contains.
+   *
+   * `writtenPaths` split the script on whitespace and punctuation and handed the result to the
+   * deferred-execution rule, so `bash -lc 'cat ~/.bashrc'` was a write of `~/.bashrc`. The
+   * resolution here is fail-closed in the same direction the wide net was, and moved rather than
+   * dropped: a command it cannot place on either side returns null, and `writtenPaths` goes back to
+   * listing every token for exactly those shapes.
+   */
+  it('resolves what a script writes, and returns null rather than guess', () => {
+    const script = (body: string) => shellWriteTargets({ executable: 'bash', args: ['-lc', body] });
+    expect(script('cat ~/.bashrc')).toEqual([]);
+    expect(script('grep -n PATH ~/.zshrc | head -3')).toEqual([]);
+    expect(script('echo x >> ~/.bashrc')).toEqual(['~/.bashrc']);
+    expect(script('echo x > out.log 2>&1')).toEqual(['out.log']);
+    // `2>&1` and `>&2` duplicate a descriptor and write no file; `2>err.log` writes one.
+    expect(script('cat notes.txt 2>&1')).toEqual([]);
+    expect(script('cat notes.txt 2>err.log')).toEqual(['err.log']);
+    // An executable this cannot place is null however harmless it is, which is the fail-closed
+    // half: `pnpm` is neither a recognised reader nor a recognised writer.
+    expect(script('pnpm test 2>&1')).toBeNull();
+    expect(script('cp a ~/.bashrc')).toEqual(['a', '~/.bashrc']);
+    expect(script('dd if=/dev/zero of=disk.img')).toContain('disk.img');
+    // Unknown fails closed: a downloader's output flag, a language runtime and a script this
+    // cannot read at all are all null, not an empty list.
+    expect(script('curl -o ~/.bashrc https://x')).toBeNull();
+    expect(
+      shellWriteTargets({ executable: 'python3', args: ['-c', "open('.bashrc','w')"] })
+    ).toBeNull();
+    expect(shellWriteTargets({ executable: 'bash', args: ['script.sh'] })).toBeNull();
+    // A bare invocation is judged the same way, with no script to read.
+    expect(shellWriteTargets({ executable: 'tee', args: ['-a', '~/.bashrc'] })).toEqual([
+      '~/.bashrc'
+    ]);
+    expect(shellWriteTargets({ executable: 'cat', args: ['~/.bashrc'] })).toEqual([]);
+  });
+
+  /*
+   * `git config` names no path, so the rule that reads the paths a call writes cannot see it at
+   * all. One predicate answers for both the card and the completion clock, because a call the floor
+   * calls consequential and the write classifier calls no change is two mechanisms disagreeing
+   * about the same call.
+   */
+  it('tells a git identity from a git setting that runs a command', () => {
+    expect(gitConfigWrite(['config', '--global', 'user.name', 'Dan'])).toBe('user.name');
+    expect(gitConfigWrite(['config', '--global', 'core.hooksPath', '/x'])).toBe('core.hookspath');
+    expect(gitConfigWrite(['config', '--list'])).toBeNull();
+    expect(gitConfigWrite(['config', '--get', 'user.name'])).toBeNull();
+    expect(gitConfigWrite(['config', 'user.name'])).toBeNull();
+    expect(gitConfigWrite(['status'])).toBeNull();
+    // An option this cannot read makes the key unnameable, and an unnameable key is exempted by
+    // nothing.
+    expect(gitConfigWrite(['config', '--file', '~/.bashrc', 'user.name', 'Dan'])).toBe('');
+    expect(gitConfigRunsCode(['config', '--global', 'user.name', 'Dan'])).toBe(false);
+    expect(gitConfigRunsCode(['config', '--global', 'user.email', 'me@example.com'])).toBe(false);
+    expect(gitConfigRunsCode(['config', '--global', 'pull.rebase', 'true'])).toBe(false);
+    expect(gitConfigRunsCode(['config', '--global', 'alias.ci', '!evil'])).toBe(true);
+    expect(gitConfigRunsCode(['config', '--global', 'include.path', '/x'])).toBe(true);
+    expect(gitConfigRunsCode(['config', '--file', '~/.bashrc', 'user.name', 'Dan'])).toBe(true);
+    expect(gitConfigRunsCode(['-C', 'repo', 'config', 'alias.x', '!evil'])).toBe(true);
   });
 });

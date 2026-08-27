@@ -25,7 +25,7 @@ import {
   priceCeilingFields,
   unwrapDataKey
 } from '@athanor/core';
-import type { OwnerPriceCeiling, RoutableModel } from '@athanor/core';
+import type { RoutableModel } from '@athanor/core';
 import { startTurnState } from '@athanor/worker';
 import { ownerPriceCeiling, resumableTaskStatuses, taskResponse } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
@@ -60,21 +60,26 @@ export const registerTaskRoutes = (context: RouteContext): void => {
   }>('/v1/tasks', async (request): Promise<TaskPage> => {
     const user = requireUser(request.user);
     const query = TaskPageQuery.parse(request.query);
-    const page = await store.listTaskPage(user.id, {
-      ...(query.workspaceId ? { workspaceId: query.workspaceId } : {}),
-      ...(query.limit === undefined ? {} : { limit: query.limit }),
-      ...(query.cursor ? { cursor: query.cursor } : {}),
-      include: query.include
-    });
     /**
-     * The owner's workspaces, read once for the whole page.
+     * The page, and the owner's workspaces read once for the whole of it.
      *
-     * Called without this, `privateTaskResponse` runs `getWorkspaceById` and `unwrapDataKey` per
-     * row - and a page defaults to 200 rows and is allowed 500, so drawing the sidebar issued 201
-     * queries instead of 2. `/v1/bootstrap` has always done it this way against the same helper;
-     * this route and `/v1/schedules` were the two that did not.
+     * Called without the second, `privateTaskResponse` runs `getWorkspaceById` and `unwrapDataKey`
+     * per row - and a page defaults to 200 rows and is allowed 500, so drawing the sidebar issued
+     * 201 queries instead of 2. `/v1/bootstrap` has always done it this way against the same
+     * helper; this route and `/v1/schedules` were the two that did not.
+     *
+     * Together, because which conversations are on this page has never had any bearing on which
+     * computers the owner has.
      */
-    const workspaces = await store.listWorkspaces(user.id);
+    const [page, workspaces] = await Promise.all([
+      store.listTaskPage(user.id, {
+        ...(query.workspaceId ? { workspaceId: query.workspaceId } : {}),
+        ...(query.limit === undefined ? {} : { limit: query.limit }),
+        ...(query.cursor ? { cursor: query.cursor } : {}),
+        include: query.include
+      }),
+      store.listWorkspaces(user.id)
+    ]);
     return {
       tasks: await Promise.all(
         page.tasks.map((task) =>
@@ -93,6 +98,29 @@ export const registerTaskRoutes = (context: RouteContext): void => {
       scheduleRunCounts: page.scheduleRunCounts
     };
   });
+
+  /**
+   * Start work now, answer for it later, and refuse in the order the checks were written in.
+   *
+   * The two writes that cost money each ran a chain of independent reads one after another - the
+   * computer, the ceiling, the spend guard, the catalogue, the ranking - so the owner waited for
+   * the sum of five round trips to four different tables, none of which was waiting on any of the
+   * others. Started together they cost the longest one.
+   *
+   * Which refusal the owner sees must not change with that, and this is what holds it: the reads
+   * are started at once, and the value or the failure of each is unwrapped at the point in the
+   * body where the serial version would have reached it. A request that names a missing computer
+   * and is also over the cap still answers `workspace_not_found`. Attaching the handler here, on
+   * the line that starts the work, is also what keeps a refusal that is thrown early from becoming
+   * an unhandled rejection while a check further up is still deciding.
+   */
+  const started = <T>(work: Promise<T>): Promise<() => T> =>
+    work.then(
+      (value) => () => value,
+      (error: unknown) => () => {
+        throw error;
+      }
+    );
 
   /** Extensions the router treats as pictures, which is the one attachment kind that changes it. */
   const IMAGE_ATTACHMENT = /\.(?:png|jpe?g|gif|webp|bmp|tiff?|heic|heif|avif)$/i;
@@ -114,19 +142,25 @@ export const registerTaskRoutes = (context: RouteContext): void => {
    */
   const noteModelFit = async (input: {
     taskId: string;
+    /**
+     * Whose ceiling to compare against, so the comparison is over routes they would actually let
+     * this box take. Without it the line reads "the router would have reached for X" naming a
+     * route the ceiling forbids - advice that cannot be followed, about money, from the one
+     * component that knows the limit.
+     *
+     * The account rather than the limits, because reading the limits is a database round trip and
+     * an argument is evaluated before the call it is an argument to. Passed as a value, the read
+     * sat in front of every first message on the box - the whole point of not awaiting this - and
+     * the `void` in front of the call bought nothing. Inside, it is paid after the owner has their
+     * answer.
+     */
+    userId: string;
     dataKey: Uint8Array;
     catalog: RoutableModel[];
     chosen: RoutableModel;
     privacyRoute: 'provider_zdr' | 'external';
     prompt: string;
     attachments: string[];
-    /**
-     * The owner's ceiling, so the comparison is against routes they would actually let this box
-     * take. Without it the line reads "the router would have reached for X" naming a route the
-     * ceiling forbids - advice that cannot be followed, about money, from the one component that
-     * knows the limit.
-     */
-    ceilingUsd: OwnerPriceCeiling;
   }): Promise<void> => {
     const fit = modelFit({
       models: input.catalog,
@@ -137,7 +171,7 @@ export const registerTaskRoutes = (context: RouteContext): void => {
         requiredModalities: ['text'],
         minContextTokens: 16_000,
         preference: 'balanced',
-        ...priceCeilingFields(input.ceilingUsd)
+        ...priceCeilingFields(ownerPriceCeiling(await store.effectiveSpendLimits(input.userId)))
       },
       signals: {
         prompt: input.prompt,
@@ -161,20 +195,34 @@ export const registerTaskRoutes = (context: RouteContext): void => {
     const user = requireUser(request.user);
     return idempotent(request, reply, user, async () => {
       const input = CreateTaskRequest.parse(request.body);
-      const workspace = await store.getWorkspace(user.id, input.workspaceId);
+      // Three chains, none of which reads anything another one writes: the computer this runs on,
+      // the money it may spend, and the model that will answer. See `started` above for why the
+      // refusals still arrive in this order.
+      const workspaceRead = started(store.getWorkspace(user.id, input.workspaceId));
+      const guarded = started(
+        resolveSpendCeiling(user.id, input.maxSpendUsd).then(async (ceilingUsd) => {
+          await assertSpendCeilingAllowed({ userId: user.id, ceilingUsd });
+          return ceilingUsd;
+        })
+      );
+      const routed = started(
+        modelsForUser(user).then(async (catalog) => ({
+          catalog,
+          chosen: input.modelId
+            ? null
+            : await pickModelUnderPriceCeiling(user.id, catalog, {
+                privacyRoute: input.privacyRoute,
+                taskKind: inferModelTask(input.prompt)
+              })
+        }))
+      );
+      const workspace = (await workspaceRead)();
       if (!workspace?.wrappedKey)
         throw new AthanorError('workspace_not_found', 'Workspace not found');
       if (workspace.status !== 'running')
         throw new AthanorError('workspace_unavailable', 'Workspace is not running');
-      const spendCeilingUsd = await resolveSpendCeiling(user.id, input.maxSpendUsd);
-      await assertSpendCeilingAllowed({ userId: user.id, ceilingUsd: spendCeilingUsd });
-      const catalog = await modelsForUser(user);
-      const chosen = input.modelId
-        ? null
-        : await pickModelUnderPriceCeiling(user.id, catalog, {
-            privacyRoute: input.privacyRoute,
-            taskKind: inferModelTask(input.prompt)
-          });
+      const spendCeilingUsd = (await guarded)();
+      const { catalog, chosen } = (await routed)();
       const selected = input.modelId
         ? catalog.find((model) => model.id === input.modelId)
         : chosen?.model;
@@ -210,38 +258,55 @@ export const registerTaskRoutes = (context: RouteContext): void => {
           `task-prompt:${workspace.id}`
         )
       });
-      await store.recordUsage({
-        userId: user.id,
-        workspaceId: workspace.id,
-        taskId: task.id,
-        kind: 'task_compute',
-        resourceClass: selected.usageClass,
-        quantity: input.maxComputeCredits,
-        unit: 'credits',
-        credits: input.maxComputeCredits,
-        state: 'reserved',
-        idempotencyKey: `task:${task.id}:reservation`
-      });
-      await store.appendTaskEvent({
-        taskId: task.id,
-        kind: 'task_created',
-        summary: 'Task queued',
-        payloadCiphertext: encryptJson(
-          {
-            model: selected.displayName,
-            privacyRoute: selected.privacyRoute,
-            budget: input.maxComputeCredits
-          },
-          dataKey,
-          `task-event:${task.id}`
-        )
-      });
-      await store.appendTaskEvent({
-        taskId: task.id,
-        kind: 'user_message',
-        summary: 'User message',
-        payloadCiphertext: encryptJson({ markdown: input.prompt }, dataKey, `task-event:${task.id}`)
-      });
+      /*
+       * The reservation beside the timeline, not behind it.
+       *
+       * The two events stay in their own order and cannot be run together: `appendTaskEvent` takes
+       * the row lock that hands out the sequence number, so racing them is how "Task queued" comes
+       * second in the conversation the owner is reading. The usage row is in another table with no
+       * ordering to keep, so it no longer waits for either of them.
+       */
+      await Promise.all([
+        store.recordUsage({
+          userId: user.id,
+          workspaceId: workspace.id,
+          taskId: task.id,
+          kind: 'task_compute',
+          resourceClass: selected.usageClass,
+          quantity: input.maxComputeCredits,
+          unit: 'credits',
+          credits: input.maxComputeCredits,
+          state: 'reserved',
+          idempotencyKey: `task:${task.id}:reservation`
+        }),
+        store
+          .appendTaskEvent({
+            taskId: task.id,
+            kind: 'task_created',
+            summary: 'Task queued',
+            payloadCiphertext: encryptJson(
+              {
+                model: selected.displayName,
+                privacyRoute: selected.privacyRoute,
+                budget: input.maxComputeCredits
+              },
+              dataKey,
+              `task-event:${task.id}`
+            )
+          })
+          .then(() =>
+            store.appendTaskEvent({
+              taskId: task.id,
+              kind: 'user_message',
+              summary: 'User message',
+              payloadCiphertext: encryptJson(
+                { markdown: input.prompt },
+                dataKey,
+                `task-event:${task.id}`
+              )
+            })
+          )
+      ]);
       /*
        * After the request it is about, so the owner reads what they asked for and then what will be
        * answering it. Started rather than awaited into the response: the task exists and is queued
@@ -254,16 +319,21 @@ export const registerTaskRoutes = (context: RouteContext): void => {
        * attached on this line and not later, so nothing about this can become an unhandled
        * rejection, and the notice still lands ahead of the worker's first frame - it is one insert
        * against a task that has yet to be leased, let alone answered.
+       *
+       * The round trip came back the same way a second time, as `await store.effectiveSpendLimits`
+       * inside the argument list: arguments are evaluated before the call, so the read was in
+       * front of `void` and not behind it. The account id goes in instead and the read happens
+       * inside.
        */
       void noteModelFit({
         taskId: task.id,
+        userId: user.id,
         dataKey,
         catalog,
         chosen: selected,
         privacyRoute: input.privacyRoute,
         prompt: input.prompt,
-        attachments: input.attachments ?? [],
-        ceilingUsd: ownerPriceCeiling(await store.effectiveSpendLimits(user.id))
+        attachments: input.attachments ?? []
       }).catch((error: unknown) => log.warn('models.fit_note_failed', errorFields(error)));
       /*
        * What the ceiling did to this pick, when it did something worth saying.
@@ -293,7 +363,34 @@ export const registerTaskRoutes = (context: RouteContext): void => {
     const user = requireUser(request.user);
     return idempotent(request, reply, user, async () => {
       const input = ContinueTaskRequest.parse(request.body);
-      const task = await store.getTask(user.id, request.params.taskId);
+      /*
+       * The conversation, the money and the catalogue, started together.
+       *
+       * The guard is keyed on the id in the path rather than on the row, which is the same string
+       * - `getTask` looks the row up by it - and is what lets the guard start before the row has
+       * come back.
+       *
+       * That is a read of a conversation row this caller has not yet been shown to own, so it is
+       * worth being exact about what it can and cannot become. `spendGuard` uses it to work out
+       * headroom and returns a verdict; nothing from that row is written, and nothing from it is
+       * ever put in a response, because the ownership check below is unwrapped first and throws
+       * `task_not_found` before the guard's answer is looked at. Chaining the guard onto the row
+       * instead would put it behind a round trip it does not need and would buy no boundary that
+       * the check below does not already hold.
+       */
+      const taskRead = started(store.getTask(user.id, request.params.taskId));
+      const guarded = started(
+        resolveSpendCeiling(user.id, input.maxSpendUsd).then(async (ceilingUsd) => {
+          await assertSpendCeilingAllowed({
+            userId: user.id,
+            ceilingUsd,
+            taskId: request.params.taskId
+          });
+          return ceilingUsd;
+        })
+      );
+      const catalogRead = started(modelsForUser(user));
+      const task = (await taskRead)();
       if (!task) throw new AthanorError('task_not_found', 'Task not found');
       if (task.userId !== user.id)
         throw new AthanorError(
@@ -332,13 +429,8 @@ export const registerTaskRoutes = (context: RouteContext): void => {
        * spent, so `additionalSpendUsd` is headroom for this turn rather than a new total. The task
        * itself is excluded from the open commitments it is checked against, for the same reason.
        */
-      const spendCeilingUsd = await resolveSpendCeiling(user.id, input.maxSpendUsd);
-      await assertSpendCeilingAllowed({
-        userId: user.id,
-        ceilingUsd: spendCeilingUsd,
-        taskId: task.id
-      });
-      const catalog = await modelsForUser(user);
+      const spendCeilingUsd = (await guarded)();
+      const catalog = (await catalogRead)();
       const selected = catalog.find((model) => model.id === (input.modelId ?? task.modelId));
       if (
         !selected ||

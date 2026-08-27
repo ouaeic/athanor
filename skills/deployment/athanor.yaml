@@ -33,8 +33,8 @@ capability:
   spend: none
 
 verify:
-  - artifact: 'workspace/deploy/health-response.txt'
-    assert: 'the captured health response body, saved during the work - set_acceptance refuses curl, wget and ssh outright, so the check is on what the request returned rather than on making the request again'
+  - run: 'test -s workspace/deploy/health-response.txt'
+    assert: 'the health response body captured during the work is on disk and not empty - set_acceptance refuses curl, wget and ssh outright, so the check is on what the request returned rather than on making the request again'
   - check: 'The health check was made twice from shell, sixty seconds apart, so a crash loop cannot pass.'
   - check: 'The rollback command is written down and was validated before the switch.'
   - check: 'Public publishing, if any, was explicitly approved by the owner.'

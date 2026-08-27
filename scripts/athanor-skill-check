@@ -103,9 +103,10 @@ for directory in "$root"/*/; do
     fail "$name" "body is $body_chars characters, over the ~5k-token review budget"
 
   # An empty inline code span is the shape a mechanical edit leaves behind, and it is invisible in
-  # review: `code-change` shipped "find every caller with ``" and "verify the real signature with
-  # ``" for four months. Both sentences are load-bearing - they name the one tool that does the
-  # thing - and both reduced to an instruction with the instruction removed. Fenced blocks are
+  # review: the since-deleted `code-change` skill shipped "find every caller with ``" and "verify
+  # the real signature with ``" for four months. Both sentences were load-bearing - they named the
+  # one tool that does the thing - and both reduced to an instruction with the instruction removed.
+  # The skill is gone; the defect class is not, so the check stays. Fenced blocks are
   # skipped, including the indented ones inside a list item, and a run of three or more backticks
   # is stripped before the search so a fence marker on a prose line cannot masquerade as one.
   empty_span=$(printf '%s\n' "$body" | awk '
@@ -134,6 +135,36 @@ for directory in "$root"/*/; do
   grep -q '^capability:' "$sidecar" || fail "$name" "athanor.yaml has no capability block"
   grep -q '^verify:' "$sidecar" || fail "$name" "athanor.yaml declares no verification contract"
   grep -q '^requires:' "$sidecar" || fail "$name" "athanor.yaml declares no required tools"
+
+  # A verify-step key the loader does not read is dropped in silence, and what the model is handed
+  # is the rest of the step with its subject removed. `verifyFrom` in apps/worker/src/skills.ts
+  # reads exactly run, assert, check and the render/vision sub-mappings and nothing else;
+  # `deployment` shipped `artifact: workspace/deploy/health-response.txt` naming the file its
+  # assertion was about, so the opened skill carried a bare "assert: the captured health response
+  # body" with no file anywhere in the block. One key in sixty, which is what a typo in a
+  # hand-written sidecar looks like from the outside. Enforced here rather than written down
+  # anywhere the model pays for: a lint that runs in CI costs zero tokens for ever.
+  #
+  # Indent decides what is a step key: 2 is the `- key:` that opens a step, 4 is a sibling key
+  # inside it, and 6 or more is a field of the render/vision sub-mapping, which has its own names.
+  unknown_key=$(awk '
+    /^verify:/ { inv = 1; next }
+    inv && /^[^ ]/ { inv = 0 }
+    inv == 0 { next }
+    {
+      line = $0
+      indent = match(line, /[^ ]/) - 1
+      if (indent >= 6 || indent < 2) next
+      sub(/^ +/, "", line)
+      sub(/^- +/, "", line)
+      if (line !~ /^[a-z_]+:/) next
+      key = line
+      sub(/:.*$/, "", key)
+      if (key !~ /^(run|assert|check|render|vision)$/) { print key; exit }
+    }
+  ' "$sidecar")
+  [ -z "$unknown_key" ] ||
+    fail "$name" "verify step key '$unknown_key' is not read by the loader, so the step is silently dropped"
 
   catalog=$(awk '/^catalog_line: */ { sub(/^catalog_line: */, ""); gsub(/^.|.$/, ""); print; exit }' "$sidecar")
   if [ -z "$catalog" ]; then

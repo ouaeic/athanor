@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { Duplex } from 'node:stream';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { PREVIEW_IDLE_EXPIRY_DAYS } from '@athanor/contracts';
@@ -7895,5 +7896,163 @@ describe('what dictation costs', () => {
     });
     expect(stillAllowed.statusCode, stillAllowed.body).toBe(200);
     expect(transcriptionCalls).toBe(callsBefore + 1);
+  }, 40_000);
+});
+
+/**
+ * How many database round trips stand between the owner pressing send and the worker being able to
+ * lease the turn.
+ *
+ * This is a bound and an instrument, not a pin on the current shape. It was written because
+ * `POST /v1/tasks` was twenty-one queries at a serial depth of twenty-one - not one of them ran
+ * beside another - and `GET /v1/bootstrap`, the request that gates first paint, was twelve deep
+ * for eighteen queries, three of those hops paid only because an object literal awaits its
+ * properties in the order the lines were typed in. On a box with PostgreSQL over a socket every
+ * link in that chain is a round trip the owner waits through before a single token is bought.
+ *
+ * `serialDepth` is what it measures: the longest chain of queries in which each was issued only
+ * after the one before it had already answered. Queries started together are one link however many
+ * of them there are, which is the number that shrinks when work is overlapped and the number a
+ * driver with a connection pool actually charges for. pglite is one backend on one connection and
+ * runs them in a line whatever the caller does, so a wall clock here would report the same total
+ * either way and prove nothing; the depth is the driver-independent half.
+ *
+ * The ceilings are the measured floor plus nothing. Four of the links they still allow are outside
+ * this file's reach and are named at each expectation, so a wave that shortens one of them should
+ * lower the number here rather than leave slack for a regression to hide in.
+ */
+describe('round trips before the first token', () => {
+  test('starts the independent reads on the send path together', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              ok: true,
+              storageBytes: 1_000,
+              hostStorageTotalBytes: 1_000_000_000,
+              hostStorageAvailableBytes: 900_000_000
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          )
+      )
+    );
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-roundtrips-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    await database.query("UPDATE model_releases SET availability='available'");
+
+    /**
+     * Every query, with the moment it was issued and the moment it answered, behind a wire.
+     *
+     * Written over the object rather than through a seam in `createApiContext`, because the store
+     * holds this same object and calls `query` on it: an own property shadows the class method for
+     * every caller, and the production path keeps no test-only branch for a measurement.
+     *
+     * The three milliseconds are the point of it. pglite answers in microseconds from inside this
+     * process, so without a wire in front of it two queries that were started together still
+     * finish one before the other is looked at, and "issued after the one before it answered" reads
+     * as true of a pair that never waited for each other - the count came out at the number of
+     * queries whatever the caller did. A delay every query pays and concurrent queries pay *once*
+     * is what a socket to PostgreSQL is, and it is what makes overlapping visible here at all.
+     */
+    const wireMs = 3;
+    let spans: Array<{ issuedAt: number; settledAt: number }> | null = null;
+    const query = database.query.bind(database);
+    (database as { query: unknown }).query = async (sql: string, params: unknown[] = []) => {
+      const span = { issuedAt: performance.now(), settledAt: 0 };
+      if (!spans) return query(sql, params);
+      spans.push(span);
+      await new Promise((wired) => setTimeout(wired, wireMs));
+      try {
+        return await query(sql, params);
+      } finally {
+        span.settledAt = performance.now();
+      }
+    };
+    const serialDepth = async (call: () => Promise<{ statusCode: number; body: string }>) => {
+      spans = [];
+      const response = await call();
+      const taken = spans;
+      spans = null;
+      expect(response.statusCode, response.body).toBeLessThan(400);
+      const ordered = [...taken].sort((first, second) => first.issuedAt - second.issuedAt);
+      const longest = ordered.map(() => 1);
+      ordered.forEach((span, index) => {
+        for (let earlier = 0; earlier < index; earlier += 1)
+          if (ordered[earlier]!.settledAt <= span.issuedAt)
+            longest[index] = Math.max(longest[index]!, longest[earlier]! + 1);
+      });
+      return {
+        depth: longest.reduce((most, value) => Math.max(most, value), 0),
+        body: response.body
+      };
+    };
+
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const bootstrap = () =>
+      app.inject({ method: 'GET', url: '/v1/bootstrap', headers: { cookie } });
+    // The first one provisions the primary computer, which is a different request from the one
+    // every launch after it makes.
+    await bootstrap();
+
+    /*
+     * Two of the five are the session and then the account it names, which is every authenticated
+     * request on the box and is decided in `auth-hook.ts`. The other three are the catalogue's own
+     * chain inside `modelsForUser`: the retention flag, the credential, then the models. The
+     * workspaces and the drafts that need their keys fit inside that, and everything else - the
+     * conversation page, the schedules, the totals, the retention flag, the search route and the
+     * provider spend - now runs beside it instead of after it.
+     */
+    const firstPaint = await serialDepth(bootstrap);
+    expect(firstPaint.depth).toBeLessThanOrEqual(5);
+    const workspaceId = (JSON.parse(firstPaint.body) as { workspaces: Array<{ id: string }> })
+      .workspaces[0]!.id;
+
+    /*
+     * The send. Fourteen links, and the four that are not this route's: two for the credential
+     * above, one to claim the idempotency key and one to settle it, and five for the spend guard -
+     * the ceiling, then `spendGuard`'s own four queries in `packages/data`. That guard is a bound
+     * and is deliberately not raced against the write it protects. The catalogue and the ranking
+     * over it now run inside the guard's chain rather than after it, and the reservation is
+     * written beside the timeline rather than in front of it.
+     */
+    const send = await serialDepth(() =>
+      app.inject({
+        method: 'POST',
+        url: '/v1/tasks',
+        headers: { cookie, 'idempotency-key': 'round-trips-create-01' },
+        payload: {
+          workspaceId,
+          prompt: 'What is the difference between a mutex and a semaphore?',
+          privacyRoute: 'provider_zdr',
+          maxComputeCredits: 5
+        }
+      })
+    );
+    expect(send.depth).toBeLessThanOrEqual(14);
+    const taskId = (JSON.parse(send.body) as { id: string }).id;
+
+    // A follow-up into a live conversation. The computer is the one link that genuinely waits:
+    // which computer to open is written on the conversation row.
+    const followUp = await serialDepth(() =>
+      app.inject({
+        method: 'POST',
+        url: `/v1/tasks/${taskId}/messages`,
+        headers: { cookie, 'idempotency-key': 'round-trips-message-01' },
+        payload: { prompt: 'And a spinlock?', maxComputeCredits: 5 }
+      })
+    );
+    expect(followUp.depth).toBeLessThanOrEqual(14);
+
+    // The sidebar: the two authentication links, and the page and the computers together.
+    const sidebar = await serialDepth(() =>
+      app.inject({ method: 'GET', url: '/v1/tasks', headers: { cookie } })
+    );
+    expect(sidebar.depth).toBeLessThanOrEqual(3);
   }, 40_000);
 });

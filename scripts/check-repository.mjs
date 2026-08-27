@@ -447,7 +447,7 @@ const COMPARATIVE =
 // comment in services/relay/src/config.ts sat for months naming another project and calling this
 // project's timeout kinder than theirs. A judgment in a `//` comment is published exactly as surely
 // as one in a README - more so, since the whole checkout lands on every owner's machine.
-const publishedText = spawnSync(
+const trackedText = spawnSync(
   'git',
   [
     'ls-files',
@@ -474,6 +474,19 @@ const publishedText = spawnSync(
 )
   .stdout.split('\0')
   .filter(Boolean);
+// `git ls-files` reads the index; this rule reads the working tree. The two disagree for exactly
+// as long as a deletion is unstaged, and during that window the whole repository check used to
+// die on ENOENT - which meant the comparison rule was not running at all, quietly, at the moment
+// a wave was deleting things. A checker that stops checking is worse than one that reports a gap,
+// so a path the index still names but the disk no longer holds is skipped and counted out loud.
+// On a clean checkout, and therefore in CI, the two lists are identical and nothing is skipped.
+const publishedText = trackedText.filter((relativePath) =>
+  existsSync(path.join(repositoryRoot, relativePath))
+);
+if (publishedText.length !== trackedText.length)
+  say(
+    `Published text: ${trackedText.length - publishedText.length} tracked file(s) are deleted in the working tree and were not read; stage the deletion so the index and the disk agree.`
+  );
 if (NAMED_PRODUCTS) {
   for (const relativePath of publishedText) {
     const lines = read(relativePath).split('\n');

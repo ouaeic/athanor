@@ -5,5 +5,5 @@
     "declaration": false,
     "allowImportingTsExtensions": false
   },
-  "include": ["*.ts", "context-quality/*.ts", "agentdojo/*.ts"]
+  "include": ["*.ts", "context-quality/*.ts", "agentdojo/*.ts", "arms/*.ts"]
 }

@@ -90,6 +90,50 @@ export const COMMAND_RUNNERS = new Set([
   'xargs'
 ]);
 
+/**
+ * The words a shell puts in front of a command without being one. `if grep -q x f; then cp a b; fi`
+ * runs grep and then cp, and every classifier here that read the first word of the segment read
+ * `if` and `then` instead - an unknown executable, twice, in a shape the model writes constantly.
+ * Stripped in the same pass as the runners because they are the same fact: the token that matters
+ * is the next one. The terminators are not here, because nothing follows them to be judged; they
+ * are inert commands and are named as such in READ_ONLY_EXECUTABLES.
+ */
+const SHELL_KEYWORDS = new Set(['!', 'do', 'elif', 'else', 'exec', 'if', 'then', 'until', 'while']);
+
+/**
+ * One invocation with its wrappers taken off: leading `FOO=1` assignments, the command runners, and
+ * the shell keywords, repeatedly until the head is the thing that actually runs.
+ *
+ * Extracted from `effectiveCommands` so `scriptCommands` can use it too, which is the whole repair:
+ * the outer form `timeout 30 curl -s "$U"` was unwrapped and the identical script inside
+ * `bash -lc 'timeout 30 curl -s "$U"'` was not, so the first tainted the turn and the second - the
+ * spelling the shell tool's own description tells the model to reach for - read an attacker-chosen
+ * page with the floor still reporting the turn clean. Measured before the fix on `timeout`, `env`
+ * and `xargs`; all three were clean.
+ */
+const withoutRunners = (tokens: readonly string[]): string[] => {
+  let rest = [...tokens];
+  // Each pass drops at least one token, so this terminates on any input, and an empty list returns
+  // on the first check.
+  for (;;) {
+    const head = (rest[0] ?? '').split('/').pop() ?? '';
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(head) || SHELL_KEYWORDS.has(head)) {
+      rest = rest.slice(1);
+      continue;
+    }
+    if (!COMMAND_RUNNERS.has(head)) return rest;
+    // The runner's own flags and the value some of them take sit between it and the command it
+    // wraps: `timeout 30`, `nice -n 5`, `xargs -0`. The wrapped command is the first token that is
+    // none of those - not a flag, not an assignment, not a number.
+    const after = rest.slice(1);
+    const wrapped = after.findIndex(
+      (token) =>
+        !token.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token) && !/^\d/.test(token)
+    );
+    rest = wrapped < 0 ? [] : after.slice(wrapped);
+  }
+};
+
 export const commandInterpreters = new Set([
   'sh',
   'bash',
@@ -217,15 +261,24 @@ export const scriptCommands = (body: string): string[][] =>
   body
     .split(/\$\(|[|;&\n`]+/)
     .map((segment) => {
-      const tokens = segment
-        .replace(/^[\s({]+/, '')
-        .split(/\s+/)
-        .filter(Boolean);
-      // `FOO=1 curl https://x` runs curl. A leading assignment is setup for the command that
-      // follows it, not a command of its own, and treating it as one made every such line unknown.
-      while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0] ?? '')) tokens.shift();
+      // `FOO=1 curl https://x` runs curl, and so do `timeout 30 curl …` and `then curl …`. Whatever
+      // sits in front of the command is setup for it, not a command of its own, and treating it as
+      // one made every such line unknown.
+      const tokens = withoutRunners(
+        segment
+          .replace(/^[\s({]+/, '')
+          .split(/\s+/)
+          .filter(Boolean)
+      );
       const executable = (tokens.shift() ?? '').split('/').pop() ?? '';
-      return executable ? [executable, ...tokens] : [];
+      // `2>&1` is split by the `&` above into `2>` and `1`, and the tail was then read as a command
+      // called `1`. Nothing executes a program whose name is a number, and the cost of pretending
+      // otherwise was measured: in autonomous mode `bash -lc 'curl -sSL https://x 2>&1'` raised
+      // "Review network access for 1" - a card naming a command that does not exist, in front of
+      // the single most common idiom in shell - and every write classifier downstream saw a segment
+      // it could not place. Dropped here rather than by not splitting on `&`, because a trailing
+      // `&` really does end a command and this is the only shape that survives the split.
+      return executable && !/^\d+$/.test(executable) ? [executable, ...tokens] : [];
     })
     .filter((command) => command.length > 0);
 
@@ -250,29 +303,156 @@ export const scriptCommands = (body: string): string[][] =>
  */
 export const effectiveCommands = (args: Record<string, unknown>): string[][] => {
   const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
-  let tokens = [textValue(args.executable), ...commandArgs];
-  // Each pass drops at least one token, so this terminates on any input, and an empty list breaks
-  // out on the first check.
-  for (;;) {
-    const head = (tokens[0] ?? '').split('/').pop() ?? '';
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(head)) {
-      tokens = tokens.slice(1);
-      continue;
-    }
-    if (!COMMAND_RUNNERS.has(head)) break;
-    // The runner's own flags and the value some of them take sit between it and the command it
-    // wraps: `timeout 30`, `nice -n 5`, `xargs -0`. The wrapped command is the first token that is
-    // none of those - not a flag, not an assignment, not a number.
-    const rest = tokens.slice(1);
-    const wrapped = rest.findIndex(
-      (token) =>
-        !token.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token) && !/^\d/.test(token)
-    );
-    tokens = wrapped < 0 ? [] : rest.slice(wrapped);
-  }
+  const tokens = withoutRunners([textValue(args.executable), ...commandArgs]);
   const executable = (tokens[0] ?? '').split('/').pop() ?? '';
   if (commandInterpreters.has(executable)) return scriptCommands(commandScript(args));
   return executable ? [[executable, ...tokens.slice(1)]] : [];
+};
+
+/**
+ * Commands that answer a question about a file and change nothing in it.
+ *
+ * Not a security boundary and deliberately not exhaustive: it is the way *out* of the wide net in
+ * `shellWriteTargets`, and a name missing from it costs one card the owner did not need rather than
+ * a write nobody saw. The terminators are here because nothing follows them to be judged - a
+ * segment that is only `fi` runs nothing at all - while the keywords that do have a command after
+ * them are stripped by `withoutRunners` instead.
+ */
+const READ_ONLY_EXECUTABLES = new Set([
+  '[',
+  'awk',
+  'base64',
+  'basename',
+  'cat',
+  'cksum',
+  'cmp',
+  'column',
+  'comm',
+  'cut',
+  'date',
+  'df',
+  'diff',
+  'dirname',
+  'done',
+  'du',
+  'echo',
+  'esac',
+  'false',
+  'fd',
+  'fi',
+  'file',
+  'find',
+  'fold',
+  'grep',
+  'head',
+  'hostname',
+  'id',
+  'jq',
+  'less',
+  'ls',
+  'md5sum',
+  'more',
+  'nl',
+  'od',
+  'paste',
+  'printf',
+  'ps',
+  'pwd',
+  'readlink',
+  'realpath',
+  'rev',
+  'rg',
+  'sha1sum',
+  'sha256sum',
+  'sort',
+  'stat',
+  'tail',
+  'test',
+  'tr',
+  'true',
+  'type',
+  'uname',
+  'uniq',
+  'wc',
+  'which',
+  'whoami',
+  'xxd',
+  'yq'
+]);
+
+/**
+ * Where a redirect puts what it writes.
+ *
+ * `2>&1` and a duplicating `>&2` are excluded by construction - the target may not begin with `&` -
+ * and so is the `->` an arrow in a comment or a string draws, by the lookbehind. A numbered
+ * redirect is read, because `2>err.log` writes `err.log` as surely as `>err.log` does; the narrower
+ * scan in `escapingRedirect` above can afford to skip those because it is only asked whether a
+ * target leaves the workspace, and this one is asked which file is written.
+ */
+const REDIRECT_TARGET = /(?<![->])(?:&|\d)?>>?\s*['"]?([^\s'"`;|&()<>]+)/g;
+
+/**
+ * A write performed through a language runtime rather than through a redirect or a writing command.
+ *
+ * The same shape as `DESTRUCTIVE_RUNTIME_CALL` and there for the same reason. `shellWriteTargets`
+ * can follow a `>` and it can follow a `tee`; it cannot follow `open(p, 'w')`, and it does not have
+ * to - it only has to know that it cannot and hand the question back to the wide net. Without this,
+ * a script whose first word happens to be a reader (`python3 -c "cat = open('.bashrc','w'); …"`)
+ * would take the read-only exit.
+ */
+const RUNTIME_WRITE_CALL =
+  /\b(?:open|fopen)\s*\([^)]*['"][^'")]*[wax][^'")]*['"]|\.(?:write|writeFile|writeFileSync|appendFile|appendFileSync|write_text|write_bytes|writelines|createWriteStream|copyfile|copytree|copy2|move|rename|renameSync|symlink|symlinkSync|link|mkdir|makedirs|touch|chmod|dump|save)\s*\(/;
+
+/**
+ * The paths a `shell` call can be *shown* to write, or null when it cannot be shown at all.
+ *
+ * `writtenPaths` used to hand its two callers every whitespace-and-punctuation token in the script,
+ * which made `bash -lc 'cat ~/.bashrc'` raise "Change a file this computer runs on its own" - a
+ * read carded as a write, in the product's most alarming class. The bare `cat` raised nothing, so
+ * the classification rewarded whichever phrasing the model happened to reach for, and
+ * `tool-catalogue.ts` tells it to reach for the wrapped one the moment it needs a pipe, a glob or a
+ * redirect. Measured on the owner-shaped "why is my PATH wrong" task: seven cards in nine calls,
+ * six of them on commands that changed nothing. A floor the owner taps through is not a floor.
+ *
+ * So the write targets are resolved instead: what a redirect points at, and the arguments of a
+ * command this file recognises as a writer. The fail-closed property is kept whole and moved rather
+ * than dropped - the moment any command in the script is one this cannot place on either side, the
+ * answer is null and the caller goes back to the wide net. That fallback costs nothing except where
+ * the script also names one of the few paths the deferred-execution rule watches, and the commands
+ * that name one of those while only reading it are exactly the ones enumerated above.
+ */
+export const shellWriteTargets = (args: Record<string, unknown>): string[] | null => {
+  const script = commandScript(args);
+  if (RUNTIME_WRITE_CALL.test(script)) return null;
+  const commands = effectiveCommands(args);
+  // An interpreter whose script could not be read at all: unknown fails closed, as it does for the
+  // autonomous network allowlist and for the same reason.
+  if (commands.length === 0) return null;
+  const targets = [...script.matchAll(REDIRECT_TARGET)].map((match) => match[1] ?? '');
+  for (const [executable = '', ...rest] of commands) {
+    const name = executable.toLowerCase();
+    // `sed` is a reader until `-i` makes it a writer, the same test `isMutatingToolCall` applies to
+    // it, and `git` is a reader until its subcommand is one that changes the tree.
+    const writes =
+      name === 'git'
+        ? WRITING_GIT_SUBCOMMANDS.has(gitSubcommand(rest) ?? '')
+        : name === 'sed'
+          ? rest.some((argument) => argument.startsWith('-i'))
+          : FILE_WRITING_EXECUTABLES.has(name) || consequentialExecutables.has(name);
+    if (!writes) {
+      if (name === 'git' || name === 'sed' || READ_ONLY_EXECUTABLES.has(name)) continue;
+      return null;
+    }
+    // Every operand, not the one that happens to be the destination: `cp a b` names its source too,
+    // and over-naming here costs a card that was already going to be raised. The tail of a
+    // `key=value` operand is taken as well, because `dd of=~/.bashrc` writes what follows the `=`.
+    for (const argument of rest) {
+      if (argument.startsWith('-')) continue;
+      targets.push(argument);
+      if (argument.includes('=')) targets.push(argument.slice(argument.indexOf('=') + 1));
+    }
+  }
+  return targets.filter(Boolean);
 };
 
 /*
@@ -404,17 +584,98 @@ const gitOptionsWithSeparateValue = new Set([
 ]);
 
 /**
+ * Where git's own options end and its subcommand begins, or -1 when there is no subcommand.
  * `git -C sub push` and `git --git-dir=... push` reach the same remote as a bare `git push`, so the
  * approval floor is keyed on the real subcommand rather than on the first argument.
  */
-export const gitSubcommand = (args: string[]): string | null => {
+const gitSubcommandIndex = (args: readonly string[]): number => {
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index] ?? '';
-    if (!argument.startsWith('-')) return argument.toLowerCase();
+    if (!argument.startsWith('-')) return index;
     if (argument.includes('=')) continue;
     if (gitOptionsWithSeparateValue.has(argument)) index += 1;
   }
-  return null;
+  return -1;
+};
+
+export const gitSubcommand = (args: string[]): string | null => {
+  const index = gitSubcommandIndex(args);
+  return index < 0 ? null : (args[index] ?? '').toLowerCase();
+};
+
+/** The options that only say which file `git config` is talking about. */
+const GIT_CONFIG_SCOPES = new Set(['--global', '--local', '--system', '--worktree']);
+
+/** The options whose whole job is to print a setting back. */
+const GIT_CONFIG_READS = new Set([
+  '--list',
+  '-l',
+  '--get',
+  '--get-all',
+  '--get-regexp',
+  '--get-urlmatch'
+]);
+
+/**
+ * Settings that cannot carry execution, however they are spelled.
+ *
+ * Kept as an exemption rather than inverted into a list of dangerous keys, because the dangerous
+ * list is open-ended - `core.hooksPath`, `alias.*`, `include.path`, `core.pager`, `credential.helper`,
+ * `filter.*.clean`, `core.fsmonitor`, `init.templateDir` and whatever git adds next all end in a
+ * command git runs on its own - and a rule that enumerated them would pass every key invented after
+ * it was written. These fourteen are the ones a first hour on a fresh box actually sets; each one
+ * takes a name, a flag or an enum, none of them takes a command, and everything else still asks.
+ */
+const GIT_CONFIG_INERT_KEYS = new Set([
+  'advice.detachedhead',
+  'color.ui',
+  'core.autocrlf',
+  'core.filemode',
+  'core.ignorecase',
+  'diff.algorithm',
+  'fetch.prune',
+  'init.defaultbranch',
+  'merge.conflictstyle',
+  'pull.rebase',
+  'push.autosetupremote',
+  'push.default',
+  'rerere.enabled',
+  'user.email',
+  'user.name'
+]);
+
+/**
+ * What a `git config` invocation writes: the setting's own key, or '' when the invocation is one
+ * this cannot read confidently. Null when it only reads.
+ *
+ * `git config` writes `.gitconfig` without ever naming a path, so the deferred-execution rule that
+ * reads the paths a call writes cannot see it at all - it needs its own answer, and two callers
+ * need the same one. The floor asks whether to stop for the owner; `isMutatingToolCall` asks
+ * whether the computer changed, which is why it was wrong for a call the floor already calls
+ * consequential to be no change at all. One predicate, so the two cannot drift apart.
+ *
+ * The '' case is the fail-closed one and it is load-bearing: `--file` and `-f` redirect the write to
+ * a file of the caller's choosing, `--unset` and `--add` change what the operands mean, and any of
+ * them makes the key unnameable here. An invocation carrying anything but a scope reports a key
+ * nothing can exempt, which is the same answer as an unrecognised key.
+ */
+export const gitConfigWrite = (args: readonly string[]): string | null => {
+  const index = gitSubcommandIndex(args);
+  if (index < 0 || (args[index] ?? '').toLowerCase() !== 'config') return null;
+  const rest = args.slice(index + 1);
+  if (rest.some((argument) => GIT_CONFIG_READS.has(argument.toLowerCase()))) return null;
+  const options = rest.filter((argument) => argument.startsWith('-'));
+  const operands = rest.filter((argument) => !argument.startsWith('-'));
+  if (!options.every((option) => GIT_CONFIG_SCOPES.has(option.toLowerCase()))) return '';
+  // `git config user.email` with nothing after it prints the setting; it is the spelling for a read
+  // that does not use `--get`, and carding it was the same defect as carding `cat`.
+  return operands.length < 2 ? null : (operands[0] ?? '').toLowerCase();
+};
+
+/** Whether a `git config` write can leave behind something a later git invocation executes. */
+export const gitConfigRunsCode = (args: readonly string[]): boolean => {
+  const key = gitConfigWrite(args);
+  return key !== null && !GIT_CONFIG_INERT_KEYS.has(key);
 };
 
 /**

@@ -136,7 +136,9 @@ on it, so this is the first error you will hit.
 - **Reaching for LaTeX or Pandoc by habit.** Neither is installed here and neither should be. Typst
   is the PDF path on this computer; an existing `.tex` tree is the only case that would ever need
   another, and that is a conversation with the owner, not an install.
-- **Writing HTML and hoping to print it.** There is no HTML-to-PDF path on this computer. A
-  deliverable that must be a PDF is authored here; a web page stays a web page.
+- **Writing HTML and printing it.** `print_pdf` is an HTML-to-PDF path and it is the right one for
+  keeping a page that already exists - a job posting, a receipt, a statement. It is the wrong one
+  for a deliverable you are authoring, because nothing in it controls where the pages break. That
+  control is the reason a CV, a letter or an invoice is typeset here.
 - **Not declaring the page limit as `expectPages`.** A CV, a one-pager, a covering letter and
   an abstract all have one, and the compiler is perfectly happy to exceed it.
