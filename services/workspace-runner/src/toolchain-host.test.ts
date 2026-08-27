@@ -190,6 +190,7 @@ describe('the shipped capability list', () => {
    * table's job to say so, and never this file's.
    */
   it('names no package manager in a sentence meant for every host', () => {
+    expect(DOCUMENT_TOOLCHAIN.length).toBeGreaterThan(0);
     for (const declared of DOCUMENT_TOOLCHAIN)
       for (const sentence of [declared.install, declared.beyondPackages ?? ''])
         expect(
@@ -199,6 +200,7 @@ describe('the shipped capability list', () => {
   });
 
   it('gives every capability a way out of being missing, resolved or not', () => {
+    expect(DOCUMENT_TOOLCHAIN.length).toBeGreaterThan(0);
     for (const declared of DOCUMENT_TOOLCHAIN) {
       expect(installAdvice(declared, undefined).length).toBeGreaterThan(0);
       expect(declared.packages?.length ?? declared.install.length).toBeGreaterThan(0);

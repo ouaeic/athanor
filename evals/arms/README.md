@@ -44,6 +44,35 @@ one that says which arm to read first. Read them before the numbers, not after.
 shipped arm on the weak tier, the sample cannot resolve the tool axis and nothing ships from that
 run.
 
+## The edit axis
+
+`pnpm eval:arms -- --edit`
+
+One arm, `line-edit`, whose single difference is the edit tool: the line-addressed candidate in
+`apps/worker/src/edit/` in place of the shipped `file_patch`. It is the gate
+`docs/design/exec3/L2.md` named when it held that format back at 61% fewer output characters,
+because that figure is an upper bound available only to a model that spells the dialect correctly
+every time, and nothing offline can say whether one does.
+
+It is run apart from the general table, on its own sample, because a task that does not edit a file
+cannot tell the two dialects apart and would print a tie — and a tie that means "the instrument is
+blind here" prints exactly like a tie that means "the candidate is free".
+
+- **The sample** is the twelve landing rows of `evals/edit/corpus.ts`, a corpus written by the wave
+  arguing the other side of this question. The requests are derived from the corpus's declared
+  changes, byte-identical across arms, and contain no dialect. The three drift and refusal rows are
+  excluded: this world does not change a file under the model, and those are rows the candidate
+  wins, so their absence understates it.
+- **The world** holds both appliers as they ship — `workspace.ts`'s exactly-once guard with the
+  real `patchFailure` explainer, and `applyEdit` unmodified — and scores an edit by the file
+  afterwards, byte for byte, never by what the tool said about itself.
+- **Offline** it prints the sample, the character bound over those same rows, the read-side
+  surcharge the bound does not include, and what a live run would cost in calls and tokens.
+- **Live** it prints edit-success and mean output tokens on the same row, plus the applied-out-of-
+  attempted column, which is the deny-list question stated as a number.
+
+Nothing about this ships the format. `--edit` costs nothing until `--live --yes`.
+
 ## The files
 
 | file          | what it holds                                                     |
@@ -54,6 +83,7 @@ run.
 | `measure.ts`  | the offline half                                                  |
 | `live.ts`     | the judged half, and the key's three arms                         |
 | `world.ts`    | the deterministic computer every tool is a window onto            |
+| `edit-arm.ts` | the edit axis: its sample, its world, its appliers, its scoring   |
 | `report.ts`   | the tables and the baseline check                                 |
 | `selftest.ts` | the checks running it cannot perform                              |
 

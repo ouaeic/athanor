@@ -12,6 +12,8 @@
  *   pnpm eval:arms -- --live --yes          confirm the spend the live half estimates
  *   pnpm eval:arms -- --live --sample 12    a shape-balanced subset, for a run somebody pays for
  *   pnpm eval:arms -- --live --strong <id>  add the installation's own model as a second tier
+ *   pnpm eval:arms -- --edit                the edit axis: its sample, its offline bound, its price
+ *   pnpm eval:arms -- --edit --live --yes   and the only half that can settle it, which costs money
  *
  * Deliberately not part of `pnpm check`, for the reason `evals/run.ts` gives about itself: a
  * behavioural suite that blocks every commit is one somebody deletes the first week it is wrong
@@ -25,16 +27,22 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { ARMS, ROOT_ARM } from './arms.js';
+import { ARMS, EDIT_ARM, ROOT_ARM } from './arms.js';
+import { EDIT_TASKS, runEditLive } from './edit-arm.js';
 import { estimateCalls, resolveKey, runLive, WEAK_TIER } from './live.js';
 import { measureAll } from './measure.js';
 import {
   baselineFrom,
   check,
+  renderEditBound,
+  renderEditCost,
+  renderEditLive,
+  renderEditSample,
   renderLive,
   renderQuestions,
   renderResident,
   scoreArms,
+  scoreEditArms,
   type Baseline
 } from './report.js';
 import { TASKS, sampleOf } from './tasks.js';
@@ -87,12 +95,59 @@ if (flag('accept')) {
   process.stdout.write(`Baseline accepted: ${baselinePath}\n`);
 }
 
-if (flag('live')) {
+/**
+ * The edit axis, on its own sample and its own table.
+ *
+ * Separate from the general run because a task that does not edit a file cannot tell `file_patch`
+ * from the candidate, and a rig that ran the edit arm over the general sample would print a tie
+ * for the same reason the offline half prints one: the instrument is blind there. A tie that means
+ * "blind" and a tie that means "free" look identical on the page, and this programme has already
+ * shipped one decision made on the second reading of the first kind of tie.
+ *
+ * The offline part runs unconditionally under `--edit` and costs nothing: the sample, the bound
+ * `evals/edit` already measured over these rows, and what the live half would cost before anybody
+ * spends it. The live part needs the key and the same `--yes` the general half needs.
+ */
+if (flag('edit')) {
+  const editArms = [ROOT_ARM, EDIT_ARM];
+  const strong = argument('strong');
+  const tiers = [WEAK_TIER, ...(strong ? [strong] : [])];
+  const seeds = Number(argument('seeds') ?? 1);
+  process.stdout.write(renderEditSample());
+  process.stdout.write(renderEditBound());
+  process.stdout.write(renderEditCost(measureAll(editArms, cut), editArms, tiers.length, seeds));
+  const key = resolveKey(flag('live'), process.env);
+  process.stdout.write(`  ${key.note}\n`);
+  if (flag('live') && key.apiKey) {
+    if (!flag('yes'))
+      process.stdout.write(
+        '  Re-run with --yes to spend it. Nothing above cost anything; everything below does.\n'
+      );
+    else {
+      const rows = await runEditLive(key.apiKey, editArms, EDIT_TASKS, tiers, seeds);
+      process.stdout.write(renderEditLive(scoreEditArms(rows)));
+      const editJson = argument('edit-json');
+      if (editJson) writeFileSync(editJson, `${JSON.stringify(rows, null, 2)}\n`);
+    }
+  } else if (key.fatal) {
+    process.exit(1);
+  }
+}
+
+if (flag('live') && !flag('edit')) {
   const key = resolveKey(true, process.env);
   process.stdout.write(`\n${key.note}\n`);
   if (key.apiKey) {
     const size = Number(argument('sample') ?? TASKS.length);
     const tasks = sampleOf(Number.isFinite(size) ? size : TASKS.length);
+    // The edit arm is not run here, and paying for it here would be worse than not running it: the
+    // general sample does not edit files, so every row would tie, and a tie printed beside a real
+    // difference reads as evidence that the dialect is free. `--edit` is where it is readable.
+    const liveArms = armIds.filter((id) => id !== EDIT_ARM);
+    if (liveArms.length !== armIds.length)
+      process.stdout.write(
+        `  ${EDIT_ARM} is not in this run. Its axis is only readable on a sample that edits files; pass --edit.\n`
+      );
     const strong = argument('strong');
     const tiers = [WEAK_TIER, ...(strong ? [strong] : [])];
     const seeds = Number(argument('seeds') ?? 1);
@@ -104,12 +159,12 @@ if (flag('live')) {
       );
     if (!flag('yes')) {
       process.stdout.write(
-        `The live half is at most ${estimateCalls(armIds, tasks, tiers, seeds)} model calls ` +
-          `(${armIds.length} arms x ${tasks.length} tasks x ${tiers.length} tier(s) x ${seeds} seed(s), ` +
+        `The live half is at most ${estimateCalls(liveArms, tasks, tiers, seeds)} model calls ` +
+          `(${liveArms.length} arms x ${tasks.length} tasks x ${tiers.length} tier(s) x ${seeds} seed(s), ` +
           `bounded by the step ceiling). Re-run with --yes to spend them.\n`
       );
     } else {
-      const rows = await runLive(key.apiKey, armIds, tasks, tiers, seeds, cut);
+      const rows = await runLive(key.apiKey, liveArms, tasks, tiers, seeds, cut);
       process.stdout.write(renderLive(scoreArms(rows)));
       const liveJson = argument('live-json');
       if (liveJson) writeFileSync(liveJson, `${JSON.stringify(rows, null, 2)}\n`);

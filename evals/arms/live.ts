@@ -30,7 +30,7 @@
  */
 import { DEFAULT_MODEL } from '../agentdojo/judged.js';
 import { settingsFor } from './arms.js';
-import { answer, resetWorld } from './world.js';
+import { WORLD_ORACLE, type Oracle } from './world.js';
 import { contractFor, knowledgeFor, toolsFor, type ContractCut } from './wire.js';
 import type { ArmTask } from './tasks.js';
 
@@ -156,9 +156,13 @@ export const runOne = async (
   armId: string,
   task: ArmTask,
   seed: number,
-  cut: ContractCut = {}
+  cut: ContractCut = {},
+  // The world is a parameter because the edit arm asks the same questions of a different one. It
+  // is reset here rather than by the caller: a world the caller has to remember to reset is a world
+  // whose first forgotten reset shows up as one arm reading a file the previous arm wrote.
+  oracle: Oracle = WORLD_ORACLE
 ): Promise<RunRow> => {
-  resetWorld();
+  oracle.reset();
   const settings = settingsFor(armId);
   const tools = openAiTools(armId);
   const messages: unknown[] = [
@@ -199,7 +203,7 @@ export const runOne = async (
           // A malformed argument bag is still a call the model chose to make, and the name is what
           // the tool-axis question reads. Dropping the row would score a choice as a refusal.
         }
-        const result = answer(name, args);
+        const result = oracle.answer(name, args);
         if (result.terminal) completed = true;
         messages.push({ role: 'tool', tool_call_id: call.id ?? 'call', content: result.content });
       }

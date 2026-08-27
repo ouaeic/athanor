@@ -58,6 +58,7 @@ import {
   WorkspaceFileError
 } from './files.js';
 import { probeBinaries, toolchainReport } from './toolchain.js';
+import { workspaceSurfaces } from './surfaces.js';
 import {
   checkPreviewPort,
   previewPort,
@@ -995,6 +996,30 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await ensureRuntimeWorkspace(root);
       return toolchainReport(root);
+    }
+  );
+
+  /**
+   * What surfaces this box has, beside what it can do with documents.
+   *
+   * Same shape, same scope and same failure story as the toolchain route above, because it answers
+   * the same kind of question: a property of the machine that the process on the other end of the
+   * wire cannot see. The difference is what it buys. The toolchain report changes a paragraph of
+   * prose; this one decides whether seven tool schemas - the two largest bags in the catalogue -
+   * are described to the model on every request of every turn. @see workspaceSurfaces.
+   */
+  app.get<{ Params: { workspaceId: string } }>(
+    '/v1/workspaces/:workspaceId/surfaces',
+    async (request) => {
+      requireScope(request, 'exec');
+      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
+      await ensureRuntimeWorkspace(root);
+      return workspaceSurfaces({
+        root,
+        browserExecutablePath: config.BROWSER_EXECUTABLE_PATH,
+        desktopBridgeExecutable: config.DESKTOP_BRIDGE_EXECUTABLE,
+        desktopSessionExecutable: config.DESKTOP_SESSION_EXECUTABLE
+      });
     }
   );
 

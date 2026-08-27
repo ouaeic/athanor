@@ -55,75 +55,23 @@ import ts from 'typescript';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
- * The tests known to have this shape when the check was written, each with the reason it is still
- * standing.
+ * The tests that were still standing when this check was written. It is empty, and that is the
+ * whole point of it.
  *
- * A ledger and not a suppression list: an entry that STOPS being vacuous fails this check too, so
- * the list cannot rot into a place where things are quietly parked. It is meant to reach zero, and
- * the only way to remove an entry is to give the test an assertion the empty case has to answer.
+ * It held fifty-one entries. Twenty-five of those were repaired - each given one assertion the
+ * empty case has to answer, a count before the loop or after it - and the other twenty-six were
+ * this check being wrong about a table the test wrote down itself: `const cases = [...]` two lines
+ * above the loop, a `satisfies`-checked map at the top of the file, `Object.entries(cases)`, a
+ * `for (let attempt = 0; attempt < 8; ...)`. Every one of those was the burial the header warns
+ * about - real findings under table-driven tests - and the fix was in the parser, not in the
+ * tests.
  *
- * Keyed by `<file>::<test name>` rather than by line, because a line number moves when somebody
- * edits the file above it and a ledger that goes stale on an unrelated edit is a ledger people
- * delete. The names are the ones vitest prints.
+ * An empty ledger is a ratchet: the next test of this shape fails the build on the commit that
+ * writes it, which is the only moment it is cheap to fix. Adding an entry here is not free and is
+ * not a way past a red build. It is a promise, in writing, that somebody will come back - and this
+ * repository has already learned what a list of those is worth after nobody does.
  */
-const LEDGER = new Set([
-  // Wave 1F owns the repairs. Three of these certify a safety or compliance property and are to
-  // be guarded rather than deleted - the command-injection guard in `images.test.ts`, the ATH-116
-  // regression in `skills.test.ts`, and the AGPL claim in `license-manifest.test.ts` - because
-  // the code they cover is load-bearing and only the test is broken. The rest may go either way:
-  // give it a count after the loop, or delete it with the behaviour it was pinning.
-  'apps/api/src/contract.test.ts::an identifier that cannot name a record is a 404, not a server fault',
-  'apps/web/src/DecisionsLog.test.tsx::says what an empty list means, in each list’s own words',
-  'apps/web/src/api-token-scopes.test.ts::never labels a scope with its own enum value',
-  'apps/web/src/approval-copy.test.ts::agrees with the contract it copies, case for case',
-  'apps/web/src/composer-state.test.ts::always carries a repair action',
-  'apps/web/src/composer-strip.test.ts::shows each condition on its own',
-  'apps/web/src/task-status.test.ts::never calls a status both finished and live',
-  'apps/web/src/task-status.test.ts::only offers resume for a conversation the agent still has',
-  'apps/worker/src/agent-run.test.ts::sends a request with no rule byte in it when nothing fired',
-  'apps/worker/src/approval-policy.test.ts::never answers a tainted call more weakly than the same call on a clean turn',
-  'apps/worker/src/connector-origin-totality.test.ts::gives every kind the table’s word on the live path',
-  'apps/worker/src/context.test.ts::re-marks the same index for several consecutive steps so the prefix is already cached',
-  'apps/worker/src/context.test.ts::crosses both recency boundaries, which is the only reason it measures anything',
-  'apps/worker/src/context.test.ts::shares three quarters of each request with the request before it',
-  'apps/worker/src/context.test.ts::moves the older-result floor a handful of times over sixty steps',
-  'apps/worker/src/context.test.ts::diverges from the previous request at the recency boundary, and further back only when the floor moved',
-  'apps/worker/src/context.test.ts::places the cache edge ahead of where this request stopped matching the last one, because a retrospective edge measures worse',
-  'apps/worker/src/context.test.ts::never reaches the automatic compaction trigger, because the trigger reads the squeezed size',
-  'apps/worker/src/context.test.ts::bills fewer full-price bytes per step than the head it replaced, in bytes rather than in a share',
-  'apps/worker/src/memory-runtime.test.ts::never emits a chunk over the byte cap, including multi-byte text',
-  'apps/worker/src/rules/rules.test.ts::puts no rule text into the operating contract or the tool catalogue',
-  'apps/worker/src/skills.test.ts::writes descriptions that say when to use and when not to',
-  'apps/worker/src/skills.test.ts::keeps every body inside the review-readable budget',
-  'apps/worker/src/skills.test.ts::declares a verification contract and a bounded capability grant for every skill',
-  'apps/worker/src/skills.test.ts::names only tools that exist, in both places a skill declares them',
-  'apps/worker/src/skills.test.ts::advertises no file to the model that the model has no tool able to open',
-  'apps/worker/src/skills.test.ts::states one version, in both places a skill declares it',
-  'apps/worker/src/tool-catalogue.test.ts::names nothing in a description that the schemas do not declare',
-  'apps/worker/src/tool-catalogue.test.ts::says where the edge is between each pair a model would otherwise confuse',
-  'packages/contracts/src/web-tools.test.ts::serialises byte-identically on repeated calls for the same facts',
-  'packages/contracts/src/web-tools.test.ts::puts nothing on the wire but the two fields the provider reads',
-  'packages/core/src/connectors.test.ts::names every kind the catalogue can offer, explicitly',
-  'packages/data/src/memory-eval.test.ts::asks every session probe in words the transcript does not use',
-  'packages/model-gateway/src/license-manifest.test.ts::records the upstream revision each reading was made against',
-  'services/workspace-runner/src/browser.test.ts::refuses to drive the agent anywhere but the public web',
-  'services/workspace-runner/src/command-policy.test.ts::catches escalation smuggled through a wrapper',
-  'services/workspace-runner/src/desktop.test.ts::applies the same command policy a shell command gets, which it used to skip entirely',
-  'services/workspace-runner/src/document-toolchain.test.ts::routes every Python capability through the one pinned interpreter',
-  'services/workspace-runner/src/document-toolchain.test.ts::proves each measurement can fail, wherever the job ran',
-  'services/workspace-runner/src/document-toolchain.test.ts::names what it could not exercise instead of implying it did',
-  'services/workspace-runner/src/execution.test.ts::refuses a package operation the approved helper cannot perform, and says so once',
-  'services/workspace-runner/src/execution.test.ts::rejects escalation spelled with a path or hidden behind a wrapper',
-  'services/workspace-runner/src/execution.test.ts::refuses a command that names a privileged helper directly',
-  'services/workspace-runner/src/images.test.ts::turns every picture it can name into one a model takes',
-  'services/workspace-runner/src/images.test.ts::never puts the file in the argument list',
-  'services/workspace-runner/src/images.test.ts::leaves no picture a model accepts without a pass that strips it',
-  'services/workspace-runner/src/processes.test.ts::refuses a background command that names a privileged helper directly',
-  'services/workspace-runner/src/terminal-renewal.test.ts::refuses one minted for another owner, workspace, role or scope',
-  'services/workspace-runner/src/toolchain-host.test.ts::is a command line this host will actually accept, per family',
-  'services/workspace-runner/src/toolchain-host.test.ts::names no package manager in a sentence meant for every host',
-  'services/workspace-runner/src/toolchain-host.test.ts::gives every capability a way out of being missing, resolved or not'
-]);
+const LEDGER = new Set([]);
 
 const files = spawnSync('git', ['ls-files', '*.test.ts', '*.test.tsx'], {
   cwd: root,
@@ -157,25 +105,80 @@ const ITERATING_METHODS = new Set([
 ]);
 
 /**
+ * A literal that cannot be emptied by a change to the product.
+ *
+ * A spread is the exception and it is the whole reason this is a function rather than two calls to
+ * `ts.isArrayLiteralExpression`: `[...connectorCatalog]` is an array literal whose contents are a
+ * production collection, and emptying that collection empties it. Treating it as a literal would
+ * excuse exactly the defect this check exists for, wearing brackets.
+ */
+const isClosedLiteral = (node, bound) => {
+  if (ts.isArrayLiteralExpression(node))
+    return node.elements.every(
+      (element) => !ts.isSpreadElement(element) || iteratesALiteral(element.expression, bound)
+    );
+  if (ts.isObjectLiteralExpression(node))
+    return node.properties.every(
+      (property) => !ts.isSpreadAssignment(property) || iteratesALiteral(property.expression, bound)
+    );
+  return false;
+};
+
+/**
  * Whether the thing being iterated is written down in the test.
  *
  * A literal cannot be emptied by a change to the product, so a loop over one is not this defect.
  * `Object.keys({...})`, `Object.entries({...})` and `[...].map(...)` chains resolve to the literal
  * at their root, which is why this walks left rather than testing the immediate expression.
+ *
+ * `bound` carries the names the enclosing test declared with a literal initialiser, because the
+ * ordinary way to write a table-driven test is two statements and not one:
+ *
+ *     const cases = [{ url: '/v1/tasks/page', code: 'task_not_found' }, ...];
+ *     for (const { url, code } of cases) ...
+ *
+ * That is the same act as looping over the literal inline - the data is in the test, emptying it is
+ * editing the test - and flagging it was the check's own documented mistake: "flagging those would
+ * bury the real findings under table-driven tests, and a check whose output nobody reads is a check
+ * that has stopped running". Twenty-seven of the fifty-one it first reported were this shape, which
+ * is exactly the burial it warned about.
  */
-const iteratesALiteral = (expression) => {
+const iteratesALiteral = (expression, bound = new Set()) => {
   let node = expression;
   for (;;) {
-    if (ts.isArrayLiteralExpression(node) || ts.isObjectLiteralExpression(node)) return true;
+    if (isClosedLiteral(node, bound)) return true;
+    if (ts.isIdentifier(node)) return bound.has(node.text);
     if (ts.isCallExpression(node)) {
-      node = node.expression;
+      // `Object.keys(cases)` holds its collection in the argument, not in the receiver, and walking
+      // left from it lands on the identifier `Object`. The header claimed this case was covered and
+      // the code never covered it: `connector-origin-totality.test.ts` walks a compiler-enforced
+      // total table through `Object.entries` and was reported for years as a test that checks
+      // nothing. Only these three, by name - a call to anything else may return an empty array on a
+      // full argument, and excusing that would certify the defect this file exists to catch.
+      const callee = node.expression;
+      if (
+        ts.isPropertyAccessExpression(callee) &&
+        ts.isIdentifier(callee.expression) &&
+        callee.expression.text === 'Object' &&
+        ['keys', 'values', 'entries'].includes(callee.name.text) &&
+        node.arguments.length === 1
+      ) {
+        node = node.arguments[0];
+        continue;
+      }
+      node = callee;
       continue;
     }
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       node = node.expression;
       continue;
     }
-    if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node)) {
+    if (
+      ts.isParenthesizedExpression(node) ||
+      ts.isAsExpression(node) ||
+      ts.isSatisfiesExpression(node) ||
+      ts.isNonNullExpression(node)
+    ) {
       node = node.expression;
       continue;
     }
@@ -184,22 +187,59 @@ const iteratesALiteral = (expression) => {
 };
 
 /**
+ * The names a test binds to data it wrote down itself.
+ *
+ * Only `const name = <literal>` counts, and only inside this test's own body: a `let` that is
+ * reassigned, a destructuring, or a name from an outer scope could all be pointed at something the
+ * product owns without this seeing it, and a check that guesses in the permissive direction is a
+ * check that certifies the thing it was built to catch. Chained literals resolve too, so
+ * `const rows = CASES.map(...)` is a literal when `CASES` is one.
+ */
+const literalsBoundIn = (body, inherited = new Set()) => {
+  const bound = new Set(inherited);
+  const visit = (node) => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      ts.isVariableDeclarationList(node.parent) &&
+      node.parent.flags & ts.NodeFlags.Const &&
+      iteratesALiteral(node.initializer, bound)
+    )
+      bound.add(node.name.text);
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(body, visit);
+  return bound;
+};
+
+/**
  * The loop, if this node is one, together with what it iterates.
  *
  * `for (;;)` and `while` are counted with no collection: a hand-rolled loop whose bound is a length
  * is the same defect wearing different syntax, and there is nothing to call a literal.
  */
-const loopOf = (node) => {
+const loopOf = (node, bound) => {
   if (ts.isForOfStatement(node) || ts.isForInStatement(node))
-    return { literal: iteratesALiteral(node.expression) };
-  if (ts.isForStatement(node) || ts.isWhileStatement(node) || ts.isDoStatement(node))
-    return { literal: false };
+    return { literal: iteratesALiteral(node.expression, bound) };
+  // `for (let attempt = 0; attempt < 8; ...)` runs eight times on every machine there has ever
+  // been. It is a repetition, not an iteration, and there is nothing to empty; `i < rows.length`
+  // is the shape that matters and it keeps its finding, because that bound IS a collection.
+  if (ts.isForStatement(node))
+    return {
+      literal: Boolean(
+        node.condition &&
+        ts.isBinaryExpression(node.condition) &&
+        (ts.isNumericLiteral(node.condition.right) || ts.isNumericLiteral(node.condition.left))
+      )
+    };
+  if (ts.isWhileStatement(node) || ts.isDoStatement(node)) return { literal: false };
   if (
     ts.isCallExpression(node) &&
     ts.isPropertyAccessExpression(node.expression) &&
     ITERATING_METHODS.has(node.expression.name.text)
   )
-    return { literal: iteratesALiteral(node.expression.expression) };
+    return { literal: iteratesALiteral(node.expression.expression, bound) };
   return null;
 };
 
@@ -215,6 +255,12 @@ for (const relative of files.stdout.split('\n').filter(Boolean)) {
     ts.ScriptKind.TSX
   );
 
+  // The same table written above the describes rather than inside them. `readsThrough` in
+  // `connector-origin-totality.test.ts` is the case: a const object literal at the top of the test
+  // file, whose totality the compiler enforces with `satisfies`. It is the test's own data wherever
+  // in the file it sits, and emptying it is still editing the test.
+  const fileLiterals = literalsBoundIn(source);
+
   const inspect = (node) => {
     if (isTestOpener(node)) {
       const [title, body] = node.arguments;
@@ -222,6 +268,7 @@ for (const relative of files.stdout.split('\n').filter(Boolean)) {
         let assertions = 0;
         let outsideALoop = 0;
         let cleared = false;
+        const bound = literalsBoundIn(body, fileLiterals);
         // Depth of enclosing loops that iterate something the test did not write down. A literal
         // loop deliberately contributes nothing, so an assertion inside one still counts as an
         // assertion the empty case has to answer.
@@ -244,7 +291,7 @@ for (const relative of files.stdout.split('\n').filter(Boolean)) {
             assertions += 1;
             if (depth === 0) outsideALoop += 1;
           }
-          const loop = loopOf(child);
+          const loop = loopOf(child, bound);
           const next = loop && !loop.literal ? depth + 1 : depth;
           ts.forEachChild(child, (grandchild) => walk(grandchild, next));
         };

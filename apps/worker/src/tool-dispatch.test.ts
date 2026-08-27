@@ -332,6 +332,10 @@ interface RunnerCall {
  */
 const isTurnScaffolding = (call: RunnerCall): boolean =>
   call.path === `${root}/toolchain` ||
+  // Beside the toolchain summary and read at the same moment for the same reason: a property of
+  // the machine, asked once before the step loop. It decides whether the browser and desktop
+  // schemas are described at all. @see workspaceSurfaces in services/workspace-runner.
+  call.path === `${root}/surfaces` ||
   call.path === `${root}/checkpoints` ||
   call.path === `${root}/file?path=workspace%2FATHANOR.md` ||
   call.path === `${root}/file?path=workspace%2FOPEN_CLOUD.md` ||
@@ -604,7 +608,7 @@ describe('what a turn asks the runner for on its own account', () => {
    * file an owner actually wrote; a workspace with `ATHANOR.md` pays one, because the chain stops
    * at the first that answers.
    */
-  it('reads the toolchain and all three brief names once, and takes one undo point before a write', async () => {
+  it('reads the surfaces, the toolchain and all three brief names once, and takes one undo point before a write', async () => {
     const executed = await dispatch(
       { name: 'file_write', arguments: { path: 'workspace/new.md', content: 'hello' } },
       { route: (_url, init) => (init?.method === 'PUT' ? json({ ok: true }) : undefined) }
@@ -615,6 +619,12 @@ describe('what a turn asks the runner for on its own account', () => {
         .filter((call) => !executed.calls.includes(call))
         .map((call) => `${call.method} ${call.path} ${call.scopes.join('+')}`)
     ).toEqual([
+      // First, and ahead of the toolchain, because it is the one read that decides what the
+      // request carries rather than what it says: a box with no browser and no screen is not sent
+      // the seven schemas describing them. It is one GET per run, on the same `exec` scope as the
+      // toolchain summary beside it. If this line disappears, the catalogue has gone back to being
+      // the unconditional constant on every box.
+      `GET ${root}/surfaces exec`,
       `GET ${root}/toolchain exec`,
       `GET ${root}/file?path=workspace%2FATHANOR.md files.read`,
       `GET ${root}/file?path=workspace%2FOPEN_CLOUD.md files.read`,

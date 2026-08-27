@@ -11,8 +11,11 @@ import {
   BrowserAction,
   DesktopAction,
   MAX_AGENT_NOTIFICATIONS_PER_TASK,
+  surfaceDescribable,
   TaskScheduleSpec,
-  type MediaModelOption
+  UNKNOWN_SURFACES,
+  type MediaModelOption,
+  type WorkspaceSurfaces
 } from '@athanor/contracts';
 import {
   connectorActions,
@@ -210,15 +213,32 @@ describe('the size of the catalogue the model is sent', () => {
     // cannot say: the name of the field a challenge arrives in, and that a clip cannot be made.
     // Pinned from now on by "pays once for a machine fact" below, so it cannot grow back quietly.
     //
-    // Three larger moves were priced against this ceiling and are NOT here, because none of them
-    // fits inside this file: conditioning the browser and desktop bags on a box that has them
-    // (~11.0 kB) needs an availability probe that does not exist anywhere yet, plus the withdrawal
-    // set in turn/claim.ts and the entitlement rebuild that has to agree with it; deferring
-    // connector_action's 48-field input bag (~4.4 kB) is held in place by a name-level pin in
-    // approval-policy.test.ts; and folding read_elements into browser_snapshot (~0.7 kB net) is
-    // named by skills/web-form-filling's front matter, which skills.test.ts checks against this
-    // catalogue. Each is a real saving and none of them is a description that grew.
-    expect(bytes).toBeLessThan(54_700);
+    // Two larger moves were priced against this ceiling and are NOT here, because neither fits
+    // inside this file: deferring connector_action's 48-field input bag (~4.4 kB) is held in place
+    // by a name-level pin in approval-policy.test.ts, and folding read_elements into
+    // browser_snapshot (~0.7 kB net) is named by skills/web-form-filling's front matter, which
+    // skills.test.ts checks against this catalogue. Both are real savings and neither is a
+    // description that grew.
+    //
+    // The third one shipped, and it is why this number did NOT move again. Conditioning the
+    // browser and desktop bags on a box that has them is worth a measured 11,692 bytes - see the
+    // block below - but it saves them on a *bare* box, not here. This figure is the fully
+    // provisioned wire, and on a box with a Chromium and a screen every one of the 41 tools is
+    // still sent: nothing was withdrawn to buy the cut, which is exactly the property that makes
+    // it honest. So the ceiling stood at 54,700 against a measured 54,632, with the same 68 bytes
+    // of headroom it has had since it was last lowered, and the saving is ratcheted separately.
+    //
+    // Then raised from 54,700 to 55,000 for a capability, by this rule and not around it: the
+    // `move` operation on file_patch, 317 bytes net. A replacement can only delete text and paste
+    // text, so a move had to emit the moved lines twice - once as oldText to cut them, once inside
+    // a second patch's newText to put them back - plus a unique anchor at each end. Measured on
+    // evals/edit's `move-function`, eleven lines moved above their caller: 777 characters of
+    // arguments become 397, and three further move shapes on the same file measure 358, 350 and
+    // 308. It passes the substitution test - no wording makes a move cost one copy instead of two
+    // - and the discovery test, because a field that is not declared cannot be found by trying.
+    // The saving grows with the block, and past a point it is not an encoding at all: two copies
+    // of a two-hundred-line function plus context is a move a model may be unable to afford.
+    expect(bytes).toBeLessThan(55_000);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
     // union of what twenty-four actions across mail, calendar and repositories accept. Those are
@@ -266,6 +286,38 @@ describe('the size of the catalogue the model is sent', () => {
     for (const [where, size] of nested) expect(size, where).toBeLessThan(1_750);
   });
 
+  it('offers the move shape it charges for, and says so where the model chooses a tool', () => {
+    /*
+     * The half of the move that lives on the wire, pinned separately from the half that lives in
+     * the arm (`tools/workspace.test.ts`), because each is useless without the other and they
+     * fail in opposite directions. An arm that accepts `moveAfter` from a catalogue that does not
+     * declare it is a capability nothing can reach - the exact shape of the gate this programme
+     * has shipped wired to nothing twice, and it would pass every test in that other file.
+     *
+     * The sentence is asserted as well as the field. A model chooses a tool by reading the tool's
+     * own description and only then reads the schema, so a `moveAfter` declared in the properties
+     * and unmentioned above them is a field found by luck.
+     */
+    const patch = sent.find((tool) => tool.name === 'file_patch');
+    const item = (
+      patch?.parameters.properties as { patches?: { items?: Record<string, unknown> } } | undefined
+    )?.patches?.items as
+      | { required?: string[]; properties?: Record<string, { description?: string }> }
+      | undefined;
+    expect(Object.keys(item?.properties ?? {})).toEqual([
+      'path',
+      'oldText',
+      'newText',
+      'moveAfter'
+    ]);
+    expect(patch?.description).toMatch(/moveAfter/);
+    // `newText` is deliberately NOT required - a move carries none - and the arm refuses a patch
+    // that names neither rather than reading the omission as a deletion. @see tools/workspace.ts
+    expect(item?.required).toEqual(['path', 'oldText']);
+    // The one fact about a move a model cannot get by trying: where an empty anchor puts the text.
+    expect(item?.properties?.moveAfter?.description).toMatch(/top/i);
+  });
+
   it('has no tool whose own description says it unlocks nothing', () => {
     // tool_search ranked definitions already in the window, billed a full pass over that window to
     // do it, and said so in its own description.
@@ -306,6 +358,137 @@ describe('the size of the catalogue the model is sent', () => {
           `${tool.name} restates "${carried}", which the contract already sends on this request`
         ).not.toMatch(restated);
     }
+  });
+});
+
+/*
+ * What a box without a screen or a browser is sent, which is the other half of the ceiling above.
+ *
+ * The ceiling above bounds the fully provisioned wire and cannot move for this, because on a box
+ * with a Chromium and an X session nothing is withdrawn at all. The saving is entirely on the
+ * other shape, so it needs a bound of its own or it is not ratcheted: a browser tool added outside
+ * `BROWSER_SURFACE_TOOLS` would keep being described to a box with no browser, and the only thing
+ * that would notice is the number below.
+ *
+ * These are unit measurements. The end-to-end drive - a real turn on a runner reporting a desktop
+ * and a runner reporting none, read off the request that left the process - is in
+ * docs/design/exec4/S1.md, because a passing unit test on a gate wired to nothing is the exact
+ * defect this programme has shipped twice.
+ */
+describe('the wire a box without a browser or a screen is sent', () => {
+  const compacted = (surfaces: WorkspaceSurfaces) => [
+    ...agentToolsFor('lead', surfaces),
+    COMPACT_CONTEXT_TOOL
+  ];
+  const provisioned = compacted({ browser: 'available', desktop: 'available' });
+  const bare = compacted({ browser: 'absent', desktop: 'absent' });
+
+  it('describes everything when nobody has said otherwise', () => {
+    // The default argument, which is what every measurement, rig and test in this repo gets. A
+    // gate whose default withdrew anything would move the eval baselines and the ceiling above
+    // without a single caller asking it to.
+    expect(agentToolsFor().map((tool) => tool.name)).toEqual(
+      agentToolsFor('lead', UNKNOWN_SURFACES).map((tool) => tool.name)
+    );
+    expect(agentToolsFor()).toHaveLength(agentTools.length);
+  });
+
+  it('withdraws nothing from a box that has both surfaces', () => {
+    // The half that would look like success while capability fell. A box with a screen and a
+    // browser is sent the identical catalogue it was sent before this gate existed.
+    expect(provisioned.map((tool) => tool.name)).toEqual(
+      [...agentToolsFor(), COMPACT_CONTEXT_TOOL].map((tool) => tool.name)
+    );
+  });
+
+  it('leaves only surface tools behind on a bare box', () => {
+    const gone = provisioned
+      .map((tool) => tool.name)
+      .filter((name) => !bare.some((tool) => tool.name === name));
+    // Named rather than counted: the point of the set is which seven, and a test that only counted
+    // them would pass while a different seven went.
+    expect(gone).toEqual([
+      'desktop_observe',
+      'desktop_launch',
+      'desktop_action',
+      'browser_snapshot',
+      'read_elements',
+      'browser_action',
+      'print_pdf'
+    ]);
+    // The two that reach for a browser and are deliberately NOT in the bag. `web_search` is
+    // answered by the provider on one of its two routes, so a box with no Chromium may still
+    // search; `parallel_web_read` is the specialist's, and the specialist wire is invariant.
+    // Withdrawing either would withdraw a capability the box still has.
+    for (const name of ['web_search', 'parallel_web_read'])
+      expect(
+        bare.map((tool) => tool.name),
+        name
+      ).toContain(name);
+  });
+
+  it('holds the bare-box wire under a ceiling of its own', () => {
+    /*
+     * Measured at 42,940 bytes / 34 tools against a provisioned 54,632 / 41: 11,692 bytes, 21.4%,
+     * off every request of every turn on a box that has neither surface - and off the head of the
+     * cached prefix, which is the most expensive place in the request to be carrying anything.
+     *
+     * 43,000 was that measurement with 60 bytes of headroom, which is a ceiling and not a licence,
+     * and it is the number to lower again if anything else leaves this wire. It is a *ceiling* and
+     * not an equality on purpose: a tool added to the catalogue that a bare box can genuinely
+     * honour should land here, and be paid for here, exactly as it is above.
+     *
+     * Which is exactly what then happened. file_patch's `move` operation is 317 bytes and a bare
+     * box honours it in full - there is nothing about moving a block that wants a browser or a
+     * screen - so it is paid for on this wire too, and the number is 43,300 against a measured
+     * 43,257. The gap to the provisioned wire is unchanged at 11,692, because the same 317 bytes
+     * landed on both.
+     */
+    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(43_300);
+    // The other direction, and the one that fails silently. A gate wired to nothing returns the
+    // unconditional constant on every box; this is the assertion that would go red if it did.
+    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(
+      Buffer.byteLength(JSON.stringify(provisioned)) - 11_000
+    );
+  });
+
+  it('withdraws nothing on an answer it could not believe', () => {
+    /*
+     * The failure direction, stated as a bound rather than as prose. Every way of not getting an
+     * answer - an unreachable runner, a timeout, an older runner with no such route, a body that
+     * is not the declared shape - lands on `unknown`, and unknown describes everything.
+     *
+     * The two ways of being wrong are not the same size. Describing a surface the box lacks costs
+     * bytes and one honest failure the model can read; withdrawing a surface the box has hides a
+     * capability the owner paid for and leaves nothing behind to say it existed.
+     */
+    expect(surfaceDescribable('unknown')).toBe(true);
+    expect(surfaceDescribable('available')).toBe(true);
+    expect(surfaceDescribable('absent')).toBe(false);
+    for (const surfaces of [
+      UNKNOWN_SURFACES,
+      { browser: 'unknown', desktop: 'absent' },
+      { browser: 'absent', desktop: 'unknown' }
+    ] as WorkspaceSurfaces[])
+      for (const tool of compacted(surfaces))
+        expect(
+          provisioned.some((entry) => entry.name === tool.name),
+          tool.name
+        ).toBe(true);
+    expect(compacted(UNKNOWN_SURFACES)).toHaveLength(provisioned.length);
+  });
+
+  it('leaves the specialist wire where it was, on every shape', () => {
+    // The specialist holds no browser or desktop tool at all, so its surface is invariant by
+    // construction. Asserted rather than assumed: a name added to `specialistToolNames` that is
+    // also in one of the two bags would make a quarantined investigator's wire depend on the box.
+    const names = agentToolsFor('specialist').map((tool) => tool.name);
+    for (const surfaces of [
+      { browser: 'available', desktop: 'available' },
+      { browser: 'absent', desktop: 'absent' },
+      UNKNOWN_SURFACES
+    ] as WorkspaceSurfaces[])
+      expect(agentToolsFor('specialist', surfaces).map((tool) => tool.name)).toEqual(names);
   });
 });
 
@@ -552,12 +735,20 @@ describe('the catalogue as the model reads it', () => {
     };
     for (const tool of agentTools) collect(tool.parameters);
 
+    // Counted, because both collections this walks can go empty without anything else changing:
+    // a catalogue that stopped being assembled, or descriptions that stopped containing a single
+    // snake_case cross-reference. Either one satisfies the loops below in no time at all and
+    // reports that every name in every description resolves.
+    let resolved = 0;
     for (const tool of agentTools)
-      for (const token of tool.description.match(/[a-z][a-z0-9]*(?:_[a-z0-9]+)+/g) ?? [])
+      for (const token of tool.description.match(/[a-z][a-z0-9]*(?:_[a-z0-9]+)+/g) ?? []) {
+        resolved += 1;
         expect(
           declared.has(token),
           `${tool.name} names "${token}", which no tool, connector action, parameter or enum declares`
         ).toBe(true);
+      }
+    expect(resolved).toBeGreaterThan(0);
   });
 
   it('offers no media kind the provider cannot actually produce', () => {

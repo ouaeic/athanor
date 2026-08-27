@@ -216,8 +216,11 @@ describe('provider web tools', () => {
   it('puts nothing on the wire but the two fields the provider reads', () => {
     // `supersedes` is athanor's own bookkeeping. A third key here would travel in the tools array
     // of the search request, where the provider has no field to put it in.
-    for (const tool of serverWebTools(permitting))
-      expect(Object.keys(tool).sort()).toEqual(['parameters', 'type']);
+    const tools = serverWebTools(permitting);
+    // A plan that offered no provider-side tool at all would satisfy the loop below without a
+    // single key being read, and the claim - that nothing extra travels - would be about nothing.
+    expect(tools.length).toBeGreaterThan(0);
+    for (const tool of tools) expect(Object.keys(tool).sort()).toEqual(['parameters', 'type']);
   });
 
   /**

@@ -147,3 +147,23 @@ export const answer = (name: string, args: Record<string, unknown>): OracleResul
       );
   }
 };
+
+/**
+ * What a runner needs from a world, so the loop is not welded to this one.
+ *
+ * `live.ts` drives a provider, a tool loop and a step ceiling, and none of that is specific to the
+ * filesystem below. The edit arm asks the same questions of a different world - the corpus files,
+ * both appliers as they ship, and a read side that carries line numbers - and copying the loop to
+ * get it would produce two loops that agree until somebody fixes a bug in one of them.
+ *
+ * `reset` is on the interface rather than called by name because a world that has to be reset by
+ * the runner is a world the runner can forget to reset, and the first symptom of that is one arm
+ * reading a file the previous arm wrote.
+ */
+export interface Oracle {
+  reset(): void;
+  answer(name: string, args: Record<string, unknown>): OracleResult;
+}
+
+/** The general sample's world, as an oracle. */
+export const WORLD_ORACLE: Oracle = { reset: resetWorld, answer };

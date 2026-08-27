@@ -71,6 +71,10 @@ describe('the pictures this computer can name', () => {
   });
 
   it('turns every picture it can name into one a model takes', () => {
+    // The table of types this box will name is the collection, and emptying it satisfies every
+    // loop in this file at once. That is not hypothetical: it is how the conversion guard below
+    // was found to be checking nothing at all.
+    expect(Object.keys(IMAGE_CONTENT_TYPES).length).toBeGreaterThan(0);
     for (const type of Object.values(IMAGE_CONTENT_TYPES))
       expect(MODEL_IMAGE_TYPES.has(conversionTargetFor(type) ?? '')).toBe(true);
   });
@@ -95,12 +99,19 @@ describe('the conversion a photograph gets', () => {
    * is the owner's to name - a holiday album called `holiday[2]` must not be a different command.
    */
   it('never puts the file in the argument list', () => {
+    // Counted, not merely iterated. This is the guard that keeps a filename out of an argument
+    // vector, and it is satisfied both by an empty type table and by a `conversionTargetFor` that
+    // started answering nothing - so the number of conversions actually inspected is the
+    // assertion, and it is checked after the loop rather than assumed before it.
+    let inspected = 0;
     for (const type of Object.keys(IMAGE_CONTENT_TYPES).map((key) => IMAGE_CONTENT_TYPES[key]!)) {
       const args = imageConvertArguments(type);
       if (!args) continue;
+      inspected += 1;
       expect(args.filter((argument) => argument.endsWith(':-'))).toHaveLength(2);
       expect(args.some((argument) => argument.includes('/'))).toBe(false);
     }
+    expect(inspected).toBeGreaterThan(0);
   });
 
   /*
@@ -133,6 +144,7 @@ describe('the conversion a photograph gets', () => {
 
   /* Whatever a model would have taken as it stood is the set that skipped the strip entirely. */
   it('leaves no picture a model accepts without a pass that strips it', () => {
+    expect(MODEL_IMAGE_TYPES.size).toBeGreaterThan(0);
     for (const type of MODEL_IMAGE_TYPES) expect(imageConvertArguments(type)).toContain('-strip');
   });
 

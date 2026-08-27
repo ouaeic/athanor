@@ -333,6 +333,11 @@ describe('the shipped built-in library', () => {
   });
 
   it('writes descriptions that say when to use and when not to', () => {
+    // Every test in this block walks `library.skills`, so every one of them asserts the count
+    // first. A loader that found no skills - a moved directory, a front-matter parse that started
+    // failing - would otherwise turn this whole block green in no time at all, and the block is
+    // where the library's only enforced contracts live.
+    expect(library.skills.length).toBeGreaterThan(0);
     for (const skill of library.skills) {
       expect(skill.description, skill.name).toMatch(/Use when|Use whenever|Use after|Use before/);
       expect(skill.description, skill.name).toMatch(/Do not use|do not use|never/);
@@ -341,6 +346,7 @@ describe('the shipped built-in library', () => {
   });
 
   it('keeps every body inside the review-readable budget', () => {
+    expect(library.skills.length).toBeGreaterThan(0);
     for (const skill of library.skills) {
       expect(skill.bodyLines, skill.name).toBeLessThanOrEqual(SKILL_BUDGET.maxBodyLines);
       expect(skill.bodyTokens, skill.name).toBeLessThanOrEqual(SKILL_BUDGET.maxBodyTokens);
@@ -351,6 +357,7 @@ describe('the shipped built-in library', () => {
   });
 
   it('declares a verification contract and a bounded capability grant for every skill', () => {
+    expect(library.skills.length).toBeGreaterThan(0);
     for (const skill of library.skills) {
       expect(skill.verify.length, skill.name).toBeGreaterThan(0);
       expect(skill.requiredTools.length, skill.name).toBeGreaterThan(0);
@@ -366,6 +373,8 @@ describe('the shipped built-in library', () => {
     // declarations are the same set said twice, so they are checked against each other and against
     // the real catalogue.
     const catalog = new Set(agentTools.map((tool) => tool.name));
+    expect(library.skills.length).toBeGreaterThan(0);
+    expect(catalog.size).toBeGreaterThan(0);
     for (const skill of library.skills) {
       for (const tool of [...skill.requiredTools, ...skill.allowedTools])
         expect(catalog.has(tool), `${skill.name} names a tool that does not exist: ${tool}`).toBe(
@@ -390,6 +399,7 @@ describe('the shipped built-in library', () => {
      *
      * Direction one: nothing in any opened block may offer a file as a resource.
      */
+    expect(library.skills.length).toBeGreaterThan(0);
     for (const skill of library.skills) {
       const opened = openSkill(library, skill.name);
       expect(opened, skill.name).not.toBeNull();
@@ -438,6 +448,7 @@ describe('the shipped built-in library', () => {
     // The loader prefers the sidecar and falls back to the front matter, so a skill whose two
     // numbers disagree ships a version block that contradicts the file it came from - and four of
     // them had already drifted apart by a revision each.
+    expect(library.skills.length).toBeGreaterThan(0);
     for (const skill of library.skills) {
       const front = parseSkillFrontMatter(readFileSync(join(skill.directory, 'SKILL.md'), 'utf8'));
       const metadata = (front.data.metadata ?? {}) as Record<string, unknown>;

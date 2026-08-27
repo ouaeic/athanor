@@ -11,9 +11,9 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "NODE_OPTIONS=--conditions=development vitest run --exclude 'dist/**'"
+    "test": "NODE_OPTIONS=--conditions=development vitest run"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",

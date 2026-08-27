@@ -1195,6 +1195,9 @@ describe('compaction and prompt caching', () => {
       marks.push(breakpointIndexes(prepareModelContext(window, 200_000, 8_000).messages));
     }
     // Consecutive steps have to overlap on a trajectory index, not just on the preamble anchor.
+    // The length first: a run that marked nothing would leave the comparison below with nothing to
+    // compare and would read as six steps of a perfectly stable prefix.
+    expect(marks.length).toBe(6);
     for (let step = 1; step < marks.length; step += 1) {
       const shared = marks[step]!.filter((index) => marks[step - 1]!.includes(index) && index > 2);
       expect(shared.length).toBeGreaterThan(0);

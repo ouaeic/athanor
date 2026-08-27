@@ -58,6 +58,10 @@ describe('what asks whatever the mode says', () => {
    * row renders as a heading with a gap under it or as a sentence with no subject.
    */
   it('gives every rule both a name and its concrete cases', () => {
+    // Both halves, counted before either is walked: a screen that explains a security mode with no
+    // rules on it is the failure this checks for, and an empty table passes a loop silently.
+    expect(alwaysAsks.length).toBeGreaterThan(0);
+    expect(balancedVsAutonomous.length).toBeGreaterThan(0);
     for (const rule of [...alwaysAsks, ...balancedVsAutonomous]) {
       expect(rule.what.length).toBeGreaterThan(0);
       expect(rule.detail.length).toBeGreaterThan(20);

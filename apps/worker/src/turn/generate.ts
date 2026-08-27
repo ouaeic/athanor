@@ -166,10 +166,17 @@ export const generateModelStep = async (
       windowOptions
     ).messages,
     sent: requestTools,
-    // Rebuilt from the same two facts the run built it from, rather than compared against a
+    // Rebuilt from the same three facts the run built it from, rather than compared against a
     // remembered copy: a remembered copy proves the array did not change, and what has to be
     // proved is that it is still the catalogue this run is entitled to send.
-    entitled: [...agentToolsFor(), COMPACT_CONTEXT_TOOL].filter(
+    //
+    // `surfaces` is the third fact and it has to be read off `run`, not re-probed. This is the
+    // second of the two places `agentToolsFor` is called on the send path, and the two must be
+    // given the same answer: gate one and not the other and every turn on a bare box dies here on
+    // `request_not_derivable` instead of sending. Taking it from the frozen run is what makes that
+    // impossible rather than merely unlikely - a second probe could answer differently between the
+    // claim and the send, and the failure would look like a corrupted trajectory.
+    entitled: [...agentToolsFor('lead', run.surfaces), COMPACT_CONTEXT_TOOL].filter(
       (tool) => !withdrawnTools.has(tool.name)
     ),
     reservedTokens,

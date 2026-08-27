@@ -447,6 +447,10 @@ describe('what a connector read is, for the label that travels with it', () => {
   it('names every kind the catalogue can offer, explicitly', () => {
     // The table is total over the kind union, so this cannot silently miss one: a connector added
     // without an entry stops the package compiling. This holds the catalogue to the same line.
+    // The count is the assertion an empty catalogue has to answer: emptying `connectorCatalog` -
+    // every connectable service the product offers - once broke one test in this package out of
+    // 249, and this was one of the 248.
+    expect(connectorCatalog.length).toBeGreaterThan(0);
     for (const definition of connectorCatalog)
       expect(Object.keys(connectorContentOrigins), definition.kind).toContain(definition.kind);
   });

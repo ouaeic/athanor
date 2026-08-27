@@ -27,14 +27,47 @@ import {
 } from '../../apps/worker/src/context.js';
 import { builtinSkillLibrary, skillCatalogBlock } from '../../apps/worker/src/skills.js';
 import { agentToolsFor } from '../../apps/worker/src/tool-catalogue.js';
+import { CANDIDATE_ENTRY } from '../edit/report.js';
 import { FLOOR_TOOL_NAMES, coreToolNamesFromSource, type ArmSettings } from './arms.js';
 
 /** The catalogue as the loop assembles it: core first, declaration order, `compact_context` last. */
 export const fullCatalogue = (): readonly ModelTool[] => [...agentToolsFor(), COMPACT_CONTEXT_TOOL];
 
+/** The shipped edit tool, and the one place its name is written down in this rig. */
+export const INCUMBENT_EDIT_TOOL = 'file_patch';
+
+/**
+ * The edit axis, applied to a tool set: the candidate entry in the incumbent's place.
+ *
+ * In its place, not appended. Two edit tools is two ways to do one thing, which athanor does not
+ * ship and which would also destroy the measurement - a model given both would spread its edits
+ * across them and every row would be a blend of the two dialects wearing one arm's name.
+ *
+ * `CANDIDATE_ENTRY` is imported from `evals/edit/report.ts` rather than written here, and that file
+ * builds it from `EDIT_FORMAT_SPEC` in `apps/worker/src/edit/prompt.ts`. So the schema this arm
+ * puts on the wire is the schema the other rig priced at +1,306 bytes net, and the two rigs cannot
+ * drift into disagreeing about the size of the same thing. `selftest.ts` checks the arithmetic
+ * against that rig rather than trusting this sentence.
+ *
+ * The throw is the point. An arm that quietly kept `file_patch` because the name had moved would
+ * be the shipped arm under a second name, and it would print a perfect tie - which reads as "the
+ * dialect is free" and is the exact conclusion the run exists to test rather than assume.
+ */
+export const withEditDialect = (
+  tools: readonly ModelTool[],
+  settings: ArmSettings
+): readonly ModelTool[] => {
+  if (settings.edit === 'patch') return tools;
+  if (!tools.some((tool) => tool.name === INCUMBENT_EDIT_TOOL))
+    throw new Error(
+      `the edit axis replaces "${INCUMBENT_EDIT_TOOL}" and this arm does not send it, so the arm would differ from its parent by nothing and its row would read as a tie`
+    );
+  return tools.map((tool) => (tool.name === INCUMBENT_EDIT_TOOL ? CANDIDATE_ENTRY : tool));
+};
+
 export const toolsFor = (settings: ArmSettings): readonly ModelTool[] => {
   const all = fullCatalogue();
-  if (settings.tools === 'full') return all;
+  if (settings.tools === 'full') return withEditDialect(all, settings);
   const wanted = new Set(
     settings.tools === 'core' ? [...coreToolNamesFromSource(), 'compact_context'] : FLOOR_TOOL_NAMES
   );
@@ -44,7 +77,7 @@ export const toolsFor = (settings: ArmSettings): readonly ModelTool[] => {
     throw new Error(
       `arm wants tools athanor does not define: ${missing.join(', ')}. A filter that silently drops a name it cannot find measures a smaller arm than the one it claims to.`
     );
-  return chosen;
+  return withEditDialect(chosen, settings);
 };
 
 /**

@@ -1,0 +1,7 @@
+{
+  // The emitting view of this package. tsconfig.json is what the editor and `pnpm typecheck` read
+  // and it still covers the tests; this one drops them so they are never compiled into dist. The
+  // reasoning, and why the two configurations must stay separate, is in tsconfig.base.json.
+  "extends": "./tsconfig.json",
+  "exclude": ["src/**/*.test.ts"]
+}

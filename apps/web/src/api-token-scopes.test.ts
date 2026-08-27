@@ -27,6 +27,9 @@ describe('the scopes an owner can actually grant', () => {
   });
 
   it('never labels a scope with its own enum value', () => {
+    // A copy table that lost its entries would satisfy every expectation below by never reaching
+    // one, and the form would render a scope list with no words in it.
+    expect(apiTokenScopeCopy.length).toBeGreaterThan(0);
     for (const item of apiTokenScopeCopy) {
       expect(item.label, item.scope).not.toContain(':');
       expect(item.label.length, item.scope).toBeGreaterThan(3);

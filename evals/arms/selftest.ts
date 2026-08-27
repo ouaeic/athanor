@@ -23,26 +23,41 @@
  * gives: `evals/` is not a workspace package, so nothing here is collected by `pnpm -r test`. It
  * exits non-zero on the first run that finds anything.
  */
+import { fileTag } from '../../apps/worker/src/edit/format.js';
 import { BASE_SYSTEM_PROMPT } from '../../apps/worker/src/context.js';
+import { TASKS as CORPUS, fileText, type EditTask } from '../edit/corpus.js';
+import { encodeLines, encodeReplace } from '../edit/encode.js';
+import { incumbentEntryCost, residentCost } from '../edit/report.js';
 import {
   ARMS,
+  EDIT_ARM,
   FLOOR_TOOL_NAMES,
   ROOT_ARM,
   coreToolNamesFromSource,
   settingsFor,
   type Arm
 } from './arms.js';
+import {
+  EDIT_TASKS,
+  EXCLUDED_CORPUS_IDS,
+  EditWorld,
+  runEditOne,
+  scoreEdit,
+  type EditArmTask
+} from './edit-arm.js';
 import { MAX_STEPS, resolveKey, runOne, type RunRow } from './live.js';
 import { measureArm } from './measure.js';
-import { scoreArms } from './report.js';
+import { scoreArms, scoreEditArms } from './report.js';
 import { TASKS, sampleOf, type ArmTask } from './tasks.js';
 import {
+  INCUMBENT_EDIT_TOOL,
   METHOD_HEADING,
   contractFor,
   danglingToolMentions,
   fullCatalogue,
   methodAxis,
-  toolsFor
+  toolsFor,
+  withEditDialect
 } from './wire.js';
 import { answer, resetWorld } from './world.js';
 
@@ -502,10 +517,230 @@ expect(
   'asking for more than there is returns everything'
 );
 
+/* ----------------------------------------------------------------------------- the edit axis */
+
+/*
+ * The arm whose whole answer is in the half that costs money, checked in the half that does not.
+ *
+ * Everything here is a way of being wrong that would still print a table. An arm that quietly kept
+ * `file_patch` prints a tie; a world whose appliers cannot land a correct edit prints zero for both
+ * arms and reads as "models cannot do this"; a sample whose intended text is the text it started
+ * with passes without an edit ever being made, which is precisely the defect Wave S4 spent its
+ * other half deleting from this repository's test suite. So: both dialects are driven through the
+ * real appliers on every row, by a scripted model that gets them right, and the row must come out
+ * byte-correct. If it does not, the instrument is broken and no live run should be bought.
+ */
+
+expect(
+  settingsFor(EDIT_ARM).edit === 'lines' &&
+    settingsFor(EDIT_ARM).tools === 'full' &&
+    settingsFor(EDIT_ARM).skills === 'index' &&
+    settingsFor(EDIT_ARM).contract === 'full',
+  'the edit arm must differ from shipped by the edit tool and nothing else'
+);
+
+const editTools = toolsFor(settingsFor(EDIT_ARM));
+expect(
+  editTools.some((tool) => tool.name === 'file_edit') &&
+    !editTools.some((tool) => tool.name === INCUMBENT_EDIT_TOOL),
+  'the edit arm must hold the candidate INSTEAD of file_patch: two edit tools is two ways to do one thing and every row would be a blend of both dialects'
+);
+expect(
+  editTools.length === toolsFor(settingsFor(ROOT_ARM)).length,
+  'a replacement changes no tool count; a count that moved means an entry was dropped rather than swapped'
+);
+/*
+ * The swap is a replacement, so it has to find the thing it replaces. Every arm today sends
+ * `file_patch` - it is in the core set and in the hand-written floor - so the way this guard is
+ * actually reached is a rename in `tool-catalogue.ts`, and the failure it prevents is silent: the
+ * arm would send the shipped catalogue under a second name and print a perfect tie.
+ */
+throws(
+  () =>
+    withEditDialect(
+      fullCatalogue().filter((tool) => tool.name !== INCUMBENT_EDIT_TOOL),
+      settingsFor(EDIT_ARM)
+    ),
+  'the edit axis must throw when there is no file_patch to replace: an arm that silently kept the shipped catalogue would print a tie, which reads as "the dialect is free"'
+);
+expect(
+  fullCatalogue().some((tool) => tool.name === INCUMBENT_EDIT_TOOL),
+  `athanor no longer ships a tool called ${INCUMBENT_EDIT_TOOL}; the edit axis is measuring a replacement for something that is not there`
+);
+
+/*
+ * Cross-rig arithmetic. `evals/edit` priced this swap at +1,306 bytes net and this arm has to be
+ * carrying that same swap, or one of the two numbers in front of the owner is about a catalogue
+ * nobody is proposing.
+ */
+const shippedCatalogue = measureArm(ROOT_ARM).catalogueBytes;
+const editCatalogue = measureArm(EDIT_ARM).catalogueBytes;
+expect(
+  editCatalogue - shippedCatalogue === residentCost() - incumbentEntryCost(),
+  `the arm swaps the catalogue by ${editCatalogue - shippedCatalogue} bytes and evals/edit prices the same swap at ${residentCost() - incumbentEntryCost()}; two rigs disagreeing about the size of one thing is two rigs one of which is wrong`
+);
+
+/* The sample: real edits, no dialect in the request, and nothing that passes without an edit. */
+expect(
+  EDIT_TASKS.length > 10,
+  `the edit sample is ${EDIT_TASKS.length} rows; the corpus has fifteen`
+);
+expect(
+  EXCLUDED_CORPUS_IDS.length === 3,
+  `${EXCLUDED_CORPUS_IDS.length} corpus rows excluded; the drift and refusal rows are three`
+);
+for (const task of EDIT_TASKS) {
+  expect(
+    task.wanted !== fileText(task.path) || task.renamedTo !== undefined,
+    `${task.corpusId}: the text a correct edit produces is the text it started with, so the row would score correct with no edit made at all`
+  );
+  expect(
+    !/\bPUT \b|\bCUT \b|oldText|newText/.test(task.request),
+    `${task.corpusId}: the request contains a dialect, so the sample is teaching one of the two arms its own answer`
+  );
+}
+
+/*
+ * A model that gets it right, on every row, through both dialects and the shipped appliers.
+ *
+ * The encodings come from `evals/edit/encode.ts` - the same derivation that produced the 61% - so
+ * this is the upper bound the arm exists to test, executed rather than asserted. Any row that does
+ * not land here is a row where a live number would be measuring this rig rather than the model.
+ */
+let landed = 0;
+for (const task of EDIT_TASKS) {
+  const corpus = CORPUS.find((one) => one.id === task.corpusId);
+  if (!corpus) {
+    failures.push(`${task.corpusId}: no longer in the corpus this sample is derived from`);
+    continue;
+  }
+  const read = fileText(corpus.path);
+
+  const incumbent = new EditWorld(false);
+  incumbent.answer('file_read', { path: corpus.path });
+  const replaceCall = encodeReplace(corpus, read);
+  if (replaceCall.tool === 'shell') incumbent.answer('shell', { ...replaceCall.args });
+  else if (replaceCall.tool === 'file_patch')
+    incumbent.answer('file_patch', { patches: replaceCall.args.patches });
+  expect(
+    scoreEdit(incumbent, task).correct,
+    `${task.corpusId}: file_patch, given the best encoding of this edit, does not leave the file as the task asked - this world is scoring the rig, not the model`
+  );
+
+  const candidate = new EditWorld(true);
+  const rendered = candidate.answer('file_read', { path: corpus.path }).content;
+  const tag = /#([0-9a-f]{4})\]/.exec(rendered)?.[1] ?? '';
+  expect(
+    tag !== '',
+    `${task.corpusId}: the numbered read carries no tag, so the dialect cannot address it`
+  );
+  candidate.answer('file_edit', encodeLines(corpus, tag).args);
+  expect(
+    scoreEdit(candidate, task).correct,
+    `${task.corpusId}: the by-line encoding of this edit does not leave the file as the task asked`
+  );
+  if (scoreEdit(candidate, task).correct && scoreEdit(incumbent, task).correct) landed += 1;
+}
+expect(
+  landed === EDIT_TASKS.length,
+  `${landed} of ${EDIT_TASKS.length} rows land through both dialects; a rig that cannot land its own sample cannot measure a model against it`
+);
+
+/* A read the model never did. The tag is the format's whole safety story and it must fail closed. */
+const fabricated = new EditWorld(true);
+fabricated.answer('file_edit', { patch: '[src/queue.ts#0000]\nPUT 11:\n+    return undefined;' });
+expect(
+  fabricated.editCalls === 1 &&
+    fabricated.editApplied === 0 &&
+    fabricated.refusals[0]?.kind === 'tag_unknown',
+  'an edit against a tag this harness never issued must be refused and counted as a refused call, or the applied column is a fiction'
+);
+expect(
+  !scoreEdit(fabricated, EDIT_TASKS[1] as EditArmTask).correct,
+  'a refused edit must not score correct'
+);
+
+/* And a quote that is not unique, which is the incumbent's own failure mode. */
+const ambiguous = new EditWorld(false);
+ambiguous.answer('file_patch', {
+  patches: [
+    { path: 'src/queue.ts', oldText: '    return null;\n', newText: '    return undefined;\n' }
+  ]
+});
+expect(
+  ambiguous.editApplied === 0 && ambiguous.refusals[0]?.kind === 'no_unique_match',
+  'a quote that appears six times must be refused by the incumbent here exactly as workspace.ts refuses it'
+);
+
+/*
+ * The edit loop end to end, against the same stubbed provider, because `runEditOne` is as
+ * unreachable on this machine as `runOne` is and rots the same way.
+ */
+const editTask = EDIT_TASKS.find((task) => task.corpusId === 'repeated-statement') as EditArmTask;
+const editCorpus = CORPUS.find((one) => one.id === 'repeated-statement') as EditTask;
+const editScript: Array<() => Response> = [
+  () =>
+    reply(
+      [
+        {
+          id: 'e1',
+          function: { name: 'file_read', arguments: JSON.stringify({ path: editCorpus.path }) }
+        }
+      ],
+      null,
+      { prompt_tokens: 9000, completion_tokens: 20 }
+    ),
+  () =>
+    reply(
+      [
+        {
+          id: 'e2',
+          function: {
+            name: 'file_edit',
+            arguments: JSON.stringify(
+              encodeLines(editCorpus, fileTag(fileText(editCorpus.path))).args
+            )
+          }
+        }
+      ],
+      null,
+      { prompt_tokens: 9400, completion_tokens: 30 }
+    ),
+  () =>
+    reply([{ id: 'e3', function: { name: 'finish', arguments: '{}' } }], 'Done.', {
+      prompt_tokens: 9600,
+      completion_tokens: 10
+    })
+];
+let editSent = 0;
+globalThis.fetch = (async () => {
+  const next = editScript[editSent];
+  editSent += 1;
+  if (!next) throw new Error('the edit loop asked for more replies than the script has');
+  return next();
+}) as typeof fetch;
+
+const editRow = await runEditOne('sk-test', 'stub', EDIT_ARM, editTask, 0);
+globalThis.fetch = realFetch;
+expect(
+  editRow.completed && editRow.correct && editRow.editCalls === 1 && editRow.editApplied === 1,
+  `the edit loop must run a correct row end to end: completed=${editRow.completed} correct=${editRow.correct} calls=${editRow.editCalls} applied=${editRow.editApplied}`
+);
+expect(
+  editRow.tokensOut === 60 && editRow.modelCalls === 3,
+  `the edit row must carry the provider own usage: ${editRow.tokensOut} out over ${editRow.modelCalls} calls`
+);
+
+const editScores = scoreEditArms([editRow]);
+expect(
+  editScores.length === 1 && editScores[0]?.correct === 1 && editScores[0]?.editApplied === 1,
+  'the edit table must score a correct row as correct, with output tokens on the same row'
+);
+
 if (failures.length) {
   for (const failure of failures) process.stderr.write(`FAIL ${failure}\n`);
   process.exit(1);
 }
 process.stdout.write(
-  'arms selftest: the one-difference rule, the core set read from source, both halves of the contract surgery, the ghost and unmetered exclusions, the recovered column, the key arms, the live loop against a stubbed provider, the oracle substitutability and the sample behave as documented.\n'
+  'arms selftest: the one-difference rule, the core set read from source, both halves of the contract surgery, the ghost and unmetered exclusions, the recovered column, the key arms, the live loop against a stubbed provider, the oracle substitutability, the sample, and the edit axis - its wire, its arithmetic against evals/edit, both dialects landing every row of its sample through the shipped appliers, both failure modes failing closed, and its own live loop - behave as documented.\n'
 );

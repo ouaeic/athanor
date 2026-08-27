@@ -32,7 +32,16 @@
  */
 import { readFileSync } from 'node:fs';
 
-/** The three axes an arm may move. Adding a fourth is adding an experiment, not a setting. */
+/**
+ * The axes an arm may move. Adding one is adding an experiment, not a setting.
+ *
+ * There were three, and the fourth was added deliberately and with a ruling behind it. `edit` is
+ * the gate `docs/design/exec3/L2.md` named before it held a measured format back: an edit dialect
+ * that is 61% cheaper in output characters, for a model that spells it correctly every time, and
+ * no evidence at all about whether one does. That question cannot be asked by the three axes above
+ * and it cannot be asked offline, so it is an axis, and it is the only one whose whole answer is
+ * in the live half.
+ */
 export interface ArmSettings {
   /** Which slice of athanor's own catalogue reaches the wire. */
   readonly tools: 'full' | 'core' | 'floor';
@@ -49,6 +58,14 @@ export interface ArmSettings {
    * candidate is submitted for judgement.
    */
   readonly contract: 'full' | 'environment-only';
+  /**
+   * Which edit tool the arm holds: the shipped `file_patch`, or the line-addressed candidate in
+   * `apps/worker/src/edit/`, which is implemented, measured, and on nothing.
+   *
+   * A replacement and never an addition. Shipping both would be two ways to do one thing, and a
+   * model given two would spread its edits across them and make every number here unreadable.
+   */
+  readonly edit: 'patch' | 'lines';
 }
 
 export interface Arm {
@@ -69,6 +86,15 @@ export interface Arm {
 }
 
 export const ROOT_ARM = 'shipped';
+
+/**
+ * The arm on the edit axis, named once so nothing has to spell it.
+ *
+ * It is excluded from the general live run and included in the offline table, which is not an
+ * inconsistency: its residency is knowable for nothing and is worth printing beside every other
+ * arm's, and its outcome is only readable on a sample that edits files.
+ */
+export const EDIT_ARM = 'line-edit';
 
 export const ARMS: readonly Arm[] = [
   {
@@ -103,6 +129,14 @@ export const ARMS: readonly Arm[] = [
       'Ships nothing on its own. It is a research arm: it gives the slope of the tool axis, and it is the only result that would justify reopening the question of how tools reach the model at all.'
   },
   {
+    id: 'line-edit',
+    asks: 'Does a model emit the line-addressed edit dialect correctly, which is the only thing the measured 61% depends on?',
+    inherits: ROOT_ARM,
+    change: { edit: 'lines' },
+    ships:
+      'Ships as a REPLACEMENT for file_patch if edit-success is within one task of the shipped arm on the same sample and on BOTH tiers, and no more than one edit call in twenty is refused for a dialect error the model does not then recover from. Nothing ships on the 61%: that figure is an offline upper bound available only to a model that gets the spelling right every time, and a dialect the model has to learn is not paid for in output characters. A loss here is the cheapest possible way to have learned that the 61% was never available.'
+  },
+  {
     id: 'floor',
     asks: 'CALIBRATION, not a proposal: with five tools, does the axis show any signal at all?',
     inherits: 'core',
@@ -130,12 +164,21 @@ export const PRE_REGISTRATION = [
   '  4. Rows the provider did not meter are excluded from the token means for the same reason and',
   '     counted the same way. Token figures come from the provider’s own usage or from nowhere.',
   '  5. Every arm that dies is published, in the shape `tool-catalogue.test.ts` already uses for a',
-  '     declined tool: what it cost, what it bought, and which of the two reasons actually decided.'
+  '     declined tool: what it cost, what it bought, and which of the two reasons actually decided.',
+  '  6. The edit axis is read on its own sample and its own table (--edit), because a task that does',
+  '     not edit a file cannot tell the two dialects apart and would print a tie. Edit-success there',
+  '     is the file afterwards, never the tool own word for what it did, and it is printed beside',
+  '     output tokens on the same row: a dialect that is cheaper and less often right is not a saving.'
 ].join('\n');
 
 /* ------------------------------------------------------------------ resolution, enforced in code */
 
-const SHIPPED: ArmSettings = { tools: 'full', skills: 'index', contract: 'full' };
+const SHIPPED: ArmSettings = {
+  tools: 'full',
+  skills: 'index',
+  contract: 'full',
+  edit: 'patch'
+};
 
 /**
  * An arm's settings, composed by walking to the root.

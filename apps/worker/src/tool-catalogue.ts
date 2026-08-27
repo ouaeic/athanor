@@ -1,4 +1,5 @@
 import type { ModelTool } from '@athanor/model-gateway';
+import { surfaceDescribable, UNKNOWN_SURFACES, type WorkspaceSurfaces } from '@athanor/contracts';
 import {
   connectorActions,
   MEMORY_RECALL_ITEM_CEILING,
@@ -465,8 +466,30 @@ export const agentTools: ModelTool[] = [
   },
   {
     name: 'file_patch',
+    /**
+     * The fourth patch shape, and the only one that does not make the model type its own result.
+     *
+     * Moving a block was the most expensive thing this tool did, by a wide margin and for a reason
+     * that is a capability limit rather than an encoding one: a replacement can only ever delete
+     * text and paste text, so a move had to emit the moved lines TWICE - once as `oldText` to cut
+     * them and once inside a second patch's `newText` to put them back - plus a unique anchor at
+     * each end. Measured on `evals/edit`'s `move-function`, eleven lines moved above the function
+     * that uses them: 777 characters of JSON arguments. With `moveAfter` the same edit is one
+     * patch and 397, because the lines cross the wire once. Three more move shapes on the same
+     * file measure 358, 350 and 308.
+     *
+     * That is 49% and not the 93% the line-addressed dialect scored on this row, and the
+     * difference is the whole reason this is here and that dialect is not: the saving there came
+     * from addressing the block by number, which needs a whole-file tag, a numbered read and a
+     * seen-lines ledger before it is safe. This needs none of them. `oldText` is still the
+     * evidence, still matched exactly once, and still fails closed with the same explanation - so
+     * a move is the shape file_patch already had, minus one copy of the text.
+     *
+     * The saving grows with the block. A 200-line function is a move a model may simply be unable
+     * to afford today, because two copies of it plus context has to fit in one generation.
+     */
     description:
-      'Apply precise, conflict-detecting text replacements to one or more files. Every oldText must occur exactly once in its file, so a stale edit fails instead of overwriting newer work. Patches that match are applied even when others in the same call do not; each failure comes back with the occurrence count, the nearest place it nearly matched, and the current text around it, so a retry usually needs no extra read.',
+      'Apply precise, conflict-detecting edits to one or more files. Every oldText must occur exactly once in its file, so a stale edit fails instead of overwriting newer work. Give a patch newText to replace that text, or moveAfter to move it elsewhere in the same file without typing it out a second time. Patches that match are applied even when others in the same call do not; each failure comes back with the occurrence count, the nearest place it nearly matched, and the current text around it, so a retry usually needs no extra read.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -479,11 +502,20 @@ export const agentTools: ModelTool[] = [
           items: {
             type: 'object',
             additionalProperties: false,
-            required: ['path', 'oldText', 'newText'],
+            // `newText` leaves the required set because a move does not carry one, and the arm
+            // refuses a patch that names neither rather than treating the omission as a deletion:
+            // an optional field whose absence silently empties a region is the one way this
+            // change could have cost the owner a file.
+            required: ['path', 'oldText'],
             properties: {
               path: { type: 'string' },
               oldText: { type: 'string' },
-              newText: { type: 'string' }
+              newText: { type: 'string' },
+              moveAfter: {
+                type: 'string',
+                description:
+                  'Move oldText unchanged to just after this text, which must itself occur exactly once in the file once oldText is cut out of it. Empty string moves it to the top.'
+              }
             }
           }
         }
@@ -1378,6 +1410,34 @@ export const specialistToolNames = new Set([
 ]);
 
 /**
+ * The two bags that describe a surface rather than a capability of the process, and are therefore
+ * the only two things in this file a box can be without.
+ *
+ * Every other tool here is answered by the runner itself - a filesystem, a shell, an HTTP client -
+ * and is on the wire on every box because it works on every box. These seven need a Chromium or an
+ * X server underneath them, and on a box with neither they were never callable: describing them was
+ * 11,692 bytes of a request telling the model about a computer it is not on, paid on every step of
+ * every task, at the head of the cached prefix where it is also the most expensive place to be.
+ *
+ * `print_pdf` is in the browser bag and it is worth saying why, because it is the one name here
+ * that does not begin with `browser_`: it keeps *what the browser is showing*. Without a browser it
+ * has no subject.
+ *
+ * `web_search` and `parallel_web_read` are deliberately NOT in it, though both can reach for a
+ * browser. `web_search` is answered by the provider on one of its two routes, so a box with no
+ * Chromium may still search; `parallel_web_read` is the specialist's, and the specialist wire is
+ * invariant by construction. Withdrawing either would withdraw a capability the box still has,
+ * which is the failure this whole gate is shaped to avoid.
+ */
+const BROWSER_SURFACE_TOOLS = new Set([
+  'browser_snapshot',
+  'read_elements',
+  'browser_action',
+  'print_pdf'
+]);
+const DESKTOP_SURFACE_TOOLS = new Set(['desktop_observe', 'desktop_launch', 'desktop_action']);
+
+/**
  * The catalogue for a task: all of the audience's tier, core set first.
  *
  * It used to be gated. Six keyword regexes over the last four user messages decided which of six
@@ -1409,11 +1469,24 @@ export const specialistToolNames = new Set([
  * Selecting here rather than filtering at the call site is not tidiness - it is what lets the tier
  * be a tested property of the wire instead of a literal buried in a six-hundred-line function.
  */
-export const agentToolsFor = (audience: ToolAudience = 'lead'): ModelTool[] => {
-  const tier =
+export const agentToolsFor = (
+  audience: ToolAudience = 'lead',
+  /**
+   * What the runner says this box has. Defaults to `unknown`, which describes everything: every
+   * call site that is a measurement, a test or a rig gets the whole catalogue without knowing this
+   * argument exists, and only a run that has actually asked the runner can withdraw anything.
+   */
+  surfaces: WorkspaceSurfaces = UNKNOWN_SURFACES
+): ModelTool[] => {
+  const audienceTier =
     audience === 'specialist'
       ? agentTools.filter((tool) => specialistToolNames.has(tool.name))
       : agentTools;
+  const tier = audienceTier.filter(
+    (tool) =>
+      (!BROWSER_SURFACE_TOOLS.has(tool.name) || surfaceDescribable(surfaces.browser)) &&
+      (!DESKTOP_SURFACE_TOOLS.has(tool.name) || surfaceDescribable(surfaces.desktop))
+  );
   return [
     ...tier.filter((tool) => coreToolNames.has(tool.name)),
     ...tier.filter((tool) => !coreToolNames.has(tool.name))

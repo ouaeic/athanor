@@ -8227,9 +8227,15 @@ describe('dormant rules on a real turn', () => {
 
   it('sends a request with no rule byte in it when nothing fired', async () => {
     const log = await turnWriting('workspace/quarterly.md');
+    // A turn that made no request has no bytes in it to be clean of, and the loops below would
+    // report that as a pass. The count is what the empty case has to answer for.
+    let read = 0;
     for (const request of log.modelRequests)
-      for (const message of messagesOf(request))
+      for (const message of messagesOf(request)) {
+        read += 1;
         expect(message.content).not.toContain('HARNESS CORRECTION');
+      }
+    expect(read).toBeGreaterThan(0);
   });
 });
 

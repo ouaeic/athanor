@@ -438,6 +438,9 @@ describe('memory retrieval eval', () => {
     // The probe set only measures ranking if the questions are paraphrases. A probe whose wording
     // is lifted from its own gold turn passes on any retrieval at all and reports nothing.
     const bodyOf = new Map(MEMORY_EVAL_SOURCES.map((source) => [source.ref, source.body]));
+    // A probe set with nothing in it measures nothing, and reports it as a pass.
+    expect(MEMORY_EVAL_SESSION_PROBES.length).toBeGreaterThan(0);
+    expect(bodyOf.size).toBeGreaterThan(0);
     for (const probe of MEMORY_EVAL_SESSION_PROBES) {
       expect(probe.gold.length, `${probe.id} has no gold turn`).toBeGreaterThan(0);
       for (const ref of probe.gold) {

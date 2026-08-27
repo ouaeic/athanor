@@ -77,6 +77,8 @@ describe('the document toolchain is declared where the drill can assert it', () 
   });
 
   it('routes every Python capability through the one pinned interpreter', () => {
+    // An empty declaration list routes nothing anywhere and passes this in no time at all.
+    expect(DOCUMENT_TOOLCHAIN.length).toBeGreaterThan(0);
     for (const capability of DOCUMENT_TOOLCHAIN)
       if (capability.pythonModules.length) expect(capability.binaries).toContain(ATHANOR_PYTHON);
   });
@@ -392,6 +394,10 @@ describe('documents this computer produces, measured', () => {
   });
 
   it('proves each measurement can fail, wherever the job ran', () => {
+    // The jobs, not the passes: a box without the toolchain legitimately skips its way past the
+    // body below, but a report with no jobs in it at all is a proof run that did not happen, and
+    // that must not read the same as one where every measurement demonstrated its own failure.
+    expect(report.jobs.length).toBeGreaterThan(0);
     for (const job of report.jobs) {
       if (job.status !== 'passed') continue;
       if (!['cv', 'deck', 'workbook'].includes(job.id)) continue;
@@ -405,6 +411,7 @@ describe('documents this computer produces, measured', () => {
   });
 
   it('names what it could not exercise instead of implying it did', () => {
+    expect(report.jobs.length).toBeGreaterThan(0);
     for (const job of report.jobs) {
       if (job.status === 'skipped') expect(job.missing?.length).toBeGreaterThan(0);
       if (job.status === 'passed') expect(Array.isArray(job.notExercised)).toBe(true);

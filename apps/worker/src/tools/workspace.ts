@@ -158,13 +158,10 @@ export async function executeWorkspaceTool(
         : [];
       if (!patches.length || patches.length > 40)
         throw new AthanorError('patch_invalid', 'Provide between 1 and 40 patches');
-      const prepared: Array<{
-        path: string;
-        before: string;
-        after: string;
-        oldText: string;
-        newText: string;
-      }> = [];
+      // Only ever counted - per path for `replacements`, and in total for `patchCount`. It used to
+      // carry the before, after, oldText and newText of every patch as well, none of which anything
+      // read, on a path that already holds two copies of every file it touches.
+      const prepared: string[] = [];
       const latestByPath = new Map<string, string>();
       /*
        * The runner's own hash of what was read, kept so the write can claim it.
@@ -183,10 +180,41 @@ export async function executeWorkspaceTool(
         const path = textValue(patch.path);
         const oldText = textValue(patch.oldText);
         const newText = textValue(patch.newText);
+        /*
+         * A move, which is a patch that says where its text goes instead of what replaces it.
+         *
+         * Presence and not emptiness decides, because the empty string is a real destination here -
+         * the top of the file, which is the one place no quotable anchor precedes. Read off the raw
+         * argument rather than through `textValue`, whose whole job is to turn an absent field into
+         * `''`, which is exactly the value that has to mean something else.
+         */
+        const moving = patch.moveAfter !== undefined && patch.moveAfter !== null;
+        const replacing = patch.newText !== undefined && patch.newText !== null;
         if (!path || !oldText)
           throw new AthanorError(
             'patch_invalid',
             'Every patch requires a path and non-empty oldText'
+          );
+        if (moving && replacing)
+          throw new AthanorError(
+            'patch_invalid',
+            'A patch carries newText or moveAfter, never both. Move the text in one patch and rewrite it in another.'
+          );
+        /*
+         * The hazard `newText` leaving the required set opened, closed here rather than in the
+         * schema, which cannot express "one of these two".
+         *
+         * Before the move shape, a patch with no `newText` deleted `oldText` - `textValue` turned
+         * the missing field into `''` and the replace emptied the region. That was safe only
+         * because the schema demanded the field, so an omission was a malformed call the provider
+         * would not send. With the field optional, the same omission is a plausible slip on a move
+         * whose `moveAfter` did not survive generation, and it would silently destroy exactly the
+         * block the model was trying to keep. An explicit `newText: ''` still deletes.
+         */
+        if (!moving && !replacing)
+          throw new AthanorError(
+            'patch_invalid',
+            'Every patch requires newText to replace oldText, an empty newText to delete it, or moveAfter to move it'
           );
         let before = latestByPath.get(path);
         if (before === undefined) {
@@ -207,9 +235,51 @@ export async function executeWorkspaceTool(
           failures.push(patchFailure(path, before, oldText));
           continue;
         }
+        /*
+         * The replacement - and, for a move, the cut it begins with.
+         *
+         * A move carries no `newText`, so `textValue` has already made it the empty string and
+         * this line removes `oldText` and leaves exactly the hole the paste below fills. That is
+         * why the move is an operation on this tool and not an applier beside it: the delete half
+         * of a move IS the replacement this tool already did, and one line serves both shapes.
+         *
+         * `evals/edit/encode.ts` reads this line, character for character, out of this file, and
+         * refuses to print a number if it is no longer here - so the rig cannot go on measuring a
+         * program that stopped existing. Keeping the move inside it keeps that pin honest too.
+         */
         const after = before.replace(oldText, newText);
-        prepared.push({ path, before, after, oldText, newText });
-        latestByPath.set(path, after);
+        let pasted: string | undefined;
+        if (moving) {
+          const moveAfter = textValue(patch.moveAfter);
+          /*
+           * The anchor is looked for in the file with the block ALREADY CUT OUT, and that is the
+           * load-bearing decision of the whole operation.
+           *
+           * Counted against the original text instead, a move whose anchor sits inside the block
+           * being moved reads as unique, and the paste then lands inside text that is no longer
+           * there - which is either a corrupt file or a crash, depending on where the anchor fell.
+           * Counting after the cut makes that case zero occurrences and a refusal the model can
+           * read. It also gives "move this to just after itself" the only honest answer.
+           */
+          if (moveAfter && countOccurrences(after, moveAfter) !== 1) {
+            /*
+             * The near-match search is worth every byte here and is not worth a second copy, so
+             * the evidence comes from `patchFailure` and only the sentence is rewritten: its own
+             * wording names `oldText`, which in this failure is the one thing that DID match.
+             */
+            const found = patchFailure(path, after, moveAfter);
+            failures.push({
+              ...found,
+              reason: found.occurrences
+                ? `moveAfter appears ${found.occurrences} times in ${path} once oldText is cut out of it, so there is nowhere unambiguous to put it. Extend moveAfter with enough surrounding lines to make it unique.`
+                : `moveAfter is not in ${path} once oldText is cut out of it, so there is nowhere to put it. Quote it exactly as the file reads now - or send an empty moveAfter to move the text to the top of the file. It cannot be text inside the block being moved.`
+            });
+            continue;
+          }
+          pasted = moveAfter ? after.replace(moveAfter, moveAfter + oldText) : oldText + after;
+        }
+        prepared.push(path);
+        latestByPath.set(path, pasted ?? after);
       }
       if (!prepared.length)
         throw new AthanorError(
@@ -254,7 +324,7 @@ export async function executeWorkspaceTool(
         filesChanged: changed.map(([path, content]) => ({
           path,
           sha256: sha256(content),
-          replacements: prepared.filter((patch) => patch.path === path).length
+          replacements: prepared.filter((patched) => patched === path).length
         })),
         patchCount: prepared.length,
         ...(failures.length

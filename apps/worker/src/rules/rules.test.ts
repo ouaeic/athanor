@@ -65,6 +65,9 @@ describe('dormant rules cost nothing until they fire', () => {
 
   it('puts no rule text into the operating contract or the tool catalogue', () => {
     const wire = `${BASE_SYSTEM_PROMPT}${JSON.stringify(agentToolsFor())}`;
+    // With no dormant rules there is nothing to be absent from the wire, and the whole claim of
+    // this file - that a rule costs nothing until it fires - would be made by an empty loop.
+    expect(DORMANT_RULES.length).toBeGreaterThan(0);
     for (const dormant of DORMANT_RULES) {
       expect(wire).not.toContain(dormant.correction);
       expect(wire).not.toContain(RULE_CORRECTION_MARKER);

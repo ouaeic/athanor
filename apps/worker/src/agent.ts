@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   MAX_AGENT_NOTIFICATIONS_PER_TASK,
+  UNKNOWN_SURFACES,
+  WorkspaceSurfaces,
   type ModelRelease,
   type SpendDecision,
   type TaskPlanStep,
@@ -293,7 +295,8 @@ export class AgentWorker {
       masterKey: this.#masterKey,
       gateway: (task, model) => this.#gateway(task, model),
       startedBySchedule: (task, key) => this.#startedBySchedule(task, key),
-      toolchainSummary: (task) => this.#toolchainSummary(task)
+      toolchainSummary: (task) => this.#toolchainSummary(task),
+      workspaceSurfaces: (task) => this.#workspaceSurfaces(task)
     };
     this.#stepBounds = {
       store,
@@ -1288,6 +1291,35 @@ export class AgentWorker {
       }>(task.workspaceId, task.id, 'exec', `/v1/workspaces/${task.workspaceId}/toolchain`)
       .catch(() => null);
     return textValue(report?.summary).trim();
+  }
+
+  /**
+   * Whether this computer has a browser and a screen, in the runner's own words.
+   *
+   * Read once at the start of a run and frozen onto `TurnRun` beside `toolchainSummary`, for the
+   * same reason and by the same route: it is a property of the machine rather than of the step,
+   * and the catalogue it decides is the head of the cached prefix, so an answer that could change
+   * between steps would move every byte behind it.
+   *
+   * Every way of not getting an answer lands on `UNKNOWN_SURFACES`, and unknown describes
+   * everything. An unreachable runner, a timeout, an older runner with no such route, a body that
+   * is not the shape the contract declares - all of them mean the same thing here, which is "this
+   * side does not know", and the only safe reading of that is the full catalogue. The two ways of
+   * being wrong are not the same size: describing a surface the box lacks costs bytes and one
+   * honest failure the model can read, while withdrawing a surface the box has hides a capability
+   * the owner paid for and leaves nothing behind to say it existed.
+   */
+  async #workspaceSurfaces(task: TaskRecord): Promise<WorkspaceSurfaces> {
+    const report = await this.#runner
+      .call<unknown>(
+        task.workspaceId,
+        task.id,
+        'exec',
+        `/v1/workspaces/${task.workspaceId}/surfaces`
+      )
+      .catch(() => null);
+    const parsed = WorkspaceSurfaces.safeParse(report);
+    return parsed.success ? parsed.data : UNKNOWN_SURFACES;
   }
 
   /** Which of a skill's declared binaries this workspace does not have, probed through the runner. */

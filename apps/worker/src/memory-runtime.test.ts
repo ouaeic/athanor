@@ -721,8 +721,12 @@ describe('verbatim chunking', () => {
   });
 
   it('never emits a chunk over the byte cap, including multi-byte text', () => {
-    for (const chunk of chunkMemoryBody('é'.repeat(400), 100))
-      expect(Buffer.byteLength(chunk, 'utf8')).toBeLessThanOrEqual(100);
+    // 400 two-byte characters at a 100-byte cap is several chunks. A chunker that returned nothing
+    // would satisfy the loop below without having capped anything, which is the failure that
+    // matters here: the cap exists because a chunk over it is rejected by the store.
+    const chunks = chunkMemoryBody('é'.repeat(400), 100);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) expect(Buffer.byteLength(chunk, 'utf8')).toBeLessThanOrEqual(100);
   });
 
   it('produces nothing for empty input', () => {

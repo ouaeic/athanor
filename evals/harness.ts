@@ -972,6 +972,23 @@ const runnerResponse = (
       missing: [],
       summary: `Available on this computer: ${TOOLCHAIN_CAPABILITIES.join(', ')}.`
     });
+  /*
+   * Whether this box has a browser and a screen, which is what decides whether seven tool schemas
+   * are described to the model at all.
+   *
+   * `available` on both, because that is the box this harness models: it answers `/browser/*` and
+   * `/desktop/*` for any fixture that stubs a page or a set of nodes, and the toolchain route above
+   * already reports a fully provisioned machine for the same reason. Anything else here would price
+   * a computer this rig does not simulate.
+   *
+   * It is here because it was not, and the whole suite went red the moment the loop started asking:
+   * the fall-through below refuses any fixture that reaches an unmodelled route, so all 67 fixtures
+   * failed with "this run measured a 404" while a wave reported the catalogue gate complete without
+   * running this rig. The 404 also fell back to `unknown`, which describes everything - so the rig
+   * was measuring the whole catalogue and calling it a gated one, which is the exact failure the
+   * gate itself was built to avoid, one layer out.
+   */
+  if (url.endsWith('/surfaces')) return json({ browser: 'available', desktop: 'available' });
   // Which of a procedure's declared binaries this box does not have. The everything-is-installed
   // answer is the default because that is what the installer leaves behind, but it is now an answer
   // rather than the absence of one: the branch that warns a model off a procedure it cannot run was

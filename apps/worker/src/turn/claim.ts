@@ -14,7 +14,12 @@
  * object that mixed them would make the read-only half look editable.
  */
 import { decryptJson, unwrapDataKey } from '@athanor/core';
-import { resolveWebToolPlan, type ModelRelease, type WebToolPlan } from '@athanor/contracts';
+import {
+  resolveWebToolPlan,
+  type ModelRelease,
+  type WebToolPlan,
+  type WorkspaceSurfaces
+} from '@athanor/contracts';
 import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import type { ModelGateway, ModelTool } from '@athanor/model-gateway';
 import type { AgentState, AgentWorkerConfig } from '../agent-state.js';
@@ -36,6 +41,8 @@ export interface TurnClaimDeps {
   }>;
   startedBySchedule(task: TaskRecord, key: Uint8Array): Promise<boolean>;
   toolchainSummary(task: TaskRecord): Promise<string>;
+  /** Whether this box has a browser and a screen. Never rejects; not knowing is `unknown`. */
+  workspaceSurfaces(task: TaskRecord): Promise<WorkspaceSurfaces>;
 }
 
 /** What the turn is, once it has been claimed. Every field is fixed for the life of the run. */
@@ -57,6 +64,15 @@ export interface TurnRun {
   readonly requestTools: ModelTool[];
   readonly reservedTokens: number;
   readonly toolchainSummary: string;
+  /**
+   * The surfaces this box has, frozen for the run.
+   *
+   * Carried on the run rather than re-probed, because the request is re-derived from it: the send
+   * path in `turn/generate.ts` rebuilds `agentToolsFor` from the same two facts this used, and
+   * `requestDerivationBreach` fails the turn if the two arrays differ. One field read twice is what
+   * makes that comparison meaningful; two probes would make it a race.
+   */
+  readonly surfaces: WorkspaceSurfaces;
 }
 
 export const claimTurn = async (
@@ -147,7 +163,29 @@ export const claimTurn = async (
   // computer can do. Nothing withdraws a tool after this line, so it is built once here rather
   // than rebuilt every step - and the closing handoff below can be handed the same array, instead
   // of a shorter one that would move the front of the prompt on the largest request of the turn.
-  const requestTools = [...agentToolsFor(), COMPACT_CONTEXT_TOOL].filter(
+  /**
+   * Surfaces this box does not have are not described either, and this is the larger half by an
+   * order of magnitude.
+   *
+   * The withdrawal above is about what the *owner* has connected. This is about what the *machine*
+   * has underneath it, which nothing on this side of the wire could answer until the runner grew a
+   * probe for it. A runner with no Chromium and no X session cannot honour `browser_action`,
+   * `browser_snapshot`, `read_elements`, `print_pdf`, `desktop_observe`, `desktop_launch` or
+   * `desktop_action` under any circumstances, and describing all seven anyway cost this request
+   * 11,692 bytes of the model's map of a computer it is not on - on every step of every task, at
+   * the head of the cached prefix.
+   *
+   * Withdrawn through `agentToolsFor` rather than added to `withdrawnTools`, and the distinction is
+   * load-bearing: `withdrawnTools` is subtraction from the catalogue this run is entitled to send,
+   * and the derivation check re-derives that entitlement from the same call. A surface the box does
+   * not have is not something withdrawn from the catalogue - it is not in the catalogue this box
+   * has. @see requestDerivationBreach, which compares the two.
+   *
+   * Failing toward the whole catalogue is deliberate and is enforced one layer down, in
+   * `surfaceDescribable`: only a probe that came back and said `absent` removes anything.
+   */
+  const surfaces = await deps.workspaceSurfaces(task);
+  const requestTools = [...agentToolsFor('lead', surfaces), COMPACT_CONTEXT_TOOL].filter(
     (tool) => !withdrawnTools.has(tool.name)
   );
   // What every request carries before a word of conversation. The step loop measures its budget
@@ -185,7 +223,8 @@ export const claimTurn = async (
       withdrawnTools,
       requestTools,
       reservedTokens,
-      toolchainSummary
+      toolchainSummary,
+      surfaces
     },
     state
   };

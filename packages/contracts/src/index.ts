@@ -1557,6 +1557,46 @@ export const DesktopLaunchRequest = z.object({
 });
 export type DesktopLaunchRequest = z.infer<typeof DesktopLaunchRequest>;
 
+/**
+ * Whether this box actually has the two surfaces the largest tool schemas describe.
+ *
+ * Three states, not two, and the third is the whole point. `absent` is a probe that ran and found
+ * nothing; `unknown` is a probe that could not be run or could not be believed - an unreachable
+ * runner, a malformed body, a route an older runner does not serve. Only `absent` is ever allowed
+ * to withdraw a schema, because the two directions of being wrong are not the same size: withdrawing
+ * wrongly hides a capability the box has and the model then cannot see it at all, while describing
+ * wrongly costs bytes on a request and one honest failure the model can read. @see surfaceDescribable.
+ */
+export const SurfacePresence = z.enum(['available', 'absent', 'unknown']);
+export type SurfacePresence = z.infer<typeof SurfacePresence>;
+
+/**
+ * The runner's answer, and the worker's copy of it. One shape on both sides of the wire so a field
+ * added here cannot be read under a different name at the other end.
+ */
+export const WorkspaceSurfaces = z.object({
+  /** A Chromium the browser manager could actually launch. */
+  browser: SurfacePresence,
+  /** The Xvfb/Openbox session and its accessibility bridge, both present and executable. */
+  desktop: SurfacePresence
+});
+export type WorkspaceSurfaces = z.infer<typeof WorkspaceSurfaces>;
+
+/**
+ * What a caller that could not ask, or could not understand the answer, must use.
+ *
+ * A constant rather than a literal at each catch site: this is the fail-safe direction, and a
+ * second spelling of it somewhere is how one call site ends up failing the other way.
+ */
+export const UNKNOWN_SURFACES: WorkspaceSurfaces = { browser: 'unknown', desktop: 'unknown' };
+
+/**
+ * Whether a surface may still be described to the model. The single place the safe direction is
+ * decided, so "unknown means send everything" is one function both call sites read rather than two
+ * conditions that have to agree.
+ */
+export const surfaceDescribable = (presence: SurfacePresence): boolean => presence !== 'absent';
+
 export const ApiError = z.object({
   error: z.object({
     code: z.string(),

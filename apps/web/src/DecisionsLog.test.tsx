@@ -171,6 +171,9 @@ describe('the four lists', () => {
    * cannot be told apart from one that was never wired up, which is the defect this file removes.
    */
   it('says what an empty list means, in each list’s own words', () => {
+    // The count is the assertion the empty case has to answer: a filter list that lost its rows
+    // would leave every expectation below unreached and this test green in no time at all.
+    expect(decisionStatuses.length).toBeGreaterThan(0);
     for (const status of decisionStatuses) {
       const markup = renderToStaticMarkup(<DecisionsList rows={[]} status={status.id} />);
       expect(markup).toContain(status.empty);

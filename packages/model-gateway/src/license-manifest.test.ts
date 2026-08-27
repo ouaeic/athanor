@@ -60,6 +60,9 @@ describe('independent model-license manifest', () => {
    * timer. A blank one would make the review unfalsifiable.
    */
   it('records the upstream revision each reading was made against', () => {
+    // The AGPL claim this file makes is a claim about the manifest's contents. An empty manifest
+    // makes it vacuously, in no time at all, which is the one way a compliance test can lie.
+    expect(modelLicenseManifest.size).toBeGreaterThan(0);
     for (const review of modelLicenseManifest.values()) {
       expect(
         review.upstreamRevision,
