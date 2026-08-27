@@ -1334,7 +1334,58 @@ const coreToolNames = new Set([
 ]);
 
 /**
- * The catalogue for a task: all of it, core set first.
+ * Who a request is being built for. Two agents run inside one task and they are not the same shape.
+ *
+ * The lead drives the computer; the delegate specialist is an isolated read-only investigator that
+ * reads hostile material on the lead's behalf and returns a report. They have different powers, so
+ * they get different wire surfaces - which is the only kind of withholding this file permits, and
+ * the reason is on `specialistToolNames` below.
+ */
+export type ToolAudience = 'lead' | 'specialist';
+
+/**
+ * The specialist's whole wire surface, and the containment property it is.
+ *
+ * Read-only, and each one safely concurrent with the other two. `parallel_web_read` earns its place
+ * because it opens its own isolated browser rather than steering the persistent session the lead and
+ * the owner share, which is what makes "read these fifteen sources and tell me where they disagree"
+ * a delegable job at all. `web_search` is here for a different reason: a challenge no longer takes
+ * the browser off the agent, it stops the one tab and the one site that raised it, so a specialist
+ * that walks into one costs that search and nothing else. A specialist that cannot search can only
+ * read sources somebody else already found for it.
+ *
+ * It lives here rather than in delegate.ts because this file owns what reaches a provider, and while
+ * the set sat inside `runDelegateMission` the only thing checking it was a four-name blocklist in
+ * agent-run.test.ts - `shell`, `file_write`, `browser_action`, `finish`. Measured: adding
+ * `file_patch` to it, a tool whose entire purpose is changing a file the specialist is told it
+ * cannot change, left all 1,145 worker tests green. The read-only fence of the quarantine path was
+ * enumerated, not derived. It is derived now, in tool-catalogue.test.ts, from the two classification
+ * sets the property actually rests on: `isMutatingToolCall` (write-classification.ts) and
+ * `REPEATABLE_TOOLS` (turn-bounds.ts). A name added here that either of those calls a change now
+ * fails, whether or not anybody thought to blocklist it.
+ *
+ * Four of these nine - `files_list`, `repo_overview`, `document_read`, `document_search` - have been
+ * proposed for demotion off the *lead's* wire on the grounds that `shell` substitutes for them.
+ * They stay on both, and the reason is the same test that keeps them here: `shell` is in neither
+ * `NON_MUTATING_TOOLS` nor `REPEATABLE_TOOLS`, so a read routed through it becomes a change, takes a
+ * workspace checkpoint, sets `mutatedBeyondProse`, lands in front of the completion-evidence rule,
+ * and is never replayed after an interrupted turn. Substituting `shell` for a reader does not move a
+ * property, it removes two.
+ */
+export const specialistToolNames = new Set([
+  'files_list',
+  'file_read',
+  'document_read',
+  'document_search',
+  'web_search',
+  'parallel_web_read',
+  'code_search',
+  'repo_overview',
+  'session_search'
+]);
+
+/**
+ * The catalogue for a task: all of the audience's tier, core set first.
  *
  * It used to be gated. Six keyword regexes over the last four user messages decided which of six
  * playbooks were in force, and only an active playbook's tools were sent. Measured against
@@ -1358,8 +1409,20 @@ const coreToolNames = new Set([
  * Order is fixed for the life of a task rather than assembled per step, which is what the caching
  * actually needs: the tool block opens the prompt prefix, so a definition moving position ends the
  * common prefix at that point. Core first, then declaration order, on every request.
+ *
+ * The audience is the one thing that does select, and it is decided once when the agent is created
+ * and never after: a residency decision taken mid-run saves tokens on one request and ends the
+ * cached prefix on every request that follows it, which costs more than it saves within two steps.
+ * Selecting here rather than filtering at the call site is not tidiness - it is what lets the tier
+ * be a tested property of the wire instead of a literal buried in a six-hundred-line function.
  */
-export const agentToolsFor = (): ModelTool[] => [
-  ...agentTools.filter((tool) => coreToolNames.has(tool.name)),
-  ...agentTools.filter((tool) => !coreToolNames.has(tool.name))
-];
+export const agentToolsFor = (audience: ToolAudience = 'lead'): ModelTool[] => {
+  const tier =
+    audience === 'specialist'
+      ? agentTools.filter((tool) => specialistToolNames.has(tool.name))
+      : agentTools;
+  return [
+    ...tier.filter((tool) => coreToolNames.has(tool.name)),
+    ...tier.filter((tool) => !coreToolNames.has(tool.name))
+  ];
+};

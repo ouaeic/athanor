@@ -1,7 +1,9 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { encryptJson, sha256, AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
-import { event, previewUrl, textValue, type ExecObservation } from '../agent.js';
+import { type ExecObservation } from '../agent-state.js';
+import { event } from '../tool-recording.js';
+import { previewUrl, textValue } from '../values.js';
 import { type ToolContext } from '../tool-dispatch.js';
 import { clampNumber, finiteNumber } from './numbers.js';
 

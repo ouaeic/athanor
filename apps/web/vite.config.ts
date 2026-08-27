@@ -19,12 +19,48 @@ import react from '@vitejs/plugin-react';
  * did exist was taken: the two rules tables on "What it may do" are prose read by a lazily-loaded
  * settings page and were riding in because the composer imports the mode labels from the same
  * module, so they now live in `asking-rules.ts`.
+ *
+ * Raised from 150 kB, deliberately and once more, to pay for decomposing `App()`. Measured: 147.9 kB
+ * before and 151.3 kB after — 203.0 kB raw against 192.4 kB, and the eager *module set* is unchanged
+ * file for file, so not one byte of it is code that was previously lazy. It is plumbing: fifty state
+ * cells that were locals in one closure, minified to single letters, are now the properties of
+ * sixteen named hooks and cross four module boundaries, where a property name cannot be mangled.
+ *
+ * Taken rather than avoided, because the alternative was not taking it: the one lever that would
+ * have paid for it is deferring the workbench itself, and that costs a round trip on the first paint
+ * of every already-signed-in owner, which is the whole screen. And it is bought back several times
+ * over on the budget below, which measures what the owner actually waits through — the first reply
+ * fell 336.1 kB to 251.3 kB in the same change.
  */
-const EAGER_BUDGET_BYTES = 150_000;
+const EAGER_BUDGET_BYTES = 153_000;
 
 /**
- * The same walk, twice used: it measures the first paint, and it writes the hashed names down for
- * the service worker, which cannot guess them and precached an index.html it could not run.
+ * What the browser must download before the owner can *read a reply*, which is not the same screen
+ * and was never measured.
+ *
+ * The first paint is a text box; the first thing anybody came for is an answer in it, and that
+ * answer is markdown. `Markdown.tsx` holds the renderer behind `lazy`, so none of it is in the
+ * eager graph above — and 180 kB gzip of it therefore sat outside every budget this repository had.
+ * The gate that could not see it is why `MarkdownBody` came to import the whole KaTeX chunk to
+ * reach `property-information`: 86.5 kB gzip of a maths typesetter fetched on the first assistant
+ * message whether or not it contained maths, with nothing in the build to say so.
+ *
+ * Measured over the same walk, from the entry *and* from the markdown renderer, so a chunk shared
+ * by both is counted once. 338.5 kB gzip when this was first measured, 252.7 kB after the
+ * `vendor-markdown` group below took the hast/unist utilities out of katex's chunk.
+ */
+const FIRST_MESSAGE_BUDGET_BYTES = 257_000;
+
+/**
+ * The module the first reply waits on. Named by source path rather than by chunk name because the
+ * chunk is hashed and the group it lands in is exactly the thing under test.
+ */
+const FIRST_MESSAGE_ROOT = /[\\/]src[\\/]MarkdownBody\.tsx$/;
+
+/**
+ * The same walk, three times used: it measures the first paint, it measures the first reply, and it
+ * writes the hashed names down for the service worker, which cannot guess them and precached an
+ * index.html it could not run.
  */
 const eagerBundleGraph = (): Plugin => ({
   name: 'athanor-eager-bundle-graph',
@@ -34,36 +70,76 @@ const eagerBundleGraph = (): Plugin => ({
     const entry = Object.values(bundle).find((item) => item.type === 'chunk' && item.isEntry);
     if (entry?.type !== 'chunk') return;
 
-    const eager = new Set<string>();
-    const walk = (fileName: string): void => {
-      if (eager.has(fileName)) return;
-      eager.add(fileName);
-      const chunk = byFileName.get(fileName);
-      if (chunk?.type !== 'chunk') return;
-      for (const imported of chunk.imports) walk(imported);
-      for (const css of chunk.viteMetadata?.importedCss ?? []) eager.add(css);
-    };
-    walk(entry.fileName);
-
-    let total = 0;
-    const parts: string[] = [];
-    for (const fileName of eager) {
+    /** Gzipped bytes of one emitted file, and the line the report prints for it. */
+    const weigh = (fileName: string): { bytes: number; line: string } | undefined => {
       const item = byFileName.get(fileName);
       const source =
         item?.type === 'chunk' ? item.code : typeof item?.source === 'string' ? item.source : '';
-      if (!source) continue;
-      const size = gzipSync(source).byteLength;
-      total += size;
-      parts.push(`${fileName} ${(size / 1000).toFixed(1)} kB`);
-    }
-    const report = `eager bundle ${(total / 1000).toFixed(1)} kB gzip (budget ${(
-      EAGER_BUDGET_BYTES / 1000
-    ).toFixed(1)} kB)\n  ${parts.sort().join('\n  ')}`;
-    if (total > EAGER_BUDGET_BYTES)
+      if (!source) return undefined;
+      const bytes = gzipSync(source).byteLength;
+      return { bytes, line: `${fileName} ${(bytes / 1000).toFixed(1)} kB` };
+    };
+
+    /** Everything reached by static import from `roots`, plus the stylesheets those chunks carry. */
+    const graphFrom = (roots: string[], seen = new Set<string>()): Set<string> => {
+      const walk = (fileName: string): void => {
+        if (seen.has(fileName)) return;
+        seen.add(fileName);
+        const chunk = byFileName.get(fileName);
+        if (chunk?.type !== 'chunk') return;
+        for (const imported of chunk.imports) walk(imported);
+        for (const css of chunk.viteMetadata?.importedCss ?? []) seen.add(css);
+      };
+      for (const root of roots) walk(root);
+      return seen;
+    };
+
+    /** One budget, reported whether or not it holds, and failing the build when it does not. */
+    const enforce = (label: string, files: Iterable<string>, budget: number, remedy: string) => {
+      let total = 0;
+      const parts: string[] = [];
+      for (const fileName of files) {
+        const weighed = weigh(fileName);
+        if (!weighed) continue;
+        total += weighed.bytes;
+        parts.push(weighed.line);
+      }
+      const report = `${label} ${(total / 1000).toFixed(1)} kB gzip (budget ${(
+        budget / 1000
+      ).toFixed(1)} kB)\n  ${parts.sort().join('\n  ')}`;
+      if (total > budget) this.error(`${report}\n${remedy}`);
+      this.info?.(report);
+    };
+
+    const eager = graphFrom([entry.fileName]);
+    enforce(
+      'eager bundle',
+      eager,
+      EAGER_BUDGET_BYTES,
+      'Move the new weight behind a dynamic import, or raise EAGER_BUDGET_BYTES deliberately.'
+    );
+
+    /*
+     * The eager set is carried in as already-seen, so the first-reply figure is the whole download
+     * and not the delta — this is what the owner waits through, and a shared chunk is paid for once.
+     */
+    const markdownRoot = Object.values(bundle).find(
+      (item) =>
+        item.type === 'chunk' && item.facadeModuleId && FIRST_MESSAGE_ROOT.test(item.facadeModuleId)
+    );
+    if (markdownRoot?.type !== 'chunk')
       this.error(
-        `${report}\nMove the new weight behind a dynamic import, or raise EAGER_BUDGET_BYTES deliberately.`
+        `no chunk was built from ${FIRST_MESSAGE_ROOT.source}, so the first-reply budget measured nothing. ` +
+          'Point FIRST_MESSAGE_ROOT at whatever renders an assistant message now.'
       );
-    this.info?.(report);
+    else
+      enforce(
+        'first reply',
+        graphFrom([markdownRoot.fileName], new Set(eager)),
+        FIRST_MESSAGE_BUDGET_BYTES,
+        'A vendor the markdown renderer reaches has grown, or a lazy chunk has become a static import of it. ' +
+          'Check the codeSplitting groups below before raising FIRST_MESSAGE_BUDGET_BYTES.'
+      );
 
     this.emitFile({
       type: 'asset',
@@ -96,6 +172,22 @@ export default defineConfig({
         codeSplitting: {
           groups: [
             { name: 'vendor-react', test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ },
+            /*
+             * Ahead of `vendor-katex`, and that order is the whole point.
+             *
+             * These are the hast/unist utilities react-markdown needs to turn a tree into
+             * elements, and rehype-katex needs them too. Groups claim in order, so with only a
+             * katex group declared they were swept into it — and `MarkdownBody` reaching
+             * `property-information` therefore reached the whole 288 kB katex chunk *statically*.
+             * Maths is behind a dynamic import (`katex-plugins.ts`) precisely so a message without
+             * maths never pays for it, and this is what made that saving unreachable: 86.5 kB gzip
+             * of KaTeX on the first assistant message, maths or no maths. Claimed here first, the
+             * markdown renderer takes what it needs and katex stays lazy.
+             */
+            {
+              name: 'vendor-markdown',
+              test: /node_modules[\\/](hast-[^\\/]*|unist-[^\\/]*|hastscript|property-information|[^\\/]*-separated-tokens|web-namespaces)[\\/]/
+            },
             { name: 'vendor-katex', test: /node_modules[\\/](katex|rehype-katex)[\\/]/ },
             {
               name: 'vendor-highlight',

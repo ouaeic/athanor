@@ -28,6 +28,21 @@ const Config = z.object({
   MODEL_CATALOG_SCOPE: z
     .enum(['provider_catalog', 'reviewed_open_weight'])
     .default('provider_catalog'),
+  /*
+   * Where an operator pointed this box, when they did it in control.env rather than in Settings.
+   *
+   * The third of three shapes a box can be pointed at a provider in, and the one that refreshed
+   * nothing: `seedModelCatalog` writes one `custom/AI_DEFAULT_MODEL` row when the API starts and no
+   * process ever asks that endpoint another question. Read here because the unit already loads the
+   * file that holds them - the same values the worker reads to send the work - so this costs no new
+   * configuration and no new place for the two halves to disagree about where the provider is.
+   */
+  AI_PROVIDER: z.enum(['openrouter', 'ollama-cloud', 'openai-compatible']).default('openrouter'),
+  AI_BASE_URL: z.string().url().default('https://openrouter.ai/api/v1'),
+  AI_DEFAULT_MODEL: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(1).max(300).optional()
+  ),
   /**
    * Where each pass writes down what it did, for `athanor doctor` to read. The default is inside
    * /var/lib/athanor-control because that is the one directory `athanor@.service` may write to.
@@ -80,6 +95,11 @@ while (running) {
     store,
     masterKey,
     environmentKey: config.OPENROUTER_REGISTRY_KEY,
+    environmentProvider: {
+      provider: config.AI_PROVIDER,
+      baseUrl: config.AI_BASE_URL,
+      modelId: config.AI_DEFAULT_MODEL
+    },
     baseUrl: config.OPENROUTER_BASE_URL,
     scope: config.MODEL_CATALOG_SCOPE
   });
@@ -91,7 +111,8 @@ while (running) {
   const line = refreshLogLine({
     previousFailures: consecutiveFailures,
     reason: outcome.reason,
-    intervalSeconds: config.REGISTRY_REFRESH_SECONDS
+    intervalSeconds: config.REGISTRY_REFRESH_SECONDS,
+    state: outcome.state
   });
   if (line) process.stderr.write(line);
   consecutiveFailures = outcome.reason === null ? 0 : consecutiveFailures + 1;

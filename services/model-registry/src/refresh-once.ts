@@ -5,6 +5,8 @@ import {
   type ModelCatalogScope
 } from '@athanor/model-gateway';
 import { catalogCredential, type CredentialSource } from './catalog-credential.js';
+import { implausibleReplacement } from './catalog-plausibility.js';
+import { refreshConfiguredCatalog, type ConfiguredCatalogInput } from './configured-catalog.js';
 import { refreshFailureReason } from './refresh-log.js';
 
 /**
@@ -47,15 +49,24 @@ export interface RefreshOutcome {
    * as it is until a key appears. This is an ordinary state on a box whose owner runs their own
    * endpoint, and it is also what a revoked key looks like, which is why it is said out loud.
    * `failed` - the attempt threw; the catalogue already in the database stays in use.
+   * `refused` - a provider answered, and what it answered no longer describes models the way the
+   * catalogue already here does. The replace was not performed. This is its own state and not a
+   * `frozen` or a `failed` because it is neither: a request succeeded, there is a key, and the
+   * thing that went wrong is upstream of this box and will not fix itself. Saying `frozen` here
+   * would send the owner to Settings to save a key they already have.
    */
-  state: 'refreshed' | 'seeded' | 'frozen' | 'failed';
+  state: 'refreshed' | 'seeded' | 'frozen' | 'failed' | 'refused';
   /**
    * What the catalogue holds after this pass, for the journal line and for `doctor`. On a `failed`
    * pass it is what the pass managed to read before it threw, so it is zero when the failure came
    * before the catalogue was listed at all - an unopenable credential, say.
    */
   models: number;
-  /** Set only for `failed`, bounded and flattened to one line by `refreshFailureReason`. */
+  /**
+   * Why the pass did not leave a fresh catalogue behind. For `failed` it is what threw, bounded and
+   * flattened to one line by `refreshFailureReason`; for `refused` it is the plausibility gate's
+   * own sentence. Null for the three states where nothing is wrong.
+   */
   reason: string | null;
 }
 
@@ -63,12 +74,19 @@ export const refreshOnce = async (input: {
   store: CatalogStore;
   masterKey: Uint8Array | null;
   environmentKey?: string | undefined;
+  /** Passed straight through; see `catalogCredential` for why it ranks where it does. */
+  environmentProvider?:
+    | { provider: string; baseUrl?: string | undefined; modelId?: string | undefined }
+    | undefined;
   baseUrl: string;
   scope: ModelCatalogScope;
   refreshCatalog?: CatalogRefresh;
+  /** The same seam as `refreshCatalog`, for the endpoint a non-OpenRouter provider answers on. */
+  configuredCatalog?: (input: ConfiguredCatalogInput) => Promise<Array<Record<string, unknown>>>;
   seed?: () => ModelRelease[];
 }): Promise<RefreshOutcome> => {
   const refreshCatalog = input.refreshCatalog ?? refreshOpenRouterCatalog;
+  const configuredCatalog = input.configuredCatalog ?? refreshConfiguredCatalog;
   const seed = input.seed ?? seedModels;
   // Carried out of the try so a failure can still say how many models the picker is living on.
   let existingCount = 0;
@@ -80,33 +98,80 @@ export const refreshOnce = async (input: {
     const credential = await catalogCredential({
       store: input.store,
       masterKey: input.masterKey,
-      environmentKey: input.environmentKey
+      environmentKey: input.environmentKey,
+      environmentProvider: input.environmentProvider
     });
     const existing = await input.store.listModels();
     existingCount = existing.length;
     if (credential) {
       // A real refresh, and a replace rather than an upsert: a model the provider has withdrawn
       // should leave the picker rather than sit in it until somebody tries to use it.
-      const live = await refreshCatalog(seed(), {
-        baseUrl: credential.baseUrl ?? input.baseUrl,
-        apiKey: credential.apiKey,
-        scope: input.scope,
-        /*
-         * What the catalogue said an hour ago, so one failing request cannot withdraw the owner's
-         * private routes. Zero-retention is a fact about live endpoints and it arrives on its own
-         * request; when that request alone fails, the answer carried forward is the last one this
-         * box actually observed rather than "not verified", which the privacy projection would
-         * read as a reason to take every private model out of the picker.
-         */
-        previous: existing.flatMap((model) => {
-          const parsed = ModelRelease.safeParse(model);
-          return parsed.success ? [parsed.data] : [];
-        })
-      });
+      const live =
+        credential.provider === 'openrouter'
+          ? await refreshCatalog(seed(), {
+              baseUrl: credential.baseUrl ?? input.baseUrl,
+              apiKey: credential.apiKey ?? '',
+              scope: input.scope,
+              /*
+               * What the catalogue said an hour ago, so one failing request cannot withdraw the
+               * owner's private routes. Zero-retention is a fact about live endpoints and it
+               * arrives on its own request; when that request alone fails, the answer carried
+               * forward is the last one this box actually observed rather than "not verified",
+               * which the privacy projection would read as a reason to take every private model
+               * out of the picker.
+               */
+              previous: existing.flatMap((model) => {
+                const parsed = ModelRelease.safeParse(model);
+                return parsed.success ? [parsed.data] : [];
+              })
+            })
+          : /*
+             * The other half of "openrouter etc.". Until this line the etc. was nothing: a
+             * credential for any other provider answered null above, the pass reported `frozen`,
+             * and the journal told the one owner it was about to save a provider key they had
+             * already saved. `configuredCatalog` asks the endpoint the same question the save path
+             * asks it and hands back rows in the same shape, so everything below - the gate, the
+             * per-provider prune, the record `doctor` reads - is shared rather than duplicated.
+             */
+            await configuredCatalog({
+              provider: credential.provider,
+              baseUrl: credential.baseUrl ?? input.baseUrl,
+              apiKey: credential.apiKey,
+              modelId: credential.modelId,
+              enforceZeroDataRetention: credential.enforceZeroDataRetention,
+              previous: existing.filter((model) => model.provider === 'custom')
+            });
+      /*
+       * The last thing between a provider's answer and deleting the owner's catalogue.
+       *
+       * Nothing used to stand here. The replace ran on whatever came back, and because every field
+       * the importer reads is optional on the way in, an answer that had stopped describing models
+       * - one renamed field upstream - was written whole, reported `refreshed`, and left the box
+       * unable to pick a model for any piece of work, with `doctor` calling the catalogue current.
+       * `implausibleReplacement` says what is wrong in a sentence; the pass carries it out to the
+       * journal and to the record `doctor` reads, and the catalogue already here goes on serving.
+       *
+       * Compared against the same slice `replaceModelCatalog` would delete - the rows belonging to
+       * the providers this answer actually covers - because those are the rows at risk and the only
+       * ones an answer can be judged against. A catalogue holding both an OpenRouter set and a
+       * configured one must not have either judged by the other's shape.
+       */
+      const covered = new Set(live.map((model) => String(model.provider)));
+      const replacing = existing.filter((model) => covered.has(String(model.provider)));
+      const refusal = implausibleReplacement({ previous: replacing, live });
+      if (refusal) return { state: 'refused', models: existingCount, reason: refusal };
       await input.store.replaceModelCatalog(live);
       // `replaceModelCatalog` prunes nothing when the provider answered with an empty list, so the
-      // catalogue that survives an empty answer is the one that was already there.
-      return { state: 'refreshed', models: live.length || existingCount, reason: null };
+      // catalogue that survives an empty answer is the one that was already there - and what this
+      // pass replaced is only the slice it covered, so the count is the catalogue with that slice
+      // swapped rather than the size of the answer. On a box holding a configured endpoint beside
+      // the built-in seeds those are different numbers, and the smaller one would have `doctor`
+      // reporting a catalogue a fraction of the size of the one in the picker.
+      return {
+        state: 'refreshed',
+        models: live.length ? existingCount - replacing.length + live.length : existingCount,
+        reason: null
+      };
     }
     if (!existingCount) {
       /*

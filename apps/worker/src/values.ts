@@ -19,6 +19,34 @@ import { AthanorError } from '@athanor/core';
 import type { ModelMessage } from '@athanor/model-gateway';
 import { SKILL_BODY_HEADINGS } from './skills.js';
 
+/**
+ * A scalar a model or a runner wrote, read as text - and the only function in this package that
+ * answers that question.
+ *
+ * There were three of it, all spelled `textValue`, all with the same signature, and they did not
+ * agree:
+ *
+ *   - here: string, number, boolean, bigint -> text; anything else -> the fallback
+ *   - `surface-actions.ts`: the same minus bigint, so a bigint became the fallback
+ *   - `acceptance.ts`: string and number only, so a **boolean became the fallback**
+ *
+ * The split ran straight through the approval path. `approval-policy.ts`, `approval-cards.ts`,
+ * `write-classification.ts` and `command-classification.ts` - the four modules that decide what
+ * card the owner is shown and what the floor does about a call - read arguments through the
+ * surface-actions copy, while every arm that then *performs* the call read them through this one.
+ * A verb the card resolved to `''` resolved to `'7'` for the arm. Nothing on the wire produces a
+ * bigint today, so that half was latent rather than live; it was latent by luck, because the two
+ * halves of one decision were being computed by two functions that nobody had put side by side.
+ *
+ * The acceptance copy was not latent. `parseAcceptanceChecks` coerces `args` with it and hands
+ * the result both to the refusal gate and to the executor, so a check declared as
+ * `{executable:'pytest', args:['--maxfail', false]}` ran as `pytest --maxfail ''` - the model's
+ * own JSON, silently losing an argument at the moment the model claims the work is done.
+ *
+ * The widest reading wins because the narrow ones lose information without saying so: a scalar the
+ * caller was handed becomes a fallback that looks exactly like an absent field. Nothing that reads
+ * a value it was given should be able to disagree with anything else that reads the same value.
+ */
 export const textValue = (value: unknown, fallback = ''): string => {
   if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint')

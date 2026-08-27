@@ -15,7 +15,7 @@
  * putting the predicate in write-classification.ts - which already imports this module for
  * `gitSubcommand` and the package-manager sets - would close a cycle between the two.
  */
-import { textValue } from './surface-actions.js';
+import { textValue } from './values.js';
 
 export const FILE_WRITING_EXECUTABLES = new Set([
   'chmod',

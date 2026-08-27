@@ -8,7 +8,8 @@ import {
   type ResolvedMediaModel
 } from './media.js';
 import { scanSkillBodyForSecrets } from './skills.js';
-import { surfaceActionVerb, textValue } from './surface-actions.js';
+import { surfaceActionVerb } from './surface-actions.js';
+import { textValue } from './values.js';
 import {
   callDestinations,
   commandInterpreters,

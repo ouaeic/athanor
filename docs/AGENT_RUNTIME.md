@@ -8,15 +8,20 @@ approved software, run long work, use Chromium and GUI applications, generate me
 previews. It must preserve useful files, verify results, and never report an external success without
 tool evidence.
 
-The contract also carries the craft guidance: how to approach code, the web, documents already on the
-computer, documents it produces, data, applications and forms, media, previews, and installed GUI
-applications. That guidance used to be chosen per request by keyword, and against the wording owners
-actually use it was wrong on ten of twenty-four measured requests: five got no guidance at all,
-including an application to a job posting, and five got a block pointed at the wrong tools, with
-“tailor my CV and give me a PDF” read as a request to read documents rather than write one. It is
-now a fixed part of the contract, sent whole on every request. It costs about 6 kB against a tool
-catalogue an order of magnitude larger that is already unconditional, and because it never changes
-during a task it stays inside the prompt prefix a provider caches.
+What the contract does **not** carry is craft guidance — how to approach code, the web, documents,
+data, forms or media. That was half its bytes, resident on every request of every turn, and it is
+method a capable model brings with it. What a model cannot bring is a fact about this particular
+machine, so the facts stayed and the instructions went. The measurement that made it safe is the one
+that matters: `pnpm eval:context` scored identically across every configuration and every probe kind
+before and after, which is the difference between minimalism and damage.
+
+What is left is conditional. A paragraph describing a capability this box does not have is not sent
+to it, so a machine with no desktop, no mail connector and no document toolchain receives a smaller
+contract than a fully provisioned one. The gating may only read facts that are fixed for the life of
+a run — the tool array is built once, the toolchain is probed once — because a gate that flipped
+mid-task would move every byte behind it on the step it flipped, which is the disease the whole
+ordering below exists to avoid. `context.test.ts` asserts that determinism directly, and holds both
+the provisioned and the bare contract under byte bands rather than writing either figure down here.
 
 Webpages, repositories, documents, model output, tool results, and terminal output are untrusted
 data. They cannot grant authority, reveal credentials, disable policy, or replace the user’s goal.
@@ -35,11 +40,13 @@ only reads that file is not tainted by it. Taint is what raises the approval car
 
 Each request carries, in this order:
 
-1. the operating contract, including the craft guidance and the safety floor;
+1. the operating contract and the safety floor, gated on what this box can do;
 2. the curated knowledge block: active memory entries ranked against the request the task opened
    with, the index of skills saved for this workspace, and the index of the vetted built-in library;
 3. the recalled memory pack, rendered once per task and re-emitted byte-for-byte on resume;
-4. `workspace/ATHANOR.md` when the owner keeps one, as the canonical project brief;
+4. the workspace brief when the owner keeps one — `ATHANOR.md` first, then the shared conventions
+   the surrounding tooling writes, so a workspace that already carries one is read without the owner
+   having to rename anything;
 5. the user’s original request, then the running brief of anything already condensed, then the
    verbatim recent trajectory;
 6. the newest live plan, re-pushed at the tail as it changes;
@@ -50,6 +57,28 @@ Each request carries, in this order:
 Only skill _names_ and one-line catalog entries are resident. A full procedure loads when the model
 opens it, and the binaries that procedure assumes are probed on the machine and reported with it, so
 a step the computer cannot support is known before it is attempted rather than after.
+
+Nothing in that list is the only place knowledge can live, and the tier that matters most is the one
+that appears in it nowhere. Everything the harness knows about _how_ used to be either a contract
+line — paid on every request of every task for ever — or a skill body, free until opened and then a
+few thousand tokens at once. The tier in between is a **rule**: a matcher over what the model just
+produced, and a correction appended to the next request if it fires. Until it fires it contributes
+zero bytes — no schema, no contract line, no index entry — and `rules.test.ts` asserts that by
+comparing the whole assembled window byte for byte with the rules loaded and none of them matching.
+
+Three boundaries on it, each a decision rather than a default. It never interrupts: the correction
+lands on the following request and the generation in flight is left alone. It observes the recorded
+step rather than the token stream, so it survives a worker handover, an approval pause and a resume,
+and it can never split an assistant's tool calls from their results. And a rule that fires on almost
+every turn is a contract line paid late plus a matcher, which is worse than a contract line — so the
+firing counter exists from the first commit, and the honest response to a high rate is to promote the
+rule back into the contract deliberately.
+
+That gives four places for anything the harness knows, and the order to try them in: **enforced in
+code**, which costs nothing and cannot be got wrong; **triggered on content**, which costs nothing
+until it fires; **opened on demand**, which costs nothing while it is closed; and **resident**, which
+is paid on every request for the life of the product. Only the last is a decision that has to be
+justified, and the tool catalogue is where almost all of it is.
 
 Every position in that list is a cache decision, and three of them were measured rather than
 reasoned about.
@@ -86,30 +115,32 @@ almost none of the requests owners actually make, so a request to read a contrac
 document reader.
 
 Its exact size is not written down here, because a byte count in prose goes stale the first time a
-tool is added and then reads exactly like a measurement. It is enforced instead: `tools.test.ts`
-holds the whole serialized catalogue under a ceiling and every individual tool description under
-1,400 bytes. The ceiling is deliberately hard to move: `tool-catalogue.test.ts` logs five raises in
-order — the figure it was first set at, then one each for `service`, `ask`, `audio_read` and
-`set_acceptance`’s render clause — and every one of them is recorded beside the measurement that
-justified it and the argument that no wording could have substituted for the capability. The rule it
-encodes is that it moves for a capability and never for prose, and it has held while the catalogue
-moved under it: most recently two undeclared schema facts were paid for out of two return-shape
-enumerations rather than out of the ceiling.
+tool is added and then reads exactly like a measurement. It is enforced instead, in
+`tool-catalogue.test.ts`, by three separate numbers: a ceiling on the whole serialized catalogue, a
+cap on each tool's own description, and a second, higher cap on every description nested inside a
+tool's `parameters` — which the first cap never reached, so the whole of a tool's prose could grow
+below it unwatched. The ceiling is deliberately hard to move: it logs every raise in order, each
+recorded beside the measurement that justified it and the argument that no wording could have
+substituted for the capability. The rule it encodes is that it moves for a capability and never for
+prose, and it has held while the catalogue moved under it — most recently two undeclared schema facts
+were paid for out of two return-shape enumerations rather than out of the ceiling.
 
-Around that ceiling the catalogue is on the order of 15,000 tokens, under a tenth of a
-160,000-token budget, and it sits at the very front of the request where a provider caches it once
-and replays it for the rest of the task. That is why the answer to a large catalogue is to write the
-descriptions tightly rather than to withhold them, and why schemas are not the place to save
-tokens: a declared action variant is an interface fact the model would otherwise guess at and spend
-a round trip discovering.
+To read the live figure rather than a sentence about it, run `pnpm eval` and read the `cat` column,
+which is what the catalogue actually cost on each fixture. It is the largest fixed cost the product
+pays and on a short turn it is the overwhelming majority of the bill — a fact the report could not
+see at all until the token column was corrected to count `body.tools`.
+
+The catalogue sits at the very front of the request, where a provider caches it once and replays it
+for the rest of the task, so it is a large share of the tokens sent and a smaller share of the money.
+That is why the answer to a large catalogue is to write the descriptions tightly rather than to
+withhold them, and why schemas are not the place to save tokens: a declared action variant is an
+interface fact the model would otherwise guess at and spend a round trip discovering.
 
 A search tool over the catalogue was built and then removed, for failing that same test from the
 other direction: it ranked definitions the model already had in front of it, billed a full pass over
 the window to do it, and admitted in its own description that it unlocked nothing. It is not coming
-back, and the arithmetic is on record — the catalogue reads from behind the cache anchor at a
-fraction of the write rate, so it is a large share of the tokens sent and a small share of the bill.
-Room, when room is needed, comes from flattening a schema rather than from withholding a definition
-or trimming prose.
+back. Room, when room is needed, comes from flattening a schema rather than from withholding a
+definition or trimming prose.
 
 The catalogue covers plans, the acceptance record that defines what would prove the job done, shell
 commands, background processes and services the computer keeps running, files, conflict-detecting
@@ -471,6 +502,16 @@ built-in library that ships in the repository, and the procedures saved for this
 skills are read-only; reusing a built-in name is reviewed as an explicit owner override that shadows
 it for this workspace rather than replacing it.
 
+A skill body carries what is true of this machine and not what is true of the craft. A procedure that
+tells a capable model how to think about a task is method, and method is not worth the thousands of
+tokens it costs when it is opened; a formula set some other renderer will not evaluate, a prefix a
+file format requires, a tool that has to be run twice to be correct, are facts nothing else on the
+box will tell it. A skill that is method end to end does not belong in the library at all, however
+well written: the resident contract already asks for the same discipline in a sentence, and a
+procedure the model can derive is a bill with no purchase. `pnpm eval:context` is what settles
+whether a cut cost anything. `scripts/athanor-skill-check` lints the library and reports its size;
+that is the number to read rather than one written here.
+
 ## Files as knowledge
 
 The computer’s files are the source of truth. `document_search` performs bounded, source-linked BM25
@@ -496,6 +537,22 @@ All modes still protect credentials, submissions, messages, purchases, public pu
 destructive system/filesystem actions, ambiguous coordinates, connected-service writes/deletes,
 subscription coding missions, and remote MCP execution. Autonomous still confirms network access for
 an executable outside the read-only and package-install allowlists.
+
+**A read is a read, however it is spelled.** The floor judges what a shell command does, not what
+shape the model wrote it in. A command wrapped in an inline script — which the catalogue itself tells
+the model to reach for the moment it needs a pipe, a glob or a redirect — is classified by resolving
+what the script actually writes: what a redirect points at, and the arguments of a command the floor
+recognises as a writer. Handing the wide net every whitespace token in the script instead is how
+reading a shell profile came to raise "Change a file this computer runs on its own", while the same
+read spelled without the wrapper raised nothing at all. A floor that rewards one phrasing over
+another is not judging the action, and a floor the owner taps through has stopped being a floor.
+
+The fail-closed property is kept whole rather than traded away: the moment any command in a script is
+one the classifier cannot place on either side, it declines to answer and the caller falls back to
+the wide net. And every write to a path this computer executes on its own still cards — a write now
+that runs later, outside any approval, is the case the rule exists for. The way to know which half is
+load-bearing is to switch the rule off and count what stops: most of those cards do, which is the
+evidence that the half that survives the correction is the half that was doing the work.
 
 An approved action is bound to the arguments the owner saw: the approval row stores an HMAC over
 them, and the resume path recomputes it before executing, so an approval cannot be spent on a

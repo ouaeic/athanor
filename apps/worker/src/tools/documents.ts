@@ -1,7 +1,10 @@
 import { randomInt, randomUUID } from 'node:crypto';
 import { sha256, AthanorError } from '@athanor/core';
 import { MediaClient, type ModelToolCall } from '@athanor/model-gateway';
-import { spendHalt, textValue, transcriptionRouteAllowed, type ExecObservation } from '../agent.js';
+import { type ExecObservation } from '../agent-state.js';
+import { transcriptionRouteAllowed } from '../routing.js';
+import { spendHalt } from '../turn-bounds.js';
+import { textValue } from '../values.js';
 import {
   managedMediaCatalog,
   mediaDimension,

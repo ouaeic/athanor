@@ -30,6 +30,8 @@
  * @athanor/contracts, which did not move - `surfaceActionRequest` below is the single place the
  * two spellings meet.
  */
+import { textValue } from './values.js';
+
 const selector = {
   type: 'string',
   description:
@@ -161,11 +163,6 @@ export const desktopActionProperties: Record<string, unknown> = {
   milliseconds: { type: 'integer', minimum: 50, maximum: 30_000 },
   purpose: { type: 'string', description: 'What this GUI action will do for the user.' }
 };
-
-export const textValue = (value: unknown, fallback = ''): string =>
-  typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
-    ? String(value)
-    : fallback;
 
 /** Everything a surface action call carries except the discriminator and the model's own sentence. */
 /**

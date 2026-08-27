@@ -9,7 +9,12 @@ import {
   type MemoryKind
 } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
-import { boundedKnowledge, openedSkillsStillReadable, skillDocument, textValue } from '../agent.js';
+import {
+  boundedKnowledge,
+  openedSkillsStillReadable,
+  skillDocument,
+  textValue
+} from '../values.js';
 import { recallMemory, searchMemorySessions } from '../memory-runtime.js';
 import { builtinSkillLibrary, findSkillByName, openSkill, skillCatalogEntries } from '../skills.js';
 import { type ToolContext } from '../tool-dispatch.js';

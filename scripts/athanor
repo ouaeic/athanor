@@ -28,6 +28,15 @@ backup_timer="athanor-backup.timer"
 # What the last backup run did, beside the certificate and dynamic DNS files the same way: the
 # interface has no other way to know whether the thing it promises daily has ever happened.
 athanor_backup_status="$athanor_state/backup.status"
+# And what the last update run did, beside it, for the same reason and in the same format.
+#
+# The daily backup has three things the weekly update did not: an OnFailure= companion, a status
+# record, and a `doctor` arm that reads it. Without them a 3 a.m. update that failed and rolled the
+# server back was invisible - the unit exits non-zero into a journal nobody reads, the timer
+# schedules next week, and the same failure repeats weekly for as long as its cause lasts, while
+# `doctor` reports unattended updates are on and the server looks perfectly healthy because it is:
+# the rollback worked. What nothing said was that the box had stopped moving.
+athanor_update_status="$athanor_state/update.status"
 # How long the unattended backup waits for the worker to go idle before standing down for the day.
 athanor_backup_idle_wait_seconds="${ATHANOR_BACKUP_IDLE_WAIT_SECONDS:-300}"
 # How long the model catalogue may go without a provider answering before `doctor` calls it a fault
@@ -296,6 +305,66 @@ relay_used_summary() {
   printf ', %s MiB used this month' "$((relay_used_bytes / 1048576))"
 }
 
+# Which Chromium the workspace runner will try to launch, asked of the thing that decides it.
+#
+# `playwright-core` pins a browser revision rather than a range - 1.61.1 asks for Chromium 1228 and
+# 1.62.1 asks for 1234 - and the cache directory is named after the revision. So the release that
+# bumps the dependency is the release the browser on disk stops being the one the code launches. The
+# installer fetched it once and `athanor update` never fetched it again, while `doctor` asked only
+# whether ~/.cache/ms-playwright exists - which it does, holding the revision from whenever the box
+# was installed. Verified broken on a live server: the checkout wanted 1234 and the cache held 1228,
+# every check passed, and every browser job failed. Both halves now ask the revision, from here, so
+# there is one answer rather than two that drift.
+managed_chromium_revision() {
+  node -e '
+    const browsers = require(process.argv[1]).browsers;
+    const chromium = browsers.find((browser) => browser.name === "chromium");
+    if (chromium && chromium.revision) process.stdout.write(String(chromium.revision));
+  ' "$athanor_root/services/workspace-runner/node_modules/playwright-core/browsers.json" 2>/dev/null ||
+    true
+}
+
+# The revision that is wanted and not on disk, or nothing when the right one is already there.
+#
+# Both directories are checked. The runner launches the headless shell and Playwright's own probe
+# reaches for the full browser, and a cache holding one without the other is exactly what a fetch
+# interrupted by a reboot leaves behind - which reads as healthy to anything that only counts
+# directories.
+managed_chromium_absent() {
+  chromium_revision=$(managed_chromium_revision)
+  [ -n "$chromium_revision" ] || return 0
+  for chromium_directory in \
+    "$athanor_home/.cache/ms-playwright/chromium-$chromium_revision" \
+    "$athanor_home/.cache/ms-playwright/chromium_headless_shell-$chromium_revision"; do
+    if [ ! -d "$chromium_directory" ]; then
+      printf '%s' "$chromium_revision"
+      return 0
+    fi
+  done
+}
+
+# Fetch it, as the account that will run it, into the cache that account reads.
+#
+# Called from `update_athanor` after the build and before the restart, which is the only window in
+# which the checkout's Playwright and the machine's browser can be brought back into agreement
+# without an outage of its own. It warns rather than failing: a box whose browser is a release
+# behind still answers every question that does not need one, and rolling a whole release back over
+# a browser download - on an unattended box, at three in the morning, taking the database with it -
+# is a worse outcome than the fault it is repairing. `doctor` is what says so afterwards, and it can
+# now see it.
+fetch_managed_chromium() {
+  chromium_wanted=$(managed_chromium_absent)
+  [ -n "$chromium_wanted" ] || return 0
+  chromium_cli="$athanor_root/services/workspace-runner/node_modules/playwright-core/cli.js"
+  [ -f "$chromium_cli" ] || {
+    warn "the pinned Playwright dependency is not installed, so the managed Chromium could not be fetched"
+    return 0
+  }
+  printf 'Fetching the managed Chromium dependency (revision %s).\n' "$chromium_wanted"
+  runuser -u athanor -- env HOME="$athanor_home" node "$chromium_cli" install chromium ||
+    warn "the managed Chromium (revision $chromium_wanted) could not be fetched; browser jobs will fail until sudo athanor update succeeds at it. sudo athanor doctor reports this"
+}
+
 doctor() {
   need_root doctor
   failed=0
@@ -388,6 +457,16 @@ doctor() {
             check_warn "the last model catalogue refresh failed (${catalog_reason:-no reason recorded}); the catalogue from $catalog_refreshed stays in use and it tries again every $catalog_interval seconds"
           fi
           ;;
+        refused)
+          # A failure, not a warning, and the only catalogue state here that is one on its first
+          # occurrence. Everything else in this case reports a box that is behaving correctly in a
+          # world that is misbehaving: an outage retries, a missing key is a choice. A refusal means
+          # a provider answered and what it answered had stopped describing models - a renamed field
+          # upstream, which is the failure that used to be written straight over the owner's
+          # catalogue and reported as success. It will not clear on its own and nothing else on the
+          # box will ever mention it, so this is the whole of the owner's warning.
+          check_fail "the model catalogue is not being replaced from the provider: ${catalog_reason:-no reason recorded}"
+          ;;
         seeded|frozen)
           # A warning and not a failure, for the reason check_warn exists: an owner running their
           # own endpoint, or a provider this service has no way to ask, is a deliberate arrangement
@@ -428,6 +507,22 @@ doctor() {
     fi
   else
     check_note "model price ceiling: this release has no column to store one, so nothing limits the price of the model a task picks"
+  fi
+  # The running half, which is the one that halts a task, and the one no command could reach until
+  # `athanor spend-cap` existed. Reported here and nowhere else on a headless box: a cap lives in
+  # Settings, Settings is a browser, and an owner setting this computer up over ssh has not opened
+  # one yet. A note rather than a warning, and deliberately not an installer prompt - the zero-prompt
+  # install is correct, and a question asked before the owner knows what a run of theirs costs is
+  # answered by whoever is holding the terminal rather than by whoever is paying.
+  if spend_cap_storable; then
+    cap_report=$(spend_cap_print)
+    if [ -n "$cap_report" ]; then
+      printf '%s\n' "$cap_report" | while IFS= read -r cap_line; do
+        check_note "spending cap - $cap_line"
+      done
+    else
+      check_note "spending cap: no account came back from the database, so there is none to report"
+    fi
   fi
   # "It could not make my CV" is the report this exists to pre-empt. The skill library prescribes
   # these by name, so a gap here is a job that fails in front of the owner rather than here.
@@ -715,13 +810,16 @@ doctor() {
   else
     check_fail "agent computer cannot reach the internet"
   fi
-  if
-    runuser -u athanor -- env HOME="$athanor_home" \
-      node -e "require('fs').accessSync(process.env.HOME + '/.cache/ms-playwright')"
-  then
-    check_ok "managed Chromium dependency"
+  # The revision, not the directory. Asking whether ~/.cache/ms-playwright exists answered yes on a
+  # box whose browser was a release behind the code that launches it, which is the state every box
+  # reaches the first time the pinned Playwright is bumped.
+  chromium_wanted=$(managed_chromium_revision)
+  if [ -z "$chromium_wanted" ]; then
+    check_fail "which Chromium this release wants could not be read; the pinned Playwright dependency is missing from the workspace runner"
+  elif [ -n "$(managed_chromium_absent)" ]; then
+    check_fail "the managed Chromium this release drives (revision $chromium_wanted) is not on this server, so every job needing a browser will fail; sudo athanor update fetches it"
   else
-    check_fail "managed Chromium dependency"
+    check_ok "managed Chromium dependency (revision $chromium_wanted)"
   fi
   # Whether an update could arrive at all, which is a different question from whether the timer is
   # enabled. A checkout that is not following a branch reports "on" and never moves.
@@ -738,6 +836,35 @@ doctor() {
   else
     check_note "unattended updates are off; run sudo athanor auto-update on to enable them"
   fi
+  # What the last update run actually did, which is a different question from whether the timer is
+  # on - and the one nothing here used to ask, on the arm of this product that is supposed to keep
+  # the box current while nobody is watching. A failed unattended update leaves a healthy server:
+  # the rollback works, every check below passes, and the box simply stops moving. Every stretch of
+  # weeks it stays stopped is a stretch with no security fix. The daily backup has had all three of
+  # these - a companion unit, a record, and this - one directory over.
+  update_outcome=$(update_status_field outcome)
+  update_at=$(update_status_field at)
+  update_reason=$(update_status_field reason)
+  case "$update_outcome" in
+    '')
+      if [ -n "$update_source_ok" ]; then
+        check_note "no update run recorded yet"
+      fi
+      ;;
+    ok) check_ok "last update run $update_at: ${update_reason:-complete} (revision $(update_status_field revision))" ;;
+    running)
+      check_warn "an update run started $update_at and has not reported back; if it is not still going, sudo athanor doctor after sudo athanor auto-update run"
+      ;;
+    skipped)
+      # A warning, not a note. Standing down for a running task is the design; standing down every
+      # week is a box that has quietly stopped updating, and nothing distinguishes the two from
+      # outside except that this line keeps appearing.
+      check_warn "the last update run stood down at $update_at - $update_reason; if this repeats, run sudo athanor update at a quiet moment"
+      ;;
+    *)
+      check_fail "the last update run failed at $update_at - $update_reason; run sudo athanor logs and sudo athanor update"
+      ;;
+  esac
   # Off and never installed are different faults with different repairs, and `is-enabled --quiet`
   # cannot tell them apart: it answers no to both. Only one of them is fixed by switching backups on,
   # because `systemctl enable` on a unit that is not on the disk fails - so a server that was updated
@@ -1392,6 +1519,11 @@ install_runtime_files() {
     "$(runtime_path /etc/systemd/system/athanor-auto-update.service)"
   install -D -m 0644 infra/native/athanor-auto-update.timer \
     "$(runtime_path /etc/systemd/system/athanor-auto-update.timer)"
+  # Placed and never enabled, exactly like the backup's alert companion: OnFailure= on the update
+  # unit is what starts it, and the unit itself refuses a manual start so nothing can file a report
+  # about an update that never failed.
+  install -D -m 0644 infra/native/athanor-auto-update-alert.service \
+    "$(runtime_path /etc/systemd/system/athanor-auto-update-alert.service)"
   # Also installed without being enabled: `athanor certificate enable` turns this one on once the
   # operator has accepted the certificate authority's subscriber agreement.
   install -D -m 0644 infra/native/athanor-certificate-renew.service \
@@ -1656,8 +1788,15 @@ update_athanor() {
       rollback_ok=0
     if [ "$rollback_ok" -eq 1 ]; then
       printf 'Rollback completed; the failed update was not activated.\n' >&2
+      # Written down, not only printed. This function is reached from the weekly timer as often as
+      # from a terminal, and on that route the sentence above goes into a journal nobody is reading
+      # at three in the morning. Left there, a box that fails the same update every week looks
+      # exactly like a box with nothing to update - the rollback worked, so nothing is broken; it
+      # has simply stopped moving, and stopping quietly is the failure mode this record ends.
+      record_update_status failed 'the update was rolled back and the previous release put back'
     else
       printf 'Automatic rollback was incomplete; keep the backup and run sudo athanor doctor.\n' >&2
+      record_update_status failed 'the update failed and the rollback did not finish; keep the backup'
     fi
     exit "$original_status"
   }
@@ -1694,6 +1833,12 @@ update_athanor() {
   systemctl enable --now athanor-network-watch.service athanor-network-refresh.timer \
     athanor-network-refresh.path
   "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)"
+  # Native things the new checkout needs that `pnpm install` does not place. The installer fetches
+  # the managed Chromium once and nothing ever fetched it again, so the first release to bump the
+  # pinned Playwright left every existing box driving a browser it no longer has - silently, with
+  # `doctor` reporting it healthy. Here rather than after the restart because this is the window the
+  # server is already stopped for; the owner is paying for one outage either way.
+  fetch_managed_chromium
   # Past this line the new release is running and its migrations have had the database, so a failure
   # from here does need the backup put back.
   database_at_risk=1
@@ -1703,6 +1848,10 @@ update_athanor() {
   # Recorded so the next run can tell the operator what to expect before it takes the server away.
   install -d -m 0755 "$athanor_state" 2>/dev/null || true
   printf '%s\n' "$outage_seconds" >"$athanor_state/last-update-outage-seconds" 2>/dev/null || true
+  # Every route to a completed update records itself, exactly as every route to a verified backup
+  # does - by hand from a terminal as well as from the weekly timer, because "when did this box last
+  # actually move" is the same question either way.
+  record_update_status ok ''
   printf 'Update complete after %s minutes offline. Keep rollback backup %s until post-update checks pass.\n' \
     "$(((outage_seconds + 59) / 60))" "$rollback_backup"
 }
@@ -1900,6 +2049,30 @@ backup_status_field() {
   sed -n "s/^$1=//p" "$athanor_backup_status" 2>/dev/null | sed -n '1p'
 }
 
+# The same record for the update, in the same format and for the same reason.
+#
+# `revision` is the extra field this one carries: the question underneath "did the update work" is
+# "what is this box running", and after a rollback those two have different answers - the run
+# failed, and the revision is the one it started from. Both are written so `doctor` can say which.
+record_update_status() {
+  install -d -m 0755 "$athanor_state" 2>/dev/null || true
+  {
+    printf 'at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'outcome=%s\n' "$1"
+    printf 'reason=%s\n' "${2:-}"
+    printf 'revision=%s\n' \
+      "$(git -C "$athanor_root" rev-parse --short HEAD 2>/dev/null || printf 'unknown')"
+  } >"$athanor_update_status" 2>/dev/null || return 0
+  # World-readable like the backup, certificate and dynamic DNS records beside it, so the API can
+  # read it as an unprivileged service. Nothing secret goes in: an outcome, a stamp, a revision,
+  # and a reason this script wrote itself.
+  chmod 0644 "$athanor_update_status" 2>/dev/null || true
+}
+
+update_status_field() {
+  sed -n "s/^$1=//p" "$athanor_update_status" 2>/dev/null | sed -n '1p'
+}
+
 # Why a run failed, in this program's own words and nobody else's.
 #
 # Everything a failing run printed is in the journal for whoever is at a shell. What lands in a
@@ -1927,26 +2100,68 @@ report_backup_status() {
   esac
 }
 
+# Written down first, then said. `fail` exits, so a reason that only reached the journal is a reason
+# nothing outside the journal can report - and every one of these is a state that repeats weekly for
+# as long as its cause lasts, which is precisely the thing this record exists to make visible.
+update_failed() {
+  record_update_status failed "$1"
+  fail "$1"
+}
+
 auto_update_run() {
   systemctl is-enabled --quiet "$auto_update_timer" 2>/dev/null ||
-    fail "unattended updates are off; run sudo athanor auto-update on"
-  [ -d "$athanor_root/.git" ] || fail "$athanor_root is not a Git checkout"
+    update_failed "unattended updates are off; run sudo athanor auto-update on"
+  [ -d "$athanor_root/.git" ] || update_failed "$athanor_root is not a Git checkout"
   git -C "$athanor_root" fetch --quiet --prune ||
-    fail "the update source could not be reached"
+    update_failed "the update source could not be reached"
   upstream_revision=$(git -C "$athanor_root" rev-parse --verify --quiet '@{upstream}') ||
-    fail "$athanor_root has no upstream branch to update from"
+    update_failed "$athanor_root has no upstream branch to update from"
   if [ "$(git -C "$athanor_root" rev-parse --verify HEAD)" = "$upstream_revision" ]; then
     printf 'athanor: already up to date.\n'
+    # A run that found nothing to do is a run that worked. Recording it is what tells the owner
+    # weeks later that the timer is still turning, which the revision alone cannot say.
+    record_update_status ok 'already on the newest revision'
     return 0
   fi
   if ! wait_for_idle_worker; then
     printf 'athanor: a task is still running; the next weekly window will retry.\n'
+    # The silent path, and the same one the backup had. Standing down once is the design; standing
+    # down every week on a box that is busy whenever the window comes round is the box quietly
+    # never updating again, and the exit status says nothing went wrong because nothing did.
+    record_update_status skipped 'a task was still running when the window came round'
     return 0
   fi
+  # Pessimistic first and corrected on the way out, because a run killed by its own two-hour start
+  # timeout, or by the power going off mid-update, never reaches another line of this script.
+  record_update_status running ''
   # Set as an ordinary variable rather than a command prefix: whether a prefix assignment survives
   # a function call is not the same across shells.
   athanor_require_idle=1
   update_athanor
+}
+
+# Started by OnFailure= on the update unit. Covers the one ending nothing above can write down: a
+# run stopped by TimeoutStartSec, or by the machine losing power partway, which gets no further line
+# to run. The `running` guard is what keeps it from filing a report about a run that finished.
+auto_update_alert() {
+  [ "$(update_status_field outcome)" = running ] || return 0
+  record_update_status failed 'the run was stopped before it finished; the server may be part-updated'
+  printf 'athanor: the unattended update did not finish. Run sudo athanor doctor.\n' >&2
+}
+
+# The last run, in the words the interface uses for it.
+report_update_status() {
+  case "$(update_status_field outcome)" in
+    '') printf 'Last run: nothing recorded yet\n' ;;
+    ok)
+      last_update_reason=$(update_status_field reason)
+      printf 'Last run: %s, %s\n' "$(update_status_field at)" \
+        "${last_update_reason:-complete}"
+      ;;
+    running) printf 'Last run: started %s and has not reported back\n' "$(update_status_field at)" ;;
+    skipped) printf 'Last run: %s, stood down - %s\n' "$(update_status_field at)" "$(update_status_field reason)" ;;
+    *) printf 'Last run: %s, failed - %s\n' "$(update_status_field at)" "$(update_status_field reason)" ;;
+  esac
 }
 
 auto_update() {
@@ -1970,8 +2185,10 @@ auto_update() {
       fi
       printf 'Installed revision: %s\n' \
         "$(git -C "$athanor_root" rev-parse --short HEAD 2>/dev/null || printf 'unknown')"
+      report_update_status
       ;;
     run) auto_update_run ;;
+    alert) auto_update_alert ;;
     *) fail "usage: athanor auto-update {on|off|status}" ;;
   esac
 }
@@ -2003,6 +2220,7 @@ uninstall_athanor() {
     "$(runtime_path /etc/systemd/system/athanor-network-watch.service)" \
     "$(runtime_path /etc/systemd/system/athanor-auto-update.service)" \
     "$(runtime_path /etc/systemd/system/athanor-auto-update.timer)" \
+    "$(runtime_path /etc/systemd/system/athanor-auto-update-alert.service)" \
     "$(runtime_path /etc/systemd/system/athanor-backup.service)" \
     "$(runtime_path /etc/systemd/system/athanor-backup.timer)" \
     "$(runtime_path /etc/systemd/system/athanor-backup-alert.service)" \
@@ -2133,7 +2351,7 @@ spend_ceiling_print() {
 }
 
 spend_ceiling_command() {
-  need_root spend-ceiling "$@"
+  need_root price-ceiling "$@"
   ceiling_action="${1:-show}"
   case "$ceiling_action" in
     show|'')
@@ -2148,7 +2366,7 @@ spend_ceiling_command() {
     set)
       shift
       [ "$#" -eq 2 ] ||
-        fail "usage: athanor spend-ceiling set INPUT OUTPUT - dollars per million tokens, or none"
+        fail "usage: athanor price-ceiling set INPUT OUTPUT - dollars per million tokens, or none"
       # `fail` exits, but inside a command substitution it exits the subshell and leaves the
       # caller holding an empty string - which would reach the statement below as a syntax error
       # rather than as a refusal. `set -e` would catch it; saying so is cheaper than relying on it.
@@ -2164,10 +2382,19 @@ spend_ceiling_command() {
         printf 'Run sudo athanor update once a release that adds it is published.\n' >&2
         exit 1
       }
+      # `monthly_cap_usd` is written on the INSERT arm and deliberately not on the UPDATE arm.
+      #
+      # This command creates a `spend_limits` row for an owner who has never had one, and every
+      # money cap in that row is NULL. `cappedMonthlyUsd` in billing.ts reads a stored row as the
+      # owner's answer in full - an explicit NULL means "no ceiling, thank you" - and gives the
+      # $100 default only where no row exists at all. So setting a price ceiling, a command about
+      # dollars per million tokens, silently removed the only dollar ceiling on the box. The comment
+      # on DEFAULT_MONTHLY_CAP_USD names this writer by name and says the fix belongs in a column
+      # default; until one exists, the writer that caused it can decline to cause it.
       runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q athanor <<SQL
 INSERT INTO spend_limits (user_id, max_input_usd_per_million_tokens,
-                          max_output_usd_per_million_tokens)
-SELECT id, $ceiling_input, $ceiling_output FROM users
+                          max_output_usd_per_million_tokens, monthly_cap_usd)
+SELECT id, $ceiling_input, $ceiling_output, $(default_monthly_cap) FROM users
 ON CONFLICT (user_id) DO UPDATE SET
   max_input_usd_per_million_tokens = EXCLUDED.max_input_usd_per_million_tokens,
   max_output_usd_per_million_tokens = EXCLUDED.max_output_usd_per_million_tokens,
@@ -2178,13 +2405,142 @@ SQL
     clear)
       spend_ceiling_command set none none
       ;;
-    *) fail "usage: athanor spend-ceiling [show|set INPUT OUTPUT|clear]" ;;
+    *) fail "usage: athanor price-ceiling [show|set INPUT OUTPUT|clear]" ;;
+  esac
+}
+
+# The default the running code applies to a box with no spend_limits row, read out of the file that
+# decides it rather than restated here - the same rule `spend_ceiling_max` follows against the
+# contract, and for the same reason: a number kept in two places is a number that disagrees with
+# itself the first time one of them moves.
+default_monthly_cap() {
+  monthly_default=$(
+    sed -n 's/^export const DEFAULT_MONTHLY_CAP_USD = \([0-9][0-9]*\);$/\1/p' \
+      "$athanor_root/packages/data/src/store/billing.ts" 2>/dev/null | sed -n '1p'
+  )
+  # NULL rather than a guessed number when the constant cannot be read. Writing a dollar cap this
+  # script invented would be worse than writing none: the owner would be stopped mid-task by a
+  # figure nothing on the box can account for.
+  [ -n "$monthly_default" ] || monthly_default=NULL
+  printf '%s' "$monthly_default"
+}
+
+# The other half of the brake, and the half the owner probably meant.
+#
+# `spend-ceiling` was a price-per-million control wearing the name of a money cap. The money caps -
+# daily and monthly dollars, the thing that actually halts a run - had no command at all: they were
+# reachable only through Settings, which is a browser, which is the one thing an owner setting up a
+# headless box over ssh does not have yet. So the command named for spending could not limit
+# spending, and the control that could was not on this computer's command line.
+#
+# Deliberately not an installer prompt. The zero-prompt install is correct and stays: a question at
+# install time is a question asked before the owner knows what a run of theirs costs, and answered
+# by whoever is holding the terminal rather than by whoever is paying. `doctor` says once, every
+# time it is run, that no cap is set. That is the right cadence for a decision the owner should make
+# with their own numbers in front of them.
+spend_cap_storable() {
+  [ "$(
+    runuser -u postgres -- psql -tAqc \
+      "SELECT COUNT(*) FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'spend_limits'
+         AND column_name IN ('daily_cap_usd', 'monthly_cap_usd')" \
+      athanor 2>/dev/null | tr -d '[:space:]'
+  )" = 2 ]
+}
+
+# One amount, validated. Echoes the SQL literal - a bare number, or NULL for "no cap". Everything
+# reaching the statement below has passed through here, so the interpolation there is over a string
+# this function proved is digits and at most one point. No upper bound, unlike a price ceiling: this
+# is the owner's own money and a cap refused for being large is a cap nobody sets.
+spend_cap_amount() {
+  case "$1" in
+    none | off | unset)
+      printf 'NULL'
+      return 0
+      ;;
+  esac
+  printf '%s' "$1" | grep -Eq '^[0-9]+(\.[0-9]+)?$' ||
+    fail "a cap is an amount in dollars, such as 20 or 5.50, or the word none - not '$1'"
+  printf '%s' "$1"
+}
+
+spend_cap_rows() {
+  runuser -u postgres -- psql -tAqc \
+    "SELECT u.username || '|' ||
+            COALESCE(s.daily_cap_usd::text, 'none') || '|' ||
+            COALESCE(s.monthly_cap_usd::text, 'none') || '|' ||
+            (CASE WHEN s.user_id IS NULL THEN 'no-row' ELSE 'row' END)
+     FROM users u LEFT JOIN spend_limits s ON s.user_id = u.id
+     ORDER BY u.created_at, u.username" \
+    athanor 2>/dev/null
+}
+
+# Said in the owner's terms, and the absent row said differently from an explicit none - because
+# they mean different things to the code that reads them. No row is nobody having been asked, and
+# the running build answers that with its own monthly default; an explicit none is the owner having
+# answered, and it is answered for good.
+spend_cap_print() {
+  cap_default=$(default_monthly_cap)
+  spend_cap_rows | while IFS='|' read -r cap_user cap_daily cap_monthly cap_row; do
+    [ -n "$cap_user" ] || continue
+    if [ "$cap_row" = no-row ] && [ "$cap_default" != NULL ]; then
+      printf '%s: no cap set, so this release applies its own $%s a month. Nothing caps a single day.\n' \
+        "$cap_user" "$cap_default"
+      continue
+    fi
+    case "$cap_daily|$cap_monthly" in
+      'none|none')
+        printf '%s: no spending cap at all. Nothing halts a run for cost.\n' "$cap_user"
+        ;;
+      'none|'*) printf '%s: at most $%s a month; nothing caps a single day.\n' "$cap_user" "$cap_monthly" ;;
+      *'|none') printf '%s: at most $%s a day; nothing caps a month.\n' "$cap_user" "$cap_daily" ;;
+      *) printf '%s: at most $%s a day and $%s a month.\n' "$cap_user" "$cap_daily" "$cap_monthly" ;;
+    esac
+  done
+}
+
+spend_cap_command() {
+  need_root spend-cap "$@"
+  cap_action="${1:-show}"
+  case "$cap_action" in
+    show | '')
+      spend_cap_storable || {
+        printf 'This server cannot store a spending cap: its database has no column for one.\n'
+        return 0
+      }
+      spend_cap_print
+      ;;
+    set)
+      shift
+      [ "$#" -eq 2 ] ||
+        fail "usage: athanor spend-cap set DAILY MONTHLY - amounts in dollars, or none"
+      # `fail` exits, but inside a command substitution it exits the subshell and leaves the caller
+      # holding an empty string, which would reach the statement below as a syntax error rather than
+      # as a refusal.
+      cap_daily=$(spend_cap_amount "$1") || exit 1
+      cap_monthly=$(spend_cap_amount "$2") || exit 1
+      spend_cap_storable || {
+        printf 'athanor: this server has no column to store a spending cap. Nothing was changed.\n' >&2
+        exit 1
+      }
+      runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q athanor <<SQL
+INSERT INTO spend_limits (user_id, daily_cap_usd, monthly_cap_usd)
+SELECT id, $cap_daily, $cap_monthly FROM users
+ON CONFLICT (user_id) DO UPDATE SET
+  daily_cap_usd = EXCLUDED.daily_cap_usd,
+  monthly_cap_usd = EXCLUDED.monthly_cap_usd,
+  updated_at = NOW();
+SQL
+      spend_cap_print
+      ;;
+    clear) spend_cap_command set none none ;;
+    *) fail "usage: athanor spend-cap [show|set DAILY MONTHLY|clear]" ;;
   esac
 }
 
 usage() {
   printf '%s\n' \
-    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|spend-ceiling [show|set INPUT OUTPUT|clear]|backup [dir]|backup auto on|off|status|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...}' \
+    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...}' \
     '' \
     'Browser sign-in needs a hostname: a passkey is bound to a domain name and the WebAuthn' \
     'standard does not allow an IP address. If this server has no name, run:' \
@@ -2210,7 +2566,22 @@ case "$command_name" in
     connection_details
     ;;
   pairing-code) pairing_code ;;
-  spend-ceiling) spend_ceiling_command "$@" ;;
+  price-ceiling) spend_ceiling_command "$@" ;;
+  # The name this was shipped under, kept answering rather than removed. It set a price per million
+  # tokens while wearing the name of a money cap, which is the confusion the rename exists to end -
+  # but an owner with the old name in a note or a shell history should be told what it is called
+  # now, not told there is no such command. Two lines, and it also disambiguates: there is now a
+  # real spend cap, and somebody typing the old name may want either.
+  spend-ceiling)
+    printf 'athanor: "spend-ceiling" set a price per million tokens, and is now called
+' >&2
+    printf '  sudo athanor price-ceiling %s
+' "$*" >&2
+    printf 'To cap what a day or a month may cost in dollars, use sudo athanor spend-cap.
+' >&2
+    spend_ceiling_command "$@"
+    ;;
+  spend-cap) spend_cap_command "$@" ;;
   set-hostname) set_hostname "${1:-}" ;;
   backup)
     case "${1:-}" in

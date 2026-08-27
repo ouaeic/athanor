@@ -138,6 +138,7 @@ cp "$repository_root/infra/native/start-desktop-session.sh" \
   "$repository_root/infra/native/athanor-network-watch.service" \
   "$repository_root/infra/native/athanor-auto-update.service" \
   "$repository_root/infra/native/athanor-auto-update.timer" \
+  "$repository_root/infra/native/athanor-auto-update-alert.service" \
   "$repository_root/infra/native/athanor-certificate-renew.service" \
   "$repository_root/infra/native/athanor-certificate-renew.timer" \
   "$repository_root/infra/native/athanor-certificate-alert.service" \

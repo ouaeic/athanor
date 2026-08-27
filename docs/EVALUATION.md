@@ -9,12 +9,16 @@ completion nag — plus a fallback plan, a baseline refusal, a repetition watch 
 continuer. Each of them was right about the failure it saw. None of them can be removed, because
 nobody could say what removing one would cost.
 
-`evals/` answers that. Fifty-three owner-shaped requests run against the real agent loop with a
-stubbed model, a stubbed workspace runner and a stubbed media provider, and every one reports what
-it cost: how many model calls, how many prompt tokens, how much of each request repeated the one
-before it byte for byte, how many commands the workspace ran, how many generations the provider was
-charged for and on which route, and which gates fired. Delete a gate, run the suite, read the
-difference. That is the whole point.
+`evals/` answers that. Owner-shaped requests — the count is in the table below — run against the real
+agent loop with a stubbed model, a stubbed workspace runner and a stubbed media provider, and every
+one reports what it cost: how many model calls, how many prompt tokens, how much of each request
+repeated the one before it byte for byte, how many commands the workspace ran, how many generations
+the provider was charged for and on which route, and which gates fired. Delete a gate, run the suite,
+read the difference. That is the whole point.
+
+One fixture states a target the loop does not meet yet. It is reported as pending rather than as a
+failure, with the sentence saying what it is waiting on, so an open gap is visible in the report
+instead of being absent from it.
 
 Not every model call in a turn is a step of it. Two of them are somebody else's: the tool-free call
 a compaction makes to write its brief, and every step a delegated specialist takes inside its own
@@ -36,22 +40,31 @@ pnpm eval --json out.json     # write the raw results as well
 pnpm eval --accept            # rewrite evals/baseline.json from this run
 pnpm eval:context             # the context-quality matrix, deterministic half
 pnpm eval:context --judge     # also the graded half; needs OPENROUTER_API_KEY
+pnpm eval:injection           # the injection floor, against a published benchmark
+pnpm eval:arms                # two configurations, the same work, one difference
 ```
+
+Four rigs, and they answer four different questions. This one prices the loop. `eval:context` asks
+whether narrowing the window cost the agent anything it needed. `eval:injection` replays a published
+untrusted-content benchmark against the floor. `eval:arms` holds two configurations of athanor
+against the same sample, which is the only honest way to settle an argument about what should be
+resident. Each has a `--ci` or offline arm that needs no provider key.
 
 The flag was called `--update` until the baseline became a gate rather than a printout. Rewriting a
 committed baseline is an acceptance, so it is spelled like one; the old name exits 2 and names the
 new one rather than silently writing nothing.
 
-`pnpm eval:context` is a second rig beside this one, in `evals/context-quality/`. This suite asserts
-counters — step counts, token counts, which holds fired — over a scripted model, so it cannot tell
-whether narrowing the window cost the agent anything it needed. That is what the context-quality
-matrix is for: it replays sixty steps of one task under each candidate context configuration and
-scores whether the fact each probe needs was still in the window at the step that needed it. Run it
-before changing any constant in `apps/worker/src/context.ts`. Its `--ci` arm is deterministic, needs
-no provider key, and exits 1 on a quality regression.
+The division of labour between the first two is worth being precise about, because it decides which
+one can catch what. This suite asserts counters — step counts, token counts, which holds fired — over
+a scripted model, so it cannot tell whether narrowing the window cost the agent anything it needed.
+`evals/context-quality/` can: it replays sixty steps of one task under each candidate context
+configuration and scores whether the fact each probe needs was still in the window at the step that
+needed it. Run it before changing any constant in `apps/worker/src/context.ts`, and before cutting
+anything from the resident set. A cut that this suite reports as pure saving and that one reports as
+a quality regression is damage, and the two together are the only way to tell the difference.
 
-It is offline and deterministic: no provider key, no network, no workspace runner, nothing to set
-up. A run takes a few seconds.
+This suite is offline and deterministic: no provider key, no network, no workspace runner, nothing to
+set up. A run takes a few seconds.
 
 `pnpm eval` exits non-zero when a fixture's expectations fail. It is **not** part of `pnpm check`,
 and it should not become part of it. A behavioural suite that blocks every commit is a suite
@@ -62,14 +75,63 @@ any change to `apps/worker/src/agent.ts`, `context.ts` or `tools.ts`, and in CI 
 The types are checked by `pnpm typecheck`, and the code is linted by `pnpm lint`, both of which do
 gate commits. Only the behaviour is kept out.
 
+## Every number on this page, and where it comes from
+
+This document used to quote its own figures in prose, with an instruction to re-derive them from the
+baseline rather than copy them forward. They were copied forward anyway, three times, and ended up
+saying three different things — which is worse than saying nothing, because a stale figure in prose
+reads exactly like a measurement.
+
+So the figures live here, once, and nowhere else on the page. Every line is a cell of
+`evals/baseline.json` or arithmetic over two of them, and `scripts/check-repository.mjs` re-derives
+the whole block on every `pnpm check`. Accept a new baseline and this page fails the build until it
+is re-derived, naming the value it should now carry. The instruction is no longer advice.
+
+```baseline
+fixtures                                                                        70
+long-a-finished-phase-is-never-declared.modelCalls                              38
+long-a-finished-phase-is-never-declared.promptTokens                     1,454,342
+long-a-finished-phase-is-never-declared.catalogueTokens                    478,648
+long-a-finished-phase-is-never-declared.cachePrefix                             95
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.modelCalls      40
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.promptTokens 1,400,688
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.catalogueTokens 491,245
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.cachePrefix     94
+long-finished-phases-condense-rather-than-shred.cachePrefix                     66
+compaction.extraModelCalls                                                       2
+compaction.tokensSaved                                                      53,654
+compaction.cachePointsGivenUp                                                    1
+floorWalk.cachePointsLost                                                       28
+```
+
+The last four are derived rather than stored, and the check does the subtraction itself:
+`compaction.*` is the condensed arm against the control arm of the proof pair, and
+`floorWalk.cachePointsLost` is the gap between the two long fixtures whose only material difference
+is the size of what their tools returned.
+
 ## What the report says
 
-Each row is one fixture: its shape, the model calls it cost, the estimated prompt tokens athanor
-built across those calls, how much of each request was a byte-for-byte repeat of the one before it,
-and the drift of all three against `evals/baseline.json`. Under the table, `WHAT FAILED` names the
-fixtures whose expectations broke, each with the prose statement of what it was protecting;
-`WHAT THE HOLDS COST` totals how many fixtures each gate fired on and how many extra model calls it
-bought.
+Each row is one fixture: its shape, the model calls it cost, the prompt tokens the provider would
+bill for across those calls, how many of those were the tool catalogue, the largest single window
+athanor prepared, how much of each request was a byte-for-byte repeat of the one before it, and the
+drift of each against `evals/baseline.json`. Under the table, `WHAT FAILED` names the fixtures whose
+expectations broke, each with the prose statement of what it was protecting; `WHAT IS PENDING` names
+the stated targets the loop does not meet yet, which are not regressions; `WHAT THE HOLDS COST`
+totals how many fixtures each gate fired on and how many extra model calls it bought.
+
+`tokens` and `cat` are the two halves of one correction, and it is worth stating plainly what it
+changed. The column used to sum athanor's own window estimate, which is the number the compaction
+trigger is compared against — and that number counts none of `body.tools`. So the largest fixed cost
+the product pays was invisible to the one instrument built to price it: deleting the entire tool
+catalogue would have moved the headline column by nothing at all. `tokens` is now what a provider
+would charge for, catalogue included, and `cat` is how much of it the catalogue was. On a
+question-answering turn `cat` is the overwhelming majority of the row.
+
+`peak` is the largest single request the run prepared, beside the sum of them. The sum says what a
+turn cost; `peak` says whether it fitted, and the two move in opposite directions on the same
+change — condensing a long turn raises the total by a summarising call and lowers the peak by
+whatever it condensed. A row whose peak approaches its window is a row about to start refusing
+requests, and nothing in this table could previously see it.
 
 Token drift of a few tokens with no step change is the runtime block's clock, which carries the
 current time and is rebuilt on every step. Anything larger is a real change in what athanor sends.
@@ -81,13 +143,12 @@ the last is the ceiling on what could be handed back cheaply. A turn that only a
 measures about 97%. A turn that rewrites bytes near the front of it, for any reason, falls into the
 sixties, and the step count does not move at all. The two long fixtures make the point on the same
 mechanism: `long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly` keeps its tool results
-small enough that the older-output floor never has to move and reads **94%**, while
+small enough that the older-output floor never has to move, while
 `long-finished-phases-condense-rather-than-shred` returns results far larger than that floor, so the
-floor walks down and re-cuts every one of them each time it moves, and it reads **66%**. Twenty-eight
-points of a long job's bill, decided by nothing but the size of what the tools returned, and not one
-other number in the report changes. Every percentage in this document is a committed cell of
-`evals/baseline.json`; read it there rather than trusting the sentence. A single-call turn has no
-previous request and reports `-`.
+floor walks down and re-cuts every one of them each time it moves. The gap between the two is
+`floorWalk.cachePointsLost` in the table above — that much of a long job's bill, decided by nothing
+but the size of what the tools returned, and not one other number in the report changes. A
+single-call turn has no previous request and reports `-`.
 
 It is measured on the request as the provider reads it — the tool catalogue first, then the
 conversation — rather than in the order the JSON body happens to be written, and the tool-free call
@@ -153,18 +214,25 @@ they are described. Delegation, on `research-a-specialist-reads-and-the-turn-inh
 is one step of the turn and an open-ended bill underneath it, and the two floors that hold it are
 that a specialist's reading crosses back into the turn as untrusted content and that its reach for a
 command runs nothing. Compaction, as a pair of proof jobs which differ only in whether the agent
-says the first document is finished. Measured on a 128,000-token window, saying so costs **two model
-calls** — the step that asks and the tool-free call that writes the brief — and saves **74,246
-prompt tokens**, for two points of cached prefix given up. Both halves of that are committed cells,
-so the claim is arithmetic rather than recollection: `long-a-finished-phase-is-never-declared` is
-983,830 prompt tokens over 38 model calls at 96% cached, and
-`long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly` is 909,584 over 40 at 94%;
-983,830 − 909,584 = 74,246. Subtract the rows and what is left is a compaction, because the control
-arm asserts zero compactions and its tool results are deliberately small enough that the
-older-output floor never cuts one. That is a number to argue with, and it is now committed —
-re-derive it from the baseline after any change rather than copying this sentence forward. And skills, on the same pair: an opened procedure is
-an ordinary tool result, so a compaction condenses it like anything else, and the brief has to name
-what it took or the agent works on to a procedure it can no longer read with nothing saying so.
+says the first document is finished. Measured on a 128,000-token window, saying so costs
+`compaction.extraModelCalls` — the step that asks and the tool-free call that writes the brief — and
+saves `compaction.tokensSaved`, for `compaction.cachePointsGivenUp` of cached prefix given up. All
+three are subtractions over committed cells, done by the check rather than by a sentence, so the
+claim is arithmetic rather than recollection. Subtract the rows and what is left is a compaction,
+because the control arm asserts zero compactions and its tool results are deliberately small enough
+that the older-output floor never cuts one.
+
+That saving is smaller than it used to look, and the reason is the correction described above. The
+two extra calls a compaction costs each re-send the whole tool catalogue, so on the billed measure
+part of what the condensed window gives back is spent again on the catalogue that pays no attention
+to it. The `catalogueTokens` cells in the table are how much: the condensed arm carries _more_
+catalogue than the control arm despite carrying a smaller window, because it makes two more requests.
+A compaction is still worth it on this pair, and it is worth less than the window-estimate column
+implied — which is what an instrument is for.
+
+And skills, on the same pair: an opened procedure is an ordinary tool result, so a compaction
+condenses it like anything else, and the brief has to name what it took or the agent works on to a
+procedure it can no longer read with nothing saying so.
 
 The mechanisms judged not worth a fixture, so that the next person does not read their absence as an
 oversight. `memory_recall`, `schedule`, `connector_list`/`connector_action`, `desktop_*`,
@@ -185,9 +253,9 @@ tail the compaction target asked to keep was larger than the whole conversation,
 held down by cutting older tool results to the two-thousand-character floor instead. Capping the
 trigger in absolute tokens fixed that, and all three now condense. What the row still reports is the
 other half of that story: its tool results are far larger than the older-output floor, so the floor
-walks down anyway and re-cuts every one of them each time it moves, and the cached share sits at 66%
-where the proof pair above — same mechanism, results small enough that the floor never has to cut
-one — reads 94%. Twenty-eight points of a long job's bill, decided by the size of what its tools
+walks down anyway and re-cuts every one of them each time it moves, and its cached share falls below
+the proof pair above by `floorWalk.cachePointsLost` — same mechanism, results small enough that the
+floor never has to cut one. That much of a long job's bill, decided by the size of what its tools
 return.
 
 ## What it does not do

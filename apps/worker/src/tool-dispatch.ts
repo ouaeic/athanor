@@ -1,7 +1,7 @@
 import type { ModelRelease, WebToolPlan } from '@athanor/contracts';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import type { ModelGateway, ModelToolCall } from '@athanor/model-gateway';
-import type { AgentState, AgentWorkerConfig, InferenceCredential } from './agent.js';
+import type { AgentState, AgentWorkerConfig, InferenceCredential } from './agent-state.js';
 import { executeDelegateTool } from './delegate.js';
 import type { DestinationContext } from './egress.js';
 import type { WebSearchAnswer } from './provider-search.js';
@@ -78,6 +78,18 @@ export interface ToolContext {
    * arm would have to be handed separately: a table whose entries take different context types is a
    * table that cannot be indexed by tool name, which is the whole shape being bought here.
    */
+  /*
+   * The dispatcher itself, so the one arm that re-enters it does not have to import it.
+   *
+   * `delegate` runs a model turn of its own, and every tool call that turn makes goes back
+   * through `executeToolCall`. Reaching for it by import made `delegate.ts` and this file a
+   * two-module runtime import cycle - the last one in the tree once `agent.ts`'s re-export shim
+   * stopped holding the other ten modules open. Handing it over at the construction site instead
+   * is the same recursion written so that the dependency runs one way: this file imports the arm,
+   * the arm does not import this file. A specialist's sub-context is `{...context, …}`, so it
+   * carries the dispatcher without anything having to remember to pass it.
+   */
+  readonly dispatch: (context: ToolContext, call: ModelToolCall) => Promise<unknown>;
   readonly gateway: (
     task: TaskRecord,
     model: ModelRelease

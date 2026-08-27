@@ -201,18 +201,26 @@ sudo athanor auto-update {status|on|off}
 sudo athanor certificate
 sudo athanor ddns
 sudo athanor set-hostname NAME
-sudo athanor spend-ceiling {show|set INPUT OUTPUT|clear}
+sudo athanor price-ceiling {show|set INPUT OUTPUT|clear}
+sudo athanor spend-cap {show|set DAILY MONTHLY|clear}
+sudo athanor spend-ceiling ...                 # the old name for price-ceiling; still answers
 sudo athanor relay {status|on|off}
 sudo athanor uninstall
 ```
 
-`spend-ceiling` is the pre-flight half of the spending brake. The daily, monthly and per-task caps
-in Settings watch what a task has already spent and halt it; this refuses to pick a model priced
-above the rates you name in the first place, which is the half that works while you are asleep.
-Both rates are dollars per million tokens - `sudo athanor spend-ceiling set 2 10` means "at most $2
-per million in and $10 per million out" - and either may be the word `none`. A model you choose by
-name is never constrained by it: the ceiling governs what athanor picks for you, not what you pick
-for yourself.
+`price-ceiling` is the pre-flight half of the spending brake, and it was called `spend-ceiling`
+until the release that added the other half; the old name still answers and tells you the new one.
+It refuses to pick a model priced above the rates you name, which is the half that works while you
+are asleep. Both rates are dollars per million tokens - `sudo athanor price-ceiling set 2 10` means
+"at most $2 per million in and $10 per million out" - and either may be the word `none`. A model you
+choose by name is never constrained by it: the ceiling governs what athanor picks for you, not what
+you pick for yourself.
+
+`spend-cap` is the running half: what a day and a month may cost you in dollars, which is what
+actually halts a task. `sudo athanor spend-cap set 5 100` is "at most $5 a day and $100 a month",
+and either may be `none`. It is the same setting as the caps in Settings, on the command line,
+because an owner setting a headless server up over ssh has no browser open yet. `sudo athanor doctor`
+says which caps are in force every time it runs.
 
 `certificate` requests a publicly trusted certificate for the existing server identity key, so the
 pinned client identity is unchanged. It is a separate command rather than part of install because

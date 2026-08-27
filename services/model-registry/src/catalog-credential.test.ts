@@ -41,6 +41,7 @@ describe('catalogCredential', () => {
     expect(credential).toEqual({
       apiKey: 'sk-owner',
       baseUrl: 'https://openrouter.ai/api/v1',
+      provider: 'openrouter',
       source: 'owner'
     });
   });
@@ -51,7 +52,11 @@ describe('catalogCredential', () => {
       masterKey,
       environmentKey: 'sk-operator'
     });
-    expect(credential).toEqual({ apiKey: 'sk-operator', source: 'environment' });
+    expect(credential).toEqual({
+      apiKey: 'sk-operator',
+      provider: 'openrouter',
+      source: 'environment'
+    });
   });
 
   it('reads the legacy openrouter row, which carries no provider and no context', async () => {
@@ -65,23 +70,63 @@ describe('catalogCredential', () => {
       }),
       masterKey
     });
-    expect(credential).toEqual({ apiKey: 'sk-legacy', source: 'owner' });
+    expect(credential).toEqual({ apiKey: 'sk-legacy', provider: 'openrouter', source: 'owner' });
   });
 
-  it('refuses to send an owner on another provider to OpenRouter', async () => {
+  /*
+   * The contract here has not changed and the assertion has. It used to be `null`, because refusing
+   * to answer was the only way this file had of keeping an Ollama Cloud key away from a request to
+   * OpenRouter - and the price of it was that such an owner's catalogue was written once and then
+   * frozen for the life of the box. Naming the provider keeps the key where it belongs and lets the
+   * pass ask the owner's own endpoint instead, which is the whole of what "openrouter etc." asked
+   * for. What must stay true is that nothing here can route that key to OpenRouter, and what the
+   * caller branches on is this field.
+   */
+  it('names the provider a key belongs to rather than sending it to OpenRouter', async () => {
     for (const provider of ['ollama-cloud', 'openai-compatible']) {
       const credential = await catalogCredential({
         store: source({
           inference: inferenceRow({
             provider,
             apiKey: 'sk-elsewhere',
-            baseUrl: 'https://x.test/v1'
+            baseUrl: 'https://x.test/v1',
+            modelId: 'served-model',
+            enforceZeroDataRetention: true
           })
         }),
         masterKey
       });
-      expect(credential).toBeNull();
+      expect(credential).toEqual({
+        apiKey: 'sk-elsewhere',
+        baseUrl: 'https://x.test/v1',
+        provider,
+        modelId: 'served-model',
+        enforceZeroDataRetention: true,
+        source: 'owner'
+      });
     }
+  });
+
+  /*
+   * An endpoint on the owner's own network commonly has no key at all. Requiring one was what took
+   * those boxes down the frozen path; requiring one for OpenRouter is still right, because a
+   * request to OpenRouter without a key answers nothing to build a catalogue from.
+   */
+  it('accepts a keyless endpoint and still refuses a keyless OpenRouter row', async () => {
+    expect(
+      await catalogCredential({
+        store: source({
+          inference: inferenceRow({ provider: 'custom', baseUrl: 'http://127.0.0.1:11434/v1' })
+        }),
+        masterKey
+      })
+    ).toEqual({ provider: 'custom', baseUrl: 'http://127.0.0.1:11434/v1', source: 'owner' });
+    expect(
+      await catalogCredential({
+        store: source({ inference: inferenceRow({ provider: 'openrouter' }) }),
+        masterKey
+      })
+    ).toBeNull();
   });
 
   it('answers null rather than throwing on the ordinary reasons there is no key', async () => {
@@ -108,6 +153,66 @@ describe('catalogCredential', () => {
       await catalogCredential({
         store: source({ inference: inferenceRow({ provider: 'openrouter' }) }),
         masterKey
+      })
+    ).toBeNull();
+  });
+
+  /*
+   * The third and last shape a box can be pointed at a provider in, and the one that refreshed
+   * nothing at all: an operator who set AI_PROVIDER and AI_BASE_URL in control.env got a single
+   * `custom/AI_DEFAULT_MODEL` row written when the API started and no process ever asked that
+   * endpoint another question for the life of the box.
+   */
+  it('refreshes the endpoint an operator configured in control.env, which nothing ever asked again', async () => {
+    expect(
+      await catalogCredential({
+        store: source({}),
+        masterKey,
+        environmentProvider: {
+          provider: 'openai-compatible',
+          baseUrl: 'https://vllm.internal/v1',
+          modelId: 'served-model'
+        }
+      })
+    ).toEqual({
+      provider: 'openai-compatible',
+      baseUrl: 'https://vllm.internal/v1',
+      modelId: 'served-model',
+      source: 'environment'
+    });
+  });
+
+  /*
+   * Order matters and is argued rather than incidental. `OPENROUTER_REGISTRY_KEY` wins over
+   * everything because an operator who deliberately points the catalogue at a separate account must
+   * not have that overridden by Settings. A key the owner saved wins over `AI_PROVIDER`, because it
+   * is the later and more specific statement of where this computer's work should go. The shipped
+   * default of `AI_PROVIDER=openrouter` names no endpoint of its own and is not a credential.
+   */
+  it('ranks the registry key above a saved key, a saved key above control.env, and ignores the shipped default', async () => {
+    const configured = {
+      provider: 'openai-compatible' as const,
+      baseUrl: 'https://vllm.internal/v1'
+    };
+    const saved = source({
+      inference: inferenceRow({ provider: 'openrouter', apiKey: 'sk-owner' })
+    });
+    expect(
+      await catalogCredential({
+        store: saved,
+        masterKey,
+        environmentKey: 'sk-operator',
+        environmentProvider: configured
+      })
+    ).toMatchObject({ apiKey: 'sk-operator', provider: 'openrouter' });
+    expect(
+      await catalogCredential({ store: saved, masterKey, environmentProvider: configured })
+    ).toMatchObject({ apiKey: 'sk-owner', provider: 'openrouter', source: 'owner' });
+    expect(
+      await catalogCredential({
+        store: source({}),
+        masterKey,
+        environmentProvider: { provider: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1' }
       })
     ).toBeNull();
   });

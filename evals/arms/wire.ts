@@ -128,15 +128,56 @@ export interface MethodAxis {
 
 let cachedAxis: MethodAxis | null = null;
 
-const sectionFromLastCommit = (): { text: string; source: string } | null => {
-  const shown = spawnSync('git', ['show', 'HEAD:apps/worker/src/context.ts'], {
-    cwd: fileURLToPath(new URL('../../', import.meta.url)),
-    encoding: 'utf8',
-    maxBuffer: 32 * 1024 * 1024
-  });
-  if (shown.status !== 0 || !shown.stdout) return null;
-  const section = sectionIn(shown.stdout, METHOD_HEADING);
-  return section === null ? null : { text: section, source: 'HEAD:apps/worker/src/context.ts' };
+/**
+ * How far back the search for the section goes. Bounded so a rig cannot walk a repository's whole
+ * history looking for prose that was never there; a hundred revisions of one file is years.
+ */
+const HISTORY_DEPTH = 100;
+
+const CONTRACT_FILE = 'apps/worker/src/context.ts';
+
+/**
+ * The section as the last revision that still carried it wrote it.
+ *
+ * ── Why this walks, when it used to read HEAD alone ────────────────────────────────────────────
+ *
+ * It read `HEAD:context.ts` and stopped, which is correct for exactly one moment: while the cut is
+ * in the working tree and not yet committed. The moment the cut lands, HEAD is the revision that
+ * removed the section - so the fallback looks in the one place the text is now guaranteed not to
+ * be, finds nothing, and throws. That is what happened. `28f3da6` committed the cut and this rig
+ * has exited non-zero on a clean checkout ever since, on the deterministic half, with no key and no
+ * network involved - and nothing noticed, because it ran in no job. An instrument nobody gates is
+ * an instrument that can be dead for a wave and still be quoted in the next report.
+ *
+ * The heading also survives in a comment ABOVE the constant, explaining what was removed, which is
+ * why this cannot be a `grep`: `sectionIn` matches a line that opens a markdown section, so prose
+ * about the section is correctly not the section. The two together are the trap - a naive check
+ * would say the text is still there and measure a tie.
+ *
+ * So: walk the file's own history newest-first and take the first revision whose contract really
+ * contains the section, naming the commit it came from in `source` so the reader can check it. The
+ * walk stops at the first hit, which on a tree where the cut has just landed is one commit back.
+ */
+const sectionFromHistory = (): { text: string; source: string } | null => {
+  const cwd = fileURLToPath(new URL('../../', import.meta.url));
+  const log = spawnSync(
+    'git',
+    ['log', '--format=%H', '-n', String(HISTORY_DEPTH), '--', CONTRACT_FILE],
+    { cwd, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }
+  );
+  if (log.status !== 0 || !log.stdout) return null;
+  for (const commit of log.stdout.split('\n').filter(Boolean)) {
+    const shown = spawnSync('git', ['show', `${commit}:${CONTRACT_FILE}`], {
+      cwd,
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024
+    });
+    if (shown.status !== 0 || !shown.stdout) continue;
+    const section = sectionIn(shown.stdout, METHOD_HEADING);
+    if (section !== null)
+      return { text: section, source: `${commit.slice(0, 7)}:${CONTRACT_FILE}` };
+  }
+  return null;
 };
 
 export const methodAxis = (supplied?: string): MethodAxis => {
@@ -159,10 +200,10 @@ export const methodAxis = (supplied?: string): MethodAxis => {
       source: 'the shipped contract'
     };
   else {
-    const previous = sectionFromLastCommit();
+    const previous = sectionFromHistory();
     if (!previous)
       throw new Error(
-        `"${METHOD_HEADING}" is in neither the shipped contract nor the last commit, so this rig cannot say what the two arms differ by. Pass --contract-section <file> with the text being argued about, rather than letting the arm measure nothing and report a tie.`
+        `"${METHOD_HEADING}" is in the shipped contract and in none of the last ${HISTORY_DEPTH} revisions of ${CONTRACT_FILE}, so this rig cannot say what the two arms differ by. Pass --contract-section <file> with the text being argued about, rather than letting the arm measure nothing and report a tie.`
       );
     cachedAxis = {
       direction: 'restore',

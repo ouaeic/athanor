@@ -5,7 +5,7 @@ import {
   scanSkillBodyForSecrets,
   SKILL_BUDGET
 } from './skills.js';
-import { textValue } from './surface-actions.js';
+import { textValue } from './values.js';
 import type { ApprovalContext } from './approval-policy.js';
 
 /*

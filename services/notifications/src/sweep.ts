@@ -40,6 +40,18 @@ export interface SweepInput {
   batchSize: number;
   /** Endpoint waits carried over from the previous pass, which widen this one's page. */
   deferredLastSweep: number;
+  /**
+   * Shutdown, checked between items and nowhere else.
+   *
+   * A full batch is a hundred serial sends, each with a ten-second ceiling, so a pass that meets a
+   * push service which accepts the connection and then says nothing can run for minutes - longer
+   * than the thirty seconds `athanor@.service` gives a stop before it sends SIGKILL. Two things
+   * follow, and only the second is a defect: every `athanor restart` and every update pays that
+   * thirty seconds, and the kill can land in the gap between a push that was sent and the ledger
+   * row recording it was sent, so the owner gets that notification a second time on the next start.
+   * Checking here - at an item boundary, never inside one - closes both without abandoning work.
+   */
+  signal?: AbortSignal;
   send: SendNotification;
   now?: () => Date;
   /** The journal. Separated so a test can read what an owner at the box would have read. */
@@ -123,6 +135,10 @@ export const runSweep = async (input: SweepInput): Promise<SweepResult> => {
   const settingsByUser = new Map<string, OwnerNotificationSettings>();
   const presenceByUser = new Map<string, boolean>();
   for (const item of pending) {
+    // Told to stop. Nothing in this batch is settled or lost by leaving now - an item that was not
+    // reached has no delivery record, so the next start considers it again - and leaving between
+    // items is the only place where that is true.
+    if (input.signal?.aborted) break;
     // An endpoint inside its wait costs nothing here: no request, no ten-second timeout, and no
     // place at the front of the queue. Nothing is settled and nothing is lost - the item is simply
     // considered again once the wait is over.

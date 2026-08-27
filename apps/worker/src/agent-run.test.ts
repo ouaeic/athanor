@@ -8,20 +8,18 @@ import {
 } from '@athanor/core';
 import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import type { ModelRelease } from '@athanor/contracts';
+import { AgentWorker } from './agent.js';
+import { approvalPreviewHash } from './approval-state.js';
+import { buildIdentity } from './build-identity.js';
+import { startTurnState } from './completion.js';
+import { createLogger, silentLogger, type Logger } from './log.js';
+import { UNTRUSTED_NOTICE_MARKER } from './provenance.js';
 import {
   ACCEPTANCE_EARLIER_TURN_CAVEAT,
-  AgentWorker,
-  approvalPreviewHash,
-  buildIdentity,
-  createLogger,
   DELEGATE_MAX_STEPS,
-  type Logger,
   MAX_NOTICES_PER_TURN,
-  silentLogger,
-  startTurnState,
-  UNTRUSTED_NOTICE_MARKER,
   WORKSPACE_BRIEF_MARKER
-} from './agent.js';
+} from './turn-bounds.js';
 import {
   baseSystemPrompt,
   compactionTargetTail,

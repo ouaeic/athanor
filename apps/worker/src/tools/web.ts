@@ -1,6 +1,6 @@
 import { type ParallelWebReadResult } from '@athanor/contracts';
 import { type ModelToolCall } from '@athanor/model-gateway';
-import { textValue } from '../agent.js';
+import { textValue } from '../values.js';
 import { perPartOutputChars } from '../context.js';
 import { surfaceActionRequest } from '../tools.js';
 import { type ToolContext } from '../tool-dispatch.js';

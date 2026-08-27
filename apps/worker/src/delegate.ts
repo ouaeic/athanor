@@ -2,23 +2,14 @@ import type { ModelRelease, ParallelWebReadResult, WebToolPlan } from '@athanor/
 import { AthanorError, sha256 } from '@athanor/core';
 import type { TaskRecord } from '@athanor/data';
 import { type ModelMessage, type ModelToolCall } from '@athanor/model-gateway';
-import {
-  boundedKnowledge,
-  delegateBudget,
-  delegateSpecialists,
-  DELEGATE_MAX_STEPS,
-  estimatedInferenceCostUsd,
-  normalisedSpan,
-  providerWebProvenance,
-  routeTo,
-  startStopWatch,
-  textValue,
-  untrustedOriginOfResult,
-  usageCredit,
-  withRequestDeadline,
-  type AgentState,
-  type DelegateEvidenceCheck
-} from './agent.js';
+import { type AgentState } from './agent-state.js';
+import { delegateBudget, estimatedInferenceCostUsd, usageCredit } from './billing.js';
+import { normalisedSpan, type DelegateEvidenceCheck } from './completion.js';
+import { providerWebProvenance, untrustedOriginOfResult } from './provenance.js';
+import { delegateSpecialists, routeTo } from './routing.js';
+import { DELEGATE_MAX_STEPS } from './turn-bounds.js';
+import { startStopWatch, withRequestDeadline } from './turn-lifecycle.js';
+import { boundedKnowledge, textValue } from './values.js';
 // Straight from the file that owns it rather than through `agent.js`'s re-export, because what this
 // needs is the half `agent.js` does not forward: the reasons a report missed its contract, which are
 // what the one correction message below is written from.
@@ -37,8 +28,8 @@ import {
   type DestinationVerdict
 } from './egress.js';
 import { sanitiseUntrustedText, untrustedEnvelope } from './sanitise.js';
-import { agentToolsFor } from './tools.js';
-import { executeToolCall, type ToolContext } from './tool-dispatch.js';
+import { agentToolsFor, specialistToolNames } from './tool-catalogue.js';
+import type { ToolContext } from './tool-dispatch.js';
 
 /**
  * Re-reads two of a specialist's own citations and checks the quoted span is really there.
@@ -206,25 +197,13 @@ async function runDelegatedMission(
   const model = eligible[0] ?? lead;
   if (!model) throw new AthanorError('model_unavailable', 'Lead model is unavailable');
   const { gateway, provider } = await context.gateway(task, model);
-  // Read-only, and each one safely concurrent with the other two. parallel_web_read earns its
-  // place here because it opens its own isolated browser rather than steering the persistent
-  // session the lead and the owner share, which is what makes "read these fifteen sources and
-  // tell me where they disagree" a delegable job at all. web_search is here now for a different
-  // reason: a challenge no longer takes the browser off the agent, it stops the one tab and the
-  // one site that raised it, so a specialist that walks into one costs that search and nothing
-  // else. A specialist that cannot search can only read sources somebody already found for it.
-  const allowed = new Set([
-    'files_list',
-    'file_read',
-    'document_read',
-    'document_search',
-    'web_search',
-    'parallel_web_read',
-    'code_search',
-    'repo_overview',
-    'session_search'
-  ]);
-  const tools = agentToolsFor().filter((tool) => allowed.has(tool.name));
+  // The read-only tier, named and reasoned about in tool-catalogue.ts where the wire is owned. It
+  // used to be a nine-name Set built here and filtered out of the full forty, which meant the
+  // containment fence - the whole reason a specialist exists - was a literal inside this function
+  // that only a four-name blocklist in agent-run.test.ts ever looked at. `file_patch` went through
+  // that blocklist untouched with every worker test green. The same set is still both fences: what
+  // is described on the wire, and what `executeDelegateTool` below will actually run.
+  const tools = agentToolsFor('specialist');
   // A specialist asked what the latest guidance says, or which of two dated documents supersedes
   // the other, cannot answer without knowing what day it is. The lead is told; this one was not.
   const timeZone = await context.store
@@ -493,7 +472,7 @@ ${clockLine(new Date(), timeZone)}
       };
     }
     for (const call of response.toolCalls) {
-      if (!allowed.has(call.name)) {
+      if (!specialistToolNames.has(call.name)) {
         messages.push({
           role: 'tool',
           toolCallId: call.id,
@@ -555,7 +534,7 @@ ${clockLine(new Date(), timeZone)}
         // The run's route travels with the call, so a specialist searches where the lead searches.
         // Without it a mission on a box whose in-house route is bot-walled would spend its whole
         // budget being refused by a search engine while the lead beside it searched successfully.
-        const result = await executeToolCall(
+        const result = await context.dispatch(
           { ...context, task, key, consequentialApproved: false, webPlan, state },
           call
         );

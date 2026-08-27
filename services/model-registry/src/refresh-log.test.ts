@@ -31,6 +31,23 @@ describe('refreshLogLine', () => {
     expect(line).toContain('3600 seconds');
   });
 
+  /*
+   * A refusal has a key and a working request; only the answer is wrong. Reporting it in the
+   * failure's words - "could not be refreshed" - sends the reader hunting an outage that is not
+   * there, and the whole value of the gate is that it names a cause the owner can act on.
+   */
+  it('says a refused replacement in its own words rather than as an outage', () => {
+    const line = refreshLogLine({
+      previousFailures: 0,
+      reason: '0% are models that can be given tools',
+      intervalSeconds: 3600,
+      state: 'refused'
+    });
+    expect(line).toContain('NOT replaced');
+    expect(line).toContain('models that can be given tools');
+    expect(line).not.toContain('could not be refreshed');
+  });
+
   it('stays quiet while a failure continues, so an outage cannot bury the log', () => {
     expect(
       refreshLogLine({ previousFailures: 1, reason: 'fetch failed', intervalSeconds: 3600 })

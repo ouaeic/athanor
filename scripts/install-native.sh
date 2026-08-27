@@ -494,6 +494,11 @@ install_asset 0644 "$athanor_root/infra/native/athanor-auto-update.service" \
   /etc/systemd/system/athanor-auto-update.service
 install_asset 0644 "$athanor_root/infra/native/athanor-auto-update.timer" \
   /etc/systemd/system/athanor-auto-update.timer
+# Installed and deliberately not enabled. OnFailure= on the update unit above starts it, and it is
+# the only thing that can report a 3 a.m. update that was killed partway - the unit exits into a
+# journal nobody reads, the rollback leaves a perfectly healthy server, and the box stops moving.
+install_asset 0644 "$athanor_root/infra/native/athanor-auto-update-alert.service" \
+  /etc/systemd/system/athanor-auto-update-alert.service
 # Installed and enabled, unlike the update timer above: an unattended update is a change the owner
 # should opt into, and a backup is the thing that makes every other risk survivable. A server left
 # alone for a year previously had no copy of its conversations, files, connector credentials or
@@ -1023,23 +1028,80 @@ git config --system --add safe.directory "$athanor_root" 2>/dev/null || true
 
 systemctl daemon-reload
 systemctl enable avahi-daemon nginx athanor.target
+# The instances this release runs, written once in this file and derived everywhere else in it.
+#
+# There were three copies here - this list, the `systemctl enable` line, and the restart loop -
+# beside two in athanor.target and one in the dispatcher. The dispatcher already records what a
+# disagreement between them costs: an arm naming a directory that is not in this repository, which
+# is not a spare capability but a unit enabled once and then crash-looping on a missing file.
+athanor_services="api worker registry notifications"
+
+# Three other files hold this same list, and a disagreement with any of them breaks the box in a
+# different way. This is not tidiness; each of the three is a failure somebody has to debug.
+#
+# - athanor.target. `Wants=` starts the unit it names whenever the target starts, enabled or not.
+#   A release that drops an instance here and leaves it in the target has the stale sweep below stop
+#   it and `systemctl start athanor.target` start it again seconds later, and again on every boot:
+#   the removal reports success and does not happen.
+# - scripts/athanor-service. An arm missing here is a unit that starts, exits 1 on the usage line,
+#   and is brought back by `Restart=always` for ever. The dispatcher's own comment records this one
+#   happening: an arm naming a directory that is not in this repository.
+# - scripts/athanor's `service_units`, which is what `athanor restart` - and therefore the last step
+#   of every update - restarts by name. A withdrawn instance left in it is restarted into that same
+#   crash loop by the command the owner runs to fix things.
+#
+# Checked here, before daemon-reload has activated anything, because this script installs all four
+# files and is the only place that sees them together. `athanor logs registry` and the doctor arms
+# are deliberately not checked: a stale name there reports "no such unit" to an owner who asked a
+# question, which is a wrong answer and not a broken machine.
+# shellcheck disable=SC2086 # splitting the list into one instance per line is the point
+declared_instances=$(printf '%s\n' $athanor_services | sort | tr '\n' ' ')
+instances_must_match() {
+  [ "$2" = "$declared_instances" ] ||
+    fail "$1 names instances [ $2] but this installer runs [ $declared_instances]; a service named in only one of them either never starts, crash-loops, or comes back after every reboot"
+}
+instances_must_match "athanor.target" "$(sed -n 's/^Wants=//p' \
+  "$athanor_root/infra/native/athanor.target" | tr ' ' '\n' |
+  sed -n 's/^athanor@\(.*\)\.service$/\1/p' | sort | tr '\n' ' ')"
+# `runner` is an arm of the dispatcher and not an instance of this template - it is its own unit,
+# with its own user and its own cgroup ceilings - so it is removed before the comparison.
+instances_must_match "scripts/athanor-service" "$(sed -n 's/^  \([a-z-]*\)) entry=.*/\1/p' \
+  "$athanor_root/scripts/athanor-service" | grep -v '^runner$' | sort | tr '\n' ' ')"
+instances_must_match "scripts/athanor" "$(sed -n 's/^service_units="//p' \
+  "$athanor_root/scripts/athanor" | tr ' ' '\n' |
+  sed -n 's/^athanor@\(.*\)\.service$/\1/p' | sort | tr '\n' ' ')"
+
+athanor_units="athanor-runner.service"
+for service_name in $athanor_services; do
+  athanor_units="$athanor_units athanor@$service_name.service"
+done
 # The services are enabled individually as well as being wanted by the target. The target alone did
 # bring them up, so this looks redundant, but it left every one of them reporting "disabled" to
 # `systemctl is-enabled` - which is what an owner or a support script checks when the box comes back
 # from a reboot with nothing serving - and it made the target the single thing standing between a
 # power cut and a dead machine. Each unit already declares `WantedBy=multi-user.target`; this makes
 # the installed state match what the unit says about itself.
-systemctl enable athanor-runner.service athanor@api.service athanor@worker.service \
-  athanor@registry.service athanor@notifications.service
+# shellcheck disable=SC2086 # the list is built above from a known set of instance names
+systemctl enable $athanor_units
 systemctl enable --now athanor-network-watch.service athanor-network-refresh.timer \
   athanor-network-refresh.path athanor-backup.timer
 systemctl restart avahi-daemon
 systemctl restart athanor-runner.service
-athanor_services="api worker registry notifications"
+for service_name in $athanor_services; do
+  systemctl restart "athanor@$service_name.service"
+done
+systemctl restart nginx
+systemctl start athanor.target
+
 # An upgrade that drops a service leaves the old one running: the target stops wanting it, which
 # prevents it starting again but never stops the copy already up. It then holds its port and its
 # database connections until someone reboots. Anything still running under the instance template
 # and no longer named here is stopped, so the set of units on the box is the set this release has.
+#
+# After the target is started, not before. Started first, the target pulls in everything it wants -
+# so a sweep that ran ahead of it stopped a dropped instance and then watched the next line start it
+# again. The cross-check above is what makes this terminal rather than a race the sweep can lose.
+#
 # The unit name is picked out by pattern rather than by column: systemd indents this listing, and
 # prefixes a status glyph to some rows, so neither the first character nor the first field is
 # reliably the name.
@@ -1057,11 +1119,6 @@ for unit in $stale_units; do
     ;;
   esac
 done
-for service_name in $athanor_services; do
-  systemctl restart "athanor@$service_name.service"
-done
-systemctl restart nginx
-systemctl start athanor.target
 
 say "Opening the network path to this computer"
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then

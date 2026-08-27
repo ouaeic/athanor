@@ -1,12 +1,8 @@
 import { AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
-import {
-  boundedKnowledge,
-  event,
-  textValue,
-  type ExecObservation,
-  type ProcessObservation
-} from '../agent.js';
+import { type ExecObservation, type ProcessObservation } from '../agent-state.js';
+import { event } from '../tool-recording.js';
+import { boundedKnowledge, textValue } from '../values.js';
 import {
   buildSubscriptionAgentArgs,
   subscriptionAgentExecutable,

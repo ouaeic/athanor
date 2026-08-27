@@ -71,7 +71,7 @@ import { builtinSkillLibrary } from '../apps/worker/src/skills.js';
  *
  * `DEFAULT_SKILL_ROOT` is derived from `import.meta.url`, so on this machine a skill the turn opens
  * arrives in the window as `Skill directory: /Users/somebody/some folder/athanor/skills/<name>` -
- * and `promptTokens` is an estimate over that window, carried through every later step of the turn.
+ * and `promptTokens` counts every byte of that request, carried through every later step of the turn.
  * Two things follow, and only one of them is small. The small one: the committed baseline is a
  * function of where the repository happens to sit, so a CI checkout and a laptop cannot compare
  * rows in a file whose entire purpose is that a diff records what a change cost. The other one is
@@ -350,6 +350,18 @@ const promptBytes = (body: Record<string, unknown>): string =>
  */
 const promptTokensFor = (body: Record<string, unknown>): number =>
   Math.ceil(promptBytes(body).length / 4);
+
+/**
+ * What the tool catalogue on one request costs, as bytes on the wire.
+ *
+ * Its own function because it is now read in three places that must not be allowed to drift: the
+ * per-request accumulation below, the trajectory dump, and the resident figure reported at the end.
+ * The catalogue is the single largest term in a request and the one this wave is trying to move, so
+ * three spellings of "how big is it" is three chances for the number that gates the work and the
+ * number that reports it to disagree.
+ */
+const catalogueBytesOf = (body: Record<string, unknown>): number =>
+  JSON.stringify(body.tools ?? []).length;
 
 const framesFor = (turn: ModelTurn, promptTokens: number): string[] => {
   const parts: string[] = [];
@@ -1575,9 +1587,52 @@ export interface RunOutcome {
    * Split out so a diff can say which of the two moved.
    */
   readonly delegatedCalls: number;
-  /** The prompt athanor built, in tokens, by its own estimate, summed over every call. */
+  /**
+   * What the provider was handed, in tokens, summed over every request it answered.
+   *
+   * The whole body: catalogue, envelope and messages. This used to be athanor's own estimate of the
+   * messages alone, which excluded `body.tools` - so on a product whose catalogue is four fifths of
+   * the fixed floor, the headline column of the suite that guards against cost regressions could
+   * not see the largest cost term at all. Emptying the catalogue moved it by 0.0%.
+   *
+   * It is deliberately not the same number the loop bills itself with: see `windowTokens`.
+   */
   readonly promptTokens: number;
-  /** The largest single prompt, which is what decides whether a long task fits its window. */
+  /**
+   * Of `promptTokens`, the part that was tool schema.
+   *
+   * Its own column because it is the term under work, and a total that moves is unreadable without
+   * knowing which half moved: a turn that took one step fewer and a turn whose catalogue shrank by
+   * a third look identical in a sum.
+   */
+  readonly catalogueTokens: number;
+  /**
+   * The catalogue on the turn's last step, in bytes as it went out.
+   *
+   * Per request rather than per run, so it is comparable across fixtures of different lengths and
+   * against the byte ceiling `tool-catalogue.test.ts` holds. On a fixture where nothing narrows the
+   * catalogue this is the resident floor every request of every turn pays.
+   */
+  readonly residentCatalogueBytes: number;
+  /**
+   * The prompt athanor thought it had built, by its own estimate, summed over every cost event.
+   *
+   * The number this suite reported as `promptTokens` until the wave that noticed the two halves of
+   * the rig disagreed. Kept, because the difference between it and `promptTokens` is exactly what
+   * the loop cannot see when it decides to condense - and because a wave that claims to have moved
+   * the catalogue should be able to show this standing still while the billed total falls.
+   */
+  readonly windowTokens: number;
+  /**
+   * The largest single window the context layer prepared, which is what decides whether a long task
+   * fits.
+   *
+   * Still the loop's own estimate, and still excluding the catalogue, which is not an oversight:
+   * the budget arithmetic in `context.ts` is a share of the window MINUS the reserved catalogue, so
+   * this is the quantity that is actually compared against a threshold, and a fixture's ceiling on
+   * it is a claim about what the layer chose to put in. What the request weighed on the wire is
+   * `promptTokens`, and what the catalogue costs is its own column.
+   */
   readonly peakPromptTokens: number;
   readonly tools: readonly string[];
   readonly proposed: readonly string[];
@@ -2022,6 +2077,9 @@ const schemaOutcome = (findings: readonly string[]): RunOutcome => ({
   modelCalls: 0,
   delegatedCalls: 0,
   promptTokens: 0,
+  catalogueTokens: 0,
+  residentCatalogueBytes: 0,
+  windowTokens: 0,
   peakPromptTokens: 0,
   tools: [],
   proposed: [],
@@ -2370,6 +2428,32 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   let modelCalls = 0;
   /** Of those, the ones the provider actually answered; see the failure branch below. */
   let answeredCalls = 0;
+  /*
+   * What every answered request cost, counted where the bytes are rather than where the loop's
+   * estimate is.
+   *
+   * This rig priced a run for its whole life from `context.estimatedInputTokens`, which is the
+   * context layer's estimate of the MESSAGES. `body.tools` is not in it, and on this athanor the
+   * catalogue is about 12,300 tokens of every single request - so the largest cost term in the
+   * product was invisible to the instrument that exists to notice when a cost term moves, and
+   * deleting the catalogue outright moved the headline column by 0.0%. Every efficiency claim
+   * argued from that column, including the ones already made, was unfalsifiable.
+   *
+   * Counted here, at the fetch, for three reasons the cost event cannot match. It sees the whole
+   * body the way a provider is paid for it - the envelope, the role keys, the serialised tool calls
+   * and the catalogue - which is what `promptBytes` above already said out loud two thousand lines
+   * before anything used it for this. It sees every billed request, including the closing handoff,
+   * whose cost event carries no window block at all and which therefore contributed nought to the
+   * old sum for the life of the suite. And it cannot be fooled by a change that moves work between
+   * the estimate and the wire, because there is only one side of it left.
+   *
+   * The loop's own estimate is kept, under `windowTokens`, rather than thrown away: the gap between
+   * the two IS the envelope plus the catalogue, and a wave that claims to have cut the catalogue
+   * should be able to show that gap closing while the estimate stands still.
+   */
+  const wirePromptTokens: number[] = [];
+  /** Of those bytes, the ones that were tool schema. The term this wave is trying to move. */
+  const wireCatalogueTokens: number[] = [];
   // Only the last request is kept, and the previous one only as the bytes the next is compared
   // against. A forty-step fixture sends forty windows of up to a megabyte each, and holding them
   // all measures this process's heap rather than the loop.
@@ -2480,6 +2564,12 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
           { status: failure, headers: { 'content-type': 'application/json' } }
         );
       }
+      // Priced once, here, and only for a request the provider answered: the 503 above returned no
+      // completion and no route bills one. Every other shape of call is counted - a step, a
+      // compaction's summariser, a vision handoff, a specialist's own steps and the closing handoff
+      // - because each of them is a request the owner is billed for.
+      wirePromptTokens.push(promptTokensFor(body));
+      wireCatalogueTokens.push(Math.ceil(catalogueBytesOf(body) / 4));
       // The summarising call a compaction makes carries no catalogue, and it is a fresh prompt with
       // no predecessor rather than the next step of one - so it is neither the window the turn was
       // working in nor a link in the chain a cache reads back along. What it costs is already in the
@@ -2778,7 +2868,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
           // What the catalogue costs, which is `reservedTokens` on the other side and the term the
           // whole budget arithmetic turns on - every threshold in `context.ts` is a share of the
           // window minus this. Read as bytes, because that is what this side can see.
-          catalogueBytes: JSON.stringify(lastAgentRequest.tools ?? []).length,
+          catalogueBytes: catalogueBytesOf(lastAgentRequest),
           // Every prepared window's size in order, which is what the compaction trigger is compared
           // against one step later. A single peak says whether a turn fitted; the sequence says
           // where it was heading and which threshold it settled against.
@@ -2794,7 +2884,14 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   return {
     modelCalls,
     delegatedCalls,
-    promptTokens: costs.reduce((total, value) => total + value, 0),
+    promptTokens: wirePromptTokens.reduce((total, value) => total + value, 0),
+    catalogueTokens: wireCatalogueTokens.reduce((total, value) => total + value, 0),
+    // The catalogue as one request carries it, which is the number a residency change moves and the
+    // only one that can be compared against `tool-catalogue.test.ts`'s ceiling. The sum above is
+    // that figure multiplied by however many steps a fixture happens to take, so it says what a
+    // turn cost and cannot say what the catalogue costs.
+    residentCatalogueBytes: catalogueBytesOf(lastAgentRequest),
+    windowTokens: costs.reduce((total, value) => total + value, 0),
     peakPromptTokens: costs.reduce((peak, value) => Math.max(peak, value), 0),
     tools: events
       .filter((entry) => entry.kind === 'tool_started')

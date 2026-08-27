@@ -958,9 +958,41 @@ const phraseTable = read(approvalPhrasePath).match(
 const phrasedTools = phraseTable ? keysAtTopLevel(phraseTable[1]).split(',').filter(Boolean) : [];
 const unphrased = raisesApproval.filter((tool) => !phrasedTools.includes(tool));
 const unraised = phrasedTools.filter((tool) => !raisesApproval.includes(tool));
+/*
+ * A size floor under the agreement above, and the one thing the agreement cannot say.
+ *
+ * The comparison is two-directional, so it already catches a pattern that narrows: the tools it
+ * stops matching are still in the phrase table and come back as `unraised`. What it cannot catch is
+ * the two lists shrinking *together*. Delete an approval branch from the floor and tidy its phrase
+ * away in the same change, and both sides agree on the smaller set, nothing here says a word, and a
+ * tool has quietly stopped asking the owner before it acts. Measured on this tree: removing
+ * `audio_read` from both files leaves seventeen tools in perfect agreement and every check above
+ * green.
+ *
+ * The floor is therefore a floor and not an equality. A tool that genuinely stops raising an
+ * approval is a decision somebody makes, and lowering this number in the same commit - where it is
+ * read, and argued with - is the shape that decision has to take.
+ *
+ * The two named tools carry the same guarantee for the case where the count is right and the set is
+ * wrong. They arrived in this file with the count, out of `apps/web/src/approval-copy.test.ts`,
+ * which asserted both across a package boundary because it had nowhere better to say them; its own
+ * comment had already recorded that this comparison belonged here, "so a new branch in the worker
+ * fails the build rather than one client's test suite".
+ */
+const APPROVAL_FLOOR_MINIMUM = 18;
+const APPROVAL_FLOOR_WITNESSES = ['audio_read', 'parallel_web_read'];
+const missingWitnesses = APPROVAL_FLOOR_WITNESSES.filter((tool) => !raisesApproval.includes(tool));
 if (!raisesApproval.length)
   fail(
     `no approval-raising tools could be read from ${approvalFloorPath}; the approval card's table is no longer being checked against anything`
+  );
+else if (raisesApproval.length < APPROVAL_FLOOR_MINIMUM)
+  fail(
+    `only ${raisesApproval.length} approval-raising tools were read from ${approvalFloorPath}, against ${APPROVAL_FLOOR_MINIMUM} expected; the pattern has narrowed and the agreement below covers a subset of the floor`
+  );
+else if (missingWitnesses.length)
+  fail(
+    `${missingWitnesses.join(', ')} is not among the tools read out of ${approvalFloorPath}; either the pattern has drifted to an older spelling and the comparison below is running against a subset of the floor, or that tool deliberately stopped raising an approval and this witness must be replaced in the same change`
   );
 else if (!phrasedTools.length)
   fail(
@@ -978,6 +1010,166 @@ else
   say(
     `Approval phrases: all ${raisesApproval.length} tools that can raise an approval are named on the card.`
   );
+
+/**
+ * The gates `pnpm check` actually runs, against the list a contributor is handed.
+ *
+ * Same failure as the server commands above, one directory up: a gate is added to the script and
+ * the page describing it is not, so somebody reads a list of eight and runs nine, and the one that
+ * fails is the one nothing prepared them for. Read from `package.json` rather than from a list kept
+ * beside it, because a list kept beside it is what drifts.
+ *
+ * Order is checked too, and it is not a nicety. The order is the whole design of that section -
+ * cheapest first, so the gate that fails is usually the one that costs least to re-run - and a page
+ * that lists them in a different order is advice to run them in a more expensive one.
+ */
+const CONTRIBUTING_PATH = 'CONTRIBUTING.md';
+const contributing = read(CONTRIBUTING_PATH);
+const checkScript = JSON.parse(read('package.json')).scripts?.check ?? '';
+// `pnpm license:check` and `node scripts/check-repository.mjs` reduce to the token a reader would
+// search the page for. Anything else in the chain - an env assignment, a shell conditional - is a
+// shape this has never had and would rather report than silently drop.
+const gates = checkScript
+  .split('&&')
+  .map((step) => step.trim())
+  .filter(Boolean)
+  .map((step) => {
+    const named = /^(?:pnpm|node)\s+(\S+)$/.exec(step);
+    return named ? named[1] : step;
+  });
+if (gates.length < 5)
+  fail(
+    `only ${gates.length} gates could be read out of package.json's check script; the list in ${CONTRIBUTING_PATH} is no longer being checked against anything`
+  );
+else {
+  // Named in backticks, with or without the runner in front of it: the page writes
+  // `pnpm license:check` and `node scripts/check-repository.mjs`, and a reader searching for either
+  // half finds the same line. Matching the bare token would miss every one of them.
+  const named = (gate) =>
+    contributing.search(
+      new RegExp(String.raw`\`(?:(?:pnpm|node) )?${gate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\``)
+    );
+  const missingGates = gates.filter((gate) => named(gate) === -1);
+  const positions = gates.map(named);
+  const outOfOrder = positions.some(
+    (at, index) => index > 0 && at >= 0 && positions[index - 1] >= 0 && at < positions[index - 1]
+  );
+  if (missingGates.length)
+    fail(
+      `pnpm check runs ${missingGates.join(', ')}, which ${CONTRIBUTING_PATH} never names; a contributor would meet a gate the page did not prepare them for`
+    );
+  else if (outOfOrder)
+    fail(
+      `${CONTRIBUTING_PATH} lists the gates of pnpm check in a different order from the one they run in; the order is cheapest-first and the page is advice to run them in a costlier one`
+    );
+  else say(`Check gates: all ${gates.length} run by pnpm check are listed, in order.`);
+}
+
+/**
+ * Every shell drill on disk is a drill the contributing page names.
+ *
+ * These are the only cover the server's shell has - the TypeScript suites never parse it - and
+ * `test-update.sh` has nothing behind it but that list, so a drill nobody is told to run is a drill
+ * nobody runs. Discovered from the directory rather than listed, so the next one is covered by
+ * existing.
+ */
+const drills = readdirSync(path.join(repositoryRoot, 'scripts'))
+  .filter((name) => name.startsWith('test-') && name.endsWith('.sh'))
+  .sort();
+const undocumentedDrills = drills.filter((name) => !contributing.includes(`scripts/${name}`));
+const imaginaryDrills = [
+  ...new Set([...contributing.matchAll(/scripts\/(test-[a-z-]+\.sh)/g)].map(([, name]) => name))
+].filter((name) => !drills.includes(name));
+if (drills.length < 3)
+  fail(
+    `only ${drills.length} shell drills were found under scripts/; the directory is no longer being read rather than the set being that small`
+  );
+else if (undocumentedDrills.length)
+  fail(
+    `scripts/ carries ${undocumentedDrills.join(', ')}, which ${CONTRIBUTING_PATH} never names; the only thing that tells anyone to run a drill is that list`
+  );
+else if (imaginaryDrills.length)
+  fail(
+    `${CONTRIBUTING_PATH} tells a contributor to run ${imaginaryDrills.join(', ')}, which scripts/ does not contain`
+  );
+else say(`Shell drills: all ${drills.length} under scripts/ are named in ${CONTRIBUTING_PATH}.`);
+
+/**
+ * The figures `docs/EVALUATION.md` quotes, re-derived from the baseline it says it reads.
+ *
+ * That page carried its own numbers in prose with an instruction to re-derive them from
+ * `evals/baseline.json` after any change rather than copy the sentence forward. They were copied
+ * forward anyway - three times, ending in three different values for one subtraction - which is the
+ * failure mode of every instruction that asks a person to do what a program could. A stale figure in
+ * prose is worse than no figure, because it reads exactly like a measurement.
+ *
+ * So the page now carries them once, in a fenced `baseline` block, and this re-derives the whole
+ * block. Accepting a new baseline fails here until the page is re-derived, and the failure names the
+ * value it should now carry. Four of the lines are arithmetic over two cells rather than cells
+ * themselves, and the subtraction is done here so that the claim the page makes about what a
+ * compaction costs is a computation rather than a recollection.
+ */
+const EVALUATION_PATH = 'docs/EVALUATION.md';
+const CONDENSED = 'long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly';
+const NEVER_DECLARED = 'long-a-finished-phase-is-never-declared';
+const FLOOR_WALK = 'long-finished-phases-condense-rather-than-shred';
+const evaluationBlock = /```baseline\n([\s\S]*?)```/.exec(read(EVALUATION_PATH));
+const baseline = JSON.parse(read('evals/baseline.json'));
+const cell = (fixture, field) => baseline[fixture]?.[field];
+/** What each key in the block is worth, computed here and never read from the page. */
+const derived = {
+  fixtures: Object.keys(baseline).filter((key) => key !== '$stamp').length,
+  'compaction.extraModelCalls': cell(CONDENSED, 'modelCalls') - cell(NEVER_DECLARED, 'modelCalls'),
+  'compaction.tokensSaved': cell(NEVER_DECLARED, 'promptTokens') - cell(CONDENSED, 'promptTokens'),
+  'compaction.cachePointsGivenUp':
+    cell(NEVER_DECLARED, 'cachePrefix') - cell(CONDENSED, 'cachePrefix'),
+  'floorWalk.cachePointsLost': cell(CONDENSED, 'cachePrefix') - cell(FLOOR_WALK, 'cachePrefix')
+};
+if (!evaluationBlock)
+  fail(
+    `${EVALUATION_PATH} no longer carries a fenced \`baseline\` block; its figures are back to being prose nothing re-derives`
+  );
+else {
+  const quoted = evaluationBlock[1]
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [key, ...rest] = line.split(/\s+/);
+      return [key, Number(rest.join('').replace(/[,_]/g, ''))];
+    });
+  const drift = [];
+  for (const [key, quotedValue] of quoted) {
+    // Two shapes of key: a derived name computed above, and `<fixture>.<field>` read straight out
+    // of the baseline. Anything else is a line nobody can check, which is the state the page was
+    // in before this existed.
+    let actual = derived[key];
+    if (actual === undefined) {
+      const at = key.lastIndexOf('.');
+      actual = at === -1 ? undefined : cell(key.slice(0, at), key.slice(at + 1));
+    }
+    if (actual === undefined || Number.isNaN(actual))
+      drift.push(`${key} names nothing in evals/baseline.json`);
+    else if (actual !== quotedValue)
+      drift.push(
+        `${key} says ${quotedValue.toLocaleString('en-GB')} and is ${actual.toLocaleString('en-GB')}`
+      );
+  }
+  // A block that stopped parsing would agree with everything by quoting nothing, which is this
+  // check failing while it looks like it passed.
+  if (quoted.length < 8)
+    fail(
+      `${EVALUATION_PATH}'s baseline block yielded only ${quoted.length} figure${quoted.length === 1 ? '' : 's'}; it is no longer being read rather than the page being that short`
+    );
+  else if (drift.length)
+    fail(
+      `${EVALUATION_PATH} is out of date against evals/baseline.json - ${drift.join('; ')}. Re-derive the block rather than editing the prose around it.`
+    );
+  else
+    say(
+      `Evaluation figures: all ${quoted.length} in ${EVALUATION_PATH} re-derive from evals/baseline.json.`
+    );
+}
 
 if (failures.length > 0) {
   process.stderr.write(`\n${failures.map((message) => `- ${message}`).join('\n')}\n`);

@@ -1,13 +1,8 @@
 import { sha256, AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
-import {
-  countOccurrences,
-  patchFailure,
-  textValue,
-  HELPER_PACKAGE_MANAGERS,
-  PACKAGE_VERBS,
-  type PatchFailure
-} from '../agent.js';
+import { patchFailure, type PatchFailure } from '../patch-failure.js';
+import { HELPER_PACKAGE_MANAGERS, PACKAGE_VERBS } from '../turn-bounds.js';
+import { countOccurrences, textValue } from '../values.js';
 import { type ToolContext } from '../tool-dispatch.js';
 import { finiteNumber } from './numbers.js';
 

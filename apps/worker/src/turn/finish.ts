@@ -1,0 +1,397 @@
+/**
+ * What happens when the model says the work is done: five holds, and then the turn completes.
+ *
+ * The largest single branch in the turn loop, and the one the reader most often arrives at with a
+ * question the surrounding four hundred lines cannot help with. It ran inline inside the batch loop
+ * inside the step loop, at nesting depth eleven.
+ *
+ * Its shape is five holds asked in a fixed order, each of which sends the model round once and only
+ * once, and each of which is bounded so that past its ceiling the turn ends **honestly rather than
+ * being thrown away**:
+ *
+ *   1. **verification** - the finish must cite something this turn produced.
+ *   2. **plan coverage** - open plan steps, but only against a plan somebody chose to write.
+ *   3. **acceptance declared** - a turn that changed something must say what would prove it.
+ *   4. **acceptance run** - the harness executes that record, and a failure sends it round.
+ *   5. **the answer itself** - a turn that did everything through tools and never said a word.
+ *
+ * The bound on every one of them exists because the alternative was observed and was worse: an
+ * agent that built the page, served it, published a working preview and wrote a correct summary,
+ * binned as a failure because its own curl made the evidence it had just cited stale. Verification
+ * failing is not the work failing, and a harness that cannot tell the difference must not be the
+ * one deciding. So the completion stands and the doubt travels with it, into `remainingRisks`,
+ * where the completion card already shows it.
+ *
+ * Lifted out of `AgentWorker.run()` unchanged; the five `continue`s became `'held'` and the one
+ * `return` became `'completed'`, which is the whole of the edit.
+ */
+import type { ModelToolCall } from '@athanor/model-gateway';
+import type { TaskRecord } from '@athanor/data';
+import type { MemoryDeadEndCheck } from '@athanor/core';
+import {
+  acceptanceFailureMessage,
+  acceptancePassedEvidence,
+  type AcceptanceCommandCheck,
+  type AcceptanceRecord,
+  type AcceptanceResult
+} from '../acceptance.js';
+import type { AgentState, AgentWorkerConfig } from '../agent-state.js';
+import {
+  citableEvidence,
+  completionVerification,
+  observedCommands,
+  type CompletionVerification
+} from '../completion.js';
+import type { DataStore } from '@athanor/data';
+import { event } from '../tool-recording.js';
+import {
+  ACCEPTANCE_EARLIER_TURN_CAVEAT,
+  CAVEAT_BESIDE_THE_TICK,
+  MAX_ACCEPTANCE_FAILURES,
+  MAX_FINISH_REJECTIONS
+} from '../turn-bounds.js';
+import { textValue } from '../values.js';
+
+/** What completing a turn needs from the worker that owns it. */
+export interface TurnFinishDeps {
+  readonly store: DataStore;
+  readonly config: AgentWorkerConfig;
+  outstandingPlanSteps(task: TaskRecord, key: Uint8Array): Promise<string[]>;
+  runAcceptanceChecks(
+    task: TaskRecord,
+    key: Uint8Array,
+    record: AcceptanceRecord,
+    options?: {
+      purpose: 'finish' | 'baseline' | 'continuation';
+      observed?: ReadonlyMap<string, number>;
+    },
+    state?: AgentState
+  ): Promise<AcceptanceResult[]>;
+  completeTurn(
+    task: TaskRecord,
+    key: Uint8Array,
+    state: AgentState,
+    completion: {
+      summary: string;
+      deliverables?: unknown[];
+      verification: CompletionVerification;
+      interrupted?: boolean;
+      outstanding?: string[];
+      acceptance?: string[];
+      verifiedCommands?: readonly AcceptanceCommandCheck[];
+    },
+    options?: { label?: string; deadEnds?: readonly MemoryDeadEndCheck[] }
+  ): Promise<void>;
+}
+
+/**
+ * `held` means the model was told why and the batch loop must move to the next call; `completed`
+ * means the turn is over and the caller must return.
+ */
+export type FinishOutcome = 'held' | 'completed';
+
+export const handleFinishCall = async (
+  deps: TurnFinishDeps,
+  task: TaskRecord,
+  key: Uint8Array,
+  state: AgentState,
+  call: ModelToolCall,
+  /** The turn this step belongs to, and the prose the model wrote alongside the call. */
+  step: { turn: number; assistantText: string }
+): Promise<FinishOutcome> => {
+  const { turn, assistantText } = step;
+  const summary = textValue(call.arguments.summary, assistantText || 'Task complete');
+  const checked = completionVerification(state, call.arguments.verification);
+  /*
+   * Past the ceiling the turn ends honestly, exactly as a failed acceptance check does
+   * below, rather than being thrown away.
+   *
+   * This used to raise `completion_unverified`, which marks the task FAILED. Observed: an
+   * agent built the page it was asked for, served it, published a working preview and
+   * wrote a correct summary - and the run was binned, because each time it curled its own
+   * server to check the result, that shell call became the newest change and made the
+   * evidence it had just cited stale. Thirty-one turns and a live deliverable, reported to
+   * the owner as a failure. Verification failing is not the work failing, and a harness
+   * that cannot tell the difference must not be the one deciding.
+   *
+   * So the completion stands and the doubt travels with it: the turn finishes, and what
+   * could not be established is carried into `remainingRisks`, where the completion card
+   * already shows it. The owner sees what was made and is told plainly that athanor could
+   * not prove it.
+   */
+  const unverifiable = !checked.ok && (state.finishRejections ?? 0) + 1 >= MAX_FINISH_REJECTIONS;
+  if (!checked.ok && !unverifiable) {
+    const rejections = (state.finishRejections ?? 0) + 1;
+    state.finishRejections = rejections;
+    state.repairStep = true;
+    state.messages.push({
+      role: 'tool',
+      toolCallId: call.id,
+      content: [
+        `Finish rejected (attempt ${rejections} of ${MAX_FINISH_REJECTIONS}): ${checked.reason}`,
+        citableEvidence(state),
+        'Either keep working, or call finish again with verification shaped exactly as {"status":"verified","evidence":[{"claim":"<what you are asserting>","source":"tool_result","toolCallId":"<id from the list above>"}],"remainingRisks":[]}.'
+      ].join('\n')
+    });
+    await event(deps.store, task, key, 'status', 'Completion needs verification', {
+      reason: checked.reason,
+      attempt: rejections
+    });
+    return 'held';
+  }
+  if (unverifiable)
+    await event(deps.store, task, key, 'warning', 'Finished, but athanor could not verify it', {
+      reason: checked.ok ? '' : checked.reason,
+      attempts: MAX_FINISH_REJECTIONS
+    });
+  state.finishRejections = 0;
+  // The plan is the one artefact the owner watches while long work runs, and until now the
+  // harness force-marked every outstanding step completed on the way out - so a turn that
+  // did four of nine steps and gave up left a panel reading nine of nine. Asked once, with
+  // the titles named; a turn that has genuinely finished answers it in one line.
+  const outstanding = await deps.outstandingPlanSteps(task, key).catch(() => []);
+  /*
+   * Only against a plan somebody chose to write.
+   *
+   * The hold exists because a turn that did four of nine steps and gave up used to leave a
+   * panel reading nine of nine - the owner watches those statuses. But when no plan was
+   * declared the harness writes one for itself, three boilerplate lines beginning "Inspect
+   * the request, inputs, and current workspace state", and then held the finish against its
+   * own boilerplate. Measured on one research task: the answer was written, and six of the
+   * ten model turns came after it, this hold among them. Nothing is lost by dropping it -
+   * the outstanding steps still travel into the completion for the turn that resumes.
+   */
+  if (outstanding.length && !state.planCoverageNagged && !state.planIsFallback) {
+    state.planCoverageNagged = true;
+    state.repairStep = true;
+    state.messages.push({
+      role: 'tool',
+      toolCallId: call.id,
+      content: `Finish held: ${outstanding.length} plan step${outstanding.length === 1 ? ' is' : 's are'} still open - ${outstanding.slice(0, 8).join('; ')}. Either finish them, mark them skipped with set_plan, or say in your reply that they are outstanding and finish again. The user is looking at those statuses.`
+    });
+    await event(deps.store, task, key, 'status', 'Plan steps are still open', {
+      outstanding
+    });
+    return 'held';
+  }
+  // Nothing in athanor ever ran a check that could fail on the work itself. A finish cited a
+  // successful call ordered after the last change, which any read of the file just written
+  // satisfies. If this turn changed something, it has to say what would prove it - once.
+  //
+  // A record the last turn declared does not answer this. It is kept, because a follow-up
+  // must not be able to break what the previous turn was held to, but it passed before this
+  // turn started: whatever this turn just did, that record is not evidence of it.
+  const inheritedAcceptance = (state.acceptanceTurn ?? 0) !== turn;
+  if (
+    state.mutatedBeyondProse &&
+    (!state.acceptance || inheritedAcceptance) &&
+    !state.acceptanceNagged
+  ) {
+    state.acceptanceNagged = true;
+    state.repairStep = true;
+    /*
+     * Both calls in one step, said in as many words.
+     *
+     * The loop has always answered a batch in order, so `set_acceptance` followed by
+     * `finish` in the same reply is declared, run and completed in a single model call -
+     * but nothing said so, and every model answered "then finish again" with one call and
+     * then another. Measured on `media-logo-set-holds-for-acceptance`: eight model calls
+     * against seven for the same job declared up front, and the whole difference was the
+     * round trip. This does not soften the hold; the record is still declared before the
+     * checks are run, and a turn that ignores the invitation is held exactly as before.
+     */
+    const inOneStep =
+      ' Send both calls in the same step - set_acceptance and then finish - and this costs you nothing.';
+    state.messages.push({
+      role: 'tool',
+      toolCallId: call.id,
+      content:
+        (state.acceptance
+          ? 'Finish held: this turn changed something, and the only acceptance checks on record are the ones an earlier turn declared - they were already passing before this turn began, so they show nothing about what you just did. Call set_acceptance with checks for this turn’s work, keeping the earlier ones alongside if they still guard something, then finish again.'
+          : 'Finish held: this turn changed something and never said what would prove it worked. Call set_acceptance with the checks the harness should run - the command that builds or tests it, the extraction that shows the document says what it should, the file that has to exist - then finish again. If the work genuinely has no executable proof, say so in your reply and declare the artifact checks that do apply.') +
+        inOneStep
+    });
+    await event(deps.store, task, key, 'status', 'Asked for an acceptance record', {});
+    return 'held';
+  }
+  /*
+   * An unverifiable finish still completes, and says so in the one sentence the owner can
+   * do something with.
+   *
+   * It used to carry `checked.reason` and the attempt count: "athanor could not confirm
+   * this completion after 3 attempts: Every cited result predates file_write (call-2)...
+   * Cite call-2 itself if its output shows the outcome". That is the harness talking to the
+   * model, printed at somebody who cannot cite anything, in the place that should say what
+   * to do about the work. The reason is not lost - the warning event above carries it,
+   * which is where a diagnostic belongs.
+   */
+  let verification: CompletionVerification = checked.ok
+    ? checked.verification
+    : {
+        status: 'not_applicable',
+        evidence: [],
+        remainingRisks: [
+          'athanor could not tie this result to anything it did, so check it before relying on it.'
+        ]
+      };
+  let acceptanceEvidence: string[] = [];
+  // Held outside the block so the finish below can keep the commands that passed. Only the
+  // commands: an artifact check says a file exists, which is about this afternoon, where a
+  // command that exits zero is about the machine.
+  let verifiedCommands: AcceptanceCommandCheck[] = [];
+  /*
+   * And the other half, which reaching this line is most of what makes it worth keeping.
+   *
+   * A check that fails sends the model round again, up to `MAX_ACCEPTANCE_FAILURES` times,
+   * and only the last of those runs is ever read here - so a command that failed and was
+   * then fixed leaves nothing behind, and a command that arrives here failed after the
+   * model had four goes at it. That is the difference between a bad afternoon and a route
+   * worth remembering was closed.
+   */
+  let deadEnds: MemoryDeadEndCheck[] = [];
+  if (state.acceptance) {
+    // Carrying what athanor has already run, so a check naming a command it executed
+    // itself after the last change is answered by that run rather than by a second build.
+    const results = await deps.runAcceptanceChecks(
+      task,
+      key,
+      state.acceptance,
+      { purpose: 'finish', observed: observedCommands(state) },
+      // The turn, so the answer hold below - which is free, runs after this, and sends the
+      // same finish round again - cannot buy a second build with it.
+      state
+    );
+    verifiedCommands = state.acceptance.checks.filter(
+      (check): check is AcceptanceCommandCheck =>
+        check.kind === 'command' &&
+        results.some((result) => result.id === check.id && result.passed)
+    );
+    deadEnds = state.acceptance.checks.flatMap((check) => {
+      if (check.kind !== 'command') return [];
+      const result = results.find((entry) => entry.id === check.id && !entry.passed);
+      // Only a run that ended. "timed out after 900s" and "the check could not run" are the
+      // harness failing to observe the command rather than the command failing, and a
+      // caution written out of either would outlive a wedged network or a runner restart.
+      if (!result?.detail.startsWith('exit ')) return [];
+      return [
+        {
+          label: check.label,
+          command: [check.executable, ...check.args].join(' '),
+          cwd: check.cwd,
+          detail: result.detail
+        }
+      ];
+    });
+    acceptanceEvidence = acceptancePassedEvidence(results);
+    const failed = results.filter((result) => !result.passed);
+    if (failed.length) {
+      const attempt = (state.acceptanceFailures ?? 0) + 1;
+      state.acceptanceFailures = attempt;
+      state.repairStep = true;
+      if (attempt < MAX_ACCEPTANCE_FAILURES) {
+        state.messages.push({
+          role: 'tool',
+          toolCallId: call.id,
+          content: acceptanceFailureMessage(results, attempt, MAX_ACCEPTANCE_FAILURES)
+        });
+        // A status, not a warning. This refusal is transient by construction: the model is
+        // told what failed and gets to fix it, and the turn that recovers used to carry a
+        // standing red line contradicting the "all passed" on its own completion card. A
+        // failure that is never recovered from is not lost - it reaches the owner as a
+        // remaining risk below, which is where a finished task's problems belong.
+        //
+        // The summary says which check, because the old one said only that "a check" failed
+        // and the payload naming it was never rendered anywhere.
+        await event(
+          deps.store,
+          task,
+          key,
+          'status',
+          `Finish refused: ${failed.length} of ${results.length} acceptance ${results.length === 1 ? 'check' : 'checks'} failed — ${failed
+            .map((result) => result.label)
+            .join('; ')
+            .slice(0, 160)}`,
+          { acceptance: results }
+        );
+        return 'held';
+      }
+      // Bounded like every other refusal in this loop: past the ceiling the turn ends
+      // honestly rather than spending the rest of the budget on the same failure.
+      verification = {
+        ...verification,
+        remainingRisks: [
+          ...verification.remainingRisks,
+          ...failed.map((result) => `${result.label} — ${result.detail}`)
+        ].slice(0, 20)
+      };
+    } else {
+      state.acceptanceFailures = 0;
+    }
+    // A green tick that means less than the last one did has to say so where the owner
+    // reads it, not only in the timeline entry for the step that declared the checks. Where
+    // exactly is the card's decision: a line written into both the acceptance list and the
+    // risks is shown beside the tick, and a line written only into the risks is shown with
+    // the rest of the detail, behind the disclosure. Only the caveat that would leave a
+    // reader who never opens it believing something untrue goes in both.
+    const caveat =
+      state.acceptanceCaveat ??
+      ((state.acceptanceTurn ?? 0) === turn ? undefined : ACCEPTANCE_EARLIER_TURN_CAVEAT);
+    if (caveat) {
+      if (CAVEAT_BESIDE_THE_TICK.has(caveat)) acceptanceEvidence = [caveat, ...acceptanceEvidence];
+      verification = {
+        ...verification,
+        remainingRisks: [...verification.remainingRisks, caveat].slice(0, 20)
+      };
+    }
+  }
+  /*
+   * A turn that did the work and never said a word.
+   *
+   * The model can do everything through tools and call finish without writing prose once,
+   * and the owner is left with a card describing the work instead of the answer they asked
+   * for - "wrote a note to notes-check.md" in reply to "tell me what it says". The finish
+   * schema already tells it the answer belongs in the reply; nothing ever checked.
+   *
+   * Asked once, and only when literally nothing was said, so a turn that answered normally
+   * never sees it. Deliberately not a `repairStep`: those suppress publishing because they
+   * are bookkeeping, and this is the opposite - it exists to get an answer published, so it
+   * clears the flag a refusal may have left set.
+   */
+  if (!state.answered && !state.answerNagged) {
+    state.answerNagged = true;
+    state.repairStep = false;
+    state.messages.push({
+      role: 'tool',
+      toolCallId: call.id,
+      content:
+        'Finish held: this turn has not said anything to the user. The card carries a description of the work, not the answer - if they asked what a file says, what you found, or what you concluded, that belongs in your reply. Write it, then call finish again.'
+    });
+    await event(deps.store, task, key, 'status', 'Asked for the answer itself', {});
+    return 'held';
+  }
+  state.messages.push({
+    role: 'tool',
+    toolCallId: call.id,
+    content: JSON.stringify({
+      completed: true,
+      summary,
+      verification
+    })
+  });
+  await deps.completeTurn(
+    task,
+    key,
+    state,
+    {
+      summary,
+      deliverables: Array.isArray(call.arguments.deliverables) ? call.arguments.deliverables : [],
+      verification,
+      ...(acceptanceEvidence.length ? { acceptance: acceptanceEvidence } : {}),
+      ...(verifiedCommands.length ? { verifiedCommands } : {})
+    },
+    // Carried beside the completion rather than inside it: the card already prints each of
+    // these as a remaining risk, and this copy exists only for the memory write.
+    deadEnds.length ? { deadEnds } : {}
+  );
+  return 'completed';
+};

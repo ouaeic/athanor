@@ -4,12 +4,16 @@ on:
   pull_request:
   push:
     branches: [main]
-  # The evaluation suite is the strongest measurement in this repository - 49 behavioural fixtures
-  # and a committed cost baseline - and it ran in no job at all, while docs/EVALUATION.md said it
-  # ran "in CI on its own schedule". It is deliberately not part of `pnpm check`: a suite that
-  # blocks every commit is a suite somebody deletes the first week it is wrong about something, and
-  # a step count is meant to be argued with. A nightly run is what makes a drift visible within a
-  # day instead of whenever somebody next remembers to run it by hand.
+  # The measurement rigs are the strongest thing in this repository - a behavioural suite with a
+  # committed cost baseline, an injection floor, a context-quality rig and a residency comparison -
+  # and they ran in no job at all, while docs/EVALUATION.md said the first of them ran "in CI on
+  # its own schedule". None of them is part of `pnpm check`: a suite that blocks every commit is a
+  # suite somebody deletes the first week it is wrong about something, and a step count is meant to
+  # be argued with. A nightly run is what makes a drift visible within a day instead of whenever
+  # somebody next remembers to run it by hand.
+  #
+  # Their negative controls are the exception and are gated on every change instead, in the
+  # `application` job: a rig that has stopped measuring anything is not a drift to argue with.
   schedule:
     - cron: '17 5 * * *'
 
@@ -24,7 +28,7 @@ concurrency:
 
 jobs:
   application:
-    # The nightly trigger exists for the evaluation suite at the bottom of this file and for
+    # The nightly trigger exists for the two evaluation jobs at the bottom of this file and for
     # nothing else; every other job here measures a change, and there is no change at 05:17.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
@@ -115,6 +119,38 @@ jobs:
       # scripts/check-repository.mjs, which `pnpm check` runs. The lists used to live here and were
       # missing five programs that ship to an owner's box; discovery replaced them.
       - run: CI=true pnpm check
+      # The negative controls for the three measurement rigs, on every change rather than nightly.
+      #
+      # `evals/` is not a workspace package, so `pnpm -r test` collects nothing in it and these
+      # three scripts - which are the only thing that checks the rigs measure what they claim -
+      # ran in no job at all. They are what catches a rig that has quietly started measuring
+      # nothing: the arms rig locates the contract section it is comparing two arms across, and
+      # when the cut it was written to certify landed at 28f3da6 the lookup found the one revision
+      # guaranteed not to carry it and threw. Both `pnpm eval:arms` and this selftest exited
+      # non-zero on a clean checkout for a whole wave, deterministically, with no key and no
+      # network involved, and nothing said so - because nothing ran them.
+      #
+      # Here rather than in the nightly block below because they cost two seconds together and
+      # because the value is naming the commit that broke a rig, not the morning after.
+      - name: Prove the measurement rigs still measure something
+        run: |
+          set -eu
+          for rig in context-quality agentdojo arms; do
+            NODE_OPTIONS=--conditions=development pnpm exec tsx "evals/$rig/selftest.ts"
+          done
+      # The same question asked of the test suite itself: can a test pass by iterating nothing?
+      #
+      # Fifty-one can, twenty-four of them confirmed by mutation - a command-injection guard that
+      # passes on an empty table of image types, a regression test for a defect that handed the
+      # model unreadable paths, an AGPL compliance claim that cannot fail. The check carries them as
+      # a ledger it is meant to empty, and fails on the fifty-second, which is the point: a
+      # loop-only assertion is the cheapest way to write a test that can never fail, so this class
+      # comes back on every wave unless something is watching for it.
+      #
+      # Here rather than in `pnpm check` only because `package.json` and `scripts/check-repository.mjs`
+      # belong to other lanes this wave; one line in either is the better home and is handed off.
+      - name: Prove no test can pass by iterating nothing
+        run: node scripts/check-vacuity.mjs
       # eslint.config.js ignores **/*.mjs because the type-aware parser has no project to resolve
       # them against, which left every shipped checker and every release verifier unlinted. They
       # are linted here rather than in `pnpm check` so an owner does not grow a second eslint pass
@@ -623,3 +659,82 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Run the behavioural evaluation suite against the committed baseline
         run: pnpm eval
+      # The other three rigs, all deterministic, all needing no key, no network and no runner, and
+      # all previously running on no gate whatever - which is how an owner comes to be shown a
+      # number by an instrument nothing protects.
+      #
+      # `--ci` on each is the arm that compares the run against its own committed baseline and
+      # exits non-zero on a move. That is the whole point of adding them: each of these rigs prints
+      # a readable table on a good day, and a table nobody diffs is a table that can drift for a
+      # wave. A number that moved is a decision, and a decision has to be accepted in a commit.
+      - name: Check the injection floor against its committed baseline
+        run: pnpm eval:injection -- --ci
+      - name: Check context quality against its committed baseline
+        run: pnpm eval:context -- --ci
+      - name: Check what each residency arm puts on the wire, against its committed baseline
+        run: pnpm eval:arms -- --ci
+
+  # The half of the same three rigs that cannot run without a provider credential: the blinded
+  # judge on context quality, and the live model on the injection suite.
+  #
+  # ── Why this fails rather than skips ───────────────────────────────────────────────────────────
+  #
+  # Both rigs already carry the arm for it. `judge.ts:63` and `judged.ts:64` return `fatal` when the
+  # judged or live half was asked for, the key is absent, and `GITHUB_ACTIONS` is set - the same
+  # shape `scripts/check-repository.mjs:116` uses for shellcheck, which is optional on a laptop and
+  # required on a runner. Nothing was invoking it.
+  #
+  # A job of its own so the credential and the measurement do not share a verdict: a missing secret
+  # must never be able to hide a real regression in the deterministic gates above, and the
+  # deterministic gates must never make a missing secret look survivable. The argument against
+  # failing at all - that a permanently red nightly is a nightly somebody mutes - is the reason this
+  # is separated rather than the reason it is silent. A graded number the owner is shown, produced
+  # by a half nobody has run in months, is worse than a red square that says which half it was.
+  #
+  # This repository holds no provider credential by design. Set OPENROUTER_API_KEY as a repository
+  # secret to arm this job; until it is set, this square is the statement that the graded halves of
+  # the availability and injection numbers are not being measured.
+  evaluation-judged:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9 # v6.0.8
+        with:
+          version: 11.9.0
+          run_install: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Grade the window with the blinded judge, and drive the injection suite live
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ATHANOR_EVAL_SPEND: ${{ vars.ATHANOR_EVAL_SPEND }}
+        run: |
+          set -eu
+          # No `if [ -z "$OPENROUTER_API_KEY" ]` here on purpose. Both rigs already decide this,
+          # in the same shape and in one place each, and a second copy of the rule in YAML is the
+          # copy that goes stale. With the secret unset the variable arrives empty, `--judge` and
+          # `--live` were still asked for, GITHUB_ACTIONS is set, and both rigs exit non-zero
+          # saying which half went unmeasured.
+          #
+          # `--yes` is what actually spends, and it is not on by default because it is not this
+          # workflow's money: the graded half of the context rig is 390 answer calls carrying
+          # about 14.7 million prompt tokens plus a grading call per probe, every night, and the
+          # live injection half is about 15 more. Without it both rigs print that estimate and
+          # stop, so the nightly still proves the credential works and still says what a graded
+          # run would cost. Set the repository variable ATHANOR_EVAL_SPEND to `yes` to buy the
+          # numbers.
+          spend=""
+          if [ "${ATHANOR_EVAL_SPEND:-}" = "yes" ]; then
+            spend="--yes"
+          fi
+          # shellcheck disable=SC2086
+          pnpm eval:context -- --ci --judge $spend
+          # shellcheck disable=SC2086
+          pnpm eval:injection -- --ci --live $spend

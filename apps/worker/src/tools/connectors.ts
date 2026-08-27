@@ -6,7 +6,8 @@ import {
   type ConnectorSecret
 } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
-import { asRecord, connectorHostAllowance, performConnectorAction, textValue } from '../agent.js';
+import { connectorHostAllowance, performConnectorAction } from '../connector-call.js';
+import { asRecord, textValue } from '../values.js';
 import { type ToolContext } from '../tool-dispatch.js';
 
 /**

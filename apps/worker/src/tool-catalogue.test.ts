@@ -20,6 +20,8 @@ import {
 } from '@athanor/core';
 import { agentTools, agentToolsFor } from './tool-catalogue.js';
 import { approvalRequirement } from './approval-policy.js';
+import { isMutatingToolCall } from './write-classification.js';
+import { REPEATABLE_TOOLS } from './turn-bounds.js';
 import { surfaceActionRequest } from './surface-actions.js';
 import { MAX_NOTICES_PER_TURN } from './agent.js';
 import { COMPACT_CONTEXT_TOOL } from './context.js';
@@ -238,6 +240,117 @@ describe('the size of the catalogue the model is sent', () => {
     // do it, and said so in its own description.
     for (const tool of sent) expect(tool.description).not.toMatch(/does not unlock anything/);
     expect(sent.map((tool) => tool.name)).not.toContain('tool_search');
+  });
+});
+
+/*
+ * The wire is two surfaces, not one, and the smaller of them is a security boundary.
+ *
+ * The ceiling above measures what the lead is sent. It is the larger number and the one the owner
+ * pays on every step, but it is not the only one: `runDelegateMission` builds an isolated read-only
+ * specialist and sends it a ninth of that. The two figures belong in the same file because the
+ * pressure to demote a tool off the lead's wire is exactly the pressure that would blind the
+ * specialist, and until this block existed nothing put them in front of the same reader.
+ *
+ * Measured when this block was written: lead 40 tools / 55,113 bytes (55,782 with the compaction
+ * tool the loop adds), specialist 9 tools / 7,431 bytes. The specialist's surface did not change
+ * when it moved out of delegate.ts - it is byte-identical, asserted below, because the array a
+ * provider caches must not move for a refactor.
+ */
+describe('the wire surface each audience is sent', () => {
+  const lead = agentToolsFor();
+  const specialist = agentToolsFor('specialist');
+  const specialistNames = specialist.map((tool) => tool.name);
+
+  it('sends the specialist a strict subset of what the lead can see', () => {
+    // The lead is the union by construction. If a name ever appears only on the specialist's wire,
+    // the delegate path has grown a capability the lead cannot audit or perform itself, and the
+    // report it gets back would be unreproducible by the agent that has to act on it.
+    const leadNames = new Set(lead.map((tool) => tool.name));
+    for (const name of specialistNames) expect(leadNames.has(name), name).toBe(true);
+    expect(specialist.length).toBeLessThan(lead.length);
+  });
+
+  it('gives the specialist nothing the harness itself classifies as a change', () => {
+    /*
+     * Derived, because enumerated did not hold. The only guard on this set was four names in
+     * agent-run.test.ts - shell, file_write, browser_action, finish - and `file_patch`, whose whole
+     * purpose is changing a file the specialist's own system prompt tells it it cannot change, went
+     * straight through with all 1,145 worker tests green. A blocklist protects the names somebody
+     * thought of.
+     *
+     * These are the two sets the containment property actually rests on, and both are consulted at
+     * runtime rather than restated here. `isMutatingToolCall` decides whether a call takes a
+     * workspace checkpoint and sets `mutatedBeyondProse`; `REPEATABLE_TOOLS` decides whether it is
+     * safe to replay after an interrupted turn. A read-only investigator that fails either is not
+     * read-only, whatever the allowlist is called.
+     */
+    for (const name of specialistNames) {
+      expect(isMutatingToolCall(name), `${name} is classified as a change`).toBe(false);
+      expect(REPEATABLE_TOOLS.has(name), `${name} is not safe to replay`).toBe(true);
+    }
+    // Named as well as derived, only because these four are the ones a future edit reaches for:
+    // the shell is the whole reason the specialist is a containment path and not just a cheaper
+    // model, and `finish` would let a quarantined agent close the owner's task.
+    for (const name of ['shell', 'process', 'file_write', 'finish'])
+      expect(specialistNames).not.toContain(name);
+  });
+
+  it('still gives it a way to read the workspace and the web', () => {
+    // The non-vacuity half. Every assertion above passes on an empty set, and an empty set is how
+    // this test would look if the tier were ever filtered by a name that no longer exists - which
+    // is how the catalogue's own nested-description walk once passed while finding nothing.
+    expect(specialistNames).toContain('file_read');
+    expect(specialistNames).toContain('web_search');
+    expect(specialistNames).toContain('parallel_web_read');
+    expect(specialist.length).toBeGreaterThan(4);
+  });
+
+  it('costs the specialist a ninth of what the lead pays, and did not move when it moved', () => {
+    // The ceiling for the smaller audience, on the same terms as the one above: it moves for a
+    // capability and not for prose. 7,431 measured, and the headroom is deliberately thin because
+    // nine read-only tools is what this agent is.
+    expect(Buffer.byteLength(JSON.stringify(specialist))).toBeLessThan(7_600);
+    // Byte-identical to the array delegate.ts used to build for itself: the same nine entries in
+    // the same order, so the refactor cannot have moved a cached prefix. Order is the point - core
+    // set first, then declaration order, exactly as the lead's is.
+    expect(specialistNames).toEqual([
+      'files_list',
+      'file_read',
+      'session_search',
+      'web_search',
+      'document_read',
+      'document_search',
+      'code_search',
+      'repo_overview',
+      'parallel_web_read'
+    ]);
+  });
+
+  it('keeps the four readers the specialist depends on out of any lead-side demotion', () => {
+    /*
+     * The record of a refusal, kept where the next person to propose it will meet it.
+     *
+     * `files_list`, `repo_overview`, `document_read` and `document_search` have been proposed for
+     * removal from the lead's wire on the grounds that `shell` substitutes for them - about 2.8 kB.
+     * It does not substitute. `shell` is in neither of the sets asserted above, so the same read
+     * arriving through it becomes a change: a workspace checkpoint, `mutatedBeyondProse` set, and a
+     * completion-evidence rule that now wants a check performed after it. That is the defect the
+     * comment on `audio_read` in write-classification.ts records happening once already, for one
+     * voice memo.
+     *
+     * So the assertion is not that the four are present - it is that the substitution being offered
+     * is false, checked against the classifier rather than against a sentence in a design document.
+     */
+    for (const name of ['files_list', 'repo_overview', 'document_read', 'document_search']) {
+      expect(specialistNames).toContain(name);
+      expect(isMutatingToolCall(name)).toBe(false);
+    }
+    expect(isMutatingToolCall('shell', { executable: 'ls', args: ['-la'] })).toBe(false);
+    // The half that matters: the shell the model is actually told to reach for whenever it needs a
+    // pipe, a glob or a redirect. Every one of those reads is a change.
+    expect(isMutatingToolCall('shell', { executable: 'bash', args: ['-lc', 'ls -la'] })).toBe(true);
+    expect(REPEATABLE_TOOLS.has('shell')).toBe(false);
   });
 });
 

@@ -1,3 +1,17 @@
+# One template, four instances, and the thing a reader gets wrong here: %i is not an isolation
+# boundary. Every instance runs as the same user and group, out of the same EnvironmentFile, with the
+# same empty CapabilityBoundingSet and the same ReadWritePaths. An instance separates nothing except
+# which entry point argv[1] selects; what it buys is a restart of its own and a journal of its own,
+# and what it costs is a whole Node runtime.
+#
+# Measured on the build machine, settled, `ps -eo rss`: a bare Node process is 41.2 MB, the notifier
+# 63.7 MB and the registry 57.0 MB. Both services' own logic, plus the push library, imported into a
+# process that already holds the API's module graph, is 1.3 MB. So two of these four instances are
+# 119 MB of duplicated runtime around timer loops that apps/api/src/maintenance already has a home
+# for - and the registry's own doctor note says the rest of it out loud: an active unit "says the
+# process is up and nothing more, and almost all of that process's life is the hour it spends
+# asleep". Folding them is a change to this file, athanor.target, scripts/athanor-service and
+# scripts/athanor at once; the installer refuses a change that moves only some of them.
 [Unit]
 Description=athanor %i service
 PartOf=athanor.target

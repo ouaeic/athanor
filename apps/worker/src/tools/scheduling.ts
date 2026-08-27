@@ -1,7 +1,7 @@
 import { TaskScheduleSpec } from '@athanor/contracts';
 import { decryptJson, encryptJson, nextScheduleRun, AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
-import { boundedKnowledge, textValue } from '../agent.js';
+import { boundedKnowledge, textValue } from '../values.js';
 import { type ToolContext } from '../tool-dispatch.js';
 import { clampNumber } from './numbers.js';
 

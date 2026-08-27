@@ -1,7 +1,8 @@
 import { type TaskPlanStep } from '@athanor/contracts';
 import { decryptJson, encryptJson, AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
-import { event, planStepsFromArguments, textValue } from '../agent.js';
+import { event } from '../tool-recording.js';
+import { planStepsFromArguments, textValue } from '../values.js';
 import { type ToolContext } from '../tool-dispatch.js';
 
 /**

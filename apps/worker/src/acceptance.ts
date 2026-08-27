@@ -25,6 +25,7 @@ import {
   inlineScriptBody,
   isDestructiveScript
 } from './command-classification.js';
+import { textValue } from './values.js';
 
 /** A command the harness runs itself, with the arguments fixed before the work started. */
 export interface AcceptanceCommandCheck {
@@ -114,9 +115,6 @@ export const MAX_ACCEPTANCE_CHECKS = 8;
 export const ACCEPTANCE_COMMAND_TIMEOUT_SECONDS = 900;
 const MAX_LABEL_CHARS = 160;
 const MAX_ARGS = 24;
-
-const textValue = (value: unknown, fallback = ''): string =>
-  typeof value === 'string' ? value : typeof value === 'number' ? String(value) : fallback;
 
 /**
  * Executables the harness will not run as an acceptance check.

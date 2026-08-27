@@ -1,0 +1,281 @@
+/**
+ * What a turn has to settle before it can take another step: everything the last one left behind.
+ *
+ * Three shapes arrive here, and only here:
+ *
+ *   - a **restart** mid-batch, so a call is in flight or a batch was dropped part-way;
+ *   - a **parked approval**, waiting on the owner to answer a card;
+ *   - a **parked question**, waiting on the owner to reply to `ask`.
+ *
+ * All three are the same kind of thing - the world moved while this turn was not running - and all
+ * three end the same two ways: the turn carries on, or it goes back to waiting exactly as it was.
+ * That is what makes a re-lease from any direction safe, whether it comes from a worker restart, a
+ * sweep, or the owner resuming, and it is why they are one phase rather than three.
+ *
+ * Lifted out of `AgentWorker.run()` unchanged: two hundred and eighteen lines that ran once, before
+ * the loop, and had nothing to do with the loop.
+ */
+import { decryptJson, encryptJson } from '@athanor/core';
+import type { ModelRelease, WebToolPlan } from '@athanor/contracts';
+import type { TaskRecord } from '@athanor/data';
+import type { ModelToolCall } from '@athanor/model-gateway';
+import type { AgentState } from '../agent-state.js';
+import { approvalArgumentsMatch, approvalOutcome } from '../approval-state.js';
+import { event, type ToolRecordingDeps } from '../tool-recording.js';
+import { sealUnansweredToolCalls, unansweredToolCallIds } from '../turn-lifecycle.js';
+import { textValue } from '../values.js';
+
+/**
+ * What settling a parked turn needs from the worker that owns it.
+ *
+ * Everything the approved-call arm needs is already `ToolRecordingDeps` - it is the same dispatch
+ * the loop's own batch goes through, watched the same way - plus the failure recorder, which the
+ * loop reaches directly and that interface therefore never had to name.
+ */
+export interface TurnResumeDeps extends ToolRecordingDeps {
+  recordToolFailure(
+    task: TaskRecord,
+    key: Uint8Array,
+    state: AgentState,
+    call: ModelToolCall,
+    error: unknown
+  ): Promise<void>;
+}
+
+/**
+ * Settles whatever the last run left parked.
+ *
+ * @returns true when the turn is parked again - awaiting the owner, stopped, or taken over - and
+ * the caller must return without stepping.
+ */
+export const resumeParkedTurn = async (
+  deps: TurnResumeDeps,
+  task: TaskRecord,
+  key: Uint8Array,
+  state: AgentState,
+  run: { model: ModelRelease; catalog: ModelRelease[]; webPlan: WebToolPlan },
+  /** The stop/cancel/takeover question, asked with this turn's own state. */
+  honorUserControl: () => Promise<boolean>
+): Promise<boolean> => {
+  const { model, catalog, webPlan } = run;
+  // A state saved partway through a tool batch is the one shape that can arrive here with calls
+  // still unanswered. An awaiting-approval state is not: its own call is answered by the approval
+  // outcome below, and the calls behind it were deferred in writing when it was saved.
+  const interrupted = state.inFlight;
+  delete state.inFlight;
+  if (interrupted && unansweredToolCallIds(state.messages).includes(interrupted.toolCallId))
+    // Whether that call reached the outside world cannot be known from here: the process died
+    // between the action and its result. Re-running it is how one restart becomes two emails, so
+    // the doubt goes to the model as the call's own result and the model has to check first.
+    state.messages.push({
+      role: 'tool',
+      toolCallId: interrupted.toolCallId,
+      content: `Interrupted: this ${interrupted.tool} call was still running when the worker restarted, so it may have taken effect and it may not have. Do not run it again until you have established which - read the file back, list the connected service's own record, or re-observe the page - and state what you found before you act.`
+    });
+  const stranded = state.pending
+    ? []
+    : sealUnansweredToolCalls(state.messages, 'the worker restarted before this call ran');
+  if (interrupted || stranded.length) {
+    // The next model call is a fresh step. Counting it keeps a worker that dies at the same call
+    // every time bounded by the step budget instead of resuming into it forever.
+    state.step += 1;
+    await event(
+      deps.store,
+      task,
+      key,
+      'warning',
+      interrupted
+        ? `${interrupted.tool} was interrupted by a restart and was not repeated automatically`
+        : 'A restart interrupted this step, so the calls that had not started were dropped',
+      {
+        ...(interrupted
+          ? {
+              toolCallId: interrupted.toolCallId,
+              tool: interrupted.tool,
+              startedAt: interrupted.startedAt
+            }
+          : {}),
+        dropped: stranded
+      }
+    );
+  }
+
+  if (state.pending) {
+    const approval = await deps.store.getApproval(state.pending.approvalId);
+    const outcome = approvalOutcome(approval);
+    if (outcome === 'waiting') {
+      await deps.store.updateTask({
+        id: task.id,
+        workerId: deps.config.WORKER_ID,
+        status: 'awaiting_user',
+        clearLease: true
+      });
+      return true;
+    }
+    const { approvalId, toolCall: call, handoffOnly } = state.pending;
+    // Dropped before the pause check below so a paused resume seals this call once instead of
+    // executing it a second time when the task is picked back up.
+    delete state.pending;
+    const approvalCoversCall =
+      outcome === 'approved' &&
+      approvalArgumentsMatch(textValue(approval?.previewHash), key, call.name, call.arguments);
+    if (outcome === 'approved' && !approvalCoversCall) {
+      // The user approved a specific action, so a different one must not inherit that decision.
+      await event(
+        deps.store,
+        task,
+        key,
+        'warning',
+        'Refused: this action no longer matches what was approved',
+        // Addressed to the owner: they answered a question about one action and a different one
+        // was attempted under that answer. Nothing else in the conversation says so.
+        { owner: true, approvalId, tool: call.name }
+      );
+      state.messages.push({
+        role: 'tool',
+        toolCallId: call.id,
+        content: `Refused: the arguments for ${call.name} no longer match the ones the user approved, so the approval does not cover this call. Request approval again for the exact action you intend to run.`
+      });
+      state.turnToolResults ??= {};
+      state.turnToolResults[call.id] = { name: call.name, success: false };
+    } else if (approvalCoversCall) {
+      await event(deps.store, task, key, 'approval_resolved', 'Approved action resumed', {
+        approvalId,
+        decision: 'approved'
+      });
+      if (handoffOnly) {
+        state.messages.push({
+          role: 'tool',
+          toolCallId: call.id,
+          content: `The user completed or reviewed the secure ${call.name === 'desktop_action' ? 'computer' : 'browser'} handoff. Observe the current state before continuing. Never request or replay the private value.`
+        });
+      } else if (await honorUserControl()) {
+        return true;
+      } else {
+        // An approved call can be the first thing this turn that touches the computer - the turn
+        // paused before it ran - so the undo point is taken here too, not only in the loop below.
+        await deps.ensureTurnUndoPoint(task, key, state, call.name);
+        // This is the one call the owner explicitly authorised, so it is also the one a restart
+        // must never run twice. Persisting the intent here is what drops the now-answered
+        // `pending` record as well: without it a worker killed here resumed with the approval
+        // still pending and executed the approved action a second time.
+        state.inFlight = {
+          toolCallId: call.id,
+          tool: call.name,
+          startedAt: new Date().toISOString()
+        };
+        await deps.checkpoint(task, key, state);
+        try {
+          // Watched exactly as the loop's own dispatch is. This is the one call the owner was
+          // asked about by name, so it is the one where Stop has most reason to work - and it was
+          // the one path without a watch: an approved `shell` runs to the runner's own ceiling,
+          // `startStopWatch` only guards model calls, and `honorUserControl` is checked at step
+          // boundaries this resume happens before. The interface said stopped while the approved
+          // command kept running.
+          const result = await deps.withLeaseRenewal(task, () =>
+            deps.withCancellationWatch(task, () =>
+              deps.execute(task, call, key, true, webPlan, state)
+            )
+          );
+          await deps.recordToolResult(task, key, state, call, result, model, catalog);
+        } catch (error) {
+          await deps.recordToolFailure(task, key, state, call, error);
+        }
+        delete state.inFlight;
+        await deps.checkpoint(task, key, state);
+      }
+    } else if (outcome === 'expired') {
+      // An unanswered request is a denial once it times out. Resuming the task is what releases
+      // its compute reservation, so leaving it in awaiting_user would hold that reservation for
+      // as long as the row lives.
+      await event(
+        deps.store,
+        task,
+        key,
+        'approval_resolved',
+        'Approval request expired without an answer, so the action was not run',
+        { approvalId, decision: 'expired', tool: call.name }
+      );
+      state.messages.push({
+        role: 'tool',
+        toolCallId: call.id,
+        content: `This ${call.name} request expired before the user answered it and was not run. Treat it as denied: continue with what you can do safely without it, and finish by stating clearly what still needs the user's decision.`
+      });
+      state.turnToolResults ??= {};
+      state.turnToolResults[call.id] = { name: call.name, success: false };
+    } else {
+      await event(deps.store, task, key, 'approval_resolved', 'Action was not approved', {
+        approvalId,
+        decision: textValue(approval?.status, 'denied')
+      });
+      state.messages.push({
+        role: 'tool',
+        toolCallId: call.id,
+        content: `The user ${textValue(approval?.status, 'denied')} this action. Continue safely without it.`
+      });
+    }
+  }
+
+  /*
+   * The answer to a parked question, taken back into the turn that asked it.
+   *
+   * A question is answered by the owner writing, and a message sent to a conversation the agent
+   * still holds is queued rather than started - so this is the same move `drainCorrection` makes
+   * mid-turn, at the one point where waiting for it is the whole state of the machine. Keeping the
+   * turn is the point: everything the agent had already established is still in the window, and
+   * the alternative - ending the turn and starting a fresh one on the reply - throws away the
+   * context that made the question worth asking.
+   *
+   * `interrupt` is not required here, as it is for a correction. There the distinction earns its
+   * keep, because "do this next" and "no, not that" are different intentions and timing alone
+   * cannot tell them apart; here the agent has stopped and said what it is waiting for, so the
+   * next thing the owner writes is the answer by construction.
+   *
+   * With nothing queued the conversation is parked again exactly as it was, mirroring the pending
+   * approval that is still waiting above. That is what makes a re-lease from any direction - a
+   * worker restart, a sweep, an owner resuming - safe: the machine returns to waiting rather than
+   * carrying on as though it had been answered.
+   */
+  if (state.question) {
+    const asked = state.question;
+    const waiting = await deps.store.getNextQueuedTaskMessage(task.id).catch(() => null);
+    const answer = waiting
+      ? decryptJson<{ prompt: string }>(waiting.promptCiphertext, key).prompt.trim()
+      : '';
+    const consumed =
+      waiting && answer
+        ? await deps.store.consumeQueuedTaskMessageInTurn({
+            taskId: task.id,
+            messageId: waiting.id,
+            workerId: deps.config.WORKER_ID,
+            // The reply reserved credits of its own, and the turn it is rejoining was budgeted
+            // before they existed - without this the loop trips its own ceiling immediately.
+            additionalComputeCredits: waiting.maxComputeCredits,
+            ...(waiting.maxSpendUsd === null ? {} : { additionalSpendUsd: waiting.maxSpendUsd }),
+            userMessageCiphertext: encryptJson({ markdown: answer }, key, `task-event:${task.id}`)
+          })
+        : false;
+    if (!consumed) {
+      await deps.store.updateTask({
+        id: task.id,
+        workerId: deps.config.WORKER_ID,
+        status: 'awaiting_user',
+        clearLease: true
+      });
+      return true;
+    }
+    delete state.question;
+    // Their words, unaltered and in their own role: the answer is owner speech everywhere it
+    // matters - the taint model, the compaction rule that never paraphrases what the user said,
+    // and the transcript. The question it answers is one message above it in the window.
+    state.messages.push({ role: 'user', content: answer });
+    // Written before anything else can fail, so a crash here loses neither the answer nor the
+    // fact that it has already been taken out of the queue.
+    await deps.checkpoint(task, key, state);
+    await event(deps.store, task, key, 'status', 'Answered - carrying on', {
+      question: asked.question
+    });
+  }
+
+  return false;
+};

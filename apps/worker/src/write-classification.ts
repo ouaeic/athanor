@@ -26,7 +26,7 @@ import {
   shellWriteTargets,
   WRITING_GIT_SUBCOMMANDS
 } from './command-classification.js';
-import { textValue } from './surface-actions.js';
+import { textValue } from './values.js';
 
 /** Tools whose successful result is a check, not a change; everything else here changes something. */
 const NON_MUTATING_TOOLS = new Set([

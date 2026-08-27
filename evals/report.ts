@@ -48,6 +48,16 @@ export interface Baseline {
     readonly modelCalls: number;
     readonly promptTokens: number;
     /**
+     * Of those tokens, the ones that were tool schema.
+     *
+     * Committed as its own row because it is the largest single term in a request and the one the
+     * residency work moves, and because a total is unreadable without it: a turn that took one step
+     * fewer and a turn whose catalogue shrank by a third are the same number in a sum. Optional so
+     * a baseline accepted before this column existed still gates the two rows it does have, rather
+     * than reading as a suite-wide regression on the first run after the upgrade.
+     */
+    readonly catalogueTokens?: number;
+    /**
      * The mean share of a request that repeated the one before it, byte for byte.
      *
      * Committed alongside the step count because it is the other half of what a long task costs,
@@ -319,6 +329,26 @@ export const check = (
           100
         ).toFixed(2)}% and the band is ${TOKEN_BAND * 100}%`
       );
+    /*
+     * And the catalogue on its own line.
+     *
+     * Banded exactly like the total and gated separately, which is the whole point of splitting it
+     * out: the residency work is meant to move this number and nothing else, so a wave that lowers
+     * it has to say so with `--accept` and a wave that raises it by adding a tool cannot hide
+     * inside a total that a shorter turn happened to lower by the same amount.
+     */
+    const catalogueDrift = Math.abs(outcome.catalogueTokens - (before.catalogueTokens ?? 0));
+    if (
+      before.catalogueTokens !== undefined &&
+      before.catalogueTokens > 0 &&
+      catalogueDrift > before.catalogueTokens * TOKEN_BAND
+    )
+      failures.push(
+        `tool-catalogue tokens against the committed baseline: was ${before.catalogueTokens}, now ${outcome.catalogueTokens}, which is ${(
+          (catalogueDrift / before.catalogueTokens) *
+          100
+        ).toFixed(2)}% and the band is ${TOKEN_BAND * 100}%`
+      );
     if (
       before.cachePrefix !== undefined &&
       outcome.modelCalls > 1 &&
@@ -352,6 +382,7 @@ const row = (result: Result, baseline: Baseline, width: number): string => {
         : ' ok ';
   const steps = drift(result.outcome.modelCalls, before?.modelCalls);
   const tokens = drift(result.outcome.promptTokens, before?.promptTokens);
+  const catalogue = drift(result.outcome.catalogueTokens, before?.catalogueTokens);
   const cached = drift(result.outcome.cachePrefix, before?.cachePrefix);
   return [
     state,
@@ -361,6 +392,12 @@ const row = (result: Result, baseline: Baseline, width: number): string => {
     padStart(steps, 5),
     padStart(String(result.outcome.promptTokens), 8),
     padStart(tokens, 8),
+    // What of that was tool schema, beside the total it is part of. Two columns rather than one
+    // because the question every row of this table is now asked - did the work get cheaper, or did
+    // the turn just get shorter - cannot be answered from a sum, and the term this programme is
+    // trying to move is precisely the one the sum used to omit entirely.
+    padStart(String(result.outcome.catalogueTokens), 8),
+    padStart(catalogue, 7),
     // The largest single request, beside the sum of them. The sum says what a turn cost; this says
     // whether it fitted, and the two move independently - condensing a long turn raises the total
     // by a summarising call and lowers this by whatever it condensed. A row whose peak approaches
@@ -382,6 +419,16 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
   );
   const steps = results.reduce((total, result) => total + result.outcome.modelCalls, 0);
   const tokens = results.reduce((total, result) => total + result.outcome.promptTokens, 0);
+  const catalogue = results.reduce((total, result) => total + result.outcome.catalogueTokens, 0);
+  const windows = results.reduce((total, result) => total + result.outcome.windowTokens, 0);
+  // The catalogue as ONE request carries it, which is the number a residency change moves and the
+  // only one comparable with the catalogue's own byte ceiling. Read off the widest row that offered
+  // a catalogue at all: a schema fixture runs no turn and a compaction-only row would report zero,
+  // and a mean over those would say the floor is lower than any request ever saw.
+  const resident = results.reduce(
+    (most, result) => Math.max(most, result.outcome.residentCatalogueBytes),
+    0
+  );
   const beforeSteps = results.reduce(
     (total, result) => total + (baseline[result.fixture.id]?.modelCalls ?? 0),
     0
@@ -415,10 +462,10 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
 
   lines.push('');
   lines.push(
-    `     ${pad('fixture', width)} ${pad('shape', 10)} ${padStart('steps', 5)} ${padStart('Δ', 5)} ${padStart('tokens', 8)} ${padStart('Δ', 8)} ${padStart('peak', 8)} ${padStart('cached', 6)} ${padStart('Δ', 5)} holds`
+    `     ${pad('fixture', width)} ${pad('shape', 10)} ${padStart('steps', 5)} ${padStart('Δ', 5)} ${padStart('tokens', 8)} ${padStart('Δ', 8)} ${padStart('cat', 8)} ${padStart('Δ', 7)} ${padStart('peak', 8)} ${padStart('cached', 6)} ${padStart('Δ', 5)} holds`
   );
   lines.push(
-    `     ${'-'.repeat(width)} ${'-'.repeat(10)} ${'-'.repeat(5)} ${'-'.repeat(5)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(6)} ${'-'.repeat(5)} -----`
+    `     ${'-'.repeat(width)} ${'-'.repeat(10)} ${'-'.repeat(5)} ${'-'.repeat(5)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(7)} ${'-'.repeat(8)} ${'-'.repeat(6)} ${'-'.repeat(5)} -----`
   );
   for (const result of results) lines.push(row(result, baseline, width));
 
@@ -478,7 +525,19 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
       pending.length ? `, ${pending.length} pending` : ''
     }. ${steps} model calls in total${
       beforeSteps ? ` (baseline ${beforeSteps})` : ''
-    }, ${tokens} estimated prompt tokens, the largest single prompt ${peak}.`
+    }, ${tokens} prompt tokens billed, the largest single prepared window ${peak}.`
+  );
+  /*
+   * Where the money went, in the one line an owner reads.
+   *
+   * Printed on every run rather than behind a flag, because the fact this sentence states is the
+   * reason the column above was rebuilt: on this athanor the tool catalogue is the largest term in
+   * the bill, it is resident on every request whether or not the turn could use it, and until this
+   * wave the number beside `tokens` could not see one byte of it. A share that falls is the whole
+   * object of the residency work; a share that rises is a tool somebody added without saying so.
+   */
+  lines.push(
+    `Of those, ${catalogue} tokens (${((catalogue / Math.max(1, tokens)) * 100).toFixed(1)}%) were the tool catalogue, resident at ${resident} bytes on every request of every turn. athanor's own window estimate, which is what the compaction trigger is compared against and which counts none of the catalogue, saw ${windows}.`
   );
   // Averaged over the turns that had a previous request to repeat, because a one-call turn has no
   // opinion about caching and averaging its nought in would make the suite look worse the more
@@ -514,6 +573,7 @@ export const baselineFrom = (results: readonly Result[]): Baseline => {
           {
             modelCalls: result.outcome.modelCalls,
             promptTokens: result.outcome.promptTokens,
+            catalogueTokens: result.outcome.catalogueTokens,
             cachePrefix: result.outcome.cachePrefix
           }
         ])

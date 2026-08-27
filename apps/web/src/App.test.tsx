@@ -7,7 +7,12 @@
  * is telling the owner to wait for a computer that is free, or saying nothing while they wait.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { computerHeldBy, mayOfferReload, nativeNoticesToRaise, type NativeNotice } from './App.js';
+import {
+  computerHeldBy,
+  mayOfferReload,
+  nativeNoticesToRaise,
+  type NativeNotice
+} from './app/conversation-facts.js';
 import { api } from './api.js';
 import type { NotificationSettings } from './notification-settings.js';
 import type { Task } from './types.js';

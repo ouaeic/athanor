@@ -5,7 +5,7 @@ import type { ModelResponse, ModelToolCall } from '@athanor/model-gateway';
 import type { AgentState } from './agent-state.js';
 import { executeDelegateTool } from './delegate.js';
 import type { AgentRunnerClient } from './runner-client.js';
-import type { ToolContext } from './tool-dispatch.js';
+import { executeToolCall, type ToolContext } from './tool-dispatch.js';
 
 /**
  * The delegate arm's own file, which it did not have.
@@ -121,6 +121,10 @@ const runMission = async (
     inferenceCredential: async () => ({}),
     providerWebSearch: async () => ({}),
     missingBinaries: async () => [],
+    // The real dispatcher, which is what this harness's own header says it drives. It arrives on
+    // the context rather than through an import inside `delegate.ts` so that the dispatcher and
+    // its one re-entrant arm are not a runtime import cycle; nothing about what runs changed.
+    dispatch: executeToolCall,
     // The one address these missions read is one the owner named, so the egress classifier lets it
     // through and the test is about the fence rather than about the refusal above it.
     destinationContext: () => ({

@@ -236,4 +236,35 @@ describe('runSweep', () => {
     expect(recorded.settled).toEqual([]);
     expect(result).toMatchObject({ failed: 1, delivered: 0 });
   });
+
+  it('stops between items when told to shut down, never between the push and its record', async () => {
+    /*
+     * A full batch is a hundred serial sends with a ten-second ceiling each, so a pass that meets a
+     * push service which accepts the connection and then says nothing outlives the thirty seconds
+     * `athanor@.service` allows a stop - and the SIGKILL that follows can land in the gap between a
+     * notification that was sent and the ledger row saying it was sent, which is how the owner gets
+     * the same push twice on the next start. The item that was in flight when the signal arrived
+     * must therefore finish both halves, and the ones behind it must not be started at all.
+     */
+    const shutdown = new AbortController();
+    const { store, recorded } = harness([
+      row({ id: 'subscription-1', resourceId: 'task-1', taskId: 'task-1' }),
+      row({ id: 'subscription-2', resourceId: 'task-2', taskId: 'task-2' }),
+      row({ id: 'subscription-3', resourceId: 'task-3', taskId: 'task-3' })
+    ]);
+    const attempted: PushPayload[] = [];
+    const { input } = sweep(store, {
+      signal: shutdown.signal,
+      send: async (_row, payload) => {
+        attempted.push(payload);
+        shutdown.abort();
+      }
+    });
+    const result = await runSweep(input);
+    expect(attempted).toHaveLength(1);
+    // The one that was in flight is settled. Two and three were never attempted, so they carry no
+    // delivery record and the next start considers them again - nothing is lost and nothing repeats.
+    expect(recorded.settled).toEqual([['subscription-1', 'task_finished', 'task-1']]);
+    expect(result).toMatchObject({ pending: 3, delivered: 1, failed: 0 });
+  });
 });
