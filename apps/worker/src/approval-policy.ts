@@ -1,6 +1,6 @@
 import { AUDIO_READ_MAX_SECONDS, type SecurityMode } from '@athanor/contracts';
 import { connectorActions } from '@athanor/core';
-import { classifyDestination, type DestinationVerdict } from './egress.js';
+import { classifyDestination, MAX_TURN_NOVEL_BYTES, type DestinationVerdict } from './egress.js';
 import {
   mediaEstimateUsd,
   transcriptionEstimateUsd,
@@ -175,13 +175,13 @@ export interface ApprovalContext {
   taintSources?: readonly string[];
   /** Hosts the owner named, a search returned, or this turn already read. */
   knownOrigins?: readonly string[];
-  /** The whole addresses behind those hosts, so a link the turn was handed is not novel material. */
+  /** The whole addresses behind those hosts, so a link the turn was handed costs the budget nothing. */
   knownAddresses?: readonly string[];
-  /** The owner's own words this task, for the destination policy's novelty bound. */
+  /** The owner's own words this task, for the destination policy's charge. */
   ownerText?: string;
   /** This installation's own address, which is not a destination data can leave by. */
   selfOrigins?: readonly string[];
-  /** What this turn has already sent that appears nowhere the owner put it, in bytes. */
+  /** What this turn has already put into addresses that the owner did not choose, in bytes. */
   spentNoveltyBytes?: number;
 }
 
@@ -228,7 +228,8 @@ const strongestRequirement = (
 const destinationCard = (
   verdicts: readonly DestinationVerdict[],
   taintSources: readonly string[],
-  what: string
+  what: string,
+  spent: number
 ): { sideEffect: 'external_reversible'; action: string; preview: string } => ({
   sideEffect: 'external_reversible',
   action: `Allow ${what} to ${verdicts[0]?.host ?? 'an outside host'}`,
@@ -239,8 +240,18 @@ const destinationCard = (
     ...verdicts
       .slice(0, 6)
       .map(
-        (verdict) => `- ${verdict.host}: ${verdict.reason} (${verdict.noveltyBytes} novel bytes)`
+        (verdict) => `- ${verdict.host}: ${verdict.reason} (${verdict.noveltyBytes} bytes charged)`
       ),
+    /*
+     * The running total, not only what this one call adds.
+     *
+     * The charge is what the whole bound rests on, and until this line the owner could not see it:
+     * every card named the bytes of the request in front of them and nothing named how much of the
+     * turn's allowance had already gone, so the difference between the first card of a research
+     * pass and the ninth chunk of an exfiltration looked identical on screen. A number that decides
+     * an answer and is never shown is a number nobody can check.
+     */
+    `This turn has put ${spent} of the ${MAX_TURN_NOVEL_BYTES} bytes it may put into addresses while untrusted content is in it, and this request adds ${verdicts.reduce((total, verdict) => total + verdict.noveltyBytes, 0)}.`,
     'An address is how data leaves this computer without a file ever moving.'
   ].join('\n')
 });
@@ -290,7 +301,8 @@ const taintedRequirement = (
       return destinationCard(
         verdicts,
         taintSources,
-        name === 'browser_action' ? 'this page' : 'this read'
+        name === 'browser_action' ? 'this page' : 'this read',
+        destinations.spentNoveltyBytes
       );
   }
   const durable = writtenPaths(name, args).filter(isDurableInstructionPath);
@@ -317,7 +329,13 @@ const taintedRequirement = (
    */
   if (name === 'shell' || name === 'desktop_launch') {
     const verdicts = sinkVerdicts();
-    if (verdicts.length) return destinationCard(verdicts, taintSources, 'this command');
+    if (verdicts.length)
+      return destinationCard(
+        verdicts,
+        taintSources,
+        'this command',
+        destinations.spentNoveltyBytes
+      );
     if (name === 'desktop_launch')
       return {
         sideEffect: 'external_consequential',

@@ -4,6 +4,7 @@ import {
   displayedLines,
   forgetDisplayedLines,
   lineEdit,
+  readerFor,
   recordDisplayedLines,
   rememberWrite,
   sayRanges,
@@ -12,6 +13,9 @@ import {
 } from './seen-lines.js';
 
 const IDENTITY = '1:2:3:4';
+/** Two tasks in one workspace, which is the arrangement the key exists to tell apart. */
+const A = { task: 'task-a' };
+const B = { task: 'task-b' };
 
 describe('what an edit rests on', () => {
   it('finds the replaced span and nothing either side of it', () => {
@@ -104,13 +108,13 @@ describe('the seen-line record', () => {
   beforeEach(() => forgetDisplayedLines());
 
   it('says nothing at all about a file no read has shown, which is not the same as saying no', () => {
-    expect(displayedLines('/w/a.ts', IDENTITY)).toBeUndefined();
+    expect(displayedLines(A, '/w/a.ts', IDENTITY)).toBeUndefined();
   });
 
   it('merges adjacent windows into one run', () => {
-    recordDisplayedLines('/w/a.ts', IDENTITY, { start: 1, end: 50 });
-    recordDisplayedLines('/w/a.ts', IDENTITY, { start: 51, end: 60 });
-    expect(displayedLines('/w/a.ts', IDENTITY)).toEqual([{ start: 1, end: 60 }]);
+    recordDisplayedLines(A, '/w/a.ts', IDENTITY, { start: 1, end: 50 });
+    recordDisplayedLines(A, '/w/a.ts', IDENTITY, { start: 51, end: 60 });
+    expect(displayedLines(A, '/w/a.ts', IDENTITY)).toEqual([{ start: 1, end: 60 }]);
   });
 
   /*
@@ -119,40 +123,85 @@ describe('the seen-line record', () => {
    * failure it exists to catch.
    */
   it('is void once the file it described has changed', () => {
-    recordDisplayedLines('/w/a.ts', IDENTITY, { start: 1, end: 50 });
-    expect(displayedLines('/w/a.ts', '1:2:3:9')).toBeUndefined();
+    recordDisplayedLines(A, '/w/a.ts', IDENTITY, { start: 1, end: 50 });
+    expect(displayedLines(A, '/w/a.ts', '1:2:3:9')).toBeUndefined();
     // And dropped, not merely disbelieved: a record that cannot be true again is not worth holding.
-    expect(displayedLines('/w/a.ts', IDENTITY)).toBeUndefined();
+    expect(displayedLines(A, '/w/a.ts', IDENTITY)).toBeUndefined();
   });
 
   it('is void past the retention horizon', () => {
     const now = Date.now();
-    recordDisplayedLines('/w/a.ts', IDENTITY, { start: 1, end: 50 }, now);
-    expect(displayedLines('/w/a.ts', IDENTITY, now + SEEN_LINE_HORIZON_MS)).toEqual([
+    recordDisplayedLines(A, '/w/a.ts', IDENTITY, { start: 1, end: 50 }, now);
+    expect(displayedLines(A, '/w/a.ts', IDENTITY, now + SEEN_LINE_HORIZON_MS)).toEqual([
       { start: 1, end: 50 }
     ]);
-    expect(displayedLines('/w/a.ts', IDENTITY, now + SEEN_LINE_HORIZON_MS + 1)).toBeUndefined();
+    expect(displayedLines(A, '/w/a.ts', IDENTITY, now + SEEN_LINE_HORIZON_MS + 1)).toBeUndefined();
   });
 
   /*
    * This box runs for months. Both caps below are memory bounds, and both fail towards "no
    * opinion": what a full store loses is the guard, never the write.
    */
-  it('keeps a bounded working set of files, evicting the least recently read', () => {
-    for (let file = 0; file < 600; file += 1)
-      recordDisplayedLines(`/w/${file}.ts`, IDENTITY, { start: 1, end: 10 });
-    expect(displayedLines('/w/599.ts', IDENTITY)).toEqual([{ start: 1, end: 10 }]);
-    expect(displayedLines('/w/0.ts', IDENTITY)).toBeUndefined();
+  it('keeps a bounded working set of records, evicting the least recently read', () => {
+    for (let file = 0; file < 1_200; file += 1)
+      recordDisplayedLines(A, `/w/${file}.ts`, IDENTITY, { start: 1, end: 10 });
+    expect(displayedLines(A, '/w/1199.ts', IDENTITY)).toEqual([{ start: 1, end: 10 }]);
+    expect(displayedLines(A, '/w/0.ts', IDENTITY)).toBeUndefined();
     let kept = 0;
-    for (let file = 0; file < 600; file += 1)
-      if (displayedLines(`/w/${file}.ts`, IDENTITY)) kept += 1;
-    expect(kept).toBe(512);
+    for (let file = 0; file < 1_200; file += 1)
+      if (displayedLines(A, `/w/${file}.ts`, IDENTITY)) kept += 1;
+    expect(kept).toBe(1_024);
+  });
+
+  /*
+   * A slot is one file for ONE READER, which is what the key cost and why the cap moved with it.
+   * Two tasks reading the same file hold a record each, and the LRU is one queue across all of
+   * them - so a busy task can push out a quiet one's record. Stated rather than hidden: what a full
+   * store loses is an opinion and never a write, and it loses a whole record rather than half of
+   * one, so no reader is ever left credited with lines it did not see.
+   */
+  it('spends a slot per reader of the same file, and evicts across readers', () => {
+    recordDisplayedLines(A, '/w/a.ts', IDENTITY, { start: 1, end: 10 });
+    recordDisplayedLines(B, '/w/a.ts', IDENTITY, { start: 90, end: 99 });
+    expect(displayedLines(A, '/w/a.ts', IDENTITY)).toEqual([{ start: 1, end: 10 }]);
+    expect(displayedLines(B, '/w/a.ts', IDENTITY)).toEqual([{ start: 90, end: 99 }]);
+    for (let file = 0; file < 1_024; file += 1)
+      recordDisplayedLines(A, `/w/${file}.ts`, IDENTITY, { start: 1, end: 10 });
+    expect(displayedLines(B, '/w/a.ts', IDENTITY)).toBeUndefined();
+    expect(displayedLines(A, '/w/1023.ts', IDENTITY)).toEqual([{ start: 1, end: 10 }]);
+  });
+
+  /*
+   * The key is a pair and has to be read back as one. Run together, `a` reading `b/x` and `ab`
+   * reading `/x` spell one string - the same defect arriving by collision rather than by design,
+   * and the worse version because nothing in the shape of the code would show it. No pair reachable
+   * today collides, since `sub` is a UUID and a target is an absolute path; the separator is what
+   * makes that a property of the key rather than of two callers this module does not own.
+   */
+  it('cannot be spelled the same way by a different reader and file', () => {
+    recordDisplayedLines({ task: 'a' }, 'b/x', IDENTITY, { start: 1, end: 10 });
+    expect(displayedLines({ task: 'ab' }, '/x', IDENTITY)).toBeUndefined();
+    expect(displayedLines({ task: 'a' }, 'b/x', IDENTITY)).toEqual([{ start: 1, end: 10 }]);
+  });
+
+  /*
+   * WHO A CAPABILITY IS, and the deliberate answer for a holder that is not an agent.
+   *
+   * The owner in the Files pane and a `control` caller are never held to what they were shown, so a
+   * record filed under either could not be read back by anybody - it would only spend a slot the
+   * records doing the guarding need. `sub` is the task the worker minted the token for, and it is
+   * signed, so the task cannot pick its own.
+   */
+  it('is a reader only for an agent, and is the task the capability names', () => {
+    expect(readerFor({ role: 'agent', sub: 'task-a' })).toEqual({ task: 'task-a' });
+    expect(readerFor({ role: 'user', sub: 'owner-1' })).toBeUndefined();
+    expect(readerFor({ role: 'control', sub: 'worker' })).toBeUndefined();
   });
 
   it('caps the intervals per file by dropping the oldest, never by coalescing them', () => {
     for (let window = 0; window < 200; window += 1)
-      recordDisplayedLines('/w/a.ts', IDENTITY, { start: window * 2 + 1, end: window * 2 + 1 });
-    const seen = displayedLines('/w/a.ts', IDENTITY)!;
+      recordDisplayedLines(A, '/w/a.ts', IDENTITY, { start: window * 2 + 1, end: window * 2 + 1 });
+    const seen = displayedLines(A, '/w/a.ts', IDENTITY)!;
     expect(seen).toHaveLength(128);
     // The newest survive; the oldest are gone rather than swallowed into a hull that would vouch
     // for every line between them.
@@ -198,11 +247,11 @@ describe('carrying a record across the write it just allowed', () => {
    * 20 - goes through unexamined.
    */
   it('shifts the seen lines by what the edit changed, and keeps the far end unseen', () => {
-    recordDisplayedLines('/w/a.ts', IDENTITY, { start: 1, end: 50 });
+    recordDisplayedLines(A, '/w/a.ts', IDENTITY, { start: 1, end: 50 });
     const before = Array.from({ length: 400 }, (_, line) => `line ${line + 1}`);
     const after = [...before.slice(0, 20), 'inserted', ...before.slice(20)];
-    rememberWrite('/w/a.ts', 'after', lineEdit(before, after));
-    const seen = displayedLines('/w/a.ts', 'after')!;
+    rememberWrite(A, '/w/a.ts', 'after', lineEdit(before, after));
+    const seen = displayedLines(A, '/w/a.ts', 'after')!;
     // Fifty lines seen, one line inserted among them: fifty-one lines are now accounted for.
     expect(unseenWithin({ start: 1, end: 51 }, seen)).toEqual([]);
     expect(unseenWithin({ start: 300, end: 300 }, seen)).toEqual([{ start: 300, end: 300 }]);
@@ -214,7 +263,23 @@ describe('carrying a record across the write it just allowed', () => {
    * would be refused for lines the first had not touched.
    */
   it('never starts guarding a file that no read had shown', () => {
-    rememberWrite('/w/b.ts', 'after', lineEdit(['a'], ['b']));
-    expect(displayedLines('/w/b.ts', 'after')).toBeUndefined();
+    rememberWrite(A, '/w/b.ts', 'after', lineEdit(['a'], ['b']));
+    expect(displayedLines(A, '/w/b.ts', 'after')).toBeUndefined();
+  });
+
+  /*
+   * And it carries the writer's own record and nobody else's. Task B's record of the same file
+   * describes the bytes as they were before A's write; shifting it by hunks B never saw would be
+   * this module inventing a reading for B. It is left to go stale, and B's identity check finds it.
+   */
+  it("leaves another reader's record where it is, to be found stale by its own check", () => {
+    recordDisplayedLines(A, '/w/a.ts', IDENTITY, { start: 1, end: 50 });
+    recordDisplayedLines(B, '/w/a.ts', IDENTITY, { start: 1, end: 50 });
+    const before = Array.from({ length: 400 }, (_, line) => `line ${line + 1}`);
+    const after = [...before.slice(0, 20), 'inserted', ...before.slice(20)];
+    rememberWrite(A, '/w/a.ts', 'after', lineEdit(before, after));
+    expect(displayedLines(A, '/w/a.ts', 'after')).toBeDefined();
+    // B was shown the file that used to be there, and the file that used to be there is gone.
+    expect(displayedLines(B, '/w/a.ts', 'after')).toBeUndefined();
   });
 });

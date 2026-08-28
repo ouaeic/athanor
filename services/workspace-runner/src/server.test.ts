@@ -662,6 +662,92 @@ describe('file organisation and toolchain routes', () => {
     expect(prepared.headers['x-audio-duration-seconds']).toBe('8');
     expect(prepared.rawPayload.length).toBeGreaterThan(0);
   }, 60_000);
+
+  /*
+   * THE SECOND SLOT, through the routes rather than through the functions under them.
+   *
+   * Two tasks share a workspace, and the runner's record of what has been shown used to be keyed by
+   * resolved path - so it answered a question about task B with task A's reading, and B's whole-file
+   * write changed a line only A had seen. What tells them apart is `sub` on the capability, which
+   * the worker stamps with the task it is running: nothing new crosses the wire, and the code inside
+   * a task cannot choose it because the token is signed over it.
+   *
+   * This case exists at the route because the route is where the reader is derived. Everything below
+   * it can be correct while the server hands the write the wrong task, or no task at all, and that
+   * is precisely the shape of the defect being closed.
+   */
+  it("holds the second task in a workspace to its own reads and not to the first task's", async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'athanor-slot-route-'));
+    disposers.push(() => rm(workspaceRoot, { recursive: true, force: true }));
+    const secret = 'runner-slot-route-secret-at-least-32-characters';
+    /*
+     * The disk this case writes to is stated rather than measured. A PUT passes the host storage
+     * floor, and measuring the real one made this the only case in the file whose answer depended
+     * on how full the machine happened to be: on its own it was the 428 below, and inside the whole
+     * package - 35 files writing temporary trees at once - it came back 507. `checkpoints.test.ts`
+     * carries the rest of the reasoning.
+     */
+    const app = await buildServer(runnerConfig(workspaceRoot, secret), {
+      hostStorage: async () => ({
+        hostStorageTotalBytes: 100 * 1024 ** 3,
+        hostStorageAvailableBytes: 50 * 1024 ** 3
+      })
+    });
+    disposers.push(() => app.close());
+    const id = '00000000-0000-4000-8000-000000000011';
+    const root = path.join(workspaceRoot, id);
+    await ensureWorkspace(root);
+    const lines = Array.from({ length: 400 }, (_, index) => `line ${index + 1}`);
+    const whole = `${lines.join('\n')}\n`;
+    await writeFile(path.join(root, 'workspace', 'app.ts'), whole);
+
+    let issued = 0;
+    const asTask = (task: string, method: 'GET' | 'PUT'): string =>
+      signCapabilityToken(
+        {
+          sub: task,
+          workspaceId: id,
+          role: 'agent',
+          scopes: [method === 'GET' ? 'files.read' : 'files.write'],
+          aud: capabilityAudience(method, `/v1/workspaces/${id}/file`),
+          nonce: `slot-${(issued += 1)}`
+        },
+        secret
+      );
+    const read = (task: string, startLine: number, endLine: number) =>
+      app.inject({
+        method: 'GET',
+        url: `/v1/workspaces/${id}/file?path=workspace/app.ts&maxBytes=400000&startLine=${startLine}&endLine=${endLine}`,
+        headers: { authorization: `Bearer ${asTask(task, 'GET')}` }
+      });
+    const writeWhole = (task: string, from: string, to: string) =>
+      app.inject({
+        method: 'PUT',
+        url: `/v1/workspaces/${id}/file?path=workspace/app.ts`,
+        headers: {
+          authorization: `Bearer ${asTask(task, 'PUT')}`,
+          'content-type': 'application/octet-stream'
+        },
+        payload: Buffer.from(whole.replace(from, to))
+      });
+
+    expect((await read('task-b', 1, 50)).statusCode).toBe(200);
+    expect((await read('task-a', 1, 401)).statusCode).toBe(200);
+
+    // B has been shown fifty lines by its own read and four hundred by nobody.
+    const fromB = await writeWhole('task-b', 'line 300', 'line 300 // from B');
+    expect(fromB.statusCode).toBe(428);
+    expect(fromB.json<{ error: { message: string } }>().error.message).toContain(
+      'no read has shown you those lines'
+    );
+    await expect(readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).resolves.toBe(whole);
+
+    // And A, which read the file, writes it: the second slot is bounded, not broken.
+    expect((await writeWhole('task-a', 'line 300', 'line 300 // from A')).statusCode).toBe(200);
+    await expect(readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).resolves.toContain(
+      'line 300 // from A'
+    );
+  });
 });
 
 /**

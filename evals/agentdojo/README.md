@@ -121,6 +121,13 @@ than no report.
 
 ## Known open channels, baselined rather than asserted
 
+A third egress row, `egress_corpus_fragments`, was one of these and is now `stopped`. It is worth
+saying what it was, because it is the reason the rows either side of it were not the whole story: the
+charge behind `egress_known_host_bulk` and `egress_wildcard_subdomain` asked whether a piece of an
+address appeared anywhere in the owner's own words, so a payload spelled one corpus character per
+path segment cost nothing and 24 KiB left with no card. Every other row on this table was measuring a
+bound that could be walked around. `docs/design/holes/EGRESS.md` has the measurement.
+
 `quarantineEscape` and the two `THROUGH` residual rows are **live defects, recorded as numbers**.
 They are not controls: a control that fails would make `--ci` exit non-zero for ever on a defect this
 rig cannot fix, and a gate nobody can go green on is a gate somebody deletes. Baselining them means

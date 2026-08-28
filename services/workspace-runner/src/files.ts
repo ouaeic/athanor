@@ -21,7 +21,8 @@ import {
   rememberWrite,
   sayRanges,
   unseenWithin,
-  type LineEdit
+  type LineEdit,
+  type Reader
 } from './seen-lines.js';
 
 const WORKSPACE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -232,6 +233,18 @@ const NEWLINE = 0x0a;
  */
 export type DisplayBudget = { maxBytes: number; maxLines: number };
 
+/**
+ * A display budget and the reader it is being spent on.
+ *
+ * `shownTo` is one field of the same object rather than an argument of its own because displaying
+ * and recording are one act: the prefix that goes back over the wire is the prefix that is
+ * recorded, and there is no way to ask for the one without saying who gets it. `undefined` is the
+ * answer for a caller that is not a reader any record can be about - see `readerFor` - and it is
+ * required rather than optional so that answering it is a decision somebody made rather than a line
+ * nobody wrote.
+ */
+export type Display = DisplayBudget & { shownTo: Reader | undefined };
+
 /** The longest prefix of `line` that is at most `limit` bytes and does not split a code point. */
 const wholeCodePoints = (line: Buffer, limit: number): Buffer => {
   let end = Math.min(limit, line.length);
@@ -308,7 +321,7 @@ export const readWorkspaceFile = async (
   root: string,
   requested: string,
   maxBytes: number,
-  display?: DisplayBudget
+  display?: Display
 ): Promise<{
   content: Buffer;
   sha256: string;
@@ -335,7 +348,14 @@ export const readWorkspaceFile = async (
     let totalLines = 1;
     for (let at = content.indexOf(NEWLINE); at !== -1; at = content.indexOf(NEWLINE, at + 1))
       totalLines += 1;
-    if (whole >= 1) recordDisplayedLines(target, fileIdentity(details), { start: 1, end: whole });
+    // Recorded against the reader the bytes are going to, and not at all when the caller is not a
+    // reader a record can be about: what a read proves is that one context window holds these
+    // lines, and there is no such thing as a line the workspace has seen.
+    if (whole >= 1 && display.shownTo)
+      recordDisplayedLines(display.shownTo, target, fileIdentity(details), {
+        start: 1,
+        end: whole
+      });
     return { content: prefix, sha256, totalLines, displayedLines: whole, partialLine };
   } finally {
     await handle.close();
@@ -361,7 +381,17 @@ export const readWorkspaceFile = async (
 export const readWorkspaceFileLines = async (
   root: string,
   requested: string,
-  window: { startLine: number; endLine: number; maxBytes: number }
+  window: {
+    startLine: number;
+    endLine: number;
+    maxBytes: number;
+    /**
+     * Who these lines are being put in front of, or `undefined` for a caller no record can be about.
+     * Required, because this arm always records what it delivered and a read that recorded against
+     * nobody in particular is the defect this key exists to close.
+     */
+    shownTo: Reader | undefined;
+  }
 ): Promise<{
   content: Buffer;
   startLine: number;
@@ -451,11 +481,15 @@ export const readWorkspaceFileLines = async (
      * half-seen text this record exists to refuse an edit on. A read cut short BETWEEN two lines
      * delivered the earlier one whole, and refusing to count it vouches for nothing - it only
      * withholds credit for text the caller is looking at.
+     *
+     * Against the reader that asked, and no record at all for a caller that is not one: the credit
+     * belongs to the context window these lines arrived in, not to the file they came out of.
      */
-    recordDisplayedLines(target, fileIdentity(details), {
-      start: window.startLine,
-      end: partialLine ? lastKept - 1 : lastKept
-    });
+    if (window.shownTo)
+      recordDisplayedLines(window.shownTo, target, fileIdentity(details), {
+        start: window.startLine,
+        end: partialLine ? lastKept - 1 : lastKept
+      });
     return {
       content: lastKeptTerminated ? content.subarray(0, content.length - 1) : content,
       startLine: window.startLine,
@@ -551,15 +585,28 @@ const MAX_GUARDED_FILE_BYTES = 8 * 1024 ** 2;
  * window read of lines 1-50 and a patch anchored at line 300 agree about every byte in the file and
  * still describe an edit made blind.
  *
- * `heldToReads` is what makes that second question askable of a caller with no hash to offer. The
- * agent's `file_write` after a WINDOWED read claims nothing - the ranged reader has no whole-file
+ * `heldTo` is what makes that second question askable, and it is the reader it is asked about. The
+ * agent's `file_write` after a WINDOWED read claims no hash - the ranged reader has no whole-file
  * digest to give it - so the guard rode on a claim that arm never makes, opened the file write-only,
  * and never ran: measured through the shipped tool on a 8,332-line file, `file_read` of lines 1-200
- * followed by a whole-file write was accepted and destroyed 8,132 lines. It is set for writes made
- * under an agent capability and for nothing else, because "no hash" means two opposite things
+ * followed by a whole-file write was accepted and destroyed 8,132 lines. It is passed for writes
+ * made under an agent capability and for nothing else, because "no hash" means two opposite things
  * depending on who said it - an agent editing from a window read, or an upload, a printed document,
  * the owner pressing Replace in the file browser, none of which claimed to have read anything and
  * none of which should meet a lecture about anchors.
+ *
+ * ONE ARGUMENT CARRIES BOTH "HELD" AND "WHO", and that is deliberate: they were two things, a
+ * boolean and a resolved path, and the pair could disagree. It said this writer is held to reads and
+ * then looked up the reads of whoever had last read that path - so a second task in the workspace
+ * was held to a file it had never opened and, worse, credited with a file another task had. A
+ * writer who is held but nameless is now unspellable.
+ *
+ * A hash on its own no longer opens the guard, for the same reason. `expectSha256` says "this is
+ * the file I read" and does not say who read it; with a record that is about a reader there is
+ * nothing for a nameless writer to be compared against, and the clause was answering with a record
+ * belonging to somebody else - which for the owner's save was the record left by an agent's window
+ * read of the same file, or by her own pane paging it. The agent, which is the caller this guard is
+ * for, names itself on every write it makes here.
  */
 export const writeWorkspaceFile = async (
   root: string,
@@ -567,7 +614,7 @@ export const writeWorkspaceFile = async (
   content: Buffer,
   maxBytes: number,
   expectSha256?: string,
-  options?: { heldToReads?: boolean }
+  heldTo?: Reader
 ): Promise<{ sha256: string; sizeBytes: number }> => {
   if (content.length > maxBytes) throw new Error(`File exceeds ${maxBytes} byte write limit`);
   const target = resolveInside(root, requested);
@@ -579,7 +626,7 @@ export const writeWorkspaceFile = async (
   // could refuse it.
   // Read-write whenever something below has to look at the old bytes, so every check reads through
   // the very descriptor that then writes and no path swap can happen between them.
-  const inspect = expectSha256 !== undefined || options?.heldToReads === true;
+  const inspect = expectSha256 !== undefined || heldTo !== undefined;
   const handle = await open(
     target,
     (inspect ? constants.O_RDWR : constants.O_WRONLY) | constants.O_CREAT | constants.O_NOFOLLOW,
@@ -607,14 +654,17 @@ export const writeWorkspaceFile = async (
      * different failure with a different answer - read it again - and answering it with a lecture
      * about anchors would send the model back to patch a version that no longer exists.
      *
-     * It runs for a caller that claimed a hash or that said it edits from reads, and that is what
-     * keeps it aimed at editing. A hash is one caller saying "I read this"; `heldToReads` is the
-     * other, and it exists because the agent's windowed read has no whole-file digest to claim and
-     * so was skipping the guard entirely. Everyone else is left exactly as unguarded as before: an
-     * upload replacing a file, a printed document landing on a name, the owner pressing Replace on a
-     * file the Files pane had paged through - none of them claimed to have read anything, and
-     * refusing them for lines they never pretended to have seen would put a lecture about anchors in
-     * front of a person who has no idea what one is.
+     * It runs for a writer that named itself, and that is what keeps it aimed at editing. Everyone
+     * else is left exactly as unguarded as before: an upload replacing a file, a printed document
+     * landing on a name, the owner pressing Replace on a file the Files pane had paged through -
+     * none of them claimed to have read anything, and refusing them for lines they never pretended
+     * to have seen would put a lecture about anchors in front of a person who has no idea what one
+     * is.
+     *
+     * And it is asked about THIS writer. The record is keyed by reader and file, so the answer is
+     * what this task has been shown - not what the workspace has been shown, which is not a thing
+     * that can be true. Where a second task in the same workspace had read the file, the old key
+     * handed its reads over to whoever wrote next.
      *
      * Binary content is skipped for the same reason: lines are not what it is made of, and a file
      * with a zero byte in it has no anchors to have seen. A file too large to hold as lines is
@@ -622,13 +672,14 @@ export const writeWorkspaceFile = async (
      * is that losing the opinion is always allowed and losing the write never is.
      */
     if (
+      heldTo !== undefined &&
       details !== undefined &&
       existing !== undefined &&
       details.size <= MAX_GUARDED_FILE_BYTES &&
       !existing.includes(0) &&
       !content.includes(0)
     ) {
-      const seen = displayedLines(target, fileIdentity(details));
+      const seen = displayedLines(heldTo, target, fileIdentity(details));
       if (seen) {
         const before = existing.toString('utf8').split('\n');
         edit = lineEdit(before, content.toString('utf8').split('\n'));
@@ -651,7 +702,7 @@ export const writeWorkspaceFile = async (
            * because every round hands over more.
            */
           for (const range of disclosure.disclosed)
-            recordDisplayedLines(target, fileIdentity(details), range);
+            recordDisplayedLines(heldTo, target, fileIdentity(details), range);
           throw new WorkspaceFileError(
             `This edit changes ${name} at line ${sayRanges(unseen)}, and no read has shown you those lines - so it is being made from memory of a file you have only seen part of. Here is what is actually there. Check your edit against it and send the same call again; these lines now count as read, so it will apply.\n\n${disclosure.text}`,
             428
@@ -684,8 +735,10 @@ export const writeWorkspaceFile = async (
       written += bytesWritten;
     }
     // The record follows the file across its own write, so a second edit in the same turn is still
-    // held to what was read. A file with no record gains none - see `rememberWrite`.
-    if (edit) rememberWrite(target, fileIdentity(await handle.stat()), edit);
+    // held to what was read. This writer's record and no other: another task's record of the same
+    // file is now stale, and it is that task's own identity check that must find it so - see
+    // `rememberWrite`. A file with no record gains none.
+    if (edit && heldTo) rememberWrite(heldTo, target, fileIdentity(await handle.stat()), edit);
   } finally {
     await handle.close();
   }

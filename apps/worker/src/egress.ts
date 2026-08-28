@@ -12,11 +12,20 @@ import { isPublicHttpUrl, matchingHostSuffix } from '@athanor/core';
  * The rule here is deliberately about provenance and volume rather than about reputation. There is
  * no blocklist to keep current and no attempt to recognise a malicious host: a destination is
  * ordinary if the owner named it, a search returned it, or this turn has already read it, and the
- * address itself carries no more novel material than a real URL needs. Everything else is shown to
- * the owner before it is fetched, with the host and the byte count computed here rather than taken
- * from anything the model wrote.
+ * address itself carries no more material the model chose than a real URL needs. Everything else is
+ * shown to the owner before it is fetched, with the host and the byte count computed here rather
+ * than taken from anything the model wrote.
  *
  * It only applies while the turn is tainted. A clean research task reads whatever it likes.
+ *
+ * THE POLICY CHOICE, because it is one and the owner may want a different one: this budget does not
+ * try to tell a leak from ordinary egress, because measured against real traffic it cannot - the
+ * worst of eight recorded research turns put 915 bytes into thirty addresses and the recorded
+ * attack put 1,020 into a hundred and seventy, and no threshold separates those. What it does is
+ * make the quantity finite, charged and visible, and hand the judgement to the owner with a card
+ * that names the number. `MAX_TURN_NOVEL_BYTES` is therefore a dial, not a floor; `MIN_TOKEN_BYTES`
+ * is the floor, and it is the part that must not be turned off, because without it the quantity is
+ * not finite at all.
  */
 
 export interface DestinationContext {
@@ -38,7 +47,7 @@ export interface DestinationContext {
   /** This installation's own address, which is not somewhere data can be sent to. */
   readonly selfOrigins?: readonly string[];
   /**
-   * What this turn has already sent that appears nowhere the owner put it, in bytes.
+   * What this turn has already put into addresses that the owner did not choose, in bytes.
    *
    * Absent means nothing has left yet. The per-address bound below is a bound on one request, and
    * a request is not the unit an attacker is limited to: measured against the shipped classifier,
@@ -51,6 +60,12 @@ export interface DestinationContext {
 export interface DestinationVerdict {
   readonly sink: boolean;
   readonly host: string;
+  /**
+   * What this address costs the turn: the bytes of it the model chose rather than was handed.
+   *
+   * Shown to the owner on the card beside the running total, because a number that decides an
+   * answer and is never displayed is a number nobody can check.
+   */
   readonly noveltyBytes: number;
   /** Why it is a sink, in the words the approval card uses. Empty when it is not one. */
   readonly reason: string;
@@ -85,13 +100,68 @@ export const MAX_NOVEL_HOST_BYTES = 24;
  *
  * This is what makes the per-address bound mean anything: without it the bound was a bound on the
  * size of a chunk rather than on the size of what leaves. It is charged only while the turn is
- * tainted, so an ordinary research pass never touches it - a link followed out of a search result
- * costs a handful of bytes, and this is a kilobyte.
+ * tainted, and an address a search handed the model costs nothing at all, so the five of eight
+ * recorded research turns that only read what they were given spend zero of it.
+ *
+ * The three that followed links off the pages they read spend 345, 419 and 915. That last one is
+ * the number to look at before changing anything here: 89.4% of the budget, for a turn that
+ * followed twenty-two links on react.dev, and a turn that followed forty would ask the owner. This
+ * is the dial - raise it and a deeper research pass stops asking, at the cost of a proportionally
+ * larger leak before anybody is asked, because the two are the same number. What must not be
+ * touched to buy that headroom is `MIN_TOKEN_BYTES`, which is what makes the number finite.
  *
  * Exceeding it is a card, not a refusal. The owner can still say yes; the point is that they are
  * asked once the material leaving stops looking like addresses.
  */
 export const MAX_TURN_NOVEL_BYTES = 1_024;
+
+/**
+ * What one piece of an address costs when the corpus already contains it.
+ *
+ * This is the number that makes every bound above mean anything, and it is the whole of the fix
+ * for what was measured here: the charge asked whether a token's exact string appeared anywhere in
+ * up to forty kilobytes of the owner's own words, and answered zero when it did. A single character
+ * is a token, and a single character is a substring of almost any corpus. So the payload was never
+ * novel: 65,536 path segments of one corpus character each - 24 KiB of material at three bits a
+ * segment - left a tainted turn through a host it had legitimately read, were charged 0, and raised
+ * no card. Every bound in this file was in force and none of them was reached, because the quantity
+ * they bound had been driven to zero.
+ *
+ * A corpus says which pieces are available. It does not say in what order, and the order is the
+ * payload: choosing one of thirteen characters carries 3.7 bits whether or not the owner wrote all
+ * thirteen. So no piece of an address is free. A piece the corpus contains costs this, the price of
+ * saying which piece; a piece it does not costs its own length, which is never less than this.
+ *
+ * Two, measured. Against eight recorded research turns it costs the most expensive of them 68
+ * bytes - 6.6% of the turn budget, 0 extra cards over 136 real reads - and it brings that 24 KiB
+ * down to at most 192 bytes. Four would halve the leak again and leave that same turn at 983 of
+ * 1,024, which is not headroom anyone would leave switched on.
+ */
+export const MIN_TOKEN_BYTES = 2;
+
+/**
+ * The longest piece of an address that can still be charged as a choice rather than as material.
+ *
+ * `MIN_TOKEN_BYTES` prices the act of saying which piece, on the reasoning that a corpus says which
+ * pieces exist and the order is what costs. That reasoning holds while a piece is short enough to
+ * be an index into the corpus. It stops holding when the piece IS the corpus: the entire owner
+ * context - thirty thousand characters of it, key ids, a database password - fits in one path
+ * segment, is trivially a substring of itself, and left a tainted turn for two bytes with no card
+ * in balanced or in strict. The recipient is the attacker's server, which has never seen a word of
+ * the corpus, so nothing about the piece was an index into anything it held.
+ *
+ * Thirty-two, measured against every address this repository commits: 501 distinct URLs, 721 path
+ * and query segments, median 5, ninetieth percentile 15, ninety-ninth 40, longest 82. The 1.39%
+ * above this cap are article slugs and disclosure-log titles - the shape a search hands over, and a
+ * handed address is credited entire and costs nothing at all. What has to fit under the cap is a
+ * piece the model composed itself, and those are short.
+ *
+ * This bounds the channel; it does not close it. A piece at exactly the cap still buys thirty-two
+ * characters for two bytes, so a turn's whole budget still moves about sixteen kilobytes rather
+ * than the hundred and nine it moved before. That is the trade this file is honest about above: the
+ * quantity is finite, charged and visible, and the owner decides.
+ */
+export const MAX_CREDITED_TOKEN_CHARS = 32;
 
 const MAX_KNOWN_ORIGINS = 64;
 
@@ -107,7 +177,20 @@ const MAX_KNOWN_ORIGINS = 64;
  * deep, and at worst a few tens of kilobytes of the trajectory.
  */
 const MAX_KNOWN_ADDRESSES = 192;
-const MAX_ADDRESS_CHARS = 256;
+
+/**
+ * Long enough that a real address is remembered whole, because a truncated one is a different
+ * address.
+ *
+ * Under the old charge this was only a corpus of substrings and clipping the tail cost a few bytes.
+ * The credit below is an identity test, so clipping the tail now costs the whole credit: at 256 a
+ * real 301-character NHS disclosure-log URL that a search had just handed the model came back as
+ * 94 bytes of material the model chose, two under the per-address bound, on a turn where nothing
+ * had been composed at all. Measured over 136 recorded addresses one exceeds 256 and none exceeds
+ * 512; the median is 54. The cost of the headroom is bounded and small - 192 addresses at 512 is
+ * 98 KB of turn state in the worst case, against the 40 KB of the owner's words already beside it.
+ */
+const MAX_ADDRESS_CHARS = 512;
 
 export const originOf = (value: string): string => {
   try {
@@ -163,11 +246,66 @@ const labelsBeyond = (host: string, suffix: string): string[] =>
     .split('.')
     .filter(Boolean);
 
-/** How much of these tokens appears nowhere the owner or an already-read page put it. */
-const novelBytes = (tokens: readonly string[], corpus: string): number =>
-  tokens
-    .filter((token) => !corpus.includes(token.toLowerCase()))
-    .reduce((total, token) => total + token.length, 0);
+/**
+ * What these pieces of an address cost: the price of choosing each one, and the length of any the
+ * corpus cannot account for.
+ *
+ * Never zero for a piece that is present, which is the property the whole file rests on. The
+ * previous rule was a filter, and a filter can be emptied.
+ */
+const chosenBytes = (tokens: readonly string[], corpus: string): number =>
+  tokens.reduce(
+    (total, token) =>
+      total +
+      (token.length <= MAX_CREDITED_TOKEN_CHARS && corpus.includes(token.toLowerCase())
+        ? MIN_TOKEN_BYTES
+        : Math.max(MIN_TOKEN_BYTES, token.length)),
+    0
+  );
+
+/**
+ * The identity of an address: the request it would make, and nothing looser.
+ *
+ * `href` after parsing, which lowercases the scheme and the host - the two parts a server cannot
+ * tell apart - and leaves the path, the query and the fragment exactly as written. Anything looser
+ * is a channel, and both of the obvious loosenings were measured to be one before this said `href`:
+ * lowercasing the whole address made `/GuIDe/PrIciNG-and-plans-for-teams` the same address as the
+ * one the search handed over, which is a free bit per letter - 4,096 requests, 12 bits each, charged
+ * 0 - and trimming trailing slashes made `/guide/pricing/` and `/guide/pricing//` the same, which is
+ * another few bits a request for as many requests as anyone likes. A credit is only safe if the
+ * thing it credits could not have been chosen.
+ */
+const sameAddress = (value: string): string => {
+  try {
+    return new URL(value.trim()).href;
+  } catch {
+    return value.trim();
+  }
+};
+
+/**
+ * Whether this exact address is one the model was handed rather than one it composed.
+ *
+ * Charging by the piece would otherwise put a price on following a search result, and following a
+ * search result is what a research turn is: six addresses a search returned cost 0 under the old
+ * filter, and would cost a couple of bytes a segment under the new charge for no reason anybody
+ * could defend - the harness put those addresses in front of the model itself.
+ *
+ * Whole addresses only, and only from the two sources an attacker cannot write into: `ownerText` is
+ * the owner's own messages, and `knownAddresses` is the harness's own reading of a search result or
+ * of where a read landed, never what a page said. A prefix would not do - handed
+ * `https://docs.example.com/a/b` would then pay nothing for `/a/b/<the mailbox>` - so it is the
+ * whole address or nothing.
+ */
+const wasHanded = (value: string, context: DestinationContext): boolean => {
+  const target = sameAddress(value);
+  return (
+    (context.knownAddresses ?? []).some((address) => sameAddress(address) === target) ||
+    (context.ownerText.match(/https?:\/\/[^\s<>"')\]]+/gi) ?? []).some(
+      (address) => sameAddress(address) === target
+    )
+  );
+};
 
 /**
  * Adds what one address carried to what this turn has already sent.
@@ -219,17 +357,20 @@ export const classifyDestination = (
   if (!isPublicHttpUrl(url.toString())) return { sink: false, host, noveltyBytes: 0, reason: '' };
   if ((context.selfOrigins ?? []).some((origin) => origin && host === origin.toLowerCase()))
     return { sink: false, host, noveltyBytes: 0, reason: '' };
+  // An address the harness handed the model is an address the model did not compose, so there is
+  // nothing of the owner's in it to charge for however long it is.
+  if (wasHanded(value, context)) return { sink: false, host, noveltyBytes: 0, reason: '' };
   // Compared case-insensitively and without the separators a URL adds, so a path segment that the
   // owner wrote as two words still counts as theirs.
   const corpus =
     `${context.ownerText}\n${context.knownOrigins.join('\n')}\n${(context.knownAddresses ?? []).join('\n')}`.toLowerCase();
-  const addressNovelty = novelBytes(addressTokens(url), corpus);
+  const addressNovelty = chosenBytes(addressTokens(url), corpus);
   const matched = matchingHostSuffix(host, context.knownOrigins);
   if (!matched)
     return {
       sink: true,
       host,
-      noveltyBytes: addressNovelty + novelBytes(host.split('.'), corpus),
+      noveltyBytes: addressNovelty + chosenBytes(host.split('.'), corpus),
       reason: `${host} is not a host the user named, a search returned, or this turn has already read`
     };
   /*
@@ -240,21 +381,29 @@ export const classifyDestination = (
    * out. Held to its own, much smaller bound rather than folded into the address one: a real
    * subdomain is a word and cannot use the room a long legitimate path needs.
    */
-  const hostNovelty = novelBytes(labelsBeyond(host, matched), corpus);
-  const noveltyBytes = addressNovelty + hostNovelty;
+  const hostNovelty = chosenBytes(labelsBeyond(host, matched), corpus);
+  /*
+   * At least the price of one piece, even when the address has no pieces at all.
+   *
+   * `https://a-host-already-read/` tokenises to nothing, so without this it is a free request - and
+   * which of the hosts a turn has read gets asked next is itself a choice, so a free request is a
+   * channel that repeats without limit. It is the same defect as the zero-rated token wearing a
+   * different address.
+   */
+  const noveltyBytes = Math.max(MIN_TOKEN_BYTES, addressNovelty + hostNovelty);
   if (hostNovelty > MAX_NOVEL_HOST_BYTES)
     return {
       sink: true,
       host,
       noveltyBytes,
-      reason: `the name ${host} puts ${hostNovelty} bytes in front of ${matched} that appear nowhere in the user's request or in a page already read`
+      reason: `the name ${host} puts ${hostNovelty} bytes in front of ${matched} that the user's request and the pages already read do not account for`
     };
   if (noveltyBytes > MAX_NOVEL_URL_BYTES)
     return {
       sink: true,
       host,
       noveltyBytes,
-      reason: `this address carries ${noveltyBytes} bytes that appear nowhere in the user's request or in a page already read`
+      reason: `this address carries ${noveltyBytes} bytes the model chose rather than was handed, past the ${MAX_NOVEL_URL_BYTES} a real link needs`
     };
   const spent = Math.max(0, context.spentNoveltyBytes ?? 0);
   if (spent + noveltyBytes > MAX_TURN_NOVEL_BYTES)
@@ -262,7 +411,7 @@ export const classifyDestination = (
       sink: true,
       host,
       noveltyBytes,
-      reason: `this turn has already sent ${spent} bytes that appear nowhere in the user's request, and ${noveltyBytes} more here is past the ${MAX_TURN_NOVEL_BYTES} allowed while untrusted content is in the turn`
+      reason: `this turn has already put ${spent} bytes into addresses that the user's request does not account for, and ${noveltyBytes} more here is past the ${MAX_TURN_NOVEL_BYTES} allowed while untrusted content is in the turn`
     };
   return { sink: false, host, noveltyBytes, reason: '' };
 };

@@ -8,6 +8,7 @@ import {
 } from '@athanor/core';
 import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import type { ModelRelease } from '@athanor/contracts';
+import { MIN_TOKEN_BYTES } from './egress.js';
 import { AgentWorker } from './agent.js';
 import { approvalPreviewHash } from './approval-state.js';
 import { buildIdentity } from './build-identity.js';
@@ -6939,10 +6940,11 @@ describe('what a tainted turn is charged for sending', () => {
 
     // The call failed, and the turn was told so.
     expect(probe.events.some((entry) => entry.kind === 'error')).toBe(true);
-    // `changelog` is the one thing in that address that appears nowhere in the owner's words, so
-    // it is exactly what the turn is charged. Asserted as the figure rather than as "more than
-    // nothing": a charge of the whole URL would be a different bug wearing the same assertion.
-    expect(noveltySpent(probe)).toBe('changelog'.length);
+    // `changelog` appears nowhere in the owner's words so it costs its length; `guide` was in the
+    // address the first read landed on, so it costs the price of naming a piece the corpus already
+    // holds rather than nothing. Asserted as the figure rather than as "more than nothing": a
+    // charge of the whole URL would be a different bug wearing the same assertion.
+    expect(noveltySpent(probe)).toBe('changelog'.length + MIN_TOKEN_BYTES);
   });
 
   it('charges nothing for an answer the harness wrote, because nothing was sent', async () => {

@@ -57,6 +57,7 @@ import {
   writeWorkspaceFile,
   WorkspaceFileError
 } from './files.js';
+import { readerFor } from './seen-lines.js';
 import { probeBinaries, toolchainReport } from './toolchain.js';
 import { workspaceSurfaces } from './surfaces.js';
 import {
@@ -822,12 +823,24 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
      */
     const displayBytes = positiveQueryInteger(request.query.displayBytes);
     const displayLines = positiveQueryInteger(request.query.displayLines);
+    /*
+     * WHO is being shown this, taken off the signed capability rather than from anything the caller
+     * chose to send. A record is about one task's context window, so a read is only evidence for the
+     * task that made it; `sub` is the task the worker minted the token for, and the code running
+     * inside that task cannot set it.
+     *
+     * `undefined` for the owner in the Files pane and for `control`, which means no record at all -
+     * see `readerFor`. Neither is ever held to what it was shown, so a record filed under either
+     * could never be read back by anybody, and would only crowd out the ones that are load-bearing.
+     */
+    const shownTo = readerFor(request.capability);
     try {
       if (maxBytes !== undefined) {
         const window = await readWorkspaceFileLines(root, requestedPath, {
           startLine: positiveQueryInteger(request.query.startLine) ?? 1,
           endLine: positiveQueryInteger(request.query.endLine) ?? Number.MAX_SAFE_INTEGER,
-          maxBytes: Math.min(maxBytes, config.MAX_FILE_BYTES)
+          maxBytes: Math.min(maxBytes, config.MAX_FILE_BYTES),
+          shownTo
         });
         reply.headers({
           'x-start-line': String(window.startLine),
@@ -852,7 +865,11 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
         requestedPath,
         config.MAX_FILE_BYTES,
         displayBytes !== undefined && displayLines !== undefined
-          ? { maxBytes: Math.min(displayBytes, config.MAX_FILE_BYTES), maxLines: displayLines }
+          ? {
+              maxBytes: Math.min(displayBytes, config.MAX_FILE_BYTES),
+              maxLines: displayLines,
+              shownTo
+            }
           : undefined
       );
       reply.header('x-content-sha256', file.sha256);
@@ -944,12 +961,17 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     // The caller's claim about what it is replacing, checked under the write's own descriptor.
     const expected = (request.query.expectSha256 ?? '').trim();
     /*
-     * Only the agent is held to what it has been shown, and the capability says who is writing
-     * rather than the body or a query parameter, so it is not something a caller can decide about
-     * itself. The agent's windowed read has no whole-file digest to claim, so before this the guard
-     * was skipped on exactly the shape that needed it most; the owner's save from the Files pane and
-     * an upload landing on a name still arrive unclaimed and stay unguarded, because neither of them
-     * said it had read anything.
+     * WHICH agent is held to what IT has been shown, taken off the signed capability rather than
+     * from the body or a query parameter, so it is not something a caller can decide about itself.
+     * The same value the read arm above records under: one task, one record, and a token minted for
+     * task A cannot ask about task B's reads because `sub` is what it is signed over.
+     *
+     * The role alone used to be the whole of it, which said held-or-not and never said who - so with
+     * two tasks in one workspace the guard held the second one to the first one's reads. The agent's
+     * windowed read also has no whole-file digest to claim, so before that the guard was skipped on
+     * exactly the shape that needed it most; the owner's save from the Files pane and an upload
+     * landing on a name still arrive unclaimed and stay unguarded, because neither of them said it
+     * had read anything.
      */
     return writeWorkspaceFile(
       root,
@@ -957,9 +979,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       body,
       config.MAX_FILE_BYTES,
       expected || undefined,
-      {
-        heldToReads: request.capability.role === 'agent'
-      }
+      readerFor(request.capability)
     );
   });
 

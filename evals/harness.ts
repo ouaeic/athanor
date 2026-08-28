@@ -62,6 +62,8 @@ import {
   RUNTIME_CONTEXT_MARKER
 } from '../apps/worker/src/context.js';
 import { forgetReads } from '../apps/worker/src/edit/index.js';
+// The runner's own display-prefix function, imported rather than modelled. See `fileDisplay`.
+import { displayablePrefix, type DisplayBudget } from '../services/workspace-runner/src/files.js';
 import { memoryItemAad, memorySourceAad } from '../apps/worker/src/memory-runtime.js';
 import { builtinSkillLibrary } from '../apps/worker/src/skills.js';
 
@@ -762,6 +764,46 @@ const fileText = (content: string): Response =>
   new Response(content, { headers: { 'content-type': 'text/plain; charset=utf-8' } });
 
 /**
+ * The DISPLAY read: `server.ts:851-864`, answered with the runner's own prefix function.
+ *
+ * `readFileForDisplay` sends `displayBytes` and `displayLines` and gets back the prefix that fits
+ * them plus `x-display-lines`, and that prefix is the whole of what the model is shown. This stub
+ * answered neither parameter, so it fell through to `fileText` and handed back the file - which the
+ * client reads, correctly and by design, as "a runner one release behind this worker displayed all
+ * of it". Measured through the shipped `readWorkspaceFile` on 9,000 lines of two characters: 800
+ * rows, 2,399 bytes. Through this stub before this existed: 9,000 rows. Every unwindowed
+ * `file_read` in this suite was answered in a shape the shipped runner cannot produce, and the two
+ * bounds `workspace.ts` derives from each other were unreachable from here.
+ *
+ * `displayablePrefix` is IMPORTED rather than modelled, unlike `fileWindow` below. The reason
+ * `fileWindow` is modelled - the real ranged reader walks a file descriptor in a fixed buffer and
+ * this stub's workspace is a map of strings - does not apply to it: it is a pure function of a
+ * Buffer and a budget, so importing it means the fake cannot drift from the thing it is faking.
+ * That is the tier CONTRIBUTING asks for first, and a second implementation here is exactly the
+ * second copy of a rule this repository keeps outliving the first.
+ *
+ * One thing it does NOT model, stated rather than left to be discovered: the real route also calls
+ * `recordDisplayedLines`, so the RUNNER keeps its own record of what it put in front of the model
+ * and `writeWorkspaceFile` consults it. Nothing here does, and the PUT route below acknowledges
+ * every write without asking. So this suite measures the worker's ledger and says nothing about the
+ * runner's - a fixture that wants that guard wants the real runner, or
+ * `services/workspace-runner/src/seen-lines.test.ts`, where it lives.
+ */
+const fileDisplay = (content: string, budget: DisplayBudget): Response => {
+  const bytes = Buffer.from(content, 'utf8');
+  const { prefix, whole, partialLine } = displayablePrefix(bytes, budget);
+  return new Response(prefix.toString('utf8'), {
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'x-content-sha256': createHash('sha256').update(bytes).digest('hex'),
+      'x-total-lines': String(content.split('\n').length),
+      'x-display-lines': String(whole),
+      'x-partial-line': String(partialLine)
+    }
+  });
+};
+
+/**
  * The windowed read: `services/workspace-runner/src/files.ts:277-370` and the headers
  * `server.ts:816-827` puts on it.
  *
@@ -1014,14 +1056,22 @@ const runnerResponse = (
     if (content === undefined) return new Response('', { status: 404 });
     const query = new URL(url).searchParams;
     const maxBytes = Number(query.get('maxBytes'));
-    // A caller naming a budget is asking for a window, which is the arm `server.ts:806-828` serves
-    // and the only arm that answers the line headers. Everything else is the whole file.
-    return Number.isFinite(maxBytes) && maxBytes > 0
-      ? fileWindow(content, {
-          startLine: Math.max(1, Number(query.get('startLine')) || 1),
-          endLine: Math.max(1, Number(query.get('endLine')) || Number.MAX_SAFE_INTEGER),
-          maxBytes
-        })
+    const displayBytes = Number(query.get('displayBytes'));
+    const displayLines = Number(query.get('displayLines'));
+    const positive = (value: number): boolean => Number.isFinite(value) && value > 0;
+    // Three callers, told apart the way `server.ts:810-856` tells them apart. A caller naming
+    // `maxBytes` is asking for a window. A caller naming BOTH display budgets is about to put what
+    // it gets in front of a model and is answered with the prefix that fits. A caller naming
+    // neither - `readFileWithHash`, which is the read a `file_patch` makes and which displays
+    // nothing - gets the whole file.
+    if (positive(maxBytes))
+      return fileWindow(content, {
+        startLine: Math.max(1, Number(query.get('startLine')) || 1),
+        endLine: Math.max(1, Number(query.get('endLine')) || Number.MAX_SAFE_INTEGER),
+        maxBytes
+      });
+    return positive(displayBytes) && positive(displayLines)
+      ? fileDisplay(content, { maxBytes: displayBytes, maxLines: displayLines })
       : fileText(content);
   }
   if (url.includes('/checkpoints'))

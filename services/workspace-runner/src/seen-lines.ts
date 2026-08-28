@@ -1,6 +1,6 @@
 /**
- * Which lines of a file were actually put in front of the model, so an edit cannot rest on a line
- * it never saw.
+ * Which lines of a file were actually put in front of WHICH MODEL, so an edit cannot rest on a line
+ * that reader never saw.
  *
  * `file_patch` proves that `oldText` occurs exactly once in the file. It does not prove the model
  * ever read that part of the file. A window read of lines 1-50 followed by a patch anchored at line
@@ -16,13 +16,77 @@
  * costing a round trip. The refusal is itself a display, so the same edit sent again applies: the
  * price of an unseen anchor is being shown the truth once, not being sent back to read.
  *
+ * EVERY RECORD IS ABOUT A READER AND A FILE, never about a file alone - see `Reader`. One workspace
+ * is shared by however many tasks are running in it, and "this file has been read" is not a fact
+ * about the file: it is a fact about one context window. Keyed by path alone, the record answered
+ * the question it was asked with somebody else's answer.
+ *
  * Nothing here is a fact about the file - that is `files.ts` and the filesystem. This module holds
- * only the record of what was shown, the arithmetic of which lines an edit rests on, and the
+ * only the record of who was shown what, the arithmetic of which lines an edit rests on, and the
  * refusal's text.
  */
 
 /** A closed, 1-indexed line range. `start` and `end` are both lines that exist. */
 export type LineRange = { start: number; end: number };
+
+/**
+ * Who was shown the lines. A task - one agent's run, with its own context window and its own memory
+ * of the file - and never a path, a workspace or a person.
+ *
+ * A record exists to answer "has THIS WRITER been shown these lines", and a workspace has more than
+ * one writer in it: a second slot of the same worker, the owner in the Files pane, the agent's own
+ * shell. Two tasks reading the same file are two readers, and what one of them has on screen says
+ * nothing whatever about what the other has. Keyed by resolved path alone the record claimed
+ * otherwise, and the claim was false in the direction that costs: measured through the shipped
+ * write, task B reading lines 1-50 of a 400-line file and then whole-writing line 300 was refused,
+ * and the same B whole-writing line 300 after task A had read 1-400 of the same file LANDED. The
+ * only difference between the two runs was another task's read, and the second one changed a line
+ * only A had ever seen.
+ *
+ * The task is taken from the capability token the request already carries - the worker stamps `sub`
+ * with the task it is running for every runner call it makes - rather than from a new query
+ * parameter or header. A parameter is something every call site has to remember to send, and a
+ * guard whose identity can be forgotten by a caller is the same class of defect as one that is
+ * keyed by the wrong thing; `sub` is signed, is already checked, and cannot be chosen by the code
+ * running inside the task.
+ */
+export type Reader = { readonly task: string };
+
+/**
+ * The reader a capability holder is, or `undefined` for a holder that is not one.
+ *
+ * THE DELIBERATE DECISION ABOUT THE OWNER IN THE FILES PANE, and about `control`: they get no
+ * record at all. They file none on a read and are held to none on a write.
+ *
+ * It is a decision and not a tidy-up, because the pane does read this way. It pages a file through
+ * the ranged reader - `apps/api` forwards `startLine`, `endLine` and `maxBytes` to the same route
+ * the agent uses - and that reader recorded whatever it delivered, under the path, for whoever
+ * wrote next to be measured against. The owner looking at half a log therefore left a record that
+ * said half that log had been read, and the agent's next write to it was held to her reading.
+ *
+ * Filing it under her name instead of the path would fix that half and start a worse one: her save
+ * would then be inside a guard built for a model editing from a window, and the second save of a
+ * file the pane had paged would be refused for lines the first did not touch - a lecture about
+ * anchors in front of a person who has no idea what one is. She is not held to reads, so a record
+ * about her has no reader; it would only spend slots in a bounded store that the records doing the
+ * guarding need. Not recording takes nothing from her and leaves the slots to the tasks.
+ */
+export const readerFor = (capability: { role: string; sub: string }): Reader | undefined =>
+  capability.role === 'agent' ? { task: capability.sub } : undefined;
+
+/**
+ * The key: who, and then which file.
+ *
+ * Joined on a NUL because it is the one byte neither a task id nor a POSIX path can contain, so no
+ * two pairs can spell one key. Run together, `a` reading `b/x` and `ab` reading `/x` are the same
+ * string, and one reader's record would answer for another's again - by collision this time rather
+ * than by design, which is the worse version because nothing in the shape of the code shows it.
+ *
+ * Priced honestly: no pair reachable today collides, because `sub` is a UUID and a target is always
+ * an absolute resolved path. That is a fact about two callers this module does not own, and the
+ * separator makes it a fact about the key instead.
+ */
+const keyFor = (reader: Reader, target: string): string => `${reader.task}\0${target}`;
 
 /** A range plus when it was recorded, which is the only thing the per-file cap can rank on. */
 type Recorded = LineRange & { at: number };
@@ -43,8 +107,17 @@ type Displayed = {
 /**
  * Per-process, and bounded on both axes because this box runs for months.
  *
- * Paths: an LRU of the files recently read in windows, which is a working set, not a history.
- * Ranges per path: a file read in many small windows would otherwise accumulate one interval per
+ * Records: an LRU of the reader-and-file pairs recently read in windows, which is a working set,
+ * not a history. A SLOT IS ONE FILE FOR ONE READER, which is what the key change cost: two tasks
+ * reading the same three hundred files hold six hundred records between them where the same reads
+ * from one task hold three hundred. Five hundred and twelve was chosen as a per-file working set
+ * and would have been half of one the moment a second slot started work - so the fix would have
+ * traded a record that answered for the wrong reader for no record at all, which is quieter and
+ * just as unguarded. A thousand and twenty-four holds two concurrent tasks at the working set the
+ * number was picked for, and the worker leases at most eight (`WORKER_CONCURRENCY` caps there);
+ * past that the busiest task evicts the quietest, and what that costs is stated below.
+ *
+ * Ranges per record: a file read in many small windows would otherwise accumulate one interval per
  * read forever. When the cap is reached the oldest intervals are dropped rather than coalesced -
  * dropping makes the guard stricter and the worst case is one extra refusal that hands over the
  * text, whereas coalescing two intervals into their hull would silently vouch for every line
@@ -54,13 +127,14 @@ type Displayed = {
  * write now adds one interval per span it authored, up to the forty operations a single patch may
  * carry. Thirty-two was inside that: one forty-hunk patch could evict every interval the reads
  * before it had put there, and refuse the next write for lines that had been shown. A hundred and
- * twenty-eight is past what a patch can spend and still four kilobytes per path at worst.
+ * twenty-eight is past what a patch can spend and still four kilobytes per record at worst, so the
+ * store is four megabytes full.
  *
  * Both are memory bounds, not correctness bounds: losing a record loses the opinion, never the
  * write. That direction is deliberate. A guard that starts refusing work because a cache filled up
  * is a worse failure than the one it exists to prevent.
  */
-const MAX_TRACKED_PATHS = 512;
+const MAX_TRACKED_RECORDS = 1_024;
 const MAX_RANGES_PER_PATH = 128;
 
 /**
@@ -121,8 +195,8 @@ const capRanges = (ranges: Recorded[]): Recorded[] =>
 const evict = (now: number): void => {
   for (const [key, record] of displayed)
     if (now - record.recordedAt > SEEN_LINE_HORIZON_MS) displayed.delete(key);
-  // Insertion order is recency order: recording a path deletes and re-sets it.
-  while (displayed.size > MAX_TRACKED_PATHS) {
+  // Insertion order is recency order: recording a file deletes and re-sets it.
+  while (displayed.size > MAX_TRACKED_RECORDS) {
     const oldest = displayed.keys().next();
     if (oldest.done) break;
     displayed.delete(oldest.value);
@@ -130,18 +204,22 @@ const evict = (now: number): void => {
 };
 
 /**
- * Notes that these lines of this exact file were returned to a caller whole.
+ * Notes that these lines of this exact file were returned to THIS READER whole.
  *
  * "Whole" is the load-bearing word: a line the read cut in half on its byte budget was not
- * displayed, and counting it would vouch for the half that never arrived.
+ * displayed, and counting it would vouch for the half that never arrived. "This reader" is the
+ * other one: what it records is that one task has these lines in front of it, which is the only
+ * thing a read is evidence of.
  */
 export const recordDisplayedLines = (
-  key: string,
+  reader: Reader,
+  target: string,
   identity: string,
   range: LineRange,
   now = Date.now()
 ): void => {
   if (range.start < 1 || range.end < range.start) return;
+  const key = keyFor(reader, target);
   const existing = displayed.get(key);
   const previous =
     existing && existing.identity === identity && now - existing.recordedAt <= SEEN_LINE_HORIZON_MS
@@ -158,18 +236,27 @@ export const recordDisplayedLines = (
 };
 
 /**
- * What this file has shown, or `undefined` for "no opinion".
+ * What this file has shown THIS READER, or `undefined` for "no opinion".
  *
  * The two are not the same and the difference is the whole safety of this: an empty array would
  * mean every line is unseen and every write refused. `undefined` means nothing was recorded, or the
  * record has expired, or the bytes moved under it - and a caller with no opinion writes exactly as
  * it did before this module existed.
+ *
+ * A reader that has read nothing is therefore in the same position as one this module has never
+ * heard of, and that is on purpose: the re-key stops one task's reads answering for another's, and
+ * does not invent an opinion where there was none. A first write to a file nobody has read still
+ * lands, exactly as it must - see `rememberWrite` on why a write may never be the thing that starts
+ * guarding a file. What the concurrent second writer is held by is the compare-and-swap on
+ * `expectSha256`, which is a different bound answering a different question.
  */
 export const displayedLines = (
-  key: string,
+  reader: Reader,
+  target: string,
   identity: string,
   now = Date.now()
 ): LineRange[] | undefined => {
+  const key = keyFor(reader, target);
   const record = displayed.get(key);
   if (!record) return undefined;
   if (now - record.recordedAt > SEEN_LINE_HORIZON_MS || record.identity !== identity) {
@@ -448,13 +535,20 @@ export const sayRanges = (ranges: LineRange[]): string =>
  * A file with no record gains none. A write must never be the thing that starts guarding a file,
  * or the file browser - which reads whole files and writes them back, and never reads a window -
  * would find its second save refused for lines its first save had not touched.
+ *
+ * It carries THIS WRITER'S record and no other. Another task's record of the same file is left
+ * where it is, to be found stale by its own identity check the next time that task is asked about:
+ * this write moved the bytes, so line 300 is no longer the line 300 that task was shown, and
+ * shifting its ranges by hunks it never saw would be this module inventing a reading for it.
  */
 export const rememberWrite = (
-  key: string,
+  reader: Reader,
+  target: string,
   identity: string,
   edit: LineEdit,
   now = Date.now()
 ): void => {
+  const key = keyFor(reader, target);
   const record = displayed.get(key);
   if (!record) return;
   const carried: Recorded[] = [];

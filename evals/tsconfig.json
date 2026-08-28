@@ -10,6 +10,7 @@
     "context-quality/*.ts",
     "agentdojo/*.ts",
     "arms/*.ts",
-    "edit/*.ts"
+    "edit/*.ts",
+    "read/*.ts"
   ]
 }

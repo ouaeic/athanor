@@ -1,0 +1,38 @@
+{
+  "$stamp": {
+    "acceptedAt": "2026-08-28T11:03:27.611Z",
+    "version": "0.1.1",
+    "commit": "13a05c4",
+    "rig": "7918089bc638"
+  },
+  "a-whole-file-read-for-a-one-line-edit": {
+    "displayedLines": 400,
+    "landedEdits": 1,
+    "linesPerEdit": 400
+  },
+  "narrow-reads-and-an-edit-each-time": {
+    "displayedLines": 40,
+    "landedEdits": 4,
+    "linesPerEdit": 10
+  },
+  "a-second-edit-after-one-read-needs-no-second-read": {
+    "displayedLines": 400,
+    "landedEdits": 2,
+    "linesPerEdit": 200
+  },
+  "a-file-written-from-nothing-displays-no-lines": {
+    "displayedLines": 0,
+    "landedEdits": 1,
+    "linesPerEdit": 0
+  },
+  "a-file-past-the-display-bound-shows-only-what-the-bound-allows": {
+    "displayedLines": 800,
+    "landedEdits": 1,
+    "linesPerEdit": 800
+  },
+  "a-read-that-lands-no-edit-is-not-averaged-in": {
+    "displayedLines": 400,
+    "landedEdits": 0,
+    "linesPerEdit": null
+  }
+}

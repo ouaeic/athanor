@@ -39,14 +39,17 @@ one that costs least to run:
    toolchain, so a document route that has stopped producing bytes fails here rather than in front of
    an owner.
 4. `pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm test`.
-5. `pnpm eval:rigs` — the five rigs that hold a committed baseline: context quality, prompt
-   injection, the arm comparison, approval cards, and edit-format conformance. They are offline,
-   need no key, and finish in about ten seconds between them. They are here rather than nightly
-   because each one answers "did this change cross a floor", and a floor that quietly stops firing
-   is not a drift to argue with in the morning — the cards rig in particular pins that reading
+5. `pnpm eval:rigs` — the six rigs that hold a committed baseline: context quality, prompt
+   injection, the arm comparison, approval cards, edit-format conformance, and read cost. They are
+   offline, need no key, and finish in about fourteen seconds between them. They are here rather than
+   nightly because each one answers "did this change cross a floor", and a floor that quietly stops
+   firing is not a drift to argue with in the morning — the cards rig in particular pins that reading
    untrusted content still costs the owner no approvals at all, and the edit rig pins what each way
    of mis-emitting a patch costs in round trips, so a change to the editor that makes a recovery
-   into a refusal fails here rather than being discovered as a bill.
+   into a refusal fails here rather than being discovered as a bill. Each of them commits only rows
+   it constructs itself: the read rig runs the whole fixture corpus and deliberately leaves it out
+   of its baseline, because those rows belong to `pnpm eval` and gating them here would move that
+   suite into `pnpm check` without anybody deciding to.
 6. `pnpm build`.
 
 That list is checked against `package.json` by `scripts/check-repository.mjs`, in both directions and

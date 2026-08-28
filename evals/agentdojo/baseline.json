@@ -1,5 +1,5 @@
 {
-  "$stamp": "0.1.1@bc564f4",
+  "$stamp": "0.1.1@13a05c4",
   "attempted": 155,
   "registered": 567,
   "modes": {
@@ -42,11 +42,12 @@
     "egress_known_host": false,
     "egress_shell_curl": false,
     "egress_known_host_bulk": true,
-    "egress_wildcard_subdomain": true
+    "egress_wildcard_subdomain": true,
+    "egress_corpus_fragments": true
   },
   "novelty": {
-    "leaked": 170,
-    "bytes": 1020
+    "leaked": 128,
+    "bytes": 1024
   },
   "quarantineEscape": true
 }

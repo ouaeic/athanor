@@ -31,7 +31,15 @@ import {
   writeWorkspaceFile,
   WorkspaceFileError
 } from './files.js';
-import { displayedLines, fileIdentity, forgetDisplayedLines } from './seen-lines.js';
+import { displayedLines, fileIdentity, forgetDisplayedLines, readerFor } from './seen-lines.js';
+
+/**
+ * The two tasks a workspace can have in it at once. Every read and every write in this file names
+ * which of them it is: a read is evidence about one context window, so a test that did not say
+ * whose window it was would be asserting the thing this key exists to deny.
+ */
+const A = { task: 'task-a' };
+const B = { task: 'task-b' };
 
 describe('workspace files', () => {
   let root: string;
@@ -341,7 +349,8 @@ describe('reading a window of a file', () => {
     const window = await readWorkspaceFileLines(root, 'workspace/huge.log', {
       startLine: 10,
       endLine: 14,
-      maxBytes: 1_000_000
+      maxBytes: 1_000_000,
+      shownTo: A
     });
     const grew = process.memoryUsage().heapUsed - before;
 
@@ -361,7 +370,8 @@ describe('reading a window of a file', () => {
     const all = await readWorkspaceFileLines(root, 'workspace/small.txt', {
       startLine: 1,
       endLine: 100,
-      maxBytes: 1_000_000
+      maxBytes: 1_000_000,
+      shownTo: A
     });
     expect(all.content.toString('utf8')).toBe('one\ntwo\nthree');
     expect(all.totalLines).toBe(3);
@@ -377,7 +387,8 @@ describe('reading a window of a file', () => {
     const capped = await readWorkspaceFileLines(root, 'workspace/wide.txt', {
       startLine: 1,
       endLine: 50,
-      maxBytes: 500
+      maxBytes: 500,
+      shownTo: A
     });
     expect(capped.truncated).toBe(true);
     expect(capped.content.length).toBeLessThanOrEqual(500);
@@ -388,7 +399,8 @@ describe('reading a window of a file', () => {
     const rest = await readWorkspaceFileLines(root, 'workspace/wide.txt', {
       startLine: capped.nextStartLine!,
       endLine: 50,
-      maxBytes: 1_000_000
+      maxBytes: 1_000_000,
+      shownTo: A
     });
     expect(rest.content.toString('utf8').split('\n')[0]).toMatch(/^\d+:y+$/);
   });
@@ -418,7 +430,8 @@ describe('reading a window of a file', () => {
     const between = await readWorkspaceFileLines(root, 'workspace/aligned.txt', {
       startLine: 1,
       endLine: 40,
-      maxBytes: 360
+      maxBytes: 360,
+      shownTo: A
     });
     expect(between.truncated).toBe(true);
     expect(between.partialLine).toBe(false);
@@ -427,7 +440,7 @@ describe('reading a window of a file', () => {
     // it. Those two have to agree or paging leaves a gap behind.
     expect(between.endLine).toBe(10);
     expect(between.nextStartLine).toBe(11);
-    expect(displayedLines(target, fileIdentity(await stat(target)))).toEqual([
+    expect(displayedLines(A, target, fileIdentity(await stat(target)))).toEqual([
       { start: 1, end: 10 }
     ]);
 
@@ -435,14 +448,15 @@ describe('reading a window of a file', () => {
     const inside = await readWorkspaceFileLines(root, 'workspace/aligned.txt', {
       startLine: 1,
       endLine: 40,
-      maxBytes: 370
+      maxBytes: 370,
+      shownTo: A
     });
     expect(inside.truncated).toBe(true);
     expect(inside.partialLine).toBe(true);
     // The eleventh line is handed over cut short - the caller asked for it - and is not vouched for.
     expect(inside.endLine).toBe(11);
     expect(inside.nextStartLine).toBe(11);
-    expect(displayedLines(target, fileIdentity(await stat(target)))).toEqual([
+    expect(displayedLines(A, target, fileIdentity(await stat(target)))).toEqual([
       { start: 1, end: 10 }
     ]);
   });
@@ -465,17 +479,19 @@ describe('reading a window of a file', () => {
     forgetDisplayedLines();
     await readWorkspaceFile(root, 'workspace/agree.txt', 10_000_000, {
       maxBytes: 360,
-      maxLines: 800
+      maxLines: 800,
+      shownTo: A
     });
-    const whole = displayedLines(target, identity);
+    const whole = displayedLines(A, target, identity);
 
     forgetDisplayedLines();
     await readWorkspaceFileLines(root, 'workspace/agree.txt', {
       startLine: 1,
       endLine: 800,
-      maxBytes: 360
+      maxBytes: 360,
+      shownTo: A
     });
-    expect(displayedLines(target, identity)).toEqual(whole);
+    expect(displayedLines(A, target, identity)).toEqual(whole);
     expect(whole).toEqual([{ start: 1, end: 10 }]);
   });
 
@@ -487,7 +503,8 @@ describe('reading a window of a file', () => {
         readWorkspaceFileLines(root, 'workspace/one-long.txt', {
           startLine: 1,
           endLine: 10,
-          maxBytes: 100
+          maxBytes: 100,
+          shownTo: A
         })
       )
       .then((first) => {
@@ -523,7 +540,8 @@ describe('a read that carries a display budget', () => {
 
     const read = await readWorkspaceFile(root, 'workspace/app.ts', 1_000_000, {
       maxBytes: 1_000_000,
-      maxLines: 50
+      maxLines: 50,
+      shownTo: A
     });
 
     expect(read.displayedLines).toBe(50);
@@ -543,7 +561,8 @@ describe('a read that carries a display budget', () => {
     await writeFile(path.join(root, 'workspace', 'notes.md'), 'one\ntwo\nthree');
     const read = await readWorkspaceFile(root, 'workspace/notes.md', 1_000_000, {
       maxBytes: 1_000_000,
-      maxLines: 800
+      maxLines: 800,
+      shownTo: A
     });
     expect(read.totalLines).toBe(3);
     expect(read.displayedLines).toBe(3);
@@ -562,7 +581,8 @@ describe('a read that carries a display budget', () => {
     await writeFile(path.join(root, 'workspace', 'acl.json'), 'x'.repeat(76_478));
     const read = await readWorkspaceFile(root, 'workspace/acl.json', 1_000_000, {
       maxBytes: 18_000,
-      maxLines: 800
+      maxLines: 800,
+      shownTo: A
     });
 
     expect(read.content.length).toBe(18_000);
@@ -570,7 +590,7 @@ describe('a read that carries a display budget', () => {
     expect(read.partialLine).toBe(true);
     expect(read.totalLines).toBe(1);
     const target = path.join(root, 'workspace', 'acl.json');
-    expect(displayedLines(target, fileIdentity(await stat(target)))).toBeUndefined();
+    expect(displayedLines(A, target, fileIdentity(await stat(target)))).toBeUndefined();
   });
 
   it('never cuts a character in half, whatever the budget lands on', async () => {
@@ -579,7 +599,8 @@ describe('a read that carries a display budget', () => {
     await writeFile(path.join(root, 'workspace', 'poem.txt'), '€'.repeat(400));
     const read = await readWorkspaceFile(root, 'workspace/poem.txt', 1_000_000, {
       maxBytes: 100,
-      maxLines: 800
+      maxLines: 800,
+      shownTo: A
     });
     expect(read.content.length).toBe(99);
     expect(read.content.toString('utf8')).toBe('€'.repeat(33));
@@ -593,7 +614,7 @@ describe('a read that carries a display budget', () => {
     const read = await readWorkspaceFile(root, 'workspace/app.ts', 1_000_000);
     expect(read.totalLines).toBeUndefined();
     const target = path.join(root, 'workspace', 'app.ts');
-    expect(displayedLines(target, fileIdentity(await stat(target)))).toBeUndefined();
+    expect(displayedLines(A, target, fileIdentity(await stat(target)))).toBeUndefined();
   });
 });
 
@@ -727,12 +748,19 @@ describe('the seen-line guard', () => {
   beforeEach(async () => {
     root = await mkdtemp(path.join(tmpdir(), 'athanor-runner-'));
     await ensureWorkspace(root);
+    forgetDisplayedLines();
     await writeFile(path.join(root, 'workspace', 'app.ts'), `${lines.join('\n')}\n`);
   });
   afterEach(async () => rm(root, { recursive: true, force: true }));
 
-  const look = (startLine: number, endLine: number, maxBytes = 400_000): Promise<unknown> =>
-    readWorkspaceFileLines(root, file, { startLine, endLine, maxBytes });
+  // One task doing all of it unless a case says otherwise, which is the single-slot workspace.
+  const look = (
+    startLine: number,
+    endLine: number,
+    maxBytes = 400_000,
+    shownTo = A
+  ): Promise<unknown> =>
+    readWorkspaceFileLines(root, file, { startLine, endLine, maxBytes, shownTo });
   // What `file_patch` does: read the whole file to match `oldText` on, keep the runner's hash.
   const prepare = async (
     find: string,
@@ -744,8 +772,8 @@ describe('the seen-line guard', () => {
       expect: read.sha256
     };
   };
-  const write = (patch: { content: Buffer; expect: string }): Promise<unknown> =>
-    writeWorkspaceFile(root, file, patch.content, 10_000_000, patch.expect);
+  const write = (patch: { content: Buffer; expect: string }, heldTo = A): Promise<unknown> =>
+    writeWorkspaceFile(root, file, patch.content, 10_000_000, patch.expect, heldTo);
 
   it('applies an edit anchored on a line the read displayed', async () => {
     await look(1, 50);
@@ -768,7 +796,8 @@ describe('the seen-line guard', () => {
   it('applies an edit anchored in the prefix an unwindowed read displayed', async () => {
     const shown = await readWorkspaceFile(root, file, 10_000_000, {
       maxBytes: 1_000_000,
-      maxLines: 50
+      maxLines: 50,
+      shownTo: A
     });
     expect(shown.displayedLines).toBe(50);
     await look(51, 100);
@@ -794,14 +823,14 @@ describe('the seen-line guard', () => {
     await look(1, 50);
     const blind = Buffer.from(`${lines.join('\n')}\n`.replace('line 300', 'line 300 // blind'));
     await expect(
-      writeWorkspaceFile(root, file, blind, 10_000_000, undefined, { heldToReads: true })
+      writeWorkspaceFile(root, file, blind, 10_000_000, undefined, A)
     ).rejects.toMatchObject({ status: 428 });
     expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).not.toContain('blind');
 
     // And it is a guard rather than a wall: the same unclaimed write, aimed at a line that read did
     // show, lands.
     const seen = Buffer.from(`${lines.join('\n')}\n`.replace('line 20', 'line 20 // seen'));
-    await writeWorkspaceFile(root, file, seen, 10_000_000, undefined, { heldToReads: true });
+    await writeWorkspaceFile(root, file, seen, 10_000_000, undefined, A);
     expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toContain(
       'line 20 // seen'
     );
@@ -964,7 +993,8 @@ describe('the seen-line guard', () => {
       file,
       Buffer.from(after),
       10_000_000,
-      read.sha256
+      read.sha256,
+      A
     ).catch((error: unknown) => error);
     expect(refusal).toMatchObject({ status: 428 });
     expect((refusal as Error).message).toContain('at line 320');
@@ -988,7 +1018,8 @@ describe('the seen-line guard', () => {
         file,
         Buffer.from(`${lines.slice(0, 50).join('\n')}\n`),
         10_000_000,
-        read.sha256
+        read.sha256,
+        A
       )
     ).rejects.toMatchObject({ status: 428 });
 
@@ -999,7 +1030,8 @@ describe('the seen-line guard', () => {
       file,
       Buffer.from(`${without}\n`),
       10_000_000,
-      gutted.sha256
+      gutted.sha256,
+      A
     ).catch((error: unknown) => error);
     expect(refusal).toMatchObject({ status: 428 });
     expect((refusal as Error).message).toContain('201-300');
@@ -1020,7 +1052,7 @@ describe('the seen-line guard', () => {
       .toString('utf8')
       .replace('line 10\n', 'line 10 // first\nline 10 // and a half\n')
       .replace('line 50\n', 'line 50 // second\n');
-    await writeWorkspaceFile(root, file, Buffer.from(after), 10_000_000, read.sha256);
+    await writeWorkspaceFile(root, file, Buffer.from(after), 10_000_000, read.sha256, A);
 
     // Line 55 of the new file is line 54 of the old one, which that read displayed: editable.
     const next = await readWorkspaceFile(root, file, 10_000_000);
@@ -1029,7 +1061,8 @@ describe('the seen-line guard', () => {
       file,
       Buffer.from(next.content.toString('utf8').replace('line 54\n', 'line 54 // third\n')),
       10_000_000,
-      next.sha256
+      next.sha256,
+      A
     );
     expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toContain('// third');
 
@@ -1041,7 +1074,8 @@ describe('the seen-line guard', () => {
         file,
         Buffer.from(last.content.toString('utf8').replace('line 300\n', 'line 300 // blind\n')),
         10_000_000,
-        last.sha256
+        last.sha256,
+        A
       )
     ).rejects.toMatchObject({ status: 428 });
   });
@@ -1059,5 +1093,173 @@ describe('the seen-line guard', () => {
     await look(100, 200);
     await write(await prepare(lines.slice(99, 200).join('\n'), 'collapsed'));
     expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toContain('collapsed');
+  });
+});
+
+/*
+ * WHOSE READ IT WAS, which is the question the record was answering with somebody else's answer.
+ *
+ * A workspace holds more than one writer: a second slot of the same worker, the owner in the Files
+ * pane, the agent's own shell. Keyed by resolved path, the record said "this file has been read"
+ * when the only question that means anything is "has THIS WRITER been shown these lines" - so task
+ * B, which had seen fifty lines, was credited with the four hundred task A had seen, and a
+ * whole-file write from B changed a line only A had ever looked at. Measured through this same
+ * `writeWorkspaceFile` before the key changed: refused when B was alone in the workspace, landed
+ * when A had read the file, and the two runs differed in nothing else.
+ *
+ * Every case here is the worker's real sequence - window read, the whole-file read `file_patch`
+ * makes to match on, then the write that claims the hash from it - and each is asserted in both
+ * directions, because a guard that only ever refuses is a guard that gets deleted.
+ */
+describe('who the seen-line record is about', () => {
+  let root: string;
+  const lines = Array.from({ length: 400 }, (_, index) => `line ${index + 1}`);
+  const file = 'workspace/app.ts';
+  const onDisk = (): Promise<string> => readFile(path.join(root, 'workspace', 'app.ts'), 'utf8');
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(tmpdir(), 'athanor-runner-'));
+    await ensureWorkspace(root);
+    forgetDisplayedLines();
+    await writeFile(path.join(root, 'workspace', 'app.ts'), `${lines.join('\n')}\n`);
+  });
+  afterEach(async () => rm(root, { recursive: true, force: true }));
+
+  const look = (
+    shownTo: { task: string } | undefined,
+    startLine: number,
+    endLine: number
+  ): Promise<unknown> =>
+    readWorkspaceFileLines(root, file, { startLine, endLine, maxBytes: 400_000, shownTo });
+  const prepare = async (
+    ...edits: Array<[string, string]>
+  ): Promise<{ content: Buffer; expect: string }> => {
+    const read = await readWorkspaceFile(root, file, 10_000_000);
+    let after = read.content.toString('utf8');
+    for (const [find, replace] of edits) after = after.replace(find, replace);
+    return { content: Buffer.from(after), expect: read.sha256 };
+  };
+  const writeAs = (
+    heldTo: { task: string } | undefined,
+    patch: { content: Buffer; expect: string }
+  ): Promise<unknown> =>
+    writeWorkspaceFile(root, file, patch.content, 10_000_000, patch.expect, heldTo);
+
+  /*
+   * THE ATTACK. B has read fifty lines and A has read four hundred, and B aims a whole-file write
+   * at line 300. B's own ledger in the worker is per-task and correctly has nothing to say for it;
+   * the runner's was per-path and answered with A's reading, so the write landed. The two tasks are
+   * deliberately given overlapping reads of the same file, because the crediting is only visible
+   * where B has a record of its own to be topped up.
+   */
+  it('refuses task B the line that only task A was ever shown', async () => {
+    await look(B, 1, 50);
+    await look(A, 1, 401);
+    const patch = await prepare(['line 300', 'line 300 // from B']);
+    await expect(writeAs(B, patch)).rejects.toMatchObject({ status: 428 });
+    expect(await onDisk()).not.toContain('from B');
+  });
+
+  /* The same write, from the task that actually read the file, has to land. */
+  it('lets task A write the line that task A was shown', async () => {
+    await look(B, 1, 50);
+    await look(A, 1, 401);
+    await writeAs(A, await prepare(['line 300', 'line 300 // from A']));
+    expect(await onDisk()).toContain('line 300 // from A');
+  });
+
+  /*
+   * A file paged end to end stays writable whole - the case commit 13a05c4 got right, and the one
+   * a per-reader key could quietly have broken by scattering one task's four windows across four
+   * records. It is the same four windows and the same whole-file write; only the reader is asserted.
+   */
+  it('lets a task that paged the whole file rewrite the whole file', async () => {
+    for (const [from, to] of [
+      [1, 100],
+      [101, 200],
+      [201, 300],
+      [301, 401]
+    ] as const)
+      await look(A, from, to);
+    await writeAs(
+      A,
+      await prepare(
+        ['line 20', 'line 20 // top'],
+        ['line 200', 'line 200 // middle'],
+        ['line 380', 'line 380 // bottom']
+      )
+    );
+    const now = await onDisk();
+    expect(now).toContain('line 20 // top');
+    expect(now).toContain('line 200 // middle');
+    expect(now).toContain('line 380 // bottom');
+  });
+
+  /* And the paging is A's. B, which paged nothing, is not carried by it. */
+  it("does not let one task's paging make the file writable by another", async () => {
+    for (const [from, to] of [
+      [1, 100],
+      [101, 200],
+      [201, 300],
+      [301, 401]
+    ] as const)
+      await look(A, from, to);
+    await look(B, 1, 50);
+    const patch = await prepare(['line 380', 'line 380 // from B']);
+    await expect(writeAs(B, patch)).rejects.toMatchObject({ status: 428 });
+    expect(await onDisk()).not.toContain('from B');
+  });
+
+  /*
+   * The refusal is a display, so it counts as a read - for the task it was handed to. It arrives in
+   * one task's tool result and nowhere else, and crediting the workspace with it would hand the
+   * second task lines that were printed into the first one's context window.
+   */
+  it('counts a refusal as a read for the task that was shown it, and for no other', async () => {
+    await look(A, 1, 50);
+    await look(B, 1, 50);
+    const patch = await prepare(['line 300', 'line 300 // touched']);
+    await expect(writeAs(A, patch)).rejects.toMatchObject({ status: 428 });
+    // B was told nothing, so B is still refused - and A, which was shown the text, now applies.
+    await expect(writeAs(B, patch)).rejects.toMatchObject({ status: 428 });
+    await writeAs(A, patch);
+    expect(await onDisk()).toContain('line 300 // touched');
+  });
+
+  /*
+   * THE OWNER IN THE FILES PANE, which is what the role decides and `readerFor` reasons about.
+   *
+   * This is her sequence, and it is the shipped one: the pane pages a file through the WINDOWED
+   * read - `apps/api` forwards `startLine`, `endLine` and `maxBytes` on the same route the agent
+   * uses, and `apps/web` asks for a window whenever a file is past its preview limit - and then she
+   * presses Replace, which claims a hash. That windowed read used to file a record unconditionally,
+   * under the path, for anyone at all to be answered with.
+   *
+   * She is not a reader, so she files nothing and is held to nothing. Making her one instead is the
+   * tempting symmetry, and it puts her saves inside a guard built for a model editing from a window:
+   * her second save is refused for lines her first did not touch, and the refusal is a lecture about
+   * anchors in front of a person who has no idea what one is.
+   */
+  it('holds the owner to nothing, whatever the pane paged for her', async () => {
+    const owner = readerFor({ role: 'user', sub: 'owner-1' });
+    await look(owner, 1, 50);
+    await writeAs(owner, await prepare(['line 300', 'line 300 // from the pane']));
+    expect(await onDisk()).toContain('line 300 // from the pane');
+  });
+
+  /*
+   * And her paging is hers. Before the key, the pane paging a large file put a record at that path
+   * and the next agent write was measured against it - the same defect as the two-task one, with the
+   * owner as the source of the credit rather than another task.
+   */
+  it("lends the owner's paging to nobody", async () => {
+    await look(readerFor({ role: 'user', sub: 'owner-1' }), 1, 401);
+    await look(A, 1, 50);
+    const patch = await prepare(['line 320', 'line 320 // from A']);
+    await expect(writeAs(A, patch)).rejects.toMatchObject({ status: 428 });
+    expect(await onDisk()).not.toContain('from A');
+
+    // The same agent, held to a line it did read, still writes.
+    await writeAs(A, await prepare(['line 20', 'line 20 // from A']));
+    expect(await onDisk()).toContain('line 20 // from A');
   });
 });

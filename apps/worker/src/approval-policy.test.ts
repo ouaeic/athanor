@@ -11,6 +11,7 @@ import type { MediaModelOption } from '@athanor/contracts';
 import { connectorActions } from '@athanor/core';
 import { agentTools, agentToolsFor } from './tool-catalogue.js';
 import { approvalRequirement, memoryApprovalReason } from './approval-policy.js';
+import { MAX_TURN_NOVEL_BYTES } from './egress.js';
 import { scriptCommands } from './command-classification.js';
 import { surfaceActionRequest } from './surface-actions.js';
 import { resolvedTranscriptionRoute, transcriptionEstimateUsd } from './media.js';
@@ -1542,7 +1543,12 @@ describe('what a tainted turn may still do through shell', () => {
       'balanced',
       tainted
     );
-    expect(batch?.preview).toContain('this turn has already sent');
+    expect(batch?.preview).toContain('this turn has already put');
+
+    // And the owner can see the charge itself, not only that one was made.
+    expect(batch?.preview).toContain(
+      `of the ${MAX_TURN_NOVEL_BYTES} bytes it may put into addresses`
+    );
 
     // And the same batch one at a time is still the same fact, so nothing was gained by splitting.
     const single = approvalRequirement(
