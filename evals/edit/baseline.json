@@ -1,84 +1,370 @@
 {
-  "rows": {
-    "one-line-repetitive": {
-      "replace": 181,
-      "lines": 110,
-      "behaved": "ql"
+  "conformance": {
+    "anchor-off-by-one-unique-evidence": {
+      "cost": 0,
+      "verdict": "landed"
     },
-    "repeated-statement": {
-      "replace": 188,
-      "lines": 64,
-      "behaved": "ql"
+    "anchor-off-by-one-repeated-evidence": {
+      "cost": 1,
+      "verdict": "over-refused"
     },
-    "repeated-guard": {
-      "replace": 279,
-      "lines": 127,
-      "behaved": "ql"
+    "anchor-off-by-one-backwards": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchor-off-by-one-no-evidence": {
+      "cost": "X-echo",
+      "verdict": "landed-wrong"
+    },
+    "anchor-off-by-three-with-evidence": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchor-off-by-many-with-evidence": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchor-past-eof": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchor-zero": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchor-negative": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchor-reversed-range": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchor-overlapping-ranges": {
+      "cost": 2,
+      "verdict": "refused"
+    },
+    "anchor-outside-the-window": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchor-window-counted-from-one": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchor-never-read": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchor-evicted-by-five-reads": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "header-from-another-dialect": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "header-names-another-file": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "header-only": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "header-git-diff-preamble": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "header-unified-diff-file-rows": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "body-minus-rows-carried-over": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "body-whole-hunk-with-context": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "body-zero-context-hunk-insert": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "body-dropped-plus-marker": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "body-unmarked-content": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "body-unmarked-content-that-reads-as-a-verb": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "body-blank-row-inside": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "body-empty-on-replace": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "body-carries-the-dialect": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "body-plus-rows-under-a-cut": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "body-minus-rows-under-an-insert": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "body-evidence-does-not-match": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "ws-crlf-file": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "ws-trailing-spaces": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "ws-tabs-in-evidence": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "ws-no-trailing-newline": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "ws-blank-line-anchor": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "register-never-cut": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "register-filled-twice": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "register-pasted-into-its-own-cut": {
+      "cost": 2,
+      "verdict": "refused"
+    },
+    "register-pasted-twice": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "register-name-with-a-dot": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "encoding-non-ascii": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "encoding-combining-characters": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "encoding-lone-surrogate": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "encoding-very-long-line": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "scale-first-line": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "scale-last-line": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "scale-append-past-last-line": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "scale-one-line-file": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "scale-empty-file": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "scale-empty-file-insert": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "scale-fifty-thousand-lines": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "scale-fifty-thousand-lines-shifted": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "dialect-space-separated-range": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "dialect-dash-range-lowercase": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "dialect-double-dot-range": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "dialect-prose-instruction": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "dialect-rem-a-file": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "dialect-mv-a-file": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "dialect-block-never-closes": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "dialect-block-above-the-window": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "dialect-repeated-stanza": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "dialect-renumbered-after-own-hunk": {
+      "cost": 0,
+      "verdict": "landed"
+    }
+  },
+  "pairs": {
+    "repeated-line": {
+      "quoted": {
+        "cost": 1,
+        "chars": 104
+      },
+      "byLine": {
+        "cost": 0,
+        "chars": 64
+      }
     },
     "deep-stanza": {
-      "replace": 338,
-      "lines": 72,
-      "behaved": "ql"
+      "quoted": {
+        "cost": 1,
+        "chars": 111
+      },
+      "byLine": {
+        "cost": 0,
+        "chars": 68
+      }
     },
-    "one-line-unique": {
-      "replace": 167,
-      "lines": 95,
-      "behaved": "ql"
+    "trailing-spaces": {
+      "quoted": {
+        "cost": 1,
+        "chars": 162
+      },
+      "byLine": {
+        "cost": 0,
+        "chars": 91
+      }
     },
-    "block-replace": {
-      "replace": 355,
-      "lines": 144,
-      "behaved": "ql"
+    "crlf-file": {
+      "quoted": {
+        "cost": 1,
+        "chars": 162
+      },
+      "byLine": {
+        "cost": 0,
+        "chars": 91
+      }
     },
-    "insert-at-gap": {
-      "replace": 179,
-      "lines": 83,
-      "behaved": "ql"
+    "stale-middle-hunk": {
+      "quoted": {
+        "cost": 2,
+        "chars": 353
+      },
+      "byLine": {
+        "cost": 1,
+        "chars": 159
+      }
     },
-    "three-hunks": {
-      "replace": 531,
-      "lines": 258,
-      "behaved": "ql"
+    "self-invalidating-hunks": {
+      "quoted": {
+        "cost": 2,
+        "chars": 374
+      },
+      "byLine": {
+        "cost": 2,
+        "chars": 158
+      }
     },
-    "move-function": {
-      "replace": 777,
-      "lines": 57,
-      "behaved": "ql"
+    "unified-diff-fallback": {
+      "quoted": {
+        "cost": 2,
+        "chars": 106
+      },
+      "byLine": {
+        "cost": 0,
+        "chars": 121
+      }
     },
-    "rename-file": {
-      "replace": 41,
-      "lines": 42,
-      "behaved": "ql"
+    "wrong-line-confidently": {
+      "quoted": {
+        "cost": "X",
+        "chars": 136
+      },
+      "byLine": {
+        "cost": "X-echo",
+        "chars": 59
+      }
     },
-    "python-block": {
-      "replace": 615,
-      "lines": 306,
-      "behaved": "ql"
+    "move-a-block": {
+      "quoted": {
+        "cost": 0,
+        "chars": 408
+      },
+      "byLine": {
+        "cost": 0,
+        "chars": 65
+      }
     },
-    "duplicated-stanza": {
-      "replace": 127,
-      "lines": 65,
-      "behaved": "ql"
-    },
-    "stale-anchor": {
-      "replace": 162,
-      "lines": 91,
-      "behaved": "ql"
-    },
-    "stale-target-rewritten": {
-      "replace": 146,
-      "lines": 75,
-      "behaved": "ql"
-    },
-    "unseen-line": {
-      "replace": 141,
-      "lines": 76,
-      "behaved": "-l"
+    "move-anchored-inside-itself": {
+      "quoted": {
+        "cost": 2,
+        "chars": 399
+      },
+      "byLine": {
+        "cost": 2,
+        "chars": 66
+      }
     }
   },
   "totals": {
-    "replace": 4086,
-    "lines": 1589,
-    "tasks": 14
+    "cases": 64,
+    "free": 34,
+    "oneTrip": 27,
+    "twoTrips": 2,
+    "overRefused": 1,
+    "defects": 1
   }
 }

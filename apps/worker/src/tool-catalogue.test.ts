@@ -32,6 +32,7 @@ import { BASE_SYSTEM_PROMPT, COMPACT_CONTEXT_TOOL } from './context.js';
 import { MEMORY_SESSION_SEARCH_MAX_RESULTS } from './memory-runtime.js';
 import { managedMediaCatalog, resolvedMediaModel } from './media.js';
 import { CODE_SEARCH_COLLAPSE_LINES, CODE_SEARCH_FILE_CEILING } from './tools/repository.js';
+import { EDIT_FORMAT_SPEC } from './edit/index.js';
 
 /** A stored media route, as the API seals one into the credential this worker decrypts. */
 const mediaOption = (
@@ -238,7 +239,42 @@ describe('the size of the catalogue the model is sent', () => {
     // - and the discovery test, because a field that is not declared cannot be found by trying.
     // The saving grows with the block, and past a point it is not an encoding at all: two copies
     // of a two-hundred-line function plus context is a move a model may be unable to afford.
-    expect(bytes).toBeLessThan(55_000);
+    //
+    // Then raised from 55,000 to 55,500 for the line-addressed editor, 509 bytes net: file_patch's
+    // whole entry replaced, 1,621 bytes for the new one against 1,112 for the quoted one it
+    // deleted. Measured at 55,458, so the room this leaves is 42 bytes and not a licence.
+    //
+    // IS IT A CAPABILITY OR AN ENCODING, which is the only question this ceiling asks. It is both,
+    // and it would not be here on the encoding alone. Three edits the quoted shape could not
+    // express at all, and now can be:
+    //
+    //   - A line with no unique quotable neighbourhood. `oldText` had to occur exactly once, so an
+    //     edit inside a run of byte-identical stanzas - a generated table, a config with twelve
+    //     identical blocks - had to grow its quote until something nearby was unique. Where nothing
+    //     is, there was no patch to write. A line number is unique by construction.
+    //   - A file the model cannot reproduce byte for byte. A line with a trailing space, or a CRLF
+    //     file, matched `oldText` zero times, and the difference is invisible in every display the
+    //     model sees - so the retry was identical and failed identically. The line address plus the
+    //     normalisation in `apps/worker/src/edit/format.ts` lands it.
+    //   - A move too large to emit twice inside one generation. `moveAfter` bought the common case
+    //     at 397 characters; `CUT N.=M @x` / `PUT >N @x` is 57 and does not grow with the block.
+    //
+    // The encoding half is what pays for it rather than what justifies it: measured offline over
+    // fifteen tasks on this repository's own corpus, 4,086 characters of arguments become 1,589 -
+    // 61%, winning fourteen of fourteen rows where both formats do what was asked - against 509
+    // bytes sitting in a cached prefix. It repays at well under one edit per request.
+    //
+    // It REPLACED rather than joined, which is the only reason the raise is this small. Two entries
+    // for one job would have cost 1,621 bytes on top of 1,112 instead of instead of them, doubled
+    // what the model has to learn, and asked this ceiling for 1,621 - for a format whose entire
+    // argument is that it emits less.
+    //
+    // The previous costing of the same format put it at +1,306 net, and almost all of the
+    // difference is one decision: the dialect it was measured from makes the model copy a per-file
+    // version tag into every patch and spends three resident paragraphs on what to do when it does
+    // not match. `apps/worker/src/edit/snapshots.ts` needs no tag, because it remembers what each
+    // read displayed - so there is nothing to describe, and nothing for a model to drop.
+    expect(bytes).toBeLessThan(55_500);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
     // union of what twenty-four actions across mail, calendar and repositories accept. Those are
@@ -286,17 +322,18 @@ describe('the size of the catalogue the model is sent', () => {
     for (const [where, size] of nested) expect(size, where).toBeLessThan(1_750);
   });
 
-  it('offers the move shape it charges for, and says so where the model chooses a tool', () => {
+  it('declares the line-addressed edit shape, and only that shape', () => {
     /*
-     * The half of the move that lives on the wire, pinned separately from the half that lives in
-     * the arm (`tools/workspace.test.ts`), because each is useless without the other and they
-     * fail in opposite directions. An arm that accepts `moveAfter` from a catalogue that does not
-     * declare it is a capability nothing can reach - the exact shape of the gate this programme
-     * has shipped wired to nothing twice, and it would pass every test in that other file.
+     * The half of the editor that lives on the wire, pinned separately from the half that lives in
+     * the arm, because each is useless without the other and they fail in opposite directions. An
+     * arm that accepts a shape the catalogue does not declare is a capability nothing can reach -
+     * the exact gate this programme has shipped wired to nothing twice - and a catalogue that
+     * declares a shape the arm cannot apply is a round trip the model cannot avoid.
      *
-     * The sentence is asserted as well as the field. A model chooses a tool by reading the tool's
-     * own description and only then reads the schema, so a `moveAfter` declared in the properties
-     * and unmentioned above them is a field found by luck.
+     * `oldText`, `newText` and `moveAfter` are asserted ABSENT, not merely unmentioned. The quoted
+     * editor was replaced rather than joined: two ways to do one thing doubles what the model has
+     * to learn and pays for both entries on every request of every turn, which is what turns a
+     * measured saving into a net loss on the wire.
      */
     const patch = sent.find((tool) => tool.name === 'file_patch');
     const item = (
@@ -304,18 +341,53 @@ describe('the size of the catalogue the model is sent', () => {
     )?.patches?.items as
       | { required?: string[]; properties?: Record<string, { description?: string }> }
       | undefined;
-    expect(Object.keys(item?.properties ?? {})).toEqual([
-      'path',
-      'oldText',
-      'newText',
-      'moveAfter'
-    ]);
-    expect(patch?.description).toMatch(/moveAfter/);
-    // `newText` is deliberately NOT required - a move carries none - and the arm refuses a patch
-    // that names neither rather than reading the omission as a deletion. @see tools/workspace.ts
-    expect(item?.required).toEqual(['path', 'oldText']);
-    // The one fact about a move a model cannot get by trying: where an empty anchor puts the text.
-    expect(item?.properties?.moveAfter?.description).toMatch(/top/i);
+    expect(Object.keys(item?.properties ?? {})).toEqual(['path', 'edit']);
+    expect(item?.required).toEqual(['path', 'edit']);
+    for (const gone of ['oldText', 'newText', 'moveAfter'])
+      expect(JSON.stringify(patch), gone).not.toContain(gone);
+    /*
+     * `path` is a field of its own rather than a header inside `edit`, and that is a safety
+     * decision before it is an encoding one: `write-classification.ts` reads the files a call
+     * writes out of exactly here, and a path buried in free text is a path the durable-instruction
+     * rule and the approval card would both miss.
+     */
+    expect(item?.properties?.path).toBeTruthy();
+    // The dialect itself, which is the only resident part of this vertical.
+    expect(item?.properties?.edit?.description).toBe(EDIT_FORMAT_SPEC);
+    // A model chooses a tool by reading its description and only then reads the schema, so the
+    // saving that justifies the format has to be legible before the schema is opened.
+    expect(patch?.description).toMatch(/line number/);
+    expect(patch?.description).toMatch(/one copy/);
+  });
+
+  it('keeps the dialect under the size its saving pays for', () => {
+    /*
+     * THE BYTE LEDGER, measured rather than asserted in prose, because this is the number the whole
+     * format had to be argued against - it is resident in the cached prefix of every request of
+     * every turn, whether or not the turn edits anything.
+     *
+     *   model-facing spec, as written      1,020 bytes
+     *   new file_patch entry, on the wire  1,621 bytes
+     *   the quoted entry it replaces      -1,112 bytes
+     *   NET ON THE CATALOGUE                +509 bytes
+     *
+     * The catalogue measured 54,949 before and 55,458 after; the ceiling above moved by exactly
+     * that, for exactly the capability named there, and the bare-box ceiling below moved by the
+     * same 509 for the same reason. The previous costing of this same format put it at +1,306, and
+     * almost all of the difference is one decision - the dialect it was measured from makes the
+     * model copy a per-file version tag into every patch and spends three resident paragraphs on
+     * what to do when it does not match, and `apps/worker/src/edit/snapshots.ts` needs no tag
+     * because it remembers what each read displayed. A tag the model cannot miscopy is a tag
+     * nobody has to describe.
+     *
+     * 1,100 is the 1,020 with room for one more operation and not for prose, which is the same
+     * distinction the ceiling above draws. The far side of the trade is measured offline over
+     * fifteen tasks on this repository's own corpus: 4,086 characters of arguments become 1,589,
+     * a 61% saving, winning fourteen of the fourteen rows where both formats do what was asked.
+     */
+    expect(Buffer.byteLength(EDIT_FORMAT_SPEC)).toBeLessThan(1_100);
+    const patch = sent.find((tool) => tool.name === 'file_patch');
+    expect(Buffer.byteLength(JSON.stringify(patch))).toBeLessThan(1_700);
   });
 
   it('has no tool whose own description says it unlocks nothing', () => {
@@ -443,8 +515,15 @@ describe('the wire a box without a browser or a screen is sent', () => {
      * screen - so it is paid for on this wire too, and the number is 43,300 against a measured
      * 43,257. The gap to the provisioned wire is unchanged at 11,692, because the same 317 bytes
      * landed on both.
+     *
+     * And again for the line-addressed editor that replaced the quoted one, on the same terms: it
+     * is 509 bytes, a bare box honours every operation in it - editing by line number wants neither
+     * a browser nor a screen - so it is paid for here too. 43,800 against a measured 43,766. The
+     * gap to the provisioned wire is still exactly 11,692, because the same 509 bytes landed on
+     * both, which is the property that keeps this number honest: it moves for what a bare box
+     * gained, never for what a provisioned box was spared.
      */
-    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(43_300);
+    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(43_800);
     // The other direction, and the one that fails silently. A gate wired to nothing returns the
     // unconditional constant on every box; this is the assertion that would go red if it did.
     expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(

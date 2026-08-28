@@ -68,20 +68,25 @@ const scanLine = (line: string, state: { quote: string }): number => {
 export const blockAt = (
   lines: readonly string[],
   index: number
-): { readonly from: number; readonly to: number } => {
+): { readonly from: number; readonly to: number; readonly closed: boolean } => {
   const opening = lines[index];
-  if (opening === undefined) return { from: index, to: index };
+  if (opening === undefined) return { from: index, to: index, closed: false };
 
   const state = { quote: '' };
   let depth = scanLine(opening, state);
   if (depth > 0) {
     for (let line = index + 1; line < lines.length; line += 1) {
       depth += scanLine(lines[line] as string, state);
-      if (depth <= 0) return { from: index, to: line };
+      if (depth <= 0) return { from: index, to: line, closed: true };
     }
-    // Unbalanced to end of file: the file is mid-edit or the scanner met something it does not
-    // understand. Claiming the rest of the file would be the destructive answer, so claim nothing.
-    return { from: index, to: index };
+    /*
+     * Unbalanced to the end of what was handed in: the file is mid-edit, the scanner met something
+     * it does not understand, or - the common case now - the lines handed in are a WINDOW and the
+     * block runs off the end of it. Claiming the rest would be the destructive answer, so claim
+     * nothing and say the block never closed. `apply.ts` turns that into a refusal that names the
+     * line, rather than into a silent one-line replacement of the opening brace.
+     */
+    return { from: index, to: index, closed: false };
   }
 
   const base = indentOf(opening);
@@ -92,5 +97,6 @@ export const blockAt = (
     if (indentOf(text) <= base) break;
     last = line;
   }
-  return { from: index, to: last };
+  // An indented suite closes by dedent or by running out of lines, and both are a real end.
+  return { from: index, to: last, closed: true };
 };

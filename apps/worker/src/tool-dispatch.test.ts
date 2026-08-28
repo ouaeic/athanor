@@ -10,6 +10,7 @@ import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import type { ModelRelease } from '@athanor/contracts';
 import { AgentWorker, approvalPreviewHash } from './agent.js';
 import type { WorkerConfig } from './config.js';
+import { forgetReads, recordRead } from './edit/index.js';
 
 /**
  * The dispatch table, arm by arm: what each tool asks the workspace runner for.
@@ -845,7 +846,10 @@ describe('the workspace arms', () => {
       endLine: 2,
       totalLines: 2,
       truncated: false,
-      content: 'one\ntwo'
+      // Numbered, because a line-addressed patch has nothing to address without it. This is the
+      // whole read-side cost of the edit format and it is asserted on the wire rather than argued
+      // about: `docs/design/edit/EDIT-GATE.md` prices it at ~4 bytes a line.
+      content: '1:one\n2:two'
     });
   });
 
@@ -882,7 +886,8 @@ describe('the workspace arms', () => {
       totalLines: 4_000,
       nextStartLine: 921,
       truncated: true,
-      content: 'line 900'
+      // From the window's own start line: a window numbered from 1 would address the wrong file.
+      content: '900:line 900'
     });
   });
 
@@ -907,15 +912,16 @@ describe('the workspace arms', () => {
     expect(executed.result).toEqual({ ok: true, sha256: 'after-write' });
   });
 
-  it('reads each patched file once, writes what it composed, and re-reads the size', async () => {
+  it('reads the patched file once, writes what it composed, and re-reads the size', async () => {
+    // Two operations in ONE patch, because a second patch on the same path is refused outright:
+    // both would address the numbers of the same read while the first had already moved them.
+    forgetReads();
+    recordRead(taskId, 'workspace/a.md', 1, 'one\ntwo\n');
     const executed = await dispatch(
       {
         name: 'file_patch',
         arguments: {
-          patches: [
-            { path: 'workspace/a.md', oldText: 'one', newText: 'ONE' },
-            { path: 'workspace/a.md', oldText: 'two', newText: 'TWO' }
-          ]
+          patches: [{ path: 'workspace/a.md', edit: 'PUT 1:\n+ONE\nPUT 2:\n+TWO\n' }]
         }
       },
       {
@@ -942,19 +948,25 @@ describe('the workspace arms', () => {
       { method: 'GET', path: `${root}/usage`, scopes: ['files.read'], body: undefined }
     ]);
     expect(executed.result).toMatchObject({
-      patchCount: 2,
-      filesChanged: [{ path: 'workspace/a.md', replacements: 2 }]
+      patchCount: 1,
+      filesChanged: [{ path: 'workspace/a.md', lines: 3 }]
     });
+    // The numbers the file has NOW, so the next edit in this turn needs no read between them.
+    expect(String((executed.result as { wrote: unknown }).wrote)).toContain('1:ONE');
   });
 
   it('applies the patches that match and reports the ones that did not', async () => {
+    // `a.md` was read this turn and `b.md` was not, so the second patch is addressed at numbers
+    // nothing has shown - the one failure a line-addressed dialect has that a quoted one does not.
+    forgetReads();
+    recordRead(taskId, 'workspace/a.md', 1, 'one\ntwo\n');
     const executed = await dispatch(
       {
         name: 'file_patch',
         arguments: {
           patches: [
-            { path: 'workspace/a.md', oldText: 'one', newText: 'ONE' },
-            { path: 'workspace/b.md', oldText: 'missing', newText: 'x' }
+            { path: 'workspace/a.md', edit: 'PUT 1:\n+ONE\n' },
+            { path: 'workspace/b.md', edit: 'PUT 1:\n+x\n' }
           ]
         }
       },
@@ -966,9 +978,15 @@ describe('the workspace arms', () => {
       }
     );
 
-    const result = executed.result as { patchCount: number; failed: Array<{ path: string }> };
+    const result = executed.result as {
+      patchCount: number;
+      failed: Array<{ path: string; reason: string }>;
+    };
     expect(result.patchCount).toBe(1);
     expect(result.failed.map((failure) => failure.path)).toEqual(['workspace/b.md']);
+    // The refusal carries the file's own numbered text, so the retry is a re-emit and not a read.
+    // That is the property the whole format is bought on; asserting the path alone would not see it.
+    expect(result.failed[0]?.reason).toMatch(/1:one/);
   });
 
   it('reads a picture through the image route rather than the file one', async () => {

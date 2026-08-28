@@ -59,11 +59,13 @@ export interface ArmSettings {
    */
   readonly contract: 'full' | 'environment-only';
   /**
-   * Which edit tool the arm holds: the shipped `file_patch`, or the line-addressed candidate in
-   * `apps/worker/src/edit/`, which is implemented, measured, and on nothing.
+   * Which editor the arm holds: the line-addressed one in `apps/worker/src/edit/`, which is what
+   * `file_patch` now is, or the quoted oldText/newText shape it replaced, which is in no file of
+   * the working tree and is read back out of the last revision that declared it.
    *
-   * A replacement and never an addition. Shipping both would be two ways to do one thing, and a
-   * model given two would spread its edits across them and make every number here unreadable.
+   * A replacement and never an addition, in either direction. Shipping both would be two ways to
+   * do one thing, and a model given two would spread its edits across them and make every number
+   * here unreadable.
    */
   readonly edit: 'patch' | 'lines';
 }
@@ -93,8 +95,14 @@ export const ROOT_ARM = 'shipped';
  * It is excluded from the general live run and included in the offline table, which is not an
  * inconsistency: its residency is knowable for nothing and is worth printing beside every other
  * arm's, and its outcome is only readable on a sample that edits files.
+ *
+ * It was called `line-edit` and it is called `quoted-edit`, because the thing it holds changed
+ * sides. The dialect landed; the arm that is not the working tree is now the quoted editor. The
+ * rename is deliberately loud - an arm called `line-edit` that sends oldText/newText is a table
+ * that lies to anybody reading it quickly, and this axis has already produced one decision taken
+ * on a tie that meant the opposite of what it looked like.
  */
-export const EDIT_ARM = 'line-edit';
+export const EDIT_ARM = 'quoted-edit';
 
 export const ARMS: readonly Arm[] = [
   {
@@ -129,12 +137,12 @@ export const ARMS: readonly Arm[] = [
       'Ships nothing on its own. It is a research arm: it gives the slope of the tool axis, and it is the only result that would justify reopening the question of how tools reach the model at all.'
   },
   {
-    id: 'line-edit',
+    id: EDIT_ARM,
     asks: 'Does a model emit the line-addressed edit dialect correctly, which is the only thing the measured 61% depends on?',
     inherits: ROOT_ARM,
-    change: { edit: 'lines' },
+    change: { edit: 'patch' },
     ships:
-      'Ships as a REPLACEMENT for file_patch if edit-success is within one task of the shipped arm on the same sample and on BOTH tiers, and no more than one edit call in twenty is refused for a dialect error the model does not then recover from. Nothing ships on the 61%: that figure is an offline upper bound available only to a model that gets the spelling right every time, and a dialect the model has to learn is not paid for in output characters. A loss here is the cheapest possible way to have learned that the 61% was never available.'
+      'Ships as a REPLACEMENT for file_patch if edit-success is within one task of the shipped arm on the same sample and on BOTH tiers, and no more than one edit call in twenty is refused for a dialect error the model does not then recover from. Nothing ships on the 61%: that figure is an offline upper bound available only to a model that gets the spelling right every time, and a dialect the model has to learn is not paid for in output characters. A loss here is the cheapest possible way to have learned that the 61% was never available. THE DIRECTION HAS INVERTED and the criterion above is unchanged: the dialect landed between this rule being written and being run, so `shipped` is now the line-addressed arm and THIS arm is the quoted editor put back. Read "the shipped arm" in the rule as "the arm holding the quoted editor", which is this one, exactly as `no-method` is read once its cut has landed. A loss for the line dialect here is a reason to roll it back, not a reason to keep it.'
   },
   {
     id: 'floor',
@@ -173,11 +181,24 @@ export const PRE_REGISTRATION = [
 
 /* ------------------------------------------------------------------ resolution, enforced in code */
 
+/**
+ * The root arm: what athanor sends today, and `edit` tracks the working tree rather than a wish.
+ *
+ * It said `patch` when this file was written, because that is what shipped. The line-addressed
+ * dialect then landed, and leaving the constant alone would have made every arm in this table -
+ * `core`, `floor`, `no-skills`, all of them - quietly send a rolled-back editor while answering a
+ * question that has nothing to do with editing. Their byte counts would all have stayed plausible.
+ *
+ * It is not read from source, because a settings tree that reconfigured itself from the tree would
+ * make `shipped` mean something different on two checkouts and both tables unreadable across a
+ * commit. It is written down and CHECKED: `wire.ts:withEditDialect` throws when this claim and the
+ * catalogue disagree, in either direction, rather than sending the other arm's entry.
+ */
 const SHIPPED: ArmSettings = {
   tools: 'full',
   skills: 'index',
   contract: 'full',
-  edit: 'patch'
+  edit: 'lines'
 };
 
 /**

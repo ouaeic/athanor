@@ -12,7 +12,8 @@
  *   pnpm eval:arms -- --live --yes          confirm the spend the live half estimates
  *   pnpm eval:arms -- --live --sample 12    a shape-balanced subset, for a run somebody pays for
  *   pnpm eval:arms -- --live --strong <id>  add the installation's own model as a second tier
- *   pnpm eval:arms -- --edit                the edit axis: its sample, its offline bound, its price
+ *   pnpm eval:arms -- --edit                the edit axis: its sample, its bound, and what a run costs
+ *   pnpm eval:arms -- --edit --live         and the price at the provider's own current rates
  *   pnpm eval:arms -- --edit --live --yes   and the only half that can settle it, which costs money
  *
  * Deliberately not part of `pnpm check`, for the reason `evals/run.ts` gives about itself: a
@@ -35,9 +36,10 @@ import {
   baselineFrom,
   check,
   renderEditBound,
-  renderEditCost,
   renderEditLive,
+  renderEditPrice,
   renderEditSample,
+  renderEditVerdict,
   renderLive,
   renderQuestions,
   renderResident,
@@ -45,8 +47,9 @@ import {
   scoreEditArms,
   type Baseline
 } from './report.js';
+import { ratesFor, type Rates } from './price.js';
 import { TASKS, sampleOf } from './tasks.js';
-import { cutSizes, readCut } from './wire.js';
+import { cutSizes, incumbentEntry, readCut } from './wire.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const baselinePath = path.join(here, 'baseline.json');
@@ -110,22 +113,65 @@ if (flag('accept')) {
  */
 if (flag('edit')) {
   const editArms = [ROOT_ARM, EDIT_ARM];
-  const strong = argument('strong');
-  const tiers = [WEAK_TIER, ...(strong ? [strong] : [])];
+  /*
+   * Two tiers, and the second one is the installation's own rather than one invented here.
+   *
+   * The pre-registration says an arm ships on BOTH tiers and it says so because the strongest
+   * finding in the study behind this whole programme is that a strong model masks bad ergonomics
+   * by paying for them - the same change was worth a fraction of a point of accuracy and 61% of
+   * the output tokens. So the weak tier is where a correctness risk shows and the strong tier is
+   * where the saving does, and a run on one of them settles neither. `AI_DEFAULT_MODEL` is what an
+   * installation actually points athanor at, which is the honest strong tier; `--strong` overrides
+   * it. Neither is invented, and where there is no second tier this refuses to spend rather than
+   * printing half a decision.
+   */
+  const strong = argument('strong') ?? process.env.AI_DEFAULT_MODEL;
+  const tiers = [WEAK_TIER, ...(strong && strong !== WEAK_TIER ? [strong] : [])];
   const seeds = Number(argument('seeds') ?? 1);
+  const incumbent = incumbentEntry();
+  process.stdout.write(
+    `\n  The edit axis is a ROLLBACK: the line-addressed dialect is what the working tree ships, so\n` +
+      `  the arm called "${ROOT_ARM}" is the quoted editor put back, read from ${incumbent.source}.\n`
+  );
   process.stdout.write(renderEditSample());
   process.stdout.write(renderEditBound());
-  process.stdout.write(renderEditCost(measureAll(editArms, cut), editArms, tiers.length, seeds));
   const key = resolveKey(flag('live'), process.env);
+  /*
+   * The rate is fetched whether or not anybody is about to spend, because the decision this rig
+   * exists to inform is taken BEFORE the spend and there is no point pricing a run only for
+   * somebody who has already committed to it. It is a public catalogue, no credential is sent, and
+   * a failure prints the tokens and says there is no price. `--no-price` skips the call entirely
+   * for a run that must touch no network at all.
+   */
+  const rates: Rates | null = flag('no-price') ? null : await ratesFor(tiers);
+  process.stdout.write(renderEditPrice(measureAll(editArms, cut), editArms, tiers, seeds, rates));
   process.stdout.write(`  ${key.note}\n`);
   if (flag('live') && key.apiKey) {
-    if (!flag('yes'))
+    if (tiers.length < 2)
       process.stdout.write(
-        '  Re-run with --yes to spend it. Nothing above cost anything; everything below does.\n'
+        '\n  ONE TIER. The pre-registered rule says both, so this run cannot settle the question and\n' +
+          '  nothing here will spend money on half of it. Set AI_DEFAULT_MODEL to the model this\n' +
+          '  installation actually runs, or pass --strong <model id>.\n'
+      );
+    else if (!flag('yes'))
+      process.stdout.write(
+        '\n  Re-run with --yes to spend it. Nothing above cost anything; everything below does.\n'
       );
     else {
-      const rows = await runEditLive(key.apiKey, editArms, EDIT_TASKS, tiers, seeds);
-      process.stdout.write(renderEditLive(scoreEditArms(rows)));
+      // Rows are printed as they land rather than at the end. A run of this size is minutes long,
+      // and a rig that prints nothing until it finishes is a rig somebody kills at the four-minute
+      // mark and pays for twice.
+      let done = 0;
+      const total = editArms.length * EDIT_TASKS.length * tiers.length * seeds;
+      const rows = await runEditLive(key.apiKey, editArms, EDIT_TASKS, tiers, seeds, (row) => {
+        done += 1;
+        process.stderr.write(
+          `  [${done}/${total}] ${row.armId} ${row.tier} ${row.taskId} ${row.correct ? 'correct' : 'wrong'} ${row.editApplied}/${row.editCalls} applied${row.unrecovered ? `, ${row.unrecovered} unrecovered` : ''}\n`
+        );
+      });
+      const scores = scoreEditArms(rows);
+      process.stdout.write(renderEditLive(scores));
+      process.stdout.write(renderEditVerdict(scores));
       const editJson = argument('edit-json');
       if (editJson) writeFileSync(editJson, `${JSON.stringify(rows, null, 2)}\n`);
     }

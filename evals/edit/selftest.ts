@@ -1,137 +1,97 @@
 /**
- * The checks the run itself cannot perform, and the one that decides whether any of it is honest.
+ * The checks the tables cannot perform, and the ones that decide whether any of them is honest.
  *
- *   NODE_OPTIONS=--conditions=development pnpm exec tsx evals/edit/selftest.ts
+ * A corpus of failures is the easiest rig in this repository to write dishonestly: choose the
+ * malformed shapes the harness happens to forgive and every column reads "cost 0". So the checks
+ * here are aimed at this lane rather than at the applier, and every one of them is a way the table
+ * above could be a confident lie:
  *
- * A comparison of two encodings is worth nothing unless they encode the SAME edit. Nothing in the
- * table can tell you that: a by-line patch that quietly did less work would show up as a saving,
- * and it would look exactly like a real one. So the first check applies both encodings to a clean
- * copy of the file and demands the two results are byte-identical to each other and to the intended
- * text, which is computed a third way and read by neither encoder.
+ *   1. AN EXPECTATION THAT MATCHES BY ACCIDENT. Every `apply` case must ask for a file that is
+ *      actually different from the one it started with. A case whose intended result is the
+ *      original scores 0 for doing nothing at all.
+ *   2. A SCORER THAT PASSES EVERYTHING. `carriesLiveText` and `namesAShape` decide the difference
+ *      between one round trip and two for the whole corpus, so they are exercised on inputs whose
+ *      answers are known: a real window, an invented one, and plain prose.
+ *   3. LEAKAGE BETWEEN CASES. The snapshot store is process-global. A record left behind by one
+ *      case would make a later one pass for a reason that has nothing to do with the case, so the
+ *      whole corpus is run twice and the two runs must agree row for row.
+ *   4. A COMPARISON AGAINST A PROGRAM THAT NO LONGER EXISTS - or, now, against one that has come
+ *      back. `assertIncumbentRetired` reads the shipped module.
+ *   5. AN INTENT THAT ASKS FOR NOTHING, or a quoted emission the schema would have rejected before
+ *      the applier ever saw it. Either would make the incumbent lose a row it never played.
  *
- * The second check is the one the incumbent is owed. `minimalUnique` claims to hand `file_patch`
- * the smallest unique `oldText`; this proves it independently, by trying every narrower range that
- * still contains the lines being replaced and demanding that none of them is unique. If that ever
- * stops holding, every saving in the table is inflated by exactly the slack.
- *
- * Deliberately not a vitest file. A rig whose honesty depends on somebody having run its test suite
- * reports a confident wrong number on the machine where the suite was skipped - so this is a script
- * that exits non-zero, and the README tells you to run it.
+ * Deliberately part of the run rather than a script beside it. A rig whose honesty depends on
+ * somebody having remembered to run a second file reports a confident wrong number on the machine
+ * where they did not.
  */
-import { applyEdit } from '../../apps/worker/src/edit/apply.js';
-import { SnapshotStore } from '../../apps/worker/src/edit/snapshots.js';
-import { fileText, TASKS } from './corpus.js';
-import {
-  applyReplace,
-  encodeLines,
-  encodeReplace,
-  intended,
-  minimalUnique,
-  region
-} from './encode.js';
+import { carriesLiveText, namesAShape, runConformance, sourceOf, CASES } from './conformance.js';
+import { assertIncumbentRetired, PAIRED } from './incumbent.js';
 
-const problems: string[] = [];
-const say = (line: string): void => {
-  process.stdout.write(`${line}\n`);
+export const selfTest = (): string[] => {
+  const problems: string[] = [];
+
+  const ids = new Set<string>();
+  for (const item of CASES) {
+    if (ids.has(item.id)) problems.push(`two cases share the id ${item.id}`);
+    ids.add(item.id);
+    if (!item.edit.length) problems.push(`${item.id}: the emission is empty`);
+  }
+
+  // 1. Every `apply` case must ask for a change. Computed here, from the case's own declaration,
+  // and never from anything the applier returned.
+  const first = runConformance();
+  for (const item of CASES) {
+    if (item.want.kind !== 'apply') continue;
+    const { live } = sourceOf(item);
+    if (item.want.after(live) === live)
+      problems.push(`${item.id}: the intended file is the original, so landing it proves nothing`);
+  }
+
+  // 2. The two scorers, on inputs whose answers are known.
+  const live = ['alpha', 'beta', 'gamma', 'delta'];
+  if (!carriesLiveText('here it is:\n1:alpha\n2:beta\n3:gamma', live))
+    problems.push('carriesLiveText rejects a real three-row window');
+  if (!carriesLiveText('here it is:\n1| alpha\n2| beta\n3| gamma', live))
+    problems.push('carriesLiveText rejects the numbering the retired explainer used');
+  if (carriesLiveText('here it is:\n1:alpha\n2:BETA\n3:GAMMA', live))
+    problems.push('carriesLiveText accepts a window that is not what the file says');
+  if (carriesLiveText('the file has 4 lines', live))
+    problems.push('carriesLiveText accepts a message that quotes nothing');
+  if (namesAShape('the file has changed since you read it'))
+    problems.push('namesAShape accepts prose that names no spelling');
+  if (!namesAShape('expected PUT N:, PUT N.=M:, CUT N.=M'))
+    problems.push('namesAShape rejects the sentence the parser actually sends');
+
+  // 3. The process-global snapshot store must not carry anything between cases.
+  const second = runConformance();
+  for (const [index, row] of first.entries()) {
+    const twin = second[index];
+    if (!twin || twin.id !== row.id || twin.cost !== row.cost || twin.verdict !== row.verdict)
+      problems.push(
+        `${row.id}: a second run of the same corpus disagrees with the first (${row.verdict}/${row.cost} then ${twin?.verdict}/${twin?.cost}), so a record is leaking between cases`
+      );
+  }
+
+  // 4. The program being compared against is the one this rig says it is.
+  try {
+    assertIncumbentRetired();
+  } catch (cause) {
+    problems.push(cause instanceof Error ? cause.message : 'the incumbent pin threw');
+  }
+
+  // 5. The paired intents ask for something, and both emissions are calls the arm would accept.
+  for (const intent of PAIRED) {
+    const live = intent.live ?? intent.file;
+    if (intent.after === live)
+      problems.push(`${intent.id}: the intended file is the original, so the intent is empty`);
+    if (!intent.patches.length) problems.push(`${intent.id}: no quoted emission`);
+    for (const patch of intent.patches)
+      if (!patch.oldText.length)
+        problems.push(
+          `${intent.id}: a quoted patch with an empty oldText, which the arm rejected before applying anything - the incumbent would not have played this row`
+        );
+    if (!intent.edit.length) problems.push(`${intent.id}: no line-addressed emission`);
+  }
+
+  return problems;
 };
-
-for (const task of TASKS) {
-  const read = fileText(task.path);
-  const lineCount = read.split('\n').length;
-  const window = task.read ?? { startLine: 1, endLine: lineCount };
-  const wanted = intended(task, read);
-  const rename = task.changes.length === 1 && task.changes[0]?.kind === 'rename';
-
-  if (!rename && wanted === read) problems.push(`${task.id}: the intended text is the original`);
-
-  // Both encodings, against a CLEAN file, with no drift and no window narrowing. Drift and windows
-  // are what the table measures; this is only asking whether the two encoders wrote the same edit.
-  const store = new SnapshotStore();
-  const tag = store.record(task.path, read);
-  const byLine = applyEdit(encodeLines(task, tag).args.patch, new Map([[task.path, read]]), store);
-  const destination = rename ? (task.changes[0] as { to: string }).to : task.path;
-  const lineResult = byLine.files.get(destination);
-
-  const quote = encodeReplace(task, read);
-  const quoteResult =
-    quote.tool === 'file_patch' ? applyReplace(quote.args.patches, read).text : read;
-
-  if (!byLine.ok)
-    problems.push(
-      `${task.id}: the by-line encoding does not apply to a clean file - ${byLine.failures[0]?.kind}`
-    );
-  else if (lineResult !== wanted)
-    problems.push(`${task.id}: the by-line encoding is not the declared edit`);
-  if (quoteResult !== wanted)
-    problems.push(`${task.id}: the quote encoding is not the declared edit`);
-  if (byLine.ok && lineResult !== quoteResult)
-    problems.push(`${task.id}: THE TWO ENCODINGS ARE DIFFERENT EDITS - the row compares nothing`);
-
-  /*
-   * Every quote the incumbent was given must be minimal, and "minimal" has to mean the right thing.
-   *
-   * A first attempt at this check shrank the quote by a line on each side and complained when the
-   * shrunken text was still unique - and it complained about all three block edits, wrongly. The
-   * quote for a block replacement IS the block: shrinking it means quoting less than the model is
-   * replacing, which is not an encoding at all. The check is now over ranges that still CONTAIN the
-   * target, which is the only kind of context there was ever a choice about.
-   *
-   * The patches are replayed in order, because `file_patch` applies them in order and the second
-   * patch's numbers live in the text the first one left behind.
-   */
-  if (quote.tool === 'file_patch') {
-    let text = read;
-    for (const [index, patch] of quote.args.patches.entries()) {
-      const spans = quote.targets[index];
-      const lines = text.split('\n');
-      if (spans) {
-        const { target, quote: written } = spans;
-        if (written.from > target.from || written.to < target.to)
-          problems.push(`${task.id}: the quote does not contain the lines it replaces`);
-        for (let from = written.from; from <= target.from; from += 1)
-          for (let to = Math.max(target.to, from); to <= written.to; to += 1) {
-            if (from === written.from && to === written.to) continue;
-            if (count(text, region(lines, from, to)) === 1)
-              problems.push(
-                `${task.id}: lines ${from}-${to} would already have been unique, so quoting ${written.from}-${written.to} overcharges the incumbent`
-              );
-          }
-      }
-      text = text.replace(patch.oldText, patch.newText);
-    }
-  }
-
-  if (window.endLine < lineCount && !task.note)
-    problems.push(`${task.id}: reads only part of the file but does not say why`);
-}
-
-function count(source: string, value: string): number {
-  let found = 0;
-  let at = source.indexOf(value);
-  while (at >= 0) {
-    found += 1;
-    at = source.indexOf(value, at + value.length);
-  }
-  return found;
-}
-
-// A last look at the tool the whole comparison rests on, exercised on the corpus rather than on a
-// hand-made string: no target may be so repetitive that no unique quote exists, because a task the
-// incumbent cannot express at all would have to be reported, not silently dropped.
-for (const task of TASKS) {
-  const read = fileText(task.path);
-  const lines = read.split('\n');
-  for (const change of task.changes)
-    if (change.kind === 'replace' && !minimalUnique(lines, read, change.from, change.to))
-      problems.push(`${task.id}: no unique quote exists at all - that is a finding, not a row`);
-}
-
-if (problems.length) {
-  say(`\n  ${problems.length} problem(s):`);
-  for (const problem of problems) say(`    ${problem}`);
-  say('');
-  process.exit(1);
-}
-say(
-  `\n  ${TASKS.length} tasks: both encodings produce the declared edit, and every quote is minimal.\n`
-);

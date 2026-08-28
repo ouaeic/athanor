@@ -1,92 +1,95 @@
 /**
- * The line-addressed edit format: how a file is shown, and how it is fingerprinted.
+ * The line-addressed edit format: how a file is shown, and how two versions of a line are compared.
  *
- * athanor's shipped editor is `file_patch`: oldText/newText with an exactly-once guard. That guard
- * is what makes it safe and also what makes it expensive - to change one line inside a function
- * that says `return null;` eleven times, the model has to quote enough surrounding text to be
- * unique, and then quote all of it back with one word different. The cost of an edit is therefore
- * set by how repetitive the file is, not by how large the edit is.
+ * athanor's editor used to be oldText/newText with an exactly-once guard. That guard is what made
+ * it safe and also what made it expensive: to change one line inside a function that says
+ * `return null;` eleven times, the model had to quote enough surrounding text to be unique and then
+ * quote all of it back with one word different. The cost of an edit was set by how repetitive the
+ * file is, not by how large the edit is. Measured over fifteen tasks on this repository's own
+ * corpus, addressing by line number instead cost 61% fewer characters of tool arguments, winning
+ * fourteen of the fourteen rows where both formats did what the task asked.
  *
- * This module is the other half of an alternative that is being MEASURED, not shipped: address by
- * line number, and prove freshness with one whole-file tag instead of with quoted context. Nothing
- * here is on the tool catalogue and nothing here is resident in a prompt. See `evals/edit/` for
- * the comparison this exists to make possible, and `docs/design/exec3/L2.md` for the ruling.
+ * Two decisions in this file are load-bearing.
  *
- * Two decisions are load-bearing and both are here:
+ * 1. NORMALISATION strips trailing spaces, tabs and carriage returns before any two lines are
+ *    compared. A file written on a machine that ends lines with CRLF, or a line the model copied
+ *    back through a display that trims, must not be a different line. Leading whitespace is
+ *    indentation and is content; inner whitespace is content. Only the tail is invisible to a
+ *    reader, and therefore only the tail may vary. Every comparison in `apply.ts` goes through
+ *    `sameLine`, so this is not advice - there is no other way to compare lines here.
  *
- * 1. Normalisation strips trailing spaces, tabs and carriage returns from every line before the
- *    tag is computed. A file read through a display that trims, or written on a machine that ends
- *    lines with CRLF, produces the same tag as the same file without those. Without this the tag
- *    is a line-ending detector, which is not what it is for.
+ * 2. THERE IS NO TAG. The reference dialect this was measured against heads every read and every
+ *    patch with a short whole-file hash, and its own harness carries a hand-maintained list of
+ *    models that "drop the tag header" often enough to be routed to a lenient parser. A header the
+ *    model can drop is a header the harness can do without: the path arrives in a JSON field the
+ *    schema guarantees, and freshness is proved by comparing the harness's own record of what it
+ *    displayed against the file as it reads now - which is strictly better evidence than sixteen
+ *    bits of hash, because it can also say WHERE the lines went. The named failure mode is designed
+ *    out rather than tolerated, which is the whole thesis of this lane.
  *
- * 2. The tag is four hex characters - sixteen bits. That is a LOOKUP KEY, never the verifier. The
- *    applier resolves the tag to a recorded snapshot and then compares the snapshot's text to the
- *    live text; a collision produces a mismatch, not a corrupt file. Anything that treats four hex
- *    characters as proof of identity is wrong once in every 65,536 stale edits, which on a machine
- *    that edits all day is a corrupted file per month.
+ *    Dropping it is also a read-side saving: a header line on every read is bytes on every read,
+ *    and forcing a whole-file digest would make a windowed read of a two-gigabyte log walk to the
+ *    end of the file. `services/workspace-runner/src/files.ts` reads a window in a fixed buffer and
+ *    stops as soon as it has one, deliberately, after a database dump buffered a gigabyte and the
+ *    OOM killer took the runner down with every other tool on it. Nothing here reopens that.
  */
-
-/** Four hex characters, the same width the format's line headers are laid out for. */
-export const TAG_HEX_LENGTH = 4;
 
 /**
  * Trailing space, tab and CR are dropped; nothing else is.
  *
- * Leading whitespace is indentation and is content. Inner whitespace is content. Only the tail is
- * invisible to a reader and therefore only the tail may vary without changing the tag.
+ * `\r` is stripped along with the spaces rather than separately because a CRLF file whose lines
+ * also have trailing spaces ends them `" \r"`, and a rule that only knew about `\r` would leave
+ * the space behind and call the line different.
  */
 export const normaliseLine = (line: string): string => line.replace(/[ \t\r]+$/, '');
 
-/** The text the tag is computed over: every line detrailed, newlines kept exactly. */
-export const normalise = (text: string): string => text.split('\n').map(normaliseLine).join('\n');
+/** Whether two lines are the same line, once the invisible tail is discounted. */
+export const sameLine = (left: string, right: string): boolean =>
+  normaliseLine(left) === normaliseLine(right);
+
+/** Whether two runs of lines are the same run. */
+export const sameLines = (left: readonly string[], right: readonly string[]): boolean =>
+  left.length === right.length && left.every((line, index) => sameLine(line, right[index] ?? ''));
 
 /**
- * FNV-1a, 32 bits, folded to 16.
+ * Splitting text into lines, once, in the one way the whole vertical agrees on.
  *
- * A dependency-free non-cryptographic hash, chosen because the tag's job is to be a short cache
- * key a model can copy back without miscounting, and because adding a hashing dependency to the
- * worker to save four bytes of catalogue would be the wrong trade in both directions. Collision
- * safety comes from `snapshots.ts` verifying the resolved text, not from this.
+ * Lines are separated by newlines, not terminated by them, so a file ending in a newline has a
+ * final empty line and a two-line file that ends in one reads as three. That is what
+ * `String.split('\n')` does, what the runner's ranged reader does (it says so), and therefore what
+ * the numbers in a read mean. Anything that trimmed it here would number the file differently from
+ * the way the runner numbers it, and every edit near the end of a file would be off by one.
  */
-export const fileTag = (text: string): string => {
-  const source = normalise(text);
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < source.length; index += 1) {
-    hash ^= source.charCodeAt(index) & 0xff;
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-    // Code points above U+00FF contribute their high byte too, so a file that differs only in a
-    // non-Latin character does not tag identically.
-    const high = source.charCodeAt(index) >>> 8;
-    if (high) {
-      hash ^= high;
-      hash = Math.imul(hash, 0x01000193) >>> 0;
-    }
-  }
-  return ((hash ^ (hash >>> 16)) & 0xffff).toString(16).padStart(TAG_HEX_LENGTH, '0');
-};
-
-/** The header a rendered file carries: the path the edit addresses, and the tag it was read at. */
-export const sectionHeader = (path: string, tag: string): string => `[${path}#${tag}]`;
+export const toLines = (text: string): string[] => text.split('\n');
 
 /**
- * A file as the model is shown it, so the numbers it edits by are numbers it has actually seen.
+ * A file as the model is shown it: `LINE:TEXT`, one-based, no header.
  *
- * `LINE:TEXT`, one-based, with the whole-file tag in the header even when the window is partial -
- * the tag says which version of the file these numbers belong to, and a window's own bytes cannot
- * say that. This is the integration cost of the format and it is real: athanor's runner answers
- * `file_read` by walking the file in a fixed buffer and STOPPING once the window is filled, and a
- * whole-file tag forces that walk to the end of the file. The walk stays O(1) in memory; it stops
- * being O(window) in time.
+ * This is the whole read-side cost of the format and it is not hidden anywhere - it is the decimal
+ * line number and one colon per line, and `docs/design/edit/BUILD.md` measures it on this
+ * repository rather than asserting it.
  */
-export const renderNumbered = (
-  path: string,
-  text: string,
-  window?: { startLine: number; endLine: number }
+export const renderNumbered = (lines: readonly string[], startLine = 1): string =>
+  lines.map((line, index) => `${startLine + index}:${line}`).join('\n');
+
+/**
+ * A numbered window of a file, clamped, for handing evidence back inside a refusal.
+ *
+ * Every refusal in `apply.ts` carries one of these. A refusal that costs a round trip is barely
+ * better than the wrong edit it prevented: the model re-reads, re-derives the same patch, and the
+ * owner pays for two turns to get one edit.
+ */
+export const numberedWindow = (
+  lines: readonly string[],
+  around: { from: number; to: number },
+  radius: number
 ): string => {
-  const lines = text.split('\n');
-  const from = Math.max(1, window?.startLine ?? 1);
-  const to = Math.min(lines.length, window?.endLine ?? lines.length);
-  const rows: string[] = [sectionHeader(path, fileTag(text))];
-  for (let line = from; line <= to; line += 1) rows.push(`${line}:${lines[line - 1] ?? ''}`);
-  return rows.join('\n');
+  const from = Math.max(1, around.from - radius);
+  const to = Math.min(lines.length, around.to + radius);
+  if (to < from) return '';
+  return renderNumbered(lines.slice(from - 1, to), from);
 };
+
+/** `41` for a single line, `41-48` for a run - the spelling every message in this module uses. */
+export const sayRange = (from: number, to: number): string =>
+  from === to ? `${from}` : `${from}-${to}`;

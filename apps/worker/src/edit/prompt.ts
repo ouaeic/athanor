@@ -1,58 +1,51 @@
 /**
- * The whole of what a model would have to be told, and the number this lane is arguing about.
+ * The whole of what the model is told, and the only part of this vertical that is RESIDENT.
  *
- * A new dialect is a tax paid on every request that carries it, and paid again in every turn where
- * the model gets the spelling wrong. `EDIT_FORMAT_SPEC` is the tax bill: it is the smallest text
- * that makes the format in `parse.ts` unambiguous, written to athanor's own rule that prompt length
- * should track what the model does NOT already know. Line numbers, ranges and `+` bodies are
- * familiar shapes; the tag, the seen-lines refusal and the original-numbering rule are not, and
- * those are what the words are spent on.
+ * athanor's rule is that the harness owns capability, bounds and evidence, and the model owns
+ * method; method may exist in the harness but may not be resident. A dialect is the one kind of
+ * method that has no choice - a format nobody has described cannot be emitted - so every byte here
+ * is paid on every request of every turn, and the job is to spend as few as the format can be
+ * unambiguous in. The reference dialect this was measured against spends 5,268 bytes on the same
+ * job; this spends under a fifth of that, and the difference is not terseness. It is that three
+ * whole paragraphs of the reference describe a version tag, what to do when it does not match, and
+ * how to recover - and `snapshots.ts` does not need the model to carry a tag at all.
  *
- * Nothing imports this into a system prompt or a tool description. It exists so the cost of
- * shipping the format can be measured against the saving, in `evals/edit/`, before anybody decides.
- * If the ruling is to ship, this is the text that ships and `EDIT_FORMAT_SPEC.length` is what it
- * adds to the resident block.
+ * What is deliberately NOT here, and this is the load-bearing omission: the parser forgives a dozen
+ * spellings - `PUT 40-42:`, a `[path]` header, `-` rows, a whole unified-diff hunk - and none of
+ * them are documented. Documenting a leniency spends resident bytes teaching a longer way to write
+ * the same edit, and then the model writes it that way. The leniency is for the model that reaches
+ * for a habit anyway; the spec is for the model reading it, and it describes only the cheapest
+ * correct form. Forgiveness is a property of the harness, not a feature of the format.
+ *
+ * Two operations from the measured reference are also missing, and the reason is the rule about
+ * gates wired to nothing rather than a byte count. `REM` deletes a file and `MV` renames one, and
+ * the worker's runner client has no route for either - `apps/worker/src/runner-client.ts` offers
+ * read, ranged read and write, and nothing else. Declaring them here would put two operations on
+ * every request that the arm behind them cannot carry out, which is the exact shape of failure this
+ * programme has shipped twice and caught twice. `shell` already deletes and renames files, it is
+ * already on the catalogue, and it needs no dialect to do it.
  */
-export const EDIT_FORMAT_SPEC = `Edit files by line number, using the numbers from your last read of that file.
+export const EDIT_FORMAT_SPEC = `Edit by line number. file_read numbers every line as N:TEXT; address those numbers.
 
-A read answers with a header and numbered lines:
-
-  [src/queue.ts#3f9a]
-  40:  const job = queue.shift();
-  41:  if (!job) return null;
-  42:  return job.payload;
-
-A patch is one section per file, headed by that same path and tag, then operations:
-
-  [src/queue.ts#3f9a]
   PUT 41.=42:
   +  if (!job) return undefined;
   +  return job.payload ?? undefined;
 
-Operations, where N and M are line numbers from the read:
+  PUT N:        replace line N
+  PUT N.=M:     replace lines N to M
+  PUT N*:       replace the whole block that opens at line N
+  PUT <N:       insert before line N
+  PUT >N:       insert after line N
+  CUT N.=M      delete lines N to M
+  CUT N.=M @x   delete them and hold them as @x
+  PUT >N @x     paste @x after line N
 
-  PUT N:            replace line N
-  PUT N.=M:         replace lines N to M inclusive
-  PUT N*:           replace the block that opens at line N, to its closing brace or its indent
-  PUT <N:           insert before line N
-  PUT >N:           insert after line N
-  CUT N.=M          delete lines N to M inclusive
-  CUT N.=M @name    delete them and keep them under @name
-  PUT >N @name      paste @name after line N
-  REM               delete the file
-  MV path           rename the file
+Body rows start with + and carry the final text of the line. Do not write the old text and do not
+repeat unchanged lines: the range says what goes, the body says what arrives. A PUT with no body
+deletes its range.
 
-Body rows begin with + and are the final text of the line, without its number. Do not write the
-old text and do not write unchanged context: the range says what goes, the body says what arrives.
-A PUT with no body rows deletes the range.
+Ranges name the numbers you read, never the numbers your own earlier operations would leave, and
+they must not overlap. One patch per file, applied whole or not at all.
 
-Ranges name the line numbers in the read you took the tag from, never the numbers after your own
-earlier operations in the same patch. Ranges within a section must not overlap.
-
-The tag is the file's version. An edit is refused, and nothing is written, when the tag was never
-issued for that file, when the file changed underneath it in a way that cannot be relocated, or
-when you address lines that read has not shown you. Every refusal comes back with the file as it
-reads now, so a retry needs no extra read.
-
-After an edit lands, the line numbers and the tag have both changed. Take the new tag from the
-response and re-read before addressing lines you have not seen since.`;
+A refusal writes nothing and comes back with the file's real text at those lines, so fix the patch
+and send it again without reading first.`;

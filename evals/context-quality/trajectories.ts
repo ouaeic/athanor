@@ -31,7 +31,112 @@
 import type { ModelMessage } from '../../packages/model-gateway/src/index.js';
 
 import { BASE_SYSTEM_PROMPT, serializeToolResultForModel } from '../../apps/worker/src/context.js';
+import { renderNumbered, toLines } from '../../apps/worker/src/edit/index.js';
 import type { Probe } from './probes.js';
+
+/* --------------------------------------------------------------- what a read looks like, and why
+ *
+ * The line-addressed editor addresses lines by the numbers a read displayed, so every `file_read`
+ * result on this machine is now `N:TEXT` rather than the file's own text. That is a permanent tax
+ * on the widest thing in the window, and `docs/design/edit/COST.md` had to answer a question no
+ * character count can: a tool result is BOUNDED at `RECENT_TOOL_OUTPUT_CHARS` before it enters the
+ * window, so the surcharge does not make the window bigger - it makes less of the file fit inside
+ * the same 24,000 characters. Whether that costs recall is this rig's question and nothing else
+ * here could ask it.
+ *
+ * Three shapes, chosen with `ATHANOR_CONTEXT_READ_SHAPE`, defaulting to the one the committed
+ * baseline was accepted under:
+ *
+ *   raw       one unbroken run of text, as this fixture has always built it
+ *   lines     the identical bytes, with a space replaced by a newline every `width` characters
+ *   numbered  those lines through the shipped `renderNumbered`, which is what a read returns now
+ *
+ * `lines` is not decoration and it is not the experiment either: it is the control that makes the
+ * experiment mean anything. Numbering requires lines, so a straight `raw` against `numbered`
+ * comparison would move two things at once - the line breaks and the numbers - and report their
+ * sum. The wrap replaces a space with a newline rather than inserting one, so `lines` is the same
+ * length as `raw`, plants the same spans at the same offsets, and should score identically. If it
+ * does not, the wrap is disturbing the fixture and the numbered row cannot be read.
+ *
+ * The trajectory IDS carry the shape whenever it is not `raw`. That is deliberate and it is the
+ * whole safety of putting a switch here at all: a row measured under a different read shape gets a
+ * different `rowKey`, so it can never be checked against - or silently accepted as - a baseline row
+ * that was measured under another. An environment variable that could quietly redefine what a
+ * committed number means is the shape of the defect this directory already caught once, when a
+ * control became a copy of `shipped` and printed a reassuring `+0.00` for a whole wave.
+ */
+
+export type ReadShape = 'raw' | 'lines' | 'numbered';
+
+/** The width the wrap uses when the setting does not name one. See `readShape` for why 80. */
+const DEFAULT_READ_WIDTH = 80;
+
+/**
+ * The read shape this process is measuring, read once.
+ *
+ * Spelled `shape` or `shape:width` - `numbered:43` is athanor's own mean source line, `numbered:130`
+ * is about a log line, and the default 80 sits between them. Width matters more than anything else
+ * in this experiment: the surcharge is a fixed few bytes per LINE, so it is 9% of a 43-character
+ * source line and 3% of a 130-character log line, and a report that quoted one number without its
+ * line width would be quoting an accident of the corpus.
+ */
+const readShape = (): { readonly shape: ReadShape; readonly width: number } => {
+  const raw = process.env.ATHANOR_CONTEXT_READ_SHAPE?.trim();
+  if (!raw) return { shape: 'raw', width: DEFAULT_READ_WIDTH };
+  const [name, width] = raw.split(':');
+  if (name !== 'raw' && name !== 'lines' && name !== 'numbered')
+    throw new Error(
+      `ATHANOR_CONTEXT_READ_SHAPE=${raw}: expected raw, lines or numbered, optionally :width`
+    );
+  const parsed = width === undefined ? DEFAULT_READ_WIDTH : Number(width);
+  if (!Number.isInteger(parsed) || parsed < 8)
+    throw new Error(`ATHANOR_CONTEXT_READ_SHAPE=${raw}: width must be an integer of at least 8`);
+  return { shape: name, width: parsed };
+};
+
+const READ_SHAPE = readShape();
+
+/** What the shape adds to a trajectory id, so no two shapes can share a baseline row. */
+const SHAPE_SUFFIX =
+  READ_SHAPE.shape === 'raw' ? '' : `+${READ_SHAPE.shape}-reads-${READ_SHAPE.width}`;
+
+/**
+ * Breaks a body into lines of about `width` without changing a single byte of it.
+ *
+ * A space becomes a newline; nothing is inserted and nothing is removed. That is what keeps the
+ * `lines` control honest - the body stays exactly as long, so every plant sits at exactly the
+ * offset it sat at, and `truncateMiddle` keeps and drops exactly the same regions.
+ *
+ * `protect` is the planted spans. A break inside one would split the evidence a probe looks for
+ * with `String.includes`, and the probe would read 0.0 because this function moved the answer
+ * rather than because the window lost it - a fabricated finding, in the direction the lane arguing
+ * against the format would want. So a space inside a planted span is never chosen.
+ */
+const wrapPreservingLength = (body: string, width: number, protect: readonly string[]): string => {
+  const guarded: Array<readonly [number, number]> = [];
+  for (const span of protect) {
+    if (!span) continue;
+    const at = body.indexOf(span);
+    if (at >= 0) guarded.push([at, at + span.length]);
+  }
+  const characters = [...body];
+  let sinceBreak = 0;
+  for (let index = 0; index < characters.length; index += 1) {
+    sinceBreak += 1;
+    if (sinceBreak < width || characters[index] !== ' ') continue;
+    if (guarded.some(([from, to]) => index >= from && index < to)) continue;
+    characters[index] = '\n';
+    sinceBreak = 0;
+  }
+  return characters.join('');
+};
+
+/** A read result's body as the model is shown it, under the shape this process is measuring. */
+const shapeReadBody = (body: string, protect: readonly string[]): string => {
+  if (READ_SHAPE.shape === 'raw') return body;
+  const wrapped = wrapPreservingLength(body, READ_SHAPE.width, protect);
+  return READ_SHAPE.shape === 'lines' ? wrapped : renderNumbered(toLines(wrapped), 1);
+};
 
 /** Tool results at the sizes production actually produces, up to the 24 kB recent bound. */
 const RESULT_SIZES = [600, 900, 1_500, 3_200, 6_400, 12_000, 18_000, 24_000];
@@ -512,6 +617,16 @@ export const stepAt = (step: number): TrajectoryStep => {
   let body = text(chars, write ? `wrote-${step}` : `log-${step}`);
   if (plant?.resultHead) body = embed(body, plant.resultHead, 0.05);
   if (plant?.resultMiddle) body = embed(body, plant.resultMiddle, 0.5);
+  /*
+   * Only a `file_read` result is shaped, because only a `file_read` result is numbered.
+   *
+   * A write echoes back what was written and a search returns matches with their own addressing;
+   * neither goes through `renderNumbered` in `apps/worker/src/tools/workspace.ts`, and shaping them
+   * here would spread the surcharge over results that do not pay it and understate what a read
+   * costs by flattering the average.
+   */
+  const isRead = !write && step % 7 !== 6;
+  if (isRead) body = shapeReadBody(body, [plant?.resultHead ?? '', plant?.resultMiddle ?? '']);
 
   const result: ModelMessage = {
     role: 'tool',
@@ -545,7 +660,7 @@ export const stepAt = (step: number): TrajectoryStep => {
  */
 export const TRAJECTORIES: readonly Trajectory[] = [
   {
-    id: 'pool-migration-131k',
+    id: `pool-migration-131k${SHAPE_SUFFIX}`,
     why: 'The smallest shipped window, where the older-result floor descends all the way. Both mechanisms run.',
     contextTokens: 131_072,
     steps: 60,
@@ -553,7 +668,7 @@ export const TRAJECTORIES: readonly Trajectory[] = [
     probes: PROBES
   },
   {
-    id: 'pool-migration-1m',
+    id: `pool-migration-1m${SHAPE_SUFFIX}`,
     why: 'The largest shipped window, where the floor barely moves and the detail boundary is almost the only thing cutting.',
     contextTokens: 1_000_000,
     steps: 60,
@@ -561,7 +676,7 @@ export const TRAJECTORIES: readonly Trajectory[] = [
     probes: PROBES
   },
   {
-    id: 'pool-migration-131k-uncompacted',
+    id: `pool-migration-131k-uncompacted${SHAPE_SUFFIX}`,
     why: 'The same job with the phase never declared, so nothing is condensed and every loss is truncation alone.',
     contextTokens: 131_072,
     steps: 60,

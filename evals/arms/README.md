@@ -48,11 +48,16 @@ run.
 
 `pnpm eval:arms -- --edit`
 
-One arm, `line-edit`, whose single difference is the edit tool: the line-addressed candidate in
-`apps/worker/src/edit/` in place of the shipped `file_patch`. It is the gate
-`docs/design/exec3/L2.md` named when it held that format back at 61% fewer output characters,
-because that figure is an upper bound available only to a model that spells the dialect correctly
-every time, and nothing offline can say whether one does.
+One arm, `quoted-edit`, whose single difference is the editor. It is the gate
+`docs/design/exec3/L2.md` named when it held the line-addressed format back at 61% fewer output
+characters, because that figure is an upper bound available only to a model that spells the dialect
+correctly every time, and nothing offline can say whether one does.
+
+**It is now a rollback, and reading it any other way inverts the answer.** The format landed while
+this rig was being built: `file_patch` IS the line dialect, so the arm called `shipped` is the
+working tree and `quoted-edit` is the oldText/newText editor put back. The pre-registered rule is
+printed unchanged above the table, with the direction stated beside it, exactly as `no-method` is
+read once its own cut has landed. A loss for the line dialect is a reason to roll it back.
 
 It is run apart from the general table, on its own sample, because a task that does not edit a file
 cannot tell the two dialects apart and would print a tie — and a tie that means "the instrument is
@@ -63,15 +68,27 @@ blind here" prints exactly like a tie that means "the candidate is free".
   changes, byte-identical across arms, and contain no dialect. The three drift and refusal rows are
   excluded: this world does not change a file under the model, and those are rows the candidate
   wins, so their absence understates it.
-- **The world** holds both appliers as they ship — `workspace.ts`'s exactly-once guard with the
-  real `patchFailure` explainer, and `applyEdit` unmodified — and scores an edit by the file
-  afterwards, byte for byte, never by what the tool said about itself.
-- **Offline** it prints the sample, the character bound over those same rows, the read-side
-  surcharge the bound does not include, and what a live run would cost in calls and tokens.
-- **Live** it prints edit-success and mean output tokens on the same row, plus the applied-out-of-
-  attempted column, which is the deny-list question stated as a number.
+- **The world** holds both editors. The candidate is `applyEdit` and the snapshot ledger, imported
+  and driven the way `apps/worker/src/tools/workspace.ts` drives them. The quoted editor is
+  reconstructed here, because it is in no file of the working tree any more, and its catalogue
+  entry is frozen in `wire.ts` and checked against the last revision that shipped it. A row is
+  scored by the file afterwards, byte for byte, never by what the tool said about itself.
+- **Offline** it prints the sample, the character bound over those same rows through both encoders,
+  the read-side surcharge the bound does not include, and what a live run costs — in calls, in
+  tokens, and in dollars at the provider's own current rates.
+- **Live** it prints edit-success, output tokens, and the two columns the ship criterion is written
+  against: `forgiven`, malformed emissions the harness absorbed with no round trip, and `unrecov`,
+  refusals the model did not answer with a landed edit in the same turn.
+- **Then it applies the rule**, as arithmetic, and will report a run as UNSETTLED rather than as a
+  pass. One in twenty cannot be seen in twelve edit calls; the smallest non-zero rate that sample
+  can print is one in twelve, which already fails, so a clean sweep on one seed settles nothing and
+  the table says how many seeds it would take.
 
-Nothing about this ships the format. `--edit` costs nothing until `--live --yes`.
+Two tiers, and it will not spend on one. `AI_DEFAULT_MODEL` is the strong tier unless `--strong`
+says otherwise, because a strong model hides a bad harness by paying turns for it: the weak tier is
+where a correctness risk shows and the strong tier is where the saving does.
+
+Nothing about this ships or unships the format. `--edit` costs nothing until `--live --yes`.
 
 ## The files
 
@@ -83,7 +100,8 @@ Nothing about this ships the format. `--edit` costs nothing until `--live --yes`
 | `measure.ts`  | the offline half                                                  |
 | `live.ts`     | the judged half, and the key's three arms                         |
 | `world.ts`    | the deterministic computer every tool is a window onto            |
-| `edit-arm.ts` | the edit axis: its sample, its world, its appliers, its scoring   |
+| `edit-arm.ts` | the edit axis: its sample, its world, both editors, its scoring   |
+| `price.ts`    | the token arithmetic, the provider's rates, the break-even        |
 | `report.ts`   | the tables and the baseline check                                 |
 | `selftest.ts` | the checks running it cannot perform                              |
 

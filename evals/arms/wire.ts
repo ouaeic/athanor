@@ -27,42 +27,270 @@ import {
 } from '../../apps/worker/src/context.js';
 import { builtinSkillLibrary, skillCatalogBlock } from '../../apps/worker/src/skills.js';
 import { agentToolsFor } from '../../apps/worker/src/tool-catalogue.js';
-import { CANDIDATE_ENTRY } from '../edit/report.js';
 import { FLOOR_TOOL_NAMES, coreToolNamesFromSource, type ArmSettings } from './arms.js';
 
 /** The catalogue as the loop assembles it: core first, declaration order, `compact_context` last. */
 export const fullCatalogue = (): readonly ModelTool[] => [...agentToolsFor(), COMPACT_CONTEXT_TOOL];
 
-/** The shipped edit tool, and the one place its name is written down in this rig. */
-export const INCUMBENT_EDIT_TOOL = 'file_patch';
+/**
+ * The editor's name, and the one place in this rig it is written down.
+ *
+ * The name did not move when the dialect did. `file_patch` is still `file_patch`; what changed is
+ * that its `patches[]` items used to require `oldText` and now require `edit`. So an arm cannot be
+ * told apart from its sibling by the tool it holds, only by the shape of the tool it holds, and
+ * every check below is written against the shape.
+ */
+export const EDIT_TOOL = 'file_patch';
 
 /**
- * The edit axis, applied to a tool set: the candidate entry in the incumbent's place.
+ * ── The axis inverted between the design of this rig and the running of it ─────────────────────
  *
- * In its place, not appended. Two edit tools is two ways to do one thing, which athanor does not
- * ship and which would also destroy the measurement - a model given both would spread its edits
- * across them and every row would be a blend of the two dialects wearing one arm's name.
+ * This file used to hold the shipped quoted editor and swap in a candidate. Then the candidate
+ * landed: `apps/worker/src/tool-catalogue.ts` now declares `file_patch` as `{path, edit}` and the
+ * quoted shape is gone from the working tree. Exactly the thing that already happened to the
+ * method axis, one axis over, and documented there at length - and the failure it produces is the
+ * same one: an arm that quietly kept sending the shipped entry under a second name would print a
+ * perfect tie, and a tie reads as "the dialect is free", which is the conclusion this run exists
+ * to test rather than assume.
  *
- * `CANDIDATE_ENTRY` is imported from `evals/edit/report.ts` rather than written here, and that file
- * builds it from `EDIT_FORMAT_SPEC` in `apps/worker/src/edit/prompt.ts`. So the schema this arm
- * puts on the wire is the schema the other rig priced at +1,306 bytes net, and the two rigs cannot
- * drift into disagreeing about the size of the same thing. `selftest.ts` checks the arithmetic
- * against that rig rather than trusting this sentence.
+ * So the axis is not "swap the candidate in" but "these two arms differ by exactly the editor",
+ * and the side that is not in the working tree is read out of the last revision that had it. The
+ * arm called `shipped` is now a ROLLBACK - what athanor sent before the format landed - and the
+ * arm called `line-edit` is the working tree unmodified. Naming the commit in the table is what
+ * lets a reader check that, and `HISTORY_DEPTH` bounds the walk.
+ */
+const CATALOGUE_FILE = 'apps/worker/src/tool-catalogue.ts';
+
+/** Whether a `file_patch` entry is the quoted shape or the line-addressed one, by its schema. */
+export const dialectOf = (tool: ModelTool): 'patch' | 'lines' | 'unknown' => {
+  const item = ((
+    tool.parameters as { properties?: { patches?: { items?: { properties?: unknown } } } }
+  )?.properties?.patches?.items?.properties ?? {}) as Record<string, unknown>;
+  if ('oldText' in item) return 'patch';
+  if ('edit' in item) return 'lines';
+  return 'unknown';
+};
+
+/** Comments out, so a `//` about a field is never mistaken for the field. */
+const withoutComments = (source: string): string =>
+  source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .map((line) => {
+      let quoted = false;
+      for (let index = 0; index < line.length; index += 1) {
+        const character = line[index];
+        if (character === '\\') {
+          index += 1;
+          continue;
+        }
+        if (character === "'") quoted = !quoted;
+        else if (!quoted && character === '/' && line[index + 1] === '/')
+          return line.slice(0, index);
+      }
+      return line;
+    })
+    .join('\n');
+
+/** A string as a TypeScript single-quoted literal, so it can be looked for in source. */
+const asLiteral = (value: string): string =>
+  `'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+
+/** The `file_patch` entry as one revision of the catalogue wrote it, comments removed. */
+const entrySliceIn = (source: string): string | null => {
+  const at = source.indexOf(`name: '${EDIT_TOOL}'`);
+  if (at < 0) return null;
+  const next = source.indexOf('\n  {', at);
+  return withoutComments(source.slice(at, next < 0 ? source.length : next));
+};
+
+/**
+ * The quoted editor's catalogue entry, frozen, with history as the CHECK rather than the source.
  *
- * The throw is the point. An arm that quietly kept `file_patch` because the name had moved would
- * be the shipped arm under a second name, and it would print a perfect tie - which reads as "the
- * dialect is free" and is the exact conclusion the run exists to test rather than assume.
+ * ── Why this is written down when nothing else in this file is ─────────────────────────────────
+ *
+ * Every other string this rig sends is sliced out of a shipped module, because those strings move
+ * and a copy of a moving thing is a rig measuring its own stale opinion. This one cannot move
+ * again: it is what `file_patch` was until the line dialect replaced it, and a retired entry is
+ * finished. The argument for reading it out of source does not apply to something that has stopped
+ * being written.
+ *
+ * The argument AGAINST reading it out of git does apply, and it is concrete. `actions/checkout`
+ * clones at depth 1 unless told otherwise, so on a continuous-integration runner `git log` over a
+ * file returns exactly one commit - and a rig whose deterministic, keyless, networkless half
+ * depends on walking history is a rig that passes on every developer's machine and fails on the
+ * one that gates the build. That has already happened once in this file, to the method axis, and
+ * it went unnoticed for a wave because the rig ran in no job.
+ *
+ * So the entry is a value, and `checkedAgainstHistory` compares it to the last revision that
+ * declared it whenever the checkout has the history to answer with. A disagreement throws; no
+ * history to ask says so and carries on. Deterministic where it has to be, verified where it can
+ * be, and never quietly measuring a transcription somebody mistyped.
+ */
+export const QUOTED_EDIT_ENTRY: ModelTool = {
+  name: EDIT_TOOL,
+  description:
+    'Apply precise, conflict-detecting edits to one or more files. Every oldText must occur exactly once in its file, so a stale edit fails instead of overwriting newer work. Give a patch newText to replace that text, or moveAfter to move it elsewhere in the same file without typing it out a second time. Patches that match are applied even when others in the same call do not; each failure comes back with the occurrence count, the nearest place it nearly matched, and the current text around it, so a retry usually needs no extra read.',
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['patches'],
+    properties: {
+      patches: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 40,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['path', 'oldText'],
+          properties: {
+            path: { type: 'string' },
+            oldText: { type: 'string' },
+            newText: { type: 'string' },
+            moveAfter: {
+              type: 'string',
+              description:
+                'Move oldText unchanged to just after this text, which must itself occur exactly once in the file once oldText is cut out of it. Empty string moves it to the top.'
+            }
+          }
+        }
+      }
+    }
+  }
+};
+
+/** Where the value above came from, so a reader can run one command and check it themselves. */
+export const QUOTED_EDIT_SOURCE = '0a1c21b:apps/worker/src/tool-catalogue.ts';
+
+let cachedIncumbent: { tool: ModelTool; source: string } | null = null;
+
+/**
+ * The frozen entry, checked against the repository's own history where that is possible.
+ *
+ * Three outcomes and all three are printed rather than swallowed: the working tree still ships the
+ * quoted editor, so use it and say so; history has the revision and agrees, so name the commit;
+ * history cannot be asked, so say that instead of pretending it was checked. A disagreement is the
+ * fourth and it throws, because a transcription that has drifted from the thing it transcribes is
+ * the failure this whole file is written against, whichever direction it drifted in.
+ */
+export const incumbentEntry = (): { tool: ModelTool; source: string } => {
+  if (cachedIncumbent) return cachedIncumbent;
+  const live = fullCatalogue().find((tool) => tool.name === EDIT_TOOL);
+  if (live && dialectOf(live) === 'patch') {
+    cachedIncumbent = { tool: live, source: 'the shipped catalogue' };
+    return cachedIncumbent;
+  }
+  const found = sliceFromHistory();
+  const disagreement = found ? disagreementWith(found.slice) : null;
+  if (found && disagreement)
+    throw new Error(
+      `the quoted file_patch written into wire.ts does not match the one in ${found.source}: ${disagreement}. One of them is wrong and this rig will not guess which; re-read that revision and correct QUOTED_EDIT_ENTRY.`
+    );
+  cachedIncumbent = {
+    tool: QUOTED_EDIT_ENTRY,
+    source: found
+      ? `${QUOTED_EDIT_SOURCE}, checked against ${found.source}`
+      : `${QUOTED_EDIT_SOURCE}, UNCHECKED: this checkout has no revision of ${CATALOGUE_FILE} that carries the quoted editor, which is what a depth-1 clone looks like`
+  };
+  return cachedIncumbent;
+};
+
+/**
+ * The last revision of the catalogue that declared the quoted editor, or null on a shallow clone.
+ *
+ * Returns the source text rather than a value, because the alternative was evaluating a literal
+ * out of git and there is no version of that which is not `new Function` wearing a hat. What comes
+ * back is checked against the frozen entry by `disagreementWith` below, which is a weaker check
+ * than a deep equality and says so.
+ */
+const sliceFromHistory = (): { slice: string; source: string } | null => {
+  const cwd = fileURLToPath(new URL('../../', import.meta.url));
+  const log = spawnSync(
+    'git',
+    ['log', '--format=%H', '-n', String(HISTORY_DEPTH), '--', CATALOGUE_FILE],
+    { cwd, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }
+  );
+  if (log.status !== 0 || !log.stdout) return null;
+  for (const commit of log.stdout.split('\n').filter(Boolean)) {
+    const shown = spawnSync('git', ['show', `${commit}:${CATALOGUE_FILE}`], {
+      cwd,
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024
+    });
+    if (shown.status !== 0 || !shown.stdout) continue;
+    const slice = entrySliceIn(shown.stdout);
+    if (slice && slice.includes('oldText:'))
+      return { slice, source: `${commit.slice(0, 7)}:${CATALOGUE_FILE}` };
+  }
+  return null;
+};
+
+/**
+ * How the frozen entry differs from the revision that shipped it, in the ways that can matter.
+ *
+ * Not a deep equality, and the difference is worth being precise about because a check that
+ * overstates itself is worse than none. What is compared is every string the entry carries -
+ * which is where the bytes are, and 535 of the description's own 1,112 - and every property name
+ * on both sides, in both directions. What is NOT compared is the ordering of the schema's keys or
+ * a numeric bound somebody changed without touching a name.
+ *
+ * That is enough for what this guards against: a transcription typo, and a rollback aimed at the
+ * wrong revision. Both of those move a string or a property name. A silently reordered schema
+ * changes no byte count and no behaviour on the wire.
+ */
+const disagreementWith = (slice: string): string | null => {
+  const strings: string[] = [];
+  const names = new Set<string>();
+  const walk = (value: unknown): void => {
+    if (typeof value === 'string') strings.push(value);
+    else if (Array.isArray(value)) for (const item of value) walk(item);
+    else if (value && typeof value === 'object')
+      for (const [key, inner] of Object.entries(value)) {
+        names.add(key);
+        walk(inner);
+      }
+  };
+  walk(QUOTED_EDIT_ENTRY.parameters);
+  strings.push(QUOTED_EDIT_ENTRY.description);
+  for (const value of strings)
+    if (!slice.includes(asLiteral(value)))
+      return `the revision does not contain the string ${asLiteral(value).slice(0, 60)}...`;
+  for (const name of names)
+    if (!new RegExp(`\\b${name}\\b`).test(slice)) return `the revision does not mention "${name}"`;
+  for (const [, name] of slice.matchAll(/^\s{12,}([A-Za-z][A-Za-z0-9_]*):/gm))
+    if (name && !names.has(name) && name !== 'description' && name !== 'type')
+      return `the revision declares "${name}", which the frozen entry does not carry`;
+  return null;
+};
+
+/**
+ * The edit axis, applied to a tool set.
+ *
+ * `lines` is the working tree untouched and is checked to actually BE the line-addressed shape;
+ * `patch` puts the quoted entry back in its place. Both directions throw rather than returning the
+ * other arm's catalogue, for the reason stated above: the silent failure here is a tie.
  */
 export const withEditDialect = (
   tools: readonly ModelTool[],
   settings: ArmSettings
 ): readonly ModelTool[] => {
-  if (settings.edit === 'patch') return tools;
-  if (!tools.some((tool) => tool.name === INCUMBENT_EDIT_TOOL))
+  const live = tools.find((tool) => tool.name === EDIT_TOOL);
+  if (!live)
     throw new Error(
-      `the edit axis replaces "${INCUMBENT_EDIT_TOOL}" and this arm does not send it, so the arm would differ from its parent by nothing and its row would read as a tie`
+      `the edit axis is defined against "${EDIT_TOOL}" and this arm does not send it, so the arm would differ from its parent by nothing and its row would read as a tie`
     );
-  return tools.map((tool) => (tool.name === INCUMBENT_EDIT_TOOL ? CANDIDATE_ENTRY : tool));
+  const shipped = dialectOf(live);
+  if (shipped === 'unknown')
+    throw new Error(
+      `${EDIT_TOOL} declares neither oldText nor edit, so this rig cannot tell which dialect the working tree ships and cannot place either arm on the axis`
+    );
+  if (settings.edit === shipped) return tools;
+  if (settings.edit === 'lines')
+    throw new Error(
+      `the line-addressed arm is the working tree, and the working tree ships the quoted ${EDIT_TOOL}. Nothing here reconstructs a candidate that has not landed; run this rig on the tree that carries it.`
+    );
+  return tools.map((tool) => (tool.name === EDIT_TOOL ? incumbentEntry().tool : tool));
 };
 
 export const toolsFor = (settings: ArmSettings): readonly ModelTool[] => {
@@ -162,8 +390,12 @@ export interface MethodAxis {
 let cachedAxis: MethodAxis | null = null;
 
 /**
- * How far back the search for the section goes. Bounded so a rig cannot walk a repository's whole
- * history looking for prose that was never there; a hundred revisions of one file is years.
+ * How far back either search goes - the method section above, the quoted editor above that.
+ *
+ * Bounded so a rig cannot walk a repository's whole history looking for text that was never there;
+ * a hundred revisions of one file is years. A rollback arm that had to reach further back than
+ * this is an arm proposing to restore something nobody has run in a very long time, and it should
+ * say so out loud rather than quietly finding it.
  */
 const HISTORY_DEPTH = 100;
 

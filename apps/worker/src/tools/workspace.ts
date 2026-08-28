@@ -1,10 +1,34 @@
 import { sha256, AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
-import { patchFailure, type PatchFailure } from '../patch-failure.js';
+import {
+  applyEdit,
+  numberedWindow,
+  readsOf,
+  recordRead,
+  recordWrite,
+  renderNumbered,
+  toLines
+} from '../edit/index.js';
 import { HELPER_PACKAGE_MANAGERS, PACKAGE_VERBS } from '../turn-bounds.js';
-import { countOccurrences, textValue } from '../values.js';
+import { textValue } from '../values.js';
 import { type ToolContext } from '../tool-dispatch.js';
 import { finiteNumber } from './numbers.js';
+
+/**
+ * How much of what a patch just wrote comes back in the result.
+ *
+ * The one failure a line-addressed format cannot detect on the way in is an off-by-one with no
+ * evidence attached: `PUT 40.=42:` where the model meant 41, and nothing in the patch says what it
+ * thought was at 40. `apply.ts` explains why guessing is not available there. This is the other half
+ * of that decision - the model is shown the head and the tail of every region it wrote, with the
+ * line above and below, so a miscount is visible on the same turn instead of at test time.
+ *
+ * Bounded, because it is input tokens on every successful edit and the whole point of the format is
+ * not spending tokens. Four rows per region is the first line, the last line and one line of context
+ * on each side, which is exactly enough to see that an edit landed one line high.
+ */
+const ECHO_ROWS_PER_REGION = 2;
+const ECHO_MAX_ROWS = 24;
 
 /**
  * The workspace tools: commands, processes and files on the owner's own computer.
@@ -127,6 +151,16 @@ export async function executeWorkspaceTool(
           endLine,
           maxBytes: 400_000
         });
+        /*
+         * A read that stopped on its byte budget stopped mid-line, and that line was not displayed.
+         * It is still returned - the model asked for it - but it is not recorded as seen, because a
+         * record that vouched for the half that never arrived is exactly the blind anchor the
+         * record exists to refuse. The runner's own seen-line ledger draws the same line in the
+         * same place, deliberately.
+         */
+        const shownLines = toLines(read.content);
+        const whole = read.truncated ? shownLines.slice(0, -1) : shownLines;
+        if (whole.length) recordRead(task.id, path, read.startLine, whole.join('\n'));
         return {
           path,
           startLine: read.startLine,
@@ -136,183 +170,148 @@ export async function executeWorkspaceTool(
           // than by reaching the end. Without it a truncated read is a dead end.
           ...(read.nextStartLine === undefined ? {} : { nextStartLine: read.nextStartLine }),
           truncated: read.truncated,
-          content: read.content
+          content: renderNumbered(shownLines, read.startLine)
         };
       }
       const read = await context.runner.readFileWithHash(task.workspaceId, task.id, path);
       if (read.sha256)
         state.readFileHashes = { ...(state.readFileHashes ?? {}), [path]: read.sha256 };
-      const lines = read.content.split('\n');
+      const lines = toLines(read.content);
+      recordRead(task.id, path, 1, read.content);
       return {
         path,
         startLine: 1,
         endLine: lines.length,
         totalLines: lines.length,
         truncated: false,
-        content: read.content
+        content: renderNumbered(lines, 1)
       };
     }
+    /*
+     * The line-addressed editor, which replaced oldText/newText search-and-replace outright.
+     *
+     * The old shape proved an edit was fresh by making the model quote the text it was replacing,
+     * exactly once. That quote was the safety AND the cost: on a file that says `return null;`
+     * eleven times the quote had to grow until it was unique, and then be typed back with one word
+     * different. Measured on this repository's own corpus over fifteen tasks, addressing by line
+     * number instead cost 61% fewer characters of arguments and won fourteen of the fourteen rows
+     * where both formats did what the task asked. A move - the worst row - went from 777 characters
+     * to 57, because the moved block crosses the wire once instead of twice.
+     *
+     * It REPLACES rather than joins. Two ways to do one thing doubles what the model has to learn,
+     * pays for both entries on every request of every turn, and turns a real saving into a net loss;
+     * `docs/design/edit/BUILD.md` has the byte ledger both ways.
+     *
+     * The freshness proof moved from the model to the harness. `apps/worker/src/edit/snapshots.ts`
+     * remembers the exact lines each `file_read` above put in front of the model, so at apply time
+     * there are two texts to compare - what was shown, and what is on disk now - and a range needs
+     * to carry no evidence at all. That is strictly better evidence than a quote, because a quote is
+     * the model's memory of the file and a snapshot is this process's record of what it sent.
+     *
+     * Nothing here loosens the two guards that were already on this path. The runner's hash from the
+     * read is still claimed on the write, so a file that changed between the two fails closed rather
+     * than being silently overwritten. The runner's own seen-line ledger still runs underneath,
+     * against the whole-file write this produces, and it is what holds when this process's snapshot
+     * cache is cold - a worker restart mid-turn loses an opinion here and loses nothing there.
+     */
     case 'file_patch': {
       const patches = Array.isArray(call.arguments.patches)
         ? (call.arguments.patches as Array<Record<string, unknown>>)
         : [];
       if (!patches.length || patches.length > 40)
         throw new AthanorError('patch_invalid', 'Provide between 1 and 40 patches');
-      // Only ever counted - per path for `replacements`, and in total for `patchCount`. It used to
-      // carry the before, after, oldText and newText of every patch as well, none of which anything
-      // read, on a path that already holds two copies of every file it touches.
-      const prepared: string[] = [];
-      const latestByPath = new Map<string, string>();
-      /*
-       * The runner's own hash of what was read, kept so the write can claim it.
-       *
-       * A patch is a read-modify-write, and the write went out with no expectation at all - so
-       * between the read and the write anything could change the file and the patch would land on
-       * top of it silently. The whole-file `file_write` beside this has claimed its read since the
-       * lost-update repair; this path had the same defect and none of the guard.
-       */
+      const applied: Array<{
+        path: string;
+        sha256: string;
+        lines: number;
+        wrote: string;
+        notes: readonly string[];
+      }> = [];
+      const failures: Array<{ path: string; reason: string }> = [];
       const readHashes = new Map<string, string>();
-      // Every patch that matches is applied. The batch used to be all-or-nothing, so one stale
-      // hunk out of five discarded the four that would have landed cleanly - and the model then
-      // had to re-read files whose earlier reads the window had already gutted.
-      const failures: PatchFailure[] = [];
+      const seenPaths = new Set<string>();
       for (const patch of patches) {
         const path = textValue(patch.path);
-        const oldText = textValue(patch.oldText);
-        const newText = textValue(patch.newText);
-        /*
-         * A move, which is a patch that says where its text goes instead of what replaces it.
-         *
-         * Presence and not emptiness decides, because the empty string is a real destination here -
-         * the top of the file, which is the one place no quotable anchor precedes. Read off the raw
-         * argument rather than through `textValue`, whose whole job is to turn an absent field into
-         * `''`, which is exactly the value that has to mean something else.
-         */
-        const moving = patch.moveAfter !== undefined && patch.moveAfter !== null;
-        const replacing = patch.newText !== undefined && patch.newText !== null;
-        if (!path || !oldText)
+        const edit = textValue(patch.edit);
+        if (!path || !edit)
           throw new AthanorError(
             'patch_invalid',
-            'Every patch requires a path and non-empty oldText'
-          );
-        if (moving && replacing)
-          throw new AthanorError(
-            'patch_invalid',
-            'A patch carries newText or moveAfter, never both. Move the text in one patch and rewrite it in another.'
+            'Every patch requires a path and a non-empty edit.'
           );
         /*
-         * The hazard `newText` leaving the required set opened, closed here rather than in the
-         * schema, which cannot express "one of these two".
+         * One patch per file, and a repeated path is refused rather than chained.
          *
-         * Before the move shape, a patch with no `newText` deleted `oldText` - `textValue` turned
-         * the missing field into `''` and the replace emptied the region. That was safe only
-         * because the schema demanded the field, so an omission was a malformed call the provider
-         * would not send. With the field optional, the same omission is a plausible slip on a move
-         * whose `moveAfter` did not survive generation, and it would silently destroy exactly the
-         * block the model was trying to keep. An explicit `newText: ''` still deletes.
+         * Every range in a patch names the numbers of the read it came from. A second patch on the
+         * same file would be addressed against those same numbers while the first patch had already
+         * moved them, so chaining the two would apply the second one somewhere the model never
+         * meant. Saying so is one sentence; getting it wrong is a corrupted file.
          */
-        if (!moving && !replacing)
+        if (seenPaths.has(path))
           throw new AthanorError(
             'patch_invalid',
-            'Every patch requires newText to replace oldText, an empty newText to delete it, or moveAfter to move it'
+            `${path} appears in two patches of the same call. Every operation on one file addresses the numbers of the same read, so they belong in that file's single patch.`
           );
-        let before = latestByPath.get(path);
-        if (before === undefined) {
-          try {
-            const read = await context.runner.readFileWithHash(task.workspaceId, task.id, path);
-            before = read.content;
-            if (read.sha256) readHashes.set(path, read.sha256);
-          } catch (cause) {
-            failures.push({
-              path,
-              occurrences: 0,
-              reason: `${path} could not be read: ${cause instanceof Error ? cause.message : 'read failed'}. Check the path with files_list before patching it.`
-            });
-            continue;
-          }
-        }
-        if (countOccurrences(before, oldText) !== 1) {
-          failures.push(patchFailure(path, before, oldText));
+        seenPaths.add(path);
+        let before: string;
+        try {
+          const read = await context.runner.readFileWithHash(task.workspaceId, task.id, path);
+          before = read.content;
+          if (read.sha256) readHashes.set(path, read.sha256);
+        } catch (cause) {
+          failures.push({
+            path,
+            reason: `${path} could not be read: ${cause instanceof Error ? cause.message : 'read failed'}. Check the path with files_list before patching it.`
+          });
           continue;
         }
-        /*
-         * The replacement - and, for a move, the cut it begins with.
-         *
-         * A move carries no `newText`, so `textValue` has already made it the empty string and
-         * this line removes `oldText` and leaves exactly the hole the paste below fills. That is
-         * why the move is an operation on this tool and not an applier beside it: the delete half
-         * of a move IS the replacement this tool already did, and one line serves both shapes.
-         *
-         * `evals/edit/encode.ts` reads this line, character for character, out of this file, and
-         * refuses to print a number if it is no longer here - so the rig cannot go on measuring a
-         * program that stopped existing. Keeping the move inside it keeps that pin honest too.
-         */
-        const after = before.replace(oldText, newText);
-        let pasted: string | undefined;
-        if (moving) {
-          const moveAfter = textValue(patch.moveAfter);
-          /*
-           * The anchor is looked for in the file with the block ALREADY CUT OUT, and that is the
-           * load-bearing decision of the whole operation.
-           *
-           * Counted against the original text instead, a move whose anchor sits inside the block
-           * being moved reads as unique, and the paste then lands inside text that is no longer
-           * there - which is either a corrupt file or a crash, depending on where the anchor fell.
-           * Counting after the cut makes that case zero occurrences and a refusal the model can
-           * read. It also gives "move this to just after itself" the only honest answer.
-           */
-          if (moveAfter && countOccurrences(after, moveAfter) !== 1) {
-            /*
-             * The near-match search is worth every byte here and is not worth a second copy, so
-             * the evidence comes from `patchFailure` and only the sentence is rewritten: its own
-             * wording names `oldText`, which in this failure is the one thing that DID match.
-             */
-            const found = patchFailure(path, after, moveAfter);
-            failures.push({
-              ...found,
-              reason: found.occurrences
-                ? `moveAfter appears ${found.occurrences} times in ${path} once oldText is cut out of it, so there is nowhere unambiguous to put it. Extend moveAfter with enough surrounding lines to make it unique.`
-                : `moveAfter is not in ${path} once oldText is cut out of it, so there is nowhere to put it. Quote it exactly as the file reads now - or send an empty moveAfter to move the text to the top of the file. It cannot be text inside the block being moved.`
-            });
-            continue;
-          }
-          pasted = moveAfter ? after.replace(moveAfter, moveAfter + oldText) : oldText + after;
+        const result = applyEdit(path, edit, before, readsOf(task.id, path));
+        if (!result.ok) {
+          failures.push({ path, reason: result.refusal.message });
+          continue;
         }
-        prepared.push(path);
-        latestByPath.set(path, pasted ?? after);
-      }
-      if (!prepared.length)
-        throw new AthanorError(
-          'patch_conflict',
-          failures.map((failure) => failure.reason).join(' ') || 'No patch could be applied'
-        );
-      const changed = [...latestByPath.entries()];
-      const writtenHashes = new Map<string, string>();
-      for (const [path, content] of changed) {
         const written = await context.runner.writeFile(
           task.workspaceId,
           task.id,
           path,
-          content,
+          result.text,
           readHashes.get(path)
         );
         const hash = (written as { sha256?: unknown })?.sha256;
-        if (typeof hash === 'string') writtenHashes.set(path, hash);
+        /*
+         * What is on disk now is what this patch just wrote, in both ledgers.
+         *
+         * The hash, so a `file_write` later in the same turn claims the version this produced rather
+         * than the one the read produced - without it the runner answered 409 naming the very tool
+         * that had caused the change. And the snapshot, so a SECOND edit to this file needs no read
+         * between them: the lines are text the model authored, which is text it has been shown by
+         * definition, and the numbers in the echo below are the numbers of this recording.
+         */
+        if (typeof hash === 'string')
+          state.readFileHashes = { ...(state.readFileHashes ?? {}), [path]: hash };
+        const after = toLines(result.text);
+        recordWrite(task.id, path, result.text);
+        applied.push({
+          path,
+          sha256: sha256(result.text),
+          lines: after.length,
+          wrote: result.wrote
+            .slice(0, Math.ceil(ECHO_MAX_ROWS / (ECHO_ROWS_PER_REGION + 2)))
+            .map((region) =>
+              region.to - region.from + 1 <= ECHO_ROWS_PER_REGION + 2
+                ? numberedWindow(after, region, 1)
+                : `${numberedWindow(after, { from: region.from, to: region.from }, 1)}\n...\n${numberedWindow(after, { from: region.to, to: region.to }, 1)}`
+            )
+            // A blank line between regions: two ranges of numbers run together read as one range
+            // with a gap in it, which is the one thing this echo exists to make unambiguous.
+            .join('\n\n'),
+          notes: result.notes
+        });
       }
-      /*
-       * What is on disk now is what this patch just wrote.
-       *
-       * Without this, a read-then-patch-then-write inside one turn sent the pre-patch hash to the
-       * runner, which answered 409 - "this file changed after you read it... or use file_patch" -
-       * naming the tool that had caused it. The only thing that changed the file was the agent's
-       * own patch two calls earlier. The runner's own hash is preferred over one computed here
-       * for the same reason the read claims one: it is the hash the next write will be checked
-       * against, and anything else is this side guessing at it.
-       */
-      for (const [path] of changed) {
-        const hash = writtenHashes.get(path);
-        if (hash) state.readFileHashes = { ...(state.readFileHashes ?? {}), [path]: hash };
-      }
+      if (!applied.length)
+        throw new AthanorError(
+          'patch_conflict',
+          failures.map((failure) => failure.reason).join('\n\n') || 'No patch could be applied'
+        );
       const usage = await context.runner.call<{ storageBytes: number }>(
         task.workspaceId,
         task.id,
@@ -321,16 +320,21 @@ export async function executeWorkspaceTool(
       );
       await context.store.setWorkspaceStorage(task.userId, task.workspaceId, usage.storageBytes);
       return {
-        filesChanged: changed.map(([path, content]) => ({
+        filesChanged: applied.map(({ path, sha256: digest, lines }) => ({
           path,
-          sha256: sha256(content),
-          replacements: prepared.filter((patched) => patched === path).length
+          sha256: digest,
+          lines
         })),
-        patchCount: prepared.length,
+        patchCount: applied.length,
+        // The numbers the file now has, so the next edit to it addresses this and not the read.
+        wrote: applied.map(({ path, wrote }) => `${path}\n${wrote}`).join('\n\n'),
+        ...(applied.some(({ notes }) => notes.length)
+          ? { notes: applied.flatMap(({ notes }) => notes) }
+          : {}),
         ...(failures.length
           ? {
               failed: failures,
-              instruction: `${failures.length} of ${patches.length} patches did not apply and were skipped; the rest are already written. Fix only the failures below and send them again.`
+              instruction: `${failures.length} of ${patches.length} patches were not applied and wrote nothing; the rest are already written. Each reason below carries the file's real text at those lines, so fix only the failures and send them again without reading first.`
             }
           : {})
       };

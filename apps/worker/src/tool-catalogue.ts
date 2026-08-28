@@ -12,6 +12,7 @@ import {
   subscriptionAgentName,
   type SubscriptionAgent
 } from './subscription-agent.js';
+import { EDIT_FORMAT_SPEC } from './edit/index.js';
 import { browserActionProperties, desktopActionProperties } from './surface-actions.js';
 
 /*
@@ -467,29 +468,39 @@ export const agentTools: ModelTool[] = [
   {
     name: 'file_patch',
     /**
-     * The fourth patch shape, and the only one that does not make the model type its own result.
+     * The editor, and the one place on this catalogue where the dialect itself is the capability.
      *
-     * Moving a block was the most expensive thing this tool did, by a wide margin and for a reason
-     * that is a capability limit rather than an encoding one: a replacement can only ever delete
-     * text and paste text, so a move had to emit the moved lines TWICE - once as `oldText` to cut
-     * them and once inside a second patch's `newText` to put them back - plus a unique anchor at
-     * each end. Measured on `evals/edit`'s `move-function`, eleven lines moved above the function
-     * that uses them: 777 characters of JSON arguments. With `moveAfter` the same edit is one
-     * patch and 397, because the lines cross the wire once. Three more move shapes on the same
-     * file measure 358, 350 and 308.
+     * It used to be oldText/newText with an exactly-once guard. That guard was the safety and also
+     * the cost: on a file that says `return null;` eleven times, the quote had to grow until it was
+     * unique and then be typed back with one word different, so the price of an edit was set by how
+     * repetitive the file is rather than by how large the edit is. Measured offline over fifteen
+     * tasks on this repository's own corpus, addressing by line number instead costs 61% fewer
+     * characters of arguments - 4,086 against 1,589 - and wins fourteen of the fourteen rows where
+     * both formats do what the task asked. The worst row is a move: eleven lines relocated cost 777
+     * characters as a quote, because the block had to cross the wire twice, and 57 as a CUT and a
+     * PUT of a named register.
      *
-     * That is 49% and not the 93% the line-addressed dialect scored on this row, and the
-     * difference is the whole reason this is here and that dialect is not: the saving there came
-     * from addressing the block by number, which needs a whole-file tag, a numbered read and a
-     * seen-lines ledger before it is safe. This needs none of them. `oldText` is still the
-     * evidence, still matched exactly once, and still fails closed with the same explanation - so
-     * a move is the shape file_patch already had, minus one copy of the text.
+     * It REPLACES the quoted shape rather than joining it. Two ways to do one thing doubles what the
+     * model has to learn, pays for both entries on every request of every turn, and is what turns a
+     * measured saving into a net loss on the wire.
      *
-     * The saving grows with the block. A 200-line function is a move a model may simply be unable
-     * to afford today, because two copies of it plus context has to fit in one generation.
+     * The spec below is resident on every request and is therefore the number that had to be
+     * argued. The reference dialect this was measured from spends 5,268 bytes describing itself;
+     * this spends 1,097, and the difference is not terseness. Three of the reference's paragraphs
+     * describe a per-file version tag, what to do when it does not match, and how to recover from
+     * that - and the harness here needs no tag at all, because `apps/worker/src/edit/snapshots.ts`
+     * remembers what each read displayed and can therefore compare the file to what the model was
+     * actually shown. The reference's own harness ships a hand-maintained list of four models that
+     * "drop the tag header" often enough to be routed to a lenient parser; a header the model can
+     * drop is a header this harness does without.
+     *
+     * `REM` and `MV` are not here for a different reason and it is worth the sentence: the worker's
+     * runner client has no delete or rename route, so declaring them would put two operations on
+     * every request that the arm behind them cannot carry out. `shell` already removes and renames
+     * files. A capability wired to nothing is the failure this programme has shipped twice.
      */
     description:
-      'Apply precise, conflict-detecting edits to one or more files. Every oldText must occur exactly once in its file, so a stale edit fails instead of overwriting newer work. Give a patch newText to replace that text, or moveAfter to move it elsewhere in the same file without typing it out a second time. Patches that match are applied even when others in the same call do not; each failure comes back with the occurrence count, the nearest place it nearly matched, and the current text around it, so a retry usually needs no extra read.',
+      'Edit files by line number, using the numbers file_read returns. The range says which lines go and the body says only what replaces them, so no text is ever typed twice and moving a block costs one copy of it rather than two.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -502,20 +513,19 @@ export const agentTools: ModelTool[] = [
           items: {
             type: 'object',
             additionalProperties: false,
-            // `newText` leaves the required set because a move does not carry one, and the arm
-            // refuses a patch that names neither rather than treating the omission as a deletion:
-            // an optional field whose absence silently empties a region is the one way this
-            // change could have cost the owner a file.
-            required: ['path', 'oldText'],
+            /*
+             * `path` stays a field of its own rather than a header inside `edit`, and that is a
+             * safety decision before it is an encoding one. Everything on this computer that has to
+             * know which files a call writes - the approval card, the durable-instruction rule, the
+             * prose classifier in `write-classification.ts` - reads it from here, and a path the
+             * model could bury in free text is a path those rules could miss. It also means a
+             * dropped section header costs the model nothing at all, which is the single most
+             * commonly reported failure of dialects of this kind.
+             */
+            required: ['path', 'edit'],
             properties: {
               path: { type: 'string' },
-              oldText: { type: 'string' },
-              newText: { type: 'string' },
-              moveAfter: {
-                type: 'string',
-                description:
-                  'Move oldText unchanged to just after this text, which must itself occur exactly once in the file once oldText is cut out of it. Empty string moves it to the top.'
-              }
+              edit: { type: 'string', description: EDIT_FORMAT_SPEC }
             }
           }
         }
