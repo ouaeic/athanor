@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
-import { executeRepositoryTool } from './repository.js';
+import { executeRepositoryTool, OVERVIEW_SYMBOL_BUDGET, spreadAcrossFiles } from './repository.js';
 import { type ToolContext } from '../tool-dispatch.js';
 
 /**
@@ -201,5 +201,64 @@ describe('what a code search answers with', () => {
     expect(result.matches).toEqual([]);
     expect(result.totalReturned).toBe(0);
     expect(result).not.toHaveProperty('summarised');
+  });
+});
+
+/**
+ * Which symbols an overview stands for, which was a race until it was not.
+ *
+ * `repo_overview` is the tool the catalogue tells the model to reach for first, and it was taking
+ * the first three hundred lines ripgrep happened to emit. Measured on this repository: 300 of 5,799
+ * symbols, covering 44 of 622 files, forty of them under `services/`, and a different forty-four on
+ * each of three consecutive runs - while `IDEMPOTENT_WITHIN_TURN` named this tool a pure function of
+ * the workspace. These are about the choice rather than the order, because ordering it alone moves
+ * the failure rather than fixing it: sorted by path, a straight prefix of 300 is 300 files of
+ * `apps/` and a codebase that appears to have no services in it at all.
+ */
+describe('what an overview stands for when it cannot show everything', () => {
+  const corpus = (files: number, each: number): string[] =>
+    Array.from({ length: files }, (_, file) =>
+      Array.from(
+        { length: each },
+        (_, line) =>
+          `${file < files / 2 ? 'apps' : 'services'}/mod${file}.ts:${line + 1}:${line === each - 1 ? 'export ' : ''}const s${line} = 1`
+      )
+    ).flat();
+
+  const filesIn = (lines: readonly string[]): Set<string> =>
+    new Set(lines.map((line) => /^(.*?):\d+:/.exec(line)?.[1] ?? line));
+
+  it('spends a budget smaller than the repository across all of it, not down the front of it', () => {
+    const shown = spreadAcrossFiles(corpus(600, 9), 300);
+    expect(shown).toHaveLength(300);
+    expect(filesIn(shown).size).toBe(300);
+    const services = [...filesIn(shown)].filter((file) => file?.startsWith('services/')).length;
+    // Half the files are under services/, so about half the sample should be, and a prefix would
+    // have given none of them.
+    expect(services).toBeGreaterThan(120);
+  });
+
+  it('gives every file a symbol before it gives any file a second', () => {
+    const shown = spreadAcrossFiles(corpus(40, 5), 60);
+    expect(filesIn(shown).size).toBe(40);
+  });
+
+  it('answers the same twice, which is what the tool was already claimed to do', () => {
+    const lines = corpus(600, 9);
+    expect(spreadAcrossFiles(lines, 300)).toEqual(spreadAcrossFiles(lines, 300));
+  });
+
+  it('shows the exported name when a file can only be represented by one of its symbols', () => {
+    const shown = spreadAcrossFiles(corpus(600, 9), 300);
+    expect(shown.every((line) => line.includes('export '))).toBe(true);
+  });
+
+  it('keeps a repository smaller than the budget whole', () => {
+    const lines = corpus(10, 4);
+    expect(spreadAcrossFiles(lines, OVERVIEW_SYMBOL_BUDGET)).toHaveLength(lines.length);
+  });
+
+  it('has nothing to say about an empty repository rather than something wrong', () => {
+    expect(spreadAcrossFiles([], 300)).toEqual([]);
   });
 });

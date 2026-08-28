@@ -1224,6 +1224,33 @@ describe('the repository arms', () => {
     ]);
   });
 
+  /*
+   * The flag that makes the overview an overview rather than a race.
+   *
+   * ripgrep searches in parallel and emits in completion order, so without this the three hundred
+   * symbols the tool keeps are whichever three hundred finished first - measured on this repository,
+   * a different forty-four files on each of three consecutive runs, while `IDEMPOTENT_WITHIN_TURN`
+   * called the answer a pure function of the workspace. Removing `--sort path` turned no test red
+   * until this one, which is why it is here rather than in a comment.
+   */
+  it('asks ripgrep for the symbols in a settled order, because the budget keeps a prefix of them', async () => {
+    const executed = await dispatch(
+      { name: 'repo_overview', arguments: { path: 'workspace/app' } },
+      {
+        route: (url, init) => {
+          if (!url.endsWith(`${root}/exec`)) return undefined;
+          const body = requestBody(init) as { executable: string; args: string[] };
+          if (body.executable === 'git') return observation({ stdout: 'a.ts\n' });
+          return observation({ stdout: 'a.ts:1:export const one = 1\n' });
+        }
+      }
+    );
+    const symbols = executed.calls
+      .map((entry) => entry.body as { executable: string; args: string[] })
+      .find((body) => body.executable === 'rg' && !body.args.includes('--files'));
+    expect(symbols?.args.join(' ')).toContain('--sort path');
+  });
+
   it('reads a repository with four commands at once and answers from all of them', async () => {
     const executed = await dispatch(
       { name: 'repo_overview', arguments: { path: 'workspace/app' } },

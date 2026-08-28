@@ -76,6 +76,70 @@ const groupByFile = (matches: readonly string[]): Map<string, number> => {
   return files;
 };
 
+/** How many symbol lines an overview carries, which is what the downstream result cap affords. */
+export const OVERVIEW_SYMBOL_BUDGET = 300;
+
+/**
+ * Which symbols an overview shows when it cannot show them all.
+ *
+ * ripgrep searches in parallel and emits in whatever order its threads finish, so taking the first
+ * three hundred lines was taking the first three hundred lines of a race. Measured on this
+ * repository: 300 of 5,797 symbols, covering 44 of 622 files, forty of them under `services/`, with
+ * the whole of `apps/` - the worker, the api, the web client, every part of the harness - standing
+ * for two files, and a different forty-four on each run. An overview whose subject is chosen by
+ * thread scheduling is not an overview, and this is the tool the catalogue tells the model to reach
+ * for first.
+ *
+ * `--sort path` settles the order. This settles the choice: one symbol from every file before any
+ * file gets a second, so a budget smaller than the repository buys breadth rather than whichever
+ * directory finished first, and within a file an exported name goes ahead of an unexported one
+ * because the public surface is what an overview is for.
+ *
+ * The path is taken up to the FIRST `:number:` rather than the last, which is the opposite of
+ * `groupByFile` above and for the opposite reason: that one is given `--column` and can anchor on
+ * a line-and-column pair too specific to appear in source text, and this one is not, so `:\d+:`
+ * matched greedily would find a time literal in the code and call it a filename.
+ */
+export const spreadAcrossFiles = (lines: readonly string[], budget: number): string[] => {
+  const byFile = new Map<string, string[]>();
+  for (const line of lines) {
+    const file = /^(.*?):\d+:/.exec(line)?.[1] ?? line;
+    const held = byFile.get(file);
+    if (held) held.push(line);
+    else byFile.set(file, [line]);
+  }
+  const unexported = (line: string): number => (/:\d+:\s*export\s/.test(line) ? 0 : 1);
+  for (const held of byFile.values()) held.sort((a, b) => unexported(a) - unexported(b));
+  const files = [...byFile.values()];
+  /*
+   * More files than budget, which is the case this tool is for. Taking the first `budget` of them
+   * in path order is the same failure as taking the first `budget` lines, only reproducible: this
+   * repository sorts `apps/` first and has 385 files under it, so a straight prefix of 300 reports
+   * a codebase with no services, no packages and no evals in it. Striding down the sorted list
+   * spends the budget in proportion to where the files actually are.
+   */
+  if (files.length > budget) {
+    const stride = files.length / budget;
+    return Array.from(
+      { length: budget },
+      (_, index) => files[Math.floor(index * stride)]?.[0] as string
+    );
+  }
+  const spread: string[] = [];
+  for (let round = 0; spread.length < budget; round += 1) {
+    let placed = false;
+    for (const held of files) {
+      const line = held[round];
+      if (line === undefined) continue;
+      spread.push(line);
+      placed = true;
+      if (spread.length === budget) return spread;
+    }
+    if (!placed) break;
+  }
+  return spread;
+};
+
 export async function executeRepositoryTool(
   context: ToolContext,
   call: ModelToolCall
@@ -233,6 +297,11 @@ export async function executeRepositoryTool(
         run('rg', [
           '--line-number',
           '--no-heading',
+          // Without this ripgrep emits in thread-completion order, and the budget below then keeps
+          // whichever directory happened to finish first. Two calls disagreed on all but a handful
+          // of rows while `IDEMPOTENT_WITHIN_TURN` called this a pure function of the workspace.
+          '--sort',
+          'path',
           '--color',
           'never',
           '--glob',
@@ -262,14 +331,20 @@ export async function executeRepositoryTool(
         files = discovered.stdout.split('\n').filter(Boolean);
       }
       const symbolLines = symbols.stdout.split('\n').filter(Boolean);
+      const shownSymbols = spreadAcrossFiles(symbolLines, OVERVIEW_SYMBOL_BUDGET);
       return {
         path,
         versionControl: status.stdout.trim() || 'No Git working tree detected',
         files: files.slice(0, maxFiles),
         fileCount: files.length,
         filesTruncated: files.length > maxFiles,
-        importantSymbols: symbolLines.slice(0, 300),
-        symbolsTruncated: symbolLines.length > 300,
+        importantSymbols: shownSymbols,
+        symbolsTruncated: symbolLines.length > shownSymbols.length,
+        // What the overview is standing for, so a model can tell "this repository has 622 files"
+        // from "I was shown symbols from 300 of them" rather than inferring coverage it does not
+        // have. The old shape reported truncation and left the reader to assume it was even.
+        symbolCount: symbolLines.length,
+        filesRepresented: new Set(shownSymbols.map((line) => /^(.*?):\d+:/.exec(line)?.[1])).size,
         instructionFiles: instructions.stdout.split('\n').filter(Boolean)
       };
     }
