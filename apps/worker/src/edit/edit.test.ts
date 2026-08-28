@@ -18,7 +18,15 @@ import { blockAt } from './block.js';
 import { normaliseLine, renderNumbered, sameLine, toLines } from './format.js';
 import { parseEdit } from './parse.js';
 import { EDIT_FORMAT_SPEC } from './prompt.js';
-import { forgetReads, readsOf, recordRead, recordWrite, SNAPSHOTS_PER_PATH } from './snapshots.js';
+import {
+  displayedRanges,
+  firstUnshownLine,
+  forgetReads,
+  readsOf,
+  recordRead,
+  recordWrite,
+  SNAPSHOTS_PER_PATH
+} from './snapshots.js';
 
 const TASK = 'task-1';
 const PATH = 'workspace/queue.ts';
@@ -49,6 +57,14 @@ const apply = (patch: string, live = FILE, path = PATH) =>
 const applied = (patch: string, live = FILE, path = PATH): string => {
   const result = apply(patch, live, path);
   if (!result.ok) throw new Error(`refused: ${result.refusal.message}`);
+  return result.text;
+};
+
+/** A patch, exactly as `file_patch` performs one: apply it, then record what it authored. */
+const patched = (patch: string, live = FILE, path = PATH): string => {
+  const result = apply(patch, live, path);
+  if (!result.ok) throw new Error(`refused: ${result.refusal.message}`);
+  recordWrite(TASK, path, result.text, result.changed);
   return result.text;
 };
 
@@ -518,16 +534,96 @@ describe('what the store remembers, and what it forgets', () => {
 
   it('lets a second edit follow the first with no read between them', () => {
     read();
-    const once = applied('PUT <1:\n+// header');
-    recordWrite(TASK, PATH, once);
+    const once = patched('PUT <1:\n+// header');
     // Line 4 in the NEW numbering is line 3 of the original.
     const twice = applied('PUT 4:\n+  if (!job) return undefined;', once);
     expect(toLines(twice)[3]).toBe('  if (!job) return undefined;');
   });
 
+  /*
+   * WHAT A PATCH VOUCHES FOR IS THE SPAN IT WROTE. This re-recorded the entire new file on the
+   * argument that a caller has seen what it authored - true of a whole-file write and false of a
+   * line-addressed patch, which authors a span and reproduces the rest of a file it may have been
+   * shown two hundred lines of. One successful patch therefore made every line of the file
+   * editable, so an anchor the record had refused a moment earlier landed silently.
+   */
+  it('vouches for the span a patch wrote, and for no more of the file than the reads did', () => {
+    const long = Array.from({ length: 400 }, (_, line) => `line ${line + 1}`).join('\n');
+    recordRead(TASK, PATH, 1, toLines(long).slice(0, 50).join('\n'));
+    const after = patched('PUT 10:\n+line 10 // touched', long);
+
+    expect(displayedRanges(TASK, PATH)).toEqual([{ start: 1, end: 50 }]);
+    expect(apply('PUT 300:\n+blind', after).ok).toBe(false);
+    expect(apply('PUT 20:\n+line 20 // also touched', after).ok).toBe(true);
+  });
+
+  /*
+   * The lines a read showed keep meaning what they meant, at whatever numbers the edit moved them
+   * to. Three lines replace one at line 10, so the fifty lines that were shown are now fifty-two,
+   * and the last of them is line 52.
+   */
+  it('moves the lines a read showed by what the edit changed the length by', () => {
+    const long = Array.from({ length: 400 }, (_, line) => `line ${line + 1}`).join('\n');
+    recordRead(TASK, PATH, 1, toLines(long).slice(0, 50).join('\n'));
+    const after = patched('PUT 10:\n+one\n+two\n+three', long);
+
+    expect(displayedRanges(TASK, PATH)).toEqual([{ start: 1, end: 52 }]);
+    expect(apply('PUT 52:\n+line 50 // touched', after).ok).toBe(true);
+    expect(apply('PUT 53:\n+blind', after).ok).toBe(false);
+  });
+
   it('keeps one task from vouching for another task reads', () => {
     read();
     expect(readsOf('some-other-task', PATH)).toHaveLength(0);
+  });
+
+  /*
+   * WHICH LINES HAVE BEEN SHOWN IS NOT A QUESTION ABOUT THE SNAPSHOTS. They carry text, so only a
+   * few of them can be kept, and answering coverage off them meant a file read from its first line
+   * to its last was still reported unread past the last four windows - 37 of this repository's 946
+   * tracked files were long enough that no sequence of reads could ever cover them. Runs of numbers
+   * cost nothing to keep, and windows that continue one another merge into one.
+   */
+  it('remembers every line shown, past the few windows whose text it can hold', () => {
+    for (let window = 0; window < 40; window += 1)
+      recordRead(TASK, PATH, window * 20 + 1, Array.from({ length: 20 }, () => 'x').join('\n'));
+    expect(readsOf(TASK, PATH)).toHaveLength(SNAPSHOTS_PER_PATH);
+    expect(displayedRanges(TASK, PATH)).toEqual([{ start: 1, end: 800 }]);
+    expect(firstUnshownLine(displayedRanges(TASK, PATH), 800)).toBeUndefined();
+    expect(firstUnshownLine(displayedRanges(TASK, PATH), 801)).toBe(801);
+  });
+
+  it('names the first line of the first gap, so a refusal can say where to read from', () => {
+    expect(firstUnshownLine([], 10)).toBe(1);
+    expect(firstUnshownLine([{ start: 1, end: 200 }], 8_332)).toBe(201);
+    expect(firstUnshownLine([{ start: 1, end: 200 }], 200)).toBeUndefined();
+    // A run that starts past the gap does not close it, and is not what the model is sent to read.
+    expect(
+      firstUnshownLine(
+        [
+          { start: 1, end: 200 },
+          { start: 400, end: 900 }
+        ],
+        900
+      )
+    ).toBe(201);
+  });
+
+  /*
+   * A whole-file write is the one caller for which "you have seen what you authored" is true of the
+   * whole file, so it replaces the record rather than adding to it: the numbers of the version it
+   * discarded describe nothing now.
+   */
+  it('lets a whole-file write replace the record with what it wrote', () => {
+    recordRead(
+      TASK,
+      PATH,
+      1,
+      Array.from({ length: 50 }, (_, line) => `line ${line + 1}`).join('\n')
+    );
+    recordWrite(TASK, PATH, 'one\ntwo\nthree');
+    expect(displayedRanges(TASK, PATH)).toEqual([{ start: 1, end: 3 }]);
+    expect(readsOf(TASK, PATH)[0]?.lines).toEqual(['one', 'two', 'three']);
   });
 });
 

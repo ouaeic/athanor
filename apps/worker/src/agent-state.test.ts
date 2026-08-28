@@ -65,6 +65,7 @@ const FIELDS: ReadonlyArray<keyof AgentState> = [
   'repeatedFailures',
   'argumentTruncations',
   'readFileHashes',
+  'partialReads',
   'seenCalls',
   'carriedArtifacts',
   'truncatedReplies',
@@ -160,6 +161,7 @@ const FULL: Required<AgentState> = {
   repeatedFailures: { 'file_patch:conflict': 2 },
   argumentTruncations: 1,
   readFileHashes: { 'workspace/importer.py': 'a1b2c3' },
+  partialReads: { 'workspace/importer.py': 4_211 },
   seenCalls: { 'file_read:workspace/importer.py': 'call-1' },
   carriedArtifacts: ['workspace/importer.py', 'pytest -q'],
   truncatedReplies: 1,
@@ -225,7 +227,7 @@ const FULL: Required<AgentState> = {
 describe('what a turn is carrying', () => {
   it('names every field the type declares, so a new one has to be classified', () => {
     expect(Object.keys(FULL).sort()).toEqual([...FIELDS].sort());
-    expect(FIELDS).toHaveLength(57);
+    expect(FIELDS).toHaveLength(58);
   });
 
   /**
@@ -340,6 +342,7 @@ describe('what a new turn inherits', () => {
       'preparedInputTokens',
       'argumentTruncations',
       'readFileHashes',
+      'partialReads',
       'truncatedReplies',
       'contextOverflowRepairs',
       'takeoversRaised',

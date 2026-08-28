@@ -10,6 +10,7 @@ import {
   symlink,
   writeFile
 } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -30,6 +31,7 @@ import {
   writeWorkspaceFile,
   WorkspaceFileError
 } from './files.js';
+import { displayedLines, fileIdentity, forgetDisplayedLines } from './seen-lines.js';
 
 describe('workspace files', () => {
   let root: string;
@@ -391,6 +393,92 @@ describe('reading a window of a file', () => {
     expect(rest.content.toString('utf8').split('\n')[0]).toMatch(/^\d+:y+$/);
   });
 
+  /*
+   * The two ways a window can end early, which are not the same fact and were reported as one.
+   *
+   * `truncated` says the window stopped before what was asked for. It does not say whether the
+   * budget ran out inside a line or exactly between two of them, and the seen-line record turns on
+   * precisely that: a line delivered in half was not displayed, and a line delivered whole was,
+   * even when there was no room to start the next one. Reading the record off `truncated` marked
+   * the last whole line of every budget-aligned window unseen - a hole one line wide that no amount
+   * of paging could close, because the reader's own `nextStartLine` steps over it.
+   *
+   * The file below is built so the budget lands exactly on a line boundary: 35 characters and a
+   * newline is 36 bytes, so 10 lines are 360 and line 11 cannot begin.
+   */
+  it('counts the last line of a window the budget ended between, and not one it ended inside', async () => {
+    forgetDisplayedLines();
+    const row = (index: number): string => `r${String(index).padStart(34, '0')}`;
+    const target = path.join(root, 'workspace', 'aligned.txt');
+    await writeFile(
+      target,
+      `${Array.from({ length: 40 }, (_, index) => row(index + 1)).join('\n')}\n`
+    );
+
+    const between = await readWorkspaceFileLines(root, 'workspace/aligned.txt', {
+      startLine: 1,
+      endLine: 40,
+      maxBytes: 360
+    });
+    expect(between.truncated).toBe(true);
+    expect(between.partialLine).toBe(false);
+    expect(between.content.toString('utf8').split('\n')).toHaveLength(10);
+    // Line 10 arrived whole, so it is recorded, and the next read starts after it rather than on
+    // it. Those two have to agree or paging leaves a gap behind.
+    expect(between.endLine).toBe(10);
+    expect(between.nextStartLine).toBe(11);
+    expect(displayedLines(target, fileIdentity(await stat(target)))).toEqual([
+      { start: 1, end: 10 }
+    ]);
+
+    forgetDisplayedLines();
+    const inside = await readWorkspaceFileLines(root, 'workspace/aligned.txt', {
+      startLine: 1,
+      endLine: 40,
+      maxBytes: 370
+    });
+    expect(inside.truncated).toBe(true);
+    expect(inside.partialLine).toBe(true);
+    // The eleventh line is handed over cut short - the caller asked for it - and is not vouched for.
+    expect(inside.endLine).toBe(11);
+    expect(inside.nextStartLine).toBe(11);
+    expect(displayedLines(target, fileIdentity(await stat(target)))).toEqual([
+      { start: 1, end: 10 }
+    ]);
+  });
+
+  /*
+   * The two read arms have to record the same lines for the same delivered prefix, because the two
+   * seen-line ledgers are asked the same question about it. They disagreed by one whenever the
+   * budget fell on a line boundary: the whole-file display arm counted the last whole line and the
+   * ranged one did not.
+   */
+  it('records the same lines as the whole-file display arm for the same delivered prefix', async () => {
+    const row = (index: number): string => `r${String(index).padStart(34, '0')}`;
+    const target = path.join(root, 'workspace', 'agree.txt');
+    await writeFile(
+      target,
+      `${Array.from({ length: 40 }, (_, index) => row(index + 1)).join('\n')}\n`
+    );
+    const identity = fileIdentity(await stat(target));
+
+    forgetDisplayedLines();
+    await readWorkspaceFile(root, 'workspace/agree.txt', 10_000_000, {
+      maxBytes: 360,
+      maxLines: 800
+    });
+    const whole = displayedLines(target, identity);
+
+    forgetDisplayedLines();
+    await readWorkspaceFileLines(root, 'workspace/agree.txt', {
+      startLine: 1,
+      endLine: 800,
+      maxBytes: 360
+    });
+    expect(displayedLines(target, identity)).toEqual(whole);
+    expect(whole).toEqual([{ start: 1, end: 10 }]);
+  });
+
   it('advances past one line that is longer than the whole budget, rather than looping on it', () => {
     // The single case with nowhere clean to go: resuming at the line would return the same half
     // forever. It advances and reports `truncated`, which is the only honest answer left.
@@ -406,6 +494,106 @@ describe('reading a window of a file', () => {
         expect(first.truncated).toBe(true);
         expect(first.nextStartLine).toBe(2);
       });
+  });
+});
+
+/*
+ * A read that says it is a display, which is the only kind that counts as having shown anything.
+ *
+ * The route answers two callers that used to be identical on the wire: an unbounded `file_read`,
+ * which puts lines in front of a model, and the read `file_patch` makes to match against, which puts
+ * nothing in front of anybody. Recording neither of them made the guard below refuse edits to lines
+ * the model HAD been shown; recording both would make it inert for the tool it exists to guard. So a
+ * caller that is about to display what it gets says so by naming the budget it will display within,
+ * and gets back that much of the file and no more.
+ */
+describe('a read that carries a display budget', () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(tmpdir(), 'athanor-runner-'));
+    await ensureWorkspace(root);
+    forgetDisplayedLines();
+  });
+  afterEach(async () => rm(root, { recursive: true, force: true }));
+
+  it('hands back the prefix that fits and the hash of the whole file', async () => {
+    const lines = Array.from({ length: 400 }, (_, index) => `line ${index + 1}`);
+    const whole = `${lines.join('\n')}\n`;
+    await writeFile(path.join(root, 'workspace', 'app.ts'), whole);
+
+    const read = await readWorkspaceFile(root, 'workspace/app.ts', 1_000_000, {
+      maxBytes: 1_000_000,
+      maxLines: 50
+    });
+
+    expect(read.displayedLines).toBe(50);
+    expect(read.partialLine).toBe(false);
+    // 401 rather than 400: lines are separated by newlines, so a file ending in one has a final
+    // empty line, and the numbers a read hands out have to mean what `toLines` means by them.
+    expect(read.totalLines).toBe(401);
+    expect(read.content.toString('utf8').split('\n')).toHaveLength(50);
+    // The hash is of the FILE. It is the claim a later write makes about what it is replacing, and
+    // a digest of a prefix would be a claim about nothing at all.
+    expect(read.sha256).toBe(createHash('sha256').update(whole).digest('hex'));
+  });
+
+  it('counts the last line of a file that does not end in a newline as a line it showed', async () => {
+    // The boundary that decides whether a small file with no trailing newline is treated as fully
+    // read. Getting it wrong here refuses every write to one of them, forever, with no way out.
+    await writeFile(path.join(root, 'workspace', 'notes.md'), 'one\ntwo\nthree');
+    const read = await readWorkspaceFile(root, 'workspace/notes.md', 1_000_000, {
+      maxBytes: 1_000_000,
+      maxLines: 800
+    });
+    expect(read.totalLines).toBe(3);
+    expect(read.displayedLines).toBe(3);
+    expect(read.content.toString('utf8')).toBe('one\ntwo\nthree');
+  });
+
+  it('shows the start of a line longer than the whole budget and vouches for none of it', async () => {
+    /*
+     * A file with no newlines in it is not an exemption from the budget, it is the case that proves
+     * the budget is about bytes delivered rather than lines delivered.
+     * `apps/desktop/src-tauri/gen/schemas/acl-manifests.json` is 76,478 bytes on one line. An answer
+     * of no lines would be a dead end the caller cannot act on, so the start of the line is
+     * delivered - and it is not counted, for the same reason the ranged reader does not count the
+     * line its byte budget cut in half.
+     */
+    await writeFile(path.join(root, 'workspace', 'acl.json'), 'x'.repeat(76_478));
+    const read = await readWorkspaceFile(root, 'workspace/acl.json', 1_000_000, {
+      maxBytes: 18_000,
+      maxLines: 800
+    });
+
+    expect(read.content.length).toBe(18_000);
+    expect(read.displayedLines).toBe(0);
+    expect(read.partialLine).toBe(true);
+    expect(read.totalLines).toBe(1);
+    const target = path.join(root, 'workspace', 'acl.json');
+    expect(displayedLines(target, fileIdentity(await stat(target)))).toBeUndefined();
+  });
+
+  it('never cuts a character in half, whatever the budget lands on', async () => {
+    // The budget is in bytes and the file is not. A cut through a multi-byte character would hand
+    // back a replacement character the caller would then display as if the file contained one.
+    await writeFile(path.join(root, 'workspace', 'poem.txt'), '€'.repeat(400));
+    const read = await readWorkspaceFile(root, 'workspace/poem.txt', 1_000_000, {
+      maxBytes: 100,
+      maxLines: 800
+    });
+    expect(read.content.length).toBe(99);
+    expect(read.content.toString('utf8')).toBe('€'.repeat(33));
+  });
+
+  it('says nothing about a file when no budget was named', async () => {
+    // `file_patch` reads the whole file one call before its write, to match against. If that counted
+    // as a display, every patch would announce that the model had just seen the whole file and the
+    // guard would be inert for the one tool it exists to guard.
+    await writeFile(path.join(root, 'workspace', 'app.ts'), 'a\nb\nc\n');
+    const read = await readWorkspaceFile(root, 'workspace/app.ts', 1_000_000);
+    expect(read.totalLines).toBeUndefined();
+    const target = path.join(root, 'workspace', 'app.ts');
+    expect(displayedLines(target, fileIdentity(await stat(target)))).toBeUndefined();
   });
 });
 
@@ -568,6 +756,58 @@ describe('the seen-line guard', () => {
   });
 
   /*
+   * THE INVERTED REFUSAL, which is the failure that would have got this guard deleted.
+   *
+   * The worker's ordinary sequence is an unwindowed read, which displays a bounded prefix, and then
+   * a window over the rest. Only the window was recorded here, so the two records of what the model
+   * had been shown disagreed about the prefix - and editing line 20, a line the FIRST read had put
+   * on screen, was refused by name while editing line 300 sailed through. A guard that refuses
+   * legitimate edits gets deleted by the first person it inconveniences and deserves to be. So the
+   * positive case is the one asserted first: shown means editable.
+   */
+  it('applies an edit anchored in the prefix an unwindowed read displayed', async () => {
+    const shown = await readWorkspaceFile(root, file, 10_000_000, {
+      maxBytes: 1_000_000,
+      maxLines: 50
+    });
+    expect(shown.displayedLines).toBe(50);
+    await look(51, 100);
+
+    await write(await prepare('line 20', 'line 20 // touched'));
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toContain(
+      'line 20 // touched'
+    );
+    // And it has not become permissive on the way: line 300 is past everything either read showed.
+    await expect(write(await prepare('line 300', 'line 300 // blind'))).rejects.toMatchObject({
+      status: 428
+    });
+  });
+
+  /*
+   * The agent's whole-file write after a WINDOW, which claims no hash because the ranged reader has
+   * no whole-file digest to give it. The guard was opened only for callers that claim one, so on the
+   * commonest read shape in the harness - 47.4% of 14,314 real reads on this machine - it never ran:
+   * measured through the shipped tool on an 8,332-line file, `file_read` of lines 1-200 followed by a
+   * whole-file write was accepted and destroyed 8,330 lines.
+   */
+  it('holds an agent to what it was shown even when it claims no hash', async () => {
+    await look(1, 50);
+    const blind = Buffer.from(`${lines.join('\n')}\n`.replace('line 300', 'line 300 // blind'));
+    await expect(
+      writeWorkspaceFile(root, file, blind, 10_000_000, undefined, { heldToReads: true })
+    ).rejects.toMatchObject({ status: 428 });
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).not.toContain('blind');
+
+    // And it is a guard rather than a wall: the same unclaimed write, aimed at a line that read did
+    // show, lands.
+    const seen = Buffer.from(`${lines.join('\n')}\n`.replace('line 20', 'line 20 // seen'));
+    await writeWorkspaceFile(root, file, seen, 10_000_000, undefined, { heldToReads: true });
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toContain(
+      'line 20 // seen'
+    );
+  });
+
+  /*
    * The refusal has to carry the truth with it. A refusal that costs a round trip is barely better
    * than the wrong edit it prevented: the model re-reads, re-derives the same patch, and the owner
    * pays for two turns to get one edit. So the real text arrives inline, the refusal counts as
@@ -681,6 +921,129 @@ describe('the seen-line guard', () => {
       10_000_000,
       read.sha256
     );
+  });
+
+  /*
+   * THE FALSE REFUSAL, and it is the shape a model reaches for on a large file: read a window here,
+   * read a window there, change one line in each of them in a single patch.
+   *
+   * What the guard is handed is a whole-file write, so it recovers what changed by comparing the
+   * two versions - and comparing only from the two ends answers with the hull from the first change
+   * to the last. Measured here before this: one write changing line 20 and line 320, both of them
+   * lines a read had displayed, refused with "this edit changes app.ts at line 51-299" - 249 lines
+   * it does not touch, named as though it did.
+   */
+  it('applies one write that changes two lines far apart, both of them shown', async () => {
+    await look(1, 50);
+    await look(300, 350);
+    const read = await readWorkspaceFile(root, file, 10_000_000);
+    const after = read.content
+      .toString('utf8')
+      .replace('line 20\n', 'line 20 // near\n')
+      .replace('line 320\n', 'line 320 // far\n');
+    await writeWorkspaceFile(root, file, Buffer.from(after), 10_000_000, read.sha256);
+    const now = await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8');
+    expect(now).toContain('line 20 // near');
+    expect(now).toContain('line 320 // far');
+  });
+
+  /*
+   * And it has not become permissive on the way, which is the direction that matters: the same
+   * two-place write, with one of the two places never displayed, is still refused - and the
+   * refusal names that place and not the distance between them.
+   */
+  it('still refuses the far half of a two-place write when no read showed it', async () => {
+    await look(1, 50);
+    const read = await readWorkspaceFile(root, file, 10_000_000);
+    const after = read.content
+      .toString('utf8')
+      .replace('line 20\n', 'line 20 // near\n')
+      .replace('line 320\n', 'line 320 // blind\n');
+    const refusal = await writeWorkspaceFile(
+      root,
+      file,
+      Buffer.from(after),
+      10_000_000,
+      read.sha256
+    ).catch((error: unknown) => error);
+    expect(refusal).toMatchObject({ status: 428 });
+    expect((refusal as Error).message).toContain('at line 320');
+    expect((refusal as Error).message).not.toContain('51-299');
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).not.toContain('// near');
+  });
+
+  /*
+   * THE ATTACK ON THE SPLIT ITSELF. Reporting several spans instead of one is only safe if every
+   * line the write destroys is inside one of them, and the two shapes that could slip through a
+   * split that was too clever are both here: a whole-file write that keeps its shown prefix and
+   * discards everything after it, and a write that deletes a block in the middle nothing showed.
+   * Any line the split calls unchanged is a line present in both versions, so neither can.
+   */
+  it('refuses a write that discards the part of the file no read reached', async () => {
+    await look(1, 50);
+    const read = await readWorkspaceFile(root, file, 10_000_000);
+    await expect(
+      writeWorkspaceFile(
+        root,
+        file,
+        Buffer.from(`${lines.slice(0, 50).join('\n')}\n`),
+        10_000_000,
+        read.sha256
+      )
+    ).rejects.toMatchObject({ status: 428 });
+
+    const gutted = await readWorkspaceFile(root, file, 10_000_000);
+    const without = [...lines.slice(0, 200), ...lines.slice(300)].join('\n');
+    const refusal = await writeWorkspaceFile(
+      root,
+      file,
+      Buffer.from(`${without}\n`),
+      10_000_000,
+      gutted.sha256
+    ).catch((error: unknown) => error);
+    expect(refusal).toMatchObject({ status: 428 });
+    expect((refusal as Error).message).toContain('201-300');
+    expect(
+      (await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).split('\n')
+    ).toHaveLength(401);
+  });
+
+  /*
+   * The record follows the file across a write that touched it in several places, and each place is
+   * carried at the numbers the ones before it moved it to. Without that, the second edit of a turn
+   * is either refused for lines the first one shifted or allowed anywhere at all.
+   */
+  it('carries the record across a write that changed the file in two places and its length', async () => {
+    await look(1, 60);
+    const read = await readWorkspaceFile(root, file, 10_000_000);
+    const after = read.content
+      .toString('utf8')
+      .replace('line 10\n', 'line 10 // first\nline 10 // and a half\n')
+      .replace('line 50\n', 'line 50 // second\n');
+    await writeWorkspaceFile(root, file, Buffer.from(after), 10_000_000, read.sha256);
+
+    // Line 55 of the new file is line 54 of the old one, which that read displayed: editable.
+    const next = await readWorkspaceFile(root, file, 10_000_000);
+    await writeWorkspaceFile(
+      root,
+      file,
+      Buffer.from(next.content.toString('utf8').replace('line 54\n', 'line 54 // third\n')),
+      10_000_000,
+      next.sha256
+    );
+    expect(await readFile(path.join(root, 'workspace', 'app.ts'), 'utf8')).toContain('// third');
+
+    // And line 300, which nothing has shown, is still refused after both of them.
+    const last = await readWorkspaceFile(root, file, 10_000_000);
+    await expect(
+      writeWorkspaceFile(
+        root,
+        file,
+        Buffer.from(last.content.toString('utf8').replace('line 300\n', 'line 300 // blind\n')),
+        10_000_000,
+        last.sha256
+      )
+    ).rejects.toMatchObject({ status: 428 });
   });
 
   /*

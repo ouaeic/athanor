@@ -23,6 +23,8 @@ export {
 export { parseEdit, type EditOp, type ParseResult } from './parse.js';
 export { EDIT_FORMAT_SPEC } from './prompt.js';
 export {
+  displayedRanges,
+  firstUnshownLine,
   forgetPath,
   forgetReads,
   readsOf,
@@ -30,5 +32,7 @@ export {
   recordWrite,
   SNAPSHOTS_PER_PATH,
   SNAPSHOT_HORIZON_MS,
+  type LineChange,
+  type LineRange,
   type Snapshot
 } from './snapshots.js';

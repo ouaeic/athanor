@@ -218,27 +218,106 @@ export const listFiles = async (root: string, requested = '.'): Promise<unknown[
   );
 };
 
+/** Big enough that an ordinary source file arrives in one read, small enough to cost nothing. */
+const LINE_SCAN_BYTES = 256 * 1024;
+const NEWLINE = 0x0a;
+
 /**
- * The whole file, and deliberately not a display.
+ * How much of a file a caller says it will put in front of a model, and therefore how much of it
+ * this module will vouch for having been shown.
+ *
+ * Two numbers rather than one because the two failures are different: bytes bound what a result can
+ * carry, and lines bound how many anchors a single read may authorise. A column of two-character
+ * lines exhausts neither budget on its own.
+ */
+export type DisplayBudget = { maxBytes: number; maxLines: number };
+
+/** The longest prefix of `line` that is at most `limit` bytes and does not split a code point. */
+const wholeCodePoints = (line: Buffer, limit: number): Buffer => {
+  let end = Math.min(limit, line.length);
+  // A continuation byte at the cut means the code point starts before it; step back off the run.
+  while (end > 0 && ((line[end] ?? 0) & 0b1100_0000) === 0b1000_0000) end -= 1;
+  return line.subarray(0, end);
+};
+
+/**
+ * The leading lines of a file that fit a display budget, counted the way `toLines` counts them.
+ *
+ * Lines are SEPARATED by newlines rather than terminated by them, so `a\nb\n` is three lines and the
+ * third is empty - which is what `String.split('\n')` does on the worker side and therefore what the
+ * numbers in a read mean. The loop below counts the same way on the bytes: it steps past a newline
+ * to reach the next line, and the run of bytes after the last newline is a line too, including the
+ * empty one at the end of a file that ends in a newline.
+ *
+ * `whole` is the load-bearing number. It is what gets recorded as displayed, and it counts only
+ * lines that arrived entire: the one case where a line is delivered in half is a first line longer
+ * than the whole budget, which cannot be served whole and must not be served empty - an answer of no
+ * lines is a dead end the model cannot act on. That half-line is returned and is NOT counted, for
+ * exactly the reason the ranged reader does not count its own: a record that vouched for the half
+ * that never arrived is the blind anchor this whole module exists to refuse.
+ */
+export const displayablePrefix = (
+  content: Buffer,
+  display: DisplayBudget
+): { prefix: Buffer; whole: number; partialLine: boolean } => {
+  let offset = 0;
+  let whole = 0;
+  while (whole < display.maxLines) {
+    const newline = content.indexOf(NEWLINE, offset);
+    const end = newline === -1 ? content.length : newline + 1;
+    if (end > display.maxBytes) break;
+    offset = end;
+    whole += 1;
+    // Nothing follows the last run of bytes in the file, so that was the final line.
+    if (newline === -1) break;
+  }
+  if (offset === content.length) return { prefix: content, whole, partialLine: false };
+  if (whole === 0)
+    return {
+      prefix: wholeCodePoints(content, display.maxBytes),
+      whole: 0,
+      partialLine: content.length > 0
+    };
+  // Something is left, so the last counted line ended on a newline - and that newline separates it
+  // from a line this read is not delivering, so it is not part of the answer.
+  return { prefix: content.subarray(0, offset - 1), whole, partialLine: false };
+};
+
+/**
+ * The whole file, and a display only when the caller says it is one.
  *
  * This route answers two callers that look identical on the wire and are opposites in meaning: an
- * unbounded `file_read`, which puts every line in front of the model, and the read-modify-write
- * that `file_patch` does one call before its write, which puts nothing in front of anybody. If this
- * recorded what it returned, every patch would announce that the model had just seen the whole
- * file - and the seen-line guard below would be inert for the one tool it exists to guard. So
- * nothing is recorded here, and only a window read, which no internal caller makes, counts as
- * having been shown.
+ * unbounded `file_read`, which puts lines in front of the model, and the read-modify-write that
+ * `file_patch` does one call before its write, which puts nothing in front of anybody. If this
+ * recorded what it returned unconditionally, every patch would announce that the model had just seen
+ * the whole file, and the seen-line guard below would be inert for the one tool it exists to guard.
  *
- * The cost of that choice is one case: a window read followed by an unbounded read followed by an
- * edit outside the window is refused once, on a file the model really had seen all of. It is
- * refused with the text inlined, so the retry lands immediately - one refusal, no extra read, and
- * the alternative was a guard that never fires.
+ * So the two are no longer identical on the wire. A caller that is about to DISPLAY what it gets
+ * passes the budget it will display within, and gets back only that much of the file plus the whole
+ * file's hash; that prefix, and nothing beyond it, is recorded as shown. A caller that passes no
+ * budget gets the file and is recorded as having shown nothing, exactly as before.
+ *
+ * Handing back only the prefix is the point rather than an economy. The two ledgers - this one and
+ * `apps/worker/src/edit/snapshots.ts` - disagreed for as long as the worker did the cutting after
+ * the fact: an unwindowed read displayed lines 1-266 of a 600-line file and recorded 267-600 here,
+ * so editing line 50, WHICH THE MODEL HAD BEEN SHOWN, was refused while editing line 400 was not.
+ * A caller cannot display what it was never sent, so delivering the prefix is what makes the two
+ * records the same set of lines by construction rather than by two implementations agreeing.
  */
 export const readWorkspaceFile = async (
   root: string,
   requested: string,
-  maxBytes: number
-): Promise<{ content: Buffer; sha256: string }> => {
+  maxBytes: number,
+  display?: DisplayBudget
+): Promise<{
+  content: Buffer;
+  sha256: string;
+  /** Lines in the whole file, and how many of them the returned prefix carries whole. Display only. */
+  totalLines?: number;
+  displayedLines?: number;
+  /** Whether one further line is included, cut short - the first line longer than the whole budget. */
+  partialLine?: boolean;
+}> => {
   const target = resolveInside(root, requested);
   await rejectSymlinkComponents(root, target);
   const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -248,15 +327,20 @@ export const readWorkspaceFile = async (
     if (!details.isFile()) throw new Error('Requested path is not a regular file');
     if (details.size > maxBytes) throw new Error(`File exceeds ${maxBytes} byte read limit`);
     const content = await handle.readFile();
-    return { content, sha256: createHash('sha256').update(content).digest('hex') };
+    // The hash is of the FILE, not of what is returned: it is the caller's claim about what it is
+    // replacing on a later write, and a digest of a prefix would be a claim about nothing.
+    const sha256 = createHash('sha256').update(content).digest('hex');
+    if (!display) return { content, sha256 };
+    const { prefix, whole, partialLine } = displayablePrefix(content, display);
+    let totalLines = 1;
+    for (let at = content.indexOf(NEWLINE); at !== -1; at = content.indexOf(NEWLINE, at + 1))
+      totalLines += 1;
+    if (whole >= 1) recordDisplayedLines(target, fileIdentity(details), { start: 1, end: whole });
+    return { content: prefix, sha256, totalLines, displayedLines: whole, partialLine };
   } finally {
     await handle.close();
   }
 };
-
-/** Big enough that an ordinary source file arrives in one read, small enough to cost nothing. */
-const LINE_SCAN_BYTES = 256 * 1024;
-const NEWLINE = 0x0a;
 
 /**
  * A window of lines, read without the whole file ever being in memory.
@@ -285,6 +369,8 @@ export const readWorkspaceFileLines = async (
   totalLines?: number;
   nextStartLine?: number;
   truncated: boolean;
+  /** Whether one further line is included, cut short by the byte budget. */
+  partialLine: boolean;
   sizeBytes: number;
 }> => {
   const target = resolveInside(root, requested);
@@ -303,6 +389,20 @@ export const readWorkspaceFileLines = async (
     // belongs to the answer only when another line follows it in the window.
     let lastKeptTerminated = false;
     let truncated = false;
+    /*
+     * Whether the budget stopped INSIDE a line rather than BETWEEN two of them, which is not the
+     * same question as `truncated` and was being answered with it.
+     *
+     * A budget that runs out with one byte of the next line already taken delivered half a line,
+     * and half a line was not displayed. A budget that runs out exactly as a line ends delivered
+     * that line whole and simply had no room to start the next - `take` is zero, nothing of it
+     * arrived, and the line before it is as displayed as any other. Both set `truncated`, so
+     * reading the record off `truncated` marked the last whole line of the first kind of window
+     * unseen. Measured through the shipped arm: of 947 tracked text files, nine paged end to end
+     * following only this reader's own `nextStartLine` came out with a one-line hole in their
+     * coverage, and the whole-file write the model had just earned was refused for it.
+     */
+    let partialLine = false;
     let position = 0;
     let eof = false;
     while (!truncated && line <= window.endLine) {
@@ -326,7 +426,12 @@ export const readWorkspaceFileLines = async (
             lastKept = line;
             lastKeptTerminated = newline !== -1 && take === end - cursor;
           }
-          if (take < end - cursor) truncated = true;
+          if (take < end - cursor) {
+            truncated = true;
+            // Something of this line arrived and the rest did not, so this line is the half-seen
+            // one. Nothing of it arrived when `take` is zero, and then the line before it stands.
+            partialLine = take > 0;
+          }
         }
         cursor = end;
         if (newline !== -1) line += 1;
@@ -341,13 +446,15 @@ export const readWorkspaceFileLines = async (
     const content = Buffer.concat(kept);
     /*
      * What this read actually put in front of its caller, remembered so a later write can be held
-     * to it. A read cut short by its byte budget stopped mid-line, and that line was not displayed:
+     * to it. A read cut short INSIDE a line stopped mid-line, and that line was not displayed:
      * counting it would vouch for the half that never arrived, which is precisely the kind of
-     * half-seen text this record exists to refuse an edit on.
+     * half-seen text this record exists to refuse an edit on. A read cut short BETWEEN two lines
+     * delivered the earlier one whole, and refusing to count it vouches for nothing - it only
+     * withholds credit for text the caller is looking at.
      */
     recordDisplayedLines(target, fileIdentity(details), {
       start: window.startLine,
-      end: truncated ? lastKept - 1 : lastKept
+      end: partialLine ? lastKept - 1 : lastKept
     });
     return {
       content: lastKeptTerminated ? content.subarray(0, content.length - 1) : content,
@@ -366,6 +473,13 @@ export const readWorkspaceFileLines = async (
           ? { nextStartLine: lastKept === window.startLine ? lastKept + 1 : lastKept }
           : { nextStartLine: lastKept + 1 }),
       truncated,
+      /*
+       * Whether one further line is included, cut short - the same field and the same meaning the
+       * whole-file display arm already returns, so a caller cutting the half-line off the end of
+       * what it shows asks the same question of both arms. Read arms that answered it differently
+       * are what let the two seen-line ledgers disagree about the same prefix of the same file.
+       */
+      partialLine,
       sizeBytes: details.size
     };
   } finally {
@@ -436,13 +550,24 @@ const MAX_GUARDED_FILE_BYTES = 8 * 1024 ** 2;
  * question that survives a clean hash: "did you ever read the part of it you are changing". A
  * window read of lines 1-50 and a patch anchored at line 300 agree about every byte in the file and
  * still describe an edit made blind.
+ *
+ * `heldToReads` is what makes that second question askable of a caller with no hash to offer. The
+ * agent's `file_write` after a WINDOWED read claims nothing - the ranged reader has no whole-file
+ * digest to give it - so the guard rode on a claim that arm never makes, opened the file write-only,
+ * and never ran: measured through the shipped tool on a 8,332-line file, `file_read` of lines 1-200
+ * followed by a whole-file write was accepted and destroyed 8,132 lines. It is set for writes made
+ * under an agent capability and for nothing else, because "no hash" means two opposite things
+ * depending on who said it - an agent editing from a window read, or an upload, a printed document,
+ * the owner pressing Replace in the file browser, none of which claimed to have read anything and
+ * none of which should meet a lecture about anchors.
  */
 export const writeWorkspaceFile = async (
   root: string,
   requested: string,
   content: Buffer,
   maxBytes: number,
-  expectSha256?: string
+  expectSha256?: string,
+  options?: { heldToReads?: boolean }
 ): Promise<{ sha256: string; sizeBytes: number }> => {
   if (content.length > maxBytes) throw new Error(`File exceeds ${maxBytes} byte write limit`);
   const target = resolveInside(root, requested);
@@ -452,13 +577,12 @@ export const writeWorkspaceFile = async (
   // Deliberately not O_TRUNC: the descriptor is only known to be the intended file once it has
   // been checked, and truncating first would empty whatever a raced path led to before the check
   // could refuse it.
+  // Read-write whenever something below has to look at the old bytes, so every check reads through
+  // the very descriptor that then writes and no path swap can happen between them.
+  const inspect = expectSha256 !== undefined || options?.heldToReads === true;
   const handle = await open(
     target,
-    // Read-write only when there is a claim to check, so the check reads through the very
-    // descriptor that then writes and no path swap can happen between the two.
-    (expectSha256 === undefined ? constants.O_WRONLY : constants.O_RDWR) |
-      constants.O_CREAT |
-      constants.O_NOFOLLOW,
+    (inspect ? constants.O_RDWR : constants.O_WRONLY) | constants.O_CREAT | constants.O_NOFOLLOW,
     0o660
   );
   let edit: LineEdit | undefined;
@@ -466,7 +590,7 @@ export const writeWorkspaceFile = async (
     await assertOpenedInPlace(root, target, handle);
     // Read through the descriptor already proven to be the intended file, so nothing can swap the
     // path between the check and the write. One read serves both checks below.
-    const details = expectSha256 === undefined ? undefined : await handle.stat();
+    const details = inspect ? await handle.stat() : undefined;
     const existing = details === undefined ? undefined : await handle.readFile();
     if (expectSha256 !== undefined && existing !== undefined) {
       const actual = createHash('sha256').update(existing).digest('hex');
@@ -483,13 +607,14 @@ export const writeWorkspaceFile = async (
      * different failure with a different answer - read it again - and answering it with a lecture
      * about anchors would send the model back to patch a version that no longer exists.
      *
-     * It rides on the same claim rather than on the record alone, and that is what keeps it aimed
-     * at editing. A caller with no hash to offer is not editing from a read: it is an upload
-     * replacing a file, a printed document landing on a name, the first write of anything. Held to
-     * a seen-line record those would be refused for lines they never pretended to have read - the
-     * owner pressing Replace on a file the pane had once paged through, told about anchors it has
-     * no idea it has. A claim about the old bytes is exactly the caller saying "I read this", and
-     * only that caller can be asked which part of it.
+     * It runs for a caller that claimed a hash or that said it edits from reads, and that is what
+     * keeps it aimed at editing. A hash is one caller saying "I read this"; `heldToReads` is the
+     * other, and it exists because the agent's windowed read has no whole-file digest to claim and
+     * so was skipping the guard entirely. Everyone else is left exactly as unguarded as before: an
+     * upload replacing a file, a printed document landing on a name, the owner pressing Replace on a
+     * file the Files pane had paged through - none of them claimed to have read anything, and
+     * refusing them for lines they never pretended to have seen would put a lecture about anchors in
+     * front of a person who has no idea what one is.
      *
      * Binary content is skipped for the same reason: lines are not what it is made of, and a file
      * with a zero byte in it has no anchors to have seen. A file too large to hold as lines is
@@ -507,30 +632,30 @@ export const writeWorkspaceFile = async (
       if (seen) {
         const before = existing.toString('utf8').split('\n');
         edit = lineEdit(before, content.toString('utf8').split('\n'));
-        if (edit.anchors) {
-          const unseen = unseenWithin(edit.anchors, seen);
-          if (unseen.length) {
-            const name = path.relative(root, target);
-            const disclosure = discloseUnseen(before, unseen);
-            if (!disclosure)
-              throw new WorkspaceFileError(
-                `This edit changes ${name} at line ${sayRanges(unseen)}, and no read has shown you those lines. That is too much unread file to hand back here. Read it with file_read using startLine and endLine over that range, then send the edit again.`,
-                428
-              );
-            /*
-             * The refusal is a display. Recording it is what stops the guard looping: the model is
-             * shown the truth once and the same edit, sent again, applies. Only the lines that
-             * actually fit in the message are recorded - a range the byte budget cut short was not
-             * shown, and the next attempt is refused again with the rest of it, which terminates
-             * because every round hands over more.
-             */
-            for (const range of disclosure.disclosed)
-              recordDisplayedLines(target, fileIdentity(details), range);
+        // One list of gaps across every span the write touched. A patch that changes two places is
+        // asked about both of them and about nothing in between - see `lineEdit`.
+        const unseen = edit.anchors.flatMap((anchor) => unseenWithin(anchor, seen));
+        if (unseen.length) {
+          const name = path.relative(root, target);
+          const disclosure = discloseUnseen(before, unseen);
+          if (!disclosure)
             throw new WorkspaceFileError(
-              `This edit changes ${name} at line ${sayRanges(unseen)}, and no read has shown you those lines - so it is being made from memory of a file you have only seen part of. Here is what is actually there. Check your edit against it and send the same call again; these lines now count as read, so it will apply.\n\n${disclosure.text}`,
+              `This edit changes ${name} at line ${sayRanges(unseen)}, and no read has shown you those lines. That is too much unread file to hand back here. Read it with file_read using startLine and endLine over that range, then send the edit again.`,
               428
             );
-          }
+          /*
+           * The refusal is a display. Recording it is what stops the guard looping: the model is
+           * shown the truth once and the same edit, sent again, applies. Only the lines that
+           * actually fit in the message are recorded - a range the byte budget cut short was not
+           * shown, and the next attempt is refused again with the rest of it, which terminates
+           * because every round hands over more.
+           */
+          for (const range of disclosure.disclosed)
+            recordDisplayedLines(target, fileIdentity(details), range);
+          throw new WorkspaceFileError(
+            `This edit changes ${name} at line ${sayRanges(unseen)}, and no read has shown you those lines - so it is being made from memory of a file you have only seen part of. Here is what is actually there. Check your edit against it and send the same call again; these lines now count as read, so it will apply.\n\n${disclosure.text}`,
+            428
+          );
         }
       }
     }

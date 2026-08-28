@@ -331,6 +331,80 @@ export class AgentRunnerClient {
   }
 
   /**
+   * The same read again, said out loud to be a DISPLAY - which is what makes it count as one.
+   *
+   * `readFileWithHash` above and this are the same route and were, until this existed, the same
+   * request: an unbounded `file_read` putting lines in front of the model, and the read `file_patch`
+   * makes to match against, which puts nothing in front of anybody. The runner cannot tell them
+   * apart, so it recorded neither - and its seen-line guard, which is what stands between a blind
+   * anchor and the disk, therefore had nothing to say about the most ordinary read in the harness.
+   * Editing a line an unwindowed read HAD shown was refused, by name, for that reason.
+   *
+   * The budget travels with the request rather than the answer coming back whole and being cut here,
+   * because a caller cannot display what it was never sent. What arrives is what the runner recorded
+   * as shown, byte for byte, instead of two layers computing the same prefix and being trusted to
+   * keep agreeing. The hash is still of the whole file: it is the claim a later write makes about
+   * what it is replacing, and a digest of a prefix would be a claim about nothing.
+   */
+  async readFileForDisplay(
+    workspaceId: string,
+    taskId: string,
+    requestedPath: string,
+    display: { maxBytes: number; maxLines: number }
+  ): Promise<{
+    content: string;
+    sha256: string | null;
+    totalLines: number;
+    displayedLines: number;
+    partialLine: boolean;
+  }> {
+    const token = signCapabilityToken(
+      {
+        sub: taskId,
+        workspaceId,
+        role: 'agent',
+        scopes: ['files.read'],
+        aud: capabilityAudience('GET', `/v1/workspaces/${workspaceId}/file`),
+        nonce: randomUUID()
+      },
+      this.secret,
+      90
+    );
+    const query = new URLSearchParams({
+      path: requestedPath,
+      displayBytes: String(display.maxBytes),
+      displayLines: String(display.maxLines)
+    });
+    const response = await runnerFetch(
+      `${this.baseUrl}/v1/workspaces/${workspaceId}/file?${query.toString()}`,
+      {
+        headers: { authorization: `Bearer ${token}` },
+        signal: requestSignal(FILE_REQUEST_TIMEOUT_MS)
+      },
+      FILE_REQUEST_TIMEOUT_MS
+    );
+    if (!response.ok) throw await runnerFailure(response);
+    const content = await response.text();
+    const count = (header: string, fallback: number): number => {
+      const raw = response.headers.get(header);
+      return raw === null || !Number.isFinite(Number(raw)) ? fallback : Number(raw);
+    };
+    /*
+     * The fallbacks are what a runner one release behind this worker answers with: no display
+     * headers at all, and the whole file in the body. Reading that as "every line of it was
+     * displayed" is the only safe reading, because it is exactly what happened.
+     */
+    const lines = content.split('\n').length;
+    return {
+      content,
+      sha256: response.headers.get('x-content-sha256'),
+      totalLines: count('x-total-lines', lines),
+      displayedLines: count('x-display-lines', lines),
+      partialLine: response.headers.get('x-partial-line') === 'true'
+    };
+  }
+
+  /**
    * The lines a read asked for, and what was left out of them.
    *
    * `readFile` fetches the whole file, which is what a patch or an upload needs and what a look at
@@ -350,6 +424,8 @@ export class AgentRunnerClient {
     totalLines?: number;
     nextStartLine?: number;
     truncated: boolean;
+    /** Whether the last row of `content` is half a line, cut short by the byte budget. */
+    partialLine: boolean;
     fileBytes: number;
   }> {
     const token = signCapabilityToken(
@@ -394,6 +470,14 @@ export class AgentRunnerClient {
       ...(totalLines === undefined ? {} : { totalLines }),
       ...(nextStartLine === undefined ? {} : { nextStartLine }),
       truncated: response.headers.get('x-truncated') === 'true',
+      /*
+       * Absent means false, and that is the safe way round rather than the convenient one. A runner
+       * too old to send this header is one whose windows are cut only where this worker already
+       * believed they were; reading a missing header as "a line was cut" would drop the last whole
+       * line of every window that ended on its budget, which is the defect this header exists to
+       * close.
+       */
+      partialLine: response.headers.get('x-partial-line') === 'true',
       fileBytes: count('x-file-bytes') ?? 0
     };
   }

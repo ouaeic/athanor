@@ -821,6 +821,13 @@ describe('the workspace arms', () => {
     expect(executed.calls[0]?.path).toBe(`${root}/files?path=workspace`);
   });
 
+  /*
+   * The display budget rides on the query, which is what turns an unbounded read into a statement
+   * about what is going in front of the model - and what makes the runner record it as shown. This
+   * runner answers with no display headers at all, which is what a runner one release behind this
+   * worker does, so the fallback is under test here too: the whole body arrived, so the whole body
+   * was displayed.
+   */
   it('reads a whole file through the hashed read, and remembers the hash for a later write', async () => {
     const executed = await dispatch(
       { name: 'file_read', arguments: { path: 'workspace/notes.md' } },
@@ -835,7 +842,7 @@ describe('the workspace arms', () => {
     expect(executed.calls).toEqual([
       {
         method: 'GET',
-        path: `${root}/file?path=workspace%2Fnotes.md`,
+        path: `${root}/file?path=workspace%2Fnotes.md&displayBytes=18000&displayLines=800`,
         scopes: ['files.read'],
         body: undefined
       }
@@ -874,7 +881,7 @@ describe('the workspace arms', () => {
     expect(executed.calls).toEqual([
       {
         method: 'GET',
-        path: `${root}/file?path=workspace%2Flog.txt&startLine=900&endLine=920&maxBytes=400000`,
+        path: `${root}/file?path=workspace%2Flog.txt&startLine=900&endLine=920&maxBytes=18000`,
         scopes: ['files.read'],
         body: undefined
       }

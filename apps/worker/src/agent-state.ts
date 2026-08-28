@@ -168,6 +168,24 @@ export interface AgentState {
   /** What each file held when this turn last read or wrote it, so a whole-file write can say so. */
   readFileHashes?: Record<string, string>;
   /**
+   * Files this turn has read part of, to a line number the reads have to cover before a whole-file
+   * write of them is allowed.
+   *
+   * A hash says the file has not changed since it was read; it says nothing about how much of it
+   * the model was shown, and a whole-file `file_write` claiming one is a request to replace lines
+   * that may never have been on screen. This is what the write is held to instead, and it is a
+   * number rather than a flag because the refusal lifts as soon as the reads on record cover it.
+   *
+   * A FLOOR, not always the exact length. An unwindowed read knows the file's length exactly; a
+   * windowed read that stopped before the end knows only that the file goes at least one line
+   * further than what it delivered whole, because the runner's ranged reader will not walk to the
+   * end of a two-gigabyte log to count. Both are recorded here, both are true as "at least this
+   * many", and the value is only ever raised - a later narrow read learning less about a file must
+   * not lower a bar a wider one set. Absent means nothing is outstanding: the file was never read
+   * this turn, was read in full, or has since been rewritten by this turn's own edit.
+   */
+  partialReads?: Record<string, number>;
+  /**
    * Read-only calls already made this turn, keyed by tool and arguments, to the id that made them.
    * Only the tools in `IDEMPOTENT_WITHIN_TURN` are recorded, and only to answer an exact repeat
    * with the pointer rather than the same work again.

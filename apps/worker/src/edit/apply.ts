@@ -37,7 +37,7 @@
 import { blockAt } from './block.js';
 import { normaliseLine, numberedWindow, sameLine, sameLines, sayRange, toLines } from './format.js';
 import { parseEdit, type EditOp, type ParseFailure } from './parse.js';
-import { type Snapshot } from './snapshots.js';
+import { type LineChange, type Snapshot } from './snapshots.js';
 
 export type EditRefusal =
   | ParseFailure
@@ -56,6 +56,15 @@ export type EditResult =
       readonly text: string;
       /** Line ranges of the new file the patch wrote, for the echo the result carries back. */
       readonly wrote: ReadonlyArray<{ from: number; to: number }>;
+      /**
+       * Every span this patch replaced, in both numberings, ascending.
+       *
+       * The ledger needs the OLD numbers as well as the new ones: it is holding ranges of the file
+       * as it was read, and to carry them across this write it has to know which of them this patch
+       * removed and how far the rest moved. `wrote` cannot answer that - it says where the new text
+       * is and not what it displaced.
+       */
+      readonly changed: readonly LineChange[];
       /** Spellings forgiven and anchors corrected, in the words the model gets back. */
       readonly notes: readonly string[];
     }
@@ -273,10 +282,17 @@ export const applyEdit = (
   const registers = new Map<string, readonly string[]>();
 
   /*
-   * A range no read displayed is a range the model is guessing at, and the refusal below has to
-   * carry the real text at those lines or it costs a round trip for nothing. That is the same
-   * bargain `services/workspace-runner/src/seen-lines.ts` strikes on the write itself, one layer
-   * down: the price of a blind anchor is being shown the truth once.
+   * A range no read displayed is a range the model is guessing at, and the refusal below carries
+   * the real text at those lines so the retry is a re-emit rather than a re-derivation.
+   *
+   * IT IS NOT A DISPLAY THAT COUNTS. `services/workspace-runner/src/seen-lines.ts` records what its
+   * refusal handed over, so the identical call sent again applies there; nothing here records
+   * anything, so the identical call sent again is refused again. Both messages used to say "send it
+   * again" and only one of them meant it. Either the disclosure is recorded or the message names
+   * the read - and recording it here would mean vouching for a window whose width is set by the
+   * range the model addressed, in a result that may carry forty of them and is cut to
+   * `RECENT_TOOL_OUTPUT_CHARS` two layers downstream, which is the same over-claim this ledger
+   * exists to remove. So the message names the read.
    */
   // Registers are filled from the live file before anything moves, so a CUT and the PUT that pastes
   // it can be written in either order and mean the same thing.
@@ -303,7 +319,7 @@ export const applyEdit = (
         ok: false,
         refusal: {
           kind: 'unseen',
-          message: `No read of ${path} is on record for this task, so the line numbers in this patch are not from anything you have been shown here. The file has ${live.length} lines, and this is what is actually at the lines you addressed - check your edit against it and send it again:\n\n${numberedWindow(live, asked, CONTEXT_LINES)}`
+          message: `No read of ${path} is on record for this task, so the line numbers in this patch are not from anything you have been shown here. The file has ${live.length} lines. Read the lines you are aiming at with file_read, using startLine and endLine - that is what puts them on record here - and send the patch again. This is what is actually at the lines you addressed:\n\n${numberedWindow(live, asked, CONTEXT_LINES)}`
         }
       };
     }
@@ -335,7 +351,7 @@ export const applyEdit = (
         ok: false,
         refusal: {
           kind: 'unseen',
-          message: `No read has shown you ${path} at ${sayRange(asked.from, asked.to)}, so editing there would land on whatever happens to be at those numbers. Here is what is actually there - check your edit against it and send it again:\n\n${numberedWindow(live, asked, CONTEXT_LINES)}`
+          message: `No read has shown you ${path} at ${sayRange(asked.from, asked.to)}, so editing there would land on whatever happens to be at those numbers. Read that range with file_read, using startLine and endLine - that is what puts it on record here, and sending this patch again without doing so is refused again. Here is what is actually there, to check your edit against:\n\n${numberedWindow(live, asked, CONTEXT_LINES)}`
         }
       };
     }
@@ -507,10 +523,33 @@ export const applyEdit = (
       wrote.unshift({ from: splice.start + 1, to: splice.start + splice.insert.length });
     else wrote.unshift({ from: Math.max(1, splice.start), to: Math.max(1, splice.start + 1) });
   }
+  /*
+   * The same splices again, front to back, in the two numberings the ledger needs.
+   *
+   * This is what the record is carried across, and it is derived here rather than diffed back out
+   * of the two texts because this function is the one place that knows exactly what it moved. A
+   * splice that inserts and removes nothing at line N reports `oldTo = oldFrom - 1`, which is the
+   * shape an insertion has everywhere in this vertical.
+   */
+  const changed: LineChange[] = [];
+  let moved = 0;
+  for (const splice of [...splices].sort((left, right) =>
+    left.start === right.start ? left.order - right.order : left.start - right.start
+  )) {
+    const oldFrom = splice.start + 1;
+    const newFrom = oldFrom + moved;
+    changed.push({
+      oldFrom,
+      oldTo: splice.start + splice.remove,
+      newFrom,
+      newTo: newFrom + splice.insert.length - 1
+    });
+    moved += splice.insert.length - splice.remove;
+  }
   // De-duplicated because one operation can be forgiven twice for the same reason - a relocation
   // reported once by the placement and once again by the evidence check that passed it through -
   // and a result that says the same sentence twice reads as two different findings.
-  return { ok: true, text: out.join('\n'), wrote, notes: [...new Set(notes)] };
+  return { ok: true, text: out.join('\n'), wrote, changed, notes: [...new Set(notes)] };
 };
 
 export { normaliseLine, numberedWindow };

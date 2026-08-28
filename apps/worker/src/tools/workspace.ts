@@ -2,6 +2,8 @@ import { sha256, AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
 import {
   applyEdit,
+  displayedRanges,
+  firstUnshownLine,
   numberedWindow,
   readsOf,
   recordRead,
@@ -9,6 +11,7 @@ import {
   renderNumbered,
   toLines
 } from '../edit/index.js';
+import { RECENT_TOOL_OUTPUT_CHARS } from '../context.js';
 import { HELPER_PACKAGE_MANAGERS, PACKAGE_VERBS } from '../turn-bounds.js';
 import { textValue } from '../values.js';
 import { type ToolContext } from '../tool-dispatch.js';
@@ -29,6 +32,121 @@ import { finiteNumber } from './numbers.js';
  */
 const ECHO_ROWS_PER_REGION = 2;
 const ECHO_MAX_ROWS = 24;
+
+/**
+ * How much of a file one `file_read` puts in front of the model, on either arm.
+ *
+ * THIS IS NOT AN ECONOMY. The economy already exists and is uniform: `recordToolResult` bounds the
+ * serialised form of EVERY tool result at `RECENT_TOOL_OUTPUT_CHARS` before pushing it into the
+ * window, so an unbounded read of this repository's largest test file arrives at exactly 24,000
+ * characters whatever this arm does. Measured through the shipped path: 354,014 bytes on disk,
+ * 403,252 characters serialised, 24,000 delivered - 5.95%. A second bound in front of that one
+ * would save no tokens, and the first draft of this change was proposed on the belief that it
+ * would.
+ *
+ * What it is for is the gap that bound OPENS. The cut happens two layers downstream, after this arm
+ * has already answered `truncated: false, totalLines: 8332` and already called `recordRead` over all
+ * 8,332 lines - so the harness's record of what the model was shown was wrong by 7,800 lines, and
+ * that record is the only evidence a line-addressed `file_patch` rests on. An edit to line 8,000
+ * of a file the model had seen 500 lines of was accepted, by name, because of this. So this bound
+ * exists to make the read's own report true: what is displayed, what is claimed, and what is
+ * recorded as seen become the same set of lines, and the downstream cut never has a file_read to
+ * make a decision about.
+ *
+ * That is why the byte budget is DERIVED from the window bound rather than chosen. It is the
+ * agreement condition between the two layers, and if someone moves the window bound the read has to
+ * follow it or the gap reopens. Three quarters leaves room for the line-number gutter, the JSON
+ * escaping and the envelope: measured over all 830 tracked text files in this repository, the worst
+ * serialised result is 21,793 characters, 2,207 inside the bound, and no file exceeds it.
+ *
+ * It is now the delivery budget rather than a cut made after delivery, and it binds both arms. The
+ * runner is handed these two numbers and answers with the prefix that fits them, so what crosses the
+ * wire, what the model is shown, and what both seen-line ledgers vouch for are one set of bytes
+ * instead of three computations that have to keep agreeing.
+ */
+const FILE_READ_DISPLAY_BYTES = Math.floor(RECENT_TOOL_OUTPUT_CHARS * 0.75);
+
+/**
+ * The line cap, and it is a CATASTROPHE FLOOR rather than an economy or a working limit.
+ *
+ * On real source the budget above is what binds and this is never reached: at 18,000 bytes, moving
+ * this number from 600 to 2,000 changes what is delivered for 0 of 830 tracked files, because a
+ * line of code averages 43.4 characters and 18,000 bytes is 415 of them. What it is here for is the
+ * file the byte budget cannot bound - 18,000 bytes of two-character lines is 9,000 lines, and 9,000
+ * lines recorded as seen is the same defect this change exists to remove, reached from the other
+ * side. A column of numbers is not a licence to edit 9,000 anchors blind.
+ *
+ * 800 because it is above what an unbounded read has any business vouching for and below what
+ * anyone reads: p75 of this repository's tracked files is 339 lines and p90 is 715, and across
+ * 12,347 real windowed reads measured on this machine p90 displayed is 360 lines. It costs a second
+ * call on the narrow-line minority and nothing on the rest.
+ */
+const FILE_READ_DISPLAY_LINES = 800;
+
+/**
+ * Notes, or forgets, that the reads of this path have not been shown to reach the end of it.
+ *
+ * A number rather than a flag, because what `firstUnshown` needs is a line the reads have to
+ * cover, and the two arms know that line to different precision. An unwindowed read has the whole
+ * file's length exactly. A windowed read that stopped before the end knows only that the file goes
+ * at least one line further than what it delivered whole - the ranged reader deliberately does not
+ * walk to the end of a two-gigabyte log to count. So the number is a floor, never an overstatement,
+ * and it is only ever raised: a later, narrower read learning less about the file must not lower the
+ * bar a wider one set.
+ *
+ * Written as a fresh object for the same reason every other field of `AgentState` is - the state is
+ * snapshotted between steps and a mutated map would edit history.
+ */
+const withPartialRead = (
+  existing: Record<string, number> | undefined,
+  path: string,
+  atLeastLines: number | undefined
+): Record<string, number> => {
+  const next = { ...(existing ?? {}) };
+  if (atLeastLines === undefined) delete next[path];
+  else next[path] = Math.max(next[path] ?? 0, atLeastLines);
+  return next;
+};
+
+/**
+ * Moves that floor by what an edit changed the file's length by, because the file it is a floor on
+ * is now one line-count longer or shorter.
+ *
+ * A patch used to DELETE the entry outright, on the reasoning that the version the read was about
+ * no longer exists. The version does not; the unread remainder does. Measured on the shipped arm:
+ * `file_read` of lines 1-200 of an 8,332-line file, then one `PUT 10:`, and the outstanding floor
+ * went from 201 to nothing - after which a whole-file `file_write` destroyed 576,512 bytes without
+ * being asked a question. An edit to line 10 says nothing about line 8,000, and clearing the floor
+ * claimed it did.
+ *
+ * "At least N lines" survives the shift exactly: a file that had at least N lines and gained
+ * `delta` of them has at least N + delta, and the floor stays a floor whichever way the edit went.
+ */
+const shiftPartialRead = (
+  existing: Record<string, number> | undefined,
+  path: string,
+  delta: number
+): Record<string, number> => {
+  const outstanding = existing?.[path];
+  if (outstanding === undefined) return { ...(existing ?? {}) };
+  return { ...existing, [path]: Math.max(1, outstanding + delta) };
+};
+
+/**
+ * The first line of this file the turn has not been shown, or `undefined` when it has been shown
+ * all of them up to `reachTo`.
+ *
+ * Asked of the COVERAGE record rather than of the snapshots. Two reads of lines 1-400 and 300-900
+ * have shown lines 1-900 and this has to say so - a model that read the rest in a second call has
+ * genuinely seen the file and should not be refused for the shape of how it got there. Asking the
+ * snapshots was how that promise was broken: they are capped at four per file because they carry
+ * text, so a file paged through in twenty windows kept the last four of them and the answer was no.
+ * Measured on this repository at the time: 37 of 946 tracked files were long enough that no
+ * sequence of reads could ever make a whole-file write of them legal - and the refusal named
+ * reading the remainder, which is what the model had just finished doing.
+ */
+const firstUnshown = (taskId: string, path: string, reachTo: number): number | undefined =>
+  firstUnshownLine(displayedRanges(taskId, path), reachTo);
 
 /**
  * The workspace tools: commands, processes and files on the owner's own computer.
@@ -145,22 +263,82 @@ export async function executeWorkspaceTool(
       const windowed = requestedStart > 0 || requestedEnd > 0;
       if (windowed) {
         const startLine = Math.max(1, requestedStart || 1);
-        const endLine = Math.max(startLine, requestedEnd || startLine + 200);
+        const wanted = Math.max(startLine, requestedEnd || startLine + 200);
+        /*
+         * The same two budgets the unwindowed arm below is held to, and for the same reason rather
+         * than for symmetry.
+         *
+         * This arm used to fetch 400,000 bytes and record every line of them as displayed, while
+         * `recordToolResult` cut the result to 24,000 characters two layers downstream. On this
+         * repository's largest test file `file_read {startLine: 1, endLine: 8332}` delivered all
+         * 354,014 bytes, vouched for all 8,332 lines, and put 5.95% of them in front of the model -
+         * the identical defect the unwindowed bound was shipped to close, still open on the arm that
+         * is 47.4% of the read traffic on this machine. It also made the write guard below trivially
+         * walkable: one wide window and the record claimed the whole file had been seen.
+         *
+         * It binds on very little real traffic. Across 12,347 windowed reads measured on this
+         * machine p90 displayed is 360 lines, and 360 lines of this repository's average 43.4
+         * characters is 15,600 bytes - inside both budgets.
+         */
+        const endLine = Math.min(wanted, startLine + FILE_READ_DISPLAY_LINES - 1);
         const read = await context.runner.readFileLines(task.workspaceId, task.id, path, {
           startLine,
           endLine,
-          maxBytes: 400_000
+          maxBytes: FILE_READ_DISPLAY_BYTES
         });
         /*
-         * A read that stopped on its byte budget stopped mid-line, and that line was not displayed.
-         * It is still returned - the model asked for it - but it is not recorded as seen, because a
+         * A read that stopped MID-LINE displayed half a line, and half a line is not displayed. It
+         * is still returned - the model asked for it - but it is not recorded as seen, because a
          * record that vouched for the half that never arrived is exactly the blind anchor the
          * record exists to refuse. The runner's own seen-line ledger draws the same line in the
-         * same place, deliberately.
+         * same place, deliberately, off the same field.
+         *
+         * `truncated` is not that question and answering it with `truncated` cost a line per
+         * window. A window whose budget ran out exactly as a line ended delivered that line whole
+         * and is reported truncated because it could not start the next one; cutting the last row
+         * off then discards a line the model is looking at. Measured through this arm over 947
+         * tracked text files, nine of them page end to end into coverage with a hole in it -
+         * `evals/report.ts` delivers line 337 and recorded 1-336 - and the whole-file write the
+         * paging had earned was refused, naming a line the model had already been shown.
          */
         const shownLines = toLines(read.content);
-        const whole = read.truncated ? shownLines.slice(0, -1) : shownLines;
+        const whole = read.partialLine ? shownLines.slice(0, -1) : shownLines;
         if (whole.length) recordRead(task.id, path, read.startLine, whole.join('\n'));
+        /*
+         * What this window leaves outstanding, so the whole-file write below can be asked about it.
+         *
+         * Nothing did this before, and that was the severe hole: a window read set no length and
+         * claimed no hash, so the worker's guard had nothing to consult and the runner's ran behind
+         * a hash this arm cannot produce. Measured through the shipped tool, `file_read` of lines
+         * 1-200 followed by a whole-file `file_write` was accepted and destroyed 8,132 lines.
+         *
+         * `totalLines` only arrives when the reader actually reached the end of the file; when it
+         * did not, all that is known is that the file goes further than what came back whole, and
+         * that is enough to refuse a write claiming to replace all of it.
+         */
+        /*
+         * `read.endLine` is a line this window reached; the floor has to be a line it did not show,
+         * and which of those two `endLine` is depends on how the window ended.
+         *
+         * Cut mid-line, `endLine` IS the unshown line - half of it arrived, so naming it is exact.
+         * Cut between lines, `endLine` was delivered whole and the file is known to go at least one
+         * further, because the reader stopped only when it found another line to start. Carrying
+         * the mid-line answer into the between-lines case understates the floor by one, and that
+         * one line is the difference between refusing a whole-file write after a single window of a
+         * 901-line file and accepting it: measured with the record fixed and this left alone, the
+         * worker's floor stopped firing and only the runner's own guard still refused.
+         */
+        const reachTo =
+          read.totalLines ??
+          (read.partialLine ? read.endLine : Math.max(read.endLine + 1, startLine));
+        state.partialReads = withPartialRead(
+          state.partialReads,
+          path,
+          read.totalLines !== undefined &&
+            firstUnshown(task.id, path, read.totalLines) === undefined
+            ? undefined
+            : reachTo
+        );
         return {
           path,
           startLine: read.startLine,
@@ -169,22 +347,79 @@ export async function executeWorkspaceTool(
           // Where to carry on from, when the window was cut short by its own byte budget rather
           // than by reaching the end. Without it a truncated read is a dead end.
           ...(read.nextStartLine === undefined ? {} : { nextStartLine: read.nextStartLine }),
-          truncated: read.truncated,
+          // True when the window the model asked for is not the window it got, whichever budget
+          // stopped it: saying `false` because no line was cut in half, on a request for 8,332
+          // lines answered with 800, is the report being wrong in the direction that costs most.
+          truncated: read.truncated || read.endLine < wanted,
           content: renderNumbered(shownLines, read.startLine)
         };
       }
-      const read = await context.runner.readFileWithHash(task.workspaceId, task.id, path);
+      /*
+       * The budget travels with the request, and what comes back is what was recorded as shown.
+       *
+       * This arm used to fetch the whole file and cut it here. The cut was right and the place was
+       * wrong: the runner is where the seen-line ledger lives, so a prefix chosen after the fact was
+       * a prefix that ledger never heard about, and the two records of what the model had been shown
+       * disagreed. Measured on a 659-line file, an unwindowed read displaying lines 1-397 followed
+       * by a window over the remainder left the runner holding 398-659 only - and a patch to line
+       * 50, a line the model HAD been shown, was refused by name. Asking for the prefix instead of
+       * making one means the arm cannot display what it was not sent, so the two ledgers hold the
+       * same lines by construction.
+       */
+      const read = await context.runner.readFileForDisplay(task.workspaceId, task.id, path, {
+        maxBytes: FILE_READ_DISPLAY_BYTES,
+        maxLines: FILE_READ_DISPLAY_LINES
+      });
+      const shown = toLines(read.content);
+      // The same rule the windowed arm above draws: a line cut short by the byte budget is shown,
+      // because an answer of no lines is a dead end, and is not recorded, because it did not arrive.
+      const whole = read.partialLine ? shown.slice(0, -1) : shown;
+      const complete = read.displayedLines >= read.totalLines;
+      /*
+       * The hash is still recorded, and deliberately, because it answers a different question.
+       *
+       * `expectSha256` asks "is this still the file you read", and the runner hashed the whole file
+       * whatever it sent back - the bound is about what is DISPLAYED, not about what was hashed - so
+       * the claim is as true as it ever was and the concurrency guard keeps working. What a partial
+       * read must not do is authorise replacing the part it did not show, and that is a second
+       * question with a second answer below. Conflating them by dropping the hash would refuse the
+       * blind write by removing a guard, which is the wrong mechanism for the right refusal: it
+       * would also switch the runner's own 409 off for the same file.
+       */
       if (read.sha256)
         state.readFileHashes = { ...(state.readFileHashes ?? {}), [path]: read.sha256 };
-      const lines = toLines(read.content);
-      recordRead(task.id, path, 1, read.content);
+      /*
+       * What a read that did not show the whole file leaves behind: the file's real length, so a
+       * later whole-file write can be asked whether anything has since shown the rest.
+       *
+       * Cleared on a complete read, because a read that showed everything has nothing outstanding
+       * and a stale entry would refuse a write that is now perfectly well evidenced.
+       */
+      state.partialReads = withPartialRead(
+        state.partialReads,
+        path,
+        complete ? undefined : read.totalLines
+      );
+      // Only what was displayed whole is recorded as displayed. This is the whole point of the
+      // bound: `readsOf` is the evidence `file_patch` rests a line number on, and before this it
+      // vouched for every line of the file after a read that had put a fraction of them on screen.
+      if (whole.length) recordRead(task.id, path, 1, whole.join('\n'));
       return {
         path,
         startLine: 1,
-        endLine: lines.length,
-        totalLines: lines.length,
-        truncated: false,
-        content: renderNumbered(lines, 1)
+        endLine: shown.length,
+        totalLines: read.totalLines,
+        /*
+         * Where to carry on from, in the same words the windowed path above uses, so a read cut
+         * short here is continued exactly as one cut short there is - and absent when there is
+         * nowhere to carry on TO. A file of one line longer than the whole budget is the case that
+         * proves this bound is about delivered bytes rather than delivered lines: it is reported
+         * truncated, because it is, and it is offered no continuation, because there is no second
+         * line and resuming at the first would hand back the same half forever.
+         */
+        ...(!complete && shown.length < read.totalLines ? { nextStartLine: shown.length + 1 } : {}),
+        truncated: !complete,
+        content: renderNumbered(shown, 1)
       };
     }
     /*
@@ -289,7 +524,24 @@ export async function executeWorkspaceTool(
         if (typeof hash === 'string')
           state.readFileHashes = { ...(state.readFileHashes ?? {}), [path]: hash };
         const after = toLines(result.text);
-        recordWrite(task.id, path, result.text);
+        /*
+         * What this patch changed, and what it did NOT.
+         *
+         * Both of these used to say the file had been read in full - the floor was deleted and the
+         * whole new text was recorded as shown - on the reasoning that the version the read was
+         * about no longer exists. One successful patch therefore disarmed both layers of the guard
+         * for the rest of the turn, on every file, always: measured on the shipped arm, a windowed
+         * read of lines 1-200 then one `PUT 10:` left `PUT 8000:` landing silently at a line
+         * nothing had displayed, and a whole-file write destroying 576,512 bytes accepted. What a
+         * patch authorises is the span it wrote; the rest of the file is exactly as unread as it
+         * was, one line-count shorter or longer.
+         */
+        state.partialReads = shiftPartialRead(
+          state.partialReads,
+          path,
+          after.length - toLines(before).length
+        );
+        recordWrite(task.id, path, result.text, result.changed);
         applied.push({
           path,
           sha256: sha256(result.text),
@@ -343,6 +595,48 @@ export async function executeWorkspaceTool(
       return context.runner.readImage(task.workspaceId, task.id, textValue(call.arguments.path));
     case 'file_write': {
       const writePath = textValue(call.arguments.path);
+      /*
+       * A whole-file write may not be the way a model discards the part of a file it was never
+       * shown.
+       *
+       * This is the other half of the display bound above, and without it that bound would have
+       * made things worse rather than better: capping the display while leaving this alone means a
+       * model that saw 415 lines of 2,000 still holds a hash over all 2,000, the runner's
+       * concurrency check passes because the file really has not changed, and 1,585 lines are
+       * destroyed by a call that looked entirely well-formed.
+       *
+       * This comment used to claim the WINDOWED read was the safe one - that the same write after a
+       * window "is refused by name one layer down". It was not. Measured through this arm against
+       * the real runner on an 8,332-line file: after `file_read {startLine: 1, endLine: 200}` the
+       * whole-file write was ACCEPTED and destroyed 8,330 of 8,332 lines, 354,002 of 354,014 bytes.
+       * The runner's guard is correct and fires by name when it runs; it simply never ran, because
+       * the windowed arm claims no hash and the guard was opened only for callers that do. Both
+       * ends of that are now closed - every read arm records what it left outstanding here, and the
+       * runner holds an agent's write to its record whether or not a hash came with it - and the
+       * lesson is the one this repository already has a rule about: a comment is not a measurement.
+       *
+       * It is a coverage question, not a freshness one, so it is asked of the read record rather
+       * than of the hash - and it lifts the moment the record covers the file, which is what makes
+       * the refusal below performable rather than a wall. Reading the rest with startLine and
+       * endLine is a thing the model can actually do, and doing it clears this.
+       */
+      const outstanding = state.partialReads?.[writePath];
+      const unshownFrom =
+        outstanding === undefined ? undefined : firstUnshown(task.id, writePath, outstanding);
+      if (unshownFrom !== undefined)
+        throw new AthanorError(
+          'write_unread',
+          /*
+           * One outstanding line is the file with no newlines in it, and it needs a different
+           * sentence because the usual two recoveries are both closed to it: there is no further
+           * range to read, and a line-addressed edit needs a line that has been shown whole. Naming
+           * a recovery the model cannot perform is a failure this repository has already paid for
+           * once, in a truncation marker that said "run the tool again".
+           */
+          outstanding === 1
+            ? `${writePath} is a single line too long to be delivered in one read, so you have been shown only the start of it and writing the whole file would discard the rest. A line-addressed edit cannot reach it either, because its one line has never been shown whole. Transform it with a program from the shell instead - read the file, change it, write it back - so nothing depends on you having seen all of it.`
+            : `${writePath} has at least ${outstanding} lines and line ${unshownFrom} onwards has never been shown to you, so writing the whole file would discard the part you have not read. Either use file_patch, which changes the lines you were shown and leaves the rest of the file exactly as it is, or read from line ${unshownFrom} with file_read using startLine and endLine and then send this write again.`
+        );
       // Only claimed when this turn actually read the file. A first write, or a write to
       // something never read, claims nothing and proceeds - demanding a hash everywhere would
       // refuse every file this computer creates.
@@ -361,6 +655,12 @@ export async function executeWorkspaceTool(
           ...(state.readFileHashes ?? {}),
           [writePath]: (result as { sha256: string }).sha256
         };
+      // The content is what this call supplied, so there is no unread remainder left to protect -
+      // and the record of what has been shown becomes that content, whole. This is the one write
+      // where "text a caller authored is text it has been shown" is true of the whole file, and
+      // saying so replaces a record whose line numbers describe a version that is now gone.
+      state.partialReads = withPartialRead(state.partialReads, writePath, undefined);
+      recordWrite(task.id, writePath, textValue(call.arguments.content));
       const usage = await context.runner.call<{ storageBytes: number }>(
         task.workspaceId,
         task.id,

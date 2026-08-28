@@ -88,20 +88,20 @@ the whole block on every `pnpm check`. Accept a new baseline and this page fails
 is re-derived, naming the value it should now carry. The instruction is no longer advice.
 
 ```baseline
-fixtures                                                                        70
-long-a-finished-phase-is-never-declared.modelCalls                              38
-long-a-finished-phase-is-never-declared.promptTokens                     1,446,134
-long-a-finished-phase-is-never-declared.catalogueTokens                    470,440
-long-a-finished-phase-is-never-declared.cachePrefix                             95
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.modelCalls      40
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.promptTokens 1,392,264
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.catalogueTokens 482,821
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.cachePrefix     94
-long-finished-phases-condense-rather-than-shred.cachePrefix                     66
-compaction.extraModelCalls                                                       2
-compaction.tokensSaved                                                      53,870
-compaction.cachePointsGivenUp                                                    1
-floorWalk.cachePointsLost                                                       28
+fixtures                                                                             73
+long-a-finished-phase-is-never-declared.modelCalls                                   38
+long-a-finished-phase-is-never-declared.promptTokens                          1,450,947
+long-a-finished-phase-is-never-declared.catalogueTokens                         475,304
+long-a-finished-phase-is-never-declared.cachePrefix                                  95
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.modelCalls           40
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.promptTokens  1,397,202
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.catalogueTokens 487,813
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.cachePrefix          94
+long-finished-phases-condense-rather-than-shred.cachePrefix                          66
+compaction.extraModelCalls                                                            2
+compaction.tokensSaved                                                           53,745
+compaction.cachePointsGivenUp                                                         1
+floorWalk.cachePointsLost                                                            28
 ```
 
 The last four are derived rather than stored, and the check does the subtraction itself:

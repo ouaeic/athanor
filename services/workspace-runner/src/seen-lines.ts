@@ -50,12 +50,18 @@ type Displayed = {
  * text, whereas coalescing two intervals into their hull would silently vouch for every line
  * between them.
  *
+ * Adjacent windows merge, so the count only grows on reads that leave gaps between them - and a
+ * write now adds one interval per span it authored, up to the forty operations a single patch may
+ * carry. Thirty-two was inside that: one forty-hunk patch could evict every interval the reads
+ * before it had put there, and refuse the next write for lines that had been shown. A hundred and
+ * twenty-eight is past what a patch can spend and still four kilobytes per path at worst.
+ *
  * Both are memory bounds, not correctness bounds: losing a record loses the opinion, never the
  * write. That direction is deliberate. A guard that starts refusing work because a cache filled up
  * is a worse failure than the one it exists to prevent.
  */
 const MAX_TRACKED_PATHS = 512;
-const MAX_RANGES_PER_PATH = 32;
+const MAX_RANGES_PER_PATH = 128;
 
 /**
  * How long a record can vouch for a read, matching the retention horizon the notification sweep
@@ -173,29 +179,175 @@ export const displayedLines = (
   return record.ranges.map(({ start, end }) => ({ start, end }));
 };
 
+/**
+ * One span the write replaced, and what took its place. Both ends are 1-indexed and inclusive.
+ *
+ * `oldTo === oldFrom - 1` removes nothing - a pure insertion before `oldFrom`. `newTo === newFrom -
+ * 1` inserts nothing - a pure deletion.
+ */
+export type Hunk = {
+  oldFrom: number;
+  oldTo: number;
+  newFrom: number;
+  newTo: number;
+};
+
 /** What a whole-file replacement did, in lines, from the two versions of the text. */
 export type LineEdit = {
-  /** Lines unchanged at the head, and at the tail, of the old file. */
-  prefix: number;
-  suffix: number;
   oldLines: number;
   newLines: number;
-  /** How many lines longer the new file is; negative when it is shorter. */
-  delta: number;
+  /** Every span the write replaced, ascending and non-overlapping. Empty when nothing changed. */
+  hunks: readonly Hunk[];
   /**
-   * The lines of the old file this edit rests on, and must therefore have been shown. `undefined`
-   * when it rests on nothing: an unchanged write, or the first content of an empty file.
+   * The lines of the old file this edit rests on, and must therefore have been shown. Empty when it
+   * rests on nothing: an unchanged write, or the first content of an empty file.
    */
-  anchors: LineRange | undefined;
+  anchors: readonly LineRange[];
 };
 
 /**
- * The span an edit rests on, found by walking in from both ends.
+ * How deep the split below will look for unchanged text before giving up and calling the rest of a
+ * block changed.
+ *
+ * Only precision is at stake, never safety: every line a shallower answer fails to align is
+ * reported as changed, which refuses more and vouches for less. Twenty-four is far past what any
+ * real edit reaches - each level needs a nested run of unique lines inside the last one - and it
+ * bounds the work at twenty-four passes over the file for a pathological input.
+ */
+const MAX_SPLIT_DEPTH = 24;
+
+/** The longest run of pairs that ascends in both coordinates, by patience. */
+const ascendingRun = (
+  pairs: ReadonlyArray<readonly [number, number]>
+): Array<readonly [number, number]> => {
+  const tails: number[] = [];
+  const previous: number[] = [];
+  for (let index = 0; index < pairs.length; index += 1) {
+    const value = (pairs[index] as readonly [number, number])[1];
+    let low = 0;
+    let high = tails.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      const at = tails[mid] as number;
+      if ((pairs[at] as readonly [number, number])[1] < value) low = mid + 1;
+      else high = mid;
+    }
+    previous[index] = low > 0 ? (tails[low - 1] as number) : -1;
+    tails[low] = index;
+  }
+  const run: Array<readonly [number, number]> = [];
+  for (
+    let at = tails.length ? (tails[tails.length - 1] as number) : -1;
+    at >= 0;
+    at = previous[at] as number
+  )
+    run.push(pairs[at] as readonly [number, number]);
+  return run.reverse();
+};
+
+/**
+ * Lines that occur exactly once on each side of a block, paired up, longest ascending run kept.
+ *
+ * A line that is unique in both versions and appears in both is the same line: nothing else it
+ * could be. Those pairs are the fixed points the block is split around, which is what turns "one
+ * span from the first change to the last" into the several spans an edit actually touched.
+ */
+const fixedPoints = (
+  before: readonly string[],
+  after: readonly string[],
+  oldFrom: number,
+  oldTo: number,
+  newFrom: number,
+  newTo: number
+): Array<readonly [number, number]> => {
+  const once = (lines: readonly string[], from: number, to: number): Map<string, number> => {
+    const where = new Map<string, number>();
+    for (let line = from; line <= to; line += 1) {
+      const text = lines[line - 1] as string;
+      where.set(text, where.has(text) ? -1 : line);
+    }
+    return where;
+  };
+  const inOld = once(before, oldFrom, oldTo);
+  const inNew = once(after, newFrom, newTo);
+  const pairs: Array<readonly [number, number]> = [];
+  for (let line = oldFrom; line <= oldTo; line += 1) {
+    const text = before[line - 1] as string;
+    if (inOld.get(text) !== line) continue;
+    const at = inNew.get(text);
+    if (at === undefined || at === -1) continue;
+    pairs.push([line, at]);
+  }
+  return ascendingRun(pairs);
+};
+
+/** Splits one block into the spans that really changed, trimming what matches at either end. */
+const splitBlock = (
+  before: readonly string[],
+  after: readonly string[],
+  oldFrom: number,
+  oldTo: number,
+  newFrom: number,
+  newTo: number,
+  depth: number,
+  into: Hunk[]
+): void => {
+  let firstOld = oldFrom;
+  let lastOld = oldTo;
+  let firstNew = newFrom;
+  let lastNew = newTo;
+  while (
+    firstOld <= lastOld &&
+    firstNew <= lastNew &&
+    before[firstOld - 1] === after[firstNew - 1]
+  ) {
+    firstOld += 1;
+    firstNew += 1;
+  }
+  while (firstOld <= lastOld && firstNew <= lastNew && before[lastOld - 1] === after[lastNew - 1]) {
+    lastOld -= 1;
+    lastNew -= 1;
+  }
+  if (firstOld > lastOld && firstNew > lastNew) return;
+  if (firstOld > lastOld || firstNew > lastNew || depth >= MAX_SPLIT_DEPTH) {
+    into.push({ oldFrom: firstOld, oldTo: lastOld, newFrom: firstNew, newTo: lastNew });
+    return;
+  }
+  const points = fixedPoints(before, after, firstOld, lastOld, firstNew, lastNew);
+  if (!points.length) {
+    into.push({ oldFrom: firstOld, oldTo: lastOld, newFrom: firstNew, newTo: lastNew });
+    return;
+  }
+  let old = firstOld;
+  let fresh = firstNew;
+  for (const [atOld, atNew] of points) {
+    splitBlock(before, after, old, atOld - 1, fresh, atNew - 1, depth + 1, into);
+    old = atOld + 1;
+    fresh = atNew + 1;
+  }
+  splitBlock(before, after, old, lastOld, fresh, lastNew, depth + 1, into);
+};
+
+/**
+ * The spans an edit rests on, recovered from the two versions of the file.
  *
  * A patch is a whole-file write by the time it reaches the runner, so the runner recovers the edit
  * rather than being told it - which means this guard needs no cooperation from the caller and
- * cannot be turned off by one. Matching prefix and suffix bound the change exactly, and everything
- * between them is text the caller replaced and therefore had to be looking at.
+ * cannot be turned off by one.
+ *
+ * IT IS SEVERAL SPANS AND NOT ONE, and that is the whole of this function. Walking in from both
+ * ends alone reports the hull from the first change to the last, which is a lie about any edit that
+ * touches two places: measured on a 400-line file with lines 1-50 and 300-350 displayed, one write
+ * changing line 20 and line 320 - both of them lines a read had shown - was refused with "this edit
+ * changes app.ts at line 51-299", naming 249 lines it does not change. A guard that refuses
+ * legitimate work gets deleted by the first person it inconveniences. So the block between the
+ * matching ends is split again around the lines that are unique to both versions, and what is left
+ * over is what actually moved.
+ *
+ * The direction of the imprecision is fixed and deliberate. A line reported as changed that was not
+ * costs a refusal the caller can lift by reading; a line reported as unchanged that was not would
+ * vouch for text nobody has seen. Every fixed point is a line present in BOTH versions, so a line
+ * this calls unchanged is a line the write kept - never a line it destroyed.
  *
  * A pure insertion replaces nothing, so it has no changed span of its own. It still rests on
  * something: the two lines it was slid between. An append to a file whose end was never displayed
@@ -205,27 +357,18 @@ export type LineEdit = {
 export const lineEdit = (before: string[], after: string[]): LineEdit => {
   const oldLines = before.length;
   const newLines = after.length;
-  let prefix = 0;
-  while (prefix < oldLines && prefix < newLines && before[prefix] === after[prefix]) prefix += 1;
-  let suffix = 0;
-  while (
-    suffix < oldLines - prefix &&
-    suffix < newLines - prefix &&
-    before[oldLines - 1 - suffix] === after[newLines - 1 - suffix]
-  )
-    suffix += 1;
-  const start = prefix + 1;
-  const end = oldLines - suffix;
-  const anchors =
-    end >= start
-      ? { start, end }
-      : // Nothing was replaced. Either the two files are identical - prefix and suffix cover the
-        // whole of an old file the same length as the new one - or lines were inserted, and the
-        // insertion point is what the caller aimed at.
-        oldLines === 0 || oldLines === newLines
-        ? undefined
-        : { start: Math.max(1, prefix), end: Math.min(oldLines, prefix + 1) };
-  return { prefix, suffix, oldLines, newLines, delta: newLines - oldLines, anchors };
+  const hunks: Hunk[] = [];
+  splitBlock(before, after, 1, oldLines, 1, newLines, 0, hunks);
+  const anchors: LineRange[] = [];
+  if (oldLines > 0)
+    for (const hunk of hunks) {
+      const span =
+        hunk.oldTo >= hunk.oldFrom
+          ? { start: hunk.oldFrom, end: hunk.oldTo }
+          : { start: Math.max(1, hunk.oldFrom - 1), end: Math.min(oldLines, hunk.oldFrom) };
+      if (span.end >= span.start) anchors.push(span);
+    }
+  return { oldLines, newLines, hunks, anchors };
 };
 
 /** The parts of `span` no range in `seen` covers, in order, as ranges rather than as lines. */
@@ -292,9 +435,15 @@ export const sayRanges = (ranges: LineRange[]): string =>
  *
  * Without this the guard is one edit deep per file: the write changes size and modification time,
  * the identity stops matching, the record is void, and the next patch - the one aimed at line 300
- * after the first one tidied line 20 - goes through unexamined. Lines before the change keep their
- * numbers, lines after it shift by the change in length, and the lines the caller has just written
- * are seen by definition: it authored them.
+ * after the first one tidied line 20 - goes through unexamined. Every stretch the write left alone
+ * keeps its lines, at the numbers the hunks before it shifted them to, and each span the caller
+ * actually authored is added: it wrote those lines, so it has seen them.
+ *
+ * WHAT IT ADDS IS THE AUTHORED SPANS AND NOT THE FILE. The two are the same thing only for a
+ * caller that supplied the whole file from nothing, and a line-addressed patch is the opposite of
+ * that: it authored a span and reproduced the rest. Recording the file would mean one successful
+ * patch vouched for every line of it, which is a licence to edit anywhere - and to discard
+ * everything - for the rest of the turn.
  *
  * A file with no record gains none. A write must never be the thing that starts guarding a file,
  * or the file browser - which reads whole files and writes them back, and never reads a window -
@@ -309,19 +458,26 @@ export const rememberWrite = (
   const record = displayed.get(key);
   if (!record) return;
   const carried: Recorded[] = [];
-  const tailStart = edit.oldLines - edit.suffix + 1;
-  for (const range of record.ranges) {
-    const headEnd = Math.min(range.end, edit.prefix);
-    if (headEnd >= range.start) carried.push({ start: range.start, end: headEnd, at: range.at });
-    const tail = Math.max(range.start, tailStart);
-    if (range.end >= tail)
-      carried.push({ start: tail + edit.delta, end: range.end + edit.delta, at: range.at });
+  /** The seen lines inside one untouched stretch of the old file, at their new numbers. */
+  const carry = (from: number, to: number, by: number): void => {
+    for (const range of record.ranges) {
+      const start = Math.max(range.start, from);
+      const end = Math.min(range.end, to);
+      if (end >= start) carried.push({ start: start + by, end: end + by, at: range.at });
+    }
+  };
+  let cursor = 1;
+  let shift = 0;
+  for (const hunk of edit.hunks) {
+    if (hunk.oldFrom - 1 >= cursor) carry(cursor, hunk.oldFrom - 1, shift);
+    if (hunk.newTo >= hunk.newFrom) {
+      sequence += 1;
+      carried.push({ start: hunk.newFrom, end: hunk.newTo, at: sequence });
+    }
+    shift += hunk.newTo - hunk.newFrom - (hunk.oldTo - hunk.oldFrom);
+    cursor = hunk.oldTo + 1;
   }
-  const authoredEnd = edit.newLines - edit.suffix;
-  if (authoredEnd >= edit.prefix + 1) {
-    sequence += 1;
-    carried.push({ start: edit.prefix + 1, end: authoredEnd, at: sequence });
-  }
+  if (cursor <= edit.oldLines) carry(cursor, edit.oldLines, shift);
   displayed.delete(key);
   displayed.set(key, {
     identity,

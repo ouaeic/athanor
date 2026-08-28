@@ -61,6 +61,7 @@ import {
   COMPRESSED_TRAJECTORY_MARKER,
   RUNTIME_CONTEXT_MARKER
 } from '../apps/worker/src/context.js';
+import { forgetReads } from '../apps/worker/src/edit/index.js';
 import { memoryItemAad, memorySourceAad } from '../apps/worker/src/memory-runtime.js';
 import { builtinSkillLibrary } from '../apps/worker/src/skills.js';
 
@@ -742,6 +743,78 @@ const routeName = (url: string, init?: RequestInit): string => {
   return `${init?.method ?? 'GET'} ${path.replace(workspaceId, ':workspaceId')}`;
 };
 
+/**
+ * A file read, answered the way the runner answers one: the bytes, and nothing around them.
+ *
+ * This route used to answer `json({ path, content, bytes })`, and `readFile`/`readFileWithHash`
+ * take `response.text()` - so every `file_read` in this suite displayed the JSON envelope AS the
+ * file, one line long, whatever the file was. Measured on `answer-missing-file-is-not-a-dead-turn`
+ * before this was fixed: `notes.txt` came back as `1:{"path":"workspace/notes.txt","content":"…"}`,
+ * `totalLines: 1`. Every read in every fixture read one line.
+ *
+ * Three things were unreachable while that stood, and all three are things this repository has
+ * shipped a bound for. The 800-line display cap and the 18,000-byte one in `workspace.ts` cannot be
+ * approached by a one-line answer. The line numbers a `file_patch` addresses were numbers of the
+ * envelope, so no line-addressed edit could land against a fixture file. And any count of what a
+ * read PUT IN FRONT OF THE MODEL was a count of this stub rather than of athanor.
+ */
+const fileText = (content: string): Response =>
+  new Response(content, { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+
+/**
+ * The windowed read: `services/workspace-runner/src/files.ts:277-370` and the headers
+ * `server.ts:816-827` puts on it.
+ *
+ * Modelled rather than imported, because the real one walks a file descriptor in a fixed buffer and
+ * this stub's workspace is a map of strings, and named as modelled where it simplifies. Lines are
+ * separated by newlines and not terminated by them, so a file ending in one has a final empty line,
+ * which is the rule `toLines` states and the numbers in a read mean. `totalLines` is answered only
+ * when the read reached the end, exactly as the runner answers it - the runner cannot count the
+ * rest without reading what a window exists to avoid, and a stub that answered it anyway would let
+ * a fixture pass on a field production does not send.
+ *
+ * Two simplifications, stated: a line longer than the whole budget is dropped rather than half-sent
+ * (the runner returns its first `maxBytes` and resumes AT it), and `x-file-bytes` is the string's
+ * UTF-8 length rather than a stat. Neither is reachable at the 400,000-byte budget `file_read`
+ * asks for; a fixture that wants to reach the first one wants the real runner.
+ */
+const fileWindow = (
+  content: string,
+  window: { startLine: number; endLine: number; maxBytes: number }
+): Response => {
+  const lines = content.split('\n');
+  const kept: string[] = [];
+  let bytes = 0;
+  let truncated = false;
+  let lastKept = window.startLine;
+  for (let line = window.startLine; line <= Math.min(window.endLine, lines.length); line += 1) {
+    const text = lines[line - 1] ?? '';
+    // The separator is charged only while another line follows it, which is where the runner's own
+    // `lastKeptTerminated` ends up.
+    const cost = Buffer.byteLength(text, 'utf8') + (line < lines.length ? 1 : 0);
+    if (bytes + cost > window.maxBytes) {
+      truncated = true;
+      break;
+    }
+    bytes += cost;
+    kept.push(text);
+    lastKept = line;
+  }
+  const reachedEnd = !truncated && window.endLine >= lines.length;
+  return new Response(kept.join('\n'), {
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'x-start-line': String(window.startLine),
+      'x-end-line': String(lastKept),
+      'x-file-bytes': String(Buffer.byteLength(content, 'utf8')),
+      'x-truncated': String(truncated),
+      ...(reachedEnd
+        ? { 'x-total-lines': String(lines.length) }
+        : { 'x-next-start-line': String(lastKept + 1) })
+    }
+  });
+};
+
 const runnerResponse = (
   stub: RunnerStub,
   state: RunnerState,
@@ -938,9 +1011,18 @@ const runnerResponse = (
     // What the turn wrote reads back as what it wrote. Without this a fixture could not measure the
     // one thing worth measuring about a re-read - that the window already held the answer.
     const content = state.written.get(path)?.text ?? stub.files?.[path];
-    return content === undefined
-      ? new Response('', { status: 404 })
-      : json({ path, content, bytes: content.length });
+    if (content === undefined) return new Response('', { status: 404 });
+    const query = new URL(url).searchParams;
+    const maxBytes = Number(query.get('maxBytes'));
+    // A caller naming a budget is asking for a window, which is the arm `server.ts:806-828` serves
+    // and the only arm that answers the line headers. Everything else is the whole file.
+    return Number.isFinite(maxBytes) && maxBytes > 0
+      ? fileWindow(content, {
+          startLine: Math.max(1, Number(query.get('startLine')) || 1),
+          endLine: Math.max(1, Number(query.get('endLine')) || Number.MAX_SAFE_INTEGER),
+          maxBytes
+        })
+      : fileText(content);
   }
   if (url.includes('/checkpoints'))
     return json({
@@ -1259,6 +1341,43 @@ export interface Expectation {
    * the whole request rather than the tail of it.
    */
   readonly anchorHeld?: boolean;
+  /**
+   * What named files hold when the turn ends, byte for byte.
+   *
+   * THE ONLY EXPECTATION IN THIS FILE THAT A BROKEN EDITOR CANNOT SATISFY, and the reason it exists
+   * is that every other one could. A fixture whose subject is landing a hunk pins `tools`, which is
+   * written before the call runs; `modelCalls`, which the script decides; and `noFailedTools:
+   * false`, which a run where EVERY call failed satisfies as happily as one where the intended
+   * three did. Five `file_patch` calls in this suite were refused `patch_invalid` by the shipped arm
+   * on every run for the life of the line-addressed editor, and the row stayed green.
+   *
+   * Exact text and not a substring: an off-by-one anchor, a register that never pasted and a CUT
+   * that removed nothing all produce a file that still contains everything a substring check would
+   * look for. A path named here that the workspace does not hold is a failure, so this also asserts
+   * the file exists.
+   */
+  readonly filesAfter?: Readonly<Record<string, string>>;
+  /**
+   * How many edits reached disk: `file_patch` hunks applied plus `file_write` calls that returned.
+   *
+   * Beside `filesAfter` rather than instead of it. `filesAfter` says the file is right; this says
+   * how many calls it took to get there, which is what separates a patch that landed from a patch
+   * that was refused and a later whole-file write that covered for it. Zero is a real expectation
+   * and the interesting one: it is what a fixture about refusals asserts.
+   */
+  readonly landedEdits?: number;
+  /**
+   * Why each failing call failed: one `code:substring` per failure, in order, matched against the
+   * message the model was handed.
+   *
+   * `noFailedTools: false` is a fixture consenting to a failure and consenting to no particular
+   * one. Every row here that is ABOUT a refusal - three of them - was green while the refusal
+   * arriving was a different refusal from a different layer, so this is the assertion that makes
+   * "the same failure" mean something. A substring rather than the whole message, because the
+   * messages carry the file's live text and pinning that would make every one of these rows fail
+   * whenever a fixture's workspace changed.
+   */
+  readonly toolFailures?: readonly string[];
   /** Every hold the harness fired, in the order it fired them. */
   readonly holds?: readonly HoldName[];
   /** Whether the boilerplate fallback plan was written for a task that never asked for one. */
@@ -1592,6 +1711,172 @@ const holdsIn = (messages: readonly string[]): { holds: HoldName[]; pushback: st
   return { holds, pushback };
 };
 
+/* ------------------------------------------------ what a turn displayed, and what it landed */
+
+/**
+ * One `file_read`, counted by what it actually put on the model's screen.
+ *
+ * `lines` is the number of rows in the result's `content`, which is `renderNumbered`'s own output
+ * and therefore the thing the model reads - never `totalLines`, and never the window the call asked
+ * for. The two differ on every read the display bound cuts short, and the whole point of the
+ * measurement is that they are allowed to.
+ */
+export interface DisplayedRead {
+  readonly toolCallId: string;
+  readonly path: string;
+  /** Rows of `content`: what was rendered and sent. */
+  readonly lines: number;
+  /** `endLine - startLine + 1`, the tool's own claim about the same quantity. */
+  readonly claimedLines: number;
+  /** The file's real length, when the read reached the end of it and could say. */
+  readonly totalLines: number | null;
+  /** Whether the model asked for a range, which is the arm `workspace.ts:256` takes. */
+  readonly windowed: boolean;
+  /** Whether the result says it stopped before the end. */
+  readonly truncated: boolean;
+}
+
+/** One edit that reached disk: a `file_patch` hunk that applied, or a `file_write` that returned. */
+export interface LandedEdit {
+  readonly toolCallId: string;
+  readonly tool: 'file_patch' | 'file_write';
+  readonly path: string;
+  /** Rows the patch echo displayed back, which is display the edit itself paid for. */
+  readonly echoLines: number;
+}
+
+/**
+ * The read side of a turn, as arithmetic rather than as an impression.
+ *
+ * DISPLAYED LINES PER LANDED EDIT is the number the whole edit-format economic case turns on and
+ * the one athanor measured nowhere. The line dialect buys output characters per edit and pays for
+ * them in input: the numbering is charged on every request after a read for as long as the file
+ * stays in the window, so `evals/arms/price.ts` can only close its break-even by ASSUMING how many
+ * edits a turn lands per read. This is that assumption, measured.
+ *
+ * Read from the event stream and not from the window: `tool_result` carries the result the tool
+ * returned, before the context layer decides how much of it to keep, so this counts what athanor
+ * chose to display and not what survived a later squeeze. Both are worth knowing and they are
+ * different questions; `evals/context-quality` owns the second one.
+ *
+ * `document_read` and `parallel_web_read` also put text in front of the model and are deliberately
+ * not counted. This is the ledger the EDIT FORMAT is priced against, and neither of those can be
+ * addressed by a patch.
+ */
+export interface ReadLedger {
+  readonly reads: readonly DisplayedRead[];
+  readonly edits: readonly LandedEdit[];
+  /** Rows of file text displayed by reads. The numerator. */
+  readonly displayedLines: number;
+  /** Rows the patch echoes displayed. Beside the numerator, never inside it, so both are readable. */
+  readonly echoLines: number;
+  /** The denominator. Zero is a real answer and is never divided by; see `linesPerEdit`. */
+  readonly landedEdits: number;
+  /**
+   * Reads whose `content` had a different number of rows than `endLine - startLine + 1`.
+   *
+   * Always zero, and asserted rather than assumed: the two are computed by different code on
+   * different sides of a JSON boundary, and a disagreement means one of them is not describing what
+   * was displayed. A rig that averaged over such a row would be averaging over a bug.
+   */
+  readonly claimMismatches: number;
+}
+
+const asRecord = (value: unknown): Record<string, unknown> =>
+  typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {};
+
+const rowsOf = (text: string): number => (text === '' ? 0 : text.split('\n').length);
+
+/**
+ * The ledger, built by pairing every `tool_result` with the `tool_started` that named its call.
+ *
+ * Paired rather than sniffed from the result's own shape, because that is the only place the
+ * ARGUMENTS are - and `windowed` is a fact about what the model asked for, not about what came
+ * back. A call that threw writes an `error` event and no `tool_result`, so a refused patch and a
+ * failed read are absent here by construction rather than by a filter somebody has to maintain.
+ */
+export const readLedgerOf = (
+  events: readonly { readonly kind: string; readonly payload: unknown }[]
+): ReadLedger => {
+  const started = new Map<string, { tool: string; arguments: Record<string, unknown> }>();
+  for (const entry of events) {
+    if (entry.kind !== 'tool_started') continue;
+    const payload = asRecord(entry.payload);
+    const id = asText(payload.toolCallId);
+    if (id) started.set(id, { tool: asText(payload.tool), arguments: asRecord(payload.arguments) });
+  }
+  const reads: DisplayedRead[] = [];
+  const edits: LandedEdit[] = [];
+  let claimMismatches = 0;
+  for (const entry of events) {
+    if (entry.kind !== 'tool_result') continue;
+    const payload = asRecord(entry.payload);
+    const toolCallId = asText(payload.toolCallId);
+    const call = started.get(toolCallId);
+    if (!call) continue;
+    const result = asRecord(payload.result);
+    if (call.tool === 'file_read' && typeof result.content === 'string') {
+      const lines = rowsOf(result.content);
+      const startLine = Number(result.startLine);
+      const endLine = Number(result.endLine);
+      const claimedLines =
+        Number.isFinite(startLine) && Number.isFinite(endLine) ? endLine - startLine + 1 : lines;
+      if (claimedLines !== lines) claimMismatches += 1;
+      reads.push({
+        toolCallId,
+        path: asText(result.path) || asText(call.arguments.path),
+        lines,
+        claimedLines,
+        totalLines: Number.isFinite(Number(result.totalLines)) ? Number(result.totalLines) : null,
+        // The same test `workspace.ts:254-256` makes, on the same two arguments.
+        windowed: Number(call.arguments.startLine) > 0 || Number(call.arguments.endLine) > 0,
+        truncated: result.truncated === true
+      });
+      continue;
+    }
+    if (call.tool === 'file_patch') {
+      const changed = Array.isArray(result.filesChanged) ? result.filesChanged : [];
+      // The echo is one string for the whole call, so it is charged to the call's first landed
+      // hunk rather than divided: dividing it would invent a per-file figure nothing produced.
+      const echo = rowsOf(asText(result.wrote));
+      for (const [index, file] of changed.entries())
+        edits.push({
+          toolCallId,
+          tool: 'file_patch',
+          path: asText(asRecord(file).path),
+          echoLines: index === 0 ? echo : 0
+        });
+      continue;
+    }
+    if (call.tool === 'file_write')
+      edits.push({
+        toolCallId,
+        tool: 'file_write',
+        path: asText(call.arguments.path),
+        echoLines: 0
+      });
+  }
+  return {
+    reads,
+    edits,
+    displayedLines: reads.reduce((total, read) => total + read.lines, 0),
+    echoLines: edits.reduce((total, edit) => total + edit.echoLines, 0),
+    landedEdits: edits.length,
+    claimMismatches
+  };
+};
+
+/**
+ * Displayed lines per landed edit, or null where the turn landed no edit.
+ *
+ * Null and never `Infinity`, and never zero. A turn that read four hundred lines and landed nothing
+ * has a real read cost and no edit to charge it to; printing `Infinity` invites a mean over it, and
+ * printing 0 would say the reads were free. Rows with no landed edit are counted in their own
+ * column wherever this is reported, which is the only honest place for them.
+ */
+export const linesPerEdit = (ledger: ReadLedger): number | null =>
+  ledger.landedEdits === 0 ? null : ledger.displayedLines / ledger.landedEdits;
+
 export interface RunOutcome {
   /** Provider calls, which is what a step costs and what the owner is billed for. */
   readonly modelCalls: number;
@@ -1682,6 +1967,29 @@ export interface RunOutcome {
    */
   readonly checkoutPathLeaks: number;
   readonly commandsRun: number;
+  /**
+   * What this turn's reads displayed and what its edits landed. See `ReadLedger`.
+   *
+   * A first-class field rather than something a reader derives from `tools`, because `tools` is
+   * recorded before a call runs and says nothing about how much a read showed or whether an edit
+   * reached disk - which is the whole of the question.
+   */
+  readonly readLedger: ReadLedger;
+  /**
+   * Every file in the workspace when the turn ended, by path, as text.
+   *
+   * The stub's starting files, overlaid with everything the turn wrote. This is the only thing in
+   * this rig that can tell an edit that LANDED from an edit that was merely ATTEMPTED, and until it
+   * existed nothing could: `tools` records a call before it runs, `noFailedTools` is satisfied by a
+   * fixture that declares its own failures, and `readLedger.landedEdits` counts writes without
+   * looking at what they contained. So `small-hunks-that-miss-in-different-places-are-a-search`
+   * spent its whole life reporting green with all five of its patches refused, and the two
+   * acceptance fixtures reported a fixed importer after writing the file back byte-identical.
+   *
+   * Text and not bytes, so an expectation reads as the file rather than as a digest, and a failure
+   * says what the file actually holds.
+   */
+  readonly filesAfter: Readonly<Record<string, string>>;
   /** Generations the provider was actually billed for, which is the only real money a turn spends. */
   readonly mediaGenerated: number;
   /** The model id each of those generations named on the wire, in order. */
@@ -1850,6 +2158,22 @@ export interface RunOutcome {
   readonly replies: number;
   /** Every tool that threw rather than returning, by name, in the order they failed. */
   readonly failedTools: readonly string[];
+  /**
+   * The same failures with their reason attached: the error code and the message the model was
+   * handed back.
+   *
+   * `failedTools` says a call threw and nothing else, which is enough to tell a fixture that meant
+   * to fail from one that did not, and not enough to tell one failure from another. Every
+   * `file_patch` in this suite threw `patch_invalid` - "Every patch requires a path and a non-empty
+   * edit" - for the whole life of the line-addressed editor, and the two rows carrying them were
+   * written about `patch_conflict`, a refusal from four hundred lines further on that they never
+   * reached. Nothing here could see the difference.
+   */
+  readonly toolFailures: ReadonlyArray<{
+    readonly tool: string;
+    readonly code: string;
+    readonly message: string;
+  }>;
   /** Every warning the turn raised, in order, by summary. */
   readonly warnings: readonly string[];
   /**
@@ -2100,6 +2424,16 @@ const schemaOutcome = (findings: readonly string[]): RunOutcome => ({
   peakPromptTokens: 0,
   tools: [],
   proposed: [],
+  // A schema fixture runs no loop, so it displayed nothing and landed nothing. The empty ledger is
+  // the truth about it, and `linesPerEdit` reads it as "no landed edit" rather than as a zero.
+  readLedger: {
+    reads: [],
+    edits: [],
+    displayedLines: 0,
+    echoLines: 0,
+    landedEdits: 0,
+    claimMismatches: 0
+  },
   commandsRun: 0,
   mediaGenerated: 0,
   mediaModels: [],
@@ -2135,12 +2469,37 @@ const schemaOutcome = (findings: readonly string[]): RunOutcome => ({
   untrusted: false,
   replies: 0,
   failedTools: [],
+  toolFailures: [],
   warnings: [...findings],
   unstubbedRoutes: [],
+  filesAfter: {},
   error: null
 });
 
 export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
+  /*
+   * THE SEEN-LINE RECORD IS PER-TASK AND EVERY FIXTURE IN THIS RIG IS THE SAME TASK.
+   *
+   * `apps/worker/src/edit/snapshots.ts` keys what a read displayed on `${taskId} ${path}`, holds it
+   * for an hour, and this file has exactly one `taskId` - a module constant shared by all seventy
+   * rows. The suite runs them sequentially in one process, so without this line a read in one
+   * fixture vouches for line numbers in the next one, and `recordWrite` leaves the text of a file
+   * one fixture rewrote standing as evidence about a different fixture's pristine copy of it.
+   *
+   * That is not a hypothetical. Measured, by removing this line and running the whole suite:
+   * `small-hunks-that-miss-in-different-places-are-a-search` lands FIVE edits instead of two. Its
+   * three opening patches exist to miss, and they stop missing, because
+   * `files-code-declares-acceptance-first` read `workspace/importer.py` earlier in the same run and
+   * left a snapshot of it on record under the same task id. The file it leaves behind is
+   * `"def load(rows):\n    return [row for row in rows if any(row)]\n    return [row for row in
+   * rows if row]"` - a corrupted importer, produced by three edits the product refuses and the rig
+   * allowed. Run on its own the same fixture is green, so the row's verdict depended on which other
+   * rows had run before it.
+   *
+   * Cleared before the run rather than after it, so a fixture run on its own and the same fixture
+   * run inside the suite start from the identical empty record.
+   */
+  forgetReads();
   if (fixture.schema) return schemaOutcome(fixture.schema());
   const model = modelFor(fixture.contextTokens);
   const task = taskFor(fixture.request, fixture.maxCredits ?? 50);
@@ -2914,6 +3273,12 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       .filter((entry) => entry.kind === 'tool_started')
       .map((entry) => asText((entry.payload as { tool?: unknown }).tool)),
     proposed,
+    readLedger: readLedgerOf(events),
+    // What the workspace holds now: what the fixture put there, then what the turn did to it.
+    filesAfter: {
+      ...(fixture.runner?.files ?? {}),
+      ...Object.fromEntries([...execState.written].map(([file, entry]) => [file, entry.text]))
+    },
     commandsRun: execState.execs,
     mediaGenerated: execState.media,
     mediaModels: execState.mediaModels,
@@ -3003,6 +3368,23 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
           (entry.payload as { toolCallId?: unknown } | undefined)?.toolCallId !== undefined
       )
       .map((entry) => entry.summary.replace(/ failed$/, '')),
+    // Same events, with the reason kept. `recordToolFailure` writes `{toolCallId, message, code}`
+    // and this rig threw away everything but the tool's name, so a row could say a call failed and
+    // nothing anywhere could say a call failed FOR THE REASON THE ROW IS ABOUT.
+    toolFailures: events
+      .filter(
+        (entry) =>
+          entry.kind === 'error' &&
+          (entry.payload as { toolCallId?: unknown } | undefined)?.toolCallId !== undefined
+      )
+      .map((entry) => {
+        const payload = asRecord(entry.payload);
+        return {
+          tool: entry.summary.replace(/ failed$/, ''),
+          code: asText(payload.code),
+          message: asText(payload.message)
+        };
+      }),
     warnings: events.filter((entry) => entry.kind === 'warning').map((entry) => entry.summary),
     unstubbedRoutes: [...new Set(execState.unstubbed)],
     error

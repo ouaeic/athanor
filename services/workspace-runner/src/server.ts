@@ -797,7 +797,14 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
 
   app.get<{
     Params: { workspaceId: string };
-    Querystring: { path: string; startLine?: string; endLine?: string; maxBytes?: string };
+    Querystring: {
+      path: string;
+      startLine?: string;
+      endLine?: string;
+      maxBytes?: string;
+      displayBytes?: string;
+      displayLines?: string;
+    };
   }>('/v1/workspaces/:workspaceId/file', async (request, reply) => {
     requireScope(request, 'files.read');
     const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
@@ -806,6 +813,15 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     // the file being read. The ceiling is the same one an unbounded read has, so asking for a
     // window can never cost the runner more than asking for everything already could.
     const maxBytes = positiveQueryInteger(request.query.maxBytes);
+    /*
+     * A caller that names a DISPLAY budget is saying the bytes it gets back are going in front of a
+     * model, which is the one thing that makes a read count as having shown anything. It gets the
+     * prefix that fits and the whole file's hash, and that prefix is recorded as seen - so the two
+     * records of what the model has been shown, this one and the worker's, are the same bytes rather
+     * than two computations that agree until one of them changes.
+     */
+    const displayBytes = positiveQueryInteger(request.query.displayBytes);
+    const displayLines = positiveQueryInteger(request.query.displayLines);
     try {
       if (maxBytes !== undefined) {
         const window = await readWorkspaceFileLines(root, requestedPath, {
@@ -818,6 +834,10 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
           'x-end-line': String(window.endLine),
           'x-file-bytes': String(window.sizeBytes),
           'x-truncated': String(window.truncated),
+          // Whether the last row of the body is half a line. `x-truncated` says the window ended
+          // early and does not say which of the two ways, and the caller's record of what it
+          // displayed turns on exactly that.
+          'x-partial-line': String(window.partialLine),
           ...(window.totalLines === undefined
             ? {}
             : { 'x-total-lines': String(window.totalLines) }),
@@ -827,8 +847,21 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
         });
         return reply.type(contentTypeFor(requestedPath)).send(window.content);
       }
-      const file = await readWorkspaceFile(root, requestedPath, config.MAX_FILE_BYTES);
+      const file = await readWorkspaceFile(
+        root,
+        requestedPath,
+        config.MAX_FILE_BYTES,
+        displayBytes !== undefined && displayLines !== undefined
+          ? { maxBytes: Math.min(displayBytes, config.MAX_FILE_BYTES), maxLines: displayLines }
+          : undefined
+      );
       reply.header('x-content-sha256', file.sha256);
+      if (file.totalLines !== undefined)
+        reply.headers({
+          'x-total-lines': String(file.totalLines),
+          'x-display-lines': String(file.displayedLines ?? 0),
+          'x-partial-line': String(file.partialLine === true)
+        });
       return reply.type(contentTypeFor(requestedPath)).send(file.content);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT')
@@ -910,12 +943,23 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     await assertHostStorageWrite(root, body.length, probeHostStorage);
     // The caller's claim about what it is replacing, checked under the write's own descriptor.
     const expected = (request.query.expectSha256 ?? '').trim();
+    /*
+     * Only the agent is held to what it has been shown, and the capability says who is writing
+     * rather than the body or a query parameter, so it is not something a caller can decide about
+     * itself. The agent's windowed read has no whole-file digest to claim, so before this the guard
+     * was skipped on exactly the shape that needed it most; the owner's save from the Files pane and
+     * an upload landing on a name still arrive unclaimed and stay unguarded, because neither of them
+     * said it had read anything.
+     */
     return writeWorkspaceFile(
       root,
       requestedPath,
       body,
       config.MAX_FILE_BYTES,
-      expected || undefined
+      expected || undefined,
+      {
+        heldToReads: request.capability.role === 'agent'
+      }
     );
   });
 

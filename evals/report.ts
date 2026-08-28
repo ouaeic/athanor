@@ -67,6 +67,18 @@ export interface Baseline {
      * every older tool result on an ordinary step did, unnoticed, for the whole life of the product.
      */
     readonly cachePrefix?: number;
+    /**
+     * Rows of file text this turn's reads put in front of the model.
+     *
+     * The numerator of displayed lines per landed edit, committed as its own row because it is the
+     * one term of that quotient a change to the read side moves on its own - and because it is a
+     * count of lines, so unlike the token columns it needs no band: nothing drifts it. Gated one
+     * way only. Showing the model MORE for the same work is the regression; showing it less is the
+     * whole point of the read lane, and a gate that fired on an improvement would be a gate against
+     * the work. Optional, so a baseline accepted before this column existed still gates its own
+     * rows rather than reading as a suite-wide regression on the first run after the upgrade.
+     */
+    readonly displayedLines?: number;
   };
 }
 
@@ -299,6 +311,50 @@ export const check = (
     failures.push(
       `holds: expected [${expect.holds.join(', ')}], got [${outcome.holds.join(', ')}]`
     );
+  /*
+   * What the workspace holds when the turn is over, which is the only claim here a broken editor
+   * cannot satisfy by accident.
+   *
+   * Quoted through `JSON.stringify` on purpose. The failures this exists to catch are an anchor off
+   * by one, a trailing newline that went missing and a block pasted back with its indentation
+   * changed, and every one of them is invisible in a message that prints the two texts raw.
+   */
+  for (const [file, wanted] of Object.entries(expect.filesAfter ?? {})) {
+    const got = outcome.filesAfter[file];
+    if (got === undefined)
+      failures.push(
+        `${file} is not in the workspace at the end of the turn; it holds [${Object.keys(outcome.filesAfter).join(', ')}]`
+      );
+    else if (got !== wanted)
+      failures.push(
+        `${file} after the turn:\n        expected ${JSON.stringify(wanted)}\n        got      ${JSON.stringify(got)}`
+      );
+  }
+  compare('edits that reached disk', expect.landedEdits, outcome.readLedger.landedEdits);
+  /*
+   * And why each failure was a failure, which `noFailedTools: false` cannot say.
+   *
+   * `code:substring`, positionally. The code alone would be satisfied by the wrong refusal with the
+   * right code, and the whole message would pin the live file text into a fixture; the pair is the
+   * narrowest claim that still names the mechanism.
+   */
+  if (expect.toolFailures) {
+    const got = outcome.toolFailures.map((failure) => `${failure.code}:${failure.message}`);
+    if (
+      got.length !== expect.toolFailures.length ||
+      !expect.toolFailures.every((wanted, index) => {
+        const at = wanted.indexOf(':');
+        const [code, fragment] = [wanted.slice(0, at), wanted.slice(at + 1)];
+        const failure = outcome.toolFailures[index];
+        return failure !== undefined && failure.code === code && failure.message.includes(fragment);
+      })
+    )
+      failures.push(
+        `why the calls failed: expected [${expect.toolFailures.join(' | ')}], got [${got
+          .map((line) => line.slice(0, 120))
+          .join(' | ')}]`
+      );
+  }
   for (const tool of expect.toolsInclude ?? [])
     if (!outcome.tools.includes(tool))
       failures.push(`${tool} never ran; the run used [${outcome.tools.join(', ')}]`);
@@ -357,6 +413,15 @@ export const check = (
       failures.push(
         `cached prefix against the committed baseline: was ${before.cachePrefix}%, now ${outcome.cachePrefix}%, and this row may not lose more than ${CACHE_PREFIX_BAND} points`
       );
+    // Exact and one-sided. A count of displayed lines drifts under nothing - not the clock, not the
+    // catalogue - so a row that moved moved because something changed what a read shows.
+    if (
+      before.displayedLines !== undefined &&
+      outcome.readLedger.displayedLines > before.displayedLines
+    )
+      failures.push(
+        `lines displayed by this turn's reads: was ${before.displayedLines}, now ${outcome.readLedger.displayedLines}. Every one of them is charged on every later request of the turn.`
+      );
   }
   return failures;
 };
@@ -407,6 +472,26 @@ const row = (result: Result, baseline: Baseline, width: number): string => {
     // and no share to report - which is not the same statement as nought per cent.
     padStart(result.outcome.modelCalls > 1 ? `${result.outcome.cachePrefix}%` : '-', 6),
     padStart(result.outcome.modelCalls > 1 ? cached : '', 5),
+    /*
+     * What the turn's reads displayed, and what each landed edit cost in displayed lines.
+     *
+     * Two columns and not one, for the reason the catalogue gets two: the quotient alone cannot say
+     * which half moved, and the halves move for completely different reasons - a display bound
+     * moves the numerator, an editor that lands more of what it is asked to moves the denominator.
+     *
+     * `-` in the second column is a turn that landed no edit. It is not zero and it is not
+     * infinity: the reads were not free and there is no edit to charge them to, and `evals/read`
+     * counts those rows in a column of their own rather than averaging over them.
+     */
+    padStart(String(result.outcome.readLedger.displayedLines), 5),
+    padStart(
+      result.outcome.readLedger.landedEdits
+        ? (
+            result.outcome.readLedger.displayedLines / result.outcome.readLedger.landedEdits
+          ).toFixed(1)
+        : '-',
+      7
+    ),
     result.outcome.holds.join(' ')
   ].join(' ');
 };
@@ -462,10 +547,10 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
 
   lines.push('');
   lines.push(
-    `     ${pad('fixture', width)} ${pad('shape', 10)} ${padStart('steps', 5)} ${padStart('Δ', 5)} ${padStart('tokens', 8)} ${padStart('Δ', 8)} ${padStart('cat', 8)} ${padStart('Δ', 7)} ${padStart('peak', 8)} ${padStart('cached', 6)} ${padStart('Δ', 5)} holds`
+    `     ${pad('fixture', width)} ${pad('shape', 10)} ${padStart('steps', 5)} ${padStart('Δ', 5)} ${padStart('tokens', 8)} ${padStart('Δ', 8)} ${padStart('cat', 8)} ${padStart('Δ', 7)} ${padStart('peak', 8)} ${padStart('cached', 6)} ${padStart('Δ', 5)} ${padStart('shown', 5)} ${padStart('l/edit', 7)} holds`
   );
   lines.push(
-    `     ${'-'.repeat(width)} ${'-'.repeat(10)} ${'-'.repeat(5)} ${'-'.repeat(5)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(7)} ${'-'.repeat(8)} ${'-'.repeat(6)} ${'-'.repeat(5)} -----`
+    `     ${'-'.repeat(width)} ${'-'.repeat(10)} ${'-'.repeat(5)} ${'-'.repeat(5)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(7)} ${'-'.repeat(8)} ${'-'.repeat(6)} ${'-'.repeat(5)} ${'-'.repeat(5)} ${'-'.repeat(7)} -----`
   );
   for (const result of results) lines.push(row(result, baseline, width));
 
@@ -550,6 +635,29 @@ export const render = (results: readonly Result[], baseline: Baseline): string =
           repeatable.length
       )}% of each request repeated the one before it byte for byte, which is the ceiling on what a prefix cache could read back.`
     );
+  /*
+   * The read side, in the same one line, and with its own n.
+   *
+   * Pooled over the turns that landed an edit and never over the whole suite: a turn that landed
+   * nothing has a real read cost and no edit to charge it to, and folding it in either direction
+   * would make the figure a function of how many conversational fixtures the suite happens to hold.
+   * `evals/read` is where this number is measured properly, on files large enough for the answer to
+   * differ; this line exists so that a change to the read side cannot land without moving something
+   * in the report every wave already reads.
+   */
+  const landing = results.filter((result) => result.outcome.readLedger.landedEdits > 0);
+  const displayed = landing.reduce(
+    (total, result) => total + result.outcome.readLedger.displayedLines,
+    0
+  );
+  const landed = landing.reduce(
+    (total, result) => total + result.outcome.readLedger.landedEdits,
+    0
+  );
+  if (landed)
+    lines.push(
+      `Reads displayed ${results.reduce((total, result) => total + result.outcome.readLedger.displayedLines, 0)} lines of file text across the suite, and ${(displayed / landed).toFixed(2)} of them per landed edit over the n=${landing.length} turns that landed one. Every displayed line is charged again on every later request of its turn.`
+    );
   if (failed.length)
     lines.push(`${failed.length} fixture${failed.length === 1 ? '' : 's'} failed.`);
   lines.push('');
@@ -574,7 +682,8 @@ export const baselineFrom = (results: readonly Result[]): Baseline => {
             modelCalls: result.outcome.modelCalls,
             promptTokens: result.outcome.promptTokens,
             catalogueTokens: result.outcome.catalogueTokens,
-            cachePrefix: result.outcome.cachePrefix
+            cachePrefix: result.outcome.cachePrefix,
+            displayedLines: result.outcome.readLedger.displayedLines
           }
         ])
     )

@@ -353,6 +353,36 @@ const SURVEY_PAGES = Object.fromEntries(
   ])
 );
 
+/**
+ * A file with enough shape in it to address by line, for the fixtures about the editor.
+ *
+ * Written as a list of lines and joined, rather than as one string with escapes in it, because
+ * every one of those fixtures names line numbers and the numbers have to be readable here. Line N
+ * of this file is entry N of this array, and the trailing `''` is the newline the file ends with -
+ * `toLines` separates on newlines rather than terminating on them, so a file ending in one has a
+ * final empty line and the editor numbers it.
+ *
+ *   1 export const drain = (jobs) => {      6 export const retry = ...
+ *   2   const done = [];                    7 (blank)
+ *   3   return done;                        8 const log = (message) => {
+ *   4 };                                    9   console.log(message);
+ *   5 (blank)                              10 };
+ *                                          11 (the trailing newline)
+ */
+const queueSource = [
+  'export const drain = (jobs) => {',
+  '  const done = [];',
+  '  return done;',
+  '};',
+  '',
+  'export const retry = (job) => job.attempts < 3;',
+  '',
+  'const log = (message) => {',
+  '  console.log(message);',
+  '};',
+  ''
+].join('\n');
+
 /** A workspace with a couple of ordinary things in it, which most fixtures can share. */
 const workspaceFiles = {
   'workspace/notes.txt': 'Renewal is due on 14 March 2027 at the standard rate.\n',
@@ -760,30 +790,40 @@ export const fixtures: readonly Fixture[] = [
     id: 'files-code-holds-for-acceptance',
     shape: 'files',
     request: 'Fix workspace/importer.py so it reads all three columns.',
-    why: 'The measured price of the acceptance hold when the model does the natural thing and declares nothing up front. Read this against files-code-declares-acceptance-first: same work, same tools, one more model call - and one fewer command run, because a record declared after the change is never watched failing on the unfinished job.',
+    why: 'The measured price of the acceptance hold when the model does the natural thing and declares nothing up front. Read this against files-code-declares-acceptance-first: same work, same tools, one more model call - and one fewer command run, because a record declared after the change is never watched failing on the unfinished job. The work itself is a read and a one-line patch, which is what fixing a file costs in the shipped editor; it used to be a whole-file `file_write` of the file’s own existing bytes, so both halves of this pair reported a fixed importer while writing it back unchanged, and the hold was being priced around a change that never happened.',
     runner: { files: workspaceFiles, exec: [0, 0] },
     model: sequence(
       {
+        calls: [{ id: 'call-1', name: 'file_read', args: { path: 'workspace/importer.py' } }]
+      },
+      {
         calls: [
           {
-            id: 'call-1',
-            name: 'file_write',
-            args: { path: 'workspace/importer.py', content: 'def load(rows):\n    return rows\n' }
+            id: 'call-2',
+            name: 'file_patch',
+            args: {
+              patches: [
+                {
+                  path: 'workspace/importer.py',
+                  edit: 'PUT 2:\n+    return [(a, b, c) for a, b, c in rows]'
+                }
+              ]
+            }
           }
         ]
       },
-      { calls: [{ id: 'call-2', name: 'shell', args: { executable: 'ls', args: ['workspace'] } }] },
+      { calls: [{ id: 'call-3', name: 'shell', args: { executable: 'ls', args: ['workspace'] } }] },
       {
         text: 'The importer now reads all three columns.',
-        calls: finishCall('call-3', {
+        calls: finishCall('call-4', {
           summary: 'Fixed the importer.',
-          verification: evidence('call-2', 'The workspace listing shows the change landed')
+          verification: evidence('call-3', 'The workspace listing shows the change landed')
         })
       },
       {
         calls: [
           {
-            id: 'call-4',
+            id: 'call-5',
             name: 'set_acceptance',
             args: {
               checks: [
@@ -799,18 +839,22 @@ export const fixtures: readonly Fixture[] = [
         ]
       },
       {
-        calls: finishCall('call-5', {
+        calls: finishCall('call-6', {
           summary: 'Fixed the importer.',
-          verification: evidence('call-2', 'The workspace listing shows the change landed')
+          verification: evidence('call-3', 'The workspace listing shows the change landed')
         })
       }
     ),
     expect: {
-      modelCalls: 5,
-      tools: ['file_write', 'shell'],
+      modelCalls: 6,
+      tools: ['file_read', 'file_patch', 'shell'],
       status: 'completed',
       verification: 'verified',
       commandsRun: 2,
+      landedEdits: 1,
+      filesAfter: {
+        'workspace/importer.py': 'def load(rows):\n    return [(a, b, c) for a, b, c in rows]\n'
+      },
       holds: ['acceptance_hold']
     }
   },
@@ -818,7 +862,7 @@ export const fixtures: readonly Fixture[] = [
     id: 'files-code-declares-acceptance-first',
     shape: 'files',
     request: 'Fix workspace/importer.py so it reads all three columns.',
-    why: 'The same job done in the order the contract asks for. Four model calls, no hold, and two commands: the harness watched the check fail before the work, and the run that shows it passing afterwards is the one the model asked athanor for. It used to be three - the suite ran once more at finish, with nothing changed in between, and charged the owner a second suite for the same answer.',
+    why: 'The same job done in the order the contract asks for. Five model calls, no hold, and two commands: the harness watched the check fail before the work, and the run that shows it passing afterwards is the one the model asked athanor for. The third command used to be a fourth - the suite ran once more at finish, with nothing changed in between, and charged the owner a second suite for the same answer. The step this row and its pair both gained is the read a line-addressed edit rests on, and it is the honest price of the change: the write it replaced named no lines and needed no evidence, because it was handing back the bytes it had never looked at.',
     runner: { files: workspaceFiles, exec: [1, 0, 0] },
     model: sequence(
       {
@@ -840,31 +884,379 @@ export const fixtures: readonly Fixture[] = [
         ]
       },
       {
+        calls: [{ id: 'call-2', name: 'file_read', args: { path: 'workspace/importer.py' } }]
+      },
+      {
         calls: [
           {
-            id: 'call-2',
-            name: 'file_write',
-            args: { path: 'workspace/importer.py', content: 'def load(rows):\n    return rows\n' }
+            id: 'call-3',
+            name: 'file_patch',
+            args: {
+              patches: [
+                {
+                  path: 'workspace/importer.py',
+                  edit: 'PUT 2:\n+    return [(a, b, c) for a, b, c in rows]'
+                }
+              ]
+            }
           }
         ]
       },
       {
-        calls: [{ id: 'call-3', name: 'shell', args: { executable: 'pytest', args: ['-q'] } }]
+        calls: [{ id: 'call-4', name: 'shell', args: { executable: 'pytest', args: ['-q'] } }]
       },
       {
         text: 'The importer now reads all three columns and the test passes.',
-        calls: finishCall('call-4', {
+        calls: finishCall('call-5', {
           summary: 'Fixed the importer.',
-          verification: evidence('call-3', 'The test passes')
+          verification: evidence('call-4', 'The test passes')
         })
       }
     ),
     expect: {
-      modelCalls: 4,
-      tools: ['file_write', 'shell'],
+      modelCalls: 5,
+      tools: ['file_read', 'file_patch', 'shell'],
       status: 'completed',
       verification: 'verified',
       commandsRun: 2,
+      landedEdits: 1,
+      // The same file as its pair, from the same patch, so the two rows differ only in the order
+      // the acceptance record was declared - which is the one thing the pair exists to price.
+      filesAfter: {
+        'workspace/importer.py': 'def load(rows):\n    return [(a, b, c) for a, b, c in rows]\n'
+      },
+      holds: []
+    }
+  },
+  /* --------------------------------------------------- the line-addressed editor, end to end */
+
+  /**
+   * Three rows, and between them they are the only place in this rig where the shipped editor is
+   * asked to do anything. The measurement that made them necessary is in
+   * `docs/design/read/FIXTURES.md`: before them the suite contained eleven `file_patch` calls over
+   * two rows, every one of them in the oldText/newText dialect `apps/worker/src/tools/workspace.ts`
+   * refuses outright, and every one of them refused `patch_invalid` - "Every patch requires a path
+   * and a non-empty edit" - before the applier was reached at all, on every run since the format
+   * changed, while both rows reported green.
+   *
+   * Each one pins `filesAfter`, and that is the whole point of them. `tools` is written before a
+   * call runs and `noFailedTools` is declarable, so the file on disk is the only assertion here
+   * that a broken applier cannot satisfy.
+   *
+   * All three declare their acceptance check first and cite the run of it that follows the change,
+   * which is not decoration: a finish citing the `file_patch` itself is refused by name - "Every
+   * cited result predates file_patch" - because the call that made a change cannot be the evidence
+   * the change worked. Two model calls of the five or six each row costs are that contract, and they
+   * are the same two `files-code-declares-acceptance-first` pays.
+   */
+  {
+    id: 'files-a-move-crosses-the-wire-once',
+    shape: 'files',
+    request: 'Move the log helper in workspace/queue.ts up above drain.',
+    why: 'The operation the whole format was bought for, and the one nothing else here executes. A move in a quoted editor costs the block twice - once to say what is going and once to say what arrives - and `docs/design/edit/DECIDE.md` prices that shape at 397 characters of arguments against 71, the widest single row in its comparison. (The 777-against-57 figure still circulating in four documents predates the quoted editor gaining `moveAfter`; DECIDE.md §3 retired it, and this row does not carry it forward.) `CUT 8.=11 @log` then `PUT <1 @log` is the shape, and it exercises four separate mechanisms in one call: the register is filled from the live file before anything moves, so the CUT and the PUT can be written in either order; both ranges name the numbers of the read rather than the numbers the other operation would leave; and the splices are applied from the end of the file backwards so that stays true. The CUT deliberately takes line 11, the empty line the file’s final newline makes, so the helper carries its own terminator with it and the file still ends in exactly one newline - a fixture that stopped at line 10 would pass with a file that had quietly grown a blank line, which is the failure this format is most likely to have and the hardest to see in an echo.',
+    runner: {
+      files: { ...workspaceFiles, 'workspace/queue.ts': queueSource },
+      exec: [1, 0, 0]
+    },
+    model: sequence(
+      {
+        calls: [
+          {
+            id: 'call-1',
+            name: 'set_acceptance',
+            args: {
+              checks: [
+                {
+                  kind: 'command',
+                  label: 'the queue module still parses',
+                  executable: 'node',
+                  args: ['--check', 'workspace/queue.ts']
+                }
+              ]
+            }
+          }
+        ]
+      },
+      { calls: [{ id: 'call-2', name: 'file_read', args: { path: 'workspace/queue.ts' } }] },
+      {
+        calls: [
+          {
+            id: 'call-3',
+            name: 'file_patch',
+            args: {
+              patches: [{ path: 'workspace/queue.ts', edit: 'CUT 8.=11 @log\nPUT <1 @log' }]
+            }
+          }
+        ]
+      },
+      {
+        calls: [
+          {
+            id: 'call-4',
+            name: 'shell',
+            args: { executable: 'node', args: ['--check', 'workspace/queue.ts'] }
+          }
+        ]
+      },
+      {
+        text: 'The log helper is now above drain in workspace/queue.ts.',
+        calls: finishCall('call-5', {
+          summary: 'Moved the log helper above drain.',
+          verification: evidence('call-4', 'The module still parses after the move')
+        })
+      }
+    ),
+    expect: {
+      modelCalls: 5,
+      tools: ['file_read', 'file_patch', 'shell'],
+      status: 'completed',
+      verification: 'verified',
+      commandsRun: 2,
+      landedEdits: 1,
+      /*
+       * The whole file, and not a line of it left to chance.
+       *
+       * Every mutation this row is meant to catch produces a file that still contains both
+       * functions: a register that never pasted loses the helper, a CUT that removes nothing
+       * duplicates it, an anchor off by one takes the blank line instead of the closing brace. A
+       * substring check would be green for all three.
+       */
+      filesAfter: {
+        'workspace/queue.ts': [
+          'const log = (message) => {',
+          '  console.log(message);',
+          '};',
+          '',
+          'export const drain = (jobs) => {',
+          '  const done = [];',
+          '  return done;',
+          '};',
+          '',
+          'export const retry = (job) => job.attempts < 3;',
+          ''
+        ].join('\n')
+      },
+      holds: []
+    }
+  },
+  {
+    id: 'files-an-edit-outside-what-the-read-showed-is-refused',
+    shape: 'files',
+    request: 'In workspace/queue.ts, have drain drop the jobs that came back empty.',
+    why: 'The guard the whole format rests on, proved in both directions in one turn. A line number carries no evidence of its own - `PUT 9:` is as well-formed against a file nobody has opened as against one just read - so `snapshots.ts` keeps the evidence instead, and `apply.ts` refuses a range no read displayed. The turn reads a window of lines 1-4, addresses line 9, and is refused with the file’s real text at that anchor; then addresses line 3, which the window did show, and lands. Both halves are load-bearing and neither is worth anything alone: a guard that refuses everything passes the first half, and a guard wired to nothing passes the second. The refusal also has to cost exactly one generation, which is why the message carries the lines rather than telling the model to go and read them - `noFailedTools: false` below is the record that one call in this turn threw, and `filesAfter` is the record that it wrote nothing on its way out.',
+    runner: {
+      files: { ...workspaceFiles, 'workspace/queue.ts': queueSource },
+      exec: [1, 0, 0]
+    },
+    model: sequence(
+      {
+        calls: [
+          {
+            id: 'call-1',
+            name: 'set_acceptance',
+            args: {
+              checks: [
+                {
+                  kind: 'command',
+                  label: 'the queue module still parses',
+                  executable: 'node',
+                  args: ['--check', 'workspace/queue.ts']
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        calls: [
+          {
+            id: 'call-2',
+            name: 'file_read',
+            args: { path: 'workspace/queue.ts', startLine: 1, endLine: 4 }
+          }
+        ]
+      },
+      {
+        // Line 9 is inside the log helper, five lines past the end of the window above.
+        calls: [
+          {
+            id: 'call-3',
+            name: 'file_patch',
+            args: {
+              patches: [
+                {
+                  path: 'workspace/queue.ts',
+                  edit: 'PUT 9:\n+  if (!QUIET) console.log(message);'
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        // Line 3 was on screen, and this is the edit the owner asked for.
+        calls: [
+          {
+            id: 'call-4',
+            name: 'file_patch',
+            args: {
+              patches: [
+                {
+                  path: 'workspace/queue.ts',
+                  edit: 'PUT 3:\n+  return done.filter(Boolean);'
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        calls: [
+          {
+            id: 'call-5',
+            name: 'shell',
+            args: { executable: 'node', args: ['--check', 'workspace/queue.ts'] }
+          }
+        ]
+      },
+      {
+        text: 'drain now drops the empty jobs.',
+        calls: finishCall('call-6', {
+          summary: 'Filtered the empty jobs out of drain.',
+          verification: evidence('call-5', 'The module still parses after the change')
+        })
+      }
+    ),
+    expect: {
+      modelCalls: 6,
+      tools: ['file_read', 'file_patch', 'file_patch', 'shell'],
+      status: 'completed',
+      verification: 'verified',
+      commandsRun: 2,
+      // The first patch threw, which is the subject of the first half of this row - and it threw
+      // for the reason the row is about rather than for any of the six other reasons `apply.ts`
+      // refuses a patch for, which is a different claim and the one worth making.
+      noFailedTools: false,
+      toolFailures: ['patch_conflict:No read has shown you workspace/queue.ts at 9'],
+      // And the second landed, which is the subject of the second half. One, not two.
+      landedEdits: 1,
+      filesAfter: {
+        'workspace/queue.ts': [
+          'export const drain = (jobs) => {',
+          '  const done = [];',
+          '  return done.filter(Boolean);',
+          '};',
+          '',
+          'export const retry = (job) => job.attempts < 3;',
+          '',
+          'const log = (message) => {',
+          '  console.log(message);',
+          '};',
+          ''
+        ].join('\n')
+      },
+      holds: []
+    }
+  },
+  {
+    id: 'files-one-patch-addresses-the-numbers-that-were-read',
+    shape: 'files',
+    request:
+      'Add a size helper to workspace/queue.ts, raise the retry limit to five, and make the logger respect QUIET.',
+    why: 'The sentence in the resident spec that costs the most if it is untrue: ranges name the numbers you read, never the numbers your own earlier operations would leave. Three operations in one patch, deliberately in ascending order so that a front-to-back applier is wrong on the second and the third - the insert after line 4 moves everything below it down by two, so an applier that did not run backwards would replace the new helper instead of the retry limit and take the wrong three lines for the block. It is also the only execution of `PUT N*:` through a tool call - `apps/worker/src/edit/edit.test.ts` covers the block operation against `applyEdit` directly - and the block is the one place the harness has to find an end the model never counted to: `blockAt` walks bracket depth from line 8 to line 10 and the model names one number. All three land or none do, and `filesAfter` is the only thing here that can tell that apart from two of three.',
+    runner: {
+      files: { ...workspaceFiles, 'workspace/queue.ts': queueSource },
+      exec: [1, 0, 0]
+    },
+    model: sequence(
+      {
+        calls: [
+          {
+            id: 'call-1',
+            name: 'set_acceptance',
+            args: {
+              checks: [
+                {
+                  kind: 'command',
+                  label: 'the queue module still parses',
+                  executable: 'node',
+                  args: ['--check', 'workspace/queue.ts']
+                }
+              ]
+            }
+          }
+        ]
+      },
+      { calls: [{ id: 'call-2', name: 'file_read', args: { path: 'workspace/queue.ts' } }] },
+      {
+        calls: [
+          {
+            id: 'call-3',
+            name: 'file_patch',
+            args: {
+              patches: [
+                {
+                  path: 'workspace/queue.ts',
+                  edit: [
+                    'PUT >4:',
+                    '+',
+                    '+export const size = (jobs) => jobs.length;',
+                    'PUT 6:',
+                    '+export const retry = (job) => job.attempts < 5;',
+                    'PUT 8*:',
+                    '+const log = (message) => {',
+                    '+  if (QUIET) return;',
+                    '+  console.log(message);',
+                    '+};'
+                  ].join('\n')
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        calls: [
+          {
+            id: 'call-4',
+            name: 'shell',
+            args: { executable: 'node', args: ['--check', 'workspace/queue.ts'] }
+          }
+        ]
+      },
+      {
+        text: 'queue.ts has a size helper, a retry limit of five, and a logger that respects QUIET.',
+        calls: finishCall('call-5', {
+          summary: 'Added size, raised the retry limit and made the logger quiet-aware.',
+          verification: evidence('call-4', 'The module still parses after all three edits')
+        })
+      }
+    ),
+    expect: {
+      modelCalls: 5,
+      tools: ['file_read', 'file_patch', 'shell'],
+      status: 'completed',
+      verification: 'verified',
+      commandsRun: 2,
+      landedEdits: 1,
+      filesAfter: {
+        'workspace/queue.ts': [
+          'export const drain = (jobs) => {',
+          '  const done = [];',
+          '  return done;',
+          '};',
+          '',
+          'export const size = (jobs) => jobs.length;',
+          '',
+          'export const retry = (job) => job.attempts < 5;',
+          '',
+          'const log = (message) => {',
+          '  if (QUIET) return;',
+          '  console.log(message);',
+          '};',
+          ''
+        ].join('\n')
+      },
       holds: []
     }
   },
@@ -2780,7 +3172,7 @@ export const fixtures: readonly Fixture[] = [
     id: 'small-hunks-that-miss-in-different-places-are-a-search',
     shape: 'small',
     request: 'The importer drops rows. Fix it and show me the suite passing.',
-    why: 'The case the repeat-failure count has to leave alone, and the one that decides what "the same failure" means. Three patches miss, all with the identical error - `patch_conflict` every time, because the model is guessing at text it has not read - and then it reads the file and lands the hunk. A count keyed on the error alone reaches its bound on the third miss and interrupts a search that is one step from succeeding; keyed on the call, every one of these is a different attempt and nothing fires. The second half is the rhythm underneath all of this work: the suite runs, fails honestly, is fixed, and passes. A non-zero exit is a tool result and not a failed call, so none of it is ever counted - which is the property this fixture pins end to end, where the unit tests can only assert it about a function.',
+    why: 'The case the repeat-failure count has to leave alone, and the one that decides what "the same failure" means. Three patches miss, all with the identical error - `patch_conflict` every time, because the model is addressing line numbers nothing has shown it - and then it reads the file and lands the hunk. A count keyed on the error alone reaches its bound on the third miss and interrupts a search that is one step from succeeding; keyed on the call, every one of these is a different attempt and nothing fires. The second half is the rhythm underneath all of this work: the suite runs, fails honestly, is fixed, and passes. A non-zero exit is a tool result and not a failed call, so none of it is ever counted - which is the property this fixture pins end to end, where the unit tests can only assert it about a function. It is also the only row in this file where a patch has to LAND twice, so `filesAfter` below is what tells a converging search from five refusals in a row: written in the oldText/newText dialect the shipped arm no longer speaks, all five of these calls were refused `patch_invalid`, the file was never touched, and this row was green.',
     runner: { files: workspaceFiles, exec: [1, 0] },
     model: ({ index, lastMessage }) => {
       // The trap: reaching here means the count fired on a search that was converging.
@@ -2788,27 +3180,30 @@ export const fixtures: readonly Fixture[] = [
         return {
           calls: [{ id: 'call-trap', name: 'web_search', args: { query: 'patch failed' } }]
         };
-      const missingHunk = (id: string, oldText: string): ModelTurn => ({
+      const missingHunk = (id: string, edit: string): ModelTurn => ({
         calls: [
           {
             id,
             name: 'file_patch',
-            args: {
-              patches: [
-                { path: 'workspace/importer.py', oldText, newText: '    return rows or []' }
-              ]
-            }
+            args: { patches: [{ path: 'workspace/importer.py', edit }] }
           }
         ]
       });
       return (
         (
           [
-            // Three guesses at text that is not in the file. Same tool, same refusal, three
-            // different calls - and each one rules a shape of the code out.
-            missingHunk('call-1', '    rows = rows[1:]'),
-            missingHunk('call-2', 'def load(rows, skip):'),
-            missingHunk('call-3', '    return rows[1:]'),
+            /*
+             * Three guesses at where the return statement is, before anything has been read. Same
+             * tool, same refusal - `applyEdit` answers all three with the same sentence, because a
+             * file nothing has shown you is refused by the file rather than by the range - and
+             * three different calls, each of which rules a shape of the code out.
+             */
+            missingHunk('call-1', 'PUT 2:\n+    return rows or []'),
+            missingHunk('call-2', 'PUT 3:\n+    return [row for row in rows if row]'),
+            missingHunk(
+              'call-3',
+              'PUT 1.=2:\n+def load(rows):\n+    return [row for row in rows if any(row)]'
+            ),
             {
               calls: [{ id: 'call-4', name: 'file_read', args: { path: 'workspace/importer.py' } }]
             },
@@ -2821,8 +3216,9 @@ export const fixtures: readonly Fixture[] = [
                     patches: [
                       {
                         path: 'workspace/importer.py',
-                        oldText: '    return rows',
-                        newText: '    return [row for row in rows if row]'
+                        // Line 2 of the read above, which numbered the file 1:def load(rows): /
+                        // 2:    return rows / 3:.
+                        edit: 'PUT 2:\n+    return [row for row in rows if row]'
                       }
                     ]
                   }
@@ -2842,8 +3238,14 @@ export const fixtures: readonly Fixture[] = [
                     patches: [
                       {
                         path: 'workspace/importer.py',
-                        oldText: '    return [row for row in rows if row]',
-                        newText: '    return [row for row in rows if any(row)]'
+                        /*
+                         * Addressed against the numbers the FIRST patch left, with no read in
+                         * between. That is the property `recordWrite` exists for: the applier
+                         * re-records what it wrote as seen, because text the model authored is text
+                         * it has been shown. A second edit costing a second read would be a real
+                         * step and a real window, on the commonest shape there is.
+                         */
+                        edit: 'PUT 2:\n+    return [row for row in rows if any(row)]'
                       }
                     ]
                   }
@@ -2900,6 +3302,31 @@ export const fixtures: readonly Fixture[] = [
       // Three of the eight calls threw, and that is the subject: a patch that misses is a failed
       // call, and the claim is that three of them in a row are a search rather than a repeat.
       noFailedTools: false,
+      /*
+       * WHY the three that threw threw, which `noFailedTools: false` cannot say.
+       *
+       * The whole point of the first half of this row is that the three misses are one failure
+       * repeated, arriving from the guard that refuses a line number nothing has shown. Measured on
+       * the corpus this replaced, they were a different refusal from a different layer -
+       * `patch_invalid`, "Every patch requires a path and a non-empty edit" - raised before the
+       * applier was reached at all, and every assertion in this block was green anyway.
+       */
+      toolFailures: Array.from(
+        { length: 3 },
+        () => 'patch_conflict:No read of workspace/importer.py is on record for this task'
+      ),
+      /*
+       * The two that did not throw, and what they left on disk.
+       *
+       * Without these two lines every assertion above is satisfied by a run in which all five
+       * patches were refused - which is exactly the run this fixture measured until the dialect
+       * above was corrected. `tools` lists a call before it runs, and `noFailedTools: false`
+       * tolerates three failures without counting them.
+       */
+      landedEdits: 2,
+      filesAfter: {
+        'workspace/importer.py': 'def load(rows):\n    return [row for row in rows if any(row)]\n'
+      },
       // Two runs of the suite, one failing and one passing, and neither of them counted anywhere.
       // The third run the acceptance check would have needed is answered from the run athanor had
       // already watched, which is a saving this fixture inherits rather than one it is about.
@@ -2927,8 +3354,9 @@ export const fixtures: readonly Fixture[] = [
             patches: [
               {
                 path: 'workspace/importer.py',
-                oldText: '    return rows[1:]',
-                newText: '    return [row for row in rows if any(row)]'
+                // Byte-identical every time, and refused every time for the same reason: no read of
+                // this file is on record for the task, so the numbers come from nowhere.
+                edit: 'PUT 2:\n+    return [row for row in rows if any(row)]'
               }
             ]
           }
@@ -2946,6 +3374,17 @@ export const fixtures: readonly Fixture[] = [
       verification: 'not_applicable',
       // Every one of the six threw, which is the shape being bounded.
       noFailedTools: false,
+      // Six failures, one reason, in the words the model was given - which is what "the same way"
+      // in this row's own title means and what nothing here could previously check.
+      toolFailures: Array.from(
+        { length: 6 },
+        () => 'patch_conflict:No read of workspace/importer.py is on record for this task'
+      ),
+      // And nothing reached disk in six attempts, which is the other half of "the same way": a
+      // bound that stopped a turn after it had quietly landed one of the six would be a different
+      // and much worse mechanism, and no expectation above could tell the two apart.
+      landedEdits: 0,
+      filesAfter: { 'workspace/importer.py': 'def load(rows):\n    return rows\n' },
       // The count and the stop, in the loop's own words. The three notices are the three pushbacks
       // the replies below are the other half of, and the fourth line is the bound arriving.
       warnings: [

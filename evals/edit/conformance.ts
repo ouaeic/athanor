@@ -315,6 +315,46 @@ export const CASES: readonly ConformanceCase[] = [
     edit: 'PUT 5:\n+export const drain = (queue: Job[]): Payload | undefined => {',
     want: { kind: 'refuse', fixableFrom: 'content' }
   },
+  /*
+   * THE TWO RELOCATION CASES BELOW ARE A PAIR AND ONLY MEAN ANYTHING TOGETHER.
+   *
+   * `placeRange` has a recovery nothing else in this corpus reaches: when the addressed lines no
+   * longer hold the text the read recorded, it looks for that text elsewhere in the live file and
+   * follows it. The recovery is guarded by `hits.length !== 1`, because text that now stands in two
+   * places has no unambiguous home and picking one writes into a region the model never saw.
+   *
+   * Every case here drove the guard in one direction only. `scale-fifty-thousand-lines-shifted`
+   * relocates uniquely and lands, so it passes whether the guard counts matches or not; nothing
+   * made the recorded text ambiguous. Relaxing `!== 1` to `< 1` therefore changed no row of this
+   * rig, and the applier silently wrote into the FIRST of two matches while reporting a note that
+   * said it had followed the text.
+   *
+   * The pair fixes that. Both cases apply the identical drift - two lines prepended, so the numbers
+   * shift by two and the direct match fails in both. The only difference is the addressed range.
+   * 10-12 is the `if (!job.ready) { return null; }` stanza, which `src/queue.ts` also holds at
+   * 26-28, so after the shift it stands twice: refuse. 13-15 holds the one `logger.warn` line and
+   * stands once: land, and report the shift. A change that breaks the guard fails the first; a
+   * change that makes it refuse ordinary drift fails the second.
+   */
+  {
+    id: 'anchor-relocation-ambiguous',
+    group: 'anchor',
+    what: 'the file shifted under the read and the recorded lines now stand in two places',
+    drift: (text) => `// added\n// by somebody else\n${text}`,
+    edit: 'PUT 10.=12:\n+  if (job.ready === false) {',
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+  {
+    id: 'anchor-relocation-unique',
+    group: 'anchor',
+    what: 'the same shift, where the recorded lines still stand in exactly one place',
+    drift: (text) => `// added\n// by somebody else\n${text}`,
+    edit: 'PUT 13.=15:\n+  if (job.expiresAt < Date.now()) {',
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 15, 17, ['  if (job.expiresAt < Date.now()) {'])
+    }
+  },
 
   /* ------------------------------------------------------------------------- header errors */
   {
@@ -395,6 +435,32 @@ export const CASES: readonly ConformanceCase[] = [
     group: 'body',
     what: 'one body row whose `+` did not survive generation',
     edit: 'PUT 10.=12:\n+  if (!job.ready) {\n    return undefined;\n+  }',
+    want: { kind: 'refuse', fixableFrom: 'shape' }
+  },
+  /*
+   * THE CASE ABOVE DOES NOT TEST THE GUARD IT LOOKS LIKE IT TESTS, AND THIS ONE DOES.
+   *
+   * `parse.ts` refuses a space-prefixed body row in a body with no `-` rows, because the row is
+   * either context or a `+` that was dropped and the two put different text in the file. Disabling
+   * that refusal leaves the case above still refused - measured, `kind` goes from `parse` to
+   * `evidence` - because its space row reads `   return undefined;`, text that is nowhere in the
+   * file, so `placeWithEvidence` throws it out for an unrelated reason. The baseline records cost
+   * and verdict, both of which stay where they were, so the row cannot see the guard go.
+   *
+   * Here the space row is `   if (!job.ready) {`, which after the marker is stripped is exactly
+   * what line 10 holds. The evidence check is then satisfied and stops covering for the parser.
+   * Measured with the guard disabled: `ok: true`, the 10-12 range collapses onto line 10 alone
+   * because the one quoted line becomes the anchor evidence, the three body rows are spliced in
+   * over it, and the file grows from 57 lines to 59 with `    return null;` and `  }` orphaned
+   * below the replacement. The result carries a note reading "the quoted lines are what was
+   * replaced", which is a false sentence about a file the tool has just corrupted while reporting
+   * success.
+   */
+  {
+    id: 'body-dropped-plus-that-matches-the-file',
+    group: 'body',
+    what: 'a dropped `+` on a row whose text really is what the addressed line holds',
+    edit: 'PUT 10.=12:\n   if (!job.ready) {\n+    return undefined;\n+  }',
     want: { kind: 'refuse', fixableFrom: 'shape' }
   },
   {

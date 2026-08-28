@@ -60,6 +60,14 @@
       "cost": 1,
       "verdict": "refused"
     },
+    "anchor-relocation-ambiguous": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchor-relocation-unique": {
+      "cost": 0,
+      "verdict": "landed"
+    },
     "header-from-another-dialect": {
       "cost": 0,
       "verdict": "landed"
@@ -93,6 +101,10 @@
       "verdict": "landed"
     },
     "body-dropped-plus-marker": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "body-dropped-plus-that-matches-the-file": {
       "cost": 1,
       "verdict": "refused"
     },
@@ -360,9 +372,9 @@
     }
   },
   "totals": {
-    "cases": 64,
-    "free": 34,
-    "oneTrip": 27,
+    "cases": 67,
+    "free": 35,
+    "oneTrip": 29,
     "twoTrips": 2,
     "overRefused": 1,
     "defects": 1
