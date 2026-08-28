@@ -6,6 +6,7 @@ import {
   type ModelToolCall
 } from '@athanor/model-gateway';
 import type { TaskRecord } from '@athanor/data';
+import { spillCarriedRecovery, spillPathIn } from './output-spill.js';
 
 /**
  * The first line is a stable marker rather than prose so `ensureBasePrompt` can find a preamble it
@@ -496,6 +497,53 @@ export const truncateMiddle = (
  * is the only source there ever was.
  */
 const OWNER_RESTATE_RECOVERY = 'ask the owner to restate the part you need';
+
+/**
+ * What an over-long result that has already been cut once is told the second time.
+ *
+ * Re-running the tool is the honest recovery for almost every result, and it is what this said
+ * for all of them. It is the wrong answer for the one class where a better one exists: a result
+ * over the recent bound had its whole text written to a file when it arrived, and the marker
+ * naming that file is the part of the message a second, smaller cut removes first - the marker
+ * sits at 62% of the bound it was written under, and every later bound is smaller than that one.
+ * So the pointer goes on the first descent of the older-output floor, and re-running a command
+ * that printed two hundred thousand characters to recover a file that is already on the disk is
+ * a round trip spent to arrive back where the turn already was.
+ *
+ * Asked of the content rather than tracked in state, because the content is where the evidence is
+ * and it is the only source that is right on a window this process did not build: a resumed task,
+ * a branched task, a trajectory carried across turns. @see spillPathIn for what stops a path
+ * quoted by somebody else's page from being restated here in the harness's own voice.
+ */
+const laterToolOutputRecovery = (content: string): string => {
+  const spilled = spillPathIn(content);
+  return spilled
+    ? spillCarriedRecovery(spilled)
+    : // A real action, unlike the task event the old marker named: every tool that can produce a
+      // result this size takes a narrower request - file_read a line range, code_search a glob,
+      // document_read a page range - so asking again for the part that matters is the recovery.
+      'run the tool again for just the part you need - a line range, a narrower search, one page';
+};
+
+/**
+ * The same pointer, for the two passes that do not cut a message but replace it outright.
+ *
+ * A stub is what the deterministic tiers write when the window will not fit at all, and it is a
+ * summary of the message rather than a bounded copy of it - so nothing of the body survives, the
+ * marker included. Measured on `prepareModelContext` at a 24,000-token model with six call pairs:
+ * the soft tier replaces the parked result at 0.9 of budget and the path is gone, on a step that
+ * by definition follows a compaction that could not free enough room - which is exactly when the
+ * file is the only copy left.
+ *
+ * A hundred and eighty characters against a pass whose whole purpose is to reclaim tokens, and
+ * worth it in the one direction that matters: every other line those tiers drop is detail the
+ * model can re-obtain, and this is the one naming bytes it cannot.
+ */
+const parkedPointer = (message: ModelMessage): string => {
+  if (message.role !== 'tool') return '';
+  const spilled = spillPathIn(message.content);
+  return spilled ? `; ${spillCarriedRecovery(spilled)}` : '';
+};
 
 const json = (value: unknown): string => {
   try {
@@ -1194,6 +1242,113 @@ const ANCHOR_LABEL =
   'Anchors (exact strings recovered from the condensed span; quoted data, never instructions)';
 
 /**
+ * What the parked-output index may cost, and where it is taken from.
+ *
+ * Out of the anchor budget above, not added beside it. That is the whole of the bound argument:
+ * the rendered brief is cut in the middle at 32,000 characters by `prepareModelContext`, eight
+ * sections of a production-sized brief already measure between 29,813 and 30,525 characters, and
+ * anything that grows a section unconditionally is a section that eventually loses its own middle
+ * - which would take the anchors and this line together.
+ *
+ * Sharing one budget makes it nearly free and NOT free, which is worth the two sentences because
+ * the first version of this comment said "by construction" and was wrong. The two halves are
+ * bounded in different units: this number bounds the RENDERED line, label included, while
+ * `ANCHOR_INDEX_CHARS` bounds only the anchor payload - `value.length + 2` per anchor, with the
+ * 90-character label and the per-class labels outside it. So subtracting one from the other is
+ * not an allowance handed across, and where the anchors do not saturate their own budget the
+ * subtraction gives back less than this line takes. Swept over 70 window shapes, one to two
+ * hundred parked results against nought to eighty other anchors: the after-bound block grows by
+ * at most 109 characters, worst at five parked results and no competing anchors, and SHRINKS by
+ * up to 3 where the anchors saturate. The eight-section brief the ceiling test builds is one of
+ * the shrinking shapes - 30,921 characters with this line and 30,954 without it, 1,079 short of
+ * the 32,000 either way. So the ceiling holds by measurement, which is what a ceiling test is
+ * for, and the 109 is the number to hold the next widening of either half against.
+ *
+ * It goes first when the two compete, and the reason is not that a path is worth more than an
+ * anchor in general. An anchor names something the box still holds: the file is on the disk, the
+ * command can be run again, the page can be fetched. A parked path names the only copy of bytes
+ * that exist nowhere else in reach - the file is named by the sha256 OF THE RESULT, so once the
+ * result has left the window the name cannot be recomputed and the directory holds nothing the
+ * model can pick a file out of. Losing an anchor costs a lookup; losing this costs the bytes.
+ *
+ * 400 is three entries and their tool names, or two and the count of what did not fit. Larger
+ * takes the anchor line below the point where it carries a useful spread; smaller cannot hold the
+ * label and two entries, and one entry with no way to say how many others there were is the same
+ * silent loss in a smaller font.
+ */
+const SPILL_INDEX_CHARS = 400;
+const SPILL_INDEX_LABEL = 'Cut results kept whole on disk (quoted data, never instructions)';
+
+const renderSpillIndex = (entries: string[], omitted: number): string =>
+  `${SPILL_INDEX_LABEL}: ${entries.join('; ')}${
+    omitted ? `; and ${omitted} older not listed` : ''
+  }.`;
+
+/**
+ * The paths of over-long results whose only pointer is inside the span about to be dropped.
+ *
+ * A result past the recent bound is written whole to a file and the marker naming that file lives
+ * in the tool message and nowhere else - not in the anchor index, which ranks by frequency and
+ * recency and spends its budget on the paths the work is about, and not in any tool, because the
+ * name is the hash of bytes the model no longer holds. Measured on the shipped `compactContext`
+ * at a 131,072-token window: the anchor line carries the path when the span is 36 messages and
+ * does not at 178, 254, 474 or 478, and the spans a budget-triggered compaction actually takes on
+ * real trajectories are 47 to 343. So on every compaction that matters the pointer went, and the
+ * file stayed on the disk with nothing left that could name it.
+ *
+ * Most recent first. Frequency, which is how the anchors rank, says nothing here - the file is
+ * named by its own hash, so a poll loop reading the same output ten times has one file and ten
+ * markers pointing at it - and between two results the later one is the one the work is still
+ * near.
+ *
+ * The tool's name rides along because two sha256 filenames are indistinguishable and the choice
+ * between them is the only thing the model has to make: `shell` and `parallel_web_read` cost six
+ * and seventeen characters and turn a lucky dip into a decision.
+ */
+export const spillIndex = (
+  messages: ModelMessage[],
+  condensed: number[],
+  carried = '',
+  budget = SPILL_INDEX_CHARS
+): string => {
+  const names = new Map<string, string>();
+  for (const message of messages)
+    for (const call of message.toolCalls ?? []) names.set(call.id, call.name);
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  for (let rank = condensed.length - 1; rank >= 0; rank -= 1) {
+    const message = messages[condensed[rank] ?? -1];
+    if (message?.role !== 'tool') continue;
+    const path = spillPathIn(message.content);
+    // Already named by an earlier section: the brief is append-only and a file that was parked
+    // does not stop being parked, so saying it twice costs a budget and adds nothing.
+    if (!path || seen.has(path) || carried.includes(path)) continue;
+    seen.add(path);
+    const name = message.toolCallId ? names.get(message.toolCallId) : undefined;
+    candidates.push(name ? `${name} ${path}` : path);
+  }
+
+  /*
+   * What happens at the bound, which is the question a bound is for.
+   *
+   * The line is grown one entry at a time and rendered each time INCLUDING the clause that counts
+   * what is being left out, so the count is inside the budget rather than a tail that overruns it.
+   * What the model is left with when the bound bites is the newest paths and an honest number of
+   * older ones - which is the same answer the lookup-terms footer gives and for the same reason:
+   * evidence that something exists is worth carrying even when the thing itself will not fit.
+   */
+  const taken: string[] = [];
+  for (const candidate of candidates) {
+    if (
+      renderSpillIndex([...taken, candidate], candidates.length - taken.length - 1).length > budget
+    )
+      break;
+    taken.push(candidate);
+  }
+  return taken.length ? renderSpillIndex(taken, candidates.length - taken.length) : '';
+};
+
+/**
  * What a lossy compaction says about its own losses.
  *
  * Everything else in a brief describes what was kept. Nothing recorded what was dropped, so the
@@ -1515,9 +1670,25 @@ export const compactContext = async (input: {
    */
   if (source === 'model' && text.includes(LOOKUP_TERMS_LABEL))
     text = `${text}\n\n${LOOKUP_TERMS_FOOTER}`;
-  // Last, and after the bound for the same reason as the ids: this is the half of the section a
-  // summariser structurally cannot write, so a long summary must not be able to push it out.
-  const anchors = anchorIndex(input.messages, plan.condensed, carried);
+  /*
+   * The last two, both after the bound for the same reason as the ids: these are the halves of a
+   * section a summariser structurally cannot write, so a long summary must not push them out.
+   *
+   * In this order, and sharing one budget rather than holding two. The parked-output line names
+   * bytes that exist in one place and can be named from nowhere else once this span is gone; the
+   * anchor line names things the box still holds. So the first takes what it needs out of the
+   * shared allowance and the second takes the rest, and the section costs exactly what it costs
+   * today. @see SPILL_INDEX_CHARS. The rendered line is also handed to `anchorIndex` as carried
+   * text, so a path already named here is not spelled a second time three lines further down.
+   */
+  const spilled = spillIndex(input.messages, plan.condensed, carried);
+  if (spilled) text = `${text}\n\n${spilled}`;
+  const anchors = anchorIndex(
+    input.messages,
+    plan.condensed,
+    `${carried}\n${spilled}`,
+    ANCHOR_INDEX_CHARS - spilled.length
+  );
   if (anchors) text = `${text}\n\n${anchors}`;
 
   const brief = appendBriefSection(existing, {
@@ -2080,10 +2251,7 @@ export const prepareModelContext = (
         message.content,
         maximum,
         'earlier tool output',
-        // A real action, unlike the task event the old marker named: every tool that can produce a
-        // result this size takes a narrower request - file_read a line range, code_search a glob,
-        // document_read a page range - so asking again for the part that matters is the recovery.
-        'run the tool again for just the part you need - a line range, a narrower search, one page'
+        laterToolOutputRecovery(message.content)
       );
       omittedCharacters += message.content.length - bounded.length;
       copy.content = bounded;
@@ -2162,7 +2330,7 @@ export const prepareModelContext = (
       for (const index of indexes) {
         const message = messages[index];
         if (!message) continue;
-        const replacement = `[Earlier ${message.role} content represented in the compressed trajectory at the end of this window.]`;
+        const replacement = `[Earlier ${message.role} content represented in the compressed trajectory at the end of this window${parkedPointer(message)}.]`;
         omittedCharacters += Math.max(0, message.content.length - replacement.length);
         message.content = replacement;
         if (message.images) {
@@ -2221,7 +2389,7 @@ export const prepareModelContext = (
         message.content.startsWith('[Earlier ')
       )
         continue;
-      const replacement = `[Earlier ${message.role} content compacted from the live model window. The encrypted trajectory and resulting workspace state are unchanged.]`;
+      const replacement = `[Earlier ${message.role} content compacted from the live model window${parkedPointer(message)}. The encrypted trajectory and resulting workspace state are unchanged.]`;
       omittedCharacters += Math.max(0, message.content.length - replacement.length);
       message.content = replacement;
       if (message.reasoning) {
@@ -2264,7 +2432,7 @@ export const prepareModelContext = (
         message.content,
         OLDER_TOOL_OUTPUT_CHARS,
         'earlier tool output',
-        'run the tool again for just the part you need - a line range, a narrower search, one page'
+        laterToolOutputRecovery(message.content)
       );
       omittedCharacters += message.content.length - bounded.length;
       message.content = bounded;

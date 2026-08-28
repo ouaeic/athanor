@@ -15,9 +15,12 @@
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import type { ModelMessage } from '@athanor/model-gateway';
+import type { ModelMessage, ModelTool } from '@athanor/model-gateway';
+import { UNKNOWN_SURFACES, type ConnectorKind } from '@athanor/contracts';
 import { describe, expect, it } from 'vitest';
 import { requestDerivationBreach } from './turn-control.js';
+import { agentToolsFor } from './tool-catalogue.js';
+import { COMPACT_CONTEXT_TOOL } from './context.js';
 
 const window = (): ModelMessage[] => [
   { role: 'system', content: 'ATHANOR RUNTIME CONTEXT (dynamic)' },
@@ -30,12 +33,30 @@ const window = (): ModelMessage[] => [
   { role: 'tool', content: 'exit 0', toolCallId: 'call-1' }
 ];
 
-const tools = (): Array<{ name: string }> => [
-  { name: 'file_read' },
-  { name: 'file_write' },
-  { name: 'shell' },
-  { name: 'compact_context' }
-];
+/**
+ * Four tools out of the real catalogue, and real ones on purpose.
+ *
+ * These were `{ name: 'file_read' }` and three more like it - a shape the code under test can
+ * never be handed, which is this programme's own "test-proves-nothing" class. It stopped being
+ * harmless when the check grew a content comparison: `connector_action`'s definition is now built
+ * per box from the kinds the owner has connected, so a stub with no `parameters` cannot exercise
+ * the one class the comparison exists for.
+ */
+const tools = (): ModelTool[] =>
+  ['file_read', 'file_write', 'shell', 'compact_context'].map((name) => {
+    const tool = [...agentToolsFor(), COMPACT_CONTEXT_TOOL].find((entry) => entry.name === name);
+    if (!tool) throw new Error(`${name} is no longer in the catalogue`);
+    return tool;
+  });
+
+/** The real entry, which is the only thing whose content varying by box is the point. */
+const connectorAction = (kinds: ConnectorKind[]): ModelTool => {
+  const tool = agentToolsFor('lead', UNKNOWN_SURFACES, kinds).find(
+    (entry) => entry.name === 'connector_action'
+  );
+  if (!tool) throw new Error('connector_action is no longer in the catalogue');
+  return tool;
+};
 
 const request = (
   overrides: Partial<Parameters<typeof requestDerivationBreach>[0]> = {}
@@ -101,15 +122,44 @@ describe('the request athanor is about to send', () => {
    * cannot honour, and moves the head of the cached prefix while doing it.
    */
   it('catches a tool the run withdrew being sent anyway', () => {
-    const breach = requestDerivationBreach(
-      request({ sent: [...tools(), { name: 'connector_action' }] })
-    );
+    const breach = requestDerivationBreach(request({ sent: [...tools(), connectorAction([])] }));
     expect(breach).toContain('withdrew');
     expect(breach).toContain('5');
   });
 
   it('catches the same tools in a different order, because the prefix is bytes and not a set', () => {
     expect(requestDerivationBreach(request({ sent: [...tools()].reverse() }))).toContain('tools');
+  });
+
+  /**
+   * The content class, which the name comparison above cannot see and which now has a live cause.
+   *
+   * `connector_action` is built per box from the kinds of service the owner has connected, so the
+   * two derivations of the catalogue can agree on all forty-one names and disagree on what one of
+   * them says. The failure that produces is silent in the worst way: the request goes out with a
+   * mailbox-shaped tool while the run believes it sent a fully connected one, or the reverse, and
+   * a provider answers either as readily.
+   *
+   * Both arms use the real entry rather than a fabricated one - a stub with no `parameters` cannot
+   * produce the shape this comparison is for, and would pass while proving nothing.
+   */
+  it('catches one tool whose definition is not the one this run may send', () => {
+    const mailbox = connectorAction(['imap']);
+    const everything = connectorAction([]);
+    // The premise, asserted rather than assumed: same name, different definition.
+    expect(mailbox.name).toBe(everything.name);
+    expect(JSON.stringify(mailbox)).not.toBe(JSON.stringify(everything));
+    const breach = requestDerivationBreach(
+      request({ sent: [...tools(), mailbox], entitled: [...tools(), everything] })
+    );
+    expect(breach).toContain('connector_action');
+    expect(breach).toContain('entitled to send');
+    // And the direction that must stay silent: the same box on both sides.
+    expect(
+      requestDerivationBreach(
+        request({ sent: [...tools(), mailbox], entitled: [...tools(), connectorAction(['imap'])] })
+      )
+    ).toBeNull();
   });
 
   /**
@@ -125,7 +175,7 @@ describe('the request athanor is about to send', () => {
 
   it('reports the tools before the window, because a wrong catalogue explains a wrong window', () => {
     const both = requestDerivationBreach(
-      request({ sent: [...tools(), { name: 'connector_action' }], rederived: [] })
+      request({ sent: [...tools(), connectorAction([])], rederived: [] })
     );
     expect(both).toContain('withdrew');
   });

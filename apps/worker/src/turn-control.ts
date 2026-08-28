@@ -12,7 +12,7 @@
  */
 import { decryptJson, encryptJson } from '@athanor/core';
 import type { DataStore, TaskRecord } from '@athanor/data';
-import type { ModelMessage } from '@athanor/model-gateway';
+import type { ModelMessage, ModelTool } from '@athanor/model-gateway';
 import type { AgentState, AgentWorkerConfig } from './agent-state.js';
 import type { Logger } from './log.js';
 import type { AgentRunnerClient } from './runner-client.js';
@@ -236,7 +236,11 @@ export const honorUserControl = async (
  * - The tools sent diverging from the catalogue minus this run's withdrawals. The withdrawal set is
  *   built once for the whole run precisely so the catalogue stays byte-identical across steps; a
  *   later rebuild that forgets a withdrawal restores a tool the box cannot honour, and moves the
- *   head of the cached prefix while doing it.
+ *   head of the cached prefix while doing it. Compared by content and not only by name, and that
+ *   is not belt-and-braces: `connector_action` is now shaped by which kinds of service the owner
+ *   has connected, so a rebuild that read the connector table again instead of the fact frozen on
+ *   the run would produce the same forty-one names carrying a different request. A name check
+ *   would have called that derivable.
  * - `reservedTokens` diverging from the array actually sent. Three places compute it independently
  *   from three arrays, and it is the number the input budget, the compaction trigger and the
  *   handoff's own floor are all derived from. A drift there is a window sized against a request
@@ -250,8 +254,8 @@ export const requestDerivationBreach = (request: {
   prepared: readonly ModelMessage[];
   rederived: readonly ModelMessage[];
   /** The tools on the request, and the catalogue this run is entitled to send. */
-  sent: readonly { name: string }[];
-  entitled: readonly { name: string }[];
+  sent: readonly ModelTool[];
+  entitled: readonly ModelTool[];
   /** What the budget was computed against, and the array that is going out. */
   reservedTokens: number;
   reservedTokensOfSent: number;
@@ -260,6 +264,13 @@ export const requestDerivationBreach = (request: {
   const entitled = request.entitled.map((tool) => tool.name);
   if (sent.length !== entitled.length || sent.some((name, at) => name !== entitled[at]))
     return `the tools on this request are not the catalogue this run withdrew from: sending ${sent.length} (${sent.slice(0, 6).join(', ')}) against ${entitled.length} entitled`;
+  // And the same tools, not merely the same names. Both sides are built by one pure function from
+  // facts frozen on the run, so they are equal or something re-derived from a different answer.
+  const differing = request.sent.findIndex(
+    (tool, at) => JSON.stringify(tool) !== JSON.stringify(request.entitled[at])
+  );
+  if (differing >= 0)
+    return `the ${sent[differing]} definition on this request is not the one this run is entitled to send: ${JSON.stringify(request.sent[differing]).length} characters against ${JSON.stringify(request.entitled[differing]).length}`;
   if (request.reservedTokens !== request.reservedTokensOfSent)
     return `the input budget was computed against ${request.reservedTokens} reserved tokens and the tools actually being sent weigh ${request.reservedTokensOfSent}`;
   if (request.prepared.length !== request.rederived.length)

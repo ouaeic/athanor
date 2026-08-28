@@ -3004,6 +3004,54 @@ describe('the connector arms', () => {
     });
   });
 
+  it('answers an action this connector cannot run by naming the ones it can', async () => {
+    /*
+     * The other half of narrowing the catalogue by connected kind.
+     *
+     * `agentToolsFor` now sends a box only the actions its own connections reach, so a model that
+     * has not called `connector_list` yet can ask for one that is not on its wire - and the answer
+     * it used to get, "Action does not match this connector", named no alternative and cost it a
+     * whole further round trip to find out what it may ask for instead. Being wrong has to be
+     * cheap: the reachable set travels back with the refusal, in the same result.
+     *
+     * Nothing about the enforcement moved. `executeConnectorAction` in @athanor/core still refuses
+     * this action on this connector; what is asserted here is that the refusal is answerable.
+     */
+    const executed = await dispatch(
+      {
+        name: 'connector_action',
+        arguments: { connectorId: 'connector-1', action: 'github_read_file', input: {} }
+      },
+      {
+        store: {
+          getConnector: async () => ({
+            id: 'connector-1',
+            kind: 'imap',
+            label: 'Work mail',
+            baseUrl: 'imaps://mail.example.com:993',
+            scopes: ['mail:mailbox.read'],
+            enabled: true,
+            secretCiphertext: encryptJson(
+              { username: 'owner', password: 'app-password' },
+              masterKey,
+              `connector:${userId}:connector-1`
+            )
+          })
+        }
+      }
+    );
+
+    expect(executed.failure?.code).toBe('connector_action_invalid');
+    // The reason, the connector it was aimed at, and every action that connector does run - so the
+    // retry is the next call rather than the call after a connector_list.
+    expect(executed.failure?.message).toContain('github_read_file is a github action');
+    expect(executed.failure?.message).toContain('Work mail is a imap connection');
+    for (const reachable of ['mail_search', 'mail_read_message', 'mail_send'])
+      expect(executed.failure?.message, reachable).toContain(reachable);
+    // And nothing was spent finding out: the mailbox was never opened.
+    expect(executed.calls).toEqual([]);
+  });
+
   it.todo(
     'executes a connector action end to end - needs a live IMAP or CalDAV server, so the executed half is covered by packages/core/src/mail-connectors.test.ts rather than here'
   );

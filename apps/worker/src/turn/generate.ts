@@ -170,15 +170,20 @@ export const generateModelStep = async (
     // remembered copy: a remembered copy proves the array did not change, and what has to be
     // proved is that it is still the catalogue this run is entitled to send.
     //
-    // `surfaces` is the third fact and it has to be read off `run`, not re-probed. This is the
-    // second of the two places `agentToolsFor` is called on the send path, and the two must be
-    // given the same answer: gate one and not the other and every turn on a bare box dies here on
-    // `request_not_derivable` instead of sending. Taking it from the frozen run is what makes that
-    // impossible rather than merely unlikely - a second probe could answer differently between the
-    // claim and the send, and the failure would look like a corrupted trajectory.
-    entitled: [...agentToolsFor('lead', run.surfaces), COMPACT_CONTEXT_TOOL].filter(
-      (tool) => !withdrawnTools.has(tool.name)
-    ),
+    // `surfaces` and `connectorKinds` are the third and fourth facts and both have to be read off
+    // `run`, not re-probed. This is the second of the two places `agentToolsFor` is called on the
+    // send path, and the two must be given the same answers: gate one and not the other and every
+    // turn on a bare box dies here on `request_not_derivable` instead of sending. Taking them from
+    // the frozen run is what makes that impossible rather than merely unlikely - a second probe
+    // could answer differently between the claim and the send, and the failure would look like a
+    // corrupted trajectory. `connectorKinds` is the sharper of the two, because it changes without
+    // the box changing and it moves a definition rather than a name: the owner connecting a
+    // mailbox mid-turn re-derives the same forty-one names carrying a different
+    // `connector_action`, which is why the check below now compares definitions.
+    entitled: [
+      ...agentToolsFor('lead', run.surfaces, run.connectorKinds),
+      COMPACT_CONTEXT_TOOL
+    ].filter((tool) => !withdrawnTools.has(tool.name)),
     reservedTokens,
     reservedTokensOfSent: Math.ceil(JSON.stringify(requestTools).length / 4)
   });

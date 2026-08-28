@@ -1,4 +1,5 @@
 import {
+  connectorActions,
   decryptJson,
   encryptJson,
   executeConnectorAction,
@@ -43,6 +44,37 @@ export async function executeConnectorTool(
         throw new AthanorError(
           'connector_secret_context',
           'Connector secret encryption context is invalid'
+        );
+      /*
+       * An action this connector cannot run, answered with the ones it can, in the same result.
+       *
+       * `executeConnectorAction` already refuses this - "Action does not match this connector" -
+       * and that sentence was enough while every action was in the enum, because a model that had
+       * read all twenty-four could work out which connector it had aimed at the wrong one. It is
+       * not enough now: `agentToolsFor` sends a box only the actions its own connections reach,
+       * so a model asking for `github_read_file` on a mailbox is usually a model that has not
+       * called `connector_list` yet, and a refusal naming no alternative costs it a whole further
+       * round trip to find out what it may ask for instead. Naming them here costs nothing
+       * resident and closes the retry in one call.
+       *
+       * Derived from `connectorActions` rather than listed, so a new action or a new kind is
+       * covered the day it lands. It pre-empts only the kind mismatch and deliberately not the
+       * scope denial below it: `connector_scope_denied` names the exact scope that is missing,
+       * which is already the better sentence, and it is the one refusal the audit trail records
+       * as `denied` rather than `failed`.
+       */
+      const definition = (connectorActions as Record<string, { kind: string } | undefined>)[
+        operation
+      ];
+      if (definition && definition.kind !== connector.kind)
+        throw new AthanorError(
+          'connector_action_invalid',
+          `${operation} is a ${definition.kind} action and ${connector.label} is a ${connector.kind} connection. On this one: ${Object.entries(
+            connectorActions
+          )
+            .filter(([, entry]) => entry.kind === connector.kind)
+            .map(([name]) => name)
+            .join(', ')}. Call connector_list to see everything that is connected.`
         );
       const secret = decryptJson<ConnectorSecret>(connector.secretCiphertext, context.masterKey);
       const requested = asRecord(call.arguments.input) ?? {};

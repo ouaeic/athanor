@@ -235,13 +235,22 @@ export const degenerateConfigurations = (): readonly string[] =>
   );
 
 /**
- * The bare specifiers `context.ts` imports. A variant lives outside the workspace, so package
- * resolution does not reach it and each one is rewritten to the file it would have resolved to
- * under the `development` condition this rig already runs with.
+ * Every specifier `context.ts` imports at runtime, and where each one really lives.
+ *
+ * A variant lives outside the workspace, so neither kind of specifier reaches its target from
+ * there: package resolution does not find `@athanor/*`, and a relative path resolves against the
+ * scratch directory, which holds one file. Both are rewritten to the file they would have resolved
+ * to under the `development` condition this rig already runs with, and a rewritten module then
+ * resolves its OWN imports from its real directory, so only what `context.ts` names belongs here.
+ *
+ * The `includes` check below is the drift guard, and it is why this list is worth keeping by hand:
+ * an import that is renamed or dropped fails the rig loudly instead of producing a variant that
+ * cannot be loaded three configurations later.
  */
 const SPECIFIERS: ReadonlyArray<readonly [string, string]> = [
   ['@athanor/model-gateway', 'packages/model-gateway/src/index.ts'],
-  ['@athanor/data', 'packages/data/src/index.ts']
+  ['@athanor/data', 'packages/data/src/index.ts'],
+  ['./output-spill.js', 'apps/worker/src/output-spill.ts']
 ];
 
 let scratch: string | undefined;

@@ -14,6 +14,7 @@ import {
   surfaceDescribable,
   TaskScheduleSpec,
   UNKNOWN_SURFACES,
+  ConnectorKind,
   type MediaModelOption,
   type WorkspaceSurfaces
 } from '@athanor/contracts';
@@ -24,7 +25,7 @@ import {
   MEMORY_RECALL_ITEM_CEILING,
   MEMORY_RECALL_MAX_ITEMS
 } from '@athanor/core';
-import { agentTools, agentToolsFor } from './tool-catalogue.js';
+import { agentTools, agentToolsFor, CONNECTOR_ACTION_INPUTS } from './tool-catalogue.js';
 import { approvalRequirement } from './approval-policy.js';
 import { isMutatingToolCall } from './write-classification.js';
 import { REPEATABLE_TOOLS } from './turn-bounds.js';
@@ -276,6 +277,57 @@ describe('the size of the catalogue the model is sent', () => {
     // version tag into every patch and spends three resident paragraphs on what to do when it does
     // not match. `apps/worker/src/edit/snapshots.ts` needs no tag, because it remembers what each
     // read displayed - so there is nothing to describe, and nothing for a model to drop.
+    //
+    // ---------------------------------------------------------------------------------------
+    //
+    // The number then held through the `connector_action` restructure, which is the case this
+    // ceiling is at its most useful for: 55,458 before and 55,458 after, byte-identical on the
+    // lead wire, the specialist wire and the bare-box wire alike, and proved against the previous
+    // revision of the file rather than against this figure. Its enum, its per-action sentence and
+    // its 49-field bag are now built from one per-action table, so that a box which has connected
+    // a mailbox is not sent the eleven GitHub, WebDAV and MCP actions `executeConnectorAction`
+    // refuses for it. Nothing was withdrawn from a box that has the thing, which is why this
+    // number could not move; the saving is ratcheted in the connected-box block below, exactly as
+    // the surface saving is ratcheted in the bare-box one.
+    //
+    // WHAT HAS BEEN MEASURED AND REFUSED, so the next wave spends its time somewhere else. Every
+    // figure here was produced by running this catalogue through `agentToolsFor` and pricing it on
+    // billing.ts's own rates - CACHE_READ_RATE 0.1, CACHE_WRITE_RATE 1.25, output at 4x input -
+    // and the working is in docs/design/organs/PREAMBLE.md and PREAMBLE-BUILD.md.
+    //
+    //   - Deduplicating prose repeated across schemas, and re-applying the "is it method the model
+    //     already has" test. Measured over all 128 descriptions in this file, 41 tool-level and 87
+    //     nested, 34,876 bytes of prose. Merging every span shared by two or more tools recovers
+    //     142 bytes at six-word granularity and 405 at four-word; the largest single repeat in the
+    //     whole catalogue is 51 bytes. Against the operating contract, which arrives on the same
+    //     request, another 360. TOTAL 765 BYTES, 1.35%. Both levers are exhausted - the two
+    //     lowering rounds recorded above are what took the duplication out - and neither should be
+    //     proposed again without re-running that measurement first.
+    //
+    //   - Re-encoding the schemas in TypeScript notation instead of JSON Schema: 44,069 bytes
+    //     against 55,458, a real 22.3% with no capability withdrawn. Refused, because realising it
+    //     means taking the schemas out of the `tools:` array and dispatching through a transport
+    //     tool - giving up native tool calling for the whole catalogue, on which
+    //     `PARALLEL_SAFE_TOOLS` and the approval floor are both keyed by tool name. 12,660 bytes
+    //     does not buy that when conditioning offers more without touching the call format.
+    //
+    //   - Deferring the cold-and-fat two thirds behind a resident index line, opened on demand.
+    //     This is the one that pays, and it is not refused, it is GATED. On measured frequencies
+    //     the 22 tools that clear break-even take the fully provisioned wire to 20,505 bytes. The
+    //     arithmetic: a resident byte is billed 1.780x per turn - a 1.25x cache write on the first
+    //     of 6.30 calls plus 0.1x on the 5.30 after it - an extra round trip costs 7,338 input-
+    //     token-equivalents, break-even is 0.349 opens per request, and the measured rate is
+    //     0.038. That is a 9.1x margin, 2.3x at the 95% upper bound. What is missing is the
+    //     instrument: the 0.038 comes from 83 hand-written eval turns rather than from production,
+    //     and the scheme returns nothing if a deferred tool is really touched in more than 9.2% of
+    //     turns - 59.8% if the open tool returns several schemas in one result, which it should.
+    //     One aggregate over the `tool_started` events the loop already emits, plus a week of
+    //     running, is what should decide it. Two constraints on whoever builds it, both measured
+    //     rather than argued: the opened schema arrives as a TOOL RESULT in the body and never in
+    //     the `tools:` array, because one byte changed in the first tool definition cost 99.9% of
+    //     the catalogue prefix and 100% of the message prefix on that request; and every deferred
+    //     tool keeps its resident index line, because a capability the model cannot discover is a
+    //     capability deleted rather than deferred.
     expect(bytes).toBeLessThan(55_500);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
@@ -657,6 +709,234 @@ describe('the wire a box without a browser or a screen is sent', () => {
       UNKNOWN_SURFACES
     ] as WorkspaceSurfaces[])
       expect(agentToolsFor('specialist', surfaces).map((tool) => tool.name)).toEqual(names);
+  });
+});
+
+/*
+ * What a box is sent about services it has not connected, which is the third fact and the only one
+ * that narrows a tool instead of removing one.
+ *
+ * `connector_action` declares twenty-four actions across five kinds of connection and was sent
+ * whole to every box that had connected any one of them. `executeConnectorAction` in @athanor/core
+ * refuses an action whose `kind` is not the connector's - "Action does not match this connector",
+ * thrown before a scope is read or a credential is opened - so on a mailbox-and-calendar box the
+ * eleven GitHub, WebDAV and MCP actions were not unlikely calls, they were impossible ones,
+ * described at the head of the cached prefix on every request of every task.
+ *
+ * Two properties have to hold together or this is a capability withdrawal wearing a gate's
+ * clothes, and both are asserted below rather than argued: nothing an owner CAN reach may leave
+ * the wire, and everything an owner cannot reach must.
+ */
+describe('the wire a box is sent about the services it has actually connected', () => {
+  const compacted = (kinds: ConnectorKind[]) => [
+    ...agentToolsFor('lead', UNKNOWN_SURFACES, kinds),
+    COMPACT_CONTEXT_TOOL
+  ];
+  const everything = [...agentToolsFor(), COMPACT_CONTEXT_TOOL];
+  const actionsOf = (tools: typeof everything): string[] =>
+    (
+      tools.find((tool) => tool.name === 'connector_action')?.parameters.properties as
+        | { action?: { enum?: string[] } }
+        | undefined
+    )?.action?.enum ?? [];
+  const inputOf = (tools: typeof everything) =>
+    (
+      tools.find((tool) => tool.name === 'connector_action')?.parameters.properties as
+        | { input?: { description?: string; properties?: Record<string, unknown> } }
+        | undefined
+    )?.input;
+
+  it('describes every action when nobody has said what is connected', () => {
+    // The default argument, on the same terms as the surface gate above: every measurement, rig
+    // and test in this repository gets the whole catalogue without knowing this argument exists.
+    // An empty list means the caller never asked - a run that genuinely has nothing connected
+    // withdraws `connector_action` outright in `claimTurn`, so there is no box this could be the
+    // honest answer for.
+    expect(actionsOf(compacted([]))).toEqual(Object.keys(connectorActions));
+    expect(Buffer.byteLength(JSON.stringify(compacted([])))).toBe(
+      Buffer.byteLength(JSON.stringify(everything))
+    );
+  });
+
+  it('withdraws nothing from a box that has connected all five kinds', () => {
+    // The half that would look like success while capability fell. Byte-identical, not merely the
+    // same names: the enum, the per-action sentence and the field bag are all rebuilt here, and a
+    // rebuild that moved one comma would be a cache miss the owner gets nothing for.
+    const all = compacted(['imap', 'caldav', 'github', 'webdav', 'mcp_http']);
+    expect(JSON.stringify(all)).toBe(JSON.stringify(everything));
+  });
+
+  it('sends exactly the actions the connected kinds can run, and every field they take', () => {
+    /*
+     * Derived from `connectorActions` on both sides, so this cannot pass by agreeing with a copy.
+     * The forward direction is the saving; the backward direction is the one that matters, because
+     * an action or a field silently dropped is a capability deleted and would look identical to a
+     * gate working.
+     */
+    for (const kinds of [
+      ['imap'],
+      ['caldav'],
+      ['github'],
+      ['webdav'],
+      ['mcp_http'],
+      ['imap', 'caldav'],
+      ['imap', 'caldav', 'github']
+    ] as ConnectorKind[][]) {
+      const label = kinds.join('+');
+      const sent = compacted(kinds);
+      const reachable = Object.entries(connectorActions)
+        .filter(([, definition]) => kinds.includes(definition.kind))
+        .map(([name]) => name);
+      expect(actionsOf(sent), label).toEqual(reachable);
+      const input = inputOf(sent);
+      // Every reachable action is still named where the model finds out what shape it takes, and
+      // nothing that cannot be reached is.
+      for (const name of Object.keys(connectorActions))
+        expect(input?.description?.includes(`${name}:`), `${label} / ${name}`).toBe(
+          reachable.includes(name)
+        );
+      // And every field one of them takes is still declared. Read off the full bag rather than
+      // listed here: a field this filter dropped while an action still needed it would be a call
+      // the model cannot make and a refusal it cannot read a reason out of.
+      const full = inputOf(everything)?.properties ?? {};
+      const kept = Object.keys(input?.properties ?? {});
+      for (const field of kept) expect(Object.keys(full), `${label} / ${field}`).toContain(field);
+      expect(kept, label).toEqual(Object.keys(full).filter((field) => kept.includes(field)));
+    }
+  });
+
+  it('holds a connected box under a ceiling of its own', () => {
+    /*
+     * Measured through `agentToolsFor` against a fully connected 55,458 / 41 tools:
+     *
+     *   mailbox and calendar   54,165   -1,293
+     *   mailbox alone          52,947   -2,511
+     *   calendar alone         51,430   -4,028
+     *   GitHub alone           51,063   -4,395
+     *   WebDAV alone           50,448   -5,010
+     *   one MCP server         50,389   -5,069
+     *   all five               55,458        0
+     *
+     * A mailbox and a calendar is the pairing the product leads with, so it is the one bounded
+     * here: 54,200 against a measured 54,165, which is 35 bytes of headroom and a ceiling rather
+     * than a licence. It moves for what a mailbox-and-calendar box gained, never for what a box
+     * without GitHub was spared - the same rule the bare-box ceiling above is kept by.
+     *
+     * NOT bounded here, and measured so the next wave does not have to: narrowing by granted
+     * SCOPE as well as by kind. `executeConnectorAction` refuses on scope two lines after it
+     * refuses on kind and just as hard, and the owner chooses read-only or send when they connect
+     * (`apps/web/src/connector-forms.ts`), so a read-only mailbox and calendar would go to 52,071
+     * - 2,094 bytes further. It is not taken because of where the model finds out what it is
+     * missing: `connector_list`'s resident description names all five kinds, so a kind absent from
+     * the enum is still discoverable, and there is no equivalent resident line for a scope. How
+     * often an owner grants read-only is not measured anywhere in this repository, and that
+     * measurement - not this argument - is what should decide it.
+     */
+    const mailAndCalendar = compacted(['imap', 'caldav']);
+    expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(54_200);
+    // The other direction, and the one that fails silently. A gate wired to nothing returns the
+    // unconditional catalogue on every box; this is the assertion that would go red if it did.
+    expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(
+      Buffer.byteLength(JSON.stringify(everything)) - 1_200
+    );
+  });
+
+  it('leaves every tool but connector_action exactly where it was', () => {
+    // The blast radius, bounded. This gate reshapes one entry and must not touch the order, the
+    // count or the bytes of anything else - the array is the head of the cached prefix, and a tool
+    // that moved position would end the common prefix at that point on every connected box.
+    const narrowed = compacted(['imap']);
+    expect(narrowed.map((tool) => tool.name)).toEqual(everything.map((tool) => tool.name));
+    for (const [at, tool] of narrowed.entries())
+      if (tool.name !== 'connector_action')
+        expect(JSON.stringify(tool), tool.name).toBe(JSON.stringify(everything[at]));
+  });
+
+  it('declares a field for every action and an action for every field', () => {
+    /*
+     * The set equality the per-action table rests on, and the one thing the compiler cannot check.
+     *
+     * `CONNECTOR_ACTION_INPUTS` is a total `Record<ConnectorAction, ...>`, so an action added to
+     * @athanor/core cannot compile until somebody says what it takes. What no type can say is that
+     * the fields it names are the fields the bag declares: a typo would orphan a field on every
+     * box at once, and a field no action reaches is 40-odd bytes nobody can use.
+     *
+     * Proved by construction rather than by listing: the union of the fields reachable from every
+     * action is exactly the bag the fully connected box is sent.
+     */
+    const full = Object.keys(inputOf(everything)?.properties ?? {});
+    const union = new Set(
+      Object.keys(connectorActions).flatMap((name) =>
+        Object.keys(
+          inputOf(compacted([connectorActions[name as keyof typeof connectorActions].kind]))
+            ?.properties ?? {}
+        )
+      )
+    );
+    expect([...union].sort()).toEqual([...full].sort());
+    expect(full.length).toBe(49);
+  });
+
+  it('gives each action the fields its own schema accepts, not its neighbour’s', () => {
+    /*
+     * The question the set equality above cannot ask, and the one a per-action table has to be
+     * held to.
+     *
+     * That test compares the UNION of the fields reachable from every action against the bag, so a
+     * field assigned to the wrong action passes it whenever a sibling of the same kind reaches the
+     * field anyway - which is nearly always, because the narrowing is by kind. Measured: the first
+     * version of `calendar_update_event` named `calendarUrl` and `attendees`, both refused by the
+     * Zod object that parses that action and the second refused again in prose by the executor
+     * ("this action cannot name an attendee"), and it cost exactly nought bytes on every box,
+     * because `calendar_read_range` and `calendar_create_event` reach both.
+     *
+     * So this reads the schema that actually decides. Thirteen of the twenty-four; the other
+     * eleven are behind an unexported union in @athanor/core and are named as unchecked rather
+     * than quietly skipped.
+     */
+    const accepted = new Map<string, string[]>();
+    for (const schema of mailConnectorActionInputs) {
+      const shape: Record<string, unknown> = schema.shape;
+      const name = (shape.action as { value: string }).value;
+      accepted.set(
+        name,
+        Object.keys(shape).filter((field) => field !== 'action')
+      );
+    }
+    expect(accepted.size).toBe(13);
+    // The one field declared here that no connector schema will ever accept, named so that it
+    // stays a decision. `saveTo` is stripped before the connector layer sees it and is honoured by
+    // the workspace write route instead, which is what the entry's own comment says.
+    const beyondTheSchema: Record<string, string[]> = { mail_read_attachment: ['saveTo'] };
+    for (const [name, fields] of accepted) {
+      const declared = CONNECTOR_ACTION_INPUTS[name as keyof typeof CONNECTOR_ACTION_INPUTS].fields;
+      expect([...declared].sort(), name).toEqual(
+        [...fields, ...(beyondTheSchema[name] ?? [])].sort()
+      );
+    }
+    // And the eleven that cannot be checked this way are eleven, so this test notices the day the
+    // union is exported or an action moves kind.
+    expect(Object.keys(connectorActions).length - accepted.size).toBe(11);
+  });
+
+  it('never sends a connected box an action list with nothing in it', () => {
+    /*
+     * The failure the heading table's totality is really guarding, stated where it can be seen.
+     *
+     * `connectorActionTool` is handed the actions of the connected kinds, so a kind carrying no
+     * actions narrows the enum to empty - and the tool is still described, still costs its
+     * description, and can no longer be called at all. The type only says every heading names a
+     * real kind; nothing types the other direction, which is why it is asserted here over the
+     * enum @athanor/contracts actually declares rather than over a list written beside it.
+     */
+    for (const kind of ConnectorKind.options) {
+      const sent = actionsOf(compacted([kind]));
+      expect(sent.length, kind).toBeGreaterThan(0);
+      // And every one of them is described, which is what a missing heading would take away
+      // without touching the enum.
+      const description = inputOf(compacted([kind]))?.description ?? '';
+      for (const action of sent) expect(description, `${kind} / ${action}`).toContain(`${action}:`);
+    }
   });
 });
 

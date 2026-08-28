@@ -1425,6 +1425,88 @@ describe('what actually reaches the provider', () => {
     expect(names).toContain('connector_list');
   });
 
+  it('describes only the connector actions the box can actually run', async () => {
+    /*
+     * The gate proved where it is paid for, not where it is written.
+     *
+     * `tool-catalogue.test.ts` proves `agentToolsFor` narrows the enum when it is told which kinds
+     * are connected. That is a different claim from the one that matters, and this programme has
+     * shipped the gap twice: a gate nothing passes an argument to is a function with a unit test.
+     * So this reads the request that really left the process, on a box whose only connection is a
+     * mailbox, and asserts the eleven actions `executeConnectorAction` would refuse for it are not
+     * on the wire while all eight it would run are.
+     */
+    const withConnectors = async (
+      connectors: Array<{ kind: string; enabled: boolean }>
+    ): Promise<
+      Array<{
+        function?: {
+          name?: string;
+          parameters?: { properties?: { action?: { enum?: string[] } } };
+        };
+      }>
+    > => {
+      const task = makeTask();
+      const probe = probeStore(() => task);
+      const log: FetchLog = { calls: [], modelRequests: [] };
+      installFetch([textFrame('thinking')], log);
+      const store = {
+        ...probe.store,
+        listConnectors: async () =>
+          connectors.map((connector, at) => ({
+            id: `c${at}`,
+            label: connector.kind,
+            scopes: [],
+            ...connector
+          }))
+      } as unknown as DataStore;
+      await new AgentWorker(store, config(), masterKey, runnerSecret)
+        .run(task)
+        .catch(() => undefined);
+      return (log.modelRequests[0]?.tools ?? []) as Array<{ function?: { name?: string } }>;
+    };
+    const tools = await withConnectors([
+      { kind: 'imap', enabled: true },
+      // Disabled, so it must not widen anything: the withdrawal above counts enabled connectors
+      // and so must this.
+      { kind: 'github', enabled: false }
+    ]);
+    const connector = tools.find((tool) => tool.function?.name === 'connector_action');
+    // Present, because a mailbox IS connected - the all-or-nothing withdrawal above does not fire.
+    expect(connector).toBeTruthy();
+    expect(connector?.function?.parameters?.properties?.action?.enum).toEqual([
+      'mail_list_mailboxes',
+      'mail_search',
+      'mail_read_message',
+      'mail_read_attachment',
+      'mail_mark',
+      'mail_draft',
+      'mail_send',
+      'mail_reply'
+    ]);
+    // Named rather than counted, because the point is which eleven went. Every one of these is
+    // refused by `executeConnectorAction` on a connector of kind `imap` before it reads a scope.
+    const wire = JSON.stringify(connector);
+    for (const gone of ['github_read_file', 'webdav_write', 'mcp_call_tool', 'calendar_list'])
+      expect(wire, gone).not.toContain(gone);
+    // And the saving is real on the request that left the process, measured against the same run
+    // on a box that has connected all five kinds - which is the only comparison that isolates this
+    // gate, because a box with nothing connected loses the whole tool to the withdrawal above.
+    // 2,511 bytes, which is where the figure in tool-catalogue.test.ts comes from.
+    const everything = await withConnectors(
+      ['imap', 'caldav', 'github', 'webdav', 'mcp_http'].map((kind) => ({ kind, enabled: true }))
+    );
+    expect(Buffer.byteLength(JSON.stringify(tools))).toBeLessThan(
+      Buffer.byteLength(JSON.stringify(everything)) - 2_400
+    );
+    // The other direction, and the one that fails quietly: a box that has connected everything is
+    // sent everything. Nothing here is a capability withdrawal.
+    expect(
+      everything.find((tool) => tool.function?.name === 'connector_action')?.function?.parameters
+        ?.properties?.action?.enum
+    ).toHaveLength(24);
+  });
+
   it('puts the built-in skill library in front of the model', async () => {
     // Nineteen vetted skills were loadable, indexable and openable, and none of it had ever
     // reached a model - while the preamble told the model to consult that index.

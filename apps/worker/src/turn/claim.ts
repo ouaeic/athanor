@@ -16,6 +16,7 @@
 import { decryptJson, unwrapDataKey } from '@athanor/core';
 import {
   resolveWebToolPlan,
+  type ConnectorKind,
   type ModelRelease,
   type WebToolPlan,
   type WorkspaceSurfaces
@@ -73,6 +74,19 @@ export interface TurnRun {
    * makes that comparison meaningful; two probes would make it a race.
    */
   readonly surfaces: WorkspaceSurfaces;
+  /**
+   * Which kinds of service the owner has connected, frozen for the run for the same reason as
+   * `surfaces` and used the same way: the send path re-derives the catalogue from this list rather
+   * than from a second read of the connector table.
+   *
+   * It has to be the frozen list and not a fresh query, and this is the field that made
+   * `requestDerivationBreach` compare tool definitions rather than only tool names. A connector
+   * enabled between the claim and the fourth step would re-derive a catalogue carrying the same
+   * forty-one names and a different `connector_action` - so the name check that guarded every
+   * other tool would have called it derivable, and the run would have sent a request its own
+   * record did not account for.
+   */
+  readonly connectorKinds: readonly ConnectorKind[];
 }
 
 export const claimTurn = async (
@@ -156,8 +170,41 @@ export const claimTurn = async (
    * this set used to do to `web_search` on the provider's route - leaves the model reading
    * descriptions of a computer it is not on.
    */
-  if (!(await deps.store.listConnectors(task.userId)).some((connector) => connector.enabled))
-    withdrawnTools.add('connector_action');
+  /**
+   * And when something *is* connected, only the actions that connection can actually run.
+   *
+   * The withdrawal above is all-or-nothing and the enum underneath it was too: twenty-four actions
+   * across mail, calendar, GitHub, WebDAV and MCP, sent whole to a box that had connected one of
+   * the five. `executeConnectorAction` in @athanor/core refuses any action whose `kind` is not the
+   * connector's - "Action does not match this connector", thrown before a scope is checked or a
+   * credential is opened - so those were not unlikely calls, they were impossible ones, described
+   * at the head of the cached prefix on every request of every task. Measured through
+   * `agentToolsFor`: 1,293 bytes on a mailbox-and-calendar box, 2,511 on a mailbox alone, 5,069
+   * where the one connection is an MCP server, and 0 where all five are connected - which is the
+   * property that makes it honest, because nothing is withdrawn from a box that has the thing.
+   *
+   * Frozen here with the rest, for the reason the whole file exists: this decides the head of the
+   * cached prefix, and a set re-read at step four would move every byte behind it. A connection
+   * made mid-turn therefore arrives on the next turn, exactly as the withdrawal above already
+   * behaves.
+   *
+   * Narrowed by kind and deliberately not by granted scope, though `executeConnectorAction`
+   * refuses on scope two lines later and just as hard. The difference is where the model finds out
+   * what it is missing: `connector_list`'s own resident description names all five kinds, so a
+   * kind that is absent from the enum is still a kind the model can read about and ask the owner
+   * to connect. There is no equivalent resident line for a scope, and how often an owner grants a
+   * read-only mailbox is not measured anywhere in this repository. It is worth 2,094 further bytes
+   * on a read-only mailbox and calendar, and it should be taken by whoever measures that, not
+   * before.
+   */
+  const connectorKinds = [
+    ...new Set(
+      (await deps.store.listConnectors(task.userId))
+        .filter((connector) => connector.enabled)
+        .map((connector) => connector.kind)
+    )
+  ];
+  if (!connectorKinds.length) withdrawnTools.add('connector_action');
   // Byte-identical on both web routes and for the whole run, which is the point: the catalogue is
   // the head of the cached prefix, and it is also the whole of the model's map of what this
   // computer can do. Nothing withdraws a tool after this line, so it is built once here rather
@@ -185,9 +232,10 @@ export const claimTurn = async (
    * `surfaceDescribable`: only a probe that came back and said `absent` removes anything.
    */
   const surfaces = await deps.workspaceSurfaces(task);
-  const requestTools = [...agentToolsFor('lead', surfaces), COMPACT_CONTEXT_TOOL].filter(
-    (tool) => !withdrawnTools.has(tool.name)
-  );
+  const requestTools = [
+    ...agentToolsFor('lead', surfaces, connectorKinds),
+    COMPACT_CONTEXT_TOOL
+  ].filter((tool) => !withdrawnTools.has(tool.name));
   // What every request carries before a word of conversation. The step loop measures its budget
   // against it, the compaction target is derived from the same budget, and the handoff counts it
   // for itself from the same array.
@@ -224,7 +272,8 @@ export const claimTurn = async (
       requestTools,
       reservedTokens,
       toolchainSummary,
-      surfaces
+      surfaces,
+      connectorKinds
     },
     state
   };
