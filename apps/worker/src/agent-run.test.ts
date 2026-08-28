@@ -8331,3 +8331,77 @@ describe('the contract the run actually sends', () => {
     expect(contractOf(log)).toBe(baseSystemPrompt({ tools: sent, toolchainSummary: toolchain }));
   });
 });
+
+/*
+ * The whole loop, against the finding this branch exists for: `code_diagnostics` runs a project's
+ * own build and test targets, and until this wave its name occurred nowhere in the approval floor.
+ * A repository cloned from anywhere is a repository whose `Makefile`, `build.rs` and tests were
+ * written by somebody else, so what these two tests separate is a stranger's program reaching the
+ * runner and an ordinary type check reaching it.
+ */
+describe('diagnosing a repository whose build somebody else wrote', () => {
+  const diagnose = async (entries: string[]) => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const raised: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      createApproval: async (input: Record<string, unknown>) => {
+        raised.push(input);
+        return 'approval-1';
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('call-1', 'code_diagnostics', { path: 'workspace/cloned' }),
+        textFrame('Checked it.')
+      ],
+      log,
+      {
+        route: (url) =>
+          url.includes('/files?path=')
+            ? jsonResponse({ entries: entries.map((name) => ({ name })) })
+            : url.endsWith('/exec')
+              ? jsonResponse({
+                  exitCode: 0,
+                  signal: null,
+                  stdout: '',
+                  stderr: '',
+                  durationMs: 4,
+                  timedOut: false
+                })
+              : undefined
+      }
+    );
+
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+
+    return { raised, probe, ran: log.calls.some((entry) => entry.includes('/exec')) };
+  };
+
+  it('never reaches the runner with go test until the owner has seen which repository it is', async () => {
+    const { raised, probe, ran } = await diagnose(['go.mod', 'main.go']);
+
+    expect(raised, 'go test ./... ran with no card').toHaveLength(1);
+    expect(raised[0]).toMatchObject({
+      action: 'code_diagnostics',
+      sideEffect: 'external_consequential'
+    });
+    expect(probe.events.some((entry) => entry.kind === 'approval_requested')).toBe(true);
+    expect(probe.checkpoints.some((entry) => entry.status === 'awaiting_user')).toBe(true);
+    // The card parks the turn, so the command must not have been run first.
+    expect(ran, 'the build ran before the owner answered').toBe(false);
+  });
+
+  it('runs an ordinary TypeScript check without stopping anybody', async () => {
+    const { raised, probe, ran } = await diagnose(['package.json', 'tsconfig.json']);
+
+    // The half that decides whether the card above survives contact with a working day: this is
+    // the shape almost every real call to this tool has, and it must cost nothing.
+    expect(raised, 'a tsc --noEmit raised an approval').toHaveLength(0);
+    expect(probe.checkpoints.some((entry) => entry.status === 'awaiting_user')).toBe(false);
+    expect(ran, 'the type check never reached the runner').toBe(true);
+  });
+});

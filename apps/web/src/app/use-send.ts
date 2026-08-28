@@ -111,8 +111,19 @@ export const useSend = (input: {
       return;
     }
     if (!workspace) return;
-    // The paths ride behind the message rather than inside the sentence, so what the transcript
-    // shows, what search indexes and what the sidebar quotes is what the owner actually wrote.
+    /*
+     * `text` is the typed sentence with the attachment paths appended to it, not the sentence
+     * alone: `composerSubmission` builds it with `withAttachments`, which puts an "Attached files:"
+     * block on the end. That block is the only channel the agent reads the paths from, so it has to
+     * be in the prompt.
+     *
+     * What that costs, said here because it is not visible from this line: `splitAttachments`
+     * takes the block off again when the transcript renders, so the reader sees their own sentence
+     * and a file strip - but the task title is the first ten words of the prompt and the name index
+     * is built from the prompt, so a message with no typed text is titled and indexed by its upload
+     * path. And no `attachments` list is sent alongside, so `hasImages` in
+     * apps/api/src/routes/tasks.ts is false for every task this client creates.
+     */
     const { text, attachments: ready, maxSpendUsd } = submission;
     const typed = prompt.trim();
     const optimistic: PendingUserMessage = {

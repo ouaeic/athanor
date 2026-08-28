@@ -237,7 +237,7 @@ allowance, because what is bounded is how long one worker may hold one lease wit
 anything.
 
 There is a fourth brake, and it is the only one that acts before any money is spent: the pre-flight
-price ceiling. `sudo athanor spend-ceiling` names a maximum input and output rate in dollars per
+price ceiling. `sudo athanor price-ceiling` names a maximum input and output rate in dollars per
 million tokens, and every place athanor picks a model _for_ the owner ranks against it — the lead at
 task creation, the vision specialist, the model the picker recommends, and the support picker behind
 titling and the subscription flows. When the ceiling empties the catalogue the outcome is `blocked`,

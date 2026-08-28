@@ -14,6 +14,7 @@ import {
   type SubscriptionAgent
 } from '../subscription-agent.js';
 import { type ToolContext } from '../tool-dispatch.js';
+import { diagnosticsCommand, diagnosticsLanguage } from './diagnostics.js';
 import { clampNumber } from './numbers.js';
 
 /**
@@ -294,107 +295,13 @@ export async function executeRepositoryTool(
         `${root}/files?path=${encodeURIComponent(path)}`
       );
       const names = new Set(listing.entries.map((entry) => entry.name));
-      const language =
-        requested !== 'auto'
-          ? requested
-          : names.has('tsconfig.json') || names.has('package.json')
-            ? 'typescript'
-            : names.has('pyproject.toml') || names.has('requirements.txt')
-              ? 'python'
-              : names.has('Cargo.toml')
-                ? 'rust'
-                : names.has('go.mod')
-                  ? 'go'
-                  : names.has('pom.xml') ||
-                      names.has('build.gradle') ||
-                      names.has('build.gradle.kts')
-                    ? 'java'
-                    : [...names].some((name) => name.endsWith('.sln') || name.endsWith('.csproj'))
-                      ? 'csharp'
-                      : names.has('CMakeLists.txt') || names.has('Makefile')
-                        ? 'cpp'
-                        : names.has('DESCRIPTION') || names.has('renv.lock')
-                          ? 'r'
-                          : names.has('Project.toml')
-                            ? 'julia'
-                            : names.has('Gemfile')
-                              ? 'ruby'
-                              : names.has('composer.json')
-                                ? 'php'
-                                : [...names].some((name) => name.endsWith('.tf'))
-                                  ? 'terraform'
-                                  : names.has('Package.swift')
-                                    ? 'swift'
-                                    : names.has('pubspec.yaml')
-                                      ? 'dart'
-                                      : '';
-      let command: { executable: string; args: string[] } | undefined;
-      if (language === 'typescript')
-        command = names.has('pnpm-lock.yaml')
-          ? { executable: 'pnpm', args: ['exec', 'tsc', '--noEmit', '--pretty', 'false'] }
-          : {
-              executable: 'npx',
-              args: ['--no-install', 'tsc', '--noEmit', '--pretty', 'false']
-            };
-      else if (language === 'python')
-        command = { executable: 'python3', args: ['-m', 'compileall', '-q', '.'] };
-      else if (language === 'rust')
-        command = { executable: 'cargo', args: ['check', '--message-format', 'short'] };
-      else if (language === 'go') command = { executable: 'go', args: ['test', './...'] };
-      else if (language === 'java')
-        command = names.has('pom.xml')
-          ? { executable: 'mvn', args: ['-q', '-DskipTests', 'compile'] }
-          : names.has('gradlew')
-            ? { executable: 'bash', args: ['./gradlew', 'compileJava', '--console=plain'] }
-            : { executable: 'gradle', args: ['compileJava', '--console=plain'] };
-      else if (language === 'kotlin')
-        command = names.has('gradlew')
-          ? { executable: 'bash', args: ['./gradlew', 'compileKotlin', '--console=plain'] }
-          : { executable: 'gradle', args: ['compileKotlin', '--console=plain'] };
-      else if (language === 'csharp')
-        command = { executable: 'dotnet', args: ['build', '--nologo'] };
-      else if (language === 'cpp')
-        command =
-          names.has('CMakeLists.txt') && names.has('build')
-            ? { executable: 'cmake', args: ['--build', 'build'] }
-            : { executable: 'make', args: ['-s'] };
-      else if (language === 'r')
-        command = {
-          executable: 'Rscript',
-          args: [
-            '-e',
-            'files <- list.files(".", pattern="\\\\.[Rr]$", recursive=TRUE, full.names=TRUE); files <- files[!grepl("/(renv|\\\\.git)/", files)]; invisible(lapply(files, function(file) parse(file=file))); cat(length(files), "R files parsed\\n")'
-          ]
-        };
-      else if (language === 'julia')
-        command = {
-          executable: 'julia',
-          args: [
-            '--project=.',
-            '-e',
-            'for (root, dirs, files) in walkdir("."); filter!(name -> name != ".git", dirs); for file in files; endswith(file, ".jl") && Meta.parseall(read(joinpath(root, file), String)); end; end'
-          ]
-        };
-      else if (language === 'ruby')
-        command = {
-          executable: 'ruby',
-          args: [
-            '-e',
-            'Dir.glob("**/*.rb").reject { |file| file.start_with?("vendor/") }.each { |file| RubyVM::InstructionSequence.compile_file(file) }'
-          ]
-        };
-      else if (language === 'php')
-        command = {
-          executable: 'php',
-          args: [
-            '-r',
-            '$files=new RecursiveIteratorIterator(new RecursiveDirectoryIterator(".")); foreach($files as $file){if($file->isFile() && $file->getExtension()==="php"){token_get_all(file_get_contents($file->getPathname()), TOKEN_PARSE);}}'
-          ]
-        };
-      else if (language === 'terraform')
-        command = { executable: 'terraform', args: ['validate', '-no-color'] };
-      else if (language === 'swift') command = { executable: 'swift', args: ['build'] };
-      else if (language === 'dart') command = { executable: 'dart', args: ['analyze'] };
+      /*
+       * The ladder and the command table moved to `tools/diagnostics.ts`, unchanged, because the
+       * approval floor has to read the same answer this call is about to act on. Two copies of it
+       * would be two answers, and the one the owner was asked about would be the wrong one.
+       */
+      const language = diagnosticsLanguage(requested, names);
+      const command = diagnosticsCommand(language, names);
       if (!command)
         return {
           available: false,

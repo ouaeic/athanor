@@ -16,7 +16,7 @@ import {
   spendCeilingRequest
 } from './SelfHostedSettings.js';
 import { BASE_MONTHLY_CEILING_USD } from './usage-model.js';
-import { providerModelFields } from './settings-facts.js';
+import { providerModelFields, skillStateNotice, skillSwitch } from './settings-facts.js';
 import type { MemoryItem, ProviderSettings } from './api.js';
 import type { WorkspaceMemory, WorkspaceSkill } from './types.js';
 
@@ -266,6 +266,115 @@ describe('the learned skills list', () => {
 
   it('does not offer to reactivate a skill that is already active', () => {
     expect(list([skill()])).not.toContain('Make active');
+  });
+
+  /*
+   * The one axis of a skill that had a reader and no writer.
+   *
+   * `enabled` is checked first of the three in the resident index — `apps/worker/src/window.ts`
+   * drops a disabled skill before it looks at status or pinning — and the row's `onSetState` prop
+   * could only carry `{ pinned?, status? }`, so nothing in the product could set it. The approval
+   * card for a skill upsert has meanwhile been telling the owner "You had turned X off. Approving
+   * this switches it back on."
+   */
+  it('offers an off switch on a skill that is on', () => {
+    const markup = list([skill()]);
+    expect(markup).toContain('aria-label="Turn the release-a-website skill off"');
+    expect(markup).toContain('aria-pressed="true"');
+  });
+
+  it('shows a skill that is off as off, and offers to turn it back on', () => {
+    const markup = list([skill({ enabled: false })]);
+    expect(markup).toContain('· off');
+    expect(markup).toContain('aria-label="Turn the release-a-website skill on"');
+    expect(markup).toContain('aria-pressed="false"');
+  });
+
+  /* The upsert forces `enabled=TRUE` on conflict, and the Save button on this screen is one. */
+  it('warns on the row that saving a skill of the same name switches it back on', () => {
+    expect(list([skill({ enabled: false })])).toContain('switches it back on');
+    expect(list([skill()])).not.toContain('switches it back on');
+  });
+
+  /* Off and retired are different axes and a row can be both; neither may hide the other. */
+  it('keeps the way back from retirement on a row that is also switched off', () => {
+    const markup = list([skill({ enabled: false, status: 'archived' })]);
+    expect(markup).toContain('Make active');
+    expect(markup).toContain('aria-label="Turn the release-a-website skill on"');
+  });
+});
+
+/*
+ * What the switch sends, which is the whole of the hole.
+ *
+ * `renderToStaticMarkup` runs no effects and this package has no DOM, so the press cannot be
+ * staged. `skillSwitch` is the press: the row's onClick is `onSetState(item, skillSwitch(item).patch)`
+ * and nothing else, so asking this function what it would send is asking the control.
+ */
+describe('what the skill on/off control sends', () => {
+  it('sends enabled false from a skill that is on, which no control could send before', () => {
+    expect(skillSwitch({ name: 'release-a-website', enabled: true }).patch).toEqual({
+      enabled: false
+    });
+  });
+
+  it('sends enabled true from a skill that is off', () => {
+    expect(skillSwitch({ name: 'release-a-website', enabled: false }).patch).toEqual({
+      enabled: true
+    });
+  });
+
+  /* The label is what pressing does, not what the row currently is. */
+  it('names the act rather than the state, in both directions', () => {
+    expect(skillSwitch({ name: 'invoices', enabled: true }).label).toBe(
+      'Turn the invoices skill off'
+    );
+    expect(skillSwitch({ name: 'invoices', enabled: false }).label).toBe(
+      'Turn the invoices skill on'
+    );
+  });
+});
+
+/*
+ * The sentence afterwards, which used to be a three-armed ternary over pinning.
+ *
+ * A skill turned off while pinned would have fallen through to "is pinned. It is no longer retired
+ * for going unused." — true, and an answer to a question nobody asked.
+ */
+describe('what the screen says after a skill’s state changes', () => {
+  it('speaks about the axis that was changed, not the one that happens to be set', () => {
+    const notice = skillStateNotice(
+      'invoices',
+      { enabled: false },
+      { enabled: false, pinned: true }
+    );
+    expect(notice).toContain('is off');
+    expect(notice).not.toContain('pinned');
+  });
+
+  it('says that the next save of the same name undoes it, because the upsert forces it on', () => {
+    expect(
+      skillStateNotice('invoices', { enabled: false }, { enabled: false, pinned: false })
+    ).toContain('switches it back on');
+  });
+
+  it('reports the state the route answered with rather than the one that was asked for', () => {
+    expect(
+      skillStateNotice('invoices', { enabled: true }, { enabled: true, pinned: false })
+    ).toContain('is on');
+  });
+
+  /* The two sentences that were already there, unchanged by the new arm in front of them. */
+  it('still says what pinning and reactivating did', () => {
+    expect(
+      skillStateNotice('invoices', { status: 'active' }, { enabled: true, pinned: false })
+    ).toContain('is active again');
+    expect(
+      skillStateNotice('invoices', { pinned: true }, { enabled: true, pinned: true })
+    ).toContain('is pinned');
+    expect(
+      skillStateNotice('invoices', { pinned: false }, { enabled: true, pinned: false })
+    ).toContain('is unpinned');
   });
 });
 

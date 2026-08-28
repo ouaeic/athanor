@@ -31,6 +31,7 @@ import {
   isDurableInstructionPath,
   writtenPaths
 } from './write-classification.js';
+import { repositoryDirectedDiagnostic } from './tools/diagnostics.js';
 import {
   codingAgentName,
   connectorApprovalCard,
@@ -171,6 +172,17 @@ export interface ApprovalContext {
     useCount: number;
     updatedAt: string;
   };
+  /**
+   * Which diagnostic `code_diagnostics` has resolved for this call, once the floor has looked.
+   *
+   * The arguments cannot carry it. `language` defaults to `auto`, which is what the model sends
+   * almost every time, and the language is then decided by a directory listing the dispatch arm
+   * takes - so on the arguments alone the floor cannot tell `tsc --noEmit` from `make -s`. The
+   * lookup is `approval-floor.ts`'s, the same way `existingSkill` and `mediaModel` are.
+   *
+   * Absent means nobody could read it, which is not the same as safe: see the branch below.
+   */
+  diagnostics?: { language: string; command: string };
   /** Origins that put untrusted content in this turn. Empty means the turn is clean. */
   taintSources?: readonly string[];
   /** Hosts the owner named, a search returned, or this turn already read. */
@@ -620,6 +632,52 @@ const ordinaryRequirement = (
       action: `Delegate repository work to ${codingAgentName(args.agent)}`,
       preview: `${textValue(args.prompt).slice(0, 2_000)}\n\nThe selected subscription service can inspect and modify files inside this agent computer. athanor keeps the process inside the workspace and records its bounded result.`
     };
+  /*
+   * A diagnostic that is the repository's own build, which is a stranger's program.
+   *
+   * `code_diagnostics` reads as the safest tool in the catalogue - it is on `REPEATABLE_TOOLS`, it
+   * is on `NON_MUTATING_TOOLS`, its description says "return concise grounded output" - and for
+   * six of its fifteen languages that is what it is. For the other nine the command it runs is the
+   * project's own build or test recipe, so what executes is a file whoever wrote the repository
+   * chose: `make -s` runs a Makefile target, `cargo check` runs `build.rs`, `go test ./...` runs the
+   * tests, and `bash ./gradlew` runs a script that is itself in the tree. Both of the first two were
+   * run here against a repository that wrote a file from its recipe, and both wrote it. Until this
+   * branch the name `code_diagnostics` did not occur anywhere in this file, in any security mode, so
+   * cloning a repository and asking for its diagnostics ran a stranger's code with nothing shown to
+   * anybody.
+   *
+   * ONE SENTENCE, WHICH SHAPES FIRE: the ones where the repository decides what runs, listed with
+   * what decides it in `REPOSITORY_DIRECTED_DIAGNOSTICS`, and not the ones where athanor names a
+   * fixed parser or type-checker - which is deliberately where TypeScript and Python are, because
+   * they are nearly all of the work this product actually does and a card on them is a card tapped
+   * through blind by Tuesday.
+   *
+   * Asked in every mode, autonomous included, and placed above every `securityMode` test for that
+   * reason. Autonomous is a promise about not interrupting reversible work; a build recipe is not
+   * one, and `apps/web/src/asking-rules.ts` now says so on the page where the mode is chosen.
+   *
+   * Unreadable fails closed. If `approval-floor.ts` could not take the listing, nobody knows which
+   * of the fifteen this is, and "unknown" answering as "safe" is how the audit found this branch
+   * missing in the first place. The dispatch arm takes the same listing a moment later, so the case
+   * where this cards and the call would have succeeded is a listing that failed once and not twice.
+   */
+  if (name === 'code_diagnostics') {
+    const resolved = context.diagnostics;
+    if (!resolved)
+      return {
+        sideEffect: 'external_consequential',
+        action: 'Run this repository’s own build',
+        preview: `Which diagnostic ${textValue(args.path, 'workspace')} selects could not be read, so it is not known whether it is a type check or this project’s own build and test recipe. A build recipe is a program whoever wrote the repository chose, and it runs on this computer.`
+      };
+    const directed = repositoryDirectedDiagnostic(resolved.language);
+    if (directed)
+      return {
+        sideEffect: 'external_consequential',
+        action: 'Run this repository’s own build',
+        preview: `Run ${resolved.command} in ${textValue(args.path, 'workspace')}. Diagnosing ${resolved.language} means running the project’s own build, so what executes is ${directed} - code whoever wrote this repository chose, running on this computer with whatever this task can reach.`
+      };
+    return null;
+  }
   /**
    * A command that can remove or overwrite data, whichever tool was used to start it.
    *

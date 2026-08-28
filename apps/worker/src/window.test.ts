@@ -470,6 +470,32 @@ describe('the preamble', () => {
   });
 
   /**
+   * The owner's own switch, which is read here first and was written nowhere.
+   *
+   * `enabled` is checked ahead of both status and pinning, so a skill the owner turned off is out
+   * of the index whatever the curation timer thinks of it and whether or not it is pinned. That
+   * order is the claim: pinning is an argument with the timer, and this is not. Until the settings
+   * row could send `enabled` nothing in the product could put a skill into this state, while the
+   * approval card for a skill upsert was already telling the owner it could.
+   */
+  it('leaves out a skill the owner turned off, whether or not it is pinned', async () => {
+    const probed = probe();
+    probed.skills = [
+      skill('s1', 'alpha', 'first'),
+      { ...skill('s2', 'beta', 'second'), enabled: false },
+      { ...skill('s3', 'gamma', 'third'), enabled: false, pinned: true }
+    ];
+    const state = freshState();
+
+    await assemblePreamble(probed.deps, { ...preamble, state });
+
+    const block = state.messages[1]?.content ?? '';
+    expect(block).toContain('alpha');
+    expect(block).not.toContain('beta');
+    expect(block).not.toContain('gamma');
+  });
+
+  /**
    * The caveat line is the difference between project context and an instruction from the harness.
    * The brief is a plain workspace file any turn can write, spliced in as a system message ahead of
    * the whole trajectory in every later task.

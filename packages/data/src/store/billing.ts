@@ -64,12 +64,25 @@ export const DEFAULT_MONTHLY_CAP_USD = 100;
  * only case this speaks for - `monthly_cap_usd` is NULL for both, and the row's absence is the only
  * thing in the schema that tells them apart.
  *
- * ⚠ Which leaves one writer it cannot see: `athanor spend-ceiling set` inserts into `spend_limits`
- * in raw SQL to store the two price ceilings, creating a row with all three money caps NULL. That
- * takes this default off a box whose owner only wanted to cap the price per million tokens - and it
- * already stamped away the epoch `updatedAt` that the first-run ceiling question keys on, before
- * this default existed. The fix covers every writer at once and belongs in a migration: a column
- * default on `monthly_cap_usd`. Until then this closes the fresh install and not that.
+ * ⚠ Which leaves one writer it cannot see: `athanor price-ceiling set` - renamed from
+ * `spend-ceiling`, which is the name to grep for in anything written before the rename - inserts
+ * into `spend_limits` in raw SQL to store the two price ceilings, and any row at all takes this
+ * function out of the conversation for that owner.
+ *
+ * It used to write that row with every money cap NULL, which took this default off a box whose
+ * owner only wanted to cap the price per million tokens. It no longer does: its INSERT arm writes
+ * `monthly_cap_usd` with the constant above - read out of this file by `default_monthly_cap` in
+ * scripts/athanor, so the two cannot come to disagree - and its UPDATE arm leaves an answer already
+ * there alone. `daily_cap_usd` and `default_task_cap_usd` stay NULL on that row, which is what both
+ * of them mean anyway.
+ *
+ * What the row still does is stamp `updated_at`, and `spendCeilingAsk` in the web client reads a
+ * non-epoch `updatedAt` as "this owner has been asked" - so an owner who set a price ceiling over
+ * ssh is never put the first-run question about money caps. They have the hundred above, and were
+ * never told it is what they have.
+ *
+ * The fix that covers every writer at once still belongs in a migration: a column default on
+ * `monthly_cap_usd`. Until then this closes the fresh install and not that.
  */
 const cappedMonthlyUsd = (stored: SpendLimitsRecord | null): number | null =>
   stored ? stored.monthlyCapUsd : DEFAULT_MONTHLY_CAP_USD;

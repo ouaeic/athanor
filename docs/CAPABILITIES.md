@@ -20,7 +20,7 @@ There is no paid tier and no metering of the owner against a plan. The owner hol
 model-provider account and pays it directly. Four ceilings bound a run, and none of them is an
 allowance:
 
-- the **pre-flight price ceiling** (`sudo athanor spend-ceiling`), a maximum rate in dollars per
+- the **pre-flight price ceiling** (`sudo athanor price-ceiling`), a maximum rate in dollars per
   million tokens that athanor will not select a model above. It is the only one that acts before
   any money is spent, and the only one that works while the owner is asleep; a model the owner
   names explicitly is never constrained by it;

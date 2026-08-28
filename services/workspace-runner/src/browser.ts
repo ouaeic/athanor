@@ -1,16 +1,15 @@
 import path from 'node:path';
 import { access, mkdir, rm } from 'node:fs/promises';
-import {
-  chromium,
-  type Browser,
-  type BrowserContext,
-  type CDPSession,
-  type Dialog,
-  type Download,
-  type Frame,
-  type Locator,
-  type Page,
-  type Response as PageResponse
+import type {
+  Browser,
+  BrowserContext,
+  CDPSession,
+  Dialog,
+  Download,
+  Frame,
+  Locator,
+  Page,
+  Response as PageResponse
 } from 'playwright-core';
 import type {
   BrowserAction,
@@ -37,6 +36,7 @@ import {
   type WebSearchResult
 } from './search.js';
 import { DesktopControl } from './holder.js';
+import { chromiumDriver } from './playwright.js';
 
 export interface BrowserStreamState {
   url: string;
@@ -1324,6 +1324,7 @@ export class BrowserManager {
       displayAvailable: Boolean(displayEnvironment),
       runningAsRoot: typeof process.getuid === 'function' && process.getuid() === 0
     });
+    const chromium = await chromiumDriver();
     let context: BrowserContext | undefined;
     let refused: unknown;
     let settled: BrowserLaunchAttempt | undefined;
@@ -1930,6 +1931,7 @@ export class BrowserManager {
     // Losing the renderer sandbox is a real reduction, not a free win, which is why it is a
     // fallback and why the installer lays down an AppArmor profile so the first attempt succeeds.
     // The command is still confined to the agent's own account either way.
+    const chromium = await chromiumDriver();
     if (asRoot) return chromium.launch(options(false));
     try {
       return await chromium.launch(options(true));

@@ -38,19 +38,25 @@ describe('how the agent is told to ask', () => {
 
 describe('what asks whatever the mode says', () => {
   /*
-   * The approval floor the product promises, stated as five things rather than as a policy. The
+   * The approval floor the product promises, stated as six things rather than as a policy. The
    * count is asserted because the value of this list is that it is short and finishable: an owner
-   * who reads it has read all of it, and a sixth line added without deciding to would quietly turn
-   * it back into the page of prose it replaced.
+   * who reads it has read all of it, and a seventh line added without deciding to would quietly
+   * turn it back into the page of prose it replaced.
+   *
+   * It was five until `code_diagnostics` gained a branch above every `securityMode` test. That is
+   * the deciding this count exists to force: the sixth line is here because running a repository's
+   * own build recipe is now one of the things no setting can switch off, and the page that lists
+   * them may not be the last place to find out.
    */
-  it('names the five things no setting can switch off', () => {
-    expect(alwaysAsks).toHaveLength(5);
+  it('names the six things no setting can switch off', () => {
+    expect(alwaysAsks).toHaveLength(6);
     const named = alwaysAsks.map((rule) => rule.what.toLowerCase()).join(' ');
     expect(named).toContain('money');
     expect(named).toContain('password');
     expect(named).toContain('public internet');
     expect(named).toContain('overwriting data');
     expect(named).toContain('git remote');
+    expect(named).toContain("repository's own build");
   });
 
   /*

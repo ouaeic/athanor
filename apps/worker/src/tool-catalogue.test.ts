@@ -17,8 +17,10 @@ import {
   type MediaModelOption,
   type WorkspaceSurfaces
 } from '@athanor/contracts';
+import { z } from 'zod';
 import {
   connectorActions,
+  mailConnectorActionInputs,
   MEMORY_RECALL_ITEM_CEILING,
   MEMORY_RECALL_MAX_ITEMS
 } from '@athanor/core';
@@ -430,6 +432,93 @@ describe('the size of the catalogue the model is sent', () => {
           `${tool.name} restates "${carried}", which the contract already sends on this request`
         ).not.toMatch(restated);
     }
+  });
+});
+
+/*
+ * Why `connector_action.input` is still resident, asked of the schemas rather than argued about.
+ *
+ * The residency ladder this catalogue is governed by puts "opened on demand" - 0 bytes resident,
+ * fetched by a call the model already makes - above "resident", and `connector_action.input` is
+ * 5,018 bytes of the 55,458-byte catalogue, the single largest thing in it. The proposed move is
+ * to have `connector_list` return the per-action field map instead, derived from the Zod union in
+ * `@athanor/core` that parses every one of these before a credential is opened. `connector_list`
+ * is already the call the model is told to make first, so the round trip is free.
+ *
+ * The move was measured and refused, and this is the measurement rather than the argument. Two of
+ * the fields the model needs are not in those schemas to be derived FROM. `saveTo` is stripped by
+ * `connector-call.ts` before the parse and appears in no schema at all, and `attachments` is
+ * declared there as base64 objects - which is the shape this catalogue deliberately contradicts,
+ * because a 2 MB PDF is 2.7 million characters of tool call. A `connector_list` result built from
+ * the schemas would therefore delete one capability and misdescribe the other, and a
+ * `connector_list` result that hand-wrote them back would be the same bytes at a different
+ * address plus a fresh copy to go stale - which is the duplicate this file's own header already
+ * retired two kilobytes of.
+ *
+ * So the two cases below are not decoration. They are the condition under which the refusal
+ * expires: give `saveTo` a schema and make `attachments` take paths, and this file goes red, and
+ * whoever is reading it can move 4,941 bytes off every request of every turn.
+ */
+describe('the one part of the catalogue that has nowhere else to be opened from', () => {
+  const connector = agentTools.find((tool) => tool.name === 'connector_action');
+  const input = (
+    connector?.parameters.properties as
+      | Record<string, { properties?: Record<string, unknown>; description?: string }>
+      | undefined
+  )?.input;
+  /** Each mail and calendar action's input schema as JSON Schema, keyed by the action it parses. */
+  const parsed = new Map(
+    mailConnectorActionInputs.map((schema) => {
+      const shape = z.toJSONSchema(schema, { io: 'input' }) as {
+        properties: Record<string, { const?: string } & Record<string, unknown>>;
+      };
+      return [shape.properties.action?.const ?? '', shape.properties];
+    })
+  );
+
+  it('is where the model is told it may choose the file an attachment is saved as', () => {
+    // The catalogue declares it, and the model has no other way to learn it exists.
+    const saveTo = input?.properties?.saveTo as { description?: string } | undefined;
+    expect(saveTo?.description).toMatch(/workspace/i);
+    // And the schema that parses `mail_read_attachment` has never heard of it, so nothing derived
+    // from that schema could carry it. `connector-call.ts:170` reads it and strips it.
+    expect(parsed.get('mail_read_attachment')).toBeTruthy();
+    expect(Object.keys(parsed.get('mail_read_attachment') ?? {})).not.toContain('saveTo');
+    expect(JSON.stringify([...parsed.values()])).not.toContain('saveTo');
+  });
+
+  it('is where the model is told to attach a file by naming it rather than by inlining it', () => {
+    const attachments = input?.properties?.attachments as
+      | { items?: { type?: string }; description?: string }
+      | undefined;
+    expect(attachments?.items?.type).toBe('string');
+    expect(attachments?.description).toMatch(/path/i);
+    /*
+     * The schema says the opposite, and that is the point. `outgoingAttachment` in
+     * mail-connectors.ts is an object requiring `contentBase64`, capped at 20,000,000 characters,
+     * and `connector-call.ts` is what turns the workspace path the model sent into one. A derived
+     * map would hand the model the post-translation shape and ask it to emit megabytes of base64.
+     */
+    const sent = parsed.get('mail_send')?.attachments as
+      | { items?: { type?: string; required?: string[] } }
+      | undefined;
+    expect(sent?.items?.type).toBe('object');
+    expect(sent?.items?.required).toContain('contentBase64');
+  });
+
+  it('carries every action name, because the enum beside it says only that they exist', () => {
+    /*
+     * The other half of what would be lost. `action` declares all twenty-four names, so the model
+     * always knows the capability is there - that much is not at risk. What is only here is which
+     * fields go with which name, and for nineteen of the twenty-four this description is the only
+     * place in the catalogue the name appears at all.
+     */
+    const map = input?.description ?? '';
+    for (const name of Object.keys(connectorActions)) expect(map, name).toContain(name);
+    const elsewhere = Object.keys(connectorActions).filter((name) =>
+      JSON.stringify(input?.properties ?? {}).includes(name)
+    );
+    expect(elsewhere.length).toBeLessThan(Object.keys(connectorActions).length);
   });
 });
 

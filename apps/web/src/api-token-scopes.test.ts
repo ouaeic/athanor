@@ -2,10 +2,10 @@
  * The token form against the scopes the server actually enforces.
  *
  * The list of scopes is written out in `api-token-scopes.ts` rather than imported, because pulling
- * the Zod schema runtime into the browser to render thirteen checkboxes is not worth the first
+ * the Zod schema runtime into the browser to render eleven checkboxes is not worth the first
  * paint. That copy is only safe if something fails when the two disagree — which is exactly the
- * drift that left six enforced scopes ungrantable — so this test imports the enum and holds the
- * table to it. A test file costs the bundle nothing.
+ * drift that left four of them ungrantable — so this test imports the enum and holds the table to
+ * it. A test file costs the bundle nothing.
  */
 import { describe, expect, it } from 'vitest';
 import { ApiTokenScope, CreateApiTokenRequest } from '@athanor/contracts';
@@ -38,13 +38,27 @@ describe('the scopes an owner can actually grant', () => {
   });
 
   /*
-   * Answering approvals on the owner's behalf, spending on generation and reconfiguring the machine
-   * each act in the world with nobody watching. They are grantable; they are not default.
+   * Answering approvals on the owner's behalf and reconfiguring the machine each act in the world
+   * with nobody watching. They are grantable; they are not default.
+   *
+   * Spending on generation acts without the owner present too, and it is default: a token that may
+   * not start work is not a token anybody writes a script against. `defaultApiTokenScopes` says
+   * that, and the checkbox for `tasks:write` says what it costs.
+   *
+   * The whole default set is asserted rather than two absences, because the sentence above claimed
+   * three for as long as the loop below held out two, and only the set can catch that.
    */
-  it('leaves the three scopes that act without the owner present unticked by default', () => {
+  it('leaves answering approvals and reconfiguring the machine unticked by default', () => {
+    expect([...defaultApiTokenScopes]).toEqual([
+      'workspaces:read',
+      'tasks:read',
+      'tasks:write',
+      'files:read',
+      'files:write',
+      'models:read'
+    ]);
     for (const scope of ['approvals:write', 'workspaces:write'] as const)
       expect(defaultApiTokenScopes, scope).not.toContain(scope);
-    expect(defaultApiTokenScopes.length).toBeGreaterThan(0);
   });
 
   it('ticks and unticks a scope, keeping the order the form is read in', () => {

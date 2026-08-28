@@ -13,6 +13,7 @@ import {
   LockKeyhole,
   Pin,
   Plus,
+  Power,
   QrCode,
   Radio,
   RotateCcw,
@@ -121,6 +122,8 @@ import {
   modelDetailLine,
   modelOpennessLine,
   providerModelFields,
+  skillStateNotice,
+  skillSwitch,
   timerStateKnown,
   updateTimerLine,
   workspaceDeletionArmed,
@@ -565,7 +568,7 @@ export function SkillList({
   onOpen: (item: WorkspaceSkill) => void;
   onSetState: (
     item: WorkspaceSkill,
-    patch: { pinned?: boolean; status?: 'active' | 'stale' | 'archived' }
+    patch: { enabled?: boolean; pinned?: boolean; status?: 'active' | 'stale' | 'archived' }
   ) => void;
   onDelete: (item: WorkspaceSkill) => void;
 }) {
@@ -584,6 +587,7 @@ export function SkillList({
             <strong>
               {item.name}
               {item.pinned ? ' · pinned' : ''}
+              {item.enabled ? '' : ' · off'}
             </strong>
             <small>
               {item.description}
@@ -598,6 +602,17 @@ export function SkillList({
                 back; pinning it keeps it there.
               </small>
             )}
+            {/*
+              Said here rather than only in the notice after the press, because the state outlives
+              the notice and the thing that ends it is the Save button on this same screen: the
+              upsert behind it sets `enabled=TRUE` on conflict.
+            */}
+            {item.enabled ? null : (
+              <small>
+                Turned off by you, so the agent is not shown it at all. The text is kept. Saving a
+                skill of this name — here or by the agent, with your approval — switches it back on.
+              </small>
+            )}
           </button>
           <span className="settings-row-actions">
             {item.status === 'active' ? null : (
@@ -609,6 +624,21 @@ export function SkillList({
                 Make active
               </button>
             )}
+            {/*
+              The one axis of a skill the owner could read and could not change. Pinning and
+              reactivating both argue with the curation timer; this is the owner overruling the
+              procedure itself, which is the control the approval card had been promising.
+            */}
+            <button
+              className="icon-btn"
+              aria-label={skillSwitch(item).label}
+              title={skillSwitch(item).title}
+              aria-pressed={item.enabled}
+              disabled={busy}
+              onClick={() => onSetState(item, skillSwitch(item).patch)}
+            >
+              <Power />
+            </button>
             <button
               className="icon-btn"
               aria-label={
@@ -2052,13 +2082,7 @@ export function SelfHostedSettings({
               setSkills((current) =>
                 current.map((entry) => (entry.id === saved.id ? saved : entry))
               );
-              setNotice(
-                patch.status === 'active'
-                  ? `“${item.name}” is active again. Pin it if you want it kept through the next curation.`
-                  : saved.pinned
-                    ? `“${item.name}” is pinned. It is no longer retired for going unused.`
-                    : `“${item.name}” is unpinned. Thirty days unused makes it stale, ninety archives it.`
-              );
+              setNotice(skillStateNotice(item.name, patch, saved));
             })
           }
           onDelete={(item) => {
@@ -2607,9 +2631,12 @@ export function SelfHostedSettings({
           />
         </label>
         {/*
-          Thirteen scopes are enforced on the server and seven used to be issuable, so the routes
-          behind the other six could not be reached by any token this box could create. They are
-          all here now, each said as what it lets a script do rather than as its enum.
+          Eleven scopes are enforced on the server and seven of them used to be issuable, so the
+          routes behind the other four could not be reached by any token this box could create.
+          They are all here now, each said as what it lets a script do rather than as its enum.
+
+          The count is re-derived from `ApiTokenScope` by scripts/check-repository.mjs, because it
+          was written here as thirteen and stayed wrong through every reading of this file.
         */}
         <fieldset className="token-scopes">
           <legend>What this token may do</legend>

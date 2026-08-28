@@ -9,25 +9,49 @@ import { sharedEnv } from './env.js';
  * Every athanor unit parses its environment with its own zod schema, and on a packaged install all
  * of them are started from the same control.env. Two schemas that disagree about one key is a box
  * that half starts: the operator raises TASK_MAX_STEPS, the worker accepts the number, the API
- * refuses to boot, and nothing in either message mentions the other. This walks every config schema
- * in the repository and fails if a shared key has drifted from the single declaration - which is
- * the only check that can catch it, because the two processes never compare notes at runtime.
+ * refuses to boot, and nothing in either message mentions the other. This walks the config schemas
+ * and fails if a shared key has drifted from the single declaration - which is the only check that
+ * can catch it, because the two processes never compare notes at runtime.
  */
 const repositoryRoot = path.resolve(import.meta.dirname, '../../..');
 
+const readOrNull = (relativePath: string): string | null => {
+  try {
+    return readFileSync(path.join(repositoryRoot, relativePath), 'utf8');
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Every file in this repository that parses an environment into a zod schema.
+ *
+ * A unit normally keeps its schema in `src/config.ts`. `services/model-registry` has no config
+ * module - it is one loop with no exported surface - and declares its schema inline in
+ * `src/index.ts`, so an index is read as well, but only where the unit has no `config.ts` and the
+ * file both builds a zod object and parses `process.env`. That pair is what separates an
+ * environment schema from `packages/contracts/src/index.ts`, which is full of zod objects and
+ * reads no environment at all.
+ *
+ * This looked at `config.ts` and nothing else, which meant the registry's twelve keys had never
+ * been compared with anybody's - and three of them had drifted, including an AI_PROVIDER value the
+ * API and the worker both refuse to start on. A walk that misses a schema is not a narrower audit,
+ * it is a green light for the one file nobody is reading.
+ */
 const configPaths = (): string[] => {
   const found: string[] = [];
   for (const group of ['apps', 'packages', 'services']) {
-    const groupPath = path.join(repositoryRoot, group);
-    for (const entry of readdirSync(groupPath, { withFileTypes: true })) {
+    for (const entry of readdirSync(path.join(repositoryRoot, group), { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
-      const candidate = path.join(groupPath, entry.name, 'src/config.ts');
-      try {
-        readFileSync(candidate, 'utf8');
-        found.push(path.relative(repositoryRoot, candidate));
-      } catch {
-        // A package without a config schema has nothing to disagree with.
+      const config = `${group}/${entry.name}/src/config.ts`;
+      if (readOrNull(config) !== null) {
+        found.push(config);
+        continue;
       }
+      const index = `${group}/${entry.name}/src/index.ts`;
+      const inline = readOrNull(index);
+      // A package without a config schema has nothing to disagree with.
+      if (inline?.includes('z.object({') && inline.includes('process.env')) found.push(index);
     }
   }
   return found.sort();
@@ -130,6 +154,13 @@ describe('shared environment declarations', () => {
     expect(files).toContain('apps/api/src/config.ts');
     expect(files).toContain('apps/worker/src/config.ts');
     expect(files).toContain('services/workspace-runner/src/config.ts');
+    // Named because it is the one this walk used to miss: its schema is inline in index.ts, so a
+    // walk of config.ts alone left it the only unit in the repository nothing compared.
+    expect(files).toContain('services/model-registry/src/index.ts');
+    // And no further: this file is a few hundred zod objects and reads no environment at all, so a
+    // walk that took every `index.ts` would audit the request contracts as if they were settings
+    // and report every one of them as a key two processes disagree about.
+    expect(files).not.toContain('packages/contracts/src/index.ts');
     expect(new Set(Object.keys(sharedEnv))).toEqual(new Set(shared.keys()));
   });
 

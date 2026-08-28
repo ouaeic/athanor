@@ -29,6 +29,7 @@ import {
   connectorCheckMessage,
   connectorDisclosure,
   connectorLastCheck,
+  connectorRevokedLine,
   connectorStatusLine,
   type ConnectorCheck
 } from './connector-access.js';
@@ -53,6 +54,124 @@ const authModeLabel = (mode: Connector['authMode']): string =>
       : mode === 'none'
         ? 'No credentials'
         : 'Encrypted credentials';
+
+/**
+ * The connections themselves, and the two controls a live one carries.
+ *
+ * Lifted out of `Connectors` so a list can be handed to it. `Connectors` fetches its own, this
+ * package has no DOM in its tests and `renderToStaticMarkup` runs no effects, so while the rows
+ * were expressions inside that component no test could put a disconnected connection in front of
+ * them — which is exactly where the following hid.
+ *
+ * `revokeConnector` is a soft delete: `UPDATE connectors SET enabled=FALSE`
+ * (packages/data/src/store/connectors.ts:293-300). `listConnectors` has no `enabled` filter (:279)
+ * and orders `enabled DESC`, so the list was designed to keep a disconnected connection and the
+ * route has served `enabled` on every row since (`apps/api/src/context.ts:904`). Nothing read it.
+ * The row therefore came back on the reload the disconnect handler runs, looking exactly like a
+ * live one, wearing a Check button and a Disconnect button that both answer 404 — `getConnector`
+ * filters `enabled=TRUE` and both routes go through it — and the second of those asked for a
+ * passkey first: the handler runs `api.stepUp()` before it asks the server anything, which outside
+ * the step-up recency window is a whole WebAuthn ceremony spent on the way to a 404. Now the row
+ * says what it is and offers neither.
+ */
+export function ConnectedList({
+  connectors,
+  audit,
+  checks,
+  checking,
+  busy,
+  now,
+  onCheck,
+  onDisconnect
+}: {
+  connectors: Connector[];
+  /** Read for the last check and for when a disconnected connection was disconnected. */
+  audit: ConnectorAuditEvent[];
+  /** Checks run on this device this session, which are the only ones that still have a sentence. */
+  checks: Record<string, ConnectorCheck>;
+  /** Which row is mid-check, so only that row's control goes quiet. */
+  checking: string;
+  busy: boolean;
+  now: number;
+  onCheck: (item: Connector) => void;
+  onDisconnect: (item: Connector) => void;
+}) {
+  return (
+    <div className="settings-list">
+      {connectors.map((item) => {
+        // The check this device just ran wins over the recorded one, because only it still has
+        // the sentence: `failure.message` is minted by the test route and stored nowhere.
+        const fresh = checks[item.id];
+        const check = fresh ?? connectorLastCheck(audit, item.id);
+        return (
+          <div key={item.id}>
+            <span>
+              <strong>
+                {item.label} · {connectedKindLabel(item.kind)}
+                {item.enabled ? '' : ' · disconnected'}
+              </strong>
+              {/*
+                What was granted, said the way it was granted. This was the stored scope ids.
+
+                Past the disconnection it is the one question a revocation leaves behind — what
+                could that thing do while it had my credential — so it is kept, under a clause that
+                stops the present tense reading as a live claim.
+              */}
+              <small>
+                {item.enabled
+                  ? `${connectorAccess(item.scopes)} · ${authModeLabel(item.authMode)}`
+                  : `What it could reach: ${connectorAccess(item.scopes)}`}
+              </small>
+              {/*
+                What the disconnect button beside it needs answered: is this credential still
+                live, and is it still good. Both were served on every load and neither was
+                drawn, so the only way to find out which of five connections mattered was to
+                remove one and see what broke.
+              */}
+              <small>
+                {item.enabled
+                  ? connectorStatusLine({ lastUsedAt: item.lastUsedAt, check }, now)
+                  : connectorRevokedLine(item.updatedAt, now)}
+              </small>
+              {item.enabled && fresh && !fresh.ok && <small>{fresh.message}</small>}
+            </span>
+            {/* One cell, two controls: the row is a two-column grid and a third child would
+                drop the disconnect button onto a line of its own. A disconnected row has no
+                second cell at all, which is the shape the recorded-calls list below already
+                uses for a row that is a statement rather than a thing to act on. */}
+            {item.enabled && (
+              <div className="settings-row-actions">
+                {/*
+                  A credential is verified once, when it is added, and then trusted. Passwords
+                  change, servers move and authorizations expire, and none of those announce
+                  themselves — so this is the answer to "is this still good", asked rather than
+                  found out by a task that failed at three in the morning.
+                */}
+                <button
+                  className="icon-btn"
+                  aria-label={`Check ${item.label}`}
+                  title="Ask this account whether the connection still works"
+                  disabled={busy || checking === item.id}
+                  onClick={() => onCheck(item)}
+                >
+                  <Stethoscope />
+                </button>
+                <button
+                  className="icon-btn"
+                  aria-label={`Disconnect ${item.label} · asks for your passkey`}
+                  title="Disconnecting cannot be undone; the stored credential is destroyed"
+                  onClick={() => onDisconnect(item)}
+                >
+                  <Trash2 />
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 /**
  * Everything the owner can point athanor at, and the two forms that are more than a token field.
@@ -658,89 +777,43 @@ export function Connectors({
       >
         <Plus /> {connectActionLabel(draft, testing)}
       </button>
-      <div className="settings-list">
-        {connectors.map((item) => {
-          // The check this device just ran wins over the recorded one, because only it still has
-          // the sentence: `failure.message` is minted by the test route and stored nowhere.
-          const fresh = checks[item.id];
-          const check = fresh ?? connectorLastCheck(audit, item.id);
-          return (
-            <div key={item.id}>
-              <span>
-                <strong>
-                  {item.label} · {connectedKindLabel(item.kind)}
-                </strong>
-                {/* What was granted, said the way it was granted. This was the stored scope ids. */}
-                <small>
-                  {connectorAccess(item.scopes)} · {authModeLabel(item.authMode)}
-                </small>
-                {/*
-                  What the disconnect button beside it needs answered: is this credential still
-                  live, and is it still good. Both were served on every load and neither was
-                  drawn, so the only way to find out which of five connections mattered was to
-                  remove one and see what broke.
-                */}
-                <small>{connectorStatusLine({ lastUsedAt: item.lastUsedAt, check }, now)}</small>
-                {fresh && !fresh.ok && <small>{fresh.message}</small>}
-              </span>
-              {/* One cell, two controls: the row is a two-column grid and a third child would
-                  drop the disconnect button onto a line of its own. */}
-              <div className="settings-row-actions">
-                {/*
-                  A credential is verified once, when it is added, and then trusted. Passwords
-                  change, servers move and authorizations expire, and none of those announce
-                  themselves — so this is the answer to "is this still good", asked rather than
-                  found out by a task that failed at three in the morning.
-                */}
-                <button
-                  className="icon-btn"
-                  aria-label={`Check ${item.label}`}
-                  title="Ask this account whether the connection still works"
-                  disabled={busy || checking === item.id}
-                  onClick={() =>
-                    void act(async () => {
-                      setChecking(item.id);
-                      try {
-                        const result = connectorCheckMessage(
-                          item.label,
-                          await api.testConnector(item.id)
-                        );
-                        // Kept on the row before it is thrown, because `act` turns a throw into a
-                        // notice that scrolls away and the row is where the question was asked.
-                        setChecks((current) => ({ ...current, [item.id]: result }));
-                        // Reloaded whichever way it went: a check that failed is recorded on the
-                        // box exactly like one that worked, and the list below this one says it
-                        // shows every call. Only reloading on success made it say so falsely.
-                        load();
-                        if (!result.ok) throw new Error(result.message);
-                        setNotice(result.message);
-                      } finally {
-                        setChecking('');
-                      }
-                    })
-                  }
-                >
-                  <Stethoscope />
-                </button>
-                <button
-                  className="icon-btn"
-                  aria-label={`Disconnect ${item.label} · asks for your passkey`}
-                  title="Disconnecting cannot be undone; the stored credential is destroyed"
-                  onClick={() =>
-                    void act(async () => {
-                      await api.stepUp();
-                      await api.revokeConnector(item.id);
-                      load();
-                    })
-                  }
-                >
-                  <Trash2 />
-                </button>
-              </div>
-            </div>
-          );
-        })}
-      </div>
+      <ConnectedList
+        connectors={connectors}
+        audit={audit}
+        checks={checks}
+        checking={checking}
+        busy={busy}
+        now={now}
+        onCheck={(item) =>
+          void act(async () => {
+            setChecking(item.id);
+            try {
+              const result = connectorCheckMessage(item.label, await api.testConnector(item.id));
+              // Kept on the row before it is thrown, because `act` turns a throw into a notice
+              // that scrolls away and the row is where the question was asked.
+              setChecks((current) => ({ ...current, [item.id]: result }));
+              // Reloaded whichever way it went: a check that failed is recorded on the box
+              // exactly like one that worked, and the list below this one says it shows every
+              // call. Only reloading on success made it say so falsely.
+              load();
+              if (!result.ok) throw new Error(result.message);
+              setNotice(result.message);
+            } finally {
+              setChecking('');
+            }
+          })
+        }
+        onDisconnect={(item) =>
+          void act(async () => {
+            await api.stepUp();
+            await api.revokeConnector(item.id);
+            // The row does not leave on this reload and is not meant to: `revokeConnector` sets
+            // `enabled=FALSE` and `listConnectors` filters nothing, so what comes back is the
+            // same connection saying it is gone.
+            load();
+          })
+        }
+      />
       {unavailable && (
         <p className="connector-unavailable">
           Your connections could not be read just now. Nothing was removed — this device could not
@@ -775,8 +848,13 @@ export function Connectors({
               return (
                 <div key={entry.id}>
                   <span>
+                    {/*
+                      "Disconnected service" was the old fallback and it was never true: a revoked
+                      connection is still in the list above, so the only way to reach this branch
+                      is a list that could not be read.
+                    */}
                     <strong>
-                      {label ?? 'Disconnected service'} · {line.action}
+                      {label ?? 'A connection this device could not name'} · {line.action}
                     </strong>
                     <small>{line.detail}</small>
                   </span>

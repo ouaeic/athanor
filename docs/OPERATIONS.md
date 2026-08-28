@@ -169,14 +169,17 @@ Address handling follows what each provider actually does:
 `ddns test` forces a publish, prints what the provider echoed back, resolves the hostname, and says
 whether the answer already includes this computer's address or is still cached.
 
-## Spending ceiling
+## Price ceiling
 
 ```bash
-sudo athanor spend-ceiling show
-sudo athanor spend-ceiling set 2 10
-sudo athanor spend-ceiling set none 10
-sudo athanor spend-ceiling clear
+sudo athanor price-ceiling show
+sudo athanor price-ceiling set 2 10
+sudo athanor price-ceiling set none 10
+sudo athanor price-ceiling clear
 ```
+
+`spend-ceiling` was the old name for this and still answers, printing the new one. It is not the
+same command as `spend-cap`, which is the money cap the old name sounded like.
 
 The pre-flight half of the spending brake, and the half that works while nobody is watching. The
 daily, monthly and per-task caps in Settings watch what a task has already spent and halt it once it

@@ -10,7 +10,7 @@
 
 import type { ModelRelease } from '@athanor/contracts';
 import type { ProviderSettings } from './api.js';
-import type { WorkspaceMemory } from './types.js';
+import type { WorkspaceMemory, WorkspaceSkill } from './types.js';
 
 /**
  * What `GET /v1/providers` says about the model the owner configured by hand.
@@ -114,6 +114,68 @@ export const memoryProvenance = (memory: Pick<WorkspaceMemory, 'source'>): strin
 /** Which computer or person the line applies to, said as a scope rather than as a person. */
 export const memoryScope = (memory: Pick<WorkspaceMemory, 'target'>): string =>
   memory.target === 'user' ? 'About you, everywhere' : 'About this computer';
+
+/**
+ * The on/off control on a learned procedure: what it says, and what it sends.
+ *
+ * `enabled` is a real column with a real reader — `apps/worker/src/window.ts:191-194` drops a
+ * disabled skill from the index the model is shown, before curation and before pinning are even
+ * looked at — and it had no writer anywhere in the product. `PATCH /v1/workspaces/:id/skills/:id`
+ * has taken it (`apps/api/src/routes/knowledge.ts:555-570`), the store has written it
+ * (`packages/data/src/store/workspaces.ts:592`) and `api.setSkillState` has declared it, while the
+ * only prop the row could send was `{ pinned?, status? }`. Meanwhile the approval card for a skill
+ * upsert told the owner, in these words, "You had turned X off. Approving this switches it back
+ * on." (`apps/worker/src/approval-cards.ts:192-193`) about a state nothing could put a skill into.
+ *
+ * A value rather than an expression inside the row, because this package has no DOM in its tests:
+ * what the control sends is the whole of the hole, and this is the only shape it can be asserted in.
+ */
+export interface SkillSwitch {
+  /** Says what pressing it does, because that is what a label on a toggle is for. */
+  label: string;
+  title: string;
+  patch: { enabled: boolean };
+}
+
+export const skillSwitch = (skill: Pick<WorkspaceSkill, 'name' | 'enabled'>): SkillSwitch =>
+  skill.enabled
+    ? {
+        label: `Turn the ${skill.name} skill off`,
+        title: 'Keep the procedure, and stop the agent being shown it',
+        patch: { enabled: false }
+      }
+    : {
+        label: `Turn the ${skill.name} skill on`,
+        title: 'Show the agent this procedure again',
+        patch: { enabled: true }
+      };
+
+/**
+ * What the screen says after a skill's state was changed, decided on the axis that was changed.
+ *
+ * Read off `saved` rather than off `patch`, because this is said after the route answered and the
+ * route's answer is the state. Which sentence, though, is decided by the axis in `patch`: a skill
+ * that was turned off while pinned is still pinned, and a notice reading "is pinned" would be true
+ * and would answer a question nobody asked. The off sentence carries the upsert, because
+ * `saveWorkspaceSkill` forces `enabled=TRUE` on conflict
+ * (`packages/data/src/store/workspaces.ts:511`) — the Save button on this same screen included —
+ * so "off" is a state the owner's next save silently ends.
+ */
+export const skillStateNotice = (
+  name: string,
+  patch: { enabled?: boolean; pinned?: boolean; status?: 'active' | 'stale' | 'archived' },
+  saved: Pick<WorkspaceSkill, 'enabled' | 'pinned'>
+): string => {
+  if (patch.enabled !== undefined)
+    return saved.enabled
+      ? `“${name}” is on. The agent is shown it again from the next task that starts.`
+      : `“${name}” is off. The agent is no longer shown it. The text is kept, and saving a skill of this name switches it back on.`;
+  if (patch.status === 'active')
+    return `“${name}” is active again. Pin it if you want it kept through the next curation.`;
+  return saved.pinned
+    ? `“${name}” is pinned. It is no longer retired for going unused.`
+    : `“${name}” is unpinned. Thirty days unused makes it stale, ninety archives it.`;
+};
 
 /** How a systemd timer's own verdict reads on a screen. */
 export type TimerState = 'on' | 'off' | 'unknown';

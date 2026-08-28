@@ -14,9 +14,11 @@ import { z } from 'zod';
  * listener and WebAuthn boundary, the runner's executable paths, the notifier's signing keys -
  * because a declaration nobody else consults is not a contract, it is just configuration.
  *
- * packages/contracts/src/env.test.ts is what keeps this true: it reads every config schema in the
- * repository, finds each key declared in more than one of them, and fails if a declaration has
- * drifted from the one below.
+ * packages/contracts/src/env.test.ts is what keeps this true: it reads each unit's config schema -
+ * `src/config.ts`, or an inline schema in `src/index.ts` for a unit that has no config module -
+ * finds each key declared in more than one of them, and fails if a declaration has drifted from
+ * the one below. It read only `src/config.ts` until services/model-registry turned out to be
+ * declaring eight of these keys inline, three of them differently.
  */
 export const sharedEnv = {
   /**
@@ -76,6 +78,22 @@ export const sharedEnv = {
     .string()
     .default('false')
     .transform((value) => value === 'true'),
+  /**
+   * Which models this box will offer at all.
+   *
+   * `provider_catalog` offers every chat model the owner's provider account can reach, so models
+   * released after this build appear without an athanor update. `reviewed_open_weight` restricts
+   * selection to models carrying a current independent weight-licence review and fails closed when
+   * one lapses.
+   *
+   * Shared because two units read it out of the same control.env and both write the catalogue with
+   * it: apps/api on a provider key being saved and on the repair pass behind it, and
+   * services/model-registry on every hourly refresh. A box where the two disagree has each of them
+   * undoing the other's answer about which models exist.
+   */
+  MODEL_CATALOG_SCOPE: z
+    .enum(['provider_catalog', 'reviewed_open_weight'])
+    .default('provider_catalog'),
   ALLOW_INSECURE_PROVIDER_URLS: z
     .string()
     .default('false')

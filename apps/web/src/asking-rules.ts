@@ -20,7 +20,7 @@ export interface AskingRule {
  * before any `securityMode` test is reached, so no setting on this page can switch them off. The
  * page that describes the modes was the one place in the product that never said so.
  *
- * Written by hand and kept to five lines deliberately. Generating it from the classifier was
+ * Written by hand and kept to six lines deliberately. Generating it from the classifier was
  * considered and dropped: it is build machinery for five sentences that change about twice a year,
  * and what a generator can produce from that function is the enum again, which is what the
  * approval card already had to be rescued from.
@@ -47,6 +47,11 @@ export const alwaysAsks: AskingRule[] = [
   {
     what: 'Pushing to a Git remote',
     detail: 'Every git push. Fetching, branching and committing locally do not ask.'
+  },
+  {
+    what: "Running a repository's own build",
+    detail:
+      'Checking Go, Rust, Java, Kotlin, C#, C++, Swift, R or Terraform code runs that project’s build or test recipe, which is a program its author wrote. Type-checking TypeScript and byte-compiling Python do not ask; they run no file the repository supplies.'
   }
 ];
 

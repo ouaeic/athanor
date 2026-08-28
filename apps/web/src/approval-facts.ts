@@ -183,8 +183,8 @@ export const approvalRequestText = (approval: Approval): string => {
 /**
  * The model's sentence about the call, and nothing else.
  *
- * `approvalPreviewText` falls back to a dump of the arguments when there is no prose, which is a
- * fact rather than a claim and belongs above with the other facts — not inside the quotation
+ * `approvalRequestText` above falls back to a dump of the arguments when there is no prose, which
+ * is a fact rather than a claim and belongs there with the other facts — not inside the quotation
  * attributed to the model.
  */
 export const agentSentence = (approval: Approval): string => {

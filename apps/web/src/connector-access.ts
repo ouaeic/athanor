@@ -368,3 +368,27 @@ export const connectorLastCheck = (
   }
   return newest;
 };
+
+/**
+ * The line under a connection the owner has already disconnected, which is a row that stays.
+ *
+ * `revokeConnector` is a soft delete and `listConnectors` filters nothing, so the row comes back on
+ * the very reload the disconnect handler runs. It used to come back looking live, over
+ * `connectorStatusLine` above, which then read "Last reached just now" — a claim about somebody
+ * else's server that nothing had touched. `recordConnectorAudit` stamps
+ * `last_used_at=NOW(),updated_at=NOW()` beside every row it writes
+ * (packages/data/src/store/connectors.ts:373-375) and the revocation route writes one, so the
+ * column the sentence came from was measuring the revocation itself.
+ *
+ * `updatedAt` is that same stamp and is passed here on purpose: after a revocation it is the
+ * instant of the revocation and stays there. Every other statement that writes to the row —
+ * `updateConnectorSecret`, and every caller of `recordConnectorAudit` — resolves the connector
+ * through `getConnector` first, which filters `enabled=TRUE`, so nothing can move it again. The
+ * difference from `lastUsedAt` is not the number, it is what the sentence built on it claims.
+ */
+export const connectorRevokedLine = (revokedAt: string | null, nowMs: number): string => {
+  const when = revokedAt ? ago(revokedAt, nowMs) : '';
+  return `${
+    when ? `Disconnected ${when}` : 'Disconnected'
+  }. The credential this box had stored was destroyed, so nothing can use this connection. Connecting again asks for a new one.`;
+};

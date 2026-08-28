@@ -1276,7 +1276,22 @@ describe('the repository arms', () => {
       }
     );
 
+    /*
+     * Two listings, and the first one is the approval floor's.
+     *
+     * `language` defaults to `auto`, so which command this call runs is decided by what the
+     * directory holds - and the floor has to know that before the call, because nine of the fifteen
+     * diagnostics are the project's own build. So it takes the same listing from the same endpoint
+     * and reads it through the same table. The cost is one directory read; the alternative is a
+     * floor judging `make -s` as if it were `tsc --noEmit`.
+     */
     expect(executed.calls).toEqual([
+      {
+        method: 'GET',
+        path: `${root}/files?path=workspace%2Fapp`,
+        scopes: ['files.read'],
+        body: undefined
+      },
       {
         method: 'GET',
         path: `${root}/files?path=workspace%2Fapp`,
@@ -1325,7 +1340,10 @@ describe('the repository arms', () => {
       }
     );
 
-    expect(executed.calls[1]?.body).toMatchObject({ timeoutSeconds: 300 });
+    // Found by route rather than by index: the approval floor takes a listing of its own ahead of
+    // this call, and an index here would be asserting about whichever call happened to be second.
+    const exec = executed.calls.find((entry) => entry.path === `${root}/exec`);
+    expect(exec?.body).toMatchObject({ timeoutSeconds: 300 });
   });
 
   it('says so, and runs nothing, when no project marker is there to recognise', async () => {
@@ -1337,7 +1355,12 @@ describe('the repository arms', () => {
       }
     );
 
-    expect(executed.calls).toHaveLength(1);
+    // The floor's listing and this call's listing, and no exec at all: a directory holding no
+    // project marker resolves to no command on both sides, so nothing is run and nothing is asked.
+    expect(executed.calls.map((entry) => entry.path)).toEqual([
+      `${root}/files?path=workspace`,
+      `${root}/files?path=workspace`
+    ]);
     expect(executed.result).toMatchObject({ available: false });
   });
 

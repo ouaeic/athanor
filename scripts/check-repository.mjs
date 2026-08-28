@@ -639,9 +639,10 @@ else say(`Node version: engines and the installer both require ${installerNodeMa
 const dispatch = read('scripts/athanor');
 const dispatchStart = dispatch.indexOf('case "$command_name" in');
 const dispatchBlock = dispatchStart === -1 ? '' : dispatch.slice(dispatchStart);
-const shippedCommands = new Set(
+const dispatchArms = new Set(
   [...dispatchBlock.matchAll(/^  ([a-z][a-z-]*)\)/gm)].map((match) => match[1])
 );
+const shippedCommands = new Set(dispatchArms);
 // `help` is the fallback arm and `install` is run by the installer, not by an owner reading this.
 for (const internal of ['help', 'install']) shippedCommands.delete(internal);
 const documented = new Set(
@@ -655,6 +656,112 @@ else if (undocumented.length)
 else if (imaginary.length)
   fail(`README documents ${imaginary.join(', ')}, which scripts/athanor does not answer to`);
 else say(`Server commands: ${shippedCommands.size} shipped, all of them documented.`);
+
+/**
+ * And every command any document tells an owner to type is one the box still offers under that
+ * name.
+ *
+ * The rule above is a set comparison against the README, and it is satisfied by a name the script
+ * merely answers to. That is a different question from "is this what an owner should type now".
+ * `spend-ceiling` was renamed to `price-ceiling` and the old arm was kept, deliberately, so that a
+ * name in somebody's shell history is told what it is called rather than told it does not exist -
+ * and four documents went on teaching the retired name for months with the check above green,
+ * because the arm was still there.
+ *
+ * The usage line the script prints is the list it offers, so it is the list a document may teach
+ * from. A retired name is allowed on a line that says so - `old name` is the marker, and the
+ * README's rename note is the one line that carries it - because documenting the rename is the
+ * point of keeping the arm.
+ */
+const usageOffered = new Set(
+  (/'Usage: athanor \{([^']*)\}'/.exec(dispatch)?.[1] ?? '')
+    // The nested `[api|worker|...]` groups are arguments to a command, not commands.
+    .replaceAll(/\[[^\]]*\]/g, ' ')
+    .split('|')
+    .map((piece) => piece.trim().split(/\s+/)[0])
+    .filter((name) => /^[a-z][a-z-]*$/.test(name))
+);
+const documents = publishedText.filter((relativePath) => relativePath.endsWith('.md'));
+const invented = [];
+const retired = [];
+let instructions = 0;
+for (const relativePath of documents) {
+  read(relativePath)
+    .split('\n')
+    .forEach((line, index) => {
+      for (const match of line.matchAll(/sudo athanor ([a-z][a-z-]*)/g)) {
+        const name = match[1];
+        const where = `${relativePath}:${index + 1} says "sudo athanor ${name}"`;
+        instructions += 1;
+        if (!dispatchArms.has(name)) invented.push(where);
+        else if (!usageOffered.has(name) && !line.includes('old name')) retired.push(where);
+      }
+    });
+}
+if (!usageOffered.size) fail('scripts/athanor no longer prints a usage line naming its commands');
+else if (invented.length)
+  fail(`${invented.join('; ')}, which scripts/athanor does not answer to at all`);
+else if (retired.length)
+  fail(
+    `${retired.join('; ')}, a name scripts/athanor still answers to but no longer offers; teach the name in its usage line, or mark the line as the old name`
+  );
+else
+  say(
+    `Documented commands: ${instructions} instructions across ${documents.length} documents, all of them names the box offers.`
+  );
+
+/**
+ * How many API token scopes there are, wherever prose says.
+ *
+ * Two comments count them, because the point both make is that the form used to offer fewer than
+ * the server enforces. Both said thirteen against an enum of eleven, and one of them then did the
+ * subtraction and published the wrong difference as well. A count in prose next to the list it
+ * counts is exactly the figure `docs/EVALUATION.md` is already held to, and just as cheap.
+ */
+const scopeEnum = /export const ApiTokenScope = z\.enum\(\[([\s\S]*?)\]\);/.exec(
+  read('packages/contracts/src/index.ts')
+);
+const scopeCount = scopeEnum ? [...scopeEnum[1].matchAll(/'[a-z]+:[a-z]+'/g)].length : 0;
+const spelled = [
+  'zero',
+  'one',
+  'two',
+  'three',
+  'four',
+  'five',
+  'six',
+  'seven',
+  'eight',
+  'nine',
+  'ten',
+  'eleven',
+  'twelve',
+  'thirteen',
+  'fourteen',
+  'fifteen',
+  'sixteen',
+  'seventeen',
+  'eighteen',
+  'nineteen',
+  'twenty'
+][scopeCount];
+const scopeClaims = [
+  ['apps/web/src/SelfHostedSettings.tsx', /([A-Za-z]+) scopes are enforced on the server/],
+  ['apps/web/src/api-token-scopes.test.ts', /render ([A-Za-z]+) checkboxes/]
+];
+if (!scopeCount)
+  fail('packages/contracts/src/index.ts no longer declares ApiTokenScope as an enum');
+else {
+  const wrong = [];
+  for (const [relativePath, pattern] of scopeClaims) {
+    const stated = pattern.exec(read(relativePath));
+    if (!stated) wrong.push(`${relativePath} no longer states how many scopes there are`);
+    else if (stated[1].toLowerCase() !== spelled)
+      wrong.push(`${relativePath} says ${stated[1].toLowerCase()}, and the enum has ${spelled}`);
+  }
+  if (wrong.length) fail(wrong.join('; '));
+  else say(`API token scopes: ${scopeCount} enforced, and both comments that count them say so.`);
+}
 
 /**
  * Every file a fresh install puts on a box is a file an update puts there too.
@@ -966,8 +1073,13 @@ const unraised = phrasedTools.filter((tool) => !raisesApproval.includes(tool));
  * the two lists shrinking *together*. Delete an approval branch from the floor and tidy its phrase
  * away in the same change, and both sides agree on the smaller set, nothing here says a word, and a
  * tool has quietly stopped asking the owner before it acts. Measured on this tree: removing
- * `audio_read` from both files leaves seventeen tools in perfect agreement and every check above
+ * `audio_read` from both files leaves eighteen tools in perfect agreement and every check above
  * green.
+ *
+ * What it also cannot say, and what nothing in this repository says, is whether a tool that *ought*
+ * to raise an approval does. Both sides of the comparison are derived from the floor, so a tool the
+ * floor has never heard of is absent from both and agrees with itself. `code_diagnostics` sat in
+ * that blind spot for the whole life of this check while it ran a cloned repository's own build.
  *
  * The floor is therefore a floor and not an equality. A tool that genuinely stops raising an
  * approval is a decision somebody makes, and lowering this number in the same commit - where it is
@@ -979,8 +1091,21 @@ const unraised = phrasedTools.filter((tool) => !raisesApproval.includes(tool));
  * comment had already recorded that this comparison belonged here, "so a new branch in the worker
  * fails the build rather than one client's test suite".
  */
-const APPROVAL_FLOOR_MINIMUM = 18;
-const APPROVAL_FLOOR_WITNESSES = ['audio_read', 'parallel_web_read'];
+const APPROVAL_FLOOR_MINIMUM = 19;
+/*
+ * The witnesses answer the case where the count is right and the set is wrong.
+ *
+ * `code_diagnostics` is the third because it is the one that was missing rather than merely
+ * unphrased. It ran `go test ./...`, `make -s` and `cargo check` - a repository's own build recipe,
+ * which is a program its author wrote - and the floor named it nowhere in any security mode. The
+ * check above never noticed, and could not have: it reads the tools the floor asks about and
+ * compares them with the card, so a tool the floor is silent about is outside the set on both
+ * sides. That is worth saying plainly rather than treating as a near miss - this check was right
+ * about what it asserts, and what it asserts is phrase coverage, not floor coverage. Naming the
+ * tool as a witness is what makes the floor coverage checkable for this one case: delete the branch
+ * and this fails here rather than in a review nobody runs.
+ */
+const APPROVAL_FLOOR_WITNESSES = ['audio_read', 'parallel_web_read', 'code_diagnostics'];
 const missingWitnesses = APPROVAL_FLOOR_WITNESSES.filter((tool) => !raisesApproval.includes(tool));
 if (!raisesApproval.length)
   fail(

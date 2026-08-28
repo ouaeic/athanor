@@ -104,15 +104,8 @@ const Config = z.object({
   AI_DEFAULT_MODEL: sharedEnv.AI_DEFAULT_MODEL,
   AI_REQUIRE_ZDR: sharedEnv.AI_REQUIRE_ZDR,
   AI_FORCE_INHOUSE_WEB: sharedEnv.AI_FORCE_INHOUSE_WEB,
-  /**
-   * `provider_catalog` offers every chat model the owner's provider account can reach, so models
-   * released after this build appear without an Athanor update. `reviewed_open_weight` restricts
-   * selection to models carrying a current independent weight-licence review and fails closed
-   * when one lapses.
-   */
-  MODEL_CATALOG_SCOPE: z
-    .enum(['provider_catalog', 'reviewed_open_weight'])
-    .default('provider_catalog'),
+  /** Read by services/model-registry from the same file, so the declaration is shared. */
+  MODEL_CATALOG_SCOPE: sharedEnv.MODEL_CATALOG_SCOPE,
   /**
    * The non-secret connection manifest the network watcher maintains. Device enrollment reuses it
    * so a new device receives the same endpoint set and pinned identity the installer would print.

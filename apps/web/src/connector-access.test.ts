@@ -5,6 +5,7 @@ import {
   connectorCheckMessage,
   connectorDisclosure,
   connectorLastCheck,
+  connectorRevokedLine,
   connectorStatusLine
 } from './connector-access.js';
 import { formatBytes } from './timeline-state.js';
@@ -388,5 +389,36 @@ describe("the box's own statement about a connection", () => {
     expect(connectorDisclosure(github)[0]).toBe('A fine-grained personal access token.');
     const { requirements: _unstated, ...older } = github;
     expect(connectorDisclosure(older)).toHaveLength(3);
+  });
+});
+
+/*
+ * The line under a connection the owner has already disconnected.
+ *
+ * The row survives its own removal — `revokeConnector` is a soft delete — so it has to say what it
+ * now is. The instant comes from `updatedAt`, which after a revocation is the revocation: the
+ * revoke statement stamps it, `recordConnectorAudit` stamps it again writing the `revoke` row, and
+ * every other writer to that row goes through `getConnector` first, which filters `enabled=TRUE`.
+ */
+describe('the line under a disconnected connection', () => {
+  const now = Date.parse('2026-08-27T09:00:00.000Z');
+
+  it('says how long ago, and that the credential is gone rather than dormant', () => {
+    const line = connectorRevokedLine('2026-08-24T09:00:00.000Z', now);
+    expect(line).toContain('Disconnected 3 days ago');
+    expect(line).toContain('destroyed');
+    expect(line).toContain('Connecting again asks for a new one');
+  });
+
+  /* A box old enough to have served no instant says less rather than inventing one. */
+  it('says only that it is disconnected when there is no instant to date it by', () => {
+    const line = connectorRevokedLine(null, now);
+    expect(line.startsWith('Disconnected.')).toBe(true);
+    expect(line).not.toContain('ago');
+  });
+
+  /* Never the other row's sentence: that one is a claim about the far end answering. */
+  it('never claims the far end was reached, which is what the live line would have said', () => {
+    expect(connectorRevokedLine('2026-08-24T09:00:00.000Z', now)).not.toContain('Last reached');
   });
 });

@@ -175,6 +175,10 @@ export const registerTaskRoutes = (context: RouteContext): void => {
       },
       signals: {
         prompt: input.prompt,
+        // `attachments` is optional on the request and the web client never sends it: it appends
+        // the paths to the prompt as an "Attached files:" block instead, which is what the agent
+        // reads them from. So this is false for every task the browser starts, and the notice
+        // below is decided by the prose alone. A caller that sends the list gets the image signal.
         hasImages: input.attachments.some((path) => IMAGE_ATTACHMENT.test(path))
       }
     });

@@ -1,7 +1,7 @@
-import { chromium } from 'playwright-core';
 import type { SurfacePresence, WorkspaceSurfaces } from '@athanor/contracts';
 import { resolveExecutable } from './command-policy.js';
 import { agentSearchPath } from './execution.js';
+import { chromiumDriver } from './playwright.js';
 
 /**
  * Whether this box actually has a browser and a desktop, asked of the process that owns them.
@@ -37,9 +37,14 @@ import { agentSearchPath } from './execution.js';
  * anything is at it*, which is precisely the case worth catching: a box that has the library and
  * has never downloaded the browser reports a plausible path to a file that does not exist.
  *
- * A throw from `executablePath()` is the registry itself refusing to name a browser. That is a
- * probe that could not answer rather than a box that has no browser, so it is `unknown` and the
- * catalogue stays whole. @see surfaceDescribable in `@athanor/contracts`.
+ * A throw is the probe failing to get an answer rather than a box that has no browser, so it is
+ * `unknown` and the catalogue stays whole. @see surfaceDescribable in `@athanor/contracts`. Two
+ * things throw there and both mean that: the registry refusing to name a browser, and - since the
+ * driver is opened on demand, @see chromiumDriver - `playwright-core` not being installable at all.
+ *
+ * The configured-path branch returns before the driver is ever asked for, and that ordering is now
+ * load-bearing rather than incidental: it is the one route through this probe that answers without
+ * making the process resident in 108.3 MB of Playwright.
  */
 export const browserPresence = async (input: {
   root: string;
@@ -52,7 +57,7 @@ export const browserPresence = async (input: {
       : 'absent';
   let bundled: string;
   try {
-    bundled = chromium.executablePath();
+    bundled = (await chromiumDriver()).executablePath();
   } catch {
     return 'unknown';
   }

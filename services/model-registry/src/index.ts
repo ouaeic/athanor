@@ -1,33 +1,46 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
+import { sharedEnv } from '@athanor/contracts/env';
 import { decodeMasterKey } from '@athanor/core';
 import { createDatabase, DataStore, migrateDatabase } from '@athanor/data';
 import { epochSeconds, readCatalogRecord, writeCatalogRecord } from './catalog-state.js';
 import { catalogueFrozenLine, refreshFailureReason, refreshLogLine } from './refresh-log.js';
 import { refreshOnce } from './refresh-once.js';
 
+/*
+ * Every key more than one athanor unit reads is taken from `sharedEnv` rather than restated here.
+ *
+ * It used to restate eight of them, and three had drifted: this schema defaulted DATABASE_DRIVER to
+ * `postgres` where every other unit defaults to `pglite`, trimmed whitespace out of DATA_MASTER_KEY
+ * where no other unit does, and accepted a third AI_PROVIDER - `ollama-cloud` - that the API and the
+ * worker both refuse to start on. All four units are started by systemd from the same
+ * /etc/athanor/control.env, so that last one is a file on which this loop runs and the box does
+ * not. None of it was ever compared, because `packages/contracts/src/env.test.ts` walked
+ * `src/config.ts` and this unit's schema is inline in `src/index.ts`; that walk has been widened.
+ *
+ * MODEL_CATALOG_SCOPE moved into `sharedEnv` at the same time, from here and from
+ * `apps/api/src/config.ts`, the two units that read it. Both write the catalogue with it - the API
+ * when a provider key is saved, this loop every hour - so a box where the two disagree has each of
+ * them undoing the other's answer about which models exist.
+ */
 const Config = z.object({
-  DATABASE_DRIVER: z.enum(['pglite', 'postgres']).default('postgres'),
-  DATABASE_URL: z.string().default('postgres://athanor:athanor@localhost:5432/athanor'),
-  PGLITE_PATH: z.string().default('.athanor/postgres'),
+  DATABASE_DRIVER: sharedEnv.DATABASE_DRIVER,
+  DATABASE_URL: sharedEnv.DATABASE_URL,
+  PGLITE_PATH: sharedEnv.PGLITE_PATH,
   REGISTRY_REFRESH_SECONDS: z.coerce.number().int().min(60).default(3600),
-  OPENROUTER_BASE_URL: z.string().url().default('https://openrouter.ai/api/v1'),
+  OPENROUTER_BASE_URL: sharedEnv.OPENROUTER_BASE_URL,
   OPENROUTER_REGISTRY_KEY: z.preprocess(
     (value) => (typeof value === 'string' && value.trim() ? value.trim() : undefined),
     z.string().min(1).optional()
   ),
   /**
-   * Optional here alone. Every other service refuses to start without it because it cannot do its
-   * job at all; this one can still seed an empty catalogue, and a developer running the loop
-   * against a scratch database should not have to hold the owner's key to do it.
+   * Absent is a working state here alone. The declaration is optional in every unit; what differs
+   * is that the others refuse to start without a key, because they cannot do their job at all,
+   * and this one can still seed an empty catalogue - a developer running the loop against a
+   * scratch database should not have to hold the owner's key to do it.
    */
-  DATA_MASTER_KEY: z.preprocess(
-    (value) => (typeof value === 'string' && value.trim() ? value.trim() : undefined),
-    z.string().min(1).optional()
-  ),
-  MODEL_CATALOG_SCOPE: z
-    .enum(['provider_catalog', 'reviewed_open_weight'])
-    .default('provider_catalog'),
+  DATA_MASTER_KEY: sharedEnv.DATA_MASTER_KEY,
+  MODEL_CATALOG_SCOPE: sharedEnv.MODEL_CATALOG_SCOPE,
   /*
    * Where an operator pointed this box, when they did it in control.env rather than in Settings.
    *
@@ -36,13 +49,16 @@ const Config = z.object({
    * process ever asks that endpoint another question. Read here because the unit already loads the
    * file that holds them - the same values the worker reads to send the work - so this costs no new
    * configuration and no new place for the two halves to disagree about where the provider is.
+   *
+   * "The same values" is now literally the same declaration. It was a copy that had grown a third
+   * provider the worker's own enum does not have, which is exactly the disagreement the sentence
+   * above claims this arrangement avoids. Ollama Cloud is still reached the way owners actually
+   * reach it - a credential saved in Settings, whose provider is a free string on that path - and
+   * `configured-catalog.ts` still treats it as a subscription rather than a single pinned model.
    */
-  AI_PROVIDER: z.enum(['openrouter', 'ollama-cloud', 'openai-compatible']).default('openrouter'),
-  AI_BASE_URL: z.string().url().default('https://openrouter.ai/api/v1'),
-  AI_DEFAULT_MODEL: z.preprocess(
-    (value) => (value === '' ? undefined : value),
-    z.string().min(1).max(300).optional()
-  ),
+  AI_PROVIDER: sharedEnv.AI_PROVIDER,
+  AI_BASE_URL: sharedEnv.AI_BASE_URL,
+  AI_DEFAULT_MODEL: sharedEnv.AI_DEFAULT_MODEL,
   /**
    * Where each pass writes down what it did, for `athanor doctor` to read. The default is inside
    * /var/lib/athanor-control because that is the one directory `athanor@.service` may write to.

@@ -120,7 +120,7 @@ points, schedules and previews at deliberately generous values, and `currentPeri
 calendar month the usage pane totals against, because nothing is being billed and so nothing has to
 remember a period. What actually stops a runaway unattended run is the owner's own two numbers, in
 the currency the provider bills: the spending caps, which halt a task once it is over, and the
-pre-flight price ceiling (`sudo athanor spend-ceiling`), which refuses to pick a model priced above
+pre-flight price ceiling (`sudo athanor price-ceiling`), which refuses to pick a model priced above
 the rates the owner named in the first place. The second is the one that works overnight.
 
 The workspace table can hold more than one row, and the server allows exactly one: `maxWorkspaces`

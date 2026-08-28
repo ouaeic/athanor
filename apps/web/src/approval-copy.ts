@@ -39,6 +39,7 @@ export const approvalToolPhrases: Record<string, string> = {
   generate_media: 'Spends money at a provider',
   audio_read: 'Spends money at a provider to read a recording',
   coding_agent: 'Hands work to a coding agent',
+  code_diagnostics: 'Runs a repository’s own build on your computer',
   memory: 'Changes what athanor remembers',
   skill: 'Changes a saved skill',
   schedule: 'Changes scheduled work'
