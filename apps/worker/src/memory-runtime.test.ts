@@ -897,6 +897,66 @@ describe('owner standing orders', () => {
     expect(observedStandingOrders('The build always takes about nine minutes.')).toEqual([]);
   });
 
+  it('refuses a rule the owner asked about, and keeps the same rule when they give it', () => {
+    // The whole sentence matched `should never`, ended on punctuation, and was stored as the
+    // standing order *never run git stash* - which nobody gave, and which is then pinned into
+    // every later turn in the workspace and obeyed.
+    expect(observedStandingOrders('Do you think I should never run git stash here?')).toEqual([]);
+    // The mark alone deciding it: an owner checking a rule they have not yet given, in a sentence
+    // with nothing else wrong with it. Its declarative twin below is stored, and this is not.
+    expect(observedStandingOrders('So from now on we use ISO dates in every filename?')).toEqual(
+      []
+    );
+    expect(
+      observedStandingOrders('So from now on we use ISO dates in every filename.')
+    ).toHaveLength(1);
+    // A `?` inside the rule is not a question about the rule.
+    expect(observedStandingOrders('Never leave a `?` in a generated filename.')).toHaveLength(1);
+    expect(observedStandingOrders('You should never run git stash here.')).toEqual([
+      {
+        subject: 'athanor',
+        predicate: 'standing_order',
+        object: 'You should never run git stash here.'
+      }
+    ]);
+  });
+
+  it("refuses somebody else's rule reported, and keeps the owner's own version of it", () => {
+    expect(
+      observedStandingOrders('My colleague insists we must always squash before merging.')
+    ).toEqual([]);
+    expect(observedStandingOrders('Dan said the rule here is never to squash a merge.')).toEqual(
+      []
+    );
+    // Positional, not grammatical: an imperative rule starts at character zero, so a saying verb
+    // inside it is part of the rule rather than a frame around it.
+    expect(observedStandingOrders('Never use a tool that wants network access.')).toHaveLength(1);
+    expect(
+      observedStandingOrders('Never ship a claim the harness said it could not check.')
+    ).toHaveLength(1);
+    expect(observedStandingOrders('We must always squash before merging.')).toEqual([
+      {
+        subject: 'athanor',
+        predicate: 'standing_order',
+        object: 'We must always squash before merging.'
+      }
+    ]);
+  });
+
+  it("refuses a sentence opening on somebody's quotation mark, as `>` is already refused", () => {
+    // Ten of the 86 candidates the owner's own corpus produced were this: a rule of theirs quoted
+    // back inside a brief. Every one of the ten also reached this function unquoted, from the turn
+    // where they actually typed it - so the refusal cost the corpus no rule at all.
+    expect(
+      observedStandingOrders('"Remember, athanor should never be called clunky, a prime directive.')
+    ).toEqual([]);
+    expect(
+      observedStandingOrders('Remember, athanor should never be called clunky, a prime directive.')
+    ).toHaveLength(1);
+    // A quotation the rule itself contains is the rule, not a frame around it.
+    expect(observedStandingOrders('Never write "TODO" into a committed file.')).toHaveLength(1);
+  });
+
   it('cannot return anything the owner did not write, whatever it is fed', () => {
     /*
      * The invariant the whole tier rests on, checked rather than believed.
@@ -970,6 +1030,14 @@ describe('owner standing orders', () => {
   });
 });
 
+/**
+ * Two rules that cannot both be obeyed, seen without reading either of them for meaning.
+ *
+ * `standing_order` is `cardinality: 'many'` and rightly so - an owner has many rules and two of
+ * them normally do not conflict - which is exactly why the deterministic engine cannot see this
+ * pair. What it can see is one instruction carried by opposite prohibitions, and that is all this
+ * claims to find.
+ */
 describe('turn capture write path', () => {
   const capture = async (probe: CaptureProbe, request: string) =>
     recordTurnEpisode({
@@ -2169,6 +2237,70 @@ describe('against the real store', () => {
     });
   });
 
+  /**
+   * The same branch, reached from the tier that could not reach it.
+   *
+   * The pass above asks the store for pairs `onlyFunctional: true`, and `standing_order` is
+   * `cardinality: 'many'` - so "Never use tabs." and "Always use tabs." were both `active`, both
+   * `pin=true`, both injected into every later turn, with the dispute queue holding zero. From
+   * outside, that is indistinguishable from there being no dispute branch at all. The first case
+   * below is the proof of the diagnosis and the rest is the repair.
+   */
+  describe('two standing orders the owner gave that cancel each other', () => {
+    /** Exactly what a promoted standing order is: the owner's sentence, stated, pinned. */
+    const standingOrder = async (sentence: string, observedAt: string) => {
+      const content = {
+        title: 'Standing instruction',
+        body: sentence,
+        subject: 'athanor',
+        object: sentence
+      };
+      return store.createMemoryItem({
+        userId: realUserId,
+        workspaceId: realWorkspaceId,
+        kind: 'fact',
+        trust: 'stated',
+        documentCiphertext: encryptJson(content, dataKey, memoryItemAad(realWorkspaceId)),
+        index: buildMemoryItemIndex(content, indexKey),
+        predicate: 'standing_order',
+        pin: true,
+        observedAt: new Date(observedAt),
+        validFrom: new Date(observedAt)
+      });
+    };
+
+    /*
+     * What the review queue does and does not see, written down so the next pass does not have to
+     * rediscover it.
+     *
+     * `resolveMemoryContradiction`, `markMemoryFactsDisputed`, `listDisputedMemoryItems` and
+     * `GET /v1/workspaces/:id/memory-review` are all real and all wired to each other. The pass
+     * that feeds them asks the store for pairs `onlyFunctional: true` - only predicates the
+     * registry declares `cardinality: 'one'` - and `standing_order` is `many`, because an owner has
+     * many rules and two of them normally do not conflict. So no pair of standing orders has ever
+     * been offered to the table, and the two below sit `active` and `pin` with the queue at zero.
+     *
+     * That is deliberate as it stands rather than an oversight, and the reason is the same
+     * cardinality: every standing order is filed under the subject `athanor`, and the pair query
+     * matches same subject with different object, so simply dropping the flag would declare every
+     * pair of unrelated rules a contradiction. Anything that closes this needs a verdict about
+     * meaning, which is the model's half of the residency line - and it needs to dispute every
+     * wording of both sides rather than one row per side, or it takes two rules out of recall,
+     * says so, and leaves a third saying one of the same two things pinned into every turn.
+     */
+    it('is invisible to the nightly pass, because the predicate permits many rules', async () => {
+      const never = await standingOrder('Never use tabs.', '2026-07-01T00:00:00.000Z');
+      const always = await standingOrder('Always use tabs.', '2026-07-02T00:00:00.000Z');
+      const report = await store.consolidateMemory(realWorkspaceId, { now: startedAt });
+      expect(report.factsDisputed).toBe(0);
+      expect(report.factsSuperseded).toBe(0);
+      expect(report.factsRetracted).toBe(0);
+      expect(await store.listDisputedMemoryItems(realWorkspaceId, 10)).toEqual([]);
+      for (const rule of [never, always])
+        expect((await store.getMemoryItem(realWorkspaceId, rule.id))?.status).toBe('active');
+    });
+  });
+
   it('records the pack outcome and survives a consolidation pass', async () => {
     await captureTurn('reload nginx on the preview gateway');
     const pack = await buildTaskMemoryPack({
@@ -2200,6 +2332,180 @@ describe('against the real store', () => {
       clockAnchor: startedAt
     });
     expect(after.body).toBe(pack.body);
+  });
+
+  describe('the pack a workspace gets once the owner has stated sixty rules', () => {
+    /*
+     * The measurement is in `packages/data/src/store.test.ts`, against the statement. This is the
+     * same defect asserted where it is actually shipped, because a bound proved only on the helper
+     * is a bound nothing guarantees the product has: `buildTaskMemoryPack` is what fills the
+     * prompt, it passes its own quotas, its own 6,000-token budget and `asOf`, and every one of
+     * those is a chance for the fix to be true of the query and false of the pack.
+     *
+     * The rows are written in exactly the shape `recordTurnEpisode` promotes a standing order into
+     * - kind `fact`, subject `athanor`, predicate `standing_order`, `pin: true`, the owner's own
+     * sentence as the body - which is pinned by "mints the owner sentence as they wrote it,
+     * pinned so a later turn cannot miss it" above.
+     */
+    const standingOrder = async (index: number) => {
+      const sentence = `Never do forbidden thing number ${index} in this checkout.`;
+      const content = {
+        title: 'Standing instruction',
+        tags: [],
+        body: sentence,
+        subject: 'athanor',
+        object: sentence
+      };
+      const observedAt = new Date(startedAt.getTime() - index * 3_600_000);
+      return store.createMemoryItem({
+        userId: realUserId,
+        workspaceId: realWorkspaceId,
+        kind: 'fact',
+        trust: 'stated',
+        documentCiphertext: encryptJson(content, dataKey, memoryItemAad(realWorkspaceId)),
+        index: buildMemoryItemIndex(content, indexKey),
+        predicate: 'standing_order',
+        pin: true,
+        observedAt,
+        validFrom: observedAt
+      });
+    };
+
+    const ownerFact = async (body: string, object: string, predicate: string) => {
+      const content = { title: null, tags: [], body, subject: 'owner', object };
+      return store.createMemoryItem({
+        userId: realUserId,
+        workspaceId: realWorkspaceId,
+        kind: 'fact',
+        trust: 'stated',
+        documentCiphertext: encryptJson(content, dataKey, memoryItemAad(realWorkspaceId)),
+        index: buildMemoryItemIndex(content, indexKey),
+        predicate,
+        observedAt: startedAt,
+        validFrom: startedAt
+      });
+    };
+
+    beforeEach(async () => {
+      await ownerFact('The owner uses fish on this computer.', 'fish', 'default_shell');
+      await ownerFact('The owner prefers ripgrep everywhere.', 'ripgrep', 'prefers');
+      // Shares no content word with either request below. Only the subject reaches it, which is
+      // what makes it the probe for the structural ladder rather than for the lexical channel.
+      await ownerFact('Flights are booked through Cathay.', 'cathay', 'related_to');
+      for (let index = 0; index < 60; index += 1) await standingOrder(index);
+      await store.rebuildMemoryCorpusStats(realWorkspaceId);
+    });
+
+    it('still tells the task what the owner said about themselves', async () => {
+      const pack = await buildTaskMemoryPack({
+        store,
+        taskId: realTaskId,
+        workspaceId: realWorkspaceId,
+        dataKey,
+        query: 'which shell does the owner use here',
+        clockAnchor: startedAt
+      });
+      expect(pack.body).toContain('The owner uses fish on this computer.');
+      expect(pack.body).toContain('Flights are booked through Cathay.');
+    });
+
+    it('still tells it the rules, on a request that names none of them', async () => {
+      // The other direction. A fix that fed the facts by starving the orders would be this same
+      // defect facing the other way, and `pin` exists precisely so a rule reaches the turn whose
+      // words never go near it.
+      const pack = await buildTaskMemoryPack({
+        store,
+        taskId: realTaskId,
+        workspaceId: realWorkspaceId,
+        dataKey,
+        query: 'rewrite the brochure copy for the spring mailing',
+        clockAnchor: startedAt
+      });
+      expect(pack.body.match(/Never do forbidden thing number/gu) ?? []).toHaveLength(4);
+    });
+
+    it('answers the recall tool with them too, on its own quotas and its own budget', async () => {
+      // The second shipped caller of the same statement, and not a formality: `recallMemory` sends
+      // `MEMORY_RECALL_QUOTAS` (cap 40, share 0.5, every kind even) against a 1,500-token budget,
+      // where the pack sends `MEMORY_PACK_QUOTAS` (fact cap 25, share 0.35) against 6,000. Every
+      // one of those differences is a chance for a fix to be true of the query and false of the
+      // path, so the path is asked directly.
+      const recalled = await recallMemory({
+        store,
+        workspaceId: realWorkspaceId,
+        dataKey,
+        taskId: realTaskId,
+        query: 'which shell does the owner use here',
+        now: startedAt
+      });
+      const bodies = recalled.entries.map((entry) => entry.body);
+      expect(bodies).toContain('The owner uses fish on this computer.');
+      expect(bodies.filter((body) => body.startsWith('Never do forbidden'))).toHaveLength(4);
+    });
+
+    it('gives back the rule the request is about, not the four most recent rules', async () => {
+      /*
+       * The other way a fix for the case above can go wrong, and the reason the structural ladder
+       * is still flat.
+       *
+       * Only four of sixty rules fit a pack, so which four is the entire question. Dealing the
+       * ladder's forty rungs round-robin across the three admissibility classes is what makes room
+       * for the owner's facts above, and it takes those rungs from the pins - eighteen of forty
+       * with the fact and procedure classes populated. Filling eighteen rungs by recency makes them
+       * the eighteen newest rules, and a rule older than that had only its lexical match left to
+       * argue with: it lost the per-subject cap to four newer rules the request never went near, so
+       * the pack answered "what is the rule about merging to main" with four rules about forbidden
+       * things in a checkout. The ladder now deals a row the request's words match before one they
+       * do not, and this is asserted at forty-fourth of sixty because that is well past where
+       * recency alone lost it, on the pack the owner actually reads.
+       */
+      const wanted = 'Never merge to main without the release checklist approval.';
+      const content = {
+        title: 'Standing instruction',
+        tags: [],
+        body: wanted,
+        subject: 'athanor',
+        object: wanted
+      };
+      const observedAt = new Date(startedAt.getTime() - 44 * 3_600_000);
+      await store.createMemoryItem({
+        userId: realUserId,
+        workspaceId: realWorkspaceId,
+        kind: 'fact',
+        trust: 'stated',
+        documentCiphertext: encryptJson(content, dataKey, memoryItemAad(realWorkspaceId)),
+        index: buildMemoryItemIndex(content, indexKey),
+        predicate: 'standing_order',
+        pin: true,
+        observedAt,
+        validFrom: observedAt
+      });
+      await store.rebuildMemoryCorpusStats(realWorkspaceId);
+
+      const question = 'does the owner need release checklist approval before merging to main';
+
+      // The recall tool first, and in that order deliberately: it excludes whatever the frozen pack
+      // already printed, so asking it after building the pack would pass for the wrong reason.
+      const recalled = await recallMemory({
+        store,
+        workspaceId: realWorkspaceId,
+        dataKey,
+        taskId: realTaskId,
+        query: question,
+        now: startedAt
+      });
+      expect(recalled.entries.map((entry) => entry.body)).toContain(wanted);
+
+      const pack = await buildTaskMemoryPack({
+        store,
+        taskId: realTaskId,
+        workspaceId: realWorkspaceId,
+        dataKey,
+        query: question,
+        clockAnchor: startedAt
+      });
+      expect(pack.body).toContain(wanted);
+    });
   });
 
   /**

@@ -3682,6 +3682,102 @@ describe('tiered agent memory', () => {
     expect(again.map((hit) => opened(hit.documentCiphertext))).not.toContain(loose.body);
   });
 
+  it('still tells the owner their own facts after sixty rules of theirs are pinned', async () => {
+    /*
+     * The defect the tier's own comment said could not happen, measured.
+     *
+     * `pin` has exactly one production writer - a promoted standing order - and standing orders all
+     * share the subject `athanor`, so the more rules the owner states the more pinned rows one
+     * subject holds. The comment beside that writer read "four is what a rendered pack shows
+     * however many rows exist", on the reasoning that the per-subject cap bounds them at four. It
+     * does. What it does not do is bound what those rows cost on the way to being cut: the kind cap
+     * and the token share were computed over rows the per-subject cap was about to discard, so
+     * sixty `athanor` rows spent sixty of the fact slot's twenty-five ranks and the whole 35% share
+     * before one `owner` row was considered. Taking the per-subject cap first is the whole repair.
+     *
+     * Measured here, on this statement, one workspace, four owner facts - three that share words
+     * with the request and one reachable only because the request names its subject - against a
+     * growing shelf of pinned rules (before this fix -> after):
+     *
+     *   pinned |  0  |  1  |  4  | 10  |  40   |  60
+     *   orders |  0  |  1  |  4  |  4  |   4   |   4
+     *   facts  |  4  |  4  |  4  |  4  | 0->4  | 0->4
+     *
+     * The fourth fact is what makes this two mechanisms rather than one. It shares no content word
+     * with the request, so the only route it has is the structural ladder - and that ladder was
+     * `ORDER BY pr ... LIMIT 40` with pinned rows first, which at forty pins is forty pins. With
+     * the cap moved and the ladder left alone, three of these four come back at sixty and that one
+     * never does, on any request, including one about its own subject. So the ladder now deals its
+     * forty rungs by turns across the three admissibility classes.
+     *
+     * That has a cost of its own, which is measured where it bites rather than here: dealing by
+     * turns leaves the pin class ceil(40 / classes) rungs, and filling those by recency threw away
+     * the rule a request was actually about. The ladder therefore deals a row the request's words
+     * match before one they do not, and `apps/worker/src/memory-runtime.test.ts` holds that at both
+     * shipped call sites.
+     *
+     * Both directions are asserted, because a fix that starved the orders to feed the facts would
+     * be the same defect facing the other way: the rules keep their four at every step, and the
+     * request below reaches them without naming one.
+     */
+    const ownerFacts = [
+      ['default shell', 'The owner uses fish on this computer.', 'fish', 'default_shell'],
+      ['preferred search', 'The owner prefers ripgrep everywhere.', 'ripgrep', 'prefers'],
+      ['working language', 'The owner writes TypeScript daily.', 'typescript', 'knows_language'],
+      // Not one content word of the request below. Only the subject it names reaches this row, so
+      // it is the probe for the structural ladder specifically.
+      ['travel', 'Flights are booked through Cathay.', 'cathay', 'related_to']
+    ] as const;
+    for (const [title, body, object, predicate] of ownerFacts)
+      await addItem('fact', { title, body, subject: 'owner', object }, { predicate });
+
+    const isOrder = (body: string) => body.startsWith('Never do forbidden');
+    const isOwnerFact = (body: string) => ownerFacts.some(([, factBody]) => factBody === body);
+
+    let pinned = 0;
+    const ladder: string[] = [];
+    for (const target of [0, 1, 4, 10, 40, 60]) {
+      for (; pinned < target; pinned += 1)
+        await addItem(
+          'fact',
+          {
+            title: 'Standing instruction',
+            body: `Never do forbidden thing number ${pinned} in this checkout.`,
+            subject: 'athanor',
+            object: `Never do forbidden thing number ${pinned} in this checkout.`
+          },
+          {
+            predicate: 'standing_order',
+            pin: true,
+            observedAt: at(pinned / 24),
+            validFrom: at(pinned / 24)
+          }
+        );
+      await store.rebuildMemoryCorpusStats(workspaceId);
+      const bodies = (await recall('which shell does the owner use')).map((hit) =>
+        opened(hit.documentCiphertext)
+      );
+      ladder.push(
+        `pinned=${target} orders=${bodies.filter(isOrder).length} facts=${bodies.filter(isOwnerFact).length}`
+      );
+    }
+    expect(ladder).toEqual([
+      'pinned=0 orders=0 facts=4',
+      'pinned=1 orders=1 facts=4',
+      'pinned=4 orders=4 facts=4',
+      'pinned=10 orders=4 facts=4',
+      'pinned=40 orders=4 facts=4',
+      'pinned=60 orders=4 facts=4'
+    ]);
+
+    // The other direction, at the number that used to break the first one: sixty rules deep, a
+    // request that names none of them and shares no word with any of them still reaches them.
+    const unrelated = (await recall('rewrite the brochure copy for the spring mailing')).map(
+      (hit) => opened(hit.documentCiphertext)
+    );
+    expect(unrelated.filter(isOrder)).toHaveLength(4);
+  });
+
   it('promotes an observation that cleared the gate and never promotes it twice', async () => {
     const episodeOne = await addItem('episode', { body: 'Noticed the agent using ripgrep.' });
     const episodeTwo = await addItem('episode', { body: 'Noticed ripgrep again.' });

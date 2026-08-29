@@ -177,19 +177,58 @@ trg AS (
 -- of facts. The fusion rank is taken by how well the row answers the request, over the forty rows
 -- that survived - and when none of them match, every score is zero and this is exactly the old
 -- order, which is what keeps the channel doing its original job for a request with no lexical grip.
+--
+-- The forty rungs are dealt round-robin across the three reasons a row is admissible, and inside a
+-- turn a row the request's own words match is dealt before one they do not. Both halves are load
+-- bearing and each was measured against the other.
+--
+-- Dealing by turns is what makes a named subject's facts reachable at all. "ORDER BY pr ... LIMIT
+-- 40" put every pinned row ahead of every fact, so a workspace with forty pins filled all forty
+-- rungs with them - and pin has exactly one production author, the owner's own standing orders,
+-- so what the owner told the box crowded out what the box knew about the owner. The per-subject
+-- cap below is the larger half of that repair and it is not the whole of it: with the cap moved
+-- and this ladder left flat, three of four owner facts come back at sixty pins and the fourth -
+-- the one this channel is the only route to - never does, on any request, including one about
+-- exactly its subject.
+--
+-- Dealing by pure recency inside a turn was the cost, and it is why the match test is here. The
+-- pin class's share is ceil(40 / populated classes), eighteen of forty with facts and procedures
+-- beside it, and eighteen recency rungs are the eighteen newest rules. A rule older than that had
+-- only its lexical match left to argue with and lost the per-subject cap to four newer rules the
+-- request never went near: asked what the rule about merging to main was, the pack answered with
+-- four rules about forbidden things in a checkout. Measured on PGlite, sixty pins with the answer
+-- at depth D from the newest, a request sharing four of its eight lexemes with it, both shipped
+-- configurations, and in the same run the four owner facts of the case above:
+--
+--   depth from newest        |  14 |  20 |  31 |  39  | owner facts at 60 pins
+--   flat ladder              |  Y  |  Y  |  Y  |  Y   | 3 of 4
+--   by turns, recency inside |  Y  |  .  |  .  |  .   | 4 of 4
+--   by turns, match first    |  Y  |  Y  |  Y  |  Y   | 4 of 4
+--
+-- q_ts is the same tsquery the lexical channel probes with and the same GIN index answers it, so
+-- this is a boolean the row already knows. It is a test and not a score: ranking the ladder by
+-- BM25 would mean scoring every admissible row before the cap, which is the cost the cap exists to
+-- avoid. Among rows that match, and among rows that do not, recency still decides - so a request
+-- with no lexical grip at all deals exactly the order it dealt before.
 struct AS (
   SELECT id, row_number() OVER (ORDER BY pr, s DESC, observed_at DESC, id) AS r FROM (
     SELECT c.id, c.pr, c.observed_at,
            mem.bm25(qq.q_lex, qq.q_idf, c.tsv, c.tsv_len, st.avg_len) AS s
     FROM (
-      SELECT i.id, i.observed_at, i.tsv, i.tsv_len,
-             CASE WHEN i.pin THEN 0 WHEN i.kind = 'fact' THEN 1 ELSE 2 END AS pr
-      FROM mem.item i CROSS JOIN q
-      WHERE ${MEMORY_ITEM_ADMISSIBLE}
-        AND (i.pin
-             OR (i.kind = 'fact' AND i.subject_key = ANY(q.q_ents))
-             OR (i.kind = 'procedure' AND i.tags_hashed && q.q_tags))
-      ORDER BY pr, i.observed_at DESC, i.id
+      SELECT l.id, l.observed_at, l.tsv, l.tsv_len, l.pr
+      FROM (
+        SELECT i.id, i.observed_at, i.tsv, i.tsv_len,
+               CASE WHEN i.pin THEN 0 WHEN i.kind = 'fact' THEN 1 ELSE 2 END AS pr,
+               row_number() OVER (
+                 PARTITION BY CASE WHEN i.pin THEN 0 WHEN i.kind = 'fact' THEN 1 ELSE 2 END
+                 ORDER BY COALESCE(i.tsv @@ qq.q_ts, false) DESC, i.observed_at DESC, i.id) AS turn
+        FROM mem.item i CROSS JOIN q CROSS JOIN qq
+        WHERE ${MEMORY_ITEM_ADMISSIBLE}
+          AND (i.pin
+               OR (i.kind = 'fact' AND i.subject_key = ANY(q.q_ents))
+               OR (i.kind = 'procedure' AND i.tags_hashed && q.q_tags))
+      ) l
+      ORDER BY l.turn, l.pr, l.observed_at DESC, l.id
       LIMIT ${MEMORY_STRUCTURAL_CANDIDATES}
     ) c CROSS JOIN qq CROSS JOIN stats st
   ) t
@@ -254,24 +293,52 @@ deduped AS (
   FROM scored s LEFT JOIN quota qt ON qt.kind = s.kind
   ORDER BY s.dedupe_key, s.score DESC, s.id
 ),
+-- The per-subject cap is taken FIRST, and that ordering is the whole point of splitting this into
+-- two windows. It used to sit beside the kind cap and the share in one WHERE, which meant all
+-- three were computed over the same unfiltered "deduped" - so the rows the per-subject cap was
+-- about to throw away had already spent the kind's twenty-five ranks and its share of the budget
+-- on their way out. One subject with sixty rows therefore cost the fact slot sixty ranks and
+-- sixty rows of tokens to seat four, and every other subject was charged for the difference.
+--
+-- Measured on PGlite, one workspace, four "owner" facts - three sharing a word with the request,
+-- one reachable only because the request names its subject - and N pinned "athanor" standing
+-- orders, asking "which shell does the owner use" (before -> after). Swept at every N from 0 to
+-- 70, not sampled: the erosion begins at 37, where the thirty-seventh pin takes the last rung the
+-- four facts were sharing, and it is total by 40.
+--
+--   pinned |  0  |  1  |  4  | 10  | 25  | 36  |  37 |  39 | 40  | 60
+--   orders |  0  |  1  |  4  |  4  |  4  |  4  |  4  |  4  |  4  |  4    (their own cap, always)
+--   facts  |  4  |  4  |  4  |  4  |  4  |  4  | 3->4| 1->4| 0->4| 0->4
+--
+-- Swept at every value from 0 to 70 rather than sampled: the fall begins at 37, where the pins take
+-- the last rung the four facts were sharing on the ladder above, and it is total by 40. This CTE is
+-- the larger half of the repair and not the whole of it - three of those four come back on this
+-- ordering alone, and the fourth needs the ladder above to deal by turns as well.
+--
+-- Retired values keep their own window. Sharing one with live rows meant "which shell did I use
+-- before?" - the only question a retired row can answer - lost that row to four unrelated live
+-- facts about the same subject, because the prior deliberately discounts a retired row and the
+-- cap then cut from the bottom. Retired rows only enter this query when the caller asked for them.
+capped AS (
+  SELECT ranked.* FROM (
+    SELECT d.*,
+           row_number() OVER (PARTITION BY d.kind, COALESCE(d.subject_key, d.id::text),
+                                           (d.status <> 'active')
+                              ORDER BY d.score DESC, d.id) AS subject_rank
+    FROM deduped d
+  ) ranked
+  WHERE ranked.subject_rank <= ranked.per_subject
+),
 windowed AS (
-  SELECT d.*,
-         row_number() OVER (PARTITION BY d.kind ORDER BY d.score DESC, d.id) AS kind_rank,
-         -- Current and retired values of the same subject are ranked in separate windows. Sharing
-         -- one meant that "which shell did I use before?" - the only question a retired row can
-         -- answer - lost that row to four unrelated live facts about the same subject, because the
-         -- prior deliberately discounts a retired row and the per-subject cap then cut from the
-         -- bottom. Retired rows only enter this query when the caller asked for them at all.
-         row_number() OVER (PARTITION BY d.kind, COALESCE(d.subject_key, d.id::text),
-                                         (d.status <> 'active')
-                            ORDER BY d.score DESC, d.id) AS subject_rank,
-         SUM(d.tokens_est) OVER (PARTITION BY d.kind ORDER BY d.score DESC, d.id
+  SELECT c.*,
+         row_number() OVER (PARTITION BY c.kind ORDER BY c.score DESC, c.id) AS kind_rank,
+         SUM(c.tokens_est) OVER (PARTITION BY c.kind ORDER BY c.score DESC, c.id
                                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS kind_tokens
-  FROM deduped d
+  FROM capped c
 ),
 eligible AS (
   SELECT w.* FROM windowed w
-  WHERE w.kind_rank <= w.cap AND w.subject_rank <= w.per_subject
+  WHERE w.kind_rank <= w.cap
     AND w.kind_tokens <= GREATEST(floor(w.share * $10::int), 1)
 ),
 -- Both cuts are taken in score order. The item limit used to be a trailing LIMIT after the

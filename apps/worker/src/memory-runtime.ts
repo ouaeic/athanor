@@ -1069,6 +1069,55 @@ const STANDING_MARKERS: readonly RegExp[] = [
   /\bas a rule\b/iu
 ];
 
+/**
+ * A question is not an order, and the question mark is the whole of the evidence.
+ *
+ * `STANDING_COMPLETE` above admits `?` and is right to: it asks whether the line is a finished
+ * sentence or a hard wrap, and a question is finished. What it cannot answer is whether the owner
+ * was GIVING the rule or ASKING about it, and those are different sentences with the same words in
+ * them. "Do you think I should never run git stash here?" matches `should never`, ends on
+ * punctuation, and was stored as the standing order *never run git stash* - a rule nobody gave,
+ * pinned into every later turn in the workspace, obeyed.
+ *
+ * Deliberately only the mark. Whether an unpunctuated sentence is interrogative is a judgement
+ * about English, which is the model's half of the residency line and not the harness's; a
+ * question the owner typed without a `?` is let through and said so, because the alternative is a
+ * hand-built grammar that will rot. Trailing closers are allowed after it so a quoted or
+ * parenthesised question is still a question.
+ */
+const STANDING_ASKED = /\?["'’”)\]`]*$/u;
+
+/**
+ * Somebody else's sentence, marked as such by the owner opening on a quotation mark.
+ *
+ * The same argument `ownerWritten` makes about `>`: a bullet says how a sentence is laid out, a
+ * quotation mark says whose sentence it is. `>` is line-level and a quotation is not, so this is
+ * taken per sentence after the split rather than per line before it.
+ *
+ * Only the double forms. A leading straight apostrophe is how a rule about `'--flag'` starts, and
+ * refusing that would cost a real rule to catch nothing the double forms do not already.
+ */
+const STANDING_QUOTED = /^["“”«]/u;
+
+/**
+ * A rule attributed to somebody, rather than given by the owner.
+ *
+ * "My colleague insists we must always squash before merging." is a report about a rule that
+ * exists somewhere else; stored, it becomes the owner's own standing order, and the owner never
+ * said it. The frame is the evidence and it is positional, not grammatical: this class of verb
+ * has to stand BETWEEN the start of the sentence and the phrase that makes it a rule. An
+ * imperative rule opens on `never` or `always`, so there is nothing in front of it and this can
+ * never fire on one - `Never use a tool that wants network access.` keeps its `wants` because the
+ * rule had already started.
+ *
+ * No carve-out for the owner reporting themselves. "Dan said the rule here is never squash." and
+ * "I said the rule here is never squash." are both refused, and that is the safe direction: a rule
+ * wrongly stored is obeyed on turns the owner is not watching, where a rule missed is one they can
+ * simply say again.
+ */
+const STANDING_REPORTED =
+  /\b(?:says?|said|tells?|told|insists?|insisted|claims?|claimed|argues?|argued|reckons?|thinks?|thought|believes?|believed|suggests?|suggested|recommends?|recommended|advises?|advised|warns?|warned|mentioned|reported|writes?|wrote)\b/iu;
+
 /** Enough of the sentence has to be its own to be worth keeping; the rest is scaffolding. */
 const STANDING_STOPWORDS = new Set([
   ...STANDING_DANGLING,
@@ -1124,6 +1173,15 @@ const STANDING_STOPWORDS = new Set([
  * The same corpus, through this rule: 1,132 turns of 3,950 (28.7%) offer something, 310 distinct
  * candidates, and the store's own unchanged two-sightings-a-day-apart gate promotes 8 of them.
  * Those 8 had been typed out by hand 280 times between them.
+ *
+ * Re-measured on the owner's own 1,138 typed turns after the three refusals below were added:
+ * 78 turns offer something (was 83), 122 observations (was 135), 74 distinct candidates (was 86),
+ * and the same 8 promote - the identical eight sentences. Of the 12 candidates refused, 10 went to
+ * the quotation mark and 2 to the attribution frame; none to the question mark, which costs this
+ * corpus nothing and is kept because the shape it refuses is storable. Six of the 12 also reach
+ * this function unquoted, from the turn where the owner actually typed the rule, and land as
+ * before. None of the twelve was near promotion: the store wants two sightings a day apart, and
+ * eleven were seen once, the twelfth twice inside one hour.
  */
 export const flattenedForStandingOrders = (text: string): string => text.replaceAll('**', '');
 
@@ -1144,7 +1202,22 @@ export const observedStandingOrders = (text: string): MemoryFactObservation[] =>
     if (!STANDING_COMPLETE.test(line)) continue;
     const head = STANDING_HEAD.exec(line);
     if (head && STANDING_DANGLING.has((head[1] ?? '').toLowerCase())) continue;
-    if (!head && !STANDING_MARKERS.some((marker) => marker.test(line))) continue;
+    /*
+     * Where the rule starts, which the three refusals below are measured against and the old
+     * `.some()` threw away. An imperative rule starts at 0 by construction; a marker rule starts
+     * wherever the earliest marker matched, and everything in front of that is frame.
+     */
+    const startsAt = head
+      ? 0
+      : STANDING_MARKERS.reduce((earliest, marker) => {
+          const at = line.search(marker);
+          return at >= 0 && at < earliest ? at : earliest;
+        }, Number.POSITIVE_INFINITY);
+    if (startsAt === Number.POSITIVE_INFINITY) continue;
+    // Asked about, quoted, or attributed to somebody. All three are sentences that contain a rule
+    // without being one, and all three used to be stored as the rule they contain.
+    if (STANDING_ASKED.test(line) || STANDING_QUOTED.test(line)) continue;
+    if (STANDING_REPORTED.test(line.slice(0, startsAt))) continue;
     // `.` and `/` are kept inside a word so `browser.ts` and `apps/web` stay whole, and stripped
     // off the end so `it.` is the stopword `it` rather than a content word the floor below counts.
     // It reached the corpus as "always better without it." - four tokens, two of them apparently
@@ -1467,17 +1540,21 @@ export const recordTurnEpisode = async (input: {
              * thing the recall SQL admits with no lexical grip at all, and it was declared, read
              * by the structural channel and by the salience formula, and written by nobody.
              *
-             * Bounded in the pack, and NOT in the ladder that fills it, which is the part worth
-             * writing down rather than assuming. Facts are capped at four per subject in a pack
-             * and every standing order shares the subject `athanor`, so four is what a rendered
-             * pack shows however many rows exist. But that cap is applied to rows that already
-             * survived the structural channel, and that channel is
-             * `ORDER BY pin DESC, ... LIMIT 40` - so at forty pinned rows the candidate set is
-             * pinned rows and nothing else, and an owner fact about a subject the request actually
-             * named cannot reach the window where the per-subject cap would have let it through.
-             * Measured on the owner's own turns this tier mints roughly one row per 340 of them,
-             * so forty is a long way off; it is a ceiling that exists rather than one that does
-             * not, and the fix belongs in the recall query, not here.
+             * Bounded in the pack, and it was NOT bounded in what those rows cost on the way to
+             * being bounded. This comment used to say that four per subject "is what a rendered
+             * pack shows however many rows exist", and then guess that forty pinned rows was a
+             * long way off. Both halves were wrong. The cap held; what it did not do was stop the
+             * rows it was about to discard from spending the fact slot's rank cap and token share
+             * first, because all three were computed over the same unfiltered set. Measured on
+             * PGlite, sweeping every pin count from 0 to 70: the owner's facts start falling out
+             * at 37 and by 40 the pack is four rows, all of them standing orders, with every owner
+             * fact gone - so the more rules the owner stated, the less of what they had told this
+             * computer came back.
+             *
+             * Fixed where it belonged, in `MEMORY_RECALL_SQL`, by taking the per-subject cap
+             * before the window rather than beside it; the numbers are beside it there and in
+             * `docs/design/quality/RECALL.md`. Kept here because this writer is why the ceiling is
+             * reachable at all: `pin` has exactly one production author, and it is this line.
              */
             pin: standing
           };
