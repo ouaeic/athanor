@@ -243,6 +243,66 @@ describe('the model&apos;s own wording, shown as a quotation', () => {
   it('will not let a preview push the buttons off the screen', () => {
     expect(agentWording(`Fine.${'\n'.repeat(400)}Also fine.`)).toBe('Fine.\n\nAlso fine.');
     expect(agentWording('x'.repeat(5_000)).length).toBe(601);
+    // One character over the limit whatever the limit is, including a limit shorter than the tail
+    // the case below keeps: the elision can never make an answer longer than the cut it replaces.
+    expect(agentWording('x'.repeat(5_000), 50).length).toBe(51);
+  });
+
+  /*
+   * What a card says last is that the card is incomplete, and it was the first thing to go.
+   *
+   * The worker names six of the paths a `file_patch` touches and then counts the rest, because a
+   * card that names six of forty and says nothing about the other thirty-four is a smaller claim
+   * wearing the shape of a complete one (`namedObjects`, `approval-policy.ts`). The count sits at
+   * the end of that sentence and the clamp cut from the end, so the owner was shown a list broken
+   * off mid-path with nothing saying anything was missing.
+   *
+   * Not a hypothetical: measured through the worker's own `approvalRequirement` for forty patches
+   * over the forty longest paths tracked in this repository, the preview is 678 characters against
+   * the 600 here, and it rendered as `…mipmap-xxxhdpi/ic_launcher_foreground.png, app…`. The six
+   * longest tracked paths are 612 characters between them, so the sentence is over the limit before
+   * the list even reaches the bound the worker put on it. The shape below is that sentence.
+   */
+  it('keeps the count of what a card did not name when it has to cut the sentence', () => {
+    const paths = Array.from(
+      { length: 6 },
+      (_, index) => `apps/worker/src/${'sub/'.repeat(20)}file-${index}.ts`
+    );
+    const preview = `Apply 40 conflict-checked file patch(es) to ${paths.join(', ')} and 34 more`;
+    const wording = agentWording(`Change a workspace file\n${preview}`);
+
+    expect(wording.length).toBe(601);
+    expect(wording.endsWith('and 34 more')).toBe(true);
+    // The head is still the head. The cut comes out of the middle of the list, where a list repeats
+    // itself, so what the call is and the first path it names both survive it.
+    expect(
+      wording.startsWith(
+        `Change a workspace file\nApply 40 conflict-checked file patch(es) to ${paths[0] ?? ''}`
+      )
+    ).toBe(true);
+    // And nothing is elided from a sentence that fits: the ellipsis is a cut, not a decoration.
+    const fits = `Apply 3 conflict-checked file patch(es) to ${paths[0] ?? ''}`;
+    expect(agentWording(fits)).toBe(fits);
+  });
+
+  /*
+   * The clause the other bound writes, and the measurement that says it never gets here.
+   *
+   * `KEPT_TAIL` is argued for by the widest closing clause a card can end in, and the widest one
+   * the worker writes is `commandPreview`'s `… and 12345 more characters`. It cannot reach this
+   * clamp: `CARD_COMMAND_CHARS` cuts the invocation at 400 first, so the whole preview is at most
+   * about 427 characters and `agentWording` never elides it. Pinned as the fact it is, because the
+   * constant above is sized by an argument and an argument about a shape that cannot occur is one
+   * somebody will later shorten the constant on.
+   */
+  it('never has to cut a command preview, because the worker has already bounded that one', () => {
+    const invocation = `bash -lc ${'echo one two three; '.repeat(80)}`;
+    const preview = `Run a command on the agent computer\n${invocation.slice(0, 400)}… and ${
+      invocation.length - 400
+    } more characters`;
+
+    expect(preview.length).toBeLessThan(600);
+    expect(agentWording(preview)).toBe(preview);
   });
 
   it('says nothing when the model said nothing', () => {

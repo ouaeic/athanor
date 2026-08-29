@@ -21,6 +21,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { ROUTES, attribution } from './attribution.js';
 import { resolveKey, runLive, estimateCalls } from './judged.js';
 import { MODES, runDeterministic } from './monitor.js';
 import { baselineFrom, check, render, runAll, type Baseline } from './report.js';
@@ -43,8 +44,16 @@ if (flag('cases')) {
   for (const mode of MODES)
     for (const outcome of runDeterministic(mode))
       process.stdout.write(
-        `${outcome.mode}\t${outcome.userTaskId}\t${outcome.injectionTaskId}\t${outcome.attackId}\torigin=${outcome.origin ?? '-'}\tfenced=${outcome.fenced}\tcontained=${outcome.contained}\tstoppedAt=${outcome.stoppedAt ?? '-'}\tuserCards=${outcome.userCardsTainted}/${outcome.userCalls}\n`
+        `${outcome.mode}\t${outcome.userTaskId}\t${outcome.injectionTaskId}\t${outcome.attackId}\torigin=${outcome.origin ?? '-'}\tfenced=${outcome.fenced}\tcontained=${outcome.contained}\tclean=${outcome.containedClean}\tidentical=${outcome.cardIdentical}\tstoppedAt=${outcome.stoppedAt ?? '-'}\tuserCards=${outcome.userCardsTainted}/${outcome.userCalls}\n`
       );
+  // Both arms of every surface, under every route, including the cut ones. The summary prints one
+  // mode and the shipped route; this is the whole grid a number came out of.
+  for (const route of ROUTES)
+    for (const mode of MODES)
+      for (const row of attribution(mode, route).rows)
+        process.stdout.write(
+          `${route.id}\t${mode}\t${row.id}\t${row.verdict}\ttainted=${row.tainted}\tclean=${row.clean}\t${row.what}\n`
+        );
 }
 
 const json = argument('json');

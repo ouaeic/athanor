@@ -123,12 +123,18 @@ export const expiryNote = (expiresAt: string, now = Date.now()): string => {
  *
  * Put through `agentWording` for the same reason the facts are: the origin is derived from content
  * that came from outside, and a host with a bidirectional override in it renders as another host.
+ *
+ * And with no kept tail, which is the one place that bound is wrong. An origin is a host, not a
+ * sentence: the end of a host is its registrable domain, so an elision that keeps the last
+ * characters turns two hundred characters of somebody else's choosing into `xxx…bank.example` -
+ * a lookalike assembled by the card itself. A host too long to show is shown truncated, which says
+ * only what is true. `approval-facts.ts` keeps the host exactly for the same reason.
  */
 export const approvalProvenance = (
   approval: Approval,
   context: ContextNote | undefined
 ): ContextNote | undefined => {
-  const origin = agentWording(approval.origin ?? '', 120);
+  const origin = agentWording(approval.origin ?? '', 120, 0);
   return origin
     ? {
         exposed: true,

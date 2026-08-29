@@ -195,6 +195,26 @@ describe('where the card says the instruction came from', () => {
     expect(note?.text).not.toMatch(/[\u202a-\u202e]/);
     expect(note?.text).toContain('bankelpmaxe.evil');
   });
+
+  /*
+   * The same trick by the other route, and the reason this one call site opts out of the elision
+   * `agentWording` does for a card's own sentence.
+   *
+   * A sentence is cut in the middle so that its last clause - the count of what it did not name -
+   * survives. A host is not a sentence: the end of a host is its registrable domain, so keeping the
+   * last characters of an over-long origin would let content from outside assemble
+   * `xxxxx…bank.example` inside a line the card writes in its own voice. The origin is
+   * truncated instead, which says only what is true about it.
+   */
+  it('will not let an over-long origin end in a host it is not', () => {
+    const origin = `${'sub.'.repeat(60)}bank.example`;
+    const note = approvalProvenance(approval({ origin }), undefined);
+
+    // What is shown is the front of the origin and then a cut, so the sentence claims nothing about
+    // where that name ends.
+    expect(note?.text).toContain(`from ${origin.slice(0, 120)}…`);
+    expect(note?.text).not.toContain('bank.example');
+  });
 });
 
 describe('which request the card shows', () => {

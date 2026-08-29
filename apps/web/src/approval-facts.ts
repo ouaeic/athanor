@@ -74,6 +74,40 @@ const DIRECTIONAL = /[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069
 const CLAMP = 400;
 
 /**
+ * How much of the END of an over-long sentence survives the cut.
+ *
+ * A card that names things ends by saying what it did not name - `and 34 more`, `and 143 more
+ * characters` - and a cut taken from the end removes exactly that clause. What is left is six paths
+ * broken off mid-path with no sign that thirty-four others are in the same call: a smaller claim
+ * wearing the shape of a complete one, on the one control where the owner is answering for the
+ * whole of it. The worker bounds these lists precisely so the card can say how much it left out
+ * (`CARD_NAMED_OBJECTS`, `CARD_COMMAND_CHARS` in `approval-policy.ts`), and the client was removing
+ * the half that says so on exactly the calls big enough to need it.
+ *
+ * Not a hypothetical shape here: forty patches over this repository's forty longest tracked paths
+ * is a preview of 678 characters against the 600 below, and the owner saw `…foreground.png, app…`.
+ * `path` carries no length limit in `tool-catalogue.ts`; the six longest tracked paths in this
+ * repository are 612 characters between them.
+ *
+ * Eighty characters, and it is a bound on the ELISION rather than a reader of the sentence. The
+ * card must not go looking for `and N more` in prose the worker owns - that is the mistake
+ * `needsComputer` records at the bottom of `approval-copy.ts`, and a model-written sentence ending
+ * in a forged count would be the reward for it. What is claimed here is only that a sentence ends
+ * where it ends: the last eighty characters are kept whatever they say, so what survives reads as
+ * the end of a sentence rather than as a fragment. The middle is what is spent, which in a list is
+ * the part that repeats itself.
+ *
+ * Eighty is headroom over the clause that actually arrives, not a fit to it. The only closing
+ * clause that reaches this clamp is `namedObjects`' own, and `tool-catalogue.ts` caps `file_patch`
+ * at forty patches against `CARD_NAMED_OBJECTS` of six, so the widest it can be is `and 34 more` -
+ * eleven characters. The wider clause the worker writes, `commandPreview`'s `… and 12345 more
+ * characters`, never gets here at all: `CARD_COMMAND_CHARS` cuts that invocation at 400, which
+ * leaves the whole preview around 427 and under the 600 below. Both are measured in
+ * `approval-facts.test.ts`, one as the sentence this cuts and one as the sentence it never has to.
+ */
+const KEPT_TAIL = 80;
+
+/**
  * How many addresses the card names, and therefore how many it does not.
  *
  * Read by the walk below and by the `parallel_web_read` row, which is what makes the card honest
@@ -92,10 +126,18 @@ const DESTINATION_LIMIT = 6;
 const AUDIO_READ_MAX_SECONDS = 5_400;
 
 // Stripped before the length is measured, so the limit counts characters the owner can actually see
-// and the ellipsis lands where the text really stops.
-const clamp = (value: string, limit = CLAMP): string => {
+// and the ellipsis lands where the text really stops. `keptTail` moves that ellipsis into the
+// middle: nothing is added to what the owner sees, and the cut is taken out of the part of a
+// sentence that says least rather than out of its last clause.
+const clamp = (value: string, limit = CLAMP, keptTail = 0): string => {
   const visible = value.replace(DIRECTIONAL, '');
-  return visible.length > limit ? `${visible.slice(0, limit)}…` : visible;
+  if (visible.length <= limit) return visible;
+  // Never more of the end than the limit leaves room for, so a caller with a short limit gets a
+  // short answer rather than one longer than the thing it was cutting.
+  const tail = Math.min(keptTail, limit);
+  return tail > 0
+    ? `${visible.slice(0, limit - tail)}…${visible.slice(-tail)}`
+    : `${visible.slice(0, limit)}…`;
 };
 
 const fact = (label: string, value: string): ApprovalFact[] =>
@@ -405,13 +447,17 @@ export const approvalFacts = (approval: Approval): ApprovalFact[] => {
  *
  * Blank lines are collapsed rather than preserved: a preview of four hundred newlines pushes Deny
  * and Approve off a phone screen, and nothing legitimate needs them.
+ *
+ * `keptTail` is what a card's own sentence is cut with, and `KEPT_TAIL` says why. A caller showing
+ * something that is not a sentence passes 0 and gets the plain cut.
  */
-export const agentWording = (value: string, limit = 600): string =>
+export const agentWording = (value: string, limit = 600, keptTail = KEPT_TAIL): string =>
   clamp(
     value
       .replace(DIRECTIONAL, '')
       .replace(/[\t ]+/g, ' ')
       .replace(/\n{3,}/g, '\n\n')
       .trim(),
-    limit
+    limit,
+    keptTail
   );

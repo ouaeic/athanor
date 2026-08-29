@@ -339,6 +339,24 @@ export const classifyDestination = (
       noveltyBytes: value.length,
       reason: `the ${url.protocol.replace(':', '')} scheme is not a web read`
     };
+  /*
+   * A name that ends in the DNS root label is the same name.
+   *
+   * `getaddrinfo` accepts `docs.example.com.` and answers for `docs.example.com` - measured on this
+   * box, `localhost.` resolves to 127.0.0.1 - so the two spellings reach one host and everything
+   * below has to be looking at the same one. Normalised here, once, before anything judges it,
+   * because this host is read by four separate rules and the trailing dot broke all four in the
+   * same direction: `isPublicHttpUrl` saw a name that was not loopback, `matchingHostSuffix` saw a
+   * host the owner had not named, `chosenBytes` priced the extra label, and the card printed a name
+   * with a dot on the end. `https://docs.example.com./guide` to the owner's own host was a card at
+   * 10 bytes, and a card in front of ordinary work is how a floor gets switched off.
+   *
+   * Guarded on length so a hostname that is only the root label is left exactly as written: it
+   * names nothing, and the empty string this would otherwise assign is a value `URL` discards
+   * silently, which would leave the host as the last thing anybody expected.
+   */
+  if (url.hostname.length > 1 && url.hostname.endsWith('.'))
+    url.hostname = url.hostname.slice(0, -1);
   const host = url.hostname.toLowerCase();
   /*
    * Somewhere data cannot go is not somewhere data can be sent.

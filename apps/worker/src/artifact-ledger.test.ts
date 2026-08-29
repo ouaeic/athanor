@@ -42,9 +42,32 @@ export const drain = (queue: Job[]): Job | null => {
 };
 `;
 
+/**
+ * One file in two states: what a read of this task put in front of the model, and what is on disk
+ * by the time the patch addressing those lines arrives. The line the patch is aimed at is not in
+ * the second text and is nowhere else in it either, so there is no unambiguous place for the edit
+ * and `applyEdit` refuses rather than guessing - which is the branch these two cases are here for.
+ */
+const CONFIG_AS_READ = `export const retries = 3;
+export const timeoutMs = 5_000;
+`;
+const CONFIG_NOW = `export const settings = { retries: 4 };
+`;
+
 interface Ran {
   readonly state: AgentState;
   readonly written: Map<string, string>;
+  /**
+   * What the arm answered, and what it threw, because a refusal is not one thing.
+   *
+   * `file_patch` refuses a call at two different places - the read, and the conflict check that
+   * runs on what the read returned - and the ledger claim is about the second one. A case that
+   * only counts the rows cannot tell which of the two it met, and the one below that meant to
+   * reach the conflict check spent its life failing at the read instead. So the reason is read
+   * here: the words in it are how a case says which guard it stopped at.
+   */
+  readonly result: unknown;
+  readonly failure: string;
 }
 
 /**
@@ -54,12 +77,17 @@ interface Ran {
  * unless a case overrides it, which is how the two byte sources are told apart below. `refuse` is
  * the runner saying no, which is the only shape that matters here: every guard on this path, on
  * both sides of the wire, ends in a throw out of `runner.writeFile` or before it.
+ *
+ * `shown` is the other state a patch can meet: a file this task read, whose text on disk is no
+ * longer the text that was read. `seen` records the live file, which is the ordinary case; `shown`
+ * records a different text at the same path, which is the state `file_patch` exists to refuse.
  */
 const run = async (
   call: { name: string; arguments: Record<string, unknown> },
   options: {
     files?: Record<string, string>;
     seen?: readonly string[];
+    shown?: Record<string, string>;
     state?: Partial<AgentState>;
     refuse?: string;
     sizeBytes?: (content: string) => unknown;
@@ -68,6 +96,8 @@ const run = async (
   forgetReads();
   const written = new Map<string, string>(Object.entries(options.files ?? {}));
   for (const path of options.seen ?? []) recordRead('task-1', path, 1, written.get(path) ?? '');
+  for (const [path, text] of Object.entries(options.shown ?? {}))
+    recordRead('task-1', path, 1, text);
   const state = { step: 7, ...options.state } as AgentState;
   const context = {
     task: { workspaceId: 'ws-1', id: 'task-1', userId: 'user-1' },
@@ -92,12 +122,22 @@ const run = async (
       call: async () => ({ storageBytes: 1 })
     }
   } as unknown as ToolContext;
-  await executeWorkspaceTool(context, {
+  let failure = '';
+  const result = await executeWorkspaceTool(context, {
     id: 'call-1',
     ...call
-  } as unknown as ModelToolCall).catch(() => undefined);
-  return { state, written };
+  } as unknown as ModelToolCall).catch((error: unknown) => {
+    failure = error instanceof Error ? error.message : String(error);
+    return undefined;
+  });
+  return { state, written, result, failure };
 };
+
+/** Why one patch of a call was not applied, in the words the model gets back. */
+const refusals = (result: unknown): string[] =>
+  ((result as { failed?: Array<{ reason?: unknown }> } | undefined)?.failed ?? []).map((failed) =>
+    typeof failed.reason === 'string' ? failed.reason : ''
+  );
 
 const rows = (ledger: ArtifactLedger | undefined): string[] =>
   (artifactLedgerBlock(ledger) ?? '').split('\n').slice(1);
@@ -179,7 +219,7 @@ describe('what reaches the ledger is what the workspace confirmed', () => {
    * a change that happened; the file that did not is not, and both are in the same result.
    */
   it('records only the file that landed when the other patch in the call was refused', async () => {
-    const { state } = await run(
+    const { state, result } = await run(
       {
         name: 'file_patch',
         arguments: {
@@ -192,9 +232,76 @@ describe('what reaches the ledger is what the workspace confirmed', () => {
       { files: { 'workspace/queue.ts': QUEUE }, seen: ['workspace/queue.ts'] }
     );
 
+    // Which refusal this is, because the arm has two and they are not the same guard: this one is
+    // the read, and it `continue`s before `applyEdit` is called at all. The next case is the other.
+    expect(refusals(result)).toEqual([expect.stringContaining('could not be read')]);
     expect(state.artifactLedger?.entries.map((entry) => entry.path)).toEqual([
       'workspace/queue.ts'
     ]);
+  });
+
+  /**
+   * The refusal `file_patch` is actually named for, which nothing had ever reached.
+   *
+   * The case above stops at the read. The conflict check is a different guard on a different fact:
+   * the file WAS read, and what is on disk is no longer the text this task was shown, so the lines
+   * the patch addresses are gone and there is no honest place to write. Both refusals end in the
+   * same `failures` array, and only one of them had a case - so `recordArtifactWrite` could be
+   * moved into the conflict branch and the whole suite stayed green, on the tool whose name is the
+   * check it was defeating.
+   *
+   * The block's promise is that a path in it is a path the workspace confirmed. This is the state
+   * where a broken arm would name one it did not.
+   */
+  it('records nothing for the patch the conflict check refused, having read that file first', async () => {
+    const { state, written, result } = await run(
+      {
+        name: 'file_patch',
+        arguments: {
+          patches: [
+            { path: 'workspace/queue.ts', edit: 'PUT 1:\n+import type { Job } from "./j";\n' },
+            { path: 'workspace/config.ts', edit: 'PUT 2:\n+export const timeoutMs = 9_000;\n' }
+          ]
+        }
+      },
+      {
+        files: { 'workspace/queue.ts': QUEUE, 'workspace/config.ts': CONFIG_NOW },
+        seen: ['workspace/queue.ts'],
+        shown: { 'workspace/config.ts': CONFIG_AS_READ }
+      }
+    );
+
+    expect(refusals(result)).toEqual([expect.stringContaining('has changed since you read it')]);
+    expect(written.get('workspace/config.ts')).toBe(CONFIG_NOW);
+    expect(state.artifactLedger?.entries.map((entry) => entry.path)).toEqual([
+      'workspace/queue.ts'
+    ]);
+  });
+
+  /**
+   * The same refusal alone in the call, where there is no landed file to hide behind: the arm
+   * throws `patch_conflict` and the turn must carry no block at all, not an empty one.
+   */
+  it('leaves no ledger behind when the only patch in the call was refused for conflict', async () => {
+    const { state, written, failure } = await run(
+      {
+        name: 'file_patch',
+        arguments: {
+          patches: [
+            { path: 'workspace/config.ts', edit: 'PUT 2:\n+export const timeoutMs = 9_000;\n' }
+          ]
+        }
+      },
+      {
+        files: { 'workspace/config.ts': CONFIG_NOW },
+        shown: { 'workspace/config.ts': CONFIG_AS_READ }
+      }
+    );
+
+    expect(failure).toContain('has changed since you read it');
+    expect(written.get('workspace/config.ts')).toBe(CONFIG_NOW);
+    expect(state.artifactLedger).toBeUndefined();
+    expect(artifactLedgerBlock(state.artifactLedger)).toBeNull();
   });
 
   /**

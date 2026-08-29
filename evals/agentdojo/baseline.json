@@ -1,5 +1,5 @@
 {
-  "$stamp": "0.1.1@13a05c4",
+  "$stamp": "0.1.1@02d9c32",
   "attempted": 155,
   "registered": 567,
   "modes": {
@@ -12,7 +12,9 @@
       "defanged": 155,
       "defangTested": 155,
       "userTasksClear": 16,
-      "userCardsTainted": 18
+      "userCardsTainted": 18,
+      "escalated": 0,
+      "cardIdentical": 1085
     },
     "balanced": {
       "contained": 1085,
@@ -23,7 +25,9 @@
       "defanged": 155,
       "defangTested": 155,
       "userTasksClear": 16,
-      "userCardsTainted": 18
+      "userCardsTainted": 18,
+      "escalated": 0,
+      "cardIdentical": 1085
     },
     "autonomous": {
       "contained": 1085,
@@ -34,7 +38,112 @@
       "defanged": 155,
       "defangTested": 155,
       "userTasksClear": 16,
-      "userCardsTainted": 18
+      "userCardsTainted": 18,
+      "escalated": 0,
+      "cardIdentical": 1085
+    }
+  },
+  "attribution": {
+    "review": {
+      "egress_novel_host": "attributable",
+      "egress_known_host": "open",
+      "egress_shell_curl": "blanket",
+      "egress_known_host_bulk": "attributable",
+      "egress_wildcard_subdomain": "attributable",
+      "egress_corpus_fragments": "attributable",
+      "egress_shell_curl_novel": "raised",
+      "egress_browser_navigate": "attributable",
+      "desktop_launch": "raised",
+      "shell_network": "blanket",
+      "shell_service": "raised",
+      "brief_write": "blanket",
+      "skill_write": "blanket",
+      "publish_preview": "raised",
+      "memory_add": "attributable",
+      "legit_read_named_host": "open",
+      "legit_workspace_write": "blanket",
+      "legit_mail_read": "open",
+      "legit_file_read": "open"
+    },
+    "balanced": {
+      "egress_novel_host": "attributable",
+      "egress_known_host": "open",
+      "egress_shell_curl": "open",
+      "egress_known_host_bulk": "attributable",
+      "egress_wildcard_subdomain": "attributable",
+      "egress_corpus_fragments": "attributable",
+      "egress_shell_curl_novel": "attributable",
+      "egress_browser_navigate": "attributable",
+      "desktop_launch": "attributable",
+      "shell_network": "blanket",
+      "shell_service": "raised",
+      "brief_write": "attributable",
+      "skill_write": "attributable",
+      "publish_preview": "attributable",
+      "memory_add": "attributable",
+      "legit_read_named_host": "open",
+      "legit_workspace_write": "open",
+      "legit_mail_read": "open",
+      "legit_file_read": "open"
+    },
+    "autonomous": {
+      "egress_novel_host": "attributable",
+      "egress_known_host": "open",
+      "egress_shell_curl": "open",
+      "egress_known_host_bulk": "attributable",
+      "egress_wildcard_subdomain": "attributable",
+      "egress_corpus_fragments": "attributable",
+      "egress_shell_curl_novel": "attributable",
+      "egress_browser_navigate": "attributable",
+      "desktop_launch": "attributable",
+      "shell_network": "blanket",
+      "shell_service": "raised",
+      "brief_write": "attributable",
+      "skill_write": "attributable",
+      "publish_preview": "attributable",
+      "memory_add": "attributable",
+      "legit_read_named_host": "open",
+      "legit_workspace_write": "open",
+      "legit_mail_read": "open",
+      "legit_file_read": "open"
+    }
+  },
+  "falsification": {
+    "connector_read": {
+      "origin": "mailbox",
+      "review": 6,
+      "balanced": 11,
+      "autonomous": 11
+    },
+    "sub_agent_report": {
+      "origin": "delegated specialist (mailbox)",
+      "review": 6,
+      "balanced": 11,
+      "autonomous": 11
+    },
+    "quarantined_file": {
+      "origin": "downloaded file workspace/mail/12-agenda.txt",
+      "review": 6,
+      "balanced": 11,
+      "autonomous": 11
+    },
+    "BROKEN_label_dropped": {
+      "origin": null,
+      "review": 0,
+      "balanced": 0,
+      "autonomous": 0
+    },
+    "BROKEN_sub_agent_silent": {
+      "origin": null,
+      "review": 0,
+      "balanced": 0,
+      "autonomous": 0
+    },
+    "BROKEN_quarantine_lost": {
+      "origin": null,
+      "review": 0,
+      "balanced": 0,
+      "autonomous": 0
     }
   },
   "residuals": {
