@@ -67,10 +67,10 @@ NODE_OPTIONS=--conditions=development pnpm exec tsx evals/context-quality/selfte
 The published work this design follows grades those 0–5 with a judge blinded to which method
 produced the answer, and reports artifact tracking as the worst of the four — 2.45/5 even for the
 winning method, with the stated conclusion that it "may need dedicated state tracking beyond
-summarization". Athanor scores 3.00/5 there on a compacted run and 5.00/5 on an uncompacted one,
-so the whole of the loss is the compaction's and no context configuration moves it. That is the
-expected result and it is reported rather than tuned away — see "where the artifact loss actually
-is" below for what does move it.
+summarization". That is the conclusion athanor took: the `ARTIFACTS WRITTEN` block is dedicated
+state tracking, it is fed from where a write lands rather than from a summary, and the artifact
+column reads 5.00 on every trajectory with it and 2.50 without — see "where the artifact loss
+actually is" below for both numbers and what each mechanism is doing.
 
 ## What the deterministic score is, and what it is not
 
@@ -158,29 +158,63 @@ The **frozen-column check** refuses a probe kind that scores the same in every c
 every trajectory. A column nothing can move is indistinguishable from a probe that has stopped
 reading the window. `starved` — every character bound at its destructive end, never a candidate —
 is what gives each kind something that genuinely takes its material away. Run without it, the
-artifact column fails this check, which is how it was calibrated.
+artifact column fails this check, which is how it was calibrated — and it is why `starved` gained
+`ANCHOR_INDEX_CHARS: 0` when the anchor index landed and `ARTIFACT_LEDGER_ROWS: 0` when the ledger
+did. Each was a new mechanism the row did not reach, and each saturated the column at 5.00 the day
+it shipped.
 
-## Where the artifact loss actually is
+## Where the artifact loss actually is, and what now holds it
 
-The artifact probe asks for the five paths this task wrote. Three survive a compacted run and two
-do not, in every configuration, on both shipped windows — which looked like a tuning question until
-`starved` was calibrated against it, and is not one.
+The artifact probes ask for the five paths this task wrote, and for one fact about one of them that
+exists in exactly one place.
 
-A written path enters the window twice: in the head of the `file_write` call's arguments, and in
-the head of the tool result (`{"ok":true,"path":…`). `truncateMiddle` keeps 62% of the remaining
-budget as head. So every ordinary cut in this codebase — the recency bound, the descending
-older-output floor, the compacted-argument bound — keeps the path, and the artifact column cannot
-be moved by the squeeze at any value anyone would ship. It moves only when a bound is set low
-enough that the head is shorter than the path itself (200/120/40, which is `starved`), or when a
-**compaction replaces the message outright**. The two missing paths are the two written before the
-compaction point; the three that survive are the ones written after it.
+A written path enters the window twice: in the head of the `file_write` call's arguments, and in the
+head of the tool result (`{"ok":true,"path":…`). `truncateMiddle` keeps 62% of the remaining budget
+as head. So every ordinary cut in this codebase — the recency bound, the descending older-output
+floor, the compacted-argument bound — keeps the path, and the artifact column cannot be moved by the
+squeeze at any value anyone would ship. It moves only when a bound is set low enough that the head
+is shorter than the path itself (200/120/40, which is `starved`), or when a **compaction replaces
+the message outright**.
 
-That is the same conclusion the published work reached from the other direction, and it says what a
-fix would have to be. Not a better summariser: a durable record. An `ARTIFACTS WRITTEN` block
-maintained the way `refreshActivePlan` maintains the plan block would have to carry, per path, the
-path itself, whether it was created or modified, the byte count last written, and the step it last
-changed on — enough to answer "which files did we modify and how" without the message that did it.
-The evidence that this works is already in the fixture: `continuation-plan-order`, the same plan
-narrated in the agent's prose, scores 0.0 in every compacted configuration, and
-`continuation-plan-block`, the identical fact carried by the re-rendered plan block, scores 5.0 in
-every configuration including `starved`. The mechanism exists; it has one user.
+Two mechanisms now carry a path across that compaction, and they are not the same kind of thing.
+
+The **anchor index** harvests exact identifiers out of the span a compaction is about to drop and
+appends them to the brief section after its own bound. It is opportunistic: it carries whatever
+happens to look like an identifier, it carries nothing about what was done to the file, and it is
+switched off by `ANCHOR_INDEX_CHARS: 0`. On this fixture it holds all five paths on its own, which
+is why `artifact-files-touched` reads 5.00 everywhere except `starved` — and why the `anchorless`
+row exists, since without it no shipped row can say anything about the second mechanism.
+
+The **artifact ledger** is state. `ARTIFACTS WRITTEN` is re-rendered at the tail of the window on
+every step from a durable per-turn record, and each row is written where the write lands — after
+`runner.writeFile` has answered, with the byte count the workspace itself reported. It carries, per
+path, the path, whether the whole file was replaced or named lines were edited, the bytes it last
+weighed, and the step it last changed on. It is bounded at twelve paths and ninety-six characters of
+path, and at the bound the oldest row is evicted and counted rather than the newest dropped.
+
+Measured on this rig, at the commit that wired the block in, shipped configuration:
+
+| trajectory                        | artifact column | tokens/task | prefix | own-think |
+| --------------------------------- | --------------- | ----------- | ------ | --------- |
+| `pool-migration-131k`, no block   | 2.50            | 2,981,016   | 75.6%  | 59/60     |
+| `pool-migration-131k`, with block | **5.00**        | 2,978,862   | 76.8%  | 59/60     |
+| `pool-migration-1m`, no block     | 2.50            | 3,687,561   | 78.9%  | 59/60     |
+| `pool-migration-1m`, with block   | **5.00**        | 3,685,407   | 80.1%  | 59/60     |
+
+And on `anchorless`, where the block is the only thing left carrying the set:
+`artifact-files-touched` 3.00 → 5.00 (three of the five paths, then five), the artifact column
+1.50 → 5.00, and 57,513 rework tokens → 0 on the small window, 84,806 → 0 on the large one.
+
+It costs one message at the tail on every step after the turn's first write. That is nil at the
+shipped `RECENT_DETAIL_MESSAGES = 8` and nil at 5 and 6, and it is 59/60 → 54/60 at `detail-4`,
+which is a fact about a four-message reasoning window rather than about the block: the boundary is
+counted from the tail, and the tail is now one longer. The table above under "the arithmetic this
+found" should be read as `N >= 4 + 2k` once a turn has written anything.
+
+The evidence that a re-rendered block is the right shape for this was already in the fixture before
+the block existed: `continuation-plan-order`, a plan narrated in the agent's prose, scores 0.0 in
+every compacted configuration, and `continuation-plan-block`, the identical fact carried by the
+re-rendered plan block, scores 5.0 in every configuration including `starved`. `artifact-ledger-row`
+is the third member of that family — 5.00 everywhere, 0.00 exactly where the block is switched off.
+
+The design and the attacks are in `docs/design/ranked/LEDGER.md`.

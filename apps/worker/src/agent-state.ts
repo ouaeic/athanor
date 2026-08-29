@@ -18,7 +18,7 @@ import type { WebToolMode } from '@athanor/contracts';
 import type { ModelMessage, ModelToolCall } from '@athanor/model-gateway';
 import type { AcceptanceRecord } from './acceptance.js';
 import type { WorkerConfig } from './config.js';
-import type { ContextBrief } from './context.js';
+import type { ArtifactLedger, ContextBrief } from './context.js';
 import type { StoredMediaRoutes } from './media.js';
 
 export interface AgentState {
@@ -345,6 +345,17 @@ export interface AgentState {
   reasoningFloor?: 'medium' | 'high';
   /** The step a compaction last landed on, so the step that follows it thinks harder. */
   compactedAtStep?: number;
+  /**
+   * The files this turn has changed, as the workspace reported each change back.
+   *
+   * Durable for the reason every other block in the tail is durable: it is re-rendered into the
+   * window from here on every step, so an approval pause, a worker handover or a compaction that
+   * ate the calls themselves cannot take the record with them. Bounded where it is written rather
+   * than where it is rendered - see `recordArtifactWrite` - so the persisted state a long turn
+   * carries is bounded too, and a turn touching four hundred files does not encrypt four hundred
+   * rows onto the task on every step.
+   */
+  artifactLedger?: ArtifactLedger;
 }
 
 export type AgentWorkerConfig = Omit<WorkerConfig, 'WORKER_HEALTH_PORT' | 'WORKER_HEALTH_HOST'>;

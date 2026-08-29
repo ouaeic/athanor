@@ -151,6 +151,7 @@ export const startTurnState = <T extends Record<string, unknown>>(
     pending?: unknown;
     question?: unknown;
     continuationMark?: unknown;
+    artifactLedger?: unknown;
   };
   delete next.reasoningFloor;
   delete next.compactedAtStep;
@@ -163,6 +164,14 @@ export const startTurnState = <T extends Record<string, unknown>>(
   // What the last turn had changed by its last ceiling says nothing about this one, and left behind
   // it would be the bar a fresh turn has to clear before it may renew its own budget.
   delete next.continuationMark;
+  /*
+   * The ledger of files changed, dropped for the plainest reason there is: the block is headed
+   * "this turn", and a turn that inherited the last one's rows would state, in the harness's own
+   * voice and at the tail of every request, that it had written files it has not touched. Dropped
+   * rather than emptied because an absent ledger and an empty one render the same block - none -
+   * and the smaller state is the one that gets encrypted onto the task on every step.
+   */
+  delete next.artifactLedger;
   return next;
 };
 

@@ -206,8 +206,43 @@ export const CONFIGURATIONS: readonly ContextConfiguration[] = [
        * arrived that it did not touch. Zeroing the budget is that end for this one. It restores
        * the contrast the column is read for - 5.00 against 3.00 on both compacted trajectories.
        */
-      ANCHOR_INDEX_CHARS: 0
+      ANCHOR_INDEX_CHARS: 0,
+      /*
+       * Added when the artifact ledger landed, for exactly the reason `ANCHOR_INDEX_CHARS` above
+       * was: this row is "the destructive end of every window mechanism at once", and the ledger is
+       * a new mechanism it did not touch. The block is re-rendered at the tail from durable state on
+       * every step, so no character bound in `context.ts` can reach it and no compaction boundary
+       * can cross it - with it on, the artifact column read 5.00 in every configuration of every
+       * trajectory and the frozen-column guard in run.ts correctly refused the run.
+       *
+       * Zero rows is this mechanism's destructive end: `recordArtifactWrite` evicts every row it is
+       * given and `artifactLedgerBlock` renders nothing, which is the same window this rig measured
+       * before the block existed.
+       */
+      ARTIFACT_LEDGER_ROWS: 0
     }
+  },
+  {
+    /**
+     * The one mechanism that carried a written path through a compaction before the ledger did, off
+     * and nothing else changed.
+     *
+     * The anchor index is a model-free regex harvest of exact identifiers out of the span a
+     * compaction is about to drop, appended to the brief section after its own bound - so on this
+     * fixture it has been holding all five written paths on its own, and `artifact-files-touched`
+     * reads 5.00 everywhere except `starved`. That makes the shipped rows unable to say anything
+     * about whether the ledger works, because nothing on them is lost for it to hold.
+     *
+     * This row is the isolation. Measured on both compacted trajectories at the commit that wired
+     * the block in: with the ledger switched off as well, `artifact-files-touched` reads 3.00 here
+     * and two of the five paths are gone; with the ledger on it reads 5.00. That is the whole of
+     * the ledger's effect on this rig's own axis, and it is a row rather than a sentence so it is
+     * re-measured on every run.
+     */
+    id: 'anchorless',
+    label: 'ANCHOR_INDEX_CHARS 700 -> 0',
+    why: 'The anchor index off and nothing else, which is the only shipped mechanism that carried a written path through a compaction before the ledger did.',
+    constants: { ANCHOR_INDEX_CHARS: 0 }
   }
 ];
 

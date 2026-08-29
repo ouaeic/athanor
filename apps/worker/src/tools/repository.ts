@@ -80,6 +80,49 @@ const groupByFile = (matches: readonly string[]): Map<string, number> => {
 export const OVERVIEW_SYMBOL_BUDGET = 300;
 
 /**
+ * The flags that make a ripgrep answer a function of the workspace rather than of thread scheduling.
+ *
+ * ripgrep searches and walks in parallel and writes each file's block as its thread finishes, so
+ * every rg call in this file emits a different order on every run. Measured on this repository over
+ * twenty consecutive runs, on ripgrep 15.2.0 and again on 13.0.0: the symbol sweep agreed with its
+ * own first run 1/20 times, `rg --files` 1/20, and the instruction-file list 1/20.
+ *
+ * The rate is not a rate to tune against. Four consecutive batches of twenty runs of one unchanged
+ * `code_search` - `clampNumber`, 40 lines across 7 files - against one unchanged tree agreed 1/20,
+ * 10/20, 1/20 and 9/20, with 8, 11, 12 and 9 distinct orders; the same search on 13.0.0 was 1/20
+ * with 20 distinct orders in every batch. A batch that came back 10/20 would have read as mostly
+ * settled. An order that holds on this machine against this corpus with this ripgrep is not an
+ * order that holds.
+ *
+ * That alone would be an ordering problem, and every consumer below cuts the output, which makes it
+ * a *set* problem. The two cuts are in different places and only one of them can be repaired here:
+ *
+ * - The harness cuts. `matches.slice(0, maxResults)`, `files.slice(0, maxFiles)` and
+ *   `spreadAcrossFiles` all keep a prefix or a stride of the lines, so whichever thread finished
+ *   first decided what the model was shown. This one a sort in this process could fix.
+ * - The runner cuts first, and this one it could not. `boundedCollector` in the runner caps a
+ *   command at `maxOutputBytes` - 1 MiB by default - keeping the leading 62% and the trailing 38%
+ *   and dropping the middle. A `code_search` for `const` on this repository emits 2.6 MB and one
+ *   for `e` emits 23.1 MB, both far over that. Simulating the collector over twelve unsorted runs:
+ *   twelve different surviving *sets*, between 9,637 and 11,108 of the 25,770 matching lines, with
+ *   3,702 lines present in the first run and absent from the second, and 507 lines that no run saw
+ *   at all. Sorting in the worker cannot return a line the runner already threw away.
+ *
+ * So the order is settled at the source, where both cuts see it. The same twelve runs with these
+ * flags: one surviving set, 9,462 lines, twelve times out of twelve.
+ *
+ * It is not free - `--sort` turns off ripgrep's parallelism, which is the reason to say what it
+ * buys rather than to reach for it everywhere. Measured cost per call on this corpus: the symbol
+ * sweep 21.5 ms -> 47.5 ms, a `code_search` 13.2 ms -> 24.6 ms, `rg --files` 8.0 ms -> 10.2 ms, the
+ * instruction-file list 8.8 ms -> 9.2 ms. Tens of milliseconds against tool timeouts of 60 and 90
+ * seconds, for the difference between an answer and a sample of one.
+ *
+ * `git status` and `git ls-files` get nothing added: both agreed 20/20 over twenty runs, because
+ * the index they read is a path-sorted structure, and there is no flag to pin.
+ */
+const SETTLED_ORDER = ['--sort', 'path'];
+
+/**
  * Which symbols an overview shows when it cannot show them all.
  *
  * ripgrep searches in parallel and emits in whatever order its threads finish, so taking the first
@@ -181,6 +224,9 @@ export async function executeRepositoryTool(
           '--line-number',
           '--column',
           '--no-heading',
+          // Both cuts below - the runner's byte cap and this arm's own `slice(0, maxResults)` -
+          // keep a prefix of whatever order arrives, so the order is settled before either.
+          ...SETTLED_ORDER,
           '--color',
           'never',
           '--smart-case',
@@ -297,11 +343,10 @@ export async function executeRepositoryTool(
         run('rg', [
           '--line-number',
           '--no-heading',
-          // Without this ripgrep emits in thread-completion order, and the budget below then keeps
-          // whichever directory happened to finish first. Two calls disagreed on all but a handful
-          // of rows while `IDEMPOTENT_WITHIN_TURN` called this a pure function of the workspace.
-          '--sort',
-          'path',
+          // `spreadAcrossFiles` keeps 300 of these, so without a settled order the overview is a
+          // sample of whichever directories finished first: 1/20 runs agreed with the first, and
+          // `IDEMPOTENT_WITHIN_TURN` called this a pure function of the workspace throughout.
+          ...SETTLED_ORDER,
           '--color',
           'never',
           '--glob',
@@ -317,6 +362,17 @@ export async function executeRepositoryTool(
         ]),
         run('rg', [
           '--files',
+          /*
+           * The one call here whose whole output is returned, and it is sorted anyway.
+           *
+           * Nothing cuts this list, so no instruction file can be lost to the order - but the
+           * result it lands in is `repo_overview`, which `IDEMPOTENT_WITHIN_TURN` names a pure
+           * function of the workspace, and it is cache-resident for the rest of the turn. Twelve
+           * paths that come back in a different order on 19 of 20 runs make that claim false and
+           * move the block every time the overview is read again. Measured cost of settling it:
+           * 8.8 ms -> 9.2 ms, because the glob has already cut the walk down to twelve rows.
+           */
+          ...SETTLED_ORDER,
           '--glob',
           'AGENTS.md',
           '--glob',
@@ -327,7 +383,15 @@ export async function executeRepositoryTool(
       ]);
       let files = tracked.stdout.split('\n').filter(Boolean);
       if (!files.length) {
-        const discovered = await run('rg', ['--files']);
+        /*
+         * The untracked branch, which had the tracked branch's ordering guarantee and nothing that
+         * provided it. `git ls-files` reads a path-sorted index and measured 20/20 identical over
+         * twenty runs, so `files.slice(0, maxFiles)` below is a defined prefix of a defined order
+         * for a repository with a working tree. For one without - a downloaded folder, a fresh
+         * `mkdir`, a checkout whose `.git` the agent has not made yet - the same slice was taking
+         * 400 of 1,071 paths out of a walk that agreed with itself 1/20 times.
+         */
+        const discovered = await run('rg', ['--files', ...SETTLED_ORDER]);
         files = discovered.stdout.split('\n').filter(Boolean);
       }
       const symbolLines = symbols.stdout.split('\n').filter(Boolean);

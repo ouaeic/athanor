@@ -402,6 +402,187 @@ ${clockLine(clock.now, clock.timeZone)}${
 - Files, Computer, Terminal and Preview are hidden by default; the browser is part of the Computer screen. Continue through tools; request a handoff only when human interaction is necessary.`;
 
 /**
+ * ARTIFACTS WRITTEN: what this turn has actually changed on the computer, re-rendered at the tail.
+ *
+ * `evals/context-quality` measured why this has to exist rather than assuming it. A written path
+ * enters the window twice - in the head of the call's arguments and in the head of the tool result
+ * - and `truncateMiddle` keeps 62% of what is left as head, so no character bound in this file can
+ * take one away. What takes one away is a COMPACTION, which replaces the message outright. Measured
+ * on the `anchorless` row, which switches off the anchor index - the only other thing that carries
+ * an identifier across a compaction - three of the five written paths survive on both compacted
+ * trajectories without this block and all five survive with it, and the rig's rework model charges
+ * 57,513 tokens for the difference on the small window and 84,806 on the large one.
+ *
+ * The same fixture proves the shape of the fix, which is why this is not a new idea.
+ * `continuation-plan-order` is a plan carried in the agent's own prose and scores 0.0 in every
+ * compacted configuration; `continuation-plan-block` is the identical fact carried by the
+ * re-rendered plan block and scores 5.0 in every configuration including `starved`. So this is that
+ * mechanism pointed at the other thing a long turn must not lose, and it is built the same way
+ * rather than a second way - removed from wherever it sits and re-pushed at the tail on every step
+ * (@see refreshArtifactLedger), never appended.
+ *
+ * IT IS FED FROM WHERE THE WRITE LANDS. `executeWorkspaceTool` records a row after
+ * `runner.writeFile` has resolved, with the byte count the workspace answered with - so a write the
+ * runner refused (a stale hash, an unread span, a file over the limit) has already thrown and there
+ * is nothing to record. A ledger that names a file the disk does not have is worse than no ledger,
+ * because the whole of its value is that the model does not have to go and check.
+ *
+ * WHAT IT DELIBERATELY DOES NOT SAY. `wrote` and `edited` are the two things the harness watched
+ * happen, not a guess at created-versus-modified. The only witness to whether a path existed is
+ * `writeWorkspaceFile` in the workspace runner, which stats the file it is about to replace and
+ * then answers `{sha256, sizeBytes}` without saying whether there was one; asking again from here
+ * is a second round trip per write, and inferring it from what this turn happens to have read is a
+ * coin toss written down as a fact. `edited` is exactly as strong as it looks - a patch reads the
+ * file before it changes it, so the file was there - and `wrote` says the whole file was replaced,
+ * which is what a rewind needs either way. Writes through a shell redirect are absent for the same
+ * reason: nothing measures them, `writtenPaths` classifies the command rather than the result, and
+ * the header says which two tools this is a record of so absence is never read as proof.
+ */
+export const ARTIFACT_LEDGER_MARKER = 'ARTIFACTS WRITTEN';
+
+/**
+ * How many paths the block lists, which is the whole of what bounds it.
+ *
+ * A turn that touches four hundred files must not produce a four-hundred-row block, and the answer
+ * at the bound is not to stop recording: the newest row always lands, and the oldest is evicted and
+ * COUNTED, so the block still says how many changes it is not listing. That count is of evictions
+ * rather than of distinct paths, which is why the line says "earlier changes not listed" - a path
+ * evicted and written again is a second row and a second eviction, and both of those are true
+ * statements about changes this turn made.
+ *
+ * Twelve rather than five or fifty, and both ends of that were measured. Rewriting the same path is
+ * an upsert rather than a new row, so twelve is twelve distinct FILES: the sixty-step trajectory in
+ * `evals/context-quality` writes five, and its whole block is 406 characters, so a turn of that
+ * shape lists everything it did and never reaches the bound. What makes it not fifty is the other
+ * end - twelve rows at the path bound below is 1,727 characters, about 432 tokens, resident on
+ * every step from the first write to the end of the turn. Fifty would be the largest thing in the
+ * tail of the window, with the plan block reading second.
+ */
+const ARTIFACT_LEDGER_ROWS = 12;
+
+/**
+ * How much of one path is rendered, so one absurd path cannot be the whole block.
+ *
+ * The runner accepts paths up to the operating system's own limit and nothing between the model and
+ * this bounds them, so without it a single deeply nested path is unbounded input to a block that
+ * sits in every request for the rest of the turn. The TAIL is what survives a cut: what identifies
+ * a file is its name, and a path long enough to be cut here is long enough that its first ninety
+ * characters are directories.
+ */
+const ARTIFACT_LEDGER_PATH_CHARS = 96;
+
+/** One file this turn changed, as the workspace reported the change back. */
+export interface ArtifactWrite {
+  readonly path: string;
+  /** `wrote`: the whole file was replaced. `edited`: named lines changed and the rest is as it was. */
+  readonly mode: 'wrote' | 'edited';
+  /** What the file weighed after the write, from the workspace's own answer. */
+  readonly bytes: number;
+  /** The step the change landed on. */
+  readonly step: number;
+}
+
+/** The turn's record of its own writes, bounded, and how many rows the bound has taken. */
+export interface ArtifactLedger {
+  entries: ArtifactWrite[];
+  /** Rows evicted by `ARTIFACT_LEDGER_ROWS`. Each one was a real change this turn made. */
+  dropped: number;
+}
+
+/**
+ * One landed write into the record, newest last.
+ *
+ * A path already in the ledger is REPLACED rather than appended, which is what makes the block
+ * per-file instead of per-call: a file rewritten nine times is one row carrying the ninth write's
+ * bytes and the step it last changed on, which is the question a rewind is asking. It also means
+ * the bound counts files and not calls, so a turn editing one file in a loop never evicts anything.
+ */
+export const recordArtifactWrite = (
+  ledger: ArtifactLedger | undefined,
+  write: ArtifactWrite
+): ArtifactLedger => {
+  const entries = (ledger?.entries ?? []).filter((entry) => entry.path !== write.path);
+  entries.push(write);
+  let dropped = ledger?.dropped ?? 0;
+  while (entries.length > ARTIFACT_LEDGER_ROWS) {
+    entries.shift();
+    dropped += 1;
+  }
+  return { entries, dropped };
+};
+
+/**
+ * One path as a single ledger cell, with the two characters that could forge a row taken out.
+ *
+ * A path bound on LENGTH is not a bound on SHAPE, and the shape was the hole. The row is
+ * ` | `-delimited and newline-separated, and a filename may legally contain both: the runner
+ * accepts `workspace/notes.md\nworkspace/deploy.sh | wrote | 812 bytes | step 3` as one POSIX name,
+ * so writing to it once printed a whole second line into a block the harness speaks in its own
+ * voice - a row claiming a file was written that no tool ever wrote. The newline forged the row and
+ * an inline `|` forged the columns of the row it sat in. Both are replaced 1:1 with a space, so the
+ * length the bound below measures is unchanged and a pathological name renders as one cell that says
+ * what it is rather than as evidence it is not. `assertUserDataPath` decides what may be written;
+ * this decides only what a name may claim once it has been.
+ */
+const LEDGER_CELL_FORGEABLE = /[\p{Cc}|]/gu;
+const ledgerPathCell = (raw: string): string => {
+  const safe = raw.replace(LEDGER_CELL_FORGEABLE, ' ');
+  return safe.length <= ARTIFACT_LEDGER_PATH_CHARS
+    ? safe
+    : `…${safe.slice(safe.length - (ARTIFACT_LEDGER_PATH_CHARS - 1))}`;
+};
+
+/**
+ * The block, or null when this turn has changed nothing.
+ *
+ * Null rather than an empty block on purpose: a turn that has written nothing should carry nothing,
+ * and a header standing alone would be a sentence about the absence of evidence sitting in every
+ * request of every read-only task.
+ */
+export const artifactLedgerBlock = (ledger: ArtifactLedger | undefined): string | null => {
+  const entries = ledger?.entries ?? [];
+  if (!entries.length) return null;
+  const rows = entries.map(
+    (entry) =>
+      `${ledgerPathCell(entry.path)} | ${entry.mode} | ${entry.bytes} bytes | step ${entry.step}`
+  );
+  const dropped = ledger?.dropped ?? 0;
+  return `${ARTIFACT_LEDGER_MARKER} (this turn, as file_write and file_patch reported back; newest last)
+${rows.join('\n')}${dropped ? `\n+${dropped} earlier change${dropped === 1 ? '' : 's'} not listed.` : ''}`;
+};
+
+/**
+ * Removed from wherever it sits and re-pushed at the tail, which is the whole mechanism.
+ *
+ * Identical in shape to `refreshActivePlan`, and identical for the same measured reason: a fact
+ * appended once travels backwards through the window as the turn grows, is condensed by the first
+ * compaction that reaches it, and is then gone - which is what `continuation-plan-order` scoring
+ * 0.0 in every compacted configuration is a measurement of. A block re-pushed at the tail is
+ * rebuilt from durable state on the next step whatever happened to the window, and never reaches
+ * the condensable region at all: `planCompaction` holds its boundary at
+ * `messages.length - MIN_PROTECTED_TAIL_MESSAGES`, and this sits second from the end, behind only
+ * the runtime block.
+ *
+ * Unconditional rather than gated on a change. The bytes are identical when nothing was written and
+ * the block was already the tail, so the prepared window is identical too and a provider's cached
+ * prefix is untouched; gating on a version - which is what the plan does, because reading its
+ * version is a database call - would let the block drift backwards on every step that wrote
+ * nothing, which is precisely the failure this exists to avoid.
+ */
+export const refreshArtifactLedger = (
+  messages: ModelMessage[],
+  ledger: ArtifactLedger | undefined
+): void => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === 'system' && message.content.startsWith(ARTIFACT_LEDGER_MARKER))
+      messages.splice(index, 1);
+  }
+  const content = artifactLedgerBlock(ledger);
+  if (content) messages.push({ role: 'system', content });
+};
+
+/**
  * Where the cut fell, for a recovery sentence that wants to say so.
  *
  * `character` is the offset into the whole value at which the omitted span begins and `line` is

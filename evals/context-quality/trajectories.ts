@@ -273,6 +273,20 @@ export const activePlanBlock = (step: number): ModelMessage => {
 export const isPlanStep = (step: number): boolean => PLAN_STEPS.has(step);
 
 /**
+ * What the `file_write` at this step actually landed, or nothing.
+ *
+ * The same two numbers the step's tool result already carries - `{"ok":true,"path":…,"bytesWritten":…}`
+ * - which is the point rather than a convenience: in production the ledger row is built from the
+ * workspace's own answer to the write, so a rig that invented its own figures would be measuring a
+ * block athanor does not render. `measure.ts` folds these through `recordArtifactWrite` at the end
+ * of the step, so the row appears in the window one step later, exactly as `openStep` publishes it.
+ */
+export const writeAt = (step: number): { readonly path: string; readonly bytes: number } | null => {
+  const write = PLANTS.get(step)?.write;
+  return write ? { path: write.path, bytes: write.bytes } : null;
+};
+
+/**
  * The step the owner interrupts on, and the sentence the correction turns on.
  *
  * 13 rather than 12, and the one off-by-one is a measurement rather than a preference. A user
@@ -518,6 +532,34 @@ export const PROBES: readonly Probe[] = [
     evidence: ARTIFACT_PATHS,
     // Recovering the set means listing the workspace and diffing it, not re-running one call.
     reworkChars: 4_000
+  },
+  {
+    /**
+     * The same question asked of the mechanism athanor now maintains for it, and the pair to
+     * `artifact-files-touched` in exactly the way `continuation-plan-block` is the pair to
+     * `continuation-plan-order`.
+     *
+     * The evidence is one verbatim row of the ARTIFACTS WRITTEN block, and the row is the point: the
+     * path is in the window four other ways (the call's arguments, the result's head, the anchor
+     * index, the brief), but "2180 bytes, on step 8, and the whole file was replaced" is one fact in
+     * one place and it is the fact a rewind dialog is asking for. Nothing else in this trajectory
+     * states it, so this probe reads the block or it reads nothing.
+     *
+     * Expected 5.0 in every configuration and 0.0 in `starved`, which sets ARTIFACT_LEDGER_ROWS to
+     * zero - the block's own destructive end, and the arm that keeps the artifact column honest now
+     * that the ledger holds the paths through a compaction.
+     */
+    id: 'artifact-ledger-row',
+    kind: 'artifact',
+    plantedAtStep: 8,
+    askedAtStep: 45,
+    question:
+      'How large was workspace/infra/pooler.ini when this task last wrote it, and at which step?',
+    reference: '2,180 bytes, written whole at step 8.',
+    evidence: ['workspace/infra/pooler.ini | wrote | 2180 bytes | step 8'],
+    // A byte count and a step number are not re-obtainable by one call: the file has been written
+    // since, and no tool answers "how big was it when you wrote it".
+    reworkChars: 0
   }
 ];
 

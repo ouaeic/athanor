@@ -35,7 +35,7 @@ import {
 } from '../../packages/model-gateway/src/index.js';
 
 import { agentToolsFor } from '../../apps/worker/src/tools.js';
-import type { ContextBrief } from '../../apps/worker/src/context.js';
+import type { ArtifactLedger, ContextBrief } from '../../apps/worker/src/context.js';
 import { contextModuleFor, type ContextConfiguration } from './configurations.js';
 import {
   judgeCeiling,
@@ -50,6 +50,7 @@ import {
   isPlanStep,
   preambleFor,
   stepAt,
+  writeAt,
   type Trajectory
 } from './trajectories.js';
 
@@ -199,6 +200,12 @@ export const measure = async (
 
   const messages = preambleFor();
   let brief: ContextBrief | undefined;
+  /**
+   * The turn's own record of what it has written, folded through the shipped recorder rather than
+   * assembled here - so `ARTIFACT_LEDGER_ROWS`, substituted by a configuration like every other
+   * integer in `context.ts`, reaches this the same way the squeeze's bounds do.
+   */
+  let ledger: ArtifactLedger | undefined;
   let floor: number | undefined;
   let preparedTokens: number | undefined;
   let previous: { pieces: string[]; bytes: string } | null = null;
@@ -223,6 +230,10 @@ export const measure = async (
           messages.splice(index, 1);
       messages.push(activePlanBlock(step));
     }
+    // The files this turn has written, removed from wherever it sits and re-pushed, which is what
+    // `openStep` does immediately before the runtime block. Nothing is reimplemented here: this is
+    // the shipped function, so the block the rig measures is the block athanor renders.
+    context.refreshArtifactLedger(messages, ledger);
     // Last of the tail blocks and re-pushed every step, exactly as refreshRuntimeContext does -
     // and the reason the newest assistant message is never the last message in the window.
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -345,6 +356,16 @@ export const measure = async (
 
     const { assistant, result } = stepAt(step);
     messages.push(assistant, result);
+    // Recorded after the step's request was measured, because that is when the write lands: the row
+    // enters the window at the top of the NEXT step, which is where `openStep` publishes it.
+    const wrote = writeAt(step);
+    if (wrote)
+      ledger = context.recordArtifactWrite(ledger, {
+        path: wrote.path,
+        mode: 'wrote',
+        bytes: wrote.bytes,
+        step
+      });
   }
 
   const probes: ProbeOutcome[] = trajectory.probes.map((probe) => {

@@ -97,7 +97,8 @@ const FIELDS: ReadonlyArray<keyof AgentState> = [
   'knownOrigins',
   'knownAddresses',
   'reasoningFloor',
-  'compactedAtStep'
+  'compactedAtStep',
+  'artifactLedger'
 ];
 
 /**
@@ -221,13 +222,17 @@ const FULL: Required<AgentState> = {
   knownOrigins: ['example.com'],
   knownAddresses: ['https://example.com/page'],
   reasoningFloor: 'high',
-  compactedAtStep: 15
+  compactedAtStep: 15,
+  artifactLedger: {
+    entries: [{ path: 'workspace/src/importer.ts', mode: 'wrote', bytes: 4_812, step: 12 }],
+    dropped: 3
+  }
 };
 
 describe('what a turn is carrying', () => {
   it('names every field the type declares, so a new one has to be classified', () => {
     expect(Object.keys(FULL).sort()).toEqual([...FIELDS].sort());
-    expect(FIELDS).toHaveLength(58);
+    expect(FIELDS).toHaveLength(59);
   });
 
   /**
@@ -300,7 +305,8 @@ describe('what a new turn inherits', () => {
       'question',
       'continuationMark',
       'reasoningFloor',
-      'compactedAtStep'
+      'compactedAtStep',
+      'artifactLedger'
     ]);
     expect(reset).toEqual([
       // The trajectory gains the owner's new message; everything else here goes back to zero.

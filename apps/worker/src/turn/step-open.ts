@@ -24,6 +24,7 @@
  */
 import type { TaskRecord } from '@athanor/data';
 import type { AgentState } from '../agent-state.js';
+import { refreshArtifactLedger } from '../context.js';
 import { noteStepBudget, stepCeiling, turnWallClockReached, type HandoffDeps } from '../handoff.js';
 import { applyDormantRules, toolsRunThisTurn } from '../rules/index.js';
 import { closeTurnAtCeiling, type TurnCloseContext } from './close.js';
@@ -80,6 +81,21 @@ export const openStep = async (
    * firing rate is instrumented from the first commit.
    */
   applyDormantRules(state.messages, toolsRunThisTurn(state.turnToolResults));
+  /*
+   * What this turn has changed, re-rendered from the durable record rather than appended.
+   *
+   * Here, and not where the write happens, because the point of the block is that it is rebuilt:
+   * a fact appended once travels backwards through the window and the first compaction that
+   * reaches it condenses it away, which is the whole of why the plan the agent narrates in prose
+   * scores 0.0 in every compacted configuration of `evals/context-quality` and the plan carried
+   * by a re-rendered block scores 5.0. Second from the tail, in front of the runtime block, so it
+   * sits inside `MIN_PROTECTED_TAIL_MESSAGES` and no compaction ever reaches it either.
+   *
+   * Synchronous and unconditional, so it needs nothing from the worker and cannot fail: it reads
+   * `state.artifactLedger`, which `executeWorkspaceTool` has already bounded. @see
+   * refreshArtifactLedger in `context.ts`.
+   */
+  refreshArtifactLedger(state.messages, state.artifactLedger);
   // Last of the tail blocks, and re-pushed on every step rather than once per turn: a block
   // left where the next step's tool results bury it stops being free to change. At a step
   // boundary every tool call has been answered, so nothing here can split a call from its

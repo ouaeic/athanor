@@ -262,3 +262,260 @@ describe('what an overview stands for when it cannot show everything', () => {
     expect(spreadAcrossFiles([], 300)).toEqual([]);
   });
 });
+
+/**
+ * Whether the answer is a function of the workspace, which is what the harness already claims.
+ *
+ * `IDEMPOTENT_WITHIN_TURN` holds `code_search` and `repo_overview` and refuses to run either of
+ * them twice with the same arguments inside one turn, on the grounds that the second call is
+ * byte-identically uninformative. Measured against this repository before the flags below, over
+ * twenty consecutive runs of each command, on ripgrep 15.2.0 and again on 13.0.0:
+ *
+ *   git status --short --branch        20/20 agreed     1 distinct order
+ *   git ls-files                       20/20 agreed     1 distinct order
+ *   rg symbol sweep                     1/20 agreed    20 distinct orders
+ *   rg --files                          1/20 agreed    20 distinct orders
+ *   rg --files --glob AGENTS.md …       1/20 agreed    20 distinct orders
+ *   rg code_search 'clampNumber'        1/20 agreed     8 distinct orders (20 on 13.0.0)
+ *
+ * The tests below are not a second copy of those numbers. They pin the flags that produce them, in
+ * the only way a flag can be pinned: with a runner that behaves the way the real one does. A stub
+ * that hands back a fixed string proves the tool can parse a string - it cannot go red when the
+ * flag that settled the string is deleted, and that is the defect this file exists to close.
+ */
+
+/** The path a ripgrep line belongs to, as ripgrep's own per-file blocks are divided. */
+const pathOf = (one: string): string => /^(.*?):\d+:/.exec(one)?.[1] ?? one;
+
+/** A corpus held the way ripgrep holds it while it searches: one block of lines per file. */
+const perFileBlocks = (lines: readonly string[]): string[][] => {
+  const byFile = new Map<string, string[]>();
+  for (const one of lines) {
+    const held = byFile.get(pathOf(one));
+    if (held) held.push(one);
+    else byFile.set(pathOf(one), [one]);
+  }
+  return [...byFile.values()];
+};
+
+/**
+ * The runner's own output cap, reproduced from `boundedCollector` in the workspace runner.
+ *
+ * It keeps the leading 62% and the trailing 38% of a command's bytes and drops the middle, which is
+ * why a sort in the worker cannot repair a large search: the lines are gone before this process
+ * sees any of them. Reproduced rather than imported because the worker does not depend on the
+ * runner package, and a copy that drifts is caught by the byte figures in DETERMINISM.md.
+ */
+const cappedLikeTheRunner = (text: string, cap: number): string => {
+  const bytes = Buffer.from(text, 'utf8');
+  if (bytes.length <= cap) return text;
+  const head = bytes.subarray(0, Math.floor(cap * 0.62));
+  const tail = bytes.subarray(bytes.length - (cap - head.length));
+  const omitted = bytes.length - head.length - tail.length;
+  return `${head.toString('utf8')}\n[… ${omitted} bytes omitted from stdout; beginning and end preserved …]\n${tail.toString('utf8')}`;
+};
+
+/**
+ * A runner that emits the way ripgrep emits: per-file blocks, in path order when it was asked for
+ * one and in a different order on every call when it was not.
+ *
+ * The unsorted branch rotates the blocks by the call number rather than shuffling them randomly,
+ * so a red run names the same rows twice and this file has no seed to carry. It is the same
+ * property the machine shows - the first call and the second disagree - reached deterministically.
+ */
+const ripgrepLike = (corpus: readonly string[], cap = Number.POSITIVE_INFINITY) => {
+  const blocks = perFileBlocks(corpus);
+  let call = 0;
+  return (args: readonly string[]): string => {
+    call += 1;
+    const settled = args.join(' ').includes('--sort path');
+    /*
+     * Bytewise, which is what ripgrep does and what `localeCompare` does not: `rg --files --sort
+     * path` on this repository answers AGENTS.md, CONTRIBUTING.md, README.md, apps/…, because 'R'
+     * is 0x52 and 'a' is 0x61. A stub that ordered these the way a phone book would would have
+     * been asserting a sequence the real command never produces.
+     */
+    const emitted = settled
+      ? [...blocks].sort((left, right) => (pathOf(left[0] ?? '') < pathOf(right[0] ?? '') ? -1 : 1))
+      : blocks.length === 0
+        ? blocks
+        : [...blocks.slice(call % blocks.length), ...blocks.slice(0, call % blocks.length)];
+    return cappedLikeTheRunner(emitted.flat().join('\n'), cap);
+  };
+};
+
+/** The same call twice against the same workspace, which is what the answers have to agree about. */
+const twice = async (
+  name: string,
+  args: Record<string, unknown>,
+  emit: (executable: string, args: readonly string[]) => string
+): Promise<[unknown, unknown]> => {
+  const context = {
+    task: { workspaceId: 'ws-1', id: 'task-1' },
+    runner: {
+      call: async (
+        _workspaceId: string,
+        _taskId: string,
+        _scopes: unknown,
+        _url: string,
+        body: { executable: string; args: readonly string[] }
+      ) => {
+        const stdout = emit(body.executable, body.args);
+        return { exitCode: stdout ? 0 : 1, stdout, stderr: '', durationMs: 1, timedOut: false };
+      }
+    }
+  } as unknown as ToolContext;
+  const call = { id: 'call-1', name, arguments: args } as unknown as ModelToolCall;
+  return [await executeRepositoryTool(context, call), await executeRepositoryTool(context, call)];
+};
+
+describe('a repository read answering the same thing twice', () => {
+  const corpus = (files: number, each: number): string[] =>
+    Array.from({ length: files }, (_, file) =>
+      Array.from({ length: each }, (_, row) =>
+        line(`packages/p${String(file).padStart(3, '0')}/src/index.ts`, row + 1)
+      )
+    ).flat();
+
+  it('gives back the same lines when the result is small enough to survive as lines', async () => {
+    // 35 lines across 7 files: under the collapse threshold and past the one-file exemption, which
+    // is the branch that was named as still holding the property after the overview was fixed.
+    const emit = ripgrepLike(corpus(7, 5));
+    const [first, second] = await twice('code_search', { query: 'handler' }, (_, args) =>
+      emit(args)
+    );
+
+    expect((first as { matches: string[] }).matches).toHaveLength(35);
+    expect(first).toEqual(second);
+  });
+
+  it('gives back the same lines under a cap the model set below the match count', async () => {
+    // The slice that makes the order load-bearing inside this process. Ten of thirty-five lines
+    // kept: which ten was decided by whichever of ripgrep's threads finished first.
+    const emit = ripgrepLike(corpus(7, 5));
+    const [first, second] = await twice(
+      'code_search',
+      { query: 'handler', maxResults: 10 },
+      (_, args) => emit(args)
+    );
+
+    expect((first as { matches: string[] }).matches).toHaveLength(10);
+    expect((first as { matches: string[] }).matches.map(pathOf)).toEqual([
+      'packages/p000/src/index.ts',
+      'packages/p000/src/index.ts',
+      'packages/p000/src/index.ts',
+      'packages/p000/src/index.ts',
+      'packages/p000/src/index.ts',
+      'packages/p001/src/index.ts',
+      'packages/p001/src/index.ts',
+      'packages/p001/src/index.ts',
+      'packages/p001/src/index.ts',
+      'packages/p001/src/index.ts'
+    ]);
+    expect(first).toEqual(second);
+  });
+
+  it('counts the same matches when the runner threw the middle of them away', async () => {
+    /*
+     * The case a sort in this process could not have fixed, and the reason the flag is on the
+     * command rather than on the array it returns. A `code_search` for `const` against this
+     * repository emits 2.6 MB and the runner's default cap is 1 MiB; simulating that cap over
+     * twelve unsorted runs gave twelve different surviving sets, 9,637 to 11,108 lines of 25,770,
+     * with 3,702 lines in the first run absent from the second. Here the cap is 8,192 - twice the
+     * runner's own schema minimum for `maxOutputBytes` - against about 28 KB of matches, which is
+     * the ratio that leaves more than `CODE_SEARCH_COLLAPSE_LINES` alive so the collapsed shape is
+     * the one being compared. At the schema minimum itself the survivors fall under the threshold
+     * and the tool answers in lines, which is the case the two tests above already hold.
+     */
+    const lines = corpus(30, 8);
+    expect(Buffer.byteLength(lines.join('\n'))).toBeGreaterThan(8_192 * 3);
+    const emit = ripgrepLike(lines, 8_192);
+    const [first, second] = await twice('code_search', { query: 'handler' }, (_, args) =>
+      emit(args)
+    );
+
+    expect((first as { summarised: boolean }).summarised).toBe(true);
+    expect((first as { totalMatches: number }).totalMatches).toBeLessThan(lines.length);
+    expect(first).toEqual(second);
+  });
+
+  it('still answers the searches it is for, rather than buying agreement with a refusal', async () => {
+    // The other direction. A bound that is only ever checked by breaking it can be a bound that
+    // refuses everything, so: the narrow search returns its lines, the wide one collapses with
+    // every file counted, and the one past the ceiling is still the refusal it was.
+    const narrow = ripgrepLike(corpus(1, 4));
+    const [lines] = await twice('code_search', { query: 'handler' }, (_, args) => narrow(args));
+    expect((lines as { matches: string[] }).matches).toHaveLength(4);
+
+    const wide = ripgrepLike(corpus(30, 6));
+    const [collapsed] = await twice('code_search', { query: 'handler' }, (_, args) => wide(args));
+    expect(collapsed).toMatchObject({ summarised: true, totalFiles: 30, totalMatches: 180 });
+
+    const broad = ripgrepLike(corpus(101, 1));
+    await expect(
+      twice('code_search', { query: 'handler' }, (_, args) => broad(args))
+    ).rejects.toMatchObject({ code: 'code_search_too_broad' });
+  });
+
+  it('stands for the same files in an overview of a tree that has no working copy', async () => {
+    /*
+     * The untracked branch. `git ls-files` returns nothing for a downloaded folder or a checkout
+     * whose `.git` the agent has not made yet, and the `rg --files` that answers instead was being
+     * cut to `maxFiles` in walk order - 400 of 1,071 paths on this repository, agreeing with the
+     * previous run 1 time in 20.
+     */
+    const files = Array.from(
+      { length: 900 },
+      (_, index) => `pkg${String(index).padStart(3, '0')}.ts`
+    );
+    const emit = ripgrepLike(files.map((path) => `${path}:1:export const one = 1`));
+    const [first, second] = await twice('repo_overview', { maxFiles: 100 }, (executable, args) => {
+      if (executable === 'git') return args[0] === 'status' ? '## main' : '';
+      if (args.includes('--files')) return emit(args).split('\n').map(pathOf).join('\n');
+      return emit(args);
+    });
+
+    expect((first as { fileCount: number }).fileCount).toBe(900);
+    expect((first as { files: string[] }).files).toHaveLength(100);
+    expect((first as { filesTruncated: boolean }).filesTruncated).toBe(true);
+    expect(first).toEqual(second);
+  });
+
+  it('names the same instruction files, which nothing cuts and which still moved every run', async () => {
+    // Nothing truncates this list, so no file is lost to the order - but `repo_overview` is
+    // cache-resident for the rest of the turn, and twelve paths that arrive in a different order
+    // each time move that block on every read of a result the harness calls a pure function.
+    const instructions = ['README.md', 'apps/web/README.md', 'AGENTS.md', 'docs/CONTRIBUTING.md'];
+    const emit = ripgrepLike(instructions.map((path) => `${path}:1:x`));
+    const [first, second] = await twice('repo_overview', {}, (executable, args) => {
+      if (executable === 'git') return args[0] === 'status' ? '## main' : 'a.ts';
+      if (args.includes('--files')) return emit(args).split('\n').map(pathOf).join('\n');
+      return 'a.ts:1:export const one = 1';
+    });
+
+    expect((first as { instructionFiles: string[] }).instructionFiles).toEqual([
+      'AGENTS.md',
+      'README.md',
+      'apps/web/README.md',
+      'docs/CONTRIBUTING.md'
+    ]);
+    expect(first).toEqual(second);
+  });
+
+  it('stands for the same symbols in an overview larger than the budget', async () => {
+    // The overview race that was fixed an hour before this file was written, pinned here by the
+    // answer rather than by the spelling of the flag: 300 symbols kept out of 4,000.
+    const emit = ripgrepLike(corpus(500, 8));
+    const [first, second] = await twice('repo_overview', {}, (executable, args) => {
+      if (executable === 'git') return args[0] === 'status' ? '## main' : 'a.ts';
+      if (args.includes('--files')) return 'README.md';
+      return emit(args);
+    });
+
+    expect((first as { importantSymbols: string[] }).importantSymbols).toHaveLength(
+      OVERVIEW_SYMBOL_BUDGET
+    );
+    expect((first as { filesRepresented: number }).filesRepresented).toBe(OVERVIEW_SYMBOL_BUDGET);
+    expect(first).toEqual(second);
+  });
+});

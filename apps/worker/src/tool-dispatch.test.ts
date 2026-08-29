@@ -1179,6 +1179,11 @@ describe('the repository arms', () => {
             '--line-number',
             '--column',
             '--no-heading',
+            // The runner caps a command's output at 1 MiB and keeps the ends, and this arm slices
+            // to `maxResults` on top of that, so without a settled order both cuts fall wherever
+            // ripgrep's threads happened to finish. `repository.test.ts` pins the consequence.
+            '--sort',
+            'path',
             '--color',
             'never',
             '--smart-case',
@@ -1213,6 +1218,8 @@ describe('the repository arms', () => {
       '--line-number',
       '--column',
       '--no-heading',
+      '--sort',
+      'path',
       '--color',
       'never',
       '--smart-case',

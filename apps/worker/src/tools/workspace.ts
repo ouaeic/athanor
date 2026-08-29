@@ -11,7 +11,7 @@ import {
   renderNumbered,
   toLines
 } from '../edit/index.js';
-import { RECENT_TOOL_OUTPUT_CHARS } from '../context.js';
+import { RECENT_TOOL_OUTPUT_CHARS, recordArtifactWrite } from '../context.js';
 import { HELPER_PACKAGE_MANAGERS, PACKAGE_VERBS } from '../turn-bounds.js';
 import { textValue } from '../values.js';
 import { type ToolContext } from '../tool-dispatch.js';
@@ -32,6 +32,24 @@ import { finiteNumber } from './numbers.js';
  */
 const ECHO_ROWS_PER_REGION = 2;
 const ECHO_MAX_ROWS = 24;
+
+/**
+ * What the file weighs now, taken from the workspace's own answer to the write.
+ *
+ * `writeWorkspaceFile` returns `{sha256, sizeBytes}` and `sizeBytes` is the length of the buffer it
+ * actually wrote, which is the only number here that is a measurement rather than an intention.
+ * `AgentRunnerClient.writeFile` types that answer as `unknown` because it is JSON from a separate
+ * service across a version boundary - the worker and the runner are deployed separately, and
+ * `athanor update` can leave one ahead of the other - so the field is read defensively and the
+ * bytes this call handed over stand in when it is absent. Both are true; only one is measured, and
+ * the measured one is preferred wherever it is there.
+ */
+const landedBytes = (response: unknown, content: string): number => {
+  const reported = finiteNumber(
+    (response as { sizeBytes?: unknown } | null | undefined)?.sizeBytes
+  );
+  return reported !== null && reported >= 0 ? reported : Buffer.byteLength(content, 'utf8');
+};
 
 /**
  * How much of a file one `file_read` puts in front of the model, on either arm.
@@ -542,6 +560,15 @@ export async function executeWorkspaceTool(
           after.length - toLines(before).length
         );
         recordWrite(task.id, path, result.text, result.changed);
+        // The ledger row, written where the write landed rather than where it was asked for: a
+        // patch that was refused above has already `continue`d into `failures` and never reaches
+        // here, so a path in the block is a path the workspace confirmed. @see ARTIFACT_LEDGER_MARKER.
+        state.artifactLedger = recordArtifactWrite(state.artifactLedger, {
+          path,
+          mode: 'edited',
+          bytes: landedBytes(written, result.text),
+          step: state.step
+        });
         applied.push({
           path,
           sha256: sha256(result.text),
@@ -661,6 +688,16 @@ export async function executeWorkspaceTool(
       // saying so replaces a record whose line numbers describe a version that is now gone.
       state.partialReads = withPartialRead(state.partialReads, writePath, undefined);
       recordWrite(task.id, writePath, textValue(call.arguments.content));
+      // Behind the await, so a write the runner refused - a stale hash, an edit over lines nobody
+      // has been shown, a file past the size limit - has thrown out of this arm with nothing
+      // recorded. @see ARTIFACT_LEDGER_MARKER in context.ts for why that ordering is the whole
+      // value of the block.
+      state.artifactLedger = recordArtifactWrite(state.artifactLedger, {
+        path: writePath,
+        mode: 'wrote',
+        bytes: landedBytes(result, textValue(call.arguments.content)),
+        step: state.step
+      });
       const usage = await context.runner.call<{ storageBytes: number }>(
         task.workspaceId,
         task.id,

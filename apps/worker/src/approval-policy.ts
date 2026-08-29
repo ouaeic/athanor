@@ -322,7 +322,7 @@ const taintedRequirement = (
     return {
       sideEffect: 'workspace_write',
       action: `Review a change to ${durable[0]}`,
-      preview: `${durable.join(', ')} is loaded ahead of every later task on this computer, so writing it while untrusted content is in the turn (${taintSources.slice(0, 3).join(', ')}) is shown to you first.`
+      preview: `${namedObjects(durable)} is loaded ahead of every later task on this computer, so writing it while untrusted content is in the turn (${taintSources.slice(0, 3).join(', ')}) is shown to you first.`
     };
   if (name === 'publish_preview')
     return {
@@ -457,6 +457,21 @@ const SURFACE_HEADLINES: Record<string, string> = {
   upload: 'Send workspace files to a website'
 };
 
+/**
+ * The verb, when it is shaped like one.
+ *
+ * `surfaceActionVerb` returns whatever the model put in `action`, and the paragraph above is about
+ * exactly this: a card assembled out of model-written text can be headed by whatever an injected
+ * instruction wrote. The verb is still worth showing - a `type` and a `click` are the same card
+ * without it - so it is shown through a shape that cannot carry a sentence. Twenty-four characters
+ * and one word: every verb the two surface enums declare fits, `select_option` being the longest at
+ * thirteen, and nothing with a space, a quotation mark or a newline gets through.
+ */
+const surfaceVerbName = (args: Record<string, unknown>): string => {
+  const verb = surfaceActionVerb(args);
+  return /^[a-z_]{1,24}$/.test(verb) ? verb : '';
+};
+
 const surfaceHeadline = (name: string, verb: string): string =>
   `${SURFACE_HEADLINES[verb] ?? 'Interact with the visible computer'} (${
     name === 'browser_action' ? 'browser' : 'desktop'
@@ -478,6 +493,66 @@ const statedReason = (purpose: unknown): string => {
 
 /** One headline for every way a call can leave code behind for a later process to run. */
 const DEFERRED_EXECUTION_ACTION = 'Change a file this computer runs on its own';
+
+/**
+ * How many of the things a call touches a card names before it stops listing them.
+ *
+ * Six, which is what the deferred-execution card below already showed, because two conventions for
+ * one job is how a card surface stops being readable. It is a bound on the LIST and not on the
+ * FACT: `namedObjects` counts what it did not show in the same sentence, which is the half that was
+ * missing. A card that names six of forty paths and says nothing about the other thirty-four is
+ * worse than one that names none, because the owner approves believing they have seen the reach.
+ *
+ * Measured against the shape that has to fit: `file_patch` takes up to forty patches in one call
+ * (tool-catalogue.ts, `maxItems: 40`), and forty patches are rarely forty files - hunks cluster.
+ * Distinct paths are what is counted for that reason: eleven edits to one file are one file to the
+ * person approving them.
+ */
+const CARD_NAMED_OBJECTS = 6;
+
+const namedObjects = (values: readonly string[]): string => {
+  const distinct = [...new Set(values.filter(Boolean))];
+  const hidden = distinct.length - CARD_NAMED_OBJECTS;
+  const shown = distinct.slice(0, CARD_NAMED_OBJECTS).join(', ');
+  return hidden > 0 ? `${shown} and ${hidden} more` : shown;
+};
+
+/**
+ * How much of a command a card prints.
+ *
+ * The card is answered on a phone, and `shell` takes an arbitrarily long inline script: a two
+ * hundred line `python3 -c` is a preview nobody reads to the end of, which is the same defect as an
+ * unnamed path wearing the opposite shape. Four hundred characters is about six lines on a phone
+ * and covers every real invocation in this repository's own tests; what is cut is counted rather
+ * than trailed off, for the reason `namedObjects` gives.
+ */
+const CARD_COMMAND_CHARS = 400;
+
+/**
+ * What the owner would see run, wherever the model wrote it down.
+ *
+ * `[executable, ...args]` alone printed "Run bash" for the whole `stdin` form - a card describing a
+ * command it did not show, which is the one thing a card must not do. That was fixed inside the
+ * destructive-command branch and nowhere else, so Review mode, which is the mode whose entire
+ * promise is that the owner sees each command before it runs, went on printing "Run bash" for every
+ * script handed over on stdin. One reader, so the two cannot say different things about one call.
+ */
+const shellInvocation = (args: Record<string, unknown>): string => {
+  const invocation = [
+    [
+      textValue(args.executable).split('/').pop() ?? '',
+      ...(Array.isArray(args.args) ? args.args.map(String) : [])
+    ]
+      .filter(Boolean)
+      .join(' '),
+    ...(textValue(args.stdin) ? [textValue(args.stdin)] : [])
+  ]
+    .filter(Boolean)
+    .join(' << ');
+  return invocation.length > CARD_COMMAND_CHARS
+    ? `${invocation.slice(0, CARD_COMMAND_CHARS)}… and ${invocation.length - CARD_COMMAND_CHARS} more characters`
+    : invocation;
+};
 
 const ordinaryRequirement = (
   name: string,
@@ -520,7 +595,7 @@ const ordinaryRequirement = (
     return {
       sideEffect: 'external_consequential',
       action: DEFERRED_EXECUTION_ACTION,
-      preview: `${deferred.slice(0, 6).join(', ')} is executed by a later process - the login shell, git itself, or one of the coding CLIs, all of which run under the agent's own HOME - so whatever it says runs after this task, outside any approval this task could raise.`
+      preview: `${namedObjects(deferred)} is executed by a later process - the login shell, git itself, or one of the coding CLIs, all of which run under the agent's own HOME - so whatever it says runs after this task, outside any approval this task could raise.`
     };
   if (name === 'schedule' && textValue(args.action) !== 'list')
     return {
@@ -759,17 +834,7 @@ const ordinaryRequirement = (
   const commandRequirement = (): ApprovalRequirement | null => {
     const executable = textValue(args.executable).split('/').pop() ?? '';
     const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
-    /*
-     * What the owner would see run, wherever the model wrote it down. `[executable, ...args]` alone
-     * printed "Run bash" for the whole `stdin` form - a card describing a command it did not show,
-     * which is the one thing a card must not do.
-     */
-    const invocation = [
-      [executable, ...commandArgs].join(' '),
-      ...(textValue(args.stdin) ? [textValue(args.stdin)] : [])
-    ]
-      .filter(Boolean)
-      .join(' << ');
+    const invocation = shellInvocation(args);
     const commands = effectiveCommands(args);
     const destructive =
       destructiveCommand(executable, commandArgs) ??
@@ -927,7 +992,10 @@ const ordinaryRequirement = (
           return;
         strongest = {
           ...requirement,
-          preview: `Step ${index + 1} of ${steps.length} in this batch (${type}):\n${requirement.preview}`
+          // The step's verb through the same shape gate as the review card's, so one line of the
+          // preview cannot be a sentence a page wrote: `type` here is `bag.action`, and a batch
+          // step's bag is as model-written as the call around it.
+          preview: `Step ${index + 1} of ${steps.length} in this batch (${surfaceVerbName(bag) || 'unnamed'}):\n${requirement.preview}`
         };
       });
       if (strongest) return strongest;
@@ -1023,22 +1091,37 @@ const ordinaryRequirement = (
       return {
         sideEffect: 'workspace_write',
         action: 'Run a command on this computer',
-        preview: `Run ${[
-          textValue(args.executable, 'command'),
-          ...(Array.isArray(args.args) ? args.args.map(String) : [])
-        ].join(' ')}`
+        // Through the same reader as every other card that prints a command, so the script handed
+        // over on stdin is shown here too. It read `[executable, ...args]`, which is "Run bash" for
+        // the one shape where the command is entirely in `stdin` - a card, in the mode that exists
+        // to show commands, describing a command it did not show.
+        preview: `Run ${shellInvocation(args) || 'command'}`
       };
-    if (name === 'file_write' || name === 'file_patch' || name === 'print_pdf')
+    /*
+     * The paths, because the paths are already in the call.
+     *
+     * This card read "Apply 3 conflict-checked file patch(es)" and named none of them, so Review
+     * mode - the mode whose whole promise is that the owner sees a change before it lands - asked
+     * for approval of an edit without saying what it edits. `file_patch` keeps `path` as a
+     * top-level field of every patch rather than as a header inside the edit body PRECISELY so that
+     * this card can read it (tool-catalogue.ts says so in as many words), and the card did not read
+     * it. Nothing new was needed: `writtenPaths` is the same reader the deferred-execution rule
+     * above and the durable-instruction rule use, so the three cannot disagree about which files a
+     * call writes.
+     */
+    if (name === 'file_write' || name === 'file_patch' || name === 'print_pdf') {
+      const patched = namedObjects(writtenPaths(name, args));
       return {
         sideEffect: 'workspace_write',
         action: 'Change a workspace file',
         preview:
           name === 'file_patch'
-            ? `Apply ${Array.isArray(args.patches) ? args.patches.length : 0} conflict-checked file patch(es)`
+            ? `Apply ${Array.isArray(args.patches) ? args.patches.length : 0} conflict-checked file patch(es) to ${patched || 'a workspace file'}`
             : name === 'print_pdf'
               ? `Print the current page to ${textValue(args.path, 'a workspace PDF')}`
               : `Create or replace ${textValue(args.path, 'a workspace file')}`
       };
+    }
     if (name === 'publish_artifact' || name === 'publish_preview' || name === 'desktop_launch')
       return {
         sideEffect: 'workspace_write',
@@ -1054,6 +1137,7 @@ const ordinaryRequirement = (
             : `Use ${textValue(args.path, textValue(args.label, 'workspace output'))}`
       };
     if (name === 'browser_action' || name === 'desktop_action') {
+      const verb = surfaceVerbName(args);
       if (
         !['focus', 'hover', 'scroll', 'reload', 'back', 'go_back', 'navigate'].includes(
           surfaceActionVerb(args)
@@ -1062,7 +1146,12 @@ const ordinaryRequirement = (
         return {
           sideEffect: 'workspace_write',
           action: `Review ${name === 'browser_action' ? 'a browser' : 'a desktop'} action`,
-          preview: `Review mode asks before each form or application change.\n${statedReason(args.purpose)}`
+          // The verb, which is the one thing the owner needs and the card did not say: a `type`
+          // and a `click` arrived under the same sentence with nothing to tell them apart. It goes
+          // in the preview and not in the headline, and the selector, the node id and the typed
+          // text stay out of both - the closed vocabulary above says why, and a batch already
+          // names its step's verb here for the same reason.
+          preview: `Review mode asks before each form or application change, and this one is ${verb || 'unnamed'}.\n${statedReason(args.purpose)}`
         };
     }
   }
