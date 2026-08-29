@@ -692,6 +692,61 @@ const OWNER_CUT_LABEL = 'this earlier message from the owner';
 const OWNER_CUT_MARKER = `characters omitted from ${OWNER_CUT_LABEL}`;
 
 /**
+ * What is left behind when a superseded owner message leaves the window entirely rather than being
+ * cut, and how a later pass reads back what earlier ones already gave up.
+ *
+ * One line for the whole class, not one per message, because the thing it replaces is unbounded in
+ * count: the reason the drop exists at all is that a per-message residue is what made the class
+ * cost `n x OWNER_MINIMUM_CHARS`. @see `boundOwnerWindow` for that arithmetic.
+ *
+ * It says the same two things every other bound in this file says - how much is gone, and the one
+ * recovery that is real - and it says them cumulatively, so the number the model reads is what is
+ * missing from the window rather than what the last pass happened to remove.
+ *
+ * A `system` message, and it lives in the preamble ahead of the goal. Both halves of that are
+ * load-bearing. `system` because the harness may not write in the owner's voice: `planCompaction`
+ * condenses on the rule that a `user` message here is text the owner typed, and a marker in that
+ * role would make the rule false in the one file that depends on it. In the preamble because
+ * `condensableStart` fixes everything ahead of the goal, so the record cannot itself be condensed
+ * away by the compaction it is describing - which is the failure a `system` message anywhere below
+ * that line would have, and it would be a silent one.
+ */
+const OWNER_DROP_PREFIX = '[… ';
+const OWNER_DROP_INFIX = ' earlier messages from the owner, ';
+const OWNER_DROP_SUFFIX = ` characters, dropped from this window; ${OWNER_RESTATE_RECOVERY} …]`;
+const ownerDropMarker = (messages: number, characters: number): string =>
+  `${OWNER_DROP_PREFIX}${messages}${OWNER_DROP_INFIX}${characters}${OWNER_DROP_SUFFIX}`;
+/**
+ * The counts in a marker this file wrote, or null for anything else.
+ *
+ * Recognised by RE-RENDERING and comparing byte for byte, rather than by matching a pattern
+ * loosely. Two digit runs is the whole of the parse and the equality is the whole of the check, so
+ * nothing that is not exactly a marker this function could have produced can be read as one. That
+ * matters because the numbers are carried forward and added to: a partial match would let a string
+ * that merely resembles the marker set the total. The role and the position rule the hazard out
+ * anyway - no owner text reaches a `system` message in the preamble - and this makes it structural
+ * rather than a thing to remember.
+ */
+const ownerDropRecord = (content: string): { messages: number; characters: number } | null => {
+  const digits = content.match(/\d+/g);
+  if (digits?.length !== 2) return null;
+  const record = { messages: Number(digits[0]), characters: Number(digits[1]) };
+  return ownerDropMarker(record.messages, record.characters) === content ? record : null;
+};
+/**
+ * What the record above can ever cost the head, rendered rather than estimated.
+ *
+ * `compactionHeadTokens` reserves this whether or not a record is present, so the budget the owner
+ * class is held to does not move when one appears or when its digits grow. @see compactionHeadTokens
+ * for what that shift used to cost. Both counts are bounded by the window they describe, so
+ * `MAX_SAFE_INTEGER` is an upper bound with room to spare and this is 47 tokens.
+ */
+const OWNER_DROP_RECORD_CHARS = ownerDropMarker(
+  Number.MAX_SAFE_INTEGER,
+  Number.MAX_SAFE_INTEGER
+).length;
+
+/**
  * What an over-long result that has already been cut once is told the second time.
  *
  * Re-running the tool is the honest recovery for almost every result, and it is what this said
@@ -862,13 +917,15 @@ export const OWNER_WINDOW_FLOOR_CHARS = 8_000;
  * On real work it is a line most of the class never reaches: the median owner message on the
  * owner's own recorded sessions is 172 characters, and most of them are already below it.
  *
- * It is also the one place the class bound stops being a single number, and that is stated in
- * `boundOwnerWindow` rather than hidden. Past `maximumChars / OWNER_MINIMUM_CHARS` candidates an
- * equal share of the budget is smaller than this floor, and from there the class costs 240
- * characters per message however large it grows - because this bound truncates and never deletes,
- * and a message cut below the marker's own length costs tokens instead of saving them. On a
- * 131,072-token window with a production head that line is around three hundred accumulated owner
- * messages; the most the owner has typed into any one recorded session is 110.
+ * It is also the line past which cutting stops being the answer, and `boundOwnerWindow` gives the
+ * message up rather than the rest of its text there. Past `maximumChars / OWNER_MINIMUM_CHARS`
+ * candidates an equal share of the budget is smaller than this floor - measured at the production
+ * call site on a 131,072-token model with the base preamble as its head, 73,576 / 240 = 306
+ * candidates, and nearer 208 behind a full production preamble. Holding every message past that
+ * line at 240 characters is what made the class cost `n x 240` and cost compaction its candidates;
+ * `ownerWindowAdmits` is where the count is now decided and `ownerDropMarker` is what says so. The
+ * most the owner has typed into any one recorded session is 110 messages, so on real work neither
+ * this floor nor the drop behind it is reached at all.
  */
 export const OWNER_MINIMUM_CHARS = 240;
 /**
@@ -1856,22 +1913,45 @@ export const ownerEvictionOrder = (messages: readonly ModelMessage[]): number[] 
  *
  * THE BOUND, and it is proved in `context.test.ts` from both directions:
  *
- *     resident candidate text <= max(maximumChars, candidates * OWNER_MINIMUM_CHARS)
+ *     resident candidate text <= maximumChars
  *
- * The first term is the ordinary one and it is exact - `ownerWindowCap` is chosen so the sum of
- * what is kept is at most the budget. The second is what the class costs when there are so many
- * messages that an equal share of the budget is below the length of the marker itself, and it is
- * named rather than hidden because that is the case where a cut stops paying for itself.
+ * One term, exact, and constant in the number of messages. It used to have a second -
+ * `candidates * OWNER_MINIMUM_CHARS` - and that term is why this paragraph is being rewritten,
+ * because a bound that is linear in message count is not a bound. Cutting alone cannot deliver
+ * the single term: below `OWNER_MINIMUM_CHARS` a cut costs more than it saves, so past
+ * `maximumChars / OWNER_MINIMUM_CHARS` candidates every one of them sits at the floor and the
+ * class grows without limit anyway. Measured at the production call site on a 131,072-token model
+ * with the base preamble as its head, that line is 306 candidates and the budget is 73,576
+ * characters: at 541 accumulated owner messages the class alone is 32,400 tokens against a target
+ * tail of 32,491, which is the whole tail, and driven to 1,201 it is 72,000 tokens - 2.2 times the
+ * tail it is supposed to fit inside. Driven six thousand steps with a 14,000-character owner
+ * message every fifth, 3,953 of 5,937 compactions refused and the deterministic soft pass stood in
+ * on 5,715 of the 6,000 steps.
  *
- * Neither term covers the goal or the newest correction, which are not candidates.
+ * SO PAST THE FLOOR THE MESSAGE GOES, RATHER THAN THE REST OF ITS TEXT. The order is the one that
+ * already exists: `ownerEvictionOrder`, worst first, so candidates are admitted from its most
+ * valuable end while the floor still fits and everything ahead of that line leaves the window. The
+ * floor is not lowered to pay for this and could not be - `OWNER_MINIMUM_CHARS` documents the two
+ * lines below which the marker stops naming a recovery and then costs more than it saves - and the
+ * two the eviction order says are worth most are not candidates and are not reachable by any of it.
  *
- * NOT SPILLED TO DISK, though the machinery exists. `output-spill.ts` would make the omitted middle
- * retrievable for about 120 resident characters, and that is the right trade for tool output the
- * owner's own computer produced through a tool the owner invoked. It is the wrong trade here: what
- * the owner types is chat, the spill directory is inside the workspace every tool, every delegate
- * and every later `file_read` can reach, and a turn that runs `git add -A` would commit it. The
- * recovery `truncateMiddle` already names for this class - ask the owner - is one the agent can
- * perform and the owner has already consented to.
+ * WHAT IS DROPPED IS NOT DROPPED SILENTLY. `ownerDropMarker` states how many of the owner's
+ * messages are gone and how many characters, cumulatively across every pass, and names the same
+ * recovery a cut names. It is one line for the whole class rather than one per message, which is
+ * the arithmetic above: a residue per dropped message would reintroduce the term this change
+ * removes.
+ *
+ * The bound does not cover the goal or the newest correction, which are not candidates, and it
+ * does not cover that one marker line, which is a constant in the head and is counted there by
+ * `compactionHeadTokens` like everything else the head holds.
+ *
+ * NOTHING IS SPILLED TO DISK. Retrieval was built for this class and reverted at the gate: the
+ * only directory that is both unreadable by the agent's shell and readable by `file_read` is
+ * `.athanor/artifacts`, and `files_list`, `file_write` and the delete route reach it through the
+ * same `assertUserDataPath` that `file_read` does - so a file parked there is one the model can
+ * enumerate, read and REWRITE, and a rewritten recovery is the model's words served back as the
+ * owner's. @see docs/design/finish/GATE.md. `OWNER_RESTATE_RECOVERY` is what a cut names, and it
+ * is the recovery that is true.
  *
  * Returns the input array unchanged, by identity, when the class already fits. That is what keeps
  * this free on every ordinary task and keeps a provider's cached prefix intact: no copy, no new
@@ -1899,40 +1979,140 @@ export const ownerWindowCap = (lengths: readonly number[], maximumChars: number)
   return Number.MAX_SAFE_INTEGER;
 };
 
+/**
+ * Which candidates the budget can still hold once every one of them is as small as it can be made.
+ * Positions into the array handed in, which is `ownerEvictionOrder` minus its two ends; everything
+ * not in the returned set leaves the window.
+ *
+ * Taken from the most valuable end, which is where that order puts the newest of the middles, so
+ * what is given up is the oldest of them - the same direction every other pass over this class
+ * gives things up in.
+ *
+ * The cost of a candidate is what it would still occupy after the bound has done everything it can
+ * to it, and the caller computes it because only the caller knows which of the two that is: a
+ * message the bound may cut costs `min(length, OWNER_MINIMUM_CHARS)`, because that is the floor a
+ * cut can reach and most of the class is already under it - the median owner message on the
+ * owner's own recorded sessions is 172 characters, and charging those 240 would give up messages
+ * the budget was already paying for. A message the bound may NOT cut costs its whole length.
+ *
+ * SKIPS RATHER THAN STOPS. One incompressible message wider than the whole budget would otherwise
+ * take every older candidate with it, which is a cliff and not an order. Passing over it and going
+ * on admits the ones that do fit; the message that could not be made to fit is the one that goes.
+ *
+ * This is also exactly the condition under which `ownerWindowCap` does not have to clamp: once the
+ * incompressible admitted lengths are taken off the top, a cap of `OWNER_MINIMUM_CHARS` is
+ * admissible for what is left, so the water level it returns is at or above the floor and the sum
+ * of what it keeps is at most the budget. The two together are the whole of the single-term bound,
+ * and the clamp inside `ownerWindowCap` is unreachable from here rather than merely unlikely.
+ * `context.test.ts` asserts that, because it used to be the escape.
+ */
+export const ownerWindowAdmits = (costs: readonly number[], maximumChars: number): Set<number> => {
+  const admitted = new Set<number>();
+  let spent = 0;
+  for (let index = costs.length - 1; index >= 0; index -= 1) {
+    const cost = costs[index] ?? 0;
+    if (spent + cost > maximumChars) continue;
+    spent += cost;
+    admitted.add(index);
+  }
+  return admitted;
+};
+
 export const boundOwnerWindow = (
   messages: ModelMessage[],
   maximumChars: number
-): { messages: ModelMessage[]; cut: number; characters: number } => {
+): {
+  messages: ModelMessage[];
+  cut: number;
+  characters: number;
+  dropped: number;
+  droppedCharacters: number;
+} => {
   // The last two of the eviction order are the goal and the newest correction, in that order, and
   // they are the two it says are worth most. Taken from there rather than recomputed, so the
   // reservation and the last-resort pass can never disagree about which two those are.
   const candidates = ownerEvictionOrder(messages).slice(0, -2);
   const lengths = candidates.map((index) => messages[index]?.content.length ?? 0);
   if (lengths.reduce((total, length) => total + length, 0) <= maximumChars)
-    return { messages, cut: 0, characters: 0 };
+    return { messages, cut: 0, characters: 0, dropped: 0, droppedCharacters: 0 };
 
-  const cap = ownerWindowCap(lengths, maximumChars);
-  const capped = new Set(candidates);
+  const lengthOf = (index: number): number => messages[index]?.content.length ?? 0;
+  /*
+   * Cut once, and never in the same place twice, so an already-cut message is INCOMPRESSIBLE and
+   * is charged its whole length rather than the floor.
+   *
+   * `truncateMiddle` counts what IT removed, so a second cut of an already-cut message writes a
+   * number that is true of the string in front of it and false about what the owner wrote: driven
+   * through this function with a shrinking tail, a 120,000-character message came back saying
+   * 23,940 characters were omitted with 112,117 actually gone. `laterToolOutputRecovery` documents
+   * the same hazard for tool output, and a marker that understates the gap by five times is worse
+   * than no marker, because a model reads it and decides not to ask.
+   *
+   * That used to be left implicit, on the argument that such a message sits at the cap it was cut
+   * to and so would be cut to the same cap again. The head and the tail do not hold still - the
+   * brief reaches its ceiling, a resumed task carries a bigger preamble, and the drop marker below
+   * is itself 156 characters of head that appears the first time anything is dropped - and every
+   * one of those makes the budget smaller underneath a message that cannot answer. Measured: over
+   * 600 driven steps the budget moved 73,576 -> 73,424 -> 73,420, and holding those messages to
+   * the new cap by DROPPING them cost 117 messages of about 10,500 characters each to a budget
+   * change of 156. Charging the length instead is what stops that: an incompressible message is
+   * either admitted whole or given up by the order, and a 156-character shift now costs at most
+   * the one candidate the eviction order already ranks last.
+   */
+  const cuttable = (index: number): boolean => !messages[index]?.content.includes(OWNER_CUT_MARKER);
+  const admitted = ownerWindowAdmits(
+    candidates.map((index) =>
+      cuttable(index) ? Math.min(lengthOf(index), OWNER_MINIMUM_CHARS) : lengthOf(index)
+    ),
+    maximumChars
+  );
+  const kept = candidates.filter((_index, position) => admitted.has(position));
+  const givenUp = new Set(candidates.filter((_index, position) => !admitted.has(position)));
+  // What cannot be cut comes off the top; what is left is divided between the ones that can be, by
+  // the same water level as before. Admission is what makes that remainder enough for a cap at or
+  // above the floor, so `ownerWindowCap` never reaches its clamp from here.
+  const fixed = kept
+    .filter((index) => !cuttable(index))
+    .reduce((total, index) => total + lengthOf(index), 0);
+  const cap = ownerWindowCap(kept.filter(cuttable).map(lengthOf), maximumChars - fixed);
+
+  const dropped = givenUp.size;
+  const droppedCharacters = [...givenUp].reduce((total, index) => total + lengthOf(index), 0);
+  // Read back rather than replaced, so the number the model is shown is what is missing from the
+  // window and not what this pass alone removed. @see ownerDropMarker for where it is allowed to
+  // live and why nothing else can be mistaken for one.
+  const recorded = messages.findIndex(
+    (message) => message.role === 'system' && ownerDropRecord(message.content) !== null
+  );
+  const carried = (recorded < 0 ? null : ownerDropRecord(messages[recorded]?.content ?? '')) ?? {
+    messages: 0,
+    characters: 0
+  };
+  // Ahead of the goal, which is where `condensableStart` fixes it beyond the reach of the
+  // compaction it describes. All candidates sit behind the goal, so the totals are known here.
+  const goal = messages.findIndex((message) => message.role === 'user');
+
+  const capped = new Set(kept.filter(cuttable));
   let cut = 0;
   let characters = 0;
-  const bounded = messages.map((message, index) => {
-    if (!capped.has(index) || message.content.length <= cap) return message;
-    // Cut once, and never in the same place twice. `truncateMiddle` counts what IT removed, so a
-    // second cut of an already-cut message writes a number that is true of the string in front of
-    // it and false about what the owner wrote: driven through this function with a shrinking tail,
-    // a 120,000-character message came back saying 23,940 characters were omitted with 112,117
-    // actually gone. `laterToolOutputRecovery` documents the same hazard for tool output, and a
-    // marker that understates the gap by five times is worse than no marker, because a model reads
-    // it and decides not to ask. The class is still bounded - a message this bound has already cut
-    // sits at the cap it was cut to, which is the cap it would be cut to again on any window whose
-    // head and tail have not moved.
-    if (message.content.includes(OWNER_CUT_MARKER)) return message;
+  const bounded: ModelMessage[] = [];
+  for (const [index, message] of messages.entries()) {
+    if (index === recorded || givenUp.has(index)) continue;
+    if (index === goal && dropped + carried.messages > 0)
+      bounded.push({
+        role: 'system',
+        content: ownerDropMarker(dropped + carried.messages, droppedCharacters + carried.characters)
+      });
+    if (!capped.has(index) || message.content.length <= cap) {
+      bounded.push(message);
+      continue;
+    }
     const content = truncateMiddle(message.content, cap, OWNER_CUT_LABEL, OWNER_RESTATE_RECOVERY);
     cut += 1;
     characters += message.content.length - content.length;
-    return { ...message, content };
-  });
-  return { messages: bounded, cut, characters };
+    bounded.push({ ...message, content });
+  }
+  return { messages: bounded, cut, characters, dropped, droppedCharacters };
 };
 
 /**
@@ -1948,13 +2128,29 @@ export const boundOwnerWindow = (
  * reach `MAX_BRIEF_SECTIONS` sections of `MAX_BRIEF_SECTION_CHARS`. A bound that measured the
  * brief it can see would hand the owner room that the next brief then takes back, and the
  * inequality would fail one compaction later than it was checked.
+ *
+ * The drop record is counted the same way and for a sharper reason. It is the other part of the
+ * head that is not there until it is: `ownerDropMarker` appears the first time anything is given
+ * up and then grows a character at a time as its numbers do. Measured at its actual size it moves
+ * the budget underneath the class the budget is for - over 600 driven steps, 73,576 -> 73,424 ->
+ * 73,420 - and a message this bound has already cut sits at EXACTLY the cap it was cut to, so a
+ * budget that shifts by 156 characters is a message that no longer fits and cannot be cut again.
+ * That cost 117 messages of about 10,500 characters each before the reservation was made. Counted
+ * at its ceiling the budget does not move at all, and `OWNER_DROP_RECORD_CHARS` is a real ceiling
+ * rather than a guess: it is the marker rendered at the largest numbers either count can hold.
  */
 export const compactionHeadTokens = (messages: ModelMessage[]): number => {
   const start = condensableStart(messages);
   const brief = lastBriefIndex(messages);
+  const record = messages.findIndex(
+    (message) => message.role === 'system' && ownerDropRecord(message.content) !== null
+  );
   return (
-    estimatedTokens(messages.slice(0, start).filter((_message, index) => index !== brief)) +
-    Math.ceil((MAX_BRIEF_SECTIONS * MAX_BRIEF_SECTION_CHARS) / 4)
+    estimatedTokens(
+      messages.slice(0, start).filter((_message, index) => index !== brief && index !== record)
+    ) +
+    Math.ceil((MAX_BRIEF_SECTIONS * MAX_BRIEF_SECTION_CHARS) / 4) +
+    Math.ceil(OWNER_DROP_RECORD_CHARS / 4)
   );
 };
 

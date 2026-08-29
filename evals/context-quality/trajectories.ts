@@ -340,8 +340,22 @@ export const correctionAt = (step: number, trajectory?: Trajectory): ModelMessag
  * mid-task owner messages totalling 75,003 characters, which is 125 times the owner text of the
  * fixture over 136 times the steps - and that session is one where compaction still works, so the
  * fixture below deliberately carries more.
+ *
+ * WRITTEN AS A CADENCE RATHER THAN A LIST, because the count is now the variable that matters. The
+ * bound on this class holds every candidate at `OWNER_MINIMUM_CHARS` at worst, so past
+ * `budget / OWNER_MINIMUM_CHARS` candidates - around 141 on this trajectory's preamble, around 306
+ * on a bare one - an equal share of the budget is below the length of the marker itself and a cut
+ * stops paying for itself. Thirteen messages is a long way inside that line, so the fixture below
+ * could show what the bound COSTS and could not show what it is for. The cadence is `step >= 8 &&
+ * step % 4 === 0`, which over sixty steps is exactly the thirteen steps this used to list, so the
+ * shorter fixture is byte-identical to the one its baseline was accepted at.
  */
-const ACCUMULATED_CORRECTION_STEPS = new Set([8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56]);
+const accumulatedCorrectionStep = (step: number): boolean => step >= 8 && step % 4 === 0;
+/** The last step at which the owner types, which is the one message the bound may never touch. */
+const lastAccumulatedStep = (steps: number): number => {
+  for (let step = steps - 1; step >= 0; step -= 1) if (accumulatedCorrectionStep(step)) return step;
+  return -1;
+};
 const ACCUMULATED_CORRECTION_CHARS = 14_000;
 /** The opening of the FIRST accumulated correction: a cut keeps the head, so this must survive. */
 export const ACCUMULATED_FIRST_OPENING =
@@ -355,10 +369,10 @@ export const ACCUMULATED_NEWEST =
 
 const accumulatedCorrectionAt = (step: number, trajectory?: Trajectory): ModelMessage | null => {
   if (!trajectory?.ownerKeepsTyping) return null;
-  if (!ACCUMULATED_CORRECTION_STEPS.has(step)) return null;
+  if (!accumulatedCorrectionStep(step)) return null;
   const body = text(ACCUMULATED_CORRECTION_CHARS, `pasted-${step}`);
   const first = step === 8;
-  const newest = step === 56;
+  const newest = step === lastAccumulatedStep(trajectory.steps);
   if (first)
     return {
       role: 'user',
@@ -654,6 +668,63 @@ export const OWNER_PROBES: readonly Probe[] = [
   }
 ];
 
+/**
+ * The same three questions, asked at a length where the class stops being holdable by cutting.
+ *
+ * `OWNER_PROBES` asks at step 58 of a sixty-step fixture carrying thirteen accumulated messages,
+ * which is inside the region where every candidate still fits above `OWNER_MINIMUM_CHARS`. The
+ * defect this rig could not see lives past `budget / OWNER_MINIMUM_CHARS` candidates - about 141
+ * behind this trajectory's preamble - where an equal share of the budget is below the marker's own
+ * length, a cut stops paying for itself, and the class costs 240 characters a message however many
+ * of them there are. These are the same probes at 150 accumulated messages instead of 13.
+ *
+ * What each one is for, and they are deliberately not all in the same direction:
+ *
+ *   the goal          never a candidate, and it is the single fact that has to survive any length;
+ *   the newest        never a candidate either, and it is the correction not yet acted on;
+ *   the earliest      the OLDEST of the middles, which is the first thing the eviction order gives
+ *                     up - so this one is expected to read 0.0 on every bounded configuration and
+ *                     5.0 with the bound off, and that difference is the price of the bound stated
+ *                     as a number rather than as a paragraph.
+ */
+const longOwnerProbes = (steps: number): readonly Probe[] => {
+  const asked = steps - 1;
+  return [
+    {
+      id: 'long-owner-goal',
+      kind: 'recall',
+      plantedAtStep: -1,
+      askedAtStep: asked,
+      question: 'What connection ceiling did the owner impose, and when does it apply?',
+      reference: `${OWNER_GOAL_CONSTRAINT}.`,
+      evidence: [OWNER_GOAL_CONSTRAINT],
+      reworkChars: 0
+    },
+    {
+      id: 'long-owner-newest',
+      kind: 'recall',
+      plantedAtStep: lastAccumulatedStep(steps),
+      askedAtStep: asked,
+      question:
+        'How long may the pooler queue before it fails, and what happened to the retry budget?',
+      reference: 'It may queue for 900 ms and then fail; the retry budget is gone.',
+      evidence: [ACCUMULATED_NEWEST],
+      reworkChars: 0
+    },
+    {
+      id: 'long-owner-earliest-opening',
+      kind: 'recall',
+      plantedAtStep: 8,
+      askedAtStep: asked,
+      question:
+        'Which pool did the owner tell you to stop using for reads, and what should serve them?',
+      reference: 'Stop using the writer pool for reads; the read replica serves them.',
+      evidence: [ACCUMULATED_FIRST_OPENING],
+      reworkChars: 0
+    }
+  ];
+};
+
 export interface Trajectory {
   readonly id: string;
   readonly why: string;
@@ -841,6 +912,17 @@ export const TRAJECTORIES: readonly Trajectory[] = [
      * at step 5,700, reached inside a fixture that still runs in a few seconds. The phase is never
      * declared, so every compaction here is the budget trigger and the `refuse` column is
      * measuring the thing it is named for.
+     *
+     * `owner-earliest-opening` reads 0.0 on every bounded configuration here and 5.0 with the
+     * bound off, and that is the price of holding the class to ONE budget rather than to
+     * `n x OWNER_MINIMUM_CHARS`. A message this bound has already cut may not be cut again - the
+     * marker's count would then be true of the string in front of it and false about what the
+     * owner wrote - so once thirteen cut messages fill the budget exactly, the fourteenth arrives
+     * and the oldest of them is given up whole rather than shaved. Availability fell 4.12 -> 3.82
+     * and unrecoverable losses 3 -> 4 when that landed, on this row and on the eight bounded
+     * configurations beside it; `owner-unbounded` and `starved` did not move, because the bound is
+     * off in one and differently set in the other. `docs/design/finish/DEGRADATION.md` states what
+     * would recover it and what has to be settled first.
      */
     id: `pool-migration-131k-owner${SHAPE_SUFFIX}`,
     why: 'The owner keeps typing: 182,000 characters of mid-task correction, which is the one class compaction may not condense and the reason it stops working on a long task.',
@@ -849,5 +931,34 @@ export const TRAJECTORIES: readonly Trajectory[] = [
     declaredCompactionStep: null,
     ownerKeepsTyping: true,
     probes: [...PROBES, ...OWNER_PROBES]
+  },
+  {
+    /**
+     * The same shape at the length where the bound stops being a bound by cutting alone.
+     *
+     * Sixty steps is thirteen accumulated messages, and thirteen is a long way inside the line the
+     * defect lives past. Six hundred steps is 150 of them - 2,100,000 characters of owner text -
+     * which is past `budget / OWNER_MINIMUM_CHARS` on this preamble, so every candidate is at the
+     * floor and the class costs 240 characters a message with nothing bounding the count. That is
+     * the state the row above could not reach and therefore could not price: measured through this
+     * file's own path at six thousand steps, `planCompaction` refused 3,953 of 5,937 attempts and
+     * the deterministic soft pass stood in for the mechanism on 5,715 of the 6,000 steps.
+     *
+     * Six hundred rather than six thousand because the rig runs every configuration against every
+     * trajectory and `owner-unbounded` is unbounded by construction - the cost of the row is set
+     * by the arm that has no bound on it, not by the shipped one. Six hundred crosses the line and
+     * still runs in seconds; the unit proof in `context.test.ts` carries 3,000 and 6,000.
+     */
+    id: `pool-migration-131k-owner-long${SHAPE_SUFFIX}`,
+    why: 'The owner keeps typing for 600 steps: 150 accumulated messages, past the count at which holding the class by cutting alone stops being possible. The `refuse` column and the earliest-owner probe are the two halves of what the bound costs and buys.',
+    contextTokens: 131_072,
+    steps: 600,
+    declaredCompactionStep: null,
+    ownerKeepsTyping: true,
+    // `PROBES` as well as the long set, and not only for coverage: every one of them is asked at
+    // step 55 to 58, so they measure the same early window the sixty-step rows measure, on a task
+    // that then runs ten times longer. A row carrying one probe kind reports the other three as
+    // NaN, which is a hole in the table rather than a finding.
+    probes: [...PROBES, ...longOwnerProbes(600)]
   }
 ];

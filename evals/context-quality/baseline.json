@@ -1,9 +1,9 @@
 {
   "$stamp": {
-    "acceptedAt": "2026-08-29T16:07:18.546Z",
+    "acceptedAt": "2026-08-29T17:17:20.694Z",
     "version": "0.1.1",
-    "commit": "9b185eb",
-    "rig": "09dca5dd24db"
+    "commit": "66043b0",
+    "rig": "2446f87f420a"
   },
   "pool-migration-131k/shipped": {
     "availability": 4.64,
@@ -294,75 +294,75 @@
     "compactionRefusals": 0
   },
   "pool-migration-131k-owner/shipped": {
-    "availability": 4.12,
-    "tokensPerTask": 3477870,
-    "cacheReadShare": 0.706,
+    "availability": 3.82,
+    "tokensPerTask": 3471178,
+    "cacheReadShare": 0.697,
     "newestReasoningSteps": 59,
-    "unrecoverableLosses": 3,
+    "unrecoverableLosses": 4,
     "compactionRefusals": 0
   },
   "pool-migration-131k-owner/configuration-fidelity": {
-    "availability": 4.12,
-    "tokensPerTask": 3477870,
-    "cacheReadShare": 0.706,
+    "availability": 3.82,
+    "tokensPerTask": 3471178,
+    "cacheReadShare": 0.697,
     "newestReasoningSteps": 59,
-    "unrecoverableLosses": 3,
+    "unrecoverableLosses": 4,
     "compactionRefusals": 0
   },
   "pool-migration-131k-owner/detail-2": {
-    "availability": 3.53,
-    "tokensPerTask": 3393169,
+    "availability": 3.24,
+    "tokensPerTask": 3386475,
     "cacheReadShare": 0.729,
     "newestReasoningSteps": 0,
-    "unrecoverableLosses": 5,
+    "unrecoverableLosses": 6,
     "compactionRefusals": 0
   },
   "pool-migration-131k-owner/tool-2": {
-    "availability": 4.12,
-    "tokensPerTask": 3438201,
-    "cacheReadShare": 0.759,
+    "availability": 3.82,
+    "tokensPerTask": 3369395,
+    "cacheReadShare": 0.752,
     "newestReasoningSteps": 59,
-    "unrecoverableLosses": 3,
+    "unrecoverableLosses": 4,
     "compactionRefusals": 0
   },
   "pool-migration-131k-owner/detail-4": {
-    "availability": 3.82,
-    "tokensPerTask": 3422113,
-    "cacheReadShare": 0.712,
-    "newestReasoningSteps": 46,
-    "unrecoverableLosses": 4,
-    "compactionRefusals": 0
-  },
-  "pool-migration-131k-owner/detail-5": {
-    "availability": 3.82,
-    "tokensPerTask": 3430743,
-    "cacheReadShare": 0.707,
-    "newestReasoningSteps": 55,
-    "unrecoverableLosses": 4,
-    "compactionRefusals": 0
-  },
-  "pool-migration-131k-owner/detail-6": {
-    "availability": 3.82,
-    "tokensPerTask": 3450351,
-    "cacheReadShare": 0.717,
-    "newestReasoningSteps": 59,
-    "unrecoverableLosses": 4,
-    "compactionRefusals": 0
-  },
-  "pool-migration-131k-owner/both-2": {
     "availability": 3.53,
-    "tokensPerTask": 3353498,
-    "cacheReadShare": 0.805,
-    "newestReasoningSteps": 0,
+    "tokensPerTask": 3415421,
+    "cacheReadShare": 0.713,
+    "newestReasoningSteps": 46,
     "unrecoverableLosses": 5,
     "compactionRefusals": 0
   },
-  "pool-migration-131k-owner/stride-8": {
-    "availability": 4.12,
-    "tokensPerTask": 3477870,
-    "cacheReadShare": 0.693,
+  "pool-migration-131k-owner/detail-5": {
+    "availability": 3.53,
+    "tokensPerTask": 3424053,
+    "cacheReadShare": 0.708,
+    "newestReasoningSteps": 55,
+    "unrecoverableLosses": 5,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner/detail-6": {
+    "availability": 3.53,
+    "tokensPerTask": 3443658,
+    "cacheReadShare": 0.708,
     "newestReasoningSteps": 59,
-    "unrecoverableLosses": 3,
+    "unrecoverableLosses": 5,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner/both-2": {
+    "availability": 3.24,
+    "tokensPerTask": 3284360,
+    "cacheReadShare": 0.786,
+    "newestReasoningSteps": 0,
+    "unrecoverableLosses": 6,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner/stride-8": {
+    "availability": 3.82,
+    "tokensPerTask": 3471178,
+    "cacheReadShare": 0.696,
+    "newestReasoningSteps": 59,
+    "unrecoverableLosses": 4,
     "compactionRefusals": 0
   },
   "pool-migration-131k-owner/owner-unbounded": {
@@ -382,10 +382,106 @@
     "compactionRefusals": 0
   },
   "pool-migration-131k-owner/anchorless": {
-    "availability": 4.12,
-    "tokensPerTask": 3470399,
-    "cacheReadShare": 0.705,
+    "availability": 3.82,
+    "tokensPerTask": 3464195,
+    "cacheReadShare": 0.697,
     "newestReasoningSteps": 59,
+    "unrecoverableLosses": 4,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner-long/shipped": {
+    "availability": 4.12,
+    "tokensPerTask": 41586134,
+    "cacheReadShare": 0.683,
+    "newestReasoningSteps": 599,
+    "unrecoverableLosses": 3,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner-long/configuration-fidelity": {
+    "availability": 4.12,
+    "tokensPerTask": 41586134,
+    "cacheReadShare": 0.683,
+    "newestReasoningSteps": 599,
+    "unrecoverableLosses": 3,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner-long/detail-2": {
+    "availability": 3.53,
+    "tokensPerTask": 41018497,
+    "cacheReadShare": 0.689,
+    "newestReasoningSteps": 0,
+    "unrecoverableLosses": 5,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner-long/tool-2": {
+    "availability": 4.12,
+    "tokensPerTask": 40410193,
+    "cacheReadShare": 0.763,
+    "newestReasoningSteps": 599,
+    "unrecoverableLosses": 3,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner-long/detail-4": {
+    "availability": 3.82,
+    "tokensPerTask": 41259737,
+    "cacheReadShare": 0.682,
+    "newestReasoningSteps": 451,
+    "unrecoverableLosses": 4,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner-long/detail-5": {
+    "availability": 3.82,
+    "tokensPerTask": 41386307,
+    "cacheReadShare": 0.68,
+    "newestReasoningSteps": 595,
+    "unrecoverableLosses": 4,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner-long/detail-6": {
+    "availability": 3.82,
+    "tokensPerTask": 41436445,
+    "cacheReadShare": 0.678,
+    "newestReasoningSteps": 599,
+    "unrecoverableLosses": 4,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner-long/both-2": {
+    "availability": 3.53,
+    "tokensPerTask": 39950614,
+    "cacheReadShare": 0.79,
+    "newestReasoningSteps": 0,
+    "unrecoverableLosses": 5,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner-long/stride-8": {
+    "availability": 4.12,
+    "tokensPerTask": 41586134,
+    "cacheReadShare": 0.677,
+    "newestReasoningSteps": 599,
+    "unrecoverableLosses": 3,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner-long/owner-unbounded": {
+    "availability": 4.12,
+    "tokensPerTask": 72082874,
+    "cacheReadShare": 0.519,
+    "newestReasoningSteps": 599,
+    "unrecoverableLosses": 3,
+    "compactionRefusals": 391
+  },
+  "pool-migration-131k-owner-long/starved": {
+    "availability": 3.53,
+    "tokensPerTask": 32085068,
+    "cacheReadShare": 0.808,
+    "newestReasoningSteps": 599,
+    "unrecoverableLosses": 2,
+    "compactionRefusals": 0
+  },
+  "pool-migration-131k-owner-long/anchorless": {
+    "availability": 4.12,
+    "tokensPerTask": 41388433,
+    "cacheReadShare": 0.688,
+    "newestReasoningSteps": 599,
     "unrecoverableLosses": 3,
     "compactionRefusals": 0
   }

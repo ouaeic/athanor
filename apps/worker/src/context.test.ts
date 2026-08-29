@@ -47,6 +47,7 @@ import {
   OWNER_MINIMUM_CHARS,
   OWNER_WINDOW_FLOOR_CHARS,
   OWNER_WINDOW_RESERVE_TOKENS,
+  ownerWindowAdmits,
   ownerWindowCap,
   renderContextBrief,
   runtimeContext,
@@ -3581,6 +3582,38 @@ describe('the bound on what the owner has accumulated', () => {
       0
     );
 
+  /** The owner's own messages, in window order. The first is the goal, the last is the newest. */
+  const owners = (messages: readonly ModelMessage[]): ModelMessage[] =>
+    messages.filter((message) => message.role === 'user');
+
+  /**
+   * The quantity the bound is about: everything the owner has accumulated BETWEEN the goal and the
+   * newest correction, which is exactly `ownerEvictionOrder` minus its two ends.
+   *
+   * Found by role rather than by index, because a drop inserts a record and removes messages, so
+   * the index a candidate had on the way in means nothing on the way out. A test that kept
+   * counting `messages[1]` would be measuring the record and calling it the goal.
+   */
+  const residentCandidateChars = (messages: readonly ModelMessage[]): number =>
+    owners(messages)
+      .slice(1, -1)
+      .reduce((total, message) => total + message.content.length, 0);
+
+  /** The record a drop leaves in the head, or undefined when nothing has been dropped. */
+  const dropRecord = (messages: readonly ModelMessage[]): ModelMessage | undefined =>
+    messages.find(
+      (message) =>
+        message.role === 'system' &&
+        message.content.startsWith('[… ') &&
+        message.content.includes('earlier messages from the owner')
+    );
+
+  /** The two numbers that record states, so a case can add them up rather than match prose. */
+  const dropped = (messages: readonly ModelMessage[]): { messages: number; characters: number } => {
+    const digits = dropRecord(messages)?.content.match(/\d+/g) ?? ['0', '0'];
+    return { messages: Number(digits[0]), characters: Number(digits[1]) };
+  };
+
   /**
    * The budget this window's own head and tail leave the class, which is what the bound is given.
    *
@@ -3648,52 +3681,152 @@ describe('the bound on what the owner has accumulated', () => {
   });
 
   /**
-   * The bound, from both ends, and with the case it does NOT hold named rather than skipped.
+   * The bound, from both ends, at the counts that used to escape it, and with the assertion proved
+   * capable of failing before it is believed.
    *
-   * The first assertion this replaced was `carried <= max(maximum, candidates * 240)` on a set of
-   * shapes that all landed on the second term, so it permitted sixty times the budget and passed
-   * by saturating. Which term binds is a property of the shape and it is asserted here as one:
-   * while an equal share of the budget is above the marker's own length the class is held to the
-   * budget exactly, and past that line it is held to 240 characters a message and no better,
-   * because this bound truncates and never deletes.
+   * TWO ASSERTIONS THIS REPLACES, both of which passed while permitting the escape. The first was
+   * `carried <= max(maximum, candidates * 240)` over shapes that ALL landed on the second term, so
+   * it allowed sixty times the budget. The second named that term as an equality and asserted it -
+   * which is honest about the arithmetic and still asserts that the class is unbounded, because
+   * `candidates * 240` is linear in a count nothing bounds. Both passed. Neither could fail.
+   *
+   * So the predicate is one line now - resident <= maximum, no second term - and the case below
+   * SHOWS it failing on the shape it is supposed to catch before showing it holding on the shape
+   * the file produces. A predicate never seen red is not evidence.
    */
-  it('holds the class to its budget, and says where that stops being possible', () => {
-    // Both ends of the attack: many small messages, a few enormous ones, and a count far past the
-    // line where an equal share falls under the floor.
-    for (const [owners, size] of [
+  it('holds the class to one budget however many messages there are', () => {
+    // Both ends of the attack: many small messages, a few enormous ones, and counts far past the
+    // line where an equal share of the budget falls under the floor.
+    for (const [count, size] of [
       [500, 4_000],
       [12, 200_000],
       [200, 40_000],
+      [541, 14_000],
       [2_000, 8_000]
     ] as const) {
-      const messages = accumulated(owners, size);
+      const messages = accumulated(count, size);
+      const maximum = budgetFor(messages, 3_000);
+      const goal = messages[1] as ModelMessage;
+      const newest = messages[count + 1] as ModelMessage;
+
+      // RED FIRST. What the class costs when a cut is the only move available - every candidate
+      // held at the floor and none of them given up - which is what this file did. The same
+      // predicate, on the same numbers, and at these counts it is false by 6x and 59x.
+      const flooredAtTheirCap = (count - 1) * OWNER_MINIMUM_CHARS;
+      if (count - 1 > Math.floor(maximum / OWNER_MINIMUM_CHARS))
+        expect(flooredAtTheirCap).toBeGreaterThan(maximum);
+
+      // GREEN. One term, and it is exact.
+      const held = boundOwnerWindow(messages, maximum);
+      expect(residentCandidateChars(held.messages)).toBeLessThanOrEqual(maximum);
+
+      // It is the accumulation that was given up, never the two ends of the eviction order.
+      const survivors = owners(held.messages);
+      expect(survivors[0]?.content).toBe(goal.content);
+      expect(survivors[survivors.length - 1]?.content).toBe(newest.content);
+      expect(held.cut + held.dropped).toBeGreaterThan(0);
+      // And whatever left the window said so, in the head, with both numbers.
+      if (held.dropped > 0) {
+        expect(dropped(held.messages).messages).toBe(held.dropped);
+        expect(dropped(held.messages).characters).toBe(held.droppedCharacters);
+        expect(dropRecord(held.messages)?.content).toContain(
+          'ask the owner to restate the part you need'
+        );
+      }
+    }
+  });
+
+  /**
+   * The predicate above, driven until it goes red, so that its green is worth something.
+   *
+   * This is the assertion the brief asked for: a case where the bound is GENUINELY exceeded, with
+   * the same measurement the passing cases use, confirmed to fail. The window is built by hand at
+   * the shape the old rule produced - every candidate resident at the floor, none given up - and
+   * the predicate rejects it.
+   */
+  it('fails when the class is genuinely over its budget', () => {
+    const messages = accumulated(541, 14_000);
+    const maximum = budgetFor(messages, 3_000);
+    // What the old rule left resident: 540 candidates, each cut to the floor and none dropped.
+    const asTheOldRuleLeftIt = messages.map((message, index) =>
+      index > 1 && index < 542 && message.role === 'user'
+        ? { ...message, content: message.content.slice(0, OWNER_MINIMUM_CHARS) }
+        : message
+    );
+    expect(residentCandidateChars(asTheOldRuleLeftIt)).toBe(540 * OWNER_MINIMUM_CHARS);
+    expect(residentCandidateChars(asTheOldRuleLeftIt)).toBeGreaterThan(maximum);
+    // 129,600 characters against a budget of 73,576, and 32,400 tokens against a target tail of
+    // 32,491 - the owner's accumulation alone refilling the whole tail the compaction was aiming
+    // at, which is the exact inequality `OWNER_WINDOW_RESERVE_TOKENS` exists to keep satisfiable.
+    expect(Math.ceil(residentCandidateChars(asTheOldRuleLeftIt) / 4)).toBeGreaterThan(3_000);
+    // The same predicate on the same window, after the bound: green.
+    expect(
+      residentCandidateChars(boundOwnerWindow(messages, maximum).messages)
+    ).toBeLessThanOrEqual(maximum);
+  });
+
+  /**
+   * The floor is not lowered to pay for any of this, and the clamp that used to be the escape is
+   * unreachable from the production path rather than merely unlikely.
+   */
+  it('never reaches the clamp that used to be the escape', () => {
+    for (const [count, size] of [
+      [541, 14_000],
+      [2_000, 8_000],
+      [300, 60_000]
+    ] as const) {
+      const messages = accumulated(count, size);
       const maximum = budgetFor(messages, 3_000);
       const held = boundOwnerWindow(messages, maximum);
-      const goal = messages[1] as ModelMessage;
-      const newest = messages[owners + 1] as ModelMessage;
-      const candidates = owners - 1;
-      const carried = ownerChars(held.messages) - goal.content.length - newest.content.length;
-      const cap = ownerWindowCap(
-        Array.from({ length: candidates }, () => size),
+      // Every message the bound kept is at or above the floor: it was cut to the cap or left alone,
+      // and the cap is above the floor because admission made room for it to be.
+      for (const message of owners(held.messages).slice(1, -1))
+        expect(message.content.length).toBeGreaterThanOrEqual(OWNER_MINIMUM_CHARS);
+      // Which is the same statement as: the water level never had to be clamped, because when it
+      // is clamped the sum of what it keeps goes over the budget and that is the whole of the
+      // escape. Asserted through `ownerWindowAdmits`, because admission is what guarantees it.
+      const lengths = owners(messages)
+        .slice(1, -1)
+        .map((message) => message.content.length);
+      const admitted = ownerWindowAdmits(
+        lengths.map((length) => Math.min(length, OWNER_MINIMUM_CHARS)),
         maximum
       );
-      if (cap > OWNER_MINIMUM_CHARS) {
-        // The ordinary term, and it is exact.
-        expect(carried).toBeLessThanOrEqual(maximum);
-      } else {
-        // The degraded term, stated as the equality it actually is. This is what the class costs
-        // when there are so many messages that an equal share is under the marker's own length,
-        // and it is linear in the count: at 2,000 messages it is 480,000 characters against a
-        // budget of 8,000, which is the honest size of the escape.
-        expect(cap).toBe(OWNER_MINIMUM_CHARS);
-        expect(carried).toBe(candidates * OWNER_MINIMUM_CHARS);
-        expect(carried).toBeGreaterThan(maximum);
+      const kept = lengths.filter((_length, index) => admitted.has(index));
+      const cap = ownerWindowCap(kept, maximum);
+      expect(cap).toBeGreaterThanOrEqual(OWNER_MINIMUM_CHARS);
+      expect(kept.reduce((total, length) => total + Math.min(length, cap), 0)).toBeLessThanOrEqual(
+        maximum
+      );
+      // And the same numbers WITHOUT admission are the escape, which is what makes the line above
+      // an assertion rather than a restatement: every candidate clamped to the floor, over budget.
+      if (lengths.length > Math.floor(maximum / OWNER_MINIMUM_CHARS)) {
+        const unadmitted = ownerWindowCap(lengths, maximum);
+        expect(unadmitted).toBe(OWNER_MINIMUM_CHARS);
+        expect(
+          lengths.reduce((total, length) => total + Math.min(length, unadmitted), 0)
+        ).toBeGreaterThan(maximum);
       }
-      // Either way it is the accumulation that was cut, not the two ends of the eviction order.
-      expect(held.messages[1]?.content).toBe(goal.content);
-      expect(held.messages[owners + 1]?.content).toBe(newest.content);
-      expect(held.cut).toBeGreaterThan(0);
     }
+  });
+
+  /**
+   * The cost of the class does not grow with the number of messages in it, which is the whole of
+   * what "a bound" means and the whole of what the second term denied.
+   */
+  it('costs the same at two thousand messages as at five hundred', () => {
+    const at = (count: number): number => {
+      const messages = accumulated(count, 14_000);
+      return residentCandidateChars(
+        boundOwnerWindow(messages, budgetFor(messages, 3_000)).messages
+      );
+    };
+    // The head is the same on every one of these, so the budget is, so the cost should be too.
+    const costs = [400, 541, 1_201, 2_000].map(at);
+    expect(new Set(costs).size).toBe(1);
+    // Under the old rule these were 95,760 / 129,600 / 288,000 / 479,760 - linear in the count.
+    for (const count of [400, 541, 1_201, 2_000])
+      expect((count - 1) * OWNER_MINIMUM_CHARS).toBeGreaterThan(costs[0] as number);
   });
 
   it('divides the budget rather than spending it on the newest few', () => {
@@ -3733,10 +3866,14 @@ describe('the bound on what the owner has accumulated', () => {
     const messages = accumulated(40, 20_000);
     const held = boundOwnerWindow(messages, budgetFor(messages, 3_000));
     let cut = 0;
-    for (let index = 0; index < messages.length; index += 1) {
-      const before = messages[index] as ModelMessage;
-      const after = held.messages[index] as ModelMessage;
-      if (before.role !== 'user' || after.content === before.content) continue;
+    // Paired by the tag each message carries, not by position: a drop moves every index behind it,
+    // and this window is small enough a budget that some of the accumulation is given up outright.
+    for (const after of owners(held.messages)) {
+      const anchor = /OWNER-ANCHOR-\d+/.exec(after.content)?.[0];
+      const before = messages.find(
+        (message) => anchor !== undefined && message.content.endsWith(anchor)
+      );
+      if (!before || after.content === before.content) continue;
       cut += 1;
       const marker = after.content.indexOf('\n[… ');
       const end = after.content.indexOf(' …]\n');
@@ -3752,20 +3889,25 @@ describe('the bound on what the owner has accumulated', () => {
       expect(after.content).not.toContain('compacted');
     }
     expect(cut).toBe(held.cut);
-    expect(cut).toBeGreaterThan(30);
+    // Everything that survived was cut rather than left whole, and what did not survive was given
+    // up whole and recorded - the two together are the class, with nothing unaccounted for.
+    expect(held.cut + held.dropped).toBe(39);
+    expect(dropped(held.messages).messages).toBe(held.dropped);
   });
 
   it('holds every superseded message to one cap rather than picking winners', () => {
     const messages = accumulated(10, 20_000);
     const held = boundOwnerWindow(messages, budgetFor(messages, 3_000));
-    const lengths = held.messages
-      .flatMap((message, index) =>
-        message.role === 'user' && index > 1 ? [message.content.length] : []
-      )
-      .slice(0, -1);
+    const lengths = owners(held.messages)
+      .slice(1, -1)
+      .map((message) => message.content.length);
     // Every candidate is held to the same cap, so none of them is given up for another.
     expect(new Set(lengths).size).toBe(1);
     expect(lengths[0]).toBeGreaterThanOrEqual(OWNER_MINIMUM_CHARS);
+    // And at this size nothing has to be given up at all, which is what makes the pairing above
+    // meaningful: the budget holds every one of them, it just holds them smaller.
+    expect(held.dropped).toBe(0);
+    expect(lengths).toHaveLength(9);
   });
 
   it('never cuts below the floor that still names the recovery', () => {
@@ -3795,39 +3937,74 @@ describe('the bound on what the owner has accumulated', () => {
    */
   it('never cuts the same owner message twice, so the marker keeps telling the truth', async () => {
     const original = typed(120_000, 'ratchet');
-    let window: ModelMessage[] = [
+    const window: ModelMessage[] = [
       { role: 'system', content: `contract ${filler(3_000)}` },
       { role: 'user', content: 'GOAL-ANCHOR-4471' },
       { role: 'user', content: original },
       ...trajectory(40).slice(3),
       { role: 'user', content: 'newest' }
     ];
-    const claims: number[] = [];
-    for (const tail of [20_000, 14_000, 10_000, 7_000, 5_000]) {
-      const outcome = await compactContext({
-        messages: window,
-        targetTailTokens: tail,
-        summarise: async () => 'condensed'
-      });
-      if (!outcome) continue;
-      window = outcome.messages;
-      const cut = window.find(
+    const claimIn = (messages: readonly ModelMessage[]): number | null => {
+      const cut = messages.find(
         (message) =>
           message.role === 'user' &&
           message.content.includes('characters omitted from this earlier message from the owner')
       );
-      expect(cut).toBeDefined();
-      const claimed = Number(/\[… (\d+) characters omitted/.exec(cut?.content ?? '')?.[1]);
-      claims.push(claimed);
-      // What the marker says is gone, against what is actually gone. They agree to within the
-      // marker's own length, which `truncateMiddle` does not count for any caller in this file.
-      const survives = cut?.content.length ?? 0;
-      expect(original.length - claimed - survives).toBeLessThan(200);
-      expect(original.length - claimed - survives).toBeGreaterThanOrEqual(0);
+      return cut ? Number(/\[… (\d+) characters omitted/.exec(cut.content)?.[1]) : null;
+    };
+    // Through the production call once, so the marker under test is one this file really writes.
+    const outcome = await compactContext({
+      messages: window,
+      targetTailTokens: 20_000,
+      summarise: async () => 'condensed'
+    });
+    expect(outcome).not.toBeNull();
+    if (!outcome) return;
+    const claimed = claimIn(outcome.messages) ?? 0;
+    const cut = outcome.messages.find((message) =>
+      message.content.includes('characters omitted')
+    ) as ModelMessage;
+    // What the marker says is gone, against what is actually gone. They agree to within the
+    // marker's own length, which `truncateMiddle` does not count for any caller in this file.
+    expect(original.length - claimed - cut.content.length).toBeLessThan(200);
+    expect(original.length - claimed - cut.content.length).toBeGreaterThanOrEqual(0);
+
+    // Run it again at the budget it was cut under - which is what a running task does, once per
+    // compaction, for the rest of the task - and nothing moves. Identity, so not even a copy.
+    const budget = budgetFor(window, 20_000);
+    for (let pass = 0; pass < 4; pass += 1) {
+      const again = boundOwnerWindow(outcome.messages, budget);
+      expect(again.messages).toBe(outcome.messages);
+      expect(again.cut).toBe(0);
+      expect(claimIn(again.messages)).toBe(claimed);
     }
-    // Cut once and then left alone, however small the tail gets afterwards.
-    expect(claims.length).toBeGreaterThan(2);
-    expect(new Set(claims).size).toBe(1);
+
+    /*
+     * Then the budget really falls, and the message will not fit even at the length it was already
+     * cut to. Two things this bound may do and one it may not: it may leave the message alone, and
+     * it may give the message up and say so - but it may NOT cut it a second time, because
+     * `truncateMiddle` counts what IT removed and the number would then be true of the string in
+     * front of it and false about what the owner wrote. Driven with a shrinking tail before that
+     * rule existed, this message came back claiming 23,940 characters were omitted with 112,117
+     * actually gone, and a model reads that number and decides not to ask. So the claim never
+     * changes, whatever else happens to the message.
+     */
+    for (const smaller of [budget - 156, Math.floor(budget / 2), OWNER_WINDOW_FLOOR_CHARS, 1]) {
+      const squeezed = boundOwnerWindow(outcome.messages, smaller);
+      const claim = claimIn(squeezed.messages);
+      expect(claim === null || claim === claimed).toBe(true);
+      if (claim === null) {
+        // Given up whole instead, and the record says exactly how much went.
+        expect(squeezed.dropped).toBe(1);
+        expect(dropped(squeezed.messages).characters).toBe(cut.content.length);
+        expect(dropRecord(squeezed.messages)?.content).toContain(
+          'ask the owner to restate the part you need'
+        );
+      }
+      // Either way the two ends of the eviction order are byte-identical.
+      expect(owners(squeezed.messages)[0]?.content).toBe('GOAL-ANCHOR-4471');
+      expect(owners(squeezed.messages).at(-1)?.content).toBe('newest');
+    }
   });
 
   it('carries the bound through the production compaction call, not just the helper', async () => {
@@ -3843,13 +4020,19 @@ describe('the bound on what the owner has accumulated', () => {
     });
     expect(outcome).not.toBeNull();
     if (!outcome) return;
-    expect(ownerChars(outcome.messages)).toBeLessThanOrEqual(
-      Math.max(budgetFor(messages, 3_000), 10 * OWNER_MINIMUM_CHARS) + 24_000 * 2
+    // The predicate itself, not a slackened version of it. What this replaced allowed the budget
+    // PLUS two whole 24,000-character messages, which is the goal and the newest correction
+    // smuggled into a bound that does not cover them - so it would have passed on a window where
+    // the accumulation was twice its budget.
+    expect(residentCandidateChars(outcome.messages)).toBeLessThanOrEqual(
+      budgetFor(messages, 3_000)
     );
     expect(ownerChars(outcome.messages)).toBeLessThan(before / 2);
-    // The goal is byte-identical, and it is the one probe that survives a long task today.
-    expect(outcome.messages[1]?.content).toBe(messages[1]?.content);
-    expect(outcome.messages[1]?.content).toContain('GOAL-ANCHOR-4471');
+    // The goal is byte-identical, and it is the one probe that survives a long task today. Found
+    // by role, because a drop moves every index behind it.
+    const survivors = owners(outcome.messages);
+    expect(survivors[0]?.content).toBe(messages[1]?.content);
+    expect(survivors[0]?.content).toContain('GOAL-ANCHOR-4471');
     // The newest correction is byte-identical too: it is the one the model has not acted on yet.
     expect(
       outcome.messages.some(
@@ -3859,6 +4042,162 @@ describe('the bound on what the owner has accumulated', () => {
     // And the caller's own array is untouched, because a compaction that refuses must leave the
     // trajectory exactly as it found it.
     expect(ownerChars(messages)).toBe(before);
+  });
+
+  /**
+   * What is dropped is not dropped silently, and the record adds up across passes rather than
+   * being overwritten by the last one.
+   */
+  it('records what left the window, cumulatively, where compaction cannot reach it', () => {
+    const messages = accumulated(541, 14_000);
+    const maximum = budgetFor(messages, 3_000);
+    const once = boundOwnerWindow(messages, maximum);
+    expect(once.dropped).toBeGreaterThan(0);
+    expect(dropped(once.messages)).toEqual({
+      messages: once.dropped,
+      characters: once.droppedCharacters
+    });
+
+    // The record is a `system` message and it sits AHEAD of the goal, which is the one place
+    // `condensableStart` puts beyond the reach of the compaction it is describing. In the owner's
+    // role it would make `planCompaction`'s rule false; behind the goal it would be condensed away.
+    const record = dropRecord(once.messages) as ModelMessage;
+    expect(record.role).toBe('system');
+    expect(once.messages.indexOf(record)).toBeLessThan(
+      once.messages.findIndex((message) => message.role === 'user')
+    );
+    expect(planCompaction(once.messages, { targetTailTokens: 3_000 })?.condensed).not.toContain(
+      once.messages.indexOf(record)
+    );
+
+    // A second pass over a window that already carries one adds to it rather than replacing it,
+    // and leaves exactly one record behind.
+    const grown = [
+      ...once.messages,
+      ...Array.from(
+        { length: 400 },
+        (_unused, index): ModelMessage => ({
+          role: 'user',
+          content: `${typed(14_000, `later-${index}`)} LATER-ANCHOR-${index}`
+        })
+      )
+    ];
+    const twice = boundOwnerWindow(grown, maximum);
+    expect(twice.messages.filter((message) => dropRecord([message]) !== undefined)).toHaveLength(1);
+    expect(dropped(twice.messages).messages).toBe(once.dropped + twice.dropped);
+    expect(dropped(twice.messages).characters).toBe(
+      once.droppedCharacters + twice.droppedCharacters
+    );
+    expect(residentCandidateChars(twice.messages)).toBeLessThanOrEqual(maximum);
+  });
+
+  /**
+   * The record is counted at its ceiling, so the budget does not move underneath the class when it
+   * appears or when its numbers grow a digit.
+   *
+   * This is the same move the brief gets in `compactionHeadTokens` and it is here for a sharper
+   * reason. A message this bound has already cut sits at EXACTLY the cap it was cut to and cannot
+   * be cut again, so a budget that shrinks by the width of one line is a message that no longer
+   * fits. Measured before the reservation: the budget moved 73,576 -> 73,424 -> 73,420 over 600
+   * driven steps and 117 messages of about 10,500 characters each were given up to it.
+   */
+  it('does not move the budget when the record appears or grows', () => {
+    const messages = accumulated(4, 400);
+    const withRecord = (record: string): ModelMessage[] => [
+      messages[0] as ModelMessage,
+      { role: 'system', content: record },
+      ...messages.slice(1)
+    ];
+    const bare = compactionHeadTokens(messages);
+    const small = boundOwnerWindow(accumulated(541, 14_000), 8_000).messages;
+    const record = dropRecord(small)?.content as string;
+    expect(record).toBeDefined();
+    // The widest this line can ever be rendered: both counts are bounded by the window they
+    // describe, so the largest integer either can hold is a ceiling with room to spare.
+    const widest = record.replace(/\d+/g, String(Number.MAX_SAFE_INTEGER));
+    expect(widest.length).toBeGreaterThan(record.length);
+
+    // STABLE. Present or absent, narrow or widest, the head is the same size - so the budget the
+    // class is held to does not move underneath a message that cannot answer a smaller one.
+    expect(compactionHeadTokens(withRecord(record))).toBe(bare);
+    expect(compactionHeadTokens(withRecord(widest))).toBe(bare);
+    expect(ownerWindowChars(40_000, compactionHeadTokens(withRecord(record)))).toBe(
+      ownerWindowChars(40_000, bare)
+    );
+
+    // AND PAID FOR. Stability on its own would be a head that simply ignores the line, which buys
+    // the class room the window does not have. So what the head adds on top of the messages it can
+    // actually see is both ceilings - the brief's and this line's - and neither is a share of the
+    // other. `accumulated` puts the whole head in its first two messages, which is what makes the
+    // subtraction below exact rather than approximate.
+    expect(compactionHeadTokens(messages) - estimatedContextTokens(messages.slice(0, 2))).toBe(
+      Math.ceil((8 * 3_000) / 4) + Math.ceil(widest.length / 4)
+    );
+  });
+
+  /**
+   * Which ones go, and it is the order that was already written down rather than a second one.
+   */
+  it('gives up the oldest of the middles, and never the two ends', () => {
+    const messages = accumulated(541, 14_000);
+    const held = boundOwnerWindow(messages, budgetFor(messages, 3_000));
+    const kept = owners(held.messages)
+      .map((message) => /OWNER-ANCHOR-(\d+)/.exec(message.content)?.[1])
+      .filter((anchor): anchor is string => anchor !== undefined)
+      .map(Number);
+    // A contiguous run ending at the newest, which is `ownerEvictionOrder` read from its valuable
+    // end: the middles go oldest first and the newest correction is the last thing reached.
+    expect(kept[kept.length - 1]).toBe(540);
+    expect(kept).toEqual(
+      Array.from({ length: kept.length }, (_unused, index) => 541 - kept.length + index)
+    );
+    // The goal is not in that list at all, because it is not a candidate.
+    expect(owners(held.messages)[0]?.content).toContain('GOAL-ANCHOR-4471');
+  });
+
+  /**
+   * A message this bound has already cut cannot be cut again without its marker lying, so it is
+   * charged its whole length at admission instead - and that is the difference between giving up
+   * one message and giving up a hundred.
+   *
+   * Measured on the driven task before this was charged properly: the budget moved 73,576 ->
+   * 73,424 -> 73,420 as the drop record appeared in the head, and holding already-cut messages to
+   * the new cap by DROPPING them cost 117 messages of about 10,500 characters each to a budget
+   * change of 156. The case below is that shift, in one step.
+   */
+  it('does not give up an already-cut message over a small change in the budget', () => {
+    const messages = accumulated(9, 14_000);
+    const maximum = budgetFor(messages, 3_000);
+    const first = boundOwnerWindow(messages, maximum);
+    expect(first.cut).toBeGreaterThan(0);
+    expect(first.dropped).toBe(0);
+    const alreadyCut = owners(first.messages).slice(1, -1);
+    expect(alreadyCut.every((message) => message.content.includes('characters omitted'))).toBe(
+      true
+    );
+
+    // The same window, 156 characters poorer - the width of the record the head grows the first
+    // time anything is dropped.
+    const shifted = boundOwnerWindow(first.messages, maximum - 156);
+    expect(shifted.dropped).toBeLessThanOrEqual(1);
+    expect(shifted.droppedCharacters).toBeLessThanOrEqual(alreadyCut[0]?.content.length ?? 0);
+    expect(residentCandidateChars(shifted.messages)).toBeLessThanOrEqual(maximum - 156);
+    // And nothing was cut a second time, so no marker started understating its own gap.
+    for (const message of owners(shifted.messages).slice(1, -1))
+      expect(alreadyCut.some((before) => before.content === message.content)).toBe(true);
+  });
+
+  /**
+   * One incompressible message wider than the whole budget does not take every older candidate
+   * with it. `ownerWindowAdmits` passes over what cannot be made to fit and goes on admitting.
+   */
+  it('gives up the message that cannot fit rather than everything behind it', () => {
+    expect([...ownerWindowAdmits([300, 300, 300, 90_000], 1_000)].sort()).toEqual([0, 1, 2]);
+    expect([...ownerWindowAdmits([240, 240, 240], 500)].sort()).toEqual([1, 2]);
+    // Nothing fits, and it says so rather than pretending one does.
+    expect(ownerWindowAdmits([9_000, 9_000], 100).size).toBe(0);
+    // Everything fits, and admission is then the whole class.
+    expect(ownerWindowAdmits([100, 100], 8_000).size).toBe(2);
   });
 
   it('leaves the caller’s trajectory alone when it refuses', async () => {
@@ -3873,10 +4212,27 @@ describe('the bound on what the owner has accumulated', () => {
     expect(messages.map((message) => message.content)).toEqual(before);
   });
 
-  it('keeps compaction working for a whole task instead of one step of it', async () => {
-    // Sixty steps with the owner typing a long correction every fifth, which is the shape that
-    // kills it: measured on a real 8,407-step trajectory, `planCompaction` returned null with zero
-    // candidates on 5,408 of 6,620 attempts and the window climbed past its own budget anyway.
+  /**
+   * The whole task, driven, at the lengths that break it - and the bound checked on every
+   * compaction rather than once at the end.
+   *
+   * Sixty steps is where this used to stop, and sixty steps is inside the region where nothing has
+   * gone wrong yet: the first refusal on this shape lands at step 70. Driven to six thousand with
+   * the same owner text, `planCompaction` returned null on 3,953 of 5,937 attempts and the
+   * deterministic soft pass stood in for it on 5,715 of the 6,000 steps, which is the mechanism
+   * being replaced by its own floor for 95% of a task.
+   */
+  const driveTask = async (
+    steps: number
+  ): Promise<{
+    attempts: number;
+    refusals: number;
+    softPassSteps: number;
+    overBudget: number;
+    residentPeak: number;
+    messages: ModelMessage[];
+    lastOwnerStep: number;
+  }> => {
     const contextTokens = 131_072;
     const tools = [...agentToolsFor(), COMPACT_CONTEXT_TOOL];
     const reservedTokens = Math.ceil(JSON.stringify(tools).length / 4);
@@ -3894,12 +4250,17 @@ describe('the bound on what the owner has accumulated', () => {
     let attempts = 0;
     let refusals = 0;
     let softPassSteps = 0;
-    for (let step = 0; step < 60; step += 1) {
-      if (step % 5 === 4)
+    let overBudget = 0;
+    let residentPeak = 0;
+    let lastOwnerStep = -1;
+    for (let step = 0; step < steps; step += 1) {
+      if (step % 5 === 4) {
         messages.push({
           role: 'user',
           content: `${typed(14_000, `correction-${step}`)} OWNER-ANCHOR-${step}`
         });
+        lastOwnerStep = step;
+      }
       messages.push({
         role: 'assistant',
         content: `Running check ${step}`,
@@ -3914,10 +4275,14 @@ describe('the bound on what the owner has accumulated', () => {
       });
       if ((preparedTokens ?? estimatedContextTokens(messages)) > compactionTrigger(budget)) {
         attempts += 1;
+        const targetTailTokens = compactionTargetTail(budget);
+        // The budget the production call is about to derive, read the same way it reads it, so the
+        // check below is against the number the bound was actually given and not a restatement.
+        const maximum = ownerWindowChars(targetTailTokens, compactionHeadTokens(messages));
         const outcome = await compactContext({
           messages,
           ...(brief ? { brief } : {}),
-          targetTailTokens: compactionTargetTail(budget),
+          targetTailTokens,
           summarise: async () => `condensed through step ${step}`
         });
         if (!outcome) refusals += 1;
@@ -3925,6 +4290,11 @@ describe('the bound on what the owner has accumulated', () => {
           messages.splice(0, messages.length, ...outcome.messages);
           brief = outcome.brief;
         }
+        // Every compaction, not just the last: the class the compaction leaves behind is inside
+        // the budget it was given.
+        const resident = residentCandidateChars(messages);
+        residentPeak = Math.max(residentPeak, resident);
+        if (resident > maximum) overBudget += 1;
       }
       const prepared = prepareModelContext(messages, contextTokens, maxOutputTokens, {
         precedingTokens: reservedTokens,
@@ -3934,14 +4304,48 @@ describe('the bound on what the owner has accumulated', () => {
       if (prepared.messages.some((m) => m.content.startsWith(COMPRESSED_TRAJECTORY_MARKER)))
         softPassSteps += 1;
     }
-    expect(attempts).toBeGreaterThan(0);
-    expect(refusals).toBe(0);
-    // Nothing had to be replaced by a stub: the deterministic passes are the floor, not the
-    // mechanism, and on this shape they used to be doing all the work.
-    expect(softPassSteps).toBe(0);
-    // The owner's opening request is still there, byte for byte, at the last step.
-    expect(messages[1]?.content).toContain('GOAL-ANCHOR-4471');
-    // And so is the newest thing they said.
-    expect(messages.some((message) => message.content.includes('OWNER-ANCHOR-59'))).toBe(true);
+    return { attempts, refusals, softPassSteps, overBudget, residentPeak, messages, lastOwnerStep };
+  };
+
+  for (const steps of [60, 3_000, 6_000])
+    it(`keeps compaction working for ${steps} steps of a task, not one step of it`, async () => {
+      const run = await driveTask(steps);
+      expect(run.attempts).toBeGreaterThan(0);
+      // Not one refusal, where six thousand steps used to refuse 3,953 of 5,937.
+      expect(run.refusals).toBe(0);
+      // Nothing had to be replaced by a stub: the deterministic passes are the floor, not the
+      // mechanism, and on this shape they used to be doing all the work.
+      expect(run.softPassSteps).toBe(0);
+      // And the class was inside its budget at every one of those compactions.
+      expect(run.overBudget).toBe(0);
+      // The owner's opening request is still there, byte for byte, at the last step. Found by
+      // role, because the record a drop leaves sits ahead of it in the head.
+      expect(owners(run.messages)[0]?.content).toContain('GOAL-ANCHOR-4471');
+      // And so is the newest thing they said, whole - not cut, not dropped, not paraphrased.
+      const newest = owners(run.messages).at(-1) as ModelMessage;
+      expect(newest.content).toContain(`OWNER-ANCHOR-${run.lastOwnerStep}`);
+      expect(newest.content).not.toContain('characters omitted');
+      expect(newest.content.length).toBeGreaterThan(14_000);
+      // Whatever left the window said so, with both numbers and the recovery that is real for it.
+      if (steps > 60) {
+        expect(dropped(run.messages).messages).toBeGreaterThan(0);
+        expect(dropRecord(run.messages)?.content).toContain(
+          'ask the owner to restate the part you need'
+        );
+      }
+    });
+
+  /**
+   * The cost of the class does not grow with the length of the task either, which is the same
+   * statement as the one about message count made against the thing that produces them.
+   */
+  it('costs no more at six thousand steps than at three thousand', async () => {
+    const [shorter, longer] = await Promise.all([driveTask(3_000), driveTask(6_000)]);
+    expect(longer.residentPeak).toBe(shorter.residentPeak);
+    // 72,000 tokens of accumulated owner text on this shape before the drop existed, against a
+    // target tail of 32,491 - the class alone, twice over, in the room the whole tail had.
+    expect(Math.ceil(longer.residentPeak / 4)).toBeLessThan(
+      compactionTargetTail(modelInputBudget(131_072, 16_384, 13_856))
+    );
   });
 });

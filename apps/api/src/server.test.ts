@@ -2442,6 +2442,119 @@ describe('memory about the owner', () => {
     );
     expect(promoted.rows[0]).toMatchObject({ workspace_id: null, key_scope: 'user' });
   });
+
+  /*
+   * The content gate on the tier that leaves the workspace, attacked in both directions.
+   *
+   * The forward half is not hypothetical and not constructed: every sentence in `secrets` below is
+   * the shape of a real turn out of the owner's own 505 typed turns on this machine, with the
+   * 73-character token replaced by a synthetic one of the same length. Six of the eight such turns
+   * cleared the old rule, because it read the word `key` and the colon next to it rather than the
+   * token - `Here is the API key: sk-…` was refused and `Here is my openrouter key: sk-…` was not.
+   *
+   * The reverse half is the one that can fail silently, so it is the longer list, and it is two
+   * attacks rather than one. Five of the nine are what `redactText` mangles - it catches all eight
+   * secrets and would have been the one-line fix, and it also turns `skateboarding`, `pkgconfig.pc`
+   * and `Token efficiency` into `[REDACTED]`; a tier the owner cannot write an ordinary English
+   * word into is a tier they stop using. `sk-learn-classifier-v2` is among them and is the one that
+   * clears a delimiter and a length threshold both, and is still a name. The other four carry a
+   * credential WORD and no credential - `api key`, `password`, `Bearer token` - which is the
+   * direction the labelled rule beneath the new shapes could over-fire in.
+   *
+   * Both entrances are attacked. `POST target:'user'` is the tier's front door and `PATCH` is the
+   * other one, because promoting a legacy row is an entry that inserts nothing.
+   */
+  test('refuses a credential into the tier that follows the owner, and only a credential', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-owner-secret-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId } = await seedOwner(app, 'owner-secret');
+
+    const token = `sk-or-v1-${'0123456789abcdef'.repeat(4)}`;
+    const secrets = [
+      `Here is my openrouter key: ${token}`,
+      `heres the openrouter api key thats credit limited: ${token}`,
+      `Here is the credit limited openrouter api key you can use to do this yourself: ${token}`,
+      `Limited spending openrouter api key for asset generation etc: ${token}`,
+      'Use ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 for the release job.',
+      `The slack bot is ${['xo', 'xb-', '123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx'].join('')}.`,
+      'Deploy with glpat-AbCdEfGhIjKlMnOpQrSt.',
+      'The AWS identity is AKIAIOSFODNN7EXAMPLE.',
+      'Maps uses AIzaSyD01234567890abcdefghijklmnopqrstu.',
+      'Session eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW.',
+      'The dav mount is https://jo:app-password-here@cloud.example/dav/.',
+      'Set password = correcthorsebatterystaple9 in the env file.',
+      // The key types the narrower list admitted while the capture path redacted them, which is
+      // the gate being weaker than the entrance it exists to be at least as strong as.
+      '-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHDBOBgkqhkiG9w0BBQ0wQTAp\n-----END ENCRYPTED PRIVATE KEY-----',
+      '-----BEGIN DSA PRIVATE KEY-----\nMIIBuwIBAAKBgQD1kGjTBqbWqM9B\n-----END DSA PRIVATE KEY-----',
+      '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAA\n-----END PRIVATE KEY-----'
+    ];
+    const storable = [
+      'Never use skateboarding metaphors in the docs.',
+      'The pkgconfig.pc file lives at /usr/lib and must stay there.',
+      'From now on use sk-learn-classifier-v2 as the baseline name.',
+      'Token efficiency matters more than raw speed.',
+      'The video id is GHSwt69ItIA8PMHo1YU and it must not change.',
+      'Always send the Bearer token that the vault issues.',
+      'The api key lives in 1Password, not in the repo.',
+      'Never write a password into a commit message.',
+      'Remember, spin up as many agents as you need.',
+      // The other direction on the widened clause: a PEM block that is not a private key, and the
+      // words on their own. Without these the widening could be `-----BEGIN` and nobody would know.
+      'The deploy bundle starts with -----BEGIN CERTIFICATE----- and that is fine to commit.',
+      'Publish the -----BEGIN PUBLIC KEY----- block in the README.',
+      'Explain what a BEGIN PRIVATE KEY header means before the next review.'
+    ];
+
+    const post = (content: string) =>
+      app.inject({
+        method: 'POST',
+        url: `/v1/workspaces/${workspaceId}/memories`,
+        headers: { cookie },
+        payload: { target: 'user', content }
+      });
+
+    for (const content of secrets) {
+      const refused = await post(content);
+      expect(refused.statusCode, content).toBe(400);
+      expect(refused.json<{ error: { code: string } }>().error.code).toBe('invalid_request');
+    }
+    // Nothing reached the tier, which is the assertion the status codes above cannot make: a
+    // refusal that returned 400 after writing the row would pass every check up to this one.
+    const emptied = await database.query(
+      `SELECT count(*)::int AS n FROM workspace_memories WHERE key_scope='user'`
+    );
+    expect((emptied.rows[0] as { n: number }).n).toBe(0);
+
+    const kept: string[] = [];
+    for (const content of storable) {
+      const saved = await post(content);
+      expect(saved.statusCode, content).toBe(200);
+      kept.push(saved.json<{ id: string }>().id);
+    }
+    expect(kept).toHaveLength(storable.length);
+
+    // The second entrance. A stored row is rewritten into a secret, which is the shape a gate that
+    // only guards the INSERT would let through.
+    const patched = await app.inject({
+      method: 'PATCH',
+      url: `/v1/workspaces/${workspaceId}/memories/${kept[0]!}`,
+      headers: { cookie },
+      payload: { content: `Here is my openrouter key: ${token}` }
+    });
+    expect(patched.statusCode, patched.body).toBe(400);
+    const listed = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memories`,
+      headers: { cookie }
+    });
+    const rows = listed.json<Array<{ id: string; content: string }>>();
+    expect(rows.find((row) => row.id === kept[0]!)?.content).toBe(storable[0]);
+    expect(rows.some((row) => row.content.includes(token))).toBe(false);
+  });
 });
 
 describe('unattended recovery', () => {

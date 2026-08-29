@@ -29,6 +29,71 @@ import { UNREADABLE_MEMORY_ITEM } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 
+/**
+ * A credential in the text, refused rather than stored.
+ *
+ * This gate is the whole of the content check on the one tier that follows the owner out of the
+ * workspace, and it was reading the LABEL rather than the secret. `api[_ -]?key\s*[:=]` wants the
+ * word and the punctuation adjacent, so `Here is the API key: sk-…` was refused and `Here is my
+ * openrouter key: sk-…` was not - same secret, same sentence, one word apart. Measured over the
+ * owner's own 924 typed turns on this machine (`type: user`, not `isSidechain`, not a tool result,
+ * not `isMeta` with a `sourceToolUseID`, no slash-command or compaction-continuation block,
+ * deduplicated by turn uuid; 3,097 transcript files, 2,093,092 characters, 10 projects): 8 of them
+ * carry a live 73-character `sk-or-v1-…` token, and the old rule refused 2. The capture path into
+ * the workspace tier already neutralises all 8, because `redactText` matches the token; the tier
+ * that outlives the workspace was the one letting them through.
+ *
+ * The count is stated because an earlier pass of this work stated 505 turns and 197,466 characters
+ * and neither reproduces - the character figure by a factor of ten. Two independent recounts on the
+ * stated filter agree on the order and on every exclusion count that matters (24,124 tool results),
+ * so the basis here is the recounted one and the ratio arguments built on the old one are withdrawn
+ * rather than repeated.
+ *
+ * So the vendor rule below reads the token: a recognised issuer prefix, ITS OWN delimiter, and
+ * somewhere after it a run of sixteen characters with no delimiter in it. Both halves are load
+ * bearing and each was measured against the other.
+ *
+ * The delimiter is what `redactText` does not require, and reusing that net here was the one-line
+ * fix. It takes the prefix plus ten more characters of anything, which is right for a log line and
+ * wrong for a refusal: it alters `skateboarding` and `pkgconfig`, and a tier the owner cannot write
+ * the word "skateboarding" into is not a tier they will use.
+ *
+ * The run is what a length threshold cannot say. A threshold has to be picked, and the number
+ * decides which names are refused while saying nothing about what a secret is - at twelve more
+ * characters it already refuses `sk-learn-classifier-v2`, and every larger number is a guess about
+ * how long a name gets. The run states the property itself, that a random token has a long
+ * undelimited stretch and a hyphenated name does not, and it is indifferent to the total length:
+ * `glpat-` with a twenty-character body and `sk-or-v1-` with seventy are the same clause.
+ *
+ * Against the same 924 turns, the four shapes together refuse all 8 secret-bearing turns and 0 of
+ * the other 916.
+ *
+ * The labelled rule is kept beneath them, because a secret with no recognisable prefix has nothing
+ * else to be caught by, and `password = …` is exactly that shape. Its PEM clause names the key
+ * types `[A-Z ]*` rather than three of them, which is what `redaction.ts:48` on the capture path
+ * has always matched: the narrower list admitted `-----BEGIN ENCRYPTED PRIVATE KEY-----` and
+ * `-----BEGIN DSA PRIVATE KEY-----` into the one tier that leaves the workspace while the capture
+ * path into the workspace redacted both, which is the property this gate exists to restore
+ * inverted. Measured on the 924 turns: the widened clause fires on the same 0 of them.
+ *
+ * STILL OPEN, named rather than papered over. `Authorization: Basic …` is redacted on the capture
+ * path (`Bearer|Basic|Token` there) and admitted here, and the naive port of that rule refuses
+ * `Always send the Bearer token that the vault issues` - the owner's own shape - so it needs a
+ * measurement this gate did not have room to make. A standing order carrying an exfiltration
+ * address is not a credential and is not this rule's business; it is the one thing this tier reads
+ * into every task in every workspace, and it has no content control at all. @see
+ * docs/design/finish/GATE.md.
+ */
+const CREDENTIAL_SHAPES: readonly RegExp[] = [
+  /\b(?:sk|pk|rk_live|ghp|gho|ghu|ghs|ghr|github_pat|xox[baprs]|glpat|dop_v1|sq0csp)[-_][-_.A-Za-z0-9]*[A-Za-z0-9]{16,}/i,
+  // Issuers whose tokens are a fixed shape rather than a prefix and a body: AWS key identifiers,
+  // Google API keys, and any JSON web token whoever signed it.
+  /\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b|\bAIza[0-9A-Za-z_-]{35}\b|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
+  // A password written into a URL, which is a complete credential arriving as an ordinary address.
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:api[_ -]?key|password|passphrase|secret|token)\s*[:=]\s*\S{12,}/i
+];
+
 const KnowledgeText = z
   .string()
   .trim()
@@ -46,10 +111,7 @@ const KnowledgeText = z
     'Hidden control and bidirectional text are not allowed'
   )
   .refine(
-    (value) =>
-      !/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|(?:api[_ -]?key|password|secret|token)\s*[:=]\s*\S{12,}/i.test(
-        value
-      ),
+    (value) => !CREDENTIAL_SHAPES.some((shape) => shape.test(value)),
     'Keep credentials out of memory and skills'
   );
 

@@ -57,8 +57,10 @@ new one rather than silently writing nothing.
 The division of labour between the first two is worth being precise about, because it decides which
 one can catch what. This suite asserts counters — step counts, token counts, which holds fired — over
 a scripted model, so it cannot tell whether narrowing the window cost the agent anything it needed.
-`evals/context-quality/` can: it replays sixty steps of one task under each candidate context
-configuration and scores whether the fact each probe needs was still in the window at the step that
+`evals/context-quality/` can: it replays one task under each candidate context configuration -
+sixty steps on four trajectories and six hundred on the fifth, which is the one long enough to
+reach the counts at which holding the owner's accumulated text by cutting alone stops being
+possible - and scores whether the fact each probe needs was still in the window at the step that
 needed it. Run it before changing any constant in `apps/worker/src/context.ts`, and before cutting
 anything from the resident set. A cut that this suite reports as pure saving and that one reports as
 a quality regression is damage, and the two together are the only way to tell the difference.
