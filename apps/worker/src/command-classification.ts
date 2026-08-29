@@ -988,6 +988,51 @@ const optionValueAt = (
 };
 
 /**
+ * Options that decide where the connection actually goes, whatever the address beside them says.
+ *
+ * `--resolve x.example:443:203.0.113.9` tells curl to skip the resolver and open the socket at that
+ * third field, while every other argument, the card and the budget go on naming `x.example`. The
+ * value was being read by `addressFromArgument`, which takes an authority as host and port and
+ * destructures exactly two fields out of `split(':')`, so the address it stood for was
+ * `https://x.example:443/` - the trusted host, already read this turn, no card and no charge - and
+ * the bytes went to the third field. Worse than unreadable: unreadable now asks the owner, and this
+ * answered confidently with the wrong host.
+ *
+ * `--connect-to h1:p1:h2:p2` is the same instruction in four fields. `-x/--proxy` needs no entry
+ * because a proxy is written as an ordinary address and reads as one.
+ *
+ * When one of these is present the connection goes where it says and nowhere else, so its target
+ * REPLACES the addresses the rest of the command names rather than joining them - a request that
+ * both named a trusted host and carried the owner's data to somebody else would otherwise be
+ * charged against the trusted one.
+ */
+const REDIRECTING_VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
+  curl: new Set(['--resolve', '--connect-to'])
+};
+
+/**
+ * Where one of those options sends the request, or '' when this cannot read it.
+ *
+ * Only the fields that name the far end are read: `--resolve` puts it third, after the host and the
+ * port it is overriding, and may list several separated by commas, of which the first is the one
+ * used; `--connect-to` puts it third and fourth. A leading `+` or `-` is curl's own add-and-remove
+ * spelling and is not part of the name. An empty third field is curl's way of REMOVING an override,
+ * which leaves the ordinary address to speak for itself.
+ */
+const redirectedAddress = (option: string, rawValue: string): string | null => {
+  const fields = rawValue.replace(/^[+-]/, '').split(':');
+  const port = fields[1] ?? '';
+  const target =
+    option === '--resolve' ? ((fields[2] ?? '').split(',')[0] ?? '') : (fields[2] ?? '');
+  // No far end named at all, which is `--resolve -host:port` removing an override rather than
+  // adding one. Null instead of '' because the two are opposite answers: this leaves the ordinary
+  // address to speak for itself, and '' means an override is present and unreadable, which is the
+  // strongest reason to ask the owner.
+  if (!target) return null;
+  return addressFromArgument(`${target}:${option === '--resolve' ? port : fields[3] || port}`);
+};
+
+/**
  * Every address one resolved command would reach, and the material it would carry there.
  *
  * The addresses and the carried material come back as one list of URLs because that is what the
@@ -1000,11 +1045,25 @@ const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]):
   const name = executable.toLowerCase();
   const local = LOCAL_VALUE_OPTIONS[name];
   const carriedTable = CARRIED_VALUE_OPTIONS[name];
+  const redirectingTable = REDIRECTING_VALUE_OPTIONS[name];
   const skip = new Set<number>();
   const carried: Array<[string, string]> = [];
+  const redirects: string[] = [];
+  let redirected = false;
   commandArgs.forEach((_argument, index) => {
     const localOption = optionValueAt(commandArgs, index, local);
     if (localOption?.takesNext) skip.add(index + 1);
+    const redirectingOption = optionValueAt(commandArgs, index, redirectingTable);
+    if (redirectingOption) {
+      if (redirectingOption.takesNext) skip.add(index + 1);
+      const target = redirectingOption.value
+        ? redirectedAddress(redirectingOption.option.toLowerCase(), redirectingOption.value)
+        : null;
+      if (target !== null) {
+        redirected = true;
+        if (target) redirects.push(target);
+      }
+    }
     const carriedOption = optionValueAt(commandArgs, index, carriedTable);
     if (!carriedOption) return;
     if (carriedOption.takesNext) skip.add(index + 1);
@@ -1021,6 +1080,10 @@ const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]):
   // for `ssh me@host`, so the server needs no branch of its own.
   if (FETCH_CLIENT_EXECUTABLES.has(name) || RESOLVING_EXECUTABLES.has(name))
     addresses = resolve(candidates);
+  // An override speaks for the whole command: it is where the socket opens, so the host the rest of
+  // the arguments name never receives anything. An override this cannot read leaves no addresses at
+  // all, which drops through to the unreadable-address card below rather than back to that host.
+  if (redirected) addresses = redirects;
   else if (CONNECTING_EXECUTABLES.has(name)) addresses = resolve(candidates).slice(0, 1);
   else if (REMOTE_SPEC_EXECUTABLES.has(name))
     addresses = resolve(candidates.filter((argument) => /[:@]/.test(argument)));
