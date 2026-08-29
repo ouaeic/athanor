@@ -56,8 +56,21 @@ const readRecords = async (root: string): Promise<Record<string, unknown>[]> => 
   return JSON.parse(contents) as Record<string, unknown>[];
 };
 
+/*
+ * `maxRetries` because a supervised service can still be writing the registry while this runs, and
+ * a recursive delete that meets a file appearing between its readdir and its rmdir fails with
+ * ENOTEMPTY. `close()` is synchronous - it marks the supervisor retiring and clears the timers -
+ * so a write already dispatched lands after it returns, which is right for a runner shutting down
+ * and only wrong for a test that deletes the directory in the same tick. Seen once in a full gate
+ * run and not reproduced in three targeted runs of this file, which is the shape of flake that
+ * teaches people to re-run a gate rather than trust it.
+ */
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await Promise.all(
+    roots
+      .splice(0)
+      .map((root) => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }))
+  );
 });
 
 describe('service restart policy', () => {
