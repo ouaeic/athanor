@@ -34,7 +34,22 @@ export const ModelMessage = z.object({
    * (currently Anthropic and Google through OpenRouter) receive a `cache_control` marker here.
    * Routes that cache automatically ignore the hint, so it is always safe to set.
    */
-  cacheBreakpoint: z.boolean().optional()
+  cacheBreakpoint: z.boolean().optional(),
+  /**
+   * Set by the owner-window bound when it truncated this message, so a later pass can tell a
+   * message the harness cut from one that merely talks about being cut.
+   *
+   * It was a content test - the middle of the marker, searched for in the message body - and a
+   * content test cannot tell those apart. The phrase appears in this repository's own test files,
+   * so pasting athanor's source into athanor made a message uncuttable: two windows differing by
+   * fifty-nine characters dropped nothing and then dropped thirty-six messages, taking 468,530
+   * characters of the owner's corrections with them. Owner-authored text was being trusted as a
+   * category when the fact wanted was about its source.
+   *
+   * Like `rawArguments` above, this describes what a caller holds and is never sent: the payload
+   * builder writes role, content and tool fields and reads nothing else.
+   */
+  ownerCut: z.boolean().optional()
 });
 export type ModelMessage = z.infer<typeof ModelMessage>;
 

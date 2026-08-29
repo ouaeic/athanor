@@ -3671,6 +3671,51 @@ describe('the bound on what the owner has accumulated', () => {
     expect(ownerEvictionOrder([{ role: 'system', content: 'none' }])).toEqual([]);
   });
 
+  /*
+   * Whether a message was already cut is a fact about the message, not about what it says.
+   *
+   * It was a content test - the marker's own middle, searched for in the body - defended on the
+   * grounds that only the owner's typed words reach a `user` message. That is true of all three
+   * entry points and beside the point, because what the owner types can quote anything: the phrase
+   * lives in this repository's own test files, so pasting athanor's source into athanor made a
+   * message uncuttable and pushed its weight onto its neighbours. Driven through the shipped
+   * function, fifty-nine characters in the middle of one correction turned thirteen cuts and
+   * nothing dropped into twelve cuts and a whole forty-thousand-character message given up.
+   */
+  it('is not moved by an owner message that quotes the cut marker', () => {
+    const plain = 'x'.repeat(40_000);
+    const quoted = `characters omitted from ${'this earlier message from the owner'}`;
+    const build = (middle: string): ModelMessage[] => [
+      { role: 'user', content: 'the goal' },
+      ...Array.from({ length: 6 }, (_, index) => ({
+        role: 'user' as const,
+        content: `correction ${index} ${plain}`
+      })),
+      { role: 'user', content: `correction 6 ${middle} ${plain}` },
+      ...Array.from({ length: 6 }, (_, index) => ({
+        role: 'user' as const,
+        content: `correction ${index + 7} ${plain}`
+      })),
+      { role: 'user', content: 'newest correction' }
+    ];
+    const clean = boundOwnerWindow(build('ordinary words'), 20_000);
+    const pasted = boundOwnerWindow(build(quoted), 20_000);
+    expect(pasted.cut).toBe(clean.cut);
+    expect(pasted.dropped).toBe(clean.dropped);
+    expect(pasted.droppedCharacters).toBe(clean.droppedCharacters);
+  });
+
+  it('marks what it cut, so a second pass reads a fact rather than a phrase', () => {
+    const held = boundOwnerWindow(accumulated(12, 40_000), 20_000);
+    const marked = held.messages.filter((message) => message.ownerCut === true);
+    expect(marked.length).toBe(held.cut);
+    // And nothing it left whole is marked, or the next pass would refuse to cut a message it never
+    // touched - which is the failure this replaces, facing the other way.
+    expect(
+      held.messages.some((message) => message.ownerCut === true && !message.content.includes('…'))
+    ).toBe(false);
+  });
+
   it('costs nothing and touches nothing while the class fits', () => {
     const messages = accumulated(6, 400);
     const held = boundOwnerWindow(messages, budgetFor(messages, 3_000));

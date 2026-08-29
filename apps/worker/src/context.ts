@@ -681,15 +681,17 @@ const OWNER_RESTATE_RECOVERY = 'ask the owner to restate the part you need';
 /**
  * What a cut owner message is labelled, and how a later pass recognises one it has already cut.
  *
- * Named rather than spelled twice because the second use is a test on content: `boundOwnerWindow`
- * will not cut a message that already carries this, so the marker's own count stays true. Safe to
- * ask of the content here in a way it would not be for a fetched page - @see `spillPathIn` for that
- * hazard - because the only text that ever reaches a `user` message is text the owner typed:
- * `turn/claim.ts:247`, `turn-control.ts:70` and `turn/resume.ts:271` are the three places one
- * enters a persisted trajectory and all three carry the owner's own words.
+ * Whether this message was already cut is asked of the message and not of its text. It used to be a
+ * content test, justified on the grounds that the only text reaching a `user` message is text the
+ * owner typed - true of all three entry points, and beside the point, because what the owner types
+ * can quote anything. This phrase appears in this repository's own test files, so pasting athanor's
+ * source into athanor made a message uncuttable and pushed the cost onto its neighbours: two windows
+ * differing by fifty-nine characters dropped nothing and then dropped thirty-six messages, taking
+ * 468,530 characters of the owner's corrections with them. Owner-authored text was being trusted as
+ * a category where the fact wanted was about its source, and `ModelMessage.ownerCut` carries that
+ * fact instead - set where the cut is made, persisted with the message, unforgeable by content.
  */
 const OWNER_CUT_LABEL = 'this earlier message from the owner';
-const OWNER_CUT_MARKER = `characters omitted from ${OWNER_CUT_LABEL}`;
 
 /**
  * What is left behind when a superseded owner message leaves the window entirely rather than being
@@ -2059,7 +2061,7 @@ export const boundOwnerWindow = (
    * either admitted whole or given up by the order, and a 156-character shift now costs at most
    * the one candidate the eviction order already ranks last.
    */
-  const cuttable = (index: number): boolean => !messages[index]?.content.includes(OWNER_CUT_MARKER);
+  const cuttable = (index: number): boolean => messages[index]?.ownerCut !== true;
   const admitted = ownerWindowAdmits(
     candidates.map((index) =>
       cuttable(index) ? Math.min(lengthOf(index), OWNER_MINIMUM_CHARS) : lengthOf(index)
@@ -2110,7 +2112,7 @@ export const boundOwnerWindow = (
     const content = truncateMiddle(message.content, cap, OWNER_CUT_LABEL, OWNER_RESTATE_RECOVERY);
     cut += 1;
     characters += message.content.length - content.length;
-    bounded.push({ ...message, content });
+    bounded.push({ ...message, content, ownerCut: true });
   }
   return { messages: bounded, cut, characters, dropped, droppedCharacters };
 };
