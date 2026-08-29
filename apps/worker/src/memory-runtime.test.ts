@@ -52,6 +52,7 @@ import {
   recordTurnEpisode,
   shouldConsolidateMemory,
   type MemoryCaptureStore,
+  type MemoryFactObservation,
   type MemoryPackStore,
   type MemoryRecallStore
 } from './memory-runtime.js';
@@ -223,7 +224,8 @@ const captureStore = (): CaptureProbe => {
           promoted.push({
             candidate,
             item: { id: `fact-${probe.promotions.length}` } as never,
-            supersededIds: []
+            supersededIds: [],
+            reattached: false
           });
         }
         return promoted;
@@ -943,6 +945,110 @@ describe('owner standing orders', () => {
     ]);
   });
 
+  it('reads the attribution wherever it stands, not only in front of the marker', () => {
+    /*
+     * The half of the frame that was missing. The refusal was measured against the span before the
+     * phrase that admitted the sentence, and a marker rule can be admitted at character zero -
+     * so the identical report with `from now on` in front of it had an empty span to be read in
+     * and was stored as an order the owner never gave. Both halves of each pair are asserted,
+     * because refusing the whole class would also pass the first half and be useless.
+     */
+    expect(
+      observedStandingOrders('From now on, my colleague says we squash before merging.')
+    ).toEqual([]);
+    expect(observedStandingOrders('From now on, we squash before merging.')).toHaveLength(1);
+    expect(observedStandingOrders('Remember, Priya says we always rebase onto main.')).toEqual([]);
+    expect(observedStandingOrders('Remember, we always rebase onto main.')).toHaveLength(1);
+    expect(observedStandingOrders('As a rule, he says we deploy on Fridays.')).toEqual([]);
+    expect(observedStandingOrders('As a rule, we deploy on Fridays.')).toHaveLength(1);
+    // The frame is a subject and a verb together, and the verb alone is not evidence. Both of
+    // these are the owner's own rules out of their own corpus, and both carry a saying verb.
+    expect(
+      observedStandingOrders("Never write another product's name into any repo file.")
+    ).toHaveLength(1);
+    expect(observedStandingOrders('Never let two agents write the same file.')).toHaveLength(1);
+    /*
+     * The false-refusal edge, which is the direction this is priced on. A rule that NAMES somebody
+     * is not a rule they reported, and a rule whose own subject is the owner or this machine is
+     * not a report either - `we` and `you` are not subjects of an attribution, which is why
+     * `From now on, we write dates in ISO.` survives a saying verb standing where the rule's own
+     * verb goes.
+     */
+    expect(
+      observedStandingOrders('Priya and I agreed we must always squash before merging.')
+    ).toHaveLength(1);
+    expect(observedStandingOrders('From now on, we write dates in ISO.')).toHaveLength(1);
+    expect(
+      observedStandingOrders('From now on, you tell me the cost before you start.')
+    ).toHaveLength(1);
+    expect(
+      observedStandingOrders('From now on, always tell me what Priya said about the schema.')
+    ).toHaveLength(1);
+  });
+
+  it('reads the attribution when the rule core stands in front of it, not only behind it', () => {
+    /*
+     * Where the owner's own words begin can only move right, and reading it against the rule core
+     * alone moved it left. `never` and `always` are as at home inside a report of a rule as inside
+     * the rule - `My colleague never said we must always squash before merging.` puts the core at
+     * character thirteen and leaves `colleague ... said` behind it, so a sentence the marker had
+     * refused became a stored standing order. The later of core and marker is where the rule
+     * starts; what is asked of the attribution is where it OPENS, because a core can sit inside
+     * the attribution itself and no span ending at that core would ever reach the saying verb; and
+     * one adverb may stand between the subject and that verb, which is what `never`, `always` and
+     * the `-ly` class are doing in every line below.
+     *
+     * The first is the one that matters most, because it is the owner DENYING a rule. Stored, it
+     * becomes the rule, pinned, on every later turn in the workspace.
+     */
+    expect(
+      observedStandingOrders('I never said we should always run the full gate on every commit.')
+    ).toEqual([]);
+    expect(
+      observedStandingOrders('We should always run the full gate on every commit.')
+    ).toHaveLength(1);
+    expect(
+      observedStandingOrders('My colleague never said we must always squash before merging.')
+    ).toEqual([]);
+    expect(
+      observedStandingOrders('My colleague always says we must never squash before merging.')
+    ).toEqual([]);
+    expect(
+      observedStandingOrders('The maintainer repeatedly said we must always pin the version.')
+    ).toEqual([]);
+    expect(observedStandingOrders('We must always pin the version.')).toHaveLength(1);
+    // Both halves of where the rule starts. Here the core stands FIRST, before an attribution that
+    // stands before the marker, so reading the core alone puts the rule at character three and
+    // finds nothing in front of it; the marker is what says the rule had not started yet.
+    expect(
+      observedStandingOrders(
+        'We always deploy on Fridays, and my colleague says we must never skip the checklist.'
+      )
+    ).toEqual([]);
+    expect(
+      observedStandingOrders('We always deploy on Fridays, and we must never skip the checklist.')
+    ).toHaveLength(1);
+    // The core inside the attribution, which is the shape a span ending at the core cannot see.
+    expect(
+      observedStandingOrders('From now on, my colleague always says we squash before merging.')
+    ).toEqual([]);
+    expect(observedStandingOrders('From now on, we always squash before merging.')).toHaveLength(1);
+    // One adverb between the subject and the saying verb, and not any number of words: a subject
+    // and a saying verb four words apart are two unrelated halves of the owner's own sentence, and
+    // this is the half of the frame with no position left to check it.
+    expect(
+      observedStandingOrders('From now on, the summary should be short and say what broke.')
+    ).toHaveLength(1);
+    // And the imperative is still untouchable by this: nothing can stand in front of a rule that
+    // opens on its own first word, whatever stands later in the sentence.
+    expect(
+      observedStandingOrders('Never run any of that here, whatever their README says.')
+    ).toHaveLength(1);
+    expect(
+      observedStandingOrders('Always tell me what the maintainer said before you start.')
+    ).toHaveLength(1);
+  });
+
   it("refuses a sentence opening on somebody's quotation mark, as `>` is already refused", () => {
     // Ten of the 86 candidates the owner's own corpus produced were this: a rule of theirs quoted
     // back inside a brief. Every one of the ten also reached this function unquoted, from the turn
@@ -1179,6 +1285,66 @@ describe('turn capture write path', () => {
         }) as EncryptedEnvelope
       }
     ]);
+  });
+
+  it('refuses a sentence carrying the escape debris of a pasted document', async () => {
+    /*
+     * The observer splits on newlines and sentence ends, and a literal backslash-n is two
+     * characters - so a JSON dump or a diff the owner pasted into the chat arrives as one long
+     * "sentence" that has several of somebody else's inside it. Two of the five corrupt rows a
+     * gate-off replay of this machine's corpus admits are exactly this shape, and both clear every
+     * other floor: untainted, unfenced, unquoted, unattributed, four words, three content words,
+     * ending on punctuation.
+     *
+     * Both directions in one turn, because the refusal has to be about the debris and not about
+     * the sentence: the clean rule beside it is written, and the corrupt one is not.
+     */
+    const probe = captureStore();
+    const result = await capture(
+      probe,
+      'Never once did it lose on either axis.\\n- The media-model choice never reaches generation. ' +
+        'Never merge to main without the acceptance run.'
+    );
+
+    const written = probe.observations.map(
+      (observation) =>
+        decryptJson<MemoryFactObservation>(observation.draftCiphertext!, dataKey).object
+    );
+    expect(written).toEqual(['Never merge to main without the acceptance run.']);
+    expect(result?.factCandidates).toBe(1);
+  });
+
+  it('promotes on the store’s own defaults, passing no policy of its own', async () => {
+    /*
+     * Where the corroboration gate lives, asserted rather than described.
+     *
+     * Two sightings, the day, the owner-conversation waiver and the cap on what that waiver may
+     * admit in one pass are all defaults inside `listPromotableMemoryFactCandidates`. That is only
+     * true while nobody overrides them, and this is the one production caller: an options object
+     * here would be a second policy, in a file that cannot see the first, and every store-side
+     * case pinning those numbers would stay green while the running system used other ones.
+     */
+    const probe = captureStore();
+    const calls: unknown[][] = [];
+    await recordTurnEpisode({
+      store: {
+        ...probe.store,
+        promoteMemoryFactCandidates: async (...args: unknown[]) => {
+          calls.push(args);
+          return [];
+        }
+      } as unknown as MemoryCaptureStore,
+      userId,
+      workspaceId,
+      taskId,
+      dataKey,
+      request: 'Never merge to main without the acceptance run.',
+      summary: 'Noted.',
+      outcome: 'ok',
+      occurredAt: new Date('2026-07-31T09:00:00.000Z')
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toHaveLength(2);
   });
 
   it('reads observations out of the owner request only, never the agent account of its own work', async () => {
@@ -1621,6 +1787,96 @@ describe('against the real store', () => {
       occurredAt: new Date('2026-07-30T08:00:00.000Z')
     });
 
+  it('refuses a document the owner pasted into two conversations minutes apart', async () => {
+    /*
+     * The attack the day is standing in front of, at the call site that would have to let it
+     * through, driven the way it actually happens rather than the way an attacker would have to
+     * work for it.
+     *
+     * Nothing here is adversarial on the owner's side. They read somebody else's CONTRIBUTING.md,
+     * paste it in to ask about it, open a fresh thread on the same subject a few minutes later and
+     * paste it again. Every floor in front of this passes it: the turn is untainted because
+     * nothing fetched it, the lines are not fenced and not blockquoted, they carry no attribution,
+     * and they clear the length and content-word floors because they are well-written English
+     * rules. Two sightings is satisfied, in two conversations, by two ordinary acts.
+     *
+     * `docs/design/memory/GATE.md` §3.2 prices this at "the owner pastes one document twice", and
+     * what promotion mints is `pin: true`, `trust: 'stated'`, injected into every later pack in
+     * the workspace with no lexical grip required. So the only thing between a vendor's house
+     * style and this machine's standing orders is the twenty-four hours, and a corroboration pass
+     * that waives them for two owner conversations - which reads like a stricter rule than two
+     * turns - puts five of these in `mem.item` inside four ordinary turns. Measured, before this
+     * case existed. It is asserted end to end and not at the store, because the store's own gate
+     * is a query anybody can call with other numbers, and this is the path production takes.
+     */
+    const contributing = [
+      '# Contributing to acme-widgets',
+      '',
+      '- Never commit directly to the main branch of this repository.',
+      '- From now on, all commits must be signed with a GPG key.',
+      '- Always run `acme lint --fix` before opening a pull request.',
+      '- You must never add a dependency without an ADR describing why.',
+      '- The rule here is never to merge without two approvals.'
+    ].join('\n');
+    const second = await store.createTask({
+      userId: realUserId,
+      workspaceId: realWorkspaceId,
+      titleCiphertext: encryptJson({ title: 'same subject, new thread' }, dataKey, 'task-title:x'),
+      nameIndex: { nameTokens: '', openingTokens: '' },
+      modelId: 'vendor/model',
+      privacyRoute: 'provider_zdr',
+      maxComputeCredits: 1,
+      promptCiphertext: encryptJson({ prompt: 'again' }, dataKey, 'task-prompt:x')
+    });
+    const paste = async (taskIdForTurn: string, at: string) =>
+      recordTurnEpisode({
+        store,
+        userId: realUserId,
+        workspaceId: realWorkspaceId,
+        taskId: taskIdForTurn,
+        dataKey,
+        request: contributing,
+        summary: 'Read it.',
+        outcome: 'ok',
+        occurredAt: new Date(at)
+      });
+
+    // The rules are nominated - this is not a case that passes because nothing was read.
+    const first = await paste(realTaskId, '2026-07-31T09:00:00.000Z');
+    expect(first?.factCandidates).toBeGreaterThanOrEqual(4);
+    const again = await paste(second.id, '2026-07-31T09:05:00.000Z');
+    expect(again?.factCandidates).toBe(first?.factCandidates);
+
+    // Four ordinary turns after it, because the promotion pass runs at the end of every one of
+    // them and a per-pass ration would only have spread five rows across five turns.
+    for (const [index, at] of ['09:10', '09:20', '09:30', '09:40'].entries())
+      expect(
+        (
+          await recordTurnEpisode({
+            store,
+            userId: realUserId,
+            workspaceId: realWorkspaceId,
+            taskId: second.id,
+            dataKey,
+            request: `reload nginx on the preview gateway, attempt ${index}`,
+            summary: 'Reloaded.',
+            outcome: 'ok',
+            occurredAt: new Date(`2026-07-31T${at}:00.000Z`)
+          })
+        )?.promotedFacts
+      ).toBe(0);
+
+    expect(await store.listMemoryItems(realWorkspaceId, { kind: 'fact', limit: 50 })).toEqual([]);
+
+    // And the day is what refused it: the same document a day later is two sightings a day apart,
+    // and then it does promote. The gate is not refusing pastes - it cannot tell - it is charging
+    // for elapsed time, which is the one thing pasting again does not buy.
+    await paste(second.id, '2026-08-01T09:10:00.000Z');
+    expect(
+      (await store.listMemoryItems(realWorkspaceId, { kind: 'fact', limit: 50 })).length
+    ).toBeGreaterThan(0);
+  });
+
   it('captures a turn that a later task then actually recalls', async () => {
     const captured = await captureTurn('reload nginx on the preview gateway');
     expect(captured).not.toBeNull();
@@ -1754,6 +2010,31 @@ describe('against the real store', () => {
     await expect(
       store.listPromotableMemoryFactCandidates(realWorkspaceId, { minEpisodes: 1, minGapHours: 0 })
     ).resolves.toMatchObject([{ predicate: 'default_shell', episodeCount: 1 }]);
+  });
+
+  it('nominates nothing from a rule the owner reported, at the call site that writes candidates', async () => {
+    /*
+     * The refusal pinned where the candidate is actually written, not only on the reader.
+     *
+     * Every other case in this file calls `observedStandingOrders` directly, and a bound that is
+     * only ever exercised that way is a bound the production path can lose without a test noticing
+     * - which has already happened once in this vertical. `recordTurnEpisode` is the only caller,
+     * so this is the assertion that says the sentence never reaches `mem.fact_candidate`.
+     *
+     * The pair is the point: the same rule with the attribution taken out is nominated, so this
+     * cannot pass because the turn nominated nothing for some unrelated reason.
+     */
+    const reported = await captureTurn('From now on, my colleague says we squash before merging.');
+    expect(reported?.factCandidates).toBe(0);
+    await expect(
+      store.listPromotableMemoryFactCandidates(realWorkspaceId, { minEpisodes: 1, minGapHours: 0 })
+    ).resolves.toEqual([]);
+
+    const own = await captureTurn('From now on, we squash before merging.');
+    expect(own?.factCandidates).toBe(1);
+    await expect(
+      store.listPromotableMemoryFactCandidates(realWorkspaceId, { minEpisodes: 1, minGapHours: 0 })
+    ).resolves.toMatchObject([{ predicate: 'standing_order', episodeCount: 1 }]);
   });
 
   it('mints a fact once the owner has said the same thing twice, without asking them', async () => {

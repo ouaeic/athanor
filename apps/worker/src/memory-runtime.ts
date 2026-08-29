@@ -1100,23 +1100,84 @@ const STANDING_ASKED = /\?["'’”)\]`]*$/u;
 const STANDING_QUOTED = /^["“”«]/u;
 
 /**
+ * Where the owner's own rule begins, as opposed to where the sentence begins.
+ *
+ * `STANDING_MARKERS` above answers "is this a rule at all", and two of its entries answer nothing
+ * about where the rule starts: `from now on` and `remember` are adverbials that INTRODUCE a rule,
+ * and `as a rule` is another. Everything between such a marker and the rule's own opening words is
+ * still frame, and `STANDING_REPORTED` below is measured against exactly that span.
+ *
+ * The opening words are `never` and `always` wherever they stand - which covers `must never`,
+ * `should always` and `never ever` without restating them - plus the two rule-shaped markers that
+ * contain neither. A sentence with none of these has no located rule, so all of it is frame.
+ */
+const STANDING_RULE_CORE =
+  /\b(?:never|always|(?:do not|don't) ever|the (?:rule|convention|house style) (?:here )?is)\b/iu;
+
+/**
  * A rule attributed to somebody, rather than given by the owner.
  *
  * "My colleague insists we must always squash before merging." is a report about a rule that
  * exists somewhere else; stored, it becomes the owner's own standing order, and the owner never
- * said it. The frame is the evidence and it is positional, not grammatical: this class of verb
- * has to stand BETWEEN the start of the sentence and the phrase that makes it a rule. An
- * imperative rule opens on `never` or `always`, so there is nothing in front of it and this can
- * never fire on one - `Never use a tool that wants network access.` keeps its `wants` because the
- * rule had already started.
+ * said it.
+ *
+ * Two things have to be true before a sentence is read that way, and each one is load-bearing.
+ *
+ * The first is the shape, and it is a frame rather than a word: a SUBJECT followed by a saying
+ * verb. The verb alone is not evidence of anything, because a saying verb is also a thing a rule
+ * can be ABOUT - `Never write another product's name into any repo file.` and `Never let two
+ * agents write the same file.` are both the owner's own, both in the corpus, and a test that read
+ * `write` on its own would refuse them. The subject is spelled out and nothing else is inferred:
+ * `he`, `she`, `they`, a possessive or definite noun phrase, or a capitalised word. Deciding by
+ * anything finer would be a hand-built grammar of English, which is the model's half of the
+ * residency line and the half that rots; a frame the owner wrote in some shape this does not list
+ * is let through and said so.
+ *
+ * `we` and `you` are deliberately not subjects here, and `I` needs no entry because English
+ * capitalises it. Those two are the owner and this machine, never a third party, and they are
+ * exactly the two that collide with the rule's own verb: `From now on, we write dates in ISO.` and
+ * `From now on, you tell me the cost before you start.` are rules, and listing `we` or `you` would
+ * refuse both. The price is one shape let through - `you think`, `you said` - measured at one
+ * single-sighting candidate over 839 owner turns, which is two sightings a day apart short of
+ * being anything.
+ *
+ * The second is position: the frame has to OPEN before the owner's own words do. Where those words
+ * begin is the later of the sentence's marker and its rule core, and neither alone is it. The
+ * marker alone was the first hole: a marker rule can start at character zero, which left an empty
+ * span in front of it, so `From now on, my colleague says we squash before merging.` was stored as
+ * the owner's own standing order while its twin with the attribution in front was refused. The
+ * core alone is the opposite hole and is worse, because it can sit EARLIER than the marker did:
+ * `My colleague never said we must always squash before merging.` puts the core at `never` and
+ * leaves the attribution behind it, so a report the marker had refused becomes a stored rule.
+ * An imperative rule opens ON its core, so nothing can stand in front of one and this can never
+ * fire on it - `Never run any of that here, whatever their README says.` keeps its `README says`
+ * because the rule had already started.
+ *
+ * Where it opens rather than whether it fits, because a core can sit INSIDE the attribution:
+ * `From now on, my colleague always says we squash.` is a report whose `always` is the first core
+ * in the sentence, so any test that reads only the characters before that core cuts the saying
+ * verb off and finds `my colleague ` innocent. 384 constructed reports - eight subjects, eight
+ * saying verbs, six shapes - go from 128 stored to zero on this, where reading the span stored 64
+ * of them and reading it against the core alone stored 256.
+ *
+ * One adverb may stand between the subject and the verb, because `never`, `always` and the `-ly`
+ * class are exactly what a report of a rule puts there. One and not any number: a subject and a
+ * saying verb five words apart are as likely to be two unrelated halves of the owner's own
+ * sentence, and this is the half of the frame with no position left to check it.
  *
  * No carve-out for the owner reporting themselves. "Dan said the rule here is never squash." and
  * "I said the rule here is never squash." are both refused, and that is the safe direction: a rule
  * wrongly stored is obeyed on turns the owner is not watching, where a rule missed is one they can
  * simply say again.
+ *
+ * Naming somebody is not reporting them, and that is the direction this is priced on: a rule with
+ * a colleague in it and no saying verb is untouched here. "Priya and I agreed we must always
+ * squash before merging." lands. Its bare cousin "Priya and I agreed we always squash before
+ * merging." does not, and not because of anything on this page - it carries no marker at all, so
+ * `STANDING_MARKERS` above never admitted it and never did.
  */
 const STANDING_REPORTED =
-  /\b(?:says?|said|tells?|told|insists?|insisted|claims?|claimed|argues?|argued|reckons?|thinks?|thought|believes?|believed|suggests?|suggested|recommends?|recommended|advises?|advised|warns?|warned|mentioned|reported|writes?|wrote)\b/iu;
+  /(?:\b(?:he|she|they)|\b(?:[Mm]y|[Oo]ur|[Yy]our|[Hh]is|[Hh]er|[Tt]heir|[Tt]he)\s+[\p{L}][\p{L}'-]*|\p{Lu}[\p{L}'-]*)(?:\s+(?:never|always|often|already|repeatedly|sometimes|[\p{L}]+ly))?\s+(?:says?|said|tells?|told|insists?|insisted|claims?|claimed|argues?|argued|reckons?|thinks?|thought|believes?|believed|suggests?|suggested|recommends?|recommended|advises?|advised|warns?|warned|mentioned|reported|writes?|wrote)\b/u;
 
 /** Enough of the sentence has to be its own to be worth keeping; the rest is scaffolding. */
 const STANDING_STOPWORDS = new Set([
@@ -1182,6 +1243,15 @@ const STANDING_STOPWORDS = new Set([
  * this function unquoted, from the turn where the owner actually typed the rule, and land as
  * before. None of the twelve was near promotion: the store wants two sightings a day apart, and
  * eleven were seen once, the twelfth twice inside one hour.
+ *
+ * Re-measured again when the attribution frame stopped being read only in front of a marker, on
+ * 389 owner-typed turns in this workspace and 839 across every project. That basis is the filter
+ * on `type: user` deduplicated by turn uuid - 635 raw lines here are 534 turns and 389 once the
+ * harness's own records go, which is where an earlier count of 459 came from: 60 of them are the
+ * `[Image: original 2560x1600...]` notice the harness writes and 10 are compaction summaries,
+ * which is the machine quoting the owner back to itself and is the one thing a corroboration gate
+ * must never count as a second sighting. The rule costs one candidate and no promotion: 21
+ * candidates here and 47 across projects, unchanged, and the same rows promote.
  */
 export const flattenedForStandingOrders = (text: string): string => text.replaceAll('**', '');
 
@@ -1217,7 +1287,25 @@ export const observedStandingOrders = (text: string): MemoryFactObservation[] =>
     // Asked about, quoted, or attributed to somebody. All three are sentences that contain a rule
     // without being one, and all three used to be stored as the rule they contain.
     if (STANDING_ASKED.test(line) || STANDING_QUOTED.test(line)) continue;
-    if (STANDING_REPORTED.test(line.slice(0, startsAt))) continue;
+    /*
+     * Everything in front of the owner's own words is frame, and neither `startsAt` nor the rule
+     * core alone is where those words begin. An adverbial marker at character zero left nothing in
+     * front of it to read, so an attribution that FOLLOWED the marker was never looked at; a core
+     * standing in front of the attribution - `My colleague never said we must always squash` -
+     * hides it the other way. The later of the two is where the rule starts, so it can only move
+     * right, and a sentence either of them refused can never become one this stores. A rule that
+     * cannot be located at all starts at the end, which is what catches
+     * `From now on, my colleague says we squash before merging.` - it has no core to stand before.
+     *
+     * Where the frame STARTS, not whether it fits: `From now on, my colleague always says we
+     * squash.` puts a core inside the attribution, so a span ending at the core cuts the saying
+     * verb off and reads `my colleague ` as innocent. A frame that opens before the rule does is
+     * a frame around it however far past the rule's first word it runs.
+     */
+    const coreAt = head ? 0 : line.search(STANDING_RULE_CORE);
+    const ruleAt = head ? 0 : Math.max(coreAt < 0 ? line.length : coreAt, startsAt);
+    const reported = STANDING_REPORTED.exec(line);
+    if (reported && reported.index < ruleAt) continue;
     // `.` and `/` are kept inside a word so `browser.ts` and `apps/web` stay whole, and stripped
     // off the end so `it.` is the stopword `it` rather than a content word the floor below counts.
     // It reached the corpus as "always better without it." - four tokens, two of them apparently
@@ -1239,6 +1327,34 @@ export const observedStandingOrders = (text: string): MemoryFactObservation[] =>
 };
 
 /* --- the capture itself --------------------------------------------------- */
+
+/**
+ * Escape debris: the marks of a machine-readable document that arrived as prose.
+ *
+ * A literal backslash-n is two characters, so the sentence splitter above cannot see it, and a
+ * JSON dump the owner pasted into the chat therefore reaches this tier as one long "sentence"
+ * spanning several of somebody else's. Two of the five corrupt rows a gate-off replay of this
+ * machine's own corpus admits are exactly that - `Never once did it lose on either axis.\n- The
+ * owner's media-model choice never reaches generation.` and `NEVER bug for citation volume.'","
+ * Shipping any premade skills.` - and both clear every existing floor: untainted, unfenced,
+ * unquoted, unattributed, four words, three content words, ending on punctuation.
+ *
+ * Measured across 3,839 replayed turns (owner-typed turns and the agent briefs beside them, every
+ * project on this machine): 23 observations carry it, every one of them a pasted diff, JSON blob
+ * or code fence flattened into prose, and no promotion at any gate setting loses a sentence to
+ * this. It sits at the write point rather than inside either observer because it is a property of
+ * the text and not of the shape either one is looking for, and because the taint gate that guards
+ * the same door is here for the same reason.
+ *
+ * A refusal and not a repair: a sentence with a `\n` in the middle of it has another sentence in
+ * it, and there is no way to tell from here which half the owner meant.
+ */
+const OBSERVATION_ESCAPE_DEBRIS = /\\[nrtu"\\]|","|":"/u;
+
+/** Both halves are checked: the subject is stored beside the object and is keyed from the same text. */
+const observationIsProse = (observation: MemoryFactObservation): boolean =>
+  !OBSERVATION_ESCAPE_DEBRIS.test(observation.object) &&
+  !OBSERVATION_ESCAPE_DEBRIS.test(observation.subject);
 
 export type MemoryCaptureStore = Pick<
   DataStore,
@@ -1450,6 +1566,7 @@ export const recordTurnEpisode = async (input: {
       ...observedMemoryFacts(request),
       ...observedStandingOrders(request)
     ]) {
+      if (!observationIsProse(observation)) continue;
       await input.store.observeMemoryFactCandidate({
         workspaceId: input.workspaceId,
         subjectKey: memorySubjectKey(observation.subject, indexKey),
@@ -1471,9 +1588,15 @@ export const recordTurnEpisode = async (input: {
    * This is what makes the memory automatic rather than a queue of chores. A candidate is something
    * the owner said; it becomes a fact once they have said it in at least two episodes at least a
    * day apart, which is the store's own rule and is unchanged. Nothing in the running system ever
-   * asked for that before, so candidates accumulated in a table nothing drained and the only kind of
-   * entry the store could hold was `episode` - the curated layer that makes memory more than a
+   * asked for that before, so candidates accumulated in a table nothing drained and the only kind
+   * of entry the store could hold was `episode` - the curated layer that makes memory more than a
    * transcript was built, tested, and unreachable.
+   *
+   * No options are passed, and that is deliberate rather than incidental: both bounds in the
+   * corroboration gate - two sightings and the day - are defaults in
+   * `listPromotableMemoryFactCandidates`, so there is exactly one place to read them and exactly
+   * one place to change them. A caller that passed its own would be a second policy nothing in the
+   * store could see.
    *
    * What keeps it safe is upstream: `observedMemoryFacts` reads the owner's own words and never
    * the agent's account of its work, so an agent cannot nominate its own beliefs; the observation
@@ -1560,7 +1683,10 @@ export const recordTurnEpisode = async (input: {
           };
         }
       );
-      promotedFacts = promotions.length;
+      // Rows this turn minted, not corroborations it settled: a restatement that landed on the row
+      // already holding that sentence added evidence and no entry, and counting it here would
+      // report a tier growing when it is not.
+      promotedFacts = promotions.filter((promotion) => !promotion.reattached).length;
     } catch {
       promotedFacts = 0;
     }

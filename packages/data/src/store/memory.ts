@@ -215,6 +215,12 @@ export interface MemoryFactPromotion {
   candidate: MemoryFactCandidateRecord;
   item: MemoryItemRecord;
   supersededIds: string[];
+  /**
+   * True when the corroboration landed on a row that already said this, rather than minting a
+   * second one. `item` is then the row that was already there and the episodes behind this
+   * candidate have been linked to it.
+   */
+  reattached: boolean;
 }
 
 export interface CreateMemoryItemInput {
@@ -899,6 +905,14 @@ export class MemoryStore {
    * Below-threshold observations wait here instead of entering mem.item. Requiring two independent
    * episodes at least a day apart is the single most effective anti-bloat rule in the design:
    * minting a fact per message pair is what makes a store unusable after a year.
+   *
+   * The day is the half that cannot be bought. A count of sightings can be: the owner pasting
+   * somebody else's document into two conversations is two sightings, five minutes apart, and it
+   * is ordinary behaviour rather than an attack anybody has to mount. Measured end to end, one
+   * bare paste of a vendor `CONTRIBUTING.md` into two threads five minutes apart puts five of
+   * somebody else's rules into `mem.item`, active and pinned, if nothing asks for elapsed time.
+   * That is why no property of WHO said it - however carefully written where the candidate is
+   * written - substitutes for the twenty-four hours here.
    */
   async observeMemoryFactCandidate(input: {
     workspaceId: string;
@@ -937,6 +951,30 @@ export class MemoryStore {
     return mapMemoryFactCandidate(result.rows[0]!);
   }
 
+  /**
+   * What the corroboration gate admits, and why both halves of it are still here.
+   *
+   * Two sightings stops a single sentence - a paste, a quote, a fragment the observer mangled -
+   * from becoming a rule the model obeys. The day stops two of them from being the same act. They
+   * do different work and neither covers for the other, which is the finding that put this query
+   * back the way it was after a pass that waived the day for a rule the owner had said in two
+   * conversations of their own.
+   *
+   * The waiver was measured on this machine's transcripts and it worked: on 389 owner-typed turns
+   * here it admitted exactly one row, `Remember, this will primarily be an app experience on
+   * desktop and mobile...`, said four times in four conversations six minutes apart, and no
+   * corrupt one. What the measurement could not see is that pasting the same document into two
+   * conversations is not an attack anybody has to mount - it is what a person does when they open
+   * a fresh thread on the same topic. Driven end to end, one bare paste of a vendor
+   * `CONTRIBUTING.md` into two threads five minutes apart put five of somebody else's rules into
+   * `mem.item`, active and pinned, inside four ordinary turns. `docs/design/memory/GATE.md` §3.2
+   * had already priced that attack at exactly "the owner pastes one document twice", and two
+   * conversations IS twice.
+   *
+   * So the day is not a proxy for anything and cannot be swapped for a better proxy. It is the one
+   * requirement a paste cannot satisfy by being pasted again, and the cost of keeping it is one
+   * rule the owner can state again tomorrow.
+   */
   async listPromotableMemoryFactCandidates(
     workspaceId: string,
     options: { minEpisodes?: number; minGapHours?: number; limit?: number } = {}
@@ -982,13 +1020,43 @@ export class MemoryStore {
    * `prepare` returning null leaves the candidate exactly where it is. That is the right answer
    * when the caller cannot open the draft, and it is why nothing here is ever destructive on its
    * own: a candidate only disappears once it has become something.
+   *
+   * Two things this does NOT do, both of which it used to.
+   *
+   * It does not mint a second row for a sentence the workspace already holds. Promotion deletes
+   * the candidate, and `standing_order` is `cardinality: 'many'`, so the supersession in
+   * `#recordMemoryFact` never fires on one: an owner restating a rule they had already had
+   * promoted re-accumulated a candidate and minted an identical, active, pinned row beside the
+   * first. The pack caps facts at four per subject, so duplicates do not merely waste bytes - the
+   * same rule takes two of the four slots every later turn in that workspace sees. The
+   * corroboration now lands on the row that is already there, as evidence.
+   *
+   * And it does not bring back a row the owner retracted. Retraction is the owner saying "stop
+   * believing this", and a promotion pass that re-mints it two sightings later is the machine
+   * overruling them - the one failure this tier cannot be allowed, because a stored rule is
+   * obeyed. The candidate is dropped rather than held, so the answer does not change on the next
+   * turn either. `DELETE /memory-items/:id` removes the row and every trace of it, and is
+   * therefore the route back for an owner who changes their mind: a rule they deleted can be
+   * learned again, a rule they retracted stays refused.
+   *
+   * Refused per SENTENCE, and the difference matters enough to say here rather than let a reader
+   * assume otherwise. The row is found by `(subject_key, predicate, object_key)`, and the object
+   * key is a blind index over `normalizeMemoryTerm`, which folds case, NFKC and runs of
+   * whitespace and nothing else. `...on a Friday afternoon!` and `...on a Friday afternoon..`
+   * are different keys and are re-minted, as is any paraphrase. The store cannot read the body,
+   * so this is the whole of what it can promise: the exact sentence the owner retracted does not
+   * come back on its own.
    */
   async promoteMemoryFactCandidates(
     workspaceId: string,
     prepare: (
       candidate: MemoryFactCandidateRecord
     ) => Promise<PreparedMemoryFact | null> | PreparedMemoryFact | null,
-    options: { minEpisodes?: number; minGapHours?: number; limit?: number } = {}
+    options: {
+      minEpisodes?: number;
+      minGapHours?: number;
+      limit?: number;
+    } = {}
   ): Promise<MemoryFactPromotion[]> {
     const candidates = await this.listPromotableMemoryFactCandidates(workspaceId, options);
     const promoted: MemoryFactPromotion[] = [];
@@ -1002,6 +1070,30 @@ export class MemoryStore {
           candidate.predicate,
           candidate.objectKey
         );
+        continue;
+      }
+      const standing = await this.#storedMemoryFact(workspaceId, candidate);
+      if (standing?.status === 'retracted') {
+        await this.deleteMemoryFactCandidate(
+          workspaceId,
+          candidate.subjectKey,
+          candidate.predicate,
+          candidate.objectKey
+        );
+        continue;
+      }
+      if (standing) {
+        const item = await this.database.transaction(async (transaction) => {
+          await this.#linkPromotionEpisodes(transaction, workspaceId, standing.id, candidate);
+          await transaction.query(
+            `DELETE FROM mem.fact_candidate
+             WHERE workspace_id=$1 AND subject_key=$2 AND predicate=$3 AND object_key=$4`,
+            [workspaceId, candidate.subjectKey, candidate.predicate, candidate.objectKey]
+          );
+          const row = await transaction.query(`SELECT * FROM mem.item WHERE id=$1`, [standing.id]);
+          return mapMemoryItem(row.rows[0]!);
+        });
+        promoted.push({ candidate, item, supersededIds: [], reattached: true });
         continue;
       }
       const prepared = await prepare(candidate);
@@ -1030,13 +1122,7 @@ export class MemoryStore {
           episodeId: candidate.episodeIds.at(-1) ?? null,
           pin: prepared.pin ?? false
         });
-        for (const episodeId of candidate.episodeIds)
-          await transaction.query(
-            `INSERT INTO mem.link(src_id,dst_id,rel)
-             SELECT $1,$2,'derived_from' FROM mem.item WHERE id=$2 AND workspace_id=$3
-             ON CONFLICT DO NOTHING`,
-            [recorded.item.id, episodeId, workspaceId]
-          );
+        await this.#linkPromotionEpisodes(transaction, workspaceId, recorded.item.id, candidate);
         await transaction.query(
           `DELETE FROM mem.fact_candidate
            WHERE workspace_id=$1 AND subject_key=$2 AND predicate=$3 AND object_key=$4`,
@@ -1044,9 +1130,54 @@ export class MemoryStore {
         );
         return recorded;
       });
-      promoted.push({ candidate, item: result.item, supersededIds: result.supersededIds });
+      promoted.push({
+        candidate,
+        item: result.item,
+        supersededIds: result.supersededIds,
+        reattached: false
+      });
     }
     return promoted;
+  }
+
+  /**
+   * The live row this candidate would be a second copy of, if there is one.
+   *
+   * Keyed identity and not the sealed body: the store cannot read either, and the blind index is
+   * what promotion already refuses a mismatch on. `archived` and `superseded` are deliberately not
+   * here - an archived row is out of recall and a superseded one is a value that stopped being
+   * true, and refusing to re-learn either would mean the owner could never move back to a city
+   * they had left.
+   */
+  async #storedMemoryFact(
+    workspaceId: string,
+    candidate: MemoryFactCandidateRecord
+  ): Promise<{ id: string; status: string } | null> {
+    const result = await this.database.query<{ id: string; status: string }>(
+      `SELECT id, status::text AS status FROM mem.item
+       WHERE workspace_id=$1 AND kind='fact' AND subject_key=$2 AND predicate=$3 AND object_key=$4
+         AND status IN ('active','retracted')
+       ORDER BY (status = 'retracted') DESC, observed_at DESC, id
+       LIMIT 1`,
+      [workspaceId, candidate.subjectKey, candidate.predicate, candidate.objectKey]
+    );
+    return result.rows[0] ?? null;
+  }
+
+  /** The episodes that vouched for a fact, whether it was just minted or was already there. */
+  async #linkPromotionEpisodes(
+    transaction: Database,
+    workspaceId: string,
+    itemId: string,
+    candidate: MemoryFactCandidateRecord
+  ): Promise<void> {
+    for (const episodeId of candidate.episodeIds)
+      await transaction.query(
+        `INSERT INTO mem.link(src_id,dst_id,rel)
+         SELECT $1,$2,'derived_from' FROM mem.item WHERE id=$2 AND workspace_id=$3
+         ON CONFLICT DO NOTHING`,
+        [itemId, episodeId, workspaceId]
+      );
   }
 
   /**

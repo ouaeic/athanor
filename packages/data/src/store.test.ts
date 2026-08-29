@@ -3566,6 +3566,32 @@ describe('tiered agent memory', () => {
     expect(repeat.episodeCount).toBe(1);
     await expect(store.listPromotableMemoryFactCandidates(workspaceId)).resolves.toEqual([]);
 
+    /*
+     * The count, on its own, with the day already satisfied - which is what that assertion above
+     * looks like it is doing and is not.
+     *
+     * One episode, seen twice two days apart, so `last_seen - first_seen` clears twenty-four hours
+     * and `n_episodes` is still one. Changing the default `minEpisodes ?? 2` to `?? 1` left every
+     * case in this file green, including the line above, because every single-sighting candidate
+     * anywhere in it is also inside its own day and the GAP was refusing them all. The two
+     * sightings are the half of this gate the corroboration ruling kept unconditionally and the
+     * half the owner-conversation waiver leans on entirely - every corrupt row a gate-off replay
+     * of this machine's corpus admits was seen exactly once - so it is worth a case that fails
+     * when it moves.
+     */
+    const spread = await store.observeMemoryFactCandidate({
+      ...observation,
+      episodeId: episodeOne.id,
+      observedAt: at(1)
+    });
+    expect(spread.episodeCount).toBe(1);
+    await expect(store.listPromotableMemoryFactCandidates(workspaceId)).resolves.toEqual([]);
+    await expect(
+      store
+        .listPromotableMemoryFactCandidates(workspaceId, { minEpisodes: 1 })
+        .then((rows) => rows.map((row) => row.objectKey))
+    ).resolves.toEqual(['object-ripgrep']);
+
     const second = await store.observeMemoryFactCandidate({
       ...observation,
       episodeId: episodeTwo.id,
@@ -3628,6 +3654,58 @@ describe('tiered agent memory', () => {
     ).resolves.toEqual(['object-same-day']);
   });
 
+  it('keeps the day whoever said it, and however many conversations they said it in', async () => {
+    /*
+     * The clause a corroboration pass added here and this one took back out, pinned so it cannot
+     * come back by accident.
+     *
+     * The argument for waiving the day was good and the measurement behind it was real: on this
+     * machine's own transcripts the day refused exactly one rule it should have kept - `Remember,
+     * this will primarily be an app experience on desktop and mobile, not browser focused.`, said
+     * in four conversations six minutes apart - and admitted no corrupt fragment in its place. The
+     * proposed bound was two conversations rather than two turns, on the reasoning that a paste
+     * twice into one thread is one act and two threads are two.
+     *
+     * It is not. `docs/design/memory/GATE.md` §3.2 prices the attack this tier has to survive at
+     * exactly "the owner pastes one document twice", and opening a fresh conversation on the same
+     * subject and pasting the same document again is what a person does, not what an attacker
+     * does. Driven end to end through `recordTurnEpisode`, that put five of a vendor's rules into
+     * `mem.item`, active and pinned, in five minutes. No count of conversations can stand in for
+     * elapsed time, because pasting again is free and waiting is not - so the day applies to
+     * everybody, and the rows below differ only in who said them and where.
+     */
+    const first = await addItem('episode', { body: 'Said it in one conversation.' });
+    const second = await addItem('episode', { body: 'Said it again in the next one.' });
+    for (const objectKey of ['object-two-threads', 'object-one-thread'] as const) {
+      await store.observeMemoryFactCandidate({
+        workspaceId,
+        subjectKey: 'subject-athanor',
+        predicate: 'standing_order',
+        objectKey,
+        episodeId: first.id,
+        observedAt: at(1)
+      });
+      await store.observeMemoryFactCandidate({
+        workspaceId,
+        subjectKey: 'subject-athanor',
+        predicate: 'standing_order',
+        objectKey,
+        episodeId: second.id,
+        observedAt: at(0.5)
+      });
+    }
+    // Two sightings each, so the count is satisfied and the day is the only thing left refusing.
+    const rows = await memory.listPromotableMemoryFactCandidates(workspaceId, { minGapHours: 6 });
+    expect(rows.map((row) => row.episodeCount)).toEqual([2, 2]);
+    await expect(store.listPromotableMemoryFactCandidates(workspaceId)).resolves.toEqual([]);
+    // And the day is what is refusing them, not the count: cleared, both come back.
+    await expect(
+      store
+        .listPromotableMemoryFactCandidates(workspaceId, { minGapHours: 0 })
+        .then((promotable) => promotable.map((row) => row.objectKey))
+    ).resolves.toEqual(['object-one-thread', 'object-two-threads']);
+  });
+
   it('pins a promoted standing order, so a request that does not name it still gets it', async () => {
     /*
      * `mem.item.pin` is read by the structural recall channel and by the salience formula, and
@@ -3680,6 +3758,147 @@ describe('tiered agent memory', () => {
     await addItem('fact', loose, { predicate: 'standing_order' });
     const again = await recall('rewrite the brochure copy for the spring mailing');
     expect(again.map((hit) => opened(hit.documentCiphertext))).not.toContain(loose.body);
+  });
+
+  it('lands a restated rule on the row that already holds it, and never on a second one', async () => {
+    /*
+     * What a promotion does to a sentence the workspace already keeps.
+     *
+     * Promotion deletes the candidate, and `standing_order` is `cardinality: 'many'`, so the
+     * supersession in `#recordMemoryFact` never fires on one: the owner saying a rule again
+     * re-accumulated a candidate and minted a second identical, active, pinned row beside the
+     * first. It is not a bytes problem. `MEMORY_PACK_QUOTAS` caps facts at four per subject and
+     * every standing order shares the subject `athanor`, so one rule said three times takes three
+     * of the four slots every later turn in the workspace sees - the pack fills with one sentence
+     * and the other rules fall out. Restating is also the most natural thing an owner does, so the
+     * cost grows with how much they use this.
+     *
+     * The corroboration still counts: the episodes that vouched for it this time are linked to the
+     * row that was already there, which is what keeps "what is this based on" answerable.
+     */
+    const content = {
+      title: 'Standing instruction',
+      body: 'Never merge to main without the acceptance run.',
+      subject: 'athanor',
+      object: 'Never merge to main without the acceptance run.'
+    };
+    const index = buildMemoryItemIndex(content, key);
+    const say = async (episodes: readonly { id: string }[], seenAt: Date) => {
+      for (const episode of episodes)
+        await store.observeMemoryFactCandidate({
+          workspaceId,
+          subjectKey: index.subjectKey!,
+          predicate: 'standing_order',
+          objectKey: index.objectKey!,
+          episodeId: episode.id,
+          observedAt: seenAt
+        });
+    };
+    const promote = () =>
+      store.promoteMemoryFactCandidates(workspaceId, () => ({
+        userId,
+        trust: 'stated' as const,
+        documentCiphertext: sealed(content.body),
+        index,
+        pin: true
+      }));
+
+    const said = await addItem('episode', { body: 'The owner said it.' });
+    const saidAgain = await addItem('episode', { body: 'And again, days later.' });
+    await say([said], at(3));
+    await say([saidAgain], at(1));
+    const first = await promote();
+    expect(first).toHaveLength(1);
+    expect(first[0]!.reattached).toBe(false);
+
+    // Days later, the same rule, twice more, clearing the same gate a second time.
+    const repeated = await addItem('episode', { body: 'Said it again this week.' });
+    const repeatedAgain = await addItem('episode', { body: 'And once more.' });
+    await say([repeated], at(2));
+    await say([repeatedAgain], at(0));
+    const second = await promote();
+    expect(second).toHaveLength(1);
+    expect(second[0]!.reattached).toBe(true);
+    expect(second[0]!.item.id).toBe(first[0]!.item.id);
+
+    // One row, still the only one, and the candidate did not survive to be promoted a third time.
+    const stored = await store.listMemoryItems(workspaceId, { kind: 'fact' });
+    expect(stored.filter((item) => item.predicate === 'standing_order')).toHaveLength(1);
+    await expect(store.listPromotableMemoryFactCandidates(workspaceId)).resolves.toEqual([]);
+
+    // All four episodes vouch for the one row.
+    const vouching = await database.query<{ dst_id: string }>(
+      `SELECT dst_id FROM mem.link WHERE src_id=$1 AND rel='derived_from' ORDER BY dst_id`,
+      [first[0]!.item.id]
+    );
+    expect(vouching.rows.map((row) => row.dst_id).sort()).toEqual(
+      [said.id, saidAgain.id, repeated.id, repeatedAgain.id].sort()
+    );
+  });
+
+  it('does not bring back a rule the owner retracted, and does bring back one they deleted', async () => {
+    /*
+     * The owner's undo has to outlast the next corroboration, or it is not an undo.
+     *
+     * Retracting is this product's "stop believing this": the row stays for the audit trail and
+     * leaves recall. If saying the thing twice more re-mints it, the machine has overruled the one
+     * instruction in the whole tier that was given deliberately, about the tier itself - and it is
+     * a pinned row, so what comes back is obeyed on every later turn. The candidate is dropped
+     * rather than held, so the answer is the same on the next turn and the one after.
+     *
+     * The other direction is why `DELETE` and `retract` are two verbs. Deleting removes the row and
+     * every trace of it, which is what an owner means when they say a line is gone - and a rule
+     * that is gone can be learned again, from evidence, exactly as it was the first time. Without
+     * this half, a refusal that only ever accumulates would slowly make the store unteachable.
+     */
+    const content = {
+      title: 'Standing instruction',
+      body: 'Never open a pull request from the release branch.',
+      subject: 'athanor',
+      object: 'Never open a pull request from the release branch.'
+    };
+    const index = buildMemoryItemIndex(content, key);
+    let episodes = 0;
+    const corroborate = async () => {
+      for (const days of [3, 1]) {
+        const episode = await addItem('episode', { body: `Sighting ${(episodes += 1)}.` });
+        await store.observeMemoryFactCandidate({
+          workspaceId,
+          subjectKey: index.subjectKey!,
+          predicate: 'standing_order',
+          objectKey: index.objectKey!,
+          episodeId: episode.id,
+          observedAt: at(days)
+        });
+      }
+      return store.promoteMemoryFactCandidates(workspaceId, () => ({
+        userId,
+        trust: 'stated' as const,
+        documentCiphertext: sealed(content.body),
+        index,
+        pin: true
+      }));
+    };
+
+    const promoted = await corroborate();
+    expect(promoted).toHaveLength(1);
+    await expect(store.retractMemoryItem(workspaceId, promoted[0]!.item.id)).resolves.toBe(true);
+
+    // Said twice more, on two more days. Nothing is minted, and nothing is waiting to be.
+    await expect(corroborate()).resolves.toEqual([]);
+    await expect(store.listPromotableMemoryFactCandidates(workspaceId)).resolves.toEqual([]);
+    await expect(
+      store
+        .listMemoryItems(workspaceId, { kind: 'fact' })
+        .then((rows) => rows.map((row) => row.status))
+    ).resolves.toEqual(['retracted']);
+
+    // Deleted instead, the same evidence teaches it again.
+    await expect(store.forgetMemoryItem(workspaceId, promoted[0]!.item.id)).resolves.toBe(true);
+    const relearned = await corroborate();
+    expect(relearned).toHaveLength(1);
+    expect(relearned[0]!.reattached).toBe(false);
+    expect(relearned[0]!.item.id).not.toBe(promoted[0]!.item.id);
   });
 
   it('still tells the owner their own facts after sixty rules of theirs are pinned', async () => {
