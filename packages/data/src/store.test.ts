@@ -14,6 +14,7 @@ import {
   memoryIndexKey,
   memoryOriginKey,
   memorySubjectKey,
+  OWNER_MEMORY_MAX_ROWS,
   planMemoryQuery,
   renderMemoryPack,
   spendWindowBounds
@@ -22,6 +23,7 @@ import {
   encryptJson,
   generateDataKey,
   hashRecoveryCode,
+  sha256,
   verifyRecoveryCode,
   wrapDataKey
 } from '@athanor/core';
@@ -2863,6 +2865,280 @@ describe('DataStore', () => {
         .listModels()
         .then((models) => models.find((model) => model.id === 'openrouter/vendor/scheduled'))
     ).resolves.toMatchObject({ availability: 'available' });
+  });
+
+  /*
+   * The tier that follows the person rather than the computer.
+   *
+   * `workspace_memories.target` has had a `'user'` value since migration 30, a label reading
+   * "About you, everywhere" and an approval card promising it was loaded into every workspace. All
+   * of it was false, because the only reader was `WHERE m.workspace_id=$2`. These tests are the
+   * ones that were missing: each of them fails against the old statement, and each attacks the new
+   * bound from the side that would let a row out of its scope as well as the side that would trap
+   * it in one.
+   */
+  describe('memory that belongs to the owner rather than to a computer', () => {
+    const envelope = (marker: string) => ({
+      v: 1 as const,
+      iv: 'iv',
+      tag: 'tag',
+      ciphertext: marker
+    });
+
+    it('is readable from a second computer, while that computer keeps its own notes to itself', async () => {
+      const user = await store.createUser({ username: 'two-boxes', displayName: 'Owner' });
+      const first = await store.createWorkspace(workspaceInput(user.id, 'First'));
+      const second = await store.createWorkspace(workspaceInput(user.id, 'Second'));
+      const owned = await store.createOwnerMemory({
+        userId: user.id,
+        maxRows: OWNER_MEMORY_MAX_ROWS,
+        contentCiphertext: envelope('about-the-person')
+      });
+      const local = await store.createWorkspaceMemory({
+        userId: user.id,
+        workspaceId: first.id,
+        target: 'workspace',
+        contentCiphertext: envelope('about-the-first-box')
+      });
+
+      const fromFirst = await store.listWorkspaceMemories(user.id, first.id);
+      const fromSecond = await store.listWorkspaceMemories(user.id, second.id);
+      expect(fromFirst.map((record) => record.id).sort()).toEqual([owned!.id, local.id].sort());
+      // Both directions. The owner row crosses; the workspace row does not, which is the half a
+      // widened `WHERE` would have broken while looking like it worked.
+      expect(fromSecond.map((record) => record.id)).toEqual([owned!.id]);
+      expect(owned!.workspaceId).toBeNull();
+      expect(owned!.keyScope).toBe('user');
+      expect(local.keyScope).toBe('workspace');
+    });
+
+    it('does not reach another account, and does not reach a workspace the caller does not own', async () => {
+      const owner = await store.createUser({ username: 'owner-a', displayName: 'A' });
+      const stranger = await store.createUser({ username: 'owner-b', displayName: 'B' });
+      const mine = await store.createWorkspace(workspaceInput(owner.id, 'Mine'));
+      const theirs = await store.createWorkspace(workspaceInput(stranger.id, 'Theirs'));
+      await store.createOwnerMemory({
+        userId: owner.id,
+        maxRows: OWNER_MEMORY_MAX_ROWS,
+        contentCiphertext: envelope('mine-only')
+      });
+      await store.createWorkspaceMemory({
+        userId: stranger.id,
+        workspaceId: theirs.id,
+        target: 'workspace',
+        contentCiphertext: envelope('not-mine')
+      });
+
+      // The authorisation moved from the workspace join to `user_id`; this is the proof it did not
+      // move to nothing. A second account sees none of it, and naming somebody else's workspace
+      // returns neither their rows nor - the subtler failure - the caller's own owner tier.
+      await expect(store.listWorkspaceMemories(stranger.id, theirs.id)).resolves.toMatchObject([
+        { keyScope: 'workspace' }
+      ]);
+      await expect(store.listWorkspaceMemories(stranger.id, mine.id)).resolves.toEqual([]);
+    });
+
+    it('outlives the computer it was written from', async () => {
+      const user = await store.createUser({ username: 'outlives', displayName: 'Owner' });
+      const workspace = await store.createWorkspace(workspaceInput(user.id, 'Doomed'));
+      const owned = await store.createOwnerMemory({
+        userId: user.id,
+        maxRows: OWNER_MEMORY_MAX_ROWS,
+        contentCiphertext: envelope('still-here')
+      });
+      await store.createWorkspaceMemory({
+        userId: user.id,
+        workspaceId: workspace.id,
+        target: 'workspace',
+        contentCiphertext: envelope('goes-with-it')
+      });
+
+      await store.deleteWorkspace(user.id, workspace.id);
+
+      // `workspace_id` is `ON DELETE CASCADE`, so before migration 70 this row went with the
+      // computer - the tier that claimed to follow the owner everywhere was destroyed by "Delete
+      // this computer". A NULL cannot be cascaded over.
+      const replacement = await store.createWorkspace(workspaceInput(user.id, 'Rebuilt'));
+      const surviving = await store.listWorkspaceMemories(user.id, replacement.id);
+      expect(surviving.map((record) => record.id)).toEqual([owned!.id]);
+      expect(surviving[0]!.contentCiphertext.ciphertext).toBe('still-here');
+    });
+
+    it('refuses the seventeenth row and evicts none of the sixteen', async () => {
+      const user = await store.createUser({ username: 'bounded', displayName: 'Owner' });
+      const workspace = await store.createWorkspace(workspaceInput(user.id, 'Box'));
+      for (let index = 0; index < OWNER_MEMORY_MAX_ROWS; index += 1)
+        expect(
+          await store.createOwnerMemory({
+            userId: user.id,
+            maxRows: OWNER_MEMORY_MAX_ROWS,
+            contentCiphertext: envelope(`row-${index}`)
+          })
+        ).not.toBeNull();
+      const before = await store.listWorkspaceMemories(user.id, workspace.id);
+      const fingerprint = sha256(JSON.stringify(before.map((record) => record.contentCiphertext)));
+
+      await expect(
+        store.createOwnerMemory({
+          userId: user.id,
+          maxRows: OWNER_MEMORY_MAX_ROWS,
+          contentCiphertext: envelope('one-too-many')
+        })
+      ).resolves.toBeNull();
+
+      // Refused, not made room for. The tier the owner cannot watch is the one that must never
+      // drop a row quietly, so the bound is proved by what is still there byte for byte as well as
+      // by the count.
+      const after = await store.listWorkspaceMemories(user.id, workspace.id);
+      expect(after).toHaveLength(OWNER_MEMORY_MAX_ROWS);
+      expect(sha256(JSON.stringify(after.map((record) => record.contentCiphertext)))).toBe(
+        fingerprint
+      );
+      await expect(store.countOwnerMemories(user.id)).resolves.toBe(OWNER_MEMORY_MAX_ROWS);
+    });
+
+    /**
+     * The tier's second entrance, which had no bound on it at all.
+     *
+     * `createOwnerMemory` carries the row bound in its INSERT, and promotion is not an insert: it
+     * is an `UPDATE` that moves a legacy `target:'user'` row - the shape a running turn could
+     * write before this build - into the same tier. Driven against this database with the bound
+     * only on the INSERT, forty promotions left the tier holding 56 rows against a bound of 16,
+     * after which every honest write was refused for the rest of the account's life while the
+     * character budget still read as nearly empty.
+     *
+     * So the promotion is attacked here from both ends: it fills the tier to the bound and then
+     * proves the seventeenth promotion is refused, with the sixteen unchanged byte for byte.
+     */
+    it('charges a promotion the same row bound an insert pays', async () => {
+      const user = await store.createUser({ username: 'promoter', displayName: 'Owner' });
+      const workspace = await store.createWorkspace(workspaceInput(user.id, 'Box'));
+      // The shape the `memory` tool wrote while it could still pass `target` through: an owner-tier
+      // row filed under a workspace and sealed under that workspace's key.
+      const legacy: string[] = [];
+      for (let index = 0; index < OWNER_MEMORY_MAX_ROWS + 4; index += 1) {
+        const id = randomUUID();
+        await database.query(
+          `INSERT INTO workspace_memories(id,user_id,workspace_id,target,key_scope,content_ciphertext)
+           VALUES ($1,$2,$3,'user','workspace',$4::jsonb)`,
+          [id, user.id, workspace.id, JSON.stringify(envelope(`legacy-${index}`))]
+        );
+        legacy.push(id);
+      }
+
+      const promote = async (id: string) =>
+        store.updateWorkspaceMemory({
+          id,
+          userId: user.id,
+          workspaceId: workspace.id,
+          keyScope: 'user',
+          maxOwnerRows: OWNER_MEMORY_MAX_ROWS,
+          contentCiphertext: envelope(`promoted-${id.slice(0, 8)}`)
+        });
+
+      for (const id of legacy.slice(0, OWNER_MEMORY_MAX_ROWS))
+        expect((await promote(id))?.keyScope).toBe('user');
+      await expect(store.countOwnerMemories(user.id)).resolves.toBe(OWNER_MEMORY_MAX_ROWS);
+
+      const before = await store.listWorkspaceMemories(user.id, workspace.id);
+      const fingerprint = sha256(
+        JSON.stringify(
+          before
+            .filter((record) => record.keyScope === 'user')
+            .map((record) => record.contentCiphertext)
+        )
+      );
+      for (const id of legacy.slice(OWNER_MEMORY_MAX_ROWS))
+        await expect(promote(id)).resolves.toBeNull();
+
+      // Still sixteen, still the same sixteen, and the rows that were refused are still in the
+      // workspace tier where they were - a refused promotion moves nothing rather than half of it.
+      await expect(store.countOwnerMemories(user.id)).resolves.toBe(OWNER_MEMORY_MAX_ROWS);
+      const after = await store.listWorkspaceMemories(user.id, workspace.id);
+      expect(
+        sha256(
+          JSON.stringify(
+            after
+              .filter((record) => record.keyScope === 'user')
+              .map((record) => record.contentCiphertext)
+          )
+        )
+      ).toBe(fingerprint);
+      expect(
+        after.filter((record) => record.keyScope === 'workspace' && record.target === 'user')
+      ).toHaveLength(4);
+
+      // And the bound is charged on entry, not on every edit: a row already inside the tier is
+      // rewritten while the tier is full.
+      const resident = after.find((record) => record.keyScope === 'user')!;
+      await expect(
+        store.updateWorkspaceMemory({
+          id: resident.id,
+          userId: user.id,
+          workspaceId: workspace.id,
+          keyScope: 'user',
+          maxOwnerRows: OWNER_MEMORY_MAX_ROWS,
+          contentCiphertext: envelope('rewritten-in-place')
+        })
+      ).resolves.not.toBeNull();
+      await expect(store.countOwnerMemories(user.id)).resolves.toBe(OWNER_MEMORY_MAX_ROWS);
+    });
+
+    it('cannot be written by the path a running turn reaches', async () => {
+      const user = await store.createUser({ username: 'no-turn-writes', displayName: 'Owner' });
+      const workspace = await store.createWorkspace(workspaceInput(user.id, 'Box'));
+      // The type already refuses this; the cast is what a JavaScript caller, a test double or a
+      // future `as` would do, and the gate has to hold at the production call site rather than at
+      // the compiler. `apps/worker/src/tools/knowledge.ts` is that call site.
+      await expect(
+        store.createWorkspaceMemory({
+          userId: user.id,
+          workspaceId: workspace.id,
+          target: 'user' as 'workspace',
+          contentCiphertext: envelope('smuggled')
+        })
+      ).rejects.toThrow(/owner tier/i);
+      await expect(store.countOwnerMemories(user.id)).resolves.toBe(0);
+    });
+
+    it('lets the owner delete a row of theirs from whichever computer they have open', async () => {
+      const user = await store.createUser({ username: 'deletes', displayName: 'Owner' });
+      const first = await store.createWorkspace(workspaceInput(user.id, 'First'));
+      const second = await store.createWorkspace(workspaceInput(user.id, 'Second'));
+      const owned = await store.createOwnerMemory({
+        userId: user.id,
+        maxRows: OWNER_MEMORY_MAX_ROWS,
+        contentCiphertext: envelope('regrettable')
+      });
+
+      // The old `DELETE ... WHERE workspace_id=$2` could not match a row whose workspace id is
+      // NULL, so a tier the owner can see and cannot remove would have been the worse half of
+      // shipping this.
+      await expect(store.deleteWorkspaceMemory(user.id, second.id, owned!.id)).resolves.toBe(true);
+      await expect(store.listWorkspaceMemories(user.id, first.id)).resolves.toEqual([]);
+    });
+
+    it('will not let a row be sealed under one scope and filed under the other', async () => {
+      const user = await store.createUser({ username: 'constrained', displayName: 'Owner' });
+      const workspace = await store.createWorkspace(workspaceInput(user.id, 'Box'));
+      // The constraint added in migration 70, attacked directly. A `key_scope='user'` row carrying
+      // a workspace id would be encrypted under one key, reachable through another, and deleted by
+      // the cascade it was supposed to have escaped.
+      await expect(
+        database.query(
+          `INSERT INTO workspace_memories(id,user_id,workspace_id,target,key_scope,content_ciphertext)
+           VALUES ($1,$2,$3,'user','user',$4::jsonb)`,
+          [randomUUID(), user.id, workspace.id, JSON.stringify(envelope('inconsistent'))]
+        )
+      ).rejects.toThrow();
+      await expect(
+        database.query(
+          `INSERT INTO workspace_memories(id,user_id,workspace_id,target,key_scope,content_ciphertext)
+           VALUES ($1,$2,NULL,'workspace','workspace',$3::jsonb)`,
+          [randomUUID(), user.id, JSON.stringify(envelope('homeless'))]
+        )
+      ).rejects.toThrow();
+    });
   });
 
   it('drops memories whose expiry passed long ago and keeps the rest', async () => {

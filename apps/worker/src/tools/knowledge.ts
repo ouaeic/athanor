@@ -4,7 +4,12 @@ import {
   decryptJson,
   encryptJson,
   memoryTemporalStatus,
+  userMemoryAad,
+  userMemoryKey,
   AthanorError,
+  OWNER_MEMORY_MAX_CHARS,
+  WORKSPACE_MEMORY_MAX_CHARS,
+  OWNER_MEMORY_MAX_ROWS,
   type MemoryDocument,
   type MemoryKind
 } from '@athanor/core';
@@ -104,9 +109,46 @@ export async function executeKnowledgeTool(
     case 'memory': {
       const action = textValue(call.arguments.action);
       const target = textValue(call.arguments.target, 'workspace') as 'workspace' | 'user';
+      /*
+       * A turn cannot write the tier that follows the owner out of this workspace.
+       *
+       * This used to pass `target` straight through to `createWorkspaceMemory`, so a running turn
+       * could mint a durable fact about the person. The store now refuses it and the type no longer
+       * admits it; this is the same refusal said early and in words the model can act on, because a
+       * type error in a package the model never reads is not an explanation.
+       *
+       * The reason is measured rather than cautious. Over 505 owner-typed turns from ten projects,
+       * the two person-shaped facts an extractor would most confidently propose are a design
+       * philosophy stated in one project and contradicted in three others, and a byline that
+       * changed value three times in six weeks. Both would have been wrong, and wrong here follows
+       * the owner into every project they ever start. The workspace tier below is the right place
+       * for anything a turn learns; the owner tier is entered in Settings, by the owner, with no
+       * turn in the loop.
+       */
+      if (target === 'user' && action !== 'list')
+        throw new AthanorError(
+          'memory_scope_refused',
+          'Memory about the owner is loaded into every workspace on this computer and only the owner can write it, in Settings. Use target "workspace" for what you learned here.'
+        );
       const records = await context.store.listWorkspaceMemories(task.userId, task.workspaceId);
+      /*
+       * The list now spans two keys, so it opens each row under the one that sealed it.
+       *
+       * Reading the owner tier is not the thing being restricted here - those rows are already in
+       * the preamble, and a model that can see a fact but cannot list it would just be confused
+       * about its own context. What a turn cannot do is write them, which is enforced above and at
+       * the store.
+       */
+      const ownerKey = userMemoryKey(context.masterKey, task.userId);
       const materialize = (record: (typeof records)[number]) => {
-        const document = decryptJson<MemoryDocument>(record.contentCiphertext, key);
+        const document =
+          record.keyScope === 'user'
+            ? decryptJson<MemoryDocument>(
+                record.contentCiphertext,
+                ownerKey,
+                userMemoryAad(task.userId)
+              )
+            : decryptJson<MemoryDocument>(record.contentCiphertext, key);
         return {
           id: record.id,
           target: record.target,
@@ -134,7 +176,7 @@ export async function executeKnowledgeTool(
         const targetTotal = current
           .filter((entry) => entry.target === target && entry.status !== 'expired')
           .reduce((total, entry) => total + entry.content.length, 0);
-        const limit = target === 'user' ? 6_000 : 12_000;
+        const limit = target === 'user' ? OWNER_MEMORY_MAX_CHARS : WORKSPACE_MEMORY_MAX_CHARS;
         if (targetTotal + content.length > limit)
           throw new AthanorError(
             'memory_full',
@@ -153,7 +195,7 @@ export async function executeKnowledgeTool(
         const created = await context.store.createWorkspaceMemory({
           userId: task.userId,
           workspaceId: task.workspaceId,
-          target,
+          target: 'workspace',
           contentCiphertext: encryptJson(document, key, `workspace-memory:${task.workspaceId}`)
         });
         return materialize(created);
@@ -161,6 +203,20 @@ export async function executeKnowledgeTool(
       const id = textValue(call.arguments.id);
       const existing = records.find((entry) => entry.id === id);
       if (!existing) throw new AthanorError('memory_not_found', 'Memory entry not found');
+      /*
+       * The refusal above reads the argument; this one reads the row.
+       *
+       * `replace` and `remove` reach a row by id, and `listWorkspaceMemories` now returns the owner
+       * tier alongside this workspace's own. Without this, a turn that omitted `target` - which
+       * defaults to `'workspace'` - could rewrite or delete a fact the owner typed about
+       * themselves, and `remove` in particular cannot be undone from here. Whose row it is, is a
+       * property of the row.
+       */
+      if (existing.target === 'user')
+        throw new AthanorError(
+          'memory_scope_refused',
+          'That entry is memory about the owner. Only the owner can change or remove it, in Settings.'
+        );
       if (action === 'replace') {
         const content = boundedKnowledge(call.arguments.content);
         const othersTotal = current
@@ -169,7 +225,11 @@ export async function executeKnowledgeTool(
               entry.target === existing.target && entry.id !== id && entry.status !== 'expired'
           )
           .reduce((total, entry) => total + entry.content.length, 0);
-        const limit = existing.target === 'user' ? 6_000 : 12_000;
+        // One tier is reachable from here, so one budget. The ternary this replaced read
+        // `existing.target === 'user' ? 6_000 : 12_000` and the compiler now rejects it outright:
+        // the refusal above has already narrowed `existing.target` to `'workspace'`, which is a
+        // stronger statement about the gate than any test could make.
+        const limit = WORKSPACE_MEMORY_MAX_CHARS;
         if (othersTotal + content.length > limit)
           throw new AthanorError('memory_full', 'Replacement would exceed the memory limit');
         const validUntil =
@@ -187,6 +247,12 @@ export async function executeKnowledgeTool(
           id,
           userId: task.userId,
           workspaceId: task.workspaceId,
+          keyScope: 'workspace',
+          // A turn writes the workspace tier and only the workspace tier, so the owner tier's row
+          // bound is never the clause that decides this statement. Passed because the parameter is
+          // required rather than optional: a bound a caller may leave out is a bound a caller
+          // leaves out.
+          maxOwnerRows: OWNER_MEMORY_MAX_ROWS,
           contentCiphertext: encryptJson(document, key, `workspace-memory:${task.workspaceId}`)
         });
         if (!updated) throw new AthanorError('memory_not_found', 'Memory entry not found');

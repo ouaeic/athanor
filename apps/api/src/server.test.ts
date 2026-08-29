@@ -17,8 +17,12 @@ import {
   memoryIndexKey,
   sha256,
   unwrapDataKey,
+  userMemoryAad,
+  userMemoryKey,
   wrapDataKey,
+  OWNER_MEMORY_MAX_ROWS,
   type ConnectorTransport,
+  type EncryptedEnvelope,
   type MailSocketFactory
 } from '@athanor/core';
 import { agentNotificationAad } from '@athanor/data';
@@ -2265,6 +2269,180 @@ const seedOwnerWithTask = async (
   expect(created.statusCode, created.body).toBe(200);
   return { cookie, workspaceId, taskId: created.json<{ id: string }>().id };
 };
+
+/*
+ * The owner tier, end to end through the routes the owner actually reaches.
+ *
+ * The store tests hold the scope and the bound. These hold the two things only the API can prove:
+ * that the row is sealed under a key no workspace has, and that a person sitting in Settings can
+ * see every one of these rows and remove any of them.
+ */
+describe('memory about the owner', () => {
+  const seedOwner = async (app: Awaited<ReturnType<typeof buildServer>>['app'], prefix: string) => {
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const workspace = await app.inject({
+      method: 'POST',
+      url: '/v1/workspaces',
+      headers: { cookie, 'idempotency-key': `${prefix}-workspace` },
+      payload: { name: 'Computer', storageLimitBytes: 10_000_000_000, region: 'auto' }
+    });
+    expect(workspace.statusCode, workspace.body).toBe(200);
+    return { cookie, workspaceId: workspace.json<{ id: string }>().id };
+  };
+
+  test('is sealed under a key the workspace does not have, and refuses the other key outright', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-owner-memory-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId } = await seedOwner(app, 'owner-memory');
+
+    const saved = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/memories`,
+      headers: { cookie },
+      payload: { target: 'user', content: 'Take the lead; do not stop to ask me for approval.' }
+    });
+    expect(saved.statusCode, saved.body).toBe(200);
+    expect(saved.json()).toMatchObject({ target: 'user', scope: 'user', source: 'owner' });
+
+    const row = await database.query(
+      `SELECT workspace_id,key_scope,content_ciphertext FROM workspace_memories WHERE key_scope='user'`
+    );
+    const stored = row.rows[0] as {
+      workspace_id: string | null;
+      content_ciphertext: EncryptedEnvelope;
+    };
+    expect(stored.workspace_id).toBeNull();
+    expect(JSON.stringify(stored)).not.toContain('Take the lead');
+
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const workspaceKey = unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id);
+    const ownerKey = userMemoryKey(masterKey, workspace.userId);
+    // Both directions, and they fail for two independent reasons rather than one. The workspace
+    // key is the wrong 32 bytes, so the GCM tag will not verify; and even a caller holding the
+    // right key is refused if it asserts the wrong context, which is what stops an owner row and a
+    // workspace row ever being substituted for one another. @see inferenceCredentialAad.
+    expect(() =>
+      decryptJson(stored.content_ciphertext, workspaceKey, userMemoryAad(workspace.userId))
+    ).toThrow();
+    expect(() =>
+      decryptJson(stored.content_ciphertext, ownerKey, `workspace-memory:${workspaceId}`)
+    ).toThrow(/context mismatch/i);
+    expect(
+      decryptJson<{ content: string }>(
+        stored.content_ciphertext,
+        ownerKey,
+        userMemoryAad(workspace.userId)
+      ).content
+    ).toBe('Take the lead; do not stop to ask me for approval.');
+  });
+
+  test('shows the owner the whole tier, refuses the row past the bound, and deletes any row', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-owner-bound-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId } = await seedOwner(app, 'owner-bound');
+
+    const add = (content: string) =>
+      app.inject({
+        method: 'POST',
+        url: `/v1/workspaces/${workspaceId}/memories`,
+        headers: { cookie },
+        payload: { target: 'user', content }
+      });
+    for (let index = 0; index < OWNER_MEMORY_MAX_ROWS; index += 1)
+      expect((await add(`Standing fact number ${index}.`)).statusCode).toBe(200);
+
+    const refused = await add('One more than the tier holds.');
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json<{ error: { code: string; message: string } }>().error.code).toBe(
+      'memory_full'
+    );
+    // The refusal has to say what is full and what to do, because the alternative design - evict
+    // the oldest - is the one the owner would never see happen.
+    expect(refused.json<{ error: { message: string } }>().error.message).toContain(
+      String(OWNER_MEMORY_MAX_ROWS)
+    );
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memories`,
+      headers: { cookie }
+    });
+    const rows = listed.json<Array<{ id: string; target: string; scope: string }>>();
+    expect(rows).toHaveLength(OWNER_MEMORY_MAX_ROWS);
+    expect(rows.every((entry) => entry.target === 'user' && entry.scope === 'user')).toBe(true);
+
+    const removed = await app.inject({
+      method: 'DELETE',
+      url: `/v1/workspaces/${workspaceId}/memories/${rows[0]!.id}`,
+      headers: { cookie }
+    });
+    expect(removed.json()).toEqual({ deleted: true });
+    // And the space comes back, so the bound is a bound rather than a one-way ratchet.
+    expect((await add('Written after making room.')).statusCode).toBe(200);
+  });
+
+  test('moves an entry written under the old promise when the owner next edits it', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-owner-promote-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store, database } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId } = await seedOwner(app, 'owner-promote');
+
+    // A row exactly as migration 30 left it: `target: 'user'`, sealed under the workspace key,
+    // filed against the workspace, and destroyed with it. A migration cannot re-seal this because
+    // migrations hold no key, so the owner's own next edit is the only honest place to do it.
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const workspaceKey = unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id);
+    const legacyId = randomUUID();
+    await database.query(
+      `INSERT INTO workspace_memories(id,user_id,workspace_id,target,key_scope,content_ciphertext)
+       VALUES ($1,$2,$3,'user','workspace',$4::jsonb)`,
+      [
+        legacyId,
+        workspace.userId,
+        workspaceId,
+        JSON.stringify(
+          encryptJson(
+            { content: 'Reject the generic.', source: 'owner' },
+            workspaceKey,
+            `workspace-memory:${workspaceId}`
+          )
+        )
+      ]
+    );
+
+    const before = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memories`,
+      headers: { cookie }
+    });
+    expect(before.json()).toMatchObject([{ id: legacyId, target: 'user', scope: 'workspace' }]);
+
+    const edited = await app.inject({
+      method: 'PATCH',
+      url: `/v1/workspaces/${workspaceId}/memories/${legacyId}`,
+      headers: { cookie },
+      payload: { content: 'Reject the generic; the target is a named beloved work.' }
+    });
+    expect(edited.statusCode, edited.body).toBe(200);
+    expect(edited.json()).toMatchObject({ id: legacyId, target: 'user', scope: 'user' });
+
+    const promoted = await database.query(
+      'SELECT workspace_id,key_scope FROM workspace_memories WHERE id=$1',
+      [legacyId]
+    );
+    expect(promoted.rows[0]).toMatchObject({ workspace_id: null, key_scope: 'user' });
+  });
+});
 
 describe('unattended recovery', () => {
   test('releases a task whose approval expired unanswered', async () => {

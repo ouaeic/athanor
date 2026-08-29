@@ -678,6 +678,18 @@ export const truncateMiddle = (
  * is the only source there ever was.
  */
 const OWNER_RESTATE_RECOVERY = 'ask the owner to restate the part you need';
+/**
+ * What a cut owner message is labelled, and how a later pass recognises one it has already cut.
+ *
+ * Named rather than spelled twice because the second use is a test on content: `boundOwnerWindow`
+ * will not cut a message that already carries this, so the marker's own count stays true. Safe to
+ * ask of the content here in a way it would not be for a fetched page - @see `spillPathIn` for that
+ * hazard - because the only text that ever reaches a `user` message is text the owner typed:
+ * `turn/claim.ts:247`, `turn-control.ts:70` and `turn/resume.ts:271` are the three places one
+ * enters a persisted trajectory and all three carry the owner's own words.
+ */
+const OWNER_CUT_LABEL = 'this earlier message from the owner';
+const OWNER_CUT_MARKER = `characters omitted from ${OWNER_CUT_LABEL}`;
 
 /**
  * What an over-long result that has already been cut once is told the second time.
@@ -755,6 +767,110 @@ const OLDER_TOOL_OUTPUT_CHARS = 2_000;
  * that only fires on cases that were never going to happen is a bound nobody has.
  */
 const VERBATIM_USER_CHARS = 4_000;
+/**
+ * How much room a compaction must leave itself, in tokens, between the head it may not touch and
+ * the tail it has promised to keep.
+ *
+ * Every other class in this window has a class bound. Tool results have one twice over, per
+ * message and per age. Reasoning is dropped past eight from the tail, images past four, tool-call
+ * arguments cut past the same boundary, a system block held to 32,000 characters and everything
+ * else to 60,000. The owner's messages had a per-message ceiling and nothing at all on the class,
+ * and the class is the one that grows without limit: `turn-control.ts:70` and `turn/resume.ts:271`
+ * push every typed correction into the persisted trajectory and `planCompaction` may never
+ * paraphrase one, so what the owner said accumulates for the life of the task and cannot be
+ * condensed out.
+ *
+ * That is not a tidiness argument, it is where compaction dies, and the death is total rather than
+ * gradual. `planCompaction` keeps the newest `targetTailTokens` verbatim and may only condense
+ * between `condensableStart` and that boundary; a window that has been compacted once is
+ * `[goal][brief][the owner's accumulated turns][recent work]`, because every non-owner message
+ * above the tail was condensed away by the compaction before. So the moment the owner's own turns
+ * grow past what is left between the head and the tail, the condensable region holds nothing but
+ * `user` messages, `planCompaction` returns null with ZERO candidates, and it returns null on
+ * every step after that: the window then sits over its own budget and the deterministic passes
+ * below stand in for it. Replayed through this file on a real recorded trajectory at 131,072
+ * tokens, with the owner's text scaled until the state is reached, 651 of 888 attempts came back
+ * with no candidate at all and the soft pass began firing.
+ *
+ * This is what stops the window entering that state, and it has to run BEFORE the plan is drawn
+ * rather than behind the refusal. Applied at the refusal it is measurably useless - on the same
+ * trajectory it cut 61,442 characters and `planCompaction` returned null again every time -
+ * because by then the condensable work it needed to expose has already been condensed.
+ *
+ * DERIVED, NOT SWEPT. A percentage of the tail was tried first and it is the wrong shape: it
+ * cannot see the head, and the head is half of the inequality. The condition for a compaction to
+ * have anything to condense is that something other than the owner's turns fits between the head
+ * and the tail -
+ *
+ *     ownerTokens <= targetTailTokens - headTokens - OWNER_WINDOW_RESERVE_TOKENS
+ *
+ * - so that is the bound, read off the window in front of it rather than chosen. On a
+ * 131,072-token model the tail is 32,549 tokens and a real preamble runs 11,000 to 14,000, which
+ * leaves the owner about 18,000 tokens; on a trajectory whose head is a bare system prompt the
+ * same expression leaves them nearer 28,000. A fixed share had to assume the worst head on every
+ * window and cut the owner's words on tasks that were never in danger: at 35% of the tail it
+ * removed 28,519 characters across four typed messages on the owner's own 8,159-step session, a
+ * run that made 75 compactions and refused none. Measured against the head, that session is not
+ * cut at all.
+ *
+ * `evals/context-quality/configurations.ts` substitutes this reserve rather than a share, so
+ * `owner-unbounded` is the inequality made unsatisfiable and `starved` is it made brutal.
+ *
+ * The value is the brief's own ceiling - `MAX_BRIEF_SECTIONS` sections of
+ * `MAX_BRIEF_SECTION_CHARS` - which is the same quantity `compactionHeadTokens` sets aside on the
+ * other side of the inequality, so one number stands for one thing in both halves: a compaction
+ * must always have at least as much to condense as the brief it is about to write, or it has paid
+ * a model call to make its own prompt bigger.
+ *
+ * `MIN_CONDENSED_TOKENS`, the span `planCompaction` refuses to go below, is one eighth of this and
+ * is not enough on its own - the plan has a second floor of `MIN_CONDENSED_MESSAGES` messages, and
+ * six messages of real work is worth far more than 750 tokens. Swept on a recorded trajectory
+ * carrying 171,196 characters of owner text, the refusals this exists to stop come back below it:
+ * 39 of 155 attempts at 750, 14 of 127 at 1,500, and none at all at 3,000 or at this. It is
+ * written as a literal because the rig substitutes integers; `context.test.ts` holds it to the
+ * multiplication it came from.
+ *
+ * What it costs is stated rather than implied. On the owner's own largest recorded session -
+ * 95,192 characters of typed text over 8,159 steps, a run that makes 75 compactions and refuses
+ * none at any reserve - this removes 12,107 characters from the middles of four messages. That is
+ * the price of the margin, not of the mechanism, and it is paid in middles: every cut keeps the
+ * owner's opening and closing words and names the one recovery that is real.
+ */
+export const OWNER_WINDOW_RESERVE_TOKENS = 6_000;
+/**
+ * The smallest budget the bound above will ever hand the owner's accumulated turns.
+ *
+ * Two messages at `VERBATIM_USER_CHARS`, which is the smallest budget at which a bound on the
+ * CLASS still bounds more than one correction, written as the integer it comes to so that
+ * `evals/context-quality/configurations.ts` can raise it past any window and measure this file
+ * with the bound genuinely off. `context.test.ts` holds it to the multiplication it came from.
+ */
+export const OWNER_WINDOW_FLOOR_CHARS = 8_000;
+/**
+ * The least one superseded owner message is ever cut to, and the one place the bound above is not
+ * a single number.
+ *
+ * Derived from `truncateMiddle`, not chosen. Its marker for this class runs to about 116
+ * characters with the recovery sentence and 73 without, and it drops the recovery when the marker
+ * would be more than half of what it is allowed - so a cut below 232 stops saying who to ask for
+ * the missing part, and a cut below 73 returns a marker LONGER than the bound that asked for it,
+ * which costs tokens instead of saving them. 240 is the first round number above the first of
+ * those lines: at it and above it the cut is exactly as long as it was told to be, and it still
+ * leaves the owner's own opening and closing words around a marker that says how many characters
+ * are gone and names the one recovery that is real.
+ *
+ * On real work it is a line most of the class never reaches: the median owner message on the
+ * owner's own recorded sessions is 172 characters, and most of them are already below it.
+ *
+ * It is also the one place the class bound stops being a single number, and that is stated in
+ * `boundOwnerWindow` rather than hidden. Past `maximumChars / OWNER_MINIMUM_CHARS` candidates an
+ * equal share of the budget is smaller than this floor, and from there the class costs 240
+ * characters per message however large it grows - because this bound truncates and never deletes,
+ * and a message cut below the marker's own length costs tokens instead of saving them. On a
+ * 131,072-token window with a production head that line is around three hundred accumulated owner
+ * messages; the most the owner has typed into any one recorded session is 110.
+ */
+export const OWNER_MINIMUM_CHARS = 240;
 /**
  * Where the older-result floor starts falling, and where it reaches the hard floor - measured in
  * tokens of actual work rather than as a share of whatever window the chosen model happens to have.
@@ -1670,6 +1786,199 @@ export const compactionTranscript = (
   );
 };
 
+/**
+ * The order the owner's own messages are given up in, worst first.
+ *
+ * One statement of the priority, read by the bound below and by the last-resort pass in
+ * `prepareModelContext` that already used it. The two used to say it separately and agreed only by
+ * accident; they are the same sentence about the same class and a change to one that did not reach
+ * the other would be a window where the harness cut the goal in one pass to protect a middle it
+ * had already decided was worth less.
+ *
+ * MIDDLE-OUT, not oldest-first. The opening request and the newest thing the owner said are the
+ * two the model most needs whole - one is what the task is for, the other is the correction it has
+ * not acted on yet - so everything between them goes first, oldest of those first, and those two
+ * are reached only when nothing else is left. Measured: on the replayed trajectory the owner's
+ * opening constraint is the ONE probe of forty-one still reachable at the last step, and it is
+ * reachable because it is last in this order.
+ */
+export const ownerEvictionOrder = (messages: readonly ModelMessage[]): number[] => {
+  const owners = messages.flatMap((message, index) => (message.role === 'user' ? [index] : []));
+  const first = owners[0];
+  const newest = owners[owners.length - 1];
+  return [
+    ...owners.filter((index) => index !== first && index !== newest),
+    ...(first === undefined || first === newest ? [] : [first]),
+    ...(newest === undefined ? [] : [newest])
+  ];
+};
+
+/**
+ * Holds the owner's ACCUMULATED messages to a budget, so that compaction still has something it is
+ * allowed to condense.
+ *
+ * This is a bound, not a compaction. Nothing here is paraphrased and nothing is summarised: a
+ * message over the cap is cut in the middle by `truncateMiddle`, which keeps its opening and its
+ * closing verbatim and states how many characters are missing and who to ask for them. The rule
+ * `planCompaction` holds - that what the owner actually said is never replaced by the model's
+ * account of it - is untouched, and it is untouched deliberately: replayed with owner messages
+ * simply made condensable instead, the task costs about 4% fewer prompt tokens than this and hands
+ * the steering channel to a summariser, which is the one trade this file has already refused.
+ *
+ * What it costs, measured rather than asserted, and measured on what the owner actually typed. A
+ * recorded 8,159-step session on this repository carries 95,192 characters of the owner's own
+ * text across 78 messages; replayed through this file at 131,072 tokens, four of them are cut and
+ * 12,107 characters go, all of it out of the middles of the longest four. Seventy-four messages
+ * are untouched, the opening request is untouched because it is not a candidate, and so is the
+ * newest thing the owner said. What goes is the middle of a pasted log.
+ *
+ * The corpus that number comes from is worth naming, because the first pass at this bound was
+ * priced on one that was wrong. A Claude Code transcript records harness-authored
+ * `<task-notification>` blocks with `origin.kind: 'task-notification'` in the `user` role, and in
+ * this session those 29 records carry 160,914 characters - 63% of everything that looks like the
+ * owner speaking. Athanor has no such class: `turn/claim.ts:247`, `turn-control.ts:70` and
+ * `turn/resume.ts:271` are the only three places a `user` message enters a persisted trajectory
+ * and all three carry text the owner typed, which is exactly what `planCompaction`'s rule assumes
+ * when it says a `user` message here is the owner's. Counted as owner text they turn a session
+ * that never refuses a compaction into one that refuses 3,564 of 4,292.
+ *
+ * THE GOAL AND THE NEWEST CORRECTION ARE NOT CANDIDATES. They are the two ends of
+ * `ownerEvictionOrder` and the two the eviction order says are worth most; the accumulation the
+ * budget exists to stop is everything between them. The goal is also the head of the prompt -
+ * `condensableStart` fixes the brief behind it, so cutting it would move every cached byte in the
+ * window - and it is the single fact that survives to the end of a long task today.
+ *
+ * DIVIDED BETWEEN THE CANDIDATES RATHER THAN SPENT NEWEST-FIRST. `ownerWindowCap` finds the
+ * largest length every candidate may keep and cuts only what is over it, which is
+ * `perPartOutputChars` applied to a class instead of to one result. Buying the newest few messages
+ * whole and flooring the rest keeps fewer of the owner's words in front of the model for the same
+ * budget, and it is the shape this file has already rejected once for a twelve-page read.
+ *
+ * THE BOUND, and it is proved in `context.test.ts` from both directions:
+ *
+ *     resident candidate text <= max(maximumChars, candidates * OWNER_MINIMUM_CHARS)
+ *
+ * The first term is the ordinary one and it is exact - `ownerWindowCap` is chosen so the sum of
+ * what is kept is at most the budget. The second is what the class costs when there are so many
+ * messages that an equal share of the budget is below the length of the marker itself, and it is
+ * named rather than hidden because that is the case where a cut stops paying for itself.
+ *
+ * Neither term covers the goal or the newest correction, which are not candidates.
+ *
+ * NOT SPILLED TO DISK, though the machinery exists. `output-spill.ts` would make the omitted middle
+ * retrievable for about 120 resident characters, and that is the right trade for tool output the
+ * owner's own computer produced through a tool the owner invoked. It is the wrong trade here: what
+ * the owner types is chat, the spill directory is inside the workspace every tool, every delegate
+ * and every later `file_read` can reach, and a turn that runs `git add -A` would commit it. The
+ * recovery `truncateMiddle` already names for this class - ask the owner - is one the agent can
+ * perform and the owner has already consented to.
+ *
+ * Returns the input array unchanged, by identity, when the class already fits. That is what keeps
+ * this free on every ordinary task and keeps a provider's cached prefix intact: no copy, no new
+ * objects, nothing to re-mark.
+ */
+export const ownerWindowCap = (lengths: readonly number[], maximumChars: number): number => {
+  /*
+   * The largest cap C for which `sum(min(length, C)) <= maximumChars`, found by handing every
+   * message an equal share and giving back what the short ones do not want.
+   *
+   * This is `perPartOutputChars` applied to a class instead of to one result, and it is here for
+   * the reason that comment gives about a twelve-page read: dividing the window between the things
+   * actually asked for returns twelve sources instead of one. Spending it newest-first instead
+   * buys three corrections whole and floors the other hundred.
+   */
+  const ascending = [...lengths].sort((left, right) => left - right);
+  let remaining = maximumChars;
+  let left = ascending.length;
+  for (const length of ascending) {
+    const share = Math.floor(remaining / Math.max(1, left));
+    if (length > share) return Math.max(OWNER_MINIMUM_CHARS, share);
+    remaining -= length;
+    left -= 1;
+  }
+  return Number.MAX_SAFE_INTEGER;
+};
+
+export const boundOwnerWindow = (
+  messages: ModelMessage[],
+  maximumChars: number
+): { messages: ModelMessage[]; cut: number; characters: number } => {
+  // The last two of the eviction order are the goal and the newest correction, in that order, and
+  // they are the two it says are worth most. Taken from there rather than recomputed, so the
+  // reservation and the last-resort pass can never disagree about which two those are.
+  const candidates = ownerEvictionOrder(messages).slice(0, -2);
+  const lengths = candidates.map((index) => messages[index]?.content.length ?? 0);
+  if (lengths.reduce((total, length) => total + length, 0) <= maximumChars)
+    return { messages, cut: 0, characters: 0 };
+
+  const cap = ownerWindowCap(lengths, maximumChars);
+  const capped = new Set(candidates);
+  let cut = 0;
+  let characters = 0;
+  const bounded = messages.map((message, index) => {
+    if (!capped.has(index) || message.content.length <= cap) return message;
+    // Cut once, and never in the same place twice. `truncateMiddle` counts what IT removed, so a
+    // second cut of an already-cut message writes a number that is true of the string in front of
+    // it and false about what the owner wrote: driven through this function with a shrinking tail,
+    // a 120,000-character message came back saying 23,940 characters were omitted with 112,117
+    // actually gone. `laterToolOutputRecovery` documents the same hazard for tool output, and a
+    // marker that understates the gap by five times is worse than no marker, because a model reads
+    // it and decides not to ask. The class is still bounded - a message this bound has already cut
+    // sits at the cap it was cut to, which is the cap it would be cut to again on any window whose
+    // head and tail have not moved.
+    if (message.content.includes(OWNER_CUT_MARKER)) return message;
+    const content = truncateMiddle(message.content, cap, OWNER_CUT_LABEL, OWNER_RESTATE_RECOVERY);
+    cut += 1;
+    characters += message.content.length - content.length;
+    return { ...message, content };
+  });
+  return { messages: bounded, cut, characters };
+};
+
+/**
+ * The part of the window a compaction may not touch, measured rather than assumed.
+ *
+ * `condensableStart` fixes it: the system preamble, the owner's opening request, and the brief. It
+ * is the other half of the inequality on `OWNER_WINDOW_RESERVE_TOKENS`, and it is read off the
+ * window in front of the compaction because it is not a constant - a bare system prompt is 2,000
+ * tokens and a production preamble with skills and memory in it is seven times that.
+ *
+ * The brief is counted at its own ceiling rather than at its current size. It is the one part of
+ * the head that grows on its own: every compaction rewrites it and `renderContextBrief` lets it
+ * reach `MAX_BRIEF_SECTIONS` sections of `MAX_BRIEF_SECTION_CHARS`. A bound that measured the
+ * brief it can see would hand the owner room that the next brief then takes back, and the
+ * inequality would fail one compaction later than it was checked.
+ */
+export const compactionHeadTokens = (messages: ModelMessage[]): number => {
+  const start = condensableStart(messages);
+  const brief = lastBriefIndex(messages);
+  return (
+    estimatedTokens(messages.slice(0, start).filter((_message, index) => index !== brief)) +
+    Math.ceil((MAX_BRIEF_SECTIONS * MAX_BRIEF_SECTION_CHARS) / 4)
+  );
+};
+
+/**
+ * How many characters of accumulated owner text a compaction aiming at this tail may leave behind.
+ *
+ * In characters because that is the unit every other bound in this file is in and the unit the
+ * marker counts in; derived from tokens by the same four `estimatedTokens` divides by, which is
+ * the same conversion `MIN_CONDENSED_TOKENS` makes in the other direction.
+ *
+ * The lower bound keeps this honest on a window where the head alone has eaten the tail: two
+ * messages at `VERBATIM_USER_CHARS` is the smallest budget at which the class bound still bounds
+ * more than one correction, and below it the last-resort pass in `prepareModelContext` is what is
+ * holding the window up anyway. It is a floor on the budget and not on the guarantee - a model
+ * whose head and tail leave nothing between them cannot be rescued by cutting the owner's words,
+ * and pretending otherwise by cutting them to nothing would spend the one class that cannot be
+ * re-obtained to buy something that was not available.
+ */
+export const ownerWindowChars = (targetTailTokens: number, headTokens: number): number =>
+  Math.max(
+    OWNER_WINDOW_FLOOR_CHARS,
+    Math.max(0, targetTailTokens - headTokens - OWNER_WINDOW_RESERVE_TOKENS) * 4
+  );
+
 export interface CompactionPlan {
   /** Index in the source window where the retained verbatim tail begins. */
   boundary: number;
@@ -1802,7 +2111,38 @@ export const compactContext = async (input: {
    */
   citableFooter?: string;
 }): Promise<CompactionOutcome | null> => {
-  const plan = planCompaction(input.messages, {
+  /*
+   * The owner's accumulated text is held to its budget BEFORE the plan is drawn, because the plan
+   * is what it breaks. `planCompaction` measures its tail backwards in tokens and may not touch a
+   * `user` message; once the owner's own text fills that tail the region it is allowed to condense
+   * holds nothing else, and it returns null with no candidates at all.
+   *
+   * BEFORE, and not as a rescue behind the refusal, which was tried and measured and does not
+   * work. By the time a compaction refuses, every non-owner message above the tail has already
+   * been condensed away by the compactions that succeeded earlier, so the window is
+   * `[goal][brief][the owner's accumulated turns][recent work]` and cutting the owner's turns
+   * creates no candidate: replayed on a trajectory carrying 128,151 characters of owner text, the
+   * bound applied at the refusal cut 61,442 characters and `planCompaction` returned null again on
+   * every one of the 651 refusals. The bound has to keep the window out of that state, because
+   * nothing gets it out afterwards.
+   *
+   * Here rather than at the caller because this is the function every path goes through - the
+   * turn's compaction, the agent's declared one, and the rig that measures both - and a bound one
+   * of them could skip is a bound nobody has.
+   *
+   * It is applied to a copy, and the copy is only what a REFUSAL leaves behind: a compaction that
+   * then returns null leaves the caller's trajectory exactly as it found it, and the next attempt
+   * re-derives the same cut from the same messages. On success the cut is durable -
+   * `compaction.ts:195` assigns `outcome.messages` into the persisted state - so what this removes
+   * is removed for the life of the task, which is why the budget is derived from the inequality it
+   * has to hold rather than set below it for comfort, and why an already-cut message is never cut
+   * again.
+   */
+  const held = boundOwnerWindow(
+    input.messages,
+    ownerWindowChars(input.targetTailTokens, compactionHeadTokens(input.messages))
+  );
+  const plan = planCompaction(held.messages, {
     targetTailTokens: input.targetTailTokens,
     ...(input.transcriptChars === undefined ? {} : { transcriptChars: input.transcriptChars })
   });
@@ -1811,7 +2151,7 @@ export const compactContext = async (input: {
   const existing = input.brief ?? emptyContextBrief();
   const carried = existing.sections.length ? renderContextBrief(existing) : '';
   const goal = truncateMiddle(
-    input.messages.find((message) => message.role === 'user')?.content ?? '',
+    held.messages.find((message) => message.role === 'user')?.content ?? '',
     MAX_COMPACTION_GOAL_CHARS,
     'the original request'
   );
@@ -1837,7 +2177,7 @@ export const compactContext = async (input: {
   }
   // Named after the bound for the same reason as the citable ids: an instruction the agent is
   // still meant to be following must not be the thing a long summary pushes out.
-  const droppedSkills = openedSkillsIn(input.messages, plan.condensed);
+  const droppedSkills = openedSkillsIn(held.messages, plan.condensed);
   if (droppedSkills.length)
     text = `${text}\n\nInstructions no longer in the window: ${droppedSkills.join(', ')}. Reopen a skill with skill(action: 'view') before relying on it again.`;
   // Appended after the bound so a long summary can never crowd the ids out of the section.
@@ -1862,10 +2202,10 @@ export const compactContext = async (input: {
    * today. @see SPILL_INDEX_CHARS. The rendered line is also handed to `anchorIndex` as carried
    * text, so a path already named here is not spelled a second time three lines further down.
    */
-  const spilled = spillIndex(input.messages, plan.condensed, carried);
+  const spilled = spillIndex(held.messages, plan.condensed, carried);
   if (spilled) text = `${text}\n\n${spilled}`;
   const anchors = anchorIndex(
-    input.messages,
+    held.messages,
     plan.condensed,
     `${carried}\n${spilled}`,
     ANCHOR_INDEX_CHARS - spilled.length
@@ -1877,20 +2217,20 @@ export const compactContext = async (input: {
     source,
     text
   });
-  const start = condensableStart(input.messages);
+  const start = condensableStart(held.messages);
   const dropped = new Set(plan.condensed);
   // Only the message this run wrote is replaced. A branched task inherits its parent's system
   // messages without its agent state, so the window can carry a rendered brief that has no sections
   // here; leaving it in place keeps the parent's condensed history instead of discarding it.
-  const replaceable = existing.sections.length ? lastBriefIndex(input.messages) : -1;
-  const head = input.messages.slice(0, start).filter((_message, index) => index !== replaceable);
+  const replaceable = existing.sections.length ? lastBriefIndex(held.messages) : -1;
+  const head = held.messages.slice(0, start).filter((_message, index) => index !== replaceable);
   const messages = [
     ...head,
     briefMessage(brief),
-    ...input.messages.filter((_message, index) => index >= start && !dropped.has(index))
+    ...held.messages.filter((_message, index) => index >= start && !dropped.has(index))
   ];
   const condensedCharacters = plan.condensed.reduce((total, index) => {
-    const message = input.messages[index];
+    const message = held.messages[index];
     if (!message) return total;
     return (
       total +
@@ -1899,6 +2239,13 @@ export const compactContext = async (input: {
       (message.reasoning?.length ?? 0)
     );
   }, 0);
+  /*
+   * Measured on what the CALLER had, not on the bounded copy, so the two numbers the owner is
+   * shown are the size of their window before this ran and its size after - the owner bound
+   * included, because the caller's next request pays for both together. Reading it off the bounded
+   * copy would report a compaction that freed less than the step actually freed, and would let the
+   * inversion guard below refuse a step that made the window smaller.
+   */
   const estimatedTokensBefore = estimatedTokens(input.messages);
   const estimatedTokensAfter = estimatedTokens(messages);
   /*
@@ -2630,24 +2977,19 @@ export const prepareModelContext = (
    * giving the paraphrase back: the middle goes, the opening and the closing stay verbatim, and
    * the marker says how many characters are missing and who to ask for them.
    *
-   * Order is middle-out rather than oldest-first, because oldest-first cuts the goal before it
-   * cuts anything else. The opening request and the newest thing the owner said are the two the
-   * model most needs whole - one is what the task is for, the other is the correction it has not
-   * acted on yet - so everything between them is cut first, oldest of those first, and those two
-   * are reached only if the window is still over budget without them.
+   * Order is `ownerEvictionOrder`, which is where that priority is now written down once and is
+   * shared with `boundOwnerWindow`. This pass is the resort behind that bound and not a second
+   * copy of it: the bound holds the class the compaction path leaves behind, and reaches only the
+   * messages between the goal and the newest correction, while this reaches all of them and fires
+   * only when the window still will not fit with every other class already at its floor.
    *
-   * It stops the moment the window fits, so an ordinary task never reaches it at all.
+   * It stops the moment the window fits, so an ordinary task never reaches it at all. It fires on
+   * a copy and re-cuts the same text on the next step, because the trajectory behind it never
+   * changes; the bound above is what keeps the window out of the state where that happens every
+   * step for the rest of the task. That is the difference between a bound and a last resort.
    */
   if (estimatedTokens(messages) > inputBudget) {
-    const users = messages.flatMap((message, index) => (message.role === 'user' ? [index] : []));
-    const first = users[0];
-    const newest = users[users.length - 1];
-    const order = [
-      ...users.filter((index) => index !== first && index !== newest),
-      ...(first === undefined || first === newest ? [] : [first]),
-      ...(newest === undefined ? [] : [newest])
-    ];
-    for (const index of order) {
+    for (const index of ownerEvictionOrder(messages)) {
       if (estimatedTokens(messages) <= inputBudget) break;
       const message = messages[index];
       if (!message || message.content.length <= VERBATIM_USER_CHARS) continue;

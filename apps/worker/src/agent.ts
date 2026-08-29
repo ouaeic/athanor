@@ -381,7 +381,7 @@ export class AgentWorker {
       completeTurn: (task, key, state, completion, options) =>
         this.#completeTurn(task, key, state, completion, options)
     };
-    this.#window = { store, config, runner: this.#runner };
+    this.#window = { store, config, runner: this.#runner, masterKey: this.#masterKey };
     this.#turnControl = {
       store,
       config,

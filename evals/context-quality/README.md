@@ -55,6 +55,62 @@ compiles this directory. The run itself is deliberately not part of `pnpm check`
 NODE_OPTIONS=--conditions=development pnpm exec tsx evals/context-quality/selftest.ts
 ```
 
+## The fourth trajectory, and the counter it exists to move
+
+Three of the four trajectories carry exactly one mid-task owner message, of 600 characters, at step 13. That is the right fixture for the axis they were written for, and it is precisely why they
+could not see the largest thing wrong with compaction on real work.
+
+`planCompaction` may never condense a `user` message — the owner's corrections are the only
+steering channel a running task has, and the text least able to correct a model is that model's own
+account of it. So what the owner types accumulates for the life of the task, and once
+`owner tokens > targetTailTokens − head tokens − OWNER_WINDOW_RESERVE_TOKENS` the region compaction
+may touch holds nothing else and it returns `null` with **zero** candidates. A window that has been
+compacted once is `[goal][brief][the owner's accumulated turns][recent work]`, because everything
+else above the tail was condensed away last time — which is why the state is absorbing rather than
+transient, and why a bound applied at the refusal cannot get out of it.
+
+Replayed through this repository's own production path on a real 8,159-step Claude Code session
+recorded on this checkout, with the owner's own text on it scaled ×2 to 171,196 characters:
+**888 attempts, 237 successes, 651 refusals**, every refusal with no candidate at all. At ×3 it is
+2,194 refusals of 2,667, the soft pass fires on 690 steps and the window sits over its own budget
+on 11 of them. Unscaled — 95,192 characters, the most this owner has typed into one session — the
+same replay makes 75 compactions and refuses none, which is the honest statement of where the
+cliff is rather than where it was assumed to be.
+
+Two additive changes make that visible here:
+
+- **`compactionRefusals`** — the count of `compactContext` returning `null`. The loop used to write
+  `if (outcome) { … }` and count only successes, so a run in which compaction was attempted 6,621
+  times and worked 1,214 was indistinguishable from one in which it worked perfectly. It prints as
+  the `refuse` column, `refused/attempted`, and `check` treats it as an exact ceiling: a refusal is
+  never progress.
+- **`pool-migration-131k-owner`** — thirteen pasted corrections of 14,000 characters, 182,000
+  characters of owner text over sixty steps, which crosses that line around step 40. The phase is
+  never declared, so every compaction is the budget trigger.
+
+`owner-unbounded` is the bound on that accumulation switched off — its floor raised past any
+window, which is the same thing. On the new trajectory it reads **5/10 refused against 0/2**, and
+3,655,632 tokens per task against 3,471,774. On the other three it is byte-identical to `shipped`,
+because there are only two owner messages there and both are reserved — which is the honest way
+round: the row costs nothing where the mechanism is not exercised.
+
+It also reads **4.41 availability against 4.12**, and that direction is not a defect in the bound.
+`owner-earliest-middle` is the probe the bound removes by design; the unbounded row keeps it and
+pays with 5 refusals in 10 attempts, which is the trade this rig exists to show rather than to
+hide.
+
+Three probes price what the bound costs and what it keeps, at the three positions a middle-out cut
+distinguishes:
+
+| probe                    | bound on | bound off | what it says                                          |
+| ------------------------ | -------- | --------- | ----------------------------------------------------- |
+| `owner-earliest-opening` | 5.0      | 5.0       | a cut keeps the head, so the opening survives         |
+| `owner-earliest-middle`  | **0.0**  | 5.0       | the middle is what the bound removes — its whole cost |
+| `owner-newest`           | 5.0      | 5.0       | the newest correction is never a candidate            |
+
+`recall-owner-constraint` — the goal — stays at 5.0 in every configuration of every trajectory,
+including this one, which is what makes it the control it is described as below.
+
 ## The four probe kinds
 
 | kind         | what it asks                                             |
@@ -132,7 +188,7 @@ At 2 the model takes its next step having had the thoughts that produced the las
 the request, on every step. Nothing breaks — `openai-compatible.ts:781-793` already carries a
 fallback for the inverse case — and no counter anywhere else in this repository moves.
 
-## Four things that keep the rig honest
+## Five things that keep the rig honest
 
 Each of these fails the run loudly and separately from the baseline check, and each exists because
 the corresponding defect produces a plausible number rather than an error.
@@ -154,14 +210,22 @@ stride 4, and for a whole wave the control was byte-identical to shipped on all 
 a reassuring `+0.00` that was an identity rather than a measurement. It is `stride-8` now, and the
 next time the tree moves onto a control's value the run says so instead of reporting agreement.
 
+`compactionRefusals` refuses a run in which compaction was attempted and freed nothing more often
+than the accepted numbers allow. It is the counter above, and it is here because it is the one
+failure this rig structurally could not report: a window held up entirely by the deterministic
+passes in `prepareModelContext` still produces a plausible availability score and a plausible token
+count, and reads as a configuration choice rather than as a mechanism that has stopped.
+
 The **frozen-column check** refuses a probe kind that scores the same in every configuration of
 every trajectory. A column nothing can move is indistinguishable from a probe that has stopped
 reading the window. `starved` — every character bound at its destructive end, never a candidate —
 is what gives each kind something that genuinely takes its material away. Run without it, the
 artifact column fails this check, which is how it was calibrated — and it is why `starved` gained
-`ANCHOR_INDEX_CHARS: 0` when the anchor index landed and `ARTIFACT_LEDGER_ROWS: 0` when the ledger
-did. Each was a new mechanism the row did not reach, and each saturated the column at 5.00 the day
-it shipped.
+`ANCHOR_INDEX_CHARS: 0` when the anchor index landed, `ARTIFACT_LEDGER_ROWS: 0` when the ledger
+did, and `OWNER_WINDOW_RESERVE_TOKENS: 1_000_000` when the bound on the owner's accumulated text
+did. Each
+was a new mechanism the row did not reach, and each saturated the column at 5.00 the day it
+shipped.
 
 ## Where the artifact loss actually is, and what now holds it
 

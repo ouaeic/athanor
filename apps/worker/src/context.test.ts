@@ -40,6 +40,14 @@ import {
   perPartOutputChars,
   planCompaction,
   prepareModelContext,
+  boundOwnerWindow,
+  compactionHeadTokens,
+  ownerEvictionOrder,
+  ownerWindowChars,
+  OWNER_MINIMUM_CHARS,
+  OWNER_WINDOW_FLOOR_CHARS,
+  OWNER_WINDOW_RESERVE_TOKENS,
+  ownerWindowCap,
   renderContextBrief,
   runtimeContext,
   RUNTIME_CONTEXT_MARKER,
@@ -3555,5 +3563,385 @@ describe('the runtime block on a record that has no ceiling on it', () => {
     );
     expect(line).toContain(RUNTIME_CONTEXT_MARKER);
     expect(line).not.toContain('Compute budget');
+  });
+});
+
+describe('the bound on what the owner has accumulated', () => {
+  /** Tagged and non-repeating, so no two owner messages can share bytes by accident. */
+  const typed = (chars: number, tag: string): string => {
+    let value = '';
+    while (value.length < chars)
+      value += `${tag} ${value.length} not that one, the other one, and keep the ${value.length % 7} ms path. `;
+    return value.slice(0, chars);
+  };
+
+  const ownerChars = (messages: readonly ModelMessage[]): number =>
+    messages.reduce(
+      (total, message) => total + (message.role === 'user' ? message.content.length : 0),
+      0
+    );
+
+  /**
+   * The budget this window's own head and tail leave the class, which is what the bound is given.
+   *
+   * Taken from the production expression rather than written out, because the whole point of the
+   * change these cases cover is that the budget is DERIVED from the window in front of it: a test
+   * that hard-coded a number here would pass against a bound that had stopped reading the head.
+   */
+  const budgetFor = (messages: ModelMessage[], tail: number): number =>
+    ownerWindowChars(tail, compactionHeadTokens(messages));
+
+  /** A window in the shape a long task reaches: head, the owner's accumulated turns, then work. */
+  const accumulated = (owners: number, size: number, turns = 24): ModelMessage[] => [
+    { role: 'system', content: `contract ${filler(3_000)}` },
+    { role: 'user', content: 'Move every service off the direct database role. GOAL-ANCHOR-4471.' },
+    ...Array.from(
+      { length: owners },
+      (_, index): ModelMessage => ({
+        role: 'user',
+        content: `${typed(size, `correction-${index}`)} OWNER-ANCHOR-${index}`
+      })
+    ),
+    ...trajectory(turns).slice(3)
+  ];
+
+  it('holds both constants to the expressions they were derived from', () => {
+    // `VERBATIM_USER_CHARS` and `MAX_BRIEF_SECTIONS`/`MAX_BRIEF_SECTION_CHARS` are module-private;
+    // 4,000, 8 and 3,000 are the values they hold. Both constants below are written as literals so
+    // that `evals/context-quality/configurations.ts` can substitute them, and this is what stops a
+    // literal from drifting away from the thing it is a literal for.
+    expect(OWNER_WINDOW_FLOOR_CHARS).toBe(2 * 4_000);
+    expect(OWNER_WINDOW_RESERVE_TOKENS).toBe(Math.ceil((8 * 3_000) / 4));
+  });
+
+  it('reads the budget off the head and the tail, and never below its floor', () => {
+    const messages = accumulated(4, 400);
+    const head = compactionHeadTokens(messages);
+    // The inequality, written out: what is left of the tail once the head and the reserve are out
+    // of it, in characters.
+    expect(ownerWindowChars(40_000, head)).toBe((40_000 - head - OWNER_WINDOW_RESERVE_TOKENS) * 4);
+    // A bigger head is a smaller budget, which is the fact a fixed share of the tail could not see.
+    expect(ownerWindowChars(40_000, head + 1_000)).toBe(ownerWindowChars(40_000, head) - 4_000);
+    // And a window whose head and tail leave nothing between them falls to the floor rather than
+    // to zero: cutting the owner's words to nothing cannot buy room that was never there.
+    expect(ownerWindowChars(1_000, head)).toBe(OWNER_WINDOW_FLOOR_CHARS);
+    expect(ownerWindowChars(0, 0)).toBe(OWNER_WINDOW_FLOOR_CHARS);
+    // The brief is counted at its ceiling, not at the size it happens to be, because it grows.
+    expect(compactionHeadTokens(messages)).toBeGreaterThanOrEqual(Math.ceil((8 * 3_000) / 4));
+  });
+
+  it('states the priority once, worst first, for both passes that read it', () => {
+    const messages = accumulated(4, 400);
+    // Middle-out: the goal and the newest correction are the last two given up, in that order.
+    expect(ownerEvictionOrder(messages)).toEqual([2, 3, 4, 1, 5]);
+    expect(ownerEvictionOrder([{ role: 'user', content: 'only one' }])).toEqual([0]);
+    expect(ownerEvictionOrder([{ role: 'system', content: 'none' }])).toEqual([]);
+  });
+
+  it('costs nothing and touches nothing while the class fits', () => {
+    const messages = accumulated(6, 400);
+    const held = boundOwnerWindow(messages, budgetFor(messages, 3_000));
+    // Identity, not equality: no copy is made, so nothing a provider has cached can move.
+    expect(held.messages).toBe(messages);
+    expect(held.cut).toBe(0);
+    expect(held.characters).toBe(0);
+  });
+
+  /**
+   * The bound, from both ends, and with the case it does NOT hold named rather than skipped.
+   *
+   * The first assertion this replaced was `carried <= max(maximum, candidates * 240)` on a set of
+   * shapes that all landed on the second term, so it permitted sixty times the budget and passed
+   * by saturating. Which term binds is a property of the shape and it is asserted here as one:
+   * while an equal share of the budget is above the marker's own length the class is held to the
+   * budget exactly, and past that line it is held to 240 characters a message and no better,
+   * because this bound truncates and never deletes.
+   */
+  it('holds the class to its budget, and says where that stops being possible', () => {
+    // Both ends of the attack: many small messages, a few enormous ones, and a count far past the
+    // line where an equal share falls under the floor.
+    for (const [owners, size] of [
+      [500, 4_000],
+      [12, 200_000],
+      [200, 40_000],
+      [2_000, 8_000]
+    ] as const) {
+      const messages = accumulated(owners, size);
+      const maximum = budgetFor(messages, 3_000);
+      const held = boundOwnerWindow(messages, maximum);
+      const goal = messages[1] as ModelMessage;
+      const newest = messages[owners + 1] as ModelMessage;
+      const candidates = owners - 1;
+      const carried = ownerChars(held.messages) - goal.content.length - newest.content.length;
+      const cap = ownerWindowCap(
+        Array.from({ length: candidates }, () => size),
+        maximum
+      );
+      if (cap > OWNER_MINIMUM_CHARS) {
+        // The ordinary term, and it is exact.
+        expect(carried).toBeLessThanOrEqual(maximum);
+      } else {
+        // The degraded term, stated as the equality it actually is. This is what the class costs
+        // when there are so many messages that an equal share is under the marker's own length,
+        // and it is linear in the count: at 2,000 messages it is 480,000 characters against a
+        // budget of 8,000, which is the honest size of the escape.
+        expect(cap).toBe(OWNER_MINIMUM_CHARS);
+        expect(carried).toBe(candidates * OWNER_MINIMUM_CHARS);
+        expect(carried).toBeGreaterThan(maximum);
+      }
+      // Either way it is the accumulation that was cut, not the two ends of the eviction order.
+      expect(held.messages[1]?.content).toBe(goal.content);
+      expect(held.messages[owners + 1]?.content).toBe(newest.content);
+      expect(held.cut).toBeGreaterThan(0);
+    }
+  });
+
+  it('divides the budget rather than spending it on the newest few', () => {
+    // The property `perPartOutputChars` exists for, on a class instead of one result: every
+    // message asked for survives, rather than the first surviving whole and the rest not at all.
+    expect(ownerWindowCap([100, 100, 100], 12_000)).toBe(Number.MAX_SAFE_INTEGER);
+    // 3,000 over three messages of which one wants 100: the other two get 1,450 each.
+    expect(ownerWindowCap([100, 9_000, 9_000], 3_000)).toBe(1_450);
+    // And an equal share below the marker's own length stops at the marker's own length.
+    expect(
+      ownerWindowCap(
+        Array.from({ length: 400 }, () => 9_000),
+        12_000
+      )
+    ).toBe(OWNER_MINIMUM_CHARS);
+    // The sum of what is kept never exceeds the budget while the cap is above the floor, and the
+    // case where it does is asserted rather than guarded past: it is exactly the floor times the
+    // count, and it is over budget by a factor this states out loud.
+    for (const lengths of [
+      [9_000, 40, 12_000, 300, 88_000],
+      Array.from({ length: 60 }, (_, index) => (index % 7) * 900 + 50),
+      Array.from({ length: 400 }, () => 9_000)
+    ]) {
+      const maximum = 40_000;
+      const cap = ownerWindowCap(lengths, maximum);
+      const kept = lengths.reduce((total, length) => total + Math.min(length, cap), 0);
+      if (cap > OWNER_MINIMUM_CHARS) expect(kept).toBeLessThanOrEqual(maximum);
+      else {
+        expect(kept).toBe(lengths.length * OWNER_MINIMUM_CHARS);
+        expect(kept).toBe(96_000);
+        expect(kept).toBeGreaterThan(maximum);
+      }
+    }
+  });
+
+  it('keeps the owner’s own opening and closing words on every message it cuts', () => {
+    const messages = accumulated(40, 20_000);
+    const held = boundOwnerWindow(messages, budgetFor(messages, 3_000));
+    let cut = 0;
+    for (let index = 0; index < messages.length; index += 1) {
+      const before = messages[index] as ModelMessage;
+      const after = held.messages[index] as ModelMessage;
+      if (before.role !== 'user' || after.content === before.content) continue;
+      cut += 1;
+      const marker = after.content.indexOf('\n[… ');
+      const end = after.content.indexOf(' …]\n');
+      expect(marker).toBeGreaterThan(0);
+      // Head and tail are the owner's, byte for byte, either side of a marker that says how many
+      // characters are missing and names the one recovery that is real.
+      expect(before.content.startsWith(after.content.slice(0, marker))).toBe(true);
+      expect(before.content.endsWith(after.content.slice(end + 4))).toBe(true);
+      expect(after.content).toContain(
+        'characters omitted from this earlier message from the owner'
+      );
+      // Nothing here is the model's account of what the owner said.
+      expect(after.content).not.toContain('compacted');
+    }
+    expect(cut).toBe(held.cut);
+    expect(cut).toBeGreaterThan(30);
+  });
+
+  it('holds every superseded message to one cap rather than picking winners', () => {
+    const messages = accumulated(10, 20_000);
+    const held = boundOwnerWindow(messages, budgetFor(messages, 3_000));
+    const lengths = held.messages
+      .flatMap((message, index) =>
+        message.role === 'user' && index > 1 ? [message.content.length] : []
+      )
+      .slice(0, -1);
+    // Every candidate is held to the same cap, so none of them is given up for another.
+    expect(new Set(lengths).size).toBe(1);
+    expect(lengths[0]).toBeGreaterThanOrEqual(OWNER_MINIMUM_CHARS);
+  });
+
+  it('never cuts below the floor that still names the recovery', () => {
+    // The attack from the other side: a tail so small the budget is nothing, on 300 messages.
+    const messages = accumulated(300, 9_000);
+    for (const tail of [1, 40, 600, 3_000]) {
+      const held = boundOwnerWindow(messages, budgetFor(messages, tail));
+      for (const message of held.messages) {
+        if (message.role !== 'user') continue;
+        expect(message.content.length).toBeGreaterThanOrEqual(
+          Math.min(message.content.length, OWNER_MINIMUM_CHARS)
+        );
+        if (message.content.includes('characters omitted'))
+          expect(message.content).toContain('ask the owner to restate the part you need');
+      }
+    }
+  });
+
+  /**
+   * The marker's number is about what the owner wrote, so the same message is never cut twice.
+   *
+   * `truncateMiddle` counts what it removed from the string in front of it. Applied to a string it
+   * has already cut, that number is true of the string and false about the message: driven through
+   * `compactContext` with a shrinking tail, a 120,000-character owner message came back claiming
+   * 23,940 characters were omitted while 112,117 were actually gone. A model reads that number and
+   * decides whether to ask.
+   */
+  it('never cuts the same owner message twice, so the marker keeps telling the truth', async () => {
+    const original = typed(120_000, 'ratchet');
+    let window: ModelMessage[] = [
+      { role: 'system', content: `contract ${filler(3_000)}` },
+      { role: 'user', content: 'GOAL-ANCHOR-4471' },
+      { role: 'user', content: original },
+      ...trajectory(40).slice(3),
+      { role: 'user', content: 'newest' }
+    ];
+    const claims: number[] = [];
+    for (const tail of [20_000, 14_000, 10_000, 7_000, 5_000]) {
+      const outcome = await compactContext({
+        messages: window,
+        targetTailTokens: tail,
+        summarise: async () => 'condensed'
+      });
+      if (!outcome) continue;
+      window = outcome.messages;
+      const cut = window.find(
+        (message) =>
+          message.role === 'user' &&
+          message.content.includes('characters omitted from this earlier message from the owner')
+      );
+      expect(cut).toBeDefined();
+      const claimed = Number(/\[… (\d+) characters omitted/.exec(cut?.content ?? '')?.[1]);
+      claims.push(claimed);
+      // What the marker says is gone, against what is actually gone. They agree to within the
+      // marker's own length, which `truncateMiddle` does not count for any caller in this file.
+      const survives = cut?.content.length ?? 0;
+      expect(original.length - claimed - survives).toBeLessThan(200);
+      expect(original.length - claimed - survives).toBeGreaterThanOrEqual(0);
+    }
+    // Cut once and then left alone, however small the tail gets afterwards.
+    expect(claims.length).toBeGreaterThan(2);
+    expect(new Set(claims).size).toBe(1);
+  });
+
+  it('carries the bound through the production compaction call, not just the helper', async () => {
+    // The defect this exists for: `planCompaction` may not condense a `user` message, so once the
+    // owner's accumulated text fills the tail it is allowed to keep, the region it may touch holds
+    // nothing else and it refuses with no candidates at all.
+    const messages = accumulated(12, 24_000);
+    const before = ownerChars(messages);
+    const outcome = await compactContext({
+      messages,
+      targetTailTokens: 3_000,
+      summarise: async () => 'condensed'
+    });
+    expect(outcome).not.toBeNull();
+    if (!outcome) return;
+    expect(ownerChars(outcome.messages)).toBeLessThanOrEqual(
+      Math.max(budgetFor(messages, 3_000), 10 * OWNER_MINIMUM_CHARS) + 24_000 * 2
+    );
+    expect(ownerChars(outcome.messages)).toBeLessThan(before / 2);
+    // The goal is byte-identical, and it is the one probe that survives a long task today.
+    expect(outcome.messages[1]?.content).toBe(messages[1]?.content);
+    expect(outcome.messages[1]?.content).toContain('GOAL-ANCHOR-4471');
+    // The newest correction is byte-identical too: it is the one the model has not acted on yet.
+    expect(
+      outcome.messages.some(
+        (message) => message.role === 'user' && message.content.includes('OWNER-ANCHOR-11')
+      )
+    ).toBe(true);
+    // And the caller's own array is untouched, because a compaction that refuses must leave the
+    // trajectory exactly as it found it.
+    expect(ownerChars(messages)).toBe(before);
+  });
+
+  it('leaves the caller’s trajectory alone when it refuses', async () => {
+    const messages = accumulated(30, 30_000, 0);
+    const before = messages.map((message) => message.content);
+    const outcome = await compactContext({
+      messages,
+      targetTailTokens: 3_000,
+      summarise: async () => 'condensed'
+    });
+    expect(outcome).toBeNull();
+    expect(messages.map((message) => message.content)).toEqual(before);
+  });
+
+  it('keeps compaction working for a whole task instead of one step of it', async () => {
+    // Sixty steps with the owner typing a long correction every fifth, which is the shape that
+    // kills it: measured on a real 8,407-step trajectory, `planCompaction` returned null with zero
+    // candidates on 5,408 of 6,620 attempts and the window climbed past its own budget anyway.
+    const contextTokens = 131_072;
+    const tools = [...agentToolsFor(), COMPACT_CONTEXT_TOOL];
+    const reservedTokens = Math.ceil(JSON.stringify(tools).length / 4);
+    const maxOutputTokens = 16_384;
+    const budget = modelInputBudget(contextTokens, maxOutputTokens, reservedTokens);
+    const messages: ModelMessage[] = [
+      { role: 'system', content: BASE_SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content: 'Move every service off the direct database role. GOAL-ANCHOR-4471.'
+      }
+    ];
+    let brief: ContextBrief | undefined;
+    let preparedTokens: number | undefined;
+    let attempts = 0;
+    let refusals = 0;
+    let softPassSteps = 0;
+    for (let step = 0; step < 60; step += 1) {
+      if (step % 5 === 4)
+        messages.push({
+          role: 'user',
+          content: `${typed(14_000, `correction-${step}`)} OWNER-ANCHOR-${step}`
+        });
+      messages.push({
+        role: 'assistant',
+        content: `Running check ${step}`,
+        toolCalls: [
+          { id: `call-${step}`, name: 'shell', arguments: { executable: `check-${step}` } }
+        ]
+      });
+      messages.push({
+        role: 'tool',
+        toolCallId: `call-${step}`,
+        content: `output-${step}-${'y'.repeat(9_000)}`
+      });
+      if ((preparedTokens ?? estimatedContextTokens(messages)) > compactionTrigger(budget)) {
+        attempts += 1;
+        const outcome = await compactContext({
+          messages,
+          ...(brief ? { brief } : {}),
+          targetTailTokens: compactionTargetTail(budget),
+          summarise: async () => `condensed through step ${step}`
+        });
+        if (!outcome) refusals += 1;
+        else {
+          messages.splice(0, messages.length, ...outcome.messages);
+          brief = outcome.brief;
+        }
+      }
+      const prepared = prepareModelContext(messages, contextTokens, maxOutputTokens, {
+        precedingTokens: reservedTokens,
+        reservedTokens
+      });
+      preparedTokens = prepared.estimatedInputTokens;
+      if (prepared.messages.some((m) => m.content.startsWith(COMPRESSED_TRAJECTORY_MARKER)))
+        softPassSteps += 1;
+    }
+    expect(attempts).toBeGreaterThan(0);
+    expect(refusals).toBe(0);
+    // Nothing had to be replaced by a stub: the deterministic passes are the floor, not the
+    // mechanism, and on this shape they used to be doing all the work.
+    expect(softPassSteps).toBe(0);
+    // The owner's opening request is still there, byte for byte, at the last step.
+    expect(messages[1]?.content).toContain('GOAL-ANCHOR-4471');
+    // And so is the newest thing they said.
+    expect(messages.some((message) => message.content.includes('OWNER-ANCHOR-59'))).toBe(true);
   });
 });

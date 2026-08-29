@@ -157,6 +157,32 @@ export const CONFIGURATIONS: readonly ContextConfiguration[] = [
   },
   {
     /**
+     * The bound on the owner's accumulated text switched off, which is the tree as it stood before
+     * that bound existed.
+     *
+     * It is here for the reason `anchorless` is: a mechanism whose absence the rig cannot show is
+     * a mechanism nobody can price. `planCompaction` may not condense a `user` message, so once
+     * the owner's own accumulated turns fill the space between the protected head and the tail it
+     * has promised to keep, the region it may touch holds nothing else and it returns null with no
+     * candidate at all - on a recorded trajectory carrying 128,151 characters of owner text, 651
+     * of 888 attempts. The window then climbs past its own budget and the deterministic passes
+     * replace two thirds of it with one-line stubs.
+     *
+     * Switched off by raising the bound's own floor past any window rather than by deleting a
+     * line: the floor is what `ownerWindowChars` returns when the derived budget is smaller, so a
+     * floor larger than the trajectory is the bound never binding. The three original trajectories
+     * cannot show any of this - they carry one mid-task owner message of 600 characters, so the
+     * bound never fires on them and this row is byte-identical to `shipped` there.
+     * `pool-migration-131k-owner` is the trajectory that can, and the `refuse` column is where it
+     * shows.
+     */
+    id: 'owner-unbounded',
+    label: 'OWNER_WINDOW_FLOOR_CHARS 8,000 -> 100,000,000 (the bound off)',
+    why: 'The tree before the owner-text bound: what compaction does on a task where the owner keeps typing. The `refuse` column is the whole of this row.',
+    constants: { OWNER_WINDOW_FLOOR_CHARS: 100_000_000 }
+  },
+  {
+    /**
      * The witness that the probes discriminate at all, and the answer to "a probe that always
      * returns 5.00 is measuring nothing".
      *
@@ -207,6 +233,15 @@ export const CONFIGURATIONS: readonly ContextConfiguration[] = [
        * the contrast the column is read for - 5.00 against 3.00 on both compacted trajectories.
        */
       ANCHOR_INDEX_CHARS: 0,
+      /*
+       * Added when the owner-text bound landed, for the reason the two entries either side of it
+       * were: this row is "the destructive end of every window mechanism at once", and a bound
+       * derived from the room a compaction actually needs is not at its destructive end. Reserving
+       * more tokens than any tail holds makes the derived budget zero, so the class falls to
+       * `OWNER_WINDOW_FLOOR_CHARS` on every window, which is what lets the owner columns fall here
+       * and nowhere else.
+       */
+      OWNER_WINDOW_RESERVE_TOKENS: 1_000_000,
       /*
        * Added when the artifact ledger landed, for exactly the reason `ANCHOR_INDEX_CHARS` above
        * was: this row is "the destructive end of every window mechanism at once", and the ledger is

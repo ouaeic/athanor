@@ -186,8 +186,17 @@ export interface TaskPlanRecord {
 export interface WorkspaceMemoryRecord {
   id: string;
   userId: string;
-  workspaceId: string;
+  /** NULL on an owner-tier row, which belongs to the person and to no workspace. */
+  workspaceId: string | null;
   target: 'workspace' | 'user';
+  /**
+   * Which key sealed `contentCiphertext`, in the clear because the reader has to choose a key
+   * before it can open anything. `'workspace'` is the workspace data key under
+   * `workspace-memory:${workspaceId}`; `'user'` is `userMemoryKey(master, userId)` under
+   * `userMemoryAad(userId)`. Rows written before migration 70 are all `'workspace'`, including
+   * `target: 'user'` ones, because a migration cannot re-encrypt.
+   */
+  keyScope: 'workspace' | 'user';
   contentCiphertext: EncryptedEnvelope;
   /**
    * Mirrors the expiry inside the encrypted document. Kept in the clear because retention has to

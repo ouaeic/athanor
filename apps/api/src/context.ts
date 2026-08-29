@@ -53,6 +53,7 @@ import {
   resolveDataMasterKey,
   sha256,
   unwrapDataKey,
+  userMemoryKey,
   type ConnectorTransport,
   type MailSocketFactory,
   type OwnerPriceCeiling
@@ -982,6 +983,15 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
   };
 
   /**
+   * The key an owner-tier memory is sealed under.
+   *
+   * Derived from the master key and the user id rather than unwrapped from a row, so there is no
+   * workspace to fetch first and nothing for `deleteWorkspace` to cascade over. @see userMemoryKey
+   * for why the owner tier is keyed to the person and what that deliberately does not survive.
+   */
+  const ownerKnowledgeKey = (userId: string): Buffer => userMemoryKey(masterKey, userId);
+
+  /**
    * The keyed tokens a conversation is findable by. Derived from the workspace data key rather
    * than being it, so the search surface and the stored ciphertext are separate secrets - which is
    * the same derivation every other blind index on this box goes through.
@@ -1063,6 +1073,7 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
     workspacePreviewResponse,
     apiTokenResponse,
     workspaceKnowledgeKey,
+    ownerKnowledgeKey,
     nameIndexFor,
     openPrompt,
     openName

@@ -158,6 +158,12 @@ export interface ConversationSearchResult {
 export interface WorkspaceMemory {
   id: string;
   target: 'workspace' | 'user';
+  /**
+   * Where the row actually lives, which is not always what `target` asked for. An entry written
+   * before the owner tier had a key of its own is `'workspace'` however it was labelled, and
+   * editing it is what moves it.
+   */
+  scope: 'workspace' | 'user';
   content: string;
   status: 'active' | 'upcoming' | 'expired';
   validFrom: string | null;

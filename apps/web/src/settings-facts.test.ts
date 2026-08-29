@@ -130,8 +130,20 @@ describe('who put a memory in the box, and who it is about', () => {
   });
 
   it('says the scope as a scope rather than as a person', () => {
-    expect(memoryScope({ target: 'user' })).toBe('About you, everywhere');
-    expect(memoryScope({ target: 'workspace' })).toBe('About this computer');
+    expect(memoryScope({ target: 'user', scope: 'user' })).toBe('About you, everywhere');
+    expect(memoryScope({ target: 'workspace', scope: 'workspace' })).toBe('About this computer');
+  });
+
+  /*
+   * The label used to read off `target` alone, which is what made it a claim the row could not
+   * keep: an owner-tier entry written before the tier had a key of its own is still sealed under a
+   * workspace key and still dies with that workspace, however it is labelled. Saying "everywhere"
+   * over such a row is the failure this whole tier exists to stop, so the third state has to be
+   * distinguishable from the first by reading, not by knowing.
+   */
+  it('does not promise everywhere for an owner row still tied to one computer', () => {
+    expect(memoryScope({ target: 'user', scope: 'workspace' })).not.toBe('About you, everywhere');
+    expect(memoryScope({ target: 'user', scope: 'workspace' })).toContain('this computer');
   });
 });
 

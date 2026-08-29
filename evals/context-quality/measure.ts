@@ -153,6 +153,24 @@ export interface Measurement {
   readonly probes: readonly ProbeOutcome[];
   readonly compactions: number;
   readonly budgetCompactions: number;
+  /**
+   * Compactions that were attempted and freed nothing, which is the state a long task actually
+   * fails in and the one number this rig could not see.
+   *
+   * `compactContext` returns null when `planCompaction` finds no candidate it is allowed to
+   * condense, and the loop below used to write `if (outcome) { ... }` and count only successes -
+   * so a run in which compaction was attempted 888 times and worked 237 was indistinguishable here
+   * from one in which it worked perfectly. Those are the numbers a recorded 8,159-step session
+   * from this repository produces once the owner's own text on it is large enough: 651 of 888
+   * attempts come back with zero candidates, because the owner's accumulated messages fill the
+   * space between the protected head and the tail `planCompaction` has promised to keep, and they
+   * are the one class it may not condense.
+   *
+   * It is a ceiling in `check`, not a floor: a refusal is never progress, and a configuration that
+   * starts refusing where the accepted numbers did not has broken the mechanism whatever its
+   * availability column says.
+   */
+  readonly compactionRefusals: number;
   readonly promptTokensTotal: number;
   readonly peakPromptTokens: number;
   readonly meanPrefixShare: number;
@@ -211,6 +229,7 @@ export const measure = async (
   let previous: { pieces: string[]; bytes: string } | null = null;
   let compactions = 0;
   let budgetCompactions = 0;
+  let compactionRefusals = 0;
 
   const steps: StepMeasurement[] = [];
   const readings = new Map<string, ProbeReading[]>();
@@ -219,7 +238,7 @@ export const measure = async (
   for (let step = 0; step < trajectory.steps; step += 1) {
     // The owner interrupting, ahead of this step's tail blocks so those stay last - which is where
     // the detail boundary is counted from and the reason their order matters here at all.
-    const correction = correctionAt(step);
+    const correction = correctionAt(step, trajectory);
     if (correction) messages.push(correction);
     // The plan block first, then the runtime block, which is the order agent.ts:9793-9799 pushes
     // them in. A plan step therefore puts the newest assistant one position further from the tail
@@ -274,7 +293,7 @@ export const measure = async (
         compactions += 1;
         if (!declared) budgetCompactions += 1;
         compactedFirst = true;
-      }
+      } else compactionRefusals += 1;
     }
 
     const prepared = context.prepareModelContext(
@@ -408,6 +427,7 @@ export const measure = async (
     probes,
     compactions,
     budgetCompactions,
+    compactionRefusals,
     promptTokensTotal: steps.reduce((sum, measurement) => sum + measurement.promptTokens, 0),
     peakPromptTokens: steps.reduce(
       (peak, measurement) => Math.max(peak, measurement.promptTokens),

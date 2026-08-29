@@ -317,13 +317,56 @@ const CORRECTION_SPAN = 'the pooled connection ceiling is now 64 and applies aro
  * never entered on any of these trajectories at any configuration (measured at 40,000 characters
  * with `VERBATIM_USER_CHARS` patched to 400: the probe still reads 5.00). At 600 it costs 0.19%.
  */
-export const correctionAt = (step: number): ModelMessage | null =>
-  step === CORRECTION_STEP
+export const correctionAt = (step: number, trajectory?: Trajectory): ModelMessage | null => {
+  const accumulating = accumulatedCorrectionAt(step, trajectory);
+  if (accumulating) return accumulating;
+  return step === CORRECTION_STEP
     ? {
         role: 'user',
         content: embed(`Stopping you there. ${text(600, 'correction')}`, CORRECTION_SPAN, 0.5)
       }
     : null;
+};
+
+/**
+ * How often, and how long, the owner keeps typing on a trajectory built to show that.
+ *
+ * The one mid-task correction above is 600 characters and lands once, which is the right fixture
+ * for the axis it was written for and is exactly why it cannot see this one. The single variable
+ * that decides whether compaction still works on a long task is how much owner text has piled up
+ * behind it - `planCompaction` may not condense a `user` message, so the accumulation sits inside
+ * the tail it is allowed to keep and eventually fills it - and on this fixture that variable was
+ * held at its minimum. Measured on a real 8,159-step session recorded on this repository: 77
+ * mid-task owner messages totalling 75,003 characters, which is 125 times the owner text of the
+ * fixture over 136 times the steps - and that session is one where compaction still works, so the
+ * fixture below deliberately carries more.
+ */
+const ACCUMULATED_CORRECTION_STEPS = new Set([8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56]);
+const ACCUMULATED_CORRECTION_CHARS = 14_000;
+/** The opening of the FIRST accumulated correction: a cut keeps the head, so this must survive. */
+export const ACCUMULATED_FIRST_OPENING =
+  'Stop using the writer pool for reads, the read replica is what that traffic belongs on';
+/** The middle of the same message: this is exactly what a cut removes, and it is measured saying so. */
+export const ACCUMULATED_FIRST_MIDDLE =
+  'the archive box in the rack is on spinning disks and must never be given more than 6 sessions';
+/** The newest correction, which is never a candidate for the bound and must survive whole. */
+export const ACCUMULATED_NEWEST =
+  'forget the retry budget entirely, the pooler is allowed to queue for 900 ms and then fail';
+
+const accumulatedCorrectionAt = (step: number, trajectory?: Trajectory): ModelMessage | null => {
+  if (!trajectory?.ownerKeepsTyping) return null;
+  if (!ACCUMULATED_CORRECTION_STEPS.has(step)) return null;
+  const body = text(ACCUMULATED_CORRECTION_CHARS, `pasted-${step}`);
+  const first = step === 8;
+  const newest = step === 56;
+  if (first)
+    return {
+      role: 'user',
+      content: embed(embed(body, ACCUMULATED_FIRST_OPENING, 0), ACCUMULATED_FIRST_MIDDLE, 0.5)
+    };
+  if (newest) return { role: 'user', content: embed(body, ACCUMULATED_NEWEST, 0.5) };
+  return { role: 'user', content: body };
+};
 
 const ARTIFACT_PATHS = [
   'workspace/infra/pooler.ini',
@@ -563,6 +606,54 @@ export const PROBES: readonly Probe[] = [
   }
 ];
 
+/**
+ * What a bound on the owner's accumulated text costs, and what it keeps, asked in three places.
+ *
+ * Every one of these is a `user` message, so `reworkChars` is 0 on all three: no tool call brings
+ * back something the owner typed, which is the whole reason the class is protected and the whole
+ * reason a bound on it has to be argued for rather than assumed. They are counted as unrecoverable
+ * losses when they go, which is the honest column for them.
+ *
+ * The three positions are the experiment. A cut keeps the leading 62% and the trailing remainder,
+ * so the opening of a superseded message survives a bound that removes its middle - and the newest
+ * correction is never a candidate at all. A change that loses the opening or the newest has taken
+ * the steering channel, not the accumulation.
+ */
+export const OWNER_PROBES: readonly Probe[] = [
+  {
+    id: 'owner-earliest-opening',
+    kind: 'recall',
+    plantedAtStep: 8,
+    askedAtStep: 58,
+    question:
+      'Which pool did the owner tell you to stop using for reads, and what should serve them?',
+    reference: 'Stop using the writer pool for reads; the read replica serves them.',
+    evidence: [ACCUMULATED_FIRST_OPENING],
+    reworkChars: 0
+  },
+  {
+    id: 'owner-earliest-middle',
+    kind: 'recall',
+    plantedAtStep: 8,
+    askedAtStep: 58,
+    question: 'What session limit did the owner put on the archive box, and why?',
+    reference: 'Never more than 6 sessions, because it is on spinning disks.',
+    evidence: [ACCUMULATED_FIRST_MIDDLE],
+    reworkChars: 0
+  },
+  {
+    id: 'owner-newest',
+    kind: 'recall',
+    plantedAtStep: 56,
+    askedAtStep: 58,
+    question:
+      'How long may the pooler queue before it fails, and what happened to the retry budget?',
+    reference: 'It may queue for 900 ms and then fail; the retry budget is gone.',
+    evidence: [ACCUMULATED_NEWEST],
+    reworkChars: 0
+  }
+];
+
 export interface Trajectory {
   readonly id: string;
   readonly why: string;
@@ -571,6 +662,13 @@ export interface Trajectory {
   /** The step at which the agent declares a phase finished, as the two `long-` eval fixtures do. */
   readonly declaredCompactionStep: number | null;
   readonly probes: readonly Probe[];
+  /**
+   * Whether the owner keeps typing long corrections as the task runs.
+   *
+   * Off everywhere but one trajectory, and off by default, so the three rows this rig has always
+   * reported keep the shape they were accepted at. @see accumulatedCorrectionAt.
+   */
+  readonly ownerKeepsTyping?: boolean;
 }
 
 /** The preamble `agent.ts:8586-8799` assembles, in its order and at its sizes. */
@@ -724,5 +822,32 @@ export const TRAJECTORIES: readonly Trajectory[] = [
     steps: 60,
     declaredCompactionStep: null,
     probes: PROBES
+  },
+  {
+    /**
+     * The trajectory the other three could not be: one where the owner keeps typing.
+     *
+     * Everything above holds the owner's mid-task text at 600 characters landing once, and that is
+     * the single variable which decides whether compaction still works on a long task - so on this
+     * rig automatic compaction always had something to condense and the `refuse` column was zero
+     * by construction. On real work it is not: replayed on an 8,159-step session recorded on this
+     * repository with the owner's own text on it scaled to 171,196 characters, 651 of 888 attempts
+     * came back with no candidate at all, because the owner's accumulated turns are the one class
+     * `planCompaction` may not touch and they had filled the space between the protected head and
+     * the tail it has promised to keep.
+     *
+     * Thirteen pasted messages of 14,000 characters is 182,000 characters of owner text over sixty
+     * steps, which crosses that line around step 40 - the same crossing the scaled session makes
+     * at step 5,700, reached inside a fixture that still runs in a few seconds. The phase is never
+     * declared, so every compaction here is the budget trigger and the `refuse` column is
+     * measuring the thing it is named for.
+     */
+    id: `pool-migration-131k-owner${SHAPE_SUFFIX}`,
+    why: 'The owner keeps typing: 182,000 characters of mid-task correction, which is the one class compaction may not condense and the reason it stops working on a long task.',
+    contextTokens: 131_072,
+    steps: 60,
+    declaredCompactionStep: null,
+    ownerKeepsTyping: true,
+    probes: [...PROBES, ...OWNER_PROBES]
   }
 ];

@@ -2510,5 +2510,53 @@ export const migrations = [
       ALTER TABLE workspace_previews DROP COLUMN IF EXISTS domain_verification_hash;
       ALTER TABLE mem.item DROP COLUMN IF EXISTS trigger_key;
     `
+  },
+  {
+    version: 70,
+    name: 'owner_memory_leaves_the_workspace',
+    // `workspace_memories.target` has had two values since migration 30. The UI calls one of them
+    // "About you, everywhere" and the approval card says "loaded into every workspace on this
+    // computer". Both were false: the only reader is `WHERE m.workspace_id=$2`, so an owner-tier
+    // row was visible in exactly the workspace it was typed in, and - because `workspace_id` is
+    // `NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE` - deleting that workspace destroyed
+    // it. A fact about a person was being kept on the lifetime of a computer.
+    //
+    // Three columns' worth of change, and the ordering of them is the whole migration.
+    //
+    // `workspace_id` becomes nullable, because NULL is the only honest value for a row that
+    // belongs to no workspace. A sentinel workspace would have been the shortcut and it fails on
+    // the same cascade.
+    //
+    // `key_scope` records which key sealed the row, and it exists because ciphertext cannot be
+    // re-sealed by a migration - this file has no master key and must never have one. Rows written
+    // before today stay `'workspace'` and keep both their workspace id and their old AAD, so they
+    // continue to open exactly as they did; the read path branches on this column rather than
+    // guessing. An existing `target='user'` row is therefore not silently promoted into a scope it
+    // was never encrypted for. Editing one re-seals it, which is where promotion actually happens
+    // and where the owner is present to see it.
+    //
+    // The CHECK is what makes the pair inseparable afterwards. Without it `key_scope='user'` with
+    // a `workspace_id` set is representable, and that row would be sealed under one key, reachable
+    // through another, and deleted by a cascade it was supposed to have escaped.
+    //
+    // Nothing is rewritten. Every statement reshapes the table around rows that are already
+    // correct under the new constraint, so this adds no entry to `REWRITING_MIGRATIONS`.
+    sql: `
+      ALTER TABLE workspace_memories ALTER COLUMN workspace_id DROP NOT NULL;
+
+      ALTER TABLE workspace_memories ADD COLUMN IF NOT EXISTS key_scope TEXT
+        NOT NULL DEFAULT 'workspace'
+        CHECK (key_scope IN ('workspace','user'));
+
+      ALTER TABLE workspace_memories DROP CONSTRAINT IF EXISTS workspace_memories_scope_ck;
+      ALTER TABLE workspace_memories ADD CONSTRAINT workspace_memories_scope_ck CHECK (
+        (key_scope = 'user' AND workspace_id IS NULL AND target = 'user')
+        OR (key_scope = 'workspace' AND workspace_id IS NOT NULL)
+      );
+
+      CREATE INDEX IF NOT EXISTS workspace_memories_owner_idx
+        ON workspace_memories(user_id, created_at)
+        WHERE key_scope = 'user';
+    `
   }
 ] as const;

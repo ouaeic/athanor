@@ -89,10 +89,12 @@ export const MEMORY_SELF_EXPIRY_HORIZON_MS = 366 * 24 * 60 * 60 * 1_000;
  * reading - which is precisely what it exists to prevent. So the floor now covers what is actually
  * hard to undo, and nothing else.
  *
- * Kept: anything that rewrites or deletes an entry the owner already reviewed; anything written to
- * `user` memory, which is loaded into every workspace rather than this one; anything permanent,
+ * Kept: anything that rewrites or deletes an entry the owner already reviewed; anything permanent,
  * because an entry with no expiry is in every future prompt until someone goes looking for it; and
  * anything that scans as a credential, which does not belong in memory at all.
+ *
+ * Gone: the card for `target: 'user'`. That tier is no longer writable from a turn at all, so
+ * there is nothing here to approve - @see the refusal in `tools/knowledge.ts`.
  *
  * Dropped: adding one self-expiring note to this workspace's own memory during work. It is scoped,
  * it is dated, and the owner can see and remove it - the same standing as a file the agent wrote.
@@ -128,8 +130,15 @@ export const memoryApprovalReason = (
   const secrets = memoryCredentialScan(content);
   if (secrets.length)
     return `This appears to contain ${secrets.join(', ')}, which must never be stored in memory.`;
-  if (textValue(args.target, 'workspace') === 'user')
-    return 'User memory is loaded into every workspace on this computer, not just this one.';
+  /*
+   * There is no card for `target: 'user'` any more, because there is no write to approve.
+   *
+   * This branch described the blast radius of an agent writing the owner tier and asked the owner
+   * to accept it. The tier now refuses that write outright - at the tool, at the type and at the
+   * store - so a card here would ask for consent to something that then fails, which teaches an
+   * owner that approving is how you find out whether something was allowed. A refusal the model
+   * can read is the better instrument, and it is in `tools/knowledge.ts`.
+   */
   const validUntil = Date.parse(textValue(args.validUntil));
   if (!Number.isFinite(validUntil) || validUntil <= now.getTime())
     return 'Without a validUntil this entry is loaded into every future task on this computer indefinitely.';

@@ -99,6 +99,8 @@ export interface BaselineRow {
   readonly cacheReadShare: number;
   readonly newestReasoningSteps: number;
   readonly unrecoverableLosses: number;
+  /** Compactions attempted that freed nothing. @see Measurement.compactionRefusals. */
+  readonly compactionRefusals: number;
 }
 
 export type Baseline = Record<string, BaselineRow>;
@@ -124,7 +126,8 @@ export const baselineFrom = (measurements: readonly Measurement[]): Baseline => 
       tokensPerTask: tokensPerTask(measurement),
       cacheReadShare: Math.round(measurement.meanCacheReadShare * 1_000) / 1_000,
       newestReasoningSteps: measurement.newestReasoningSteps,
-      unrecoverableLosses: measurement.unrecoverableLosses
+      unrecoverableLosses: measurement.unrecoverableLosses,
+      compactionRefusals: measurement.compactionRefusals
     };
   return baseline;
 };
@@ -132,10 +135,11 @@ export const baselineFrom = (measurements: readonly Measurement[]): Baseline => 
 /**
  * What counts as a regression.
  *
- * Availability and the reasoning-window count are exact: they are integer-derived and nothing but
- * a real change to what the model can read moves them, so a band would only hide the thing this
- * file is for. Tokens per task gets 2%, the same band `evals/report.ts` gives its own token
- * columns, because the catalogue and the operating contract drift with unrelated work.
+ * Availability, the reasoning-window count and the refusal count are exact: they are
+ * integer-derived and nothing but a real change to what the model can read, or to whether
+ * compaction still works, moves them - so a band would only hide the thing this file is for.
+ * Tokens per task gets 2%, the same band `evals/report.ts` gives its own token columns, because
+ * the catalogue and the operating contract drift with unrelated work.
  */
 export const check = (
   measurement: Measurement,
@@ -156,6 +160,14 @@ export const check = (
   if (measurement.unrecoverableLosses > expected.unrecoverableLosses)
     failures.push(
       `${measurement.unrecoverableLosses} unrecoverable losses, accepted ${expected.unrecoverableLosses}: no tool call brings these back`
+    );
+  // Exact, and a ceiling: a compaction that frees nothing is never progress, and a change that
+  // starts refusing where the accepted numbers did not has broken the mechanism whatever the
+  // availability column says. `?? 0` so a baseline accepted before this column existed reads as
+  // "none accepted" rather than silently disabling the check.
+  if (measurement.compactionRefusals > (expected.compactionRefusals ?? 0))
+    failures.push(
+      `${measurement.compactionRefusals} compaction${measurement.compactionRefusals === 1 ? '' : 's'} attempted and freed nothing, accepted ${expected.compactionRefusals ?? 0}: the window is being held up by the deterministic passes instead`
     );
   const tokens = tokensPerTask(measurement);
   if (tokens > expected.tokensPerTask * 1.02)
@@ -218,6 +230,7 @@ export const render = (
       padStart('tokens/task', 12),
       padStart('rework', 8),
       padStart('unrec', 6),
+      padStart('refuse', 7),
       padStart('cache', 7),
       padStart('prefix', 7),
       padStart('own-think', 10)
@@ -244,6 +257,7 @@ export const render = (
           padStart(tokensPerTask(row).toLocaleString('en-GB'), 12),
           padStart(row.reworkTokens.toLocaleString('en-GB'), 8),
           padStart(String(row.unrecoverableLosses), 6),
+          padStart(`${row.compactionRefusals}/${row.compactions + row.compactionRefusals}`, 7),
           padStart(percent(row.meanCacheReadShare), 7),
           padStart(percent(row.meanPrefixShare), 7),
           padStart(`${row.newestReasoningSteps}/${row.steps.length}`, 10)
@@ -258,9 +272,15 @@ export const render = (
   }
 
   lines.push('', 'Per-probe availability at the step the task needed it (0-5 ceiling)', '');
-  const probeIds = measurements[0]?.probes.map((outcome) => outcome.probe.id) ?? [];
-  const width = Math.max(24, ...probeIds.map((id) => id.length));
+  // Read off the trajectory's own first row rather than the run's, because a trajectory may carry
+  // probes the others do not: taking the ids from `measurements[0]` silently dropped every probe
+  // that only one trajectory plants, and the column it belongs in read as if it were not there.
+  const width = Math.max(
+    24,
+    ...measurements.flatMap((row) => row.probes.map((outcome) => outcome.probe.id.length))
+  );
   for (const [trajectoryId, rows] of byTrajectory) {
+    const probeIds = rows[0]?.probes.map((outcome) => outcome.probe.id) ?? [];
     lines.push(trajectoryId);
     lines.push(
       [

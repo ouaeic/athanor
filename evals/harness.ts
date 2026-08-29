@@ -2589,6 +2589,11 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       userId,
       workspaceId,
       target: entry.target ?? 'workspace',
+      // Rig rows are all workspace-scoped and sealed under the workspace key, which is what
+      // `keyScope: 'workspace'` says. A fixture that claimed the owner scope would have to be
+      // sealed under the owner key too, and a rig that got that pair wrong would be measuring a
+      // row the product could never produce.
+      keyScope: 'workspace' as const,
       contentCiphertext: encryptJson(
         {
           content: entry.content,

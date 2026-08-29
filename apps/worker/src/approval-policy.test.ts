@@ -1282,9 +1282,6 @@ describe('when a memory write is worth stopping the owner for', () => {
     expect(
       reason({ action: 'add', target: 'workspace', content: 'They prefer UK spelling.' })
     ).toContain('indefinitely');
-    expect(reason({ action: 'add', target: 'user', content: 'x', validUntil: soon })).toContain(
-      'every workspace'
-    );
     expect(
       reason({ action: 'add', target: 'workspace', content: 'x', validUntil: distant })
     ).toContain('permanent entry with a date');
@@ -1305,13 +1302,32 @@ describe('when a memory write is worth stopping the owner for', () => {
   it('names the reason on the card, so the owner can see why this one stopped', () => {
     const card = approvalRequirement('memory', {
       action: 'add',
-      target: 'user',
-      content: 'They fly from Gatwick.',
-      validUntil: soon
+      target: 'workspace',
+      content: 'They fly from Gatwick.'
     });
     expect(card?.sideEffect).toBe('workspace_write');
     expect(card?.preview).toContain('They fly from Gatwick.');
-    expect(card?.preview).toContain('every workspace');
+    expect(card?.preview).toContain('indefinitely');
+  });
+
+  /*
+   * There is no card for the owner tier, and its absence is the control rather than a gap in one.
+   *
+   * This used to return "User memory is loaded into every workspace on this computer", which asked
+   * the owner to accept a blast radius. Two things were wrong with it. The sentence was false -
+   * the only reader filtered on `workspace_id`, so the row went nowhere - and asking for consent
+   * is the weaker instrument here anyway: a card is a decision the owner makes with the turn's
+   * text, injected or not, still in front of them, and a wrong fact about a person follows them
+   * into every project they ever start. The write is now refused outright at the tool, at the type
+   * and at the store, so approving it is not a thing that can happen.
+   */
+  it('raises no card for an owner-tier write, because there is no such write to approve', () => {
+    expect(
+      memoryApprovalReason(
+        { action: 'add', target: 'user', content: 'They fly from Gatwick.', validUntil: soon },
+        now
+      )
+    ).toBeNull();
   });
 
   it('withdraws the self-expiry exemption while the turn has read untrusted content', () => {

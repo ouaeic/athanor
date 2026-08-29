@@ -3,6 +3,8 @@ import {
   decryptJson,
   encryptJson,
   generateDataKey,
+  userMemoryAad,
+  userMemoryKey,
   verifyCapabilityToken,
   wrapDataKey
 } from '@athanor/core';
@@ -1653,6 +1655,55 @@ describe('the knowledge arms', () => {
       content: 'The build runs on Node 24.',
       previousUpdatedAt: '2026-06-02T00:00:00.000Z'
     });
+  });
+
+  /*
+   * The gate on the tier that leaves this workspace, at the call site that would cross it.
+   *
+   * This is the production path: `tools/knowledge.ts` calls the store directly rather than going
+   * through the API, so a rule enforced only in a route would not be enforced here at all. Two
+   * refusals, because there are two ways in. The first reads the argument; the second reads the
+   * row, and it is the one that matters more - `replace` and `remove` reach a row by id, and the
+   * list they search now includes the owner tier, so a call that simply omitted `target` could
+   * have rewritten or deleted a fact the owner typed about themselves.
+   */
+  it('refuses to write the owner tier, whether it is named or reached by id', async () => {
+    const named = await dispatch(
+      {
+        name: 'memory',
+        arguments: { action: 'add', target: 'user', content: 'They prefer to be left to work.' }
+      },
+      { approved: true }
+    );
+    expect(named.failure?.code).toBe('memory_scope_refused');
+    expect(named.failure?.message).toMatch(/only the owner can write it/i);
+    expect(named.asked('createWorkspaceMemory')).toBeUndefined();
+
+    const ownerRow = {
+      id: 'memory-owner',
+      target: 'user',
+      keyScope: 'user',
+      contentCiphertext: encryptJson(
+        { content: 'Take the lead.', source: 'owner' },
+        userMemoryKey(masterKey, userId),
+        userMemoryAad(userId)
+      ),
+      createdAt: '2026-06-01T00:00:00.000Z',
+      updatedAt: '2026-06-02T00:00:00.000Z'
+    };
+    for (const call of [
+      { action: 'replace', id: 'memory-owner', content: 'Do not take the lead.' },
+      { action: 'remove', id: 'memory-owner' }
+    ]) {
+      const reached = await dispatch(
+        { name: 'memory', arguments: call },
+        { approved: true, store: { listWorkspaceMemories: async () => [ownerRow] } }
+      );
+      expect(reached.failure?.code).toBe('memory_scope_refused');
+      expect(reached.failure?.message).toMatch(/only the owner can change or remove it/i);
+      expect(reached.asked('updateWorkspaceMemory')).toBeUndefined();
+      expect(reached.asked('deleteWorkspaceMemory')).toBeUndefined();
+    }
   });
 
   it('refuses to change a memory entry that is not there', async () => {

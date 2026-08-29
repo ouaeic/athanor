@@ -458,6 +458,14 @@ export class DataStore {
     return this.#workspaces.createWorkspaceMemory(...args);
   }
 
+  createOwnerMemory(...args: Parameters<WorkspaceStore['createOwnerMemory']>) {
+    return this.#workspaces.createOwnerMemory(...args);
+  }
+
+  countOwnerMemories(...args: Parameters<WorkspaceStore['countOwnerMemories']>) {
+    return this.#workspaces.countOwnerMemories(...args);
+  }
+
   updateWorkspaceMemory(...args: Parameters<WorkspaceStore['updateWorkspaceMemory']>) {
     return this.#workspaces.updateWorkspaceMemory(...args);
   }

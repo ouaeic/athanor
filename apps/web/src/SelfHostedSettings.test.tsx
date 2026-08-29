@@ -137,6 +137,7 @@ describe('the durable memory list', () => {
     {
       id: 'm1',
       target: 'workspace',
+      scope: 'workspace',
       content: 'Deploys go out on Thursdays',
       status: 'active',
       validFrom: '2026-01-01T00:00:00.000Z',
@@ -149,6 +150,7 @@ describe('the durable memory list', () => {
     {
       id: 'm2',
       target: 'user',
+      scope: 'user',
       content: 'Call me Dan',
       status: 'active',
       validFrom: '2026-01-01T00:00:00.000Z',

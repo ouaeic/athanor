@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { AthanorError } from '@athanor/core';
 import type { EncryptedEnvelope } from '@athanor/core';
 import { MAX_WORKSPACE_PREVIEWS, PREVIEW_IDLE_EXPIRY_DAYS } from '@athanor/contracts';
 import type { Database } from '../database.js';
@@ -398,36 +399,73 @@ export class WorkspaceStore {
     return result.rowCount ?? 0;
   }
 
+  /**
+   * Everything this workspace can see: its own rows, plus the owner tier, which belongs to the
+   * person and is visible from every workspace they own.
+   *
+   * The authorisation moved from the workspace to the user, and it had to. The old statement
+   * joined `workspaces w ON w.id=m.workspace_id` and read `w.user_id`, which cannot decide an
+   * owner-tier row because that row has no workspace to join to. `m.user_id=$1` is the check
+   * instead, and the workspace half is now a membership test rather than the whole authorisation:
+   * the caller still has to name a workspace they own, so a request for a workspace that is not
+   * theirs returns nothing rather than their own owner tier.
+   *
+   * Owner rows sort first. They are the standing facts every workspace shares; a reader running
+   * out of budget should lose the project note before it loses the person.
+   */
   async listWorkspaceMemories(
     userId: string,
     workspaceId: string
   ): Promise<WorkspaceMemoryRecord[]> {
     const result = await this.database.query(
       `SELECT m.* FROM workspace_memories m
-       JOIN workspaces w ON w.id=m.workspace_id
-       WHERE m.workspace_id=$2 AND w.user_id=$1
-       ORDER BY m.target,m.created_at,m.id`,
+       WHERE m.user_id=$1
+         AND (
+           m.key_scope='user'
+           OR (m.workspace_id=$2 AND EXISTS (
+             SELECT 1 FROM workspaces w WHERE w.id=$2 AND w.user_id=$1
+           ))
+         )
+       ORDER BY (m.key_scope='user') DESC,m.target,m.created_at,m.id`,
       [userId, workspaceId]
     );
     return result.rows.map(mapWorkspaceMemory);
   }
 
+  /**
+   * A note about this computer. It cannot write the owner tier, and the type is the first half of
+   * why.
+   *
+   * `target` was `WorkspaceMemoryRecord['target']`, so the one production caller that reaches this
+   * method from inside a running turn - `apps/worker/src/tools/knowledge.ts`, the `memory` tool -
+   * could pass `'user'` and did. Narrowing it to `'workspace'` turns that into a compile error at
+   * that call site rather than a rule written down somewhere the call site never reads. The
+   * runtime throw below is the second half, because a JavaScript caller, a test double or a future
+   * `as` cast can still get past the type, and this is the production call site the gate has to
+   * hold at.
+   *
+   * @see createOwnerMemory for the other tier and for what it takes to enter it.
+   */
   async createWorkspaceMemory(input: {
     userId: string;
     workspaceId: string;
-    target: WorkspaceMemoryRecord['target'];
+    target: 'workspace';
     contentCiphertext: EncryptedEnvelope;
     validUntil?: string | null;
   }): Promise<WorkspaceMemoryRecord> {
+    if ((input.target as string) !== 'workspace')
+      throw new AthanorError(
+        'memory_scope_refused',
+        'The owner tier is written by the owner in Settings, not through this path.'
+      );
     const result = await this.database.query(
       `INSERT INTO workspace_memories(
-        id,user_id,workspace_id,target,content_ciphertext,valid_until
-       ) VALUES ($1,$2,$3,$4,$5::jsonb,$6) RETURNING *`,
+        id,user_id,workspace_id,target,key_scope,content_ciphertext,valid_until
+       ) VALUES ($1,$2,$3,'workspace','workspace',$4::jsonb,$5) RETURNING *`,
       [
         randomUUID(),
         input.userId,
         input.workspaceId,
-        input.target,
         JSON.stringify(input.contentCiphertext),
         input.validUntil ?? null
       ]
@@ -435,36 +473,138 @@ export class WorkspaceStore {
     return mapWorkspaceMemory(result.rows[0]!);
   }
 
-  async updateWorkspaceMemory(input: {
-    id: string;
+  /**
+   * A fact about the OWNER, which every workspace they own will read and which deleting a computer
+   * does not remove.
+   *
+   * There is no `workspaceId` parameter and that is the gate, not an omission. A turn is the thing
+   * that has read a web page, opened a repository, or been handed somebody else's CONTRIBUTING.md,
+   * and a turn always knows which workspace it is in; a method that cannot be told a workspace
+   * cannot be called usefully from inside one. The only caller is the API route behind an
+   * authenticated owner session, where there is no task in the loop and nothing untrusted has been
+   * read. That is strictly stronger than the workspace tier's gate, which downgrades an agent
+   * write to an approval card and still writes it - a card is a decision the owner makes while the
+   * injected text is still in front of them, and a wrong row here follows them into every project
+   * they ever start.
+   *
+   * The row bound is enforced by the statement rather than by a count taken beforehand. A
+   * `SELECT count(*)` followed by an `INSERT` is two statements with a gap in the middle, and the
+   * bound on the one tier that outlives everything should not depend on nobody racing it. At the
+   * bound the `WHERE` fails, `RETURNING` yields nothing, and the caller is refused - nothing is
+   * evicted. Silently dropping the oldest fact the owner recorded about themselves to make room
+   * for a newer one is the failure this tier cannot afford, because the owner would never see it
+   * happen.
+   */
+  async createOwnerMemory(input: {
     userId: string;
-    workspaceId: string;
+    maxRows: number;
     contentCiphertext: EncryptedEnvelope;
     validUntil?: string | null;
   }): Promise<WorkspaceMemoryRecord | null> {
     const result = await this.database.query(
-      `UPDATE workspace_memories SET content_ciphertext=$4::jsonb,valid_until=$5,updated_at=NOW()
-       WHERE id=$1 AND workspace_id=$3 AND EXISTS (
-         SELECT 1 FROM workspaces w
-         WHERE w.id=workspace_memories.workspace_id AND w.user_id=$2
-       ) RETURNING *`,
+      `INSERT INTO workspace_memories(
+        id,user_id,workspace_id,target,key_scope,content_ciphertext,valid_until
+       )
+       SELECT $1,$2,NULL,'user','user',$3::jsonb,$4
+       WHERE (
+         SELECT count(*) FROM workspace_memories WHERE user_id=$2 AND key_scope='user'
+       ) < $5
+       RETURNING *`,
       [
-        input.id,
+        randomUUID(),
         input.userId,
-        input.workspaceId,
         JSON.stringify(input.contentCiphertext),
-        input.validUntil ?? null
+        input.validUntil ?? null,
+        input.maxRows
       ]
     );
     return result.rows[0] ? mapWorkspaceMemory(result.rows[0]) : null;
   }
 
+  /** How many rows the owner tier is holding, for a caller that has to report the bound. */
+  async countOwnerMemories(userId: string): Promise<number> {
+    const result = await this.database.query(
+      `SELECT count(*)::int AS n FROM workspace_memories WHERE user_id=$1 AND key_scope='user'`,
+      [userId]
+    );
+    return Number((result.rows[0] as { n: number } | undefined)?.n ?? 0);
+  }
+
+  /**
+   * Rewrites one row, in either tier.
+   *
+   * `keyScope` is an argument rather than something this reads off the row, because the caller is
+   * the only party that knows which key it just sealed under and a mismatch between the two is
+   * unreadable ciphertext that nothing would notice until a later read. Passing it also makes the
+   * one useful promotion possible: a `target:'user'` row written before migration 70 is still
+   * sealed under a workspace key, and re-encrypting it under the owner key on an ordinary edit
+   * moves it out of the workspace at the one moment the owner is present and looking at it.
+   *
+   * `workspace_id` is set from `keyScope` in the same statement, so the row can never be sealed
+   * under one scope and filed under the other - the constraint added in migration 70 would reject
+   * it if it tried.
+   *
+   * `maxRows` is here because promotion is the tier's SECOND entrance and it was unbounded. The
+   * row bound was written into `createOwnerMemory`'s INSERT and nowhere else, and this statement
+   * moves a row into the same tier without inserting anything: driven against a real migrated
+   * database, forty legacy `target:'user'` rows promoted one at a time left the tier holding 56
+   * rows against a bound of 16, after which every honest INSERT was refused for the rest of the
+   * account's life. The clause fires only on a promotion - a row already at `key_scope='user'`,
+   * and every write to the workspace tier, is untouched by it - and it is inside the statement for
+   * the same reason the INSERT's is: a count taken beforehand and a write issued afterwards are
+   * two statements with a gap in the middle.
+   */
+  async updateWorkspaceMemory(input: {
+    id: string;
+    userId: string;
+    workspaceId: string;
+    keyScope: WorkspaceMemoryRecord['keyScope'];
+    maxOwnerRows: number;
+    contentCiphertext: EncryptedEnvelope;
+    validUntil?: string | null;
+  }): Promise<WorkspaceMemoryRecord | null> {
+    const result = await this.database.query(
+      `UPDATE workspace_memories SET
+         content_ciphertext=$5::jsonb,
+         valid_until=$6,
+         key_scope=$4,
+         workspace_id=CASE WHEN $4='user' THEN NULL ELSE $3::uuid END,
+         updated_at=NOW()
+       WHERE id=$1 AND user_id=$2
+         AND (key_scope='user' OR workspace_id=$3)
+         AND ($4='workspace' OR target='user')
+         AND (
+           $4='workspace' OR key_scope='user' OR (
+             SELECT count(*) FROM workspace_memories o
+             WHERE o.user_id=$2 AND o.key_scope='user'
+           ) < $7
+         )
+       RETURNING *`,
+      [
+        input.id,
+        input.userId,
+        input.workspaceId,
+        input.keyScope,
+        JSON.stringify(input.contentCiphertext),
+        input.validUntil ?? null,
+        input.maxOwnerRows
+      ]
+    );
+    return result.rows[0] ? mapWorkspaceMemory(result.rows[0]) : null;
+  }
+
+  /**
+   * Removes one row from either tier.
+   *
+   * Authorised on `user_id`, so the owner tier is reachable from whichever workspace the owner
+   * happens to have open. That is the half of "they can see the whole tier and delete any row"
+   * that a workspace-scoped `DELETE` could not do: a row with no workspace id was not deletable
+   * through this at all before, only through the cascade that took the whole computer with it.
+   */
   async deleteWorkspaceMemory(userId: string, workspaceId: string, id: string): Promise<boolean> {
     const result = await this.database.query(
-      `DELETE FROM workspace_memories WHERE id=$3 AND workspace_id=$2 AND EXISTS (
-         SELECT 1 FROM workspaces w
-         WHERE w.id=workspace_memories.workspace_id AND w.user_id=$1
-       )`,
+      `DELETE FROM workspace_memories
+       WHERE id=$3 AND user_id=$1 AND (key_scope='user' OR workspace_id=$2)`,
       [userId, workspaceId, id]
     );
     return result.rowCount === 1;

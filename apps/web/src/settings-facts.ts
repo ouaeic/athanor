@@ -111,9 +111,22 @@ export const memoryPatch = (draft: {
 export const memoryProvenance = (memory: Pick<WorkspaceMemory, 'source'>): string =>
   memory.source === 'agent' ? 'the agent decided this' : 'you wrote this';
 
-/** Which computer or person the line applies to, said as a scope rather than as a person. */
-export const memoryScope = (memory: Pick<WorkspaceMemory, 'target'>): string =>
-  memory.target === 'user' ? 'About you, everywhere' : 'About this computer';
+/**
+ * Which computer or person the line applies to, said as a scope rather than as a person.
+ *
+ * "About you, everywhere" was a promise the row could not keep: the only reader filtered on
+ * `workspace_id`, so an owner-tier entry was visible in the one workspace it was typed in and was
+ * destroyed with it. The read path and the key now honour it — but only for rows sealed under the
+ * owner key, and an entry written before that existed is still workspace-bound whatever its label
+ * says. Three states, because there are three, and the third one tells the owner what to do about
+ * it rather than quietly reading like the first.
+ */
+export const memoryScope = (memory: Pick<WorkspaceMemory, 'target' | 'scope'>): string =>
+  memory.target !== 'user'
+    ? 'About this computer'
+    : memory.scope === 'user'
+      ? 'About you, everywhere'
+      : 'About you — still tied to this computer; edit to move it';
 
 /**
  * The on/off control on a learned procedure: what it says, and what it sends.

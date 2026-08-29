@@ -20,6 +20,8 @@ import {
   encryptJson,
   memoryTemporalStatus,
   recallMemories,
+  userMemoryAad,
+  userMemoryKey,
   type MemoryDocument
 } from '@athanor/core';
 import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
@@ -44,6 +46,13 @@ export interface WindowDeps {
   readonly store: DataStore;
   readonly config: AgentWorkerConfig;
   readonly runner: AgentRunnerClient;
+  /**
+   * Needed for one row class and no other: the owner tier, whose key is derived from this and the
+   * user id rather than unwrapped from `workspace_keys`. It arrives as the resolved 32 bytes
+   * because `config.DATA_MASTER_KEY` is the encoded form and resolving it twice is two places for
+   * one secret to be got wrong. @see userMemoryKey.
+   */
+  readonly masterKey: Buffer;
 }
 
 /** The facts the runtime block states, all of them fixed for the run except the clock. */
@@ -138,10 +147,27 @@ export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): 
     );
   const knowledgeMarker = 'CURATED ENCRYPTED KNOWLEDGE';
   const memoryRecords = await deps.store.listWorkspaceMemories(task.userId, task.workspaceId);
+  /*
+   * The owner tier is sealed under a key this workspace does not hold, and that is the point.
+   *
+   * `listWorkspaceMemories` returns two scopes now: rows about this computer, sealed under the
+   * workspace data key, and rows about the person, sealed under a key derived from the master key
+   * and the user id so that deleting this computer cannot reach them. The AAD check below stays
+   * exactly as strict as it was - it is still an equality against the one context this row is
+   * allowed to carry - it simply now knows about two contexts instead of one, and picks the key
+   * from the same fact rather than from a guess. @see userMemoryKey.
+   */
+  const ownerMemoryKey = userMemoryKey(deps.masterKey, task.userId);
+  const ownerMemoryAad = userMemoryAad(task.userId);
   const activeMemoryEntries = memoryRecords.flatMap((record) => {
-    if (record.contentCiphertext.aad !== `workspace-memory:${task.workspaceId}`) return [];
+    const owned = record.keyScope === 'user';
+    const expectedAad = owned ? ownerMemoryAad : `workspace-memory:${task.workspaceId}`;
+    if (record.contentCiphertext.aad !== expectedAad) return [];
     try {
-      const document = decryptJson<MemoryDocument>(record.contentCiphertext, key);
+      const document = decryptJson<MemoryDocument>(
+        record.contentCiphertext,
+        owned ? ownerMemoryKey : key
+      );
       // Anchored for the same reason the ranking below it is, and it is the half that was
       // missing. With the wall clock as its `now`, an entry whose `validUntil` fell between the
       // task starting and the current step was in this block on one request and gone from the

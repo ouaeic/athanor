@@ -396,6 +396,73 @@ const encodeToken = (digest: Buffer, chars: number): string => {
 export const memoryIndexKey = (dataKey: Uint8Array): Buffer =>
   Buffer.from(hkdfSync('sha256', dataKey, new Uint8Array(0), 'athanor-memory-index-v1', 32));
 
+/**
+ * The key a fact about the OWNER is sealed under, and the reason the owner tier can leave a
+ * workspace at all.
+ *
+ * Every other secret on this box is sealed under a workspace data key: `generateDataKey()` at
+ * `createWorkspace`, wrapped as `workspace-key:${workspaceId}`, and unwrapped from
+ * `workspace_keys` - a table whose rows are `ON DELETE CASCADE` from `workspaces`. That is the
+ * correct scope for a fact about a project and the wrong scope for a fact about a person, and it
+ * is the whole of why `workspace_memories.target = 'user'` has never meant what its label says:
+ * a row sealed under workspace A's key is unreadable in B, and deleting A destroys it outright.
+ * Widening the SQL alone would have returned rows that then failed to decrypt.
+ *
+ * This is derived rather than stored, which is the same choice `memoryIndexKey` above makes and
+ * for the same reason: a subordinate key with no row of its own has no wrap to get out of step,
+ * no `ON DELETE` to reason about, and no second rotation story. Deleting a workspace cannot reach
+ * it, because it was never in `workspace_keys`. The user id is the salt, so two accounts on one
+ * box derive different keys from the same master and neither can open the other's rows even with
+ * full database access.
+ *
+ * What it deliberately does NOT do is survive a reinstall. The master key is minted once by the
+ * installer and `service-keys.ts` is blunt about the consequence - a key that did not encrypt this
+ * database cannot read it back. So the owner tier outlives a workspace and does not outlive the
+ * box, and the honest place to say so is here rather than in a label the owner reads.
+ */
+export const userMemoryKey = (masterKey: Uint8Array, userId: string): Buffer =>
+  Buffer.from(
+    hkdfSync('sha256', masterKey, Buffer.from(userId, 'utf8'), 'athanor-user-memory-v1', 32)
+  );
+
+/**
+ * The context an owner-tier row is bound to.
+ *
+ * Its own domain rather than a reused `workspace-memory:` string, because the GCM tag proves the
+ * ciphertext and the AAD were made together and not that the AAD is the one this caller meant -
+ * the standing warning on `inferenceCredentialAad`. A workspace row and an owner row must never be
+ * substitutable for one another even by a caller holding both keys.
+ */
+export const userMemoryAad = (userId: string): string => `user-memory:${userId}`;
+
+/**
+ * How many facts about the owner this box will hold, and the measurement the number comes from.
+ *
+ * 505 owner-typed turns across ten projects and four and a half months were read end to end. The
+ * dispositions that recur in more than one project - the ones that would still be true in a
+ * project not yet started - come to eight by probe and fewer on reading: one is overwhelming
+ * (thirty-four sentences in eight of the ten projects), three more clear three projects, and one
+ * collapses entirely once the sentences are read rather than counted. Nothing in that corpus asks
+ * to be remembered about the person even once.
+ *
+ * So the honest content of this tier is single figures, and sixteen is double the widest defensible
+ * reading of it. A bound set at what the evidence supports rather than at what the column could
+ * hold is what keeps the tier legible: sixteen rows inside 6,000 characters is a screen the owner
+ * can read in one sitting, and a tier nobody reads is a tier nobody notices a wrong row in.
+ *
+ * At the bound the write is refused and the owner is told what is full. Nothing is evicted. The
+ * workspace tier can afford an eviction policy because its rows die with the computer anyway; a
+ * fact about a person that quietly disappeared to make room would be a thing the owner told this
+ * machine once and can never find out it forgot.
+ */
+export const OWNER_MEMORY_MAX_ROWS = 16;
+
+/** The owner tier's character budget, unchanged - it is what already forced one screen. */
+export const OWNER_MEMORY_MAX_CHARS = 6_000;
+
+/** The workspace tier's character budget. Wider, because those rows die with the computer. */
+export const WORKSPACE_MEMORY_MAX_CHARS = 12_000;
+
 const keyedToken = (domain: string, value: string, key: Uint8Array, chars: number): string =>
   encodeToken(createHmac('sha256', key).update(`${domain} ${value}`).digest(), chars);
 

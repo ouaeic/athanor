@@ -251,8 +251,9 @@ export const mapTaskPlan = (row: Record<string, unknown>): TaskPlanRecord => ({
 export const mapWorkspaceMemory = (row: Record<string, unknown>): WorkspaceMemoryRecord => ({
   id: String(row.id),
   userId: String(row.user_id),
-  workspaceId: String(row.workspace_id),
+  workspaceId: optionalText(row.workspace_id),
   target: String(row.target) as WorkspaceMemoryRecord['target'],
+  keyScope: row.key_scope === 'user' ? 'user' : 'workspace',
   contentCiphertext: json<EncryptedEnvelope>(row.content_ciphertext),
   validUntil: row.valid_until ? iso(row.valid_until) : null,
   createdAt: iso(row.created_at),

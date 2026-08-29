@@ -22,7 +22,7 @@
  *   in the file at length.
  */
 import { WEB_TOOL_DISCLOSURE, type WebToolPlan } from '@athanor/contracts';
-import { encryptJson } from '@athanor/core';
+import { encryptJson, userMemoryAad, userMemoryKey } from '@athanor/core';
 import type {
   DataStore,
   MemoryCandidateRecord,
@@ -49,6 +49,8 @@ import {
 } from './window.js';
 
 const key = new Uint8Array(32).fill(9);
+/** The box's master key, from which the owner tier's key is derived rather than stored. */
+const boxMasterKey = Buffer.alloc(32, 7);
 const KNOWLEDGE_MARKER = 'CURATED ENCRYPTED KNOWLEDGE';
 const PLAN_MARKER = 'ACTIVE USER-VISIBLE PLAN';
 const BASE_PROMPT = 'BASE SYSTEM PROMPT';
@@ -94,6 +96,30 @@ const memory = (id: string, target: 'workspace' | 'user', content: string): Work
     workspaceId,
     target,
     contentCiphertext: encryptJson({ content }, key, `workspace-memory:${workspaceId}`),
+    validUntil: null,
+    createdAt: '2026-07-01T00:00:00.000Z',
+    updatedAt: '2026-07-01T00:00:00.000Z'
+  }) as WorkspaceMemoryRecord;
+
+/**
+ * A row of the owner tier, sealed the way the product seals one.
+ *
+ * Deliberately not the same shape as `memory` above: a different key, a different AAD and no
+ * workspace id. A fixture that sealed this under the workspace key would be measuring a row this
+ * product cannot produce, and would pass whether or not the preamble had learned the second scope.
+ */
+const ownerMemory = (id: string, content: string): WorkspaceMemoryRecord =>
+  ({
+    id,
+    userId,
+    workspaceId: null,
+    target: 'user',
+    keyScope: 'user',
+    contentCiphertext: encryptJson(
+      { content },
+      userMemoryKey(boxMasterKey, userId),
+      userMemoryAad(userId)
+    ),
     validUntil: null,
     createdAt: '2026-07-01T00:00:00.000Z',
     updatedAt: '2026-07-01T00:00:00.000Z'
@@ -148,6 +174,7 @@ const probe = (): Probe => {
   const packs = new Map<string, MemoryPackRecord>();
   state.deps = {
     config: { PREVIEW_BASE_URL: 'https://preview.invalid' } as unknown as AgentWorkerConfig,
+    masterKey: boxMasterKey,
     runner: {
       readFile: async (_workspaceId: string, _taskId: string, path: string) => {
         if (state.brief === null) throw new Error(`no such file: ${path}`);
@@ -250,6 +277,41 @@ describe('the preamble', () => {
    * and is therefore the one block that genuinely changes between turns. Ahead of them it would move
    * the divergence point to the second message and re-bill everything behind it.
    */
+  /*
+   * The tier that is not this computer's, reaching the model at all.
+   *
+   * `workspace_memories.target='user'` has been readable here since migration 30 and has never
+   * carried anything a second workspace could see, because the row was sealed under the workspace
+   * key and dropped by the AAD equality below. It is now sealed under a key derived from the master
+   * key and the user, and this is the assertion that the preamble picks the right one - without it
+   * the whole tier would be a database row nothing ever reads.
+   *
+   * The second half is the attack from the other side. A row that merely *claims* the owner scope
+   * while carrying the workspace context is dropped, so the check is still an equality against one
+   * permitted context rather than a widened net: `key_scope` chooses which context is expected, it
+   * does not excuse a row from having one.
+   */
+  it('reads the owner tier under its own key, and drops a row whose scope and context disagree', async () => {
+    const probed = probe();
+    probed.memories = [
+      ownerMemory('m-owner', 'take the lead and do not stop to ask'),
+      {
+        ...ownerMemory('m-forged', 'this should never be read'),
+        contentCiphertext: encryptJson(
+          { content: 'this should never be read' },
+          key,
+          `workspace-memory:${workspaceId}`
+        )
+      } as WorkspaceMemoryRecord
+    ];
+    const state = freshState();
+
+    await assemblePreamble(probed.deps, { ...preamble, state });
+
+    expect(state.messages[1]?.content).toContain('take the lead and do not stop to ask');
+    expect(state.messages[1]?.content).not.toContain('this should never be read');
+  });
+
   it('puts the frozen blocks ahead of the block that changes', async () => {
     const probed = probe();
     probed.brief = 'This project uses uv.';

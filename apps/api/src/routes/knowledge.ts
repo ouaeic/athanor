@@ -15,11 +15,15 @@ import {
   decryptJson,
   encryptJson,
   memoryExcerpt,
-  memoryTemporalStatus
+  memoryTemporalStatus,
+  userMemoryAad,
+  OWNER_MEMORY_MAX_CHARS,
+  OWNER_MEMORY_MAX_ROWS,
+  WORKSPACE_MEMORY_MAX_CHARS
 } from '@athanor/core';
 import type { MemoryDocument } from '@athanor/core';
 import type { MemoryItemBody } from '@athanor/contracts';
-import type { MemoryItemRecord } from '@athanor/data';
+import type { MemoryItemRecord, WorkspaceMemoryRecord } from '@athanor/data';
 import { z } from 'zod';
 import { UNREADABLE_MEMORY_ITEM } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
@@ -72,36 +76,99 @@ const SkillDocumentInput = z
   });
 
 export const registerKnowledgeRoutes = (context: RouteContext): void => {
-  const { app, store, workspaceKnowledgeKey, idempotent } = context;
+  const { app, store, workspaceKnowledgeKey, ownerKnowledgeKey, idempotent } = context;
+
+  /**
+   * Two keys, and the rule for which row opens under which.
+   *
+   * A memory list is no longer one scope. The workspace tier is sealed under the workspace data
+   * key with `workspace-memory:${workspaceId}`; the owner tier is sealed under a key derived from
+   * the master key and the user, with its own AAD domain. `keyScope` is in the clear precisely so
+   * this choice can be made before anything is decrypted rather than by trying one key and
+   * catching the failure - a decrypt that fails and a decrypt that opened the wrong row look
+   * identical from the outside only when nobody wrote down which key was meant.
+   *
+   * A `target: 'user'` row written before migration 70 is still `keyScope: 'workspace'` and still
+   * opens the old way, so no existing entry changes meaning under its owner. `PATCH` is what
+   * promotes one, and it does so with the owner watching.
+   */
+  const memoryKeyring = async (userId: string, workspaceId: string) => {
+    const { key: workspaceKey } = await workspaceKnowledgeKey(userId, workspaceId);
+    const ownerKey = ownerKnowledgeKey(userId);
+    const open = (record: WorkspaceMemoryRecord): MemoryDocument =>
+      record.keyScope === 'user'
+        ? decryptJson<MemoryDocument>(record.contentCiphertext, ownerKey, userMemoryAad(userId))
+        : decryptJson<MemoryDocument>(
+            record.contentCiphertext,
+            workspaceKey,
+            `workspace-memory:${workspaceId}`
+          );
+    return { workspaceKey, ownerKey, open };
+  };
+
+  /**
+   * What one row looks like on the wire.
+   *
+   * `scope` is served beside `target` and is not the same fact. `target` is what the owner chose;
+   * `scope` is where the row actually lives now. They differ on exactly the rows that were written
+   * under the old promise, and a client that shows "About you, everywhere" needs to be able to
+   * tell those apart rather than repeating a claim the row cannot keep.
+   */
+  const memoryResponse = (record: WorkspaceMemoryRecord, document: MemoryDocument) => ({
+    id: record.id,
+    target: record.target,
+    scope: record.keyScope,
+    content: document.content,
+    status: memoryTemporalStatus(document),
+    validFrom: document.validFrom ?? null,
+    validUntil: document.validUntil ?? null,
+    source: document.source ?? 'owner',
+    sourceTaskId: document.sourceTaskId ?? null,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt
+  });
+
+  /** Characters already spent in one tier, counting only rows that are still in force. */
+  const spentCharacters = (
+    records: readonly WorkspaceMemoryRecord[],
+    open: (record: WorkspaceMemoryRecord) => MemoryDocument,
+    target: WorkspaceMemoryRecord['target'],
+    exceptId?: string
+  ): number =>
+    records
+      .filter((record) => record.target === target && record.id !== exceptId)
+      .reduce((total, record) => {
+        const document = open(record);
+        return memoryTemporalStatus(document) === 'expired'
+          ? total
+          : total + document.content.length;
+      }, 0);
+
   app.get<{ Params: { workspaceId: string } }>(
     '/v1/workspaces/:workspaceId/memories',
     async (request) => {
       const user = requireUser(request.user);
-      const { key } = await workspaceKnowledgeKey(user.id, request.params.workspaceId);
+      const { open } = await memoryKeyring(user.id, request.params.workspaceId);
       return (await store.listWorkspaceMemories(user.id, request.params.workspaceId)).map(
-        (record) => {
-          const document = decryptJson<MemoryDocument>(
-            record.contentCiphertext,
-            key,
-            `workspace-memory:${request.params.workspaceId}`
-          );
-          return {
-            id: record.id,
-            target: record.target,
-            content: document.content,
-            status: memoryTemporalStatus(document),
-            validFrom: document.validFrom ?? null,
-            validUntil: document.validUntil ?? null,
-            source: document.source ?? 'owner',
-            sourceTaskId: document.sourceTaskId ?? null,
-            createdAt: record.createdAt,
-            updatedAt: record.updatedAt
-          };
-        }
+        (record) => memoryResponse(record, open(record))
       );
     }
   );
 
+  /**
+   * Writes a memory, and the only path by which the owner tier can be entered.
+   *
+   * The gate is what is missing from this handler rather than what is in it: there is no task, no
+   * tool call and no agent on this path. It is an authenticated owner session posting a form.
+   * `createOwnerMemory` takes no workspace id for the same reason, so a caller that has one - which
+   * is every caller inside a running turn - cannot use it. The worker's `memory` tool is refused at
+   * the type and again at the store; @see createWorkspaceMemory.
+   *
+   * Two bounds, and they are not redundant. Characters are checked here because only a holder of
+   * both keys can add up what is already stored, and rows are checked inside the insert because a
+   * count taken here and an insert issued afterwards are two statements with a gap between them.
+   * Both refuse. Neither evicts.
+   */
   app.post<{
     Params: { workspaceId: string };
     Body: { target: 'workspace' | 'user'; content: string; validUntil?: string };
@@ -114,33 +181,17 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
         validUntil: z.string().datetime({ offset: true }).optional()
       })
       .parse(request.body);
-    const { key } = await workspaceKnowledgeKey(user.id, request.params.workspaceId);
+    const { workspaceKey, ownerKey, open } = await memoryKeyring(
+      user.id,
+      request.params.workspaceId
+    );
     const records = await store.listWorkspaceMemories(user.id, request.params.workspaceId);
-    const targetTotal = records
-      .filter((record) => {
-        if (record.target !== input.target) return false;
-        const document = decryptJson<MemoryDocument>(
-          record.contentCiphertext,
-          key,
-          `workspace-memory:${request.params.workspaceId}`
-        );
-        return memoryTemporalStatus(document) !== 'expired';
-      })
-      .reduce(
-        (total, record) =>
-          total +
-          decryptJson<{ content: string }>(
-            record.contentCiphertext,
-            key,
-            `workspace-memory:${request.params.workspaceId}`
-          ).content.length,
-        0
-      );
-    const limit = input.target === 'user' ? 6_000 : 12_000;
-    if (targetTotal + input.content.length > limit)
+    const limit = input.target === 'user' ? OWNER_MEMORY_MAX_CHARS : WORKSPACE_MEMORY_MAX_CHARS;
+    const spent = spentCharacters(records, open, input.target);
+    if (spent + input.content.length > limit)
       throw new AthanorError(
         'memory_full',
-        `${input.target} memory is full. Consolidate or remove an entry first.`
+        `${input.target} memory is ${spent}/${limit} characters. Consolidate or remove an entry first.`
       );
     const document: MemoryDocument = {
       content: input.content,
@@ -149,30 +200,42 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
       ...(input.validUntil ? { validUntil: input.validUntil } : {})
     };
     assertMemoryValidity(document);
+    if (input.target === 'user') {
+      const created = await store.createOwnerMemory({
+        userId: user.id,
+        maxRows: OWNER_MEMORY_MAX_ROWS,
+        contentCiphertext: encryptJson(document, ownerKey, userMemoryAad(user.id))
+      });
+      if (!created)
+        throw new AthanorError(
+          'memory_full',
+          `Memory about you holds ${OWNER_MEMORY_MAX_ROWS} entries and all ${OWNER_MEMORY_MAX_ROWS} are in use. Remove one you no longer stand behind before adding another.`
+        );
+      return memoryResponse(created, document);
+    }
     const created = await store.createWorkspaceMemory({
       userId: user.id,
       workspaceId: request.params.workspaceId,
-      target: input.target,
+      target: 'workspace',
       contentCiphertext: encryptJson(
         document,
-        key,
+        workspaceKey,
         `workspace-memory:${request.params.workspaceId}`
       )
     });
-    return {
-      id: created.id,
-      target: created.target,
-      content: input.content,
-      status: memoryTemporalStatus(document),
-      validFrom: document.validFrom ?? null,
-      validUntil: document.validUntil ?? null,
-      source: document.source ?? 'owner',
-      sourceTaskId: document.sourceTaskId ?? null,
-      createdAt: created.createdAt,
-      updatedAt: created.updatedAt
-    };
+    return memoryResponse(created, document);
   });
 
+  /**
+   * Rewrites one entry, and promotes a legacy owner-tier row on the way through.
+   *
+   * A `target: 'user'` row written before migration 70 is sealed under a workspace key and dies
+   * with that workspace. It cannot be re-sealed by a migration, because migrations hold no key.
+   * This is the moment it can be: the owner has both keys in hand, is looking at the row, and is
+   * already rewriting its bytes. So an edit to any `target: 'user'` row seals the result under the
+   * owner key and clears its workspace id, which is the difference between a promise in a label
+   * and a row that keeps it.
+   */
   app.patch<{
     Params: { workspaceId: string; memoryId: string };
     Body: { content: string; validUntil?: string | null };
@@ -184,37 +247,17 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
         validUntil: z.string().datetime({ offset: true }).nullable().optional()
       })
       .parse(request.body);
-    const { key } = await workspaceKnowledgeKey(user.id, request.params.workspaceId);
+    const { workspaceKey, ownerKey, open } = await memoryKeyring(
+      user.id,
+      request.params.workspaceId
+    );
     const records = await store.listWorkspaceMemories(user.id, request.params.workspaceId);
     const existing = records.find((record) => record.id === request.params.memoryId);
     if (!existing) throw new AthanorError('memory_not_found', 'Memory entry not found', 404);
-    const existingDocument = decryptJson<MemoryDocument>(
-      existing.contentCiphertext,
-      key,
-      `workspace-memory:${request.params.workspaceId}`
-    );
-    const otherTotal = records
-      .filter((record) => {
-        if (record.target !== existing.target || record.id === existing.id) return false;
-        const document = decryptJson<MemoryDocument>(
-          record.contentCiphertext,
-          key,
-          `workspace-memory:${request.params.workspaceId}`
-        );
-        return memoryTemporalStatus(document) !== 'expired';
-      })
-      .reduce(
-        (total, record) =>
-          total +
-          decryptJson<{ content: string }>(
-            record.contentCiphertext,
-            key,
-            `workspace-memory:${request.params.workspaceId}`
-          ).content.length,
-        0
-      );
-    const limit = existing.target === 'user' ? 6_000 : 12_000;
-    if (otherTotal + input.content.length > limit)
+    const existingDocument = open(existing);
+    const limit = existing.target === 'user' ? OWNER_MEMORY_MAX_CHARS : WORKSPACE_MEMORY_MAX_CHARS;
+    const spent = spentCharacters(records, open, existing.target, existing.id);
+    if (spent + input.content.length > limit)
       throw new AthanorError('memory_full', 'Replacement would exceed the memory limit');
     const updatedDocument: MemoryDocument = {
       content: input.content,
@@ -230,29 +273,42 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
             : {})
     };
     assertMemoryValidity(updatedDocument);
+    const keyScope = existing.target === 'user' ? 'user' : 'workspace';
+    /*
+     * A promotion is an entry to the owner tier and pays the tier's row bound, exactly as an
+     * insert does. Only a row that is not already there can pay it, so an ordinary edit to a row
+     * the owner has already promoted is not charged twice.
+     *
+     * Checked here for the message and inside the statement for the guarantee, which is the same
+     * division the POST above makes and for the same reason: this count and the write that follows
+     * it are two statements with a gap in the middle, and the bound on the one tier that outlives
+     * a workspace should not depend on nobody racing it.
+     */
+    if (keyScope === 'user' && existing.keyScope !== 'user') {
+      const held = await store.countOwnerMemories(user.id);
+      if (held >= OWNER_MEMORY_MAX_ROWS)
+        throw new AthanorError(
+          'memory_full',
+          `Memory about you already holds ${OWNER_MEMORY_MAX_ROWS} entries. Remove one you no longer stand behind before moving this one across.`
+        );
+    }
     const updated = await store.updateWorkspaceMemory({
       id: existing.id,
       userId: user.id,
       workspaceId: request.params.workspaceId,
-      contentCiphertext: encryptJson(
-        updatedDocument,
-        key,
-        `workspace-memory:${request.params.workspaceId}`
-      )
+      keyScope,
+      maxOwnerRows: OWNER_MEMORY_MAX_ROWS,
+      contentCiphertext:
+        keyScope === 'user'
+          ? encryptJson(updatedDocument, ownerKey, userMemoryAad(user.id))
+          : encryptJson(
+              updatedDocument,
+              workspaceKey,
+              `workspace-memory:${request.params.workspaceId}`
+            )
     });
     if (!updated) throw new AthanorError('memory_not_found', 'Memory entry not found', 404);
-    return {
-      id: updated.id,
-      target: updated.target,
-      content: input.content,
-      status: memoryTemporalStatus(updatedDocument),
-      validFrom: updatedDocument.validFrom ?? null,
-      validUntil: updatedDocument.validUntil ?? null,
-      source: updatedDocument.source ?? 'owner',
-      sourceTaskId: updatedDocument.sourceTaskId ?? null,
-      createdAt: updated.createdAt,
-      updatedAt: updated.updatedAt
-    };
+    return memoryResponse(updated, updatedDocument);
   });
 
   app.delete<{ Params: { workspaceId: string; memoryId: string } }>(
