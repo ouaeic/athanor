@@ -8,7 +8,13 @@
  * A test that only exercises the callee would have been green through all nine waves of that.
  */
 import { describe, expect, it } from 'vitest';
-import { encryptJson, renderMemoryPack, type MemoryPackEntry } from '@athanor/core';
+import {
+  decryptJson,
+  encryptJson,
+  renderMemoryPack,
+  type EncryptedEnvelope,
+  type MemoryPackEntry
+} from '@athanor/core';
 import type { DataStore, MemoryPackRecord, TaskRecord } from '@athanor/data';
 import type { ModelMessage } from '@athanor/model-gateway';
 import type { AgentState } from './agent-state.js';
@@ -50,11 +56,14 @@ interface CaptureProbe {
   readonly deps: MemoryCaptureDeps;
   readonly uses: Array<{ itemIds: readonly string[]; cited?: boolean; outcome?: string }>;
   readonly warnings: string[];
+  /** Every timeline line this write path emitted, sealed exactly as the store would hold it. */
+  readonly events: Array<{ kind: string; payloadCiphertext: EncryptedEnvelope }>;
 }
 
 const probe = (): CaptureProbe => {
   const uses: CaptureProbe['uses'] = [];
   const warnings: string[] = [];
+  const events: CaptureProbe['events'] = [];
   const pack: MemoryPackRecord = {
     taskId,
     workspaceId,
@@ -86,13 +95,24 @@ const probe = (): CaptureProbe => {
     // never fail a verified turn, so `captureMemory` catches everything and reports it as a
     // timeline warning - which means a test that only checks "it did not throw" checks nothing at
     // all, and would have passed with the whole write path broken.
-    appendTaskEvent: async (input: { kind: string }) => {
+    appendTaskEvent: async (input: { kind: string; payloadCiphertext: EncryptedEnvelope }) => {
       warnings.push(input.kind);
+      events.push(input);
       return { id: 'event' };
     }
   } as unknown as DataStore;
-  return { deps: { store, memoryConsolidatedAt: new Map() }, uses, warnings };
+  return { deps: { store, memoryConsolidatedAt: new Map() }, uses, warnings, events };
 };
+
+/** What the owner would read on the timeline, out of the sealed payload the store holds. */
+const summaries = (capture: CaptureProbe, kind: string): string[] =>
+  capture.events
+    .filter((entry) => entry.kind === kind)
+    .map(
+      (entry) =>
+        decryptJson<{ summary: string }>(entry.payloadCiphertext, dataKey, `task-event:${taskId}`)
+          .summary
+    );
 
 const task = {
   id: taskId,
@@ -162,6 +182,54 @@ describe('what a finished turn tells the store about the memory it was given', (
     );
     expect(capture.warnings).toEqual([]);
     expect(capture.uses[0]).toMatchObject({ itemIds: [SEND_ID], cited: true });
+  });
+
+  /**
+   * The cap that ate 57.7% of everything the owner had ever typed, in silence.
+   *
+   * `recordTurnEpisode` keeps the first eight six-kilobyte chunks of each part and drops the rest.
+   * Measured over 3,950 real turns: 197 (5.0%) run past it, and 34.6 MB of 59.9 MB of the owner's
+   * own words never reached a source row. The cap is right and is unchanged; what was wrong is
+   * that nothing said so, so the owner could search memory for a constraint they had definitely
+   * written and be told, truthfully and uselessly, that nothing matched.
+   */
+  describe('saying what the verbatim cap refused', () => {
+    const oversized = 'The brief. '.padEnd(60_000, 'y');
+
+    it('says how much of an oversized turn is searchable in the conversation only', async () => {
+      const capture = probe();
+      await captureMemory(
+        capture.deps,
+        task,
+        dataKey,
+        state([
+          { role: 'user', content: oversized },
+          { role: 'assistant', content: 'Read it.' }
+        ]),
+        { summary: 'Read the brief.', verification: conversational() }
+      );
+      // Never a warning: the turn WAS recorded, and "this turn was not recorded in memory" is the
+      // sentence that must stay reserved for when it was not.
+      expect(capture.warnings).not.toContain('warning');
+      expect(summaries(capture, 'status')).toEqual([
+        'Stored the first 8 parts of this turn verbatim; 2 further parts are searchable in the conversation but not in memory'
+      ]);
+    });
+
+    it('stays quiet on a turn that fitted, which is 95% of them', async () => {
+      const capture = probe();
+      await captureMemory(
+        capture.deps,
+        task,
+        dataKey,
+        state([
+          { role: 'user', content: 'What rate are we renewing the brochure job at?' },
+          { role: 'assistant', content: RATE_BODY }
+        ]),
+        { summary: 'Answered.', verification: conversational() }
+      );
+      expect(summaries(capture, 'status')).toEqual([]);
+    });
   });
 
   it('grades nothing at all on a turn the harness stopped', async () => {

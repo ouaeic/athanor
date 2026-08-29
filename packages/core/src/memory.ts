@@ -322,6 +322,26 @@ export const MEMORY_PREDICATES: readonly MemoryPredicateDefinition[] = [
     cardinality: 'many',
     isTemporal: false,
     description: 'An untyped association between two entities.'
+  },
+  /*
+   * The one predicate that is not a state of the world.
+   *
+   * Every entry above it describes something that is true - where the owner lives, what a service
+   * listens on, which tool they reach for. Measured over 3,950 real typed turns, that registry
+   * minted one durable fact, and the thing the owner actually says over and over is none of these
+   * shapes: it is a rule for the machine. "Never run git stash." "Never hardcode the main body
+   * colour." Those have no predicate to go into, so a regex could not have helped; the shape had
+   * nowhere to land.
+   *
+   * `many` because an owner has more than one rule and two of them do not contradict; temporal
+   * because a rule can be withdrawn, which is what `retractMemoryItem` is for. The object is the
+   * owner's own sentence, unedited, which is why nothing here needs a model to read it.
+   */
+  {
+    name: 'standing_order',
+    cardinality: 'many',
+    isTemporal: true,
+    description: 'A rule the owner stated for how this computer must behave, in their own words.'
   }
 ];
 

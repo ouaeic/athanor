@@ -203,6 +203,12 @@ export interface PreparedMemoryFact {
   observedAt?: Date | string | null;
   validFrom?: Date | string | null;
   taskId?: string | null;
+  /**
+   * Admits the row to recall with no lexical grip at all, and exempts it from archival. Off unless
+   * the caller asks: this is the one flag that puts an entry in front of every later task in the
+   * workspace whether or not that task's words reached it.
+   */
+  pin?: boolean;
 }
 
 export interface MemoryFactPromotion {
@@ -1021,7 +1027,8 @@ export class MemoryStore {
           observedAt: prepared.observedAt ?? candidate.lastSeen,
           validFrom: prepared.validFrom ?? candidate.lastSeen,
           taskId: prepared.taskId ?? null,
-          episodeId: candidate.episodeIds.at(-1) ?? null
+          episodeId: candidate.episodeIds.at(-1) ?? null,
+          pin: prepared.pin ?? false
         });
         for (const episodeId of candidate.episodeIds)
           await transaction.query(

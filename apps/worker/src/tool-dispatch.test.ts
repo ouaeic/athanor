@@ -1258,7 +1258,7 @@ describe('the repository arms', () => {
     expect(symbols?.args.join(' ')).toContain('--sort path');
   });
 
-  it('reads a repository with four commands at once and answers from all of them', async () => {
+  it('reads a repository with five commands at once and answers from all of them', async () => {
     const executed = await dispatch(
       { name: 'repo_overview', arguments: { path: 'workspace/app' } },
       {
@@ -1274,10 +1274,14 @@ describe('the repository arms', () => {
       }
     );
 
-    expect(executed.calls).toHaveLength(4);
+    // Five: the working-tree state, the tracked files, the symbol sweep, the import sweep the
+    // symbols are ranked by, and the instruction files. They go out together, so what the fifth
+    // adds to a call bounded at 90 seconds is the difference between the slowest two of them -
+    // measured on this repository, 36 ms for the import sweep against 57 ms for the symbols.
+    expect(executed.calls).toHaveLength(5);
     expect(
       executed.calls.map((entry) => (entry.body as { executable: string }).executable)
-    ).toEqual(['git', 'git', 'rg', 'rg']);
+    ).toEqual(['git', 'git', 'rg', 'rg', 'rg']);
     expect(executed.calls.every((entry) => entry.path === `${root}/exec`)).toBe(true);
     expect(executed.calls.every((entry) => entry.scopes.join() === 'exec')).toBe(true);
     expect(executed.calls[0]?.body).toEqual({

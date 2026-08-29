@@ -22,6 +22,7 @@ import type { CompletionVerification } from './completion.js';
 import {
   extractTurn,
   finishedAnswerText,
+  MEMORY_MAX_SOURCE_CHUNKS,
   memoryItemAad,
   recordMemoryPackOutcome,
   recordTurnEpisode,
@@ -74,7 +75,7 @@ export const captureMemory = async (
     // What this turn touched, including the steps a compaction removed from the window. Carried
     // first so the earliest work is named first, which is the order it happened in.
     const touched = [...new Set([...(state.carriedArtifacts ?? []), ...artifacts])];
-    await recordTurnEpisode({
+    const written = await recordTurnEpisode({
       store: deps.store,
       userId: task.userId,
       workspaceId: task.workspaceId,
@@ -107,6 +108,28 @@ export const captureMemory = async (
       tainted: Boolean(state.taint),
       occurredAt
     });
+    /*
+     * What the source cap refused, said out loud.
+     *
+     * The cap itself is right and is unchanged: eight rows of six kilobytes per part, keeping the
+     * head. What was wrong is that a 400 KB brief was stored as its first 48 KB with no event of
+     * any kind, so the owner could later search memory for a constraint they had definitely
+     * written and be told, truthfully and uselessly, that nothing matched. Over 3,950 real turns
+     * this fires on 197 of them (5.0%) and accounts for 57.7% of everything the owner typed.
+     *
+     * A status rather than a warning: the turn WAS recorded, and the sentence above it - "this
+     * turn was not recorded in memory" - is the one that must stay reserved for when it was not.
+     * Never fatal, like every other line in this function after the episode is written.
+     */
+    if (written && written.sourceChunksDropped > 0)
+      await event(
+        deps.store,
+        task,
+        key,
+        'status',
+        `Stored the first ${MEMORY_MAX_SOURCE_CHUNKS} parts of this turn verbatim; ${written.sourceChunksDropped} further ${written.sourceChunksDropped === 1 ? 'part is' : 'parts are'} searchable in the conversation but not in memory`,
+        { droppedChunks: written.sourceChunksDropped, keptChunks: written.sourceIds.length }
+      ).catch(() => undefined);
     await recordDeadEnds(deps, task, key, {
       tainted: Boolean(state.taint),
       passed: completion.verifiedCommands ?? [],

@@ -3576,13 +3576,110 @@ describe('tiered agent memory', () => {
     const promotable = await store.listPromotableMemoryFactCandidates(workspaceId);
     expect(promotable.map((candidate) => candidate.objectKey)).toEqual(['object-ripgrep']);
 
-    // Two sightings inside the same day are still one observation as far as promotion goes.
+    // A 48-hour gap does not satisfy a 72-hour requirement. This exercises the PARAMETER; the
+    // default it usually runs under is pinned by its own case below, because these two sightings
+    // are two days apart and every default in [0, 48) would pass here identically.
     await expect(
       store.listPromotableMemoryFactCandidates(workspaceId, { minGapHours: 72 })
     ).resolves.toEqual([]);
     await expect(
       memory.deleteMemoryFactCandidate(workspaceId, 'subject-owner', 'prefers', 'object-ripgrep')
     ).resolves.toBe(true);
+  });
+
+  it('holds back two sightings inside the same day, on the default nobody passes', async () => {
+    /*
+     * The half of the gate that had no case at all.
+     *
+     * `listPromotableMemoryFactCandidates` defaults `minGapHours ?? 24`, and `store/memory.ts`
+     * calls that rule "the single most effective anti-bloat rule in the design". Changing the
+     * default to 0 left `store.test.ts` and `memory-eval.test.ts` green at 196 of 196, because the
+     * only sightings anywhere were 48 hours apart - so any default in [0, 48) passed. Over a real
+     * corpus of 3,950 typed turns that silent zero takes the store from 1 promotion to 37.
+     *
+     * Both directions: twelve hours apart is refused by the default, and the same pair is admitted
+     * once the caller asks for a shorter gap, so the default bounds without refusing real work.
+     */
+    const morning = await addItem('episode', { body: 'Heard it at breakfast.' });
+    const evening = await addItem('episode', { body: 'Heard it again at supper.' });
+    const observation = {
+      workspaceId,
+      subjectKey: 'subject-owner',
+      predicate: 'prefers',
+      objectKey: 'object-same-day'
+    };
+    await store.observeMemoryFactCandidate({
+      ...observation,
+      episodeId: morning.id,
+      observedAt: at(1)
+    });
+    const seen = await store.observeMemoryFactCandidate({
+      ...observation,
+      episodeId: evening.id,
+      observedAt: at(0.5)
+    });
+    expect(seen.episodeCount).toBe(2);
+
+    await expect(store.listPromotableMemoryFactCandidates(workspaceId)).resolves.toEqual([]);
+    await expect(
+      store
+        .listPromotableMemoryFactCandidates(workspaceId, { minGapHours: 6 })
+        .then((rows) => rows.map((row) => row.objectKey))
+    ).resolves.toEqual(['object-same-day']);
+  });
+
+  it('pins a promoted standing order, so a request that does not name it still gets it', async () => {
+    /*
+     * `mem.item.pin` is read by the structural recall channel and by the salience formula, and
+     * until this wave no production path wrote it. It is the only thing the fused query admits
+     * with no lexical grip at all, which is exactly what a rule for the machine needs: "never run
+     * git stash" is wanted on the turn where the agent is about to run it, and that turn's request
+     * never says "git".
+     */
+    const episodeOne = await addItem('episode', { body: 'The owner said it once.' });
+    const episodeTwo = await addItem('episode', { body: 'The owner said it again.' });
+    const content = {
+      title: 'Standing instruction',
+      body: 'Never run git stash in this checkout.',
+      subject: 'athanor',
+      object: 'Never run git stash in this checkout.'
+    };
+    const index = buildMemoryItemIndex(content, key);
+    const observation = {
+      workspaceId,
+      subjectKey: index.subjectKey!,
+      predicate: 'standing_order',
+      objectKey: index.objectKey!
+    };
+    for (const [episode, seenAt] of [
+      [episodeOne, at(3)],
+      [episodeTwo, at(1)]
+    ] as const)
+      await store.observeMemoryFactCandidate({
+        ...observation,
+        episodeId: episode.id,
+        observedAt: seenAt
+      });
+
+    const promoted = await store.promoteMemoryFactCandidates(workspaceId, () => ({
+      userId,
+      trust: 'stated' as const,
+      documentCiphertext: sealed(content.body),
+      index,
+      pin: true
+    }));
+    expect(promoted).toHaveLength(1);
+    expect(promoted[0]!.item).toMatchObject({ kind: 'fact', trust: 'stated', pin: true });
+
+    // Not one word of this request reaches the rule, and it comes back anyway.
+    const hits = await recall('rewrite the brochure copy for the spring mailing');
+    expect(hits.map((hit) => opened(hit.documentCiphertext))).toContain(content.body);
+
+    // The same rule left unpinned is not in that answer, which is what makes the flag the cause.
+    const loose = { ...content, body: 'Never format a repo file with the wrong config.' };
+    await addItem('fact', loose, { predicate: 'standing_order' });
+    const again = await recall('rewrite the brochure copy for the spring mailing');
+    expect(again.map((hit) => opened(hit.documentCiphertext))).not.toContain(loose.body);
   });
 
   it('promotes an observation that cleared the gate and never promotes it twice', async () => {

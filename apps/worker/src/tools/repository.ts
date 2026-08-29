@@ -97,9 +97,9 @@ export const OVERVIEW_SYMBOL_BUDGET = 300;
  * That alone would be an ordering problem, and every consumer below cuts the output, which makes it
  * a *set* problem. The two cuts are in different places and only one of them can be repaired here:
  *
- * - The harness cuts. `matches.slice(0, maxResults)`, `files.slice(0, maxFiles)` and
- *   `spreadAcrossFiles` all keep a prefix or a stride of the lines, so whichever thread finished
- *   first decided what the model was shown. This one a sort in this process could fix.
+ * - The harness cuts. `matches.slice(0, maxResults)`, `strideAcross` and `spreadAcrossFiles` all
+ *   keep a prefix or a stride of the lines, so whichever thread finished first decided what the
+ *   model was shown. This one a sort in this process could fix.
  * - The runner cuts first, and this one it could not. `boundedCollector` in the runner caps a
  *   command at `maxOutputBytes` - 1 MiB by default - keeping the leading 62% and the trailing 38%
  *   and dropping the middle. A `code_search` for `const` on this repository emits 2.6 MB and one
@@ -123,6 +123,25 @@ export const OVERVIEW_SYMBOL_BUDGET = 300;
 const SETTLED_ORDER = ['--sort', 'path'];
 
 /**
+ * The source an overview reads, shared by the two sweeps that read it.
+ *
+ * Held together rather than written twice because the second sweep counts names that the first one
+ * has to be able to place: a file inside one glob and outside the other contributes references to
+ * a declaration that is not in the sample, or a declaration nothing can vouch for. Two copies of
+ * this list are two answers to the same question.
+ */
+const SOURCE_GLOBS = [
+  '--glob',
+  '!node_modules/**',
+  '--glob',
+  '!dist/**',
+  '--glob',
+  '!build/**',
+  '--glob',
+  '*.{ts,tsx,js,jsx,py,rs,go,java,kt,rb,php,cs,cpp,c,h,hpp,swift}'
+];
+
+/**
  * Which symbols an overview shows when it cannot show them all.
  *
  * ripgrep searches in parallel and emits in whatever order its threads finish, so taking the first
@@ -143,6 +162,21 @@ const SETTLED_ORDER = ['--sort', 'path'];
  * a line-and-column pair too specific to appear in source text, and this one is not, so `:\d+:`
  * matched greedily would find a time literal in the code and call it a filename.
  */
+/**
+ * A budget smaller than the list, spent along the whole of it instead of down the front.
+ *
+ * Taking the first `budget` entries of a path-sorted list is the same failure as taking the first
+ * `budget` that ripgrep happened to emit, only reproducible: this repository sorts `apps/` first
+ * and has 644 of its 1,079 tracked files under it, so a straight prefix of 400 is 385 files of
+ * `apps/` and fifteen dotfiles - no services, no packages, no evals, no skills, no scripts, no
+ * infra, no docs. Striding spends the budget in proportion to where the entries actually are.
+ */
+export const strideAcross = <T>(items: readonly T[], budget: number): T[] => {
+  if (items.length <= budget) return [...items];
+  const stride = items.length / budget;
+  return Array.from({ length: budget }, (_, index) => items[Math.floor(index * stride)] as T);
+};
+
 export const spreadAcrossFiles = (lines: readonly string[], budget: number): string[] => {
   const byFile = new Map<string, string[]>();
   for (const line of lines) {
@@ -154,20 +188,8 @@ export const spreadAcrossFiles = (lines: readonly string[], budget: number): str
   const unexported = (line: string): number => (/:\d+:\s*export\s/.test(line) ? 0 : 1);
   for (const held of byFile.values()) held.sort((a, b) => unexported(a) - unexported(b));
   const files = [...byFile.values()];
-  /*
-   * More files than budget, which is the case this tool is for. Taking the first `budget` of them
-   * in path order is the same failure as taking the first `budget` lines, only reproducible: this
-   * repository sorts `apps/` first and has 385 files under it, so a straight prefix of 300 reports
-   * a codebase with no services, no packages and no evals in it. Striding down the sorted list
-   * spends the budget in proportion to where the files actually are.
-   */
-  if (files.length > budget) {
-    const stride = files.length / budget;
-    return Array.from(
-      { length: budget },
-      (_, index) => files[Math.floor(index * stride)]?.[0] as string
-    );
-  }
+  // More files than budget, which is the case this tool is for.
+  if (files.length > budget) return strideAcross(files, budget).map((held) => held[0] as string);
   const spread: string[] = [];
   for (let round = 0; spread.length < budget; round += 1) {
     let placed = false;
@@ -181,6 +203,196 @@ export const spreadAcrossFiles = (lines: readonly string[], budget: number): str
     if (!placed) break;
   }
   return spread;
+};
+
+/**
+ * The import statements of a repository, which is the only reference edge a regular expression can
+ * read without resolving anything.
+ *
+ * It is two shapes, and the reason is that under `--multiline` a lazy run does not stop at the end
+ * of a statement. `--multiline` is needed at all because the shape this is for spans lines -
+ * `import {` newline names newline `} from '...'` - and a line-based pattern does not see it: the
+ * opening line carries no `from '...'` for a pattern to match, so it is not returned as a first
+ * line, it is not returned at all. Measured on this repository, the flag leaves the ranking 2,113
+ * names to order and a line-based sweep leaves it 1,163.
+ *
+ * With the flag, one run of `[A-Za-z0-9_$,{}\s*]*?` between the keyword and `from` walks out of
+ * the statement, because `\s` matches newlines and `{` and `}` are inside the class. On these five
+ * lines
+ *
+ *     export interface Bounds {
+ *       ceiling
+ *       floor
+ *     }
+ *     export { clampNumber } from './numbers.js';
+ *
+ * it returns all five as one match, and `Bounds`, `ceiling` and `floor` are then counted as names
+ * the repository imports. So a newline is allowed only where a statement can contain one: the
+ * first branch is a single line with no quote in it, the second is a brace list that may span
+ * lines, and neither can leave the statement it started in. On those five lines this returns the
+ * import and nothing else.
+ *
+ * The two agree everywhere in this repository - byte-identical output, 6,337 lines and 230,381
+ * bytes - which is the point: it is a bound with no case here yet, and the case is five lines of
+ * ordinary TypeScript away. Both return 0 bytes against the 1,745 source files of Python 3.12's
+ * standard library, where the fallback below is what answers.
+ *
+ * The quoted specifier is not in that position: without it, five lines of this repository are read
+ * as imports today - `stepPane`, `sayRange`, `region`, `dragCommand` and a `Buffer.from([...])`,
+ * every one an exported function whose first parameter is called `from` - and two of the Python
+ * library's, one of them a sentence inside a docstring.
+ *
+ * Neither the filename nor the line number is asked for, because neither is used. Counting
+ * distinct importing files and counting occurrences agree on 149 of the top 150 on this
+ * repository and score within noise of each other (3.25 against 3.29 held-out references per
+ * line), so the cheaper one is taken: dropping both prefixes takes the sweep from 463 KiB to
+ * 225 KiB, which is 22% of the runner's 1 MiB output cap rather than 45%. Past that cap
+ * `boundedCollector` drops the middle of the output; the ranking degrades to fewer names and the
+ * proportional fill covers the rest, and because `--sort path` fixes the bytes, what survives is
+ * the same on every run.
+ *
+ * Measured cost of the whole sweep: 36 ms over five runs on this repository, against the symbol
+ * sweep's 57 ms beside it, and 62 ms on the 1,745 files of the Python library it declines to read.
+ */
+export const IMPORT_SWEEP_PATTERN =
+  '(?m)^[ \\t]*(?:import|export)[ \\t]+(?:[^\\n\'"]*?|[^\\n\'"{]*\\{[A-Za-z0-9_$,\\s]*?\\}[ \\t]*)\\bfrom[ \\t]*[\'"][^\'"\\n]+[\'"]';
+
+/** The words an import statement is built from, which are not the names it carries. */
+const IMPORT_GRAMMAR = new Set(['import', 'export', 'from', 'type', 'as', 'default']);
+
+/**
+ * Which half of an overview's symbol budget is bought by importance rather than by breadth.
+ *
+ * Measured on this repository against a held-out half of the corpus the ranking never saw - the
+ * graph built from one half, scored by how many files in the other half mention each name in code
+ * with comments and string bodies stripped - mean over four splits, 300 symbols each time:
+ *
+ *   ranked head    0    50   100   150   200   250   300
+ *   references   363   653   709   785   782   790   784
+ *   files        300   281   253   232   196   174   143
+ *
+ * The reference mass stops rising at half the budget and only the breadth keeps falling, so half
+ * is where the two meet. At 300 the sample is 143 files and `evals/` is down to five of them; at
+ * 150 it is 232 files with every top-level directory still in it, and the proportional tail is
+ * still doing the job the whole budget used to do alone.
+ */
+export const OVERVIEW_RANKED_SHARE = 2;
+
+/** How many of the ranked rows one file may supply. @see `rankByReference`, where it is spent. */
+export const OVERVIEW_RANKED_PER_FILE = 8;
+
+/**
+ * The symbols an overview leads with, ordered by how many times the repository imports them.
+ *
+ * The shipped sample was proportional, not ranked: one symbol from each of 300 of 625 files, which
+ * spends 103 of its 300 rows on test files, 116 on names nothing outside their own file can even
+ * reach, and 47 of its 197 measurable rows on names referenced from nowhere else at all. Its first
+ * four rows on this repository are `SAFARI_MACOS`, `productionEnvironment`, `nginxConf` and
+ * `MODEL_ID`, every one of them a fixture. Ranked, the first four are `AthanorError`, `DataStore`,
+ * `TaskRecord` and `AgentState`.
+ *
+ * Three ways of getting an order out of the imports were measured against the held-out half
+ * described above, as mean references per measurable row over four splits:
+ *
+ *   proportional, as shipped                                          1.84
+ *   aider: pagerank over the file graph, rank split across out-edges   2.14
+ *   distinct importers per (resolved declaring file, name)             2.25
+ *   occurrences of the name in import clauses, no graph at all         3.25
+ *
+ * Those four were prototypes. This function, re-measured the same way against the sweep the
+ * shipped ripgrep arguments actually produce, scores 3.18 against the proportional 1.76.
+ *
+ * So the graph is declined. Not because PageRank is wrong but because it measured worse than
+ * counting, twice: it also loses to counting on the whole corpus, and adding aider's own
+ * distinctiveness filter to it does not close the gap (2.14 -> 2.08). What the graph costs to
+ * resolve is what it loses by: an import of `@athanor/core` or of a barrel that re-exports is an
+ * edge no path arithmetic here resolves, and those are exactly the imports the most-used symbols
+ * arrive through. Counting keeps them. A damping factor and forty iterations of a numeric fixed
+ * point, for a worse answer, is the organ nobody needs.
+ *
+ * A name is only counted when the sweep declares it in exactly one file, because a count cannot be
+ * attributed to a declaration that could be any of several - `workspaceId` is declared in eight
+ * files here and `task` in sixteen. Ties break on the symbol line, which is unique, so the whole
+ * order is total and the answer is the same on every run, as `IDEMPOTENT_WITHIN_TURN` already
+ * claims it is.
+ *
+ * When the sweep is empty - a repository of Python, Rust, Go or C, none of which writes
+ * `import ... from '...'`, or one where the runner returned nothing - there is no ranked head and
+ * this returns exactly the proportional sample that shipped before it. The fallback is the same
+ * code path rather than a branch beside it, so there is no arrangement in which it is skipped.
+ */
+export const rankByReference = (
+  symbolLines: readonly string[],
+  importSweep: string,
+  budget: number
+): string[] => {
+  const declaration =
+    /^(.*?):\d+:\s*(?:export\s+)?(?:abstract\s+)?(?:class|interface|type|function|const|def|fn|struct|enum|trait)\s+([A-Za-z_$][A-Za-z0-9_$]*)/;
+  const exported = (line: string): boolean => /:\d+:\s*export\s/.test(line);
+  const filesDeclaring = new Map<string, Set<string>>();
+  const declaredAt = new Map<string, string>();
+  for (const line of symbolLines) {
+    const found = declaration.exec(line);
+    if (found === null) continue;
+    const file = found[1] as string;
+    const name = found[2] as string;
+    const seen = filesDeclaring.get(name);
+    if (seen) seen.add(file);
+    else filesDeclaring.set(name, new Set([file]));
+    /*
+     * The first exported declaration of the name, not the last. A name is routinely written twice
+     * in one file - `export const Task = z.object({...})` and then `export type Task = z.infer<...>`
+     * - and the second is a restatement of the first. Keeping whichever came last showed
+     * `export type ModelRelease = z.infer<typeof ModelRelease>` at the top of this repository's
+     * overview in place of the schema it infers from.
+     */
+    const held = declaredAt.get(name);
+    if (held === undefined || (!exported(held) && exported(line))) declaredAt.set(name, line);
+  }
+  const imported = new Map<string, number>();
+  // The specifier is a path, not a reference: `from './values.js'` would otherwise score whatever
+  // `values` happens to be declared as.
+  const named = importSweep.replace(/'[^'\n]*'|"[^"\n]*"/g, ' ');
+  for (const word of named.matchAll(/[A-Za-z_$][A-Za-z0-9_$]*/g)) {
+    const name = word[0];
+    if (IMPORT_GRAMMAR.has(name) || filesDeclaring.get(name)?.size !== 1) continue;
+    imported.set(name, (imported.get(name) ?? 0) + 1);
+  }
+  const ordered = [...imported]
+    .map(([name, count]) => [declaredAt.get(name) as string, count] as const)
+    .sort((left, right) => right[1] - left[1] || (left[0] < right[0] ? -1 : 1));
+  /*
+   * How much of the ranked head one file may buy.
+   *
+   * Counting beat the graph because it trusts raw multiplicity, and raw multiplicity is the one
+   * thing somebody adding a file to the repository controls completely. Measured: a 300-module
+   * tree plus two inert files - 160 constants in one, each imported 40 times from the other, and
+   * nothing anywhere referencing either - took 149 of the 300 rows, and because a row is the
+   * declaration line verbatim, whoever wrote the file also wrote its text. `repo_overview` is the
+   * first thing an agent runs in an unfamiliar checkout, so that is a dependency choosing 149
+   * lines of what the model reads about the repository it is about to edit. The proportional
+   * sample this replaced gave that file 0 rows, because it gave every file at most one.
+   *
+   * Eight rather than one, because the head does not lose rows to this - it refills from the next
+   * name down - and what changes is which rows. Measured on this repository against the uncapped
+   * head: the import mass the 150 rows represent goes from 1,672 to 1,646 (98.4%) and the files
+   * they come from from 77 to 90. A cap of one would keep only 88% of the mass and cost the real
+   * barrel files - `packages/contracts/src/index.ts` legitimately declares 26 of the 150 - so this
+   * is set where an attacker is bounded to 8 rows of 300 and the measured win is intact.
+   */
+  const perFile = new Map<string, number>();
+  const ranked: string[] = [];
+  for (const [line] of ordered) {
+    if (ranked.length >= Math.floor(budget / OVERVIEW_RANKED_SHARE)) break;
+    const file = /^(.*?):\d+:/.exec(line)?.[1] ?? line;
+    const taken = perFile.get(file) ?? 0;
+    if (taken >= OVERVIEW_RANKED_PER_FILE) continue;
+    perFile.set(file, taken + 1);
+    ranked.push(line);
+  }
+  const shown = new Set(ranked.map((line) => /^(.*?):\d+:/.exec(line)?.[1] ?? line));
+  const rest = symbolLines.filter((line) => !shown.has(/^(.*?):\d+:/.exec(line)?.[1] ?? line));
+  return [...ranked, ...spreadAcrossFiles(rest, budget - ranked.length)];
 };
 
 export async function executeRepositoryTool(
@@ -337,7 +549,7 @@ export async function executeRepositoryTool(
           cwd: path,
           timeoutSeconds: 90
         });
-      const [status, tracked, symbols, instructions] = await Promise.all([
+      const [status, tracked, symbols, imports, instructions] = await Promise.all([
         run('git', ['status', '--short', '--branch']),
         run('git', ['ls-files']),
         run('rg', [
@@ -349,15 +561,26 @@ export async function executeRepositoryTool(
           ...SETTLED_ORDER,
           '--color',
           'never',
-          '--glob',
-          '!node_modules/**',
-          '--glob',
-          '!dist/**',
-          '--glob',
-          '!build/**',
-          '--glob',
-          '*.{ts,tsx,js,jsx,py,rs,go,java,kt,rb,php,cs,cpp,c,h,hpp,swift}',
+          ...SOURCE_GLOBS,
           '^(export\\s+)?(abstract\\s+)?(class|interface|type|function|const|def|fn|struct|enum|trait)\\s+',
+          '.'
+        ]),
+        /*
+         * The reference sweep, over the same source files as the symbol sweep so that a name it
+         * counts is a name the other one can place. It is the cheaper of the two - measured over
+         * five runs each on this repository, 44 ms against the symbol sweep's 57 ms - and it runs
+         * beside it here, so what it adds to a call bounded at 90 seconds is nothing.
+         */
+        run('rg', [
+          '--multiline',
+          '--no-filename',
+          '--no-line-number',
+          '--no-heading',
+          ...SETTLED_ORDER,
+          '--color',
+          'never',
+          ...SOURCE_GLOBS,
+          IMPORT_SWEEP_PATTERN,
           '.'
         ]),
         run('rg', [
@@ -386,20 +609,20 @@ export async function executeRepositoryTool(
         /*
          * The untracked branch, which had the tracked branch's ordering guarantee and nothing that
          * provided it. `git ls-files` reads a path-sorted index and measured 20/20 identical over
-         * twenty runs, so `files.slice(0, maxFiles)` below is a defined prefix of a defined order
-         * for a repository with a working tree. For one without - a downloaded folder, a fresh
-         * `mkdir`, a checkout whose `.git` the agent has not made yet - the same slice was taking
-         * 400 of 1,071 paths out of a walk that agreed with itself 1/20 times.
+         * twenty runs, so the stride below is a defined sample of a defined order for a repository
+         * with a working tree. For one without - a downloaded folder, a fresh `mkdir`, a checkout
+         * whose `.git` the agent has not made yet - it was taking 400 of 1,071 paths out of a walk
+         * that agreed with itself 1/20 times.
          */
         const discovered = await run('rg', ['--files', ...SETTLED_ORDER]);
         files = discovered.stdout.split('\n').filter(Boolean);
       }
       const symbolLines = symbols.stdout.split('\n').filter(Boolean);
-      const shownSymbols = spreadAcrossFiles(symbolLines, OVERVIEW_SYMBOL_BUDGET);
+      const shownSymbols = rankByReference(symbolLines, imports.stdout, OVERVIEW_SYMBOL_BUDGET);
       return {
         path,
         versionControl: status.stdout.trim() || 'No Git working tree detected',
-        files: files.slice(0, maxFiles),
+        files: strideAcross(files, maxFiles),
         fileCount: files.length,
         filesTruncated: files.length > maxFiles,
         importantSymbols: shownSymbols,
