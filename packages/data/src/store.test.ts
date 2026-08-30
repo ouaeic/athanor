@@ -3889,6 +3889,170 @@ describe('tiered agent memory', () => {
     ).resolves.toBe(true);
   });
 
+  /*
+   * Who nominated a sentence, and the one direction that answer is allowed to move in.
+   *
+   * `origin` decides the trust a promotion is minted at - `stated` for the owner's own line,
+   * `derived` for a model's wording of it - and it decides which rows the owner is shown as
+   * proposals. So it has to be sticky towards `proposed`: a sentence a model wrote must not become
+   * the owner's own by being matched once by a regex afterwards, which is the exact sequence a
+   * model's normalisation of a phrase the owner keeps restating would produce.
+   */
+  it('remembers that a model wrote a sentence, however often a pattern matches it after', async () => {
+    const episodeOne = await addItem('episode', { body: 'Told it to take the lead.' });
+    const episodeTwo = await addItem('episode', { body: 'Told it again.' });
+    const key = {
+      workspaceId,
+      subjectKey: 'subject-athanor',
+      predicate: 'standing_order',
+      objectKey: 'object-lead'
+    };
+    const proposed = await store.observeMemoryFactCandidate({
+      ...key,
+      episodeId: episodeOne.id,
+      observedAt: at(3),
+      origin: 'proposed'
+    });
+    expect(proposed.origin).toBe('proposed');
+    const matched = await store.observeMemoryFactCandidate({
+      ...key,
+      episodeId: episodeTwo.id,
+      observedAt: at(1)
+    });
+    expect(matched.origin).toBe('proposed');
+    expect(matched.episodeCount).toBe(2);
+    await expect(
+      store.listMemoryFactProposals(workspaceId).then((rows) => rows.map((row) => row.objectKey))
+    ).resolves.toEqual(['object-lead']);
+
+    // The other direction, so the stickiness is a rule and not the order these two happened to run
+    // in: a pattern first, a model second, still a proposal.
+    const other = { ...key, objectKey: 'object-fanout' };
+    await store.observeMemoryFactCandidate({
+      ...other,
+      episodeId: episodeOne.id,
+      observedAt: at(3)
+    });
+    await expect(store.countMemoryFactProposals(workspaceId)).resolves.toBe(1);
+    const crossed = await store.observeMemoryFactCandidate({
+      ...other,
+      episodeId: episodeTwo.id,
+      observedAt: at(1),
+      origin: 'proposed'
+    });
+    expect(crossed.origin).toBe('proposed');
+    await expect(store.countMemoryFactProposals(workspaceId)).resolves.toBe(2);
+  });
+
+  /*
+   * The owner's refusal, at the two statements that have to agree about it.
+   *
+   * A dismissal that only removed the row from the list would be a button that clears the screen
+   * for one night. It has to be refused where candidates are WRITTEN, or the next observation
+   * resurrects it; and it has to be refused where they are READ, or a sentence dismissed after it
+   * had already accumulated its sightings promotes anyway.
+   */
+  it('refuses a dismissed sentence at the write and at the gate, and never deletes the refusal', async () => {
+    const episodeOne = await addItem('episode', { body: 'Said it once.' });
+    const episodeTwo = await addItem('episode', { body: 'Said it twice.' });
+    const key = {
+      workspaceId,
+      subjectKey: 'subject-athanor',
+      predicate: 'standing_order',
+      objectKey: 'object-refused'
+    };
+    await store.observeMemoryFactCandidate({ ...key, episodeId: episodeOne.id, observedAt: at(3) });
+    await store.observeMemoryFactCandidate({ ...key, episodeId: episodeTwo.id, observedAt: at(1) });
+    // Promotable before the refusal, which is what makes the refusal below mean something.
+    await expect(
+      store
+        .listPromotableMemoryFactCandidates(workspaceId)
+        .then((rows) => rows.map((row) => row.objectKey))
+    ).resolves.toEqual(['object-refused']);
+
+    await expect(
+      store.dismissMemoryFactCandidate(workspaceId, key.subjectKey, key.predicate, key.objectKey)
+    ).resolves.toBe(true);
+    await expect(store.listPromotableMemoryFactCandidates(workspaceId)).resolves.toEqual([]);
+    // Twice is not two refusals. The route answers 404 on the second, so the store has to say so.
+    await expect(
+      store.dismissMemoryFactCandidate(workspaceId, key.subjectKey, key.predicate, key.objectKey)
+    ).resolves.toBe(false);
+
+    const again = await store.observeMemoryFactCandidate({
+      ...key,
+      episodeId: episodeOne.id,
+      observedAt: at(0)
+    });
+    expect(again.dismissedAt).not.toBeNull();
+    expect(again.episodeCount).toBe(2);
+    expect(again.draftCiphertext).toBeNull();
+    await expect(store.listPromotableMemoryFactCandidates(workspaceId)).resolves.toEqual([]);
+
+    /*
+     * The same refusal against a fixture that can actually reach it, which the three lines above
+     * cannot.
+     *
+     * They re-observe with an episode the row already holds and with no draft, so the two things
+     * the guard protects are unreachable by arithmetic: `n_episodes` does not climb for an episode
+     * already in `episode_ids`, and `draft_ciphertext = COALESCE(EXCLUDED.draft_ciphertext, ...)`
+     * of NULL over NULL is NULL. Deleting `WHERE mem.fact_candidate.dismissed_at IS NULL` from the
+     * upsert leaves every one of them green, and leaves this whole repository green - the report
+     * a caller reads does not change either way, because the row still comes back carrying
+     * `dismissedAt` and the caller still counts it as refused. What changes is the row.
+     *
+     * So: a THIRD episode, and a real draft. Without the guard the update fires, `n_episodes`
+     * climbs on a sentence the owner refused and the plaintext the dismissal deliberately erased
+     * is put back by the COALESCE.
+     */
+    const episodeThree = await addItem('episode', { body: 'Said it a third time.' });
+    const restored = await store.observeMemoryFactCandidate({
+      ...key,
+      episodeId: episodeThree.id,
+      observedAt: at(0),
+      draftCiphertext: sealed('the sentence the owner refused')
+    });
+    expect(restored.draftCiphertext).toBeNull();
+    expect(restored.episodeCount).toBe(2);
+    expect(restored.dismissedAt).not.toBeNull();
+
+    // And the pass whose job is to age candidates out leaves it alone. Deleting the refusal would
+    // put the sentence back in the queue on the first night after the retention horizon.
+    const report = await store.consolidateMemory(workspaceId, { candidateRetentionDays: 1 });
+    expect(report.candidatesPruned).toBe(0);
+    await expect(
+      store
+        .observeMemoryFactCandidate({ ...key, episodeId: episodeOne.id })
+        .then((row) => row.dismissedAt === null)
+    ).resolves.toBe(false);
+  });
+
+  /*
+   * The once-a-day claim on the one model call memory makes. It is in the database rather than in
+   * the worker because the worker's own cadence is a `Map` that a restart clears, and the thing
+   * being scheduled is a request the owner pays for.
+   */
+  it('hands the nightly claim to one caller a day and tells it where its window starts', async () => {
+    const first = await store.claimMemoryProposalRun(workspaceId, {
+      now: '2026-07-30T22:00:00.000Z'
+    });
+    // No previous run, so no window: the caller takes the clock and reads nothing.
+    expect(first).toEqual({ claimed: true, previous: null });
+    await expect(
+      store.claimMemoryProposalRun(workspaceId, { now: '2026-07-31T20:00:00.000Z' })
+    ).resolves.toEqual({ claimed: false, previous: null });
+
+    const second = await store.claimMemoryProposalRun(workspaceId, {
+      now: '2026-07-31T23:00:00.000Z'
+    });
+    // The PREVIOUS value, not the one just written: it is the far end of the window the caller is
+    // about to read, so a run 25 hours later reads 25 hours and nothing falls between two passes.
+    expect(second).toEqual({ claimed: true, previous: '2026-07-30T22:00:00.000Z' });
+    await expect(
+      store.claimMemoryProposalRun(workspaceId, { now: '2026-07-31T23:00:01.000Z' })
+    ).resolves.toEqual({ claimed: false, previous: null });
+  });
+
   it('holds back two sightings inside the same day, on the default nobody passes', async () => {
     /*
      * The half of the gate that had no case at all.

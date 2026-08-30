@@ -23,7 +23,11 @@ import {
 } from '@athanor/core';
 import type { MemoryDocument } from '@athanor/core';
 import type { MemoryItemBody } from '@athanor/contracts';
-import type { MemoryItemRecord, WorkspaceMemoryRecord } from '@athanor/data';
+import type {
+  MemoryFactCandidateRecord,
+  MemoryItemRecord,
+  WorkspaceMemoryRecord
+} from '@athanor/data';
 import { z } from 'zod';
 import { UNREADABLE_MEMORY_ITEM } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
@@ -114,6 +118,17 @@ const KnowledgeText = z
     (value) => !CREDENTIAL_SHAPES.some((shape) => shape.test(value)),
     'Keep credentials out of memory and skills'
   );
+
+/**
+ * The two constants behind a proposal's handle, written where they can be read.
+ *
+ * `SEPARATOR` is the NUL escape rather than a literal one, for the reason `memory-runtime.ts`
+ * records beside its own: a literal NUL makes the whole source file arrive as `data`, so grep
+ * skips it and `git diff` refuses to show it - a file no tool will read is a file nobody reviews.
+ * It is a byte none of the three parts can contain, which is what a joining character has to be.
+ */
+const SEPARATOR = '\u0000';
+const PROPOSAL_HANDLE_CONTEXT = 'athanor-memory-proposal';
 
 const SkillDocumentInput = z
   .object({
@@ -533,6 +548,71 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
     pin: record.pin
   });
 
+  /**
+   * A stable handle for a row that has no id of its own.
+   *
+   * `mem.fact_candidate` is keyed on `(workspace_id, subject_key, predicate, object_key)` and the
+   * two key columns are keyed blind hashes. A surrogate `id` column would have meant a volatile
+   * default on an existing table - a rewrite - to give a name to rows that already have one, so the
+   * name is derived from the key instead: same row, same handle, every request, and the index keys
+   * themselves never leave the server.
+   *
+   * Not a secret and not treated as one: it is a hash of values only the key holder can compute,
+   * handed to the key holder. It exists so a client can say "that one".
+   */
+  const memoryProposalId = (record: MemoryFactCandidateRecord): string =>
+    createHmac('sha256', PROPOSAL_HANDLE_CONTEXT)
+      .update([record.subjectKey, record.predicate, record.objectKey].join(SEPARATOR))
+      .digest('hex')
+      .slice(0, 32);
+
+  /**
+   * What a model has nominated, in the owner's hands before it is in the agent's.
+   *
+   * `sentence` is the whole of the proposed rule and not an excerpt, which is the one place this
+   * screen differs from every other memory list. Those clamp at 200 characters because a stored row
+   * can be a paragraph and fifty of them is a megabyte of ciphertext decrypted to answer a question
+   * about one. A proposal is capped at `MEMORY_STANDING_ORDER_MAX_CHARS` by the harness that wrote
+   * it, so the whole of it fits - and asking somebody to accept or refuse a rule while showing them
+   * the opening of it is not a decision anybody can make.
+   *
+   * `sightings` and `needsAnotherDay` are the gate said out loud. A proposal is one sighting and
+   * nothing else; it becomes something this computer acts on when the same sentence is proposed
+   * again from a different conversation at least a day later. An owner looking at this list should
+   * be able to see that nothing here is believed yet.
+   */
+  const memoryProposalFields = (
+    record: MemoryFactCandidateRecord,
+    key: Buffer,
+    workspaceId: string
+  ) => {
+    const sentence = ((): string => {
+      if (!record.draftCiphertext) return UNREADABLE_MEMORY_ITEM;
+      try {
+        return (
+          decryptJson<{ object?: string }>(
+            record.draftCiphertext,
+            key,
+            `memory-fact-candidate:${workspaceId}`
+          ).object ?? UNREADABLE_MEMORY_ITEM
+        );
+      } catch {
+        return UNREADABLE_MEMORY_ITEM;
+      }
+    })();
+    return {
+      id: memoryProposalId(record),
+      sentence,
+      sightings: record.episodeCount,
+      firstSeen: record.firstSeen,
+      lastSeen: record.lastSeen,
+      /** True while the two sightings it has are too close together to count as two. */
+      needsAnotherDay:
+        new Date(record.lastSeen).getTime() - new Date(record.firstSeen).getTime() <
+        24 * 60 * 60 * 1000
+    };
+  };
+
   app.get<{
     Params: { workspaceId: string };
     Querystring: { staleDays?: string; limit?: string };
@@ -548,11 +628,12 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
         limit: z.coerce.number().int().min(1).max(200).default(50)
       })
       .parse(request.query);
-    const [procedures, disputed] = await Promise.all([
+    const [procedures, disputed, proposals] = await Promise.all([
       store.listStaleMemoryProcedures(workspaceId, {
         ...(query.staleDays === undefined ? {} : { staleDays: query.staleDays })
       }),
-      store.listDisputedMemoryItems(workspaceId, query.limit)
+      store.listDisputedMemoryItems(workspaceId, query.limit),
+      store.listMemoryFactProposals(workspaceId, query.limit)
     ]);
     return {
       procedures: procedures.slice(0, query.limit).map((record) => ({
@@ -564,9 +645,70 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
       disputed: disputed.map((record) => ({
         ...memoryReviewFields(record, key, workspaceId),
         contradicts: record.contradicts
-      }))
+      })),
+      proposals: proposals.map((record) => memoryProposalFields(record, key, workspaceId))
     };
   });
+
+  /**
+   * "No, don't remember that", said about a sentence that is not yet a memory.
+   *
+   * The one bound in this whole mechanism that did not exist before it. `mem.fact_candidate` has
+   * been in the schema since the memory subsystem shipped and had no production route and no screen
+   * anywhere: outside the store its only appearance in this app was a single assertion in
+   * `server.test.ts`. That was survivable while the only thing writing to it was a regex over the
+   * owner's own sentence, and it stops being survivable the moment a model writes to it - a queue
+   * nobody can look at is not a bound, it is the same promise a post-hoc audit makes, moved one
+   * table over.
+   *
+   * A dismissal is durable and it is deliberately not a delete: the store keeps the row, drops the
+   * draft and refuses the same sentence at the write point, so the proposer cannot offer it again
+   * tomorrow night and every night after. Exactly per sentence, with the same honest limit
+   * retraction has - the keys fold case, NFKC and whitespace and nothing else, so a paraphrase is a
+   * different row.
+   *
+   * 404 rather than `{dismissed:false}`, matching verify and retract next door: the store returns
+   * false for one reason only, which is that this workspace has no such open proposal, and a client
+   * shown 200-with-false would have to guess whether it had been dismissed already or never existed.
+   */
+  app.post<{ Params: { workspaceId: string }; Body: { proposal?: string } }>(
+    '/v1/workspaces/:workspaceId/memory-proposals/dismiss',
+    async (request, reply) => {
+      const user = requireUser(request.user);
+      return idempotent(request, reply, user, async () => {
+        const workspaceId = request.params.workspaceId;
+        await workspaceKnowledgeKey(user.id, workspaceId);
+        const { proposal } = z
+          .object({ proposal: z.string().regex(/^[0-9a-f]{32}$/) })
+          .parse(request.body ?? {});
+        /*
+         * The handle is resolved against the open list rather than turned back into a key, and it
+         * travels in the body rather than in the path. Both are the same decision made twice.
+         *
+         * A candidate is named by `(subject_key, predicate, object_key)` and two of those are keyed
+         * blind hashes, so there is no id to put in a URL - and the hook on every path parameter
+         * ending in `Id` is right that the ones there are are UUID columns. Deriving a UUID-shaped
+         * string from a hash would have satisfied the shape and lied about what it was.
+         *
+         * The list is bounded at `MEMORY_MAX_OPEN_PROPOSALS`, so resolving a handle is a scan of at
+         * most twenty rows and the index keys never leave this process.
+         */
+        const open = await store.listMemoryFactProposals(workspaceId, 200);
+        const wanted = open.find((record) => memoryProposalId(record) === proposal);
+        if (
+          !wanted ||
+          !(await store.dismissMemoryFactCandidate(
+            workspaceId,
+            wanted.subjectKey,
+            wanted.predicate,
+            wanted.objectKey
+          ))
+        )
+          throw new AthanorError('memory_proposal_not_found', 'Proposal not found', 404);
+        return { dismissed: true };
+      });
+    }
+  );
 
   /**
    * "This is still right." Moves the procedure out of the queue by moving the clock the queue reads.

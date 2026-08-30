@@ -38,7 +38,8 @@ const item = (patch: Partial<MemoryReviewItem> = {}): MemoryReviewItem => ({
 
 const queue = (patch: Partial<MemoryReviewItem> = {}): MemoryReviewQueue => ({
   procedures: [{ ...item(patch), reason: 'failing', recentOkCount: 1, recentGradedCount: 4 }],
-  disputed: []
+  disputed: [],
+  proposals: []
 });
 
 /** The three verbs are asserted in `MemoryReview.test.tsx`; nothing here presses one. */

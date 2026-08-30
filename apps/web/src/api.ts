@@ -93,6 +93,23 @@ export interface MemoryReviewItem extends MemoryItem {
   pin: boolean;
 }
 
+/**
+ * A rule a model has put forward about how this computer should work, which nothing believes yet.
+ *
+ * It is not a memory and the fields say so. `sightings` is how many separate conversations it has
+ * been drawn from, `needsAnotherDay` is true while those are too close together to count as two,
+ * and until both clear it does nothing at all. `sentence` is the whole rule rather than an excerpt,
+ * because accepting or refusing one while reading its opening is not a decision anybody can make.
+ */
+export interface MemoryProposal {
+  id: string;
+  sentence: string;
+  sightings: number;
+  firstSeen: string;
+  lastSeen: string;
+  needsAnotherDay: boolean;
+}
+
 /** What the box has stopped being sure of, in the two shapes that being unsure comes in. */
 export interface MemoryReview {
   procedures: Array<
@@ -108,6 +125,8 @@ export interface MemoryReview {
     }
   >;
   disputed: Array<MemoryReviewItem & { contradicts: string[] }>;
+  /** Rules a model has put forward and the owner has not refused. Nothing here is believed yet. */
+  proposals: MemoryProposal[];
 }
 
 /**
@@ -966,6 +985,17 @@ export const api = {
     request<{ deleted: boolean }>(
       `/v1/workspaces/${workspaceId}/memory-items/${itemId}`,
       mutation('DELETE', {})
+    ),
+  /**
+   * "No, don't remember that", about a rule that is not a memory yet.
+   *
+   * Durable, and deliberately not a delete on the box's side: the refusal is kept so the same
+   * sentence is refused the next time it is put forward, rather than reappearing every night.
+   */
+  dismissMemoryProposal: (workspaceId: string, proposalId: string) =>
+    request<{ dismissed: boolean }>(
+      `/v1/workspaces/${workspaceId}/memory-proposals/dismiss`,
+      mutation('POST', { proposal: proposalId })
     ),
   skills: (workspaceId: string) =>
     request<WorkspaceSkill[]>(`/v1/workspaces/${workspaceId}/skills`),

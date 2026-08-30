@@ -47,6 +47,7 @@ export type {
   MemoryCandidateRecord,
   MemoryCapabilities,
   MemoryConsolidationReport,
+  MemoryFactCandidateOrigin,
   MemoryFactCandidateRecord,
   MemoryFactPromotion,
   MemoryItemRecord,
@@ -54,6 +55,7 @@ export type {
   MemoryLinkRelation,
   MemoryPackRecord,
   MemoryProcedureReviewRecord,
+  MemoryProposalSourceRow,
   MemorySourceChannel,
   MemorySourceHit,
   MemorySourceRecord,
@@ -522,6 +524,26 @@ export class DataStore {
 
   promoteMemoryFactCandidates(...args: Parameters<MemoryStore['promoteMemoryFactCandidates']>) {
     return this.#memory.promoteMemoryFactCandidates(...args);
+  }
+
+  dismissMemoryFactCandidate(...args: Parameters<MemoryStore['dismissMemoryFactCandidate']>) {
+    return this.#memory.dismissMemoryFactCandidate(...args);
+  }
+
+  listMemoryFactProposals(...args: Parameters<MemoryStore['listMemoryFactProposals']>) {
+    return this.#memory.listMemoryFactProposals(...args);
+  }
+
+  countMemoryFactProposals(...args: Parameters<MemoryStore['countMemoryFactProposals']>) {
+    return this.#memory.countMemoryFactProposals(...args);
+  }
+
+  listMemoryProposalSources(...args: Parameters<MemoryStore['listMemoryProposalSources']>) {
+    return this.#memory.listMemoryProposalSources(...args);
+  }
+
+  claimMemoryProposalRun(...args: Parameters<MemoryStore['claimMemoryProposalRun']>) {
+    return this.#memory.claimMemoryProposalRun(...args);
   }
 
   markMemoryFactsDisputed(...args: Parameters<MemoryStore['markMemoryFactsDisputed']>) {

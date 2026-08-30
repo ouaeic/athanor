@@ -111,7 +111,7 @@ describe('the queries each method builds', () => {
   });
 
   it('bounds the review queue only when a caller asks it to', async () => {
-    answer({ procedures: [], disputed: [] });
+    answer({ procedures: [], disputed: [], proposals: [] });
     await api.memoryReview('ws-1');
     expect(only().url).toBe('/v1/workspaces/ws-1/memory-review');
 

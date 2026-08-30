@@ -25,6 +25,7 @@ import type {
 import type { Database } from '../database.js';
 import {
   iso,
+  json,
   mapMemoryCandidate,
   mapMemoryFactCandidate,
   mapMemoryItem,
@@ -73,6 +74,17 @@ export interface MemoryItemRecord {
   citedCount: number;
   negCount: number;
   lastUsedAt: string | null;
+  /**
+   * Whether the turn that produced this row read somebody else's words, or `null` for a row
+   * written before migration 71, where nobody recorded the answer.
+   *
+   * It exists so that the taint gate outlives the turn it was taken on. Everything the gate used
+   * to protect happened inside `recordTurnEpisode`; the verbatim owner text of a tainted turn went
+   * into `mem.source` regardless, so a pass reading sources a day later had nothing to consult.
+   * Readers test for `false` rather than for `not true`, which is what makes the unknown backlog
+   * refused rather than trusted.
+   */
+  tainted: boolean | null;
   salience: number;
   tokensEst: number;
   indexed: boolean;
@@ -187,6 +199,41 @@ export interface MemoryFactCandidateRecord {
   lastSeen: string;
   episodeIds: string[];
   draftCiphertext: EncryptedEnvelope | null;
+  /**
+   * Which side nominated this sentence: the shipped patterns over the owner's own words, or a
+   * model. Sticky towards `proposed` at the upsert, so a sentence a model wrote cannot become the
+   * owner's own by being matched once by a regex afterwards.
+   *
+   * It decides two things and neither is cosmetic. A promotion from `proposed` is minted at
+   * `derived` rather than `stated` - the sentence is a machine's wording of what the owner said,
+   * not the owner's - and only `proposed` rows are offered to the owner as proposals.
+   */
+  origin: MemoryFactCandidateOrigin;
+  /**
+   * When the owner refused this sentence, or null. A refusal is kept rather than deleted because a
+   * deleted candidate is proposed again the next night, forever. The draft is dropped at the same
+   * moment; the three keys that remain are keyed blind hashes and are all the store needs to
+   * refuse it again.
+   */
+  dismissedAt: string | null;
+}
+
+export type MemoryFactCandidateOrigin = 'observed' | 'proposed';
+
+/**
+ * One verbatim chunk of one owner turn, carrying the episode it belongs to.
+ *
+ * Chunks rather than turns because that is how `mem.source` holds them - up to eight rows of six
+ * kilobytes per part - and the store cannot join them back into a turn, because it cannot read
+ * them. The caller holds the key and does the assembly.
+ */
+export interface MemoryProposalSourceRow {
+  readonly episodeId: string;
+  readonly occurredAt: string;
+  readonly taskId: string | null;
+  readonly sourceId: string;
+  readonly chunkIndex: number;
+  readonly bodyCiphertext: EncryptedEnvelope;
 }
 
 /**
@@ -242,6 +289,12 @@ export interface CreateMemoryItemInput {
   lastVerified?: Date | string | null;
   pin?: boolean;
   salience?: number;
+  /**
+   * Whether the turn this row came from read somebody else's words. Written on episodes, where a
+   * later pass can read it; left unset elsewhere, where there is no later pass and the gate is
+   * still taken at the moment of writing.
+   */
+  tainted?: boolean | null;
 }
 
 export interface RecallMemoryInput {
@@ -639,11 +692,11 @@ export class MemoryStore {
          id,user_id,workspace_id,kind,status,trust,document_ciphertext,title_tokens,tag_tokens,
          alias_tokens,body_tokens,tags_hashed,trigrams,dedupe_key,observed_at,valid_from,valid_to,
          subject_key,predicate,object_key,episode_id,task_id,last_verified,pin,salience,
-         tokens_est,indexed
+         tokens_est,indexed,tainted
        ) VALUES (
          $1,$2,$3,$4::mem.kind,COALESCE($5::mem.status,'active'),$6::mem.trust,$7::jsonb,$8,$9,
          $27,$10,$11::text[],$12::text[],$13,COALESCE($14,NOW()),COALESCE($15,NOW()),$16,$17,
-         $18,$19,$20,$21,$22,$23,$24,$25,$26
+         $18,$19,$20,$21,$22,$23,$24,$25,$26,$28::boolean
        ) RETURNING *`,
       [
         input.id ?? randomUUID(),
@@ -672,7 +725,8 @@ export class MemoryStore {
         input.salience ?? 0,
         input.index.tokensEst,
         input.index.indexed,
-        input.index.aliasTokens
+        input.index.aliasTokens,
+        input.tainted ?? null
       ]
     );
     return mapMemoryItem(result.rows[0]!);
@@ -922,12 +976,14 @@ export class MemoryStore {
     episodeId: string;
     observedAt?: Date | string;
     draftCiphertext?: EncryptedEnvelope | null;
+    /** Who nominated it. Defaults to the shipped patterns over the owner's own sentence. */
+    origin?: MemoryFactCandidateOrigin;
   }): Promise<MemoryFactCandidateRecord> {
     const result = await this.database.query(
       `INSERT INTO mem.fact_candidate(
          workspace_id,subject_key,predicate,object_key,n_episodes,first_seen,last_seen,
-         episode_ids,draft_ciphertext
-       ) VALUES ($1,$2,$3,$4,1,COALESCE($6,NOW()),COALESCE($6,NOW()),ARRAY[$5::uuid],$7::jsonb)
+         episode_ids,draft_ciphertext,origin
+       ) VALUES ($1,$2,$3,$4,1,COALESCE($6,NOW()),COALESCE($6,NOW()),ARRAY[$5::uuid],$7::jsonb,$8)
        ON CONFLICT (workspace_id,subject_key,predicate,object_key) DO UPDATE SET
          n_episodes = mem.fact_candidate.n_episodes
            + CASE WHEN $5::uuid = ANY(mem.fact_candidate.episode_ids) THEN 0 ELSE 1 END,
@@ -936,7 +992,16 @@ export class MemoryStore {
            ELSE (mem.fact_candidate.episode_ids || ARRAY[$5::uuid])[1:32] END,
          first_seen = LEAST(mem.fact_candidate.first_seen, EXCLUDED.first_seen),
          last_seen = GREATEST(mem.fact_candidate.last_seen, EXCLUDED.last_seen),
-         draft_ciphertext = COALESCE(EXCLUDED.draft_ciphertext, mem.fact_candidate.draft_ciphertext)
+         draft_ciphertext = COALESCE(EXCLUDED.draft_ciphertext, mem.fact_candidate.draft_ciphertext),
+         -- One-way. A sentence a model wrote stays marked as a model's, however many times a
+         -- pattern matches it afterwards, because the trust a promotion is minted at and the
+         -- queue the owner reads both key off this column.
+         origin = CASE WHEN EXCLUDED.origin = 'proposed' THEN 'proposed'
+                       ELSE mem.fact_candidate.origin END
+       -- The owner's refusal, enforced where the row is written rather than where it is read.
+       -- Without it a dismissed sentence is re-observed tonight, re-proposed tomorrow, and the
+       -- dismissal is a button that clears the screen for one day.
+       WHERE mem.fact_candidate.dismissed_at IS NULL
        RETURNING *`,
       [
         input.workspaceId,
@@ -945,10 +1010,181 @@ export class MemoryStore {
         input.objectKey,
         input.episodeId,
         input.observedAt ?? null,
-        input.draftCiphertext ? JSON.stringify(input.draftCiphertext) : null
+        input.draftCiphertext ? JSON.stringify(input.draftCiphertext) : null,
+        input.origin ?? 'observed'
       ]
     );
-    return mapMemoryFactCandidate(result.rows[0]!);
+    // A conflicting row the WHERE above refused updates nothing and returns nothing. The row is
+    // still there and the caller is owed the truth about it - it comes back untouched, carrying
+    // `dismissedAt`, so a caller counting what it managed to nominate can see that this one it
+    // did not.
+    if (result.rows[0]) return mapMemoryFactCandidate(result.rows[0]);
+    const standing = await this.database.query(
+      `SELECT * FROM mem.fact_candidate
+       WHERE workspace_id=$1 AND subject_key=$2 AND predicate=$3 AND object_key=$4`,
+      [input.workspaceId, input.subjectKey, input.predicate, input.objectKey]
+    );
+    if (!standing.rows[0])
+      throw new AthanorError(
+        'memory_candidate_missing',
+        'A fact candidate could not be observed or read back'
+      );
+    return mapMemoryFactCandidate(standing.rows[0]);
+  }
+
+  /**
+   * "Do not remember this", said about a sentence that is not yet a memory.
+   *
+   * The refusal is durable and it is deliberately not a delete: `mem.fact_candidate` is keyed on
+   * three blind hashes, so keeping the row keeps exactly enough to refuse the same sentence again
+   * and nothing that can be read. A delete would clear the screen for one night and the proposer
+   * would nominate it again on the next pass, which is the failure this whole column exists to
+   * prevent - and the same failure `promoteMemoryFactCandidates` already refuses one tier up, where
+   * a retracted fact is dropped rather than re-minted two sightings later.
+   *
+   * Per sentence, with the same limit the retraction path has: the keys fold case, NFKC and runs of
+   * whitespace and nothing else, so a paraphrase is a different row and can be proposed again. That
+   * is the whole of what a store which cannot read the body can promise.
+   */
+  async dismissMemoryFactCandidate(
+    workspaceId: string,
+    subjectKey: string,
+    predicate: string,
+    objectKey: string
+  ): Promise<boolean> {
+    const result = await this.database.query(
+      `UPDATE mem.fact_candidate
+       SET dismissed_at = NOW(), draft_ciphertext = NULL
+       WHERE workspace_id=$1 AND subject_key=$2 AND predicate=$3 AND object_key=$4
+         AND dismissed_at IS NULL`,
+      [workspaceId, subjectKey, predicate, objectKey]
+    );
+    return result.rowCount === 1;
+  }
+
+  /**
+   * What a model has nominated and the owner has not yet refused, newest and best-corroborated
+   * first.
+   *
+   * `origin='proposed'` and not every candidate, and the reason is measured rather than tidy: over
+   * this machine's own 646 owner-typed turns the shipped patterns produce 35 distinct candidates of
+   * which one ever promotes. A queue where the row the owner has to judge is one in thirty-six is a
+   * queue nobody reads. These are the rows a model wrote, they are bounded at three a night and
+   * twenty outstanding, and they are the only ones the owner has never had a chance to refuse.
+   */
+  async listMemoryFactProposals(
+    workspaceId: string,
+    limit = 50
+  ): Promise<MemoryFactCandidateRecord[]> {
+    const result = await this.database.query(
+      `SELECT * FROM mem.fact_candidate
+       WHERE workspace_id=$1 AND origin='proposed' AND dismissed_at IS NULL
+       ORDER BY n_episodes DESC, last_seen DESC, subject_key, predicate, object_key
+       LIMIT $2`,
+      [workspaceId, Math.max(1, Math.trunc(limit))]
+    );
+    return result.rows.map(mapMemoryFactCandidate);
+  }
+
+  /** How many proposals are outstanding, which is what the standing bound is enforced against. */
+  async countMemoryFactProposals(workspaceId: string): Promise<number> {
+    const result = await this.database.query<{ open: string }>(
+      `SELECT count(*) AS open FROM mem.fact_candidate
+       WHERE workspace_id=$1 AND origin='proposed' AND dismissed_at IS NULL`,
+      [workspaceId]
+    );
+    return Number(result.rows[0]?.open ?? 0);
+  }
+
+  /**
+   * The once-a-day claim on the one model call memory makes, taken in the database rather than in a
+   * worker's memory.
+   *
+   * `consolidateMemory` is scheduled from a `Map` held by the worker, and for consolidation that is
+   * correct: the pass is idempotent maintenance and running it twice costs a few statements. The
+   * proposer is not that. It is a request to a provider that the owner pays for, and a cadence that
+   * lives in a process is reset by every restart - a worker crash-looping every twenty minutes
+   * would make the nightly call every twenty minutes, and nothing anywhere would say so.
+   *
+   * One UPDATE, so the claim and the test are the same statement and two workers finishing turns in
+   * the same second cannot both win it. It returns the PREVIOUS value from a self-join, because
+   * `RETURNING` on an UPDATE yields the new row - and the previous value is the whole point: it is
+   * the far end of the window the caller is about to read, so a run that happens thirty hours after
+   * the last one reads thirty hours rather than twenty-four and nothing falls between two passes.
+   *
+   * A first claim returns `previous: null`, which is not a window and must not be treated as one.
+   * There is no last run to read forward from, so the honest answer is to take the clock and read
+   * nothing - a fresh installation pays for no call at all on its first finished turn.
+   *
+   * It lives on the memory store and writes a `workspaces` column, which is the same shape as
+   * `consolidateMemory` reaching into `tasks` to drop the bundles of settled conversations: the
+   * table is not the subject, the pass is.
+   */
+  async claimMemoryProposalRun(
+    workspaceId: string,
+    options: { now?: Date | string; minGapHours?: number } = {}
+  ): Promise<{ claimed: boolean; previous: string | null }> {
+    const result = await this.database.query<{ previous: unknown }>(
+      `UPDATE workspaces w
+       SET memory_proposed_at = COALESCE($2::timestamptz, NOW())
+       FROM workspaces before
+       WHERE w.id = $1 AND before.id = w.id
+         AND (before.memory_proposed_at IS NULL
+              OR before.memory_proposed_at
+                 <= COALESCE($2::timestamptz, NOW()) - make_interval(hours => $3::int))
+       RETURNING before.memory_proposed_at AS previous`,
+      [workspaceId, options.now ?? null, Math.max(1, Math.trunc(options.minGapHours ?? 24))]
+    );
+    if (result.rows.length === 0) return { claimed: false, previous: null };
+    const previous = result.rows[0]?.previous;
+    return { claimed: true, previous: previous ? iso(previous) : null };
+  }
+
+  /**
+   * Yesterday's turns, as the owner's own verbatim words, for a pass that runs once a day.
+   *
+   * Three filters and every one of them is load-bearing.
+   *
+   * `i.tainted = FALSE` and not `NOT i.tainted`: an episode written before migration 71 has NULL
+   * here and nobody recorded whether that turn read somebody else's words, so it is refused. This
+   * is the taint gate given a second life - it used to exist only inside the worker, on the turn
+   * itself, and the verbatim text of a tainted turn went into `mem.source` anyway.
+   *
+   * `s.role = 'owner'` and not every source on the episode. The other role is the agent's own
+   * summary of its work, and it is the laundering route: a turn that read a hostile page and
+   * summarised it is a turn whose SUMMARY would carry the page's instructions into a pass that
+   * proposes what this computer should believe. The episode's own body is not read here either,
+   * for the same reason - it renders that summary into its `Result:` line.
+   *
+   * `s.chunk_ix` in the ordering, because the owner's turn is stored as up to eight chunks and
+   * reading them out of order would hand a proposer a shuffled sentence.
+   */
+  async listMemoryProposalSources(
+    workspaceId: string,
+    input: { since: Date | string; limit?: number }
+  ): Promise<MemoryProposalSourceRow[]> {
+    const result = await this.database.query(
+      `SELECT i.id AS episode_id, i.observed_at, i.task_id, s.id AS source_id,
+              s.chunk_ix, s.body_ciphertext
+       FROM mem.source s
+       JOIN mem.item i ON i.id = s.episode_id AND i.workspace_id = s.workspace_id
+       WHERE s.workspace_id = $1
+         AND i.kind = 'episode'
+         AND i.tainted = FALSE
+         AND s.role = 'owner'
+         AND i.observed_at >= $2::timestamptz
+       ORDER BY i.observed_at, i.id, s.chunk_ix
+       LIMIT $3`,
+      [workspaceId, input.since, Math.max(1, Math.trunc(input.limit ?? 256))]
+    );
+    return result.rows.map((row) => ({
+      episodeId: String(row.episode_id),
+      occurredAt: iso(row.observed_at),
+      taskId: optionalText(row.task_id),
+      sourceId: String(row.source_id),
+      chunkIndex: Number(row.chunk_ix),
+      bodyCiphertext: json<EncryptedEnvelope>(row.body_ciphertext)
+    }));
   }
 
   /**
@@ -980,9 +1216,15 @@ export class MemoryStore {
     options: { minEpisodes?: number; minGapHours?: number; limit?: number } = {}
   ): Promise<MemoryFactCandidateRecord[]> {
     const result = await this.database.query(
+      // `dismissed_at IS NULL` is the third clause and it is not part of the corroboration gate:
+      // the two above are what a sentence has to earn, this is the owner having already said no.
+      // It sits here as well as at the write point because the two guard different moments - the
+      // write refuses a dismissed sentence being re-observed, this refuses one that was dismissed
+      // after it had already accumulated its sightings.
       `SELECT * FROM mem.fact_candidate
        WHERE workspace_id=$1 AND n_episodes >= $2
          AND last_seen - first_seen >= make_interval(hours => $3::int)
+         AND dismissed_at IS NULL
        ORDER BY n_episodes DESC, last_seen DESC, subject_key, predicate, object_key
        LIMIT $4`,
       [
@@ -1737,9 +1979,14 @@ export class MemoryStore {
          AND used_at < COALESCE($2::timestamptz,NOW()) - make_interval(days => $3::int)`,
       [workspaceId, now, useRetentionDays]
     );
+    // A dismissed candidate is exempt, and permanently. Ageing one out would delete the only
+    // record of the owner's refusal, and the sentence would be proposed again on the first night
+    // after the horizon - which is the same defect as re-minting a retracted fact, on the tier
+    // below it. What survives is three blind hashes and a timestamp, written only by the owner
+    // pressing a button, so the exemption cannot grow faster than they refuse things.
     const candidates = await this.database.query(
       `DELETE FROM mem.fact_candidate
-       WHERE workspace_id=$1
+       WHERE workspace_id=$1 AND dismissed_at IS NULL
          AND last_seen < COALESCE($2::timestamptz,NOW()) - make_interval(days => $3::int)`,
       [workspaceId, now, candidateRetentionDays]
     );

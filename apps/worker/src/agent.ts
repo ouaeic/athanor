@@ -352,7 +352,18 @@ export class AgentWorker {
       withLeaseRenewal: (task, operation) => this.#withLeaseRenewal(task, operation),
       currentCatalog: (fallback) => this.#currentCatalog(fallback)
     };
-    this.#memoryCapture = { store, memoryConsolidatedAt: this.#memoryConsolidatedAt };
+    /*
+     * The nightly proposer takes the compaction set unchanged, because it needs exactly what a
+     * compaction needs and nothing more: a configured provider, a gateway, a lease that survives
+     * the request, and the live catalogue to pick the cheapest chat model on the task's own
+     * provider. Assembling a second identical set would be two places to keep a routing decision
+     * in step.
+     */
+    this.#memoryCapture = {
+      store,
+      memoryConsolidatedAt: this.#memoryConsolidatedAt,
+      proposals: this.#compaction
+    };
     this.#approvalFloor = {
       store,
       masterKey: this.#masterKey,

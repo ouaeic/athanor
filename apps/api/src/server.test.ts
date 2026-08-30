@@ -15,6 +15,8 @@ import {
   generateDataKey,
   inferenceCredentialAad,
   memoryIndexKey,
+  memoryObjectKey,
+  memorySubjectKey,
   sha256,
   unwrapDataKey,
   userMemoryAad,
@@ -6827,6 +6829,126 @@ describe('what the computer wrote down about its owner', () => {
         })
       ).statusCode
     ).toBe(404);
+  }, 30_000);
+
+  /*
+   * The bound that did not exist before a model was allowed to nominate anything.
+   *
+   * `mem.fact_candidate` has been in the schema since the memory subsystem shipped, with no
+   * production route and no screen: outside the store its only appearance in this app was one
+   * assertion about what a deleted conversation takes with it. That was survivable while the only
+   * writer was a regex over the owner's own sentence. It stops being survivable the moment a model
+   * writes to it - a queue nobody can look at is not a bound.
+   *
+   * Three things, and the third is the one that makes a dismissal mean anything: the sentence comes
+   * back whole rather than clipped, refusing it takes it off the list, and refusing it a second
+   * time is a 404 because there is nothing there any more.
+   */
+  test('shows a rule a model put forward, whole, and refuses it for good on one press', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-memory-proposals-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'memory-proposals',
+      'Carry on'
+    );
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspaceId);
+    const indexKey = memoryIndexKey(key);
+    const episode = await store.createMemoryItem({
+      userId: workspace.userId,
+      workspaceId,
+      kind: 'episode',
+      trust: 'derived',
+      documentCiphertext: encryptJson(
+        { title: 'lead', tags: [], body: 'Told it to take the lead.' },
+        key,
+        `memory-item:${workspaceId}`
+      ),
+      index: buildMemoryItemIndex({ title: 'lead', tags: [], body: 'lead' }, indexKey),
+      taskId,
+      tainted: false
+    });
+    // Longer than the 200 characters every other memory list clips at, which is the point: a rule
+    // shown as an opening is a rule nobody can accept or refuse.
+    const sentence =
+      'Work autonomously from start to finish without progress reports or permission checks, ' +
+      'except that a plan is agreed before a large redirection and money is never spent with a ' +
+      'third party until you have asked.';
+    expect(sentence.length).toBeGreaterThan(200);
+    const observation = { subject: 'athanor', predicate: 'standing_order', object: sentence };
+    await store.observeMemoryFactCandidate({
+      workspaceId,
+      subjectKey: memorySubjectKey('athanor', indexKey),
+      predicate: 'standing_order',
+      objectKey: memoryObjectKey(sentence, indexKey),
+      episodeId: episode.id,
+      draftCiphertext: encryptJson(observation, key, `memory-fact-candidate:${workspaceId}`),
+      origin: 'proposed'
+    });
+
+    const queue = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memory-review`,
+      headers: { cookie }
+    });
+    expect(queue.statusCode, queue.body).toBe(200);
+    const proposals = queue.json<{
+      proposals: Array<{
+        id: string;
+        sentence: string;
+        sightings: number;
+        needsAnotherDay: boolean;
+      }>;
+    }>().proposals;
+    expect(proposals).toHaveLength(1);
+    expect(proposals[0]!.sentence).toBe(sentence);
+    expect(proposals[0]!.sightings).toBe(1);
+    // Said out loud on the screen, because a list under a heading about memory reads as a list of
+    // things the computer has decided, and this one has decided none of it.
+    expect(proposals[0]!.needsAnotherDay).toBe(true);
+
+    const dismissed = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/memory-proposals/dismiss`,
+      headers: { cookie, 'idempotency-key': 'memory-proposal-dismiss' },
+      payload: { proposal: proposals[0]!.id }
+    });
+    expect(dismissed.statusCode, dismissed.body).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: `/v1/workspaces/${workspaceId}/memory-review`,
+          headers: { cookie }
+        })
+      ).json<{ proposals: unknown[] }>().proposals
+    ).toEqual([]);
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/v1/workspaces/${workspaceId}/memory-proposals/dismiss`,
+          headers: { cookie, 'idempotency-key': 'memory-proposal-dismiss-again' },
+          payload: { proposal: proposals[0]!.id }
+        })
+      ).statusCode
+    ).toBe(404);
+    // And it is a refusal rather than a deletion: the same sentence observed again does not come
+    // back into the queue, tonight or on any later night.
+    await store.observeMemoryFactCandidate({
+      workspaceId,
+      subjectKey: memorySubjectKey('athanor', indexKey),
+      predicate: 'standing_order',
+      objectKey: memoryObjectKey(sentence, indexKey),
+      episodeId: episode.id,
+      draftCiphertext: encryptJson(observation, key, `memory-fact-candidate:${workspaceId}`),
+      origin: 'proposed'
+    });
+    expect(await store.listMemoryFactProposals(workspaceId)).toEqual([]);
   }, 30_000);
 });
 

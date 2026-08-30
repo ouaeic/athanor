@@ -34,6 +34,9 @@ type ProcedureRow = MemoryReviewQueue['procedures'][number];
 /** Two things the owner said that contradict each other, carrying the ids of the other side. */
 type DisputedRow = MemoryReviewQueue['disputed'][number];
 
+/** A rule a model put forward, which nothing believes yet and the owner can refuse outright. */
+type MemoryProposalRow = MemoryReviewQueue['proposals'][number];
+
 /** The three verbs, named as the store names them rather than as the buttons read. */
 export type MemoryReviewVerb = 'verify' | 'retract' | 'forget';
 
@@ -145,8 +148,44 @@ export const shouldReadWhole = (state: {
 /** The queue without one row, whatever list it was in. */
 export const withoutMemoryItem = (queue: MemoryReviewQueue, itemId: string): MemoryReviewQueue => ({
   procedures: queue.procedures.filter((row) => row.id !== itemId),
-  disputed: queue.disputed.filter((row) => row.id !== itemId)
+  disputed: queue.disputed.filter((row) => row.id !== itemId),
+  proposals: queue.proposals
 });
+
+/** The queue without one proposal, which is addressed by its own id and never by an item's. */
+export const withoutMemoryProposal = (
+  queue: MemoryReviewQueue,
+  proposalId: string
+): MemoryReviewQueue => ({
+  ...queue,
+  proposals: queue.proposals.filter((row) => row.id !== proposalId)
+});
+
+/** Nothing to review at all, which is three empty lists and not two. */
+export const memoryReviewIsEmpty = (queue: MemoryReviewQueue): boolean =>
+  queue.procedures.length + queue.disputed.length + queue.proposals.length === 0;
+
+/**
+ * What a proposal still has to do, said as the thing that has not happened yet.
+ *
+ * Two sightings at least a day apart, and this line exists because the natural reading of a list
+ * like this is "the computer has decided these". It has not. A proposal is a sentence a model
+ * offered once; it is not injected into anything, it changes nothing, and it stays that way until
+ * the same sentence is put forward again from a different conversation on a later day.
+ */
+export const memoryProposalStanding = (proposal: MemoryProposalRow): string => {
+  const drawn =
+    proposal.sightings === 1
+      ? `Put forward once, from a conversation on ${on(proposal.firstSeen) ?? 'an unrecorded day'}.`
+      : `Put forward ${proposal.sightings} times, between ${
+          on(proposal.firstSeen) ?? '—'
+        } and ${on(proposal.lastSeen) ?? '—'}.`;
+  const needed =
+    proposal.sightings < 2 || proposal.needsAnotherDay
+      ? 'It has to come up again on a later day before this computer acts on it.'
+      : 'It has met the bar and will become something this computer acts on.';
+  return `${drawn} ${needed}`;
+};
 
 /**
  * Run one verb against the box and hand back the queue the answer implies.
@@ -358,6 +397,7 @@ export function MemoryReviewLists({
   onAct,
   onOpenTask,
   onReadWhole,
+  onDismiss,
   busy = false
 }: {
   queue: MemoryReviewQueue;
@@ -372,10 +412,54 @@ export function MemoryReviewLists({
    * has no reader draws the old sentence rather than an expander onto nothing.
    */
   onReadWhole?: ((item: MemoryReviewItem) => Promise<string>) | undefined;
+  /**
+   * How to refuse a proposal, passed in like everything else here and optional like the reader.
+   *
+   * Optional so this component still renders without one, and the list draws no button when there
+   * is nothing behind it — a refuse button that does nothing is worse than no list at all, because
+   * the owner would believe they had refused something.
+   */
+  onDismiss?: ((proposal: MemoryProposalRow) => void) | undefined;
   busy?: boolean;
 }) {
   return (
     <>
+      {queue.proposals.length > 0 ? (
+        <>
+          {/*
+            The strongest claim on this screen and the one most worth getting exactly right: these
+            are not memories. A model read a day of the owner's own messages and offered a sentence;
+            the store put it in the candidate table behind the same two-sightings-a-day-apart gate
+            every observed candidate faces, and nothing recalls it, injects it or obeys it until it
+            clears that gate. The note says so first, before any row, because a list of rules under
+            a heading about memory reads as a list of things the computer has decided.
+          */}
+          <p className="memory-observed-note">
+            Rules that have been put forward about how this computer should work, drawn from your
+            own messages. None of them is remembered yet, and none of them is doing anything: a rule
+            has to come up again from another conversation on a later day before this computer acts
+            on it. Refusing one is permanent — it will not be put forward again.
+          </p>
+          <div className="settings-list">
+            {queue.proposals.map((proposal) => (
+              <div key={proposal.id}>
+                <span>
+                  <strong>Put forward, not remembered</strong>
+                  <small className="memory-review-excerpt">{proposal.sentence}</small>
+                  <small className="memory-review-reason">{memoryProposalStanding(proposal)}</small>
+                </span>
+                {onDismiss ? (
+                  <div className="settings-row-actions">
+                    <button disabled={busy} onClick={() => onDismiss(proposal)}>
+                      Don&rsquo;t remember this
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </>
+      ) : null}
       {queue.procedures.length > 0 ? (
         <>
           {/*
@@ -513,6 +597,31 @@ export function MemoryReview({
   const readWhole = (item: MemoryReviewItem): Promise<string> =>
     memoryItemBody(workspaceId, item.id).then((answer) => answer.body);
 
+  /**
+   * "No, don't remember that", and the row leaves on the answer rather than on a refetch.
+   *
+   * A 404 removes it too, for the same reason the three verbs above do: the route answers
+   * `memory_proposal_not_found` when this workspace has no such open proposal, which means the
+   * screen is holding a row the box does not have. Anything else is a real failure and is said,
+   * because a proposal that quietly vanishes on a network blip would leave the owner believing they
+   * had refused something they had not.
+   */
+  const dismiss = (proposal: MemoryProposalRow): void => {
+    if (!queue) return;
+    setBusy(true);
+    setError('');
+    api
+      .dismissMemoryProposal(workspaceId, proposal.id)
+      .catch((cause: unknown) => {
+        if (!(cause instanceof ApiFailure) || cause.status !== 404) throw cause;
+      })
+      .then(() => setQueue(withoutMemoryProposal(queue, proposal.id)))
+      .catch((cause: unknown) => {
+        setError(memoryReviewFailure(cause, 'That did not reach your box; nothing has changed.'));
+      })
+      .finally(() => setBusy(false));
+  };
+
   return (
     <>
       <div className="section-heading compact">
@@ -520,8 +629,8 @@ export function MemoryReview({
         <div>
           <strong>Needs review</strong>
           <span>
-            What the computer has stopped being sure of, and what it holds that disagrees with
-            itself.
+            What the computer has stopped being sure of, what it holds that disagrees with itself,
+            and what has been put forward about you that it does not believe yet.
           </span>
         </div>
       </div>
@@ -531,10 +640,11 @@ export function MemoryReview({
         </div>
       ) : null}
       {queue ? (
-        queue.procedures.length + queue.disputed.length === 0 ? (
+        memoryReviewIsEmpty(queue) ? (
           <p className="memory-observed-note">
             Nothing needs review: every remembered way of doing things has been confirmed recently
-            enough, and nothing it holds disagrees with anything else.
+            enough, nothing it holds disagrees with anything else, and nothing has been put forward
+            for you to look at.
           </p>
         ) : (
           <MemoryReviewLists
@@ -542,6 +652,7 @@ export function MemoryReview({
             onAct={act}
             onOpenTask={onOpenTask}
             onReadWhole={readWhole}
+            onDismiss={dismiss}
             busy={busy}
           />
         )

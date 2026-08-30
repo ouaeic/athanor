@@ -16,11 +16,14 @@ import {
   memoryReviewContradictions,
   memoryReviewFacts,
   memoryReviewFailure,
+  memoryReviewIsEmpty,
   MemoryReviewLists,
+  memoryProposalStanding,
   memoryReviewReason,
-  withoutMemoryItem
+  withoutMemoryItem,
+  withoutMemoryProposal
 } from './MemoryReview.js';
-import type { MemoryReview, MemoryReviewItem } from './api.js';
+import type { MemoryProposal, MemoryReview, MemoryReviewItem } from './api.js';
 
 const item = (over: Partial<MemoryReviewItem> = {}): MemoryReviewItem => ({
   id: 'item-1',
@@ -50,6 +53,7 @@ const queue = (over: Partial<MemoryReview> = {}): MemoryReview => ({
     }
   ],
   disputed: [],
+  proposals: [],
   ...over
 });
 
@@ -103,7 +107,8 @@ describe('a remembered procedure that may have stopped working', () => {
     expect(
       render({
         procedures: [{ ...item(), reason: 'both', recentOkCount: 0, recentGradedCount: 4 }],
-        disputed: []
+        disputed: [],
+        proposals: []
       })
     ).toContain('Failing, and unconfirmed');
   });
@@ -118,7 +123,7 @@ describe('a remembered procedure that may have stopped working', () => {
   });
 
   it('draws nothing at all when the box is sure of everything it holds', () => {
-    expect(render({ procedures: [], disputed: [] })).toBe('');
+    expect(render({ procedures: [], disputed: [], proposals: [] })).toBe('');
   });
 });
 
@@ -130,6 +135,7 @@ describe('a remembered procedure that may have stopped working', () => {
 describe('two things the box holds that disagree', () => {
   const pair = (): MemoryReview => ({
     procedures: [],
+    proposals: [],
     disputed: [
       {
         ...item({
@@ -205,7 +211,8 @@ describe('reading the whole of what was written down', () => {
           recentGradedCount: 0
         }
       ],
-      disputed: []
+      disputed: [],
+      proposals: []
     });
     expect(clipped).toContain('This is the opening of what is stored.');
     expect(render(queue())).not.toContain('This is the opening of what is stored.');
@@ -314,7 +321,8 @@ describe('what each answer does to the box and to the screen', () => {
     const both = withoutMemoryItem(
       {
         procedures: queue().procedures,
-        disputed: [{ ...item({ id: 'other' }), contradicts: [] }]
+        disputed: [{ ...item({ id: 'other' }), contradicts: [] }],
+        proposals: []
       },
       'other'
     );
@@ -344,5 +352,80 @@ describe('the sentence shown when something fails', () => {
     expect(
       memoryReviewFailure(new TypeError('Failed to fetch'), 'That did not work.')
     ).not.toContain('Quote');
+  });
+});
+
+/*
+ * Rules a model has put forward, which are the one thing on this screen that is not a memory.
+ *
+ * The wording is the whole test. A list of imperative sentences under a heading about memory reads
+ * as a list of things the computer has decided, and it has decided none of it: each row is one
+ * sighting behind the same two-sightings-a-day-apart gate every observed candidate faces, and until
+ * it clears that gate nothing recalls it, injects it or obeys it. A screen that let an owner think
+ * otherwise would be asking them to refuse something they believe is already in force.
+ */
+describe('a rule that has been put forward and is not remembered', () => {
+  const proposal = (over: Partial<MemoryProposal> = {}): MemoryProposal => ({
+    id: 'a'.repeat(32),
+    sentence: 'Work autonomously to the end without asking for confirmation.',
+    sightings: 1,
+    firstSeen: '2026-08-02T10:00:00.000Z',
+    lastSeen: '2026-08-02T10:00:00.000Z',
+    needsAnotherDay: true,
+    ...over
+  });
+
+  it('says it is not remembered, and what it still has to do', () => {
+    const markup = render({ procedures: [], disputed: [], proposals: [proposal()] });
+    expect(markup).toContain('Put forward, not remembered');
+    expect(markup).toContain('Work autonomously to the end without asking for confirmation.');
+    expect(markup).toContain('None of them is remembered yet');
+    expect(markup).toContain('Refusing one is permanent');
+  });
+
+  it('tells the truth about a rule that has met the bar and one that has not', () => {
+    expect(memoryProposalStanding(proposal())).toContain('has to come up again on a later day');
+    expect(
+      memoryProposalStanding(
+        proposal({ sightings: 2, lastSeen: '2026-08-04T10:00:00.000Z', needsAnotherDay: false })
+      )
+    ).toContain('has met the bar');
+    // Two sightings inside one day is not two, and the row has to say so rather than counting.
+    expect(
+      memoryProposalStanding(
+        proposal({ sightings: 2, lastSeen: '2026-08-02T18:00:00.000Z', needsAnotherDay: true })
+      )
+    ).toContain('has to come up again on a later day');
+  });
+
+  /*
+   * A refuse button with nothing behind it is worse than no list at all, because the owner would
+   * believe they had refused something. Both directions on one queue.
+   */
+  it('draws the refusal only when there is something behind it', () => {
+    const queue = { procedures: [], disputed: [], proposals: [proposal()] };
+    expect(render(queue)).not.toContain('remember this');
+    expect(
+      renderToStaticMarkup(
+        <MemoryReviewLists queue={queue} onAct={() => undefined} onDismiss={() => undefined} />
+      )
+    ).toContain('remember this');
+  });
+
+  it('takes only the proposal it was asked about, and leaves the other lists alone', () => {
+    const before = {
+      procedures: queue().procedures,
+      disputed: [],
+      proposals: [proposal(), proposal({ id: 'b'.repeat(32), sentence: 'Never push to main.' })]
+    };
+    const after = withoutMemoryProposal(before, 'b'.repeat(32));
+    expect(after.proposals.map((row) => row.id)).toEqual(['a'.repeat(32)]);
+    expect(after.procedures).toHaveLength(1);
+    // And a proposal is not an item: the item verb must not reach into this list by id.
+    expect(withoutMemoryItem(before, 'a'.repeat(32)).proposals).toHaveLength(2);
+    expect(memoryReviewIsEmpty({ procedures: [], disputed: [], proposals: [proposal()] })).toBe(
+      false
+    );
+    expect(memoryReviewIsEmpty({ procedures: [], disputed: [], proposals: [] })).toBe(true);
   });
 });

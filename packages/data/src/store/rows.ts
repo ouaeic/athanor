@@ -390,6 +390,9 @@ export const mapMemoryItem = (row: Record<string, unknown>): MemoryItemRecord =>
   citedCount: Number(row.cited_count),
   negCount: Number(row.neg_count),
   lastUsedAt: row.last_used_at ? iso(row.last_used_at) : null,
+  // Three-valued on purpose: `null` is an episode written before the column existed, and means
+  // nobody recorded whether that turn read somebody else's words. Never collapsed to `false`.
+  tainted: row.tainted === null || row.tainted === undefined ? null : Boolean(row.tainted),
   salience: Number(row.salience),
   tokensEst: Number(row.tokens_est),
   indexed: Boolean(row.indexed),
@@ -454,5 +457,9 @@ export const mapMemoryFactCandidate = (
   firstSeen: iso(row.first_seen),
   lastSeen: iso(row.last_seen),
   episodeIds: (row.episode_ids as string[] | null) ?? [],
-  draftCiphertext: row.draft_ciphertext ? json<EncryptedEnvelope>(row.draft_ciphertext) : null
+  draftCiphertext: row.draft_ciphertext ? json<EncryptedEnvelope>(row.draft_ciphertext) : null,
+  // Read through the same narrowing every other enum column here uses. A row from before
+  // migration 71 has the column's default, so this is never absent.
+  origin: row.origin === 'proposed' ? 'proposed' : 'observed',
+  dismissedAt: row.dismissed_at ? iso(row.dismissed_at) : null
 });

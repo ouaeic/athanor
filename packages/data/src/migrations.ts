@@ -2558,5 +2558,71 @@ export const migrations = [
         ON workspace_memories(user_id, created_at)
         WHERE key_scope = 'user';
     `
+  },
+  {
+    version: 71,
+    name: 'a_proposal_is_not_a_promotion',
+    // Three columns, and each of them exists because something that used to be a property of one
+    // turn now has to survive that turn and be read by a pass which runs a day later.
+    //
+    // `mem.item.tainted` is the one that matters. "A turn that read somebody else's words settles
+    // nothing durable" was enforced entirely in the worker, at the moment the episode was written:
+    // `recordTurnEpisode` skipped its observations and its promotions and recorded nothing about
+    // WHY. The verbatim owner text of that turn still went into `mem.source`, because sources are
+    // written unconditionally - so any later reader of `mem.source` walks straight past a gate that
+    // has no representation in the database at all. A nightly pass that reads yesterday's turns is
+    // exactly such a reader.
+    //
+    // Deliberately NULLABLE with no default, which is the whole design of the column. Rows written
+    // before today have no answer to "did that turn read somebody else's words", and the only
+    // honest value for a question nobody recorded is unknown. `NOT NULL DEFAULT FALSE` would have
+    // written a confident FALSE onto every historical episode, which is precisely the claim that
+    // cannot be made. Readers test `tainted = FALSE`, so NULL is refused - an unknown turn is
+    // treated as tainted, and the whole backlog is off the table for good rather than for a day.
+    //
+    // `origin` records which side nominated a candidate: the shipped regexes over the owner's own
+    // sentence, or a model. It is not cosmetic - it decides the trust a promotion is minted at
+    // (`stated` for the owner's words, `derived` for a model's wording of them) and it is what the
+    // owner's queue selects on. Sticky towards `proposed` at the upsert, so a sentence a model
+    // touched can never launder itself back into `observed` by being seen once by a regex.
+    //
+    // `dismissed_at` is the owner's refusal, and it has to be a column rather than a deletion for
+    // one reason: a deleted candidate is re-proposed the next night, forever. Keeping the row keeps
+    // the three keys, which are keyed blind hashes and are the whole of what the store needs to
+    // refuse the sentence again. The draft is dropped at the same moment - the owner has said they
+    // do not want it, so the only thing worth keeping is the refusal.
+    //
+    // `workspaces.memory_proposed_at` is the fourth, and it is on a different table because it is a
+    // different kind of fact: not a property of a candidate but the clock the paid call is claimed
+    // against. Consolidation's own cadence is a `Map` in the worker process and that is right for
+    // it - the pass is idempotent maintenance, and running it twice costs a few UPDATEs. A model
+    // call is money, and an in-process clock means a worker that restarts every twenty minutes
+    // makes the "nightly" call every twenty minutes. This column is what the run is claimed
+    // against, atomically, so two workers racing and one worker restarting both settle to one call.
+    //
+    // No index is added on `mem.item` for the nightly read. `mem_item_kind_idx (workspace_id, kind,
+    // observed_at DESC) WHERE status='active'` is already an exact prefix of that query, and the
+    // taint test is a filter over one day of episodes; a second partial index would be paid for on
+    // every episode insert - which is every finished turn - to save nothing.
+    //
+    // Nothing here rewrites a row: two constant defaults, a nullable column, a CHECK that every
+    // existing row already satisfies, and one partial index. No entry in `REWRITING_MIGRATIONS`.
+    sql: `
+      ALTER TABLE mem.item ADD COLUMN IF NOT EXISTS tainted BOOLEAN;
+
+      ALTER TABLE mem.fact_candidate ADD COLUMN IF NOT EXISTS origin TEXT
+        NOT NULL DEFAULT 'observed';
+      ALTER TABLE mem.fact_candidate DROP CONSTRAINT IF EXISTS mem_fact_candidate_origin_ck;
+      ALTER TABLE mem.fact_candidate ADD CONSTRAINT mem_fact_candidate_origin_ck
+        CHECK (origin IN ('observed','proposed'));
+
+      ALTER TABLE mem.fact_candidate ADD COLUMN IF NOT EXISTS dismissed_at TIMESTAMPTZ;
+
+      CREATE INDEX IF NOT EXISTS mem_fact_candidate_open_idx
+        ON mem.fact_candidate (workspace_id, origin, last_seen DESC)
+        WHERE dismissed_at IS NULL;
+
+      ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS memory_proposed_at TIMESTAMPTZ;
+    `
   }
 ] as const;
