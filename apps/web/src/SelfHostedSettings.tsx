@@ -64,7 +64,7 @@ import {
   type SpendLimitsDraft
 } from './usage-model.js';
 import { securityModeCopy, securityModeNotice, securityModes } from './security-mode.js';
-import { alwaysAsks, balancedVsAutonomous } from './asking-rules.js';
+import { alwaysAsks, balancedVsAutonomous, modeFloors } from './asking-rules.js';
 import {
   apiTokenRequest,
   apiTokenScopeCopy,
@@ -146,7 +146,7 @@ import type { ModelRelease } from '@athanor/contracts';
   bookkeeping in the entry chunk rather than any code from here. Twenty-five bytes is not worth a
   waterfall.
 */
-import { MemoryReview } from './MemoryReview.js';
+import { MemoryReview, memoryOriginLabel } from './MemoryReview.js';
 import { DecisionsLog } from './DecisionsLog.js';
 import { ConnectionRow } from './ConnectionRow.js';
 
@@ -704,8 +704,14 @@ export function RememberedList({
         {items.map((item) => (
           <div key={item.id}>
             <span>
+              {/*
+                Provenance in the position a reader takes for provenance, which is the same defect
+                `memoryProvenance` fixed one list up: this row printed a kind and a date, so a rule
+                a model wrote about the owner and a sentence they typed were the same two lines.
+                The kind stays because "Fact" and "Procedure" are not the same thing to delete.
+              */}
               <strong>
-                {rememberedKindLabel[item.kind]}
+                {rememberedKindLabel[item.kind]} · {memoryOriginLabel(item.origin)}
                 {item.status === 'active' ? '' : ` · ${item.status}`}
               </strong>
               <small>{item.excerpt}</small>
@@ -1796,6 +1802,12 @@ export function SelfHostedSettings({
               />
               <strong>{securityModeCopy[mode].label}</strong>
               <small>{securityModeCopy[mode].description}</small>
+              {/* The sentence the floor itself enforces, under the mode it governs. The line above
+                  it ends "High-impact actions always need approval", which is an adjective the
+                  owner cannot act on and was the only answer this control gave: `modeFloors` is the
+                  same three sentences `SECURITY_MODE_FLOOR` is written in, held against it by
+                  scripts/check-repository.mjs, so what is read here cannot drift from what runs. */}
+              <small>{modeFloors[mode]}</small>
             </label>
           ))}
         </fieldset>

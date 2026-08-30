@@ -20,6 +20,11 @@ import { providerModelFields, skillStateNotice, skillSwitch } from './settings-f
 import type { MemoryItem, ProviderSettings } from './api.js';
 import type { WorkspaceMemory, WorkspaceSkill } from './types.js';
 
+/*
+ * One row the harness watched itself write and one a model wrote about the owner, which is the
+ * pair this list could not tell apart: both are `derived`, both were drawn as a kind and a date,
+ * and the second is obeyed in every later conversation in the workspace.
+ */
 const items: MemoryItem[] = [
   {
     id: 'a1',
@@ -36,8 +41,8 @@ const items: MemoryItem[] = [
     status: 'superseded',
     excerpt: 'Reports open with an executive summary',
     observedAt: '2026-01-04T18:30:00.000Z',
-    trust: 'stated',
-    origin: 'stated'
+    trust: 'derived',
+    origin: 'proposed'
   }
 ];
 
@@ -62,7 +67,20 @@ describe('the list of what the computer remembers by itself', () => {
   it('names the tier in the owner’s words and marks a row that is no longer live', () => {
     const markup = render(items);
     expect(markup).toContain('Conversation');
-    expect(markup).toContain('Fact · superseded');
+    expect(markup).toContain('Fact · A model wrote this · superseded');
+  });
+
+  /*
+   * The defect this list existed with: two rows the store both calls `derived`, one written by the
+   * harness watching its own work and one written by a model about the owner, drawn identically.
+   * Both directions on one render, because a screen that said "a model wrote this" over everything
+   * would pass an assertion that only looked for the sentence.
+   */
+  it('tells a row a model wrote about the owner from one the box watched itself write', () => {
+    const markup = render(items);
+    expect(markup).toContain('Conversation · The box watched this');
+    expect(markup).toContain('Fact · A model wrote this');
+    expect(markup).not.toContain('Conversation · A model wrote this');
   });
 
   it('offers a delete on every row, and no dialog', () => {

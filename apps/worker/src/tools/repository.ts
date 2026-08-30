@@ -658,9 +658,20 @@ export async function executeRepositoryTool(
       );
       const names = new Set(listing.entries.map((entry) => entry.name));
       /*
-       * The ladder and the command table moved to `tools/diagnostics.ts`, unchanged, because the
-       * approval floor has to read the same answer this call is about to act on. Two copies of it
-       * would be two answers, and the one the owner was asked about would be the wrong one.
+       * The ladder and the command table live in `tools/diagnostics.ts`, and this is now their only
+       * caller.
+       *
+       * They moved there so the approval floor could read the same answer this call was about to
+       * act on - two copies would have been two answers, and the one the owner was asked about
+       * would have been the wrong one. That reason is gone: the `code_diagnostics` card was removed
+       * and `approval-floor.ts` no longer takes a listing of its own, so nothing else reads this
+       * table. They stay a leaf anyway, for the reason written at the top of that file: it imports
+       * nothing, so a test that asks what a `Cargo.toml` resolves to does not drag `tool-dispatch`
+       * and the runner client in behind it.
+       *
+       * What replaced the card is `REPEATABLE_TOOLS_THAT_WRITE` in `turn-bounds.ts`, which takes the
+       * turn's undo point before this arm runs - measured, because `make -s` and `cargo check` write
+       * to the tree and this tool was exempt from that undo point while they did.
        */
       const language = diagnosticsLanguage(requested, names);
       const command = diagnosticsCommand(language, names);

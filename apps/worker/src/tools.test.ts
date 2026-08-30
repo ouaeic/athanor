@@ -128,11 +128,22 @@ describe('which calls count as changing something', () => {
  */
 describe('what a shell command brings back from outside', () => {
   it('judges the command rather than the flag the model chose to set', () => {
-    // The declaration still counts, for the commands that are honest about it.
-    expect(untrustedShellOrigin({ executable: 'python3', network: true })).toBe(
-      'network command output'
-    );
-    // And so does the fetch that did not declare itself.
+    /*
+     * The declaration counts for NOTHING, which is the second half of this repair and the half that
+     * took a measurement to see.
+     *
+     * The flag stayed as a sufficient condition here after the command reader was added, so a turn
+     * tainted itself installing its own dependencies: `npm run dev` with `network: true` marked the
+     * window as having read somebody else's words, `npm run dev` without it did not, and the two
+     * run the same program with the same access. Measured on the owner's own one-shot-app
+     * trajectory, four of the six cards autonomous mode raised came from that single branch. A
+     * declaration the runner ignores is not evidence that anything was read.
+     */
+    expect(untrustedShellOrigin({ executable: 'python3', network: true })).toBeNull();
+    expect(
+      untrustedShellOrigin({ executable: 'npm', args: ['run', 'dev'], network: true })
+    ).toBeNull();
+    // And a fetch taints whether or not it declared itself.
     expect(
       untrustedShellOrigin({ executable: 'curl', args: ['https://vendor.example/brief'] })
     ).toBe('network command output');
@@ -155,6 +166,73 @@ describe('what a shell command brings back from outside', () => {
         args: ['-c', 'import urllib.request as u; print(u.urlopen("http://vendor.example").read())']
       })
     ).toBe('network command output');
+    /*
+     * And where the fetch went, for the clients that write their far end down.
+     *
+     * A health check against the dev server this turn just started reads this computer's own
+     * output. `classifyDestination` has always answered `sink: false` for loopback; the taint reader
+     * did not ask, so the agent doing what the resident contract tells it to do - check the app
+     * came up - marked every call after it as working with hostile material.
+     */
+    expect(
+      untrustedShellOrigin({
+        executable: 'curl',
+        args: ['-sS', 'http://localhost:5173/api/health'],
+        network: true
+      })
+    ).toBeNull();
+    expect(
+      untrustedShellOrigin({ executable: 'bash', args: ['-lc', 'curl -s http://127.0.0.1:8080/'] })
+    ).toBeNull();
+    // An operand the client wrote and this could not read is not a cleared address. It comes back
+    // from the address reader as one that will not parse, and unreadable fails closed.
+    expect(
+      untrustedShellOrigin({ executable: 'bash', args: ['-lc', 'curl -s "$U" -o p.html'] })
+    ).toBe('network command output');
+  });
+
+  /*
+   * The other half of that question, and the half that is easy to lose: "not somewhere data can go"
+   * is a much larger set than "this computer". `isPublicHttpUrl` answers false for loopback and
+   * just as false for RFC1918, link-local, `*.local`, `*.internal`, `*.home.arpa` and
+   * `metadata.google.internal` - so a taint reader that asks the egress classifier whether an
+   * address is a sink clears every machine on the estate LAN and the cloud metadata service along
+   * with the dev server. Each of these is somebody else's bytes arriving in the window, and the
+   * turn that reads one goes on to write the brief and fetch outward.
+   *
+   * Driven in both spellings on purpose. The rest of the flag removal is bounded by "the silent
+   * spelling was already free"; this clause is not, because it took the stop away from a call that
+   * carded with `network` set and without it.
+   */
+  it('treats a read of another machine on the network as untrusted, not merely as somewhere data cannot go', () => {
+    for (const address of [
+      'http://wiki.internal/runbook',
+      'http://192.168.1.50/notes',
+      'http://10.0.0.5/brief',
+      'http://172.16.4.9/x',
+      'http://printer.local/status',
+      'http://box.home.arpa/f',
+      // Link-local, and the one address on it that matters: the cloud metadata service.
+      'http://169.254.169.254/latest/meta-data/',
+      'http://metadata.google.internal/computeMetadata/v1/'
+    ]) {
+      expect(untrustedShellOrigin({ executable: 'curl', args: ['-s', address] })).toBe(
+        'network command output'
+      );
+      expect(
+        untrustedShellOrigin({ executable: 'curl', args: ['-s', address], network: true })
+      ).toBe('network command output');
+    }
+    // And the counterweight, so this cannot be satisfied by tainting everything: the loopback
+    // spellings a health check really uses stay clean, including the root label and IPv6.
+    for (const address of [
+      'http://localhost:5173/api/health',
+      'http://127.0.0.1:8080/',
+      'http://127.0.0.53/status',
+      'http://app.localhost/p',
+      'http://[::1]:3000/health'
+    ])
+      expect(untrustedShellOrigin({ executable: 'curl', args: ['-s', address] })).toBeNull();
   });
 
   it('labels a shell read of the download directory, which the file readers already did', () => {

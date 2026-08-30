@@ -992,6 +992,31 @@ const copiedConstants = [
     find: /providerWalls: Record<[^=]*= \{([\s\S]*?)\n\};/,
     findInCopy: /PARKABLE_PROVIDER_WALLS = new Set\(\[([\s\S]*?)\]\)/,
     normalise: keysAtTopLevel
+  },
+  {
+    what: 'what each security mode stops for',
+    owner: 'apps/worker/src/approval-policy.ts',
+    copy: 'apps/web/src/asking-rules.ts',
+    /*
+     * The one copied constant that is prose, and it earns the place the numbers above hold.
+     *
+     * `SECURITY_MODE_FLOOR` is what the floor reads: three sites in `ordinaryRequirement` that used
+     * to compare a mode inline now read its fields, so these sentences are a claim about behaviour
+     * rather than a paragraph beside it. `asking-rules.ts` is what the owner reads on the page where
+     * the mode is chosen, and it cannot import from the worker. Before the two were held together
+     * there were four descriptions of these three modes in the product and they had drifted: the
+     * page called Autonomous "Balanced minus two rules" while the two produced the same number of
+     * cards on the owner's own work, and the always-resident contract promised in a third wording
+     * that public publishing always stopped while `npm publish` raised no card in any mode.
+     *
+     * The object bodies have different shapes - a record of objects here, a record of strings there
+     * - so the sentences are lifted out of both by the same pattern rather than compared raw. Forty
+     * characters is the floor on what counts as one, which is well above every other quoted string
+     * either body contains and well below the shortest sentence.
+     */
+    find: /SECURITY_MODE_FLOOR[\s\S]*?\n> = \{([\s\S]*?)\n\};/,
+    findInCopy: /modeFloors: Record<[^=]*= \{([\s\S]*?)\n\};/,
+    normalise: (body) => [...body.matchAll(/'([^']{40,})'/g)].map(([, text]) => text).join(' | ')
   }
 ];
 const drifted = [];
@@ -1078,12 +1103,20 @@ const unraised = phrasedTools.filter((tool) => !raisesApproval.includes(tool));
  *
  * What it also cannot say, and what nothing in this repository says, is whether a tool that *ought*
  * to raise an approval does. Both sides of the comparison are derived from the floor, so a tool the
- * floor has never heard of is absent from both and agrees with itself. `code_diagnostics` sat in
- * that blind spot for the whole life of this check while it ran a cloned repository's own build.
+ * floor has never heard of is absent from both and agrees with itself.
  *
  * The floor is therefore a floor and not an equality. A tool that genuinely stops raising an
  * approval is a decision somebody makes, and lowering this number in the same commit - where it is
  * read, and argued with - is the shape that decision has to take.
+ *
+ * Lowered from 19 to 18 with the removal of the `code_diagnostics` branch, which is that shape.
+ * That branch asked before running a repository's own build recipe. It was removed because the
+ * identical nine commands run through `shell` with no card in balanced or autonomous - so it was a
+ * toll on the phrasing rather than a floor - and because it charged the owner's own Rust project
+ * for their own code. What replaced it is not another card: `code_diagnostics` is subtracted from
+ * `CHECKPOINT_EXEMPT_TOOLS` in `apps/worker/src/turn-bounds.ts`, so the turn takes an undo point
+ * before the build runs, which is the thing the card was standing in for and could not do.
+ * `docs/design/floor/DIAGNOSTICS.md` is the whole of it, including what is still uncovered.
  *
  * The two named tools carry the same guarantee for the case where the count is right and the set is
  * wrong. They arrived in this file with the count, out of `apps/web/src/approval-copy.test.ts`,
@@ -1091,21 +1124,16 @@ const unraised = phrasedTools.filter((tool) => !raisesApproval.includes(tool));
  * comment had already recorded that this comparison belonged here, "so a new branch in the worker
  * fails the build rather than one client's test suite".
  */
-const APPROVAL_FLOOR_MINIMUM = 19;
+const APPROVAL_FLOOR_MINIMUM = 18;
 /*
  * The witnesses answer the case where the count is right and the set is wrong.
  *
- * `code_diagnostics` is the third because it is the one that was missing rather than merely
- * unphrased. It ran `go test ./...`, `make -s` and `cargo check` - a repository's own build recipe,
- * which is a program its author wrote - and the floor named it nowhere in any security mode. The
- * check above never noticed, and could not have: it reads the tools the floor asks about and
- * compares them with the card, so a tool the floor is silent about is outside the set on both
- * sides. That is worth saying plainly rather than treating as a near miss - this check was right
- * about what it asserts, and what it asserts is phrase coverage, not floor coverage. Naming the
- * tool as a witness is what makes the floor coverage checkable for this one case: delete the branch
- * and this fails here rather than in a review nobody runs.
+ * Two rather than three since the `code_diagnostics` witness went with the branch it witnessed.
+ * Both remaining names are tools that were merely unphrased for a long time while their entire
+ * subject - money leaving for a provider, and which addresses data leaves by - is the thing an
+ * owner most needs a card to name.
  */
-const APPROVAL_FLOOR_WITNESSES = ['audio_read', 'parallel_web_read', 'code_diagnostics'];
+const APPROVAL_FLOOR_WITNESSES = ['audio_read', 'parallel_web_read'];
 const missingWitnesses = APPROVAL_FLOOR_WITNESSES.filter((tool) => !raisesApproval.includes(tool));
 if (!raisesApproval.length)
   fail(

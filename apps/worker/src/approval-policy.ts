@@ -20,18 +20,21 @@ import {
   gitConfigRunsCode,
   gitSubcommand,
   isDestructiveScript,
+  reachesAnUnreadableFarEnd,
+  noEgressExecutables,
+  outboundDestinations,
   packageInstallCommands,
   packageRemovalCommands,
   packageRemovalExecutables,
+  registryPublishOperation,
   safeNetworkExecutables,
   sendsDataOverNetwork
 } from './command-classification.js';
 import {
-  isDeferredExecutionPath,
+  deferredExecutionPaths,
   isDurableInstructionPath,
   writtenPaths
 } from './write-classification.js';
-import { repositoryDirectedDiagnostic } from './tools/diagnostics.js';
 import {
   codingAgentName,
   connectorApprovalCard,
@@ -181,17 +184,6 @@ export interface ApprovalContext {
     useCount: number;
     updatedAt: string;
   };
-  /**
-   * Which diagnostic `code_diagnostics` has resolved for this call, once the floor has looked.
-   *
-   * The arguments cannot carry it. `language` defaults to `auto`, which is what the model sends
-   * almost every time, and the language is then decided by a directory listing the dispatch arm
-   * takes - so on the arguments alone the floor cannot tell `tsc --noEmit` from `make -s`. The
-   * lookup is `approval-floor.ts`'s, the same way `existingSkill` and `mediaModel` are.
-   *
-   * Absent means nobody could read it, which is not the same as safe: see the branch below.
-   */
-  diagnostics?: { language: string; command: string };
   /** Origins that put untrusted content in this turn. Empty means the turn is clean. */
   taintSources?: readonly string[];
   /** Hosts the owner named, a search returned, or this turn already read. */
@@ -306,7 +298,33 @@ const taintedRequirement = (
    * `PARALLEL_SAFE_TOOLS` names as the reason two web reads may not overlap; it was already inside
    * one call.
    */
-  const sinkVerdicts = (): DestinationVerdict[] => {
+  /*
+   * EVERY verdict, and the sinks separately - because empty used to mean two different things.
+   *
+   * `sinkVerdicts()` returned only the sinks, so a caller could not tell "no address in this call
+   * could be read" from "every address was read and every one of them was cleared". One branch
+   * answered for both, and what it answered with was `args.network === true`: a request to
+   * `http://localhost:5173/api/health` was cleared by `classifyDestination` in this same call -
+   * `{sink: false, host: 'localhost', noveltyBytes: 0}` - and then carded as "Allow internet access
+   * for bash", after the harness's own instrument said it reaches nowhere. A card that contradicts
+   * the instrument the same function just consulted is not a floor.
+   *
+   * The three facts, now that they are apart:
+   *  - a sink was read: the owner is asked, and the card names the host and the bytes.
+   *  - every address was read and cleared: nothing is asked. Loopback, this box's own origin, a
+   *    host the owner named, a page this turn already read.
+   *  - nothing could be read: nothing is asked HERE, and that is the deliberate part. An address a
+   *    fetch client wrote and this could not resolve is not the empty case - it comes back from
+   *    `commandAddresses` as an operand that will not parse and `classifyDestination` calls it a
+   *    sink, so `curl -s "$U"` cards on the first line above. What is left in the empty case is a
+   *    command that named no far end at all - `npm install`, `git pull`, `cargo build`, whose
+   *    remote lives in configuration - and carding those would card the ordinary work of this
+   *    product on every tainted turn. The one shape inside the empty case that IS a question is a
+   *    connecting client whose operand a substitution ate, and `ordinaryRequirement` asks it there
+   *    through `reachesAnUnreadableFarEnd`, where the mode can answer. The only thing that used to
+   *    speak for any of this was a flag the runner ignores.
+   */
+  const destinationVerdicts = (): DestinationVerdict[] => {
     let spent = destinations.spentNoveltyBytes;
     const verdicts: DestinationVerdict[] = [];
     for (const url of callDestinations(name, args)) {
@@ -314,8 +332,10 @@ const taintedRequirement = (
       spent += verdict.noveltyBytes;
       verdicts.push(verdict);
     }
-    return verdicts.filter((verdict) => verdict.sink);
+    return verdicts;
   };
+  const sinkVerdicts = (): DestinationVerdict[] =>
+    destinationVerdicts().filter((verdict) => verdict.sink);
   if (name === 'parallel_web_read' || name === 'browser_action') {
     const verdicts = sinkVerdicts();
     if (verdicts.length)
@@ -349,26 +369,33 @@ const taintedRequirement = (
    * so it was the better of the two to be handed.
    */
   if (name === 'shell' || name === 'desktop_launch') {
-    const verdicts = sinkVerdicts();
-    if (verdicts.length)
-      return destinationCard(
-        verdicts,
-        taintSources,
-        'this command',
-        destinations.spentNoveltyBytes
-      );
+    const verdicts = destinationVerdicts();
+    const sinks = verdicts.filter((verdict) => verdict.sink);
+    if (sinks.length)
+      return destinationCard(sinks, taintSources, 'this command', destinations.spentNoveltyBytes);
     if (name === 'desktop_launch')
       return {
         sideEffect: 'external_consequential',
         action: `Open ${textValue(args.executable, 'an application')} on the desktop`,
         preview: `Launch ${[textValue(args.executable, 'an application'), ...(Array.isArray(args.args) ? args.args.map(String) : [])].join(' ')} on the agent computer's desktop, after this turn read untrusted content (${taintSources.slice(0, 3).join(', ')}).`
       };
-    if (args.network === true)
-      return {
-        sideEffect: 'external_reversible',
-        action: `Allow internet access for ${textValue(args.executable, 'command')}`,
-        preview: `Run ${[textValue(args.executable, 'command'), ...(Array.isArray(args.args) ? args.args.map(String) : [])].join(' ')} with outbound network access, after this turn read untrusted content (${taintSources.slice(0, 3).join(', ')}).`
-      };
+    /*
+     * `verdicts.length > 0` here is every address read and cleared, and `verdicts.length === 0` is
+     * a command that named no far end at all. Both are free, and they are free for two different
+     * reasons that used to be one branch reading `args.network === true`.
+     *
+     * That branch returned "Allow internet access for bash" for both, and it was four of the six
+     * cards the owner's own one-shot-app scenario raised in autonomous mode: two `npm install`s, a
+     * `git clone` to a host the destination policy had already cleared, and a health check against
+     * `http://localhost:5173` that this same function had just classified `{sink: false}`. The flag
+     * they were charged to is a field the runner ignores - `execution.ts` isolates only when
+     * `policy.isolateNetwork && !request.network`, and `ISOLATE_AGENT_NETWORK` ships false - so
+     * omitting it bought identical access with no card. Four cards for telling the truth.
+     *
+     * What genuinely goes somewhere nobody can see is not the empty case: `commandAddresses` hands
+     * back the operand a fetch client wrote and could not resolve, `classifyDestination` calls an
+     * address that will not parse a sink, and `curl -s "$U"` cards on the first line above.
+     */
   }
   return null;
 };
@@ -408,6 +435,116 @@ const serviceRequirement = (
         : ''
     }`
   };
+};
+
+/**
+ * What each mode stops for, said once, in the file that enforces it.
+ *
+ * `securityMode` used to be four bare comparisons scattered through `ordinaryRequirement`, and
+ * nothing anywhere named what the setting MEANT. The page where the owner chooses it
+ * (`apps/web/src/asking-rules.ts`) described the difference in its own words, the always-resident
+ * contract (`apps/worker/src/context.ts`) described it in a third set, and the three had drifted:
+ * the contract's "public publishing always stops" was false in every mode until the registry-publish
+ * card below existed, and the page's two-rule summary of Autonomous was measured producing zero
+ * difference from Balanced on the owner's own scenario. Three descriptions of one behaviour, none of
+ * them derived from it.
+ *
+ * So the sentences live here, beside the branches, and the three sites that used to compare a mode
+ * inline now read a field of this record - which is what makes the sentence a claim about the code
+ * rather than a paragraph next to it. `scripts/check-repository.mjs` holds `asking-rules.ts` against
+ * these strings so a mode's behaviour cannot change without the page that describes it changing in
+ * the same commit, and `approval-policy.test.ts` holds each clause of the Autonomous sentence
+ * against the floor by driving the acts it names.
+ *
+ * THE LAYERING IS THE POINT, and it is why each sentence names the mode below it rather than
+ * repeating the list. Autonomous is the floor every mode shares; Balanced is that floor plus two
+ * rules; Review is Balanced plus a card in front of every change. No setting on the page can switch
+ * off the Autonomous clauses, because every branch that raises one sits above the first mode test in
+ * this file.
+ *
+ * `anything left behind to run after the turn is over` is the clause that reads as odd until you
+ * have the case: a `.bashrc`, a git hook, a service, a schedule and a saved skill are all reversible
+ * and invisible on the day they are written, and all of them run after this task and every card in
+ * it is over, under a process this floor does not govern. Irreversibility and reach do not cover
+ * them, and they are exactly the acts the owner meant by "modifying system files".
+ *
+ * The Autonomous sentence was written by driving the floor rather than by summarising it:
+ * `approval-policy.test.ts` names each clause with an act that belongs to it - twelve of them - and
+ * asserts that each cards in autonomous, with nine calls from the owner's own scenario asserted to
+ * card in neither direction. A summary that is only mostly true is how the contract came to promise
+ * that publishing always stopped while `npm publish` ran unasked.
+ *
+ * WHAT THAT TEST DOES NOT DO, said here because the sentence above used to claim it did: it does not
+ * enumerate the branches. A new branch added below that belongs to no clause of the sentence passes
+ * it, because nothing walks this file. The twelve acts hold the clauses against the floor; they do
+ * not hold the floor against the clauses, and the exhaustiveness of the sentence is a review
+ * obligation rather than a checked one. Making it checked needs a branch inventory this file does
+ * not expose - `scripts/check-repository.mjs` counts the TOOLS that can raise a card, which is the
+ * nearest thing and is one level too coarse.
+ *
+ * The last clause is the coordinate click and the bare Enter: nothing could identify the control, so
+ * it is carded because it might be any of the clauses before it.
+ *
+ * TWO CLAUSES WERE MEASURED FALSE AT THE GATE AND ARE NARROWED HERE, both of them universal claims
+ * rather than category names, which is the distinction that decides which gaps get fixed and which
+ * get reported:
+ *
+ *  - Balanced said "reaching an address outside this computer". Driven, `curl http://192.168.1.50/x`,
+ *    `http://wiki.internal/x` and `http://169.254.169.254/latest/meta-data/` raise no card in
+ *    Balanced: the arm is `classifyDestination`, whose sink test is `isPublicHttpUrl`, and every
+ *    RFC1918, link-local and `*.internal` address answers false there. The LAN really is outside
+ *    this computer, so the sentence was false for an entire common address class. "Out on the
+ *    internet" is exactly the question the arm asks, so it is now true as measured. The floor's own
+ *    blind spot on the estate LAN is unchanged and deliberately not this wave's - it is one address
+ *    test shared by every egress rule in the product, and narrowing it is a measured wave.
+ *  - Autonomous said "anything left behind to run after the turn is over". Driven, `crontab
+ *    /tmp/mycron`, `systemctl enable`, `at` and a sudo write of a systemd unit all raise no card in
+ *    any mode. The word doing the damage was "anything": what the floor actually holds is the file
+ *    shapes it can name, so the clause now names them.
+ *
+ * WHAT IS DELIBERATELY LEFT ALONE, for consistency rather than for want of a measurement. The
+ * remaining clauses are category names, and a category name carries the gaps its category has:
+ * "publishing" does not reach `vercel --prod` or `flyctl deploy`, and "agreeing to something on your
+ * behalf" is `sign`, `accept offer`, `submit` and `confirm` but not "accept the terms", "agree to
+ * the terms" or "consent to the cookies" - `consequentialText` never held those words and this wave
+ * did not change it. Both gaps are real, both are reported, and both want the same operation-table
+ * treatment the registry-publish rule got. Widening one category while deferring the other would be
+ * a judgement dressed as a repair.
+ */
+export const SECURITY_MODE_FLOOR: Record<
+  SecurityMode,
+  {
+    /** Review only: a card in front of every command, file write and browser or desktop action. */
+    readonly asksBeforeEveryChange: boolean;
+    /** Whether a command that reaches an address outside this computer is asked about at all. */
+    readonly asksBeforeReachingTheInternet: boolean;
+    /** Whether adding software to this computer is asked about. Removing it always is. */
+    readonly asksBeforeInstallingSoftware: boolean;
+    /** The whole of what this mode stops for, in the owner's language. */
+    readonly sentence: string;
+  }
+> = {
+  review: {
+    asksBeforeEveryChange: true,
+    asksBeforeReachingTheInternet: true,
+    asksBeforeInstallingSoftware: true,
+    sentence:
+      'Every command, every file written, and every browser or desktop action, on top of everything Balanced asks about.'
+  },
+  balanced: {
+    asksBeforeEveryChange: false,
+    asksBeforeReachingTheInternet: true,
+    asksBeforeInstallingSoftware: true,
+    sentence:
+      'Reaching an address out on the internet, and installing software onto it, on top of everything Autonomous asks about.'
+  },
+  autonomous: {
+    asksBeforeEveryChange: false,
+    asksBeforeReachingTheInternet: false,
+    asksBeforeInstallingSoftware: false,
+    sentence:
+      'Only what this computer cannot take back for you — publishing, sending, spending, destroying data, agreeing to something on your behalf, a startup file, hook or tool configuration it would run on its own afterwards, and a control on a screen that nothing could identify.'
+  }
 };
 
 export const approvalRequirement = (
@@ -593,8 +730,18 @@ const ordinaryRequirement = (
    * this headline. `writtenPaths` now resolves the write targets and falls back to the wide net only
    * where it cannot read the script, so what arrives here is over-inclusive where that is all
    * anybody can be and precise everywhere else.
+   *
+   * KEPT WHERE IT BITES AND DROPPED WHERE IT CANNOT. `shell` is not path-confined and `~/.bashrc`
+   * there is the real one; `file_write`, `file_patch` and `print_pdf` are, because every path they
+   * are handed goes through `assertUserDataPath` and comes back inside `workspace/` - one directory
+   * BELOW the agent's HOME. So eleven of the thirteen names in the deferred set were unreachable by
+   * those three tools and the card was firing `external_consequential`, in every mode, on a write
+   * that lands where no login shell and no git ever looks. `deferredExecutionPaths` is the one
+   * reader that holds both halves; the two names that execute wherever they sit, the git hooks and
+   * config, and the coding-CLI directories all keep their card through every tool, because a coding
+   * CLI and git read those out of the project directory the agent is working in.
    */
-  const deferred = [...new Set(writtenPaths(name, args).filter(isDeferredExecutionPath))].sort(
+  const deferred = deferredExecutionPaths(name, args).sort(
     // `writtenPaths` hands a shell call every token it can see, so a redirect arrives twice: once
     // as the whole `-lc` argument and once as the path itself. Both name the same write, and the
     // shorter one is the one the owner can read, so it is the one the card leads with.
@@ -717,51 +864,34 @@ const ordinaryRequirement = (
       preview: `${textValue(args.prompt).slice(0, 2_000)}\n\nThe selected subscription service can inspect and modify files inside this agent computer. athanor keeps the process inside the workspace and records its bounded result.`
     };
   /*
-   * A diagnostic that is the repository's own build, which is a stranger's program.
+   * `code_diagnostics` is deliberately absent from this file, and this note is here so the next
+   * audit reads the decision rather than rediscovering the hole.
    *
-   * `code_diagnostics` reads as the safest tool in the catalogue - it is on `REPEATABLE_TOOLS`, it
-   * is on `NON_MUTATING_TOOLS`, its description says "return concise grounded output" - and for
-   * six of its fifteen languages that is what it is. For the other nine the command it runs is the
-   * project's own build or test recipe, so what executes is a file whoever wrote the repository
-   * chose: `make -s` runs a Makefile target, `cargo check` runs `build.rs`, `go test ./...` runs the
-   * tests, and `bash ./gradlew` runs a script that is itself in the tree. Both of the first two were
-   * run here against a repository that wrote a file from its recipe, and both wrote it. Until this
-   * branch the name `code_diagnostics` did not occur anywhere in this file, in any security mode, so
-   * cloning a repository and asking for its diagnostics ran a stranger's code with nothing shown to
-   * anybody.
+   * A branch was added here in the previous wave, on the finding that nine of its fifteen languages
+   * run the project's own build or test recipe. The finding is true and the instrument was wrong
+   * three measured ways.
    *
-   * ONE SENTENCE, WHICH SHAPES FIRE: the ones where the repository decides what runs, listed with
-   * what decides it in `REPOSITORY_DIRECTED_DIAGNOSTICS`, and not the ones where athanor names a
-   * fixed parser or type-checker - which is deliberately where TypeScript and Python are, because
-   * they are nearly all of the work this product actually does and a card on them is a card tapped
-   * through blind by Tuesday.
+   * It asked about a shape the owner can reach unasked one line over. The same nine recipes through
+   * `shell` - `make -s`, `cargo check`, `go test ./...`, `bash ./gradlew build` - raise no card in
+   * balanced or autonomous, because none of them removes data, reaches a network or leaves the
+   * workspace. A card that a rephrasing walks around is not a floor; it is a toll on the phrasing.
    *
-   * Asked in every mode, autonomous included, and placed above every `securityMode` test for that
-   * reason. Autonomous is a promise about not interrupting reversible work; a build recipe is not
-   * one, and `apps/web/src/asking-rules.ts` now says so on the page where the mode is chosen.
+   * It cost the owner's own project a card on their own code. `npm install` makes every project's
+   * dependency tree foreign and the build then runs it, so a ledger honest enough to call
+   * `node_modules` a stranger's would card every build there is. Running someone else's code is the
+   * job here, not the exception, and the tool that does it is not the place to relitigate that.
    *
-   * Unreadable fails closed. If `approval-floor.ts` could not take the listing, nobody knows which
-   * of the fifteen this is, and "unknown" answering as "safe" is how the audit found this branch
-   * missing in the first place. The dispatch arm takes the same listing a moment later, so the case
-   * where this cards and the call would have succeeded is a listing that failed once and not twice.
+   * And it claimed a property the same repository had already measured false: the tool sat on
+   * `CHECKPOINT_EXEMPT_TOOLS`, which says it leaves nothing to undo, while `make -s` and
+   * `cargo check` were recorded writing files. So a turn of nothing but diagnostics took no undo
+   * point at all. That is the repair, and it is a bound rather than a question: `turn-bounds.ts`
+   * now takes the undo point for every `code_diagnostics` call, in every language and every mode,
+   * whoever wrote the repository. What a card would have asked, a checkpoint answers.
+   *
+   * What is left uncovered is written down rather than papered over, in
+   * `docs/design/floor/DIAGNOSTICS.md`: a build recipe still runs as the agent identity, and the
+   * sandbox around it is an identity boundary rather than a filesystem one.
    */
-  if (name === 'code_diagnostics') {
-    const resolved = context.diagnostics;
-    if (!resolved)
-      return {
-        sideEffect: 'external_consequential',
-        action: 'Run this repository’s own build',
-        preview: `Which diagnostic ${textValue(args.path, 'workspace')} selects could not be read, so it is not known whether it is a type check or this project’s own build and test recipe. A build recipe is a program whoever wrote the repository chose, and it runs on this computer.`
-      };
-    const directed = repositoryDirectedDiagnostic(resolved.language);
-    if (directed)
-      return {
-        sideEffect: 'external_consequential',
-        action: 'Run this repository’s own build',
-        preview: `Run ${resolved.command} in ${textValue(args.path, 'workspace')}. Diagnosing ${resolved.language} means running the project’s own build, so what executes is ${directed} - code whoever wrote this repository chose, running on this computer with whatever this task can reach.`
-      };
-    return null;
-  }
   /**
    * A command that can remove or overwrite data, whichever tool was used to start it.
    *
@@ -850,6 +980,53 @@ const ordinaryRequirement = (
       commands.map(([command = '', ...rest]) => destructiveCommand(command, rest)).find(Boolean);
     if (destructive) return { sideEffect: 'external_consequential', ...destructive };
     /*
+     * A version that goes to a registry, which is the one act the owner named and the floor did not
+     * have.
+     *
+     * Measured on this tree before this branch existed: `npm publish`, `pnpm publish`,
+     * `yarn publish`, `cargo publish`, `twine upload`, `gem push`, `poetry publish`,
+     * `dotnet nuget push`, `mvn deploy` and `docker push` raised NO card in balanced or in
+     * autonomous - while `rm -rf node_modules`, which the checkpoint restores, stopped the turn in
+     * all three, and `context.ts` told the owner in the always-resident contract that public
+     * publishing always stops. `safeNetworkExecutables` is an allowlist of executables, so the
+     * allowance written for `npm install` carried `npm publish`; `curl` and `git` had operation
+     * checks bolted on and the package managers did not. `registryPublishOperation` is that check.
+     *
+     * `external_consequential` and above every `securityMode` test, from the two-part rule the rest
+     * of this file's consequential cards are drawn from: the act cannot be taken back by this
+     * computer - npm's unpublish window is 72 hours and crates.io has none - and its effect is
+     * visible to somebody other than the owner. Autonomous is a promise about not interrupting
+     * reversible work, and there is no more irreversible act reachable from this tool.
+     *
+     * Before the install card, deliberately. `npm dist-tag add` and `npm owner add` were reaching
+     * that branch on the word `add` and being shown to the owner as "Install or update software
+     * with npm" - the right instinct on the wrong evidence, under a sentence that describes the
+     * opposite direction of travel.
+     *
+     * Read through `effectiveCommands` like every gate around it, so `bash -lc 'cd packages/api &&
+     * npm publish'` is the same card as the bare form. The extra arm below it is for the one shape
+     * `effectiveCommands` returns nothing for: an interpreter handed a script FILE rather than an
+     * inline script (`bash ./gradlew publish`), where the tokens after the interpreter are the
+     * command and there is no script text to read.
+     */
+    const publishing =
+      registryPublishOperation(executable, commandArgs) ??
+      commands
+        .map(([command = '', ...rest]) => registryPublishOperation(command, rest))
+        .find(Boolean) ??
+      (commands.length === 0 && commandInterpreters.has(executable)
+        ? registryPublishOperation(
+            (commandArgs[0] ?? '').split('/').pop() ?? '',
+            commandArgs.slice(1)
+          )
+        : null);
+    if (publishing)
+      return {
+        sideEffect: 'external_consequential',
+        action: `Publish to a package registry with ${publishing}`,
+        preview: `Run ${invocation}. This changes what anyone installing this package gets. A version that has reached a public registry cannot be taken back by this computer - npm allows an unpublish for 72 hours and crates.io does not allow one at all - and withdrawing or re-pointing one breaks every build that already resolved it.`
+      };
+    /*
      * `git config` writes `.gitconfig` without ever naming a path, so the deferred-execution rule
      * above - which reads the paths a call writes - cannot see it. It is the likeliest way to write
      * that file and the most dangerous: `core.hooksPath` points every later commit at a directory
@@ -882,7 +1059,7 @@ const ordinaryRequirement = (
         packageRemovalExecutables.has(command) &&
         rest.some((argument) => packageInstallCommands.has(argument.toLowerCase()))
     );
-    if (installer && securityMode !== 'autonomous')
+    if (installer && SECURITY_MODE_FLOOR[securityMode].asksBeforeInstallingSoftware)
       return {
         sideEffect: 'external_reversible',
         action: `Install or update software with ${installer[0]}`,
@@ -919,38 +1096,85 @@ const ordinaryRequirement = (
     const commands = effectiveCommands(args);
     const requirement = commandRequirement();
     if (requirement) return requirement;
-    if (args.network === true && securityMode === 'autonomous') {
+    /*
+     * WHAT THIS CALL REACHES, NOT WHAT IT DECLARED.
+     *
+     * Both network branches below used to open on `args.network === true`, and that field decides
+     * nothing about the command: `execution.ts` puts a command in its own network namespace only
+     * when `policy.isolateNetwork && !request.network`, and `ISOLATE_AGENT_NETWORK` ships false
+     * because a namespace of one's own comes with a loopback of one's own and published previews
+     * stop answering. So the flag bought no confinement, and the same forty-seven calls of
+     * `K-one-shot-app`, on the turn that has read something, with every `network` omitted cost two
+     * cards in autonomous instead of six and four in balanced instead of six, with byte-identical
+     * access. That is an
+     * incentive pointed at silence, in a floor whose whole input is what the model tells it.
+     *
+     * The declaration therefore stops costing, and what it claimed to stand for is asked of the
+     * harness's own address reader instead. `outboundDestinations` is `callDestinations` judged by
+     * `classifyDestination` against an empty corpus, so it answers one question - does this request
+     * leave the computer - and loopback, the private ranges and this box's own origin come back
+     * empty. A request to `http://localhost:5173/api/health` no longer asks the owner to allow
+     * internet access, which it did while the instrument that cleared it was being consulted in the
+     * same call.
+     */
+    const outbound = outboundDestinations(name, args, context.selfOrigins ?? []);
+    /*
+     * The third fact, and the one the flag used to answer for by accident: a client whose grammar
+     * is "here is where to connect", whose far end this could not read because a substitution ate
+     * it. See `reachesAnUnreadableFarEnd`. Kept out of `outbound` rather than folded into it,
+     * because the card below names hosts and this case has none to name - an arm that pretended
+     * otherwise would print a destination for a request whose destination is exactly what nobody
+     * has.
+     */
+    const unreadable = reachesAnUnreadableFarEnd(args);
+    // The fact both arms below are about, named once: this call goes somewhere off this computer,
+    // whether or not the harness could read where.
+    const reachesOutside = outbound.length > 0 || unreadable;
+    if (reachesOutside && !SECURITY_MODE_FLOOR[securityMode].asksBeforeReachingTheInternet) {
       /**
        * The allowlist judges what the command really runs, not what launched it. An interpreter is
        * never on the list and never can be - `bash` is not a network client, it is whatever the
-       * script says - so the question is asked of each command the script names instead, under the
-       * same rules the bare form would face: on the list, not sending data out, not destructive,
-       * not a push. A script naming anything else, and a script this cannot read at all, both keep
-       * their card; unknown fails closed, which is why the empty case is checked separately.
+       * script says - so the question is asked of each command the script names instead: on the
+       * list, or a segment with no socket in it. A script naming anything else, and a script this
+       * cannot read at all, both keep their card - unknown fails closed, which is why the empty
+       * case is checked separately.
+       *
+       * `noEgressExecutables` is the repair to the inversion this arm shipped. The question it asks
+       * is "is every command here a known-safe network client", and it was asked of every segment,
+       * so `cd app && npm install express` carded as "Review network access for cd" while
+       * `curl -sS https://example.com -o data.json` was free - nine of fourteen idiomatic install
+       * lines, on a clean turn, backwards on blast radius. Two changes put it right: the arm only
+       * opens when an address really leaves the computer, and a segment that opens no socket is not
+       * asked to be a network client. The escalating cases - an upload, a push, a destructive
+       * command - are caught one rule earlier by `commandRequirement()` in every mode, so they are
+       * no longer restated here where only autonomous would have read them.
        */
       const unlisted = commands.find(
-        ([command = '', ...rest]) =>
-          !(safeNetworkExecutables.has(command) || command === 'gh') ||
-          sendsDataOverNetwork(command, rest) ||
-          destructiveCommand(command, rest) !== null ||
-          (command === 'git' && gitSubcommand(rest) === 'push')
+        ([command = '']) =>
+          !(
+            noEgressExecutables.has(command) ||
+            safeNetworkExecutables.has(command) ||
+            command === 'gh'
+          )
       );
       if (unlisted || commands.length === 0)
         return {
           sideEffect: 'external_reversible',
           action: `Review network access for ${unlisted?.[0] || executable || 'command'}`,
-          preview: `Run ${[executable, ...commandArgs].join(' ')} with outbound network access. ${unlisted ? `It runs ${unlisted[0]}, which is not read-only or package-install use of the allowlist.` : 'What it runs could not be read, so its network use is unknown.'}`
+          preview: `Run ${[executable, ...commandArgs].join(' ')}. It reaches ${outbound.length ? namedObjects([...new Set(outbound.map(({ host }) => host))]) : 'an address this could not read'}, and ${unlisted ? `it runs ${unlisted[0]}, which is not read-only or package-install use of the allowlist.` : 'what it runs could not be read, so its network use is unknown.'}`
         };
     }
-    if (args.network === true && securityMode !== 'autonomous')
+    if (reachesOutside && SECURITY_MODE_FLOOR[securityMode].asksBeforeReachingTheInternet)
       return {
         sideEffect: 'external_reversible',
         action: `Allow internet access for ${executable || 'command'}`,
         // This used to promise that the default shell is network-isolated. The installer ships that
         // setting off, because a command in its own network namespace also has its own loopback and
         // published previews stop working - so the card was telling the owner a confinement was in
-        // place that was not. Describe only what approving this actually does.
-        preview: `Run ${[executable, ...commandArgs].join(' ')} with outbound network access, so it can reach the internet and send data out.`
+        // place that was not. Describe only what approving this actually does, and name where.
+        preview: outbound.length
+          ? `Run ${[executable, ...commandArgs].join(' ')}. It reaches ${namedObjects([...new Set(outbound.map(({ host }) => host))])}, which is outside this computer, so it can send data out.`
+          : `Run ${[executable, ...commandArgs].join(' ')}. It connects to somewhere this computer could not read out of the command, so where it sends data is unknown.`
       };
   }
   if (name === 'publish_site') {
@@ -1095,7 +1319,7 @@ const ordinaryRequirement = (
         )
       };
   }
-  if (securityMode === 'review') {
+  if (SECURITY_MODE_FLOOR[securityMode].asksBeforeEveryChange) {
     if (name === 'shell')
       return {
         sideEffect: 'workspace_write',

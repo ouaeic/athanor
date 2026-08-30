@@ -1,9 +1,9 @@
 {
   "$stamp": {
-    "acceptedAt": "2026-08-27T13:26:44.209Z",
+    "acceptedAt": "2026-08-30T20:03:56.646Z",
     "version": "0.1.1",
-    "commit": "58eb412",
-    "rig": "3a87f7179ad0"
+    "commit": "fb93b40",
+    "rig": "70581ad939d2"
   },
   "A-calendar/review": {
     "calls": 4,
@@ -42,13 +42,13 @@
   },
   "C-set-up-coding/balanced": {
     "calls": 7,
-    "clean": 4,
-    "tainted": 4
+    "clean": 3,
+    "tainted": 3
   },
   "C-set-up-coding/autonomous": {
     "calls": 7,
-    "clean": 3,
-    "tainted": 4
+    "clean": 2,
+    "tainted": 2
   },
   "D-build-and-publish/review": {
     "calls": 9,
@@ -57,13 +57,13 @@
   },
   "D-build-and-publish/balanced": {
     "calls": 9,
-    "clean": 2,
-    "tainted": 3
+    "clean": 1,
+    "tainted": 2
   },
   "D-build-and-publish/autonomous": {
     "calls": 9,
     "clean": 1,
-    "tainted": 3
+    "tainted": 2
   },
   "E-path-is-wrong/review": {
     "calls": 9,
@@ -154,5 +154,65 @@
     "calls": 6,
     "clean": 3,
     "tainted": 3
+  },
+  "K-one-shot-app/review": {
+    "calls": 47,
+    "clean": 38,
+    "tainted": 38
+  },
+  "K-one-shot-app/balanced": {
+    "calls": 47,
+    "clean": 4,
+    "tainted": 5
+  },
+  "K-one-shot-app/autonomous": {
+    "calls": 47,
+    "clean": 1,
+    "tainted": 2
+  },
+  "L-no-research-build/review": {
+    "calls": 35,
+    "clean": 31,
+    "tainted": 31
+  },
+  "L-no-research-build/balanced": {
+    "calls": 35,
+    "clean": 3,
+    "tainted": 4
+  },
+  "L-no-research-build/autonomous": {
+    "calls": 35,
+    "clean": 1,
+    "tainted": 2
+  },
+  "M-same-build-typescript/review": {
+    "calls": 15,
+    "clean": 8,
+    "tainted": 8
+  },
+  "M-same-build-typescript/balanced": {
+    "calls": 15,
+    "clean": 0,
+    "tainted": 0
+  },
+  "M-same-build-typescript/autonomous": {
+    "calls": 15,
+    "clean": 0,
+    "tainted": 0
+  },
+  "M-same-build-rust/review": {
+    "calls": 15,
+    "clean": 8,
+    "tainted": 8
+  },
+  "M-same-build-rust/balanced": {
+    "calls": 15,
+    "clean": 0,
+    "tainted": 0
+  },
+  "M-same-build-rust/autonomous": {
+    "calls": 15,
+    "clean": 0,
+    "tainted": 0
   }
 }

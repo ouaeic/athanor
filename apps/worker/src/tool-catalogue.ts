@@ -616,13 +616,23 @@ export const agentTools: ModelTool[] = [
         network: {
           type: 'boolean',
           default: false,
-          // It used to read "request outbound internet access", which told the model that a command
-          // without it cannot reach the internet. The installer ships the per-command network
-          // namespace off - a command with its own loopback breaks published previews - so on the
-          // shipped configuration it reaches the internet either way, and a model taught otherwise
-          // has been told a confinement is in force that is not.
+          /*
+           * It used to read "request outbound internet access", which told the model that a command
+           * without it cannot reach the internet. The installer ships the per-command network
+           * namespace off - a command with its own loopback breaks published previews - so on the
+           * shipped configuration it reaches the internet either way, and a model taught otherwise
+           * has been told a confinement is in force that is not.
+           *
+           * And then it went on saying which modes ASK about it, which was true and was the defect:
+           * the flag granted nothing and cost cards, so the honest answer was the expensive one.
+           * Measured on the owner's own one-shot-app trajectory, four of the six cards autonomous
+           * mode raised came from branches reading this field. The floor no longer reads it at all -
+           * it reads the addresses the command names - and `evals/cards`' DECLARATION check holds
+           * that: for every call the rig knows, in every mode, setting this and omitting it must
+           * answer identically. So the description can go back to describing the field.
+           */
           description:
-            'Declare that this command reaches the internet, so the user is asked about it: Balanced and Review ask first, Autonomous lets the ordinary fetch-and-install tools through and asks for anything else. Set it whenever the command will make a request - on some configurations of this computer it is also what grants access.'
+            'Whether this command reaches the network, recorded on the call. It does not change what the command can reach and does not decide what the user is asked about - that is judged from the addresses the command actually names - so answer it accurately and do not weigh it when choosing how to write a command.'
         }
       }
     }

@@ -103,22 +103,27 @@ describe('the approval floor is evaluated once per call', () => {
 });
 
 /*
- * The half of the diagnostics card that is not in `approval-policy.ts`.
+ * The lookup this floor used to do before every diagnostic, and no longer does.
  *
- * The floor there is a pure function of the arguments, and the arguments of a `code_diagnostics`
- * call settle nothing: `language` is `auto`, so the language is whatever a directory listing says.
- * This is the lookup that takes that listing, and the reason a `go.mod` in the directory and a
- * `package.json` in the directory are two different answers to the same tool call.
+ * A `code_diagnostics` call carries `language: 'auto'` and settles nothing, so the removed approval
+ * card could not tell `tsc --noEmit` from `make -s` on the arguments. It bought the answer with a
+ * directory listing taken here, from the runner, before every call. The card is gone and so is the
+ * round trip - which is the second saving, and the one nobody would have noticed: the dispatch arm
+ * takes the same listing a moment later and acts on it, so this one was a runner call per
+ * diagnostic spent entirely on the wording of a question.
+ *
+ * Both halves are asserted, because "the card is gone" and "the lookup is gone" fail differently.
+ * A floor that still asks costs the owner a click; a floor that still looks costs a round trip on
+ * every diagnostic and shows up as nothing at all.
  */
-describe('what the floor has to look up before it can judge a diagnostic', () => {
-  const listing = (entries: string[], fail = false): ApprovalFloorDeps => ({
+describe('what the floor no longer has to look up before a diagnostic runs', () => {
+  const listing = (entries: string[], seen: string[] = [], fail = false): ApprovalFloorDeps => ({
     store: {} as DataStore,
     masterKey: Buffer.alloc(32, 1),
     runner: {
-      call: async (_workspaceId: string, _taskId: string, scope: string, path: string) => {
+      call: async (_workspaceId: string, _taskId: string, scope: string) => {
+        seen.push(scope);
         if (fail) throw new Error('the runner is not answering');
-        expect(scope).toBe('files.read');
-        expect(path).toContain('files?path=');
         return { entries: entries.map((name) => ({ name })) };
       }
     } as unknown as AgentRunnerClient,
@@ -134,55 +139,63 @@ describe('what the floor has to look up before it can judge a diagnostic', () =>
     })
   });
 
-  const judge = async (entries: string[], fail = false, args: Record<string, unknown> = {}) =>
+  const judge = async (
+    entries: string[],
+    args: Record<string, unknown> = {},
+    seen: string[] = [],
+    fail = false
+  ) =>
     approvalForCallOnce(
-      listing(entries, fail),
+      listing(entries, seen, fail),
       createApprovalFloorMemo(),
       task,
       call('call-1', 'code_diagnostics', { path: 'workspace/cloned', ...args }),
       { messages: [], toolsStarted: 0 } as unknown as AgentState
     );
 
-  it('stops a turn that would run a cloned repository’s test suite', async () => {
-    const card = await judge(['go.mod', 'main.go']);
-    expect(card?.sideEffect).toBe('external_consequential');
-    expect(card?.preview).toContain('go test ./...');
-  });
-
-  it('stops a turn that would run a Makefile target nobody has read', async () => {
-    const card = await judge(['Makefile', 'main.c']);
-    expect(card?.preview).toContain('make -s');
-  });
-
-  it('leaves an ordinary TypeScript check alone, which is most of what this tool is for', async () => {
+  /*
+   * The owner's own Rust project against the owner's own TypeScript project, driven through the
+   * real listing so the two calls genuinely differ - identical arguments, one marker file apart,
+   * which is the only place in the product where that difference was ever visible. The Rust one
+   * used to cost a card and the TypeScript one did not, and the difference is measured here rather
+   * than argued: `evals/cards` counts the same pair over a whole trajectory.
+   */
+  it('charges a Cargo.toml exactly what it charges a package.json, which is nothing', async () => {
+    expect(await judge(['Cargo.toml', 'src'])).toBeNull();
     expect(await judge(['package.json', 'tsconfig.json'])).toBeNull();
-  });
-
-  it('leaves a directory with no project marker alone, because nothing will be run', async () => {
+    expect(await judge(['go.mod', 'main.go'])).toBeNull();
+    expect(await judge(['Makefile', 'main.c'])).toBeNull();
     expect(await judge(['notes.md'])).toBeNull();
   });
 
   /*
-   * Fail closed. The dispatch arm takes the same listing a moment later, so a listing that fails
-   * here and succeeds there is one transient failure apart - and the cost of being wrong the other
-   * way is running a stranger's build without asking.
+   * The saving, asserted as an absence of a runner call rather than as a comment claiming one.
+   * `files.read` here was the listing; nothing else in this floor reaches the runner for a
+   * diagnostic, so an empty scope list is the whole statement.
    */
-  it('asks rather than assuming, when the listing it needs cannot be taken', async () => {
-    const card = await judge([], true);
-    expect(card?.sideEffect).toBe('external_consequential');
-    expect(card?.preview).toMatch(/could not be read/i);
+  it('reaches the runner not at all, where it used to take a listing before every call', async () => {
+    const seen: string[] = [];
+    expect(await judge(['Cargo.toml', 'src'], {}, seen)).toBeNull();
+    expect(seen).toEqual([]);
   });
 
   /*
-   * `language` is the one argument the model chooses freely, so it is the one worth asking about
-   * twice. It cannot be used to walk past the card and it cannot be used to invent one, because the
-   * same `diagnosticsLanguage` call decides the command the dispatch arm runs and the language this
-   * floor judges - naming `go` runs `go test`, and naming `ruby` runs the Ruby parser, whatever the
-   * directory happens to hold.
+   * The old branch failed closed: a listing it could not take became a card, on the reasoning that
+   * unknown must not read as safe. With nothing to be unknown about, a runner that is not answering
+   * costs the diagnostic nothing here - it is the dispatch arm's error to report, once, in its own
+   * words.
    */
-  it('judges the language the call names, not the one the directory would have chosen', async () => {
-    const named = await judge(['package.json', 'tsconfig.json'], false, { language: 'go' });
-    expect(named?.preview).toContain('go test ./...');
-    expect(await judge(['Makefile', 'main.c'], false, { language: 'ruby' })).toBeNull();
+  it('does not invent a card out of a runner that is not answering', async () => {
+    expect(await judge([], {}, [], true)).toBeNull();
+  });
+
+  /*
+   * `language` is the one argument the model chooses freely, and it used to be the one worth asking
+   * about twice: it could neither walk past the card nor invent one. Now it decides only which
+   * command the dispatch arm runs, and this floor has no opinion about any of them.
+   */
+  it('has no opinion about the language the call names, whichever it names', async () => {
+    expect(await judge(['package.json', 'tsconfig.json'], { language: 'go' })).toBeNull();
+    expect(await judge(['Makefile', 'main.c'], { language: 'ruby' })).toBeNull();
   });
 });

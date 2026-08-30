@@ -8415,11 +8415,18 @@ describe('the contract the run actually sends', () => {
 });
 
 /*
- * The whole loop, against the finding this branch exists for: `code_diagnostics` runs a project's
- * own build and test targets, and until this wave its name occurred nowhere in the approval floor.
- * A repository cloned from anywhere is a repository whose `Makefile`, `build.rs` and tests were
- * written by somebody else, so what these two tests separate is a stranger's program reaching the
- * runner and an ordinary type check reaching it.
+ * The whole loop, against the repair that replaced the `code_diagnostics` approval card.
+ *
+ * The finding behind that card is true: a repository cloned from anywhere is a repository whose
+ * `Makefile`, `build.rs` and tests were written by somebody else, and nine of the fifteen commands
+ * this tool can run are exactly those files. What the card did about it was wrong three measured
+ * ways, and the third is the one a loop test can hold: the tool sat on `CHECKPOINT_EXEMPT_TOOLS`,
+ * so a turn that ran a stranger's build recipe and nothing else took no undo point at all.
+ *
+ * So these two tests separate what the two used to: a diagnostic reaches the runner without parking
+ * the turn, in either language, and the turn has something to rewind to when it does. Driving the
+ * real loop rather than the floor is the point - `CHECKPOINT_EXEMPT_TOOLS` is consulted in
+ * `agent.ts` and in `tool-recording.ts`, neither of which `approvalRequirement` can see.
  */
 describe('diagnosing a repository whose build somebody else wrote', () => {
   const diagnose = async (entries: string[]) => {
@@ -8460,30 +8467,44 @@ describe('diagnosing a repository whose build somebody else wrote', () => {
       .run(task)
       .catch(() => undefined);
 
-    return { raised, probe, ran: log.calls.some((entry) => entry.includes('/exec')) };
+    return { raised, probe, log, ran: log.calls.some((entry) => entry.includes('/exec')) };
   };
 
-  it('never reaches the runner with go test until the owner has seen which repository it is', async () => {
-    const { raised, probe, ran } = await diagnose(['go.mod', 'main.go']);
+  /*
+   * `go test ./...` compiles and runs the repository's own test files, which is the loudest case
+   * the removed card was written for. It runs, and the owner keeps a way back from it: the
+   * checkpoint is in front of the exec, not behind it, because a checkpoint taken afterwards holds
+   * the state the owner is trying to get away from.
+   */
+  it('takes the undo point before a cloned repository’s test suite runs, and does not ask', async () => {
+    const { raised, probe, log, ran } = await diagnose(['go.mod', 'main.go']);
 
-    expect(raised, 'go test ./... ran with no card').toHaveLength(1);
-    expect(raised[0]).toMatchObject({
-      action: 'code_diagnostics',
-      sideEffect: 'external_consequential'
-    });
-    expect(probe.events.some((entry) => entry.kind === 'approval_requested')).toBe(true);
-    expect(probe.checkpoints.some((entry) => entry.status === 'awaiting_user')).toBe(true);
-    // The card parks the turn, so the command must not have been run first.
-    expect(ran, 'the build ran before the owner answered').toBe(false);
+    expect(raised, 'a diagnostic parked the turn').toHaveLength(0);
+    expect(probe.checkpoints.some((entry) => entry.status === 'awaiting_user')).toBe(false);
+    expect(ran, 'go test ./... never reached the runner').toBe(true);
+
+    const checkpointCalls = log.calls.filter((entry) => entry.includes('/checkpoints'));
+    expect(checkpointCalls, 'the build ran with no undo point').toHaveLength(1);
+    expect(log.calls.indexOf(checkpointCalls[0]!)).toBeLessThan(
+      log.calls.findIndex((entry) => entry.includes('/exec'))
+    );
+    expect(probe.undoPoints).toHaveLength(1);
+    expect(probe.undoPoints[0]).toMatchObject({ workspaceId, taskId, turn: 0 });
   });
 
-  it('runs an ordinary TypeScript check without stopping anybody', async () => {
+  /*
+   * The owner's own project, and the half that decides whether any of this survives a working day.
+   * A `tsc --noEmit` is the shape almost every real call to this tool has; it must cost no card -
+   * and it takes the same undo point, because `tsc --noEmit` under `incremental` writes a
+   * `.tsbuildinfo` and `python3 -I -m compileall` leaves `__pycache__`. The bound is the tool, not
+   * a list of nine languages, and this is where that is visible.
+   */
+  it('takes it for an ordinary TypeScript check too, and still stops nobody', async () => {
     const { raised, probe, ran } = await diagnose(['package.json', 'tsconfig.json']);
 
-    // The half that decides whether the card above survives contact with a working day: this is
-    // the shape almost every real call to this tool has, and it must cost nothing.
     expect(raised, 'a tsc --noEmit raised an approval').toHaveLength(0);
     expect(probe.checkpoints.some((entry) => entry.status === 'awaiting_user')).toBe(false);
     expect(ran, 'the type check never reached the runner').toBe(true);
+    expect(probe.undoPoints).toHaveLength(1);
   });
 });

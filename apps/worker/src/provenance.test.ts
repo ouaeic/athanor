@@ -135,9 +135,10 @@ describe('what the turn treats as somebody else’s words', () => {
     expect(untrustedOriginOfResult(call('coding_agent', { action: 'run' }), {})).toBe(
       'coding agent report'
     );
-    expect(untrustedOriginOfResult(call('shell', { network: true }), {})).toBe(
-      'network command output'
-    );
+    // A bare declaration is not a read. `network: true` with no command behind it reaches nothing
+    // and brings nothing back, and the flag is not a gate on what the command could reach anyway -
+    // so labelling the turn from it marked windows hostile that had read only their own output.
+    expect(untrustedOriginOfResult(call('shell', { network: true }), {})).toBeNull();
     // And the fetch that did not declare itself, which is what the flag was never able to catch:
     // it changes what the owner is asked, not what the command can reach.
     expect(

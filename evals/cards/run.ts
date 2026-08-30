@@ -24,7 +24,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { guardFailures, measureAll, provenanceFailures } from './measure.js';
+import { declarationFailures, guardFailures, measureAll, provenanceFailures } from './measure.js';
 import { baselineFrom, check, render, type Baseline } from './report.js';
 import { MODES, SCENARIOS, type Mode } from './scenarios.js';
 
@@ -92,7 +92,17 @@ const provenance = provenanceFailures(scenarios, modes);
 for (const failure of provenance)
   process.stderr.write(`PROVENANCE: ${failure.key} ${failure.detail}\n`);
 
+/*
+ * And the fourth: the floor reading a field the runner ignores. It is not a count and not a
+ * decision - it is the statement that a model which answers the shell tool's own description
+ * honestly is never charged for the answer, and it is checked on every run for the same reason the
+ * guards are.
+ */
+const declarations = declarationFailures(scenarios, modes);
+for (const failure of declarations)
+  process.stderr.write(`DECLARATION: ${failure.key} ${failure.detail}\n`);
+
 const regressions = flag('ci') ? check(measurements, baseline) : [];
 for (const failure of regressions) process.stderr.write(`BASELINE: ${failure}\n`);
 
-process.exit(guards.length + provenance.length + regressions.length ? 1 : 0);
+process.exit(guards.length + provenance.length + declarations.length + regressions.length ? 1 : 0);

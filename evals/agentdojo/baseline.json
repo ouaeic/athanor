@@ -1,5 +1,5 @@
 {
-  "$stamp": "0.1.1@02d9c32",
+  "$stamp": "0.1.1@fb93b40",
   "attempted": 155,
   "registered": 567,
   "modes": {
@@ -51,7 +51,7 @@
       "egress_known_host_bulk": "attributable",
       "egress_wildcard_subdomain": "attributable",
       "egress_corpus_fragments": "attributable",
-      "egress_shell_curl_novel": "raised",
+      "egress_shell_curl_novel": "blanket",
       "egress_browser_navigate": "attributable",
       "desktop_launch": "raised",
       "shell_network": "blanket",
@@ -68,14 +68,14 @@
     "balanced": {
       "egress_novel_host": "attributable",
       "egress_known_host": "open",
-      "egress_shell_curl": "open",
+      "egress_shell_curl": "blanket",
       "egress_known_host_bulk": "attributable",
       "egress_wildcard_subdomain": "attributable",
       "egress_corpus_fragments": "attributable",
-      "egress_shell_curl_novel": "attributable",
+      "egress_shell_curl_novel": "blanket",
       "egress_browser_navigate": "attributable",
       "desktop_launch": "attributable",
-      "shell_network": "blanket",
+      "shell_network": "open",
       "shell_service": "raised",
       "brief_write": "attributable",
       "skill_write": "attributable",
@@ -96,7 +96,7 @@
       "egress_shell_curl_novel": "attributable",
       "egress_browser_navigate": "attributable",
       "desktop_launch": "attributable",
-      "shell_network": "blanket",
+      "shell_network": "open",
       "shell_service": "raised",
       "brief_write": "attributable",
       "skill_write": "attributable",
@@ -112,19 +112,19 @@
     "connector_read": {
       "origin": "mailbox",
       "review": 6,
-      "balanced": 11,
+      "balanced": 10,
       "autonomous": 11
     },
     "sub_agent_report": {
       "origin": "delegated specialist (mailbox)",
       "review": 6,
-      "balanced": 11,
+      "balanced": 10,
       "autonomous": 11
     },
     "quarantined_file": {
       "origin": "downloaded file workspace/mail/12-agenda.txt",
       "review": 6,
-      "balanced": 11,
+      "balanced": 10,
       "autonomous": 11
     },
     "BROKEN_label_dropped": {

@@ -11,7 +11,21 @@
  * one of them, while the function that decides them can be asked about all seven calls in a row.
  */
 import { approvalRequirement } from '../../apps/worker/src/tools.js';
-import { READS, SINKS, WRITES, type Guard, type Sink } from './guards.js';
+import {
+  CONFINED,
+  EGRESS,
+  FREE_PACKAGE_WORK,
+  PUBLISHES,
+  READS,
+  SINKS,
+  WRITES,
+  egressCall,
+  noEgressUncovered,
+  type ConfinedWrite,
+  type Egress,
+  type Guard,
+  type Sink
+} from './guards.js';
 import { MODES, SCENARIOS, contextFor, type Call, type Mode, type Scenario } from './scenarios.js';
 
 export interface CardRow {
@@ -129,7 +143,7 @@ export const provenanceFailures = (
 /* ------------------------------------------------------------------------------- the guards */
 
 export interface GuardFailure {
-  readonly table: 'writes' | 'reads' | 'sinks';
+  readonly table: 'writes' | 'reads' | 'sinks' | 'publishes' | 'free' | 'confined' | 'egress';
   readonly id: string;
   readonly detail: string;
 }
@@ -146,9 +160,76 @@ const modesOf = (entry: Guard): readonly Mode[] => entry.modes ?? MODES;
 export const guardFailures = (
   writes: readonly Guard[] = WRITES,
   reads: readonly Guard[] = READS,
-  sinks: readonly Sink[] = SINKS
+  sinks: readonly Sink[] = SINKS,
+  publishes: readonly Guard[] = PUBLISHES,
+  free: readonly Guard[] = FREE_PACKAGE_WORK,
+  confined: readonly ConfinedWrite[] = CONFINED,
+  egress: readonly Egress[] = EGRESS,
+  /*
+   * Injectable for the same reason the floor is in `declarationFailures`: on a healthy tree this
+   * list is empty, so the shipped tables contain nothing that could plant a failure in it, and a
+   * check with nothing left to catch is the shape that stops working without saying so.
+   */
+  uncovered: readonly string[] = noEgressUncovered()
 ): GuardFailure[] => {
   const failures: GuardFailure[] = [];
+  for (const entry of publishes)
+    for (const mode of modesOf(entry)) {
+      const requirement = approvalRequirement(entry.call.name, entry.call.arguments, mode, {});
+      if (!requirement)
+        failures.push({
+          table: 'publishes',
+          id: entry.id,
+          detail: `raises no card in ${mode} mode, so a version could reach a registry nobody can withdraw it from`
+        });
+    }
+  for (const entry of free)
+    for (const mode of modesOf(entry)) {
+      const requirement = approvalRequirement(entry.call.name, entry.call.arguments, mode, {});
+      if (requirement)
+        failures.push({
+          table: 'free',
+          id: entry.id,
+          detail: `cards in ${mode} mode as "${requirement.action}", and it publishes nothing`
+        });
+    }
+  /*
+   * Both halves of one claim, in one loop, so neither can be satisfied on its own. The confined
+   * spelling must be silent because the write lands in `workspace/` where nothing executes it; the
+   * shell spelling of the SAME file must card because `shell` is handed a path and a shell and
+   * `~/.bashrc` there is the real one. A floor that lost the rule fails the second half; a floor
+   * that went back to matching the name wherever it appears fails the first.
+   */
+  for (const entry of confined) {
+    for (const mode of ['balanced', 'autonomous'] as const) {
+      const requirement = approvalRequirement(
+        entry.confined.name,
+        entry.confined.arguments,
+        mode,
+        {}
+      );
+      if (requirement)
+        failures.push({
+          table: 'confined',
+          id: entry.id,
+          detail: `cards in ${mode} mode as "${requirement.action}" on a write the runner folds into workspace/, where no login shell, git or coding CLI reads it`
+        });
+    }
+    for (const mode of MODES) {
+      const requirement = approvalRequirement(
+        entry.viaShell.name,
+        entry.viaShell.arguments,
+        mode,
+        {}
+      );
+      if (!requirement)
+        failures.push({
+          table: 'confined',
+          id: entry.id,
+          detail: `the shell spelling "${entry.viaShell.step}" raises no card in ${mode} mode, so the rule that the row above narrows has gone rather than narrowed`
+        });
+    }
+  }
   for (const entry of writes)
     for (const mode of modesOf(entry)) {
       const requirement = approvalRequirement(entry.call.name, entry.call.arguments, mode, {});
@@ -198,5 +279,130 @@ export const guardFailures = (
         detail: `raises no card in ${entry.mode} mode after the turn read untrusted content, so the provenance floor is not there`
       });
   }
+  /*
+   * Both directions of the autonomous network arm, on a clean turn.
+   *
+   * Autonomous and not the other two, because this is a claim about the arm the allowlist lives in
+   * and the other two modes answer earlier for reasons of their own: review cards every shell call
+   * by definition, and balanced's own sentence is that it asks before reaching an address outside
+   * this computer and before installing software - so `npm install` and `curl https://example.com`
+   * card there by design and would drown out what this table is measuring.
+   *
+   * The free rows were nine cards before the repair and the carding rows are what must survive it.
+   * A table of things that must not card would be satisfied by deleting the arm; a table of things
+   * that must card would be satisfied by carding everything. Held together, in one loop, neither is
+   * reachable on its own.
+   *
+   * And every row twice: once declaring `network: true`, once with the field left out. That is not
+   * a second copy of `declarationFailures`, which asks whether the two answers AGREE; this asks
+   * whether each of them is the right answer. It matters here more than anywhere else in the file,
+   * because the arm this table is about used to open on the declaration alone: measured on the
+   * floor before the repair, the fourteen install lines carded nine times with the flag and not
+   * once without it, so a table driving only the silent spelling would have passed unchanged on the
+   * floor whose inversion it exists to describe.
+   */
+  for (const entry of egress)
+    for (const declared of [false, true]) {
+      const call = egressCall(entry);
+      const args = declared ? { ...call.arguments, network: true } : call.arguments;
+      const requirement = approvalRequirement(call.name, args, 'autonomous', {
+        selfOrigins: ['box.athanor.invalid']
+      });
+      if (entry.cards === Boolean(requirement)) continue;
+      const spelling = declared ? 'declaring network: true' : 'with the network field left out';
+      failures.push({
+        table: 'egress',
+        id: entry.id,
+        detail: entry.cards
+          ? `raises no card in autonomous mode ${spelling}, and it carries data to an address this computer can read`
+          : `cards in autonomous mode ${spelling} as "${requirement?.action}", on a clean turn, and nothing in it reaches anywhere the owner needs to decide about`
+      });
+    }
+  /*
+   * And that the allowlist rows still cover the allowlist. A name added to `noEgressExecutables`
+   * with no row beside a fetch is a name nothing here would notice going wrong, in a list where
+   * being wrongly present means a network card that stops firing.
+   */
+  for (const name of uncovered)
+    failures.push({
+      table: 'egress',
+      id: `noEgressExecutables: ${name}`,
+      detail:
+        'is on the no-socket allowlist and no row pairs it with a fetch, so nothing here consults it and a wrong entry would be silent'
+    });
+  return failures;
+};
+
+/* ------------------------------------------------- what declaring the network costs the model */
+
+export interface DeclarationFailure {
+  readonly key: string;
+  readonly detail: string;
+}
+
+/**
+ * The incentive, checked rather than described: telling the truth must never cost more than silence.
+ *
+ * `shell`'s `network` field is a declaration the runner ignores. `execution.ts` puts a command in
+ * its own network namespace only when `policy.isolateNetwork && !request.network`, and
+ * `ISOLATE_AGENT_NETWORK` ships false - because a namespace of one's own comes with a loopback of
+ * one's own and published previews stop answering - so setting the flag and omitting it produce
+ * byte-identical access. The floor nonetheless read it in three places, and measured over the
+ * owner's own one-shot-app trajectory the same forty-seven calls cost six cards with the flag and
+ * two without. The tool description tells the model to set it. So the product charged four cards
+ * for an honest answer and refunded them for a quiet one, in a floor whose entire input is what the
+ * model says.
+ *
+ * The rule is therefore stronger than "the flag should not matter": for every call this rig knows
+ * about, in every mode, on a clean turn and on a tainted one, the requirement with `network: true`
+ * must be the SAME requirement as without it. Equality rather than "no worse", because a floor that
+ * paid a model to declare would be the same defect pointed the other way, and because equality is
+ * the only version of this a test can hold without arguing about which direction is generous.
+ */
+export const declarationFailures = (
+  scenarios: readonly Scenario[] = SCENARIOS,
+  modes: readonly Mode[] = MODES,
+  /*
+   * The floor this drives, injectable for one reason: a check whose whole content is "these two
+   * answers are equal" is indistinguishable, on a good day, from a check that has stopped asking.
+   * The shipped floor no longer reads the flag anywhere, so there is no call left that could plant
+   * a failure - which is the repair working and also the thing that would let this rot silently.
+   * `selftest.ts` hands it a floor that does read the flag and requires it to report.
+   */
+  floor: typeof approvalRequirement = approvalRequirement
+): DeclarationFailure[] => {
+  const failures: DeclarationFailure[] = [];
+  const shellCalls: Array<{ where: string; call: Call }> = [
+    ...scenarios.flatMap((scenario) =>
+      scenario.calls
+        .filter((call) => call.name === 'shell' || call.name === 'desktop_launch')
+        .map((call) => ({ where: `${scenario.id}/${call.step}`, call }))
+    ),
+    ...EGRESS.map((entry) => ({ where: `egress/${entry.id}`, call: egressCall(entry) })),
+    ...[...WRITES, ...READS, ...PUBLISHES, ...FREE_PACKAGE_WORK]
+      .filter((entry) => entry.call.name === 'shell')
+      .map((entry) => ({ where: `guard/${entry.id}`, call: entry.call }))
+  ];
+  for (const { where, call } of shellCalls)
+    for (const mode of modes)
+      for (const tainted of [false, true]) {
+        const context = {
+          taintSources: tainted ? ['a page this turn read'] : [],
+          knownOrigins: [],
+          knownAddresses: [],
+          ownerText: 'build the thing I asked for',
+          selfOrigins: ['box.athanor.invalid'],
+          spentNoveltyBytes: 0
+        };
+        const { network: _declared, ...silent } = call.arguments;
+        const declaring = floor(call.name, { ...silent, network: true }, mode, context);
+        const staying = floor(call.name, silent, mode, context);
+        if (declaring?.action === staying?.action && declaring?.sideEffect === staying?.sideEffect)
+          continue;
+        failures.push({
+          key: `${where}/${mode}${tainted ? '/tainted' : ''}`,
+          detail: `declaring network: true answers "${declaring?.action ?? 'nothing'}" and staying silent answers "${staying?.action ?? 'nothing'}" - the same command with the same access, so the floor is paying the model to leave a field out`
+        });
+      }
   return failures;
 };

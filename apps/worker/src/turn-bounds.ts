@@ -47,6 +47,47 @@ export const REPEATABLE_TOOLS = new Set([
 ]);
 
 /**
+ * The members of the set above that are safe to run twice and still leave something behind.
+ *
+ * Two properties were being read off one list, and only one of them is what that list says. A tool
+ * whose second run cannot surprise anyone is a tool that is safe to REPLAY; it is not necessarily a
+ * tool that changed nothing. `code_diagnostics` is exactly that gap and it is the only member: a
+ * repeated `make -s` tells the owner nothing new, which is what earns it a place above, and it
+ * writes to the tree while doing it, which is what takes it out of the two sets derived below.
+ *
+ * Measured on this machine rather than argued, and measured on both halves of the tool - because the
+ * point is that the split the removed approval card drew is not this one:
+ *
+ *   - `make -s` on a Makefile whose default target writes a file wrote it. 1 new file, exit 0.
+ *   - `cargo check --message-format short` on a crate with a `build.rs` that writes a file left 50
+ *     new paths: `Cargo.lock`, the build script's own file, and 48 under `target/`.
+ *   - `cargo check` on a crate with NO `build.rs` at all still left 16: `Cargo.lock` and 15 under
+ *     `target/`. Nothing a stranger wrote had to run for that.
+ *   - `python3 -I -m compileall -q .` wrote `__pycache__/app.cpython-310.pyc`, and `tsc --noEmit`
+ *     under `incremental: true` wrote `tsconfig.tsbuildinfo`. Those are two of the SIX languages the
+ *     old card called safe.
+ *
+ * So the whole tool writes, not nine fifteenths of it, and the bound is unconditional. That is also
+ * why this is a set of tool names and not a per-language question: the only thing that could answer
+ * per language is a directory listing taken before the call, which is the runner round trip the
+ * approval floor was doing and no longer does.
+ *
+ * The ordinary call lands under `workspace`, which is `CHECKPOINT_CONTENT[0]`, so the undo point
+ * below covers what these commands write. It is a default and not a guarantee - the runner's
+ * `resolveInside` confines an exec cwd to the container home rather than to `workspace` - and a
+ * checkpoint that covers the common case is still the difference between a rewind and none.
+ *
+ * And the set this one is NOT about, because the obvious next move after reading the above is to
+ * finish the job and it would be wrong: `code_diagnostics` stays on `NON_MUTATING_TOOLS` in
+ * `write-classification.ts`. That set asks a third question - is the result a check, or a change
+ * whose evidence `finish` must see re-cited afterwards - and a compiler is the verification, not the
+ * thing to verify. Its own comment says so. Reading "left nothing behind" off "safe to replay" is
+ * the defect this constant exists for; reading "not a check" off "it writes" is the same mistake
+ * pointed the other way, and it would leave a model unable to ground its own completion.
+ */
+export const REPEATABLE_TOOLS_THAT_WRITE: ReadonlySet<string> = new Set(['code_diagnostics']);
+
+/**
  * Tools where the same call twice in one turn cannot say anything the first did not.
  *
  * A loop is the failure mode a step budget contains rather than prevents: an agent that cannot find
@@ -90,6 +131,10 @@ export const idempotentCallKey = (call: ModelToolCall): string =>
  * - The call cannot change the computer, so no order between it and a sibling is observable at all.
  *   `set_plan` and `set_acceptance` are the two members that write, and both are out: a plan
  *   published while the read that decides its next step is still running is a plan nobody chose.
+ *   `REPEATABLE_TOOLS_THAT_WRITE` is out for the same clause and was in for years: two `make -s`
+ *   runs over one tree race for the targets they both build, and two `cargo check`s block on the
+ *   same `target/` lock. Subtracting it costs a batch containing a diagnostic one round trip, which
+ *   is what this bullet has always been willing to pay.
  * - Its answer does not depend on when a sibling's answer lands. Everything left reads the
  *   workspace, the memory store, or a search index.
  * - The approval floor's verdict on it cannot move while the run is in flight. This is what puts
@@ -103,7 +148,9 @@ export const idempotentCallKey = (call: ModelToolCall): string =>
  */
 export const PARALLEL_SAFE_TOOLS: ReadonlySet<string> = new Set(
   [...REPEATABLE_TOOLS].filter(
-    (name) => !['set_plan', 'set_acceptance', 'parallel_web_read'].includes(name)
+    (name) =>
+      !['set_plan', 'set_acceptance', 'parallel_web_read'].includes(name) &&
+      !REPEATABLE_TOOLS_THAT_WRITE.has(name)
   )
 );
 
@@ -152,16 +199,30 @@ export const parallelToolRun = (
 /**
  * Tools that cannot change the computer, so a turn made only of these needs no undo point.
  *
- * The read-only set above is exactly the right basis: a tool that is safe to run twice after a
- * restart is a tool that left nothing behind to undo. `finish` and `compact_context` are added
+ * The read-only set above is very nearly the right basis and the inference it invites is the one
+ * defect this constant has ever had: a tool that is safe to run twice after a restart is NOT
+ * therefore a tool that left nothing behind to undo. `finish` and `compact_context` are added
  * because they are harness bookkeeping and never touch the workspace, and `notify` because the only
  * thing it reaches is the owner's own lock screen - it is not repeatable, since a second send is a
  * second buzz, but there is nothing on the computer for a checkpoint to hold. Everything else counts
  * as mutating, deliberately - a checkpoint taken before a call that turns out to change nothing
  * costs a walk of the tree and no bytes at all, and missing one costs the owner their undo.
+ *
+ * `REPEATABLE_TOOLS_THAT_WRITE` is subtracted, and that subtraction is the bound that replaced the
+ * `code_diagnostics` approval card. The card asked the owner whether to run a build recipe somebody
+ * else wrote; it asked in a place a `shell` call one line over does not ask, it charged the owner's
+ * own Rust project for their own code, and it sat on this very set claiming there was nothing to
+ * undo while the repository next door recorded `make -s` and `cargo check` writing files. So a turn
+ * of nothing but diagnostics took no undo point at all - the one shape where a rewind is most
+ * plainly wanted, because a build is the thing an owner runs on a tree they have not read.
+ *
+ * A bound beats a question. This costs one lazy tree walk on the first diagnostic of a turn that
+ * would otherwise have taken none, it cannot be tapped through, and it is right in every language
+ * rather than in nine of fifteen - which matters, because two of the six the card called safe were
+ * measured writing too (see above). What the card asked, this answers.
  */
 export const CHECKPOINT_EXEMPT_TOOLS = new Set([
-  ...REPEATABLE_TOOLS,
+  ...[...REPEATABLE_TOOLS].filter((name) => !REPEATABLE_TOOLS_THAT_WRITE.has(name)),
   'finish',
   'compact_context',
   'notify'

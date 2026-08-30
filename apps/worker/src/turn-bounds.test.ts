@@ -15,7 +15,10 @@ import {
   MAX_REPEATED_FAILURES,
   MAX_STATIONARY_ACTING_STEPS,
   MAX_STATIONARY_STEPS,
+  CHECKPOINT_EXEMPT_TOOLS,
   PARALLEL_SAFE_TOOLS,
+  REPEATABLE_TOOLS,
+  REPEATABLE_TOOLS_THAT_WRITE,
   PUSHBACK_MARKERS,
   REPEATED_FAILURES_BEFORE_STOP,
   STEP_BUDGET_HANDOFF_STEPS,
@@ -657,6 +660,57 @@ describe('a turn that lost its undo point', () => {
   });
 });
 
+/*
+ * Replay-safe is not the same as left-nothing-behind, and reading one off the other is the defect
+ * this block exists for.
+ *
+ * `code_diagnostics` is on `REPEATABLE_TOOLS` because a second `make -s` after a restart tells the
+ * owner nothing new - which is true, and is why it stays there. `CHECKPOINT_EXEMPT_TOOLS` was
+ * derived from that set wholesale, so the tool that runs a project's build and test recipe was
+ * also the tool the turn took no undo point for. A turn of nothing but diagnostics could not be
+ * rewound at all.
+ *
+ * Measured on this machine, not inferred: `make -s` on a Makefile whose default target writes a
+ * file wrote it; `cargo check --message-format short` left 50 new paths on a crate with a writing
+ * `build.rs`, and still left 16 - `Cargo.lock` and `target/` - on a crate with no `build.rs` at
+ * all. Two of the six languages the removed approval card called safe write too: `python3 -I -m
+ * compileall` leaves `__pycache__`, and `tsc --noEmit` under `incremental` leaves a
+ * `.tsbuildinfo`. So the bound is the tool, in every language, and not a list of nine.
+ *
+ * This is the bound that replaced that card. An approval card is a question the owner can tap
+ * through and a rephrasing can walk around - the same nine recipes through `shell` never asked at
+ * all. An undo point is neither.
+ */
+describe('the undo point a diagnostic no longer escapes', () => {
+  it('is taken for a tool that is safe to replay and still writes to the tree', () => {
+    expect(REPEATABLE_TOOLS.has('code_diagnostics')).toBe(true);
+    expect(REPEATABLE_TOOLS_THAT_WRITE.has('code_diagnostics')).toBe(true);
+    expect(CHECKPOINT_EXEMPT_TOOLS.has('code_diagnostics')).toBe(false);
+  });
+
+  /*
+   * The other direction, and the reason this is not simply "exempt fewer things". The exempt set
+   * has to keep covering the reads, or every `file_read` starts walking the tree for a checkpoint
+   * of nothing - which is how a bound stops being free and starts being a cost somebody removes.
+   */
+  it('still costs an ordinary read nothing at all', () => {
+    for (const name of ['file_read', 'code_search', 'repo_overview', 'web_search', 'files_list'])
+      expect(CHECKPOINT_EXEMPT_TOOLS.has(name), name).toBe(true);
+    for (const name of ['finish', 'compact_context', 'notify'])
+      expect(CHECKPOINT_EXEMPT_TOOLS.has(name), name).toBe(true);
+    // Counted, so that a subtraction which quietly took the whole set with it fails here.
+    expect(CHECKPOINT_EXEMPT_TOOLS.size).toBe(REPEATABLE_TOOLS.size - 1 + 3);
+  });
+
+  /*
+   * And the direction that matters most: the writers were never exempt and must not become so.
+   */
+  it('was already taken for everything that obviously changes the computer', () => {
+    for (const name of ['shell', 'file_write', 'file_patch', 'browser_action', 'desktop_launch'])
+      expect(CHECKPOINT_EXEMPT_TOOLS.has(name), name).toBe(false);
+  });
+});
+
 describe('the reads a batch may run at the same time', () => {
   const read = (id: string, path: string): ModelToolCall => ({
     id,
@@ -671,6 +725,9 @@ describe('the reads a batch may run at the same time', () => {
     // nobody chose.
     expect(PARALLEL_SAFE_TOOLS.has('set_plan')).toBe(false);
     expect(PARALLEL_SAFE_TOOLS.has('set_acceptance')).toBe(false);
+    // The third writer, and the one that hid in here for years because it only ever reads back.
+    // Two `make -s` runs over one tree race for the targets they both build.
+    expect(PARALLEL_SAFE_TOOLS.has('code_diagnostics')).toBe(false);
     // The exfiltration floor's per-turn novelty budget is charged when a result is recorded, so two
     // web reads judged against the same spent total can jointly pass a bound that would have
     // carded the second. Replay safety does not imply that, which is why this set is not simply

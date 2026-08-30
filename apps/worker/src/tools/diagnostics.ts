@@ -1,16 +1,68 @@
 /**
- * What `code_diagnostics` will actually run, and which of those commands is the repository's own.
+ * What `code_diagnostics` will actually run: fifteen languages, the marker each is recognised by,
+ * and the one command each resolves to.
  *
- * This is one table read by two callers that must never disagree. `tools/repository.ts` runs the
- * command; `approval-policy.ts` decides whether the owner is asked first. While the ladder lived
- * only in the dispatch arm the floor could not see it at all - `code_diagnostics` appeared nowhere
- * in `approval-policy.ts`, in any security mode - so a tool that runs `go test ./...`, `make -s` and
- * `cargo check` ran them with nothing shown to anybody.
+ * ── What stops a cloned repository's build recipe, and what does not ───────────────────────────
  *
- * A leaf module rather than an export from `repository.ts` because `approval-policy.ts` must import
- * it: `repository.ts` reaches `tool-dispatch.js`, and an import back the other way closes a cycle
- * whose evaluation order decides whether the floor reads an initialised table or throws on the
- * temporal dead zone. The same answer `CODE_SEARCH_COLLAPSE_LINES` records one file over.
+ * Stated here plainly because it used to be answered by an approval card, and a stated limit is
+ * worth more than a card that asks about one of two doors.
+ *
+ * Nine of these fifteen commands are the project's own build or test recipe, so what executes is a
+ * file whoever wrote the repository chose: `cargo check` compiles and runs `build.rs` and the
+ * crate's procedural macros; `go test ./...` builds and runs the repository's tests; `make -s` runs
+ * a Makefile target; `mvn compile` and `dotnet build` run the plugins and tasks the project file
+ * names; `gradle` evaluates `build.gradle` as a program, and the `gradlew` form runs a script that
+ * is itself in the tree; `swift build` compiles and runs `Package.swift`; `Rscript` sources an
+ * `.Rprofile` from the working directory before it reaches the parse loop; `terraform validate`
+ * launches the provider plugins under `.terraform`. The other six - TypeScript, Python, Julia,
+ * Ruby, PHP, Dart - name a fixed parser or type-checker over files the repository supplies as data.
+ *
+ * WHAT STOPS IT: nothing in the approval floor, and that is deliberate. A card was tried here and
+ * removed. `shell` runs the identical nine commands with no card in balanced or autonomous, so the
+ * card asked about a shape the model reaches unasked one line over; `npm install` makes every
+ * project's dependency tree foreign and the build then runs it, so a rule honest enough to call
+ * `node_modules` a stranger's would card every build there is. Running someone else's code is the
+ * job here, not the exception.
+ *
+ * WHAT DOES STOP IT: two bounds and one limit, none of them a question.
+ *   1. The turn takes an undo point first. `code_diagnostics` is subtracted from
+ *      `CHECKPOINT_EXEMPT_TOOLS` (`turn-bounds.ts`) by name, in every language, so the writes
+ *      measured below are rewindable. This is the repair the card was standing in for.
+ *   2. It runs under a bounded timeout - `clampNumber(timeoutSeconds, 10..1800, 300)` in the
+ *      dispatch arm - and under `cwd: path`, whose default is `workspace`. Say what that confinement
+ *      is and is not, because the difference decides whether bound 1 reaches: the runner's
+ *      `resolveInside` refuses a path outside the CONTAINER HOME, not outside `workspace`, and
+ *      `isUserData` is not applied to an exec cwd. So the ordinary call - `workspace`, or a
+ *      directory under it - runs inside `CHECKPOINT_CONTENT` and is fully rewindable, and a call
+ *      naming `.athanor/browser` would not be, since the roots pick that up only when
+ *      `CHECKPOINT_INCLUDE_BROWSER_PROFILE` is on and it ships off. Nothing confines where the
+ *      command writes once it has started; that is rung 0, below.
+ *   3. And the limit, unhedged: beyond that, a build recipe runs with whatever this task can reach.
+ *      The sandbox is an IDENTITY boundary and not a filesystem one. `scripts/athanor-sandbox` is
+ *      `setpriv --reuid --regid --clear-groups --no-new-privs`; there is no bwrap, no landlock and
+ *      no filter on what a command may open. `execution.ts` sets `HOME` to the workspace root,
+ *      which is one level ABOVE `CHECKPOINT_CONTENT`, so a recipe that writes to `$HOME/.cargo` or
+ *      `$HOME/.gradle` writes outside what bound 1 can rewind. And `ISOLATE_AGENT_NETWORK` ships
+ *      false, so the recipe has the host's ordinary network access whatever the call declared.
+ *      `docs/design/floor/DIAGNOSTICS.md` argues that rather than mentioning it: it is rung-0 work,
+ *      it is not this wave's, and a card on rung 3 was never going to substitute for it.
+ *
+ * Measured on this machine rather than assumed, and it is why the bound is unconditional rather
+ * than per-language: `make -s` on a Makefile whose target writes a file wrote it; `cargo check` on
+ * a crate with a writing `build.rs` left 50 new paths and on a crate with NO `build.rs` at all
+ * still left 16; and two of the six "parse only" languages write too - `python3 -I -m compileall`
+ * leaves `__pycache__`, `tsc --noEmit` under `incremental` leaves a `.tsbuildinfo`. The nine/six
+ * split is a fact about whose program runs. It was never the write/no-write split, and no bound
+ * should be keyed to it.
+ *
+ * ── Why this is its own module ────────────────────────────────────────────────────────────────
+ *
+ * A leaf rather than an export from `repository.ts`, which is the only caller that runs these
+ * commands: `repository.ts` imports `tool-dispatch.js`, so a test that wanted to ask what a
+ * `Cargo.toml` resolves to would drag the dispatch table and the runner client in behind it. The
+ * ladder and the table are the subject of their own suite and of the design note above, and they
+ * are worth reading without that. The same answer `CODE_SEARCH_COLLAPSE_LINES` records one file
+ * over.
  */
 
 export interface DiagnosticsCommand {
@@ -54,15 +106,19 @@ export const diagnosticsCommand = (
       ? { executable: 'pnpm', args: ['exec', 'tsc', '--noEmit', '--pretty', 'false'] }
       : { executable: 'npx', args: ['--no-install', 'tsc', '--noEmit', '--pretty', 'false'] };
   /*
-   * `-I` is not decoration, and it is the reason Python is not on the carded table below.
+   * `-I` is not decoration, and it is the one place in this table where a hole was closed instead
+   * of described.
    *
    * `python3 -m compileall` puts the working directory at the front of `sys.path`, so a repository
    * with a `compileall.py` at its root has that file imported and executed instead of the standard
    * library's - measured on this machine against CPython 3.10.10, where a `compileall.py` writing to
    * stderr produced its line and exit 0. `-I` is isolated mode: neither the script directory nor the
-   * user site directory is on `sys.path`, the same run leaves the repository's file alone, and the
-   * `__pycache__` entries for the real sources are still written. Without it Python would belong
-   * beside `make` and `cargo`, and the card would be asking about a hole that can simply be closed.
+   * user site directory is on `sys.path`, and the same run leaves the repository's file alone.
+   * Without it Python would be running a stranger's program the way `make` and `cargo` do, and no
+   * amount of asking the owner about it would have been as good as the flag.
+   *
+   * The `__pycache__` entries for the real sources are still written, which is why Python does not
+   * escape the undo point either: see `REPEATABLE_TOOLS_THAT_WRITE`.
    */
   if (language === 'python')
     return { executable: 'python3', args: ['-I', '-m', 'compileall', '-q', '.'] };
@@ -122,55 +178,3 @@ export const diagnosticsCommand = (
   if (language === 'dart') return { executable: 'dart', args: ['analyze'] };
   return undefined;
 };
-
-/**
- * ONE SENTENCE, AND IT IS THE WHOLE RULE: the card fires on the languages whose diagnostic is the
- * project's own build or test recipe - where what runs is a file the repository author wrote - and
- * not on the languages where athanor names a fixed parser or type-checker that the repository's own
- * files cannot redirect.
- *
- * The value is what the owner is told decides it, because "this runs arbitrary code" is an adjective
- * and `build.rs` is a fact they can go and read. Presence in this table is the whole of the test:
- * a language here cards in every security mode, a language absent from it never cards, and
- * `diagnostics.test.ts` fails if the catalogue offers a language this table has not judged either
- * way.
- *
- * Measured on this machine rather than assumed, for the three that can be run here:
- *   - `make -s` on a Makefile whose default target writes a file wrote it (exit 0).
- *   - `cargo check --message-format short` on a crate with a `build.rs` that writes a file ran it
- *     (cargo 1.x, "Compiling x v0.1.0", then the file existed).
- *   - `ruby -e '...compile_file...'` over a script whose top level writes a file did NOT write it,
- *     which is why Ruby is absent: `RubyVM::InstructionSequence.compile_file` compiles and stops.
- *
- * The rest are the documented job of the command. `go test ./...` builds and runs the repository's
- * tests. `mvn compile` runs the plugins the `pom.xml` names, and `dotnet build` the tasks the
- * project file names. `gradle` evaluates `build.gradle` as a program, and the `gradlew` form is
- * worse than that: the executable is itself a script in the repository, which fetches and runs the
- * distribution its own properties file names. `swift build` compiles and runs `Package.swift` to
- * get the manifest. `Rscript` sources an `.Rprofile` from the working directory before it reaches
- * the parse loop the arguments ask for, so the repository chooses what runs even though the command
- * only means to parse. `terraform validate` launches the provider plugins under `.terraform` to read
- * their schemas, and those are executables sitting in the tree.
- *
- * Deliberately absent, and each for a reason rather than by omission: TypeScript and Python are the
- * two languages nearly all of this product's own work is in, and a card on them is a card tapped
- * through by Tuesday. `tsc --noEmit` type-checks and emits nothing; `python3 -I -m compileall`
- * byte-compiles in isolated mode and imports nothing of the repository's (see above). Julia, Ruby,
- * PHP and Dart are parse-and-analyse commands over files the repository supplies as *data*.
- */
-export const REPOSITORY_DIRECTED_DIAGNOSTICS: Readonly<Record<string, string>> = {
-  rust: 'a build.rs and the procedural macros the crate depends on, which cargo compiles and runs',
-  go: "the repository's own test files, which go test compiles and runs",
-  java: 'the pom.xml plugins, or build.gradle - and where a gradlew is present, a script in the repository itself',
-  kotlin:
-    'build.gradle - and where a gradlew is present, a script in the repository itself, which fetches the toolchain its properties file names',
-  csharp: 'the build tasks the .csproj or .sln names, which MSBuild loads and runs',
-  cpp: 'the recipes in the Makefile, or the custom commands in the generated CMake build',
-  swift: 'Package.swift, which swift build compiles and runs to produce the manifest',
-  r: 'an .Rprofile in this directory, which R runs at startup before it parses anything',
-  terraform: 'the provider plugins under .terraform, which validate launches to read their schemas'
-};
-
-/** What in this repository decides what the diagnostic runs, or null when nothing there does. */
-export const repositoryDirectedDiagnostic = (language: string): string | null =>
-  REPOSITORY_DIRECTED_DIAGNOSTICS[language] ?? null;

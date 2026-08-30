@@ -268,18 +268,26 @@ for (const id of [
 /*
  * Three verdicts a reader would be surprised by, pinned by value.
  *
- * `shell_network` is the branch that earns nothing: a command with `network:true` cards on a clean
- * turn as well, so the taint block's third arm changes no answer. `shell_service` is the opposite
- * shape - both arms card and the tainted one asks harder - and it is the only row that distinguishes
- * "the floor moved" from "the floor decided". `egress_known_host` is a channel that is open in both
- * arms and must keep saying so.
+ * `shell_network` is `node ingest.js` with `network: true`, and it is now an OPEN channel in
+ * balanced: neither arm cards. It was pinned here as `blanket` - both arms card, so the taint block
+ * earns nothing on it - and that was true of a floor that read the declaration. It no longer does:
+ * `execution.ts` isolates only when `policy.isolateNetwork && !request.network` and
+ * `ISOLATE_AGENT_NETWORK` ships false, so the flag bought no confinement and the card it bought was
+ * reachable only through a model honest enough to set it. The identical call with the field left out
+ * was already open, which is why this is a verdict changing its name rather than a channel opening.
+ * See `docs/design/floor/TAINT.md`. It stays pinned by value, in the other direction, because a
+ * `blanket` appearing here again would mean a branch has gone back to reading what the model says.
+ *
+ * `shell_service` is the opposite shape - both arms card and the tainted one asks harder - and it is
+ * the only row that distinguishes "the floor moved" from "the floor decided". `egress_known_host` is
+ * a channel that is open in both arms and must keep saying so.
  */
 const balanced = attribution('balanced', SHIPPED);
 const verdictOf = (id: string): string =>
   balanced.rows.find((row) => row.id === id)?.verdict ?? 'missing';
 expect(
-  verdictOf('shell_network') === 'blanket',
-  `shell with network access cards on a clean turn too; got ${verdictOf('shell_network')}`
+  verdictOf('shell_network') === 'open',
+  `a declared network flag must buy neither access nor a card; got ${verdictOf('shell_network')}`
 );
 expect(
   verdictOf('shell_service') === 'raised',

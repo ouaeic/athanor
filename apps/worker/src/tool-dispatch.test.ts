@@ -1317,21 +1317,20 @@ describe('the repository arms', () => {
     );
 
     /*
-     * Two listings, and the first one is the approval floor's.
+     * ONE listing, and it was two.
      *
-     * `language` defaults to `auto`, so which command this call runs is decided by what the
-     * directory holds - and the floor has to know that before the call, because nine of the fifteen
-     * diagnostics are the project's own build. So it takes the same listing from the same endpoint
-     * and reads it through the same table. The cost is one directory read; the alternative is a
-     * floor judging `make -s` as if it were `tsc --noEmit`.
+     * `language` defaults to `auto`, so which command runs is decided by what the directory holds,
+     * and this arm has always had to read it. The approval floor read it too, from the same
+     * endpoint with the same path, so that the removed `code_diagnostics` card could tell
+     * `tsc --noEmit` from `make -s` before asking about it. That card is gone - the same nine
+     * recipes run through `shell` without asking, so it was a toll on the phrasing - and the round
+     * trip went with it. The bound that replaced it needs no lookup at all: the turn takes its undo
+     * point for every diagnostic, whatever the listing would have said.
+     *
+     * Asserted as the exact call list rather than as a `find`, because a saving of one runner call
+     * per diagnostic is invisible in every other shape this test could take.
      */
     expect(executed.calls).toEqual([
-      {
-        method: 'GET',
-        path: `${root}/files?path=workspace%2Fapp`,
-        scopes: ['files.read'],
-        body: undefined
-      },
       {
         method: 'GET',
         path: `${root}/files?path=workspace%2Fapp`,
@@ -1380,8 +1379,9 @@ describe('the repository arms', () => {
       }
     );
 
-    // Found by route rather than by index: the approval floor takes a listing of its own ahead of
-    // this call, and an index here would be asserting about whichever call happened to be second.
+    // Found by route rather than by index. It was written that way when the approval floor took a
+    // listing of its own ahead of this call; the floor no longer does, and finding the exec by its
+    // path is still the right shape - what is being asserted is the clamp, not the call order.
     const exec = executed.calls.find((entry) => entry.path === `${root}/exec`);
     expect(exec?.body).toMatchObject({ timeoutSeconds: 300 });
   });
@@ -1395,12 +1395,10 @@ describe('the repository arms', () => {
       }
     );
 
-    // The floor's listing and this call's listing, and no exec at all: a directory holding no
-    // project marker resolves to no command on both sides, so nothing is run and nothing is asked.
-    expect(executed.calls.map((entry) => entry.path)).toEqual([
-      `${root}/files?path=workspace`,
-      `${root}/files?path=workspace`
-    ]);
+    // One listing and no exec at all: a directory holding no project marker resolves to no command,
+    // so nothing is run and nothing is asked. It was two listings while the approval floor took one
+    // of its own to decide a card that no longer exists.
+    expect(executed.calls.map((entry) => entry.path)).toEqual([`${root}/files?path=workspace`]);
     expect(executed.result).toMatchObject({ available: false });
   });
 

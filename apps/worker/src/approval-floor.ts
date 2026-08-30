@@ -23,7 +23,6 @@ import {
 } from './media.js';
 import type { AgentRunnerClient } from './runner-client.js';
 import { approvalRequirement, surfaceActionRequest, type ApprovalContext } from './tools.js';
-import { diagnosticsCommand, diagnosticsLanguage } from './tools/diagnostics.js';
 import { textValue } from './values.js';
 
 /** What the floor needs from the worker that owns the turn. */
@@ -130,10 +129,19 @@ export const approvalForCall = async (
     call.name === 'skill' && textValue(call.arguments.action) === 'upsert'
       ? await existingSkillFor(deps, task, textValue(call.arguments.name))
       : undefined;
-  const diagnostics =
-    call.name === 'code_diagnostics' ? await diagnosticsForCall(deps, task, call) : undefined;
+  /*
+   * `code_diagnostics` had a lookup of its own here, and it went with the card it fed.
+   *
+   * It took a directory listing from the runner before every diagnostic, so the floor could tell
+   * `tsc --noEmit` from `make -s` on arguments that say only `language: 'auto'`. That round trip
+   * bought one thing and one thing only: the wording of a card that no longer exists. The dispatch
+   * arm takes the same listing a moment later and acts on it, which is where the answer was always
+   * needed; asking for it twice to decide a question nobody asks any more is a runner call per
+   * diagnostic for nothing. The bound that replaced the card is in `turn-bounds.ts` and needs no
+   * lookup at all: every `code_diagnostics` call takes the turn's undo point, whatever it resolves
+   * to.
+   */
   const declared = approvalRequirement(call.name, call.arguments, task.securityMode, {
-    ...(diagnostics ? { diagnostics } : {}),
     ...(call.name === 'generate_media'
       ? {
           mediaCommittedUsd: await mediaCommittedUsd(deps, task),
@@ -208,53 +216,6 @@ export const approvalForCall = async (
     // The execution call will return the browser's authoritative error if preflight is unavailable.
   }
   return declared;
-};
-
-/**
- * Which of the fifteen diagnostics this call will actually select, taken the way the call will take
- * it.
- *
- * The floor needs this and the arguments cannot carry it: `language` is `auto` by default, and the
- * dispatch arm picks the command from a directory listing. So the listing is taken here too, from
- * the same endpoint with the same `path`, and read through the same table
- * (`tools/diagnostics.ts`) - one function, so the language the owner was asked about and the
- * language that then runs cannot be two different languages.
- *
- * `undefined` on any failure, which `approvalRequirement` reads as unknown and cards on. That is the
- * opposite of how `mediaModelForCall` treats an unreadable credential, and deliberately: there, not
- * knowing the route costs the owner a price on a card, and refusing would replace a clear provider
- * error with a failed turn. Here, not knowing is not knowing whether the next thing to happen is
- * `tsc --noEmit` or a Makefile target somebody else wrote.
- */
-export const diagnosticsForCall = async (
-  deps: ApprovalFloorDeps,
-  task: TaskRecord,
-  call: ModelToolCall
-): Promise<ApprovalContext['diagnostics']> => {
-  const path = textValue(call.arguments.path, 'workspace');
-  try {
-    const listing = await deps.runner.call<{ entries: Array<{ name: string }> }>(
-      task.workspaceId,
-      task.id,
-      'files.read',
-      `/v1/workspaces/${task.workspaceId}/files?path=${encodeURIComponent(path)}`
-    );
-    const names = new Set((listing.entries ?? []).map((entry) => entry.name));
-    const language = diagnosticsLanguage(textValue(call.arguments.language, 'auto'), names);
-    const command = diagnosticsCommand(language, names);
-    /*
-     * No command is still an answer, and it must not come back as `undefined`. It is the
-     * `available: false` reply the dispatch arm gives for a directory holding no project marker,
-     * where nothing is executed at all - so it is resolved, and resolved as nothing. Returning
-     * `undefined` for it would put it in the unreadable case and card the one shape of this call
-     * that provably runs no command.
-     */
-    return command
-      ? { language, command: [command.executable, ...command.args].join(' ') }
-      : { language: '', command: '' };
-  } catch {
-    return undefined;
-  }
 };
 
 /**
