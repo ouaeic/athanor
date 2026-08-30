@@ -13,6 +13,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import {
   applyMemoryReviewVerb,
   memoryExcerptIsClipped,
+  memoryOriginFact,
+  memoryOriginLabel,
   memoryReviewContradictions,
   memoryReviewFacts,
   memoryReviewFailure,
@@ -20,8 +22,10 @@ import {
   MemoryReviewLists,
   memoryProposalStanding,
   memoryReviewReason,
+  refuseMemoryProposals,
   withoutMemoryItem,
-  withoutMemoryProposal
+  withoutMemoryProposal,
+  withoutMemoryProposals
 } from './MemoryReview.js';
 import type { MemoryProposal, MemoryReview, MemoryReviewItem } from './api.js';
 
@@ -33,6 +37,7 @@ const item = (over: Partial<MemoryReviewItem> = {}): MemoryReviewItem => ({
   observedAt: '2026-02-01T09:00:00.000Z',
   taskId: 'task-9',
   trust: 'derived',
+  origin: 'watched',
   validFrom: '2026-02-01T09:00:00.000Z',
   validTo: null,
   lastVerified: null,
@@ -143,16 +148,24 @@ describe('two things the box holds that disagree', () => {
           kind: 'fact',
           status: 'disputed',
           trust: 'stated',
+          origin: 'stated',
           excerpt: 'Invoices go to accounts@example.test'
         }),
         contradicts: ['fact-b']
       },
+      /*
+       * The other side is a model's wording of something the owner said, which is the pair that
+       * matters: `resolveMemoryContradiction` lets a stated fact retire a derived one outright, so
+       * which of these two the owner keeps is decided by knowing which is which - and both used to
+       * be drawn as "The box worked this out".
+       */
       {
         ...item({
           id: 'fact-b',
           kind: 'fact',
           status: 'disputed',
-          trust: 'stated',
+          trust: 'derived',
+          origin: 'proposed',
           excerpt: 'Invoices go to billing@example.test'
         }),
         contradicts: ['fact-a']
@@ -181,6 +194,79 @@ describe('two things the box holds that disagree', () => {
     expect(markup).not.toContain('Still right');
     expect(markup).toContain('Stop believing it');
   });
+
+  /*
+   * The defect this whole vertical exists for, on the screen where the owner has to choose between
+   * two lines. Both of these are facts about the same thing; one is the owner's own sentence and
+   * one is a model's wording of what it read them say, and the store calls the second `derived` -
+   * the same word it uses for a command the harness ran. A headline drawn off `trust` said "The box
+   * worked this out" over the model's rule and nothing at all about where the words came from.
+   */
+  it('names which side of the computer wrote each of two lines that disagree', () => {
+    const markup = render(pair());
+    expect(markup).toContain('<strong>You said this</strong>');
+    expect(markup).toContain('<strong>A model wrote this</strong>');
+    // Both directions on one render: neither headline is applied to both rows.
+    expect(markup.match(/<strong>A model wrote this<\/strong>/gu)).toHaveLength(1);
+    expect(markup.match(/<strong>You said this<\/strong>/gu)).toHaveLength(1);
+    expect(markup).not.toContain('The box worked this out');
+  });
+});
+
+/*
+ * Where a row came from, which `trust` cannot say and every screen used to read off it anyway.
+ *
+ * Two of the three things that write to `mem.item` set `trust: 'derived'`, and they are the two
+ * furthest apart in the subsystem: a sentence a model wrote about the owner, pinned in front of
+ * every later task in the workspace, and a note that the harness ran a command and watched it fail.
+ * A two-way branch had to round one of them onto the other.
+ */
+describe('which side of the computer put a row there', () => {
+  it('gives three answers where trust gives two, and does not use the same word twice', () => {
+    expect(memoryOriginLabel('stated')).toBe('You said this');
+    expect(memoryOriginLabel('proposed')).toBe('A model wrote this');
+    expect(memoryOriginLabel('watched')).toBe('The box watched this');
+    expect(new Set(['stated', 'proposed', 'watched'] as const).size).toBe(3);
+  });
+
+  /*
+   * The long form, which is the claim rather than the heading. The middle one has to say that the
+   * words are a machine's and that the row is acted on anyway, because a rule that is obeyed and
+   * was never the owner's wording is the exact thing they are being asked to check.
+   */
+  it('says of a promoted proposal that the words are a model’s and that it is acted on', () => {
+    const model = memoryOriginFact('proposed');
+    expect(model).toContain('A model wrote this sentence out of your own messages');
+    expect(model).toContain('acted on');
+    // And neither of the other two claims a model wrote it, which is what makes the first one mean
+    // something: a fact line saying it everywhere would pass a test that only looked here. The
+    // harness line does say the word, in the sentence that denies it - "no model was asked for it"
+    // is the whole point of telling these two apart.
+    expect(memoryOriginFact('stated')).not.toContain('model');
+    expect(memoryOriginFact('watched')).not.toContain('A model wrote this');
+    expect(memoryOriginFact('watched')).toContain('no model was asked for it');
+    expect(memoryOriginFact('stated')).toContain('You said this');
+    expect(memoryOriginFact('watched')).toContain('as it watched the work');
+  });
+
+  /* And the row shows it, rather than the helper being right where nothing calls it. */
+  it('puts it on the row a decision is made on', () => {
+    expect(render(queue())).toContain('The box wrote this down as it watched the work');
+    expect(
+      render({
+        procedures: [
+          {
+            ...item({ trust: 'stated', origin: 'stated' }),
+            reason: 'unverified',
+            recentOkCount: 0,
+            recentGradedCount: 0
+          }
+        ],
+        disputed: [],
+        proposals: []
+      })
+    ).toContain('You said this; the box did not work it out.');
+  });
 });
 
 /*
@@ -194,7 +280,7 @@ describe('reading the whole of what was written down', () => {
     const markup = render(queue());
     expect(markup).toContain('<details');
     expect(markup).not.toContain('<details open');
-    expect(markup).toContain('The box worked this out for itself.');
+    expect(markup).toContain('The box wrote this down as it watched the work');
     expect(markup).toContain('Never confirmed since.');
     expect(markup).toContain('Used 7 times: it worked 2 and failed 5.');
   });
@@ -412,6 +498,106 @@ describe('a rule that has been put forward and is not remembered', () => {
     ).toContain('remember this');
   });
 
+  /*
+   * One press for the whole group, because the group is the unit the owner judges in.
+   *
+   * These arrive three a night against a standing twenty and the proposer stops outright when the
+   * list is full, so a screenful nobody can clear in one gesture is a mechanism that switches
+   * itself off. Three directions, because two of them are ways of getting this wrong: a control
+   * with nothing behind it, and a "refuse all 1" beside a row that already carries its own button.
+   */
+  it('offers one press for a group, none for a group of one, and none with nothing behind it', () => {
+    const two = {
+      procedures: [],
+      disputed: [],
+      proposals: [proposal(), proposal({ id: 'b'.repeat(32), sentence: 'Never push to main.' })]
+    };
+    const draw = (
+      value: MemoryReview,
+      onDismissAll?: (proposals: readonly MemoryProposal[]) => void
+    ): string =>
+      renderToStaticMarkup(
+        <MemoryReviewLists
+          queue={value}
+          onAct={() => undefined}
+          onDismiss={() => undefined}
+          {...(onDismissAll ? { onDismissAll } : {})}
+        />
+      );
+    expect(draw(two)).not.toContain('Refuse all');
+    expect(
+      draw({ procedures: [], disputed: [], proposals: [proposal()] }, () => undefined)
+    ).not.toContain('Refuse all');
+    const grouped = draw(two, () => undefined);
+    expect(grouped).toContain('Refuse all 2');
+    /* Armed by the first press, exactly as the delete inside a row is: the irreversible sentence
+       is not in the markup until somebody has asked for it. */
+    expect(grouped).not.toContain('Yes, refuse all');
+  });
+
+  /*
+   * What leaves for the box, and what the screen does with the answer. A refusal is permanent, so
+   * both halves are asserted: one row sends the handle the route has always taken, a group sends
+   * the list, and neither sends "all of them" - a proposal written while the owner was reading is
+   * one nobody has looked at, and a durable refusal must never take one of those.
+   */
+  it('sends one handle for one row and the named list for a group, and drops exactly those rows', async () => {
+    const before: MemoryReview = {
+      procedures: queue().procedures,
+      disputed: [],
+      proposals: [
+        proposal(),
+        proposal({ id: 'b'.repeat(32), sentence: 'Never push to main.' }),
+        proposal({ id: 'c'.repeat(32), sentence: 'Ask before spending money.' })
+      ]
+    };
+    answer({ dismissed: 1 });
+    const afterOne = await refuseMemoryProposals('ws-1', [before.proposals[0]!], before);
+    expect(calls).toEqual([
+      { url: '/v1/workspaces/ws-1/memory-proposals/dismiss', method: 'POST' }
+    ]);
+    expect(afterOne.proposals.map((row) => row.id)).toEqual(['b'.repeat(32), 'c'.repeat(32)]);
+
+    calls.length = 0;
+    answer({ dismissed: 2 });
+    const afterGroup = await refuseMemoryProposals(
+      'ws-1',
+      [before.proposals[0]!, before.proposals[1]!],
+      before
+    );
+    expect(calls).toHaveLength(1);
+    // The row it was not shown is still there, and the two lists it was not about are untouched.
+    expect(afterGroup.proposals.map((row) => row.id)).toEqual(['c'.repeat(32)]);
+    expect(afterGroup.procedures).toHaveLength(1);
+  });
+
+  /*
+   * The two failure directions the single refusal already keeps, kept for the group as well. A 404
+   * means every handle named was already gone, so the rows go; anything else is the box not having
+   * heard, and rows that vanish on a blip would leave the owner believing they had refused
+   * something they had not.
+   */
+  it('drops a group the box says it does not have, and keeps one it never heard about', async () => {
+    const before: MemoryReview = {
+      procedures: [],
+      disputed: [],
+      proposals: [proposal(), proposal({ id: 'b'.repeat(32), sentence: 'Never push to main.' })]
+    };
+    answer(
+      { error: { code: 'memory_proposal_not_found', message: 'Proposal not found' } },
+      { status: 404 }
+    );
+    expect((await refuseMemoryProposals('ws-1', before.proposals, before)).proposals).toEqual([]);
+
+    vi.stubGlobal('fetch', () => Promise.reject(new TypeError('Failed to fetch')));
+    await expect(refuseMemoryProposals('ws-1', before.proposals, before)).rejects.toThrow();
+
+    // And a refusal of nothing asks the box for nothing at all.
+    calls.length = 0;
+    expect(await refuseMemoryProposals('ws-1', [], before)).toBe(before);
+    expect(calls).toEqual([]);
+  });
+
   it('takes only the proposal it was asked about, and leaves the other lists alone', () => {
     const before = {
       procedures: queue().procedures,
@@ -427,5 +613,8 @@ describe('a rule that has been put forward and is not remembered', () => {
       false
     );
     expect(memoryReviewIsEmpty({ procedures: [], disputed: [], proposals: [] })).toBe(true);
+    // The group helper the single one is built out of, named one handle at a time in both.
+    expect(withoutMemoryProposals(before, ['a'.repeat(32), 'b'.repeat(32)]).proposals).toEqual([]);
+    expect(withoutMemoryProposals(before, []).proposals).toHaveLength(2);
   });
 });

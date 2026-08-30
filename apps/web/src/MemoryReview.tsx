@@ -22,7 +22,12 @@
  */
 import { useEffect, useState } from 'react';
 import { BookOpenText, Trash2, X } from 'lucide-react';
-import { api, type MemoryReview as MemoryReviewQueue, type MemoryReviewItem } from './api.js';
+import {
+  api,
+  type MemoryItemOrigin,
+  type MemoryReview as MemoryReviewQueue,
+  type MemoryReviewItem
+} from './api.js';
 import { ApiFailure } from './api-failure.js';
 import { describeFailure } from './failure-text.js';
 import { memoryItemBody } from './memory-api.js';
@@ -72,17 +77,47 @@ export const memoryReviewReason = (row: ProcedureRow): string => {
 };
 
 /**
+ * Where a row came from, in three words rather than two.
+ *
+ * Every screen that has ever shown this drew it off `trust`, which has two values in use and calls
+ * two entirely different things `derived`: a sentence a model wrote about the owner out of their
+ * own messages, and a command the harness ran and watched the result of. So "the box worked this
+ * out for itself" was said equally over a rule that is obeyed in every later conversation and over
+ * a note that `pnpm check` passed - and the first of those is the one the owner would want to
+ * argue with. The route answers the three-way question now and this is where it is read.
+ */
+export const memoryOriginLabel = (origin: MemoryItemOrigin): string =>
+  origin === 'stated'
+    ? 'You said this'
+    : origin === 'proposed'
+      ? 'A model wrote this'
+      : 'The box watched this';
+
+/**
+ * The same three, said as the sentence a person would say, for the row's own expander.
+ *
+ * Longer than the label because the label is a heading and this is the claim. The middle one is the
+ * whole reason the distinction exists: a promoted proposal is a machine's wording of something the
+ * owner said, it is pinned in front of every later task in the workspace, and nothing on any screen
+ * used to say so.
+ */
+export const memoryOriginFact = (origin: MemoryItemOrigin): string =>
+  origin === 'stated'
+    ? 'You said this; the box did not work it out.'
+    : origin === 'proposed'
+      ? 'A model wrote this sentence out of your own messages. The words are its, not yours, and it is acted on like the rest.'
+      : 'The box wrote this down as it watched the work: nobody said it and no model was asked for it.';
+
+/**
  * What a decision about this row would actually rest on.
  *
- * The review route projects all of it - which conversation wrote it, how far it is trusted, when it
- * was last confirmed, what it has been worth in use - precisely because the narrower memory list
- * drops every one of those fields, and "delete this or keep it" is unanswerable without them.
+ * The review route projects all of it - which conversation wrote it, where it came from, when it
+ * was last confirmed, what it has been worth in use - and "delete this or keep it" is unanswerable
+ * without them.
  */
 export const memoryReviewFacts = (item: MemoryReviewItem): string[] => {
   const facts = [
-    item.trust === 'stated'
-      ? 'You said this; the box did not work it out.'
-      : 'The box worked this out for itself.',
+    memoryOriginFact(item.origin),
     `Written down ${on(item.observedAt) ?? 'at an unrecorded time'}.`,
     item.lastVerified === null
       ? 'Never confirmed since.'
@@ -152,14 +187,26 @@ export const withoutMemoryItem = (queue: MemoryReviewQueue, itemId: string): Mem
   proposals: queue.proposals
 });
 
+/**
+ * The queue without a whole group of proposals, named one by one.
+ *
+ * Not `proposals: []`. The screen refuses exactly the handles it was showing, so anything the box
+ * put forward while the owner was reading is still there afterwards - which is the same rule the
+ * route keeps on its own side, and the reason neither end has a "refuse everything" flag.
+ */
+export const withoutMemoryProposals = (
+  queue: MemoryReviewQueue,
+  proposalIds: readonly string[]
+): MemoryReviewQueue => {
+  const refused = new Set(proposalIds);
+  return { ...queue, proposals: queue.proposals.filter((row) => !refused.has(row.id)) };
+};
+
 /** The queue without one proposal, which is addressed by its own id and never by an item's. */
 export const withoutMemoryProposal = (
   queue: MemoryReviewQueue,
   proposalId: string
-): MemoryReviewQueue => ({
-  ...queue,
-  proposals: queue.proposals.filter((row) => row.id !== proposalId)
-});
+): MemoryReviewQueue => withoutMemoryProposals(queue, [proposalId]);
 
 /** Nothing to review at all, which is three empty lists and not two. */
 export const memoryReviewIsEmpty = (queue: MemoryReviewQueue): boolean =>
@@ -216,6 +263,44 @@ export const applyMemoryReviewVerb = async (
     if (!(cause instanceof ApiFailure) || cause.status !== 404) throw cause;
   }
   return withoutMemoryItem(queue, itemId);
+};
+
+/**
+ * "No, don't remember that", about one rule or about the whole group, and the queue that leaves.
+ *
+ * One function for both gestures, so the round trip is assertable rather than living inside a
+ * handler: what leaves this file for the box, and what the screen does with the answer, are the two
+ * halves of a refusal that is permanent, and the second half is where a refusal goes wrong silently.
+ *
+ * Two bodies, deliberately. A single row's button sends the handle the route has always taken; the
+ * group's button sends the list. Collapsing them onto the array would leave the route's single form
+ * with nothing that sends it, which is exactly the shape of a feature nobody exercises - and the
+ * two really are different gestures, which is worth saying on the wire.
+ *
+ * One request for the group rather than one per row. Twenty presses behind twenty idempotency keys
+ * can half-succeed, and a screen holding the half that failed cannot say which half that was.
+ *
+ * A 404 takes the rows away too, exactly as the three verbs above do: the route answers
+ * `memory_proposal_not_found` when NONE of the handles named is an open proposal in this workspace,
+ * which means the screen is holding rows the box does not have. Anything else is a real failure and
+ * is thrown, because a proposal that quietly vanishes on a network blip would leave the owner
+ * believing they had refused something they had not.
+ */
+export const refuseMemoryProposals = async (
+  workspaceId: string,
+  proposals: readonly { id: string }[],
+  queue: MemoryReviewQueue
+): Promise<MemoryReviewQueue> => {
+  const ids = proposals.map((proposal) => proposal.id);
+  if (ids.length === 0) return queue;
+  try {
+    const only = ids.length === 1 ? ids[0] : undefined;
+    if (only !== undefined) await api.dismissMemoryProposal(workspaceId, only);
+    else await api.dismissMemoryProposals(workspaceId, ids);
+  } catch (cause) {
+    if (!(cause instanceof ApiFailure) || cause.status !== 404) throw cause;
+  }
+  return withoutMemoryProposals(queue, ids);
 };
 
 /**
@@ -398,6 +483,7 @@ export function MemoryReviewLists({
   onOpenTask,
   onReadWhole,
   onDismiss,
+  onDismissAll,
   busy = false
 }: {
   queue: MemoryReviewQueue;
@@ -420,8 +506,28 @@ export function MemoryReviewLists({
    * the owner would believe they had refused something.
    */
   onDismiss?: ((proposal: MemoryProposalRow) => void) | undefined;
+  /**
+   * How to refuse the whole group at once, and the reason it is a separate prop rather than a loop
+   * over `onDismiss`.
+   *
+   * Twenty presses to say one thing is the interface asking somebody to do a machine's counting,
+   * and this queue in particular is never drained by anything else: the proposer stops outright
+   * when the list is full, so a screenful nobody can clear in one gesture is a mechanism that
+   * silently switches itself off. It is also one request rather than twenty, so the group either
+   * lands or does not, instead of the screen ending up in a state neither end can name.
+   */
+  onDismissAll?: ((proposals: readonly MemoryProposalRow[]) => void) | undefined;
   busy?: boolean;
 }) {
+  /**
+   * Armed by a first press, exactly as the delete inside a row is.
+   *
+   * A refusal here is permanent and this one is permanent twenty times over, so it is the one
+   * control on this screen that would be worth a dialog - except that a dialog is what the approval
+   * floor wears, and this is the owner acting on their own record on their own machine. The arming
+   * is the same gesture the rest of the file already uses for exactly that reason.
+   */
+  const [refuseAllArmed, setRefuseAllArmed] = useState(false);
   return (
     <>
       {queue.proposals.length > 0 ? (
@@ -438,7 +544,47 @@ export function MemoryReviewLists({
             Rules that have been put forward about how this computer should work, drawn from your
             own messages. None of them is remembered yet, and none of them is doing anything: a rule
             has to come up again from another conversation on a later day before this computer acts
-            on it. Refusing one is permanent — it will not be put forward again.
+            on it. Refusing one is permanent — it will not be put forward again.{' '}
+            {/*
+              The group refusal, in the note rather than in the list, because the note is what the
+              group has instead of a row: these are twenty sentences a model wrote about the owner
+              and "no, none of this" is one decision rather than twenty. Offered only from two,
+              since "Refuse all 1" beside a row that already carries its own button is a second
+              control for the same press. Armed first, like every other permanent thing here.
+            */}
+            {onDismissAll && queue.proposals.length > 1 ? (
+              refuseAllArmed ? (
+                <>
+                  <button
+                    type="button"
+                    className="memory-observed-more"
+                    disabled={busy}
+                    onClick={() => {
+                      setRefuseAllArmed(false);
+                      onDismissAll(queue.proposals);
+                    }}
+                  >
+                    Yes, refuse all {queue.proposals.length}
+                  </button>{' '}
+                  <button
+                    type="button"
+                    className="memory-observed-more"
+                    onClick={() => setRefuseAllArmed(false)}
+                  >
+                    Keep them
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="memory-observed-more"
+                  disabled={busy}
+                  onClick={() => setRefuseAllArmed(true)}
+                >
+                  Refuse all {queue.proposals.length}
+                </button>
+              )
+            ) : null}
           </p>
           <div className="settings-list">
             {queue.proposals.map((proposal) => (
@@ -519,7 +665,7 @@ export function MemoryReviewLists({
               <MemoryReviewRow
                 key={row.id}
                 item={row}
-                headline={row.trust === 'stated' ? 'You said this' : 'The box worked this out'}
+                headline={memoryOriginLabel(row.origin)}
                 reason="This contradicts something else it holds."
                 extra={memoryReviewContradictions(row, queue.disputed).map(
                   (line) => `It disagrees with: ${line}`
@@ -598,24 +744,21 @@ export function MemoryReview({
     memoryItemBody(workspaceId, item.id).then((answer) => answer.body);
 
   /**
-   * "No, don't remember that", and the row leaves on the answer rather than on a refetch.
+   * "No, don't remember that", about one row or about the group, and the rows leave on the answer
+   * rather than on a refetch.
    *
-   * A 404 removes it too, for the same reason the three verbs above do: the route answers
-   * `memory_proposal_not_found` when this workspace has no such open proposal, which means the
-   * screen is holding a row the box does not have. Anything else is a real failure and is said,
-   * because a proposal that quietly vanishes on a network blip would leave the owner believing they
-   * had refused something they had not.
+   * One handler for both presses, because they are one statement: the whole of the difference is
+   * how many handles are named, and `refuseMemoryProposals` is where that is decided and where it
+   * is asserted. Exactly the handles that were on screen, so a proposal written between the screen
+   * being drawn and the button being pressed survives, unseen and unrefused - which is what a
+   * permanent refusal owes anything nobody has looked at.
    */
-  const dismiss = (proposal: MemoryProposalRow): void => {
+  const refuse = (proposals: readonly MemoryProposalRow[]): void => {
     if (!queue) return;
     setBusy(true);
     setError('');
-    api
-      .dismissMemoryProposal(workspaceId, proposal.id)
-      .catch((cause: unknown) => {
-        if (!(cause instanceof ApiFailure) || cause.status !== 404) throw cause;
-      })
-      .then(() => setQueue(withoutMemoryProposal(queue, proposal.id)))
+    refuseMemoryProposals(workspaceId, proposals, queue)
+      .then(setQueue)
       .catch((cause: unknown) => {
         setError(memoryReviewFailure(cause, 'That did not reach your box; nothing has changed.'));
       })
@@ -652,7 +795,8 @@ export function MemoryReview({
             onAct={act}
             onOpenTask={onOpenTask}
             onReadWhole={readWhole}
-            onDismiss={dismiss}
+            onDismiss={(proposal) => refuse([proposal])}
+            onDismissAll={refuse}
             busy={busy}
           />
         )

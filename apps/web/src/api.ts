@@ -63,10 +63,23 @@ export interface ProviderSettings {
 }
 
 /**
+ * Which side of the computer put a row into memory, which is the question `trust` cannot answer.
+ *
+ * `stated` is the owner's own sentence. `proposed` is a model's wording of what it read them say,
+ * corroborated on two days and now pinned into every task in the workspace. `watched` is the
+ * harness: a command it ran, or a turn it filed as that turn finished. The store's `trust` column
+ * has two values in use and calls the last two both `derived`, so the list served it faithfully and
+ * still could not tell an owner which of the three they were looking at.
+ */
+export type MemoryItemOrigin = 'stated' | 'proposed' | 'watched';
+
+/**
  * A row the agent wrote into its own memory as work finished, rather than one the owner typed.
  *
  * `excerpt` is the opening of the stored text, decrypted on the server with the workspace key: the
- * client is shown what is actually held, not a description of it.
+ * client is shown what is actually held, not a description of it. `trust` and `origin` say where it
+ * came from: a row a model proposed is obeyed exactly like a sentence the owner typed, and until
+ * these two fields were served this list drew them identically.
  */
 export interface MemoryItem {
   id: string;
@@ -74,16 +87,18 @@ export interface MemoryItem {
   status: 'active' | 'superseded' | 'disputed' | 'archived' | 'retracted';
   excerpt: string;
   observedAt: string;
+  /** Whether the owner said this or the box worked it out, which decides how firmly it is put. */
+  trust: 'stated' | 'derived';
+  /** The three-way answer `trust` collapses to two. */
+  origin: MemoryItemOrigin;
 }
 
 /**
- * The same row with everything a decision about it would rest on: which conversation wrote it, how
- * far it is trusted, when it was last confirmed, and what it has been worth in use.
+ * The same row with everything a decision about it would rest on: which conversation wrote it, when
+ * it was last confirmed, and what it has been worth in use.
  */
 export interface MemoryReviewItem extends MemoryItem {
   taskId: string | null;
-  /** Whether the owner said this or the box worked it out, which decides how firmly it is put. */
-  trust: 'stated' | 'derived';
   validFrom: string;
   validTo: string | null;
   lastVerified: string | null;
@@ -952,9 +967,11 @@ export const api = {
    * evidence. `disputed` is "two things you said contradict each other", and carries `contradicts`
    * because naming a dispute without naming the other side is not something a person can act on.
    *
-   * The projection is wider than `memoryItems` on purpose: which conversation wrote it, how far it
-   * is trusted, when it was last confirmed and what it has been worth are exactly the fields a
-   * decision rests on, and the narrower route drops all of them.
+   * The projection is wider than `memoryItems` on purpose: which conversation wrote it, when it was
+   * last confirmed and what it has been worth are exactly the fields a decision rests on, and the
+   * narrower route has no use for them. Provenance is not among them any more - `memoryItems`
+   * carries `trust` and `origin` too, because where a row came from is a fact about the row rather
+   * than about the decision.
    */
   memoryReview: (workspaceId: string, options: { staleDays?: number; limit?: number } = {}) => {
     const query = new URLSearchParams();
@@ -993,9 +1010,23 @@ export const api = {
    * sentence is refused the next time it is put forward, rather than reappearing every night.
    */
   dismissMemoryProposal: (workspaceId: string, proposalId: string) =>
-    request<{ dismissed: boolean }>(
+    request<{ dismissed: number }>(
       `/v1/workspaces/${workspaceId}/memory-proposals/dismiss`,
       mutation('POST', { proposal: proposalId })
+    ),
+  /**
+   * The same refusal said once about the whole group, which is the unit the owner judges in.
+   *
+   * The handles are sent rather than a "refuse everything open" flag, and the difference is a
+   * proposal written between the screen being drawn and the button being pressed: a flag would
+   * refuse it permanently without anybody having seen it, which is the one thing a durable refusal
+   * must never do. The answer is how many of the named rows were still open and are now refused;
+   * the ones that resolved to nothing had already gone.
+   */
+  dismissMemoryProposals: (workspaceId: string, proposalIds: readonly string[]) =>
+    request<{ dismissed: number }>(
+      `/v1/workspaces/${workspaceId}/memory-proposals/dismiss`,
+      mutation('POST', { proposals: [...proposalIds] })
     ),
   skills: (workspaceId: string) =>
     request<WorkspaceSkill[]>(`/v1/workspaces/${workspaceId}/skills`),

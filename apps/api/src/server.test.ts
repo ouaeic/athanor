@@ -6608,6 +6608,157 @@ describe('what the computer wrote down about its owner', () => {
     expect(after.json<Array<{ id: string }>>().map((row) => row.id)).toEqual([older.id]);
   });
 
+  /*
+   * A rule a model wrote about the owner, drawn exactly like a sentence they typed.
+   *
+   * `GET /memory-items` is the only list of this tier an owner can browse, and it returned five
+   * fields: id, kind, status, excerpt, observedAt. None of them says where a row came from - so a
+   * standing order a model wrote out of the owner's messages, corroborated on two days and now
+   * pinned in front of every later task in the workspace, was one line of text with a kind and a
+   * date, indistinguishable from the owner's own words. A memory system whose rows are obeyed and
+   * whose provenance is invisible cannot be audited by the person it is about.
+   *
+   * The four rows here are the four production writers of `mem.item` on this computer, with the
+   * pairs each of them fixes. Every pair is pinned at its own call site in the worker's own tests -
+   * `memory-runtime.test.ts` asserts the episode at `derived`, the verified command at `derived`,
+   * the promotion of a pattern-observed candidate at `stated` and the promotion of a model-proposed
+   * one at `fact`/`derived` - and what is asserted here is the half those cannot reach: what this
+   * route makes of them.
+   *
+   * The pair that matters is the middle two. Both are `derived`; one is a model's sentence about
+   * the owner and one is a note that a command failed, and `trust` alone has to call them the same
+   * thing.
+   */
+  test('says which side of the computer wrote each remembered row, not just how far it is trusted', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-memory-origin-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'memory-origin',
+      'Carry on'
+    );
+    // `mem.item.predicate` is a foreign key onto the vetted registry, so the two facts below are
+    // refused outright without it. Said here rather than assumed, because the refusal is a
+    // constraint violation and not an empty list.
+    await store.syncMemoryPredicates();
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspaceId);
+    const indexKey = memoryIndexKey(key);
+    const write = async (input: {
+      kind: 'episode' | 'fact' | 'procedure';
+      trust: 'stated' | 'derived';
+      body: string;
+      observedAt: string;
+      predicate?: string;
+    }) => {
+      const content = { title: input.body.slice(0, 40), tags: [], body: input.body };
+      return store.createMemoryItem({
+        userId: workspace.userId,
+        workspaceId,
+        kind: input.kind,
+        trust: input.trust,
+        documentCiphertext: encryptJson(content, key, `memory-item:${workspaceId}`),
+        index: {
+          ...buildMemoryItemIndex(content, indexKey),
+          ...(input.kind === 'fact'
+            ? {
+                subjectKey: memorySubjectKey('athanor', indexKey),
+                objectKey: memoryObjectKey(input.body, indexKey)
+              }
+            : {})
+        },
+        ...(input.predicate ? { predicate: input.predicate } : {}),
+        observedAt: input.observedAt,
+        taskId
+      });
+    };
+    // `recordTurnEpisode` - the finished turn, assembled from what was asked and what was run.
+    const episode = await write({
+      kind: 'episode',
+      trust: 'derived',
+      body: 'Goal: Carry on\nOutcome: ok',
+      observedAt: '2026-02-01T09:00:00.000Z'
+    });
+    // Its promotion, with a candidate whose own origin was `observed`: the owner's sentence,
+    // lifted by the shipped patterns, minted at `stated`.
+    const typed = await write({
+      kind: 'fact',
+      trust: 'stated',
+      predicate: 'standing_order',
+      body: 'Never run git stash in a tree an agent is editing.',
+      observedAt: '2026-02-02T09:00:00.000Z'
+    });
+    // The same promotion with a candidate whose origin was `proposed`: a model's wording.
+    const proposed = await write({
+      kind: 'fact',
+      trust: 'derived',
+      predicate: 'standing_order',
+      body: 'Work autonomously to the end without asking for confirmation.',
+      observedAt: '2026-02-03T09:00:00.000Z'
+    });
+    // `recordDeadEnds` - a command the harness ran and watched fail. Same trust as the row above
+    // it and nothing whatever in common with it.
+    const watched = await write({
+      kind: 'procedure',
+      trust: 'derived',
+      body: 'In workspace, `pnpm check` did not pass when the harness last ran it.',
+      observedAt: '2026-02-04T09:00:00.000Z'
+    });
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memory-items`,
+      headers: { cookie }
+    });
+    expect(listed.statusCode, listed.body).toBe(200);
+    const rows = new Map(
+      listed
+        .json<Array<{ id: string; trust: string; origin: string }>>()
+        .map((row) => [row.id, row])
+    );
+    expect(rows.get(typed.id)).toMatchObject({ trust: 'stated', origin: 'stated' });
+    expect(rows.get(proposed.id)).toMatchObject({ trust: 'derived', origin: 'proposed' });
+    expect(rows.get(watched.id)).toMatchObject({ trust: 'derived', origin: 'watched' });
+    expect(rows.get(episode.id)).toMatchObject({ trust: 'derived', origin: 'watched' });
+    /*
+     * The two directions that matter, said as one comparison rather than as four labels: the two
+     * rows the store cannot tell apart are told apart here, and the two that genuinely are the same
+     * provenance still are. A mapping that answered `proposed` for everything `derived` would pass
+     * the first three assertions above and fail this one.
+     */
+    expect(rows.get(proposed.id)!.trust).toBe(rows.get(watched.id)!.trust);
+    expect(rows.get(proposed.id)!.origin).not.toBe(rows.get(watched.id)!.origin);
+    expect(rows.get(watched.id)!.origin).toBe(rows.get(episode.id)!.origin);
+
+    /*
+     * And the queue carries it too. The review screen used to draw its headline off `trust`, so a
+     * disputed pair of one owner sentence against one model sentence read as two rows the box had
+     * worked out for itself - and `resolveMemoryContradiction` lets the first retire the second, so
+     * which is which is the whole of that decision.
+     */
+    expect(await store.markMemoryFactsDisputed(workspaceId, [typed.id, proposed.id])).toBe(2);
+    const queue = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memory-review`,
+      headers: { cookie }
+    });
+    expect(queue.statusCode, queue.body).toBe(200);
+    expect(
+      queue
+        .json<{ disputed: Array<{ id: string; origin: string }> }>()
+        .disputed.map((row) => [row.id, row.origin])
+        .sort()
+    ).toEqual(
+      [
+        [typed.id, 'stated'],
+        [proposed.id, 'proposed']
+      ].sort()
+    );
+  }, 30_000);
+
   /**
    * The review queue, which was built at three layers and reached nobody.
    *
@@ -6949,6 +7100,125 @@ describe('what the computer wrote down about its owner', () => {
       origin: 'proposed'
     });
     expect(await store.listMemoryFactProposals(workspaceId)).toEqual([]);
+  }, 30_000);
+
+  /*
+   * The group, which is the unit the owner actually judges in.
+   *
+   * These arrive three a night against a standing twenty, and when the twenty is full the proposer
+   * stops until somebody clears it. So "refuse these" costing one press per row is not a cosmetic
+   * complaint: a queue nobody drains is a mechanism that quietly switches itself off, and the
+   * owner's dismissal is the only release valve it has.
+   *
+   * Three properties, and the middle one is the one that would be easy to get wrong. The group
+   * refusal names the handles the screen was showing, so a proposal written between the screen
+   * being drawn and the press landing survives - a refusal is permanent, and permanently refusing
+   * a sentence nobody has read is exactly what this queue exists to prevent. And a group that
+   * names nothing the box still has is the same 404 one row gets, for the same reason.
+   */
+  test('refuses a screenful of proposed rules on one press, and leaves the one it was not shown', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-memory-group-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, store } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      app,
+      'memory-group',
+      'Carry on'
+    );
+    const workspace = (await store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspaceId);
+    const indexKey = memoryIndexKey(key);
+    const episode = await store.createMemoryItem({
+      userId: workspace.userId,
+      workspaceId,
+      kind: 'episode',
+      trust: 'derived',
+      documentCiphertext: encryptJson(
+        { title: 'day', tags: [], body: 'A day of messages.' },
+        key,
+        `memory-item:${workspaceId}`
+      ),
+      index: buildMemoryItemIndex({ title: 'day', tags: [], body: 'day' }, indexKey),
+      taskId,
+      tainted: false
+    });
+    const propose = async (sentence: string) => {
+      const observation = { subject: 'athanor', predicate: 'standing_order', object: sentence };
+      await store.observeMemoryFactCandidate({
+        workspaceId,
+        subjectKey: memorySubjectKey('athanor', indexKey),
+        predicate: 'standing_order',
+        objectKey: memoryObjectKey(sentence, indexKey),
+        episodeId: episode.id,
+        draftCiphertext: encryptJson(observation, key, `memory-fact-candidate:${workspaceId}`),
+        origin: 'proposed'
+      });
+    };
+    await propose('Work autonomously to the end without asking for confirmation.');
+    await propose('Never leave a branch unpushed at the end of a session.');
+    const onScreen = (
+      await app.inject({
+        method: 'GET',
+        url: `/v1/workspaces/${workspaceId}/memory-review`,
+        headers: { cookie }
+      })
+    ).json<{ proposals: Array<{ id: string; sentence: string }> }>().proposals;
+    expect(onScreen).toHaveLength(2);
+
+    // Written after the screen was drawn, and never named by the press that follows.
+    await propose('Ask before spending money with a third party.');
+
+    const refused = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/memory-proposals/dismiss`,
+      headers: { cookie, 'idempotency-key': 'memory-proposal-group' },
+      payload: { proposals: onScreen.map((row) => row.id) }
+    });
+    expect(refused.statusCode, refused.body).toBe(200);
+    expect(refused.json()).toEqual({ dismissed: 2 });
+    const left = await app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/memory-review`,
+      headers: { cookie }
+    });
+    expect(left.json<{ proposals: Array<{ sentence: string }> }>().proposals).toMatchObject([
+      { sentence: 'Ask before spending money with a third party.' }
+    ]);
+
+    /* And it is a refusal rather than a deletion, for the group exactly as for one row: the same
+       sentences observed again do not come back tonight or on any later night. */
+    await propose('Work autonomously to the end without asking for confirmation.');
+    await propose('Never leave a branch unpushed at the end of a session.');
+    expect(
+      (await store.listMemoryFactProposals(workspaceId)).map((record) => record.objectKey)
+    ).toEqual([memoryObjectKey('Ask before spending money with a third party.', indexKey)]);
+
+    // Naming only handles this workspace no longer has is the 404 one row answers, for one reason:
+    // there is nothing there. A client shown 200-with-nothing would have to guess which.
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/v1/workspaces/${workspaceId}/memory-proposals/dismiss`,
+          headers: { cookie, 'idempotency-key': 'memory-proposal-group-again' },
+          payload: { proposals: onScreen.map((row) => row.id) }
+        })
+      ).statusCode
+    ).toBe(404);
+
+    // A body naming nothing at all is refused at the door rather than answering "dismissed 0".
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/v1/workspaces/${workspaceId}/memory-proposals/dismiss`,
+          headers: { cookie, 'idempotency-key': 'memory-proposal-group-empty' },
+          payload: {}
+        })
+      ).statusCode
+    ).toBe(400);
   }, 30_000);
 });
 

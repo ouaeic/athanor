@@ -130,6 +130,49 @@ const KnowledgeText = z
 const SEPARATOR = '\u0000';
 const PROPOSAL_HANDLE_CONTEXT = 'athanor-memory-proposal';
 
+/** Which side of this computer put a row into memory. Three answers, because there are three. */
+export type MemoryItemOrigin = 'stated' | 'proposed' | 'watched';
+
+/**
+ * The provenance of a stored row, derived at the door because `mem.item` does not carry a column
+ * for it.
+ *
+ * `trust` on its own cannot answer the question the owner is actually asking. It has two values in
+ * use and three things write rows, so `derived` means both "a model wrote this sentence" and "the
+ * harness ran a command and watched what happened" - the two provenances furthest apart in the
+ * whole subsystem and the two an owner most needs told apart. Until this function existed the one
+ * list the owner can browse carried neither field, so all three read identically.
+ *
+ * The mapping is not a guess. Every production writer of `mem.item` on this computer is one of four
+ * call sites, and each one fixes both columns outright:
+ *
+ * - `recordTurnEpisode` writes the finished turn, `kind: 'episode'`, always `derived`.
+ * - its verified-command loop writes `kind: 'procedure'`, `derived`.
+ * - `recordDeadEnds` in `memory-capture.ts` writes a command it watched fail, also `procedure`,
+ *   `derived`.
+ * - `recordTurnEpisode`'s promotion mints a corroborated candidate at `kind: 'fact'`, `stated` when
+ *   the candidate's own `origin` was `observed` - the shipped patterns over the owner's own
+ *   sentence - and `derived` when it was `proposed`, because then the wording is a model's account
+ *   of what the owner said rather than the owner's.
+ *
+ * Named rather than cited by line: this list is the whole of the argument, and a line number in it
+ * would be wrong by the next commit.
+ *
+ * So `stated` is the owner, a `derived` fact is a model's wording, and everything else `derived` is
+ * the harness. `inferred` - the third value in the SQL enum, the tier recall excludes - has no
+ * writer on this computer and is not in `MemoryTrust` at all, which is why nothing here branches on
+ * it.
+ *
+ * `watched` and not `observed`, which reads more naturally and is already taken:
+ * `mem.fact_candidate.origin` spells the OPPOSITE side of this distinction `observed` - a sentence
+ * the patterns lifted out of the owner's own words - and one word for two things in one subsystem
+ * is how a field stops being read.
+ */
+export const memoryItemOrigin = (
+  record: Pick<MemoryItemRecord, 'kind' | 'trust'>
+): MemoryItemOrigin =>
+  record.trust === 'stated' ? 'stated' : record.kind === 'fact' ? 'proposed' : 'watched';
+
 const SkillDocumentInput = z
   .object({
     name: z
@@ -483,6 +526,14 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
    * Every status is served, including the retired ones - a line the agent has stopped believing is
    * still a line about the owner, still on their disk, and hiding it here is the defect this route
    * exists to fix.
+   *
+   * `trust` and `origin` are the second half of that defect, and they were the half still open. The
+   * five fields this route used to return could not tell a rule the owner typed from a rule a model
+   * wrote for them: both arrive as one line of text with a kind and a date, and a model's sentence
+   * that has cleared the corroboration gate is pinned into every later task in the workspace. A
+   * memory system whose rows are obeyed and whose provenance is invisible is one nobody can audit,
+   * so the field the review queue has always projected is now on the list the owner actually
+   * browses, beside the three-way answer `trust` alone cannot give.
    */
   app.get<{ Params: { workspaceId: string }; Querystring: { limit?: string } }>(
     '/v1/workspaces/:workspaceId/memory-items',
@@ -495,7 +546,9 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
         kind: record.kind,
         status: record.status,
         excerpt: memoryItemExcerpt(record, key, request.params.workspaceId),
-        observedAt: record.observedAt
+        observedAt: record.observedAt,
+        trust: record.trust,
+        origin: memoryItemOrigin(record)
       }));
     }
   );
@@ -527,9 +580,11 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
    * ids of the other side - because "this is disputed" with no answer to "with what" is not
    * something a person can act on.
    *
-   * The projection is deliberately wider than `/memory-items`, which returns five fields and drops
-   * everything a decision would rest on: which conversation wrote this, how far it is trusted, when
-   * it was last confirmed, what it has been worth. This is the screen where those matter.
+   * The projection is wider than `/memory-items`: which conversation wrote this, when it was last
+   * confirmed, what it has been worth. Those are the fields a "keep it or delete it" decision rests
+   * on and the narrower list has no use for. `trust` and `origin` are no longer among them - the
+   * browsable list carries both now, because provenance is not a fact about a decision, it is a
+   * fact about the row.
    */
   const memoryReviewFields = (record: MemoryItemRecord, key: Buffer, workspaceId: string) => ({
     id: record.id,
@@ -537,6 +592,7 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
     status: record.status,
     excerpt: memoryItemExcerpt(record, key, workspaceId),
     observedAt: record.observedAt,
+    origin: memoryItemOrigin(record),
     taskId: record.taskId,
     trust: record.trust,
     validFrom: record.validFrom,
@@ -667,45 +723,84 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
    * retraction has - the keys fold case, NFKC and whitespace and nothing else, so a paraphrase is a
    * different row.
    *
-   * 404 rather than `{dismissed:false}`, matching verify and retract next door: the store returns
-   * false for one reason only, which is that this workspace has no such open proposal, and a client
-   * shown 200-with-false would have to guess whether it had been dismissed already or never existed.
+   * 404 rather than `{dismissed:0}`, matching verify and retract next door: the store refuses for
+   * one reason only, which is that this workspace has no such open proposal, and a client shown
+   * 200-with-nothing would have to guess whether it had been dismissed already or never existed.
+   *
+   * **One press for the whole group, because the group is the unit the owner judges in.** The rows
+   * here are the only ones on this computer nobody has ever had a chance to refuse, they arrive
+   * three a night against a standing twenty, and the thing an owner does with a screenful of
+   * sentences a model wrote about them is refuse the screenful. Twenty presses to say it once is
+   * the interface asking somebody to do a machine's counting, and a queue that costs twenty presses
+   * to drain is a queue that is never drained - which is not a cosmetic loss, because the proposer
+   * stops entirely when the list is full.
+   *
+   * `proposals` names the exact handles the screen is showing rather than meaning "everything open
+   * now". The difference is a proposal written between the screen being drawn and the button being
+   * pressed: `all: true` would refuse it permanently, unseen, which is the one thing a durable
+   * refusal must never do. Naming them costs a list the client already holds.
+   *
+   * The single-handle form is kept exactly as it was - it is what one row's own button sends - and
+   * both are the same statement over a list of one, so there is one bound, one resolution and one
+   * 404 rule rather than two routes drifting apart.
    */
-  app.post<{ Params: { workspaceId: string }; Body: { proposal?: string } }>(
+  app.post<{ Params: { workspaceId: string }; Body: { proposal?: string; proposals?: string[] } }>(
     '/v1/workspaces/:workspaceId/memory-proposals/dismiss',
     async (request, reply) => {
       const user = requireUser(request.user);
       return idempotent(request, reply, user, async () => {
         const workspaceId = request.params.workspaceId;
         await workspaceKnowledgeKey(user.id, workspaceId);
-        const { proposal } = z
-          .object({ proposal: z.string().regex(/^[0-9a-f]{32}$/) })
+        const handle = z.string().regex(/^[0-9a-f]{32}$/);
+        const body = z
+          .object({
+            proposal: handle.optional(),
+            // Bounded at the widest page `/memory-review` will serve, which is the widest group the
+            // owner can have had in front of them. A longer list is a client naming rows no screen
+            // has shown, and this is a refusal that cannot be taken back.
+            proposals: z.array(handle).min(1).max(200).optional()
+          })
+          .refine((value) => value.proposal !== undefined || value.proposals !== undefined)
           .parse(request.body ?? {});
+        const wanted = new Set([
+          ...(body.proposals ?? []),
+          ...(body.proposal ? [body.proposal] : [])
+        ]);
         /*
-         * The handle is resolved against the open list rather than turned back into a key, and it
-         * travels in the body rather than in the path. Both are the same decision made twice.
+         * The handles are resolved against the open list rather than turned back into keys, and they
+         * travel in the body rather than in the path. Both are the same decision made twice.
          *
          * A candidate is named by `(subject_key, predicate, object_key)` and two of those are keyed
          * blind hashes, so there is no id to put in a URL - and the hook on every path parameter
          * ending in `Id` is right that the ones there are are UUID columns. Deriving a UUID-shaped
          * string from a hash would have satisfied the shape and lied about what it was.
          *
-         * The list is bounded at `MEMORY_MAX_OPEN_PROPOSALS`, so resolving a handle is a scan of at
-         * most twenty rows and the index keys never leave this process.
+         * One scan for the whole group. The list is bounded at `MEMORY_MAX_OPEN_PROPOSALS`, so this
+         * is at most twenty rows however many handles were named, and the index keys never leave
+         * this process.
          */
         const open = await store.listMemoryFactProposals(workspaceId, 200);
-        const wanted = open.find((record) => memoryProposalId(record) === proposal);
-        if (
-          !wanted ||
-          !(await store.dismissMemoryFactCandidate(
-            workspaceId,
-            wanted.subjectKey,
-            wanted.predicate,
-            wanted.objectKey
-          ))
-        )
+        let dismissed = 0;
+        for (const record of open) {
+          if (!wanted.has(memoryProposalId(record))) continue;
+          if (
+            await store.dismissMemoryFactCandidate(
+              workspaceId,
+              record.subjectKey,
+              record.predicate,
+              record.objectKey
+            )
+          )
+            dismissed += 1;
+        }
+        /*
+         * Nothing at all is the 404 the single form has always answered, and a group that hit some
+         * of what it named is not one: those rows are refused for good, saying so is the truth, and
+         * the handles that resolved to nothing were rows already gone before the press landed.
+         */
+        if (dismissed === 0)
           throw new AthanorError('memory_proposal_not_found', 'Proposal not found', 404);
-        return { dismissed: true };
+        return { dismissed };
       });
     }
   );

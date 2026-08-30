@@ -132,6 +132,29 @@ describe('the bodies each method sends', () => {
     expect(sentBody()).toEqual({ content: 'Bins go out Thursday', validUntil: null });
   });
 
+  /*
+   * The two shapes a refusal comes in, and the field neither of them has.
+   *
+   * A group refusal names every handle the screen was showing rather than sending "all of them".
+   * The difference is a proposal written between the screen being drawn and the button being
+   * pressed: a flag would refuse it permanently, unseen, which is the one thing a refusal that
+   * cannot be taken back must never do. One row keeps the single-handle body the route has always
+   * taken, so that form is not left with nothing that sends it.
+   */
+  it('names every proposal a group refusal is refusing, rather than saying all of them', async () => {
+    answer({ dismissed: 2 });
+    await api.dismissMemoryProposals('ws-1', ['a'.repeat(32), 'b'.repeat(32)]);
+    expect(only().url).toBe('/v1/workspaces/ws-1/memory-proposals/dismiss');
+    expect(only().init?.method).toBe('POST');
+    expect(sentBody()).toEqual({ proposals: ['a'.repeat(32), 'b'.repeat(32)] });
+
+    calls.length = 0;
+    answer({ dismissed: 1 });
+    await api.dismissMemoryProposal('ws-1', 'c'.repeat(32));
+    expect(only().url).toBe('/v1/workspaces/ws-1/memory-proposals/dismiss');
+    expect(sentBody()).toEqual({ proposal: 'c'.repeat(32) });
+  });
+
   it('turns a skill off through the state route, carrying the field the toggle means', async () => {
     answer({ id: 'skill-1', enabled: false });
     await api.setSkillState('ws-1', 'skill-1', { enabled: false });

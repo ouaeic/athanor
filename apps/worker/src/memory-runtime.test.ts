@@ -57,6 +57,9 @@ import {
   MEMORY_MAX_NIGHTLY_PROPOSALS,
   MEMORY_MAX_OPEN_PROPOSALS,
   MEMORY_STANDING_ORDER_MAX_CHARS,
+  splitQualification,
+  composeQualifiedRule,
+  factCandidateKeys,
   MEMORY_STANDING_ORDER_MIN_CHARS,
   observedMemoryFacts,
   observedStandingOrders,
@@ -1295,6 +1298,11 @@ describe('turn capture write path', () => {
         subjectKey: memorySubjectKey('owner', indexKey),
         predicate: 'default_shell',
         objectKey: memoryObjectKey('fish', indexKey),
+        // A value, not a rule, and it is keyed whole. `factCandidateKeys` splits a qualification
+        // off `standing_order` alone: stripping `but ...` from a functional predicate's object
+        // would file a qualified value under the bare one and let supersession retire the real
+        // answer, which is the store deciding the owner changed shells.
+        qualifications: [],
         episodeId: result?.episodeId,
         observedAt: new Date('2026-07-31T09:00:00.000Z'),
         draftCiphertext: expect.objectContaining({
@@ -1403,7 +1411,10 @@ describe('turn capture write path', () => {
         workspaceId,
         subjectKey: memorySubjectKey('athanor', indexKey),
         predicate: 'standing_order',
-        objectKey: memoryObjectKey('Never run git stash here.', indexKey),
+        // The rule without its terminator, because that is what `splitQualification` calls the
+        // core - and the core is the whole of the identity a sighting is counted under.
+        objectKey: memoryObjectKey('Never run git stash here', indexKey),
+        qualifications: [],
         episodeId: result?.episodeId,
         observedAt: new Date('2026-07-31T09:00:00.000Z'),
         draftCiphertext: expect.objectContaining({
@@ -1428,7 +1439,7 @@ describe('turn capture write path', () => {
     expect(probe.observations.filter((entry) => entry.predicate === 'runs_on')).toHaveLength(5);
     expect(probe.observations.filter((entry) => entry.predicate === 'standing_order')).toEqual([
       expect.objectContaining({
-        objectKey: memoryObjectKey('Never name another AI product in a repo file.', indexKey)
+        objectKey: memoryObjectKey('Never name another AI product in a repo file', indexKey)
       })
     ]);
   });
@@ -3072,6 +3083,68 @@ describe('what a model may propose about the owner', () => {
     ]);
   };
 
+  /**
+   * Two nights a day apart proposing one rule, and a third turn to promote it.
+   *
+   * Written as a helper because the three cases below differ in exactly one thing - which night
+   * attached a carve-out - and a fixture that differed anywhere else would not be attacking the
+   * same property twice. `firstBut` is the first night's clause and `but` the second's, so a
+   * carve-out stated on ONE night is what the singleton case actually feeds the store.
+   *
+   * The citation is the night's own turn: `MEMORY_PROPOSAL_REREAD_MS` puts yesterday's episodes in
+   * tonight's batch, so citing episode 1 twice would file both proposals against one turn and buy
+   * no corroboration at all.
+   *
+   * Returns the bodies of the standing orders the store actually holds, decrypted - the sentence a
+   * later turn would be given, which is the only thing any of these cases is about.
+   */
+  const twoNights = async (input: {
+    rule: string;
+    but?: string | readonly string[];
+    firstBut?: string | readonly string[];
+  }) => {
+    for (const [night, day] of ['2026-08-02', '2026-08-04'].entries()) {
+      await writeTurn({
+        request: `Carry on with it now, day ${night + 1}.`,
+        at: `${day}T10:00:00.000Z`
+      });
+      await readyToPropose(`${day}T23:00:00.000Z`);
+      const clauses = [night === 0 ? input.firstBut : input.but].flat().filter(Boolean) as string[];
+      await proposeMemoryFacts(
+        proposer(
+          JSON.stringify(
+            clauses.length === 0
+              ? [{ episode: night + 1, rule: input.rule }]
+              : clauses.map((but) => ({ episode: night + 1, rule: input.rule, but }))
+          )
+        ).deps,
+        task,
+        dataKey,
+        { now: new Date(`${day}T23:00:00.000Z`) }
+      );
+    }
+    // The production promotion site: every finished turn drains what the gate now admits.
+    await recordTurnEpisode({
+      store,
+      userId,
+      workspaceId,
+      taskId,
+      dataKey,
+      request: 'Carry on.',
+      summary: 'Carried on.',
+      outcome: 'ok',
+      occurredAt: new Date('2026-08-05T10:00:00.000Z')
+    });
+    const facts = (await store.listMemoryItems(workspaceId, { kind: 'fact', limit: 50 })).filter(
+      (item) => item.predicate === 'standing_order' && item.status === 'active'
+    );
+    return facts.map(
+      (item) =>
+        decryptJson<{ body: string }>(item.documentCiphertext, dataKey, memoryItemAad(workspaceId))
+          .body
+    );
+  };
+
   beforeEach(async () => {
     database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
     await migrateDatabase(database);
@@ -3280,14 +3353,24 @@ describe('what a model may propose about the owner', () => {
     expect(report.proposed).toBe(1);
     expect(await store.listPromotableMemoryFactCandidates(workspaceId)).toEqual([]);
 
-    // The other direction: the same sentence, from a different day's turn, on the next run. That
-    // is what corroboration is, and it is the one thing that makes a proposal durable.
+    /*
+     * The other direction: the same sentence, from a different day's turn, on the next run. That
+     * is what corroboration is, and it is the one thing that makes a proposal durable.
+     *
+     * Episode 3 and not episode 1, and the number is the fixture doing what its own sentence says.
+     * The window starts `MEMORY_PROPOSAL_REREAD_MS` behind the previous run rather than at it, so
+     * this batch is offered all three turns and yesterday's are episodes 1 and 2. Citing 1 again
+     * would be the model re-proposing from the SAME turn - which is one sighting however many
+     * nights it is repeated, and is exactly the overlap the re-read window says it is safe against.
+     * It is not the case this is here to make.
+     */
     await writeTurn({ request: 'Stop pausing.', at: '2026-08-03T11:00:00.000Z' });
     await readyToPropose('2026-08-03T23:00:00.000Z');
-    const second = proposer(JSON.stringify([{ episode: 1, rule }]));
-    await proposeMemoryFacts(second.deps, task, dataKey, {
+    const second = proposer(JSON.stringify([{ episode: 3, rule }]));
+    const later = await proposeMemoryFacts(second.deps, task, dataKey, {
       now: new Date('2026-08-03T23:00:00.000Z')
     });
+    expect(later.episodesOffered).toBe(3);
     const promotable = await store.listPromotableMemoryFactCandidates(workspaceId);
     expect(promotable).toHaveLength(1);
     expect(promotable[0]?.episodeCount).toBe(2);
@@ -3622,17 +3705,355 @@ describe('what a model may propose about the owner', () => {
     expect(repaired.calls()).toBe(1);
   });
 
+  /*
+   * A day is not spent on a run that could never have reached a provider, for the two reasons the
+   * catalogue check above does not cover.
+   *
+   * Both of these throw, neither of them touches the network, and both used to be tested BEHIND the
+   * claim - so a box whose key had been rotated away, or whose task model belongs to the other
+   * provider, threw on every finished turn, was caught three levels up, and had already moved the
+   * window past a day of the owner's own words. Unlike a provider that is merely down, these two
+   * last until somebody changes a setting: the loss is one day per finished turn for as long as the
+   * misconfiguration stands.
+   *
+   * Both directions on one clock, exactly as the catalogue case does it: the mark does not move,
+   * and the very next run with the provider repaired makes the call it was owed.
+   */
+  it('does not spend the day when there is no credential to answer with', async () => {
+    await writeTurn({ request: 'Never merge on a red build.', at: '2026-08-02T10:00:00.000Z' });
+    await readyToPropose('2026-08-02T23:00:00.000Z');
+    const claimedAt = async (): Promise<unknown> =>
+      (
+        await database.query<{ at: unknown }>(
+          'SELECT memory_proposed_at AS at FROM workspaces WHERE id=$1',
+          [workspaceId]
+        )
+      ).rows[0]?.at;
+    const before = await claimedAt();
+
+    const stranded = proposer('[]');
+    await expect(
+      proposeMemoryFacts(
+        {
+          ...stranded.deps,
+          assertProviderConfigured: async () => {
+            throw new Error('provider_not_connected');
+          }
+        },
+        task,
+        dataKey,
+        { now: new Date('2026-08-02T23:00:00.000Z') }
+      )
+    ).rejects.toThrow('provider_not_connected');
+    expect(await claimedAt()).toEqual(before);
+
+    // The second one, which is a different setting and the same loss: a model from a provider the
+    // stored credential does not belong to.
+    await expect(
+      proposeMemoryFacts(
+        {
+          ...stranded.deps,
+          gateway: async () => {
+            throw new Error('provider_model_mismatch');
+          }
+        },
+        task,
+        dataKey,
+        { now: new Date('2026-08-02T23:00:00.000Z') }
+      )
+    ).rejects.toThrow('provider_model_mismatch');
+    expect(await claimedAt()).toEqual(before);
+    expect(stranded.calls()).toBe(0);
+
+    const repaired = proposer('[]');
+    await proposeMemoryFacts(repaired.deps, task, dataKey, {
+      now: new Date('2026-08-02T23:00:00.000Z')
+    });
+    expect(repaired.calls()).toBe(1);
+    expect(await claimedAt()).not.toEqual(before);
+  });
+
+  /*
+   * The defect this constant exists for: a call that never came back used to cost a day of the
+   * owner's own words, permanently and in silence.
+   *
+   * The claim is spent by an attempt, which is correct - it is a bound on money and a request that
+   * reached a provider and failed there is still a request. What was wrong is that the same write
+   * was the only thing the window was measured from, so the next run started where the failed one
+   * had already moved the mark to and the day in between was never read by anything.
+   *
+   * Both directions on one fixture, and the negative control is the old behaviour said out loud:
+   * with the re-read at zero - the window the claim used to define on its own - the failed night's
+   * turn is not offered, and with it separated from the claim it is. The clock is restored between
+   * the two so that the only difference between them is the window.
+   */
+  it('offers again the day a call never came back from', async () => {
+    const lost = 'Never merge on a red build.';
+    await writeTurn({ request: lost, at: '2026-08-02T10:00:00.000Z' });
+    await readyToPropose('2026-08-02T23:00:00.000Z');
+    const unreachable = proposer('[]');
+    await expect(
+      proposeMemoryFacts(
+        {
+          ...unreachable.deps,
+          gateway: async () => ({
+            provider: 'custom',
+            gateway: {
+              chat: async () => {
+                throw new Error('provider unreachable');
+              }
+            } as unknown as ModelGateway
+          })
+        },
+        task,
+        dataKey,
+        { now: new Date('2026-08-02T23:00:00.000Z') }
+      )
+    ).rejects.toThrow('provider unreachable');
+    const spent = new Date('2026-08-02T23:00:00.000Z');
+    expect(
+      (
+        await database.query<{ at: unknown }>(
+          'SELECT memory_proposed_at AS at FROM workspaces WHERE id=$1',
+          [workspaceId]
+        )
+      ).rows[0]?.at
+    ).toEqual(spent);
+
+    const nextNight = new Date('2026-08-04T00:00:00.000Z');
+    await writeTurn({ request: 'Never push straight to main.', at: '2026-08-03T11:00:00.000Z' });
+    const rewind = async () =>
+      database.query('UPDATE workspaces SET memory_proposed_at=$2 WHERE id=$1', [
+        workspaceId,
+        spent
+      ]);
+
+    // What the window used to be. The failed night's turn is behind the mark and nothing reads it.
+    const asBefore = proposer('[]');
+    await proposeMemoryFacts(asBefore.deps, task, dataKey, { now: nextNight, rereadMs: 0 });
+    expect(asBefore.calls()).toBe(1);
+    expect(asBefore.shown.join('\n')).toContain('Never push straight to main.');
+    expect(asBefore.shown.join('\n')).not.toContain(lost);
+
+    // And separated from it. Same clock, same material, same everything else.
+    await rewind();
+    const recovered = proposer('[]');
+    await proposeMemoryFacts(recovered.deps, task, dataKey, { now: nextNight });
+    expect(recovered.calls()).toBe(1);
+    expect(recovered.shown.join('\n')).toContain(lost);
+    expect(recovered.shown.join('\n')).toContain('Never push straight to main.');
+  });
+
+  /*
+   * The safety property the whole re-read rests on, attacked directly.
+   *
+   * An overlapping window means the same turn is offered on more than one night, and a model that
+   * proposes the same sentence off it again would be a second sighting bought with one night's
+   * evidence - the exact failure the two-sightings-a-day-apart gate exists to refuse, arriving
+   * through the window instead of through the batch. It cannot: the gate counts distinct episode
+   * ids and the store adds to `n_episodes` only for an episode the candidate is not already filed
+   * against. The positive control is next door - the same sentence from the LATER day's turn does
+   * promote - so this is not a case that would pass against a proposer that proposed nothing.
+   */
+  it('cannot buy a sighting by reading the same turn again on the next night', async () => {
+    const rule = 'Work autonomously to the end without asking for confirmation.';
+    await writeTurn({ request: 'Never ask me to confirm.', at: '2026-08-02T10:00:00.000Z' });
+    await readyToPropose('2026-08-02T23:00:00.000Z');
+    await proposeMemoryFacts(proposer(JSON.stringify([{ episode: 1, rule }])).deps, task, dataKey, {
+      now: new Date('2026-08-02T23:00:00.000Z')
+    });
+    expect((await store.listMemoryFactProposals(workspaceId))[0]?.episodeCount).toBe(1);
+
+    await readyToPropose('2026-08-04T00:00:00.000Z');
+    const again = proposer(JSON.stringify([{ episode: 1, rule }]));
+    const report = await proposeMemoryFacts(again.deps, task, dataKey, {
+      now: new Date('2026-08-04T00:00:00.000Z')
+    });
+    // The turn really was offered a second time, which is what makes the assertion below mean
+    // something: a run that had read nothing would leave the count at one for the wrong reason.
+    expect(again.shown.join('\n')).toContain('Never ask me to confirm.');
+    expect(report.episodesOffered).toBe(1);
+    expect((await store.listMemoryFactProposals(workspaceId))[0]?.episodeCount).toBe(1);
+    expect(await store.listPromotableMemoryFactCandidates(workspaceId)).toEqual([]);
+  });
+
+  /*
+   * THE SAFETY PROPERTY, on the sentence the last pass found and end to end.
+   *
+   * The owner said, in one breath on 10 August: *"Ease of use is paramount. Don't be heavy-handed
+   * with approvals. The safety floor that stays: purchases, credentials, public publishing,
+   * destructive actions, git pushes."* Counted over their own 648 typed turns, the slogan is 4
+   * turns across 3 days and the floor is 2 turns inside 1 day - so under a gate that keys the whole
+   * sentence the slogan corroborates and the floor cannot, and what promotes is a pinned standing
+   * instruction telling every later turn that the approval floor is in the way.
+   *
+   * What this asserts is the property, not the plumbing: **a rule whose only qualified sighting is a
+   * singleton promotes WITH the qualification or not at all - never bare.** The rule is proposed on
+   * two nights two days apart and the carve-out on exactly one of them, and the stored sentence is
+   * the qualified one.
+   *
+   * Both directions, on one fixture. The control below is the identical run with `but` omitted, and
+   * it promotes the bare sentence - so this is not a case that would pass against a store that
+   * happened to keep every sentence it was given.
+   */
+  it('promotes a rule with the carve-out it was stated with, from one sighting of the carve-out', async () => {
+    const rule = 'Ease of use is paramount and approvals should not be heavy-handed';
+    const floor =
+      'but always ask before purchases, credentials, public publishing, destructive actions and git pushes';
+    const qualified = `${rule}, ${floor}.`;
+    expect(qualified).toHaveLength(167);
+
+    const promoted = await twoNights({ rule, but: floor });
+    expect(promoted).toEqual([qualified]);
+    // Said as the property rather than inferred from the equality above: the sentence the old gate
+    // would have kept is not in the store under any spelling.
+    expect(promoted[0]).not.toBe(`${rule}.`);
+    expect(promoted[0]).toContain('purchases, credentials, public publishing');
+  });
+
+  /*
+   * The same property with the two nights the other way round, and it is not a duplicate of the
+   * case above - it is the only one of the two that reaches the accumulator.
+   *
+   * `observeMemoryFactCandidate` writes `draft_ciphertext = COALESCE(EXCLUDED, existing)`, so the
+   * LAST sighting's sentence is the draft. Attach the carve-out to the second night and the draft
+   * itself carries it, and a promotion that read nothing but the draft would still look right.
+   * Attach it to the FIRST night and the draft ends up bare - the clause exists in exactly one
+   * place, `mem.fact_qualification`, and the sentence that reaches `mem.item` is qualified only if
+   * the promotion composes from there.
+   */
+  it('keeps a carve-out stated on the first night and restated on neither', async () => {
+    const rule = 'Ease of use is paramount and approvals should not be heavy-handed';
+    const floor =
+      'but always ask before purchases, credentials, public publishing, destructive actions and git pushes';
+    await expect(twoNights({ rule, firstBut: floor })).resolves.toEqual([`${rule}, ${floor}.`]);
+  });
+
+  /*
+   * Two carve-outs on one rule, in one night, reaching the store as two rows.
+   *
+   * At the production call site, because that is where the split can be lost: `proposeMemoryFacts`
+   * hands `factCandidateKeys` the split the run already made, and a version that let it be
+   * re-derived from the composed sentence would find only the first connective and write one row
+   * saying both things. Beside rows an earlier night wrote for each clause separately, that row is
+   * a third clause saying nothing new - and the promoted sentence would then say both of them
+   * twice, inside a 200-character bound that would refuse the rule outright.
+   */
+  it('writes two carve-outs on one rule as two rows, not one row saying both', async () => {
+    const rule = 'Spin up as many agents as the work divides into';
+    await writeTurn({ request: 'Use more agents here.', at: '2026-08-02T10:00:00.000Z' });
+    await readyToPropose('2026-08-02T23:00:00.000Z');
+    const report = await proposeMemoryFacts(
+      proposer(
+        JSON.stringify([
+          { episode: 1, rule, but: 'never more than the budget allows' },
+          { episode: 1, rule, but: 'never where the work does not divide' }
+        ])
+      ).deps,
+      task,
+      dataKey,
+      { now: new Date('2026-08-02T23:00:00.000Z') }
+    );
+    expect(report.proposed).toBe(1);
+    expect(report.refused.duplicate).toBe(1);
+    const [candidate] = await store.listPromotableMemoryFactCandidates(workspaceId, {
+      minEpisodes: 1,
+      minGapHours: 0
+    });
+    expect(candidate?.qualifications ?? []).toHaveLength(2);
+    expect(
+      (candidate?.qualifications ?? [])
+        .map(
+          (qualification) =>
+            decryptJson<{ qualification: string }>(
+              qualification.ciphertext,
+              dataKey,
+              memoryFactCandidateAad(workspaceId)
+            ).qualification
+        )
+        .sort()
+    ).toEqual(
+      // Sorted, because two clauses seen in the same instant share a `first_seen` and the
+      // accumulator's tiebreak is the blind key - deterministic, and not the order the model wrote
+      // them in. Clauses from different sightings come back oldest first, which is the ordering
+      // that matters for a sentence assembled over months.
+      ['but never more than the budget allows', 'but never where the work does not divide'].sort()
+    );
+  });
+
+  /*
+   * And two carve-outs written in one night still say themselves once in the promoted sentence.
+   *
+   * The night that attaches both leaves a draft reading `core, q1, q2` beside accumulator rows for
+   * `q1` and `q2`. `splitQualification` takes one split per sentence, so re-splitting that draft
+   * yields the single clause `q1, q2` - which matches neither row. A promotion that added the
+   * draft's split to the accumulator's rows would compose `core, q1, q2, q1, q2`, and at that
+   * length the 200-character bound would refuse the rule outright: the carve-outs would have
+   * deleted their own rule.
+   */
+  it('says a carve-out once when one night attached two of them', async () => {
+    const rule = 'Spin up as many agents as the work divides into';
+    const first = 'but never more than the budget allows';
+    const second = 'but never where the work does not divide';
+    // On the SECOND night, so the two-clause sentence is the draft that survives: the upsert keeps
+    // the LAST sighting's draft, and a pair attached on the first night would be overwritten by the
+    // second night's bare restatement before promotion ever reads it.
+    const promoted = await twoNights({ rule, but: [first, second] });
+    expect(promoted).toHaveLength(1);
+    // Order follows the accumulator, which ties on the blind key for two clauses seen in the same
+    // instant - so the assertion is on what the sentence says, once each, and on its shape.
+    expect(promoted[0]).toContain(first);
+    expect(promoted[0]).toContain(second);
+    expect(promoted[0]!.split('but never').length - 1).toBe(2);
+    expect(promoted[0]).toHaveLength(`${rule}, ${first}, ${second}.`.length);
+  });
+
+  /* The control: the same two nights with nothing attached, which is the bare rule and says so. */
+  it('promotes the bare rule when no sighting carried a carve-out', async () => {
+    const rule = 'Ease of use is paramount and approvals should not be heavy-handed';
+    await expect(twoNights({ rule })).resolves.toEqual([`${rule}.`]);
+  });
+
+  /*
+   * The other half of "or not at all", taken at the promotion rather than at the reply.
+   *
+   * Two nights, two different carve-outs, each of which fits beside the rule on its own night and
+   * which do not fit together. The composer refuses, `prepare` answers null, and
+   * `promoteMemoryFactCandidates` leaves the candidate exactly where it is - so what the store
+   * holds afterwards is NOTHING, and in particular not the rule without the floor. The candidate
+   * surviving is the second half of the assertion: a refusal here is a rule the owner can state
+   * again, not a rule thrown away.
+   */
+  it('refuses to promote at all rather than drop a carve-out that will not fit', async () => {
+    const rule = 'Ease of use is paramount and approvals should not be heavy-handed';
+    const first = `but always ask before purchases, credentials, public publishing, destructive actions and git pushes`;
+    const second = `unless the owner has already said to go ahead on this specific irreversible thing today`;
+    expect(`${rule}, ${first}, ${second}.`.length).toBeGreaterThan(MEMORY_STANDING_ORDER_MAX_CHARS);
+    await expect(twoNights({ rule, firstBut: first, but: second })).resolves.toEqual([]);
+    // Held, not discarded. The rule is still promotable, with both its clauses beside it, so
+    // the refusal costs a rule the owner can state again rather than the clauses themselves.
+    const held = await store.listPromotableMemoryFactCandidates(workspaceId);
+    expect(held).toHaveLength(1);
+    expect(held[0]?.qualifications ?? []).toHaveLength(2);
+  });
+
   /* A promoted proposal is the model's wording of what the owner said, and says so. */
   it('mints a corroborated proposal at derived rather than as something the owner said', async () => {
     const rule = 'Take the lead and finish the work without asking for confirmation.';
-    for (const [day, text] of [
-      ['2026-08-02', 'You are the lead here.'],
-      ['2026-08-04', 'Do not stop to ask me things.']
-    ] as const) {
+    // The citation is the night's own turn, which is the last episode in the batch rather than the
+    // first: the window reaches `MEMORY_PROPOSAL_REREAD_MS` behind the previous run, so the second
+    // night is offered both days and citing episode 1 would file the second proposal against the
+    // turn the first one already used. Two sightings means two turns.
+    for (const [night, [day, text]] of (
+      [
+        ['2026-08-02', 'You are the lead here.'],
+        ['2026-08-04', 'Do not stop to ask me things.']
+      ] as const
+    ).entries()) {
       await writeTurn({ request: text, at: `${day}T10:00:00.000Z` });
       await readyToPropose(`${day}T23:00:00.000Z`);
       await proposeMemoryFacts(
-        proposer(JSON.stringify([{ episode: 1, rule }])).deps,
+        proposer(JSON.stringify([{ episode: night + 1, rule }])).deps,
         task,
         dataKey,
         { now: new Date(`${day}T23:00:00.000Z`) }
@@ -3724,7 +4145,9 @@ describe('what the harness does with what a model answers', () => {
       {
         episodeId: 'ep-2',
         occurredAt: '2026-08-02T18:00:00.000Z',
-        object: 'Never leave the branch unpushed at the end of a session.'
+        object: 'Never leave the branch unpushed at the end of a session.',
+        core: 'Never leave the branch unpushed at the end of a session',
+        qualifications: []
       }
     ]);
   });
@@ -3754,7 +4177,9 @@ describe('what the harness does with what a model answers', () => {
       {
         episodeId: 'ep-1',
         occurredAt: '2026-08-02T09:00:00.000Z',
-        object: 'Never leave the branch unpushed at the end of a session.'
+        object: 'Never leave the branch unpushed at the end of a session.',
+        core: 'Never leave the branch unpushed at the end of a session',
+        qualifications: []
       }
     ]);
   });
@@ -3950,5 +4375,312 @@ describe('what the harness does with what a model answers', () => {
     });
     expect(queueNearlyFull).toContain('2 past the 1 the list below still had room for');
     expect(queueNearlyFull).not.toContain('nightly limit');
+  });
+});
+
+/*
+ * Where a rule stops and its carve-out starts.
+ *
+ * Everything here is pure, so every bound is attacked in both directions on one fixture: the shape
+ * that splits and the shape one character away from it that must not.
+ */
+describe('the exception a rule was stated with', () => {
+  it('splits a rule from the carve-out the owner attached, and puts it back unchanged', () => {
+    const rule = 'Ease of use is paramount and approvals should not be heavy-handed';
+    const floor =
+      'but always ask before purchases, credentials, public publishing, destructive actions and git pushes';
+    const sentence = `${rule}, ${floor}.`;
+    expect(splitQualification(sentence)).toEqual({
+      core: rule,
+      qualifications: [floor],
+      terminator: '.'
+    });
+    // Character-identical, which is the invariant the whole tier rests on: the sentence a later
+    // turn is shown is the words the owner used, not a paraphrase this file assembled.
+    expect(composeQualifiedRule(splitQualification(sentence))).toBe(sentence);
+  });
+
+  it('leaves a rule with no carve-out exactly as it was', () => {
+    for (const sentence of [
+      'Never leave anything clunky.',
+      // `rather than` is a comparative INSIDE a clause, not a connective that carves out of the
+      // rule. Splitting here would file "check every requirement has been met solidly" as the rule
+      // and "adequately" as an exception to it, which is two halves of one sentence pulled apart.
+      'Never half-do anything: check every requirement has been met solidly rather than adequately.',
+      // Scope, not exception. A rule that says when it applies is that rule.
+      'Never stop until the work is complete; do not pause to report progress.'
+    ]) {
+      expect(splitQualification(sentence).qualifications).toEqual([]);
+      expect(composeQualifiedRule(splitQualification(sentence))).toBe(sentence);
+    }
+  });
+
+  it('refuses a split that would leave no rule in front of it, or no clause behind it', () => {
+    // A sentence that OPENS on a connective has no core to be an exception to. The lookbehind is
+    // what refuses it, and the whole sentence stays the identity - which is what the store does
+    // today, so nothing is lost by refusing.
+    const leading = 'Unless the tests are green, never push anything to the main branch.';
+    expect(splitQualification(leading).qualifications).toEqual([]);
+    // And a dangling conjunction, which is a connective with nothing after it worth keeping. One
+    // character either side of `MEMORY_QUALIFICATION_MIN_CHARS`, so the bound is the thing tested.
+    expect(splitQualification('Never leave the branch unpushed but not.').qualifications).toEqual(
+      []
+    );
+    expect(
+      splitQualification('Never leave the branch unpushed but not yet.').qualifications
+    ).toEqual(['but not yet']);
+  });
+
+  it('refuses to compose a sentence past the bound rather than dropping the last carve-out', () => {
+    const core = 'Ease of use is paramount and approvals should not be heavy-handed';
+    // Sized so the composed sentence is exactly the bound, then one character longer. The refusal
+    // has to be null and not a shorter sentence: a composer that trimmed to fit would put the rule
+    // in the store without the floor, which is the defect with a length bound in front of it.
+    const fits = `but ${'x'.repeat(MEMORY_STANDING_ORDER_MAX_CHARS - core.length - 7)}`;
+    const composed = composeQualifiedRule({
+      core,
+      qualifications: [fits],
+      terminator: '.'
+    });
+    expect(composed).toHaveLength(MEMORY_STANDING_ORDER_MAX_CHARS);
+    expect(
+      composeQualifiedRule({ core, qualifications: [`${fits}x`], terminator: '.' })
+    ).toBeNull();
+  });
+
+  /*
+   * The identity change, stated as the thing it changes: what corroboration counts.
+   *
+   * The same rule bare and carrying its floor are ONE key and were two. That is the whole finding
+   * of the last pass - the slogan clears two sightings a day apart and the carve-out never does -
+   * turned into an equality that fails if the split is removed.
+   */
+  it('keys a rule and the same rule with its carve-out to one identity', () => {
+    const key = memoryIndexKey(dataKey);
+    const rule = 'Ease of use is paramount and approvals should not be heavy-handed';
+    const bare = { subject: 'athanor', predicate: 'standing_order', object: `${rule}.` };
+    const qualified = {
+      ...bare,
+      object: `${rule}, but always ask before purchases, credentials and git pushes.`
+    };
+    expect(factCandidateKeys(bare, key, dataKey, workspaceId).objectKey).toBe(
+      factCandidateKeys(qualified, key, dataKey, workspaceId).objectKey
+    );
+    // And the whole sentence keys differently, which is what the store did before and is the
+    // control that makes the equality above mean something.
+    expect(memoryObjectKey(bare.object, key)).not.toBe(memoryObjectKey(qualified.object, key));
+    // The carve-out is not lost in the merge: it comes back as a row of its own.
+    expect(factCandidateKeys(bare, key, dataKey, workspaceId).qualifications).toHaveLength(0);
+    expect(factCandidateKeys(qualified, key, dataKey, workspaceId).qualifications).toHaveLength(1);
+  });
+
+  /*
+   * A value is not a rule. `lives_in Berlin, but only until March` keyed on `Berlin` would file a
+   * qualified value under the bare one, and `lives_in` is functional - so the next promotion would
+   * retire the real answer. Only `standing_order` splits.
+   */
+  /*
+   * The schema half: asking for the qualification was already in the prompt and was ignored, so it
+   * is a field. What is keyed is `rule`; what rides along is `but`.
+   */
+  it('keeps the carve-out the model put in its own field, and keys only the rule', () => {
+    const episodes = [{ episodeId: 'ep-1', occurredAt: '2026-08-02T09:00:00.000Z', text: 'x' }];
+    const { proposals } = memoryProposalsFromReply(
+      JSON.stringify([
+        {
+          episode: 1,
+          rule: 'Ease of use is paramount and approvals should not be heavy-handed',
+          but: 'always ask before purchases, credentials and git pushes'
+        }
+      ]),
+      episodes,
+      3
+    );
+    expect(proposals).toEqual([
+      {
+        episodeId: 'ep-1',
+        occurredAt: '2026-08-02T09:00:00.000Z',
+        object:
+          'Ease of use is paramount and approvals should not be heavy-handed, but always ask before purchases, credentials and git pushes.',
+        core: 'Ease of use is paramount and approvals should not be heavy-handed',
+        // `but ` was supplied because the model's clause did not open on a connective. Every later
+        // stage reads a clause by its opener, so a tail without one would be swallowed back into
+        // the core on the next split and the rule's identity would depend on the model's phrasing.
+        qualifications: ['but always ask before purchases, credentials and git pushes']
+      }
+    ]);
+  });
+
+  it('reads the carve-out out of the rule when the model puts it there anyway', () => {
+    const episodes = [{ episodeId: 'ep-1', occurredAt: '2026-08-02T09:00:00.000Z', text: 'x' }];
+    const { proposals } = memoryProposalsFromReply(
+      JSON.stringify([
+        {
+          episode: 1,
+          rule: 'Ease of use is paramount and approvals should not be heavy-handed, but always ask before purchases, credentials and git pushes.'
+        }
+      ]),
+      episodes,
+      3
+    );
+    expect(proposals[0]?.core).toBe(
+      'Ease of use is paramount and approvals should not be heavy-handed'
+    );
+    expect(proposals[0]?.qualifications).toEqual([
+      'but always ask before purchases, credentials and git pushes'
+    ]);
+  });
+
+  /*
+   * The asymmetry inside one reply, and it is the whole design in six lines.
+   *
+   * Two proposals of one rule with two different carve-outs are ONE row to the store, so letting
+   * both through is a night buying its own second sighting. The count is refused; the clause is
+   * not, because an exception needs one sighting where a rule needs two and merging can only make
+   * the stored rule smaller.
+   */
+  it('refuses a second sighting of one rule in one night and keeps its carve-out', () => {
+    const episodes = [
+      { episodeId: 'ep-1', occurredAt: '2026-08-02T09:00:00.000Z', text: 'x' },
+      { episodeId: 'ep-2', occurredAt: '2026-08-02T18:00:00.000Z', text: 'y' }
+    ];
+    const { proposals, refused } = memoryProposalsFromReply(
+      JSON.stringify([
+        {
+          episode: 1,
+          rule: 'Spin up as many agents as the work divides into',
+          but: 'never more than the budget allows'
+        },
+        {
+          episode: 2,
+          rule: 'Spin up as many agents as the work divides into',
+          but: 'never where the work does not divide'
+        }
+      ]),
+      episodes,
+      3
+    );
+    expect(refused.duplicate).toBe(1);
+    expect(proposals).toHaveLength(1);
+    expect(proposals[0]?.episodeId).toBe('ep-1');
+    expect(proposals[0]?.qualifications).toEqual([
+      'but never more than the budget allows',
+      'but never where the work does not divide'
+    ]);
+    expect(proposals[0]?.object).toBe(
+      'Spin up as many agents as the work divides into, but never more than the budget allows, but never where the work does not divide.'
+    );
+  });
+
+  /*
+   * And when the merge will not fit, the RULE goes rather than the clause.
+   *
+   * A run that kept the rule and dropped the exception because the pair was too long is the defect
+   * this file exists to remove, wearing a length bound's clothes. Both directions on one fixture:
+   * the same reply with a shorter second clause keeps the rule.
+   */
+  it('drops the rule rather than the carve-out when the two will not fit together', () => {
+    const episodes = [
+      { episodeId: 'ep-1', occurredAt: '2026-08-02T09:00:00.000Z', text: 'x' },
+      { episodeId: 'ep-2', occurredAt: '2026-08-02T18:00:00.000Z', text: 'y' }
+    ];
+    const rule = 'Ease of use is paramount and approvals should not be heavy-handed';
+    const first = 'always ask before purchases, credentials, public publishing and git pushes';
+    const attempt = (second: string) =>
+      memoryProposalsFromReply(
+        JSON.stringify([
+          { episode: 1, rule, but: first },
+          { episode: 2, rule, but: second }
+        ]),
+        episodes,
+        3
+      );
+    const tooLong = attempt(
+      'never waive any of that because a deadline is close or a person asks nicely'
+    );
+    expect(tooLong.proposals).toEqual([]);
+    expect(tooLong.refused.unusable).toBe(1);
+    const fits = attempt('never waive any of it');
+    expect(fits.proposals).toHaveLength(1);
+    expect(fits.proposals[0]?.qualifications).toHaveLength(2);
+  });
+
+  /*
+   * A carve-out with a connective in the MIDDLE of it, which is the shape that silently rewrote the
+   * rule.
+   *
+   * The harness prefixes `but ` when the model's clause does not open on a connective. Asked
+   * whether the clause CONTAINS one instead of whether it OPENS on one, this clause is left
+   * unprefixed - and `splitQualification` then cuts the composed sentence at its `unless` and calls
+   * everything in front of that the rule. The core would become "…, but always ask before
+   * purchases", a rule the model never proposed and one that no later sighting of the real rule can
+   * corroborate.
+   */
+  it('reads whether a carve-out opens on a connective, not whether it contains one', () => {
+    const episodes = [{ episodeId: 'ep-1', occurredAt: '2026-08-02T09:00:00.000Z', text: 'x' }];
+    const { proposals } = memoryProposalsFromReply(
+      JSON.stringify([
+        {
+          episode: 1,
+          rule: 'Ease of use is paramount and approvals should not be heavy-handed',
+          but: 'always ask before purchases unless the owner has already said to go ahead'
+        }
+      ]),
+      episodes,
+      3
+    );
+    expect(proposals[0]?.core).toBe(
+      'Ease of use is paramount and approvals should not be heavy-handed'
+    );
+    expect(proposals[0]?.qualifications).toEqual([
+      'but always ask before purchases unless the owner has already said to go ahead'
+    ]);
+    // And the composed sentence splits back to the same core, which is the property that actually
+    // matters: what the store keys is what the model proposed.
+    expect(splitQualification(proposals[0]!.object).core).toBe(proposals[0]?.core);
+  });
+
+  /*
+   * Two clauses on one rule reach the store as two rows, not as one row saying both.
+   *
+   * `factCandidateKeys` would re-derive them from the composed sentence and find only the first
+   * connective, storing `q1, q2` as a single clause. Harmless alone; not harmless beside rows for
+   * `q1` and `q2` that an earlier night wrote separately, because the accumulator would then hold
+   * three clauses saying two things and the promoted sentence would say both of them twice. The
+   * proposer holds the split it made and hands it over.
+   */
+  it('keeps two carve-outs on one rule as two rows in the accumulator', () => {
+    const key = memoryIndexKey(dataKey);
+    const core = 'Spin up as many agents as the work divides into';
+    const clauses = ['but never more than the budget allows', 'but never where it does not divide'];
+    const object = `${core}, ${clauses.join(', ')}.`;
+    const observation = { subject: 'athanor', predicate: 'standing_order', object };
+    // Re-derived from the sentence, the two clauses are one - this is the control that makes the
+    // line below mean something rather than restating its own input.
+    expect(factCandidateKeys(observation, key, dataKey, workspaceId).qualifications).toHaveLength(
+      1
+    );
+    const handed = factCandidateKeys(observation, key, dataKey, workspaceId, {
+      core,
+      qualifications: clauses,
+      terminator: ''
+    });
+    expect(handed.qualifications.map((one) => one.key)).toEqual(
+      clauses.map((clause) => memoryObjectKey(clause, key))
+    );
+    expect(handed.objectKey).toBe(memoryObjectKey(core, key));
+  });
+
+  it('never splits a carve-out off a predicate that holds a value', () => {
+    const key = memoryIndexKey(dataKey);
+    const observation = {
+      subject: 'owner',
+      predicate: 'lives_in',
+      object: 'Berlin, but only until March'
+    };
+    expect(factCandidateKeys(observation, key, dataKey, workspaceId)).toEqual({
+      objectKey: memoryObjectKey(observation.object, key),
+      qualifications: []
+    });
   });
 });

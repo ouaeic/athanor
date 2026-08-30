@@ -17,7 +17,7 @@ import {
 } from '@athanor/core';
 import type { ModelRelease } from '@athanor/contracts';
 import type { DataStore, MemoryPackRecord, TaskRecord } from '@athanor/data';
-import type { ModelMessage } from '@athanor/model-gateway';
+import type { ModelGateway, ModelMessage } from '@athanor/model-gateway';
 import type { AgentState } from './agent-state.js';
 import type { CompletionVerification } from './completion.js';
 import { captureMemory, type MemoryCaptureDeps } from './memory-capture.js';
@@ -320,9 +320,22 @@ describe('the one model call a day, from the turn that triggers it', () => {
                 assertProviderConfigured: async () => undefined,
                 currentCatalog: async () => catalogue,
                 withLeaseRenewal: async (_task, operation) => operation(),
-                gateway: async () => {
-                  throw new Error('no case here should reach a provider');
-                }
+                /*
+                 * A gateway that opens and a chat that does not.
+                 *
+                 * `proposeMemoryFacts` resolves the provider in FRONT of the claim, so a stub that
+                 * threw here refused the run before it read anything - and this case is about what
+                 * it reads. The refusal that belongs to this fixture is on the request itself: the
+                 * day is empty, so the call is never made, and a version that made one fails here.
+                 */
+                gateway: async () => ({
+                  provider: 'custom',
+                  gateway: {
+                    chat: async () => {
+                      throw new Error('no case here should reach a provider');
+                    }
+                  } as unknown as ModelGateway
+                })
               }
             }
           }

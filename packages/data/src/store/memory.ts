@@ -189,11 +189,43 @@ export interface MemoryContradictionPair {
   readonly right: MemoryItemRecord;
 }
 
+/**
+ * One carve-out on one rule, as the store holds it: a blind hash of the clause and the sealed
+ * clause itself.
+ *
+ * `key` is `memoryObjectKey` over the clause under the store's own fold, so two spellings of one
+ * exception are one row and the store can dedupe what it cannot read. It belongs to the RULE -
+ * `(workspace, subject, predicate, object_key)` - and not to the candidate that carried it, which
+ * is why it survives the candidate's promotion.
+ */
+export interface MemoryFactQualification {
+  readonly key: string;
+  readonly ciphertext: EncryptedEnvelope;
+  readonly firstSeen: string;
+}
+
 export interface MemoryFactCandidateRecord {
   workspaceId: string;
   subjectKey: string;
   predicate: string;
+  /**
+   * The rule with its qualification stripped, keyed.
+   *
+   * This is what corroboration counts, and the stripping is the whole point: a sentence and the
+   * same sentence with the owner's exception attached have to reach the same counter, or the bare
+   * one collects the sightings and the qualified one dies a singleton. The exception is not lost -
+   * it is in `qualifications`, on terms of its own.
+   */
   objectKey: string;
+  /**
+   * Every carve-out anyone has seen on this rule, oldest first, whether or not this candidate's own
+   * sighting carried one.
+   *
+   * Absent rather than empty when the caller did not ask for them: only the promotion path and the
+   * owner's queue load them, and a record that has not been asked must not look like a rule with
+   * none. Ordered by `first_seen` so composition is deterministic across passes.
+   */
+  qualifications?: readonly MemoryFactQualification[];
   episodeCount: number;
   firstSeen: string;
   lastSeen: string;
@@ -245,6 +277,14 @@ export interface PreparedMemoryFact {
   documentCiphertext: EncryptedEnvelope;
   /** Its `subjectKey` and `objectKey` must be the candidate's, or the promotion is refused. */
   index: MemoryItemIndex;
+  /**
+   * The carve-outs the sealed body actually carries, as keys.
+   *
+   * Recorded on the row so a later candidate can be asked "does the live rule already say this?"
+   * against a store that cannot read either sentence. It is not checked against the candidate the
+   * way the subject and object are, because it is not an identity - it is a set that grows.
+   */
+  qualificationKeys?: readonly string[];
   /** Defaults to `derived`: a promoted fact was assembled from episodes, not stated outright. */
   trust?: MemoryTrust;
   observedAt?: Date | string | null;
@@ -295,6 +335,12 @@ export interface CreateMemoryItemInput {
    * still taken at the moment of writing.
    */
   tainted?: boolean | null;
+  /**
+   * The carve-outs this row's sentence carries, keyed. Facts promoted from a candidate only; every
+   * other writer leaves it null, which reads as "this row makes no claim about exceptions" rather
+   * than "this rule has none".
+   */
+  qualificationKeys?: readonly string[] | null;
 }
 
 export interface RecallMemoryInput {
@@ -579,6 +625,24 @@ export class MemoryStore {
   static readonly nearDuplicateJaccard = 0.9;
 
   /**
+   * How many carve-outs one rule may accumulate.
+   *
+   * The only spelling of this bound. It lives beside the statement that enforces it rather than in
+   * the worker that supplies the clauses, because a caller-supplied maximum is a second policy the
+   * store cannot see - and this store has paid for one of those already, in the corroboration gate
+   * whose two halves are defaults here for exactly that reason.
+   *
+   * Four, and the number is measured rather than round: over the owner's 648 typed turns no rule
+   * core accumulates more than two distinct qualifications, and the 200-character bound on a
+   * standing order refuses a fifth long before this does - the shortest carve-out in that corpus is
+   * 24 characters, so five of them behind a 16-character core is already past 200. It exists at all
+   * because this is a table and composition is not what stops it growing: a rule whose clauses no
+   * longer compose keeps every row it has, so without a bound here a proposer restating one rule
+   * nightly with a fresh clause grows a row set nothing will ever read.
+   */
+  static readonly maxQualifications = 4;
+
+  /**
    * The fewest distinct body lexemes an entry must have before similarity means anything.
    *
    * Under this, Jaccard is measuring a coincidence. "Ships on Friday" and "Ships on Monday" share
@@ -692,11 +756,11 @@ export class MemoryStore {
          id,user_id,workspace_id,kind,status,trust,document_ciphertext,title_tokens,tag_tokens,
          alias_tokens,body_tokens,tags_hashed,trigrams,dedupe_key,observed_at,valid_from,valid_to,
          subject_key,predicate,object_key,episode_id,task_id,last_verified,pin,salience,
-         tokens_est,indexed,tainted
+         tokens_est,indexed,tainted,qualification_keys
        ) VALUES (
          $1,$2,$3,$4::mem.kind,COALESCE($5::mem.status,'active'),$6::mem.trust,$7::jsonb,$8,$9,
          $27,$10,$11::text[],$12::text[],$13,COALESCE($14,NOW()),COALESCE($15,NOW()),$16,$17,
-         $18,$19,$20,$21,$22,$23,$24,$25,$26,$28::boolean
+         $18,$19,$20,$21,$22,$23,$24,$25,$26,$28::boolean,$29::text[]
        ) RETURNING *`,
       [
         input.id ?? randomUUID(),
@@ -726,7 +790,8 @@ export class MemoryStore {
         input.index.tokensEst,
         input.index.indexed,
         input.index.aliasTokens,
-        input.tainted ?? null
+        input.tainted ?? null,
+        input.qualificationKeys ? [...input.qualificationKeys] : null
       ]
     );
     return mapMemoryItem(result.rows[0]!);
@@ -978,6 +1043,12 @@ export class MemoryStore {
     draftCiphertext?: EncryptedEnvelope | null;
     /** Who nominated it. Defaults to the shipped patterns over the owner's own sentence. */
     origin?: MemoryFactCandidateOrigin;
+    /**
+     * The carve-outs this sighting carried, if any. Written beside the candidate rather than into
+     * it, and on terms of their own: one sighting is enough for an exception where a rule needs
+     * two, so they are accumulated rather than counted.
+     */
+    qualifications?: readonly { key: string; ciphertext: EncryptedEnvelope }[];
   }): Promise<MemoryFactCandidateRecord> {
     const result = await this.database.query(
       `INSERT INTO mem.fact_candidate(
@@ -1014,6 +1085,54 @@ export class MemoryStore {
         input.origin ?? 'observed'
       ]
     );
+    /*
+     * The carve-outs, on their own terms.
+     *
+     * Insert-only, so the set a rule carries can only grow - that monotonicity is what makes the
+     * safety property hold after the first promotion as well as at it, and it is structural rather
+     * than asserted: there is no statement anywhere that removes one of these except the owner's
+     * own dismissal and the workspace cascade.
+     *
+     * Not a read-modify-write on the candidate's draft, which is the shape this obviously wants to
+     * be. Two turns finishing in the same second would each read the draft, union their own clause
+     * into it, and write back - and the later write would drop the earlier one's carve-out. A row
+     * per clause keyed on a blind hash of the clause is idempotent by construction and needs no
+     * transaction at all.
+     *
+     * The bound and the owner's refusal are both taken in the statement rather than around it. A
+     * count read first and enforced afterwards is two statements a concurrent turn fits between,
+     * and `dismissed_at` tested in TypeScript would let the clauses of a sentence the owner has
+     * refused accumulate beside the refusal.
+     */
+    const qualifications = (input.qualifications ?? []).slice(0, MemoryStore.maxQualifications);
+    for (const qualification of qualifications)
+      await this.database.query(
+        `INSERT INTO mem.fact_qualification(
+           workspace_id,subject_key,predicate,object_key,qualification_key,ciphertext,first_seen
+         )
+         SELECT $1,$2,$3,$4,$5,$6::jsonb,COALESCE($7::timestamptz,NOW())
+         WHERE (
+                 SELECT count(*) FROM mem.fact_qualification q
+                 WHERE q.workspace_id=$1 AND q.subject_key=$2 AND q.predicate=$3
+                   AND q.object_key=$4
+               ) < $8::int
+           AND NOT EXISTS (
+                 SELECT 1 FROM mem.fact_candidate c
+                 WHERE c.workspace_id=$1 AND c.subject_key=$2 AND c.predicate=$3
+                   AND c.object_key=$4 AND c.dismissed_at IS NOT NULL
+               )
+         ON CONFLICT DO NOTHING`,
+        [
+          input.workspaceId,
+          input.subjectKey,
+          input.predicate,
+          input.objectKey,
+          qualification.key,
+          JSON.stringify(qualification.ciphertext),
+          input.observedAt ?? null,
+          MemoryStore.maxQualifications
+        ]
+      );
     // A conflicting row the WHERE above refused updates nothing and returns nothing. The row is
     // still there and the caller is owed the truth about it - it comes back untouched, carrying
     // `dismissedAt`, so a caller counting what it managed to nominate can see that this one it
@@ -1059,7 +1178,26 @@ export class MemoryStore {
          AND dismissed_at IS NULL`,
       [workspaceId, subjectKey, predicate, objectKey]
     );
+    // The carve-outs go with the draft and for the same reason. They are the owner's words about a
+    // rule the owner has just refused, and the three keys are the whole of what a refusal needs to
+    // be enforceable. Keeping them would leave clauses of a sentence nobody may store.
+    if (result.rowCount === 1)
+      await this.#dropQualifications(workspaceId, subjectKey, predicate, objectKey);
     return result.rowCount === 1;
+  }
+
+  /** Every carve-out on one rule, dropped together. Never called by promotion, which keeps them. */
+  async #dropQualifications(
+    workspaceId: string,
+    subjectKey: string,
+    predicate: string,
+    objectKey: string
+  ): Promise<void> {
+    await this.database.query(
+      `DELETE FROM mem.fact_qualification
+       WHERE workspace_id=$1 AND subject_key=$2 AND predicate=$3 AND object_key=$4`,
+      [workspaceId, subjectKey, predicate, objectKey]
+    );
   }
 
   /**
@@ -1234,7 +1372,52 @@ export class MemoryStore {
         options.limit ?? 50
       ]
     );
-    return result.rows.map(mapMemoryFactCandidate);
+    return this.#withQualifications(workspaceId, result.rows.map(mapMemoryFactCandidate));
+  }
+
+  /**
+   * Every carve-out on every rule in a batch, in one statement.
+   *
+   * One query and not one per candidate: this runs at the end of every finished turn, behind a
+   * `LIMIT 50`, and fifty round trips to answer "does this rule have an exception" on a corpus
+   * where almost none do is the shape of cost that gets noticed a year later. The object key is
+   * unique enough to filter on and the triple is matched in memory, which is where the store can
+   * afford to be exact.
+   *
+   * A candidate with no carve-out gets `[]` and not `undefined`: it has been asked, and the answer
+   * is none. That distinction is what `MemoryFactCandidateRecord.qualifications` is optional for.
+   */
+  async #withQualifications(
+    workspaceId: string,
+    candidates: MemoryFactCandidateRecord[]
+  ): Promise<MemoryFactCandidateRecord[]> {
+    if (candidates.length === 0) return candidates;
+    const result = await this.database.query(
+      `SELECT subject_key, predicate, object_key, qualification_key, ciphertext, first_seen
+       FROM mem.fact_qualification
+       WHERE workspace_id=$1 AND object_key = ANY($2::text[])
+       ORDER BY first_seen, qualification_key`,
+      [workspaceId, candidates.map((candidate) => candidate.objectKey)]
+    );
+    const byRule = new Map<string, MemoryFactQualification[]>();
+    for (const row of result.rows) {
+      const rule = [String(row.subject_key), String(row.predicate), String(row.object_key)].join(
+        '\0'
+      );
+      const held = byRule.get(rule) ?? [];
+      held.push({
+        key: String(row.qualification_key),
+        ciphertext: json<EncryptedEnvelope>(row.ciphertext),
+        firstSeen: iso(row.first_seen)
+      });
+      byRule.set(rule, held);
+    }
+    return candidates.map((candidate) => ({
+      ...candidate,
+      qualifications:
+        byRule.get([candidate.subjectKey, candidate.predicate, candidate.objectKey].join('\0')) ??
+        []
+    }));
   }
 
   async deleteMemoryFactCandidate(
@@ -1248,6 +1431,12 @@ export class MemoryStore {
        WHERE workspace_id=$1 AND subject_key=$2 AND predicate=$3 AND object_key=$4`,
       [workspaceId, subjectKey, predicate, objectKey]
     );
+    // Abandoning the nomination abandons its carve-outs. This is the path for a rule whose
+    // predicate has left the registry and for one the owner retracted - in both the rule is not
+    // going to be stored, and clauses of a sentence nothing will ever compose are dead rows.
+    // Promotion does NOT come through here: it deletes the candidate with its own statement,
+    // precisely so the accumulator outlives the nomination that filled it.
+    await this.#dropQualifications(workspaceId, subjectKey, predicate, objectKey);
     return result.rowCount === 1;
   }
 
@@ -1324,7 +1513,27 @@ export class MemoryStore {
         );
         continue;
       }
-      if (standing) {
+      /*
+       * The live row says this rule already - but does it say the exception?
+       *
+       * Reattaching is right when it does, and it is the wrong answer when the rule promoted in
+       * June and the owner stated its carve-out in August: the corroboration would land on a row
+       * that still reads as the bare rule, and the exception would sit in an accumulator nothing
+       * ever composes. That is the same defect this whole change exists to remove, one tier along
+       * and after the fact.
+       *
+       * The test is a set containment over blind keys, which is the whole of what a store that
+       * cannot read either sentence is able to do. The accumulator is insert-only and survives
+       * promotion, so a row minted from it can only ever have been minted from a subset of what is
+       * there now - which makes the direction of this comparison structural: the new row carries
+       * every key the old one had and at least one more. **A rule's carve-outs never shrink.**
+       */
+      const carriesEveryQualification =
+        !standing ||
+        (candidate.qualifications ?? []).every((qualification) =>
+          standing.qualificationKeys.includes(qualification.key)
+        );
+      if (standing && carriesEveryQualification) {
         const item = await this.database.transaction(async (transaction) => {
           await this.#linkPromotionEpisodes(transaction, workspaceId, standing.id, candidate);
           await transaction.query(
@@ -1362,9 +1571,33 @@ export class MemoryStore {
           validFrom: prepared.validFrom ?? candidate.lastSeen,
           taskId: prepared.taskId ?? null,
           episodeId: candidate.episodeIds.at(-1) ?? null,
-          pin: prepared.pin ?? false
+          pin: prepared.pin ?? false,
+          qualificationKeys: prepared.qualificationKeys ?? null
         });
         await this.#linkPromotionEpisodes(transaction, workspaceId, recorded.item.id, candidate);
+        /*
+         * The thinner row retires in the same transaction that mints the fuller one.
+         *
+         * `standing_order` is `cardinality: 'many'`, so `#recordMemoryFact`'s own supersession
+         * never fires on one and both rows would otherwise stay active - the same rule twice,
+         * spending two of the four slots the pack gives a subject, one of them saying less than the
+         * other. Superseded rather than deleted, like every other retirement in this table: the row
+         * stays answerable and leaves recall.
+         */
+        if (standing) {
+          await transaction.query(
+            `UPDATE mem.item SET status='superseded', valid_to=COALESCE($2::timestamptz,NOW()),
+                                 retired_at=NOW(), updated_at=NOW()
+             WHERE id=$1 AND status='active'`,
+            [standing.id, prepared.validFrom ?? candidate.lastSeen]
+          );
+          await transaction.query(
+            `INSERT INTO mem.link(src_id,dst_id,rel) VALUES ($1,$2,'supersedes')
+             ON CONFLICT DO NOTHING`,
+            [recorded.item.id, standing.id]
+          );
+          recorded.supersededIds.push(standing.id);
+        }
         await transaction.query(
           `DELETE FROM mem.fact_candidate
            WHERE workspace_id=$1 AND subject_key=$2 AND predicate=$3 AND object_key=$4`,
@@ -1394,16 +1627,28 @@ export class MemoryStore {
   async #storedMemoryFact(
     workspaceId: string,
     candidate: MemoryFactCandidateRecord
-  ): Promise<{ id: string; status: string } | null> {
-    const result = await this.database.query<{ id: string; status: string }>(
-      `SELECT id, status::text AS status FROM mem.item
+  ): Promise<{ id: string; status: string; qualificationKeys: string[] } | null> {
+    const result = await this.database.query<{
+      id: string;
+      status: string;
+      qualification_keys: string[] | null;
+    }>(
+      // `COALESCE(...,'{}')` and not a null check at the caller: a row minted before this column
+      // existed makes no claim about exceptions, and the only safe reading of no claim is that it
+      // carries none - so a candidate with a carve-out mints the fuller row rather than reattaching
+      // to a row that may or may not already say it.
+      `SELECT id, status::text AS status, COALESCE(qualification_keys,'{}') AS qualification_keys
+       FROM mem.item
        WHERE workspace_id=$1 AND kind='fact' AND subject_key=$2 AND predicate=$3 AND object_key=$4
          AND status IN ('active','retracted')
        ORDER BY (status = 'retracted') DESC, observed_at DESC, id
        LIMIT 1`,
       [workspaceId, candidate.subjectKey, candidate.predicate, candidate.objectKey]
     );
-    return result.rows[0] ?? null;
+    const row = result.rows[0];
+    return row
+      ? { id: row.id, status: row.status, qualificationKeys: row.qualification_keys ?? [] }
+      : null;
   }
 
   /** The episodes that vouched for a fact, whether it was just minted or was already there. */
@@ -1990,6 +2235,36 @@ export class MemoryStore {
          AND last_seen < COALESCE($2::timestamptz,NOW()) - make_interval(days => $3::int)`,
       [workspaceId, now, candidateRetentionDays]
     );
+    /*
+     * Carve-outs whose rule is neither nominated nor stored any more.
+     *
+     * Not aged out on their own clock, and the two NOT EXISTS clauses are why. A carve-out on a
+     * rule that is still a candidate is waiting for the rule's second sighting, and a carve-out on
+     * a rule that has already promoted is what a later restatement is compared against - deleting
+     * either would put the accumulator back to where a rule stated in June cannot pick up the
+     * exception stated in August, which is the failure the table exists to remove. What is left
+     * after both is a clause belonging to nothing, and it goes on the candidate's own horizon.
+     *
+     * `status IN ('active','retracted')` matches `#storedMemoryFact` exactly: those are the two
+     * statuses a promotion consults, so those are the two that can still need the set.
+     */
+    await this.database.query(
+      `DELETE FROM mem.fact_qualification q
+       WHERE q.workspace_id=$1
+         AND q.first_seen < COALESCE($2::timestamptz,NOW()) - make_interval(days => $3::int)
+         AND NOT EXISTS (
+               SELECT 1 FROM mem.fact_candidate c
+               WHERE c.workspace_id=q.workspace_id AND c.subject_key=q.subject_key
+                 AND c.predicate=q.predicate AND c.object_key=q.object_key
+             )
+         AND NOT EXISTS (
+               SELECT 1 FROM mem.item i
+               WHERE i.workspace_id=q.workspace_id AND i.kind='fact'
+                 AND i.subject_key=q.subject_key AND i.predicate=q.predicate
+                 AND i.object_key=q.object_key AND i.status IN ('active','retracted')
+             )`,
+      [workspaceId, now, candidateRetentionDays]
+    );
     const packs = await this.database.query(
       `DELETE FROM mem.pack WHERE workspace_id=$1 AND task_id IN (
          SELECT t.id FROM tasks t
@@ -2237,6 +2512,28 @@ export class MemoryStore {
             SET episode_ids = array_remove(episode_ids, $2::uuid),
                 n_episodes = n_episodes - 1
           WHERE workspace_id=$1 AND $2::uuid = ANY(episode_ids)`,
+        [workspaceId, itemId]
+      );
+      /*
+       * And the carve-outs on the rule this row IS, if it is one.
+       *
+       * `mem.fact_qualification` is deliberately outlived by nothing else - it survives promotion so
+       * that a rule stated in June can pick up the exception stated in August - which makes it the
+       * one table where "delete removes every trace" needs a statement of its own. Without this,
+       * deleting a standing order leaves its clauses behind, and the sentence the owner deleted
+       * would come back qualified the next time they said the rule. That is the safe direction and
+       * it is still not what the route promises.
+       *
+       * Before the item is deleted, because the keys have to be read off it. Only for a fact, and
+       * only for one that has all three keys: the qualification table is keyed on the triple, and a
+       * row with a null object key belongs to no rule.
+       */
+      await transaction.query(
+        `DELETE FROM mem.fact_qualification q
+         USING mem.item i
+         WHERE i.id=$2 AND i.workspace_id=$1 AND i.kind='fact'
+           AND q.workspace_id=i.workspace_id AND q.subject_key=i.subject_key
+           AND q.predicate=i.predicate AND q.object_key=i.object_key`,
         [workspaceId, itemId]
       );
       const removed = await transaction.query(

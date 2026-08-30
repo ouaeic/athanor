@@ -26,14 +26,18 @@ const items: MemoryItem[] = [
     kind: 'episode',
     status: 'active',
     excerpt: 'Goal: Prepare the quarterly numbers',
-    observedAt: '2026-02-01T09:00:00.000Z'
+    observedAt: '2026-02-01T09:00:00.000Z',
+    trust: 'derived',
+    origin: 'watched'
   },
   {
     id: 'b2',
     kind: 'fact',
     status: 'superseded',
     excerpt: 'Reports open with an executive summary',
-    observedAt: '2026-01-04T18:30:00.000Z'
+    observedAt: '2026-01-04T18:30:00.000Z',
+    trust: 'stated',
+    origin: 'stated'
   }
 ];
 

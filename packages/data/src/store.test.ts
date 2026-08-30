@@ -4276,6 +4276,176 @@ describe('tiered agent memory', () => {
     );
   });
 
+  /*
+   * The carve-outs on a rule, which are counted on different terms from the rule itself.
+   *
+   * `mem.fact_qualification` is keyed on the rule and on a blind hash of the clause, so the store
+   * dedupes exceptions it cannot read; the bound is taken in the statement rather than around it;
+   * and a sentence the owner has dismissed accumulates nothing beside its refusal.
+   */
+  it('accumulates a rule’s carve-outs, deduped, bounded, and never past a refusal', async () => {
+    const episode = await addItem('episode', { body: 'The owner said it.' });
+    const rule = {
+      workspaceId,
+      subjectKey: 'subject-athanor',
+      predicate: 'standing_order',
+      objectKey: 'object-approvals'
+    };
+    const clause = (name: string) => ({ key: `q-${name}`, ciphertext: sealed(name) });
+    await store.observeMemoryFactCandidate({
+      ...rule,
+      episodeId: episode.id,
+      observedAt: at(3),
+      qualifications: [clause('purchases'), clause('purchases'), clause('credentials')]
+    });
+    const held = async () =>
+      (
+        await store.listPromotableMemoryFactCandidates(workspaceId, {
+          minEpisodes: 1,
+          minGapHours: 0
+        })
+      )
+        .flatMap((candidate) => candidate.qualifications ?? [])
+        .map((qualification) => opened(qualification.ciphertext));
+    // The same clause twice in one sighting is one row: the key is the identity, and the store is
+    // the only place that can hold that opinion, because it is the only place both spellings meet.
+    expect(await held()).toEqual(['credentials', 'purchases']);
+
+    // Past the bound, taken in the INSERT rather than by a count read first and enforced after -
+    // two statements are two statements a concurrent turn fits between.
+    const laterEpisode = await addItem('episode', { body: 'And again, days later.' });
+    await store.observeMemoryFactCandidate({
+      ...rule,
+      episodeId: laterEpisode.id,
+      observedAt: at(1),
+      qualifications: ['publishing', 'destructive', 'pushes', 'branches'].map(clause)
+    });
+    expect(await held()).toHaveLength(MemoryStore.maxQualifications);
+
+    // And the owner's refusal takes the clauses with the draft. They are their words about a rule
+    // they have just said they do not want; keeping them would leave clauses of a sentence nothing
+    // may ever store.
+    await expect(
+      store.dismissMemoryFactCandidate(workspaceId, rule.subjectKey, rule.predicate, rule.objectKey)
+    ).resolves.toBe(true);
+    await expect(
+      database
+        .query('SELECT count(*)::int AS n FROM mem.fact_qualification')
+        .then((result) => (result.rows[0] as { n: number }).n)
+    ).resolves.toBe(0);
+    // A refused sentence accumulates nothing afterwards either, and that is the same statement
+    // doing it rather than a second guard somewhere else.
+    await store.observeMemoryFactCandidate({
+      ...rule,
+      episodeId: episode.id,
+      observedAt: at(0),
+      qualifications: [clause('purchases')]
+    });
+    await expect(
+      database
+        .query('SELECT count(*)::int AS n FROM mem.fact_qualification')
+        .then((result) => (result.rows[0] as { n: number }).n)
+    ).resolves.toBe(0);
+  });
+
+  /*
+   * A rule that promoted in June, given its exception in August.
+   *
+   * This is the half of the design that cannot live in the worker. The accumulator survives
+   * promotion - it belongs to the rule, not to the nomination that filled it - so a later sighting
+   * carrying a clause the live row does not have mints the fuller sentence and retires the thinner
+   * one, instead of reattaching to a row that still reads as the bare rule. Because rows are only
+   * ever inserted there, the set can only grow: **a rule's carve-outs never shrink.**
+   *
+   * Both directions on one fixture. The second promotion below carries a new clause and supersedes;
+   * the third carries nothing new and reattaches, which is the control that stops this passing
+   * against a store that simply minted a row every time.
+   */
+  it('gives a promoted rule the exception stated after it, and retires the sentence without one', async () => {
+    const bare = 'Ease of use is paramount and approvals should not be heavy-handed.';
+    const qualified =
+      'Ease of use is paramount and approvals should not be heavy-handed, but always ask before purchases and git pushes.';
+    const core = 'Ease of use is paramount and approvals should not be heavy-handed';
+    const indexFor = (body: string) =>
+      buildMemoryItemIndex(
+        { title: 'Standing instruction', body, subject: 'athanor', object: core },
+        key
+      );
+    const rule = {
+      workspaceId,
+      subjectKey: indexFor(bare).subjectKey!,
+      predicate: 'standing_order',
+      objectKey: indexFor(bare).objectKey!
+    };
+    const say = async (
+      episodes: readonly { id: string }[],
+      seenAt: Date,
+      qualifications: readonly { key: string; ciphertext: EncryptedEnvelope }[] = []
+    ) => {
+      for (const episode of episodes)
+        await store.observeMemoryFactCandidate({
+          ...rule,
+          episodeId: episode.id,
+          observedAt: seenAt,
+          qualifications
+        });
+    };
+    // The worker's own composer, in one line: the body is the rule and every clause the store has.
+    const promote = (body: string) =>
+      store.promoteMemoryFactCandidates(workspaceId, (candidate) => ({
+        userId,
+        trust: 'derived' as const,
+        documentCiphertext: sealed(body),
+        index: indexFor(body),
+        qualificationKeys: (candidate.qualifications ?? []).map((one) => one.key),
+        pin: true
+      }));
+
+    await say([await addItem('episode', { body: 'Said it.' })], at(6));
+    await say([await addItem('episode', { body: 'Said it again.' })], at(4));
+    const first = await promote(bare);
+    expect(first).toHaveLength(1);
+    expect(opened(first[0]!.item.documentCiphertext)).toBe(bare);
+
+    // August. The same rule, twice more, and one of the two sightings carries the floor.
+    const floor = [
+      { key: 'q-floor', ciphertext: sealed('but always ask before purchases and git pushes') }
+    ];
+    await say([await addItem('episode', { body: 'Said it in August.' })], at(3), floor);
+    await say([await addItem('episode', { body: 'And once more.' })], at(1));
+    // The accumulator outlived the first promotion, which is what makes any of this reachable.
+    const promotable = await store.listPromotableMemoryFactCandidates(workspaceId);
+    expect(promotable[0]?.qualifications?.map((one) => one.key)).toEqual(['q-floor']);
+
+    const second = await promote(qualified);
+    expect(second).toHaveLength(1);
+    expect(second[0]!.reattached).toBe(false);
+    expect(second[0]!.supersededIds).toEqual([first[0]!.item.id]);
+    const live = (await store.listMemoryItems(workspaceId, { kind: 'fact', limit: 50 })).filter(
+      (item) => item.predicate === 'standing_order' && item.status === 'active'
+    );
+    expect(live.map((item) => opened(item.documentCiphertext))).toEqual([qualified]);
+
+    // The accumulator is not consumed by the promotion that used it. That is the whole reason it
+    // is keyed on the rule instead of on the candidate: the candidate is deleted here, and a store
+    // that took the clauses with it would be back to a rule that cannot pick up an exception
+    // stated after it - which is this case, one promotion later.
+    await expect(
+      database
+        .query('SELECT qualification_key FROM mem.fact_qualification')
+        .then((result) => result.rows.map((row) => String(row.qualification_key)))
+    ).resolves.toEqual(['q-floor']);
+
+    // The control: a restatement with nothing new lands on the row that already says it. Without
+    // this the case above would pass against a store that minted a second row every time.
+    await say([await addItem('episode', { body: 'September.' })], at(1.5));
+    await say([await addItem('episode', { body: 'And again.' })], at(0.4));
+    const third = await promote(qualified);
+    expect(third).toHaveLength(1);
+    expect(third[0]!.reattached).toBe(true);
+    expect(third[0]!.item.id).toBe(second[0]!.item.id);
+  });
+
   it('does not bring back a rule the owner retracted, and does bring back one they deleted', async () => {
     /*
      * The owner's undo has to outlast the next corroboration, or it is not an undo.

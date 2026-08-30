@@ -26,6 +26,7 @@ const item = (patch: Partial<MemoryReviewItem> = {}): MemoryReviewItem => ({
   observedAt: '2026-02-01T09:00:00.000Z',
   taskId: null,
   trust: 'derived',
+  origin: 'watched',
   validFrom: '2026-02-01T09:00:00.000Z',
   validTo: null,
   lastVerified: null,

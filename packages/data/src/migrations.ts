@@ -2624,5 +2624,51 @@ export const migrations = [
 
       ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS memory_proposed_at TIMESTAMPTZ;
     `
+  },
+  {
+    version: 72,
+    name: 'a_rule_keeps_the_exception_it_was_stated_with',
+    // Corroboration counts a whole sentence, so a rule and the same rule with the owner's carve-out
+    // attached are two rows with two counters - and the bare one collects the sightings while the
+    // qualified one is left a singleton. Measured on this machine's own 648 owner-typed turns, the
+    // slogan clears two-sightings-a-day-apart in all four themes where a carve-out exists and the
+    // carve-out clears it in none.
+    //
+    // The fix is an identity change, and it needs somewhere for the discarded half to live.
+    // `mem.fact_candidate.object_key` becomes the key of the rule with its qualification stripped,
+    // and the qualifications accumulate here, one row each, keyed by a blind hash of their own text
+    // so the store can dedupe them without being able to read one.
+    //
+    // Deliberately NOT keyed on the candidate, and not deleted when the candidate is promoted. The
+    // carve-outs belong to the RULE, not to the nomination that happened to carry them: a rule that
+    // promoted in June and is given its exception in August must be able to pick it up, and it can
+    // only do that if the August row can still see what June accumulated. Because rows are only
+    // ever inserted here, the set a rule carries is monotone - a promotion can add a carve-out to a
+    // rule and nothing on this path can remove one, which is the property that makes "never bare"
+    // hold after the first promotion as well as at it.
+    //
+    // `mem.item.qualification_keys` is the same set as it stood when a row was minted, and it is
+    // what lets the store answer "does the live row already say this?" without reading either. A
+    // candidate whose accumulated keys are all present reattaches as before; one carrying a key the
+    // row lacks mints the fuller row and supersedes the thinner one.
+    //
+    // Nothing here rewrites a row: one new table and one nullable column with no default. No entry
+    // in `REWRITING_MIGRATIONS`. No index is added on the new table - its primary key is
+    // `(workspace_id, subject_key, predicate, object_key, qualification_key)` and every read is a
+    // prefix of that.
+    sql: `
+      CREATE TABLE IF NOT EXISTS mem.fact_qualification (
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        subject_key TEXT NOT NULL,
+        predicate TEXT NOT NULL,
+        object_key TEXT NOT NULL,
+        qualification_key TEXT NOT NULL,
+        ciphertext JSONB NOT NULL,
+        first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (workspace_id, subject_key, predicate, object_key, qualification_key)
+      );
+
+      ALTER TABLE mem.item ADD COLUMN IF NOT EXISTS qualification_keys TEXT[];
+    `
   }
 ] as const;
