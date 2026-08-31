@@ -88,6 +88,106 @@ describe('browser action policy', () => {
     ).toMatchObject({ consequential: false, sensitiveInput: false });
   });
 
+  /*
+   * The three mode sentences promised "agreeing to something on your behalf" and this classifier
+   * held `sign`, `accept offer`, `submit` and `confirm`. Driven at cd7033f, a control reading
+   * "Accept the Terms" was `consequential: false` - the promise was kept for a control named
+   * "Delete" and broken for the one act the owner is named on afterwards.
+   */
+  it('gates a control that accepts terms, a licence or an agreement in the owner’s name', () => {
+    const banner = (name: string) => ({
+      tag: 'button',
+      type: 'button',
+      name,
+      autocomplete: '',
+      formAction: '',
+      inForm: false
+    });
+    for (const name of [
+      'Accept the Terms',
+      'I agree to the Terms of Service',
+      'Accept Terms and Conditions',
+      'Accept the licence',
+      'Accept the End User License Agreement',
+      'I accept the EULA'
+    ])
+      expect(
+        classifyBrowserAction({ type: 'click', selector: '#agree' }, banner(name)),
+        name
+      ).toMatchObject({ consequential: true });
+  });
+
+  /*
+   * The counterweight, and the honest half of the same finding.
+   *
+   * Consent is not a category this can recognise: `ElementPolicyInput` carries a tag, a type, a
+   * name, an autocomplete token, a form action and whether a form is around it, and a cookie
+   * banner's button is structurally identical to every other button on the page. So the only
+   * evidence is the words, and "Accept", "Agree", "Allow" and "Got it" are the words on a banner
+   * that stands in front of almost every page a research turn opens. Carding those is friction on
+   * ordinary reading, not a safeguard - so they are deliberately absent, the mode sentence no
+   * longer claims them, and this row is what stops somebody adding them without saying so.
+   */
+  it('does not card the banner in front of every page on the web', () => {
+    const banner = (name: string) => ({
+      tag: 'button',
+      type: 'button',
+      name,
+      autocomplete: '',
+      formAction: '',
+      inForm: false
+    });
+    for (const name of [
+      'Accept all',
+      'Accept all cookies',
+      'Agree',
+      'I agree',
+      'Allow all',
+      'Got it',
+      'Continue',
+      'OK'
+    ])
+      expect(
+        classifyBrowserAction({ type: 'click', selector: '#consent' }, banner(name)),
+        name
+      ).toMatchObject({ consequential: false });
+  });
+
+  /*
+   * And the other direction of the same vocabulary, which cost more than the banner would have.
+   *
+   * `terms`, `licence`, `license` and `eula` sat in the alternation as bare nouns for one wave.
+   * Every other word in it names an ACT; these four name a DOCUMENT, and the ordinary thing to do
+   * with a document is read it - so a link named "License" in a repository sidebar was
+   * `consequential: true` and stopped the turn in every mode, on nothing but the word. The
+   * alternation pairs an agreeing verb with the object now, which is what the mode sentence
+   * promises, and these rows are what stops the nouns coming back bare.
+   */
+  it('does not card the link that opens a licence to read it', () => {
+    const link = (name: string) => ({
+      tag: 'a',
+      type: '',
+      name,
+      autocomplete: '',
+      formAction: '',
+      inForm: false
+    });
+    for (const name of [
+      'License',
+      'LICENSE',
+      'Licence',
+      'Terms',
+      'Terms of Service',
+      'MIT License',
+      'EULA',
+      'View licence'
+    ])
+      expect(
+        classifyBrowserAction({ type: 'click', selector: '#read' }, link(name)),
+        name
+      ).toMatchObject({ consequential: false });
+  });
+
   it('gates a double click on the control it activates, exactly like a click', () => {
     const submit = {
       tag: 'button',

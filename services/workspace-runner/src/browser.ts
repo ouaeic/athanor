@@ -929,12 +929,35 @@ const DOWNLOAD_TRIGGERING_ACTIONS: BrowserAction['type'][] = [
  * ceremony ATH-001 was fixed to remove. The floor promises destructive operations and ambiguous
  * coordinates; a bare coordinate is separately and unconditionally consequential.
  *
+ * AGREEING, AND THE HALF OF IT THAT CAN BE RECOGNISED. The three mode sentences promised "agreeing
+ * to something on your behalf" and this list held `sign`, `accept offer`, `submit` and `confirm` -
+ * so a control reading "Accept the Terms", "I agree to the Terms of Service" or "Accept the licence
+ * agreement" raised nothing at all in balanced or autonomous. Driven on this tree at cd7033f: eight
+ * such labels, no card in either mode.
+ *
+ * Consent is not a category anything here can recognise. The evidence a click carries is
+ * `ElementPolicyInput` - a tag, a type, an accessible name, an autocomplete token, a form action
+ * and whether there is a form around it - and a consent control is a plain `<button>` outside any
+ * form, structurally identical to every other button on the page. `isSubmitControl` is the one
+ * structural rule here and it cannot see one. So the only evidence is the words, and words are a
+ * list that rots.
+ *
+ * What is added is therefore the OBJECT of the agreement rather than the verb on the button:
+ * `terms`, `licence`, `license`, `eula`. A legal document has a small, stable name; a button has
+ * whatever copy a designer chose this year. "Accept", "Agree" and "Consent" are NOT added, and the
+ * reason is the one that keeps OK and Continue out: they are the words on a cookie banner, a cookie
+ * banner stands in front of almost every page a research turn opens, and a card there is friction on
+ * ordinary reading rather than a safeguard. Both costs are stated rather than hidden - a control
+ * named "License" in a footer now cards when it is only a link, and a banner whose button says "Got
+ * it" is not reached by this and cannot be - and the mode sentence claims only what this keeps. See
+ * docs/design/gaps/NETWORK.md.
+ *
  * `desktop.ts` holds the same list for the same promise and scripts/check-repository.mjs compares
  * them, because a word added to one and not the other is how one surface silently stops keeping a
  * floor the other still keeps.
  */
 const consequentialText =
-  /\b(submit|apply|purchase|buy|pay|send|publish|delete|remove|confirm|place order|sign|accept offer|post|save changes|install|uninstall|erase|wipe|destroy|discard|overwrite|revoke|deactivate|terminate|format|reset|empty trash|empty bin|move to trash|move to bin)\b/i;
+  /\b(submit|apply|purchase|buy|pay|send|publish|delete|remove|confirm|place order|sign|accept offer|post|save changes|install|uninstall|erase|wipe|destroy|discard|overwrite|revoke|deactivate|terminate|format|reset|empty trash|empty bin|move to trash|move to bin|accept\w*\s+[a-z ]{0,16}terms|agree\w*\s+[a-z ]{0,16}terms|accept\w*\s+[a-z ]{0,16}licen[cs]e|agree\w*\s+[a-z ]{0,16}licen[cs]e|accept\w*\s+[a-z ]{0,16}eula|agree\w*\s+[a-z ]{0,16}eula)\b/i;
 const sensitiveFieldText =
   /\b(password|passcode|one.?time|otp|verification code|credit.?card|card number|cvv|cvc|social security|ssn|passport number|bank account)\b/i;
 

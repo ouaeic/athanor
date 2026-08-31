@@ -1,13 +1,21 @@
-import { isPublicHttpUrl, matchingHostSuffix } from '@athanor/core';
+import { matchingHostSuffix, reachOfHttpUrl, type NetworkReach } from '@athanor/core';
 /**
  * Where a request is allowed to go once untrusted content is in the turn.
  *
- * `network-scope.ts` in core answers one question - is this address on the public internet - which
- * stops SSRF against a metadata service and stops nothing else. The read tools take a complete URL
- * and raise no approval, so an attacker who has landed an instruction has a clean GET channel: put
- * the owner's secret in a path segment and read the attacker's page. That is the third leg of the
- * lethal trifecta, and it survives every fix to the chat client because it is a tool call rather
- * than a rendered image.
+ * `network-scope.ts` in core answers where an address is - this computer, the estate, or the public
+ * internet - which stops SSRF against a metadata service and stops nothing else. The read tools take
+ * a complete URL and raise no approval, so an attacker who has landed an instruction has a clean GET
+ * channel: put the owner's secret in a path segment and read the attacker's page. That is the third
+ * leg of the lethal trifecta, and it survives every fix to the chat client because it is a tool call
+ * rather than a rendered image.
+ *
+ * THE ESTATE IS A DESTINATION. For six waves this file asked core "is this on the internet" and
+ * treated no as free, so the owner's NAS, their router and the link-local block the cloud metadata
+ * service answers on were charged nought bytes and raised no card in any mode - measured at
+ * cd7033f, nine addresses, three modes, both spellings, not one card. A private address is still
+ * another computer. It is now charged and judged exactly as a public one is, against the same turn
+ * budget; only loopback and this installation's own origin are free, because only those are this
+ * process reading its own output.
  *
  * The rule here is deliberately about provenance and volume rather than about reputation. There is
  * no blocklist to keep current and no attempt to recognise a malicious host: a destination is
@@ -69,6 +77,16 @@ export interface DestinationVerdict {
   readonly noveltyBytes: number;
   /** Why it is a sink, in the words the approval card uses. Empty when it is not one. */
   readonly reason: string;
+  /**
+   * Where this address is, relative to this computer: `self`, `estate`, or `internet`.
+   *
+   * Carried on the verdict rather than re-derived by each reader, because the two questions the
+   * floor asks about a destination are not the same question and had been sharing one boolean. The
+   * ordinary arm asks "does this leave for the internet", where the LAN is out of scope by design;
+   * the provenance arm asks "does this reach a computer that is not this one", where it is the
+   * whole of the gap. A reader that wants the narrower question says so by naming this field.
+   */
+  readonly reach: NetworkReach;
 }
 
 /**
@@ -329,7 +347,8 @@ export const classifyDestination = (
       sink: true,
       host: 'unparseable address',
       noveltyBytes: value.length,
-      reason: 'this address could not be parsed'
+      reason: 'this address could not be parsed',
+      reach: 'estate'
     };
   }
   if (!['http:', 'https:'].includes(url.protocol))
@@ -337,7 +356,8 @@ export const classifyDestination = (
       sink: true,
       host: url.protocol.replace(':', ''),
       noveltyBytes: value.length,
-      reason: `the ${url.protocol.replace(':', '')} scheme is not a web read`
+      reason: `the ${url.protocol.replace(':', '')} scheme is not a web read`,
+      reach: 'estate'
     };
   /*
    * A name that ends in the DNS root label is the same name.
@@ -359,7 +379,7 @@ export const classifyDestination = (
     url.hostname = url.hostname.slice(0, -1);
   const host = url.hostname.toLowerCase();
   /*
-   * Somewhere data cannot go is not somewhere data can be sent.
+   * Somewhere data cannot go is not somewhere data can be sent - and neither of those is "the LAN".
    *
    * This asked the owner to approve the agent reading its own web server. A single "build a page
    * and serve it" run raised ten approval cards, and every one of them was athanor talking to
@@ -367,17 +387,39 @@ export const classifyDestination = (
    * the machine in any of them, and the owner learned to click Approve without reading - which is
    * the only way this rule can actually fail.
    *
-   * Loopback and the private ranges are decided by `isPublicHttpUrl` in core rather than by a
-   * second opinion held here, because a spelling that walks past one of two lists is exactly how
-   * this class of check breaks. Publishing something to the internet is still gated, on the tool
-   * that does it: `publish_site` raises its own card and this is not a way round it.
+   * The repair for that was `isPublicHttpUrl`, which answers "is this out on the internet" - and
+   * it is false for loopback and equally false for 192.168.0.0/16, 10.0.0.0/8, the link-local block
+   * where the cloud metadata service lives, and every `*.internal`, `*.local` and `*.home.arpa`
+   * name. So the whole of the owner's own network came back with the same verdict as this process
+   * talking to itself: `sink: false`, nought bytes charged, no card in any mode on a clean turn or
+   * a hostile one. Measured on this tree at cd7033f, nine such addresses, all three modes, both
+   * spellings: not one card. `curl http://192.168.1.50/notes` and
+   * `curl http://169.254.169.254/latest/meta-data/` were free.
+   *
+   * That is one question answered where two were asked, and the two differ in exactly the way this
+   * file's whole argument turns on: an address is how data leaves this computer, and the owner's
+   * NAS, their router and the metadata service are all not this computer. So the question asked
+   * here is now `reachOfHttpUrl`, which has three answers, and only the first of them is free.
+   *
+   * `self` keeps everything the loopback repair bought, because that is what it was actually
+   * buying: the health check the owner's own scenario ends on stays at nought bytes and no card.
+   * `estate` is charged and judged exactly like the internet below, differing only in the words on
+   * the card - and it is the ORDINARY floor, not this one, that is entitled to treat the LAN as out
+   * of scope, which it says by reading `verdict.reach` rather than by being handed a verdict that
+   * lies to it. Publishing something to the internet is still gated on the tool that does it:
+   * `publish_site` raises its own card and this is not a way round it.
    */
-  if (!isPublicHttpUrl(url.toString())) return { sink: false, host, noveltyBytes: 0, reason: '' };
-  if ((context.selfOrigins ?? []).some((origin) => origin && host === origin.toLowerCase()))
-    return { sink: false, host, noveltyBytes: 0, reason: '' };
+  const reach = (context.selfOrigins ?? []).some(
+    (origin) => origin && host === origin.toLowerCase()
+  )
+    ? // This installation's own published address is this installation, whatever the DNS says about
+      // where the name points. A read of it is the box reading itself.
+      'self'
+    : reachOfHttpUrl(url.toString());
+  if (reach === 'self') return { sink: false, host, noveltyBytes: 0, reason: '', reach };
   // An address the harness handed the model is an address the model did not compose, so there is
   // nothing of the owner's in it to charge for however long it is.
-  if (wasHanded(value, context)) return { sink: false, host, noveltyBytes: 0, reason: '' };
+  if (wasHanded(value, context)) return { sink: false, host, noveltyBytes: 0, reason: '', reach };
   // Compared case-insensitively and without the separators a URL adds, so a path segment that the
   // owner wrote as two words still counts as theirs.
   const corpus =
@@ -389,7 +431,18 @@ export const classifyDestination = (
       sink: true,
       host,
       noveltyBytes: addressNovelty + chosenBytes(host.split('.'), corpus),
-      reason: `${host} is not a host the user named, a search returned, or this turn has already read`
+      /*
+       * Named separately for the estate, because "not a host the user named" is a true sentence
+       * that reads as an accusation about the internet, and the owner answering this card needs to
+       * know which of their own machines is being talked to. A search never returns a LAN address
+       * and the read tools refuse to open one, so the only way a host gets on this list is the
+       * owner writing it down - which is exactly the distinction the card should draw.
+       */
+      reason:
+        reach === 'estate'
+          ? `${host} is another computer on this network, and not one the user named`
+          : `${host} is not a host the user named, a search returned, or this turn has already read`,
+      reach
     };
   /*
    * The name is measured too, against the part of it that was already allowed.
@@ -414,14 +467,16 @@ export const classifyDestination = (
       sink: true,
       host,
       noveltyBytes,
-      reason: `the name ${host} puts ${hostNovelty} bytes in front of ${matched} that the user's request and the pages already read do not account for`
+      reason: `the name ${host} puts ${hostNovelty} bytes in front of ${matched} that the user's request and the pages already read do not account for`,
+      reach
     };
   if (noveltyBytes > MAX_NOVEL_URL_BYTES)
     return {
       sink: true,
       host,
       noveltyBytes,
-      reason: `this address carries ${noveltyBytes} bytes the model chose rather than was handed, past the ${MAX_NOVEL_URL_BYTES} a real link needs`
+      reason: `this address carries ${noveltyBytes} bytes the model chose rather than was handed, past the ${MAX_NOVEL_URL_BYTES} a real link needs`,
+      reach
     };
   const spent = Math.max(0, context.spentNoveltyBytes ?? 0);
   if (spent + noveltyBytes > MAX_TURN_NOVEL_BYTES)
@@ -429,7 +484,8 @@ export const classifyDestination = (
       sink: true,
       host,
       noveltyBytes,
-      reason: `this turn has already put ${spent} bytes into addresses that the user's request does not account for, and ${noveltyBytes} more here is past the ${MAX_TURN_NOVEL_BYTES} allowed while untrusted content is in the turn`
+      reason: `this turn has already put ${spent} bytes into addresses that the user's request does not account for, and ${noveltyBytes} more here is past the ${MAX_TURN_NOVEL_BYTES} allowed while untrusted content is in the turn`,
+      reach
     };
-  return { sink: false, host, noveltyBytes, reason: '' };
+  return { sink: false, host, noveltyBytes, reason: '', reach };
 };

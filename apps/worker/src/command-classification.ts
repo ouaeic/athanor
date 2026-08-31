@@ -201,22 +201,212 @@ export const consequentialExecutables = new Set([
  * Strictly monotonic: nothing in this repository keys on the executable `npx` or `bunx`, so no call
  * that cards today stops carding, and the wrapped command becomes visible to the destructive,
  * publish, install, push and upload readers alike.
+ *
+ * `sudo` and the rest of the escalation family are here for the opposite reason to `npx`, and they
+ * are the reason this set was widened. A card keyed on the head of a command is switched off by
+ * putting one word in front of it, and measured on this tree before the change, in balanced AND
+ * autonomous: `sudo npm publish`, `sudo docker push me/img`, `sudo git push origin main`,
+ * `sudo apt-get install nginx` and `sudo rm -rf /etc/nginx` ALL raised nothing, while every bare
+ * form beside them raised a card. `doas`, `pkexec`, `runuser`, `command` and `builtin` are the same
+ * shape. Nothing in this repository keys on any of these names, so stripping them removes no card;
+ * `subscription-agent.ts` denies `sudo *` to a packaged client through its own deny-list, which is
+ * a different reader and is unaffected.
+ *
+ * A list of wrappers can never be complete - a shell function, an alias and a script on PATH are
+ * all unreadable from the command text - so this set is the cheap half of the repair and not the
+ * bound. The bound is `publishingOperation` at the foot of this file, which keeps reading past any
+ * word it cannot name.
  */
 export const COMMAND_RUNNERS = new Set([
+  'arch',
+  'builtin',
   'bunx',
+  'caffeinate',
+  'catchsegv',
+  'chronic',
+  'chrt',
+  'command',
+  'doas',
   'env',
+  'eval',
   'flock',
+  'gtimeout',
   'ionice',
+  'ltrace',
   'nice',
   'nohup',
   'npx',
+  'pkexec',
+  'proxychains',
+  'proxychains4',
+  'retry',
+  'runuser',
+  'setarch',
   'setsid',
   'stdbuf',
+  'strace',
+  'sudo',
+  'taskset',
   'time',
   'timeout',
+  'unbuffer',
   'watch',
   'xargs'
 ]);
+
+/**
+ * A wrapper whose name is two words, and the second word is what makes it one.
+ *
+ * `poetry run npm publish` and `poetry publish` share a head, so a set of bare names cannot hold
+ * both: stripping `poetry` would hide the operation this file exists to see. Keyed on the pair
+ * instead, so only the `run`/`exec`/`dlx` spelling comes off and the publishing subcommand of the
+ * same tool is untouched.
+ */
+const RUNNER_SUBCOMMANDS = new Map<string, ReadonlySet<string>>([
+  ['asdf', new Set(['exec'])],
+  ['bun', new Set(['x'])],
+  ['bundle', new Set(['exec'])],
+  ['conda', new Set(['run'])],
+  ['direnv', new Set(['exec'])],
+  ['hatch', new Set(['run'])],
+  ['mise', new Set(['exec'])],
+  ['nodenv', new Set(['exec'])],
+  ['npm', new Set(['exec'])],
+  ['pdm', new Set(['run'])],
+  ['pipenv', new Set(['run'])],
+  ['pnpm', new Set(['dlx', 'exec'])],
+  ['poetry', new Set(['run'])],
+  ['pyenv', new Set(['exec'])],
+  ['rbenv', new Set(['exec'])],
+  ['rye', new Set(['run'])],
+  ['uv', new Set(['run'])],
+  ['yarn', new Set(['dlx', 'exec'])]
+]);
+
+/**
+ * The runner's own options that carry their value in the NEXT token, and the positional arguments
+ * that belong to the runner rather than to what it wraps.
+ *
+ * Both tables exist because the shipped heuristic - "the wrapped command is the first token that is
+ * not a flag, not an assignment and not a number" - is wrong on exactly these two shapes, and both
+ * were measured defeating the publish card: `sudo -u root npm publish` read `root` as the command,
+ * `xargs -I {} npm publish` read `{}`, and `flock /tmp/lock docker push me/img` read the lock file.
+ * All three raised nothing outside review.
+ *
+ * `-c`/`--command` is deliberately absent from every value list. `su -c 'npm publish'` and
+ * `runuser -u x -c 'npm publish'` put the command in a quoted string, and leaving `-c` to be
+ * skipped as a plain flag lets the head land on the string's first word - which `unquoted` then
+ * makes readable. Naming it as a value option would swallow the command instead.
+ */
+const RUNNER_VALUE_OPTIONS = new Map<string, ReadonlySet<string>>([
+  // `command -v vercel` and `command -V vercel` PRINT where vercel is and run nothing at all, and
+  // it is how every setup script asks whether a tool is installed. Stripping `command` and then
+  // reading the name after the flag turned that read into "Publish online with vercel" in all three
+  // modes - a consequential card, on a command that opens no socket. Naming the two options as
+  // carrying a value is the true statement: what follows them is a name to look up, not a command.
+  ['command', new Set(['-v', '-V'])],
+  ['conda run', new Set(['-n', '--name', '-p', '--prefix'])],
+  ['env', new Set(['-u', '--unset', '-C', '--chdir'])],
+  ['flock', new Set(['-w', '--wait', '--timeout', '-E', '--conflict-exit-code'])],
+  ['ionice', new Set(['-c', '-n', '-p', '-P', '-u', '--class', '--classdata', '--pid'])],
+  ['ltrace', new Set(['-e', '-o', '-p', '-s'])],
+  ['nice', new Set(['-n', '--adjustment'])],
+  ['pkexec', new Set(['--user'])],
+  ['proxychains', new Set(['-f'])],
+  ['proxychains4', new Set(['-f'])],
+  ['runuser', new Set(['-u', '--user', '-g', '--group', '-G', '--supp-group', '-s', '--shell'])],
+  ['stdbuf', new Set(['-i', '-o', '-e', '--input', '--output', '--error'])],
+  ['strace', new Set(['-e', '-o', '-p', '-s', '-E'])],
+  [
+    'sudo',
+    new Set([
+      '-u',
+      '--user',
+      '-g',
+      '--group',
+      '-h',
+      '--host',
+      '-p',
+      '--prompt',
+      '-r',
+      '--role',
+      '-t',
+      '--type',
+      '-C',
+      '--close-from',
+      '-D',
+      '--chdir',
+      '-R',
+      '--chroot',
+      '-T',
+      '--command-timeout',
+      '-U',
+      '--other-user'
+    ])
+  ],
+  ['taskset', new Set(['-p', '--pid'])],
+  ['timeout', new Set(['-s', '--signal', '-k', '--kill-after'])],
+  ['gtimeout', new Set(['-s', '--signal', '-k', '--kill-after'])],
+  ['watch', new Set(['-n', '--interval', '-d'])],
+  ['xargs', new Set(['-I', '-i', '-L', '-a', '-d', '-E', '--arg-file', '--delimiter', '--replace'])]
+]);
+
+/**
+ * The runner options whose value is the COMMAND rather than a setting for it.
+ *
+ * `env -S 'npm publish'` and `env --split-string='npm publish'` are one option away from
+ * `sh -c 'npm publish'`, and this wave's own repair opened them: naming `-S` a value option made
+ * the runner swallow the command, exactly as the note above says naming `-c` would. Both spellings
+ * raised NOTHING outside review while `env -u X npm publish` beside them carded.
+ *
+ * The value is split on whitespace because that is what the option means - it is the shell's word
+ * splitting, handed to `env` - so the command inside it becomes tokens every table here can read.
+ * `-c` is still deliberately absent from every table: an interpreter's script is read by
+ * `commandScript`, which is a whole reader rather than one option, and this is only for the
+ * runners that have no such reader.
+ */
+const RUNNER_SCRIPT_OPTIONS = new Map<string, ReadonlySet<string>>([
+  ['env', new Set(['-s', '--split-string'])]
+]);
+
+/**
+ * Positional tokens the runner takes for itself, consumed BEFORE the "not a number" rule rather
+ * than after it. `flock 3 npm publish` locks file descriptor 3, so the digit rule would skip the
+ * lock and then read `npm` as the runner's own argument; consuming the declared positional first
+ * gets both spellings right, and `timeout 30 npm publish` - which declares none - still reaches the
+ * digit rule that was written for it.
+ */
+const RUNNER_POSITIONALS = new Map<string, number>([
+  ['direnv exec', 1],
+  ['flock', 1],
+  ['setarch', 1]
+]);
+
+/**
+ * A token with the shell's quoting taken off, for the places where a quote can only be noise.
+ *
+ * `"npm" publish` and `eval "npm publish"` were two of the six one-word bypasses: nothing here
+ * splits a script the way a shell does, so a quoted word arrives with its quotes attached and
+ * matches no table.
+ *
+ * EVERY quote, not the ones at the ends. Stripping the two ends independently reads `"npm" publish`
+ * and stops dead at the spelling one character along, and the shell does not care where the quote
+ * sits: `n"p"m publish`, `np''m publish`, `"n"pm publish` and `n\pm publish` all run npm, and all
+ * four raised NOTHING outside review on this tree - measured beside `"npm" publish`, which carded.
+ * The same held for `v"e"rcel --prod` and `kube"ctl" apply -f k8s.yaml`. A repair that only reaches
+ * the spelling it was written against is the shape this file exists to stop having.
+ *
+ * Only ever applied to a token being matched against a table of program, subcommand and operation
+ * names, or to the tokens of a nested script that the shell would itself have unquoted before
+ * running - and no program, subcommand or operation this file names can contain a quote or a
+ * backslash, so nothing legitimate is lost.
+ */
+const unquoted = (token: string): string =>
+  // `$'npm'` is bash's ANSI-C quoting and `$"npm"` its locale form; both run npm, and a dollar left
+  // in front of the word matches no table. Only a dollar that IMMEDIATELY precedes a quote comes
+  // off, so `curl -s "$U"` still reaches the readers below as `$U` - an operand nobody can resolve,
+  // which is what the taint rule needs it to stay.
+  token.replace(/\$(?=['"])/g, '').replace(/['"\\]/g, '');
 
 /**
  * The words a shell puts in front of a command without being one. `if grep -q x f; then cp a b; fi`
@@ -238,27 +428,79 @@ const SHELL_KEYWORDS = new Set(['!', 'do', 'elif', 'else', 'exec', 'if', 'then',
  * spelling the shell tool's own description tells the model to reach for - read an attacker-chosen
  * page with the floor still reporting the turn clean. Measured before the fix on `timeout`, `env`
  * and `xargs`; all three were clean.
+ *
+ * The runner's own arguments are read from `RUNNER_VALUE_OPTIONS` and `RUNNER_POSITIONALS` rather
+ * than guessed at, and `--` ends them outright wherever it appears, because the guess was wrong on
+ * every shape that carries a name: `sudo -u root`, `xargs -I {}`, `flock /tmp/lock`,
+ * `runuser -u deploy --`.
  */
+const runnerBody = (runner: string, after: readonly string[]): string[] => {
+  const valueOptions = RUNNER_VALUE_OPTIONS.get(runner);
+  let positionals = RUNNER_POSITIONALS.get(runner) ?? 0;
+  const scriptOptions = RUNNER_SCRIPT_OPTIONS.get(runner);
+  const split = (value: string): string[] => value.split(/\s+/).filter(Boolean);
+  for (const [index, token = ''] of after.entries()) {
+    // Everything before `--` is the runner's; everything after it is the command, whatever it looks
+    // like. This is the only spelling in which a command may legitimately begin with a dash.
+    if (token === '--') return [...after.slice(index + 1)];
+    if (scriptOptions) {
+      /*
+       * `-S` before its value, and `--split-string=` carrying it. Case-folded on the option only:
+       * `env -S` and `env -s` are the same option and the value is left exactly as written.
+       *
+       * AND EVERYTHING AFTER IT, which is the half the repair was missing. The option's value is
+       * one shell word, and a shell word containing a space arrives here as several tokens whenever
+       * the call was written as a script rather than as an argument array: `env -S 'npm publish'`
+       * inside `bash -lc` is `-S`, `'npm`, `publish'`. Taking only `after[index + 1]` read the
+       * value as `npm` with no operation after it, so the row that proved this repair - which used
+       * the array spelling, where the value really is one token - passed while the spelling the
+       * shell tool's own description tells the model to write raised nothing at all in balanced or
+       * autonomous. Measured on this tree before this line: `env -S 'npm publish'` and
+       * `env --split-string='npm publish'` free, `{ executable: 'env', args: ['-S', 'npm publish'] }`
+       * carding beside them. The rest of the tokens are appended in both spellings; nothing else
+       * can follow the value, because `-S` consumes the remainder of the command line by
+       * definition.
+       */
+      const separator = token.indexOf('=');
+      if (separator > 0 && scriptOptions.has(token.slice(0, separator).toLowerCase()))
+        return [...split(token.slice(separator + 1)), ...after.slice(index + 1)];
+      if (scriptOptions.has(token.toLowerCase()))
+        return [...split(after[index + 1] ?? ''), ...after.slice(index + 2)];
+    }
+    if (token.startsWith('-')) continue;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) continue;
+    if (index > 0 && valueOptions?.has(after[index - 1] ?? '')) continue;
+    if (positionals > 0) {
+      positionals -= 1;
+      continue;
+    }
+    if (/^\d/.test(token)) continue;
+    return [...after.slice(index)];
+  }
+  return [];
+};
+
 const withoutRunners = (tokens: readonly string[]): string[] => {
   let rest = [...tokens];
   // Each pass drops at least one token, so this terminates on any input, and an empty list returns
   // on the first check.
   for (;;) {
-    const head = (rest[0] ?? '').split('/').pop() ?? '';
+    const head = (
+      unquoted(rest[0] ?? '')
+        .split('/')
+        .pop() ?? ''
+    ).toLowerCase();
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(head) || SHELL_KEYWORDS.has(head)) {
       rest = rest.slice(1);
       continue;
     }
+    const subcommand = unquoted(rest[1] ?? '').toLowerCase();
+    if (RUNNER_SUBCOMMANDS.get(head)?.has(subcommand)) {
+      rest = runnerBody(`${head} ${subcommand}`, rest.slice(2));
+      continue;
+    }
     if (!COMMAND_RUNNERS.has(head)) return rest;
-    // The runner's own flags and the value some of them take sit between it and the command it
-    // wraps: `timeout 30`, `nice -n 5`, `xargs -0`. The wrapped command is the first token that is
-    // none of those - not a flag, not an assignment, not a number.
-    const after = rest.slice(1);
-    const wrapped = after.findIndex(
-      (token) =>
-        !token.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token) && !/^\d/.test(token)
-    );
-    rest = wrapped < 0 ? [] : after.slice(wrapped);
+    rest = runnerBody(head, rest.slice(1));
   }
 };
 
@@ -427,6 +669,17 @@ const proxyOptionsFrom = (tokens: readonly string[], executable: string): string
  * keeps the leading word of each, which is enough to name what runs. Anything it cannot read comes
  * back as no commands at all, and the caller treats that as unknown rather than as safe.
  */
+const nestedScript = (tokens: readonly string[]): string[] => {
+  const at = tokens.findIndex((token) =>
+    INLINE_SCRIPT_FLAGS.some((flag) => token === flag || token.startsWith(`${flag}=`))
+  );
+  return at < 0
+    ? []
+    : withoutRunners(tokens.slice(at + 1))
+        .map(unquoted)
+        .filter(Boolean);
+};
+
 export const scriptCommands = (body: string): string[][] => {
   /*
    * A proxy set anywhere in a script applies to every fetch after it, and `export http_proxy=x;
@@ -437,31 +690,80 @@ export const scriptCommands = (body: string): string[][] => {
    * alternative is missing the shape that does.
    */
   const bodyTokens = body.split(/\s+/).filter(Boolean);
-  return body
-    .split(/\$\(|[|;&\n`]+/)
-    .map((segment) => {
-      // `FOO=1 curl https://x` runs curl, and so do `timeout 30 curl …` and `then curl …`. Whatever
-      // sits in front of the command is setup for it, not a command of its own, and treating it as
-      // one made every such line unknown.
-      const tokens = withoutRunners(
-        segment
-          .replace(/^[\s({]+/, '')
-          .split(/\s+/)
-          .filter(Boolean)
-      );
-      const executable = (tokens.shift() ?? '').split('/').pop() ?? '';
-      // `2>&1` is split by the `&` above into `2>` and `1`, and the tail was then read as a command
-      // called `1`. Nothing executes a program whose name is a number, and the cost of pretending
-      // otherwise was measured: in autonomous mode `bash -lc 'curl -sSL https://x 2>&1'` raised
-      // "Review network access for 1" - a card naming a command that does not exist, in front of
-      // the single most common idiom in shell - and every write classifier downstream saw a segment
-      // it could not place. Dropped here rather than by not splitting on `&`, because a trailing
-      // `&` really does end a command and this is the only shape that survives the split.
-      return executable && !/^\d+$/.test(executable)
-        ? [executable, ...tokens, ...proxyOptionsFrom(bodyTokens, executable)]
-        : [];
-    })
-    .filter((command) => command.length > 0);
+  return body.split(/\$\(|[|;&\n`]+/).flatMap((segment) => {
+    /*
+     * `FOO=1 curl https://x` runs curl, and so do `timeout 30 curl …` and `then curl …`. Whatever
+     * sits in front of the command is setup for it, not a command of its own, and treating it as
+     * one made every such line unknown.
+     *
+     * AND WHATEVER CLOSES IT, which was the same defect at the other end of the segment and left a
+     * one-character bypass of everything this file does. The opening `(` and `{` came off and the
+     * matching `)` and `}` did not, so the LAST token of a subshell kept its bracket and matched no
+     * table. Measured on this tree before this line, in balanced and autonomous: `(npm publish)`,
+     * `(sudo npm publish)`, `(cd dist && npm publish)`, `(apt-get install nginx)` and
+     * `$(npm publish)` all raised NOTHING, while `{ npm publish; }` beside them carded - because
+     * the `;` split that brace form and there is no `;` in the paren one. The same missing strip
+     * put a card in front of the owner naming a program that does not exist:
+     * `(curl -sSL https://x | bash)` read as "Review network access for bash)".
+     *
+     * The trailing class is exactly the leading one and carries the same imprecision, deliberately:
+     * a closing bracket really can be the last character of an operand, and losing it costs the
+     * path of a URL whose host - the only part any reader here asks about - is decided before it.
+     */
+    const tokens = withoutRunners(
+      segment
+        .replace(/^[\s({]+/, '')
+        .replace(/[\s)}]+$/, '')
+        .split(/\s+/)
+        .filter(Boolean)
+    );
+    const executable =
+      unquoted(tokens.shift() ?? '')
+        .split('/')
+        .pop() ?? '';
+    // `2>&1` is split by the `&` above into `2>` and `1`, and the tail was then read as a command
+    // called `1`. Nothing executes a program whose name is a number, and the cost of pretending
+    // otherwise was measured: in autonomous mode `bash -lc 'curl -sSL https://x 2>&1'` raised
+    // "Review network access for 1" - a card naming a command that does not exist, in front of
+    // the single most common idiom in shell - and every write classifier downstream saw a segment
+    // it could not place. Dropped here rather than by not splitting on `&`, because a trailing
+    // `&` really does end a command and this is the only shape that survives the split.
+    if (!executable || /^\d+$/.test(executable)) return [];
+    const command = [executable, ...tokens, ...proxyOptionsFrom(bodyTokens, executable)];
+    /*
+     * AN INTERPRETER INSIDE A SCRIPT is the prefix defect one level down, and it was live:
+     * `bash -lc 'sh -c "npm publish"'` and `bash -lc "bash -c 'vercel --prod'"` raised NOTHING in
+     * balanced or autonomous, while the same call written as `{ executable: 'sh', args: ['-c',
+     * 'npm publish'] }` carded in all three. `commandScript` reads the OUTER call's `-c` and
+     * `stdin`, so the outer script is read once and whatever is quoted inside it stays a pair of
+     * word-shaped tokens nobody re-parses.
+     *
+     * Emitted BESIDE the segment rather than instead of it, so nothing that reads the outer form
+     * loses it, and every reader that keys on a command sees the inner one too. Unquoted, because
+     * the inner script arrives as `"npm` and `publish"` - the shell would have taken those quotes
+     * off before anything ran.
+     */
+    const nested: string[][] = [];
+    let inner = commandInterpreters.has(executable) ? nestedScript(tokens) : [];
+    /*
+     * AND AGAIN, for as long as the thing inside is another interpreter. One level was measured and
+     * repaired; two was not, and `bash -lc 'sh -c "bash -c \'npm publish\'"'` and
+     * `bash -lc "bash -c 'sh -c \"vercel --prod\"'"` raised NOTHING outside review while the
+     * one-level spelling beside them carded. The walk that reads the inner command stops at the
+     * first name it knows, and `bash` is a name it knows - so a second wrapper turned the whole
+     * rule off again.
+     *
+     * Bounded at four rather than left to terminate on its own: each pass slices past an inline
+     * flag and so must shorten, but a bound that is stated cannot be argued about, and nothing
+     * anybody writes on purpose nests four interpreters.
+     */
+    for (let depth = 0; inner.length && depth < 4; depth += 1) {
+      nested.push(inner);
+      const head = (inner[0] ?? '').split('/').pop() ?? '';
+      inner = commandInterpreters.has(head) ? nestedScript(inner.slice(1)) : [];
+    }
+    return [command, ...nested];
+  });
 };
 
 /**
@@ -487,7 +789,10 @@ export const effectiveCommands = (args: Record<string, unknown>): string[][] => 
   const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
   const raw = [textValue(args.executable), ...commandArgs];
   const tokens = withoutRunners(raw);
-  const executable = (tokens[0] ?? '').split('/').pop() ?? '';
+  const executable =
+    unquoted(tokens[0] ?? '')
+      .split('/')
+      .pop() ?? '';
   if (commandInterpreters.has(executable)) return scriptCommands(commandScript(args));
   return executable ? [[executable, ...tokens.slice(1), ...proxyOptionsFrom(raw, executable)]] : [];
 };
@@ -817,6 +1122,21 @@ const REGISTRY_PUBLISH_OPERATIONS = new Map<string, readonly (readonly string[])
 const REGISTRY_READ_OPERATIONS = new Set(['get', 'info', 'list', 'ls']);
 
 /**
+ * The word that turns the operation after it into a question about it.
+ *
+ * `kubectl auth can-i create pods` asks the cluster whether this account MAY create pods, and
+ * changes nothing whatever the answer is. The run is matched wherever it sits in the word list -
+ * which it has to be, because `kubectl -n prod apply -f x` puts the namespace's value in front of
+ * the operation - so `create` was found at word three and the read was shown to the owner as
+ * "Change what is deployed with kubectl create", consequential, in all three modes.
+ *
+ * One name, because one shape was measured: this is the mirror of the trailing test above rather
+ * than a list of safe things, and it is checked against the word BEFORE for the same reason that
+ * one is checked against the word after.
+ */
+const ASKING_OPERATIONS = new Set(['can-i']);
+
+/**
  * The one spelling that is an option rather than an operation.
  *
  * `docker buildx build --push .` builds and pushes in a single command and never says `push` as a
@@ -844,30 +1164,258 @@ const REGISTRY_PUBLISH_OPTIONS = new Map<string, ReadonlySet<string>>([
  * be wrong in here: the card prints the whole command, and a person reading `npm run publish`
  * answers it in a second, while the miss in the other direction is a version on a registry forever.
  */
+/**
+ * The run of words a command performs out of an operation table, longest first.
+ *
+ * Longest first, so `yarn npm publish` is named as itself rather than as the `publish` inside it.
+ * Both are cards; the card prints the operation, and the more specific one is the true statement.
+ *
+ * Shared with the hosting table below so the two cannot drift on the one thing that decides them:
+ * where a subcommand may sit, and which trailing word makes it a read instead.
+ */
+const operationNamed = (
+  operations: readonly (readonly string[])[],
+  words: readonly string[]
+): readonly string[] | undefined =>
+  [...operations]
+    .sort((left, right) => right.length - left.length)
+    .find((operation) =>
+      words.some(
+        (_, start) =>
+          operation.every((word, index) => words[start + index] === word) &&
+          !REGISTRY_READ_OPERATIONS.has(words[start + operation.length] ?? '') &&
+          !ASKING_OPERATIONS.has(words[start - 1] ?? '')
+      )
+    );
+
 export const registryPublishOperation = (
   executable: string,
   commandArgs: readonly string[]
 ): string | null => {
   const operations = REGISTRY_PUBLISH_OPERATIONS.get(executable);
   if (!operations) return null;
-  const lowered = commandArgs.map((argument) => argument.toLowerCase());
+  const lowered = commandArgs.map((argument) => unquoted(argument).toLowerCase());
   const option = lowered.find((argument) =>
     REGISTRY_PUBLISH_OPTIONS.get(executable)?.has(argument)
   );
   if (option) return `${executable} ${option}`;
-  const words = lowered.filter((argument) => !argument.startsWith('-'));
-  // Longest first, so `yarn npm publish` is named as itself rather than as the `publish` inside it.
-  // Both are cards; the card prints the operation, and the more specific one is the true statement.
-  const matched = [...operations]
-    .sort((left, right) => right.length - left.length)
-    .find((operation) =>
-      words.some(
-        (_, start) =>
-          operation.every((word, index) => words[start + index] === word) &&
-          !REGISTRY_READ_OPERATIONS.has(words[start + operation.length] ?? '')
-      )
-    );
+  const matched = operationNamed(
+    operations,
+    lowered.filter((argument) => !argument.startsWith('-'))
+  );
   return matched ? `${executable} ${matched.join(' ')}` : null;
+};
+
+/**
+ * Putting something where other people can reach it, by a route that is not a package registry.
+ *
+ * The owner named "publishing anything online" as a thing that must always stop, and until this
+ * table the floor's whole answer to it was `git push`, `publish_site` and the registry rule above.
+ * Measured on this tree before the change, in balanced AND autonomous: `vercel --prod`,
+ * `vercel deploy --prod`, `flyctl deploy`, `netlify deploy --prod`, `wrangler publish`,
+ * `wrangler deploy`, `kubectl apply -f k8s.yaml`, `gcloud app deploy`, `terraform apply` and
+ * `firebase deploy` raised NOTHING. Two of the brief's seven already stopped and are left where
+ * they are rather than duplicated: `gh release create` raised "Send data using gh" and
+ * `aws s3 sync ./dist s3://bucket` raised "Allow internet access", both `external_reversible`; the
+ * gh entry below promotes the first to the consequential card that says what it is, and the second
+ * keeps the card it has.
+ *
+ * An operation check rather than a bare executable name, for the reason the registry table gives:
+ * `vercel dev` is not `vercel --prod`, `netlify dev` is not `netlify deploy`, `kubectl get` is not
+ * `kubectl apply`, and carding both is the friction the owner has explicitly rejected. Every read
+ * verb any of these tools spells - `ls`, `logs`, `status`, `plan`, `describe`, `get`, `top`,
+ * `rollout status`, `env pull`, `whoami`, `tail`, `dev`, `build` - is absent by construction,
+ * because this names what changes rather than what is safe.
+ *
+ * Two kinds, because one card cannot honestly name both. `vercel deploy` puts bytes where the
+ * public can read them; `kubectl apply` replaces what a cluster is running. Both are irreversible
+ * from this computer and both must stop, and each says which it is.
+ */
+type DeploymentKind = 'publishes' | 'reconfigures';
+const DEPLOYMENT_OPERATIONS = new Map<
+  string,
+  { readonly kind: DeploymentKind; readonly operations: readonly (readonly string[])[] }
+>();
+const deployments = (
+  kind: DeploymentKind,
+  table: Record<string, readonly (readonly string[])[]>
+): void => {
+  for (const [executable, operations] of Object.entries(table))
+    DEPLOYMENT_OPERATIONS.set(executable, { kind, operations });
+};
+
+const FLY_OPERATIONS = [['deploy'], ['launch'], ['apps', 'create'], ['apps', 'destroy']];
+const NETLIFY_OPERATIONS = [['deploy']];
+const SERVERLESS_OPERATIONS = [['deploy'], ['remove']];
+const VERCEL_OPERATIONS = [['deploy'], ['promote'], ['redeploy'], ['rollback'], ['alias', 'set']];
+deployments('publishes', {
+  // `aws s3 sync` and `aws s3 cp` are NOT here. They already stop, in every mode, through the
+  // egress arm - and an object copy to a bucket nobody can read is not publishing, so a card
+  // claiming it was would be false on the common case. What is unambiguous is turning a bucket into
+  // a website, and handing an object an acl anyone can read, which `publicObjectAcl` below covers.
+  aws: [['s3', 'website']],
+  eb: [['deploy']],
+  firebase: [['deploy']],
+  fly: FLY_OPERATIONS,
+  flyctl: FLY_OPERATIONS,
+  gcloud: [
+    ['app', 'deploy'],
+    ['run', 'deploy'],
+    ['functions', 'deploy'],
+    ['builds', 'submit']
+  ],
+  // `gh release list` and `gh release view` are reads and stay free; `gh gist create` is the same
+  // act as a release by a shorter route.
+  gh: [
+    ['release', 'create'],
+    ['release', 'upload'],
+    ['release', 'edit'],
+    ['release', 'delete'],
+    ['gist', 'create']
+  ],
+  netlify: NETLIFY_OPERATIONS,
+  ntl: NETLIFY_OPERATIONS,
+  serverless: SERVERLESS_OPERATIONS,
+  sls: SERVERLESS_OPERATIONS,
+  sst: [['deploy']],
+  vercel: VERCEL_OPERATIONS,
+  wrangler: [
+    ['deploy'],
+    ['publish'],
+    ['pages', 'deploy'],
+    ['pages', 'publish'],
+    ['versions', 'upload'],
+    ['triggers', 'deploy']
+  ]
+});
+deployments('reconfigures', {
+  // `helm push` is in the registry table; these four change what a cluster runs rather than what a
+  // chart repository holds.
+  helm: [['install'], ['upgrade'], ['uninstall'], ['rollback']],
+  kubectl: [
+    ['apply'],
+    ['create'],
+    ['delete'],
+    ['replace'],
+    ['patch'],
+    ['edit'],
+    ['scale'],
+    ['annotate'],
+    ['label'],
+    ['drain'],
+    ['taint'],
+    ['cordon'],
+    ['uncordon'],
+    ['set'],
+    ['rollout', 'restart'],
+    ['rollout', 'undo']
+  ],
+  pulumi: [['up'], ['destroy']],
+  terraform: [['apply'], ['destroy'], ['import'], ['taint'], ['state', 'push']],
+  tofu: [['apply'], ['destroy'], ['import'], ['taint'], ['state', 'push']]
+});
+
+/**
+ * The one spelling that is an option rather than an operation, and the one that is neither.
+ *
+ * `vercel --prod` is the whole deployment written as a flag, and it is what every Vercel tutorial
+ * says; so is a bare `vercel`, which deploys the working directory. Both are held here rather than
+ * in the operation table because neither says a word this file could match. `--help` and
+ * `--version` are the counterweight: they are the only arguments under which a bare invocation
+ * deploys nothing.
+ */
+const DEPLOYMENT_OPTIONS = new Map<string, ReadonlySet<string>>([
+  ['vercel', new Set(['--prod', '--production'])]
+]);
+const DEPLOYS_WHEN_BARE = new Set(['vercel']);
+const INFORMATIONAL_OPTIONS = new Set(['-h', '--help', '-v', '--version', '--json']);
+
+/**
+ * The two shapes under which a named deployment operation deploys nothing.
+ *
+ * `--help` printed the manual and was shown to the owner as the act itself: `terraform apply
+ * --help` and `kubectl set image --help` both raised "Change what is deployed", consequential, in
+ * all three modes. `INFORMATIONAL_OPTIONS` already existed and already said this - it was only
+ * ever consulted on a BARE invocation, so the arm that matches an operation never saw it. Narrower
+ * than that set here, deliberately: `-v` is kubectl's verbosity and `--json` is how `pulumi up`
+ * is read by a script, and both of those really do deploy.
+ *
+ * A CLIENT-SIDE DRY RUN is the other, and it is the one that costs a working day.
+ * `kubectl create deployment app --image=nginx --dry-run=client -o yaml` is how every manifest in
+ * every tutorial is generated, `kubectl apply --dry-run=client` is what anybody does before
+ * applying, and `helm upgrade --dry-run` renders the chart and contacts nothing. All four carded
+ * as the deployment itself. `--dry-run=none` is kubectl's spelling of "actually do it" and is
+ * deliberately not matched.
+ *
+ * Held here and NOT in the registry table above, which refuses the same exemption and says why:
+ * `npm publish --dry-run` is one word from the real thing, and an exemption keyed on a flag is one
+ * an injected instruction writes for itself. The difference is that these tools spell the flag as a
+ * mode the tool itself enforces before anything leaves, and this table is the only reader of it.
+ *
+ * PER EXECUTABLE, and that is the whole care in it. `--help` is honoured by every program ever
+ * written, so one set holds it; `--dry-run` is honoured by the four tools below that define it,
+ * and a tool that IGNORED an option it did not recognise would otherwise be handed an exemption
+ * written in nine characters. So the option is only read on a tool this file knows spells it.
+ *
+ * `kubectl label pods p --list` is NOT covered and stays a false card, recorded rather than
+ * repaired: `--list` is an option two kubectl verbs define and nothing else in this table does,
+ * and buying one uncommon read with an exemption the rest of the table would not recognise is the
+ * trade this paragraph exists to refuse.
+ */
+const DRY_RUN_OPTIONS = new Map<string, RegExp>([
+  ['kubectl', /^--dry-run(?:=(?:client|server))?$/],
+  ['helm', /^--dry-run(?:=\S+)?$/],
+  ['wrangler', /^--dry-run$/],
+  ['firebase', /^--dry-run$/]
+]);
+const HELP_OPTIONS = new Set(['-h', '--help']);
+
+/**
+ * An object handed an access-control list anyone can read, whichever store CLI wrote it.
+ *
+ * The brief's `aws s3 sync` to a PUBLIC bucket, which no command names as such - the bucket's
+ * policy is on the far side. What a command does name is the acl it sets, and `public-read` on a
+ * copy or on a bucket is the act itself rather than a guess about one.
+ */
+const PUBLIC_OBJECT_ACLS = new Set(['public-read', 'public-read-write']);
+const publicObjectAcl = (executable: string, words: readonly string[]): boolean =>
+  OBJECT_STORE_EXECUTABLES.has(executable) && words.some((word) => PUBLIC_OBJECT_ACLS.has(word));
+
+/** What this command deploys, and which of the two things it does to it, or null. */
+export const deploymentOperation = (
+  executable: string,
+  commandArgs: readonly string[],
+  /**
+   * Whether this name is the command itself rather than a word found inside one.
+   *
+   * The bare arm below is the weakest evidence in this file - a name and no operation at all - and
+   * the walk that reads past unnamed words hands it every word of every command. `hash vercel`,
+   * which asks the shell to remember where vercel is, came back as "Publish online with vercel" in
+   * all three modes on that route. A bare name is only a deployment when nothing else was asked.
+   */
+  atHead = true
+): { readonly kind: DeploymentKind; readonly operation: string } | null => {
+  const lowered = commandArgs.map((argument) => unquoted(argument).toLowerCase());
+  const dryRun = DRY_RUN_OPTIONS.get(executable);
+  if (lowered.some((argument) => HELP_OPTIONS.has(argument) || dryRun?.test(argument))) return null;
+  const words = lowered.filter((argument) => !argument.startsWith('-'));
+  if (publicObjectAcl(executable, words))
+    return { kind: 'publishes', operation: `${executable} --acl public-read` };
+  const entry = DEPLOYMENT_OPERATIONS.get(executable);
+  if (!entry) return null;
+  // The operation before the option, which is the opposite order to the registry table and for the
+  // opposite reason: `docker --push` is the only way that act is spelt, while `vercel deploy --prod`
+  // says both, and the word is the truer half of the name a card prints.
+  const matched = operationNamed(entry.operations, words);
+  if (matched) return { kind: entry.kind, operation: `${executable} ${matched.join(' ')}` };
+  const option = lowered.find((argument) => DEPLOYMENT_OPTIONS.get(executable)?.has(argument));
+  if (option) return { kind: entry.kind, operation: `${executable} ${option}` };
+  return atHead &&
+    DEPLOYS_WHEN_BARE.has(executable) &&
+    words.length === 0 &&
+    !lowered.some((argument) => INFORMATIONAL_OPTIONS.has(argument))
+    ? { kind: entry.kind, operation: executable }
+    : null;
 };
 
 export const packageRemovalExecutables = new Set([
@@ -1991,7 +2539,23 @@ export const outboundDestinations = (
         spentNoveltyBytes: 0
       })
     }))
-    .filter(({ verdict }) => verdict.sink)
+    /*
+     * The internet only, said out loud rather than inherited.
+     *
+     * `verdict.sink` used to mean the internet by accident: `classifyDestination` cleared every
+     * private, link-local and `*.internal` address before it judged anything, so a filter on `sink`
+     * and a filter on "leaves for the internet" were the same filter. They are not any more - the
+     * estate is charged and judged there now - and the difference lands here, on the arm that
+     * decides whether BALANCED asks about a command on a clean turn.
+     *
+     * Kept narrow on purpose, so that this change moves no card on a turn nothing hostile has been
+     * read in. The provenance floor reads `classifyDestination` directly and does gate the estate,
+     * which is where a bound can be argued from evidence; widening THIS line would card a
+     * self-hosted owner's ordinary traffic to their own NAS in balanced mode, and that is a
+     * judgement about how often that happens rather than a bound anything here enforces. It is one
+     * clause, and a wave that can measure it can delete it - see docs/design/gaps/NETWORK.md.
+     */
+    .filter(({ verdict }) => verdict.sink && verdict.reach === 'internet')
     .map(({ address, verdict }) => ({ address, host: verdict.host }));
 
 /**
@@ -2181,4 +2745,72 @@ export const untrustedShellOrigin = (args: Record<string, unknown>): string | nu
   const tokens = [...commandArgs, ...script.split(/[\s'"`>|;()<]+/)].filter(Boolean);
   const quarantined = tokens.find(isQuarantinedDownloadPath);
   return quarantined ? `downloaded file ${quarantineRelative(quarantined)}` : null;
+};
+
+/* ---------------------------------------- past a word this file has never heard of ------------ */
+
+/**
+ * Every program name any table in this file can place.
+ *
+ * Not a security boundary and not a list of safe things - it is the stopping condition for the
+ * walk below, and the only property it needs is that a name on it is a program this file has an
+ * opinion about rather than a wrapper it has never seen. `git`, `echo`, `cat`, `grep` and `curl`
+ * are all here, which is what keeps `git commit -m "npm publish"` and `echo npm publish` from
+ * raising a publish card: the walk stops at the first word it can name.
+ */
+const placeableExecutable = (name: string): boolean =>
+  READ_ONLY_EXECUTABLES.has(name) ||
+  noEgressExecutables.has(name) ||
+  FILE_WRITING_EXECUTABLES.has(name) ||
+  consequentialExecutables.has(name) ||
+  packageRemovalExecutables.has(name) ||
+  safeNetworkExecutables.has(name) ||
+  commandInterpreters.has(name) ||
+  RESOLVING_EXECUTABLES.has(name) ||
+  FETCH_CLIENT_EXECUTABLES.has(name) ||
+  CONNECTING_EXECUTABLES.has(name) ||
+  REMOTE_SPEC_EXECUTABLES.has(name) ||
+  OBJECT_STORE_EXECUTABLES.has(name) ||
+  NETWORK_CLIENT_EXECUTABLES.has(name) ||
+  ADDRESS_NAMING_EXECUTABLES.has(name) ||
+  REGISTRY_PUBLISH_OPERATIONS.has(name) ||
+  DEPLOYMENT_OPERATIONS.has(name);
+
+/**
+ * What this command publishes, however many words were put in front of it.
+ *
+ * THE BOUND, and the reason `COMMAND_RUNNERS` above is not one. A card keyed on the head of a
+ * command is defeated by any word that can precede a command, and the set of such words cannot be
+ * enumerated: `sudo` and `xargs` can be named, a shell function, an alias and a wrapper script on
+ * PATH cannot. So the walk does not ask which wrappers exist. It asks the opposite question -
+ * whether this file can NAME the word it is looking at - and keeps reading while the answer is no.
+ *
+ * That inversion is what makes the rule cheap to be wrong about in the only direction that matters.
+ * A word it cannot name might be a wrapper, so it reads on and may raise a card the bare form would
+ * have raised anyway; a word it CAN name ends the walk immediately, so every ordinary command in an
+ * owner's day - which is made of words this file names - is judged exactly as it was before. Driven
+ * over the fourteen scenarios in `evals/cards`, in all three modes, clean and tainted: not one card
+ * moves that is not a publish.
+ *
+ * `sudo npm publish` does not need this - `sudo` is a runner now and comes off upstream. What needs
+ * it is `deploy-prod npm publish`, `np` where `np` is an alias for `npm publish`, and whatever the
+ * next wrapper is called. The limit is written down rather than implied: an alias or function whose
+ * BODY holds the operation, and a container that runs it on another machine
+ * (`docker run img npm publish`), are past what any reader of this command's text can see, and
+ * `docs/design/gaps/BYPASS.md` records both.
+ */
+export const publishingOperation = (
+  tokens: readonly string[]
+): { readonly kind: 'registry' | DeploymentKind; readonly operation: string } | null => {
+  for (const [index, token = ''] of tokens.entries()) {
+    const name = (unquoted(token).split('/').pop() ?? '').toLowerCase();
+    if (!name) continue;
+    const rest = tokens.slice(index + 1);
+    const registry = registryPublishOperation(name, rest);
+    if (registry) return { kind: 'registry', operation: registry };
+    const deployment = deploymentOperation(name, rest, index === 0);
+    if (deployment) return deployment;
+    if (placeableExecutable(name)) return null;
+  }
+  return null;
 };

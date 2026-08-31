@@ -26,7 +26,7 @@ import {
   packageInstallCommands,
   packageRemovalCommands,
   packageRemovalExecutables,
-  registryPublishOperation,
+  publishingOperation,
   safeNetworkExecutables,
   sendsDataOverNetwork
 } from './command-classification.js';
@@ -494,22 +494,55 @@ const serviceRequirement = (
  *    Balanced: the arm is `classifyDestination`, whose sink test is `isPublicHttpUrl`, and every
  *    RFC1918, link-local and `*.internal` address answers false there. The LAN really is outside
  *    this computer, so the sentence was false for an entire common address class. "Out on the
- *    internet" is exactly the question the arm asks, so it is now true as measured. The floor's own
- *    blind spot on the estate LAN is unchanged and deliberately not this wave's - it is one address
- *    test shared by every egress rule in the product, and narrowing it is a measured wave.
+ *    internet" is exactly the question the arm asks, so it is now true as measured. It STAYS "out
+ *    on the internet" after the wave that gave the LAN back to the floor: `classifyDestination` now
+ *    charges and gates the estate and the provenance arm asks about it, but `outboundDestinations`
+ *    - the arm this sentence describes - still filters on `reach === 'internet'`, deliberately, so
+ *    that a self-hosted owner's ordinary traffic to their own NAS does not card on a clean turn.
+ *    The sentence and the arm still say the same thing.
  *  - Autonomous said "anything left behind to run after the turn is over". Driven, `crontab
  *    /tmp/mycron`, `systemctl enable`, `at` and a sudo write of a systemd unit all raise no card in
  *    any mode. The word doing the damage was "anything": what the floor actually holds is the file
  *    shapes it can name, so the clause now names them.
  *
- * WHAT IS DELIBERATELY LEFT ALONE, for consistency rather than for want of a measurement. The
- * remaining clauses are category names, and a category name carries the gaps its category has:
- * "publishing" does not reach `vercel --prod` or `flyctl deploy`, and "agreeing to something on your
- * behalf" is `sign`, `accept offer`, `submit` and `confirm` but not "accept the terms", "agree to
- * the terms" or "consent to the cookies" - `consequentialText` never held those words and this wave
- * did not change it. Both gaps are real, both are reported, and both want the same operation-table
- * treatment the registry-publish rule got. Widening one category while deferring the other would be
- * a judgement dressed as a repair.
+ * AND THE THIRD, THIS WAVE. Autonomous said "agreeing to something on your behalf", and what the
+ * floor held was `sign`, `accept offer`, `submit` and `confirm`: driven, "accept the terms", "agree
+ * to the terms and conditions", "accept the licence", "I agree", "Accept all cookies" and "opt in"
+ * raised no card in balanced or autonomous. That clause is now split rather than widened, because
+ * the two halves of it are answerable by different amounts of evidence.
+ *
+ * The half that can be recognised is an agreeing VERB carrying the object of the agreement:
+ * `accept`/`agree` within a few words of `terms`, `licence`, `license` or `eula` are now in
+ * `consequentialText`, so accepting terms in the owner's name stops in every mode - and the
+ * sentence says "signing or accepting terms in your name", which is exactly that and no more.
+ *
+ * THE VERB IS LOAD-BEARING and the four bare nouns were not what the sentence promised. Held on
+ * their own for one wave, they carded the act of READING the document as reliably as the act of
+ * accepting it, because `terms`, `licence` and `eula` name a document and every other word in this
+ * list names an act. Driven over eight ordinary reading acts, in all three modes: clicking the
+ * LICENSE link in a repository sidebar, opening an API terms page to find a rate limit, filtering a
+ * package list to MIT, and reading a library's licence all raised
+ * `external_consequential` - four of five, and the desktop installer's "View licence" control with
+ * them - against nought at `cd7033f`. Every one of those is friction on ordinary work, which is the
+ * thing the owner's rule rejects by name, and none of it was promised by any sentence. Paired, the
+ * six controls the runner asserts and the three acts the sentence test drives all still card, and
+ * all eight reads are free again.
+ *
+ * The half that cannot is consent as a category. `classifyBrowserAction` has one structural rule -
+ * a submit control inside a form - and a cookie banner's "Accept all" is a plain button outside any
+ * form, indistinguishable from every other button by the evidence a click carries. So consent can
+ * only ever be a phrase list over button copy, that list rots in one direction ("Got it", "Alle
+ * akzeptieren") and fires on ordinary reading in the other, since a banner stands in front of
+ * almost every page a research turn opens. A promise the floor cannot keep is worse than a missing
+ * promise, so the sentence stops making it. Written up in docs/design/gaps/NETWORK.md.
+ *
+ * WHAT IS STILL DELIBERATELY LEFT ALONE. "Publishing" is a category name and carries the gaps its
+ * category has. It reaches `vercel --prod`, `flyctl deploy` and `kubectl apply` now, through
+ * `deploymentOperation`'s tables and the walk in `publishingOperation` - the sentence was written
+ * when it reached none of them - but a table is a list and a list is not a bound, so the category
+ * still misses what the command's text does not name: `make deploy`, `npm run deploy`,
+ * `lerna publish` and the deployment CLIs nobody has written down yet. Counted and named in
+ * docs/design/gaps/GATE.md; the sentence deliberately does not promise them.
  */
 export const SECURITY_MODE_FLOOR: Record<
   SecurityMode,
@@ -543,7 +576,7 @@ export const SECURITY_MODE_FLOOR: Record<
     asksBeforeReachingTheInternet: false,
     asksBeforeInstallingSoftware: false,
     sentence:
-      'Only what this computer cannot take back for you — publishing, sending, spending, destroying data, agreeing to something on your behalf, a startup file, hook or tool configuration it would run on its own afterwards, and a control on a screen that nothing could identify.'
+      'Only what this computer cannot take back for you — publishing, sending, spending, destroying data, signing or accepting terms in your name, a startup file, hook or tool configuration it would run on its own afterwards, and a control on a screen that nothing could identify.'
   }
 };
 
@@ -575,7 +608,7 @@ export const approvalRequirement = (
  * and scripts/check-repository.mjs compares it against services/workspace-runner/src/browser.ts.
  */
 const consequentialText =
-  /\b(submit|apply|purchase|buy|pay|send|publish|delete|remove|confirm|place order|sign|accept offer|post|save changes|install|uninstall|erase|wipe|destroy|discard|overwrite|revoke|deactivate|terminate|format|reset|empty trash|empty bin|move to trash|move to bin)\b/i;
+  /\b(submit|apply|purchase|buy|pay|send|publish|delete|remove|confirm|place order|sign|accept offer|post|save changes|install|uninstall|erase|wipe|destroy|discard|overwrite|revoke|deactivate|terminate|format|reset|empty trash|empty bin|move to trash|move to bin|accept\w*\s+[a-z ]{0,16}terms|agree\w*\s+[a-z ]{0,16}terms|accept\w*\s+[a-z ]{0,16}licen[cs]e|agree\w*\s+[a-z ]{0,16}licen[cs]e|accept\w*\s+[a-z ]{0,16}eula|agree\w*\s+[a-z ]{0,16}eula)\b/i;
 
 /**
  * The sentence the owner reads on their phone, written by the harness and not by the model.
@@ -974,6 +1007,38 @@ const ordinaryRequirement = (
     const executable = textValue(args.executable).split('/').pop() ?? '';
     const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
     const invocation = shellInvocation(args);
+    /**
+     * The three ways this tool puts something where other people have it, each said as itself.
+     *
+     * One rule and three different things to be asked about, for the reason `registryPublishOperation`
+     * is named rather than boolean: a card reading "publishing" over a JSON dump is the shape
+     * `approvalToolPhrases` exists to stop, and "this changes what anyone installing this package
+     * gets" is simply false of `kubectl apply`. All three are `external_consequential` and above
+     * every `securityMode` test, from the same two-part rule: the act cannot be taken back by this
+     * computer, and its effect is visible to somebody other than the owner.
+     */
+    const publishCard = ({
+      kind,
+      operation
+    }: NonNullable<ReturnType<typeof publishingOperation>>): {
+      action: string;
+      preview: string;
+    } => {
+      if (kind === 'registry')
+        return {
+          action: `Publish to a package registry with ${operation}`,
+          preview: `Run ${invocation}. This changes what anyone installing this package gets. A version that has reached a public registry cannot be taken back by this computer - npm allows an unpublish for 72 hours and crates.io does not allow one at all - and withdrawing or re-pointing one breaks every build that already resolved it.`
+        };
+      if (kind === 'publishes')
+        return {
+          action: `Publish online with ${operation}`,
+          preview: `Run ${invocation}. This puts what is here on a hosted service, where anyone with the address can read it. What it replaces is held on that service and not on this computer, so this computer cannot put the previous version back, and anything already fetched from the old one stays fetched.`
+        };
+      return {
+        action: `Change what is deployed with ${operation}`,
+        preview: `Run ${invocation}. This changes what is running on infrastructure outside this computer. The state it overwrites lives on that infrastructure, so nothing here can restore it, and whatever depends on the running version sees the change immediately.`
+      };
+    };
     const commands = effectiveCommands(args);
     const destructive =
       destructiveCommand(executable, commandArgs) ??
@@ -1010,22 +1075,11 @@ const ordinaryRequirement = (
      * command and there is no script text to read.
      */
     const publishing =
-      registryPublishOperation(executable, commandArgs) ??
-      commands
-        .map(([command = '', ...rest]) => registryPublishOperation(command, rest))
-        .find(Boolean) ??
+      commands.map((command) => publishingOperation(command)).find(Boolean) ??
       (commands.length === 0 && commandInterpreters.has(executable)
-        ? registryPublishOperation(
-            (commandArgs[0] ?? '').split('/').pop() ?? '',
-            commandArgs.slice(1)
-          )
+        ? publishingOperation(commandArgs)
         : null);
-    if (publishing)
-      return {
-        sideEffect: 'external_consequential',
-        action: `Publish to a package registry with ${publishing}`,
-        preview: `Run ${invocation}. This changes what anyone installing this package gets. A version that has reached a public registry cannot be taken back by this computer - npm allows an unpublish for 72 hours and crates.io does not allow one at all - and withdrawing or re-pointing one breaks every build that already resolved it.`
-      };
+    if (publishing) return { sideEffect: 'external_consequential', ...publishCard(publishing) };
     /*
      * `git config` writes `.gitconfig` without ever naming a path, so the deferred-execution rule
      * above - which reads the paths a call writes - cannot see it. It is the likeliest way to write
@@ -1112,10 +1166,16 @@ const ordinaryRequirement = (
      * The declaration therefore stops costing, and what it claimed to stand for is asked of the
      * harness's own address reader instead. `outboundDestinations` is `callDestinations` judged by
      * `classifyDestination` against an empty corpus, so it answers one question - does this request
-     * leave the computer - and loopback, the private ranges and this box's own origin come back
-     * empty. A request to `http://localhost:5173/api/health` no longer asks the owner to allow
-     * internet access, which it did while the instrument that cleared it was being consulted in the
-     * same call.
+     * go out on the internet - and loopback, the estate and this box's own origin come back empty.
+     * A request to `http://localhost:5173/api/health` no longer asks the owner to allow internet
+     * access, which it did while the instrument that cleared it was being consulted in the same
+     * call.
+     *
+     * "The internet" and not "off this computer", and the difference is a decision rather than an
+     * accident now that `classifyDestination` can tell them apart. The estate is charged and gated
+     * by the provenance arm above, where a turn has read somebody else's instructions; here, on a
+     * clean turn, the owner's own machines are the owner's own work. Widening this is one clause in
+     * `outboundDestinations` and four rows in `evals/cards` - see docs/design/gaps/NETWORK.md.
      */
     const outbound = outboundDestinations(name, args, context.selfOrigins ?? []);
     /*

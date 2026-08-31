@@ -45,12 +45,95 @@ describe('where a tainted turn may send a request', () => {
   it('does not ask about the machine talking to itself', () => {
     for (const address of [
       'http://localhost:8080/world-clock.html',
+      'http://localhost./world-clock.html',
+      'http://sub.localhost:8080/status',
       'http://127.0.0.1:8080/status',
+      'http://127.0.0.53:5353/status',
       'http://[::1]:3000/health',
-      'http://192.168.1.10/thing',
-      'http://box.local/page'
-    ])
-      expect(classifyDestination(address, context()).sink).toBe(false);
+      'http://[::ffff:127.0.0.1]:3000/health'
+    ]) {
+      const verdict = classifyDestination(address, context());
+      expect(verdict.sink, address).toBe(false);
+      expect(verdict.reach, address).toBe('self');
+      expect(verdict.noveltyBytes, address).toBe(0);
+    }
+  });
+
+  /*
+   * The other half of the same repair, and the half that was wrong for six waves.
+   *
+   * `http://192.168.1.10/thing` and `http://box.local/page` sat in the list above, under a comment
+   * about athanor talking to itself, and neither of them is athanor talking to itself: one is the
+   * owner's NAS and the other is whatever answers mDNS on their LAN. The reason they were there is
+   * that the predicate underneath answered one question - "is this out on the internet" - and the
+   * whole estate shares its answer with loopback. Driven on the shipped floor at cd7033f, nine such
+   * addresses in three modes and both spellings raised NOT ONE CARD, on a clean turn or a hostile
+   * one, and were charged nought bytes.
+   *
+   * A private address is another computer. It is judged here exactly as a public one is, so the
+   * bound and the credit are the same bound and the same credit - which is what the next test
+   * holds.
+   */
+  it('treats another computer on this network as a destination, not as itself', () => {
+    for (const address of [
+      'http://192.168.1.50/notes',
+      'http://10.0.0.5/x',
+      'http://172.16.4.4/x',
+      'http://100.64.0.1/x',
+      // The cloud metadata service, which is the single highest-value address on a hosted box.
+      'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+      'http://metadata.google.internal/computeMetadata/v1/',
+      'http://wiki.internal/runbook',
+      'http://nas.local/share',
+      'http://router.home.arpa/admin',
+      // Reserved and not routable, so a name resolving here is a redirection rather than a place.
+      'http://198.18.0.1/x',
+      // A unique-local IPv6 address is the estate's own /8 by another spelling.
+      'http://[fd00::1]/x'
+    ]) {
+      const verdict = classifyDestination(address, context());
+      expect(verdict.sink, address).toBe(true);
+      expect(verdict.reach, address).toBe('estate');
+      expect(verdict.noveltyBytes, address).toBeGreaterThan(0);
+    }
+  });
+
+  /*
+   * The counterweight, because a test of things that must card is an argument for carding
+   * everything. A LAN host the owner wrote down is ordinary work and must stay free, and it is free
+   * by the same clause that makes `docs.example.com` free - there is no second rule for the estate.
+   */
+  it('lets the owner name a machine on their own network', () => {
+    const named = context({
+      knownOrigins: ['192.168.1.50'],
+      ownerText: 'back the database up to the NAS at http://192.168.1.50/'
+    });
+    expect(classifyDestination('http://192.168.1.50/backups/today', named).sink).toBe(false);
+    // And the bound still applies to it: naming the host does not buy an unlimited path.
+    const verdict = classifyDestination(
+      `http://192.168.1.50/${'a'.repeat(MAX_NOVEL_URL_BYTES + 20)}`,
+      named
+    );
+    expect(verdict.sink).toBe(true);
+    expect(verdict.reach).toBe('estate');
+  });
+
+  /*
+   * The estate's bytes are the internet's bytes.
+   *
+   * Two budgets would be two dials to turn off, and the attacker chooses which one to spend: a turn
+   * that has already put 1,000 bytes into addresses the owner did not choose must not get a fresh
+   * kilobyte because the next hop is on the LAN.
+   */
+  it('charges what goes to the estate against the same turn budget', () => {
+    const spent = MAX_TURN_NOVEL_BYTES - 4;
+    const verdict = classifyDestination('http://192.168.1.50/notes', {
+      ...context({ knownOrigins: ['192.168.1.50'] }),
+      ownerText: 'back up to http://192.168.1.50/',
+      spentNoveltyBytes: spent
+    });
+    expect(verdict.sink).toBe(true);
+    expect(verdict.reason).toContain(`${MAX_TURN_NOVEL_BYTES} allowed`);
   });
 
   it('does not ask about this installation reading its own published preview', () => {

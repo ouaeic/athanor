@@ -42,13 +42,17 @@ every column of the table. So the counts are pinned against a baseline, and thre
   command. None may card outside review mode. Reverting `writtenPaths` to the wide net it used to
   use turns nine of these into cards and takes "my PATH is wrong" from one interruption to eight.
 - **SINKS** — the calls provenance is documented to stop: a memory write, the running brief, a
-  preview link, a novel destination. Each must be free on a clean turn **and** must card on a
-  tainted one. Switching the provenance half of the floor off changes no number in the table at
-  all; this is the only thing in the rig that sees it.
-- **EGRESS** — forty shell lines against the autonomous network arm, in both directions and in both
-  spellings. Thirty-three must be free: the idiomatic install lines, a fetch from a named host, a
+  preview link, a novel destination, and four addresses on the owner's own network. Each must be
+  free on a clean turn **and** must card on a tainted one. Switching the provenance half of the
+  floor off changes no number in the table at all; this is the only thing in the rig that sees it.
+  The four estate rows are this wave's: the NAS, the cloud metadata endpoint, a name on the estate
+  and a secret carried in a LAN address raised nothing at all in any mode before it, because
+  `classifyDestination` cleared everything `isPublicHttpUrl` calls private before judging it.
+- **EGRESS** — forty-four shell lines against the network arm, in both directions and in both
+  spellings. Thirty-seven must be free: the idiomatic install lines, a fetch from a named host, a
   clone, this computer reading its own dev server, the two clients asking their local binary a
-  question, and fifteen rows that put each name on `noEgressExecutables` beside a fetch that really
+  question, four that reach the owner's own network on a clean turn, and fifteen rows that put each
+  name on `noEgressExecutables` beside a fetch that really
   leaves — which is the only way the allowlist is consulted at all, since `npm install` names no
   address and the arm never opens on it. Nine of the install lines carded before the arm was
   repaired — `cd`, `set`, `mkdir`, `tee`, `export` and `test` each raising "Review network access
@@ -57,6 +61,12 @@ every column of the table. So the counts are pinned against a baseline, and thre
   cannot read that names an address, a socket opened as a path, an upload, a name lookup carrying
   its payload in a substitution, and an `ssh` to a host in a variable. A table of only the first
   kind would be satisfied by deleting the arm.
+
+  Autonomous unless a row names its modes, and the four estate rows name balanced as well. With
+  `curl` on the allowlist, autonomous answers the same way whether the ordinary network arm asks
+  about the LAN or only about the internet — so a row driven only there is a fixture that does not
+  exercise the path, and measured, widening `outboundDestinations` to the estate produced ZERO
+  failures here until the loop read `entry.modes`.
 
   Every row is driven twice, declaring `network: true` and with the field left out, and that is a
   correction rather than a flourish: those nine lines carded 9/14 with the flag and 0/14 without it,
@@ -73,15 +83,19 @@ balanced. The check drives every shell call this rig holds, in every mode, on a
 clean turn and a tainted one, with the flag and without, and requires the two answers to be the same
 requirement. A floor that charges for an honest answer fails here.
 
-- **PUBLISHES** — twenty-three ways a version reaches a package registry, or is withdrawn or
-  re-pointed once it has: `npm publish`, `cargo publish`, `twine upload`, `docker buildx build
---push`, the wrapped spellings and the `desktop_launch` one. Each must card in every mode.
-  Measured at `d07d9ea`, before the rule existed, every one of them raised no card in balanced or
-  autonomous — while `rm -rf node_modules`, which the checkpoint restores, stopped the turn in all
-  three.
+- **PUBLISHES** — seventy-three ways something reaches somebody else: a version arriving at a
+  package registry or being withdrawn once it has, a hosting CLI putting bytes online, and an
+  infrastructure tool replacing what a cluster runs. `npm publish`, `cargo publish`, `twine
+upload`, `docker buildx build --push`, `vercel --prod`, `kubectl apply`, `gh release create`,
+  the wrapped spellings, the quoted ones, the nested interpreters, the subshell — each must card in
+  every mode. Measured at `d07d9ea`, before the rule existed, every registry row raised no card in
+  balanced or autonomous; measured at `cd7033f`, one word in front of any of them turned the card
+  off again and no hosting row stopped anything outside review.
 - **FREE_PACKAGE_WORK** — the other direction of the same rule, and the one that costs the owner:
-  `npm install`, `npm ci`, `npm run build`, `cargo check`, `npm owner ls`. A publish rule that
-  widened back from the operation to the executable cards every turn this product has.
+  fifty-three rows of `npm install`, `npm ci`, `npm run build`, `cargo check`, `npm owner ls`,
+  `vercel dev`, `kubectl rollout status`, `terraform plan`, `gh release list`. A publish rule that
+  widened back from the operation to the executable cards every turn this product has, and a walk
+  that reads every word of every command does the same from the other end.
 - **CONFINED** — pairs. A shell startup file written through `file_write`, `file_patch` or
   `print_pdf` lands at `workspace/.bashrc`, which no login shell reads, so it must not card; the
   same file through `shell` must. Six rows of WRITES used to assert only the second half and were

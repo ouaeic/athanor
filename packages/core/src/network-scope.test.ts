@@ -3,7 +3,8 @@ import {
   hostMatchesSuffix,
   isPublicHttpUrl,
   isPublicInternetAddress,
-  matchingHostSuffix
+  matchingHostSuffix,
+  reachOfHttpUrl
 } from './network-scope.js';
 
 describe('public internet addresses', () => {
@@ -97,6 +98,120 @@ describe('public HTTP URLs', () => {
       'not a url'
     ])
       expect({ url, public: isPublicHttpUrl(url) }).toEqual({ url, public: false });
+  });
+
+  /*
+   * One character walked past every name test in this file.
+   *
+   * `getaddrinfo` accepts a trailing root label and answers for the same host - `localhost.`
+   * resolves to 127.0.0.1 on the box this was measured on - but `isInternalHostname` compares
+   * suffixes, and `localhost.` is neither `localhost` nor a `.localhost`. Measured before this was
+   * normalised here: `isPublicHttpUrl` answered TRUE for `http://localhost./`,
+   * `http://wiki.internal./x`, `http://nas.local./x` and `http://metadata.google.internal./x`.
+   *
+   * `assertPublicHttpUrl` caught it on the resolving path, but `agentReachablePage` - the
+   * synchronous check the session browser makes on the page it is about to read back - is this
+   * predicate alone, so a page that moved itself to `http://localhost./admin` was readable.
+   */
+  it('refuses a local name spelled with the DNS root label on the end', () => {
+    for (const url of [
+      'http://localhost./',
+      'http://sub.localhost./x',
+      'http://wiki.internal./runbook',
+      'http://nas.local./share',
+      'http://gateway.home.arpa./',
+      'http://metadata.google.internal./computeMetadata/v1'
+    ])
+      expect({ url, public: isPublicHttpUrl(url) }).toEqual({ url, public: false });
+    // And the same normalisation must not cost a real host its answer.
+    expect(isPublicHttpUrl('https://docs.example.com./research')).toBe(true);
+    // A hostname that is only the root label names nothing and must not become the empty string,
+    // which `URL` discards silently.
+    expect(isPublicHttpUrl('http://./x')).toBe(true);
+  });
+});
+
+/*
+ * Three answers where there were two, and the middle one is the whole of what was missing.
+ *
+ * Every caller that wanted "is this somewhere data can go" or "is this somebody else's machine" was
+ * reading `isPublicHttpUrl`, which answers neither: it is false for loopback and equally false for
+ * the entire estate. So the owner's NAS and this process talking to itself came back with one
+ * verdict, and the egress budget charged both of them nothing.
+ */
+describe('where an address is, relative to this computer', () => {
+  it('calls loopback this computer, in every spelling that reaches it', () => {
+    for (const url of [
+      'http://localhost:5173/api/health',
+      'http://localhost./api/health',
+      'http://tracker.localhost:5173/',
+      'http://127.0.0.1:8080/',
+      // 127.0.0.0/8 entire: a resolver stub on 127.0.0.53 is still this computer.
+      'http://127.0.0.53:5353/',
+      'http://[::1]:3000/',
+      'http://[::ffff:127.0.0.1]:3000/'
+    ])
+      expect({ url, reach: reachOfHttpUrl(url) }).toEqual({ url, reach: 'self' });
+  });
+
+  it('calls the private ranges and the internal names another computer', () => {
+    for (const url of [
+      'http://192.168.1.50/notes',
+      'http://10.0.0.5/x',
+      'http://172.16.4.4/x',
+      'http://100.64.0.1/x',
+      'http://169.254.169.254/latest/meta-data/',
+      'http://[fe80::1]/x',
+      'http://[fd00::1]/x',
+      'http://198.18.0.1/x',
+      'http://203.0.113.8/x',
+      'http://wiki.internal/runbook',
+      'http://nas.local/share',
+      'http://router.home.arpa/admin',
+      'http://metadata.google.internal/computeMetadata/v1/'
+    ])
+      expect({ url, reach: reachOfHttpUrl(url) }).toEqual({ url, reach: 'estate' });
+  });
+
+  it('calls the public unicast space the internet', () => {
+    for (const url of [
+      'https://docs.example.com/research',
+      'http://93.184.216.34/',
+      'http://[2606:4700:4700::1111]/'
+    ])
+      expect({ url, reach: reachOfHttpUrl(url) }).toEqual({ url, reach: 'internet' });
+  });
+
+  /*
+   * Fails towards the estate rather than towards the internet, and the direction is the point: of
+   * the three answers, `estate` is the one whose callers charge for it. An address nobody can read
+   * must not come back as this computer's own output, and it must not come back cleared.
+   */
+  it('answers estate for anything it cannot read, rather than self or internet', () => {
+    for (const url of ['file:///etc/passwd', 'chrome://settings', 'not a url', ''])
+      expect({ url, reach: reachOfHttpUrl(url) }).toEqual({ url, reach: 'estate' });
+  });
+
+  /*
+   * The equivalence that lets the SSRF callers keep one predicate. `isPublicHttpUrl` is now an arm
+   * of this, so a spelling that walks past one of them cannot walk past only one of them.
+   */
+  it('agrees with the public-internet predicate on every address either of them answers', () => {
+    for (const url of [
+      'https://docs.example.com/research',
+      'https://docs.example.com./research',
+      'http://localhost/',
+      'http://localhost./',
+      'http://192.168.1.50/notes',
+      'http://169.254.169.254/',
+      'http://wiki.internal./x',
+      'file:///etc/passwd',
+      'not a url'
+    ])
+      expect({ url, public: isPublicHttpUrl(url) }).toEqual({
+        url,
+        public: reachOfHttpUrl(url) === 'internet'
+      });
   });
 });
 

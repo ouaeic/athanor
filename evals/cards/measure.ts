@@ -302,22 +302,34 @@ export const guardFailures = (
    * floor whose inversion it exists to describe.
    */
   for (const entry of egress)
-    for (const declared of [false, true]) {
-      const call = egressCall(entry);
-      const args = declared ? { ...call.arguments, network: true } : call.arguments;
-      const requirement = approvalRequirement(call.name, args, 'autonomous', {
-        selfOrigins: ['box.athanor.invalid']
-      });
-      if (entry.cards === Boolean(requirement)) continue;
-      const spelling = declared ? 'declaring network: true' : 'with the network field left out';
-      failures.push({
-        table: 'egress',
-        id: entry.id,
-        detail: entry.cards
-          ? `raises no card in autonomous mode ${spelling}, and it carries data to an address this computer can read`
-          : `cards in autonomous mode ${spelling} as "${requirement?.action}", on a clean turn, and nothing in it reaches anywhere the owner needs to decide about`
-      });
-    }
+    /*
+     * Autonomous unless the row says otherwise, and the exception is not a convenience.
+     *
+     * Driving every row in one mode is what made this table unable to see the arm above it: with
+     * `curl` on the allowlist, autonomous answers the same way whether the ordinary network arm
+     * asks about the estate or only about the internet, so a row that says "a command reaching the
+     * owner's own LAN must not card on a clean turn" is a fixture that does not exercise the path
+     * unless it is also asked in balanced, where that arm is the one that answers. Measured:
+     * widening `outboundDestinations` to the estate produced ZERO failures here until this loop
+     * read `entry.modes`.
+     */
+    for (const mode of entry.modes ?? ['autonomous'])
+      for (const declared of [false, true]) {
+        const call = egressCall(entry);
+        const args = declared ? { ...call.arguments, network: true } : call.arguments;
+        const requirement = approvalRequirement(call.name, args, mode, {
+          selfOrigins: ['box.athanor.invalid']
+        });
+        if (entry.cards === Boolean(requirement)) continue;
+        const spelling = declared ? 'declaring network: true' : 'with the network field left out';
+        failures.push({
+          table: 'egress',
+          id: entry.id,
+          detail: entry.cards
+            ? `raises no card in ${mode} mode ${spelling}, and it carries data to an address this computer can read`
+            : `cards in ${mode} mode ${spelling} as "${requirement?.action}", on a clean turn, and nothing in it reaches anywhere the owner needs to decide about`
+        });
+      }
   /*
    * And that the allowlist rows still cover the allowlist. A name added to `noEgressExecutables`
    * with no row beside a fetch is a name nothing here would notice going wrong, in a list where

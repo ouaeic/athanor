@@ -89,7 +89,7 @@ export const modeFloors: Record<'review' | 'balanced' | 'autonomous', string> = 
   balanced:
     'Reaching an address out on the internet, and installing software onto it, on top of everything Autonomous asks about.',
   autonomous:
-    'Only what this computer cannot take back for you — publishing, sending, spending, destroying data, agreeing to something on your behalf, a startup file, hook or tool configuration it would run on its own afterwards, and a control on a screen that nothing could identify.'
+    'Only what this computer cannot take back for you — publishing, sending, spending, destroying data, signing or accepting terms in your name, a startup file, hook or tool configuration it would run on its own afterwards, and a control on a screen that nothing could identify.'
 };
 
 /**

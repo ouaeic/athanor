@@ -102,20 +102,101 @@ const isInternalHostname = (host: string): boolean =>
   host.endsWith('.home.arpa');
 
 /**
- * Rejects `file:`, `chrome:` and every other scheme before the host is even considered: a reader
- * that only guards addresses still hands over /etc/passwd.
+ * The IPv4 address inside an IPv4-mapped IPv6 one, in either spelling, or null.
+ *
+ * Both spellings, because only one of them survives a `URL`. `new URL('http://[::ffff:127.0.0.1]/')`
+ * reports its hostname as `[::ffff:7f00:1]` - the same address written in hex - so a reader that
+ * only knows the dotted form is a reader that never sees the form its own callers hand it. That is
+ * how `::ffff:127.0.0.1` was recognised as loopback in a unit test and not in the browser.
  */
-export const isPublicHttpUrl = (raw: string): boolean => {
+const mappedIpv4 = (host: string): string | null => {
+  const dotted = host.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (dotted?.[1]) return dotted[1];
+  const hex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (!hex) return null;
+  const high = Number.parseInt(hex[1] ?? '', 16);
+  const low = Number.parseInt(hex[2] ?? '', 16);
+  return `${high >>> 8}.${high & 255}.${low >>> 8}.${low & 255}`;
+};
+
+/**
+ * This process's own output, and nothing else.
+ *
+ * Held apart from `isInternalHostname` because the two answer opposite questions. That one asks
+ * "could this resolve somewhere off the public internet", a wide set where being generous is safe.
+ * This asks "is this address this very computer", a tiny set where being generous is the whole
+ * hole: the owner's NAS, their router and the cloud metadata service are all reachable without
+ * leaving the estate, and every one of them is somebody else's machine.
+ *
+ * 127.0.0.0/8 entire, not 127.0.0.1 alone - a resolver stub on 127.0.0.53 is still this computer -
+ * and the IPv4-mapped spelling is unwrapped first so `::ffff:127.0.0.1` cannot walk past it.
+ */
+const isLoopbackHost = (host: string): boolean => {
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  return /^127(?:\.\d{1,3}){3}$/.test(mappedIpv4(host) ?? host) || host === '::1';
+};
+
+/**
+ * Where an address is, relative to this computer. Three answers, because for six waves there were
+ * two and the middle one was being given the wrong half of the pair.
+ *
+ * `isPublicHttpUrl` answers "is this out on the internet", and every caller that needed "is this
+ * somewhere data can go" or "is this somebody else's machine" has been reading it as if it did.
+ * It does not: it is false for loopback and equally false for all of RFC1918, carrier-grade NAT,
+ * link-local, `*.local`, `*.internal` and `*.home.arpa` - so `http://192.168.1.50/notes` and
+ * `http://127.0.0.1:5173/health` came back identical, and on a self-hosted box the first is the
+ * owner's NAS and the second is this process talking to itself.
+ *
+ * - `self` is loopback: this process's own output, which is not a destination and not a source of
+ *   anybody else's bytes.
+ * - `estate` is everything reserved that is not loopback, plus a name that resolves inside the
+ *   estate: another computer, reachable without leaving the building, and where an unauthenticated
+ *   admin interface lives.
+ * - `internet` is the public unicast address space.
+ *
+ * FAILS TOWARDS `estate`, deliberately. An address that will not parse, or that carries a scheme
+ * this cannot reason about, is not this computer and is not known to be the internet - and of the
+ * three answers `estate` is the one whose callers charge for it rather than clear it.
+ */
+export type NetworkReach = 'self' | 'estate' | 'internet';
+
+export const reachOfHttpUrl = (raw: string): NetworkReach => {
+  let host: string;
   try {
     const url = new URL(raw);
-    if (!['http:', 'https:'].includes(url.protocol)) return false;
-    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-    if (isInternalHostname(host)) return false;
-    return !isIP(host) || isPublicInternetAddress(host);
+    if (!['http:', 'https:'].includes(url.protocol)) return 'estate';
+    host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   } catch {
-    return false;
+    return 'estate';
   }
+  /*
+   * A name that ends in the DNS root label is the same name, and this is the one place that fact
+   * can be held for every caller at once.
+   *
+   * `getaddrinfo` accepts `localhost.` and answers 127.0.0.1, so the two spellings reach one host -
+   * and `isPublicHttpUrl` said TRUE for `http://localhost./`, `http://wiki.internal./x` and
+   * `http://metadata.google.internal./x`, because a trailing dot walks past every suffix test
+   * below it. `assertPublicHttpUrl` catches that on the resolving path, but `agentReachablePage` -
+   * the synchronous check the browser makes on the page it is about to read back - does not, so
+   * one character turned the browser's destination guard off for the estate. Two other files had
+   * already grown their own copy of this normalisation for the same measured reason; this is where
+   * it belongs.
+   */
+  if (host.length > 1 && host.endsWith('.')) host = host.slice(0, -1);
+  if (isLoopbackHost(host)) return 'self';
+  if (isInternalHostname(host)) return 'estate';
+  return !isIP(host) || isPublicInternetAddress(host) ? 'internet' : 'estate';
 };
+
+/**
+ * Rejects `file:`, `chrome:` and every other scheme before the host is even considered: a reader
+ * that only guards addresses still hands over /etc/passwd.
+ *
+ * One arm of `reachOfHttpUrl` rather than a second walk of the same lists, so that the question
+ * every SSRF caller asks and the question the egress budget asks cannot drift apart - which is the
+ * drift this whole file exists to prevent, and which had already happened inside it once.
+ */
+export const isPublicHttpUrl = (raw: string): boolean => reachOfHttpUrl(raw) === 'internet';
 
 /**
  * The syntactic check plus the one it cannot make: a name the caller controls can point anywhere,

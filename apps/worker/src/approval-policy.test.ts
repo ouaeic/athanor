@@ -2442,6 +2442,498 @@ describe('publishing a version to a package registry', () => {
     expect(requirement?.preview).toContain('cd packages/api && npm publish --access public');
     expect(requirement?.preview).toContain('cannot be taken back');
   });
+
+  /*
+   * ONE WORD IN FRONT OF THE COMMAND, which switched this card off the day it shipped.
+   *
+   * Measured on `cd7033f`, in balanced AND autonomous, against the bare `npm publish` beside them
+   * which raised `external_consequential` in all three: `sudo npm publish`, `sudo -u root npm
+   * publish`, `doas`, `pkexec`, `command`, `builtin`, `eval`, `flock /tmp/lock`, `xargs -I {}`,
+   * `uv run`, `pipenv run`, `conda run`, `unbuffer`, `script -qec`, `strace -f`, `proxychains`,
+   * `systemd-run`, `caffeinate`, `taskset -c 0`, `cpulimit -l 50 --`, `cross-env FOO=1`,
+   * `dotenv --`, `nix-shell -p x --run` and a quoted `"npm" publish` ALL raised nothing at all.
+   * Sixty-one spellings were driven; two - `docker run` and `ssh host` - remain out of reach by
+   * construction and are written down in `docs/design/gaps/BYPASS.md` rather than implied closed.
+   *
+   * The three shapes are separate defects and each row is one of them. A missing NAME (`sudo`,
+   * `command`) - now in `COMMAND_RUNNERS`. A misread ARGUMENT (`sudo -u root` read `root` as the
+   * command, `xargs -I {}` read `{}`, `flock /tmp/lock` read the lock file) - now
+   * `RUNNER_VALUE_OPTIONS` and `RUNNER_POSITIONALS`. And a word this file has NEVER HEARD OF,
+   * which no list can ever hold: `publishingOperation` reads past it, and stops dead at the first
+   * word it can name, which is what keeps `git commit -m "npm publish"` two tests up free.
+   */
+  it('is not switched off by any word put in front of the command', () => {
+    const prefixes: Array<[string, string[]]> = [
+      ['sudo', ['sudo']],
+      ['sudo with a user', ['sudo', '-u', 'root']],
+      ['sudo with a separator', ['sudo', '--']],
+      ['doas', ['doas']],
+      ['pkexec', ['pkexec']],
+      ['runuser', ['runuser', '-u', 'deploy', '--']],
+      ['command', ['command']],
+      ['builtin', ['builtin']],
+      ['eval', ['eval']],
+      ['exec', ['exec']],
+      ['env with an assignment', ['env', 'NODE_ENV=production']],
+      ['nice', ['nice', '-n', '5']],
+      ['ionice', ['ionice', '-c', '2', '-n', '0']],
+      ['timeout', ['timeout', '300']],
+      ['xargs with a replacement', ['xargs', '-I', '{}']],
+      ['flock on a lock file', ['flock', '/tmp/publish.lock']],
+      ['flock on a descriptor', ['flock', '3']],
+      ['setarch', ['setarch', 'x86_64']],
+      ['taskset', ['taskset', '-c', '0']],
+      ['strace', ['strace', '-f', '-o', '/tmp/trace']],
+      ['proxychains', ['proxychains']],
+      ['unbuffer', ['unbuffer']],
+      ['caffeinate', ['caffeinate']],
+      ['uv run', ['uv', 'run']],
+      ['poetry run', ['poetry', 'run']],
+      ['pipenv run', ['pipenv', 'run']],
+      ['conda run in a named env', ['conda', 'run', '-n', 'ci']],
+      ['bundle exec', ['bundle', 'exec']],
+      ['mise exec', ['mise', 'exec', '--']],
+      ['direnv exec', ['direnv', 'exec', '.']],
+      // Not a name on any list here, and this is the row that says the list is not the bound.
+      ['a wrapper script nobody has named', ['./scripts/deploy-prod']],
+      ['a wrapper with an option', ['run-with-retries', '--attempts', '3']]
+    ];
+    expect(prefixes.length).toBe(32);
+    for (const mode of modes)
+      for (const [label, prefix] of prefixes) {
+        const [executable = '', ...rest] = [...prefix, 'npm', 'publish'];
+        for (const [spelling, args] of [
+          ['bare', { executable, args: rest }],
+          ['wrapped', shell([...prefix, 'npm', 'publish'].join(' '))]
+        ] as const) {
+          const requirement = approvalRequirement('shell', args, mode);
+          expect(requirement?.sideEffect, `${label} ${spelling} in ${mode}`).toBe(
+            'external_consequential'
+          );
+          expect(requirement?.action, `${label} ${spelling} in ${mode}`).toBe(
+            'Publish to a package registry with npm publish'
+          );
+        }
+      }
+  });
+
+  /*
+   * The shell's own quoting, which is the sixth spelling and the one that needs no wrapper at all.
+   *
+   * Nothing here splits a script the way a shell does, so `"npm" publish` arrives as the token
+   * `"npm` and matches no table. Stripped leading and trailing independently rather than as a
+   * matched pair, because `eval "npm publish"` reaches this as `"npm` and `publish"` - two
+   * half-quoted tokens with no pair between them.
+   */
+  it('reads a quoted command name', () => {
+    for (const script of [
+      '"npm" publish',
+      "'npm' publish",
+      'npm "publish"',
+      'eval "npm publish"',
+      "eval 'npm publish'",
+      'sudo "npm" "publish"'
+    ])
+      expect(approvalRequirement('shell', shell(script), 'autonomous')?.action, script).toBe(
+        'Publish to a package registry with npm publish'
+      );
+  });
+
+  /*
+   * AN INTERPRETER INSIDE A SCRIPT, which is the same defeat one level down and was live.
+   *
+   * Measured on `cd7033f` in balanced and autonomous: `bash -lc 'sh -c "npm publish"'` and
+   * `bash -lc "bash -c 'vercel --prod'"` raised NOTHING, while the same call written as
+   * `{ executable: 'sh', args: ['-c', 'npm publish'] }` raised `external_consequential` in all
+   * three. `commandScript` reads the OUTER call's `-c` and `stdin`; the script quoted inside that
+   * one was a pair of word-shaped tokens nobody re-parsed.
+   */
+  it('reads a script an inner interpreter was handed inside an outer one', () => {
+    for (const [script, action] of [
+      ['sh -c "npm publish"', 'Publish to a package registry with npm publish'],
+      ["bash -c 'npm publish'", 'Publish to a package registry with npm publish'],
+      ['sudo sh -c "npm publish"', 'Publish to a package registry with npm publish'],
+      ['zsh -c "vercel --prod"', 'Publish online with vercel --prod']
+    ] as const)
+      expect(approvalRequirement('shell', shell(script), 'autonomous')?.action, script).toBe(
+        action
+      );
+    // The outer form is still read as itself, which is what "beside" rather than "instead of" buys.
+    expect(
+      approvalRequirement('shell', shell('sh -c "rm -rf /etc/nginx"'), 'autonomous')?.sideEffect
+    ).toBe('external_consequential');
+  });
+
+  /*
+   * THE SAME QUOTE, ONE CHARACTER ALONG - and the reason the test above is not enough.
+   *
+   * `unquoted` stripped the leading and trailing runs of a token, which reads every spelling the
+   * test above lists and stops dead at the next one. Measured on the tree that shipped it, in
+   * balanced AND autonomous: `n"p"m publish`, `np''m publish`, `"n"pm publish`, `n\pm publish`
+   * and `$'npm' publish` all raised NOTHING, beside `"npm" publish` which carded - and the same
+   * held of `v"e"rcel --prod` and `kube"ctl" apply`. The shell does not care where the quote is.
+   *
+   * `env -S` is this wave's own repair opening a door rather than closing one: naming it a value
+   * option made the runner swallow the command it carries, which is precisely what
+   * `RUNNER_VALUE_OPTIONS` says in its own note that naming `-c` would do.
+   */
+  it('reads a quoted command name wherever in the name the quote sits', () => {
+    for (const [script, action] of [
+      ['n"p"m publish', 'Publish to a package registry with npm publish'],
+      ["np''m publish", 'Publish to a package registry with npm publish'],
+      ['"n"pm publish', 'Publish to a package registry with npm publish'],
+      ['n\\pm publish', 'Publish to a package registry with npm publish'],
+      ["$'npm' publish", 'Publish to a package registry with npm publish'],
+      ['do"cker" push me/img', 'Publish to a package registry with docker push'],
+      ['v"e"rcel --prod', 'Publish online with vercel --prod'],
+      ['kube"ctl" apply -f k8s.yaml', 'Change what is deployed with kubectl apply']
+    ] as const)
+      for (const mode of modes)
+        expect(
+          approvalRequirement('shell', shell(script), mode)?.action,
+          `${script} in ${mode}`
+        ).toBe(action);
+  });
+
+  /* The option whose value IS the command, in both spellings, which no interpreter reader sees. */
+  it('reads the command env was handed to split for itself', () => {
+    for (const args of [
+      ['-S', 'npm publish'],
+      ['--split-string=npm publish'],
+      ['-S', 'vercel --prod']
+    ])
+      for (const mode of modes)
+        expect(
+          approvalRequirement('shell', { executable: 'env', args }, mode)?.sideEffect,
+          `${args.join(' ')} in ${mode}`
+        ).toBe('external_consequential');
+    // The counterweight, and the row the repair had to keep: a real value option still comes off.
+    expect(
+      approvalRequirement(
+        'shell',
+        { executable: 'env', args: ['-u', 'X', 'npm', 'publish'] },
+        'autonomous'
+      )?.action
+    ).toBe('Publish to a package registry with npm publish');
+  });
+
+  /*
+   * The prefix rule has to hold for the destructive, install and push cards too, or it is a repair
+   * to one card rather than to the reader every card shares. Measured on `cd7033f` in balanced and
+   * autonomous: `sudo apt-get install nginx`, `sudo git push origin main`, `sudo docker push
+   * me/img` and `sudo rm -rf /etc/nginx` all raised nothing, while every bare form carded.
+   */
+  it('carries the same repair to the destructive, install and push cards', () => {
+    for (const [label, args, expected] of [
+      ['install', { executable: 'sudo', args: ['apt-get', 'install', 'nginx'] }, 'Install'],
+      // The row that reaches `RUNNER_VALUE_OPTIONS`. The publish rows above cannot: `publishingOperation`
+      // reads past `root` on its own, so emptying sudo's option table leaves every one of them green
+      // while `root` becomes the executable for every other reader in the floor.
+      [
+        'install behind a user option',
+        { executable: 'sudo', args: ['-u', 'root', 'apt-get', 'install', 'nginx'] },
+        'Install'
+      ],
+      ['push', { executable: 'sudo', args: ['git', 'push', 'origin', 'main'] }, 'Push Git'],
+      // And the row that reaches `RUNNER_POSITIONALS`, for the same reason: the publish rows read
+      // past the lock file on their own, and every other reader takes it for the command.
+      [
+        'install behind a lock file',
+        { executable: 'flock', args: ['/tmp/deploy.lock', 'apt-get', 'install', 'nginx'] },
+        'Install'
+      ],
+      ['registry', { executable: 'sudo', args: ['docker', 'push', 'me/img'] }, 'package registry'],
+      // Named for the wrapper rather than the wrapped command, because `destructiveCommand` is
+      // asked of the raw invocation first and `sudo` is now a runner carrying `rm`. The card prints
+      // the whole command either way, which is what the owner answers.
+      ['destructive', { executable: 'sudo', args: ['rm', '-rf', '/etc/nginx'] }, 'Run sudo']
+    ] as const) {
+      const requirement = approvalRequirement('shell', args, 'balanced');
+      expect(requirement?.action, label).toContain(expected);
+      expect(requirement?.preview, label).toContain([args.executable, ...args.args].join(' '));
+    }
+  });
+});
+
+/*
+ * PUTTING SOMETHING ONLINE BY A ROUTE THAT IS NOT A PACKAGE REGISTRY.
+ *
+ * The owner named "publishing anything online" as a thing that must always stop, and until this
+ * table the floor's whole answer to it was `git push`, `publish_site` and the registry rule above.
+ * Measured on `cd7033f` in balanced and autonomous, every row of the first test below raised
+ * NOTHING; the two the brief named that already stopped - `gh release create` as "Send data using
+ * gh" and `aws s3 sync ./dist s3://bucket` as "Allow internet access", both `external_reversible` -
+ * are noted where they are rather than duplicated.
+ *
+ * An operation table rather than an executable one, for the reason the registry rule gives and the
+ * owner has already rejected the alternative to: `vercel dev` is not `vercel --prod`, `kubectl get`
+ * is not `kubectl apply`, and carding both is friction on every turn that touches a deployed
+ * service. The second test is that half, and it is the expensive one to get wrong.
+ */
+describe('publishing online, and changing what is deployed', () => {
+  const modes = ['review', 'balanced', 'autonomous'] as const;
+  const shell = (script: string) => ({ executable: 'bash', args: ['-lc', script] });
+
+  it('stops every hosting and infrastructure deployment in every mode', () => {
+    const deployments: Array<[string, string, string]> = [
+      ['vercel', 'vercel --prod', 'Publish online with vercel --prod'],
+      ['vercel spelt as a subcommand', 'vercel deploy --prod', 'Publish online with vercel deploy'],
+      ['vercel bare, which deploys the directory', 'vercel', 'Publish online with vercel'],
+      ['vercel promote', 'vercel promote dpl_x', 'Publish online with vercel promote'],
+      ['flyctl', 'flyctl deploy', 'Publish online with flyctl deploy'],
+      ['fly, the short name', 'fly deploy --now', 'Publish online with fly deploy'],
+      ['netlify', 'netlify deploy --prod', 'Publish online with netlify deploy'],
+      ['netlify draft, still a URL', 'netlify deploy', 'Publish online with netlify deploy'],
+      ['wrangler, the old verb', 'wrangler publish', 'Publish online with wrangler publish'],
+      ['wrangler, the new verb', 'wrangler deploy', 'Publish online with wrangler deploy'],
+      ['wrangler pages', 'wrangler pages deploy dist', 'Publish online with wrangler pages deploy'],
+      ['gh release', 'gh release create v1.0.0 app.tgz', 'Publish online with gh release create'],
+      ['gh gist', 'gh gist create notes.md', 'Publish online with gh gist create'],
+      ['gcloud app', 'gcloud app deploy', 'Publish online with gcloud app deploy'],
+      ['gcloud run', 'gcloud run deploy api --source .', 'Publish online with gcloud run deploy'],
+      ['firebase', 'firebase deploy --only hosting', 'Publish online with firebase deploy'],
+      ['serverless', 'serverless deploy', 'Publish online with serverless deploy'],
+      ['sst', 'sst deploy', 'Publish online with sst deploy'],
+      // The brief's "aws s3 sync to a PUBLIC bucket". No command says a bucket is public - that is
+      // on the far side - but a command does say the acl it sets, and a website is a website.
+      [
+        'a public acl',
+        'aws s3 cp dist s3://b --recursive --acl public-read',
+        'Publish online with aws --acl public-read'
+      ],
+      [
+        'a bucket turned into a site',
+        'aws s3 website s3://b --index-document index.html',
+        'Publish online with aws s3 website'
+      ],
+      ['kubectl', 'kubectl apply -f k8s.yaml', 'Change what is deployed with kubectl apply'],
+      [
+        'kubectl delete',
+        'kubectl delete deploy api',
+        'Change what is deployed with kubectl delete'
+      ],
+      [
+        'kubectl rollout, which is a read one word away',
+        'kubectl rollout undo deploy/api',
+        'Change what is deployed with kubectl rollout undo'
+      ],
+      [
+        'terraform',
+        'terraform apply -auto-approve',
+        'Change what is deployed with terraform apply'
+      ],
+      ['terraform destroy', 'terraform destroy', 'Change what is deployed with terraform destroy'],
+      ['helm', 'helm upgrade --install api ./chart', 'Change what is deployed with helm upgrade'],
+      ['pulumi', 'pulumi up', 'Change what is deployed with pulumi up']
+    ];
+    expect(deployments.length).toBe(27);
+    for (const mode of modes)
+      for (const [label, script, action] of deployments) {
+        const [executable = '', ...rest] = script.split(' ');
+        for (const [spelling, args] of [
+          ['bare', { executable, args: rest }],
+          ['wrapped', shell(script)]
+        ] as const) {
+          const requirement = approvalRequirement('shell', args, mode);
+          expect(requirement?.sideEffect, `${label} ${spelling} in ${mode}`).toBe(
+            'external_consequential'
+          );
+          expect(requirement?.action, `${label} ${spelling} in ${mode}`).toBe(action);
+        }
+      }
+  });
+
+  /*
+   * The direction that costs the owner. Every one of these is how somebody looks at a deployed
+   * service before deciding anything about it, and `vercel dev`, `netlify dev` and `wrangler dev`
+   * are local development servers that reach nothing at all. A rule keyed on the executable would
+   * card all of them.
+   */
+  it('says nothing about developing, building, planning or reading a deployment', () => {
+    const free = [
+      'vercel dev',
+      'vercel build',
+      'vercel ls',
+      'vercel logs my-app',
+      'vercel env pull',
+      'vercel inspect dpl_x',
+      'vercel --help',
+      'netlify dev',
+      'netlify status',
+      'netlify link',
+      'wrangler dev',
+      'wrangler tail',
+      'wrangler whoami',
+      'kubectl get pods',
+      'kubectl describe pod api',
+      'kubectl logs pod/api',
+      'kubectl top pods',
+      'kubectl diff -f k8s.yaml',
+      // One word from `rollout undo`, and a read.
+      'kubectl rollout status deploy/api',
+      'terraform plan',
+      'terraform init',
+      'terraform validate',
+      'terraform show',
+      'gh release list',
+      'gh release view v1.0.0',
+      'helm list',
+      'helm template ./chart',
+      'helm lint ./chart',
+      'aws s3 ls',
+      'fly status',
+      'flyctl logs',
+      'gcloud config list',
+      'firebase projects:list',
+      'pulumi preview'
+    ];
+    expect(free.length).toBe(34);
+    for (const script of free) {
+      const [executable = '', ...rest] = script.split(' ');
+      expect(approvalRequirement('shell', { executable, args: rest }, 'autonomous'), script).toBe(
+        null
+      );
+      expect(approvalRequirement('shell', shell(script), 'autonomous'), `${script} wrapped`).toBe(
+        null
+      );
+    }
+  });
+
+  /*
+   * AND AGAIN, because the repair above was one level deep and said nothing about two.
+   *
+   * Measured on the tree that shipped it: an inner interpreter inside an inner interpreter raised
+   * NOTHING outside review, while the one-level spelling beside it raised `external_consequential`
+   * in all three modes. The inner script was emitted once and never re-read, and the walk that
+   * reads it stops at the first name it knows - which `bash` is.
+   */
+  it('keeps reading while what is inside is another interpreter', () => {
+    for (const [script, action] of [
+      ['sh -c "bash -c \'npm publish\'"', 'Publish to a package registry with npm publish'],
+      ['bash -c \'sh -c "vercel --prod"\'', 'Publish online with vercel --prod'],
+      ['sudo sh -c "bash -c \'cargo publish\'"', 'Publish to a package registry with cargo publish']
+    ] as const)
+      for (const mode of modes)
+        expect(
+          approvalRequirement('shell', shell(script), mode)?.action,
+          `${script} in ${mode}`
+        ).toBe(action);
+    // Still not a reader of everything quoted anywhere: an ordinary message is not a command.
+    expect(
+      approvalRequirement('shell', shell('git commit -m "sh -c npm publish"'), 'autonomous')
+    ).toBe(null);
+  });
+
+  /*
+   * ASKING WHETHER THE TOOL IS THERE, AND ASKING IT WHAT IT WOULD DO.
+   *
+   * The expensive direction, and the one the hosting table got wrong. Measured on the tree that
+   * shipped it, in ALL THREE modes and as `external_consequential`: `command -v vercel` - the
+   * first line of every setup script - came back "Publish online with vercel"; `hash vercel` the
+   * same; `kubectl auth can-i create pods` asked the cluster a question and was read as the
+   * answer; `kubectl create ... --dry-run=client -o yaml`, the way every manifest in every
+   * tutorial is generated, was read as the creation; `terraform apply --help` printed the manual.
+   *
+   * Four separate causes wearing one symptom, which is why the rows are here rather than added to
+   * the free list above: a value option the runner set never held, a bare name read out of the
+   * middle of somebody else’s command, an operation matched behind the word that asks about it,
+   * and an informational option the bare arm honoured and the matched arm did not.
+   */
+  it('says nothing when the command asks where the tool is, or what it would do', () => {
+    const asking: Array<[string, Record<string, unknown>]> = [
+      ['command -v', { executable: 'command', args: ['-v', 'vercel'] }],
+      ['command -V', { executable: 'command', args: ['-V', 'kubectl'] }],
+      ['hash', { executable: 'hash', args: ['vercel'] }],
+      ['can-i', { executable: 'kubectl', args: ['auth', 'can-i', 'create', 'pods'] }],
+      [
+        'apply dry run',
+        { executable: 'kubectl', args: ['apply', '-f', 'k8s.yaml', '--dry-run=client'] }
+      ],
+      [
+        'create dry run',
+        {
+          executable: 'kubectl',
+          args: ['create', 'deployment', 'a', '--dry-run=client', '-o', 'yaml']
+        }
+      ],
+      ['helm dry run', { executable: 'helm', args: ['upgrade', 'r', './c', '--dry-run'] }],
+      ['wrangler dry run', { executable: 'wrangler', args: ['deploy', '--dry-run'] }],
+      ['terraform help', { executable: 'terraform', args: ['apply', '--help'] }],
+      ['kubectl help', { executable: 'kubectl', args: ['set', 'image', '--help'] }],
+      ['vercel help', { executable: 'vercel', args: ['deploy', '--help'] }]
+    ];
+    for (const [label, args] of asking)
+      for (const mode of ['balanced', 'autonomous'] as const)
+        expect(approvalRequirement('shell', args, mode), `${label} in ${mode}`).toBe(null);
+  });
+
+  /*
+   * The other end of the same four repairs, because each of them is an exemption and an exemption
+   * that reaches too far is the whole of what this table is for. `--dry-run=none` is kubectl’s
+   * spelling of "actually do it"; `-v` is its verbosity; a bare name is still the deployment when
+   * it is the command; and a real value option still comes off the front.
+   */
+  it('still stops the same commands written without the question', () => {
+    for (const [label, args] of [
+      ['apply', { executable: 'kubectl', args: ['apply', '-f', 'k8s.yaml'] }],
+      [
+        'apply, dry run none',
+        { executable: 'kubectl', args: ['apply', '-f', 'k8s.yaml', '--dry-run=none'] }
+      ],
+      ['apply, verbose', { executable: 'kubectl', args: ['-v=5', 'apply', '-f', 'k8s.yaml'] }],
+      [
+        'apply, namespaced',
+        { executable: 'kubectl', args: ['-n', 'prod', 'apply', '-f', 'k8s.yaml'] }
+      ],
+      // The width of the asking word, which nothing else reaches: it is ONE name, and a set that
+      // grew would be a set an option's value could be chosen to sit in. Widening it to `auth`,
+      // `deployment` and `secret` was attacked and nothing failed until these three rows existed.
+      [
+        'namespace called auth',
+        { executable: 'kubectl', args: ['-n', 'auth', 'apply', '-f', 'x.yaml'] }
+      ],
+      [
+        'namespace called deployment',
+        { executable: 'kubectl', args: ['-n', 'deployment', 'apply', '-f', 'x.yaml'] }
+      ],
+      [
+        'context called secret',
+        { executable: 'kubectl', args: ['--context', 'secret', 'apply', '-f', 'x.yaml'] }
+      ],
+      ['create', { executable: 'kubectl', args: ['create', 'deployment', 'a', '--image=nginx'] }],
+      ['helm', { executable: 'helm', args: ['upgrade', 'r', './c'] }],
+      ['bare vercel', { executable: 'vercel', args: [] }],
+      ['bare vercel behind a runner', { executable: 'sudo', args: ['vercel'] }],
+      ['vercel behind a wrapper script', { executable: './ship', args: ['vercel', '--prod'] }],
+      ['pulumi up --json', { executable: 'pulumi', args: ['up', '--json'] }],
+      ['command -p', { executable: 'command', args: ['-p', 'npm', 'publish'] }]
+    ] as const)
+      expect(approvalRequirement('shell', args, 'autonomous')?.sideEffect, label).toBe(
+        'external_consequential'
+      );
+  });
+  /* The prefix repair is one reader, so it has to hold here too rather than only on the registry. */
+  it('is not switched off by a word in front of it either', () => {
+    for (const script of [
+      'sudo vercel --prod',
+      'timeout 600 flyctl deploy',
+      'env CI=1 kubectl apply -f k8s.yaml',
+      './scripts/ship terraform apply'
+    ])
+      expect(approvalRequirement('shell', shell(script), 'autonomous')?.sideEffect, script).toBe(
+        'external_consequential'
+      );
+  });
+
+  /* The card prints what is being approved, and says which of the two acts it is. */
+  it('names the operation and says what cannot be put back', () => {
+    expect(approvalRequirement('shell', shell('vercel --prod'), 'autonomous')?.preview).toContain(
+      'anyone with the address can read it'
+    );
+    expect(
+      approvalRequirement('shell', shell('kubectl apply -f k8s.yaml'), 'autonomous')?.preview
+    ).toContain('nothing here can restore it');
+  });
 });
 
 describe('the write card that guarded nothing', () => {
@@ -2596,7 +3088,32 @@ describe('what a security mode means', () => {
       ['sending', 'shell', { executable: 'git', args: ['push'] }],
       ['sending', 'connector_action', { action: 'mail_send', input: { to: 'a@b.invalid' } }],
       ['destroying data', 'shell', { executable: 'rm', args: ['-rf', 'node_modules'] }],
-      ['agreeing on your behalf', 'coding_agent', { action: 'setup', agent: 'claude' }],
+      /*
+       * The clause used to be named here by `coding_agent setup`, which agrees to nothing on
+       * anybody's behalf: it cards because it writes a coding tool's own configuration, which is the
+       * "left behind to run later" clause two rows down. So the sentence's one unheld clause was
+       * being held by an act belonging to another clause - a fixture that does not exercise the
+       * path, in the test whose whole job is that the sentence is exhaustive.
+       *
+       * The acts below are the clause. `sign` was already in the vocabulary; `terms` and `licence`
+       * are this wave's, and the sentence was narrowed to what these three prove - see the
+       * counterweight in the next test, which is the half the floor cannot keep.
+       */
+      [
+        'signing in your name',
+        'browser_action',
+        { action: 'click', selector: '#sign', purpose: 'sign the tenancy agreement' }
+      ],
+      [
+        'accepting terms in your name',
+        'browser_action',
+        { action: 'click', selector: '#accept', purpose: 'accept the terms of service' }
+      ],
+      [
+        'accepting terms in your name',
+        'desktop_action',
+        { action: 'invoke', nodeId: 'accept-eula', purpose: 'accept the licence to finish setup' }
+      ],
       [
         'left behind to run later',
         'shell',
@@ -2641,5 +3158,127 @@ describe('what a security mode means', () => {
     ];
     for (const [name, args] of ordinary)
       expect(approvalRequirement(name, args, 'autonomous'), JSON.stringify(args)).toBeNull();
+  });
+
+  /*
+   * WHAT THE SENTENCE DELIBERATELY STOPPED PROMISING, and why this is a test rather than a comment.
+   *
+   * Autonomous said "agreeing to something on your behalf". Driven at cd7033f, every one of these
+   * raised no card in balanced or autonomous, so the clause was false for the commonest thing on
+   * the web. The repair was not to widen it: consent is not a category either classifier can
+   * recognise - a cookie banner's button is a plain `<button>` outside any form, indistinguishable
+   * by the evidence a click carries from every other button on the page - so it could only be a
+   * phrase list over button copy, and that list rots outwards ("Got it", "Alle akzeptieren") while
+   * firing on ordinary reading, because a banner stands in front of almost every page a research
+   * turn opens.
+   *
+   * So the sentence was narrowed to "signing or accepting terms in your name", which the test above
+   * drives, and these stay free on purpose. If a later wave decides a cookie banner is worth a card,
+   * it changes this test and the sentence in the same commit - which is the whole point of holding
+   * a deliberate absence in the rig rather than in prose.
+   */
+  it('does not promise, or card, the cookie banner in front of every page', () => {
+    for (const purpose of [
+      'accept all cookies',
+      'consent to the cookies',
+      'agree and continue',
+      'dismiss the banner',
+      'opt in to the newsletter'
+    ])
+      expect(
+        approvalRequirement(
+          'browser_action',
+          { action: 'click', selector: '#consent', purpose },
+          'autonomous'
+        ),
+        purpose
+      ).toBeNull();
+    // And the sentence must not have quietly regained the promise those rows cannot keep.
+    expect(SECURITY_MODE_FLOOR.autonomous.sentence).not.toContain('agreeing to something');
+    expect(SECURITY_MODE_FLOOR.autonomous.sentence).toContain('accepting terms in your name');
+  });
+
+  /*
+   * READING A LICENCE IS NOT ACCEPTING ONE, and this is the counterweight the vocabulary above
+   * needs in the other direction.
+   *
+   * `terms`, `licence`, `license` and `eula` were held bare for one wave, and a bare noun cannot
+   * tell the two acts apart: every other word in `consequentialText` names an ACT - submit,
+   * install, delete - while these four name a DOCUMENT, and the commonest thing anybody does with
+   * a document is read it. Driven with the nouns bare, in all three modes, these all raised
+   * `external_consequential`: opening a repository's LICENSE link, opening an API terms page to
+   * find a rate limit, filtering a package list to MIT, reading a library's licence, and a desktop
+   * installer's "View licence" control. None of them was promised by any sentence, and a card that
+   * fires on ordinary work is the friction the owner's rule rejects by name.
+   *
+   * The alternation is paired instead - an agreeing verb within a few words of the object - so the
+   * sentence and the code say the same thing. These rows are what stops the nouns coming back bare.
+   */
+  it('does not card reading a licence or a terms page, in any mode', () => {
+    const reads: Array<[string, string, Record<string, unknown>]> = [
+      [
+        'the LICENSE link in a repository sidebar',
+        'browser_action',
+        {
+          action: 'click',
+          selector: "a[href$='LICENSE']",
+          purpose: 'open the LICENSE file to see what licence this package uses'
+        }
+      ],
+      [
+        'an API terms page, read for its rate limit',
+        'browser_action',
+        {
+          action: 'click',
+          selector: 'a.footer-terms',
+          purpose: 'read the API terms page to find the rate limit'
+        }
+      ],
+      [
+        'filtering a package list by licence',
+        'browser_action',
+        {
+          action: 'click',
+          selector: '#license-filter-mit',
+          purpose: 'filter the package list to MIT licensed results'
+        }
+      ],
+      [
+        "a library's licence terms",
+        'browser_action',
+        {
+          action: 'click',
+          selector: 'text=Licence',
+          purpose: 'read the licence terms for this library'
+        }
+      ],
+      [
+        "an installer's View licence control",
+        'desktop_action',
+        {
+          action: 'invoke',
+          nodeId: 'View licence',
+          purpose: 'read the licence text in the installer'
+        }
+      ]
+    ];
+    for (const [what, tool, args] of reads)
+      for (const mode of ['balanced', 'autonomous'] as const)
+        expect(approvalRequirement(tool, args, mode), `${what} in ${mode}`).toBeNull();
+    // And the acts themselves still card, which is the half the pairing keeps.
+    for (const purpose of [
+      'accept the terms of service',
+      'agree to the terms and conditions',
+      'accept the end user licence agreement',
+      'I accept the EULA'
+    ])
+      expect(
+        approvalRequirement(
+          'browser_action',
+          { action: 'click', selector: '#accept', purpose },
+          'autonomous'
+        ),
+        purpose
+      ).toMatchObject({ sideEffect: 'external_consequential' });
   });
 });
