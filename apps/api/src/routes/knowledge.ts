@@ -12,20 +12,25 @@ import { createHmac } from 'node:crypto';
 import {
   AthanorError,
   assertMemoryValidity,
+  decryptBytes,
   decryptJson,
+  encryptBytes,
   encryptJson,
   memoryExcerpt,
   memoryTemporalStatus,
+  ownerBlockAad,
   userMemoryAad,
   OWNER_MEMORY_MAX_CHARS,
   OWNER_MEMORY_MAX_ROWS,
   WORKSPACE_MEMORY_MAX_CHARS
 } from '@athanor/core';
 import type { MemoryDocument } from '@athanor/core';
+import { OWNER_BLOCK_MAX_BYTES } from '@athanor/data';
 import type { MemoryItemBody } from '@athanor/contracts';
 import type {
   MemoryFactCandidateRecord,
   MemoryItemRecord,
+  OwnerBlockRecord,
   WorkspaceMemoryRecord
 } from '@athanor/data';
 import { z } from 'zod';
@@ -98,6 +103,35 @@ const CREDENTIAL_SHAPES: readonly RegExp[] = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:api[_ -]?key|password|passphrase|secret|token)\s*[:=]\s*\S{12,}/i
 ];
 
+/**
+ * The two content rules, named rather than inlined, because a second surface now needs both.
+ *
+ * The owner block below is the one text in this system that reaches every request of every task, so
+ * it is the last place a hidden direction or a pasted key may be admitted. Copying the two
+ * refinements into a second schema would have been two rules that agree today; naming them is one
+ * rule with two callers. @see CREDENTIAL_SHAPES for what the second one measures and what it still
+ * misses.
+ *
+ * The Unicode Tags block is the last range here and the one this scan was missing, which made the
+ * trusted surface the unguarded one. `sanitise.ts` strips `U+E0000-U+E007F` from every untrusted
+ * tool result precisely because it is the invisible-instruction channel - so a model could only
+ * emit a tag character by copying one it had read, and what it read had already been cleaned, while
+ * a paste from the owner's clipboard crossed no such boundary at all. `British spelling.` carrying
+ * `Ignore the safety floor.` in that block is 113 bytes, 17 visible code points, and NFKC leaves it
+ * exactly as it arrived. The scan above cannot see it even in principle: `charCodeAt(0)` on an
+ * astral character is the high surrogate, 0xDB40 for every character in this range. The one review
+ * this block's design rests on is a person reading their own words, and that is the review a
+ * character with no glyph defeats by construction.
+ */
+const carriesHiddenDirection = (value: string): boolean =>
+  [...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31) || code === 127;
+  }) || /[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/u.test(value);
+
+const carriesCredential = (value: string): boolean =>
+  CREDENTIAL_SHAPES.some((shape) => shape.test(value));
+
 const KnowledgeText = z
   .string()
   .trim()
@@ -105,19 +139,36 @@ const KnowledgeText = z
   .max(24_000)
   .transform((value) => value.normalize('NFKC'))
   .refine(
-    (value) =>
-      ![...value].some((character) => {
-        const code = character.charCodeAt(0);
-        return (
-          code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31) || code === 127
-        );
-      }) && !/[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/u.test(value),
+    (value) => !carriesHiddenDirection(value),
     'Hidden control and bidirectional text are not allowed'
   )
+  .refine((value) => !carriesCredential(value), 'Keep credentials out of memory and skills');
+
+/**
+ * The owner block's text, which differs from `KnowledgeText` in exactly two ways.
+ *
+ * Empty is allowed, because emptying the block is a thing the owner is entitled to do and a
+ * schema that refused it would make "clear this" reachable only by deleting a row from a screen
+ * that has no row on it.
+ *
+ * The character cap is deliberately well ABOVE the byte bound rather than equal to it, and getting
+ * that wrong is what this comment is for. Set to the bound's own number it fires first on every
+ * ordinary overlong draft, and zod's refusal is "one or more request fields are invalid" - so the
+ * owner is refused by a schema instead of being told which surface is full and by how much. Its
+ * job is only to stop a megabyte of text being normalised and regex-scanned before anything counts
+ * it; the bound itself is counted in bytes after NFKC, because normalisation can lengthen a string
+ * and a limit checked before it is a limit the database would refuse a second time.
+ */
+const OwnerBlockText = z
+  .string()
+  .trim()
+  .max(OWNER_BLOCK_MAX_BYTES * 4)
+  .transform((value) => value.normalize('NFKC'))
   .refine(
-    (value) => !CREDENTIAL_SHAPES.some((shape) => shape.test(value)),
-    'Keep credentials out of memory and skills'
-  );
+    (value) => !carriesHiddenDirection(value),
+    'Hidden control and bidirectional text are not allowed'
+  )
+  .refine((value) => !carriesCredential(value), 'Keep credentials out of your block');
 
 /**
  * The two constants behind a proposal's handle, written where they can be read.
@@ -443,6 +494,114 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
           request.params.memoryId
         )
       };
+    }
+  );
+
+  /**
+   * The owner's block: one text about the person, and the two routes that reach it.
+   *
+   * It is not under `/v1/workspaces/:workspaceId` and that is the address doing part of the work.
+   * Everything above is about a computer and dies with one; this is about the person and outlives
+   * every computer they ever create, so a URL that named a workspace would be a promise the row
+   * does not keep - which is exactly the defect migration 70 was written to repair in the tier next
+   * door.
+   *
+   * The gate is what is absent from these two handlers rather than what is in them: no task, no
+   * tool call, no agent. `MemoryStore.writeOwnerBlock` cannot be told a workspace or a task at all -
+   * both are typed `never` - so the one production caller that runs inside a turn cannot form a
+   * call to it, and the worker's window holds a reader and no writer. The agent's route to this
+   * text is the review queue and the owner's own hands, which is the only gate strictly stronger
+   * than the taint rule: a turn that read somebody else's words nominates nothing here, and neither
+   * does a turn that read nobody's.
+   */
+  const ownerBlockText = (block: OwnerBlockRecord, ownerKey: Buffer): string => {
+    try {
+      return decryptBytes(block.ciphertext, ownerKey, ownerBlockAad(block.userId)).toString('utf8');
+    } catch {
+      return '';
+    }
+  };
+
+  const ownerBlockResponse = (block: OwnerBlockRecord | null, ownerKey: Buffer) => ({
+    /*
+     * A block this key will not open answers as empty rather than as a failure, and the version
+     * beside it is the real one.
+     *
+     * Only a changed master key can produce that state, and a box in it has bigger problems - but
+     * the consequence worth avoiding is specific: a route that threw here would leave the owner
+     * looking at an error on the one screen that exists so they can correct what this computer
+     * holds about them, with no way to overwrite it. Answering with the true version means their
+     * next save replaces it.
+     */
+    text: block ? ownerBlockText(block, ownerKey) : '',
+    bytes: block?.contentBytes ?? 0,
+    limit: OWNER_BLOCK_MAX_BYTES,
+    // Zero means "there is no block", which is the version a first write states. It is served
+    // rather than left for the client to infer, because a client that guessed it would be guessing
+    // the one value that decides whether a save overwrites somebody's newer text.
+    version: block?.version ?? 0,
+    updatedAt: block?.updatedAt ?? null
+  });
+
+  app.get('/v1/account/memory-block', async (request) => {
+    const user = requireUser(request.user);
+    return ownerBlockResponse(await store.readOwnerBlock(user.id), ownerKnowledgeKey(user.id));
+  });
+
+  /**
+   * Rewrites the whole block, refuses past the bound, and refuses a stale write.
+   *
+   * REFUSED, never trimmed and never evicted. The workspace tier can afford to drop a row because
+   * its rows die with the computer; a sentence the owner typed about themselves that quietly
+   * disappeared to make room is something they would never find out had gone. So the message names
+   * the number and the surface and leaves the stored bytes exactly as they were - which the store
+   * guarantees, because the refusal happens before the statement and the database's own CHECK
+   * refuses a caller that got past it.
+   *
+   * `expectedVersion` is the version the client read. Two settings tabs on one block is not an
+   * exotic case - it is what happens when the owner opens settings on their phone and their
+   * laptop - and the alternative to a conflict is the older tab silently deleting the newer text.
+   */
+  app.put<{ Body: { text: string; expectedVersion: number } }>(
+    '/v1/account/memory-block',
+    async (request) => {
+      const user = requireUser(request.user);
+      const input = z
+        .object({ text: OwnerBlockText, expectedVersion: z.number().int().min(0) })
+        .parse(request.body);
+      const bytes = Buffer.byteLength(input.text, 'utf8');
+      if (bytes > OWNER_BLOCK_MAX_BYTES)
+        throw new AthanorError(
+          'owner_block_full',
+          `Your block holds ${OWNER_BLOCK_MAX_BYTES} bytes and this is ${bytes}. Shorten it - nothing here is dropped to make room.`
+        );
+      const ownerKey = ownerKnowledgeKey(user.id);
+      if (!input.text) {
+        const cleared = await store.clearOwnerBlock(user.id, input.expectedVersion);
+        const remaining = cleared ? null : await store.readOwnerBlock(user.id);
+        // Not deleted and nothing left is "it was already empty", which is what the owner asked
+        // for. Not deleted and something still there is a stale tab, and it is told so rather than
+        // being allowed to try again with a version it has no reason to trust either.
+        if (!cleared && remaining)
+          throw new AthanorError(
+            'owner_block_conflict',
+            'Your block changed somewhere else since this screen loaded. Reload it before saving.',
+            409
+          );
+        return ownerBlockResponse(null, ownerKey);
+      }
+      const written = await store.writeOwnerBlock({
+        userId: user.id,
+        ciphertext: encryptBytes(Buffer.from(input.text, 'utf8'), ownerKey, ownerBlockAad(user.id)),
+        expectedVersion: input.expectedVersion
+      });
+      if (!written)
+        throw new AthanorError(
+          'owner_block_conflict',
+          'Your block changed somewhere else since this screen loaded. Reload it before saving.',
+          409
+        );
+      return ownerBlockResponse(written, ownerKey);
     }
   );
 

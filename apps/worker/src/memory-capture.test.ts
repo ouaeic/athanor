@@ -15,9 +15,8 @@ import {
   type EncryptedEnvelope,
   type MemoryPackEntry
 } from '@athanor/core';
-import type { ModelRelease } from '@athanor/contracts';
 import type { DataStore, MemoryPackRecord, TaskRecord } from '@athanor/data';
-import type { ModelGateway, ModelMessage } from '@athanor/model-gateway';
+import type { ModelMessage } from '@athanor/model-gateway';
 import type { AgentState } from './agent-state.js';
 import type { CompletionVerification } from './completion.js';
 import { captureMemory, type MemoryCaptureDeps } from './memory-capture.js';
@@ -120,24 +119,9 @@ const task = {
   userId,
   workspaceId,
   status: 'running',
-  // The proposer resolves the task's own model before it claims the day, so a task with none would
-  // stop one step earlier than these cases are about.
   modelId: 'vendor/model',
   privacyRoute: 'provider_zdr'
 } as unknown as TaskRecord;
-
-/** Enough of a release for `compactionModel` to have something to fall back to. */
-const catalogue = [
-  {
-    id: 'vendor/model',
-    provider: 'custom',
-    commercialUse: true,
-    contextTokens: 128_000,
-    capabilities: ['chat'],
-    usageClass: 'light',
-    privacyRoute: 'provider_zdr'
-  }
-] as unknown as ModelRelease[];
 
 const state = (messages: ModelMessage[]): AgentState =>
   ({ messages, step: 3, credits: 1 }) as unknown as AgentState;
@@ -268,15 +252,20 @@ describe('what a finished turn tells the store about the memory it was given', (
 });
 
 /*
- * The production call site for the nightly proposer.
+ * The nightly proposer's production call site, after the deletion.
  *
- * `proposeMemoryFacts` is pinned against the real schema in `memory-runtime.test.ts`. What only
- * this file can pin is that a finished turn reaches it at all, and - the half that matters more -
- * that a proposer which cannot reach a provider does not turn a recorded turn into a warning
- * saying it was not recorded. That sentence is reserved, and it would be false here: the episode,
- * the sources, the observations and the promotions are all written before this runs.
+ * `captureMemory` used to make one model call a day here, hung off the consolidation cadence, and
+ * `docs/design/memory2/RULES.md` records what retired it. The removal is asserted where it can
+ * fail rather than by the absence of a symbol: the store this turn is handed throws on all three
+ * of the reads that were the nightly route's and nobody else's, and `captureMemory` catches
+ * everything and reports it as a timeline warning - so a call site put back does not fail to
+ * compile somewhere else, it turns this green case red with the warning in hand.
+ *
+ * The consolidation beside it is the positive control, in both directions: the cadence still
+ * fires, exactly once, and a second turn inside the same day does not fire it again. Without it
+ * this case would pass against a `captureMemory` that had stopped doing anything at all.
  */
-describe('the one model call a day, from the turn that triggers it', () => {
+describe('what the daily cadence spends now', () => {
   const finish = async (capture: CaptureProbe) =>
     captureMemory(
       capture.deps,
@@ -289,99 +278,32 @@ describe('the one model call a day, from the turn that triggers it', () => {
       { summary: 'Carried on.', verification: conversational() }
     );
 
-  /**
-   * Both directions on one fixture: the day's sources are read exactly once when the proposer is
-   * wired in, and not at all when it is not. Counting the store read rather than the provider call
-   * is deliberate - it is the first thing the run does that only the proposer does, so a route that
-   * silently stopped being taken would show here rather than being hidden behind an unreachable
-   * provider.
-   */
-  it('reads the day only when a proposer is wired in, and never otherwise', async () => {
-    let read = 0;
-    const wire = (capture: CaptureProbe, withProposer: boolean): CaptureProbe => {
-      Object.assign(capture.deps.store, {
-        claimMemoryProposalRun: async () => ({
-          claimed: true,
-          previous: '2026-07-30T00:00:00.000Z'
-        }),
-        countMemoryFactProposals: async () => 0,
-        listMemoryProposalSources: async () => {
-          read += 1;
-          return [];
-        }
-      });
-      return withProposer
-        ? {
-            ...capture,
-            deps: {
-              ...capture.deps,
-              proposals: {
-                store: capture.deps.store,
-                assertProviderConfigured: async () => undefined,
-                currentCatalog: async () => catalogue,
-                withLeaseRenewal: async (_task, operation) => operation(),
-                /*
-                 * A gateway that opens and a chat that does not.
-                 *
-                 * `proposeMemoryFacts` resolves the provider in FRONT of the claim, so a stub that
-                 * threw here refused the run before it read anything - and this case is about what
-                 * it reads. The refusal that belongs to this fixture is on the request itself: the
-                 * day is empty, so the call is never made, and a version that made one fails here.
-                 */
-                gateway: async () => ({
-                  provider: 'custom',
-                  gateway: {
-                    chat: async () => {
-                      throw new Error('no case here should reach a provider');
-                    }
-                  } as unknown as ModelGateway
-                })
-              }
-            }
-          }
-        : capture;
-    };
-
-    const bare = wire(probe(), false);
-    await finish(bare);
-    expect(read).toBe(0);
-    expect(bare.warnings).toEqual([]);
-
-    const wired = wire(probe(), true);
-    await finish(wired);
-    expect(read).toBe(1);
-    // Quiet, because nothing was refused. The nightly line is written only when a bound fired.
-    expect(wired.warnings).toEqual([]);
-  });
-
-  it('never says a recorded turn was not recorded, when only the proposer failed', async () => {
+  it('consolidates the workspace once a day and takes none of the nightly route', async () => {
     const capture = probe();
-    const wired: CaptureProbe = {
-      ...capture,
-      deps: {
-        ...capture.deps,
-        proposals: {
-          store: capture.deps.store,
-          assertProviderConfigured: async () => {
-            throw new Error('no provider is configured');
-          },
-          currentCatalog: async () => catalogue,
-          withLeaseRenewal: async (_task, operation) => operation(),
-          gateway: async () => {
-            throw new Error('unreachable');
-          }
-        }
-      }
-    };
-    Object.assign(wired.deps.store, {
+    let consolidated = 0;
+    Object.assign(capture.deps.store, {
+      consolidateMemory: async () => {
+        consolidated += 1;
+      },
       claimMemoryProposalRun: async () => {
-        throw new Error('the database went away');
+        throw new Error('the day must not be claimed');
+      },
+      countMemoryFactProposals: async () => {
+        throw new Error('there is no queue left to count');
+      },
+      listMemoryProposalSources: async () => {
+        throw new Error("the day's sources must not be read");
       }
     });
-    await finish(wired);
-    expect(wired.warnings).not.toContain('warning');
-    expect(summaries(wired, 'status')).toEqual([
-      'Could not look over the day for rules worth remembering; everything this turn did is still recorded'
-    ]);
+
+    await finish(capture);
+    expect(consolidated).toBe(1);
+    expect(capture.warnings).toEqual([]);
+    expect(summaries(capture, 'status')).toEqual([]);
+
+    // The cadence, not a second pass: the claim is taken before the await and held in the worker.
+    await finish(capture);
+    expect(consolidated).toBe(1);
+    expect(capture.warnings).toEqual([]);
   });
 });

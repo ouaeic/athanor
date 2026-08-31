@@ -452,3 +452,65 @@ pivot AS (
 SELECT n.* FROM neighbours n CROSS JOIN pivot p
 WHERE n.rn BETWEEN p.rn - $3::int AND p.rn + $4::int
 ORDER BY n.rn`;
+
+/**
+ * The owner block's bound, in bytes of the owner's own UTF-8 text.
+ *
+ * Derived the way the tier beside it derived its row count - from what the evidence supports and
+ * then doubled past it. A reading of 673 owner-typed turns produced five sentences and 727 bytes;
+ * 2,000 is 2.75x the widest defensible draft, and it is still one screen. A block nobody reads to
+ * the end is a block nobody spots a wrong line in, which is the failure this number is chosen
+ * against rather than storage.
+ *
+ * It is stated here rather than in `@athanor/core` because the statement below and the CHECK in
+ * migration 73 are the two places it is enforced, and a bound that lives a package away from both
+ * of them is a bound that can drift from the thing enforcing it. `owner-block.test.ts` holds the
+ * three copies - this constant, the migration, and the route's message - to one number.
+ */
+export const OWNER_BLOCK_MAX_BYTES = 2_000;
+
+/**
+ * The block, and its byte length taken from the ciphertext rather than from a column.
+ *
+ * `octet_length(decode(...))` is exact: AES-256-GCM's ciphertext is the same length as its
+ * plaintext, so this is the size of the owner's text to the byte without anything here holding a
+ * key. That is what lets a caller report "1,240 of 2,000" - and what lets the bound be a CHECK
+ * rather than a counter somebody has to keep honest.
+ */
+export const OWNER_BLOCK_READ_SQL = `
+SELECT user_id,
+       ciphertext,
+       version,
+       octet_length(decode(ciphertext->>'ciphertext','base64')) AS content_bytes,
+       created_at,
+       updated_at
+FROM owner_blocks
+WHERE user_id = $1::uuid`;
+
+/**
+ * One statement for the first write and every rewrite, refusing on a stale version.
+ *
+ * The `WHERE` on the conflict arm is the owner's own concurrency: a second settings tab that loaded
+ * the block before the first one saved holds the older version, its update matches nothing, and
+ * `RETURNING` yields no row - so the caller is told the block moved instead of silently discarding
+ * what the other tab wrote. A first write states version 0, finds no row to conflict with, and
+ * inserts.
+ *
+ * There is no eviction arm and no truncation arm, because there is nothing here to evict: the
+ * bound is a property of the one value being written, enforced by the CHECK this statement writes
+ * through. A refused write leaves the stored bytes exactly as they were.
+ */
+export const OWNER_BLOCK_WRITE_SQL = `
+INSERT INTO owner_blocks(user_id, ciphertext, version)
+VALUES ($1::uuid, $2::jsonb, 1)
+ON CONFLICT (user_id) DO UPDATE
+  SET ciphertext = EXCLUDED.ciphertext,
+      version = owner_blocks.version + 1,
+      updated_at = NOW()
+  WHERE owner_blocks.version = $3::int
+RETURNING user_id,
+          ciphertext,
+          version,
+          octet_length(decode(ciphertext->>'ciphertext','base64')) AS content_bytes,
+          created_at,
+          updated_at`;

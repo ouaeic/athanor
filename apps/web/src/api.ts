@@ -9,6 +9,7 @@ import type {
   ConversationSearchResult,
   DesktopSnapshot,
   FileEntry,
+  OwnerBlock,
   RelayReport,
   RewindScope,
   Task,
@@ -928,6 +929,22 @@ export const api = {
       `/v1/workspaces/${workspaceId}/brief`,
       mutation('PUT', { markdown })
     ),
+  /**
+   * The owner's own block, which is addressed to the person rather than to a computer.
+   *
+   * No workspace id in either path, deliberately: everything else in this section is about the box
+   * the owner happens to have open, and this text outlives every box they ever make.
+   */
+  ownerBlock: () => request<OwnerBlock>('/v1/account/memory-block'),
+  /**
+   * Saves the whole block, or is refused.
+   *
+   * `expectedVersion` is the version this screen loaded. Sending it is what turns "the other tab
+   * saved first" into a message the owner can act on instead of a silent overwrite of whichever
+   * text they typed second.
+   */
+  saveOwnerBlock: (text: string, expectedVersion: number) =>
+    request<OwnerBlock>('/v1/account/memory-block', mutation('PUT', { text, expectedVersion })),
   memories: (workspaceId: string) =>
     request<WorkspaceMemory[]>(`/v1/workspaces/${workspaceId}/memories`),
   addMemory: (

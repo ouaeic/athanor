@@ -43,7 +43,8 @@ import type {
   MemoryItemRecord,
   MemoryPackRecord,
   MemorySourceChannel,
-  MemorySourceRecord
+  MemorySourceRecord,
+  OwnerBlockRecord
 } from '../store.js';
 
 export const iso = (value: unknown): string => new Date(String(value)).toISOString();
@@ -462,4 +463,20 @@ export const mapMemoryFactCandidate = (
   // migration 71 has the column's default, so this is never absent.
   origin: row.origin === 'proposed' ? 'proposed' : 'observed',
   dismissedAt: row.dismissed_at ? iso(row.dismissed_at) : null
+});
+
+/**
+ * The owner block.
+ *
+ * `content_bytes` is computed by the statement rather than stored, so this mapper is the one place
+ * that would have to be wrong for the number the settings screen prints and the number the database
+ * refuses on to part company - and it cannot be, because it copies a column it did not compute.
+ */
+export const mapOwnerBlock = (row: Record<string, unknown>): OwnerBlockRecord => ({
+  userId: String(row.user_id),
+  ciphertext: json<EncryptedEnvelope>(row.ciphertext),
+  contentBytes: Number(row.content_bytes),
+  version: Number(row.version),
+  createdAt: iso(row.created_at),
+  updatedAt: iso(row.updated_at)
 });

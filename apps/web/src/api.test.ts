@@ -329,3 +329,50 @@ describe('what a failure carries back', () => {
     expect(failure.requestId).toBeUndefined();
   });
 });
+
+/**
+ * The block, whose whole claim is that it is about the person rather than about a computer.
+ *
+ * The URL is the assertion. The tier next door spent a migration learning that a row addressed
+ * through a workspace is a row that dies with the workspace whatever its label says, so a client
+ * that reached this text through `/v1/workspaces/:id/...` would be making the same mistake in the
+ * one place nothing else would notice: the server would answer, the round trip would pass, and the
+ * text would be scoped to whichever box happened to be open.
+ */
+describe('the owner block', () => {
+  it('is addressed to the account, with no workspace anywhere in it', async () => {
+    answer({ text: '- You are the lead.', bytes: 19, limit: 2_000, version: 3, updatedAt: null });
+    await api.ownerBlock();
+    expect(only().url).toBe('/v1/account/memory-block');
+    expect(only().url).not.toContain('workspace');
+  });
+
+  /*
+   * The version travels with the text, and it is the difference between "the other tab saved
+   * first, reload" and this tab silently deleting what the other one wrote.
+   */
+  it('sends the version it loaded alongside the text it is replacing', async () => {
+    answer({ text: 'new', bytes: 3, limit: 2_000, version: 4, updatedAt: null });
+    await api.saveOwnerBlock('new', 3);
+    expect(sentBody()).toEqual({ text: 'new', expectedVersion: 3 });
+    expect(only().init?.method).toBe('PUT');
+  });
+
+  it('carries the conflict back as something the screen can act on', async () => {
+    answer(
+      {
+        error: {
+          code: 'owner_block_conflict',
+          message: 'Reload it before saving.',
+          requestId: 'req-9'
+        }
+      },
+      { status: 409 }
+    );
+    const failure = (await api
+      .saveOwnerBlock('x', 1)
+      .catch((cause: unknown) => cause)) as ApiFailure;
+    expect(failure).toBeInstanceOf(ApiFailure);
+    expect(failure.code).toBe('owner_block_conflict');
+  });
+});

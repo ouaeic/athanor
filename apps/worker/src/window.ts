@@ -16,9 +16,11 @@ import { randomUUID } from 'node:crypto';
 import type { TaskPlanStep, WebToolPlan } from '@athanor/contracts';
 import {
   AthanorError,
+  decryptBytes,
   decryptJson,
   encryptJson,
   memoryTemporalStatus,
+  ownerBlockAad,
   recallMemories,
   userMemoryAad,
   userMemoryKey,
@@ -29,6 +31,7 @@ import type { ModelMessage } from '@athanor/model-gateway';
 import type { AgentState, AgentWorkerConfig } from './agent-state.js';
 import {
   CONDENSED_HISTORY_MARKER,
+  ensureOwnerBlock,
   isRuntimeContext,
   preambleInsertIndex,
   renderContextBrief,
@@ -159,6 +162,51 @@ export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): 
    */
   const ownerMemoryKey = userMemoryKey(deps.masterKey, task.userId);
   const ownerMemoryAad = userMemoryAad(task.userId);
+  /*
+   * The owner's own block, and it is the one surface here that nothing ranks.
+   *
+   * Everything else assembled in this function competes for room: the two memory tiers are scored
+   * against the task's opening request in one pool, and the pack is a budgeted retrieval. That is
+   * the right shape for anything the request can be relied on to name, and the wrong shape for the
+   * question this answers - who the owner is - which no request names and no ranking can therefore
+   * reach. Measured against the production ranker, sixteen owner-tier rows lose two of themselves
+   * to eighteen matching workspace rows and all sixteen to thirty-two, and nothing caps the number
+   * of workspace rows an agent may write. So this is installed by position rather than by score.
+   *
+   * Sealed under the same derived key and the same context as the owner tier, so it is unreachable
+   * from a workspace key and survives deleting every computer on the box; @see userMemoryKey. It is
+   * stored as bytes rather than as a JSON document because the byte bound is enforced by a CHECK on
+   * the ciphertext length, which is only the plaintext length when nothing has been wrapped around
+   * it. @see migration 73.
+   *
+   * A failure leaves whatever is already in the window alone, exactly as the pack below does and
+   * for a stronger reason: dropping the block would both rewrite the cached prefix and silently
+   * take away the owner's own standing words, which is the one failure this tier cannot afford.
+   * The notice therefore says only that it could not be read - on a resumed turn the previous bytes
+   * are still there, and a line claiming the task is running without them would be false.
+   */
+  try {
+    const storedOwnerBlock = await deps.store.readOwnerBlock(task.userId);
+    ensureOwnerBlock(
+      state.messages,
+      storedOwnerBlock
+        ? decryptBytes(
+            storedOwnerBlock.ciphertext,
+            ownerMemoryKey,
+            ownerBlockAad(task.userId)
+          ).toString('utf8')
+        : ''
+    );
+  } catch (cause) {
+    await event(
+      deps.store,
+      task,
+      key,
+      'warning',
+      'What you have written about yourself could not be read for this task',
+      { message: cause instanceof Error ? cause.message : 'owner block unavailable' }
+    ).catch(() => undefined);
+  }
   const activeMemoryEntries = memoryRecords.flatMap((record) => {
     const owned = record.keyScope === 'user';
     const expectedAad = owned ? ownerMemoryAad : `workspace-memory:${task.workspaceId}`;

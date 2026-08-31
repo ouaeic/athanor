@@ -22,6 +22,7 @@ import {
   memoryScope,
   modelDetailLine,
   modelOpennessLine,
+  ownerBlockDraft,
   providerModelFields,
   timerStateKnown,
   updateTimerLine,
@@ -144,6 +145,93 @@ describe('who put a memory in the box, and who it is about', () => {
   it('does not promise everywhere for an owner row still tied to one computer', () => {
     expect(memoryScope({ target: 'user', scope: 'workspace' })).not.toBe('About you, everywhere');
     expect(memoryScope({ target: 'user', scope: 'workspace' })).toContain('this computer');
+  });
+});
+
+/**
+ * The counter under the owner's block, which has one job: agree with the server to the byte.
+ *
+ * A counter that disagrees is worse than no counter, because it is an invitation to keep typing
+ * into a refusal. Two things make agreement non-obvious and both are asserted rather than assumed:
+ * the count is of UTF-8 bytes, not characters, and the server trims and NFKC-normalises before it
+ * counts.
+ */
+describe('the owner block editor', () => {
+  const block = { text: '- You are the lead.', bytes: 19, limit: 2_000 };
+
+  it('counts UTF-8 bytes the way the server does, not characters', () => {
+    // An em dash is one character and three bytes. Counting characters would tell an owner they had
+    // 2,000 to spend and let the route refuse them at roughly 700.
+    expect(ownerBlockDraft('—', block).bytes).toBe(3);
+    expect(ownerBlockDraft('abc', block).bytes).toBe(3);
+    // The same trim and normalisation the route applies, in the same order, so the number shown and
+    // the number checked are the same number.
+    expect(ownerBlockDraft('  abc  ', block).bytes).toBe(3);
+    expect(ownerBlockDraft('\u0065\u0301', block).bytes).toBe(
+      new TextEncoder().encode('\u0065\u0301'.normalize('NFKC')).length
+    );
+  });
+
+  it('states the bound before it is reached, and says what happens at it', () => {
+    expect(ownerBlockDraft('abc', block).counter).toBe('3 of 2,000 bytes');
+    const over = ownerBlockDraft('x'.repeat(2_050), block);
+    expect(over.counter).toContain('50 over');
+    expect(over.savable).toBe(false);
+    // The refusal names the surface, the number and what does NOT happen - because the alternative
+    // design, dropping the end to fit, is the one the owner would never see.
+    expect(over.refusal).toContain('nothing here is dropped to make room');
+  });
+
+  /*
+   * The bound comes off the answer, not out of this file. A client with its own copy of the number
+   * disagrees with the server the moment the server changes it, and both directions are bad: a
+   * stale smaller number refuses text the box would have taken, a stale larger one invites the
+   * owner to type into a refusal.
+   */
+  it('takes the bound from what the server said, not from a constant of its own', () => {
+    expect(ownerBlockDraft('x'.repeat(600), { text: '', bytes: 0, limit: 500 }).savable).toBe(
+      false
+    );
+    expect(ownerBlockDraft('x'.repeat(600), { text: '', bytes: 0, limit: 500 }).counter).toContain(
+      'of 500'
+    );
+    expect(ownerBlockDraft('x'.repeat(600), { text: '', bytes: 0, limit: 4_000 }).savable).toBe(
+      true
+    );
+  });
+
+  it('offers to save only what differs from what is stored', () => {
+    expect(ownerBlockDraft(block.text, block).savable).toBe(false);
+    expect(ownerBlockDraft(`${block.text}\n`, block).savable).toBe(false);
+    expect(ownerBlockDraft(`${block.text}\n- British spelling.`, block).savable).toBe(true);
+    // Emptying it is a change like any other, so the owner can clear the block from this screen.
+    expect(ownerBlockDraft('', block).savable).toBe(true);
+    expect(ownerBlockDraft('', { text: '', bytes: 0, limit: 2_000 }).savable).toBe(false);
+  });
+
+  /*
+   * The one state where an empty draft is not an empty block.
+   *
+   * When this box can no longer decrypt the row, the route answers with empty `text` and the row's
+   * real `bytes` - and a screen counting only the draft renders that identically to having no block
+   * at all, with Save disabled because empty matches empty. The owner is then holding a surface
+   * that is silently occupied and offers them no way to clear it. Both halves are asserted against
+   * the genuinely-empty case beside them, which must keep saying the opposite.
+   */
+  it('says when bytes are stored that this computer can no longer read, and lets them go', () => {
+    const unreadable = { text: '', bytes: 41, limit: 2_000 };
+    expect(ownerBlockDraft('', unreadable).counter).toBe(
+      '0 of 2,000 bytes — 41 stored bytes this computer can no longer read'
+    );
+    // Save with nothing typed clears the row, which is the honest thing to do with bytes nobody
+    // can read. It is enabled for exactly that.
+    expect(ownerBlockDraft('', unreadable).savable).toBe(true);
+    expect(ownerBlockDraft('typed again', unreadable).savable).toBe(true);
+
+    // A block that is genuinely empty still says nothing is there and still refuses a no-op save.
+    const empty = { text: '', bytes: 0, limit: 2_000 };
+    expect(ownerBlockDraft('', empty).counter).toBe('0 of 2,000 bytes');
+    expect(ownerBlockDraft('', empty).savable).toBe(false);
   });
 });
 

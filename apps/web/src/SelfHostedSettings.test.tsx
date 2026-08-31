@@ -10,6 +10,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import {
   ContextWindowField,
   MemoryList,
+  OwnerBlockEditor,
   RememberedList,
   SkillList,
   SpendCeilingField,
@@ -18,7 +19,7 @@ import {
 import { BASE_MONTHLY_CEILING_USD } from './usage-model.js';
 import { providerModelFields, skillStateNotice, skillSwitch } from './settings-facts.js';
 import type { MemoryItem, ProviderSettings } from './api.js';
-import type { WorkspaceMemory, WorkspaceSkill } from './types.js';
+import type { OwnerBlock, WorkspaceMemory, WorkspaceSkill } from './types.js';
 
 /*
  * One row the harness watched itself write and one a model wrote about the owner, which is the
@@ -443,5 +444,62 @@ describe('the provider form after a reload', () => {
       />
     );
     expect(markup).toContain('value="128000"');
+  });
+});
+
+/**
+ * The one surface on this screen the agent cannot write, and the two things it has to say for the
+ * owner to trust it: what is in it, and what happens when it is full.
+ *
+ * The section is drawn only when the server answered, which is why the empty case is a real case:
+ * an editor rendered against a box with no such route would refuse every save and read as broken.
+ */
+describe('the block the owner writes about themselves', () => {
+  const block: OwnerBlock = {
+    text: '- You are the lead.',
+    bytes: 19,
+    limit: 2_000,
+    version: 3,
+    updatedAt: '2026-08-30T09:00:00.000Z'
+  };
+  const draw = (draft: string, over: Partial<OwnerBlock> = {}): string =>
+    renderToStaticMarkup(
+      <OwnerBlockEditor
+        block={{ ...block, ...over }}
+        draft={draft}
+        busy={false}
+        onChange={() => undefined}
+        onSave={() => undefined}
+        onCancel={() => undefined}
+      />
+    );
+
+  it('says who writes it and where what the agent worked out goes instead', () => {
+    const markup = draw(block.text);
+    expect(markup).toContain('The agent cannot write here');
+    expect(markup).toContain('every other one you own');
+  });
+
+  it('states the bound with the box, not at the moment of refusal', () => {
+    expect(draw(block.text)).toContain('19 of 2,000 bytes');
+    const over = draw('x'.repeat(2_040));
+    expect(over).toContain('40 over');
+    expect(over).toContain('nothing here is dropped to make room');
+  });
+
+  /*
+   * Save is unavailable in both directions and for two different reasons - nothing has changed, or
+   * what has changed will not fit. Both halves, because a control disabled on everything would
+   * satisfy the second assertion alone.
+   */
+  it('offers Save only for a change that will fit', () => {
+    expect(draw(block.text)).toContain('disabled=""');
+    expect(draw('x'.repeat(2_040))).toContain('disabled=""');
+    expect(draw(`${block.text}\n- British spelling.`)).not.toContain('disabled=""');
+  });
+
+  it('offers a way back to the stored text once the draft differs from it', () => {
+    expect(draw(block.text)).not.toContain('Cancel');
+    expect(draw('something else')).toContain('Cancel');
   });
 });

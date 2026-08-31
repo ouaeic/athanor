@@ -21,7 +21,11 @@ import {
   dropLegacyGuidance,
   emptyContextBrief,
   ensureBasePrompt,
+  ensureOwnerBlock,
   isRuntimeContext,
+  OWNER_BLOCK_MARKER,
+  ownerBlockMessage,
+  preambleInsertIndex,
   olderToolOutputChars,
   estimatedContextTokens,
   markCacheBreakpoints,
@@ -57,6 +61,7 @@ import {
   truncateMiddle,
   type ContextBrief
 } from './context.js';
+import { recallMemories } from '@athanor/core';
 import { SPILL_DIRECTORY, spillPathFor, spillRecovery } from './output-spill.js';
 import { sanitiseUntrustedText, untrustedEnvelope } from './sanitise.js';
 
@@ -4392,5 +4397,227 @@ describe('the bound on what the owner has accumulated', () => {
     expect(Math.ceil(longer.residentPeak / 4)).toBeLessThan(
       compactionTargetTail(modelInputBudget(131_072, 16_384, 13_856))
     );
+  });
+});
+
+/**
+ * The owner's block, and the one property that makes it different from every other memory surface:
+ * it is installed by position and nothing ranks it.
+ *
+ * The negative control is in this file rather than in a design note, because "resident" is a claim
+ * that only means something beside the thing it replaces. The last case here runs the SAME sentences
+ * through the production ranker the owner tier goes through, on the same pool, and watches them
+ * disappear - so if somebody ever puts the block back into `recallMemories`, the case above it and
+ * the case below it say the opposite of each other and one of them fails.
+ */
+describe('the owner block', () => {
+  const BLOCK = '- You are the lead.\n- British spelling, always.';
+
+  const preambleWindow = (): ModelMessage[] => [
+    { role: 'system', content: BASE_SYSTEM_PROMPT },
+    {
+      role: 'system',
+      content: 'CURATED ENCRYPTED KNOWLEDGE (user-visible)\nWorkspace memory:\n- x'
+    },
+    { role: 'user', content: 'fix the importer' }
+  ];
+
+  it('sits directly behind the contract and inside the preamble, ahead of every other block', () => {
+    const messages = preambleWindow();
+    ensureOwnerBlock(messages, BLOCK);
+    expect(
+      messages.map((message) =>
+        [BASE_PROMPT_MARKER, OWNER_BLOCK_MARKER, 'CURATED ENCRYPTED KNOWLEDGE'].find((marker) =>
+          message.content.startsWith(marker)
+        )
+      )
+    ).toEqual([BASE_PROMPT_MARKER, OWNER_BLOCK_MARKER, 'CURATED ENCRYPTED KNOWLEDGE', undefined]);
+    expect(messages[1]?.content).toContain(BLOCK);
+    // Inside the leading run of system messages is what keeps it out of the condensable region, so
+    // the position is asserted as a property and not only as an index.
+    expect(preambleInsertIndex(messages)).toBeGreaterThan(1);
+  });
+
+  /**
+   * Empty costs nothing, which is the state a fresh box is in and stays in until somebody types.
+   *
+   * A zero-length block rendered with its header would be 271 resident bytes claiming to be the
+   * owner's words while carrying none of them - worse than absent, because the model would weigh
+   * the claim.
+   */
+  it('is absent when there is nothing in it, and leaves when it is emptied', () => {
+    const messages = preambleWindow();
+    ensureOwnerBlock(messages, '');
+    expect(messages).toHaveLength(3);
+    ensureOwnerBlock(messages, BLOCK);
+    expect(messages).toHaveLength(4);
+    ensureOwnerBlock(messages, '   \n  ');
+    expect(messages).toHaveLength(3);
+    expect(JSON.stringify(messages)).not.toContain(OWNER_BLOCK_MARKER);
+  });
+
+  /**
+   * Byte-identical across turns, including on a window that is not in the canonical shape.
+   *
+   * The steady state is easy and is asserted first. The case that decides the design is the second
+   * one: a resumed window whose block sits behind another system block, which is what a saved
+   * window from a build that ordered the preamble differently looks like. Written over WHERE IT
+   * SITS, that window is unchanged. Removed and re-inserted at the canonical index it would move,
+   * and everything behind it with it - the front of the prompt rewritten, and the whole trajectory
+   * re-billed at the cache write premium, over a block whose bytes had not changed by one.
+   *
+   * The steady-state assertion alone cannot see that difference, because at the canonical index a
+   * remove-and-reinsert lands in the same place. It was written first, it passed under both
+   * arrangements, and that is why this case exists.
+   */
+  it('rewrites where it sits, so an unchanged block leaves even an odd window identical', () => {
+    const messages = preambleWindow();
+    ensureOwnerBlock(messages, BLOCK);
+    const before = JSON.stringify(messages);
+    ensureOwnerBlock(messages, BLOCK);
+    expect(JSON.stringify(messages)).toBe(before);
+
+    const resumed: ModelMessage[] = [
+      { role: 'system', content: BASE_SYSTEM_PROMPT },
+      { role: 'system', content: 'A BLOCK FROM AN OLDER BUILD' },
+      ownerBlockMessage(BLOCK),
+      { role: 'user', content: 'fix the importer' }
+    ];
+    const resumedBefore = JSON.stringify(resumed);
+    ensureOwnerBlock(resumed, BLOCK);
+    expect(JSON.stringify(resumed)).toBe(resumedBefore);
+
+    // And a window carrying two copies keeps one, at the position the first of them already had.
+    resumed.splice(3, 0, ownerBlockMessage(BLOCK));
+    expect(ensureOwnerBlock(resumed, BLOCK)).toEqual({ removedDuplicates: 1 });
+    expect(JSON.stringify(resumed)).toBe(resumedBefore);
+  });
+
+  /**
+   * Resident under pressure, measured through the function production actually sends with.
+   *
+   * Two hundred matching workspace rows, a hundred-step trajectory and a window over its soft
+   * threshold: the block's bytes come out of `prepareModelContext` unchanged, because nothing in
+   * the bounding, the compression or the compaction passes touches a system message in the head.
+   */
+  it('survives a window under pressure with its bytes unchanged', () => {
+    const messages = preambleWindow();
+    ensureOwnerBlock(messages, BLOCK);
+    const rendered = messages[1]!.content;
+    messages.splice(
+      3,
+      0,
+      ...Array.from({ length: 200 }, (_, index) => ({
+        role: 'system' as const,
+        content: `CURATED ENCRYPTED KNOWLEDGE row ${index}: the importer fix for the importer`
+      }))
+    );
+    for (let step = 0; step < 100; step += 1) {
+      messages.push({ role: 'assistant', content: `step ${step}` });
+      messages.push({ role: 'tool', content: 'z'.repeat(4_000) });
+    }
+    const prepared = prepareModelContext(messages, 32_000, 4_000);
+    expect(prepared.messages.filter((message) => message.content === rendered)).toHaveLength(1);
+    expect(prepared.messages[1]?.content).toBe(rendered);
+  });
+
+  /**
+   * A compaction cannot reach it, which is the other half of "resident".
+   *
+   * `prepareModelContext` above bounds and compresses; this is the pass that actually removes
+   * messages, and the block has to be outside the region it may touch. The assertion is on the
+   * plan's own boundary rather than on the result of one run, so it holds for every target tail
+   * rather than for the one this case happened to pick.
+   */
+  it('is outside the region a compaction may condense', async () => {
+    const messages = preambleWindow();
+    ensureOwnerBlock(messages, BLOCK);
+    const rendered = messages[1]!.content;
+    for (let step = 0; step < 60; step += 1) {
+      messages.push({ role: 'assistant', content: `step ${step}` });
+      messages.push({ role: 'tool', content: 'z'.repeat(3_000) });
+    }
+    const plan = planCompaction(messages, { targetTailTokens: 3_000 });
+    expect(plan).not.toBeNull();
+    expect(plan!.condensed).not.toContain(1);
+
+    const outcome = await compactContext({
+      messages,
+      targetTailTokens: 3_000,
+      summarise: async () => 'a summary'
+    });
+    expect(outcome).not.toBeNull();
+    expect(outcome!.messages[1]?.content).toBe(rendered);
+  });
+
+  /**
+   * The window before `ensureBasePrompt` has run, which is what a brand-new task's array is.
+   *
+   * With no contract to sit behind, the block goes to the head rather than to wherever the search
+   * for one happened to fail - so it is still inside the leading run of system messages, which is
+   * the property that keeps it out of the condensable region. `ensureBasePrompt` then unshifts the
+   * contract in front of it and the steady state is reached from either order.
+   */
+  it('lands at the head when the contract has not been installed yet', () => {
+    const messages: ModelMessage[] = [{ role: 'user', content: 'fix the importer' }];
+    ensureOwnerBlock(messages, BLOCK);
+    expect(messages[0]?.content.startsWith(OWNER_BLOCK_MARKER)).toBe(true);
+    ensureBasePrompt(messages);
+    expect(messages.map((message) => message.role)).toEqual(['system', 'system', 'user']);
+    expect(messages[1]?.content.startsWith(OWNER_BLOCK_MARKER)).toBe(true);
+  });
+
+  /**
+   * The same sentences, ranked instead of resident - which is what the tier beside it does.
+   *
+   * `recallMemories` is the production ranker and these are the production options, taken from
+   * `window.ts`. Sixteen owner rows against thirty-two workspace rows that match the request lose
+   * every one of themselves, because a flat `+1.5` does not compete with `overlap * 2.5` on a row
+   * that shares the request's words - and nothing caps how many workspace rows an agent may write.
+   *
+   * This is the measurement the block exists because of, and it is here so that making the block
+   * ranked makes this case and the one above it contradict each other.
+   */
+  it('would be evicted if it were ranked, which is why it is not', () => {
+    const goal = 'fix the flaky importer retry in the ingest pipeline';
+    const owner = Array.from({ length: 16 }, (_, index) => ({
+      id: `owner-${index}`,
+      target: 'user' as const,
+      content: `You are the lead; do not stop to ask (${index}).`,
+      updatedAt: '2026-07-01T00:00:00.000Z'
+    }));
+    const workspaceRows = (count: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        id: `ws-${index}`,
+        target: 'workspace' as const,
+        content: `The flaky importer retry in the ingest pipeline is fixed by step ${index}.`,
+        updatedAt: '2026-07-20T00:00:00.000Z'
+      }));
+    const surviving = (count: number) =>
+      recallMemories([...owner, ...workspaceRows(count)], goal, {
+        maxItems: 32,
+        maxCharacters: 16_000,
+        now: new Date('2026-08-01T00:00:00.000Z')
+      }).filter((entry) => entry.target === 'user').length;
+
+    expect(surviving(14)).toBe(16);
+    expect(surviving(18)).toBeLessThan(16);
+    expect(surviving(32)).toBe(0);
+    // And it is relevance that does it, not volume: forty rows about something else evict nothing.
+    expect(
+      recallMemories(
+        [
+          ...owner,
+          ...Array.from({ length: 40 }, (_, index) => ({
+            id: `far-${index}`,
+            target: 'workspace' as const,
+            content: `The kitchen light is on a timer, entry ${index}.`,
+            updatedAt: '2026-07-20T00:00:00.000Z'
+          }))
+        ],
+        goal,
+        { maxItems: 32, maxCharacters: 16_000, now: new Date('2026-08-01T00:00:00.000Z') }
+      ).filter((entry) => entry.target === 'user').length
+    ).toBe(16);
   });
 });

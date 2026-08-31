@@ -42,6 +42,7 @@ export {
   TASK_MAX_ATTEMPTS
 } from './store/tasks.js';
 export type { TaskEventPage, TaskListFilter, TaskNameHit, TaskPage } from './store/tasks.js';
+export { OWNER_BLOCK_MAX_BYTES } from './store/memory.js';
 export type {
   CreateMemoryItemInput,
   MemoryCandidateRecord,
@@ -60,6 +61,7 @@ export type {
   MemorySourceHit,
   MemorySourceRecord,
   MemoryUseOutcome,
+  OwnerBlockRecord,
   PreparedMemoryFact,
   RecallMemoryInput,
   SearchMemorySourcesInput
@@ -474,6 +476,23 @@ export class DataStore {
 
   deleteWorkspaceMemory(...args: Parameters<WorkspaceStore['deleteWorkspaceMemory']>) {
     return this.#workspaces.deleteWorkspaceMemory(...args);
+  }
+
+  /**
+   * The owner block, forwarded read-and-write because the two callers are in two packages: the
+   * worker's window reads it on every turn, and the owner's own settings route is the only thing
+   * that writes it. @see MemoryStore.writeOwnerBlock for why a turn cannot reach the writer.
+   */
+  readOwnerBlock(...args: Parameters<MemoryStore['readOwnerBlock']>) {
+    return this.#memory.readOwnerBlock(...args);
+  }
+
+  writeOwnerBlock(...args: Parameters<MemoryStore['writeOwnerBlock']>) {
+    return this.#memory.writeOwnerBlock(...args);
+  }
+
+  clearOwnerBlock(...args: Parameters<MemoryStore['clearOwnerBlock']>) {
+    return this.#memory.clearOwnerBlock(...args);
   }
 
   syncMemoryPredicates(...args: Parameters<MemoryStore['syncMemoryPredicates']>) {

@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 import type { TaskPlanStep } from '@athanor/contracts';
 import { AthanorError } from '@athanor/core';
 import type { ModelMessage } from '@athanor/model-gateway';
+import { UNICODE_TAG_CHARACTERS } from './sanitise.js';
 import { SKILL_BODY_HEADINGS } from './skills.js';
 
 /**
@@ -93,8 +94,28 @@ export const countOccurrences = (source: string, value: string): number => {
   return count;
 };
 
+/**
+ * What the agent may write down, and where a written-down direction may not hide in it.
+ *
+ * The Tags block is stripped here rather than refused, and the difference is deliberate. This
+ * function guards the machine's own text: memory rows the agent writes for a later window, and the
+ * missions it hands a specialist. `sanitise.ts` already strips exactly this range from every
+ * untrusted tool result, and `delegate.ts` relies on that treatment - a lead that copied an
+ * invisible character into a mission should lose the character, not the mission. Refusing here
+ * would end a turn over bytes nobody can see; stripping ends the direction instead, and the visible
+ * sentence survives intact.
+ *
+ * The API's `carriesHiddenDirection` refuses the same range on the owner's own block, and that
+ * asymmetry is the right way round: a person is standing at that surface and can be told, while
+ * nothing is standing here. Stripped BEFORE the length bound, so invisible padding cannot crowd out
+ * text a reader would have seen.
+ *
+ * It could not be done with the scan below in any case: `charCodeAt(0)` on an astral character
+ * answers with its high surrogate - 0xDB40 for every character in this block - so no threshold over
+ * that number can see one. @see UNICODE_TAG_CHARACTERS.
+ */
 export const boundedKnowledge = (value: unknown, maximum = 4_000): string => {
-  const content = textValue(value).normalize('NFKC').trim();
+  const content = textValue(value).normalize('NFKC').replace(UNICODE_TAG_CHARACTERS, '').trim();
   if (!content) throw new AthanorError('knowledge_empty', 'Knowledge content cannot be empty');
   if (content.length > maximum)
     throw new AthanorError(

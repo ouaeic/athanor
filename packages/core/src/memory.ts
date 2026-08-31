@@ -436,6 +436,24 @@ export const userMemoryKey = (masterKey: Uint8Array, userId: string): Buffer =>
 export const userMemoryAad = (userId: string): string => `user-memory:${userId}`;
 
 /**
+ * The context the owner's block is bound to, and it is not the one above.
+ *
+ * The rule stated over `userMemoryAad` is that two surfaces must never be substitutable even by a
+ * caller holding both keys, and it kept that against a workspace row - whose context names a
+ * workspace - while failing against the one row class that shares this key. Both surfaces are about
+ * the same person, so a context naming only the person is satisfied by both: an owner-tier memory
+ * row's envelope was byte-for-byte a legal owner block, and copying the JSONB across needed no key
+ * at all. The consequence is what makes it worth its own string - the block has no `status` and no
+ * expiry by design, so a ranked row the owner had let lapse would come back unranked, resident and
+ * permanent.
+ *
+ * Named for the surface rather than for the person, which is the property the other one is missing.
+ * Migration 73's `owner_blocks_context_ck` is the same equality written where a caller that bypasses
+ * this module still meets it.
+ */
+export const ownerBlockAad = (userId: string): string => `owner-block:${userId}`;
+
+/**
  * How many facts about the owner this box will hold, and the measurement the number comes from.
  *
  * 505 owner-typed turns across ten projects and four and a half months were read end to end. The

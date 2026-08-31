@@ -24,13 +24,9 @@ import {
   finishedAnswerText,
   MEMORY_MAX_SOURCE_CHUNKS,
   memoryItemAad,
-  memoryProposalSummary,
-  memoryProposalWasRefused,
-  proposeMemoryFacts,
   recordMemoryPackOutcome,
   recordTurnEpisode,
-  shouldConsolidateMemory,
-  type MemoryProposalDeps
+  shouldConsolidateMemory
 } from './memory-runtime.js';
 import { event } from './tool-recording.js';
 
@@ -43,15 +39,6 @@ export interface MemoryCaptureDeps {
    * the await still stops a second turn finishing concurrently from running it twice.
    */
   readonly memoryConsolidatedAt: Map<string, number>;
-  /**
-   * What the nightly pass needs to make its one model call, or nothing at all.
-   *
-   * Optional because the proposer is the only thing in this file that needs a provider, and every
-   * other line here works without one. A worker assembled without it consolidates exactly as
-   * before: the rest of memory does not depend on a model being reachable, and it must not start
-   * to.
-   */
-  readonly proposals?: MemoryProposalDeps;
 }
 
 /**
@@ -193,7 +180,6 @@ export const captureMemory = async (
         deps.memoryConsolidatedAt.set(task.workspaceId, now);
       }
       await deps.store.consolidateMemory(task.workspaceId);
-      await proposeFromTheDay(deps, task, key);
     }
   } catch (cause) {
     // The user already has their verified result; a memory write must never turn that into a
@@ -206,53 +192,6 @@ export const captureMemory = async (
       'warning',
       'This turn was not recorded in memory, so it will not be recalled later',
       { message: cause instanceof Error ? cause.message : 'memory capture failed' }
-    ).catch(() => undefined);
-  }
-};
-
-/**
- * The one model call a day, hung off the cadence that already exists.
- *
- * It runs inside the same 24-hour claim as `consolidateMemory` and after it, which is deliberate on
- * both counts. Inside, because the claim is what stops two turns finishing concurrently from
- * running it twice, and a proposer with no such claim would be a call per turn wearing a nightly
- * name. After, because consolidation prunes the candidate table, and proposing into a queue that is
- * about to be pruned would count rows the next statement removes.
- *
- * Isolated from the block above it, and that is the whole reason this is a function rather than
- * three lines inline. `captureMemory`'s catch reports "This turn was not recorded in memory", which
- * would be FALSE here: the episode, the sources, the observations and the promotions are all
- * already written by the time this runs. A provider that is unreachable, out of quota or slow must
- * cost the owner nothing but the proposals, so it is caught here and says so in its own words.
- *
- * The line is written only when a bound actually fired. A nightly status saying nothing was refused
- * is how an owner learns to stop reading the timeline.
- */
-const proposeFromTheDay = async (
-  deps: MemoryCaptureDeps,
-  task: TaskRecord,
-  key: Uint8Array
-): Promise<void> => {
-  if (!deps.proposals) return;
-  try {
-    const report = await proposeMemoryFacts(deps.proposals, task, key);
-    if (!memoryProposalWasRefused(report)) return;
-    await event(deps.store, task, key, 'status', memoryProposalSummary(report), {
-      memoryProposals: {
-        episodesOffered: report.episodesOffered,
-        allowance: report.allowance,
-        proposed: report.proposed,
-        refused: report.refused
-      }
-    }).catch(() => undefined);
-  } catch (cause) {
-    await event(
-      deps.store,
-      task,
-      key,
-      'status',
-      'Could not look over the day for rules worth remembering; everything this turn did is still recorded',
-      { message: cause instanceof Error ? cause.message : 'memory proposal failed' }
     ).catch(() => undefined);
   }
 };

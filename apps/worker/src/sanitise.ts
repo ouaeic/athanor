@@ -29,7 +29,7 @@ import { randomBytes } from 'node:crypto';
  * escape is read as `\u{E000}` followed by a literal `0`, so the class becomes a range over one
  * private-use character and matches none of what this exists for.
  */
-const UNICODE_TAG_CHARACTERS = /[\u{E0000}-\u{E007F}]/gu;
+export const UNICODE_TAG_CHARACTERS = /[\u{E0000}-\u{E007F}]/gu;
 
 /**
  * Whether a string can be returned untouched without looking at it twice.

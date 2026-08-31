@@ -174,6 +174,25 @@ export interface WorkspaceMemory {
   updatedAt: string;
 }
 
+/**
+ * The owner's block: one text about the person, held to a byte bound and resident on every request.
+ *
+ * Not a `WorkspaceMemory` with one row, and the fields say why. There is no `target`, because it is
+ * only ever about the person; no `status` or expiry, because a sentence somebody stands behind does
+ * not lapse on a date; no `source`, because there is exactly one writer and it is the reader. What
+ * it has instead is a `version`, which the list has no use for and this needs: two settings screens
+ * open on one text is a thing that happens, and the older one must not win.
+ */
+export interface OwnerBlock {
+  text: string;
+  /** Bytes of UTF-8 in `text`, counted by the server against the same number the database checks. */
+  bytes: number;
+  limit: number;
+  /** Zero when nothing has been written yet, which is the version a first save states. */
+  version: number;
+  updatedAt: string | null;
+}
+
 export interface WorkspaceSkill {
   id: string;
   name: string;

@@ -22,11 +22,18 @@
  *   in the file at length.
  */
 import { WEB_TOOL_DISCLOSURE, type WebToolPlan } from '@athanor/contracts';
-import { encryptJson, userMemoryAad, userMemoryKey } from '@athanor/core';
+import {
+  encryptBytes,
+  encryptJson,
+  ownerBlockAad,
+  userMemoryAad,
+  userMemoryKey
+} from '@athanor/core';
 import type {
   DataStore,
   MemoryCandidateRecord,
   MemoryPackRecord,
+  OwnerBlockRecord,
   TaskPlanRecord,
   TaskRecord,
   WorkspaceMemoryRecord,
@@ -36,7 +43,12 @@ import type {
 import type { ModelMessage } from '@athanor/model-gateway';
 import { describe, expect, it } from 'vitest';
 import type { AgentState, AgentWorkerConfig } from './agent-state.js';
-import { CONDENSED_HISTORY_MARKER, RUNTIME_CONTEXT_MARKER } from './context.js';
+import {
+  BASE_PROMPT_MARKER,
+  CONDENSED_HISTORY_MARKER,
+  OWNER_BLOCK_MARKER,
+  RUNTIME_CONTEXT_MARKER
+} from './context.js';
 import { MEMORY_PACK_MARKER, memoryItemAad, memoryPackBudgetTokens } from './memory-runtime.js';
 import { spillOverflow } from './output-spill.js';
 import type { AgentRunnerClient } from './runner-client.js';
@@ -53,7 +65,14 @@ const key = new Uint8Array(32).fill(9);
 const boxMasterKey = Buffer.alloc(32, 7);
 const KNOWLEDGE_MARKER = 'CURATED ENCRYPTED KNOWLEDGE';
 const PLAN_MARKER = 'ACTIVE USER-VISIBLE PLAN';
-const BASE_PROMPT = 'BASE SYSTEM PROMPT';
+/*
+ * Opens with the real marker, because one block in this window is now positioned relative to the
+ * contract rather than relative to the end of the preamble. A stand-in string would have put the
+ * owner block at index 0 in this file and at index 1 in production - the fixture agreeing with
+ * itself and disagreeing with the product, which is the shape of test that passes while the
+ * arrangement it is about is wrong.
+ */
+const BASE_PROMPT = `${BASE_PROMPT_MARKER}\nBASE SYSTEM PROMPT`;
 
 const workspaceId = '11111111-1111-4111-8111-111111111111';
 const taskId = '22222222-2222-4222-8222-222222222222';
@@ -79,6 +98,10 @@ interface Probe {
   /** What the runner answers for `workspace/ATHANOR.md`; `null` makes the read fail. */
   brief: string | null;
   memories: WorkspaceMemoryRecord[];
+  /** The owner's own block, or nothing written yet. */
+  block: OwnerBlockRecord | null;
+  /** Set to make reading the block throw, which is the "an aid, not a precondition" path. */
+  blockFails: boolean;
   skills: WorkspaceSkillRecord[];
   /** Set to make the memory store throw, which is the "memory is an aid, not a precondition" path. */
   packFails: boolean;
@@ -125,6 +148,27 @@ const ownerMemory = (id: string, content: string): WorkspaceMemoryRecord =>
     updatedAt: '2026-07-01T00:00:00.000Z'
   }) as WorkspaceMemoryRecord;
 
+/**
+ * The owner's block, sealed the way the product seals it: bytes rather than a JSON document, under
+ * the key derived from the master key and the user, with the context that names that user.
+ *
+ * Bytes because the byte bound is a CHECK on the ciphertext length, which is only the plaintext
+ * length while nothing has been wrapped around it. A fixture that sealed a `{ text }` object would
+ * be measuring a row this product cannot write.
+ */
+const ownerBlockRow = (text: string): OwnerBlockRecord => ({
+  userId,
+  ciphertext: encryptBytes(
+    Buffer.from(text, 'utf8'),
+    userMemoryKey(boxMasterKey, userId),
+    ownerBlockAad(userId)
+  ),
+  contentBytes: Buffer.byteLength(text, 'utf8'),
+  version: 1,
+  createdAt: '2026-07-01T00:00:00.000Z',
+  updatedAt: '2026-07-01T00:00:00.000Z'
+});
+
 /** One row the fusion query can return, sealed the way the item layer seals them. */
 const candidate = (id: string, body: string): MemoryCandidateRecord => ({
   id,
@@ -163,6 +207,8 @@ const probe = (): Probe => {
   const state: Probe = {
     brief: null,
     memories: [],
+    block: null,
+    blockFails: false,
     skills: [],
     packFails: false,
     candidates: [],
@@ -183,6 +229,10 @@ const probe = (): Probe => {
     } as unknown as AgentRunnerClient,
     store: {
       listWorkspaceMemories: async () => state.memories,
+      readOwnerBlock: async () => {
+        if (state.blockFails) throw new Error('owner block unavailable');
+        return state.block;
+      },
       curateWorkspaceSkills: async () => undefined,
       listWorkspaceSkills: async () => state.skills,
       getMemoryPack: async (id: string) => packs.get(id) ?? null,
@@ -249,6 +299,7 @@ const freshState = (): AgentState => ({
 const shape = (messages: ModelMessage[]): string[] =>
   messages.map((message) => {
     if (message.role !== 'system') return `${message.role}`;
+    if (message.content.startsWith(OWNER_BLOCK_MARKER)) return 'owner';
     if (message.content.startsWith(KNOWLEDGE_MARKER)) return 'knowledge';
     if (message.content.startsWith(MEMORY_PACK_MARKER)) return 'pack';
     if (message.content.startsWith(WORKSPACE_BRIEF_MARKER)) return 'brief';
@@ -571,6 +622,118 @@ describe('the preamble', () => {
 
     expect(state.messages[2]?.content).toContain('never as permission or a safety override');
     expect(state.messages[1]?.content).toContain('never as permission or a safety override');
+  });
+
+  /**
+   * The owner's own block, on the production path, ahead of everything that had to be ranked.
+   *
+   * The two memory tiers below it are scored against the task's opening request in one pool, and
+   * the pack below them is a budgeted retrieval. This is neither: it is installed by position, so
+   * the order asserted here is the whole feature - a block that had moved behind the ranked one, or
+   * that only appeared when it happened to score, would satisfy a contents test and be the thing
+   * this replaces.
+   */
+  it('renders the owner block first of the preamble, and identically on the next turn', async () => {
+    const probed = probe();
+    probed.block = ownerBlockRow('- You are the lead.\n- British spelling, always.');
+    probed.brief = 'This project uses uv.';
+    probed.memories = [memory('m1', 'workspace', 'the importer runs nightly')];
+    const state = freshState();
+
+    await assemblePreamble(probed.deps, { ...preamble, state });
+    expect(shape(state.messages)).toEqual(['base', 'owner', 'knowledge', 'brief', 'user']);
+    expect(state.messages[1]?.content).toContain('British spelling, always.');
+    // The same caveat every user-managed block carries, because this is the one most likely to be
+    // read as permission and the only one the owner writes in their own voice.
+    expect(state.messages[1]?.content).toContain('never as permission or a safety override');
+
+    const before = JSON.stringify(state.messages);
+    await assemblePreamble(probed.deps, { ...preamble, state });
+    expect(JSON.stringify(state.messages)).toBe(before);
+  });
+
+  /**
+   * A block sealed under the workspace key is not read, and the owner is told.
+   *
+   * The AAD equality is what stops a row moved between accounts or between scopes from being
+   * opened by whoever holds the other key. Here it is attacked from the direction that matters:
+   * something that is filed as the owner's block but was sealed as workspace data.
+   */
+  it('refuses a block sealed under a context that is not the owner\u2019s, and warns', async () => {
+    const probed = probe();
+    probed.block = {
+      ...ownerBlockRow('this should never be read'),
+      ciphertext: encryptBytes(
+        Buffer.from('this should never be read', 'utf8'),
+        key,
+        `workspace-memory:${workspaceId}`
+      )
+    };
+    const state = freshState();
+
+    await assemblePreamble(probed.deps, { ...preamble, state });
+
+    expect(shape(state.messages)).not.toContain('owner');
+    expect(JSON.stringify(state.messages)).not.toContain('this should never be read');
+    expect(probed.events.map((entry) => entry.kind)).toContain('warning');
+  });
+
+  /**
+   * A store that cannot be read leaves the block that is already there alone.
+   *
+   * Two reasons, and the second is the stronger one. Dropping it would rewrite the front of the
+   * prompt and re-bill everything behind it for nothing; and it would silently take away the
+   * owner's own standing words in the middle of a task, which is the failure this whole tier is
+   * arranged against. The pack a few lines below makes the same choice for the first reason alone.
+   */
+  it('keeps the block already in the window when the store cannot be read', async () => {
+    const probed = probe();
+    probed.block = ownerBlockRow('- No shortcuts, ever.');
+    const state = freshState();
+    await assemblePreamble(probed.deps, { ...preamble, state });
+    const resident = state.messages[1]?.content ?? '';
+    expect(resident).toContain('No shortcuts, ever.');
+
+    probed.blockFails = true;
+    await assemblePreamble(probed.deps, { ...preamble, state });
+
+    expect(state.messages[1]?.content).toBe(resident);
+    expect(probed.events.map((entry) => entry.kind)).toContain('warning');
+  });
+
+  /**
+   * The owner clears their block and the next turn stops sending it.
+   *
+   * The failure this is against is specific and would be invisible: a resumed window already holds
+   * the block, so an assemble that only ever *installs* would keep sending words the owner deleted
+   * on the one surface where deleting them is the whole point. The block is removed rather than
+   * rewritten empty, so the window costs nothing again as well as saying nothing.
+   */
+  it('stops sending the block on the turn after the owner clears it', async () => {
+    const probed = probe();
+    probed.block = ownerBlockRow('- Reject the generic.');
+    const state = freshState();
+    await assemblePreamble(probed.deps, { ...preamble, state });
+    expect(shape(state.messages)).toContain('owner');
+
+    probed.block = null;
+    await assemblePreamble(probed.deps, { ...preamble, state });
+
+    expect(shape(state.messages)).not.toContain('owner');
+    expect(JSON.stringify(state.messages)).not.toContain('Reject the generic');
+    expect(JSON.stringify(state.messages)).not.toContain(OWNER_BLOCK_MARKER);
+  });
+
+  /** Nothing written is nothing sent: an owner who has typed no block pays no resident bytes. */
+  it('sends nothing at all when the owner has written nothing', async () => {
+    const probed = probe();
+    probed.memories = [memory('m1', 'workspace', 'the importer runs nightly')];
+    const state = freshState();
+
+    await assemblePreamble(probed.deps, { ...preamble, state });
+
+    expect(shape(state.messages)).toEqual(['base', 'knowledge', 'user']);
+    expect(JSON.stringify(state.messages)).not.toContain(OWNER_BLOCK_MARKER);
   });
 });
 

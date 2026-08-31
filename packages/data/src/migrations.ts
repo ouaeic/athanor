@@ -2670,5 +2670,74 @@ export const migrations = [
 
       ALTER TABLE mem.item ADD COLUMN IF NOT EXISTS qualification_keys TEXT[];
     `
+  },
+  {
+    version: 73,
+    name: 'the_owner_writes_one_block',
+    // One text per person, written by the person, read into every request of every task.
+    //
+    // The tier beside it - `workspace_memories` with `key_scope='user'` - is rows, and rows have to
+    // win a ranking to be read: measured against the production ranker, sixteen owner rows survive
+    // fourteen matching workspace rows, lose two at eighteen and all sixteen at thirty-two, and
+    // there is no row cap on the tier they compete with. A row that must out-score a search result
+    // to be read is a search result. This table is the other thing, and its whole design is that
+    // nothing ranks it: one row, addressed by the person, rendered whole or not at all.
+    //
+    // `user_id` is the PRIMARY KEY, which is the "one text" claim written where it cannot be
+    // wished away. There is no `workspace_id` here at all - not nullable, absent - so nothing
+    // cascades from deleting a computer and no statement can file a block against one.
+    //
+    // THE BOUND IS ON THE PLAINTEXT AND IT IS ENFORCED BY A DATABASE THAT CANNOT READ IT. AES-256-GCM
+    // is a stream construction: the ciphertext is exactly as long as the plaintext, with the tag
+    // carried separately in its own column of the envelope. So `octet_length(decode(...))` is the
+    // byte length of the owner's own text, to the byte, and the CHECK is the real bound rather than
+    // a number the writer also supplies and could get wrong. A counter column beside it would have
+    // been a second way to say the same thing, and the two would eventually disagree.
+    //
+    // At the bound the write is REFUSED. Nothing is evicted and nothing is truncated: this is the
+    // one surface whose content the owner typed about themselves, and a sentence that quietly
+    // disappeared to make room is something they can never find out was dropped. The workspace tier
+    // can afford eviction because its rows die with the computer; this cannot.
+    //
+    // The context CHECK is the second half of `ownerBlockAad`'s guarantee, moved into the schema.
+    // The GCM tag proves the ciphertext and the AAD were made together; it does not prove the AAD
+    // names THIS row's owner, so a block lifted from one account's row into another's decrypts
+    // perfectly well for anyone holding the first key. Here the row cannot be filed at all unless
+    // the sealed context names the user it is filed under.
+    //
+    // It is spelled with `IS NOT NULL` in front, and that clause is the whole constraint rather
+    // than belt and braces. `encryptBytes` omits `aad` entirely when it is not given one, so
+    // `ciphertext->>'aad'` is then SQL NULL, `NULL = 'owner-block:…'` is NULL, and a CHECK fails
+    // only on FALSE - the row with no sealed context at all was the one row this constraint let
+    // through, and `assertAad` returns early on an absent AAD by design, so nothing downstream
+    // caught it either.
+    //
+    // And it names the SURFACE, not the person. `user-memory:` seals the owner's ranked memory
+    // rows, which share this table's key and are also about this table's person, so under that
+    // string an owner-tier row's envelope was a legal block and could be moved across with no key
+    // at all - turning a row with a lapsed `validUntil` into an unranked, never-expiring resident
+    // one, since this table has no temporal column to stop it.
+    //
+    // `version` is the owner's own concurrency, not the schema's: two settings tabs open on one
+    // block must not silently overwrite each other, so a write states the version it read and the
+    // statement refuses when that is stale.
+    //
+    // Nothing here rewrites a row - one new table with inline constraints, so a replay of the whole
+    // list is a no-op on it. No entry in `REWRITING_MIGRATIONS`. No index: the primary key is the
+    // only way this table is ever read.
+    sql: `
+      CREATE TABLE IF NOT EXISTS owner_blocks (
+        user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        ciphertext JSONB NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT owner_blocks_bound_ck
+          CHECK (octet_length(decode(ciphertext->>'ciphertext','base64')) <= 2000),
+        CONSTRAINT owner_blocks_context_ck
+          CHECK (ciphertext->>'aad' IS NOT NULL
+                 AND ciphertext->>'aad' = 'owner-block:' || user_id::text)
+      );
+    `
   }
 ] as const;

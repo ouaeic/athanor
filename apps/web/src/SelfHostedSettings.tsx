@@ -24,6 +24,7 @@ import {
   ShieldCheck,
   Trash2,
   TriangleAlert,
+  UserRoundPen,
   X
 } from 'lucide-react';
 import {
@@ -90,6 +91,7 @@ import type {
   SecurityMode,
   Task,
   TaskEvent,
+  OwnerBlock,
   User,
   RelayReport,
   Workspace,
@@ -121,6 +123,7 @@ import {
   memoryScope,
   modelDetailLine,
   modelOpennessLine,
+  ownerBlockDraft,
   providerModelFields,
   skillStateNotice,
   skillSwitch,
@@ -477,6 +480,78 @@ const rememberedKindLabel: Record<MemoryItem['kind'], string> = {
 };
 
 /**
+ * The owner's block: one text about the person, edited whole.
+ *
+ * A component of its own rather than JSX inside the settings screen, for the reason the four lists
+ * beside it are: this package has no DOM in its tests, so anything that stays an expression inside
+ * a three-thousand-line component is a control nobody can assert on. Two of the three things worth
+ * asserting here - that the bound is stated before it is met, and that Save is unavailable past it
+ * - are exactly the kind that were write-only controls in this file before.
+ *
+ * It holds no state. The draft lives with the caller because saving it needs the screen's step-up
+ * wrapper and its busy flag, and a component that owned the text would have to hand it back anyway.
+ */
+export function OwnerBlockEditor({
+  block,
+  draft,
+  busy,
+  onChange,
+  onSave,
+  onCancel
+}: {
+  block: OwnerBlock;
+  draft: string;
+  busy: boolean;
+  onChange: (value: string) => void;
+  onSave: () => void;
+  onCancel: () => void;
+}) {
+  const state = ownerBlockDraft(draft, block);
+  return (
+    <>
+      <hr />
+      <div className="section-heading">
+        <UserRoundPen />
+        <div>
+          <strong>What it knows about you</strong>
+          <span>
+            One short text, in your words, read at the start of every conversation — on this
+            computer and on every other one you own. The agent cannot write here. What it works out
+            for itself goes in the lists below, where it has to be seen twice before it counts; this
+            is simply what you say, because you say it.
+          </span>
+        </div>
+      </div>
+      <label className="brief-editor">
+        {/* The counter states the bound whether or not the draft is near it. A limit somebody meets
+            for the first time at the moment they are refused is a limit they experience as a bug. */}
+        <span className="brief-path">{state.counter}</span>
+        <textarea
+          value={draft}
+          rows={7}
+          spellCheck={false}
+          placeholder={
+            '- You are the lead. Take the decisions and keep going.\n- Never leave anything half-finished here.\n- British spelling, always.\n'
+          }
+          onChange={(event) => onChange(event.target.value)}
+        />
+      </label>
+      {state.refusal ? <p className="memory-observed-note">{state.refusal}</p> : null}
+      <div className="modal-actions">
+        <button disabled={busy || !state.savable} onClick={onSave}>
+          <Save /> Save
+        </button>
+        {draft === block.text ? null : (
+          <button className="secondary" onClick={onCancel}>
+            Cancel
+          </button>
+        )}
+      </div>
+    </>
+  );
+}
+
+/**
  * The durable facts: what put each one here, how long it lasts, and the way to change one word.
  *
  * This list was add-and-delete, and it printed the *scope* of a row where a reader looks for its
@@ -794,6 +869,16 @@ export function SelfHostedSettings({
   const [contextTokens, setContextTokens] = useState(128_000);
   const [vision, setVision] = useState(false);
   const [zdr, setZdr] = useState(true);
+  /*
+   * The owner's own block, and it is deliberately not in `loadKnowledge` with the lists below.
+   *
+   * Everything in that loader is addressed to a workspace and reloaded when the owner switches
+   * computers. This is addressed to the person: one text, no workspace in its route, unchanged by
+   * which box is open. Loading it beside things that are about a box would have been the first step
+   * towards its being about one.
+   */
+  const [ownerBlock, setOwnerBlock] = useState<OwnerBlock | null>(null);
+  const [blockDraft, setBlockDraft] = useState('');
   const [memories, setMemories] = useState<WorkspaceMemory[]>([]);
   const [memory, setMemory] = useState('');
   const [memoryTarget, setMemoryTarget] = useState<'workspace' | 'user'>('workspace');
@@ -1096,6 +1181,17 @@ export function SelfHostedSettings({
   useEffect(() => {
     if (workspace) setDefaultMode(workspace.securityMode);
   }, [workspace?.securityMode]);
+  useEffect(() => {
+    void api
+      .ownerBlock()
+      .then((block) => {
+        setOwnerBlock(block);
+        setBlockDraft(block.text);
+      })
+      // A server from before this route existed answers 404, and the section is simply absent -
+      // which is honest, where an empty editor that refused every save would not be.
+      .catch(() => setOwnerBlock(null));
+  }, []);
   useEffect(() => {
     // Null means this server has no relay route at all, which is a different thing from "off" and
     // is why the whole block is absent rather than showing controls that could not work.
@@ -1899,6 +1995,30 @@ export function SelfHostedSettings({
         >
           <Save /> Save instructions
         </button>
+        {ownerBlock ? (
+          <OwnerBlockEditor
+            block={ownerBlock}
+            draft={blockDraft}
+            busy={busy}
+            onChange={setBlockDraft}
+            onCancel={() => setBlockDraft(ownerBlock.text)}
+            onSave={() =>
+              void act(async () => {
+                // The version this screen loaded travels with the text. A second tab that saved
+                // first makes this one a conflict the owner is told about, rather than a silent
+                // overwrite of whichever of their two drafts happened to arrive second.
+                const saved = await api.saveOwnerBlock(blockDraft, ownerBlock.version);
+                setOwnerBlock(saved);
+                setBlockDraft(saved.text);
+                setNotice(
+                  saved.text
+                    ? 'Saved. Every new conversation starts by reading this.'
+                    : 'Cleared. Nothing about you is sent with a conversation now.'
+                );
+              })
+            }
+          />
+        ) : null}
         <hr />
         <div className="section-heading">
           <BookOpenText />

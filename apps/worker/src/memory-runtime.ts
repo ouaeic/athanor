@@ -34,20 +34,14 @@ import {
   type MemoryStatus,
   type MemoryTrust
 } from '@athanor/core';
-import { sha256 } from '@athanor/core';
-import type { ModelRelease } from '@athanor/contracts';
 import type {
   DataStore,
   MemoryCandidateRecord,
   MemoryPackRecord,
-  MemoryUseOutcome,
-  TaskRecord
+  MemoryUseOutcome
 } from '@athanor/data';
-import type { ModelGateway, ModelMessage } from '@athanor/model-gateway';
-import { estimatedInferenceCostUsd, usageCredit } from './billing.js';
+import type { ModelMessage } from '@athanor/model-gateway';
 import { preambleInsertIndex } from './context.js';
-import { COMPACTION_REQUEST_TIMEOUT_MS, compactionModel, routeTo } from './routing.js';
-import { withRequestDeadline } from './turn-lifecycle.js';
 
 /* ------------------------------------------------------------------------ *
  * Encryption contexts
@@ -1016,11 +1010,16 @@ export const MEMORY_STANDING_ORDER_MAX_CHARS = 200;
  * observations it produces, 3 carry a clause these openers find - one `but remember,`, one
  * `but not`, one `although that`. The other nine alternatives never fire on this corpus and are
  * kept anyway: a connective that is restrictive in English does not stop being restrictive because
- * this owner has not typed it yet, and an unused alternative in a regex costs nothing. What that
- * measurement also says is that this change buys the pattern path nothing here - 35 distinct cores
- * from 35 distinct sentences, so no two of the owner's own typed rules merge. It is aimed at the
- * proposer, which is the writer that says one thing twice in two phrasings, and the pattern path
- * goes through it because a second identity would be a second policy.
+ * this owner has not typed it yet, and an unused alternative in a regex costs nothing.
+ *
+ * What that measurement says about the MERGE has to be restated now the nightly proposer is gone,
+ * because the merge is the half that was aimed at it. On this corpus the split merges nothing: 35
+ * distinct cores out of 35 distinct sentences, so no two of the owner's own typed rules ever meet
+ * on one counter, and a writer that says one thing twice in two phrasings no longer exists. What
+ * the split still does, on those 3 sightings of 40, is the half that was always the pattern path's:
+ * a rule reaches `mem.item` carrying the exception it was stated with, or does not reach it at all.
+ * That is `promotedStandingOrder`'s refusal, and it is a claim about what a stored sentence says
+ * rather than a way of collecting sightings.
  */
 const QUALIFICATION_OPENERS = [
   'but',
@@ -1115,8 +1114,8 @@ export const composeQualifiedRule = (rule: QualifiedRule): string | null => {
 /**
  * The same fold the store keys a qualification under, so "the same carve-out" means one thing.
  *
- * `normalizeMemoryTerm` and not a second normalisation that happens to look like it - the identical
- * argument as `memoryProposalsFromReply`'s dedupe, and the identical failure if they drift: two
+ * `normalizeMemoryTerm` and not a second normalisation that happens to look like it - the same fold
+ * `memoryObjectKey` already applies to the rule, and the identical failure if the two drift: two
  * spellings of one exception would be two accumulator rows, and the composed sentence would say the
  * same thing twice inside a 200-character bound that then refuses the rule outright.
  */
@@ -1137,24 +1136,23 @@ export const factCandidateKeys = (
   observation: MemoryFactObservation,
   indexKey: Uint8Array,
   dataKey: Uint8Array,
-  workspaceId: string,
-  /*
-   * The split the caller already has, when it has one.
-   *
-   * The proposer does: a reply can attach two clauses to one rule, and it holds them as two. Left
-   * to re-derive them from the composed sentence this function would find only the FIRST connective
-   * and store "q1, q2" as a single clause - which is harmless on its own and is not harmless beside
-   * rows for `q1` and `q2` that an earlier night wrote separately. The accumulator would then hold
-   * three clauses saying two things, and the promoted sentence would say both of them twice.
-   */
-  presplit?: QualifiedRule
+  workspaceId: string
 ): {
   objectKey: string;
   qualifications: { key: string; ciphertext: EncryptedEnvelope }[];
 } => {
   if (observation.predicate !== 'standing_order')
     return { objectKey: memoryObjectKey(observation.object, indexKey), qualifications: [] };
-  const rule = presplit ?? splitQualification(observation.object);
+  /*
+   * The split is taken here and never handed in.
+   *
+   * It used to be an optional parameter, for the one writer that held a rule and two clauses
+   * already apart - the nightly proposer, whose reply could attach two carve-outs to one sentence.
+   * That writer is gone, and with it the only way a single sighting can carry more than one clause:
+   * `splitQualification` takes one split per sentence. Two clauses on one rule are now necessarily
+   * two sightings, which is the shape the accumulator was built for.
+   */
+  const rule = splitQualification(observation.object);
   return {
     objectKey: memoryObjectKey(rule.core, indexKey),
     qualifications: rule.qualifications.map((qualification) => ({
@@ -1237,11 +1235,11 @@ const STANDING_TRAILING_MARKUP = /[\s*_]+$/u;
  * every one of them a sentence of the owner's own being quoted back at them - so it costs the
  * measured result nothing and removes the only route by which a page reaches this tier.
  *
- * Two callers, and both of them are that route: `observedStandingOrders`, which reads the turn in
- * front of it, and `memoryProposalBatch`, which builds the day a model is shown. The second was
- * added after the first shipped without it, and the asymmetry it left was the wider hole of the
- * two - a regex carries a pasted sentence forward with the paste's own punctuation attached, and
- * a model carries it forward as clean prose with nothing left to detect.
+ * One caller now, and it is that route: `observedStandingOrders`, which reads the turn in front of
+ * it. There were two while the nightly proposer existed, and the second was the wider hole of the
+ * pair - a regex carries a pasted sentence forward with the paste's own punctuation still attached,
+ * where a model carried it forward as clean prose with nothing left to detect. Deleting that reader
+ * closed the hole; this line stays because the regex path still reads pasted documents.
  */
 const ownerWritten = (text: string): string => {
   const kept: string[] = [];
@@ -1761,10 +1759,11 @@ export const recordTurnEpisode = async (input: {
      * turn is still a turn the owner had and still has to be searchable - so `mem.source` ends up
      * holding text that no gate anywhere in the database refuses.
      *
-     * That was fine while the only reader of a source row was a search the owner typed. It stops
-     * being fine the moment a pass reads yesterday's turns and proposes what this computer should
-     * believe, which is exactly what `proposeMemoryFacts` does. Recording it here is what lets that
-     * pass be refused at the database rather than at a comment.
+     * That was fine while the only reader of a source row was a search the owner typed, and it
+     * stopped being fine the moment a nightly pass read yesterday's turns and proposed what this
+     * computer should believe. That pass is deleted; the column stays, because it is the only
+     * representation the taint gate has in the database and the next reader of `mem.source` that
+     * is not a search the owner typed has to be refusable there rather than in a comment.
      *
      * Always a boolean from this writer, never left unset: `null` in that column means an episode
      * from before the column existed, and the readers treat unknown as tainted.
@@ -1978,6 +1977,12 @@ export const recordTurnEpisode = async (input: {
              * owner typed; it is still not one they typed, and minting it at `stated` would be the
              * store telling every later turn that the owner said something they did not.
              *
+             * The `proposed` arm has no writer left in this program - the nightly proposer that
+             * wrote it is deleted - and it stays because the rows it judges outlive the code that
+             * made them. A box that ran that version has `origin='proposed'` candidates sitting in
+             * `mem.fact_candidate` now, and they are still promotable; dropping this branch would
+             * mint every one of them at `stated`, which is the exact lie it was added to stop.
+             *
              * `derived` is the honest level and it is not a demotion into uselessness: recall
              * admits it and prices it at 0.85 against 1.00, and `inferred` - the level that IS
              * excluded from recall - means the agent concluded it about its own work, which this is
@@ -2174,897 +2179,3 @@ export const shouldConsolidateMemory = (
   now: number,
   intervalMs: number = MEMORY_CONSOLIDATION_INTERVAL_MS
 ): boolean => lastRunAt === undefined || now - lastRunAt >= intervalMs;
-
-/* ------------------------------------------------------------------------ *
- * The nightly proposer
- *
- * What the shipped extractor cannot do, measured rather than asserted. Over this machine's own
- * 646 owner-typed turns (927 records match the harness's own user filter; 281 of them are subagent
- * completion notices injected into the user role, and they are 90.6% of the bytes) the patterns in
- * this file produce 40 observations, 35 distinct candidates, 2 that reach two sightings and 1 that
- * promotes - and that one row is a sentence Claude wrote, in a brief the owner asked for and pasted
- * back three times. The owner never typed it.
- *
- * The theme the owner really restates - "you are the lead, don't ask me" - appears in 25 turns
- * across 7 projects on 14 days and is stored ONCE, because they phrase it differently every time:
- * "I leave you as the dev lead on this", "I am giving you the lead role in developing this", "DO
- * NOT STOP TO ASK ME THINGS, YOU ARE THE LEAD NOW". A pattern that matched all eight of those
- * sentences would store eight different strings under eight different object keys, which is what it
- * does today. It is a normalisation problem and no number of patterns fixes it.
- *
- * Three decisions, each of which could have gone the other way:
- *
- * NIGHTLY AND NOT COMPACTION. `summariseForCompaction` is free in requests and it was the leading
- * candidate. Measured on the same corpus it is wrong twice: 22 compactions in 13 of 37 sessions
- * means a proposer hooked there can see at most 43.3% of the owner's turns, and its output is "the
- * one call whose output every later step re-reads" under a 400-word cap, so a second job in it
- * trades brief quality for proposals. The nightly pass has neither problem, and it has the property
- * that decides it: a compaction sees one window of one session and cannot know the owner said the
- * same thing in four other projects, and repetition across sessions is the entire signal that
- * separates a durable fact from a passing instruction.
- *
- * ONE CALL A DAY IS NOT A COST QUESTION. The main thread on this machine already spends 36,343
- * model calls for those 646 turns - 56.3 per turn, 17.7 billion input tokens. One nightly call is
- * +0.37% of calls and +0.0004% of tokens over the same 136 days. Every hook considered was
- * affordable; the choice was made on coverage and on what the call is allowed to break.
- *
- * STANDING ORDERS ONLY. The model may not propose into the other ten predicates, and the reason is
- * `mem_fact_current_one`: a functional predicate has one current value, so a wrong `lives_in` does
- * not sit beside the right one, it RETIRES it. `standing_order` is `cardinality: 'many'`, so a
- * proposal here cannot supersede anything - the worst a wrong one can do is take a slot. Three of
- * the four durable rows in this corpus are rules for the machine anyway; the fourth is biography,
- * dense and act-changing inside one project of ten and near-worthless outside it.
- * ------------------------------------------------------------------------ */
-
-/**
- * Proposals one run may write.
- *
- * Three, against a measured production rate of roughly one genuinely durable person-fact per month
- * on this corpus - 90x headroom - and deliberately tighter than the regexes'
- * `MEMORY_MAX_FACT_OBSERVATIONS` of 5, because a model can fill its allowance where a pattern
- * cannot. At the bound the run is truncated and the surplus is counted, not retried: the material
- * is still in `mem.source` tomorrow night.
- */
-export const MEMORY_MAX_NIGHTLY_PROPOSALS = 3;
-
-/**
- * Proposals that may be outstanding at once, across every night.
- *
- * The per-run bound alone is not a bound at all: three a night for the 180-day candidate horizon is
- * 540 rows in a queue whose whole purpose is that a person looks at it. This is the standing one,
- * and it is enforced before the model is called rather than after, so a full queue costs zero
- * requests as well as zero rows.
- *
- * Twenty, and the number is measured rather than picked. Replaying this machine's own 47 active
- * days through the shipped candidate table and the shipped promotion predicate - 52 proposals, 21
- * distinct sentences, 12 of which corroborated into facts - the queue peaks at **12 outstanding**.
- * Setting the bound at 12 would have been a bound saturated by the only real traffic there is: it
- * would have bitten on this corpus, refused 9 proposals, and cost 3 of the 12 durable rows. Twenty
- * is 67% above the measured peak, and it is still comfortably under the other ceiling in this
- * subsystem - the owner's own facts start falling out of the recalled pack at 37 pinned rows, and
- * a promoted standing order pins.
- *
- * What actually drains the queue is worth being clear about, because it is not promotion. Nine of
- * the 21 sentences were said once and never again; those sit until the owner dismisses them or the
- * 180-day retention sweep takes them. So the residue is roughly two rows a month, and the bound is
- * about five months of it.
- *
- * When it is full the proposer stops until the owner clears it, which is the correct failure and
- * not a degradation: a queue nobody drains must not grow, and the owner's dismissal is the release
- * valve precisely so that the mechanism cannot run away from the person it is for.
- */
-export const MEMORY_MAX_OPEN_PROPOSALS = 20;
-
-/** Episodes one run will read. A day of 53 turns is this machine's busiest ever; 40 is the cap. */
-export const MEMORY_PROPOSAL_MAX_EPISODES = 40;
-
-/**
- * How far back a run may read when the last one was long ago.
- *
- * The window is normally "since the previous run", which is a day. This is the ceiling over a
- * machine that was switched off: a fortnight of unread turns should not silently collapse to the
- * last day of it, and should not arrive as a fortnight of material proposed as though it were
- * today's either. The episode and character caps bound the size in both cases.
- */
-export const MEMORY_PROPOSAL_MAX_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
-
-/**
- * How far behind the last claim a run starts reading, which is what separates the cadence from the
- * window.
- *
- * One column carries both today: `claimMemoryProposalRun` writes `workspaces.memory_proposed_at`
- * before the call, so the cadence is honoured whatever happens next - and the same write was the
- * only thing the window was measured from, so a call that never returned moved the window past a
- * day of the owner's own words nothing would ever read again. Every outage cost exactly one day of
- * proposals, silently: this path reports every refusal counter at zero when it throws, so there was
- * no line anywhere saying a day had gone.
- *
- * The claim cannot be given back. It is one UPDATE guarded on its own written value, so a run that
- * fails cannot restore the timestamp it consumed - `SET memory_proposed_at = $2` needs
- * `memory_proposed_at <= $2 - 24h`, and the value to restore is older than the one now stored. So
- * the window stops being defined by the claim instead: a run reads from this far behind the last
- * claim, and the failed run's material is inside the next run's window rather than behind it.
- *
- * Forty-eight hours, which is two cadences, and the number is what one lost run costs rather than a
- * round figure. The claim refuses a second run inside twenty-four hours and the run itself happens
- * on the first finished turn after that, so consecutive claims sit a little over a day apart; the
- * failed run's own window was that gap, and covering it needs the gap plus the next one. Two full
- * cadences covers a night that failed and the night after it too.
- *
- * It is not free and it is not expensive. Re-reading is bounded by the two caps this run already
- * has, and against the settled corpus for this machine - 648 owner-typed turns, 207,522 characters,
- * 10 projects, 48 active days (`type: user`, not `isSidechain`, `userType: external`, not a tool
- * result, not `isMeta` with a `sourceToolUseID`, no slash-command or compaction block, deduplicated
- * by turn uuid, with task-notification records stripped) - a night goes from one active day of
- * owner text to three: 2,242 characters median becomes 6,726, the 4,412 mean becomes 13,236, and
- * `MEMORY_PROPOSAL_MAX_CHARS` binds on the worst stretches at 32,000. At four characters to the
- * token that is 1,700 input tokens on the median night where it was 560, 3,300 on the mean where it
- * was 1,100, and 8,000 at the cap - on one call a day.
- *
- * And re-reading cannot buy a sighting. The corroboration gate counts DISTINCT episodes:
- * `observeMemoryFactCandidate` adds to `n_episodes` only when the episode id is not already in
- * `episode_ids`, so the same sentence proposed again from the same turn leaves the count exactly
- * where it was. That is what makes an overlapping window safe at all, and it is the property to
- * check first if this constant is ever touched.
- *
- * What it does not fix: an outage that spans more than this loses the excess, bounded by
- * `MEMORY_PROPOSAL_MAX_LOOKBACK_MS` above. Removing that residue needs a second durable column -
- * the window mark, advanced only by a run that got an answer, beside the claim that is spent by
- * every attempt - which is a change to `workspaces` and to the store rather than to this file.
- */
-export const MEMORY_PROPOSAL_REREAD_MS = 48 * 60 * 60 * 1000;
-
-/**
- * Owner text one run will send.
- *
- * Measured per active day on this machine: median 2,242 characters, mean 4,412, p90 11,783, max
- * 23,284. 32,000 is 37% above the worst day this computer has ever had, and about 8,000 tokens -
- * against the 17.7 billion the main thread has already spent.
- */
-export const MEMORY_PROPOSAL_MAX_CHARS = 32_000;
-
-/**
- * Addressed to this computer rather than about the owner, exactly as `observedStandingOrders`
- * files its own. Sharing the subject is what lets a proposal and a pattern hit on the same sentence
- * corroborate each other instead of accumulating as two rows that never meet.
- */
-export const MEMORY_PROPOSAL_SUBJECT = 'athanor';
-
-/** Per episode, so one 14,625-character brief cannot spend the whole batch on its own. */
-export const MEMORY_PROPOSAL_MAX_EPISODE_CHARS = 6_000;
-
-/** One turn of one owner, reassembled from its chunks, as the proposer is offered it. */
-export interface MemoryProposalEpisode {
-  readonly episodeId: string;
-  readonly occurredAt: string;
-  readonly text: string;
-}
-
-/** A sentence the model proposed, and the one episode it says supports it. */
-export interface MemoryProposal {
-  readonly episodeId: string;
-  readonly occurredAt: string;
-  /** The whole sentence, rule and carve-outs, as it will be shown to the owner and stored. */
-  readonly object: string;
-  /**
-   * The rule alone. This is what is keyed, and the reason the field exists rather than being
-   * re-derived at the write: the run's own duplicate check and the store's object key have to agree
-   * about what "the same rule" is, and one function answering both is the only way that holds.
-   */
-  readonly core: string;
-  /** Every carve-out the reply attached to this rule, including any merged in from a duplicate. */
-  readonly qualifications: readonly string[];
-}
-
-/**
- * Why a run wrote fewer rows than the model offered. Every field is a bound doing its job, and the
- * whole record is reported so that a bound firing is visible rather than inferred from an absence.
- */
-export interface MemoryProposalRefusals {
-  /** Offered past `MEMORY_MAX_NIGHTLY_PROPOSALS`. */
-  overRun: number;
-  /**
-   * The same RULE twice in one run, which is how a batch would manufacture its own second sighting.
-   *
-   * Counted on the rule and not on the whole sentence, and that is forced by the identity change:
-   * two proposals with one core and two different carve-outs are one row to the store, so a run
-   * free to write both would corroborate a rule on a single night's evidence with the carve-out
-   * doing the work of a second day. The duplicate's clause is not thrown away with it - it is
-   * merged into the proposal that stays, because an exception needs one sighting where a rule needs
-   * two, and merging can only make the stored rule smaller.
-   */
-  duplicate: number;
-  /** Cited an episode index the run never offered. */
-  unknownEpisode: number;
-  /** Not a rule this store can hold: wrong shape, wrong length, escape debris. */
-  unusable: number;
-  /** Scanned as a credential. Dropped whole rather than redacted. */
-  secret: number;
-  /** Refused at the write because the owner had already dismissed that exact sentence. */
-  dismissed: number;
-}
-
-export interface MemoryProposalReport {
-  readonly episodesOffered: number;
-  readonly charactersOffered: number;
-  /** How many the standing bound left room for. Zero means no model call was made. */
-  readonly allowance: number;
-  readonly called: boolean;
-  readonly proposed: number;
-  readonly refused: MemoryProposalRefusals;
-}
-
-const noRefusals = (): MemoryProposalRefusals => ({
-  overRun: 0,
-  duplicate: 0,
-  unknownEpisode: 0,
-  unusable: 0,
-  secret: 0,
-  dismissed: 0
-});
-
-/**
- * The day's turns, reassembled from `mem.source` chunks and bounded on both axes.
- *
- * Chunks arrive already ordered by episode and then by `chunk_ix`, so joining them is a fold rather
- * than a sort. Both caps are taken here rather than in SQL because the store cannot read a
- * ciphertext and therefore cannot count a character: a `LIMIT` in the query bounds rows, and rows
- * are six kilobytes each.
- *
- * This is also where a turn stops being a message and becomes the owner's own words: the join
- * happens first, `ownerWritten` second, the slice third. That order is forced - a fence opening in
- * chunk three and closing in chunk five is only a fence once the chunks are one string, and
- * stripping after the slice would spend the episode's budget on a page nobody is going to read.
- *
- * **The caps are spent on the newest turns and the batch is offered oldest first.** Those are two
- * different orderings and they are both deliberate. The rows arrive oldest first, so filling in
- * arrival order spends the budget on the far end of the window and drops what happened today - and
- * once the window overlaps the previous run's, as it does since the window was split off the claim,
- * the far end is the material a run has already been offered and today's is the material nothing
- * has ever read. Selecting newest first is what makes the overlap safe on a busy machine: 53 turns
- * is this computer's busiest day ever against `MEMORY_PROPOSAL_MAX_EPISODES` of 40, so a
- * three-day window saturates the cap and the fill order decides the whole content of the batch.
- * What is offered is then sorted back into time order, because a day read out of sequence is a day
- * whose later turns look like they came first, and `memoryProposalRequest` numbers what it is
- * given.
- */
-export const memoryProposalBatch = (
-  rows: readonly {
-    episodeId: string;
-    occurredAt: string;
-    text: string;
-    chunkIndex: number;
-  }[],
-  limits: { maxEpisodes?: number; maxChars?: number; maxEpisodeChars?: number } = {}
-): MemoryProposalEpisode[] => {
-  const maxEpisodes = limits.maxEpisodes ?? MEMORY_PROPOSAL_MAX_EPISODES;
-  const maxChars = limits.maxChars ?? MEMORY_PROPOSAL_MAX_CHARS;
-  const maxEpisodeChars = limits.maxEpisodeChars ?? MEMORY_PROPOSAL_MAX_EPISODE_CHARS;
-  const byEpisode = new Map<string, { occurredAt: string; parts: string[] }>();
-  for (const row of [...rows].sort((left, right) => left.chunkIndex - right.chunkIndex)) {
-    const entry = byEpisode.get(row.episodeId);
-    if (entry) entry.parts.push(row.text);
-    else byEpisode.set(row.episodeId, { occurredAt: row.occurredAt, parts: [row.text] });
-  }
-  const episodes: MemoryProposalEpisode[] = [];
-  let characters = 0;
-  const newestFirst = [...byEpisode].sort(
-    (left, right) => Date.parse(right[1].occurredAt) - Date.parse(left[1].occurredAt)
-  );
-  for (const [episodeId, entry] of newestFirst) {
-    if (episodes.length >= maxEpisodes) break;
-    /*
-     * The same door the pattern path goes through, at the same point the text becomes readable.
-     *
-     * `ownerWritten` says of itself that it "removes the only route by which a page reaches this
-     * tier", and it had exactly one caller - `observedStandingOrders`. This path had none, and it
-     * is the wider door of the two: `mem.source` holds `redactText(request.trim())`, the whole
-     * message with the paste in it, and a model reading a pasted document does not carry the
-     * document's punctuation forward for `observationIsProse` to catch. It reads the page and
-     * writes clean prose, which is precisely the transformation that defeats a filter looking for
-     * debris. Nothing else on this path could tell the difference afterwards.
-     *
-     * Joined first and stripped second, because a turn is stored as up to eight chunks and a fence
-     * that opens in one closes in another - stripping per chunk would lose the fence state at
-     * every boundary. Stripped before the slice, so the episode's six thousand characters are
-     * spent on the owner's own sentences rather than on somebody else's README.
-     *
-     * An episode that was nothing but a paste contributes nothing, which is the `!text` line
-     * below already saying the right thing about a new case.
-     */
-    const text = ownerWritten(entry.parts.join('')).trim().slice(0, maxEpisodeChars);
-    if (!text) continue;
-    // The whole episode or none of it. Half a turn is a sentence the owner did not finish, and a
-    // proposer handed one would be proposing from a fragment the harness chose the end of.
-    if (characters + text.length > maxChars) break;
-    characters += text.length;
-    episodes.push({ episodeId, occurredAt: entry.occurredAt, text });
-  }
-  return episodes.sort((left, right) => Date.parse(left.occurredAt) - Date.parse(right.occurredAt));
-};
-
-/**
- * What the model is asked, and the shape of the only thing it is allowed to answer with.
- *
- * The episodes are numbered from 1 and the reply cites a number, never an identifier. That is a
- * bound and not a convenience: a UUID in a reply is a value the model can invent, and an integer
- * index into a list this function built is a value it cannot - anything outside the range is
- * refused by arithmetic. The attribution matters because the corroboration gate counts distinct
- * episodes, so a proposal that could not be pinned to one would be a proposal with no provenance to
- * count.
- *
- * Everything except the sentence and the number is fixed by the harness: the subject is `athanor`,
- * because that is what a standing order is addressed to and filing these under `owner` would let
- * four rules crowd the owner's own facts out of the four-per-subject slot; and the predicate is
- * `standing_order`, the one entry in the registry with `cardinality: 'many'`, so nothing a model
- * proposes can retire something the owner said.
- *
- * **The exception is a field, and it used to be a sentence.** This prompt said, in as many words,
- * *"Keep their qualifications - a rule with an exception stated is that rule, not the unqualified
- * one"*, and the qualification was dropped anyway - by a careful author holding the whole corpus
- * with that instruction in front of them. Asking is not a mechanism. A field is: `rule` is what
- * gets keyed and counted, `but` is what rides along, and a model that puts the carve-out in `rule`
- * is not punished for it either - `splitQualification` finds the clause and files it in the same
- * place. What the schema buys is that dropping the exception is now a thing the harness can see.
- */
-export const memoryProposalRequest = (
-  episodes: readonly MemoryProposalEpisode[]
-): ModelMessage[] => [
-  {
-    role: 'system',
-    content: [
-      "You are reading one day of one person's own messages to their computer, to find the rules",
-      'they keep restating about how it should work. You are not summarising the day and you are',
-      'not describing the work.',
-      '',
-      `Propose at most ${MEMORY_MAX_NIGHTLY_PROPOSALS} rules. Fewer is the normal answer and zero`,
-      'is a good day. A rule earns a proposal only if it is about how this computer should behave',
-      'towards this person, would change what a NEW project does on its first turn, and is still',
-      'true at the end of the day you are reading.',
-      '',
-      'Do not propose: anything true of everyone who ever used a computer ("wants high quality",',
-      '"prefers clear answers"); anything about the specific task, file, repository or deadline in',
-      'front of them; anything they were asking about rather than instructing; anything they said',
-      'once in passing; a preference for how one screen should look.',
-      '',
-      'Write each rule as one plain sentence in the second person, addressed to the computer, in',
-      "the person's own vocabulary. Do not write a rule you would not be willing to have obeyed in",
-      'a project you have not seen.',
-      '',
-      'Put any exception, carve-out or safety floor they attached to a rule in "but", as a clause',
-      'that continues the sentence - not in "rule". If they said the rule and the exception in the',
-      'same breath, both belong in the answer. A rule with no exception has no "but".',
-      '',
-      'Answer with a JSON array and nothing else. Each element is',
-      '{"episode": <the number of the message that supports it>, "rule": "<one sentence>",',
-      '"but": "<the exception, or omitted>"}.',
-      `Each rule must be between ${MEMORY_STANDING_ORDER_MIN_CHARS} and`,
-      `${MEMORY_STANDING_ORDER_MAX_CHARS} characters, and the rule and its exception together must`,
-      `fit in ${MEMORY_STANDING_ORDER_MAX_CHARS}. An empty array is a complete answer.`
-    ].join('\n')
-  },
-  {
-    role: 'user',
-    content: episodes
-      .map((episode, index) => `[${index + 1}] ${episode.occurredAt.slice(0, 10)}\n${episode.text}`)
-      .join('\n\n')
-  }
-];
-
-/** The first JSON array in a reply, tolerating the fence a chat model wraps one in. */
-const jsonArrayIn = (text: string): unknown[] | null => {
-  const opened = text.indexOf('[');
-  const closed = text.lastIndexOf(']');
-  if (opened < 0 || closed <= opened) return null;
-  try {
-    const parsed: unknown = JSON.parse(text.slice(opened, closed + 1));
-    return Array.isArray(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-};
-
-/**
- * The harness's half: everything the model said, reduced to what the store is allowed to be told.
- *
- * Pure, and separated from the call so the bounds can be attacked without a provider. Six refusals,
- * in the order they are cheapest to take:
- *
- * 1. A citation that is not an integer the harness issued. Outside the offered range is the only
- *    way a proposal can name an episode that was withheld - and the tainted ones are exactly what
- *    was withheld - and a citation of the wrong type is refused rather than coerced, because
- *    `Number(true)` is 1 and episode 1 is somebody else's evidence.
- * 2. A sentence outside the length the shipped extractor already uses for the same shape, so a
- *    model cannot store a paragraph where a rule belongs.
- * 3. Escape debris, the same refusal `observationIsProse` makes on the pattern path: a sentence
- *    with a literal `\n` in it has another sentence inside it.
- * 4. Anything `redactText` changes. The corpus this was measured on carries a live third-party API
- *    key in 8 of 646 turns, and the row is dropped whole rather than stored redacted - a rule with
- *    `[REDACTED]` in the middle of it is not a rule.
- * 5. The same sentence twice in one run, under `normalizeMemoryTerm` - the store's own fold, so
- *    this refusal and the object key cannot disagree about what "the same sentence" is. This is
- *    the one that stops a batch manufacturing its own corroboration: the gate counts distinct
- *    episodes, so a run free to attribute one sentence to two of the day's episodes would clear a
- *    two-sighting gate on a single night's evidence.
- * 6. Anything past the allowance, counted rather than dropped in silence.
- */
-export const memoryProposalsFromReply = (
-  reply: string,
-  episodes: readonly MemoryProposalEpisode[],
-  allowance: number
-): { proposals: MemoryProposal[]; refused: MemoryProposalRefusals } => {
-  const refused = noRefusals();
-  const parsed = jsonArrayIn(reply);
-  if (!parsed) return { proposals: [], refused };
-  /*
-   * Held open rather than finished as they are read, because a later element of the same reply can
-   * still add a clause to one - and a rule whose clauses stop composing has to be withdrawn rather
-   * than kept in its narrower reading. `dropped` is how an identity stays refused after that
-   * happens, so a third copy cannot resurrect the rule the second one killed.
-   */
-  interface OpenProposal {
-    readonly episodeId: string;
-    readonly occurredAt: string;
-    readonly rule: QualifiedRule;
-    readonly qualifications: string[];
-    dropped: boolean;
-  }
-  const open: OpenProposal[] = [];
-  const seen = new Map<string, OpenProposal>();
-  for (const entry of parsed) {
-    if (!entry || typeof entry !== 'object') {
-      refused.unusable += 1;
-      continue;
-    }
-    const record = entry as { episode?: unknown; rule?: unknown; but?: unknown };
-    /*
-     * `typeof === 'number'` and not `Number(record.episode)`, because `Number(true)` is 1 and a
-     * citation is provenance rather than a formality. The gate counts distinct episodes, so a
-     * reply whose citation is unusable would otherwise be attributed to the first episode of the
-     * batch by a coercion rule, and that borrowed id is what a later day's proposal would be
-     * counted as distinct from. A citation this function cannot read is a proposal with nothing
-     * behind it, and it is refused rather than given somebody else's evidence.
-     */
-    const cited = typeof record.episode === 'number' ? record.episode : Number.NaN;
-    const episode = Number.isInteger(cited) ? episodes[cited - 1] : undefined;
-    if (!episode) {
-      refused.unknownEpisode += 1;
-      continue;
-    }
-    if (typeof record.rule !== 'string') {
-      refused.unusable += 1;
-      continue;
-    }
-    const rule = record.rule.replace(/\s+/gu, ' ').trim();
-    /*
-     * The carve-out, folded into the sentence before anything else looks at it.
-     *
-     * `but ` is prefixed when the model's clause does not already open on a connective, because
-     * every later stage - the split that recovers the core, the composer that rebuilds the sentence,
-     * the key that decides what corroborates - reads clauses by their opener. A tail with no opener
-     * would be re-absorbed into the core on the next split, and the rule's identity would then
-     * depend on whether the model happened to write "but" that night.
-     *
-     * `attached` is a single sentence from here on, which means every refusal below - the length,
-     * the prose test, the credential scan - is taken over the rule AND its exception rather than
-     * over the rule alone. A carve-out carrying a key is refused for the same reason a rule
-     * carrying one is.
-     */
-    const clause = typeof record.but === 'string' ? record.but.replace(/\s+/gu, ' ').trim() : '';
-    const opened =
-      clause.length < MEMORY_QUALIFICATION_MIN_CHARS
-        ? ''
-        : // Does it OPEN on a connective, not does it contain one. A clause that merely has an
-          // `unless` in the middle of it - "always ask before purchases unless I said go ahead" -
-          // would be left unprefixed by a containment test, and `splitQualification` would then cut
-          // the composed sentence at that `unless` and call everything in front of it the rule. The
-          // core would silently become "…, but always ask before purchases", which is a different
-          // rule from the one the model proposed.
-          QUALIFICATION_OPENER.exec(` ${clause}`)?.index === 1
-          ? clause
-          : `but ${clause}`;
-    const split = splitQualification(rule);
-    const attached: QualifiedRule = {
-      ...split,
-      qualifications: opened ? [...split.qualifications, opened] : split.qualifications
-    };
-    // An empty string here is `composeQualifiedRule` refusing, and it falls through to the length
-    // refusal below. That is the "or not at all" half of the safety property taken at the earliest
-    // point it can be taken: a rule whose exception will not fit inside the 200 characters is not
-    // written without it.
-    const object = composeQualifiedRule(attached) ?? '';
-    if (
-      rule.length < MEMORY_STANDING_ORDER_MIN_CHARS ||
-      object.length < MEMORY_STANDING_ORDER_MIN_CHARS ||
-      object.length > MEMORY_STANDING_ORDER_MAX_CHARS ||
-      !observationIsProse({ subject: MEMORY_PROPOSAL_SUBJECT, predicate: 'standing_order', object })
-    ) {
-      refused.unusable += 1;
-      continue;
-    }
-    if (redactText(object) !== object) {
-      refused.secret += 1;
-      continue;
-    }
-    /*
-     * The store's own normalisation, not a second one that happens to look like it.
-     *
-     * This refusal and `memoryObjectKey` have to agree about what "the same sentence" is, because
-     * one of them decides whether a run may write two rows and the other decides whether those two
-     * rows are one. `toLowerCase()` folded case and the whitespace collapse above folded spacing,
-     * and `normalizeMemoryTerm` folds NFKC as well - so a sentence differing only by a ligature
-     * used to be two proposals to this function and one row to the store, which is a batch
-     * corroborating itself with a single model call. `claimMemoryProposalRun` refuses a run inside
-     * twenty-four hours, so `since` is always at least a day back and one batch routinely spans
-     * the separation the gate asks for; the drift was reachable rather than theoretical.
-     */
-    const identity = normalizeMemoryTerm(attached.core);
-    const already = seen.get(identity);
-    if (already) {
-      /*
-       * The asymmetry, taken inside a single reply.
-       *
-       * A second proposal of the same rule is refused as the duplicate it is - the store would key
-       * it to the same row, and letting it through is a night corroborating itself. Its carve-out
-       * is not refused with it. An exception needs one sighting where a rule needs two, and every
-       * clause merged here can only make the rule that does get written smaller, so the safe
-       * answer is to keep the exception and discard the count.
-       *
-       * Unless the merge stops composing, in which case the RULE goes rather than the clause. A run
-       * that kept the rule and dropped the exception because the pair was too long is the defect
-       * this file exists to remove, wearing a length bound's clothes.
-       */
-      refused.duplicate += 1;
-      if (already.dropped || !opened || already.qualifications.includes(opened)) continue;
-      const merged = [...already.qualifications, opened];
-      if (composeQualifiedRule({ ...already.rule, qualifications: merged })) {
-        already.qualifications.push(opened);
-        continue;
-      }
-      already.dropped = true;
-      refused.unusable += 1;
-      continue;
-    }
-    if (open.filter((proposal) => !proposal.dropped).length >= Math.max(0, allowance)) {
-      refused.overRun += 1;
-      continue;
-    }
-    const proposal: OpenProposal = {
-      episodeId: episode.episodeId,
-      occurredAt: episode.occurredAt,
-      rule: attached,
-      qualifications: [...attached.qualifications],
-      dropped: false
-    };
-    seen.set(identity, proposal);
-    open.push(proposal);
-  }
-  const proposals: MemoryProposal[] = [];
-  for (const proposal of open) {
-    if (proposal.dropped) continue;
-    const object = composeQualifiedRule({
-      ...proposal.rule,
-      qualifications: proposal.qualifications
-    });
-    // Unreachable by construction - every merge above tested composition before it was accepted -
-    // and refused rather than asserted, because the one thing this function may never do is emit a
-    // sentence narrower than the clauses it holds.
-    if (!object) {
-      refused.unusable += 1;
-      continue;
-    }
-    proposals.push({
-      episodeId: proposal.episodeId,
-      occurredAt: proposal.occurredAt,
-      object,
-      core: proposal.rule.core,
-      qualifications: proposal.qualifications
-    });
-  }
-  return { proposals, refused };
-};
-
-/** What the nightly call needs from the worker that owns the turn it is hanging off. */
-export interface MemoryProposalDeps {
-  readonly store: DataStore;
-  assertProviderConfigured(task: TaskRecord): Promise<void>;
-  gateway(
-    task: TaskRecord,
-    model: ModelRelease
-  ): Promise<{ gateway: ModelGateway; provider: string }>;
-  withLeaseRenewal<T>(task: TaskRecord, operation: () => Promise<T>): Promise<T>;
-  currentCatalog(fallback: ModelRelease[]): Promise<ModelRelease[]>;
-}
-
-/**
- * The one model call a day, and the only thing in this system that nominates a memory row without
- * a pattern having matched.
- *
- * The order of operations is the design. Everything that can make a run impossible - no model in
- * the catalogue, no room in the owner's list, no provider credential, a credential that does not
- * match the model - is tested in FRONT of the claim, so none of them costs anything at all: no
- * clock taken, no episodes decrypted, no request sent, and the day still there to be read tomorrow.
- * The two provider checks moved in front of it in the same wave that split the window off the
- * claim, and they belong there for the reason the catalogue does: both are a store read and an
- * object built, neither reaches the network, and both throw - so a box whose credential was
- * rotated away used to spend a day per finished turn, three levels deep in a `catch`, saying
- * nothing. The batch is read second, from a query
- * that has already refused every tainted episode and every agent-written source, so the prompt
- * cannot contain material the taint gate excluded. The call is third. The harness's own filter is
- * fourth. And the write is last, into `mem.fact_candidate` behind the unchanged
- * two-sightings-a-day-apart gate - a proposal is one sighting, not a fact, and a run that proposes
- * the same sentence tomorrow from tomorrow's episode is what makes it durable.
- *
- * `observedAt` is the EPISODE's own timestamp and not the run clock, which matters for the same
- * reason the duplicate refusal above does: the gate measures elapsed time between sightings, and
- * stamping every proposal with the moment the batch ran would let a backlog spanning two days
- * promote on the strength of one pass.
- *
- * Never fatal, like every other line on this path. The turn that triggered it has already done its
- * work, and a memory pass that cannot reach a provider must not turn a finished turn into a failure.
- */
-export const proposeMemoryFacts = async (
-  deps: MemoryProposalDeps,
-  task: TaskRecord,
-  dataKey: Uint8Array,
-  options: { now?: Date; lookbackMs?: number; rereadMs?: number } = {}
-): Promise<MemoryProposalReport> => {
-  const now = options.now ?? new Date();
-  const empty: MemoryProposalReport = {
-    episodesOffered: 0,
-    charactersOffered: 0,
-    allowance: 0,
-    called: false,
-    proposed: 0,
-    refused: noRefusals()
-  };
-  /*
-   * Which model would answer, resolved BEFORE the claim is taken, and the order is the point.
-   *
-   * The claim is consumed whether or not a call follows it, so anything that can make the run
-   * impossible has to be tested in front of it. The catalogue is exactly that: it refreshes on its
-   * own timer and this machine has already had a spell where it did not refresh at all, so a
-   * workspace whose task model has left the catalogue would otherwise take the clock every night,
-   * find no model, and propose nothing - for as long as the catalogue stayed broken, silently, with
-   * a passing test suite. Resolved first, the day is not spent and the pass resumes by itself on
-   * the first night the catalogue is right again.
-   *
-   * The read is memoised and this whole function runs at most once a day, so it costs nothing to
-   * put it here.
-   */
-  const catalog = await deps.currentCatalog([]);
-  const lead = catalog.find((entry) => entry.id === task.modelId);
-  if (!lead) return empty;
-
-  /*
-   * How much room the owner's list has, read BEFORE the claim, for the reason stated above it.
-   *
-   * A full queue is exactly the second thing that can make the run impossible, and it used to be
-   * tested behind the claim - so a night the owner had left twenty proposals unanswered took the
-   * clock, called nothing, and moved the window past a day of the owner's own words. The next run
-   * reads from `run.previous`, and `since` takes the LATER of that and the seven-day floor, so
-   * nothing recovers the day afterwards: every rule stated while the list was full was discarded,
-   * with no bound on how many days that lasts and no line on the timeline, because this path
-   * returns with every refusal counter at zero. The queue drains only by the owner dismissing or
-   * by the retention sweep at 180 days.
-   *
-   * In front of the claim it costs a count, and the day is still there tomorrow.
-   */
-  const open = await deps.store.countMemoryFactProposals(task.workspaceId);
-  const allowance = Math.min(MEMORY_MAX_NIGHTLY_PROPOSALS, MEMORY_MAX_OPEN_PROPOSALS - open);
-  if (allowance <= 0) return empty;
-
-  /*
-   * The provider, resolved BEFORE the claim, for the third time and the same reason.
-   *
-   * Both of these throw and neither of them reaches the network: `assertProviderConfigured` is a
-   * lookup for a stored credential, and `gateway` is a second lookup plus an adapter constructed
-   * around it, which additionally refuses a model whose provider is not the one configured. So they
-   * are exactly the shape of the catalogue check above - conditions that make the run impossible
-   * before any of it has happened - and behind the claim they were conditions that spent the day
-   * instead. A box whose key was rotated away, or whose task model belongs to the other provider,
-   * threw here on every finished turn: the caller catches, so nothing was said, and the window had
-   * already moved past a day of the owner's words.
-   *
-   * Still thrown rather than swallowed. "No provider is configured" is not a quiet nothing, and the
-   * caller has always treated a memory pass that cannot reach a provider as non-fatal.
-   */
-  const summariser = compactionModel(catalog, lead, task.privacyRoute);
-  await deps.assertProviderConfigured(task);
-  const { gateway, provider } = await deps.gateway(task, summariser);
-
-  /*
-   * The durable claim, before anything is counted or decrypted.
-   *
-   * `captureMemory` reaches this function from a cadence held in the worker's own memory, which a
-   * restart resets - so on its own it bounds nothing about how often a provider is paid. This
-   * statement is the bound: one UPDATE, so two workers finishing turns in the same second cannot
-   * both win it, and a process that restarts every twenty minutes still gets one call a day.
-   *
-   * A first claim has no previous run to read forward from. It takes the clock and returns, so a
-   * fresh installation's first finished turn costs no request at all - the alternative is a call
-   * over a single episode, which cannot corroborate anything and is a bill for nothing.
-   */
-  const run = await deps.store.claimMemoryProposalRun(task.workspaceId, { now });
-  if (!run.claimed || !run.previous) return empty;
-
-  /*
-   * The window, which is no longer the claim.
-   *
-   * It used to start exactly at `run.previous`, so the claim decided both how often a call is made
-   * and what that call may read - and a call that never returned therefore threw away a day of the
-   * owner's own words, because the next run started where the failed one had already moved the mark
-   * to. That is one lost day per outage with nothing anywhere saying so.
-   *
-   * Now the claim answers only "may this workspace pay for a call", and the window starts
-   * `MEMORY_PROPOSAL_REREAD_MS` behind it. A night that failed is inside the next night's window
-   * instead of behind it, and the overlap cannot manufacture corroboration: the gate counts
-   * distinct episode ids and the store adds to `n_episodes` only for an episode the candidate has
-   * not already been seen in, so the same sentence from the same turn is the same one sighting.
-   *
-   * `run.previous` still widens it. A machine that was off for a fortnight has a fortnight of turns
-   * nobody has read, and the seven-day ceiling is what stops the other extreme - a batch of ancient
-   * material proposed as though it were today's, out of a corpus whose later turns may already have
-   * contradicted it.
-   */
-  const since = new Date(
-    Math.max(
-      new Date(run.previous).getTime() - (options.rereadMs ?? MEMORY_PROPOSAL_REREAD_MS),
-      now.getTime() - (options.lookbackMs ?? MEMORY_PROPOSAL_MAX_LOOKBACK_MS)
-    )
-  );
-  const rows = await deps.store.listMemoryProposalSources(task.workspaceId, {
-    since,
-    // Eight chunks per turn is the source cap, so this is the row budget for the episode cap.
-    limit: MEMORY_PROPOSAL_MAX_EPISODES * MEMORY_MAX_SOURCE_CHUNKS
-  });
-  const readable = rows.flatMap((row) => {
-    const body = openSourceBody(row, task.workspaceId, dataKey);
-    return body === null
-      ? []
-      : [
-          {
-            episodeId: row.episodeId,
-            occurredAt: row.occurredAt,
-            chunkIndex: row.chunkIndex,
-            text: body
-          }
-        ];
-  });
-  const episodes = memoryProposalBatch(readable);
-  if (episodes.length === 0) return empty;
-  const charactersOffered = episodes.reduce((total, episode) => total + episode.text.length, 0);
-
-  const response = await deps.withLeaseRenewal(task, () =>
-    withRequestDeadline(
-      (signal) =>
-        gateway.chat(provider, {
-          ...routeTo(summariser),
-          messages: memoryProposalRequest(episodes),
-          tools: [],
-          // Not zero. A proposer at zero repeats the nearest sentence in the batch verbatim, which
-          // is the pattern path with a model's bill attached; the whole point of the call is the
-          // normalisation across differently-worded restatements.
-          temperature: 0.2,
-          // Three sentences of at most 200 characters, plus the JSON around them. The cap is a
-          // bound on the answer, not a budget the model is invited to spend.
-          maxTokens: 512,
-          reasoningEffort: 'medium',
-          sessionId: sha256(`athanor-memory-proposal:${task.workspaceId}`).slice(0, 64),
-          signal
-        }),
-      // The same deadline the other cheap tool-free side call runs under, and for the same reason:
-      // a summariser that never answers must not hold a lease open behind a finished turn.
-      COMPACTION_REQUEST_TIMEOUT_MS
-    )
-  );
-  const credit = usageCredit(summariser, response.usage.inputTokens, response.usage.outputTokens);
-  await deps.store.recordUsage({
-    userId: task.userId,
-    workspaceId: task.workspaceId,
-    taskId: task.id,
-    kind: 'model_inference',
-    resourceClass: summariser.usageClass,
-    quantity: response.usage.totalTokens,
-    unit: 'tokens',
-    credits: credit,
-    costUsd:
-      response.usage.costUsd ??
-      estimatedInferenceCostUsd(
-        summariser,
-        response.usage.inputTokens,
-        response.usage.outputTokens,
-        response.usage
-      ),
-    state: 'settled',
-    // One a day per workspace, so the day is the key: a second worker that raced the cadence claim
-    // writes the same row rather than a second charge.
-    idempotencyKey: `memory-proposal:${task.workspaceId}:${now.toISOString().slice(0, 10)}`,
-    providerRef: `${response.metadata.provider}:${response.metadata.model}`
-  });
-
-  const { proposals, refused } = memoryProposalsFromReply(response.text, episodes, allowance);
-  const indexKey = memoryIndexKey(dataKey);
-  let proposed = 0;
-  for (const proposal of proposals) {
-    const observation: MemoryFactObservation = {
-      subject: MEMORY_PROPOSAL_SUBJECT,
-      predicate: 'standing_order',
-      object: proposal.object
-    };
-    // Keyed on the rule and never on the sentence, so tonight's qualified restatement of a rule
-    // proposed bare last week lands on last week's counter instead of starting a second one that
-    // dies a singleton. The draft is still the whole sentence - it is what the owner is shown in
-    // the queue, and showing them the rule without its exception would be asking them to judge a
-    // sentence the store is not going to hold.
-    const keys = factCandidateKeys(observation, indexKey, dataKey, task.workspaceId, {
-      core: proposal.core,
-      qualifications: proposal.qualifications,
-      terminator: ''
-    });
-    const candidate = await deps.store.observeMemoryFactCandidate({
-      workspaceId: task.workspaceId,
-      subjectKey: memorySubjectKey(observation.subject, indexKey),
-      predicate: observation.predicate,
-      objectKey: keys.objectKey,
-      qualifications: keys.qualifications,
-      episodeId: proposal.episodeId,
-      observedAt: proposal.occurredAt,
-      draftCiphertext: encryptJson(observation, dataKey, memoryFactCandidateAad(task.workspaceId)),
-      origin: 'proposed'
-    });
-    // The store refuses a sentence the owner has already dismissed and hands back the standing row
-    // untouched, so a refusal is a fact this report can carry rather than a silence.
-    if (candidate.dismissedAt) refused.dismissed += 1;
-    else proposed += 1;
-  }
-  return {
-    episodesOffered: episodes.length,
-    charactersOffered,
-    allowance,
-    called: true,
-    proposed,
-    refused
-  };
-};
-
-/** True when a run refused something, which is the only condition worth telling the owner about. */
-export const memoryProposalWasRefused = (report: MemoryProposalReport): boolean =>
-  Object.values(report.refused).some((count) => count > 0);
-
-/**
- * One line for the timeline, said only when a bound actually fired.
- *
- * The same discipline the source-cap notice next door keeps: a status and not a warning, because
- * nothing failed, and silent when nothing was refused, because a nightly line saying "refused 0"
- * is how an owner learns to stop reading them.
- */
-export const memoryProposalSummary = (report: MemoryProposalReport): string => {
-  const { refused } = report;
-  const reasons = [
-    /*
-     * Two different bounds can produce `overRun`, and calling both of them "the nightly limit"
-     * would be a sentence that lies to the owner on the second one. `allowance` is
-     * `min(3, 20 - open)`: when the queue has room it IS the nightly limit and naming it is
-     * informative, and when the queue is nearly full it is what is left of the standing bound - a
-     * line reading "past the nightly limit of 1" would tell the owner this machine proposes one
-     * rule a night, which it does not, and would hide the fact that what actually refused the
-     * others is a list waiting on them.
-     */
-    refused.overRun > 0
-      ? report.allowance === MEMORY_MAX_NIGHTLY_PROPOSALS
-        ? `${refused.overRun} past the nightly limit of ${report.allowance}`
-        : `${refused.overRun} past the ${report.allowance} the list below still had room for`
-      : '',
-    refused.duplicate > 0 ? `${refused.duplicate} repeated within the same night` : '',
-    refused.unknownEpisode > 0 ? `${refused.unknownEpisode} citing a message it was not shown` : '',
-    refused.unusable > 0 ? `${refused.unusable} not usable as a rule` : '',
-    refused.secret > 0 ? `${refused.secret} containing something that scans as a credential` : '',
-    refused.dismissed > 0 ? `${refused.dismissed} you had already dismissed` : ''
-  ].filter(Boolean);
-  return (
-    `Looked over the day's conversations for rules worth remembering and kept ${report.proposed}` +
-    `; refused ${reasons.join(', ')}. Nothing is remembered yet: each one has to be proposed` +
-    ' again on a later day before it becomes something this computer acts on.'
-  );
-};

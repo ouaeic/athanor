@@ -305,3 +305,63 @@ export const modelOpennessLine = (model: Pick<ModelRelease, 'openness'>): string
  */
 export const workspaceDeletionArmed = (typed: string, workspaceName: string): boolean =>
   typed.trim().length > 0 && typed.trim() === workspaceName;
+
+/**
+ * The owner block's editor, as a value: what the counter says and whether Save may be pressed.
+ *
+ * The byte count is done here rather than in the component because it has to agree with the server
+ * to the byte, and agreement is a property worth a test. Two things make it non-obvious. The count
+ * is of UTF-8 bytes, not characters - an em dash is three - and the server trims and NFKC-normalises
+ * before it counts, so a draft measured raw would tell the owner they had room the route is about
+ * to refuse. Both steps are applied here in the same order the route applies them.
+ *
+ * At the bound the answer is a refusal, and it says so in the words the server uses. Nothing here
+ * truncates the draft to fit: this is the one text on this screen the owner typed about themselves,
+ * and silently dropping its last sentence is the failure the whole tier is arranged against.
+ */
+export interface OwnerBlockDraft {
+  /** UTF-8 bytes the server will count, after the same trim and normalisation it applies. */
+  bytes: number;
+  /** The line under the box. It states the bound whether or not the draft is near it. */
+  counter: string;
+  /** False when the draft is unchanged, or over the bound. */
+  savable: boolean;
+  /** Present only when the draft cannot be saved as it stands. */
+  refusal?: string;
+}
+
+export const ownerBlockDraft = (
+  draft: string,
+  block: { text: string; bytes: number; limit: number }
+): OwnerBlockDraft => {
+  const settled = draft.trim().normalize('NFKC');
+  const bytes = new TextEncoder().encode(settled).length;
+  const counter = `${bytes.toLocaleString()} of ${block.limit.toLocaleString()} bytes`;
+  if (bytes > block.limit)
+    return {
+      bytes,
+      counter: `${counter} — ${(bytes - block.limit).toLocaleString()} over`,
+      savable: false,
+      refusal: `Your block holds ${block.limit.toLocaleString()} bytes and this is ${bytes.toLocaleString()}. Shorten it — nothing here is dropped to make room.`
+    };
+  /*
+   * A block this box can no longer decrypt, which is the one state where counting the draft alone
+   * tells the owner a lie.
+   *
+   * The route is careful here: on a decrypt failure it serves empty `text` with the row's REAL
+   * `bytes` and `version`, so the screen has everything it needs. Counting only the draft threw the
+   * honest half away and rendered exactly what no block at all renders - `0 of 2,000 bytes`, Save
+   * disabled, because an empty draft equals empty text. So the owner could neither see that
+   * something was stored nor press the one button that would replace it, on the single surface that
+   * exists for them to correct what the computer holds about them. Save is enabled with nothing
+   * typed on purpose: pressing it clears the row, which is the honest thing to do with bytes
+   * nobody can read.
+   */
+  if (block.text === '' && block.bytes > 0)
+    return {
+      bytes,
+      counter: `${counter} — ${block.bytes.toLocaleString()} stored bytes this computer can no longer read`,
+      savable: true
+    };
+  return { bytes, counter, savable: settled !== block.text.trim().normalize('NFKC') };
+};

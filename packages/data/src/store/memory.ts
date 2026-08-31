@@ -31,14 +31,48 @@ import {
   mapMemoryItem,
   mapMemoryPack,
   mapMemorySource,
+  mapOwnerBlock,
   optionalText
 } from './rows.js';
 import {
   MEMORY_RECALL_SQL,
   MEMORY_SOURCE_SEARCH_PER_TASK,
   MEMORY_SOURCE_SEARCH_SQL,
-  MEMORY_SOURCE_WINDOW_SQL
+  MEMORY_SOURCE_WINDOW_SQL,
+  OWNER_BLOCK_MAX_BYTES,
+  OWNER_BLOCK_READ_SQL,
+  OWNER_BLOCK_WRITE_SQL
 } from './sql/memory.js';
+
+export { OWNER_BLOCK_MAX_BYTES };
+
+/**
+ * The owner's own block, as it is stored: sealed text, its exact plaintext length, and the version
+ * a rewrite has to state.
+ *
+ * `contentBytes` is not a stored column. It is `octet_length` of the decoded ciphertext, which for
+ * AES-256-GCM is the plaintext length to the byte - so the number a caller reports against the
+ * bound and the number the database refuses on are the same number by construction rather than by
+ * two writers agreeing.
+ */
+export interface OwnerBlockRecord {
+  userId: string;
+  ciphertext: EncryptedEnvelope;
+  contentBytes: number;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * The plaintext length of a sealed block, read off the envelope without a key.
+ *
+ * GCM is a counter mode: the ciphertext is exactly as long as what went in, and the authentication
+ * tag lives in its own field beside it. This is the same arithmetic migration 73's CHECK does in
+ * SQL, and it is here so the refusal can carry a message before the statement runs.
+ */
+export const ownerBlockBytes = (envelope: EncryptedEnvelope): number =>
+  Buffer.from(envelope.ciphertext, 'base64').byteLength;
 
 /** Guards the one lookup whose ids arrive as model-written text rather than from a prior row. */
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -2542,5 +2576,87 @@ export class MemoryStore {
       );
       return removed.rowCount === 1;
     });
+  }
+
+  /**
+   * The owner block: one text per person, and the only memory surface nothing ranks.
+   *
+   * Every other tier here answers "what is relevant to this request". This one answers a question
+   * no request names - who the owner is and how they want to be worked with - which is exactly why
+   * retrieval cannot serve it and why it is read whole, on every request, or not at all.
+   *
+   * There is no `workspaceId` and no `taskId` in this signature, and their absence is the gate
+   * rather than an omission. `createWorkspaceMemory` narrows its `target` for the same reason; here
+   * the two parameters a running turn always has are declared `never`, so the one production caller
+   * inside a turn - `apps/worker/src/tools/knowledge.ts` - cannot even name them without a compile
+   * error, and the runtime throw below holds for a JavaScript caller or an `as` cast that gets past
+   * the type. The agent has no verb for this table at all: the worker's window READS it and nothing
+   * in the worker writes it.
+   *
+   * @see OWNER_BLOCK_WRITE_SQL for the concurrency arm and for why a refused write changes nothing.
+   */
+  async readOwnerBlock(userId: string): Promise<OwnerBlockRecord | null> {
+    const result = await this.database.query(OWNER_BLOCK_READ_SQL, [userId]);
+    return result.rows[0] ? mapOwnerBlock(result.rows[0]) : null;
+  }
+
+  /**
+   * Writes the whole block, or refuses and leaves the stored bytes untouched.
+   *
+   * Two independent bounds on one number, and they are not redundant. This one reads the sealed
+   * bytes it was handed and refuses past `OWNER_BLOCK_MAX_BYTES` with a message naming what is
+   * full, because a caller deserves to be told which surface refused it. The CHECK in migration 73
+   * is the one that cannot be talked out of it: it measures the same bytes in the database, so a
+   * caller that computed the length wrong, or lied about it, is refused there.
+   *
+   * `expectedVersion` is the version the caller read. Zero means "there was no block". A stale
+   * version matches no row and returns null, which the caller reports as a conflict - two settings
+   * tabs cannot silently overwrite one another on the one surface whose every word the owner chose.
+   */
+  async writeOwnerBlock(input: {
+    userId: string;
+    ciphertext: EncryptedEnvelope;
+    expectedVersion: number;
+    /** A turn always has these. This method cannot be told them, which is what keeps turns out. */
+    workspaceId?: never;
+    taskId?: never;
+  }): Promise<OwnerBlockRecord | null> {
+    if (input.workspaceId !== undefined || input.taskId !== undefined)
+      throw new AthanorError(
+        'owner_block_refused',
+        'The owner block is written by the owner in Settings, not from inside a task.'
+      );
+    const bytes = ownerBlockBytes(input.ciphertext);
+    if (bytes > OWNER_BLOCK_MAX_BYTES)
+      throw new AthanorError(
+        'owner_block_full',
+        `Your block holds ${OWNER_BLOCK_MAX_BYTES} bytes and this is ${bytes}. Shorten it; nothing here is dropped to make room.`
+      );
+    const result = await this.database.query(OWNER_BLOCK_WRITE_SQL, [
+      input.userId,
+      JSON.stringify(input.ciphertext),
+      input.expectedVersion
+    ]);
+    return result.rows[0] ? mapOwnerBlock(result.rows[0]) : null;
+  }
+
+  /**
+   * Empties the block, which is a deletion rather than a write of nothing.
+   *
+   * An empty block must cost zero resident bytes, and the honest way to say that is that the row is
+   * gone: a zero-length ciphertext row would still be a row the window has to read and decide about
+   * every turn.
+   *
+   * It states a version for the same reason a rewrite does, and emptying is the write where it
+   * matters most - a settings tab left open since yesterday must not be able to delete what the
+   * owner typed this morning. One statement, so there is no gap between deciding and deleting; a
+   * caller that gets `false` re-reads to learn whether it was stale or the block was already gone.
+   */
+  async clearOwnerBlock(userId: string, expectedVersion: number): Promise<boolean> {
+    const result = await this.database.query(
+      'DELETE FROM owner_blocks WHERE user_id=$1::uuid AND version=$2::int',
+      [userId, expectedVersion]
+    );
+    return result.rowCount === 1;
   }
 }
