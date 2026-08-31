@@ -130,15 +130,6 @@ export interface SeededStore {
   readonly episodes: number;
 }
 
-/**
- * A stand-in task record, for the two places the write path needs one and the store's own
- * `createTask` is the wrong shape: `event` takes a `TaskRecord` and reads only `id` off it.
- */
-const taskFor = (store: DataStore, task: TaskRecord): TaskRecord => {
-  void store;
-  return task;
-};
-
 export const seedStore = async (
   turns: readonly OwnerTurn[],
   probes: readonly Probe[],
@@ -194,14 +185,10 @@ export const seedStore = async (
         if (!call.resultText) continue;
         // The write `recordToolResult` performs, in the shape it performs it: the raw result under
         // the call's own id, on the conversation's timeline, sealed with the task's own context.
-        const row = await event(
-          store,
-          taskFor(store, task),
-          dataKey,
-          'tool_result',
-          `${call.name} completed`,
-          { toolCallId: call.id, result: call.resultText }
-        );
+        const row = await event(store, task, dataKey, 'tool_result', `${call.name} completed`, {
+          toolCallId: call.id,
+          result: call.resultText
+        });
         toolResultEvents += 1;
         const isCited = shape.cite === 'all' || call.id === probe.citedCallId;
         if (isCited && shape.citations === 'kept')

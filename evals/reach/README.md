@@ -1,10 +1,11 @@
 # The evidence-reach rig
 
 ```
-pnpm exec tsx evals/reach/run.ts                       # one arrangement, ~1m40s
+pnpm exec tsx evals/reach/run.ts                        # one arrangement, ~3m
 pnpm exec tsx evals/reach/run.ts --fall                 # the whole fall table, ~15m
-pnpm exec tsx evals/reach/run.ts --freeze /tmp/p.json    # keep this corpus for a later run
-pnpm exec tsx evals/reach/run.ts --probes /tmp/p.json    # ask the identical questions again
+pnpm exec tsx evals/reach/run.ts --ci                   # the fall table against the baseline
+pnpm exec tsx evals/reach/run.ts --freeze /tmp/p.json   # keep this corpus for a later run
+pnpm exec tsx evals/reach/run.ts --probes /tmp/p.json   # ask the identical questions again
 ```
 
 Offline, no key, no network, no model. **Not in `pnpm check`, and it cannot be** — see
@@ -95,10 +96,15 @@ return type would be worth, measured. It is never the product's number.
 4. **The baseline**, under `--ci`, as rates rather than counts because the corpus grows. On
    `shipped` a fall fails and a rise passes. On the fault rows it is the other way round: those
    numbers are meant to be on the floor, and a fault that has started letting probes through is a
-   broken instrument rather than an improvement.
+   broken instrument rather than an improvement. The slack is measured rather than picked — nine
+   runs over the identical probe set spread `reach@1` by 2.1 points, from three production
+   `ORDER BY` clauses whose last term is a random UUID, so `SLACK_SHIPPED` is that plus one probe.
 
+`--ci` implies `--fall`, because the baseline **is** the fall table: without that, a `--ci` run of
+one arrangement produces a row the baseline has no entry for and passes by having asked no question.
 `--accept` refuses a limited run, a run that is not the whole fall table, and any run that failed
-its own checks. It does not refuse a frozen one: a baseline accepted over the frozen set is the
+its own checks. `--baseline <path>` checks against another file, which is how the gate is attacked —
+point a run at a doctored copy, watch it exit 1, and the committed bytes are never touched. It does not refuse a frozen one: a baseline accepted over the frozen set is the
 baseline whose numbers a recorded table can be checked against, and the stamp carries that set's
 digest, so a later live run prints the difference rather than hiding it.
 

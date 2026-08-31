@@ -5,7 +5,10 @@
  * from `~/.claude/projects`, which are not in the repository and must never be, so it cannot run in
  * CI and is not in `pnpm check`. `README.md` argues that out rather than asserting it.
  *
- *   --ci                check the committed baseline; exit non-zero on a regression
+ *   --ci                check the committed baseline; exit non-zero on a regression. Implies
+ *                       --fall, because the baseline is the fall table
+ *   --baseline <path>   check against this file instead of the committed one, which is how the
+ *                       baseline gate is attacked without editing the file it guards
  *   --accept            rewrite baseline.json from this run
  *   --limit <n>         mine at most n probes (for iterating; a run so limited never accepts)
  *   --freeze <path>     write the mined probe set outside the repository, so a later run can be
@@ -40,13 +43,21 @@ import { selfTest } from './selftest.js';
 import { seedStore, type SeedShape } from './seed.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const baselinePath = path.join(here, 'baseline.json');
 
 const flag = (name: string): boolean => process.argv.includes(`--${name}`);
 const argument = (name: string): string | undefined => {
   const index = process.argv.indexOf(`--${name}`);
   return index < 0 ? undefined : process.argv[index + 1];
 };
+
+/**
+ * The committed file, unless a caller names another one.
+ *
+ * `--baseline` exists so the gate can be attacked without editing the file it guards: point a run
+ * at a doctored copy, watch it exit 1, and the committed bytes are untouched throughout. A gate
+ * whose failure has never been observed is a gate nobody has checked.
+ */
+const baselinePath = argument('baseline') ?? path.join(here, 'baseline.json');
 
 /** One row of the run: a named arrangement of the store, and what the probes scored against it. */
 export interface Row {
@@ -138,8 +149,15 @@ if (freeze) {
   );
 }
 
+/*
+ * `--ci` implies `--fall`, because the baseline IS the fall table.
+ *
+ * Without this a `--ci` run of one arrangement produces a row the baseline has no entry for, and
+ * `check` passes it by having nothing to compare - a gate that is green because it asked no
+ * question. The read rig's `--ci` implies `--trajectories` for the same reason.
+ */
 const rows: Row[] = [];
-if (flag('fall')) {
+if (flag('fall') || flag('ci')) {
   for (const entry of FALL_TABLE)
     rows.push({
       name: entry.name,
@@ -179,7 +197,7 @@ if (flag('accept')) {
     process.stderr.write('--accept refused: a limited run is not the corpus.\n');
     process.exit(2);
   }
-  if (!flag('fall')) {
+  if (!flag('fall') && !flag('ci')) {
     process.stderr.write(
       '--accept refused: the baseline is the whole fall table, so run --fall.\n'
     );

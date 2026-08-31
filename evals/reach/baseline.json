@@ -1,6 +1,6 @@
 {
   "$stamp": {
-    "acceptedAt": "2026-08-31T18:19:26.264Z",
+    "acceptedAt": "2026-08-31T18:39:00.141Z",
     "corpus": {
       "turns": 681,
       "characters": 234835,
@@ -15,8 +15,8 @@
     "n": 146,
     "reachedAt1": 81,
     "reachedAt2": 37,
-    "reachedViaSearch": 126,
-    "verbatimAt1": 74
+    "reachedViaSearch": 125,
+    "verbatimAt1": 70
   },
   "no-citation": {
     "n": 146,
@@ -34,23 +34,23 @@
   },
   "span-exact": {
     "n": 146,
-    "reachedAt1": 82,
+    "reachedAt1": 81,
     "reachedAt2": 37,
-    "reachedViaSearch": 126,
-    "verbatimAt1": 70
+    "reachedViaSearch": 124,
+    "verbatimAt1": 69
   },
   "span-shifted": {
     "n": 146,
-    "reachedAt1": 81,
+    "reachedAt1": 80,
     "reachedAt2": 37,
-    "reachedViaSearch": 126,
+    "reachedViaSearch": 127,
     "verbatimAt1": 0
   },
   "cite-all": {
     "n": 146,
-    "reachedAt1": 32,
+    "reachedAt1": 30,
     "reachedAt2": 15,
-    "reachedViaSearch": 49,
+    "reachedViaSearch": 50,
     "verbatimAt1": 12
   }
 }

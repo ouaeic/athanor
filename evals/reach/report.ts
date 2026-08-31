@@ -56,10 +56,10 @@ export const MIN_SEPARATION = 10;
 /**
  * How far a row may move before the baseline calls it a regression, measured rather than picked.
  *
- * Six runs of the same arrangement over the SAME frozen 146 probes, with the workspace key and the
- * ranking clock both fixed, still spread: `reach@1` over 54.1-55.5 (two probes), `reach@2*` over
- * 84.2-87.0 (four), `verbatim@1` over 47.3-50.0 (four). `reach@2`, `packed`, `ranked` and `located`
- * were identical on all six.
+ * Nine runs of the same arrangement over the SAME frozen 146 probes, with the workspace key and the
+ * ranking clock both fixed, still spread: `reach@1` over 54.1-56.2 (three probes), `reach@2*` over
+ * 84.2-87.0 (four), `verbatim@1` over 46.6-50.0 (five). `reach@2`, `packed`, `ranked` and `located`
+ * were identical on all nine.
  *
  * The spread is not this rig's. It is three production `ORDER BY`s whose last term is a random
  * UUID - `MEMORY_SOURCE_SEARCH_SQL`'s `ORDER BY s DESC, sc.id`, `listMemoryEvidence`'s
@@ -68,9 +68,10 @@ export const MIN_SEPARATION = 10;
  * and the order is then fixed, so this is a rig cost rather than a product one; a rig that re-seeds
  * pays it on every run.
  *
- * So `SLACK_SHIPPED` is twice the widest observed spread and `SLACK_FAULT` is one point, because
- * the fault rows measured exactly 0.0% on six runs out of six and have no spread to allow for. A
- * gate tighter than the instrument's own noise is a gate that fires on nothing.
+ * The gate below compares `reach@1` and nothing else, so `SLACK_SHIPPED` is three points - the
+ * observed 2.1 plus one probe. `SLACK_FAULT` is one point, because the fault rows measured exactly
+ * 0.0% on nine runs out of nine and have no spread to allow for. A gate tighter than the
+ * instrument's own noise is a gate that fires on nothing.
  */
 export const SLACK_SHIPPED = 0.03;
 export const SLACK_FAULT = 0.01;
