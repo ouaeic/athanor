@@ -11,6 +11,7 @@
     "agentdojo/*.ts",
     "arms/*.ts",
     "edit/*.ts",
-    "read/*.ts"
+    "read/*.ts",
+    "reach/*.ts"
   ]
 }

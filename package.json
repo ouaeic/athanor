@@ -21,7 +21,7 @@
     "eval:edit": "NODE_OPTIONS=--conditions=development tsx evals/edit/run.ts",
     "eval:read": "NODE_OPTIONS=--conditions=development tsx evals/read/run.ts",
     "eval:rigs": "pnpm eval:context -- --ci && pnpm eval:injection -- --ci && pnpm eval:arms -- --ci && pnpm eval:cards -- --ci && pnpm eval:edit -- --ci && pnpm eval:read -- --ci",
-    "lint": "eslint .",
+    "lint": "NODE_OPTIONS=--max-old-space-size=8192 eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "license:check": "node scripts/check-dependency-licenses.mjs",

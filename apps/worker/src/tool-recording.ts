@@ -485,7 +485,17 @@ export const recordToolResult = async (
   const eventResult = untrustedOrigin
     ? sanitiseUntrusted(imageSummary ?? result)
     : (imageSummary ?? result);
-  await event(deps.store, task, key, 'tool_result', `${call.name} completed`, {
+  /*
+   * The row this is written to is now named, because something later has to be able to find it.
+   *
+   * These bytes are the raw object the tool returned - the model's copy below is bounded, fenced
+   * and possibly spilled, and this one is not - and until now nothing in the product could reach
+   * them: the readers of `task_events` are the owner's timeline and the privacy export. A `finish`
+   * that cites this call can leave a durable pointer to it, and the pointer is worth keeping only
+   * if following it is one lookup rather than a walk over the conversation decrypting payloads
+   * until one matches. The id is the harness's own; nothing the model writes can name a row.
+   */
+  const recorded = await event(deps.store, task, key, 'tool_result', `${call.name} completed`, {
     toolCallId: call.id,
     result: eventResult
   });
@@ -519,6 +529,9 @@ export const recordToolResult = async (
   state.turnToolResults[call.id] = {
     name: call.name,
     success: !skipped,
+    // Recorded for every result, including a harness answer: whether a call is citable is the
+    // completion contract's question, and this is only where its bytes were put.
+    ...(recorded?.id ? { eventId: recorded.id } : {}),
     ...(skipped ? { skipped: true } : {}),
     mutating: isMutatingToolCall(call.name, call.arguments),
     // Recorded, not subtracted from `mutating`: the approval card, the checkpoint set and

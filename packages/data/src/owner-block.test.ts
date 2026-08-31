@@ -461,5 +461,24 @@ describe('the owner block', () => {
       'packages/data/src/store.ts',
       'packages/data/src/store/memory.ts'
     ]);
+    /*
+     * And who is SHOWN it, which is the other question and now has more than one answer.
+     *
+     * The block reaches two model windows: the lead's, and - since the specialist gained it - the
+     * read-only mission's. Both are fed from the single read above, in `window.ts`, once per turn;
+     * `delegate.ts` takes the rendered message out of the lead's window rather than reading the
+     * store again, so one turn has one text even if the owner saves Settings while it is in flight.
+     * That is why this list has three files and the one above it still has one worker file: a
+     * fourth window here, or a `readOwnerBlock` appearing beside these names, is a second copy of
+     * the owner's own words with its own lifetime, and this goes red naming the file.
+     *
+     * All three names, because they are three ways to reach the same message and matching only one
+     * of them would have missed `window.ts` - which installs the block and never writes the marker.
+     */
+    expect(await mentions(/\b(OWNER_BLOCK_MARKER|ensureOwnerBlock|ownerBlockMessage)\b/)).toEqual([
+      'apps/worker/src/context.ts',
+      'apps/worker/src/delegate.ts',
+      'apps/worker/src/window.ts'
+    ]);
   });
 });

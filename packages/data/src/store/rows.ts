@@ -394,6 +394,7 @@ export const mapMemoryItem = (row: Record<string, unknown>): MemoryItemRecord =>
   // Three-valued on purpose: `null` is an episode written before the column existed, and means
   // nobody recorded whether that turn read somebody else's words. Never collapsed to `false`.
   tainted: row.tainted === null || row.tainted === undefined ? null : Boolean(row.tainted),
+  taintOrigin: optionalText(row.taint_origin),
   salience: Number(row.salience),
   tokensEst: Number(row.tokens_est),
   indexed: Boolean(row.indexed),

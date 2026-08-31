@@ -288,12 +288,16 @@ ${text}`
 /**
  * Installs the owner's block as exactly one message directly behind the contract, or removes it.
  *
- * Resident rather than retrieved, and that distinction is the whole feature. The owner-tier rows
- * beside it compete for room in `recallMemories` against every workspace row that happens to match
- * the request: measured against the production ranker, sixteen owner rows survive fourteen matching
- * workspace rows, lose two at eighteen and all sixteen at thirty-two - and nothing caps the number
- * of workspace rows an agent may write. A fact about a person cannot be retrieved by relevance to a
- * request that never mentions the person, so nothing here ranks it.
+ * Resident rather than retrieved, and that distinction is the whole feature. A fact about a person
+ * cannot be retrieved by relevance to a request that never mentions the person, so nothing here
+ * ranks it: it is installed by position, not by score.
+ *
+ * The measurement that says so was taken on the tier beside it, which was ranked. Sixteen owner-tier
+ * rows put through `recallMemories` at the production options survive fourteen matching workspace
+ * rows, lose two at eighteen and all sixteen at thirty-two - and nothing caps how many workspace
+ * rows an agent may write. That is now a reserve rather than a race (`window.ts`, where the owner
+ * tier takes its own storage bound out of the shared budget), and this block still never enters the
+ * pool at all: one text is not sixteen rows, and there is no request it could be ranked against.
  *
  * Written over where it already sits, for the reason the curated block above it is: an unchanged
  * block then leaves the window byte-identical rather than merely equal. Splicing it out and back in

@@ -1041,3 +1041,135 @@ describe('which brief the window reads', () => {
     expect(shape(state.messages)).not.toContain('brief');
   });
 });
+
+/**
+ * The reserved share, and it is the difference between a label and a promise.
+ *
+ * Settings prints an owner-tier row as "About you, everywhere" (`apps/web/src/settings-facts.ts`).
+ * Migration 70 made the first half of that true - the row leaves the workspace it was typed in and
+ * survives its deletion - and the second half was still false, because the row then had to win a
+ * relevance contest against every workspace row that happened to share a word with the request. It
+ * never did. A fact about a person cannot be retrieved by relevance to a request that never
+ * mentions the person, and nothing caps how many workspace rows an agent may write.
+ *
+ * The cost is measured here rather than asserted: the same fixture is rendered with and without the
+ * owner rows present, so what the reserve displaces is a subtraction the case performs, not a claim
+ * its comment makes. And the two totals are pinned at the literal numbers the block cost before -
+ * thirty-two items and 16,000 characters - because reading them from `window.ts`'s own constants
+ * would pass unchanged on the day somebody raised them, which is exactly the regression "adds no
+ * resident bytes" is a claim about.
+ */
+describe('the owner tier inside the reviewed block', () => {
+  const goal = 'fix the flaky importer retry in the ingest pipeline';
+  /** Sentences with nothing in them the request could match, which is what a person-fact is. */
+  const ownerRows = (count: number): WorkspaceMemoryRecord[] =>
+    Array.from({ length: count }, (_, index) =>
+      ownerMemory(`owner-${index}`, `You are the lead; do not stop to ask (${index}).`)
+    );
+  /** And rows that match it on five of its six terms, which is what a workspace row looks like. */
+  const workspaceRows = (count: number): WorkspaceMemoryRecord[] =>
+    Array.from({ length: count }, (_, index) =>
+      memory(
+        `ws-${index}`,
+        'workspace',
+        `The flaky importer retry in the ingest pipeline is fixed by step ${index}.`
+      )
+    );
+
+  const rendered = async (
+    owner: number,
+    workspace: number
+  ): Promise<{ owner: number; workspace: number; characters: number }> => {
+    const probed = probe();
+    probed.memories = [...ownerRows(owner), ...workspaceRows(workspace)];
+    const state = freshState();
+    await assemblePreamble(probed.deps, { ...preamble, state, goal });
+    const block =
+      state.messages.find((message) => message.content.startsWith(KNOWLEDGE_MARKER))?.content ?? '';
+    const rows = block.split('\n').filter((line) => line.startsWith('- '));
+    return {
+      owner: rows.filter((line) => line.includes('do not stop to ask')).length,
+      workspace: rows.filter((line) => line.includes('is fixed by step')).length,
+      characters: rows.reduce((total, line) => total + line.length - 2, 0)
+    };
+  };
+
+  /**
+   * Sixteen rows against sixty that match, which is the shape the tier was losing in.
+   *
+   * On the build before this one every one of the sixteen was gone: the ranker scores a matching
+   * workspace row at about 16.6 and a person-fact at about 2.2, the request has thirty-two seats,
+   * and sixty rows were queuing for them. This case therefore fails on that build rather than
+   * merely reading differently.
+   */
+  it('keeps every owner row against sixty workspace rows that match the request', async () => {
+    expect(await rendered(16, 60)).toMatchObject({ owner: 16, workspace: 16 });
+  });
+
+  /**
+   * What it costs, subtracted rather than asserted.
+   *
+   * The same sixty workspace rows are rendered with the owner tier empty and with it full, and the
+   * difference is the price: sixteen matching workspace rows displaced, every one of them ranked
+   * below sixteen others that still arrive, and every one still reachable in one call through
+   * `memory(action=list)`. The rows that took their place have no second door at all.
+   */
+  it('displaces exactly the sixteen workspace rows the reserve is the size of', async () => {
+    const empty = await rendered(0, 60);
+    const full = await rendered(16, 60);
+    expect(empty).toMatchObject({ owner: 0, workspace: 32 });
+    expect(empty.workspace - full.workspace).toBe(16);
+    expect(full.owner + full.workspace).toBe(empty.owner + empty.workspace);
+  });
+
+  /**
+   * A reserve, not an allocation: three rows take three seats and hand back the other thirteen.
+   *
+   * This is the case a fixed split passes and a reserve has to earn. The measured content of this
+   * tier is single figures (`OWNER_MEMORY_MAX_ROWS` carries the reading it came from), so the state
+   * this case describes is the ordinary one and the case above it is the bound.
+   */
+  it('costs the workspace tier nothing it does not use', async () => {
+    expect(await rendered(3, 60)).toMatchObject({ owner: 3, workspace: 29 });
+    expect(await rendered(0, 60)).toMatchObject({ owner: 0, workspace: 32 });
+  });
+
+  /**
+   * And the block is no larger than it was, on both axes it is bounded on.
+   *
+   * The reserve comes out of the shared budget rather than beside it, so a full owner tier and a
+   * full workspace tier still render inside the thirty-two items and 16,000 characters the one
+   * pool spent. Resident bytes are the axis this product is measured on; a fix that bought reach
+   * by growing the prompt would be a trade nobody agreed to.
+   */
+  it('adds no resident bytes, with both tiers over their own budgets', async () => {
+    const probed = probe();
+    probed.memories = [
+      ...Array.from({ length: 16 }, (_, index) =>
+        ownerMemory(`owner-${index}`, `${'o'.repeat(374)}${index % 10}`)
+      ),
+      ...Array.from({ length: 40 }, (_, index) =>
+        memory(
+          `ws-${index}`,
+          'workspace',
+          `flaky importer retry ingest pipeline ${'w'.repeat(663)}${index % 10}`
+        )
+      )
+    ];
+    const state = freshState();
+    await assemblePreamble(probed.deps, { ...preamble, state, goal });
+    const block =
+      state.messages.find((message) => message.content.startsWith(KNOWLEDGE_MARKER))?.content ?? '';
+    // The two fixtures only, because the same block also carries the skill index and the built-in
+    // catalogue, and those are not what either memory budget is spent on.
+    const rows = block
+      .split('\n')
+      .filter((line) => line.startsWith('- o') || line.startsWith('- flaky importer retry'));
+    expect(rows.filter((line) => line.startsWith('- o')).length).toBe(16);
+    expect(rows.length).toBeLessThanOrEqual(32);
+    expect(rows.reduce((total, line) => total + line.length - 2, 0)).toBeLessThanOrEqual(16_000);
+    // And the character budget is the one that binds here, not the item count - so this case is
+    // measuring the axis it names rather than passing on the other one.
+    expect(rows.length).toBeLessThan(32);
+  });
+});

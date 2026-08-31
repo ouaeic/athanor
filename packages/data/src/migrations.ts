@@ -2739,5 +2739,67 @@ export const migrations = [
                  AND ciphertext->>'aad' = 'owner-block:' || user_id::text)
       );
     `
+  },
+  {
+    version: 74,
+    name: 'a_memory_can_reach_the_call_that_justified_it',
+    // The one edge this store wrote nowhere: from a remembered turn to the tool call that proved it.
+    //
+    // `mem.evidence` already reaches the verbatim tier - the owner's request and the agent's
+    // summary, chunked into `mem.source` - and that tier is under 1% of what a trajectory is made
+    // of. The other 80% is tool results, and they are already retained untruncated in
+    // `task_events`, written by `recordToolResult` with the raw object rather than the model's
+    // bounded copy. Nothing could read them: no agent tool reaches `task_events` at all.
+    //
+    // The completion contract already produces the exact pointer that fixes this. A `finish`
+    // cites the `toolCallId` of the call that justifies each claim; `memory-capture.ts` mapped that
+    // evidence to `item.claim` and dropped the id one line before storage. This table keeps it.
+    //
+    // THE TRAP THIS DELIBERATELY REFUSES: not indexing the 80%. Nothing here is searchable and
+    // nothing here holds a second copy of a result. `mem.lexeme_df` and `mem.corpus_stats` are
+    // untouched, so the document-frequency statistics the verbatim tier's ranking rests on do not
+    // move by one row. This is a pointer, and a pointer is the whole design: two ids and an edge.
+    //
+    // `event_id` rather than a scan. The alternative was to find the cited call by walking that
+    // conversation's `tool_result` rows and decrypting each payload until one carried the id -
+    // which is a read whose cost grows with the conversation and whose bound would have been a
+    // number of rows to give up after. A foreign key is exact, is one index lookup, and cannot
+    // dangle: the row goes when the event goes, and both go when the task goes. `tool_call_id` is
+    // kept beside it because that is the id the model cited and the id a proof can compare against
+    // the stored payload - the event id is where the harness put it, not what was cited.
+    //
+    // Both cascades are already the retention story this schema tells. `mem.item(id)` takes the
+    // citation out with the memory; `task_events(id)` takes it out with the conversation, and
+    // migration 57 made `mem.item.task_id` cascade from `tasks` so the memory goes at the same
+    // moment. Deleting the conversation deletes the reach, which is what makes "reversible" true.
+    //
+    // The index on `event_id` is the FK's own: PostgreSQL indexes the referenced side and not the
+    // referencing one, so without it every `task_events` delete - the delta prune runs on a
+    // schedule - sequentially scans this table. It is not there for a read; every read is a prefix
+    // of the primary key.
+    //
+    // `taint_origin` is the second half of `mem.item.tainted`, which says WHETHER the turn read
+    // somebody else's words and could not say from where. The reach needs the where: material
+    // pulled back out of a tainted turn is handed to the model fenced as untrusted and raises the
+    // taint again, and the line the owner reads on their timeline names the source. Without this
+    // the line could only say "somewhere", and a repeat origin across tasks - buying the ranking
+    // for a query the owner will plausibly run - is the residual attack that record exists to make
+    // visible. Nullable, because a turn that read nothing from outside has no origin to record and
+    // because every row written before this migration has none; the readers treat an absent origin
+    // on a row that is not known-untainted as untrusted, exactly as they treat `tainted IS NULL`.
+    //
+    // Nothing here rewrites a row: one new table with inline constraints, one index on it, and one
+    // nullable column with no default. No entry in `REWRITING_MIGRATIONS`.
+    sql: `
+      CREATE TABLE IF NOT EXISTS mem.cited_call (
+        item_id UUID NOT NULL REFERENCES mem.item(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL,
+        event_id UUID NOT NULL REFERENCES task_events(id) ON DELETE CASCADE,
+        PRIMARY KEY (item_id, tool_call_id)
+      );
+      CREATE INDEX IF NOT EXISTS mem_cited_call_event_idx ON mem.cited_call (event_id);
+
+      ALTER TABLE mem.item ADD COLUMN IF NOT EXISTS taint_origin TEXT;
+    `
   }
 ] as const;

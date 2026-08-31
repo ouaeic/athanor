@@ -120,8 +120,32 @@ export interface AgentState {
        * change, is answered from that run instead of running the build or the suite a second time.
        */
       command?: { fingerprint: string; exitCode: number };
+      /**
+       * The timeline row this call's raw, untruncated result was written to.
+       *
+       * The result the model is holding has been bounded, fenced and possibly spilled; the row
+       * named here is the object the tool actually returned. It is kept so that a `finish` citing
+       * this call can leave behind a pointer a later turn can follow - `mem.cited_call` stores this
+       * id, and the reach dereferences it by primary key rather than by walking a conversation's
+       * events and decrypting each one until a payload matches.
+       *
+       * Absent on the paths that never wrote a result row: a call the harness answered itself, one
+       * that threw, and the two failure paths in `agent.ts` that record only a name.
+       */
+      eventId?: string;
     }
   >;
+  /**
+   * Reaches into stored evidence this turn has already spent.
+   *
+   * Per turn, like every counter around it, and for the reason the reach is bounded at all: it
+   * returns material the compaction bound exists to keep OUT of the window. One reach is capped at
+   * `MEMORY_REACH_MAX_CHARS` and a turn may spend `MEMORY_REACH_MAX_PER_TURN` of them, so the most
+   * a turn can pull back out of the store is exactly `RECENT_TOOL_OUTPUT_CHARS` - what a single
+   * live tool result is allowed to occupy. Replaying stored material must not cost more than
+   * producing it did.
+   */
+  memoryReaches?: number;
   /**
    * Consecutive rejected `finish` calls this turn. Persisted rather than kept in the loop frame so a
    * pause, an approval, or a worker handover cannot reset it - otherwise a model that cannot ground

@@ -90,6 +90,28 @@ export const captureMemory = async (
       // failures.
       outcome: completion.interrupted ? 'interrupted' : 'ok',
       verifiedClaims: completion.verification.evidence.map((item) => item.claim),
+      /*
+       * The pointer the completion contract already produced, kept instead of dropped.
+       *
+       * `completion.ts` makes the agent cite the `toolCallId` of the call that justifies each
+       * claim, and `tool-recording.ts` writes that call's raw untruncated result to the timeline.
+       * Both ends of the edge existed; the line above mapped the evidence to `item.claim` and the
+       * id went no further. So athanor computed, on every verified turn, exactly the pointer into
+       * the eighty per cent of a trajectory that is tool output - the part that is not re-derivable
+       * and is worth keeping - and threw it away at the memory boundary.
+       *
+       * Resolved through `state.turnToolResults`, which is the harness's own ledger of what it ran
+       * this turn, and that is the bound rather than a check bolted on afterwards: an id the model
+       * invented resolves to nothing here and is dropped, so nothing downstream has to ask whether
+       * a stored citation was real. Costs zero resident bytes - the episode body is unchanged, and
+       * what is stored is two ids in a table nothing renders into a window.
+       */
+      citedCalls: completion.verification.evidence.flatMap((item) => {
+        const eventId = item.toolCallId
+          ? state.turnToolResults?.[item.toolCallId]?.eventId
+          : undefined;
+        return eventId ? [{ toolCallId: item.toolCallId!, eventId }] : [];
+      }),
       remainingRisks: completion.verification.remainingRisks,
       artifacts: touched,
       // What the harness itself verified about this workspace, which is the half of memory that
@@ -106,6 +128,19 @@ export const captureMemory = async (
         : {}),
       // A turn that read somebody else's words records what happened but settles nothing.
       tainted: Boolean(state.taint),
+      /*
+       * And now it records WHAT it read, not only that it read something.
+       *
+       * The boolean is enough for the gates that run at capture time - they refuse and forget. It
+       * is not enough for the reach, which hands stored material from this turn back to a later
+       * one: that material has to arrive fenced and carrying an origin, and the origin has to name
+       * a real source or the owner's timeline can only ever say "somewhere".
+       *
+       * The newest source rather than the first, which is the same choice `raiseTaint` makes when
+       * it keeps `slice(-8)`: the arrival is the one that matters, and the openers of a research
+       * turn are the eight that do not.
+       */
+      ...(state.taint?.sources.at(-1) ? { taintOrigin: state.taint.sources.at(-1)! } : {}),
       occurredAt
     });
     /*
@@ -114,8 +149,20 @@ export const captureMemory = async (
      * The cap itself is right and is unchanged: eight rows of six kilobytes per part, keeping the
      * head. What was wrong is that a 400 KB brief was stored as its first 48 KB with no event of
      * any kind, so the owner could later search memory for a constraint they had definitely
-     * written and be told, truthfully and uselessly, that nothing matched. Over 3,950 real turns
-     * this fires on 197 of them (5.0%) and accounts for 57.7% of everything the owner typed.
+     * written and be told, truthfully and uselessly, that nothing matched.
+     *
+     * HOW OFTEN IT FIRES ON THIS MACHINE: never, so far. Measured over the owner's real corpus -
+     * 675 turns, 233,064 characters, 11 projects, 49 active days, filtered as `type: user`,
+     * `userType: external`, not a sidechain, not a tool result, not `isMeta` with a
+     * `sourceToolUseID`, no slash-command or compaction-continuation block, deduped by uuid, with
+     * `origin.kind: "task-notification"` stripped - the largest single turn is 14,625 characters
+     * against a cap of 48,000 bytes per part. It fires 0 times and 100.0% of what the owner typed
+     * reaches a source row. The 197-of-3,950 and 57.7% this comment used to state were measured on
+     * a corpus that counted machine-written text as the owner's, and are void.
+     *
+     * The event stays, and so does the cap. A number that has never fired is not a number that
+     * cannot: one 400 KB paste is one turn away, and the whole point of the line below is that the
+     * owner finds out on the day it happens rather than a month later from a search that misses.
      *
      * A status rather than a warning: the turn WAS recorded, and the sentence above it - "this
      * turn was not recorded in memory" - is the one that must stay reserved for when it was not.

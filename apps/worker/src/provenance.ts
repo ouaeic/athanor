@@ -100,18 +100,35 @@ const ORIGIN_PHRASES: readonly string[] = [
   'a downloaded file',
   'downloaded file',
   'connected service',
+  /*
+   * What a reach into stored evidence says when the turn it is replaying recorded no origin.
+   *
+   * Every episode written before migration 74 is in that position, and so is any later one whose
+   * taint was raised with an empty source list. The reach still fences the material and still
+   * raises the taint - `mem.item.tainted` is what decides that, and it is three-valued so an
+   * unknown reads as untainted-unknown and fences - and this is the phrase the owner's timeline
+   * shows when the store cannot say more than that.
+   */
+  'a stored tool result',
   ...Object.values(connectorContentOrigins)
 ];
 
 /**
- * One origin off a specialist's report, kept only as far as it reads like something this build says.
+ * One origin arriving as a value, kept only as far as it reads like something this build says.
  *
  * A label is a phrase, optionally followed by a comma-separated list of tokens - `web page a.test,
  * b.test`, `downloaded file workspace/downloads/x.pdf`. Anything after the phrase that is not a
  * token is dropped and the phrase is kept, because the phrase is still true: a specialist did read
  * a web page, and the taint has to be raised whatever the rest of the string turned out to be.
+ *
+ * Two callers now, and the second is why this is no longer named for the first. A specialist's
+ * report hands back the origins its own reads produced; a reach into stored evidence hands back
+ * the origin the turn it is replaying recorded at the time. Both are strings this file did not
+ * write as literals, both have to be checked against the closed list before being quoted in the
+ * harness's voice, and a second copy of that check for the second caller is the drift this
+ * function exists to prevent.
  */
-const specialistOrigin = (value: string): string => {
+const harnessOrigin = (value: string): string => {
   const label = boundedOrigin(value);
   const phrase = ORIGIN_PHRASES.find(
     (candidate) => label === candidate || label.startsWith(`${candidate} `)
@@ -306,7 +323,29 @@ const unboundedOriginOfResult = (call: ModelToolCall, result: unknown): string |
     // what the turn is allowed to do next.
     const named = textValue(record.origin);
     if (CONNECTOR_ORIGINS.has(named)) return named;
-    return originDetail(named) || originDetail(textValue(record.provenance)) || 'connected service';
+    /*
+     * `harnessOrigin` rather than `originDetail`, which accepted a bare token and nothing else.
+     *
+     * Every phrase this build writes carries a space - `web page a.test`, `a downloaded file` -
+     * so a result labelled with one was falling through to `connected service` and the owner's
+     * timeline named the wrong thing. It did not matter while the only producers of this shape
+     * were connectors, whose kinds are single tokens covered by the line above; it matters now
+     * that a reach into stored evidence hands back the origin the original read recorded, which
+     * is exactly one of those phrases. Strictly wider than what it replaces: `harnessOrigin`
+     * falls through to `originDetail` for anything the closed list does not recognise.
+     *
+     * What the widening costs, said rather than left to be discovered. This branch also reads
+     * `origin` off a connector or MCP result, which the far end writes - so a remote server can now
+     * get the timeline to say `web page a.test` where it used to say `connected service`. That is
+     * the same permission the delegate arm below has always given a specialist's report, bounded by
+     * the same closed list and the same token shape: the phrase is one of this file's own, and
+     * anything after it must be a comma-separated list of tokens or the phrase alone is kept. A
+     * label chosen outside this build still cannot become a second sentence, which is the property
+     * the check exists for. The taint is raised either way; only the wording moves.
+     */
+    return (
+      harnessOrigin(named) || originDetail(textValue(record.provenance)) || 'connected service'
+    );
   }
   switch (call.name) {
     case 'web_search':
@@ -348,7 +387,7 @@ const unboundedOriginOfResult = (call: ModelToolCall, result: unknown): string |
       // failed that check would have left an empty list, a falsy answer, and a turn holding a
       // hostile page with the floor back down. A source nobody can name is still a source.
       if (!reported.length) return null;
-      const sources = [...new Set(reported.map(specialistOrigin))].filter(Boolean);
+      const sources = [...new Set(reported.map(harnessOrigin))].filter(Boolean);
       return sources.length
         ? `delegated specialist (${sources.slice(0, 3).join(', ')})`
         : 'delegated specialist';

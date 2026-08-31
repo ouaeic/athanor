@@ -5175,8 +5175,9 @@ describe('tiered agent memory', () => {
     });
   });
 
-  it('records provenance from a curated item back to the verbatim rows behind it', async () => {
-    const source = await addSource('owner: I always deploy with pnpm, never npm.');
+  it('hands back the words behind a citation, not only the pointer', async () => {
+    const body = 'owner: I always deploy with pnpm, never npm.';
+    const source = await addSource(body);
     const fact = await addItem(
       'fact',
       {
@@ -5190,9 +5191,73 @@ describe('tiered agent memory', () => {
     await expect(
       store.attachMemoryEvidence(fact.id, [{ sourceId: source.id, span: [7, 40] }])
     ).resolves.toBe(1);
-    await expect(store.listMemoryEvidence(fact.id)).resolves.toEqual([
-      { sourceId: source.id, span: '[7,40)', occurredAt: now.toISOString() }
-    ]);
+    const [evidence] = await store.listMemoryEvidence(fact.id);
+    expect(evidence).toMatchObject({
+      sourceId: source.id,
+      span: '[7,40)',
+      occurredAt: now.toISOString(),
+      channel: 'terminal',
+      chunkIndex: 0
+    });
+    /*
+     * The whole of what this method was missing, and the reason it had no caller anywhere.
+     *
+     * It selected the id, the range and the instant and NOT `body_ciphertext`, so athanor could
+     * name the exact character range of the exact stored turn behind a remembered fact and hand
+     * back a reference nothing could follow. The row now carries the sealed body, and the span
+     * addresses the plaintext the key holder opens - which is why the cut is asserted here on the
+     * opened text rather than expected from the store, which cannot read it.
+     */
+    expect(opened(evidence!.bodyCiphertext)).toBe(body);
+    expect(opened(evidence!.bodyCiphertext).slice(7, 40)).toBe('I always deploy with pnpm, never ');
+  });
+
+  it('cites the tool call behind a memory, and refuses to fetch anything else with it', async () => {
+    const task = await store.createTask({
+      userId,
+      workspaceId,
+      titleCiphertext: sealed('deploy'),
+      nameIndex: { nameTokens: '', openingTokens: '' },
+      modelId: 'vendor/model',
+      privacyRoute: 'provider_zdr',
+      maxComputeCredits: 1,
+      promptCiphertext: sealed('deploy the gateway')
+    });
+    const result = await store.appendTaskEvent({
+      taskId: task.id,
+      kind: 'tool_result',
+      summary: 'Encrypted tool result event',
+      payloadCiphertext: sealed('{"toolCallId":"call-1","result":"exit 0"}')
+    });
+    // A second row of a different kind, filed against the same conversation. The reach may never
+    // return one of these, whatever a citation says, and the assertion below is what says so.
+    const warning = await store.appendTaskEvent({
+      taskId: task.id,
+      kind: 'warning',
+      summary: 'Encrypted warning event',
+      payloadCiphertext: sealed('{"toolCallId":"call-2","result":"a hostile page"}')
+    });
+    const episode = await addItem(
+      'episode',
+      { body: 'Deployed the gateway.' },
+      { taskId: task.id }
+    );
+
+    await expect(
+      store.attachMemoryCitedCalls(episode.id, [
+        { toolCallId: 'call-1', eventId: result.id },
+        { toolCallId: 'call-2', eventId: warning.id }
+      ])
+    ).resolves.toBe(2);
+    const cited = await store.listMemoryCitedCalls(episode.id);
+    expect(cited.map((call) => call.toolCallId)).toEqual(['call-1']);
+    expect(cited[0]).toMatchObject({ eventId: result.id, taskId: task.id });
+    expect(opened(cited[0]!.payloadCiphertext)).toContain('exit 0');
+
+    // Deleting the conversation takes the pointer with it, which is what makes "reversible" true
+    // of the reach as well as of the memory: the row cannot outlive the result it names.
+    await store.deleteTask(userId, task.id);
+    await expect(store.listMemoryCitedCalls(episode.id)).resolves.toEqual([]);
   });
 
   it('consolidates by demoting and trimming, never by dropping cited verbatim text', async () => {

@@ -1,0 +1,56 @@
+{
+  "$stamp": {
+    "acceptedAt": "2026-08-31T18:19:26.264Z",
+    "corpus": {
+      "turns": 681,
+      "characters": 234835,
+      "projects": 11,
+      "days": 49,
+      "conversations": 41
+    },
+    "digest": "e5617b0e90d2",
+    "probes": 146
+  },
+  "shipped": {
+    "n": 146,
+    "reachedAt1": 81,
+    "reachedAt2": 37,
+    "reachedViaSearch": 126,
+    "verbatimAt1": 74
+  },
+  "no-citation": {
+    "n": 146,
+    "reachedAt1": 0,
+    "reachedAt2": 0,
+    "reachedViaSearch": 0,
+    "verbatimAt1": 89
+  },
+  "pointer-only": {
+    "n": 146,
+    "reachedAt1": 0,
+    "reachedAt2": 0,
+    "reachedViaSearch": 0,
+    "verbatimAt1": 0
+  },
+  "span-exact": {
+    "n": 146,
+    "reachedAt1": 82,
+    "reachedAt2": 37,
+    "reachedViaSearch": 126,
+    "verbatimAt1": 70
+  },
+  "span-shifted": {
+    "n": 146,
+    "reachedAt1": 81,
+    "reachedAt2": 37,
+    "reachedViaSearch": 126,
+    "verbatimAt1": 0
+  },
+  "cite-all": {
+    "n": 146,
+    "reachedAt1": 32,
+    "reachedAt2": 15,
+    "reachedViaSearch": 49,
+    "verbatimAt1": 12
+  }
+}

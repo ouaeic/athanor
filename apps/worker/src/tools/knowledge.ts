@@ -20,7 +20,7 @@ import {
   skillDocument,
   textValue
 } from '../values.js';
-import { recallMemory, searchMemorySessions } from '../memory-runtime.js';
+import { reachMemoryEvidence, recallMemory, searchMemorySessions } from '../memory-runtime.js';
 import { builtinSkillLibrary, findSkillByName, openSkill, skillCatalogEntries } from '../skills.js';
 import { type ToolContext } from '../tool-dispatch.js';
 import { finiteNumber } from './numbers.js';
@@ -39,6 +39,58 @@ export async function executeKnowledgeTool(
   const { task, key, state } = context;
   switch (call.name) {
     case 'session_search': {
+      /*
+       * The arm this tool's own description has always promised: "inspect matching messages around
+       * a result".
+       *
+       * Every id in this system was write-only. `session_search` returned a `mem.source` id no tool
+       * accepted; `memory_recall` and the memory pack print `mem.item` ids no tool accepted; and a
+       * `finish` cites the `toolCallId` whose raw result the harness stores and nothing could read.
+       * A pointer nobody can dereference is the defect, and this is the one call that dereferences
+       * all three - `expand`, in the field's words, over edges athanor already wrote.
+       *
+       * It is here rather than in a tool of its own on purpose. A new tool is resident bytes in
+       * every request and a second concept for the model to choose between; this is the same
+       * question the arm above answers - what did we say and do about this - asked about one
+       * result instead of about a corpus. Two ways to reach past history is what this repository
+       * deletes.
+       */
+      const reachId = textValue(call.arguments.id);
+      if (reachId) {
+        /*
+         * The slot is CLAIMED before the await, and given back only if the reach refused.
+         *
+         * `session_search` is in `PARALLEL_SAFE_TOOLS`, so up to `MAX_PARALLEL_TOOL_CALLS` of these
+         * are in flight at once - and a budget read at the start of each call and written at the
+         * end of each is a budget four siblings all pass at the same value. Starting from three
+         * spent, a batch of four would have returned seven reaches against a ceiling of four:
+         * 42,000 characters where the bound says 24,000. The read and the write here are two
+         * adjacent synchronous statements, so no sibling can interleave between them and each one
+         * takes a distinct slot however the batch is ordered.
+         *
+         * The refund is what keeps the other half true: the budget bounds characters put back into
+         * the window, a refusal puts none there, and spending a slot on a mistyped id would let one
+         * bad argument cost the turn a reach it never got. Spamming refusals is not free either -
+         * each one is a step, and the step budget is what bounds that.
+         */
+        const spent = state.memoryReaches ?? 0;
+        state.memoryReaches = spent + 1;
+        try {
+          return await reachMemoryEvidence({
+            store: context.store,
+            workspaceId: task.workspaceId,
+            dataKey: key,
+            id: reachId,
+            // The window itself is the bound on which ids may be reached, so it is passed rather
+            // than a ledger of what was returned: see `idReturnedInWindow`.
+            messages: state.messages,
+            spent
+          });
+        } catch (error) {
+          state.memoryReaches = Math.max(0, (state.memoryReaches ?? 1) - 1);
+          throw error;
+        }
+      }
       /*
        * The index, not a scan.
        *

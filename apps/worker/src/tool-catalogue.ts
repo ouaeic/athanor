@@ -908,17 +908,46 @@ export const agentTools: ModelTool[] = [
   },
   {
     name: 'session_search',
+    /*
+     * The second sentence is the arm, and it is the first time this description has been true.
+     *
+     * It used to promise "then optionally inspect matching messages around a result" while every
+     * id the tool returned was accepted by nothing - the same shape as the "or browse" claim two
+     * fields below, which ATH-165 removed. The clause was already paid for on the wire; what it
+     * cost to make it true is the sentence naming what `id` takes and what comes back, because
+     * neither is discoverable without spending a billed call to find out.
+     *
+     * It names WHICH id, and that is 32 of the bytes rather than a flourish. A match carries two -
+     * its own row id, which reaches that turn's words, and the `episodeId` of the memory the turn
+     * was captured into, which is the only one that reaches the tool results, because
+     * `mem.cited_call` hangs off the episode. Measured over 146 probes whose answer is only in a
+     * tool result (`docs/design/reach/RIG.md`, another lane's rig): the search locates the right
+     * turn on 100.0% of them, and reaching from the row id answers 25.3% against 86.3% from the
+     * episode id. A sentence that left the model to guess between them would have been paying for
+     * the whole arm and then losing sixty points of it at the last step.
+     */
     description:
-      'Search the user’s encrypted history of past conversations with you, then optionally inspect matching messages around a result. Use for prior decisions, facts, or work instead of guessing; use document_search for files on this computer and use web_search for anything on the internet.',
+      'Search the user’s encrypted history of past conversations with you, then reach into a result: set id to a match’s own id for the whole stored turn behind it, or to its episodeId - or an id from memory_recall or the memory pack - for the raw output of the tool calls that work cited. Use for prior decisions, facts, or work instead of guessing; use document_search for files on this computer and use web_search for anything on the internet.',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['query'],
+      /*
+       * No `required`, because either field is now enough on its own and `['query']` would be the
+       * same kind of false statement the description used to make. A call carrying neither is
+       * still refused - by `searchMemorySessions`, in words, rather than by a schema.
+       */
       properties: {
         query: { type: 'string' },
+        /*
+         * No prose of its own. What `id` takes and what comes back is two clauses of the sentence
+         * above, and a field description repeating them would pay the wire twice for one fact -
+         * which is the trade `code_search` above already made in the other direction.
+         */
+        id: { type: 'string' },
         // "or browse" advertised a mode that does not exist: `searchMemorySessions` throws
         // `session_search_query_empty` before it looks at `taskId`, so a call carrying a task and
-        // no query is an error and never a listing (ATH-165).
+        // no query is an error and never a listing (ATH-165). Still true of `taskId`, which
+        // narrows a search; `id` above does not search at all, which is why it needs no query.
         taskId: { type: 'string', description: 'Optional task to search.' },
         // The real ceiling, read from the function that enforces it rather than copied beside it.
         // It said 50 and returned 30, which is the worst version of this defect: the model asks

@@ -4568,15 +4568,100 @@ describe('the owner block', () => {
   });
 
   /**
-   * The same sentences, ranked instead of resident - which is what the tier beside it does.
+   * What the placement costs, said as the property that decides the price.
+   *
+   * The block sits inside the leading run of system messages, and the shallowest breakpoint this
+   * file chooses is the ANCHOR at the end of that run. So every mark a request carries sits behind
+   * the block, and one Settings edit means a provider has no boundary at which to serve anything at
+   * all - not the tool catalogue, not the operating contract, not the trajectory.
+   *
+   * Measured on the sixty-step driver in this file's own harness, with the block installed at the
+   * shipped position and one edit landing on each step in turn:
+   *
+   *   window        served/request   ONE EDIT costs      block at the tail instead
+   *   131,072       35,837 tokens    41,212 t.e. mean    0 per edit, +137 per request
+   *   1,000,000     48,046 tokens    55,253 t.e. mean    0 per edit, +137 per request
+   *
+   * ("t.e." is token-equivalents of base input: a prefix that would have been read at 0.1x is
+   * written at 1.25x instead, so an edit costs 1.15x what it invalidated. The block is re-read once
+   * per TURN, at `assemblePreamble`, not once per step - so an edit costs one request, not sixty.
+   * The tail's per-request figure is 0.9x the block's own tokens - 1.0x uncached instead of 0.1x
+   * read - which is 137 at the 605 bytes a real block renders to and 511 at the 2,000-byte bound.)
+   *
+   * So the tail is cheaper only above one edit per 301 requests, or one per 81 with the block at
+   * its bound. The owner's own trajectory runs a median of 20 model requests per turn and a mean of
+   * 56.7 (780 turn boundaries and 44,203 assistant records over 3,149 files in `~/.claude/projects`
+   * under the strict owner filter), so the tail would need Settings edited about every four turns.
+   * The observed rate is nought edits, over a feature that is hours old - which is a weak bound and
+   * is named as one; the strong argument is the other half, that the tail stops being read at the
+   * start of the conversation, which is the thing this block is for.
+   *
+   * The other bought option is priced and refused here too: spending one of the four breakpoint
+   * slots on index 0, so the catalogue and the contract (16,366 tokens) stay servable across an
+   * edit. It halves the edit to 21,211 and costs 2.58 points of served share on EVERY request
+   * (3.63 at 1,000,000, where it costs 2,566 t.e. to save 21,484) - break-even at one edit per 13.5
+   * requests, or 8.4 on the large window. Both alternatives are refused on the same arithmetic, and
+   * this case is what would notice the placement moving.
+   */
+  it('sits ahead of every breakpoint, so one edit re-bills a prefix nothing can then serve', () => {
+    const messages = preambleWindow();
+    ensureOwnerBlock(messages, BLOCK);
+    for (let step = 0; step < 30; step += 1) {
+      messages.push({ role: 'assistant', content: `step ${step}` });
+      messages.push({ role: 'tool', toolCallId: `c${step}`, content: filler(400) });
+    }
+    // The catalogue in front of the messages, which is part of the same cached prefix.
+    const prepared = prepareModelContext(messages, 131_072, 16_384, {
+      precedingTokens: 14_000,
+      reservedTokens: 14_000
+    });
+    const block = prepared.messages.findIndex((message) =>
+      message.content.startsWith(OWNER_BLOCK_MARKER)
+    );
+    const marks = breakpointIndexes(prepared.messages);
+    expect(block).toBe(1);
+    expect(marks.length).toBeGreaterThan(1);
+    expect(Math.min(...marks)).toBeGreaterThan(block);
+
+    // And an edit diverges exactly at the block, with no mark at or before it - which is the whole
+    // of why the price is the whole prefix rather than the bytes that changed.
+    const editedSource = preambleWindow();
+    ensureOwnerBlock(editedSource, `${BLOCK}\n- And one more line.`);
+    editedSource.push(...messages.slice(3));
+    const edited = prepareModelContext(editedSource, 131_072, 16_384, {
+      precedingTokens: 14_000,
+      reservedTokens: 14_000
+    });
+    let common = 0;
+    while (
+      common < prepared.messages.length &&
+      prepared.messages[common]?.content === edited.messages[common]?.content
+    )
+      common += 1;
+    expect(common).toBe(block);
+    expect(marks.filter((mark) => mark < common)).toEqual([]);
+  });
+
+  /**
+   * The same sentences, ranked instead of resident - which is what the tier beside it did.
    *
    * `recallMemories` is the production ranker and these are the production options, taken from
-   * `window.ts`. Sixteen owner rows against thirty-two workspace rows that match the request lose
-   * every one of themselves, because a flat `+1.5` does not compete with `overlap * 2.5` on a row
-   * that shares the request's words - and nothing caps how many workspace rows an agent may write.
+   * `window.ts`. A matching workspace row scores about 16.6 (`overlap 5 * 2.5 + coverage .833 * 4 +
+   * recency .744`) and a person-fact about 2.2 (`recency .744 + 1.5`), so a flat `+1.5` decides
+   * nothing - and nothing caps how many workspace rows an agent may write. Swept at every count
+   * rather than sampled, which is what locates the two ends:
    *
-   * This is the measurement the block exists because of, and it is here so that making the block
-   * ranked makes this case and the one above it contradict each other.
+   *   matching workspace rows   0   14   16   17   18   20   24   32   60
+   *   owner rows surviving     16   16   16   15   14   12    8    0    0
+   *
+   * Erosion begins at the seventeenth and is total at the thirty-second, which is the item cap. The
+   * three assertions below are those two boundaries and the total, so a scoring change that moved
+   * either end fails here rather than reading differently.
+   *
+   * This is the measurement the block exists because of, and it is also the measurement the tier's
+   * reserve was built from: `window.ts` no longer puts the two tiers in one pool, so the sixteen
+   * rows survive there now, and `window.test.ts` holds that. What is asserted here is the RANKER,
+   * unchanged, so that anyone who proposes ranking this block again reads the number first.
    */
   it('would be evicted if it were ranked, which is why it is not', () => {
     const goal = 'fix the flaky importer retry in the ingest pipeline';
@@ -4600,8 +4685,8 @@ describe('the owner block', () => {
         now: new Date('2026-08-01T00:00:00.000Z')
       }).filter((entry) => entry.target === 'user').length;
 
-    expect(surviving(14)).toBe(16);
-    expect(surviving(18)).toBeLessThan(16);
+    expect(surviving(16)).toBe(16);
+    expect(surviving(17)).toBe(15);
     expect(surviving(32)).toBe(0);
     // And it is relevance that does it, not volume: forty rows about something else evict nothing.
     expect(

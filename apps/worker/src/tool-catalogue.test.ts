@@ -328,7 +328,35 @@ describe('the size of the catalogue the model is sent', () => {
     //     the catalogue prefix and 100% of the message prefix on that request; and every deferred
     //     tool keeps its resident index line, because a capability the model cannot discover is a
     //     capability deleted rather than deferred.
-    expect(bytes).toBeLessThan(55_500);
+    //
+    // ---------------------------------------------------------------------------------------
+    //
+    // And once more, for the reach: 55,600 against 55,650, a raise of 160 bytes for
+    // `session_search`'s `id` and the clauses of its description that say what the id takes, which
+    // id to use for which half, and what comes back. The whole entry goes from 574 bytes to 734.
+    //
+    // It is the smallest raise in this comment and it buys the largest tier. The stored tool
+    // results in `task_events` are 80% of what a trajectory is made of, they are already retained
+    // untruncated, and until this argument existed the only readers were the owner's timeline and
+    // the privacy export - no agent tool reached them at all. What is paid for here is not a new
+    // capability bolted on but the dereference of ids this catalogue was ALREADY handing out:
+    // `session_search` returned a result id no tool accepted, and `memory_recall` and the memory
+    // pack print memory ids no tool accepted.
+    //
+    // The clause that promised it was already resident and already paid for - "then optionally
+    // inspect matching messages around a result" - and had been false since it was written, in
+    // exactly the way ATH-165's "or browse" was false. 158 of these 160 bytes are that sentence
+    // being made true; `id` itself is 23 bytes, and dropping `required: ["query"]` gave 21 back.
+    // Thirty-two of the 158 are the clause naming WHICH id: a match carries its own row id, which
+    // reaches that turn's words, and the `episodeId` of the memory it was captured into, which is
+    // the only one that reaches the tool results. Measured over 146 probes whose answer is only in
+    // a tool result, reaching from the first answers 25.3% and from the second 86.3%, so a
+    // sentence that left the model to guess would have paid for the whole arm and lost sixty
+    // points of it at the last step.
+    // The field carries no description of its own, on the same trade `code_search` made above: the
+    // sentence naming it is in the tool description, and a second copy beside the field would pay
+    // the wire twice for one fact.
+    expect(bytes).toBeLessThan(55_650);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
     // union of what twenty-four actions across mail, calendar and repositories accept. Those are
@@ -663,8 +691,13 @@ describe('the wire a box without a browser or a screen is sent', () => {
      * gap to the provisioned wire is still exactly 11,692, because the same 509 bytes landed on
      * both, which is the property that keeps this number honest: it moves for what a bare box
      * gained, never for what a provisioned box was spared.
+     *
+     * And again for the reach, on exactly those terms: `session_search`'s `id` is 160 bytes, a bare
+     * box honours it in full - dereferencing a stored result wants neither a browser nor a screen -
+     * so it is paid for here too. 43,950 against a measured 43,908, up from 43,748. The gap to the
+     * provisioned wire is still exactly 11,692, because the same 160 bytes landed on both.
      */
-    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(43_800);
+    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(43_950);
     // The other direction, and the one that fails silently. A gate wired to nothing returns the
     // unconditional constant on every box; this is the assertion that would go red if it did.
     expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(
@@ -833,7 +866,10 @@ describe('the wire a box is sent about the services it has actually connected', 
      * measurement - not this argument - is what should decide it.
      */
     const mailAndCalendar = compacted(['imap', 'caldav']);
-    expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(54_200);
+    // Raised by the same 160 bytes as the two ceilings above and for the same reason: the reach is
+    // on every wire, because a box with a mailbox connected has the same stored results behind its
+    // memories as one without. 54,307 measured, up from 54,147.
+    expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(54_350);
     // The other direction, and the one that fails silently. A gate wired to nothing returns the
     // unconditional catalogue on every box; this is the assertion that would go red if it did.
     expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(
@@ -1089,12 +1125,33 @@ describe('the catalogue as the model reads it', () => {
     ): { additionalProperties?: unknown; properties: Record<string, Record<string, unknown>> } =>
       agentTools.find((tool) => tool.name === name)?.parameters as never;
 
+    const schemaOf = (name: string): Record<string, unknown> =>
+      agentTools.find((tool) => tool.name === name)?.parameters as never;
+
     const search = schema('session_search');
     expect(search.properties.maxResults?.maximum).toBe(MEMORY_SESSION_SEARCH_MAX_RESULTS);
     // No default here: the number the loop passes when the model omits this lives at the call
     // site, and a third copy could only ever drift away from it.
     expect(search.properties.maxResults).not.toHaveProperty('default');
     expect(String(search.properties.taskId?.description)).not.toMatch(/browse/);
+    /*
+     * The arm the description promises, declared where a model can reach it.
+     *
+     * "then optionally inspect matching messages around a result" was resident, paid for, and
+     * false: `session_search` returned an id and accepted none. The same shape as the "or browse"
+     * claim the line above holds down, and it stood for longer.
+     *
+     * `required` is gone with it. A reach carries an id and no query, so `['query']` would have
+     * been the next version of the same false statement - and a call carrying neither is still
+     * refused, in words, by `searchMemorySessions`.
+     */
+    expect(search.properties).toHaveProperty('id');
+    expect(schemaOf('session_search')).not.toHaveProperty('required');
+    const promise = agentTools.find((tool) => tool.name === 'session_search')?.description ?? '';
+    expect(promise).toContain('set id to');
+    // Which id, not just that there is one: the two a match carries reach different halves.
+    expect(promise).toContain('episodeId');
+    expect(promise).not.toMatch(/optionally inspect/);
 
     const recall = schema('memory_recall');
     expect(recall.properties.maxItems?.maximum).toBe(MEMORY_RECALL_ITEM_CEILING);

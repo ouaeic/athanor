@@ -37,6 +37,7 @@ import {
 import type {
   DataStore,
   MemoryCandidateRecord,
+  MemoryCitedCallRecord,
   MemoryPackRecord,
   MemoryUseOutcome
 } from '@athanor/data';
@@ -465,6 +466,27 @@ export interface MemorySessionTurn {
   readonly channel: string;
   readonly occurredAt: string;
   readonly text: string;
+  /**
+   * The memory this turn was captured into, which is the id a reach has to be given to get at the
+   * tool results that turn cited.
+   *
+   * `id` above is a `mem.source` row and reaching one returns the turn's own words and nothing
+   * else, because `mem.cited_call` hangs off the episode. So a search that found the right
+   * conversation could hand the model an id that reaches half of what is behind it, and no id at
+   * all for the other half - the half that is 80% of the record.
+   *
+   * Measured on the owner's own trajectories over 146 probes whose answer is only in a tool result
+   * (`docs/design/reach/RIG.md`, another lane's rig): `session_search` locates the right stored
+   * turn on 100.0% of them, and reaching from the id it used to return answers 25.3%. Reaching
+   * from this one answers 86.3%, against a hard ceiling of 92.5% set by
+   * `MEMORY_REACH_MAX_CHARS`. One string per match, in a tool result rather than in the resident
+   * catalogue, and no new call, tool or concept: the id is dereferenced by the arm that already
+   * exists under the bound that already exists.
+   *
+   * Absent rather than null when there is none, so a row captured outside `recordTurnEpisode`
+   * costs nothing to report.
+   */
+  readonly episodeId?: string;
 }
 
 export interface MemorySessionMatch extends MemorySessionTurn {
@@ -548,7 +570,10 @@ export const searchMemorySessions = async (
 ): Promise<MemorySessionSearchResult> => {
   const query = input.query.trim();
   if (!query)
-    throw new AthanorError('session_search_query_empty', 'A search needs something to look for');
+    throw new AthanorError(
+      'session_search_query_empty',
+      'A search needs something to look for, or an id to reach into a result already returned.'
+    );
   const limit = clamp(
     input.maxResults,
     MEMORY_SESSION_SEARCH_DEFAULT_RESULTS,
@@ -577,6 +602,7 @@ export const searchMemorySessions = async (
       role: hit.role,
       channel: hit.channel,
       occurredAt: hit.occurredAt,
+      ...(hit.episodeId ? { episodeId: hit.episodeId } : {}),
       text: memoryExcerpt(body, query)
     };
     // Only the leading hits carry their neighbours: each one is a second bounded query, and a page
@@ -597,6 +623,10 @@ export const searchMemorySessions = async (
             role: row.role,
             channel: row.channel,
             occurredAt: row.occurredAt,
+            // Carried on a neighbour exactly as on a hit: the answer is very often in the reply to
+            // what matched, and a context row the model can read but not reach past is the same
+            // half-usable pointer this whole arm exists to stop handing out.
+            ...(row.episodeId ? { episodeId: row.episodeId } : {}),
             text: memoryExcerpt(text, query)
           }
         ];
@@ -620,13 +650,444 @@ export const searchMemorySessions = async (
 };
 
 /* ------------------------------------------------------------------------ *
- * Write path
+ * The width of one stored verbatim row
+ *
+ * Declared here rather than beside the chunker that enforces them, because the reach below derives
+ * its own bound from `MEMORY_SOURCE_CHUNK_BYTES` and a `const` cannot be read above its
+ * declaration. The alternative was a second copy of 6,000 with a comment claiming it matched,
+ * which is the drift this file has already paid for twice.
  * ------------------------------------------------------------------------ */
 
 /** §1.3: one verbatim row per 6 KB of body, well under the tsvector limits. */
 export const MEMORY_SOURCE_CHUNK_BYTES = 6_000;
 /** Bounds the writes a single turn can produce; the transcript itself is retained elsewhere. */
 export const MEMORY_MAX_SOURCE_CHUNKS = 8;
+
+/* ------------------------------------------------------------------------ *
+ * Reaching from a result back to the material it was made from
+ *
+ * The one operation this store wrote every edge for and read none of.
+ *
+ * `mem.evidence` is populated on every turn and its reader had no caller. `session_search` returns
+ * a `mem.source` id no tool accepted. `memory_recall` and the memory pack print `mem.item` ids no
+ * tool accepted. And a `finish` cites the `toolCallId` of the call that justified it, whose raw
+ * untruncated result `tool-recording.ts` writes to `task_events`, which no agent tool could read at
+ * all. Three ids the system hands out and nothing takes back.
+ *
+ * This is that one arm. It takes an id the harness itself printed into this window and returns what
+ * is behind it: the whole verbatim turn a search excerpted, and for a memory, the tool results the
+ * turn cited. It indexes nothing, copies nothing, and adds no tier - `mem.lexeme_df` and
+ * `mem.corpus_stats` do not move by a row, which is what keeps the ranking the verbatim tier's
+ * quality rests on exactly where it was.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * How much one reach may hand back, and how many a turn may make.
+ *
+ * The reach reads material the compaction bound exists to keep out of the window, so an unbounded
+ * one undoes the squeeze rather than complementing it. Both numbers are derived rather than picked:
+ *
+ * - `MEMORY_REACH_MAX_CHARS` is `MEMORY_SOURCE_CHUNK_BYTES`, the most a single stored verbatim row
+ *   can ever hold. So a reach of one turn always comes back whole, and a reach of a tool result -
+ *   which has no such cap in `task_events` - is held to the same width as the tier beside it.
+ * - `MEMORY_REACH_MAX_PER_TURN` is 4 because 4 x 6,000 is `RECENT_TOOL_OUTPUT_CHARS` = 24,000: the
+ *   most a turn may replay out of the store is exactly what ONE live tool result is allowed to
+ *   occupy in the window. Reading a stored answer must not cost more than producing it did. That
+ *   arithmetic is pinned in `memory-runtime.test.ts`, which is the one place both constants are in
+ *   scope - stated here and imported would be a cycle through `context.ts`.
+ *
+ * The two bounds are not interchangeable and both are load-bearing. Without the per-call cap one
+ * reach of a 2 MB `file_read` result is the whole window; without the per-turn cap a search
+ * returning thirty ids is thirty reaches, and every one of them is in the window at once.
+ */
+export const MEMORY_REACH_MAX_CHARS = MEMORY_SOURCE_CHUNK_BYTES;
+export const MEMORY_REACH_MAX_PER_TURN = 4;
+/**
+ * Pieces one reach may name, whatever the character budget allows.
+ *
+ * An episode can carry sixteen evidence rows and eight cited calls, and twenty-four fragments of a
+ * hundred characters each is a list rather than an answer. Set to the number of claims an episode
+ * body renders, `episodeContent`'s own `slice(0, 8)`, so the reach shows what the memory shows.
+ */
+export const MEMORY_REACH_MAX_PIECES = 8;
+/**
+ * The smallest piece worth cutting one down to.
+ *
+ * At the character bound a piece is either cut or withheld, and a forty-character tail of a command
+ * output is not evidence of anything - it is a fragment the model will cite as though it were. Both
+ * outcomes are reported; this only decides which one happens.
+ */
+const MEMORY_REACH_MIN_PIECE_CHARS = 400;
+
+export type MemoryReachStore = Pick<
+  DataStore,
+  'listMemorySourceWindow' | 'getMemoryItem' | 'listMemoryEvidence' | 'listMemoryCitedCalls'
+>;
+
+export interface MemoryReachPiece {
+  /** `turn` is verbatim text the owner or the agent wrote; `tool_result` is what a tool returned. */
+  readonly kind: 'turn' | 'tool_result';
+  /** The verbatim row's id, or the id of the tool call the memory cited. */
+  readonly id: string;
+  readonly occurredAt: string;
+  readonly role?: string;
+  /** The character range of the row that the evidence edge actually vouches for, when it named one. */
+  readonly span?: string;
+  readonly text: string;
+  /** Characters the bound cut from the end of this piece. Absent when it came back whole. */
+  readonly cut?: number;
+}
+
+export interface MemoryReach {
+  readonly id: string;
+  /** Whether the id named a stored turn or a remembered piece of work. */
+  readonly of: 'turn' | 'memory';
+  /**
+   * The episode these pieces were actually taken from, when the id named a memory that holds no
+   * provenance rows of its own. Present only after that hop, because "the turn this was last
+   * observed in cited X" is a different sentence from "this memory cites X".
+   */
+  readonly via?: string;
+  readonly pieces: MemoryReachPiece[];
+  readonly chars: number;
+  /** Pieces the character bound had no room for at all, so an absence is never silent. */
+  readonly withheld?: number;
+  readonly reachesLeft: number;
+}
+
+/** The reach as it is handed back when what it found came out of a turn that read the outside. */
+export interface UntrustedMemoryReach {
+  readonly trust: 'untrusted';
+  readonly origin: string;
+  readonly content: MemoryReach;
+}
+
+/**
+ * The origin a reach carries when the turn it is replaying was tainted and did not record from
+ * where - every episode written before migration 74, and any later one whose taint sources were
+ * empty. It is one of `provenance.ts`'s own phrases, so it survives the closed-list check that
+ * stops a label chosen outside this build being quoted in the harness's voice.
+ */
+export const MEMORY_REACH_UNNAMED_ORIGIN = 'a stored tool result';
+
+/**
+ * The raw result out of one stored timeline row, or null when it is not the one that was cited.
+ *
+ * Three things have to hold before these bytes are anything at all, and each refuses a different
+ * mistake. The envelope has to declare the conversation's own context - `assertAad` returns early
+ * on an absent one, so an envelope carrying no context would otherwise decrypt under any claim.
+ * The AES-GCM tag has to verify, which is what makes the row this workspace's. And the payload's
+ * own `toolCallId` has to be the id the memory cited, which is the completion contract's promise
+ * checked at the moment it is finally used rather than only where it was written: a citation and a
+ * row that disagree about which call this was produce nothing.
+ */
+const openTaskEventPayload = (call: MemoryCitedCallRecord, dataKey: Uint8Array): unknown => {
+  const aad = `task-event:${call.taskId}`;
+  if (call.payloadCiphertext.aad !== aad) return null;
+  try {
+    const opened = decryptJson<{ payload?: { toolCallId?: unknown; result?: unknown } }>(
+      call.payloadCiphertext,
+      dataKey,
+      aad
+    );
+    const payload = opened.payload;
+    if (!payload || payload.toolCallId !== call.toolCallId) return null;
+    return payload.result;
+  } catch {
+    return null;
+  }
+};
+
+/** A stored tool result as text, bounded by the caller. */
+const reachedResultText = (value: unknown): string => {
+  if (typeof value === 'string') return value;
+  if (value === null || value === undefined) return '';
+  try {
+    return JSON.stringify(value) ?? '';
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * The half-open `int4range` Postgres stores a span as, applied to the plaintext.
+ *
+ * Returned as text by the store because the store cannot open the body; cut here, where the key is.
+ * A range that does not parse, or that names nothing inside this body, yields the whole chunk
+ * rather than an empty string: the edge is still true - this row is the evidence - and answering a
+ * malformed offset with silence would turn a provenance defect into a missing answer.
+ */
+const spanOfBody = (body: string, span: string | null): string => {
+  if (!span) return body;
+  const parsed = /^\[(\d+),(\d+)\)$/u.exec(span.trim());
+  if (!parsed) return body;
+  const start = Number(parsed[1]);
+  const end = Number(parsed[2]);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || start >= body.length)
+    return body;
+  return body.slice(start, Math.min(end, body.length));
+};
+
+/**
+ * Whether this id is one the harness itself put in front of the model, in the window it is holding.
+ *
+ * This is the whole refusal, and it is stronger than checking that the row exists. A `mem.source`
+ * or `mem.item` id reaches the model only by being returned by `session_search`, by `memory_recall`
+ * or by the memory pack, all three of which are bounded reads the harness performed; the ids are
+ * random UUIDs under the owner's own key, so a page the turn read cannot contain one and a model
+ * cannot construct one. The arm therefore reads WHAT WAS RETURNED and never what exists, which is
+ * the difference between this and an enumerable table.
+ *
+ * Narrowed against the window rather than against a ledger, exactly as `openedSkillsStillReadable`
+ * is: a compaction that condensed away the search result also takes away the right to dereference
+ * it, which is correct rather than unfortunate - the model can no longer say where the id came from
+ * either. Re-running the search restores both.
+ */
+const idReturnedInWindow = (messages: readonly ModelMessage[], id: string): boolean =>
+  messages.some((message) => message.content.includes(id));
+
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+/**
+ * One refusal for every way of naming something this arm will not fetch.
+ *
+ * A fabricated id, an id the model was never given, an id from another workspace and an id of a row
+ * that has been deleted all answer the same sentence, deliberately. Distinguishing them would make
+ * this an oracle for which UUIDs exist in the owner's store, which is a strictly worse thing to
+ * hand out than the material itself.
+ */
+const reachRefused = (): AthanorError =>
+  new AthanorError(
+    'session_search_reach_unknown',
+    'Reach only an id this conversation was given: a result id from session_search, or a memory id from memory_recall or the memory pack. Search first, then reach into a result.'
+  );
+
+export interface MemoryReachInput {
+  readonly store: MemoryReachStore;
+  readonly workspaceId: string;
+  readonly dataKey: Uint8Array;
+  readonly id: string;
+  /** The window as it stands, which is the only place a reachable id can have come from. */
+  readonly messages: readonly ModelMessage[];
+  /** Reaches this turn has already spent, against `MEMORY_REACH_MAX_PER_TURN`. */
+  readonly spent: number;
+}
+
+/**
+ * Given an id the system itself returned, the material behind it.
+ *
+ * Three things can be behind one: a verbatim row, which comes back whole rather than as the
+ * query-cut excerpt a search prints; a remembered piece of work, which comes back as the tool
+ * results it cited and the verbatim rows it was extracted from; and nothing, which is refused.
+ *
+ * The cited tool results are spent from the budget FIRST and the verbatim rows get what is left.
+ * That ordering is the point of the whole operation: the verbatim tier is reachable by search, and
+ * the tool results are reachable by nothing else at all - they are 80% of what a trajectory is
+ * made of and until this arm existed the only reader of `task_events` was the owner's own timeline.
+ */
+export const reachMemoryEvidence = async (
+  input: MemoryReachInput
+): Promise<MemoryReach | UntrustedMemoryReach> => {
+  if (input.spent >= MEMORY_REACH_MAX_PER_TURN)
+    throw new AthanorError(
+      'session_search_reach_exhausted',
+      `This turn has already reached into ${MEMORY_REACH_MAX_PER_TURN} stored results, which is the limit for one turn. Work with what came back, or search for what is still missing.`
+    );
+  const id = input.id.trim();
+  if (!UUID_SHAPE.test(id) || !idReturnedInWindow(input.messages, id)) throw reachRefused();
+
+  const budget = { left: MEMORY_REACH_MAX_CHARS, withheld: 0 };
+  const pieces: MemoryReachPiece[] = [];
+  /** Spends the budget on one piece, cutting it, withholding it, or taking it whole. */
+  const offer = (piece: Omit<MemoryReachPiece, 'cut'>): void => {
+    const text = piece.text.trim();
+    if (!text) return;
+    if (pieces.length >= MEMORY_REACH_MAX_PIECES || budget.left < MEMORY_REACH_MIN_PIECE_CHARS) {
+      budget.withheld += 1;
+      return;
+    }
+    if (text.length <= budget.left) {
+      budget.left -= text.length;
+      pieces.push({ ...piece, text });
+      return;
+    }
+    pieces.push({ ...piece, text: text.slice(0, budget.left), cut: text.length - budget.left });
+    budget.left = 0;
+  };
+
+  const [turn] = await input.store.listMemorySourceWindow(input.workspaceId, id, {
+    before: 0,
+    after: 0
+  });
+  if (turn) {
+    /*
+     * A verbatim row, whole.
+     *
+     * This is the same tier `session_search` already returns and the same bytes, at the width the
+     * row was stored at rather than at `MEMORY_EXCERPT_CHARS`. So it is never fenced: the excerpt
+     * of it is not fenced today, and marking the owner's own request as untrusted data because the
+     * turn it was typed in later read a web page would be a false statement about whose words
+     * these are. What the taint gate governs is the tier below, which is new.
+     */
+    const body = openSourceBody(turn, input.workspaceId, input.dataKey);
+    if (!body) throw reachRefused();
+    offer({
+      kind: 'turn',
+      id: turn.id,
+      occurredAt: turn.occurredAt,
+      ...(turn.role ? { role: turn.role } : {}),
+      text: body
+    });
+    return {
+      id,
+      of: 'turn',
+      pieces,
+      chars: MEMORY_REACH_MAX_CHARS - budget.left,
+      ...(budget.withheld ? { withheld: budget.withheld } : {}),
+      reachesLeft: MEMORY_REACH_MAX_PER_TURN - input.spent - 1
+    };
+  }
+
+  const item = await input.store.getMemoryItem(input.workspaceId, id);
+  if (!item) throw reachRefused();
+
+  /** Everything one item points at, offered in budget order. Answers whether it pointed anywhere. */
+  const gather = async (itemId: string): Promise<boolean> => {
+    let held = false;
+    for (const call of await input.store.listMemoryCitedCalls(itemId, MEMORY_REACH_MAX_PIECES)) {
+      /*
+       * Opened under the conversation's own context, which is a second lock on the same door.
+       *
+       * `task-event:<taskId>` is the AAD the timeline row was sealed with, and the task id comes
+       * from the row the citation joined rather than from the item - so a citation filed against an
+       * event belonging to some other conversation does not decrypt, and produces nothing, rather
+       * than producing that conversation's material under this memory's name.
+       */
+      const opened = openTaskEventPayload(call, input.dataKey);
+      if (opened === null || opened === undefined) continue;
+      held = true;
+      offer({
+        kind: 'tool_result',
+        id: call.toolCallId,
+        occurredAt: call.occurredAt,
+        text: reachedResultText(opened)
+      });
+    }
+    for (const evidence of await input.store.listMemoryEvidence(
+      itemId,
+      2 * MEMORY_MAX_SOURCE_CHUNKS
+    )) {
+      if (evidence.bodyCiphertext.aad !== memorySourceAad(input.workspaceId)) continue;
+      let body: string;
+      try {
+        body = decryptJson<{ body: string }>(evidence.bodyCiphertext, input.dataKey).body;
+      } catch {
+        continue;
+      }
+      if (typeof body !== 'string') continue;
+      held = true;
+      offer({
+        kind: 'turn',
+        id: evidence.sourceId,
+        occurredAt: evidence.occurredAt,
+        ...(evidence.role ? { role: evidence.role } : {}),
+        ...(evidence.span ? { span: evidence.span } : {}),
+        text: spanOfBody(body, evidence.span)
+      });
+    }
+    return held;
+  };
+
+  /*
+   * One hop, for the tier that has no provenance rows of its own.
+   *
+   * `recordTurnEpisode` is the only production writer of `mem.evidence` and it files against the
+   * EPISODE. A corroborated fact - the tier the owner actually cares about, the standing order and
+   * the convention - is minted by `promoteMemoryFactCandidates` with no evidence at all, so a reach
+   * on one would have come back empty and the claim that every durable memory is one call from the
+   * words behind it would have been true of episodes and false of facts.
+   *
+   * The edge for it is already written and, like every other edge in this file, was read by
+   * nothing: `mem.item.episode_id` carries the last episode that sighted the candidate. So the hop
+   * costs no new column and no new write.
+   *
+   * Exactly one hop, taken only when the item itself pointed nowhere, and never recursive: an
+   * episode's own `episode_id` is null, so there is no second step to take even in principle. The
+   * budget is untouched when the first pass held nothing, so the hop spends a full one rather than
+   * a remainder.
+   *
+   * `via` is on the result because the model must not be told these sources are the fact's own
+   * citations. They are the citations of the turn the fact was last observed in, which is a
+   * different sentence.
+   */
+  let from = item;
+  let via: string | undefined;
+  if (!(await gather(item.id)) && item.episodeId && item.episodeId !== item.id) {
+    const episode = await input.store.getMemoryItem(input.workspaceId, item.episodeId);
+    if (episode && (await gather(episode.id))) {
+      from = episode;
+      via = episode.id;
+    }
+  }
+
+  const reach: MemoryReach = {
+    id,
+    of: 'memory',
+    ...(via ? { via } : {}),
+    pieces,
+    chars: MEMORY_REACH_MAX_CHARS - budget.left,
+    ...(budget.withheld ? { withheld: budget.withheld } : {}),
+    reachesLeft: MEMORY_REACH_MAX_PER_TURN - input.spent - 1
+  };
+  /*
+   * A reach does not launder what it reaches.
+   *
+   * The material a memory cited may be the hostile page a turn read three weeks ago. Handing it
+   * back as the harness's own tool result would strip the fence, the sanitiser and the approval
+   * floor off content that carried all three the first time it arrived - which is a laundering
+   * step, and it is the one this arm could most easily have been.
+   *
+   * The condition is exactly one sentence: a reach that returns a stored tool result out of a
+   * memory that is not KNOWN untainted comes back untrusted. `tainted === false` is the only
+   * clearance, so `null` - an episode written before the column existed - fences, in line with
+   * every other reader of that column. And `false` is a real clearance rather than an optimistic
+   * one, because `recordProvenance` asks `untrustedOriginOfResult` of every single tool result: a
+   * turn holding an untrusted result is a turn whose taint was raised, so an untainted turn cannot
+   * be hiding one. Nothing here re-classifies the bytes; the classification was made when they
+   * arrived and this reads it back.
+   *
+   * Declaring `trust: 'untrusted'` is not decoration. It is the shape `untrustedOriginOfResult`
+   * already recognises, so this result is fenced by `untrustedEnvelope`, stripped of tag characters
+   * by `sanitiseUntrusted`, written onto the owner's timeline as an origin they can go back to, and
+   * charged against the turn's approval floor - by the same code that does it for a live web read,
+   * with nothing new to keep in step.
+   */
+  const returnsToolResult = pieces.some((piece) => piece.kind === 'tool_result');
+  // Read off the row the material actually came from, which after a hop is the episode and not the
+  // fact. A promoted fact records no taint of its own - promotion runs only on untainted turns and
+  // `#recordMemoryFact` is passed none - so asking the fact would fence everything a fact reaches,
+  // for ever, on a `null` that means "this row was never in a position to answer".
+  if (!returnsToolResult || from.tainted === false) return reach;
+  return {
+    trust: 'untrusted',
+    /*
+     * Bounded again on the way out, at the same width `boundedOrigin` uses.
+     *
+     * The only writer of this column stores a label that has already been through `raiseTaint`, so
+     * in principle this changes nothing - and `provenance.ts` bounds it a third time before it
+     * reaches the owner's timeline. It is applied because THIS field is read by the model directly,
+     * and a bound that is only correct while every producer stays correct is the kind of guarantee
+     * that lasts until the next producer.
+     */
+    origin: (from.taintOrigin ?? MEMORY_REACH_UNNAMED_ORIGIN).slice(0, 120),
+    content: reach
+  };
+};
+
+/* ------------------------------------------------------------------------ *
+ * Write path
+ * ------------------------------------------------------------------------ */
+
 export const MEMORY_MAX_FACT_OBSERVATIONS = 5;
 
 const byteLength = (value: string): number => Buffer.byteLength(value, 'utf8');
@@ -1622,6 +2083,7 @@ export type MemoryCaptureStore = Pick<
   | 'createMemoryItem'
   | 'createMemorySource'
   | 'attachMemoryEvidence'
+  | 'attachMemoryCitedCalls'
   | 'observeMemoryFactCandidate'
   | 'promoteMemoryFactCandidates'
   | 'getMemoryPack'
@@ -1634,11 +2096,16 @@ export interface TurnEpisodeResult {
   /**
    * Verbatim chunks the source cap refused, across both parts of the turn.
    *
-   * Measured over 3,950 real turns: 197 of them (5.0%) run past `MEMORY_MAX_SOURCE_CHUNKS`, and
-   * 57.7% of everything the owner typed - 34.6 MB of 59.9 MB - never reached a source row. That
-   * is the correct cap and it is not moved here; what was wrong is that it happened in silence,
-   * so the owner could search for a brief that had been stored with its tail cut off and be told
-   * only that nothing matched.
+   * Measured over the owner's real corpus - 675 turns, 233,064 characters, 11 projects, 49 active
+   * days, on the strict owner-turn filter - the widest single turn is 14,625 characters against
+   * `MEMORY_MAX_SOURCE_CHUNKS * MEMORY_SOURCE_CHUNK_BYTES` = 48,000 bytes per part. This is 0 on
+   * every one of them, and 100.0% of what the owner typed reaches a source row. The 197 turns
+   * (5.0%) and 34.6 MB of 59.9 MB (57.7%) this used to state were measured on a corpus that
+   * counted machine-written text as the owner's; they are void and are not the cap's rationale.
+   *
+   * The cap is unchanged. What was wrong was never the number, it was that reaching it happened in
+   * silence - the owner could search for a brief stored with its tail cut off and be told only
+   * that nothing matched - and `captureMemory` says so out loud when this is non-zero.
    */
   readonly sourceChunksDropped: number;
   readonly factCandidates: number;
@@ -1709,10 +2176,22 @@ export const recordTurnEpisode = async (input: {
     cwd: string;
   }[];
   /**
+   * The tool calls this turn's `finish` cited, paired with the timeline rows their raw results were
+   * written to. Both ids come from the harness's own ledger of what it ran, never from the model's
+   * arguments, so a citation that names a call this turn did not make never reaches here.
+   *
+   * This is the whole of the reach into the tool-output tier. It stores two ids per call and copies
+   * no bytes: `task_events` already holds the result untruncated, and `mem.cited_call` is a foreign
+   * key onto it that dies with the conversation.
+   */
+  citedCalls?: readonly { toolCallId: string; eventId: string }[];
+  /**
    * Whether this turn read somebody else's words. A tainted turn still records what happened, but
    * nothing it saw is allowed to settle into a durable fact on the strength of that turn.
    */
   tainted?: boolean;
+  /** Which source it read them from, so a later reach into this turn can name what it is replaying. */
+  taintOrigin?: string;
   occurredAt: Date;
 }): Promise<TurnEpisodeResult | null> => {
   // Redacted at the door, so one edit covers the whole fan-out below: the episode title and body,
@@ -1768,7 +2247,10 @@ export const recordTurnEpisode = async (input: {
      * Always a boolean from this writer, never left unset: `null` in that column means an episode
      * from before the column existed, and the readers treat unknown as tainted.
      */
-    tainted: Boolean(input.tainted)
+    tainted: Boolean(input.tainted),
+    // Kept beside the flag it explains, and only meaningful with it: the store writes null here on
+    // any row whose `tainted` is not true, so an origin can never outlive the taint it named.
+    ...(input.taintOrigin ? { taintOrigin: input.taintOrigin } : {})
   });
 
   const originKey = memoryOriginKey(`task:${input.taskId}`, indexKey);
@@ -1818,6 +2300,23 @@ export const recordTurnEpisode = async (input: {
       episodeId,
       sourceIds.map((sourceId) => ({ sourceId }))
     );
+  /*
+   * The other provenance edge, and the one that reaches the eighty per cent.
+   *
+   * `mem.evidence` above cites the verbatim rows this episode was assembled from - the owner's own
+   * request and the agent's own summary, which together are under one per cent of what a trajectory
+   * is made of. This cites the tool calls the turn's `finish` named, whose raw results are already
+   * retained untruncated and were readable by nothing.
+   *
+   * Bounded at `MEMORY_REACH_MAX_PIECES`, which is the number of claims `episodeContent` renders
+   * into the body: a memory that cites more calls than it can show claims for is storing pointers
+   * nothing will ever print. Deduplicated by id, because a `finish` may cite one call for two
+   * claims and the primary key would otherwise make the second insert an update of the first.
+   */
+  const citedCalls = [
+    ...new Map((input.citedCalls ?? []).map((call) => [call.toolCallId, call] as const)).values()
+  ].slice(0, MEMORY_REACH_MAX_PIECES);
+  if (citedCalls.length > 0) await input.store.attachMemoryCitedCalls(episodeId, citedCalls);
 
   /*
    * Only the owner's own words are scanned. The agent's summary is its own account of its work, so

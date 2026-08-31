@@ -58,12 +58,15 @@ interface CaptureProbe {
   readonly warnings: string[];
   /** Every timeline line this write path emitted, sealed exactly as the store would hold it. */
   readonly events: Array<{ kind: string; payloadCiphertext: EncryptedEnvelope }>;
+  /** Every citation the write path filed from a memory to the tool call that justified it. */
+  readonly citedCalls: Array<{ itemId: string; calls: { toolCallId: string; eventId: string }[] }>;
 }
 
 const probe = (): CaptureProbe => {
   const uses: CaptureProbe['uses'] = [];
   const warnings: string[] = [];
   const events: CaptureProbe['events'] = [];
+  const citedCalls: CaptureProbe['citedCalls'] = [];
   const pack: MemoryPackRecord = {
     taskId,
     workspaceId,
@@ -78,6 +81,13 @@ const probe = (): CaptureProbe => {
     createMemoryItem: async (input: { id?: string }) => ({ id: input.id ?? 'item' }),
     createMemorySource: async () => ({ id: 'source' }),
     attachMemoryEvidence: async () => 0,
+    attachMemoryCitedCalls: async (
+      itemId: string,
+      calls: readonly { toolCallId: string; eventId: string }[]
+    ) => {
+      citedCalls.push({ itemId, calls: calls.map((call) => ({ ...call })) });
+      return calls.length;
+    },
     observeMemoryFactCandidate: async () => undefined,
     promoteMemoryFactCandidates: async () => [],
     recordMemoryDeadEnds: async () => ({ recorded: [], retired: [] }),
@@ -101,7 +111,7 @@ const probe = (): CaptureProbe => {
       return { id: 'event' };
     }
   } as unknown as DataStore;
-  return { deps: { store, memoryConsolidatedAt: new Map() }, uses, warnings, events };
+  return { deps: { store, memoryConsolidatedAt: new Map() }, uses, warnings, events, citedCalls };
 };
 
 /** What the owner would read on the timeline, out of the sealed payload the store holds. */
@@ -159,6 +169,67 @@ describe('what a finished turn tells the store about the memory it was given', (
     ]);
   });
 
+  /**
+   * The id the completion contract produced and the memory boundary threw away.
+   *
+   * `completion.ts` makes a `finish` cite the `toolCallId` of the call that justifies each claim,
+   * and `tool-recording.ts` writes that call's raw untruncated result into `task_events`. Both ends
+   * of the edge existed for as long as both files have; this line - `evidence.map(item =>
+   * item.claim)` - dropped the id one step before storage, so athanor computed the pointer into the
+   * only part of the tool-output tier worth keeping and discarded it on every verified turn.
+   *
+   * The assertion is on the WIRE to the store rather than on the shape of the argument, because the
+   * argument was never the defect: a claim mapped out of an evidence item is a perfectly good
+   * `verifiedClaims`, and it stayed one. What was missing was a second call, and this is it.
+   */
+  it('keeps the tool call a finish cited, resolved against what the harness actually ran', async () => {
+    const capture = probe();
+    await captureMemory(
+      capture.deps,
+      task,
+      dataKey,
+      {
+        messages: [
+          { role: 'user', content: 'Did the certificate renew?' },
+          { role: 'assistant', content: 'It renewed.' }
+        ],
+        step: 3,
+        credits: 1,
+        turnToolResults: {
+          'call-1': { name: 'shell', success: true, eventId: 'event-77' },
+          // Ran, recorded, and not cited. The reach is over what a finish named, never over what a
+          // turn happened to do, and a citation table that collected every call would be the
+          // enumerable tier this design refuses.
+          'call-2': { name: 'file_read', success: true, eventId: 'event-78' }
+        }
+      } as unknown as AgentState,
+      {
+        summary: 'Renewed the certificate.',
+        verification: {
+          status: 'verified',
+          evidence: [
+            { claim: 'the serial changed', source: 'tool_result', toolCallId: 'call-1' },
+            /*
+             * The forgery, in the same call as the real one.
+             *
+             * `call-9` is an id no tool call in this turn carries. It resolves to nothing in the
+             * harness's own ledger and is dropped here, which is why nothing downstream has to ask
+             * whether a stored citation was ever real - and why the model cannot name a timeline
+             * row it was not handed.
+             */
+            { claim: 'and the gateway reloaded', source: 'tool_result', toolCallId: 'call-9' }
+          ],
+          remainingRisks: []
+        } as unknown as CompletionVerification
+      }
+    );
+
+    expect(capture.warnings).toEqual([]);
+    expect(capture.citedCalls).toHaveLength(1);
+    expect(typeof capture.citedCalls[0]?.itemId).toBe('string');
+    expect(capture.citedCalls[0]?.calls).toEqual([{ toolCallId: 'call-1', eventId: 'event-77' }]);
+  });
+
   it('counts a procedure the harness followed, which no answer would ever quote', async () => {
     const capture = probe();
     await captureMemory(
@@ -187,13 +258,19 @@ describe('what a finished turn tells the store about the memory it was given', (
   });
 
   /**
-   * The cap that ate 57.7% of everything the owner had ever typed, in silence.
+   * The cap that would eat a brief in silence.
    *
    * `recordTurnEpisode` keeps the first eight six-kilobyte chunks of each part and drops the rest.
-   * Measured over 3,950 real turns: 197 (5.0%) run past it, and 34.6 MB of 59.9 MB of the owner's
-   * own words never reached a source row. The cap is right and is unchanged; what was wrong is
-   * that nothing said so, so the owner could search memory for a constraint they had definitely
-   * written and be told, truthfully and uselessly, that nothing matched.
+   * On the owner's real corpus - 675 turns, 233,064 characters, 11 projects, 49 active days, on the
+   * strict owner-turn filter - the widest single turn is 14,625 characters against 48,000 bytes per
+   * part, so it has never fired and 100.0% of what the owner typed reached a source row. The 197 of
+   * 3,950 (5.0%) and 34.6 MB of 59.9 MB (57.7%) this comment used to state were measured on a
+   * corpus that counted machine-written text as the owner's, and are void.
+   *
+   * The cap is right and is unchanged, and a bound that has not fired yet is not a bound that
+   * cannot. What was wrong is that nothing said so when it did, so the owner could search memory
+   * for a constraint they had definitely written and be told, truthfully and uselessly, that
+   * nothing matched. That is what this describe block holds in place.
    */
   describe('saying what the verbatim cap refused', () => {
     const oversized = 'The brief. '.padEnd(60_000, 'y');

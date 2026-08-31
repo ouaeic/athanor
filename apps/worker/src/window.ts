@@ -20,6 +20,8 @@ import {
   decryptJson,
   encryptJson,
   memoryTemporalStatus,
+  OWNER_MEMORY_MAX_CHARS,
+  OWNER_MEMORY_MAX_ROWS,
   ownerBlockAad,
   recallMemories,
   userMemoryAad,
@@ -43,6 +45,16 @@ import type { AgentRunnerClient } from './runner-client.js';
 import { builtinSkillLibrary, skillCatalogBlock } from './skills.js';
 import { event } from './tool-recording.js';
 import { WORKSPACE_BRIEF_MARKER } from './turn-bounds.js';
+
+/**
+ * What the reviewed knowledge block may spend, across both of its tiers together.
+ *
+ * Named rather than inline because they are now arithmetic and not only arguments: the owner tier
+ * takes its own storage bound out of these, and the workspace tier takes the rest. Two numbers in
+ * one place is what keeps the two tiers' shares provably summing to what the block cost before.
+ */
+const MEMORY_RECALL_MAX_ITEMS = 32;
+const MEMORY_RECALL_MAX_CHARACTERS = 16_000;
 
 /** What assembling the window needs from the worker that owns the turn. */
 export interface WindowDeps {
@@ -165,13 +177,16 @@ export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): 
   /*
    * The owner's own block, and it is the one surface here that nothing ranks.
    *
-   * Everything else assembled in this function competes for room: the two memory tiers are scored
-   * against the task's opening request in one pool, and the pack is a budgeted retrieval. That is
-   * the right shape for anything the request can be relied on to name, and the wrong shape for the
-   * question this answers - who the owner is - which no request names and no ranking can therefore
-   * reach. Measured against the production ranker, sixteen owner-tier rows lose two of themselves
-   * to eighteen matching workspace rows and all sixteen to thirty-two, and nothing caps the number
-   * of workspace rows an agent may write. So this is installed by position rather than by score.
+   * Everything else assembled in this function is scored: the memory tiers are ranked against the
+   * task's opening request and the pack is a budgeted retrieval. That is the right shape for
+   * anything the request can be relied on to name, and the wrong shape for the question this
+   * answers - who the owner is - which no request names and no ranking can therefore reach. So this
+   * is installed by position rather than by score.
+   *
+   * The tier below now has a reserve for the same reason, and it is a different remedy for the same
+   * defect rather than a reason to fold one into the other: sixteen discrete rows the owner reviews
+   * and retracts one at a time still want ranking AMONG THEMSELVES, and one text the owner wrote in
+   * their own prose has nothing to be ranked against.
    *
    * Sealed under the same derived key and the same context as the owner tier, so it is unreachable
    * from a workspace key and survives deleting every computer on the box; @see userMemoryKey. It is
@@ -255,11 +270,65 @@ export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): 
    * long as the task exists, which is exactly the life the header promises. The memory pack a few
    * lines below already anchors to it under the name `clockAnchor`.
    */
-  const memoryEntries = recallMemories(activeMemoryEntries, goal, {
-    maxItems: 32,
-    maxCharacters: 16_000,
-    now: new Date(task.createdAt)
-  });
+  /*
+   * Two tiers, two pools, one total - and the split is what makes the label on this tier true.
+   *
+   * `workspace_memories.target='user'` is printed in Settings as "About you, everywhere". Ranked
+   * with the workspace tier in ONE pool it kept none of itself: measured through this same call
+   * with these same options, sixteen owner rows survive fourteen matching workspace rows, lose two
+   * at eighteen and all sixteen at thirty-two, because a flat `+1.5` cannot compete with
+   * `overlap * 2.5` on a row that shares the request's words. A fact about a person cannot be
+   * retrieved by relevance to a request that never mentions the person, and nothing caps how many
+   * workspace rows an agent may write - so the tier that follows the owner between computers was
+   * evicted, everywhere, by whichever computer they were standing on.
+   *
+   * The reserve is the tier's OWN storage bound rather than a number chosen here. The owner tier
+   * is refused past `OWNER_MEMORY_MAX_ROWS` rows and `OWNER_MEMORY_MAX_CHARS` characters at both
+   * writers (`routes/knowledge.ts`, and the agent cannot write it at all), so reserving exactly
+   * that reserves the whole of what can ever exist: every owner row reaches the window, and the
+   * reserve costs nothing it does not use, because an owner with three rows leaves twenty-nine
+   * item slots and 15,700-odd characters to the tier beside it.
+   *
+   * What it costs, said rather than implied. The totals are unchanged - `MEMORY_RECALL_MAX_ITEMS`
+   * and `MEMORY_RECALL_MAX_CHARACTERS` still bound both tiers together, so this adds no resident
+   * bytes - and the price is paid by workspace rows on a box where BOTH tiers are full: sixteen
+   * of the thirty-two item slots and 6,000 of the 16,000 characters. On the fixture in
+   * `window.test.ts` that is sixteen matching workspace rows displaced, all of them ranked below
+   * sixteen others that still arrive, and every one of them still reachable in one call through
+   * `memory(action=list)`. The owner rows have no second door: nothing in a request about the
+   * importer will ever retrieve who the owner is.
+   *
+   * Nothing here reaches `mem.pack`. That is a different store read by a different statement
+   * (`MEMORY_PACK_SQL`), and its committed recall of 1.00 at 364 tokens
+   * (`packages/data/src/memory-eval.test.ts`) is measured on `mem.item`/`mem.source` rows this
+   * function never sees.
+   */
+  const clockAnchor = new Date(task.createdAt);
+  const ownerMemoryEntries = recallMemories(
+    activeMemoryEntries.filter((entry) => entry.target === 'user'),
+    goal,
+    {
+      maxItems: Math.min(OWNER_MEMORY_MAX_ROWS, MEMORY_RECALL_MAX_ITEMS),
+      maxCharacters: Math.min(OWNER_MEMORY_MAX_CHARS, MEMORY_RECALL_MAX_CHARACTERS),
+      now: clockAnchor
+    }
+  );
+  const ownerMemoryCharacters = ownerMemoryEntries.reduce(
+    (total, entry) => total + entry.content.length,
+    0
+  );
+  const memoryEntries = [
+    ...ownerMemoryEntries,
+    ...recallMemories(
+      activeMemoryEntries.filter((entry) => entry.target !== 'user'),
+      goal,
+      {
+        maxItems: MEMORY_RECALL_MAX_ITEMS - ownerMemoryEntries.length,
+        maxCharacters: MEMORY_RECALL_MAX_CHARACTERS - ownerMemoryCharacters,
+        now: clockAnchor
+      }
+    )
+  ];
   await deps.store.curateWorkspaceSkills(task.workspaceId);
   const skillRecords = await deps.store.listWorkspaceSkills(task.userId, task.workspaceId);
   const skillIndex = skillRecords.flatMap((record) => {
@@ -349,7 +418,7 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       workspaceId: task.workspaceId,
       dataKey: key,
       query: goal,
-      clockAnchor: new Date(task.createdAt),
+      clockAnchor,
       budgetTokens: memoryPackBudgetTokens(contextTokens)
     });
     injectMemoryPack(state.messages, pack);

@@ -119,6 +119,13 @@ export interface MemoryItemRecord {
    * refused rather than trusted.
    */
   tainted: boolean | null;
+  /**
+   * The source the taint above came from, or `null` when the turn read nothing from outside and on
+   * every row written before migration 74. It names what a reach back into this turn's stored tool
+   * results is replaying, which is what the owner's timeline needs in order to say more than
+   * "somewhere".
+   */
+  taintOrigin: string | null;
   salience: number;
   tokensEst: number;
   indexed: boolean;
@@ -160,6 +167,42 @@ export interface MemorySourceRecord {
 }
 
 export type MemorySourceChannel = 'chat' | 'terminal' | 'file' | 'browser' | 'desktop' | 'tool';
+
+/**
+ * One provenance edge from a curated item to the verbatim row behind it, with the row's sealed body
+ * so the edge can actually be followed.
+ *
+ * The span is Postgres's own `int4range` text - `[7,40)` - and it is deliberately not parsed here.
+ * A range is a half-open pair of character offsets into the plaintext, and the store never holds
+ * the plaintext: cutting it is the key holder's job, and a store that returned an already-cut
+ * `text` field would be claiming to have read what it cannot read.
+ */
+export interface MemoryEvidenceRecord {
+  sourceId: string;
+  span: string | null;
+  occurredAt: string;
+  role: string | null;
+  channel: MemorySourceChannel;
+  taskId: string | null;
+  chunkIndex: number;
+  bodyCiphertext: EncryptedEnvelope;
+}
+
+/** One tool call a memory cited, with the raw result the harness stored for it, sealed. */
+export interface MemoryCitedCallRecord {
+  toolCallId: string;
+  eventId: string;
+  /**
+   * The conversation the event belongs to, read off the event row rather than off the memory.
+   *
+   * It is the encryption context the payload was sealed under, so taking it from here is what makes
+   * a citation that somehow named an event in another conversation fail to open rather than open
+   * that conversation's material under this memory's name.
+   */
+  taskId: string;
+  payloadCiphertext: EncryptedEnvelope;
+  occurredAt: string;
+}
 
 export type MemoryUseOutcome = 'ok' | 'fail' | 'unknown';
 
@@ -369,6 +412,14 @@ export interface CreateMemoryItemInput {
    * still taken at the moment of writing.
    */
   tainted?: boolean | null;
+  /**
+   * Where those words came from, when they came from somewhere. The boolean above says whether a
+   * turn read untrusted content and cannot say what it read; a reach back into this turn's stored
+   * material has to hand the model, and the owner's timeline, the name of the source it is
+   * replaying. Written only where `tainted` is true, and never read on its own: an absent origin
+   * on a row that is not known-untainted is treated exactly as `tainted IS NULL` is.
+   */
+  taintOrigin?: string | null;
   /**
    * The carve-outs this row's sentence carries, keyed. Facts promoted from a candidate only; every
    * other writer leaves it null, which reads as "this row makes no claim about exceptions" rather
@@ -790,11 +841,11 @@ export class MemoryStore {
          id,user_id,workspace_id,kind,status,trust,document_ciphertext,title_tokens,tag_tokens,
          alias_tokens,body_tokens,tags_hashed,trigrams,dedupe_key,observed_at,valid_from,valid_to,
          subject_key,predicate,object_key,episode_id,task_id,last_verified,pin,salience,
-         tokens_est,indexed,tainted,qualification_keys
+         tokens_est,indexed,tainted,qualification_keys,taint_origin
        ) VALUES (
          $1,$2,$3,$4::mem.kind,COALESCE($5::mem.status,'active'),$6::mem.trust,$7::jsonb,$8,$9,
          $27,$10,$11::text[],$12::text[],$13,COALESCE($14,NOW()),COALESCE($15,NOW()),$16,$17,
-         $18,$19,$20,$21,$22,$23,$24,$25,$26,$28::boolean,$29::text[]
+         $18,$19,$20,$21,$22,$23,$24,$25,$26,$28::boolean,$29::text[],$30
        ) RETURNING *`,
       [
         input.id ?? randomUUID(),
@@ -825,7 +876,10 @@ export class MemoryStore {
         input.index.indexed,
         input.index.aliasTokens,
         input.tainted ?? null,
-        input.qualificationKeys ? [...input.qualificationKeys] : null
+        input.qualificationKeys ? [...input.qualificationKeys] : null,
+        // Only ever beside a true `tainted`. Written null otherwise rather than left to a caller's
+        // default, so a row can never claim an origin for words nobody said came from outside.
+        input.tainted === true ? (input.taintOrigin ?? null) : null
       ]
     );
     return mapMemoryItem(result.rows[0]!);
@@ -1038,19 +1092,103 @@ export class MemoryStore {
     });
   }
 
-  async listMemoryEvidence(
-    itemId: string
-  ): Promise<{ sourceId: string; span: string | null; occurredAt: string }[]> {
+  /**
+   * The words, not only the pointer.
+   *
+   * This selected `source_id`, `span` and `occurred_at` and had no caller anywhere outside the
+   * store's own delegate - which is the whole defect it was: athanor can name the exact character
+   * range of the exact stored turn that justifies a remembered fact, and handed back a reference
+   * nothing could dereference. `body_ciphertext` is what makes the edge readable, and it comes back
+   * sealed like every other body in this tier: the store cannot open it, and the span is returned
+   * beside it so the caller cuts the range the edge actually vouches for rather than the chunk it
+   * happens to sit in.
+   *
+   * Bounded in rows here and in characters at the caller, because the two bounds refuse different
+   * things. `recordTurnEpisode` attaches at most `2 x MEMORY_MAX_SOURCE_CHUNKS` rows to one
+   * episode, so the default is that number and a caller asking for more gets what exists; the
+   * characters are the caller's because only the caller knows what it is about to put in a window.
+   *
+   * Ordered by chunk within an instant, so the parts of one turn come back in reading order. The
+   * previous ordering was by source id inside `occurred_at`, which for a turn chunked into eight
+   * parts written in the same transaction is a random permutation of the owner's own sentence.
+   */
+  async listMemoryEvidence(itemId: string, limit = 16): Promise<MemoryEvidenceRecord[]> {
     const result = await this.database.query(
-      `SELECT e.source_id, e.span::text AS span, s.occurred_at
+      `SELECT e.source_id, e.span::text AS span, s.occurred_at, s.role, s.channel, s.task_id,
+              s.chunk_ix, s.body_ciphertext
        FROM mem.evidence e JOIN mem.source s ON s.id=e.source_id
-       WHERE e.item_id=$1 ORDER BY s.occurred_at, e.source_id`,
-      [itemId]
+       WHERE e.item_id=$1
+       ORDER BY s.occurred_at, s.chunk_ix, e.source_id
+       LIMIT $2`,
+      [itemId, Math.max(1, Math.trunc(limit))]
     );
     return result.rows.map((row) => ({
       sourceId: String(row.source_id),
       span: optionalText(row.span),
-      occurredAt: iso(row.occurred_at)
+      occurredAt: iso(row.occurred_at),
+      role: optionalText(row.role),
+      channel: String(row.channel) as MemorySourceChannel,
+      taskId: optionalText(row.task_id),
+      chunkIndex: Number(row.chunk_ix),
+      bodyCiphertext: json<EncryptedEnvelope>(row.body_ciphertext)
+    }));
+  }
+
+  /**
+   * The other half of an item's provenance: the tool calls a `finish` cited to justify it.
+   *
+   * `mem.evidence` reaches the verbatim tier, which is the owner's request and the agent's summary
+   * and under one per cent of what a trajectory is made of. This reaches the tier that is most of
+   * it - the raw tool results `recordToolResult` already stores untruncated in `task_events` - and
+   * it reaches exactly the calls the completion contract named, never the rows that exist.
+   *
+   * Nothing is copied. The event id is a foreign key, so a citation cannot outlive the result it
+   * points at, and both go when the conversation does.
+   */
+  async attachMemoryCitedCalls(
+    itemId: string,
+    calls: readonly { toolCallId: string; eventId: string }[]
+  ): Promise<number> {
+    if (calls.length === 0) return 0;
+    return this.database.transaction(async (transaction) => {
+      let written = 0;
+      for (const call of calls) {
+        const result = await transaction.query(
+          `INSERT INTO mem.cited_call(item_id,tool_call_id,event_id)
+           VALUES ($1,$2,$3)
+           ON CONFLICT (item_id,tool_call_id) DO UPDATE SET event_id=EXCLUDED.event_id`,
+          [itemId, call.toolCallId, call.eventId]
+        );
+        written += result.rowCount;
+      }
+      return written;
+    });
+  }
+
+  /**
+   * What one memory cited, with the stored result behind it, sealed.
+   *
+   * `e.kind = 'tool_result'` is the refusal written where it cannot be forgotten. The citation
+   * table can only ever be written with the id of an event the harness recorded for a tool call,
+   * and this clause means that even a row filed against some other kind of event - a warning, an
+   * approval card, the owner's own message - answers nothing. The reach reads what was cited, and
+   * of that only what a tool returned.
+   */
+  async listMemoryCitedCalls(itemId: string, limit = 8): Promise<MemoryCitedCallRecord[]> {
+    const result = await this.database.query(
+      `SELECT c.tool_call_id, c.event_id, e.task_id, e.payload_ciphertext, e.created_at
+       FROM mem.cited_call c JOIN task_events e ON e.id = c.event_id
+       WHERE c.item_id = $1 AND e.kind = 'tool_result' AND e.payload_ciphertext IS NOT NULL
+       ORDER BY e.sequence
+       LIMIT $2`,
+      [itemId, Math.max(1, Math.trunc(limit))]
+    );
+    return result.rows.map((row) => ({
+      toolCallId: String(row.tool_call_id),
+      eventId: String(row.event_id),
+      taskId: String(row.task_id),
+      payloadCiphertext: json<EncryptedEnvelope>(row.payload_ciphertext),
+      occurredAt: iso(row.created_at)
     }));
   }
 

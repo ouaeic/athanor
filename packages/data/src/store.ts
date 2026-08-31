@@ -47,7 +47,9 @@ export type {
   CreateMemoryItemInput,
   MemoryCandidateRecord,
   MemoryCapabilities,
+  MemoryCitedCallRecord,
   MemoryConsolidationReport,
+  MemoryEvidenceRecord,
   MemoryFactCandidateOrigin,
   MemoryFactCandidateRecord,
   MemoryFactPromotion,
@@ -529,6 +531,14 @@ export class DataStore {
 
   listMemoryEvidence(...args: Parameters<MemoryStore['listMemoryEvidence']>) {
     return this.#memory.listMemoryEvidence(...args);
+  }
+
+  attachMemoryCitedCalls(...args: Parameters<MemoryStore['attachMemoryCitedCalls']>) {
+    return this.#memory.attachMemoryCitedCalls(...args);
+  }
+
+  listMemoryCitedCalls(...args: Parameters<MemoryStore['listMemoryCitedCalls']>) {
+    return this.#memory.listMemoryCitedCalls(...args);
   }
 
   observeMemoryFactCandidate(...args: Parameters<MemoryStore['observeMemoryFactCandidate']>) {

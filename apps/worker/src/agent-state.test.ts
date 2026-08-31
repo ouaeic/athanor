@@ -93,6 +93,7 @@ const FIELDS: ReadonlyArray<keyof AgentState> = [
   'planIsFallback',
   'taint',
   'turnNoveltyBytes',
+  'memoryReaches',
   'webToolMode',
   'knownOrigins',
   'knownAddresses',
@@ -218,6 +219,7 @@ const FULL: Required<AgentState> = {
   planIsFallback: true,
   taint: { level: 'untrusted', sources: ['https://example.com/page'], sinceStep: 8 },
   turnNoveltyBytes: 412,
+  memoryReaches: 2,
   webToolMode: 'in_house',
   knownOrigins: ['example.com'],
   knownAddresses: ['https://example.com/page'],
@@ -232,7 +234,7 @@ const FULL: Required<AgentState> = {
 describe('what a turn is carrying', () => {
   it('names every field the type declares, so a new one has to be classified', () => {
     expect(Object.keys(FULL).sort()).toEqual([...FIELDS].sort());
-    expect(FIELDS).toHaveLength(59);
+    expect(FIELDS).toHaveLength(60);
   });
 
   /**
@@ -335,7 +337,10 @@ describe('what a new turn inherits', () => {
       'selfContinuations',
       'planCoverageNagged',
       'planIsFallback',
-      'turnNoveltyBytes'
+      'turnNoveltyBytes',
+      // Per turn like the egress budget above it, and for the same reason: the refusal says "this
+      // turn", so a counter that carried would refuse the first reach of every turn afterwards.
+      'memoryReaches'
     ]);
     expect(carried).toEqual([
       'credits',
@@ -387,6 +392,7 @@ describe('what a new turn inherits', () => {
     expect(next.turn).toBe(4);
     expect(next.turnToolResults).toEqual({});
     expect(next.turnNoveltyBytes).toBe(0);
+    expect(next.memoryReaches).toBe(0);
   });
 
   /**

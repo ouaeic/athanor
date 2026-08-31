@@ -114,12 +114,20 @@ export const memoryProvenance = (memory: Pick<WorkspaceMemory, 'source'>): strin
 /**
  * Which computer or person the line applies to, said as a scope rather than as a person.
  *
- * "About you, everywhere" was a promise the row could not keep: the only reader filtered on
- * `workspace_id`, so an owner-tier entry was visible in the one workspace it was typed in and was
- * destroyed with it. The read path and the key now honour it — but only for rows sealed under the
- * owner key, and an entry written before that existed is still workspace-bound whatever its label
- * says. Three states, because there are three, and the third one tells the owner what to do about
- * it rather than quietly reading like the first.
+ * "About you, everywhere" was a promise the row could not keep, in two halves, and both are kept
+ * now. The first was storage: the only reader filtered on `workspace_id`, so an owner-tier entry
+ * was visible in the one workspace it was typed in and was destroyed with it. The read path and
+ * the key honour it — but only for rows sealed under the owner key, and an entry written before
+ * that existed is still workspace-bound whatever its label says. Three states, because there are
+ * three, and the third one tells the owner what to do about it rather than quietly reading like
+ * the first.
+ *
+ * The second half was reach, and it is the one this label reads as. Being stored everywhere and
+ * being sent nowhere is not what a person understands by "everywhere": the row still had to win a
+ * relevance contest against every workspace row that happened to share a word with the request,
+ * and against sixty of those it kept none of its sixteen. The word is honest now because
+ * `apps/worker/src/window.ts` reserves this tier's own storage bound out of the reviewed block's
+ * budget, so the label is describing a bound rather than a hope. Say the label; keep the bound.
  */
 export const memoryScope = (memory: Pick<WorkspaceMemory, 'target' | 'scope'>): string =>
   memory.target !== 'user'

@@ -121,6 +121,18 @@ export const startTurnState = <T extends Record<string, unknown>>(
      * still judged - it just gets its own kilobyte rather than the remains of the last one's.
      */
     turnNoveltyBytes: 0,
+    /*
+     * The reach budget, and it is per turn for the same reason the egress budget above it is.
+     *
+     * The tool says "this turn" when it refuses, and a bound whose refusal names a turn while the
+     * counter it reads spans a conversation is a bound the model cannot obey: a thread that had
+     * spent four reaches an hour ago would refuse the first reach of every turn afterwards, for
+     * ever. Safe to clear here and only here, because the one thing that starts a turn is the owner
+     * writing or a schedule they set firing - neither of which anything the last turn read can
+     * bring about. What is deliberately NOT cleared is the taint the reach may have raised, which
+     * carries with everything else above.
+     */
+    memoryReaches: 0,
     // A new turn has changed nothing yet, so its evidence ordering and its plan both start over.
     mutated: false,
     mutatedBeyondProse: false,
