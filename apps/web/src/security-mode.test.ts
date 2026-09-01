@@ -70,6 +70,16 @@ describe('what asks whatever the mode says', () => {
      */
     expect(named).toContain('package anyone can install');
     expect(named).toContain('run later');
+    /*
+     * The details of those last two, held rather than only their headings, because the wave that
+     * widened them widened the floor with them. Measured at 89185c6, in balanced AND autonomous:
+     * `dropdb production`, `redis-cli FLUSHALL`, `docker volume rm`, `crontab /tmp/mycron` and
+     * `systemctl --user enable` all raised no card, while this page said removing data and leaving
+     * something behind always stop. Both rows were lists of FILES, and none of those five is one.
+     */
+    const detailed = alwaysAsks.map((rule) => rule.detail.toLowerCase()).join(' ');
+    for (const act of ['database', 'redis', 'bucket', 'docker volume', 'crontab', 'systemctl'])
+      expect(detailed, act).toContain(act);
   });
 
   /*

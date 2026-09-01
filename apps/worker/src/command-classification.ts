@@ -2774,7 +2774,8 @@ const placeableExecutable = (name: string): boolean =>
   NETWORK_CLIENT_EXECUTABLES.has(name) ||
   ADDRESS_NAMING_EXECUTABLES.has(name) ||
   REGISTRY_PUBLISH_OPERATIONS.has(name) ||
-  DEPLOYMENT_OPERATIONS.has(name);
+  DEPLOYMENT_OPERATIONS.has(name) ||
+  namesAStoreOrASchedule(name);
 
 /**
  * What this command publishes, however many words were put in front of it.
@@ -2813,4 +2814,622 @@ export const publishingOperation = (
     if (placeableExecutable(name)) return null;
   }
   return null;
+};
+
+/* -------------------------------------------------------------- what a rewind does not put back */
+
+/**
+ * WHAT THE UNDO POINT COVERS, which is the fact this whole section is keyed on.
+ *
+ * `CHECKPOINT_CONTENT` (services/workspace-runner/src/checkpoints.ts) is `['workspace',
+ * '.athanor/artifacts']`. That is the whole of what a rewind restores, and it decides which of the
+ * commands below are worth a card and which are friction. `rm -rf node_modules` lands inside it and
+ * cards anyway, from a rule older than the checkpoint; `dropdb production`, `redis-cli flushall`,
+ * `docker volume rm pgdata` and `aws s3 rm --recursive` all land outside it and raised NOTHING in
+ * balanced or autonomous, while the always-resident contract told the owner that destroying data
+ * always stops. Measured through the shipped `approvalRequirement` at 89185c6, over eighty commands
+ * in all three modes: sixty-four were free in autonomous, and every database, cache, bucket,
+ * container volume and scheduling command among them was one of the sixty-four.
+ *
+ * THE OPERATION AND NOT THE EXECUTABLE, which is the rule the package-registry work already
+ * established here and the reason this is a table rather than a set of names. `psql` is not
+ * `psql -c 'DROP DATABASE'`: the owner's own scenario runs `psql tracker -f migrations/001_init.sql`
+ * and `psql tracker -c "select count(*) from tenancies"` twice each, so a card keyed on `psql`
+ * charges the owner for their own migration and their own row count. Same for `docker`, whose
+ * ordinary day is `build`, `run` and `ps`, and `systemctl`, whose ordinary day is `status` and
+ * `restart`.
+ *
+ * AND THE SAME RULE DECIDES WHAT IS ABSENT. A package-manager cache clear - `npm cache clean
+ * --force`, `pnpm store prune`, `go clean -modcache`, `brew cleanup` - destroys nothing that cannot
+ * be fetched again from the place it came from, so what it costs is minutes rather than data and it
+ * raises no card here. `cargo clean` deletes `target/`, which is inside `CHECKPOINT_CONTENT` and is
+ * put back by a rewind. `git branch -D`, `git reflog expire` and `git gc --prune=now` are the same
+ * answer one level down: they rewrite `.git`, and the repository the agent works in lives under
+ * `workspace/`, so the undo point already holds what they threw away. The one git act that leaves
+ * the checkpoint's reach is the one that reaches another computer, and it already cards - see
+ * `forcedGitPush`. All of this is written down in docs/design/itself/DESTRUCTION.md rather than
+ * left to be rediscovered as a hole.
+ */
+export type DestructionKind = 'store' | 'persistence';
+
+/** What this command destroys or leaves running, and which of the two it is. */
+export interface DestructionOperation {
+  readonly kind: DestructionKind;
+  readonly operation: string;
+}
+
+/**
+ * The two clients whose whole invocation is the act.
+ *
+ * `dropdb x` and `dropuser x` have no other mode: there is no read verb, no subcommand, and the
+ * only options that do not drop something are the ones that print the manual. So these are named
+ * rather than operation-matched, and they are the only two names in this section that are.
+ */
+const DESTROYING_EXECUTABLES = new Set(['dropdb', 'dropuser']);
+
+/**
+ * The clients that take a statement on the command line, and are therefore readable.
+ *
+ * A statement is evidence; a file is not. `psql -f migrations/001_init.sql` is the shape the
+ * owner's own build uses and its contents are on the far side of a path this function cannot open,
+ * so it raises nothing and is recorded as the gap it is. What arrives as text - `-c`, `-e`,
+ * `--command=`, `sqlite3 app.db 'DROP TABLE users'` - is read, and read per argument rather than
+ * over the joined line, because the clause that decides an unqualified `DELETE FROM` is the ABSENCE
+ * of anything after the table name and joining the arguments would put the next one there.
+ */
+const SQL_CLIENTS = new Set([
+  'clickhouse-client',
+  'cockroach',
+  'duckdb',
+  'mariadb',
+  'mysql',
+  'psql',
+  'sqlite',
+  'sqlite3',
+  'usql'
+]);
+
+/** The administrative client whose subcommand is the act: `mysqladmin drop app`. */
+const ADMIN_STORE_OPERATIONS: Record<string, readonly (readonly string[])[]> = {
+  mysqladmin: [['drop']]
+};
+
+/**
+ * A statement that removes a table, a schema, a database or every row of one.
+ *
+ * `DELETE FROM t WHERE …` is deliberately not here and the difference is the whole care in this
+ * pattern: a qualified delete is what an application does to its own rows all day, and an
+ * unqualified one is a truncate wearing different words. The clause is "nothing follows the table
+ * name", which is what separates them, rather than a list of the shapes a `WHERE` can take.
+ *
+ * `DROP INDEX` and `DROP VIEW` are here because both throw away something only a migration can
+ * rebuild, and neither is reachable by accident. `DROP FUNCTION`, `DROP TRIGGER` and the rest of
+ * the schema vocabulary are not: the same argument would admit every DDL verb there is, and the
+ * card would then be in front of the migration itself.
+ *
+ * THE END OF THE STATEMENT, NOT THE END OF THE LINE, which is the clause the delete pattern turns
+ * on and the one it got wrong. It carried the `m` flag, so `$` meant end of LINE, and a qualified
+ * delete written the way anybody writes a long one -
+ *
+ *     DELETE FROM tenancies
+ *     WHERE ended_at < now()
+ *
+ * - matched at the end of its first line and carded as "DELETE FROM with no WHERE". The heredoc
+ * form did it too, and `FREE_STORE_WORK` held a counterweight row for exactly this written on one
+ * line, which is the single spelling that passed. A statement ends at a `;` or at the end of the
+ * text, so those are what it is anchored to now; `\s` crosses newlines with the flag gone, so a
+ * multi-statement body still reaches every one of its statements through the `;`.
+ */
+const SQL_DROP =
+  /\bdrop\s+(database|schema|table|tablespace|role|user|index|sequence|materialized\s+view|view)\b/i;
+const SQL_TRUNCATE = /\btruncate\s+\S/i;
+const SQL_UNQUALIFIED_DELETE = /\bdelete\s+from\s+[^\s;'"]+\s*(?:;|['"]?\s*$)/i;
+
+/**
+ * The act a statement performs, named the way a card can print it, or null.
+ *
+ * The name and not the statement, because the card's headline is the name: quoting the whole of
+ * `DROP SCHEMA public CASCADE; DROP DATABASE production` into an action line gives the owner a dump
+ * to read rather than a question to answer, which is the shape `approvalToolPhrases` exists to
+ * stop. The statement itself is in the preview, where the whole command already is.
+ */
+export const destructiveSqlOperation = (statement: string): string | null => {
+  const dropped = SQL_DROP.exec(statement);
+  if (dropped) return `DROP ${(dropped[1] ?? '').toUpperCase().replace(/\s+/g, ' ')}`;
+  if (SQL_TRUNCATE.test(statement)) return 'TRUNCATE';
+  return SQL_UNQUALIFIED_DELETE.test(statement) ? 'DELETE FROM with no WHERE' : null;
+};
+
+/**
+ * The key-value clients, and the two commands that empty a store rather than a key.
+ *
+ * `del` and `unlink` name what they remove and are not here; `flushall` and `flushdb` name nothing,
+ * which is the point of them. Redis persistence lives in the server's own data directory, so
+ * neither is inside `CHECKPOINT_CONTENT` and neither is undone by a rewind.
+ */
+const KEY_VALUE_CLIENTS = new Set(['keydb-cli', 'redis-cli', 'valkey-cli']);
+const KEY_VALUE_DESTRUCTION = new Set(['flushall', 'flushdb']);
+
+/**
+ * The document clients, whose destructive verbs arrive as a line of JavaScript.
+ *
+ * Matched on the method rather than on the receiver, for the reason `DESTRUCTIVE_RUNTIME_CALL`
+ * gives about `require('fs')`: `db.dropDatabase()`, `db.getSiblingDB('x').dropDatabase()` and
+ * `db.users.drop()` are one act under three receivers. `deleteMany` and `remove` are matched only
+ * with an EMPTY filter, which is the same clause the unqualified `DELETE FROM` above turns on.
+ */
+const DOCUMENT_CLIENTS = new Set(['mongo', 'mongosh']);
+const DESTRUCTIVE_DOCUMENT_CALL =
+  /\.drop(?:database|indexes)?\s*\(|\b(?:deletemany|remove)\s*\(\s*(?:\{\s*\}\s*)?\)/i;
+
+/**
+ * A word-run that destroys a store this computer does not hold, keyed per executable.
+ *
+ * Every read and every write verb these tools spell - `ls`, `cp`, `sync`, `mb`, `cat`, `head`,
+ * `stat`, `presign`, `ps`, `build`, `run`, `images`, `logs` - is absent by construction, because
+ * this table names what removes rather than what is safe. `aws s3 cp` and `aws s3 sync` upload and
+ * are somebody else's rule; `aws s3 rm` and `aws s3 rb` take the far copy away, and the far copy is
+ * the only copy once the local one is gone.
+ *
+ * The container rows are here because a volume is where a container's database lives. `docker rmi`
+ * is absent - an image is re-pullable and re-buildable - and so is `docker rm`, whose writable
+ * layer is scratch by design. `docker volume rm` and `docker volume prune` always take a volume
+ * with them, and neither is inside `CHECKPOINT_CONTENT`.
+ *
+ * `docker system prune` is NOT here, and it was: without `--volumes` it removes stopped containers,
+ * unused networks, dangling images and the build cache, every one of which is re-pullable or
+ * re-buildable - which is the same answer this section already gives `docker rmi`, `npm cache
+ * clean` and `brew cleanup`, and it costs minutes rather than data. Carding it while `docker rmi`
+ * beside it was free was this section disagreeing with itself about one act. With `--volumes` it is
+ * the whole of `docker volume prune` and more, so it is in `STORE_DESTRUCTION_PAIRS` below, which
+ * is the table that exists for exactly this distinction.
+ */
+const STORE_DESTRUCTION_OPERATIONS: Record<string, readonly (readonly string[])[]> = {
+  aws: [
+    ['s3', 'rm'],
+    ['s3', 'rb'],
+    ['s3api', 'delete-object'],
+    ['s3api', 'delete-objects'],
+    ['s3api', 'delete-bucket'],
+    ['dynamodb', 'delete-table']
+  ],
+  az: [
+    ['storage', 'blob', 'delete'],
+    ['storage', 'blob', 'delete-batch'],
+    ['storage', 'container', 'delete'],
+    ['storage', 'fs', 'delete']
+  ],
+  docker: [
+    ['volume', 'rm'],
+    ['volume', 'prune']
+  ],
+  gcloud: [
+    ['storage', 'rm'],
+    ['storage', 'buckets', 'delete']
+  ],
+  gsutil: [['rm'], ['rb']],
+  mc: [['rm'], ['rb']],
+  podman: [
+    ['volume', 'rm'],
+    ['volume', 'prune']
+  ],
+  rclone: [['delete'], ['deletefile'], ['purge'], ['rmdir'], ['rmdirs']],
+  s3cmd: [['del'], ['rm'], ['rb']]
+};
+
+/**
+ * The acts in this section that need a word AND a flag to be themselves.
+ *
+ * `docker compose down` stops what it started and leaves the volumes where they are; `docker
+ * compose down -v` is how a developer's database disappears. Rows here rather than a widening of
+ * the table above, because carding the bare `down` would put a card in front of stopping a dev
+ * stack - which is ordinary work, several times an hour.
+ *
+ * `docker system prune` is the same shape and was on the wrong side of it. Bare, and with `-a`, it
+ * throws away stopped containers, unused networks, dangling images and the build cache: minutes of
+ * re-pulling and re-building, and nothing a rewind is needed for - which is the answer this file
+ * already gives `docker rmi` and every package-manager cache clear. `--volumes` is the word that
+ * makes it take the database with it, and it is the only spelling here that does. `-v` is
+ * deliberately NOT accepted on this row: `docker system prune` has no short form for it, and `-v`
+ * on that command is the version flag.
+ */
+const STORE_DESTRUCTION_PAIRS: Record<
+  string,
+  readonly { readonly operation: readonly string[]; readonly options: ReadonlySet<string> }[]
+> = {
+  docker: [
+    { operation: ['compose', 'down'], options: new Set(['-v', '--volumes']) },
+    { operation: ['system', 'prune'], options: new Set(['--volumes']) }
+  ],
+  'docker-compose': [{ operation: ['down'], options: new Set(['-v', '--volumes']) }],
+  podman: [
+    { operation: ['compose', 'down'], options: new Set(['-v', '--volumes']) },
+    { operation: ['system', 'prune'], options: new Set(['--volumes']) }
+  ]
+};
+
+/**
+ * The dry runs these tools spell, honoured for the reason `DRY_RUN_OPTIONS` gives above: the tool
+ * itself enforces the mode before anything leaves, and this table is the only reader of the flag.
+ * `aws s3 rm --dryrun` prints what it would delete and deletes nothing, and it is what anybody
+ * sensible types first.
+ */
+const STORE_DRY_RUN_OPTIONS = new Map<string, RegExp>([
+  ['aws', /^--dryrun$/],
+  ['gsutil', /^-n$/],
+  ['mc', /^--dry-run$/],
+  ['rclone', /^--dry-run$/],
+  ['s3cmd', /^--dry-run$/]
+]);
+
+/**
+ * Work that outlives the turn, and the reads of the same tools that must not card.
+ *
+ * The contract's autonomous sentence used to name only files - "a startup file, hook or tool
+ * configuration it would run on its own afterwards" - and `deferredExecutionPaths` keeps that half.
+ * What no path rule can see is the half that never names a file: `crontab -`, `at now + 1 minute`, `systemctl --user enable` and
+ * `launchctl load` all install something that runs after this task and every card in it is over,
+ * and all four were free in balanced and autonomous. None of them is inside `CHECKPOINT_CONTENT`
+ * either, so a rewind of the turn leaves the schedule running.
+ *
+ * `systemctl start`, `stop`, `restart` and `daemon-reload` are absent: they change what is running
+ * now and nothing about what runs after a reboot, and the owner's own deploy scenario restarts a
+ * service. `enable`, `disable`, `mask` and `link` are the ones that write a link into the unit tree.
+ */
+const PERSISTENCE_OPERATIONS: Record<string, readonly (readonly string[])[]> = {
+  launchctl: [['load'], ['unload'], ['bootstrap'], ['bootout'], ['enable'], ['disable']],
+  systemctl: [
+    ['enable'],
+    ['disable'],
+    ['mask'],
+    ['unmask'],
+    ['link'],
+    ['preset'],
+    ['set-default'],
+    ['edit']
+  ]
+};
+
+/**
+ * A transient unit is not persistence; a transient TIMER is. `systemd-run --on-calendar=daily` puts
+ * a schedule in the manager that survives the turn, and a bare `systemd-run` runs a command once
+ * and is gone. Prefix-matched before `=`, because every one of these options is written both ways.
+ */
+const PERSISTENCE_OPTIONS: Record<string, ReadonlySet<string>> = {
+  'systemd-run': new Set([
+    '--on-active-sec',
+    '--on-boot-sec',
+    '--on-calendar',
+    '--on-startup-sec',
+    '--on-unit-active-sec',
+    '--timer-property'
+  ])
+};
+
+/**
+ * The two schedulers whose ordinary invocation IS the write, and the options that make one a read.
+ *
+ * `crontab` with no argument reads a table off stdin and replaces the owner's whole crontab with it;
+ * `crontab file` does the same from a path; `crontab -r` throws it away. Only `-l` prints. `at` and
+ * `batch` are the same shape with one option more: `-l` lists and `-c` prints a job back. Keyed per
+ * executable rather than as one set, because `crontab -c` is not a read and not an option at all,
+ * and a shared exemption would have handed it one. So these are stated as "destructive unless read"
+ * rather than as an operation table -
+ * the inverse of every other entry in this section, and the honest shape for a command whose
+ * default is to write.
+ *
+ * `atq` and `atrm` are separate programs and are deliberately not here. `atq` only lists, and
+ * `atrm 3` names the single job it removes, which is a targeted act rather than the whole table.
+ */
+const SCHEDULE_READ_OPTIONS: Record<string, ReadonlySet<string>> = {
+  at: new Set(['-l', '--list', '-c']),
+  batch: new Set(['-l', '--list', '-c']),
+  crontab: new Set(['-l', '--list'])
+};
+
+/**
+ * The names this section will accept behind a word it cannot read, and the ones it will not.
+ *
+ * The walk hands every arm every word of every command, and the arms that fire on a bare name with
+ * no operation beside it are the weakest evidence here - the same fact `deploymentOperation`'s
+ * `atHead` exists for. But refusing all of them outright is a bypass rather than a precaution:
+ * measured, `./scripts/db dropdb production` raised NOTHING while the bare `dropdb production`
+ * carded in all three modes, which is the wrapper defeat `publishingOperation` was written to
+ * close, reopened one table along.
+ *
+ * So the line is drawn on the word rather than on the position. `dropdb`, `dropuser` and `crontab`
+ * are program names and nothing else - no English sentence contains them - so they are read
+ * wherever the walk finds them. `at` and `batch` are ordinary English words, and the walk reaches
+ * them only after passing a word this file cannot name, where "look at this" and "run the batch"
+ * are as likely as the scheduler; those two are read at the head and nowhere else.
+ */
+const NAMED_ANYWHERE = new Set(['crontab', 'dropdb', 'dropuser']);
+
+/**
+ * The readers whose operand IS a program name, which is the cost the rule above came with.
+ *
+ * `NAMED_ANYWHERE` reads `crontab` wherever the walk finds it, and that is what closes the wrapper
+ * defeat - it is also what put a card in front of reading the manual. Measured: `man crontab`,
+ * `info crontab`, `tldr crontab` and `man -k crontab` each raised "Install work that outlives this
+ * turn with crontab" in ALL THREE MODES, so looking up how a scheduler works stopped an autonomous
+ * turn, while `grep crontab /etc/passwd` beside them was free only because `grep` happens to sit in
+ * an unrelated table and nothing pinned it.
+ *
+ * Every one of these takes the NAME of a program and prints text about it. None can run the thing
+ * it names, so there is no wrapper defeat behind them to protect against: the walk stops here the
+ * same way it already stops at `echo` and `git`. `xargs`, `sudo`, `timeout` and `env` are pointedly
+ * not here - each of those does run what follows it, and each is a row in `DESTROYS`.
+ */
+const PROGRAM_NAMING_READERS = new Set([
+  'apropos',
+  'info',
+  'man',
+  'tldr',
+  'whatis',
+  'whereis',
+  'which'
+]);
+
+/** Whether any option here is one of `names`, matched before a `=` so both spellings count. */
+const optionNamed = (options: readonly string[], names: ReadonlySet<string>): boolean =>
+  options.some((option) => names.has(option.split('=')[0] ?? option));
+
+/**
+ * What this one command destroys or leaves behind, or null - the per-command half of the walk.
+ *
+ * `atHead` carries the same fact `deploymentOperation` needs it for. The walk below hands this
+ * every word of every command so that a wrapper nobody has heard of cannot hide the operation, and
+ * the arms that need no operation at all - a bare `dropdb`, a bare `crontab` - would then fire on
+ * the word `crontab` inside `grep crontab /etc/passwd`. They are asked only of the head.
+ */
+const destructionForCommand = (
+  executable: string,
+  commandArgs: readonly string[],
+  atHead: boolean
+): DestructionOperation | null => {
+  const lowered = commandArgs.map((argument) => unquoted(argument).toLowerCase());
+  /*
+   * `--help` and `--version` and NOT `-h`, which is the one place this section may not borrow
+   * `HELP_OPTIONS` from the deployment table above. `-h` is the HOST option on `psql`, `mysql`,
+   * `redis-cli` and `mongosh`, and reading it as help silently exempted every one of them:
+   * `redis-cli -h 127.0.0.1 flushall` raised nothing while the bare `redis-cli flushall` beside it
+   * carded in all three modes, and `psql -h db.internal -c 'DROP DATABASE x'` would have gone the
+   * same way. Losing `-h` costs a card on `docker volume rm -h`, which prints the manual; that is
+   * the direction to be wrong in.
+   */
+  if (lowered.some((argument) => argument === '--help' || argument === '--version')) return null;
+  const words = lowered.filter((argument) => !argument.startsWith('-'));
+  const options = lowered.filter((argument) => argument.startsWith('-'));
+  const store = (operation: string): DestructionOperation => ({ kind: 'store', operation });
+  const persistence = (operation: string): DestructionOperation => ({
+    kind: 'persistence',
+    operation
+  });
+  const readable = atHead || NAMED_ANYWHERE.has(executable);
+  if (readable && DESTROYING_EXECUTABLES.has(executable)) return store(executable);
+  if (SQL_CLIENTS.has(executable)) {
+    const statement = commandArgs
+      .map((argument) => destructiveSqlOperation(unquoted(argument)))
+      .find(Boolean);
+    if (statement) return store(`${executable} ${statement}`);
+  }
+  if (KEY_VALUE_CLIENTS.has(executable)) {
+    const flush = words.find((word) => KEY_VALUE_DESTRUCTION.has(word));
+    if (flush) return store(`${executable} ${flush}`);
+  }
+  if (
+    DOCUMENT_CLIENTS.has(executable) &&
+    commandArgs.some((argument) => DESTRUCTIVE_DOCUMENT_CALL.test(unquoted(argument)))
+  )
+    return store(`${executable} dropping a database or collection`);
+  const dryRun = STORE_DRY_RUN_OPTIONS.get(executable);
+  if (!lowered.some((argument) => dryRun?.test(argument))) {
+    const matched = operationNamed(
+      [
+        ...(ownEntry(STORE_DESTRUCTION_OPERATIONS, executable) ?? []),
+        ...(ownEntry(ADMIN_STORE_OPERATIONS, executable) ?? [])
+      ],
+      words
+    );
+    if (matched) return store(`${executable} ${matched.join(' ')}`);
+    for (const pair of ownEntry(STORE_DESTRUCTION_PAIRS, executable) ?? [])
+      if (operationNamed([pair.operation], words) && optionNamed(options, pair.options))
+        return store(`${executable} ${pair.operation.join(' ')} --volumes`);
+  }
+  const persisting = operationNamed(ownEntry(PERSISTENCE_OPERATIONS, executable) ?? [], words);
+  if (persisting) return persistence(`${executable} ${persisting.join(' ')}`);
+  if (optionNamed(options, ownEntry(PERSISTENCE_OPTIONS, executable) ?? new Set()))
+    return persistence(executable);
+  const scheduleReads = ownEntry(SCHEDULE_READ_OPTIONS, executable);
+  if (readable && scheduleReads && !options.some((option) => scheduleReads.has(option)))
+    return persistence(executable);
+  return null;
+};
+
+/**
+ * Every program the section above has an opinion about, for `placeableExecutable`.
+ *
+ * The walk's stopping condition is "can this file NAME the word", and a name it can act on but
+ * cannot recognise is the worst of both: the walk reads past it into its own arguments. Without
+ * this, `bash -lc 'psql -c "select * from crontab"'` reached the walk as separate tokens, `psql`
+ * was not a name this file knew, and the word `crontab` inside the owner's own query raised
+ * "Install work that outlives this turn". Naming them stops the walk where the command
+ * really begins.
+ */
+const namesAStoreOrASchedule = (name: string): boolean =>
+  DESTROYING_EXECUTABLES.has(name) ||
+  SQL_CLIENTS.has(name) ||
+  KEY_VALUE_CLIENTS.has(name) ||
+  DOCUMENT_CLIENTS.has(name) ||
+  ownEntry(SCHEDULE_READ_OPTIONS, name) !== undefined ||
+  ownEntry(ADMIN_STORE_OPERATIONS, name) !== undefined ||
+  ownEntry(STORE_DESTRUCTION_OPERATIONS, name) !== undefined ||
+  ownEntry(STORE_DESTRUCTION_PAIRS, name) !== undefined ||
+  ownEntry(PERSISTENCE_OPERATIONS, name) !== undefined ||
+  ownEntry(PERSISTENCE_OPTIONS, name) !== undefined;
+
+/**
+ * What this command destroys or leaves running, however many words were put in front of it.
+ *
+ * The same walk as `publishingOperation`, for the same reason and with the same bound: it does not
+ * ask which wrappers exist, because a shell function, an alias and a script on PATH cannot be
+ * enumerated. It asks whether this file can NAME the word it is looking at, and keeps reading while
+ * the answer is no. `sudo dropdb prod`, `timeout 60 redis-cli flushall` and
+ * `deploy-tool docker volume rm pgdata` are all read as themselves; `git commit -m "flushall"`,
+ * `echo docker volume rm` and `man crontab` stop at `git`, `echo` and `man`, which this file names.
+ */
+export const destructionOperation = (tokens: readonly string[]): DestructionOperation | null => {
+  for (const [index, token = ''] of tokens.entries()) {
+    const name = (unquoted(token).split('/').pop() ?? '').toLowerCase();
+    if (!name) continue;
+    const found = destructionForCommand(name, tokens.slice(index + 1), index === 0);
+    if (found) return found;
+    if (PROGRAM_NAMING_READERS.has(name) || placeableExecutable(name)) return null;
+  }
+  return null;
+};
+
+/**
+ * A statement the wrapper's quoting took apart, read back off the whole script.
+ *
+ * `scriptCommands` splits a script on whitespace, so `bash -lc 'psql -c "DROP DATABASE production"'`
+ * arrives at the walk as the four tokens `psql`, `-c`, `"DROP` and `DATABASE`, and the statement
+ * that decides the card is no longer a statement. Measured: the bare form carded in all three modes
+ * and the wrapped form was free in balanced and autonomous - and `shell`'s own description tells the
+ * model to reach for `bash -lc` the moment it needs a pipe or a redirect, so the wrapped spelling is
+ * the one real work arrives in. Every other gate in this file solved this by reading the script;
+ * this one has to read it UNSPLIT, because the evidence spans the split.
+ *
+ * The pair is required, not either half, and the client half is asked of the HEAD of a command
+ * rather than of any word in the script - which is the walk's own stopping condition, kept here
+ * because a raw scan of the body does not have it. Measured: a body scan carded
+ * `echo "psql -c DROP DATABASE x"`, which is the counterweight row `git commit -m "npm publish"`
+ * already holds one table along. `grep -n "DROP TABLE" schema.sql` runs `grep` and raises nothing;
+ * `psql -f migrations/001_init.sql` names no statement and raises nothing, which is the shape the
+ * owner's own build uses twice.
+ *
+ * It over-reaches by the width of a script, the same way `scriptCommands` does with a proxy
+ * assignment and for the same reason: a client in one line and a drop in another are credited to
+ * each other. That costs a card on a script that would not have run the pair, and the alternative
+ * is missing every script that does.
+ *
+ * `consumer` IS THE PROGRAM THE TEXT IS BEING FED TO, and without it this read the body for a
+ * client and then refused to look at the one place a client is always named. `shell` takes a
+ * `stdin` string - it is in the shipped schema, and `execution.ts` ends the child's stdin with it -
+ * so `shell(executable: 'psql', args: ['-d', 'postgres'], stdin: 'DROP DATABASE production;')` is a
+ * spelling the model can write today. Measured before this parameter existed: free in balanced AND
+ * autonomous on psql, mysql, sqlite3, mongosh and redis-cli, while
+ * `shell(executable: 'bash', stdin: 'dropdb production')` carded - the gate read stdin when the
+ * executable was an interpreter and ignored it when the executable was the program that would
+ * consume it. Both halves of the evidence were already being computed: `commandScript` returned the
+ * statement and `destructiveSqlOperation` named it, and nothing put them together, because
+ * `scriptCommands` finds the head of `DROP DATABASE production;` to be `drop`. The `DESTROYS` row
+ * that looked like it covered this passed for the wrong reason - its body spelled `psql` a second
+ * time inside the heredoc, so a head existed to find.
+ *
+ * The key-value clients are read here and not in the arm above for one reason that only holds on
+ * stdin: a redis command stream carries no connection options, so the command really is the first
+ * word of a line. On a command LINE it is not - `redis-cli -h 127.0.0.1 flushall` puts the host
+ * where the command would be - which is why that arm still reads any word and still cards
+ * `redis-cli GET flushall`.
+ */
+const STDIN_FLUSH = /^[ \t]*(flushall|flushdb)\b/im;
+
+export const scriptDestroysAStore = (body: string, consumer = ''): string | null => {
+  const consuming = (unquoted(consumer).split('/').pop() ?? '').toLowerCase();
+  const heads = [
+    ...scriptCommands(body).map(([command = '']) => command),
+    ...(consuming ? [consuming] : [])
+  ];
+  const sql = heads.find((head) => SQL_CLIENTS.has(head));
+  if (sql && destructiveSqlOperation(body)) return sql;
+  const document = heads.find((head) => DOCUMENT_CLIENTS.has(head));
+  if (document && DESTRUCTIVE_DOCUMENT_CALL.test(body)) return document;
+  if (!KEY_VALUE_CLIENTS.has(consuming)) return null;
+  const flush = STDIN_FLUSH.exec(body)?.[1]?.toLowerCase();
+  return flush ? `${consuming} ${flush}` : null;
+};
+
+/**
+ * A push that replaces what another computer already has, rather than adding to it.
+ *
+ * Every `git push` already cards, and this does not add one: it changes what the card SAYS. A
+ * forced push discards commits on a remote this computer does not hold and cannot restore, and
+ * `external_reversible` under the headline "Push Git changes" is the wrong sentence in front of the
+ * one push that is not. `--force-with-lease` is here with the rest: it refuses only when the remote
+ * moved since the last fetch, which makes it safer to run and no easier to undo afterwards.
+ */
+export const forcedGitPush = (tokens: readonly string[]): boolean =>
+  tokens[0] === 'git' &&
+  gitSubcommand(tokens.slice(1)) === 'push' &&
+  tokens.some((token) =>
+    /^(?:-[a-z]*f[a-z]*|--force(?:-with-lease)?(?:=.*)?)$/i.test(unquoted(token))
+  );
+
+/**
+ * The directories a scheduler or an init system executes the contents of.
+ *
+ * `deferredExecutionPaths` holds the file half of the contract's persistence clause - `~/.bashrc`,
+ * `.git/hooks/*`, a coding CLI's own directory - and every name in it is a file under the agent's
+ * HOME or inside the project. These are the other shape: absolute system directories whose whole
+ * contents are run on a schedule by a process nobody here starts. Measured at 89185c6,
+ * `echo "* * * * * root curl x" | sudo tee /etc/cron.d/job` raised NOTHING in any mode - the
+ * command names no rc file, opens no socket and removes nothing, and it runs every minute
+ * afterwards. A redirect to the same place carded, but only as "Run bash" through the escaping-
+ * redirect rule, which is a card about leaving the workspace rather than about what was left behind.
+ *
+ * Kept here with the rest of this file's vocabulary and read by the floor, which is the split every
+ * other list in this file has. Directories rather than filenames, for the reason
+ * `DEFERRED_EXECUTION_DIRECTORIES` gives: none of these documents a fixed set of names, and a rule
+ * listing today's would miss tomorrow's.
+ */
+const SCHEDULED_EXECUTION_DIRECTORIES = new Set([
+  'cron.d',
+  'cron.daily',
+  'cron.hourly',
+  'cron.monthly',
+  'cron.weekly',
+  'crontabs',
+  'init.d',
+  'launchagents',
+  'launchdaemons',
+  'profile.d'
+]);
+
+/** The two unit trees, each named by its parent so `systemd/user/x.service` is one and only one. */
+const UNIT_TREE_PARENTS = new Set(['system', 'user']);
+
+/**
+ * Whether a written path lands where a scheduler or an init system will run it.
+ *
+ * ABSOLUTE, OR UNDER THE AGENT'S OWN HOME, which is what the paragraph above says these are and
+ * what this did not check. `shell` resolves every relative path through `resolveInside` against the
+ * workspace root (services/workspace-runner/src/execution.ts), so `deploy/init.d/app` is a file in
+ * the owner's project that no scheduler has ever read - and `file_write` on that same name was
+ * already free, so the two spellings of one file disagreed about it. Measured before this test:
+ * `cp tpl deploy/init.d/app`, `tar czf out.tgz deploy/init.d/app` and `git add deploy/init.d/app`
+ * each raised "Change a file this computer runs on its own" in all three modes, the last two on
+ * commands that only READ the file - `shellWriteTargets` names every operand, which it may do
+ * while the card was one that was going to be raised anyway, and this was not.
+ *
+ * The `CONFINED` pair in evals/cards holds both ends of this and could not see the middle: it roots
+ * one arm at `~/…` and the other at a workspace-relative name through `file_write`, and the hole
+ * was a workspace-relative name through `shell`.
+ */
+export const isScheduledExecutionPath = (path: string): boolean => {
+  if (!/^[~/]/.test(path)) return false;
+  const segments = path
+    .toLowerCase()
+    .split(/[\\/]+/)
+    .filter((segment) => segment && segment !== '.');
+  // The last segment is the file being written; a bare `/etc/cron.d` is not a write into it.
+  return segments.some((segment, index) => {
+    if (index === segments.length - 1) return false;
+    if (SCHEDULED_EXECUTION_DIRECTORIES.has(segment)) return true;
+    return (
+      segment === 'systemd' &&
+      UNIT_TREE_PARENTS.has(segments[index + 1] ?? '') &&
+      index + 2 < segments.length
+    );
+  });
 };

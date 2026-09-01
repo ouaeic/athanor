@@ -10,10 +10,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   callDestinations,
+  destructionOperation,
   effectiveCommands,
+  forcedGitPush,
+  isScheduledExecutionPath,
   gitConfigRunsCode,
   gitConfigWrite,
   registryPublishOperation,
+  scriptDestroysAStore,
   sendsDataOverNetwork,
   shellWriteTargets,
   untrustedShellOrigin
@@ -1368,5 +1372,231 @@ describe('the punctuation a shell writes around a command', () => {
     );
     // The counterweight: `env` running something that is not a publish stays unnamed.
     expect(publishes({ executable: 'bash', args: ['-lc', "env -S 'npm run build'"] })).toBeNull();
+  });
+});
+
+/*
+ * The two readers behind the destruction card, asked directly rather than through a card.
+ *
+ * The floor drives both at the production call site in `approval-policy.test.ts`; these are the
+ * questions that call site cannot ask cleanly - what the walk names an operation, and where it
+ * stops - because a card answers "yes" without saying which arm said so.
+ */
+describe('destructionOperation', () => {
+  it('names the operation rather than the executable', () => {
+    expect(destructionOperation(['dropdb', 'production'])).toEqual({
+      kind: 'store',
+      operation: 'dropdb'
+    });
+    expect(destructionOperation(['psql', '-c', 'TRUNCATE TABLE t'])?.kind).toBe('store');
+    expect(destructionOperation(['psql', 'tracker', '-f', 'migrations/001.sql'])).toBeNull();
+    expect(destructionOperation(['docker', 'volume', 'rm', 'pgdata'])).toEqual({
+      kind: 'store',
+      operation: 'docker volume rm'
+    });
+    expect(destructionOperation(['docker', 'compose', 'down'])).toBeNull();
+    expect(destructionOperation(['docker', 'compose', 'down', '-v'])?.kind).toBe('store');
+    expect(destructionOperation(['systemctl', '--user', 'enable', 'x'])).toEqual({
+      kind: 'persistence',
+      operation: 'systemctl enable'
+    });
+    expect(destructionOperation(['systemctl', 'restart', 'x'])).toBeNull();
+    expect(destructionOperation(['crontab', '-l'])).toBeNull();
+    expect(destructionOperation(['crontab', '/tmp/mycron'])?.kind).toBe('persistence');
+  });
+
+  /*
+   * `-h` is the HOST option on every client in the SQL and key-value tables, and reading it as
+   * `--help` exempted all of them: `redis-cli -h 127.0.0.1 flushall` came back null while the bare
+   * form did not.
+   */
+  it('does not read a host option as a request for the manual', () => {
+    expect(destructionOperation(['redis-cli', '-h', '127.0.0.1', 'flushall'])?.kind).toBe('store');
+    expect(destructionOperation(['psql', '-h', 'db.internal', '-c', 'DROP TABLE t'])?.kind).toBe(
+      'store'
+    );
+    expect(destructionOperation(['gsutil', 'rm', '--help'])).toBeNull();
+  });
+
+  /*
+   * Where the walk stops, in both directions. A word this file cannot name is read past, because a
+   * wrapper cannot be enumerated; a word it CAN name ends the walk, which is what keeps the owner's
+   * own query off the card.
+   */
+  it('reads past a wrapper it cannot name and stops at one it can', () => {
+    expect(destructionOperation(['./scripts/db', 'dropdb', 'production'])?.operation).toBe(
+      'dropdb'
+    );
+    expect(destructionOperation(['./scripts/db', 'crontab', '/tmp/x'])?.kind).toBe('persistence');
+    expect(destructionOperation(['git', 'commit', '-m', 'dropdb production'])).toBeNull();
+    expect(destructionOperation(['echo', 'docker', 'volume', 'rm', 'x'])).toBeNull();
+    // `at` and `batch` are English words and are read at the head only.
+    expect(destructionOperation(['./scripts/db', 'at', 'now'])).toBeNull();
+    expect(destructionOperation(['at', '-f', 'job.sh', 'now'])?.kind).toBe('persistence');
+    // And a name this section knows ends the walk before its own arguments are misread.
+    expect(destructionOperation(['psql', '-c', 'select', '*', 'from', 'crontab'])).toBeNull();
+  });
+
+  /*
+   * The cost `NAMED_ANYWHERE` came with. Reading `crontab` wherever the walk finds it is what closes
+   * the wrapper defeat above, and it put "Install work that outlives this turn with crontab" in
+   * front of `man crontab` in ALL THREE modes. A reader that names a program cannot run it; a
+   * wrapper that names one can, and both directions are here.
+   */
+  it('does not card the manual for a scheduler, and still cards the wrappers that run one', () => {
+    for (const reader of ['man', 'info', 'tldr', 'whatis', 'apropos', 'whereis', 'which'])
+      expect(destructionOperation([reader, 'crontab']), reader).toBeNull();
+    expect(destructionOperation(['man', '-k', 'crontab'])).toBeNull();
+    expect(destructionOperation(['man', 'dropdb'])).toBeNull();
+    // The words that DO run what follows them stay on the other side of the line.
+    for (const runner of ['sudo', 'xargs', 'env', 'timeout'])
+      expect(destructionOperation([runner, 'dropdb', 'production'])?.operation, runner).toBe(
+        'dropdb'
+      );
+  });
+
+  /*
+   * `docker system prune` without `--volumes` removes stopped containers, unused networks, dangling
+   * images and the build cache - all re-pullable, which is the answer this file already gives
+   * `docker rmi` and `npm cache clean`. It carded anyway, which was the pair rule that exists for
+   * `docker compose down` not being applied to the command beside it.
+   */
+  it('asks for the flag that takes the volume, on both prune commands', () => {
+    expect(destructionOperation(['docker', 'system', 'prune'])).toBeNull();
+    expect(destructionOperation(['docker', 'system', 'prune', '-a', '-f'])).toBeNull();
+    expect(destructionOperation(['podman', 'system', 'prune', '-a'])).toBeNull();
+    expect(destructionOperation(['docker', 'system', 'prune', '-af', '--volumes'])).toEqual({
+      kind: 'store',
+      operation: 'docker system prune --volumes'
+    });
+    expect(destructionOperation(['podman', 'system', 'prune', '--volumes'])?.kind).toBe('store');
+    // The one that always takes a volume needs no flag, and did not change.
+    expect(destructionOperation(['docker', 'volume', 'prune', '-f'])?.kind).toBe('store');
+  });
+
+  /*
+   * The clause is "nothing follows the table name", and the pattern carried the `m` flag, so `$`
+   * meant end of LINE and a qualified delete written across two of them read as unqualified.
+   */
+  it('reads a WHERE on the next line, and still reads a statement that has none', () => {
+    expect(destructionOperation(['psql', '-c', 'DELETE FROM tenancies'])?.operation).toBe(
+      'psql DELETE FROM with no WHERE'
+    );
+    expect(destructionOperation(['psql', '-c', 'DELETE FROM tenancies;'])?.kind).toBe('store');
+    expect(destructionOperation(['psql', '-c', 'DELETE FROM t; VACUUM'])?.kind).toBe('store');
+    expect(
+      destructionOperation(['psql', '-c', 'DELETE FROM sessions\nWHERE expires_at < now()'])
+    ).toBeNull();
+    expect(
+      destructionOperation(['psql', '-c', 'DELETE FROM sessions WHERE expires_at < now()'])
+    ).toBeNull();
+  });
+});
+
+/*
+ * The statement the wrapper's quoting took apart. `scriptCommands` splits on whitespace, so the
+ * evidence spans the split and has to be read off the unsplit body - but the CLIENT half is still
+ * asked of a command head, which is the walk's stopping condition kept by hand.
+ */
+describe('scriptDestroysAStore', () => {
+  it('reads a statement the token split destroyed, and only behind its own client', () => {
+    expect(scriptDestroysAStore('psql -c "DROP DATABASE production"')).toBe('psql');
+    expect(scriptDestroysAStore('psql tracker <<SQL\nTRUNCATE TABLE t;\nSQL')).toBe('psql');
+    expect(scriptDestroysAStore('mongosh --eval "db.t.deleteMany({ })"')).toBe('mongosh');
+    expect(scriptDestroysAStore('psql tracker -c "select count(*) from tenancies"')).toBeNull();
+    expect(scriptDestroysAStore('psql tracker -f db/migrations/001_init.sql')).toBeNull();
+    expect(scriptDestroysAStore('grep -n "DROP TABLE" db/schema.sql')).toBeNull();
+    expect(scriptDestroysAStore('echo "psql -c DROP DATABASE x"')).toBeNull();
+  });
+
+  /*
+   * The client is on the OUTSIDE of the string when the statement arrives on stdin, which is a
+   * spelling the shipped `shell` schema takes and `execution.ts` feeds to the child. Every one of
+   * these was free in balanced and autonomous while the same statement in `-c` carded in all three.
+   */
+  it('reads a statement fed to the program that will consume it', () => {
+    expect(scriptDestroysAStore('DROP DATABASE production;', 'psql')).toBe('psql');
+    expect(scriptDestroysAStore('DROP DATABASE app;', 'mysql')).toBe('mysql');
+    expect(scriptDestroysAStore('DROP TABLE users;', 'sqlite3')).toBe('sqlite3');
+    expect(scriptDestroysAStore('TRUNCATE TABLE tenancies;', '/usr/bin/psql')).toBe('psql');
+    expect(scriptDestroysAStore('db.dropDatabase()', 'mongosh')).toBe('mongosh');
+    expect(scriptDestroysAStore('flushall', 'redis-cli')).toBe('redis-cli flushall');
+    expect(scriptDestroysAStore('SELECT 1;\nFLUSHDB\n', 'valkey-cli')).toBe('valkey-cli flushdb');
+  });
+
+  /*
+   * The other direction, and the reason the key-value half is read HERE and not on the command
+   * line: a stdin stream carries no connection options, so the command really is the first word of
+   * a line. `redis-cli GET flushall` on a command line is a different question and a different arm.
+   */
+  it('leaves a read fed to the same program alone', () => {
+    expect(scriptDestroysAStore('select count(*) from tenancies;', 'psql')).toBeNull();
+    expect(
+      scriptDestroysAStore('DELETE FROM sessions\nWHERE expires_at < now();', 'psql')
+    ).toBeNull();
+    expect(scriptDestroysAStore('db.t.find()', 'mongosh')).toBeNull();
+    expect(scriptDestroysAStore('GET flushall', 'redis-cli')).toBeNull();
+    expect(scriptDestroysAStore('cat notes.md', 'bash')).toBeNull();
+    // A consumer this section does not know reads nothing back out of its own input.
+    expect(scriptDestroysAStore('DROP DATABASE production;', 'tee')).toBeNull();
+    expect(scriptDestroysAStore('DROP DATABASE production;', '')).toBeNull();
+  });
+});
+
+describe('forcedGitPush and isScheduledExecutionPath', () => {
+  it('separates the push that replaces from the push that adds', () => {
+    expect(forcedGitPush(['git', 'push', '--force', 'origin', 'main'])).toBe(true);
+    expect(forcedGitPush(['git', 'push', '-f'])).toBe(true);
+    expect(forcedGitPush(['git', 'push', '-fu', 'origin', 'main'])).toBe(true);
+    expect(forcedGitPush(['git', 'push', '--force-with-lease'])).toBe(true);
+    expect(forcedGitPush(['git', 'push', 'origin', 'main'])).toBe(false);
+    expect(forcedGitPush(['git', 'push', '--follow-tags'])).toBe(false);
+    expect(forcedGitPush(['git', 'clean', '-f'])).toBe(false);
+  });
+
+  it('names the directories a scheduler runs the contents of, and not the directory itself', () => {
+    for (const path of [
+      '/etc/cron.d/job',
+      '/etc/cron.daily/backup',
+      '/var/spool/cron/crontabs/athanor',
+      '/etc/systemd/system/tracker.service',
+      '~/.config/systemd/user/tracker.service',
+      '/etc/profile.d/path.sh',
+      '~/Library/LaunchAgents/com.x.plist'
+    ])
+      expect(isScheduledExecutionPath(path), path).toBe(true);
+    for (const path of [
+      '/etc/cron.d',
+      'workspace/notes.md',
+      'workspace/systemd/README.md',
+      '/etc/hostname'
+    ])
+      expect(isScheduledExecutionPath(path), path).toBe(false);
+  });
+
+  /*
+   * "Absolute system directories" is what the list is written from, and it was not being asked for.
+   * `shell` resolves a relative path inside the workspace root, so these are files in the owner's
+   * own project that no scheduler reads - and `file_write` on the same names was already free, so
+   * one file had two answers depending on which tool wrote it.
+   */
+  it('asks for the absolute path its list is written from', () => {
+    for (const path of [
+      'deploy/init.d/app',
+      'conf/profile.d/x.sh',
+      'node_modules/foo/init.d/bar',
+      'src/cron.d/notes.md',
+      'workspace/site/profile.d/index.html',
+      './init.d/thing',
+      'config/systemd/user/tracker.service'
+    ])
+      expect(isScheduledExecutionPath(path), path).toBe(false);
+    // And the same names where a scheduler really does read them.
+    for (const path of [
+      '/etc/init.d/app',
+      '/etc/profile.d/x.sh',
+      '~/.config/systemd/user/tracker.service'
+    ])
+      expect(isScheduledExecutionPath(path), path).toBe(true);
   });
 });

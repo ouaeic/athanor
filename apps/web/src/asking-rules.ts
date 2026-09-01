@@ -55,7 +55,7 @@ export const alwaysAsks: AskingRule[] = [
   {
     what: 'Removing or overwriting data',
     detail:
-      'rm, shred, mkfs, git reset --hard, find -delete, rsync --delete, removing a package — including inside a script, an xargs, or a desktop window.'
+      'rm, shred, mkfs, git reset --hard, find -delete, rsync --delete, removing a package — including inside a script, an xargs, or a desktop window. And the stores that are not files: dropping or truncating a database, flushing a Redis cache, deleting from a bucket, removing a Docker volume. None of those is inside the undo point a rewind restores.'
   },
   {
     what: 'Pushing to a Git remote',
@@ -64,7 +64,7 @@ export const alwaysAsks: AskingRule[] = [
   {
     what: 'Leaving something behind to run later',
     detail:
-      'A shell startup file, a git hook, git config that carries a command, a coding tool’s own configuration, a service that restarts itself, scheduled work, a saved skill, or a memory entry with no expiry. Each of these runs after the conversation is over, when no card can be raised.'
+      'A shell startup file, a git hook, git config that carries a command, a coding tool’s own configuration, a service that restarts itself, scheduled work, a saved skill, or a memory entry with no expiry — and the ones that name no file at all: crontab, at, systemctl enable, launchctl load. Each of these runs after the conversation is over, when no card can be raised.'
   }
 ];
 
@@ -89,7 +89,7 @@ export const modeFloors: Record<'review' | 'balanced' | 'autonomous', string> = 
   balanced:
     'Reaching an address out on the internet, and installing software onto it, on top of everything Autonomous asks about.',
   autonomous:
-    'Only what this computer cannot take back for you — publishing, sending, spending, destroying data, signing or accepting terms in your name, a startup file, hook or tool configuration it would run on its own afterwards, and a control on a screen that nothing could identify.'
+    'Only what this computer cannot take back for you — publishing, sending, spending, destroying data, signing or accepting terms in your name, a startup file, hook, schedule, service or tool configuration it would run on its own afterwards, and a control on a screen that nothing could identify.'
 };
 
 /**

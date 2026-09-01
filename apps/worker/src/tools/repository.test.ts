@@ -2,13 +2,16 @@ import { describe, expect, it } from 'vitest';
 import { AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
 import {
+  declaredSymbol,
   executeRepositoryTool,
   IMPORT_SWEEP_PATTERN,
   OVERVIEW_RANKED_PER_FILE,
   OVERVIEW_SYMBOL_BUDGET,
   rankByReference,
+  SOURCE_GLOBS,
   spreadAcrossFiles,
-  strideAcross
+  strideAcross,
+  SYMBOL_SWEEP_PATTERN
 } from './repository.js';
 import { type ToolContext } from '../tool-dispatch.js';
 
@@ -618,6 +621,53 @@ describe('which symbols an overview leads with', () => {
 
     expect(source.match(sweepPattern())).toBeNull();
   });
+
+  /**
+   * THE RANKING IS JS AND TS ONLY, and this is that limit written as a case rather than a comment.
+   *
+   * The symbol sweep now reads every language the glob admits. This half of the answer reads
+   * one family, because `IMPORT_SWEEP_PATTERN` needs an import statement that names the symbols it
+   * carries and of the thirteen languages in `SOURCE_GLOBS` only six write one: TypeScript,
+   * JavaScript, Python, Rust, Java and Kotlin, PHP. The other seven import a module or a file and
+   * nothing else. Measured against the three whole-project fixtures behind the coverage table
+   * above, the sweep returns 0 bytes for each - a five-file Go module, a five-file Swift package, a
+   * five-file Rust crate - so all three fall through to the proportional stride, which is the
+   * answer that shipped before ranking existed and is still a complete one.
+   *
+   * A stated limit beats a silent one: the case that matters is not that ranking declines to fire,
+   * it is that the overview is unchanged when it does.
+   */
+  it.each([
+    ['go', ['package router', 'import "net/http"', 'import (', '\t"fmt"', ')']],
+    ['swift', ['import Foundation', 'import Core', '@testable import Router']],
+    ['rust', ['use std::collections::HashMap;', 'use crate::store::{Record, Store};']],
+    ['ruby', ["require 'json'", "require_relative 'store'"]],
+    ['c', ['#include <stdlib.h>', '#include "registry.h"']],
+    ['csharp', ['using System.Collections.Generic;', 'using Athanor.Server;']]
+  ])(
+    'reads no reference at all out of %s, so its overview is the proportional one',
+    (_, source) => {
+      expect(source.join('\n').match(sweepPattern())).toBeNull();
+    }
+  );
+
+  it('answers a Rust crate with exactly the stride, which is what an empty sweep is worth', () => {
+    /*
+     * The fixture is the five-file crate from the coverage table, whose sweep the case above
+     * measures at zero bytes. `rankByReference` reaching `spreadAcrossFiles` unchanged is the
+     * fallback being the same code path rather than a branch beside it - break the fallback and
+     * this goes red where a comment saying it falls back could not.
+     */
+    const crate = [
+      'src/internal.rs:1:pub(crate) struct Bookkeeping {',
+      'src/lib.rs:1:pub mod router;',
+      'src/lib.rs:8:pub const DEFAULT_PORT: u16 = 8080;',
+      'src/router.rs:3:pub struct Route {',
+      'src/router.rs:16:impl Mux {',
+      'src/store/mod.rs:7:pub trait Store {'
+    ];
+    expect(rankByReference(crate, '', 4)).toEqual(spreadAcrossFiles(crate, 4));
+  });
 });
 
 /**
@@ -762,6 +812,375 @@ describe('how much of the ranked head one file may buy', () => {
     const shown = rankByReference(real, sweep, 60);
     const fromOneFile = shown.filter((row) => row.startsWith('src/area0.ts:'));
     expect(fromOneFile).toHaveLength(4);
+  });
+});
+
+/**
+ * Whether `repo_overview` can see the languages its own glob admits.
+ *
+ * `SOURCE_GLOBS` reads seventeen extensions across thirteen languages, and the anchor that looked
+ * for a declaration inside them was `class|interface|type|function|const|def|fn|struct|enum|trait`
+ * with `export` and `abstract` allowed in front. That is one language's vocabulary. Measured
+ * against one fixture per extension - 105 top-level declarations written the way each language
+ * writes them - it found 44, and where it did not find them it did not find them at all:
+ *
+ *   extension   before   after            what the anchor could not say
+ *   .ts/.tsx     100%     100%
+ *   .js/.jsx     100%     100%
+ *   .py           75%     100%            no `async def`
+ *   .go           50%     100%            no `func`
+ *   .java         20%      80%            no `public`
+ *   .kt           25%      75%            no `fun`, no `object`, no `data class`
+ *   .cs            0%      85%            no `public`, no `namespace`, no `record`
+ *   .swift         0%      70%            no `func`, no `protocol`, no `extension`
+ *   .rs            0%      83%            no `pub`, no `impl`, no `mod`
+ *   .rb            0%      20%            no `module`
+ *   .php          62%      75%            no `namespace`
+ *   .c/.h         40/50%  60/75%          no `typedef`
+ *   .cpp/.hpp     50/60%  66/80%          no `namespace`
+ *   TOTAL         44/105  84/105
+ *
+ * Three whole-project fixtures behind those percentages, run through the arm itself: a five-file Go
+ * module returned 7 symbols from 4 files and not one function; a five-file Swift package returned
+ * exactly one symbol, `struct App`, the only non-`public` type in it; a five-file Rust crate
+ * returned nothing at all. After, the same three return 17 from 5, 12 from 5 and 20 from 5.
+ *
+ * The 21 of 105 still missed are two named limits, and the cases below hold both of them open
+ * rather than letting them read as coverage: a declaration indented inside a type, and a C or C++
+ * function definition, which is not led by a keyword at all.
+ */
+describe('which languages an overview can see', () => {
+  /** The pattern as ripgrep is given it, compiled by the engine on this side of the wire. */
+  const sweep = new RegExp(SYMBOL_SWEEP_PATTERN);
+
+  /**
+   * One entry per extension the glob admits, written as that language writes a declaration.
+   *
+   * `seen` is what an overview of such a repository has to contain; `blind` is what this anchor
+   * deliberately does not reach, so that widening it later has to argue with a case rather than
+   * with a comment.
+   */
+  const languages: ReadonlyArray<{
+    readonly extension: string;
+    readonly seen: ReadonlyArray<readonly [string, string | null]>;
+    readonly blind: readonly string[];
+  }> = [
+    {
+      extension: 'ts',
+      seen: [
+        ['export class Registry {', 'Registry'],
+        ['export interface Handler {', 'Handler'],
+        ['export type Route = string;', 'Route'],
+        ['export abstract class Base {}', 'Base'],
+        ['export async function mount(app: App) {}', 'mount'],
+        ['export const DEFAULT_PORT = 8080;', 'DEFAULT_PORT'],
+        // Selected, and deliberately unnamed: the identifier position holds a quoted specifier.
+        // Eleven of this repository's 6,392 sweep lines are this shape, and they are still shown.
+        ["declare module 'fastify' {", null],
+        ["export type { Task } from './task.js';", null]
+      ],
+      blind: ['  const handler = resolve();', 'constant = 4;']
+    },
+    {
+      extension: 'tsx',
+      seen: [
+        ['export function Panel() {', 'Panel'],
+        ['export const Card = () => null;', 'Card']
+      ],
+      blind: ['  return <Panel />;']
+    },
+    {
+      extension: 'js',
+      seen: [
+        ["const path = require('path');", 'path'],
+        ['class Router {', 'Router'],
+        ['function normalise(input) {', 'normalise'],
+        ['let registry = null;', 'registry'],
+        ['var legacy = 1;', 'legacy']
+      ],
+      blind: ['  function inner() {}']
+    },
+    {
+      extension: 'py',
+      seen: [
+        ['class Registry:', 'Registry'],
+        ['def resolve(name):', 'resolve'],
+        ['async def fetch(url):', 'fetch']
+      ],
+      blind: ['    def method(self):']
+    },
+    {
+      extension: 'go',
+      seen: [
+        ['type Registry struct {', 'Registry'],
+        ['type Resolver interface {', 'Resolver'],
+        ['func NewRegistry() *Registry {', 'NewRegistry'],
+        ['func (r *Registry) Resolve(name string) int {', 'Resolve'],
+        ['const DefaultPort = 8080', 'DefaultPort'],
+        ['var DefaultRegistry = NewRegistry()', 'DefaultRegistry']
+      ],
+      blind: ['\treturn r.entries[name]']
+    },
+    {
+      extension: 'rs',
+      seen: [
+        ['pub mod routing;', 'routing'],
+        ['mod internal;', 'internal'],
+        ['pub struct Registry {', 'Registry'],
+        ['pub enum Level {', 'Level'],
+        ['pub trait Resolve {', 'Resolve'],
+        ['impl Registry {', 'Registry'],
+        ['impl<T> Resolve for Registry<T> {', 'Resolve'],
+        ['pub async fn mount(port: u16) {}', 'mount'],
+        ['pub(crate) fn tally(items: &[usize]) -> usize {', 'tally'],
+        ['pub const DEFAULT_PORT: u16 = 8080;', 'DEFAULT_PORT'],
+        ['pub type Result<T> = std::result::Result<T, Error>;', 'Result']
+      ],
+      blind: ['    pub fn new() -> Self {']
+    },
+    {
+      extension: 'swift',
+      seen: [
+        ['public struct Route {', 'Route'],
+        ['public final class Registry {', 'Registry'],
+        ['public protocol Resolver {', 'Resolver'],
+        ['extension Registry: Resolver {', 'Registry'],
+        ['public actor Store {', 'Store'],
+        ['public func mount(port: Int) {}', 'mount'],
+        ['public typealias RecordID = String', 'RecordID'],
+        ['public let defaultPort = 8080', 'defaultPort']
+      ],
+      blind: ['    public func resolve(_ name: String) -> Int {']
+    },
+    {
+      extension: 'java',
+      seen: [
+        ['public class Registry {', 'Registry'],
+        ['interface Resolver {', 'Resolver'],
+        ['public enum Level {', 'Level'],
+        ['public record Route(String path) {}', 'Route']
+      ],
+      blind: ['    public int resolve(String name) {']
+    },
+    {
+      extension: 'kt',
+      seen: [
+        ['class Registry {', 'Registry'],
+        ['data class Route(val path: String)', 'Route'],
+        ['object DefaultRegistry', 'DefaultRegistry'],
+        ['fun mount(port: Int) {}', 'mount'],
+        ['fun <T> map(value: T): T = value', 'map'],
+        ['val DEFAULT_PORT = 8080', 'DEFAULT_PORT']
+      ],
+      blind: ['    fun resolve(name: String): Int = 0']
+    },
+    {
+      extension: 'rb',
+      seen: [
+        ['module Athanor', 'Athanor'],
+        ['class Registry', 'Registry'],
+        ['def self.mount(port)', 'mount']
+      ],
+      blind: ['  def resolve(name)']
+    },
+    {
+      extension: 'php',
+      seen: [
+        ['namespace Athanor\\Server;', 'Athanor'],
+        ['class Registry', 'Registry'],
+        ['interface Resolver', 'Resolver'],
+        ['trait Loggable', 'Loggable'],
+        ['function mount(int $port): void {}', 'mount']
+      ],
+      blind: ['    public function resolve(string $name): int']
+    },
+    {
+      extension: 'cs',
+      seen: [
+        ['namespace Athanor.Server;', 'Athanor'],
+        ['public class Registry', 'Registry'],
+        ['public interface IResolver', 'IResolver'],
+        ['public struct Route', 'Route'],
+        ['public record Endpoint(string Path);', 'Endpoint']
+      ],
+      blind: ['    public int Resolve(string name) => 0;']
+    },
+    {
+      extension: 'cpp',
+      seen: [
+        ['namespace athanor {', 'athanor'],
+        ['class Registry {', 'Registry'],
+        ['struct Route {', 'Route'],
+        ['enum class Level {', 'Level']
+      ],
+      // Not keyword-led, so reaching it means matching `identifier identifier(`, which matches a
+      // call as readily as a definition.
+      blind: ['int Registry::Resolve(const std::string& name) {', 'void mount(int port) {}']
+    },
+    {
+      extension: 'hpp',
+      seen: [
+        ['namespace athanor {', 'athanor'],
+        ['class Registry;', 'Registry'],
+        ['struct Route {', 'Route']
+      ],
+      blind: ['void mount(int port);', 'template <typename T>']
+    },
+    {
+      extension: 'c',
+      seen: [
+        ['struct Registry {', 'Registry'],
+        ['enum Level {', 'Level'],
+        ['typedef struct Registry Registry;', 'Registry'],
+        ['union Payload {', 'Payload']
+      ],
+      blind: ['int registry_resolve(Registry* r, const char* name) {']
+    },
+    {
+      extension: 'h',
+      seen: [
+        ['struct Registry;', 'Registry'],
+        ['typedef struct Route {', 'Route'],
+        ['enum Level { LOW };', 'Level']
+      ],
+      blind: ['int registry_resolve(struct Registry* r, const char* name);']
+    },
+    {
+      extension: 'jsx',
+      seen: [
+        ['export function Widget() {', 'Widget'],
+        ['class Legacy extends React.Component {}', 'Legacy']
+      ],
+      blind: ['  const styles = {};']
+    }
+  ];
+
+  for (const { extension, seen, blind } of languages) {
+    it(`sees what a .${extension} file declares`, () => {
+      for (const [source, name] of seen) {
+        expect([source, sweep.test(source)]).toEqual([source, true]);
+        // The two readers on one line: ripgrep would have selected it, and this is the name the
+        // ranking gets to attribute a reference to.
+        expect([source, declaredSymbol(`one.${extension}:1:${source}`)?.name ?? null]).toEqual([
+          source,
+          name
+        ]);
+      }
+    });
+
+    it(`says nothing about what it cannot see in a .${extension} file`, () => {
+      for (const source of blind) expect([source, sweep.test(source)]).toEqual([source, false]);
+    });
+  }
+
+  it('covers every extension the glob it reads admits, so neither list can grow alone', () => {
+    /*
+     * The glob and the anchor are one decision written in two places - a language admitted by the
+     * first and unknown to the second returns files whose symbols are all invisible, which is
+     * exactly the state `func` and `pub` were in. This is the case that goes red when somebody adds
+     * an extension to `SOURCE_GLOBS` and nothing else.
+     */
+    const admitted = /\*\.\{([^}]+)\}/.exec(SOURCE_GLOBS.join(' '))?.[1]?.split(',') ?? [];
+    expect(admitted).toHaveLength(17);
+    expect(languages.map((one) => one.extension).sort()).toEqual([...admitted].sort());
+  });
+});
+
+/**
+ * ONE PATTERN, TWO READERS, and the cases that keep them one.
+ *
+ * ripgrep selects the symbol lines and `declaredSymbol` parses them back, and before this they were
+ * two hand-written regular expressions in two places. They had already drifted: the parser
+ * tolerated leading whitespace where the sweep anchors at `^`, so half of it was written for lines
+ * ripgrep cannot emit. Drift of the other kind is the one that costs - a keyword in the sweep and
+ * not in the parser is a symbol ripgrep returns, the ranking silently drops, and nobody counts.
+ */
+describe('the symbol anchor and the reader that parses it back', () => {
+  it('is the same string the arm hands ripgrep, and not a second spelling of it', async () => {
+    /*
+     * The production call site. Every case below could pass against a constant nothing sends, which
+     * is the shape this repository has shipped three times: a bound proved on a helper whose caller
+     * had no case.
+     */
+    let symbolArgs: readonly string[] = [];
+    await one('repo_overview', {}, (executable, args) => {
+      if (executable === 'rg' && args.some((arg) => arg.startsWith('^'))) symbolArgs = args;
+      if (executable === 'git' && args[0] === 'ls-files') return 'src/index.ts';
+      return '';
+    });
+    expect(symbolArgs).toContain(SYMBOL_SWEEP_PATTERN);
+  });
+
+  it('steps over whatever each language puts between the keyword and the name', () => {
+    /*
+     * The agreement bound. Measured over this repository's own tree, 6,392 lines came back from
+     * ripgrep and the engine on this side rejected 0 of them - which it cannot fail to do while
+     * there is one string. What it can fail is this: a line selected and then not parsed, because
+     * the name sits behind something the parser does not step over - Go's receiver, Rust's generic
+     * list, C's and C++'s second type word, Ruby's `self.`. Eleven of those 6,392 have no
+     * identifier in that position at all and are meant not to; these six do.
+     */
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ['pkg/router/mux.go:7:func (m *mux) Add(route Route) {', 'Add'],
+      ['src/router.rs:22:impl<T> Router for Mux<T> {', 'Router'],
+      ['src/level.cpp:9:enum class Level {', 'Level'],
+      ['lib/registry.rb:11:def self.mount(port)', 'mount'],
+      ['Sources/Core/Store.swift:9:extension Store: CustomStringConvertible {', 'Store'],
+      ['src/util.kt:4:fun <T> map(value: T): T = value', 'map']
+    ];
+    for (const [line, name] of cases)
+      expect([line, declaredSymbol(line)?.name]).toEqual([line, name]);
+  });
+
+  it('will not read a keyword out of the middle of a longer word', () => {
+    // What the `[\s<]` at the end of the pattern is for, on an engine with no lookaround. `\s+`
+    // alone would have done it and would not have admitted `impl<T>`.
+    for (const source of ['constant = 4;', 'functional(x);', 'typedefs.push(one);', 'modulo(3);'])
+      expect([source, new RegExp(SYMBOL_SWEEP_PATTERN).test(source)]).toEqual([source, false]);
+    expect(declaredSymbol('src/lib.rs:1:impl<T> Trait for Type<T> {}')?.name).toBe('Trait');
+  });
+
+  it('stops at the top level, which is the anchor stated rather than assumed', () => {
+    /*
+     * The measured reason it is not relaxed. `^[ \t]{0,4}` reaches the members these miss - a Java
+     * or Swift method, the body of a Rust `impl` - and takes this repository's sweep from 6,392
+     * lines and 579,112 bytes to 23,289 lines and 2,145,552 bytes. The runner caps a command at
+     * `maxOutputBytes`, 1,048,576 by default, and past it `boundedCollector` keeps the ends and
+     * drops the middle. So the relaxed anchor returns a torn sweep, not a fuller one: 2.05x the
+     * cap, which is the failure 69b1db0 exists to end.
+     */
+    expect(new RegExp(SYMBOL_SWEEP_PATTERN).test('    pub fn new() -> Self {')).toBe(false);
+    expect(declaredSymbol('src/lib.rs:9:    pub fn new() -> Self {')).toBeUndefined();
+  });
+
+  it('lets a public declaration stand for its file, in the words each language uses', () => {
+    /*
+     * `spreadAcrossFiles` shows one symbol per file when the budget is smaller than the tree, and
+     * the one it shows is the public one. That predicate knew only `export`, which under a sweep
+     * that now reads Rust, Swift and Java called every one of their public declarations private.
+     */
+    const shown = spreadAcrossFiles(
+      [
+        'src/lib.rs:9:struct Private {',
+        'src/lib.rs:1:pub struct Public {',
+        'Sources/Core/Route.swift:9:struct Private {',
+        'Sources/Core/Route.swift:1:public struct Public {',
+        'src/index.ts:9:const privateThing = 1;',
+        'src/index.ts:1:export const publicThing = 1;'
+      ],
+      3
+    );
+    expect(shown.every((row) => row.includes('Public') || row.includes('publicThing'))).toBe(true);
+  });
+
+  it('calls a restricted Rust declaration restricted, because pub(crate) is not the surface', () => {
+    // The other direction of the same predicate, and the case that decides its shape: a five-file
+    // crate led with `pub(crate) struct Bookkeeping` out of a module named `internal`.
+    const shown = spreadAcrossFiles(
+      ['src/internal.rs:5:pub(crate) struct Bookkeeping {', 'src/internal.rs:1:pub mod router;'],
+      1
+    );
+    expect(shown).toEqual(['src/internal.rs:1:pub mod router;']);
   });
 });
 

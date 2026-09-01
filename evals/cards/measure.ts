@@ -13,8 +13,10 @@
 import { approvalRequirement } from '../../apps/worker/src/tools.js';
 import {
   CONFINED,
+  DESTROYS,
   EGRESS,
   FREE_PACKAGE_WORK,
+  FREE_STORE_WORK,
   PUBLISHES,
   READS,
   SINKS,
@@ -143,7 +145,16 @@ export const provenanceFailures = (
 /* ------------------------------------------------------------------------------- the guards */
 
 export interface GuardFailure {
-  readonly table: 'writes' | 'reads' | 'sinks' | 'publishes' | 'free' | 'confined' | 'egress';
+  readonly table:
+    | 'writes'
+    | 'reads'
+    | 'sinks'
+    | 'publishes'
+    | 'free'
+    | 'confined'
+    | 'egress'
+    | 'destroys'
+    | 'free-store';
   readonly id: string;
   readonly detail: string;
 }
@@ -170,7 +181,9 @@ export const guardFailures = (
    * list is empty, so the shipped tables contain nothing that could plant a failure in it, and a
    * check with nothing left to catch is the shape that stops working without saying so.
    */
-  uncovered: readonly string[] = noEgressUncovered()
+  uncovered: readonly string[] = noEgressUncovered(),
+  destroys: readonly Guard[] = DESTROYS,
+  freeStore: readonly Guard[] = FREE_STORE_WORK
 ): GuardFailure[] => {
   const failures: GuardFailure[] = [];
   for (const entry of publishes)
@@ -335,6 +348,33 @@ export const guardFailures = (
    * with no row beside a fetch is a name nothing here would notice going wrong, in a list where
    * being wrongly present means a network card that stops firing.
    */
+  /*
+   * The stores and the schedules, in both directions and in one loop for the reason the egress
+   * pair gives: a table of things that must card is satisfied by carding everything, and a table of
+   * things that must not is satisfied by deleting the rule. `psql -c 'DROP DATABASE'` must stop and
+   * `psql tracker -f migrations/001_init.sql` must not, and the second of those is a call the
+   * owner's own scenario makes twice.
+   */
+  for (const entry of destroys)
+    for (const mode of modesOf(entry)) {
+      const requirement = approvalRequirement(entry.call.name, entry.call.arguments, mode, {});
+      if (!requirement)
+        failures.push({
+          table: 'destroys',
+          id: entry.id,
+          detail: `raises no card in ${mode} mode, and what it removes is outside CHECKPOINT_CONTENT, so rewinding the turn does not put it back`
+        });
+    }
+  for (const entry of freeStore)
+    for (const mode of modesOf(entry)) {
+      const requirement = approvalRequirement(entry.call.name, entry.call.arguments, mode, {});
+      if (requirement)
+        failures.push({
+          table: 'free-store',
+          id: entry.id,
+          detail: `cards in ${mode} mode as "${requirement.action}", and it destroys nothing the turn's undo point is not already holding`
+        });
+    }
   for (const name of uncovered)
     failures.push({
       table: 'egress',

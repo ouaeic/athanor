@@ -276,12 +276,70 @@ expect(
  * declaration check below.
  */
 expect(
-  guardFailures([], [], [], [], [], [], [], ['planted-allowlist-name']).length === 1,
+  guardFailures([], [], [], [], [], [], [], ['planted-allowlist-name'], [], []).length === 1,
   'the egress guard does not report an allowlist name with no row beside a fetch, so a name could be added to noEgressExecutables and never be consulted here'
 );
 expect(
-  guardFailures([], [], [], [], [], [], [], undefined).length === 0,
+  guardFailures([], [], [], [], [], [], [], undefined, [], []).length === 0,
   'the coverage check reports the shipped allowlist, so a name is on noEgressExecutables that no row pairs with a fetch'
+);
+
+/*
+ * The stores and the schedules, planted in both directions for the reason the egress pair gives.
+ *
+ * A table of acts that must card is satisfied by a floor that cards everything, and the
+ * counterweight is a table of ordinary database, container and cache work that must not - which is
+ * satisfied by deleting the rule. Neither plant is reachable from the shipped tables: on a healthy
+ * tree both are empty, so each is injected as the only row.
+ *
+ * `dropdb` and `psql -f` rather than something invented, because the pair is the whole decision
+ * this wave turned on: `psql` is not `psql -c "DROP DATABASE"`, and the owner's own scenario runs
+ * the file form twice.
+ */
+expect(
+  guardFailures(
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [
+      {
+        id: 'planted: a drop the floor lets through',
+        call: { name: 'file_read', arguments: { path: 'db/schema.sql' }, step: 'planted' }
+      }
+    ],
+    []
+  ).length === MODES.length,
+  'the destroys guard does not report an act that raises no card, so dropdb and FLUSHALL going quiet again would be silent'
+);
+expect(
+  guardFailures(
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [
+      {
+        id: 'planted: a migration the floor stops',
+        call: {
+          name: 'shell',
+          arguments: { executable: 'psql', args: ['-c', 'DROP DATABASE production'] },
+          step: 'planted'
+        },
+        modes: ['balanced', 'autonomous'] as const
+      }
+    ]
+  ).length === 2,
+  'the free-store guard does not report ordinary database work that cards, so the destruction rule widening back to the executable would be silent'
 );
 
 /* ------------------------------------------------- declaring the network cannot start costing */
@@ -436,6 +494,6 @@ for (const failure of failures) process.stderr.write(`SELFTEST: ${failure}\n`);
 process.stdout.write(
   failures.length
     ? `${failures.length} check(s) failed.\n`
-    : 'The cards rig measures something: every scenario names a shipped tool, all seven guard tables report a planted failure in both spellings, the no-socket allowlist is covered name by name, the sink declaration cannot silence itself, the baseline comparison compares, and no column is a constant.\n'
+    : 'The cards rig measures something: every scenario names a shipped tool, all nine guard tables report a planted failure in both spellings, the no-socket allowlist is covered name by name, the sink declaration cannot silence itself, the baseline comparison compares, and no column is a constant.\n'
 );
 process.exit(failures.length ? 1 : 0);

@@ -14,7 +14,7 @@ import {
   type SubscriptionAgent
 } from '../subscription-agent.js';
 import { type ToolContext } from '../tool-dispatch.js';
-import { diagnosticsCommand, diagnosticsLanguage } from './diagnostics.js';
+import { diagnosticsLanguage, diagnosticsSelection } from './diagnostics.js';
 import { clampNumber } from './numbers.js';
 
 /**
@@ -129,8 +129,13 @@ const SETTLED_ORDER = ['--sort', 'path'];
  * has to be able to place: a file inside one glob and outside the other contributes references to
  * a declaration that is not in the sample, or a declaration nothing can vouch for. Two copies of
  * this list are two answers to the same question.
+ *
+ * Exported for one case, which is the third reader of it: this list decides which languages reach
+ * the sweep and `SYMBOL_SWEEP_PATTERN` decides which of them the sweep can see, and a language
+ * admitted here and unknown there returns files whose every symbol is invisible. That was the
+ * shipped state for Go, Swift and Rust. The case holds the two lists to the same length.
  */
-const SOURCE_GLOBS = [
+export const SOURCE_GLOBS = [
   '--glob',
   '!node_modules/**',
   '--glob',
@@ -140,6 +145,143 @@ const SOURCE_GLOBS = [
   '--glob',
   '*.{ts,tsx,js,jsx,py,rs,go,java,kt,rb,php,cs,cpp,c,h,hpp,swift}'
 ];
+
+/**
+ * The words a declaration may be prefixed with before the word that says what it is.
+ *
+ * The shipped anchor allowed one of these - `abstract` - and `export` ahead of it, which is the
+ * vocabulary of one language family. Every other language in the glob above writes its visibility
+ * first: `pub fn`, `public class`, `open class`, `data class`, `suspend fun`, `pub(crate) struct`.
+ * A declaration that begins with any of them was invisible to a tool whose description says it maps
+ * a repository, and `export async function` - seventy-two lines of this repository's own
+ * TypeScript - was invisible for the same reason, because `async` sits where `abstract` was allowed
+ * and nothing else was.
+ *
+ * The run is bounded at three rather than left open. Three is what the longest real prefix needs -
+ * `public static final class`, `pub async unsafe fn`, `public open suspend fun` - and an unbounded
+ * `(?:...\s+)*` in front of an alternation is a shape whose cost on a pathological line nobody here
+ * has measured. A bound that is never reached costs nothing and cannot be the thing that hangs a
+ * sweep.
+ */
+const DECLARATION_MODIFIER =
+  'export|default|declare|public|private|protected|internal|open|abstract|final|sealed|static|partial|async|suspend|override|inline|unsafe|extern|data|value|pub(?:\\([^)]*\\))?';
+
+/**
+ * The word that says a line declares something, in the languages the glob above admits.
+ *
+ * The shipped list was `class|interface|type|function|const|def|fn|struct|enum|trait`, which is
+ * TypeScript's vocabulary plus four words borrowed from elsewhere. Measured against one fixture per
+ * extension - 105 top-level declarations across all seventeen the glob names - it found 44 of them,
+ * and it found *none* of Go's functions, none of Swift's anything, and none of Rust's public
+ * surface: no `func`, so Go and Swift returned 0%; no `pub`, so every `pub fn`, `pub struct`,
+ * `pub enum` and `pub trait` was skipped; no `impl` or `mod`, so Rust's two structural keywords
+ * were skipped too. On this repository's own tree it was blind to 56 of the 130 Rust declarations
+ * it can now see.
+ *
+ * Longer words sort ahead of their own prefixes - `typealias` before `type`, `module` before `mod`,
+ * `function` before `func` before `fun` - because both engines that read this alternation prefer
+ * the leftmost branch that can match, so `type` written first turns `typealias Foo` into a line
+ * that starts with `type` and then fails on the `a`.
+ *
+ * What is deliberately absent: C and C++ function definitions, which are not led by a keyword at
+ * all - `int registry_resolve(Registry*, const char*)` - so reaching them means matching
+ * `identifier identifier(`, which matches a call as readily as a definition. The fixture measures
+ * that limit rather than hiding it: C is 3 of 5 and C++ 4 of 6, and the three misses are the three
+ * function bodies.
+ */
+const DECLARATION_KEYWORD =
+  'class|interface|typealias|typedef|type|function|func|fun|def|fn|const|let|var|val|struct|enum|union|trait|protocol|extension|impl|module|mod|namespace|record|object|actor';
+
+/**
+ * ONE PATTERN, TWO READERS. Both of them are below; neither has a copy of it.
+ *
+ * ripgrep selects the lines with this, and `declaredSymbol` re-runs the same string over each line
+ * that comes back to say which name the line declares. They were two hand-written regular
+ * expressions before - the sweep argument in the `repo_overview` arm and a `declaration` literal
+ * inside `rankByReference` - and they had already drifted: the ranking one tolerated leading
+ * whitespace with `\s*` where the sweep anchors at `^`, so it was written to parse lines ripgrep
+ * can never emit. Two spellings of one question are two answers to it, and the reader that loses
+ * simply drops the symbol without saying so.
+ *
+ * That is why nothing here uses lookaround, and why the keyword is followed by a character class
+ * rather than by an assertion. One of the two readers is ripgrep, whose engine has none, so the
+ * pattern lives in the intersection of the two grammars or it cannot be one pattern. `[\s<]` is
+ * that intersection doing the work a `(?![A-Za-z0-9_$])` would do: it keeps `constant` from
+ * matching `const`, and it admits `impl<T> Trait for Type` where the generic list is written tight
+ * against the keyword.
+ *
+ * It stays anchored at `^`, and that is a measured decision rather than an inherited one. Relaxing
+ * it to `^[ \t]{0,4}` reaches the members this misses - the methods inside a Java or Swift or Ruby
+ * type, the bodies of a Rust `impl` - and takes this repository's sweep from 6,392 lines and
+ * 579,112 bytes to 23,289 lines and 2,145,552 bytes. The runner caps a command at
+ * `maxOutputBytes`, 1,048,576 by default, and past it `boundedCollector` keeps the ends and drops
+ * the middle. So the relaxed anchor does not return more symbols, it returns a torn sweep: 2.05x
+ * the cap, which is the failure 69b1db0 was written to end. Top-level only, and said out loud.
+ */
+export const SYMBOL_SWEEP_PATTERN = `^(?:(?:${DECLARATION_MODIFIER})\\s+){0,3}(?:${DECLARATION_KEYWORD})[\\s<]`;
+
+/** The `path:line:` ripgrep writes in front of every symbol line, and nothing of the source. */
+const SYMBOL_LINE_PREFIX = /^(.*?):\d+:/;
+
+/** The same pattern the sweep is run with, compiled for the second reader. */
+const SYMBOL_HEAD = new RegExp(SYMBOL_SWEEP_PATTERN);
+
+/**
+ * The name, once the modifiers and the keyword are behind it.
+ *
+ * Three things may still stand between the keyword and the name, and each is one language's:
+ * a generic list, so `impl<T> Resolve` and `fun <T> map` name `Resolve` and `map` rather than
+ * nothing; a receiver, so Go's `func (r *Registry) Resolve` names `Resolve` rather than failing on
+ * the bracket; and a second type word, so C's `typedef struct Route {`, C++'s `enum class Level`
+ * and Ruby's `def self.mount` name `Route`, `Level` and `mount` rather than `struct`, `class` and
+ * `self`.
+ *
+ * Some lines the sweep selects have no identifier in this position at all, and they are meant to:
+ * `declare module 'fastify' {` names a quoted specifier, `export type { Task } from './x.js'` and
+ * `const { app } = await build()` name a brace. Measured over this repository's 6,392 sweep lines,
+ * eleven of them. They are still shown - a row is the declaration verbatim, and reading it is what
+ * an overview is for - they are simply not the rows the ranking can attribute a reference to.
+ */
+const NAME_AFTER_KEYWORD =
+  /^\s*(?:<[^>\n]*>\s*)?(?:\([^)\n]*\)\s*)?(?:(?:class|struct|enum|union)\s+)?(?:self\.)?([A-Za-z_$][A-Za-z0-9_$]*)/;
+
+/**
+ * What a sweep line declares, or nothing, which is the second reader of `SYMBOL_SWEEP_PATTERN`.
+ *
+ * Exported for the cases that hold the two readers together. A line the sweep selects and this
+ * cannot place is a symbol the ranking drops without saying so, and the ones that shape this are
+ * the ones where the name hides behind a language's own punctuation rather than behind a
+ * disagreement about vocabulary - Go's receiver, Rust's generic list, C's second type word.
+ * Measured over this repository's 6,392 sweep lines, eleven are placed by neither, and those
+ * eleven are the shapes named above that carry no identifier at all.
+ */
+export const declaredSymbol = (line: string): { file: string; name: string } | undefined => {
+  const prefix = SYMBOL_LINE_PREFIX.exec(line);
+  if (prefix === null) return undefined;
+  const source = line.slice(prefix[0].length);
+  const head = SYMBOL_HEAD.exec(source);
+  if (head === null) return undefined;
+  // Minus one, because the pattern ends by consuming the `[\s<]` that proved the keyword ended and
+  // the `<` of a generic list is part of what comes next.
+  const name = NAME_AFTER_KEYWORD.exec(source.slice(head[0].length - 1))?.[1];
+  return name === undefined ? undefined : { file: prefix[1] as string, name };
+};
+
+/**
+ * Whether a declaration is one the repository outside this file can reach.
+ *
+ * Written twice before - once in `spreadAcrossFiles` to decide which symbol stands for a file, and
+ * once in `rankByReference` to decide which declaration of a name to point at - and both copies
+ * knew only `export`. Under a symbol sweep that now sees Rust, Swift, Java, Kotlin, C# and PHP, a
+ * predicate that only knows `export` calls every one of their public declarations private, and the
+ * file's representative row becomes whichever line sorted first instead of its public surface.
+ *
+ * `pub` is public and `pub(crate)` is not, which is the whole reason this is not simply `pub`
+ * followed by anything: Rust spells restricted visibility as a parenthesised `pub`, and a fixture
+ * of five files led with `pub(crate) struct Bookkeeping` from the module named `internal` while
+ * `pub mod router` sat below it. The trailing `\s` is what separates them.
+ */
+const publiclyDeclared = (line: string): boolean => /:\d+:(?:export|pub|public)\s/.test(line);
 
 /**
  * Which symbols an overview shows when it cannot show them all.
@@ -185,7 +327,7 @@ export const spreadAcrossFiles = (lines: readonly string[], budget: number): str
     if (held) held.push(line);
     else byFile.set(file, [line]);
   }
-  const unexported = (line: string): number => (/:\d+:\s*export\s/.test(line) ? 0 : 1);
+  const unexported = (line: string): number => (publiclyDeclared(line) ? 0 : 1);
   for (const held of byFile.values()) held.sort((a, b) => unexported(a) - unexported(b));
   const files = [...byFile.values()];
   // More files than budget, which is the case this tool is for.
@@ -316,26 +458,36 @@ export const OVERVIEW_RANKED_PER_FILE = 8;
  * order is total and the answer is the same on every run, as `IDEMPOTENT_WITHIN_TURN` already
  * claims it is.
  *
- * When the sweep is empty - a repository of Python, Rust, Go or C, none of which writes
- * `import ... from '...'`, or one where the runner returned nothing - there is no ranked head and
- * this returns exactly the proportional sample that shipped before it. The fallback is the same
- * code path rather than a branch beside it, so there is no arrangement in which it is skipped.
+ * THE RANKING IS JS AND TS ONLY. The symbol sweep now reads every language the glob admits;
+ * this half of the answer reads one family, and the rest of the glob falls through to the
+ * proportional stride. That is a stated limit, not an oversight, and the count behind it is why:
+ * `IMPORT_SWEEP_PATTERN` needs an import statement that names the symbols it carries, and of the
+ * thirteen languages in `SOURCE_GLOBS` only six write one at all - TypeScript, JavaScript, Python
+ * (`from x import a, b`), Rust (`use crate::{A, B}`), Java and Kotlin (a dotted path whose last
+ * segment is the name), PHP (`use Ns\Name`). The other seven import a module or a file and nothing
+ * else: Go and Swift name a package, Ruby a file, C and C++ a header, C# a namespace. A per-
+ * language grammar would therefore buy signal for six of thirteen and none for seven, and this
+ * repository has no corpus in five of those six to measure the six against - so extending it here
+ * would be adding a reader whose benefit nobody has a number for, which is the shape this file
+ * declined once already when it measured the graph and kept counting.
+ *
+ * What the limit costs is stated rather than guessed: outside JS and TS the head is empty and the
+ * overview is exactly the proportional sample that shipped before ranking existed - one symbol per
+ * file, public surface first, strided across the whole tree. The fallback is the same code path
+ * rather than a branch beside it, so there is no arrangement in which it is skipped, and the same
+ * sentence covers a repository whose runner returned nothing.
  */
 export const rankByReference = (
   symbolLines: readonly string[],
   importSweep: string,
   budget: number
 ): string[] => {
-  const declaration =
-    /^(.*?):\d+:\s*(?:export\s+)?(?:abstract\s+)?(?:class|interface|type|function|const|def|fn|struct|enum|trait)\s+([A-Za-z_$][A-Za-z0-9_$]*)/;
-  const exported = (line: string): boolean => /:\d+:\s*export\s/.test(line);
   const filesDeclaring = new Map<string, Set<string>>();
   const declaredAt = new Map<string, string>();
   for (const line of symbolLines) {
-    const found = declaration.exec(line);
-    if (found === null) continue;
-    const file = found[1] as string;
-    const name = found[2] as string;
+    const found = declaredSymbol(line);
+    if (found === undefined) continue;
+    const { file, name } = found;
     const seen = filesDeclaring.get(name);
     if (seen) seen.add(file);
     else filesDeclaring.set(name, new Set([file]));
@@ -347,7 +499,8 @@ export const rankByReference = (
      * overview in place of the schema it infers from.
      */
     const held = declaredAt.get(name);
-    if (held === undefined || (!exported(held) && exported(line))) declaredAt.set(name, line);
+    if (held === undefined || (!publiclyDeclared(held) && publiclyDeclared(line)))
+      declaredAt.set(name, line);
   }
   const imported = new Map<string, number>();
   // The specifier is a path, not a reference: `from './values.js'` would otherwise score whatever
@@ -562,7 +715,9 @@ export async function executeRepositoryTool(
           '--color',
           'never',
           ...SOURCE_GLOBS,
-          '^(export\\s+)?(abstract\\s+)?(class|interface|type|function|const|def|fn|struct|enum|trait)\\s+',
+          // The pattern `rankByReference` parses these lines back with, not a second spelling of
+          // it. @see `SYMBOL_SWEEP_PATTERN`.
+          SYMBOL_SWEEP_PATTERN,
           '.'
         ]),
         /*
@@ -674,13 +829,16 @@ export async function executeRepositoryTool(
        * to the tree and this tool was exempt from that undo point while they did.
        */
       const language = diagnosticsLanguage(requested, names);
-      const command = diagnosticsCommand(language, names);
-      if (!command)
-        return {
-          available: false,
-          reason:
-            'No supported project marker was found. Use the shell tool for a repository-specific diagnostic command.'
-        };
+      /*
+       * The selection is one question, and this is the arm that has to ask it, because it is the
+       * only place a command is executed. A directory holding a `package.json` and no
+       * `tsconfig.json` used to resolve to `tsc --noEmit` and run it: exit 1 and 4,994 bytes of the
+       * compiler's own usage, returned as `passed: false` with output, which is what a wall of type
+       * errors looks like. `diagnosticsSelection` returns a sentence there instead, and it returns
+       * the sentence rather than an approval - an unrunnable command is not the owner's decision.
+       */
+      const { command, reason } = diagnosticsSelection(language, names);
+      if (!command) return { available: false, language, reason };
       const result = await context.runner.call<ExecObservation>(
         task.workspaceId,
         task.id,

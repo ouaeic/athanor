@@ -16,10 +16,13 @@ import {
   commandScript,
   consequentialExecutables,
   COMMAND_RUNNERS,
+  destructionOperation,
   effectiveCommands,
+  forcedGitPush,
   gitConfigRunsCode,
   gitSubcommand,
   isDestructiveScript,
+  isScheduledExecutionPath,
   reachesAnUnreadableFarEnd,
   noEgressExecutables,
   outboundDestinations,
@@ -28,6 +31,7 @@ import {
   packageRemovalExecutables,
   publishingOperation,
   safeNetworkExecutables,
+  scriptDestroysAStore,
   sendsDataOverNetwork
 } from './command-classification.js';
 import {
@@ -536,6 +540,38 @@ const serviceRequirement = (
  * almost every page a research turn opens. A promise the floor cannot keep is worse than a missing
  * promise, so the sentence stops making it. Written up in docs/design/gaps/NETWORK.md.
  *
+ * AND THE FOURTH, THIS WAVE, and it is the only one of the four that was widened rather than
+ * narrowed - because unlike consent, the evidence was there and nothing was reading it.
+ *
+ * Autonomous said "destroying data". Driven through this function at 89185c6, in balanced AND
+ * autonomous: `dropdb production`, `psql -c "DROP DATABASE production"`,
+ * `psql -c "TRUNCATE TABLE users"`, `mysql -e "DROP DATABASE app"`, `redis-cli FLUSHALL`,
+ * `redis-cli FLUSHDB`, `mongosh --eval "db.dropDatabase()"`, `sqlite3 app.db "DROP TABLE users"`,
+ * `docker volume rm pgdata`, `docker system prune -af --volumes`, `s3cmd del --recursive`,
+ * `az storage blob delete-batch` and `gsutil` and `aws` deletes that carded only because the
+ * address happened to parse - ALL of them free. The clause was true of files and of nothing else,
+ * while `rm -rf node_modules`, which is inside the workspace and which a rewind puts straight back,
+ * stopped the turn in all three modes. `destructionOperation` is that clause's branch, and the
+ * sentence is unchanged because the words were never wrong: the code was.
+ *
+ * The persistence clause is the half that DID move. It said "a startup file, hook or tool
+ * configuration", which is a list of files, and `crontab -`, `crontab /tmp/mycron`, `crontab -r`,
+ * `at -f job.sh now`, `systemctl --user enable`, `systemctl enable` and `launchctl load` name no
+ * file at all - all seven free in balanced and autonomous. Two words rather than a category:
+ * "schedule, service" now sit in the list beside the file shapes, and both are held by acts in
+ * `approval-policy.test.ts` below.
+ *
+ * WHAT DECIDED WHAT IS ABSENT, and it is the reason this wave is not simply a longer list.
+ * `CHECKPOINT_CONTENT` is `['workspace', '.athanor/artifacts']`, so a rewind is a real answer for
+ * anything inside it and no answer at all for anything outside. Every operation the new branch
+ * names is outside. Package-manager cache clears, `cargo clean`, `git branch -D`, `git reflog
+ * expire` and `git gc --prune=now` are not: a cache re-fetches, `target/` and `.git` are under
+ * `workspace/`, and carding them would be friction with a rewind already standing behind it. The
+ * one git act that leaves the checkpoint's reach is the forced push, and that raised a card headed
+ * "Push Git changes" under `external_reversible` - the right stop under the wrong sentence, now
+ * `forcedGitPush` and a card that says what a forced push does. Counted, and the residue named, in
+ * docs/design/itself/DESTRUCTION.md.
+ *
  * WHAT IS STILL DELIBERATELY LEFT ALONE. "Publishing" is a category name and carries the gaps its
  * category has. It reaches `vercel --prod`, `flyctl deploy` and `kubectl apply` now, through
  * `deploymentOperation`'s tables and the walk in `publishingOperation` - the sentence was written
@@ -576,7 +612,7 @@ export const SECURITY_MODE_FLOOR: Record<
     asksBeforeReachingTheInternet: false,
     asksBeforeInstallingSoftware: false,
     sentence:
-      'Only what this computer cannot take back for you — publishing, sending, spending, destroying data, signing or accepting terms in your name, a startup file, hook or tool configuration it would run on its own afterwards, and a control on a screen that nothing could identify.'
+      'Only what this computer cannot take back for you — publishing, sending, spending, destroying data, signing or accepting terms in your name, a startup file, hook, schedule, service or tool configuration it would run on its own afterwards, and a control on a screen that nothing could identify.'
   }
 };
 
@@ -785,6 +821,35 @@ const ordinaryRequirement = (
       sideEffect: 'external_consequential',
       action: DEFERRED_EXECUTION_ACTION,
       preview: `${namedObjects(deferred)} is executed by a later process - the login shell, git itself, or one of the coding CLIs, all of which run under the agent's own HOME - so whatever it says runs after this task, outside any approval this task could raise.`
+    };
+  /*
+   * The same clause one directory up, and the shape the file half cannot see.
+   *
+   * `deferredExecutionPaths` above asks whether a written path is a file a later process executes,
+   * and every name it knows is a file. `/etc/cron.d/job`, `/etc/systemd/system/x.service` and
+   * `~/.config/systemd/user/x.service` are DIRECTORIES whose contents are run, and a write into one
+   * of them installs something that runs after this task with no second command to card. Measured
+   * at 89185c6: `echo "* * * * * root curl x" | sudo tee /etc/cron.d/job` raised nothing in any
+   * mode. Read from the same `writtenPaths` as the rule above, so a redirect and a `tee` are one
+   * write judged once.
+   *
+   * `shell` AND NOTHING ELSE, which is the narrowing `deferredExecutionPaths` had to be given
+   * separately and which is a bound rather than a habit: every path `file_write`, `file_patch` and
+   * `print_pdf` are handed goes through `assertUserDataPath`, which refuses anything absolute or
+   * stepping up through `..` and folds a bare name into `workspace/`. So
+   * `file_write('.config/systemd/user/x.service')` writes
+   * `workspace/.config/systemd/user/x.service`, which no scheduler has ever read, and carding it
+   * would be the exact defect eleven rows of the deferred set were fixed for. The pair is held in
+   * `CONFINED` in evals/cards.
+   */
+  const scheduled = (name === 'shell' ? writtenPaths(name, args) : [])
+    .filter((path) => isScheduledExecutionPath(path))
+    .sort((left, right) => left.length - right.length);
+  if (scheduled.length)
+    return {
+      sideEffect: 'external_consequential',
+      action: DEFERRED_EXECUTION_ACTION,
+      preview: `${namedObjects(scheduled)} is inside a directory a scheduler or an init system runs the contents of, so whatever it says runs on its own schedule after this task, outside any approval this task could raise.`
     };
   if (name === 'schedule' && textValue(args.action) !== 'list')
     return {
@@ -1045,6 +1110,60 @@ const ordinaryRequirement = (
       commands.map(([command = '', ...rest]) => destructiveCommand(command, rest)).find(Boolean);
     if (destructive) return { sideEffect: 'external_consequential', ...destructive };
     /*
+     * A store this computer does not hold, and work that outlives the turn - the two halves of the
+     * autonomous sentence that had no branch.
+     *
+     * Measured through this function at 89185c6, in balanced AND autonomous: `dropdb production`,
+     * `psql -c "DROP DATABASE production"`, `psql -c "TRUNCATE TABLE users"`,
+     * `mysql -e "DROP DATABASE app"`, `redis-cli FLUSHALL`, `redis-cli FLUSHDB`,
+     * `mongosh --eval 'db.dropDatabase()'`, `sqlite3 app.db "DROP TABLE users"`,
+     * `docker volume rm pgdata`, `docker system prune -af --volumes`, `s3cmd del --recursive`,
+     * `az storage blob delete-batch`, `crontab /tmp/mycron`, `crontab -r`, `at -f job.sh now`,
+     * `systemctl --user enable mysvc` and `launchctl load -w x.plist` ALL raised nothing, while
+     * `rm -rf node_modules` - which the turn's undo point puts straight back - stopped the task in
+     * all three modes. The contract told the owner in the always-resident text that destroying data
+     * and leaving a startup file behind always stop.
+     *
+     * `external_consequential` and above every `securityMode` test, from the two-part rule the rest
+     * of this file's consequential cards are drawn from. The first part is met by construction here
+     * rather than argued row by row: `CHECKPOINT_CONTENT` is `workspace` and `.athanor/artifacts`,
+     * every operation in `destructionOperation` lands outside both, so the rewind that answers for
+     * `rm -rf node_modules` answers for none of these.
+     *
+     * After `destructiveCommand` and before the publish rule. The first is the more specific
+     * statement where both apply - `rm` is `rm` whoever owns the bytes - and no command in either
+     * of the two tables below is in the publish tables, measured, so the order between them changes
+     * no card either way.
+     *
+     * `executable` is handed to `scriptDestroysAStore` because the text a command is fed is only
+     * evidence once you know what will read it. `commandScript` already joins `args`' inline body
+     * to `stdin` - it was written for exactly the walk-past this closes - but the statement it
+     * returns for `shell(executable: 'psql', stdin: 'DROP DATABASE production;')` has `drop` as its
+     * head, and every client this section knows is on the OUTSIDE of that string. Measured before
+     * this argument existed: that call, and the same one on mysql, sqlite3, mongosh and redis-cli,
+     * raised nothing in balanced or autonomous, while the same statement typed into `-c` carded in
+     * all three.
+     */
+    const inScript = scriptDestroysAStore(commandScript(args), executable);
+    const destruction =
+      commands.map((command) => destructionOperation(command)).find(Boolean) ??
+      (commands.length === 0 && commandInterpreters.has(executable)
+        ? destructionOperation(commandArgs)
+        : null) ??
+      (inScript ? ({ kind: 'store', operation: inScript } as const) : null);
+    if (destruction)
+      return {
+        sideEffect: 'external_consequential',
+        action:
+          destruction.kind === 'store'
+            ? `Destroy stored data with ${destruction.operation}`
+            : `Install work that outlives this turn with ${destruction.operation}`,
+        preview:
+          destruction.kind === 'store'
+            ? `Run ${invocation}. What this removes is not in the workspace - a database, a cache, a bucket or a container volume all live outside it - so rewinding this turn does not put it back. The turn's undo point covers workspace/ and .athanor/artifacts and nothing else.`
+            : `Run ${invocation}. This installs something that runs after this task and every card in it is over, under a process no approval here governs, and it is not inside the turn's undo point either - rewinding this turn leaves it running.`
+      };
+    /*
      * A version that goes to a registry, which is the one act the owner named and the floor did not
      * have.
      *
@@ -1118,6 +1237,23 @@ const ordinaryRequirement = (
         sideEffect: 'external_reversible',
         action: `Install or update software with ${installer[0]}`,
         preview: `Run ${invocation} inside the persistent Linux computer. Downloaded software and its publisher terms become part of this installation.`
+      };
+    /*
+     * A forced push before the ordinary one, because the two are not the same act and one card was
+     * describing both.
+     *
+     * Every push already stops - `external_reversible` under "Push Git changes" - and that sentence
+     * is true of the ordinary case: what a push adds, a later push can take away, and the commits
+     * are still here. A forced push discards commits that exist on a remote this computer does not
+     * hold, and nothing here can put them back. This adds no card and moves no count; it changes
+     * what the one already there says, and raises it to the class the act belongs to.
+     */
+    const forced = commands.find((command) => forcedGitPush(command));
+    if (forced)
+      return {
+        sideEffect: 'external_consequential',
+        action: 'Overwrite history on a Git remote',
+        preview: `Run ${invocation}. A forced push replaces what the remote has rather than adding to it, and the commits it discards live on that remote and not on this computer, so nothing here can put them back. Anyone who already fetched the old history keeps a copy this one no longer agrees with.`
       };
     if (
       commands.some(

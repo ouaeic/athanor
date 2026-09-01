@@ -31,7 +31,7 @@ counts, which is what a gate needs.
 
 Fewer cards is not automatically better. A floor exists to stop things, and the fastest way to
 fewer cards is a floor that has stopped working — which is silent, and which looks like a win in
-every column of the table. So the counts are pinned against a baseline, and three tables in
+every column of the table. So the counts are pinned against a baseline, and nine tables in
 `guards.ts` are asserted on every run, with or without `--ci`:
 
 - **WRITES** — twenty calls that leave text a later, more privileged process executes: `~/.bashrc`,
@@ -99,7 +99,32 @@ upload`, `docker buildx build --push`, `vercel --prod`, `kubectl apply`, `gh rel
 - **CONFINED** — pairs. A shell startup file written through `file_write`, `file_patch` or
   `print_pdf` lands at `workspace/.bashrc`, which no login shell reads, so it must not card; the
   same file through `shell` must. Six rows of WRITES used to assert only the second half and were
-  asserting it of the tool that cannot reach the file.
+  asserting it of the tool that cannot reach the file. Two pairs are a scheduler's own tree rather
+  than a startup file — `~/.config/systemd/user/x.service` and `/etc/cron.d/job` — because the rule
+  that reads them is a directory rule and had to be given the same narrowing.
+- **DESTROYS** — fifty-three acts that remove a store this computer does not hold, or install work
+  that outlives the turn: `dropdb`, `psql -c 'DROP DATABASE'`, `TRUNCATE`, an unqualified
+  `DELETE FROM`, `mysqladmin drop`, `sqlite3 'DROP TABLE'`, `db.dropDatabase()`, `FLUSHALL`,
+  `aws s3 rb --force`, `rclone purge`, `docker volume rm`, `docker compose down -v`, `crontab`,
+  `at`, `systemctl enable`, `launchctl load` — each in its bare, `bash -lc`, heredoc, `sudo`,
+  `timeout`, unnamed-wrapper and `desktop_launch` spellings, and five more where the statement is
+  handed straight to the client on `stdin`, which is a spelling the shipped `shell` schema takes and
+  which walked past the whole rule until the gate pass. Each must card in every mode. Measured
+  at `89185c6`, before the rule existed, every row raised nothing in balanced or autonomous while
+  `rm -rf node_modules`, which a rewind restores, stopped the turn in all three. What decides the
+  table is `CHECKPOINT_CONTENT` — `workspace` and `.athanor/artifacts` — which none of these is
+  inside.
+- **FREE_STORE_WORK** — the other direction, sixty rows, and the direction the owner pays for.
+  `psql tracker -f migrations/001_init.sql` and `psql tracker -c "select count(*) from tenancies"`
+  are not hypotheticals: both are in `K-one-shot-app` and `L-no-research-build`, twice each.
+  Measured, widening the SQL arm from the statement to the executable took K from four cards to six
+  in balanced and one to three in autonomous. The cache clears, `cargo clean`, `git branch -D` and
+  `git gc --prune=now` are here as decisions rather than oversights: a cache re-fetches, and
+  `target/` and `.git` are inside the undo point. Seven rows are a READER in front of the same
+  vocabulary — `man crontab`, `man -k crontab`, `info`, `tldr`, `which`, `man dropdb`, `grep
+crontab /etc/passwd` — a shape this table had none of, and every one of the first six stopped the
+  turn in all three modes until the gate pass. Four more are a directory in the owner's project that
+  happens to be called `init.d` or `profile.d`, which is a file no scheduler reads.
 
 ## The owner's own sentence
 

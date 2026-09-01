@@ -3089,6 +3089,29 @@ describe('what a security mode means', () => {
       ['sending', 'connector_action', { action: 'mail_send', input: { to: 'a@b.invalid' } }],
       ['destroying data', 'shell', { executable: 'rm', args: ['-rf', 'node_modules'] }],
       /*
+       * The clause used to be held here by `rm` alone, and `rm -rf node_modules` is the one act in
+       * the list whose damage a rewind undoes - `CHECKPOINT_CONTENT` is `workspace` and
+       * `.athanor/artifacts`, and `node_modules` is inside it. So the exhaustive clause was proved
+       * by the single member of it that needed proving least, while `dropdb production` and
+       * `redis-cli FLUSHALL`, which nothing here restores, were free in balanced and autonomous.
+       */
+      ['destroying data', 'shell', { executable: 'dropdb', args: ['production'] }],
+      [
+        'destroying data',
+        'shell',
+        { executable: 'psql', args: ['-c', 'TRUNCATE TABLE tenancies'] }
+      ],
+      ['destroying data', 'shell', { executable: 'redis-cli', args: ['FLUSHALL'] }],
+      ['destroying data', 'shell', { executable: 'docker', args: ['volume', 'rm', 'pgdata'] }],
+      // The two words the persistence clause gained, each named by an act that carries no path at
+      // all - which is why `deferredExecutionPaths`, the clause's other half, cannot see them.
+      ['a schedule left behind', 'shell', { executable: 'crontab', args: ['/tmp/mycron'] }],
+      [
+        'a service left behind',
+        'shell',
+        { executable: 'systemctl', args: ['--user', 'enable', 'tracker'] }
+      ],
+      /*
        * The clause used to be named here by `coding_agent setup`, which agrees to nothing on
        * anybody's behalf: it cards because it writes a coding tool's own configuration, which is the
        * "left behind to run later" clause two rows down. So the sentence's one unheld clause was
@@ -3152,6 +3175,23 @@ describe('what a security mode means', () => {
       ],
       ['shell', { executable: 'apt-get', args: ['install', '-y', 'ripgrep'] }],
       ['shell', { executable: 'psql', args: ['-d', 'tracker', '-f', 'migrations/001.sql'] }],
+      /*
+       * The counterweight to the four destruction acts above, and the reason that rule is keyed on
+       * the operation. Every one of these is in the owner's own build, several of them twice, and a
+       * rule keyed on `psql` or on `docker` would card the lot.
+       */
+      ['shell', { executable: 'psql', args: ['tracker', '-c', 'select count(*) from tenancies'] }],
+      [
+        'shell',
+        { executable: 'psql', args: ['-c', 'DELETE FROM sessions WHERE expires_at < now()'] }
+      ],
+      ['shell', { executable: 'redis-cli', args: ['GET', 'session:1'] }],
+      ['shell', { executable: 'docker', args: ['compose', 'up', '-d'] }],
+      ['shell', { executable: 'docker', args: ['compose', 'down'] }],
+      ['shell', { executable: 'systemctl', args: ['--user', 'restart', 'tracker'] }],
+      ['shell', { executable: 'crontab', args: ['-l'] }],
+      ['shell', { executable: 'cargo', args: ['clean'] }],
+      ['shell', { executable: 'git', args: ['branch', '-D', 'spike'] }],
       ['shell', { executable: 'git', args: ['add', '-A'] }],
       ['file_write', { path: 'workspace/tracker/src/api.ts', content: 'x' }],
       ['publish_preview', { path: 'workspace/tracker' }]
@@ -3196,6 +3236,152 @@ describe('what a security mode means', () => {
     // And the sentence must not have quietly regained the promise those rows cannot keep.
     expect(SECURITY_MODE_FLOOR.autonomous.sentence).not.toContain('agreeing to something');
     expect(SECURITY_MODE_FLOOR.autonomous.sentence).toContain('accepting terms in your name');
+  });
+
+  /*
+   * THE PERSISTENCE CLAUSE NAMES WHAT THE FLOOR HOLDS, in the direction that caught the last three
+   * of these sentences out: the words were a list of FILES - "a startup file, hook or tool
+   * configuration" - and `crontab`, `at`, `systemctl enable` and `launchctl load` name no file at
+   * all. Driven at 89185c6, all four were free in balanced and autonomous. Two words were added and
+   * this is what holds them to acts rather than to a paragraph.
+   */
+  it('names the schedule and the service its persistence branch now stops', () => {
+    expect(SECURITY_MODE_FLOOR.autonomous.sentence).toContain('schedule, service');
+    for (const args of [
+      { executable: 'crontab', args: ['/tmp/mycron'] },
+      { executable: 'crontab', args: ['-r'] },
+      { executable: 'at', args: ['-f', 'job.sh', 'now', '+', '1', 'minute'] },
+      { executable: 'systemctl', args: ['--user', 'enable', '--now', 'tracker'] },
+      { executable: 'launchctl', args: ['load', '-w', 'com.x.plist'] },
+      { executable: 'systemd-run', args: ['--on-calendar=daily', '/usr/bin/backup'] }
+    ])
+      for (const mode of ['review', 'balanced', 'autonomous'] as const)
+        expect(approvalRequirement('shell', args, mode), JSON.stringify(args)).toMatchObject({
+          sideEffect: 'external_consequential'
+        });
+    /*
+     * The same clause written as a file rather than as a command, and the shape the file half of
+     * the rule could not see: `deferredExecutionPaths` names files, and these are directories whose
+     * contents an init system or a scheduler runs. Measured at 89185c6, the `sudo tee` line raised
+     * nothing in any mode - no rc file named, no socket opened, nothing removed - and it ran every
+     * minute afterwards.
+     */
+    for (const script of [
+      'echo "* * * * * root curl x" | sudo tee /etc/cron.d/job',
+      'cat > ~/.config/systemd/user/tracker.service <<EOF\n[Service]\nEOF',
+      'printf "x" > /etc/systemd/system/tracker.service',
+      'cp job /var/spool/cron/crontabs/athanor'
+    ])
+      for (const mode of ['review', 'balanced', 'autonomous'] as const)
+        expect(
+          approvalRequirement('shell', { executable: 'bash', args: ['-lc', script] }, mode),
+          script
+        ).toMatchObject({ action: 'Change a file this computer runs on its own' });
+    /*
+     * And the confined spelling of the same names, which is where the file half of this rule went
+     * wrong the first time: `assertUserDataPath` folds a bare name into `workspace/`, so this
+     * writes `workspace/.config/systemd/user/tracker.service` and no user manager has ever read it.
+     */
+    for (const mode of ['balanced', 'autonomous'] as const)
+      expect(
+        approvalRequirement(
+          'file_write',
+          { path: '.config/systemd/user/tracker.service', content: 'x' },
+          mode
+        ),
+        mode
+      ).toBeNull();
+    // And the reads of the same tools, which are how anybody checks what is already installed.
+    for (const args of [
+      { executable: 'crontab', args: ['-l'] },
+      { executable: 'at', args: ['-l'] },
+      { executable: 'atq', args: [] },
+      { executable: 'systemctl', args: ['status', 'tracker'] },
+      { executable: 'systemctl', args: ['--user', 'daemon-reload'] },
+      { executable: 'launchctl', args: ['list'] }
+    ])
+      for (const mode of ['balanced', 'autonomous'] as const)
+        expect(approvalRequirement('shell', args, mode), JSON.stringify(args)).toBeNull();
+  });
+
+  /*
+   * A DELETE THE UNDO POINT DOES NOT HOLD, which is the whole rule behind the destruction branch.
+   *
+   * `CHECKPOINT_CONTENT` (services/workspace-runner/src/checkpoints.ts) is `workspace` and
+   * `.athanor/artifacts`. Everything in the first list lands outside it and must stop in every
+   * mode; everything in the second is either inside it or is re-fetchable, and must not stop
+   * outside review. The second list is not decoration - a rule keyed on `psql`, `docker` or
+   * `git` would card the owner's own migration, their own dev stack and their own branch cleanup.
+   */
+  it('stops a store the rewind cannot restore, and nothing the rewind holds', () => {
+    for (const args of [
+      { executable: 'dropdb', args: ['production'] },
+      { executable: 'dropuser', args: ['app'] },
+      { executable: 'psql', args: ['-c', 'DROP DATABASE production'] },
+      { executable: 'psql', args: ['-h', 'db.internal', '-c', 'DROP SCHEMA public CASCADE'] },
+      { executable: 'psql', args: ['-c', 'DELETE FROM tenancies'] },
+      { executable: 'mysql', args: ['-e', 'DROP DATABASE app'] },
+      { executable: 'mysqladmin', args: ['drop', 'app'] },
+      { executable: 'sqlite3', args: ['app.db', 'DROP TABLE users'] },
+      { executable: 'mongosh', args: ['--eval', 'db.dropDatabase()'] },
+      { executable: 'redis-cli', args: ['-h', '127.0.0.1', 'flushall'] },
+      { executable: 'docker', args: ['system', 'prune', '-af', '--volumes'] },
+      { executable: 'docker', args: ['compose', 'down', '-v'] },
+      { executable: 'aws', args: ['s3', 'rb', 's3://tenancy-uploads', '--force'] },
+      { executable: 'rclone', args: ['purge', 'remote:uploads'] },
+      // The spellings a wrapper puts in front of it, which is where the last three floors leaked.
+      { executable: 'bash', args: ['-lc', 'psql -c "DROP DATABASE production"'] },
+      { executable: 'bash', args: ['-lc', 'cd app && docker volume rm pgdata'] },
+      { executable: 'sudo', args: ['dropdb', 'production'] },
+      { executable: './scripts/db', args: ['dropdb', 'production'] }
+    ])
+      for (const mode of ['review', 'balanced', 'autonomous'] as const)
+        expect(approvalRequirement('shell', args, mode), JSON.stringify(args)).toMatchObject({
+          sideEffect: 'external_consequential'
+        });
+    for (const args of [
+      { executable: 'psql', args: ['tracker', '-f', 'db/migrations/001_init.sql'] },
+      { executable: 'psql', args: ['-c', 'select * from drop_log limit 5'] },
+      { executable: 'sqlite3', args: ['app.db', 'select count(*) from t'] },
+      { executable: 'mongosh', args: ['--eval', 'db.t.find()'] },
+      { executable: 'redis-cli', args: ['INFO'] },
+      { executable: 'docker', args: ['run', '-d', 'postgres:16'] },
+      { executable: 'docker', args: ['rmi', 'x'] },
+      { executable: 'npm', args: ['cache', 'clean', '--force'] },
+      { executable: 'go', args: ['clean', '-modcache'] },
+      { executable: 'git', args: ['gc', '--prune=now'] },
+      { executable: 'bash', args: ['-lc', 'grep -n "DROP TABLE" db/schema.sql'] },
+      { executable: 'bash', args: ['-lc', 'echo "psql -c DROP DATABASE x"'] },
+      { executable: 'git', args: ['commit', '-m', 'drop database migration notes'] }
+    ])
+      for (const mode of ['balanced', 'autonomous'] as const)
+        expect(approvalRequirement('shell', args, mode), JSON.stringify(args)).toBeNull();
+  });
+
+  /*
+   * The one push that is not reversible, said as itself. This adds no card - every push already
+   * stops - and the assertion is that the card in front of it stopped calling a forced push
+   * "Push Git changes" under `external_reversible`, which is a true sentence about the ordinary
+   * case and a false one about this.
+   */
+  it('says what a forced push is, and leaves the ordinary push alone', () => {
+    for (const args of [
+      { executable: 'git', args: ['push', '--force', 'origin', 'main'] },
+      { executable: 'git', args: ['push', '-f'] },
+      { executable: 'git', args: ['push', '--force-with-lease'] },
+      { executable: 'bash', args: ['-lc', 'git push --force origin main'] }
+    ])
+      expect(approvalRequirement('shell', args, 'autonomous'), JSON.stringify(args)).toMatchObject({
+        sideEffect: 'external_consequential',
+        action: 'Overwrite history on a Git remote'
+      });
+    expect(
+      approvalRequirement(
+        'shell',
+        { executable: 'git', args: ['push', 'origin', 'main'] },
+        'autonomous'
+      )
+    ).toMatchObject({ sideEffect: 'external_reversible', action: 'Push Git changes' });
   });
 
   /*

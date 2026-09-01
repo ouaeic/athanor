@@ -1318,7 +1318,8 @@ describe('the repository arms', () => {
       { name: 'code_diagnostics', arguments: { path: 'workspace/app' } },
       {
         route: (url) => {
-          if (url.includes('/files?path=')) return json({ entries: [{ name: 'package.json' }] });
+          if (url.includes('/files?path='))
+            return json({ entries: [{ name: 'package.json' }, { name: 'tsconfig.json' }] });
           if (url.endsWith(`${root}/exec`)) return observation({ stdout: 'no errors' });
           return undefined;
         }
@@ -1367,6 +1368,44 @@ describe('the repository arms', () => {
   });
 
   /**
+   * The other direction, at the arm that executes rather than at the table that answers.
+   *
+   * The listing above holds a `tsconfig.json`, and it did not have to: this test read
+   * `[{ name: 'package.json' }]` and passed, while the arm sent `tsc --noEmit` to a directory with
+   * no project for it to read. Driven on this machine, `pnpm exec tsc --noEmit --pretty false` at
+   * this repository's own root - a `package.json`, no `tsconfig.json`, and the default `path` of
+   * `workspace` names exactly that shape - exits 1 with 4,994 bytes of the compiler's usage on
+   * stdout and nothing on stderr. The arm returned `passed: false` carrying those 4,994 bytes,
+   * which is indistinguishable from a wall of type errors and contains no fact about the code.
+   *
+   * Asserted as the exact call list, because the whole repair is that the second call is not made.
+   * A sentence and no exec, and no approval: an unrunnable command is not a decision for an owner.
+   */
+  it('says which project file is missing, and runs nothing, rather than returning a usage page', async () => {
+    const executed = await dispatch(
+      { name: 'code_diagnostics', arguments: { path: 'workspace/app' } },
+      {
+        route: (url) => {
+          if (url.includes('/files?path=')) return json({ entries: [{ name: 'package.json' }] });
+          if (url.endsWith(`${root}/exec`)) return observation({ stdout: 'no errors' });
+          return undefined;
+        }
+      }
+    );
+
+    expect(executed.calls).toEqual([
+      {
+        method: 'GET',
+        path: `${root}/files?path=workspace%2Fapp`,
+        scopes: ['files.read'],
+        body: undefined
+      }
+    ]);
+    expect(executed.result).toMatchObject({ available: false, language: 'typescript' });
+    expect((executed.result as { reason: string }).reason).toContain('no tsconfig.json');
+  });
+
+  /**
    * A timeout the model spelled wrong must not delete the floor it was clamped by.
    *
    * `Math.min(1_800, Math.max(10, Number('a while')))` is `NaN`, and `JSON.stringify` writes `NaN`
@@ -1381,7 +1420,8 @@ describe('the repository arms', () => {
       { name: 'code_diagnostics', arguments: { path: 'workspace/app', timeoutSeconds: 'a while' } },
       {
         route: (url) => {
-          if (url.includes('/files?path=')) return json({ entries: [{ name: 'package.json' }] });
+          if (url.includes('/files?path='))
+            return json({ entries: [{ name: 'package.json' }, { name: 'tsconfig.json' }] });
           if (url.endsWith(`${root}/exec`)) return observation({ stdout: 'no errors' });
           return undefined;
         }

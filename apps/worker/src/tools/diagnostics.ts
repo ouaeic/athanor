@@ -1,6 +1,8 @@
 /**
  * What `code_diagnostics` will actually run: fifteen languages, the marker each is recognised by,
- * and the one command each resolves to.
+ * the one command each resolves to, and - `diagnosticsSelection` at the foot of this file - the
+ * project file that command has to be pointed at before it is a diagnostic rather than a usage
+ * page. `docs/design/itself/DIAGNOSTICS.md` has the measurements behind that last one.
  *
  * ── What stops a cloned repository's build recipe, and what does not ───────────────────────────
  *
@@ -68,6 +70,14 @@
 export interface DiagnosticsCommand {
   executable: string;
   args: string[];
+}
+
+/**
+ * What the arm does with a directory: run this command, or return this sentence and run nothing.
+ */
+export interface DiagnosticsSelection {
+  command?: DiagnosticsCommand;
+  reason?: string;
 }
 
 /**
@@ -177,4 +187,117 @@ export const diagnosticsCommand = (
   if (language === 'swift') return { executable: 'swift', args: ['build'] };
   if (language === 'dart') return { executable: 'dart', args: ['analyze'] };
   return undefined;
+};
+
+/**
+ * The project file the chosen command has to be pointed at, when the directory does not hold it.
+ *
+ * ── The defect this closes ────────────────────────────────────────────────────────────────────
+ *
+ * The ladder recognises TypeScript by `tsconfig.json` OR `package.json`, and the command it
+ * resolves to is `tsc --noEmit`, which reads `tsconfig.json` and nothing else. So a directory with
+ * a `package.json` and no `tsconfig.json` - which on this repository is the root itself, and the
+ * default `path` of `workspace` - ran `tsc` with no project to check. Measured here on 2026-09-01,
+ * `pnpm exec tsc --noEmit --pretty false` at the repository root: **exit 1, 4,994 bytes on stdout,
+ * 0 on stderr**, and every byte of it is the compiler's own usage - "COMMON COMMANDS", the option
+ * list, `tsc --init`. The arm returned that as `passed: false` with 4,994 bytes of output, which is
+ * the exact shape of a wall of type errors and says nothing whatever about the code.
+ *
+ * ── The same shape in the other fourteen ──────────────────────────────────────────────────────
+ *
+ * A command that runs and fails for want of a project file rather than for a defect in the code.
+ * Driven on this machine rather than reasoned about, in a `mktemp -d` holding only the marker:
+ *
+ *   `make -s`, `CMakeLists.txt` and no `Makefile`  - exit 2, 61 bytes, "No targets specified and
+ *     no makefile found". The second auto-selected condition: the ladder recognises C++ by
+ *     `CMakeLists.txt` OR `Makefile`, but `cmake --build build` is chosen only when a `build`
+ *     directory is already configured, so `CMakeLists.txt` alone falls through to `make`.
+ *   `cargo check --message-format short`, no `Cargo.toml` - exit 101, 153 bytes.
+ *   `swift build`, no `Package.swift` - exit 1, 420 bytes.
+ *
+ * Those last two are not reachable from `auto` - the ladder names Rust only for a `Cargo.toml` and
+ * Swift only for a `Package.swift` - but `language` is an argument, and a named language stands
+ * without being re-derived from the directory. So the requirement is checked whether the language
+ * came from the ladder or from the caller; the two are the same mistake with a different author.
+ *
+ * The languages absent from this table are absent because their command takes the DIRECTORY as its
+ * input and no project file at all: Python, R, Julia, Ruby, PHP each glob the tree from `.`.
+ * Measured for the two whose interpreter is installed here - `ruby -e Dir.glob(...)` and
+ * `python3 -I -m compileall -q .` in an empty directory both exit 0 with no output - and true by
+ * construction for the other three, whose argument is the same recursive walk.
+ *
+ * WHAT THIS DOES NOT COVER, said rather than implied: `terraform validate` needs `terraform init`
+ * to have run, and `.terraform` is written by a command rather than by whoever wrote the tree, so a
+ * `.tf` file is a project and an uninitialised directory is still a real failure to report. It is a
+ * different condition from a missing project file and Terraform is not installed on this machine to
+ * measure it, so it is left alone rather than guessed at. `dart analyze` reads loose files as well
+ * as a package, so `pubspec.yaml` is not required either.
+ */
+const missingProjectFile = (language: string, names: ReadonlySet<string>): string | undefined => {
+  const anyName = (matches: (name: string) => boolean) => [...names].some(matches);
+  if (language === 'typescript' && !names.has('tsconfig.json')) return 'tsconfig.json';
+  if (language === 'rust' && !names.has('Cargo.toml')) return 'Cargo.toml';
+  if (language === 'go' && !names.has('go.mod')) return 'go.mod';
+  if (
+    (language === 'java' || language === 'kotlin') &&
+    !names.has('pom.xml') &&
+    !names.has('build.gradle') &&
+    !names.has('build.gradle.kts')
+  )
+    return 'pom.xml or build.gradle';
+  if (
+    language === 'csharp' &&
+    !anyName((name) => name.endsWith('.sln') || name.endsWith('.csproj'))
+  )
+    return '.sln or .csproj';
+  /*
+   * Keyed to the command the table actually chose, not to the marker that named the language.
+   * `cmake --build build` is chosen only when BOTH `CMakeLists.txt` and a configured `build`
+   * directory are there; every other C++ directory falls through to `make -s`, which reads a
+   * `Makefile`. Written as the negation of the cmake condition rather than as `!names.has('build')`,
+   * which a directory holding a stray `build` and no `CMakeLists.txt` would have walked straight
+   * through into a `make` that has nothing to run.
+   */
+  if (
+    language === 'cpp' &&
+    !names.has('Makefile') &&
+    !(names.has('CMakeLists.txt') && names.has('build'))
+  )
+    return names.has('CMakeLists.txt') ? 'configured build directory, and no Makefile' : 'Makefile';
+  if (language === 'swift' && !names.has('Package.swift')) return 'Package.swift';
+  if (language === 'terraform' && !anyName((name) => name.endsWith('.tf'))) return '.tf file';
+  return undefined;
+};
+
+/**
+ * What runs here, or the one sentence saying why nothing does.
+ *
+ * Two different absences and two different sentences, because they are two different answers and
+ * collapsing them would have been the same evasion as the help text. Nothing recognisable at all
+ * is "no marker"; a marker whose command has no project to read is named by the file it wanted.
+ * Neither is a question: an unrunnable command is not a decision for the owner to take, and the
+ * card this tool used to raise was removed for reasons `docs/design/floor/DIAGNOSTICS.md` records
+ * in full.
+ */
+export const diagnosticsSelection = (
+  language: string,
+  names: ReadonlySet<string>
+): DiagnosticsSelection => {
+  const command = diagnosticsCommand(language, names);
+  if (!command)
+    return {
+      reason:
+        'No supported project marker was found. Use the shell tool for a repository-specific diagnostic command.'
+    };
+  const missing = missingProjectFile(language, names);
+  if (missing)
+    return {
+      /*
+       * The whole command rather than its executable. `pnpm` is what runs `tsc` here, and "running
+       * pnpm would fail" names the wrong program to whoever reads it; the nine languages this
+       * branch can reach all spell out in a handful of words.
+       */
+      reason: `This directory has no ${missing}, so there is no ${language} project here to check. Running ${[command.executable, ...command.args].join(' ')} would fail for want of one rather than report anything about the code. Point path at a directory that holds it, or use the shell tool for this project's own command.`
+    };
+  return { command };
 };

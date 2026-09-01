@@ -1,9 +1,9 @@
 {
   "$stamp": {
-    "acceptedAt": "2026-08-30T20:03:56.646Z",
+    "acceptedAt": "2026-09-01T13:44:19.734Z",
     "version": "0.1.1",
-    "commit": "fb93b40",
-    "rig": "70581ad939d2"
+    "commit": "89185c6",
+    "rig": "7e0f7f079b74"
   },
   "A-calendar/review": {
     "calls": 4,
