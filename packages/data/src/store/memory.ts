@@ -42,6 +42,7 @@ import {
 import {
   MEMORY_RECALL_SQL,
   MEMORY_SOURCE_SEARCH_PER_TASK,
+  MEMORY_SOURCE_ARCHIVE_SEARCH_SQL,
   MEMORY_SOURCE_SEARCH_SQL,
   MEMORY_SOURCE_WINDOW_SQL,
   OWNER_BLOCK_MAX_BYTES,
@@ -476,6 +477,16 @@ export interface SearchMemorySourcesInput {
    * a search already restricted to one task raises it, because there is nothing to crowd out.
    */
   perTask?: number;
+  /**
+   * Which tier to search. `indexed` is every row the nightly pass has not yet archived and is the
+   * default; `archived` is only the rows past the horizon, searched by recomputing their vector
+   * from the tokens the pass now keeps.
+   *
+   * Two calls rather than one union, because they are two different costs and the caller should
+   * have to decide to pay the second: the first is a GIN probe, the second is a scan. @see
+   * MEMORY_SOURCE_ARCHIVE_SEARCH_SQL.
+   */
+  reach?: 'indexed' | 'archived';
 }
 
 export interface MemorySourceHit extends MemorySourceRecord {
@@ -2204,44 +2215,62 @@ export class MemoryStore {
     const lexemes = input.plan.lexemes.filter(isMemoryToken);
     if (lexemes.length === 0) return [];
     const limit = Math.trunc(input.limit ?? 20);
-    const result = await this.database.query(MEMORY_SOURCE_SEARCH_SQL, [
-      input.workspaceId,
-      lexemes,
-      input.taskId ?? null,
-      input.since ?? null,
-      input.until ?? null,
-      limit,
-      // Inside a single conversation there is no second thread to make room for, so the cap would
-      // only throw away rows the caller asked for by name.
-      Math.max(
-        1,
-        Math.trunc(input.perTask ?? (input.taskId ? limit : MEMORY_SOURCE_SEARCH_PER_TASK))
-      )
-    ]);
+    const result = await this.database.query(
+      input.reach === 'archived' ? MEMORY_SOURCE_ARCHIVE_SEARCH_SQL : MEMORY_SOURCE_SEARCH_SQL,
+      [
+        input.workspaceId,
+        lexemes,
+        input.taskId ?? null,
+        input.since ?? null,
+        input.until ?? null,
+        limit,
+        // Inside a single conversation there is no second thread to make room for, so the cap
+        // would only throw away rows the caller asked for by name.
+        Math.max(
+          1,
+          Math.trunc(input.perTask ?? (input.taskId ? limit : MEMORY_SOURCE_SEARCH_PER_TASK))
+        )
+      ]
+    );
     return result.rows.map((row) => ({ ...mapMemorySource(row), score: Number(row.score) }));
   }
 
   /**
-   * How far back the verbatim layer actually reaches.
+   * How far back the verbatim layer actually reaches, in each of the two tiers separately.
    *
    * A search that returns nothing has two completely different meanings - the owner never discussed
    * it, or it happened before this workspace started recording - and an agent that cannot tell them
    * apart will state the first one as fact. Capture began when the memory schema did, so on a
    * computer that has been in use longer than that there is a real horizon, and it is a number
    * rather than a guess.
+   *
+   * `archived` is the second half of that same argument and it exists because the horizon is no
+   * longer where the record stops. Past the archive age a row leaves the fast index and keeps its
+   * tokens, so "nothing in the indexed tier" and "nothing recorded" are now a THIRD pair of
+   * meanings an agent could confuse - and the honest answer to a search that found nothing is not
+   * only how far back the record goes but how much of it the first pass could not see. Counted in
+   * one statement over one scan rather than two queries, because it is asked on the path where the
+   * agent is about to tell the owner something about their own history from an absence.
    */
   async memorySourceCoverage(workspaceId: string): Promise<{
     turns: number;
     conversations: number;
     earliest: string | null;
+    /** Rows past the archive horizon: out of the fast index, still searchable one step further. */
+    archived: { turns: number; earliest: string | null };
   }> {
     const result = await this.database.query<{
       turns: string;
       conversations: string;
       earliest: unknown;
+      archived_turns: string;
+      archived_earliest: unknown;
     }>(
       `SELECT count(*) AS turns, count(DISTINCT task_id) AS conversations,
-              min(occurred_at) AS earliest
+              min(occurred_at) AS earliest,
+              count(*) FILTER (WHERE NOT indexed AND body_tokens <> '') AS archived_turns,
+              min(occurred_at) FILTER (WHERE NOT indexed AND body_tokens <> '')
+                AS archived_earliest
        FROM mem.source WHERE workspace_id = $1`,
       [workspaceId]
     );
@@ -2249,7 +2278,11 @@ export class MemoryStore {
     return {
       turns: Number(row?.turns ?? 0),
       conversations: Number(row?.conversations ?? 0),
-      earliest: row?.earliest ? iso(row.earliest) : null
+      earliest: row?.earliest ? iso(row.earliest) : null,
+      archived: {
+        turns: Number(row?.archived_turns ?? 0),
+        earliest: row?.archived_earliest ? iso(row.archived_earliest) : null
+      }
     };
   }
 
@@ -2466,8 +2499,10 @@ export class MemoryStore {
       [workspaceId]
     );
 
-    // Compaction never deletes verbatim text: items are demoted to 'archived' and sources merely
-    // leave the lexical index. Anything pinned or cited by a live item is exempt.
+    // Compaction never deletes anything: items are demoted to 'archived' and sources merely leave
+    // the lexical index, keeping every byte they were written with. An item that is pinned, or that
+    // something still links to, is exempt; the source tier's own exemption is gone and the
+    // paragraph on the statement below says why.
     const archived = await this.database.query(
       `UPDATE mem.item SET status='archived', updated_at=NOW()
        WHERE workspace_id=$1 AND status='active' AND NOT pin
@@ -2475,11 +2510,83 @@ export class MemoryStore {
          AND NOT EXISTS (SELECT 1 FROM mem.link l WHERE l.dst_id=mem.item.id)`,
       [workspaceId, now, archiveAfterDays]
     );
+    /*
+     * THE ARCHIVE HORIZON, AND THE ONE COLUMN IT MUST NOT TOUCH.
+     *
+     * This statement read `SET indexed=FALSE, body_tokens=''`, and the comment above it said
+     * compaction never deletes verbatim text. Both halves of that were true and together they
+     * were still the one place the owner's rule - no memory is ever totally gone, only further
+     * away or more steps to get to - was broken. `body_ciphertext` did survive, so the words were
+     * on the disk; `body_tokens` did not, and it is the ONLY searchable representation this
+     * database has of them. The tokens are keyed HMACs of the lexemes, computed in the worker
+     * against a key the server does not hold, so a server-side reindex is not merely unimplemented
+     * here - it is impossible from anything the erasing statement left behind. Nothing in the tree
+     * rebuilds them from the ciphertext either. A conversation straddling the horizon stayed
+     * reachable in two steps through a surviving neighbour; one entirely older than two years had
+     * no route in from any query at all.
+     *
+     * So the pass now flips one boolean and erases nothing. What that costs and what it buys are
+     * both exact:
+     *
+     *   - The row still leaves the fast index. `mem_source_tsv_gin` is partial - `WHERE indexed` -
+     *     so `indexed=FALSE` removes it from the GIN structure, which is the expensive half and
+     *     the half this pass exists for.
+     *   - What stays is everything else the row was written with: the sealed body, the keyed
+     *     `body_tokens`, and - since migration 76 - the `tsv` those tokens make, which costs no
+     *     index bytes at all while the flag is false. `MEMORY_SOURCE_ARCHIVE_SEARCH_SQL` then
+     *     matches it with the same `@@` off a scan. That is the extra step: the ordinary search
+     *     never sees these rows, and a search that finds nothing reaches them by scanning rather
+     *     than by probing. @see searchMemorySessions, which takes that second step for the agent
+     *     so a two-year-old conversation is answered rather than merely reachable in principle.
+     *
+     * IT DOES NOT RESURRECT A ROW THAT WAS NEVER INDEXED. `createMemorySource` still writes `''`
+     * for `body_tokens` when the caller says `indexed: false`, and that is a different decision
+     * about a different row - a body with nothing to index, or one the taint gate refuses to make
+     * searchable. This statement only ever moves rows that WERE indexed, so it can never put
+     * tokens on a row the write path decided must not have them.
+     *
+     * Irreversible deletion is still available and is still the owner's: `forgetMemoryItem` and
+     * the task-deletion cascade both remove rows outright. What is gone is a timer that did it.
+     *
+     * ── AND THE CITATION EXEMPTION GOES WITH THE ERASURE, BECAUSE IT WAS THE ERASURE'S GUARD ────
+     *
+     * This statement also carried `AND NOT EXISTS (SELECT 1 FROM mem.evidence e WHERE
+     * e.source_id=mem.source.id)`, described as "anything cited by a live item is exempt". Measured
+     * against the only production writer of `mem.source`, that clause did not narrow the pass - it
+     * switched it off. `recordTurnEpisode` writes every chunk of the owner's request and the
+     * agent's summary and then calls `attachMemoryEvidence(episodeId, ...)` over EVERY id it just
+     * wrote, in the same function, unconditionally. So every row this pass could ever see was
+     * cited, `sourcesUnindexed` was structurally zero on this box, and the verbatim index was
+     * bounded by nothing at all. The erasure above was therefore a landmine rather than a live
+     * loss - and the tier below it was a route no production row could reach.
+     *
+     * The exemption existed for one reason and it was the erasure. A cited row whose tokens were
+     * destroyed would leave a curated fact pointing at provenance that could never be found again,
+     * which is exactly what it was written to prevent. With the tokens kept there is nothing left
+     * to protect: `listMemoryEvidence` reads `body_ciphertext` and `memoryReach` dereferences by
+     * id, and neither has ever looked at `indexed`. An archived row's citation dereferences to the
+     * same bytes it always did.
+     *
+     * What the clause's removal actually changes is the one thing the horizon is FOR: the fast
+     * index now holds a two-year window rather than everything ever said. That is a tiering, not a
+     * deletion - hot rows in the partial GIN index, cold rows one scan away with their tokens
+     * intact - and it is the first version of this pass that both bounds the index and keeps every
+     * word reachable. Measured on the owner's real corpus - 1,006 turns, 2,394 rows, 138 days -
+     * keeping everything rather than erasing it costs 10.20 MiB, which is 27 MiB a year at that
+     * rate and 0.034% of this box's free disk over ten; tiering hands back the 3.47 MiB of GIN
+     * index those rows were holding. @see docs/design/prime/CLOSE.md.
+     *
+     * One approximation it introduces, stated rather than discovered: `rebuildMemoryCorpusStats`
+     * counts only indexed rows, so a cold-tier search scores with the hot corpus's document
+     * frequencies and average length. It affects ranking WITHIN the cold tier only - the tier is
+     * reached only when the hot one answered nothing - and a shared normalisation constant moves
+     * every cold row together. A term that survives only in cold rows gets no `mem.lexeme_df` entry
+     * and therefore maximum IDF, which is the right way round for a rare term.
+     */
     const unindexed = await this.database.query(
-      `UPDATE mem.source SET indexed=FALSE, body_tokens=''
+      `UPDATE mem.source SET indexed=FALSE
        WHERE workspace_id=$1 AND indexed
-         AND occurred_at < COALESCE($2::timestamptz,NOW()) - make_interval(days => $3::int)
-         AND NOT EXISTS (SELECT 1 FROM mem.evidence e WHERE e.source_id=mem.source.id)`,
+         AND occurred_at < COALESCE($2::timestamptz,NOW()) - make_interval(days => $3::int)`,
       [workspaceId, now, archiveAfterDays]
     );
 

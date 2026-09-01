@@ -296,6 +296,7 @@ export class AgentWorker {
       gateway: (task, model) => this.#gateway(task, model),
       startedBySchedule: (task, key) => this.#startedBySchedule(task, key),
       toolchainSummary: (task) => this.#toolchainSummary(task),
+      machineSummary: (task) => this.#machineSummary(task),
       workspaceSurfaces: (task) => this.#workspaceSurfaces(task)
     };
     this.#stepBounds = {
@@ -1297,6 +1298,29 @@ export class AgentWorker {
   }
 
   /**
+   * What machine this run is on, in the runner's own words.
+   *
+   * Read from the runner rather than from `node:os` here, and the difference is not cosmetic: the
+   * worker is its own systemd unit under its own control group, so every number `os` would answer
+   * with describes the wrong process. The runner is the unit an agent command is a child of, so
+   * `cpu.max`, `memory.max` and the RLIMIT_DATA it applies are all read there, by the process they
+   * bind. @see machineReport in `services/workspace-runner/src/machine.ts`.
+   *
+   * A runner that cannot answer costs this line and nothing else, exactly as the toolchain probe
+   * above does - and the runner's own report is already empty rather than approximate when it
+   * cannot establish a field, so an absent line here and a partial line there are the same
+   * decision made once, on the side that can actually see the machine.
+   */
+  async #machineSummary(task: TaskRecord): Promise<string> {
+    const report = await this.#runner
+      .call<{
+        summary?: unknown;
+      }>(task.workspaceId, task.id, 'exec', `/v1/workspaces/${task.workspaceId}/machine`)
+      .catch(() => null);
+    return textValue(report?.summary).trim();
+  }
+
+  /**
    * Whether this computer has a browser and a screen, in the runner's own words.
    *
    * Read once at the start of a run and frozen onto `TurnRun` beside `toolchainSummary`, for the
@@ -1714,7 +1738,8 @@ export class AgentWorker {
       unattended,
       webPlan,
       requestTools,
-      toolchainSummary
+      toolchainSummary,
+      machineSummary
     } = run;
     /*
      * Asked before anything is said, which is the whole point of the silent arm.
@@ -1803,6 +1828,7 @@ export class AgentWorker {
         state,
         timeZone,
         toolchainSummary,
+        machineSummary,
         unattended,
         webPlan
       });

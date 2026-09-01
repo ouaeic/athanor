@@ -42,6 +42,8 @@ export interface TurnClaimDeps {
   }>;
   startedBySchedule(task: TaskRecord, key: Uint8Array): Promise<boolean>;
   toolchainSummary(task: TaskRecord): Promise<string>;
+  /** What this box can give one job. Never rejects; a probe that fails answers ''. */
+  machineSummary(task: TaskRecord): Promise<string>;
   /** Whether this box has a browser and a screen. Never rejects; not knowing is `unknown`. */
   workspaceSurfaces(task: TaskRecord): Promise<WorkspaceSurfaces>;
 }
@@ -65,6 +67,15 @@ export interface TurnRun {
   readonly requestTools: ModelTool[];
   readonly reservedTokens: number;
   readonly toolchainSummary: string;
+  /**
+   * Cores, memory and free disk, in the runner's words, frozen for the run.
+   *
+   * A property of the machine rather than of the step, so it is read once here beside the
+   * toolchain probe and re-rendered from the frozen string on every step. It could not be read per
+   * step even if it were free to: the runtime block is rewritten at the tail on every step, and a
+   * disk figure that moved while a command wrote would make those bytes differ every time.
+   */
+  readonly machineSummary: string;
   /**
    * The surfaces this box has, frozen for the run.
    *
@@ -240,7 +251,10 @@ export const claimTurn = async (
   // against it, the compaction target is derived from the same budget, and the handoff counts it
   // for itself from the same array.
   const reservedTokens = Math.ceil(JSON.stringify(requestTools).length / 4);
-  const toolchainSummary = await deps.toolchainSummary(task);
+  const [toolchainSummary, machineSummary] = await Promise.all([
+    deps.toolchainSummary(task),
+    deps.machineSummary(task)
+  ]);
   const state: AgentState = savedState ?? {
     messages: [
       { role: 'system', content: BASE_SYSTEM_PROMPT },
@@ -272,6 +286,7 @@ export const claimTurn = async (
       requestTools,
       reservedTokens,
       toolchainSummary,
+      machineSummary,
       surfaces,
       connectorKinds
     },

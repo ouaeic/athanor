@@ -39,6 +39,7 @@ import {
   IMAGE_SOURCE_MAX_BYTES
 } from './images.js';
 import { commandLimits, resolveCommandLimiter } from './limits.js';
+import { machineReport, type CgroupReading } from './machine.js';
 import { runnerLogger } from './log.js';
 import { ProcessManager } from './processes.js';
 import { findRenderTools, proveRender, RENDER_SOURCE_MAX_BYTES } from './render-proof.js';
@@ -238,6 +239,13 @@ const DesktopViewport = z.object({
 export interface RunnerServerOptions {
   /** Free-space probe. Injected so the disk floor can be exercised without filling a filesystem. */
   hostStorage?: ((root: string) => Promise<HostStorage>) | undefined;
+  /**
+   * Control-group ceilings. The runner's other contact with the kernel, and injected for the same
+   * reason as the one above: what a job may actually have is set by `cpu.max`, `memory.max` and
+   * `cpuset.cpus.effective`, and a suite that can only read the build machine's own cgroup can
+   * never prove the case that matters - a box whose hardware and whose allowance disagree.
+   */
+  cgroup?: (() => Promise<CgroupReading>) | undefined;
   /** The desktop, so the stream route can be driven without an Xvfb and an ffmpeg on the box. */
   desktop?: DesktopManager | undefined;
 }
@@ -1078,6 +1086,40 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await ensureRuntimeWorkspace(root);
       return toolchainReport(root);
+    }
+  );
+
+  /**
+   * What machine this is, in the three numbers that decide how a job is sized.
+   *
+   * Same shape and same failure story as the two probes below it - a property of the machine that
+   * the process on the other end of the wire cannot see - and the same trade: a runner that cannot
+   * answer costs the runtime block one line and nothing else.
+   *
+   * It is answered HERE, in the process the control group actually holds, and that is the whole
+   * reason it is a route rather than an `os` call in the worker. The worker is a different unit
+   * with a different cgroup; `apps/worker` reading `availableParallelism()` would describe its own
+   * allowance and label it the agent's. @see machineReport, which reads the ceilings this unit is
+   * under and never the hardware beneath them.
+   */
+  app.get<{ Params: { workspaceId: string } }>(
+    '/v1/workspaces/:workspaceId/machine',
+    async (request) => {
+      requireScope(request, 'exec');
+      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
+      await ensureRuntimeWorkspace(root);
+      return machineReport({
+        root,
+        // The rlimit this runner actually applies to every agent command, not a second derivation
+        // of it: `guards.limits` is the object `commandLimitArguments` builds `--data=` from.
+        commandMemoryBytes: limits.memoryBytes,
+        // Passed straight through, `undefined` and all. There is no `?? readCgroup` here on
+        // purpose: `machineReport` already defaults this to the kernel, and a second default in
+        // this file would be a second place the production join could be wrong with no case able
+        // to see it - which is what it was. One default, in the module that owns the kernel.
+        readCgroupLimits: options.cgroup,
+        storage: probeHostStorage
+      });
     }
   );
 

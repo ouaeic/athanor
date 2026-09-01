@@ -339,6 +339,10 @@ const isTurnScaffolding = (call: RunnerCall): boolean =>
   // the machine, asked once before the step loop. It decides whether the browser and desktop
   // schemas are described at all. @see workspaceSurfaces in services/workspace-runner.
   call.path === `${root}/surfaces` ||
+  // The third of the three probes read once before the step loop, and read there for the same
+  // reason: cores, memory and free disk are properties of the machine the commands run on, and the
+  // process that can see them is the runner rather than this one. @see machineReport.
+  call.path === `${root}/machine` ||
   call.path === `${root}/checkpoints` ||
   call.path === `${root}/file?path=workspace%2FATHANOR.md` ||
   call.path === `${root}/file?path=workspace%2FOPEN_CLOUD.md` ||
@@ -611,7 +615,7 @@ describe('what a turn asks the runner for on its own account', () => {
    * file an owner actually wrote; a workspace with `ATHANOR.md` pays one, because the chain stops
    * at the first that answers.
    */
-  it('reads the surfaces, the toolchain and all three brief names once, and takes one undo point before a write', async () => {
+  it('reads the surfaces, the machine, the toolchain and all three brief names once, and takes one undo point before a write', async () => {
     const executed = await dispatch(
       { name: 'file_write', arguments: { path: 'workspace/new.md', content: 'hello' } },
       { route: (_url, init) => (init?.method === 'PUT' ? json({ ok: true }) : undefined) }
@@ -629,6 +633,11 @@ describe('what a turn asks the runner for on its own account', () => {
       // the unconditional constant on every box.
       `GET ${root}/surfaces exec`,
       `GET ${root}/toolchain exec`,
+      // Issued together with the toolchain rather than after it - one `Promise.all`, two round
+      // trips in flight at once - because both are properties of the machine, both are frozen for
+      // the run, and neither decides anything about the other. Sequencing them would put a second
+      // runner latency in front of every turn's first token for nothing.
+      `GET ${root}/machine exec`,
       `GET ${root}/file?path=workspace%2FATHANOR.md files.read`,
       `GET ${root}/file?path=workspace%2FOPEN_CLOUD.md files.read`,
       `GET ${root}/file?path=workspace%2FAGENTS.md files.read`,

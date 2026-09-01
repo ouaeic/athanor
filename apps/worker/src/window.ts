@@ -77,6 +77,7 @@ export interface RuntimeContextInput {
   readonly state: AgentState;
   readonly timeZone: string;
   readonly toolchainSummary: string;
+  readonly machineSummary: string;
   readonly unattended: boolean;
   readonly webPlan: WebToolPlan;
 }
@@ -97,12 +98,22 @@ export interface PreambleInput {
 }
 
 export const refreshRuntimeContext = (deps: WindowDeps, input: RuntimeContextInput): void => {
-  const { workspace, task, state, timeZone, toolchainSummary, unattended, webPlan } = input;
+  const {
+    workspace,
+    task,
+    state,
+    timeZone,
+    toolchainSummary,
+    machineSummary,
+    unattended,
+    webPlan
+  } = input;
   const content = runtimeContext(
     { ...workspace, securityMode: task.securityMode },
     deps.config.PREVIEW_BASE_URL,
     { now: new Date(), timeZone },
     toolchainSummary,
+    machineSummary,
     unattended,
     webPlan.mode,
     // The money, from the two facts that decide it: what this turn has billed so far and the

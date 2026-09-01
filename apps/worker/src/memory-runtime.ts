@@ -496,6 +496,15 @@ export interface MemorySessionMatch extends MemorySessionTurn {
    * result on its own is a fragment: the answer is very often in the reply to what matched.
    */
   readonly context?: MemorySessionTurn[];
+  /**
+   * Present, and only ever true, on a row the fast index no longer carries.
+   *
+   * Absent on an ordinary hit rather than `false`, so the common result costs no bytes for it. It
+   * is stated at all because the two tiers are not equally complete: an archived row's neighbours
+   * may themselves be archived, and the excerpt is the same words either way but the surrounding
+   * conversation is older than everything the first pass could see.
+   */
+  readonly archived?: true;
 }
 
 export interface MemorySessionSearchResult {
@@ -516,7 +525,20 @@ export interface MemorySessionSearchResult {
     readonly turns: number;
     /** Oldest recorded turn, or null when nothing has ever been recorded. */
     readonly earliest: string | null;
+    /**
+     * The tier past the archive horizon, which this search already looked in and which is the
+     * reason an empty answer here is now a strong statement rather than a horizon effect.
+     */
+    readonly archived: { readonly turns: number; readonly earliest: string | null };
   };
+  /**
+   * True when the indexed tier answered nothing and the archive was searched as well.
+   *
+   * The model is told this because it changes what a thin result means: the fast tier had nothing,
+   * so what came back - if anything - is from beyond the horizon and there is no closer material
+   * to narrow towards.
+   */
+  readonly reachedArchive?: true;
 }
 
 export interface MemorySessionSearchInput {
@@ -580,14 +602,36 @@ export const searchMemorySessions = async (
     1,
     MEMORY_SESSION_SEARCH_MAX_RESULTS
   );
-  const hits = await input.store.searchMemorySources({
-    workspaceId: input.workspaceId,
-    plan: planMemoryQuery(query, memoryIndexKey(input.dataKey)),
-    limit,
-    ...(input.taskId ? { taskId: input.taskId } : {}),
-    ...(input.since ? { since: input.since } : {}),
-    ...(input.until ? { until: input.until } : {})
-  });
+  const ask = async (reach: 'indexed' | 'archived') =>
+    input.store.searchMemorySources({
+      workspaceId: input.workspaceId,
+      plan: planMemoryQuery(query, memoryIndexKey(input.dataKey)),
+      limit,
+      reach,
+      ...(input.taskId ? { taskId: input.taskId } : {}),
+      ...(input.since ? { since: input.since } : {}),
+      ...(input.until ? { until: input.until } : {})
+    });
+  /*
+   * THE SECOND STEP, TAKEN FOR THE AGENT.
+   *
+   * Past the archive horizon a turn leaves the fast index and keeps its tokens, so it is reachable
+   * and it is not free: the archive query recomputes each row's vector from those tokens instead
+   * of probing a GIN structure. The owner's rule is that a memory may be further away or take more
+   * steps, never gone - so the step is real and the harness takes it rather than leaving it behind
+   * a flag on a tool schema that no model would think to set for a question it does not know is
+   * old.
+   *
+   * ONLY WHEN THE FIRST PASS FOUND NOTHING, which is what keeps it bounded. Every search that hits
+   * anything at all pays exactly what it paid before, so the scan is on the miss path only - and a
+   * miss is the one case where the alternative is telling the owner their own history does not
+   * contain something it does contain. A search that hits recent material and wants older is the
+   * ordinary narrowing problem and is answered by asking again more precisely, not by scanning on
+   * every call.
+   */
+  const indexed = await ask('indexed');
+  const reachedArchive = indexed.length === 0;
+  const hits = reachedArchive ? await ask('archived') : indexed;
 
   // Two hits in one thread are each other's neighbours, so without this the same turn is printed
   // once as a result and again as context - the same tokens, twice, in the same reply.
@@ -631,18 +675,32 @@ export const searchMemorySessions = async (
           }
         ];
       });
-      matches.push({ ...turn, score: hit.score, ...(context.length > 0 ? { context } : {}) });
+      matches.push({
+        ...turn,
+        score: hit.score,
+        ...(reachedArchive ? { archived: true as const } : {}),
+        ...(context.length > 0 ? { context } : {})
+      });
       continue;
     }
-    matches.push({ ...turn, score: hit.score });
+    matches.push({
+      ...turn,
+      score: hit.score,
+      ...(reachedArchive ? { archived: true as const } : {})
+    });
   }
 
   return {
     query,
     matches,
     conversations: new Set(matches.map((match) => match.taskId ?? match.id)).size,
+    // Said only when it changes the reading of the result: these rows are older than everything
+    // the ordinary search can see, and there is nothing closer to narrow towards.
+    ...(reachedArchive && matches.length > 0 ? { reachedArchive: true as const } : {}),
     // One extra aggregate, and only on the path where the agent is about to tell the owner
-    // something about their own history from an absence of evidence.
+    // something about their own history from an absence of evidence. It now carries the archived
+    // tier too, so "nothing found" is a statement about the whole record rather than about the
+    // half of it the fast index still holds.
     ...(matches.length === 0
       ? { searchable: await input.store.memorySourceCoverage(input.workspaceId) }
       : {})

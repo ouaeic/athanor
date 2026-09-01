@@ -1315,6 +1315,7 @@ describe('runtime context in the cached preamble', () => {
       'https://preview.example.com',
       { now: new Date('2026-08-02T09:41:22Z'), timeZone: 'UTC' },
       '',
+      '', // the runner named no machine, as a box whose cgroup cannot be read does
       true
     );
     expect(line).toContain('started by a schedule');
@@ -1340,6 +1341,7 @@ describe('runtime context in the cached preamble', () => {
       'https://preview.example.com',
       { now: new Date('2026-08-02T09:41:22Z'), timeZone: 'UTC' },
       '',
+      '', // the runner named no machine, as a box whose cgroup cannot be read does
       false,
       'server'
     );
@@ -2819,6 +2821,7 @@ describe('sixty steps of one task, measured on the bytes that leave the machine'
           'https://preview.example.com',
           { now: new Date(Date.UTC(2026, 2, 3, 9, 15) + step * 45_000), timeZone: 'Europe/London' },
           'python3 3.11, typst 0.12, libreoffice 24.2',
+          '', // the runner named no machine, as a box whose cgroup cannot be read does
           false,
           'in_house'
         )
@@ -3440,6 +3443,7 @@ describe('the money the model can see', () => {
       'https://preview.example.com',
       { now: new Date('2026-08-02T09:41:22Z'), timeZone: 'UTC' },
       '',
+      '', // the runner named no machine, as a box whose cgroup cannot be read does
       false,
       'in_house',
       { credits, maxCredits }
@@ -3563,6 +3567,7 @@ describe('the runtime block on a record that has no ceiling on it', () => {
       'https://preview.example.com',
       { now: new Date('2026-08-02T09:41:22Z'), timeZone: 'UTC' },
       '',
+      '', // the runner named no machine, as a box whose cgroup cannot be read does
       false,
       'in_house',
       { credits: 5, maxCredits: undefined as unknown as number }

@@ -8414,6 +8414,90 @@ describe('the contract the run actually sends', () => {
   });
 });
 
+/**
+ * THE PRODUCTION CALL SITE for the machine block.
+ *
+ * `machineReport` and its route are proved in the runner's own suite, against real cgroup files.
+ * What no case there can see is whether the sentence the runner produced ever reaches the model,
+ * which is the join this repository has shipped a proof without three times. So this drives the
+ * real `AgentWorker` against a stubbed runner and reads the line back off the request that went
+ * out - and the negative arm is the one that matters most, because a probe that silently answers
+ * nothing is exactly how a block stops carrying numbers without anything going red.
+ */
+describe('the machine the run tells the model it is on', () => {
+  const runtimeBlockOf = (log: FetchLog): string => {
+    const messages = (log.modelRequests[0]?.messages ?? []) as { content: string }[];
+    const block = messages.find((message) => message.content.startsWith(RUNTIME_CONTEXT_MARKER));
+    if (!block) throw new Error('no runtime block on the request');
+    return block.content;
+  };
+
+  /** `summary` is what the runner's probe answers; `null` is a runner with no such route at all. */
+  const turn = async (summary: string | null): Promise<FetchLog> => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('Done.')], log, {
+      route: (url) =>
+        summary !== null && new URL(url).pathname.endsWith('/machine')
+          ? new Response(JSON.stringify({ ok: true, summary }), {
+              headers: { 'content-type': 'application/json' }
+            })
+          : undefined
+    });
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+    return log;
+  };
+
+  /** The owner's box, as `machineReport` words it. */
+  const OWNER =
+    '16 cores, 21.9 GiB memory per command, 730.1 GiB free disk. Size parallel work, memory and output to these rather than to a default.';
+
+  it('carries the numbers, on the same request as the disk sentence they belong beside', async () => {
+    const block = runtimeBlockOf(await turn(OWNER));
+    expect(block).toContain(`- Machine: ${OWNER}`);
+    // Beside, not instead of: the block still sends the agent to `df -h` for live capacity, and the
+    // two lines have to arrive adjacent or the machine figure reads as an unrelated aside.
+    const lines = block.split('\n');
+    const machine = lines.findIndex((line) => line.startsWith('- Machine: '));
+    expect(machine).toBeGreaterThan(-1);
+    expect(lines[machine + 1] ?? '').toContain('df -h /home/athanor');
+  });
+
+  /**
+   * The case that fails if the block stops carrying the numbers.
+   *
+   * Named individually rather than by the whole sentence: what a model reads off this line is a
+   * core count, a memory ceiling and a disk figure, and a plumbing change that dropped any one of
+   * them while keeping the line would pass a `toContain` on the prose and fail the agent.
+   */
+  it('states a core count, a memory ceiling and a disk figure, each of them', async () => {
+    const block = runtimeBlockOf(await turn(OWNER));
+    expect(block).toMatch(/^- Machine: .*\b16 cores\b/m);
+    expect(block).toMatch(/^- Machine: .*\b21\.9 GiB memory per command\b/m);
+    expect(block).toMatch(/^- Machine: .*\b730\.1 GiB free disk\b/m);
+  });
+
+  it('says nothing at all when the runner has no such route', async () => {
+    const block = runtimeBlockOf(await turn(null));
+    expect(block).not.toContain('- Machine:');
+    // And the rest of the block is untouched, which is what makes an unanswerable probe free.
+    expect(block).toContain('- Check real capacity with `df -h /home/athanor`');
+  });
+
+  /**
+   * A runner that answers with an empty summary - every field unestablishable, which is what a box
+   * whose cgroup cannot be read produces - has to look identical to no runner at all. Byte
+   * identity rather than an absence check: this is the branch that decides whether a machine that
+   * cannot describe itself costs the cached tail anything.
+   */
+  it('is byte-identical to a run with no probe when the runner establishes nothing', async () => {
+    expect(runtimeBlockOf(await turn(''))).toBe(runtimeBlockOf(await turn(null)));
+  });
+});
+
 /*
  * The whole loop, against the repair that replaced the `code_diagnostics` approval card.
  *

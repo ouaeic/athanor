@@ -2891,5 +2891,75 @@ export const migrations = [
           * (CASE WHEN pin THEN 1.6 ELSE 1.0 END);
       $ath$;
     `
+  },
+  {
+    version: 76,
+    name: 'an_archived_turn_keeps_the_vector_it_is_found_by',
+    /*
+     * The far tier of the verbatim layer, made cheap enough to be a tier rather than a threat.
+     *
+     * `consolidateMemory` takes a turn out of the fast index past its archive horizon. The GIN
+     * index is partial - `mem_source_tsv_gin ... WHERE indexed` - so flipping the flag is what
+     * frees it, and that is the whole point of the horizon. What the flag ALSO did, through this
+     * trigger, was null the row's `tsv`; paired with the pass's own `body_tokens=''` that left the
+     * owner's words on disk with no representation anything could search, which is the one place
+     * "no memory is ever totally gone, just further away" was still broken.
+     *
+     * The tokens are kept now, and a search of the far tier could rebuild the vector from them per
+     * row at query time. Measured on the owner's real corpus - 1,006 turns, 2,394 rows - that is
+     * 695 ms median against 50 ms for the indexed tier, and it grows linearly with the archive
+     * forever. Reading the vector the row already had instead is 55 ms on the same rows with the
+     * GIN index dropped: 5 ms of the 645 was the index, and all the rest was `to_tsvector` running
+     * again on text that had already been tokenised once.
+     *
+     * So an archived row keeps its vector, and `indexed` goes back to meaning exactly one thing:
+     * whether this row is in the GIN index. Out of the index, still in the heap, still matched by
+     * `@@` on a scan. The vector costs no index bytes at all while `indexed` is false, because the
+     * index that would hold it does not accept the row.
+     *
+     * The `item` branch is deliberately untouched. `rebuildMemoryCorpusStats` reads `mem.item`
+     * with `tsv IS NOT NULL` and no `indexed` guard beside it, so a non-null vector on an
+     * unindexed item would quietly enter the corpus statistics; the two `mem.source` arms of the
+     * same statement do carry the guard. One table's behaviour changes and it is the one whose
+     * readers were checked.
+     *
+     * The backfill is for rows an older build already archived. It sets the vector directly rather
+     * than touching a trigger column, so it cannot be confused with a rewrite, and it skips rows
+     * whose tokens the old pass erased - those cannot be rebuilt from anything the database holds,
+     * because the lexemes are keyed in the worker. On a box where the citation exemption made the
+     * pass unable to fire it moves nothing, which is the case this was written for.
+     */
+    sql: `
+      CREATE OR REPLACE FUNCTION mem.index_row() RETURNS trigger LANGUAGE plpgsql AS $ath$
+      BEGIN
+        IF TG_TABLE_NAME = 'item' THEN
+          IF NEW.indexed THEN
+            NEW.tsv :=
+                setweight(to_tsvector('simple', NEW.title_tokens), 'A')
+             || setweight(to_tsvector('simple', NEW.tag_tokens), 'B')
+             || setweight(to_tsvector('simple', NEW.alias_tokens), 'C')
+             || setweight(to_tsvector('simple', NEW.body_tokens), 'D');
+          ELSE
+            NEW.tsv := NULL;
+          END IF;
+          NEW.pred_functional := NEW.predicate IS NOT NULL AND EXISTS (
+            SELECT 1 FROM mem.predicate p
+            WHERE p.name = NEW.predicate AND p.cardinality = 'one');
+          NEW.trigram_len := COALESCE(cardinality(NEW.trigrams), 0);
+        ELSE
+          NEW.tsv := setweight(to_tsvector('simple', NEW.body_tokens), 'D');
+        END IF;
+        NEW.tsv_len := COALESCE(
+          (SELECT SUM(COALESCE(array_length(positions, 1), 1)) FROM unnest(NEW.tsv)), 0)::int;
+        RETURN NEW;
+      END $ath$;
+
+      UPDATE mem.source SET
+        tsv = setweight(to_tsvector('simple', body_tokens), 'D'),
+        tsv_len = COALESCE((SELECT SUM(COALESCE(array_length(u.positions, 1), 1))
+                            FROM unnest(setweight(to_tsvector('simple', body_tokens), 'D')) u),
+                           0)::int
+      WHERE NOT indexed AND tsv IS NULL AND body_tokens <> '';
+    `
   }
 ] as const;

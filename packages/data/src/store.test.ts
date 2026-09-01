@@ -5260,7 +5260,21 @@ describe('tiered agent memory', () => {
     await expect(store.listMemoryCitedCalls(episode.id)).resolves.toEqual([]);
   });
 
-  it('consolidates by demoting and trimming, never by dropping cited verbatim text', async () => {
+  /**
+   * Consolidation demotes and de-indexes; it does not drop, and it does not exempt.
+   *
+   * This case used to assert that a cited old row stayed in the lexical index, which was the
+   * behaviour of a pass whose `indexed=FALSE` also erased `body_tokens`: an exemption was the only
+   * thing standing between a curated fact and provenance nobody could ever search for again.
+   * Measured against the only production writer of `mem.source`, that exemption did not narrow the
+   * pass, it switched it off - `recordTurnEpisode` cites every chunk it writes - so the horizon had
+   * never once run and the verbatim index was bounded by nothing.
+   *
+   * The pass erases nothing now, so both old rows leave the index and both keep every byte they
+   * were written with. The assertions below are the new contract in full: what leaves is index
+   * membership, what stays is the sealed body, the keyed tokens and the vector those tokens make.
+   */
+  it('consolidates by de-indexing old verbatim text and keeping every byte of it', async () => {
     const cited = await addSource('$ nginx -t\nconfiguration file test is successful', at(900));
     const uncited = await addSource('$ ls /tmp\nnothing interesting here', at(900));
     const recent = await addSource('$ uptime\nup 3 days', at(1));
@@ -5284,17 +5298,33 @@ describe('tiered agent memory', () => {
 
     const report = await store.consolidateMemory(workspaceId, { now });
     expect(report.itemsArchived).toBeGreaterThan(0);
-    expect(report.sourcesUnindexed).toBe(1);
+    // Both old rows, the cited one included. Under the exemption this was 1 and the pass could
+    // never reach a row production had written.
+    expect(report.sourcesUnindexed).toBe(2);
 
-    const indexedNow = await database.query<{ id: string; indexed: boolean }>(
-      'SELECT id, indexed FROM mem.source ORDER BY occurred_at'
+    const indexedNow = await database.query<{
+      id: string;
+      indexed: boolean;
+      tokens: string;
+      tsv: string | null;
+    }>(
+      'SELECT id, indexed, body_tokens AS tokens, tsv::text AS tsv FROM mem.source ORDER BY occurred_at'
     );
-    const indexState = new Map(indexedNow.rows.map((row) => [row.id, row.indexed]));
-    // Verbatim text is never deleted; only the uncited old row leaves the lexical index.
-    expect(indexState.size).toBe(3);
-    expect(indexState.get(cited.id)).toBe(true);
-    expect(indexState.get(uncited.id)).toBe(false);
-    expect(indexState.get(recent.id)).toBe(true);
+    const rows = new Map(indexedNow.rows.map((row) => [row.id, row]));
+    expect(rows.size).toBe(3);
+    expect(rows.get(cited.id)?.indexed).toBe(false);
+    expect(rows.get(uncited.id)?.indexed).toBe(false);
+    expect(rows.get(recent.id)?.indexed).toBe(true);
+    // And nothing that cannot be got back was touched: the keyed lexemes and the vector they make
+    // are on every row, archived or not, which is what makes de-indexing a tier rather than a loss.
+    for (const row of rows.values()) {
+      expect(row.tokens.length).toBeGreaterThan(0);
+      expect(row.tsv).not.toBeNull();
+    }
+    // The citation the exemption existed to protect opens exactly as it did before.
+    const evidence = await store.listMemoryEvidence(fact.id);
+    expect(evidence.map((edge) => edge.sourceId)).toEqual([cited.id]);
+    expect(opened(evidence[0]!.bodyCiphertext)).toContain('configuration file test is successful');
 
     // A pinned fact is exempt, and salience reflects use rather than a stored decayed score.
     await expect(store.getMemoryItem(workspaceId, pinned.id)).resolves.toMatchObject({
@@ -5539,7 +5569,8 @@ describe('tiered agent memory', () => {
     await expect(store.memorySourceCoverage(workspaceId)).resolves.toEqual({
       turns: 0,
       conversations: 0,
-      earliest: null
+      earliest: null,
+      archived: { turns: 0, earliest: null }
     });
 
     // A real task row, because mem.source.task_id now cascades from it.
@@ -5574,7 +5605,10 @@ describe('tiered agent memory', () => {
     await expect(store.memorySourceCoverage(workspaceId)).resolves.toEqual({
       turns: 2,
       conversations: 1,
-      earliest: at(40).toISOString()
+      earliest: at(40).toISOString(),
+      // Nothing has been past the horizon yet, and the two tiers are counted separately so that a
+      // search which found nothing can say which of them it looked in.
+      archived: { turns: 0, earliest: null }
     });
   });
 
@@ -6841,8 +6875,70 @@ describe('the upgrade path onto rows an older athanor wrote', () => {
     53: 3,
     55: 1,
     57: 2,
-    62: 1
+    62: 1,
+    76: 1
   };
+
+  /**
+   * Migration 76 gives an archived verbatim row back the vector that finds it.
+   *
+   * The shape it has to meet is one an older build left behind: `indexed` false, `tsv` null,
+   * `body_tokens` still there - a turn past its archive horizon on a build whose trigger nulled the
+   * vector when the flag went down. On a replay this statement matches nothing, because the trigger
+   * it ships beside has already written the vector on every insert since; the only way to see it
+   * work is to put a row in the old shape in front of it.
+   *
+   * Both directions, because the wrong backfill here is a generous one: a row whose tokens the old
+   * pass ERASED must stay unfindable rather than being handed an empty vector that reads like an
+   * indexed row with nothing in it. Those lexemes were keyed in the worker and nothing in the
+   * database can rebuild them; inventing an empty answer for them would be the one thing worse than
+   * saying the memory is gone.
+   */
+  it('gives an archived turn back the vector it is found by, and invents none for an erased one', async () => {
+    await migrateBelow(76);
+    await seedOwner();
+    const kept = '00000000-0000-4000-8000-0000000000d1';
+    const erased = '00000000-0000-4000-8000-0000000000d2';
+    const live = '00000000-0000-4000-8000-0000000000d3';
+    // Written the way the old build wrote them: straight SQL, and the trigger in force at 75 nulls
+    // the vector on any row whose flag is down.
+    for (const [id, indexed, tokens] of [
+      [kept, false, 'abcdabcdabcdabcd efghefghefghefgh'],
+      [erased, false, ''],
+      [live, true, 'ijklijklijklijkl']
+    ] as const)
+      await database.query(
+        `INSERT INTO mem.source(id,user_id,workspace_id,channel,body_ciphertext,indexed,body_tokens)
+         VALUES ($1,$2,$3,'chat',$4::jsonb,$5,$6)`,
+        [id, OWNER_ID, SPACE_ID, sealed, indexed, tokens]
+      );
+    const vectors = async () =>
+      Object.fromEntries(
+        (
+          await database.query<{ id: string; tsv: string | null; len: number }>(
+            'SELECT id, tsv::text AS tsv, tsv_len AS len FROM mem.source ORDER BY id'
+          )
+        ).rows.map((row) => [row.id, { tsv: row.tsv, len: Number(row.len) }])
+      );
+
+    // The state the migration has to find, asserted first so this cannot pass against a database
+    // that was already at 76 when the rows went in.
+    const before = await vectors();
+    expect(before[kept]?.tsv).toBeNull();
+    expect(before[erased]?.tsv).toBeNull();
+    expect(before[live]?.tsv).not.toBeNull();
+
+    await apply(76);
+
+    const after = await vectors();
+    expect(after[kept]?.tsv).toContain('abcdabcdabcdabcd');
+    expect(after[kept]?.len).toBe(2);
+    // Nothing to rebuild from, so nothing is claimed.
+    expect(after[erased]?.tsv).toBeNull();
+    expect(after[erased]?.len).toBe(0);
+    // And the row that was never archived is untouched, to the byte.
+    expect(after[live]).toEqual(before[live]);
+  });
 
   it('has an upgrade test for every migration that rewrites rows rather than reshaping them', () => {
     const rewriting = Object.fromEntries(

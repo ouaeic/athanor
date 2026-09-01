@@ -747,6 +747,7 @@ describe('the runtime block', () => {
       state,
       timeZone: 'Europe/Berlin',
       toolchainSummary: 'libreoffice',
+      machineSummary: '',
       unattended: false,
       webPlan: inHouse
     };
@@ -774,6 +775,7 @@ describe('the runtime block', () => {
       state,
       timeZone: 'UTC',
       toolchainSummary: '',
+      machineSummary: '',
       unattended: false,
       webPlan: inHouse
     };
@@ -796,6 +798,7 @@ describe('the runtime block', () => {
       state,
       timeZone: 'UTC',
       toolchainSummary: '',
+      machineSummary: '',
       unattended: true,
       webPlan: inHouse
     });
@@ -959,6 +962,7 @@ describe('what the preamble registers besides blocks', () => {
       task: { ...task, maxComputeCredits: 20 } as unknown as TaskRecord,
       timeZone: 'UTC',
       toolchainSummary: '',
+      machineSummary: '',
       unattended: false,
       webPlan: inHouse
     };

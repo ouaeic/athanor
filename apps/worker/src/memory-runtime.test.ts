@@ -3060,6 +3060,313 @@ describe('against the real store', () => {
     expect(found.searchable?.earliest).toBe('2026-07-20T08:00:00.000Z');
   });
 
+  /**
+   * TWO YEARS OLD, AND STILL REACHABLE - the one place the owner's rule was still broken.
+   *
+   * "No memory should ever be totally gone, just further away, or more steps to get to." The
+   * nightly pass used to run `UPDATE mem.source SET indexed=FALSE, body_tokens=''` past its
+   * archive horizon, and the second half of that statement is what broke the rule. `body_tokens`
+   * is the ONLY searchable representation this database has: the lexemes are HMACs computed in the
+   * worker under a key the server never sees, so nothing on the server can rebuild them, and
+   * nothing anywhere in this tree rebuilds them from the ciphertext either. A conversation
+   * straddling the horizon survived through a neighbour that had not crossed it yet; one entirely
+   * older than two years had no route in from any query at all.
+   *
+   * Every case below is driven through the two functions production calls - `recordTurnEpisode`
+   * writes the rows, `consolidateMemory` is the nightly pass `memory-capture.ts` runs - and read
+   * back through `searchMemorySessions`, which is what `session_search` dispatches to. Nothing
+   * here reaches past them into a query written for the test.
+   */
+  describe('a conversation older than the archive horizon', () => {
+    /** The pass's own default. Everything here is aged against it rather than against a literal. */
+    const ARCHIVE_AFTER_DAYS = 730;
+    const NOW = new Date('2026-07-31T08:00:00.000Z');
+    const daysAgo = (days: number): Date => new Date(NOW.getTime() - days * 86_400_000);
+
+    /** One conversation, entirely on the far side of the horizon. */
+    const buriedConversation = async (
+      request: string,
+      summary: string,
+      days = ARCHIVE_AFTER_DAYS + 30
+    ): Promise<string> => {
+      const created = await store.createTask({
+        userId: realUserId,
+        workspaceId: realWorkspaceId,
+        titleCiphertext: encryptJson({ title: 'old' }, dataKey, 'task-title:x'),
+        nameIndex: { nameTokens: '', openingTokens: '' },
+        modelId: 'vendor/model',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 1,
+        promptCiphertext: encryptJson({ prompt: request }, dataKey, 'task-prompt:x')
+      });
+      await recordTurnEpisode({
+        store,
+        userId: realUserId,
+        workspaceId: realWorkspaceId,
+        taskId: created.id,
+        dataKey,
+        request,
+        summary,
+        outcome: 'ok',
+        occurredAt: daysAgo(days)
+      });
+      await store.rebuildMemoryCorpusStats(realWorkspaceId);
+      return created.id;
+    };
+
+    const sweep = async () =>
+      store.consolidateMemory(realWorkspaceId, {
+        now: NOW,
+        archiveAfterDays: ARCHIVE_AFTER_DAYS
+      });
+
+    const search = async (query: string) =>
+      searchMemorySessions({ store, workspaceId: realWorkspaceId, dataKey, query });
+
+    /**
+     * THE CASE THAT FAILS IF THE TOKENS ARE ERASED, and it fails by erasing them.
+     *
+     * The first half proves the route works. The second half runs the exact statement this wave
+     * deleted - `SET body_tokens = ''` on the same rows - and proves the same search then finds
+     * nothing. So this is not an assertion that a query returns rows; it is an assertion that the
+     * one column the old pass cleared is what the answer is made of, and it cannot rot into a
+     * tautology because the negative arm re-creates the defect on the same corpus.
+     */
+    it('is still found, and stops being found the moment its tokens are erased', async () => {
+      await buriedConversation(
+        'the reverse proxy kept dropping websocket upgrades under load',
+        'Raised proxy_read_timeout to 3600 and set proxy_http_version 1.1 with the Upgrade header.'
+      );
+      const report = await sweep();
+      expect(report?.sourcesUnindexed).toBeGreaterThan(0);
+
+      const found = await search('websocket upgrades dropped by the reverse proxy');
+      expect(found.matches.length).toBeGreaterThan(0);
+      // From the far tier, and said so: these rows are older than anything the fast index holds.
+      expect(found.reachedArchive).toBe(true);
+      expect(found.matches.every((match) => match.archived === true)).toBe(true);
+      expect(found.matches.map((match) => match.text).join(' ')).toContain('websocket');
+
+      // The deleted statement, restored and run on the same rows.
+      await database.query(
+        `UPDATE mem.source SET body_tokens='' WHERE workspace_id=$1 AND NOT indexed`,
+        [realWorkspaceId]
+      );
+      const gone = await search('websocket upgrades dropped by the reverse proxy');
+      expect(gone.matches).toEqual([]);
+      // And the verbatim text is still sitting there undecryptable-by-search, which is precisely
+      // what "gone for good" looked like before: present on the disk, reachable by nothing.
+      const rows = await database.query<{ n: string }>(
+        `SELECT count(*) AS n FROM mem.source WHERE workspace_id=$1 AND NOT indexed`,
+        [realWorkspaceId]
+      );
+      expect(Number(rows.rows[0]?.n ?? 0)).toBeGreaterThan(0);
+    });
+
+    /**
+     * The pass still does its job, and this is the direction that fails if "keep everything" was
+     * read as "change nothing".
+     *
+     * `mem_source_tsv_gin` is partial - `WHERE indexed` - so flipping the flag is what actually
+     * frees the index, and it is the whole reason the pass exists. The row must leave the ordinary
+     * search too: a two-year-old turn crowding today's results is the cost the horizon was drawn
+     * to avoid, and it would be paid on every search rather than on a miss.
+     */
+    it('leaves the fast index, so the ordinary search never carries it', async () => {
+      const buried = await buriedConversation(
+        'the reverse proxy kept dropping websocket upgrades under load',
+        'Raised proxy_read_timeout to 3600 and set proxy_http_version 1.1 with the Upgrade header.'
+      );
+      // A recent conversation about the same subject, so the ordinary search has something to
+      // answer with and the assertion below is about which tier answered rather than about silence.
+      await buriedConversation(
+        'the websocket upgrades are fine now but check the proxy timeout',
+        'Confirmed proxy_read_timeout is 3600 on the live gateway.',
+        3
+      );
+      await sweep();
+
+      const rows = await database.query<{ indexed: boolean; tsv: string | null; tokens: string }>(
+        `SELECT indexed, tsv::text AS tsv, body_tokens AS tokens FROM mem.source
+         WHERE workspace_id=$1 AND task_id=$2`,
+        [realWorkspaceId, buried]
+      );
+      expect(rows.rows.length).toBeGreaterThan(0);
+      for (const row of rows.rows) {
+        expect(row.indexed).toBe(false);
+        // Everything the row was written with is still on it. `indexed` now means exactly one
+        // thing - whether the GIN index accepts this row - and the vector it would have held costs
+        // nothing in the heap while the flag is false. This is the difference between a memory that
+        // is further away and one that is gone.
+        expect(row.tokens.length).toBeGreaterThan(0);
+        expect(row.tsv).not.toBeNull();
+        expect(row.tsv?.length ?? 0).toBeGreaterThan(0);
+      }
+
+      // And the flag is what frees the index, read off the catalogue rather than asserted from a
+      // comment: the GIN index is partial on `indexed`, so an archived row's kept vector occupies
+      // none of it. Without this predicate every number in the tiering argument is wrong.
+      const definition = await database.query<{ def: string }>(
+        `SELECT pg_get_indexdef(c.oid) AS def FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname='mem' AND c.relname='mem_source_tsv_gin'`
+      );
+      expect(definition.rows[0]?.def).toContain('WHERE indexed');
+
+      const ordinary = await search('websocket upgrades and the proxy timeout');
+      expect(ordinary.matches.length).toBeGreaterThan(0);
+      expect(ordinary.reachedArchive).toBeUndefined();
+      expect(ordinary.matches.every((match) => match.taskId !== buried)).toBe(true);
+    });
+
+    /**
+     * The archive is reached on a miss and on nothing else, which is the whole of what bounds it.
+     *
+     * The far tier is a scan: each row's vector is recomputed from its tokens because the index
+     * entry is exactly what the pass gave up. Paying that on every search would be a real cost on
+     * every turn; paying it when the alternative is telling the owner their own history does not
+     * contain something it does contain is not a cost at all.
+     */
+    it('pays for the second tier only when the first one answered nothing', async () => {
+      await buriedConversation(
+        'the reverse proxy kept dropping websocket upgrades under load',
+        'Raised proxy_read_timeout to 3600 and set proxy_http_version 1.1 with the Upgrade header.',
+        3
+      );
+      const reaches: Array<string | undefined> = [];
+      // The real store behind a recording front, rather than a stub: the count below is only worth
+      // anything if the searches it counts are the ones that actually ran.
+      const watched = {
+        searchMemorySources: (input: Parameters<DataStore['searchMemorySources']>[0]) => {
+          reaches.push(input.reach);
+          return store.searchMemorySources(input);
+        },
+        listMemorySourceWindow: (...args: Parameters<DataStore['listMemorySourceWindow']>) =>
+          store.listMemorySourceWindow(...args),
+        memorySourceCoverage: (...args: Parameters<DataStore['memorySourceCoverage']>) =>
+          store.memorySourceCoverage(...args)
+      };
+
+      const hit = await searchMemorySessions({
+        store: watched,
+        workspaceId: realWorkspaceId,
+        dataKey,
+        query: 'websocket upgrades dropped by the reverse proxy'
+      });
+      expect(hit.matches.length).toBeGreaterThan(0);
+      expect(reaches).toEqual(['indexed']);
+
+      reaches.length = 0;
+      const miss = await searchMemorySessions({
+        store: watched,
+        workspaceId: realWorkspaceId,
+        dataKey,
+        query: 'what did the dentist charge for the crown'
+      });
+      expect(miss.matches).toEqual([]);
+      expect(reaches).toEqual(['indexed', 'archived']);
+    });
+
+    /**
+     * A row the write path decided must not be searchable does not become searchable here.
+     *
+     * `createMemorySource` writes `body_tokens=''` whenever the caller passes `indexed: false` -
+     * a body with nothing to index, or one a gate refuses to expose - and that is a different
+     * decision about a different row. The pass only ever moves rows that WERE indexed, so it can
+     * never hand tokens to one the writer withheld them from. Asserted because the two states now
+     * look alike in the column that used to tell them apart.
+     */
+    it('does not make a row searchable that was written unsearchable', async () => {
+      const index = buildMemoryItemIndex(
+        { title: '', body: 'kept out of the index deliberately', tags: [] },
+        memoryIndexKey(dataKey)
+      );
+      await store.createMemorySource({
+        userId: realUserId,
+        workspaceId: realWorkspaceId,
+        channel: 'chat',
+        bodyCiphertext: encryptJson(
+          { body: 'kept out of the index deliberately' },
+          dataKey,
+          memorySourceAad(realWorkspaceId)
+        ),
+        bodyTokens: index.bodyTokens,
+        tokensEst: 8,
+        indexed: false,
+        occurredAt: daysAgo(ARCHIVE_AFTER_DAYS + 30)
+      });
+      await sweep();
+
+      const row = await database.query<{ tokens: string }>(
+        `SELECT body_tokens AS tokens FROM mem.source WHERE workspace_id=$1 AND NOT indexed`,
+        [realWorkspaceId]
+      );
+      expect(row.rows.map((entry) => entry.tokens)).toEqual(['']);
+      const found = await search('kept out of the index deliberately');
+      expect(found.matches).toEqual([]);
+    });
+
+    /**
+     * THE PASS CAN NOW FIRE AT ALL, which it could not before, and the citation survives it.
+     *
+     * `recordTurnEpisode` cites every chunk it writes, in the same call, unconditionally - so the
+     * old `NOT EXISTS (mem.evidence ...)` clause did not narrow this pass, it switched it off:
+     * `sourcesUnindexed` was structurally zero for every row production has ever written, and the
+     * verbatim index was bounded by nothing. This is the case that fails if that clause comes back,
+     * and it asserts in the same breath the reason the clause existed is gone - the episode still
+     * dereferences to the same sealed bytes it always did.
+     */
+    it('archives a turn its own episode cites, and the citation still opens', async () => {
+      const request = 'the reverse proxy kept dropping websocket upgrades under load';
+      const buried = await buriedConversation(
+        request,
+        'Raised proxy_read_timeout to 3600 and set proxy_http_version 1.1 with the Upgrade header.'
+      );
+      const episode = await database.query<{ id: string }>(
+        `SELECT id FROM mem.item WHERE workspace_id=$1 AND kind='episode' AND task_id=$2`,
+        [realWorkspaceId, buried]
+      );
+      const episodeId = episode.rows[0]?.id;
+      expect(episodeId).toBeTypeOf('string');
+      const cited = await store.listMemoryEvidence(episodeId!);
+      expect(cited.length).toBeGreaterThan(0);
+
+      const report = await sweep();
+      // Every chunk of the turn, all of them cited, all of them moved.
+      expect(report?.sourcesUnindexed).toBe(cited.length);
+
+      const after = await store.listMemoryEvidence(episodeId!);
+      expect(after.map((edge) => edge.sourceId)).toEqual(cited.map((edge) => edge.sourceId));
+      // The bytes, not merely the pointer: what the fact was extracted from opens exactly as before.
+      const bodies = after.map(
+        (edge) => decryptJson<{ body: string }>(edge.bodyCiphertext, dataKey).body
+      );
+      expect(bodies.join('\n')).toContain(request);
+    });
+
+    /**
+     * An empty answer now says how far back BOTH tiers reach.
+     *
+     * Before the far tier existed, "nothing found" and "nothing recorded within reach" were the
+     * same reply. They are different facts and the agent is about to state one of them to the
+     * owner about their own life, so the coverage line carries the archived count and its own
+     * oldest row.
+     */
+    it('says how much of the record the first pass could not see', async () => {
+      await buriedConversation(
+        'the reverse proxy kept dropping websocket upgrades under load',
+        'Raised proxy_read_timeout to 3600 and set proxy_http_version 1.1 with the Upgrade header.'
+      );
+      await sweep();
+      const found = await search('what did the dentist charge for the crown');
+      expect(found.matches).toEqual([]);
+      expect(found.searchable?.archived.turns).toBeGreaterThan(0);
+      expect(found.searchable?.archived.earliest).toBe(
+        daysAgo(ARCHIVE_AFTER_DAYS + 30).toISOString()
+      );
+    });
+  });
+
   it('says the store is empty rather than that nothing was ever discussed', async () => {
     const found = await searchMemorySessions({
       store,
@@ -3067,7 +3374,14 @@ describe('against the real store', () => {
       dataKey,
       query: 'anything at all'
     });
-    expect(found.searchable).toEqual({ conversations: 0, turns: 0, earliest: null });
+    expect(found.searchable).toEqual({
+      conversations: 0,
+      turns: 0,
+      earliest: null,
+      // Both tiers, so "nothing found" is a statement about the whole record: an empty archive is
+      // the difference between "never discussed" and "older than the fast index can see".
+      archived: { turns: 0, earliest: null }
+    });
   });
 
   /*

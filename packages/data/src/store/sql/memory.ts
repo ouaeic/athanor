@@ -389,7 +389,7 @@ export const MEMORY_SOURCE_SEARCH_PER_TASK = 3;
  * scoring and only ever moves a row down, so a conversation that genuinely holds the best rows
  * still leads - it just stops holding all of them.
  */
-export const MEMORY_SOURCE_SEARCH_SQL = `
+const sourceSearchSql = (tier: 'indexed' | 'archived'): string => `
 WITH q AS (
   SELECT $1::uuid AS ws, $3::uuid AS task, $4::timestamptz AS since, $5::timestamptz AS until,
          $7::int AS per_task
@@ -403,7 +403,8 @@ ${MEMORY_TERMS_CTE},
 hits AS (
   SELECT sc.id, sc.task_id, mem.bm25(qq.q_lex, qq.q_idf, sc.tsv, sc.tsv_len, st.avg_len) AS s
   FROM mem.source sc CROSS JOIN q CROSS JOIN qq CROSS JOIN stats st
-  WHERE sc.workspace_id = q.ws AND sc.indexed AND sc.tsv @@ qq.q_ts
+  WHERE sc.workspace_id = q.ws AND ${tier === 'indexed' ? 'sc.indexed' : 'NOT sc.indexed'}
+    AND sc.tsv @@ qq.q_ts
     AND (q.task IS NULL OR sc.task_id = q.task)
     AND (q.since IS NULL OR sc.occurred_at >= q.since)
     AND (q.until IS NULL OR sc.occurred_at <= q.until)
@@ -426,6 +427,38 @@ FROM (
   LIMIT $6::int
 ) r JOIN mem.source sc ON sc.id = r.id
 ORDER BY r.s DESC, sc.id`;
+
+export const MEMORY_SOURCE_SEARCH_SQL = sourceSearchSql('indexed');
+
+/**
+ * The same search, one step further away: over the rows the nightly pass took out of the index.
+ *
+ * Past its archive horizon a turn leaves the GIN index - which is partial, `WHERE indexed`, so the
+ * flag is what frees it - and keeps everything else it was written with: the sealed body, the keyed
+ * tokens, and since migration 76 the vector those tokens make. So this statement differs from the
+ * one above by exactly one character of predicate, and the whole of the difference between the two
+ * tiers is that this one has no index to probe and reads the same `@@` off a scan.
+ *
+ * A SEPARATE STATEMENT rather than a flag on the one above, and that is a planning decision rather
+ * than a stylistic one. The fast path's `sc.indexed AND sc.tsv @@ qq.q_ts` is exactly the predicate
+ * the partial GIN index is built for; folding an archive branch into it behind a boolean parameter
+ * would put a parameter where the planner needs a constant and risk the ordinary search - every
+ * search on this box - losing the index it was written around. Two statements, and the default one
+ * is byte-identical to what shipped.
+ *
+ * WHY THE VECTOR IS KEPT RATHER THAN REBUILT, in numbers, because the other design is the obvious
+ * one and it is 12.6x worse. Rebuilding it here with `to_tsvector` over `body_tokens` per row costs
+ * 695 ms median on the owner's real corpus against 50 ms for the indexed tier; reading the stored
+ * vector on the same rows with the GIN index dropped costs 55 ms. Five milliseconds of that gap was
+ * the index and 640 was re-tokenising text that had already been tokenised once, on every miss, for
+ * ever. @see docs/design/prime/CLOSE.md.
+ *
+ * There is no index over archived rows, and that is the tier working rather than a gap in it: the
+ * far tier is reached only when the near one answered nothing, one scan is 5 ms dearer than one
+ * probe at this corpus's size, and an index that is never the bound is bytes on every write for
+ * nothing.
+ */
+export const MEMORY_SOURCE_ARCHIVE_SEARCH_SQL = sourceSearchSql('archived');
 
 /**
  * The rows either side of a hit.

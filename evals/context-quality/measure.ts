@@ -266,6 +266,7 @@ export const measure = async (
         'https://preview.example.com',
         { now: new Date(Date.UTC(2026, 2, 3, 9, 15) + step * 45_000), timeZone: 'Europe/London' },
         'python3 3.11, typst 0.12, libreoffice 24.2',
+        '',
         false,
         'in_house'
       )
