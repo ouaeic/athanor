@@ -707,3 +707,133 @@ describe('memory retrieval eval under pressure', () => {
     expect(result.packTokens).toBeGreaterThan(packRun.packTokens);
   }, 300_000);
 });
+
+/**
+ * The same corpus, with a use history.
+ *
+ * WHY THIS BLOCK EXISTS. Every number above it was measured on a store where no `mem.item_use` row
+ * had ever been written and `consolidateMemory` had never been called, so all fifty-six items
+ * carried `salience = 0` - minimum and maximum - and `mem.prior`'s salience factor evaluated to
+ * exactly 1.0 for every row in every probe. The usage half of the ranking was unmeasurable by the
+ * repository's only retrieval instrument, and it stayed unmeasurable through an audit that moved
+ * six of its constants at once - deleting the negative term, multiplying the usage window by a
+ * hundred, cutting both positive weights tenfold - with 2,296 tests green.
+ *
+ * A second corpus rather than usage added to the first, for the same reason the padded block is a
+ * second database: the numbers above are the comparison, and a gate re-baselined to accommodate a
+ * fixture is not a gate. The A/B between the two blocks is the measurement.
+ *
+ * The histories are hand-written per row in `MEMORY_EVAL_ITEMS` and were NOT written with these
+ * probes in hand - the heaviest history in the corpus belongs to a retired value that must never
+ * come back for a present-tense question. So this arm measures the usage prior in its worst case,
+ * where a row's history says nothing about whether it answers the question, and the MRR it commits
+ * is a floor under that. In production the two are not independent: a `mem.item_use` row is
+ * written by this same query answering an earlier turn.
+ */
+describe('memory retrieval eval with a use history', () => {
+  let database: Database;
+  let store: DataStore;
+  let seed: MemoryEvalSeed;
+  let workspaceId: string;
+  let packRun: MemoryEvalReport;
+
+  const key = memoryIndexKey(Buffer.alloc(32, 11));
+  const now = new Date('2026-07-31T08:00:00.000Z');
+
+  /**
+   * Today's numbers on this corpus, committed the way the ones above are.
+   *
+   * Recall and the pack size do not move: 100.0% and 364 tokens, identical to the arm with no
+   * usage at all, and no retired value leaks. MRR does - 0.469 with the salience factor switched
+   * off entirely, 0.427 under the `1 + 0.15*ln(1 + greatest(salience,0))` this replaced, 0.395
+   * under the shipped `exp(0.15*asinh(salience))`. All three were measured on THIS corpus by
+   * substituting the body of `mem.prior`, and they are the first numbers in this repository that
+   * say what the usage tier is worth. What they say is that on a fixture where usage carries no
+   * information about the question, the tier can only cost rank, and costs more the more of the
+   * salience range it exposes - which is the argument for leaving 0.15 where it is until somebody
+   * measures the other side of it.
+   */
+  const MIN_USAGE_PACK_RECALL = 1;
+  const MIN_USAGE_MRR = 0.37;
+  const MAX_USAGE_PACK_TOKENS = 450;
+
+  beforeAll(async () => {
+    database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+    await migrateDatabase(database);
+    store = new DataStore(database);
+    const user = await store.createUser({ username: 'eval-owner', displayName: 'Owner' });
+    const workspace = await store.createWorkspace({
+      userId: user.id,
+      name: 'computer',
+      storageLimitBytes: 10 * 1024 ** 3,
+      imageRevision: 'dev',
+      region: 'auto',
+      wrappedKey: 'wrapped'
+    });
+    workspaceId = workspace.id;
+    seed = await seedMemoryEvalCorpus({
+      store,
+      userId: user.id,
+      workspaceId,
+      key,
+      now,
+      withUsage: true
+    });
+    packRun = await runMemoryRecallEval({ store, workspaceId, key, now, seed });
+  }, 300_000);
+
+  afterAll(async () => database.close());
+
+  it('carries a salience the ranking can see, which is what nothing here did before', async () => {
+    const spread = await database.query<{ lo: number; hi: number; nonzero: string; rows: string }>(
+      `SELECT MIN(salience) AS lo, MAX(salience) AS hi,
+              count(*) FILTER (WHERE salience <> 0) AS nonzero, count(*) AS rows
+       FROM mem.item WHERE workspace_id=$1`,
+      [workspaceId]
+    );
+    const { lo, hi, nonzero, rows } = spread.rows[0]!;
+    // Both signs present. A corpus that only ever produced positive salience could not show that
+    // negative reinforcement reaches the ranking, and one at a single value shows nothing at all.
+    expect(Number(lo)).toBeLessThan(0);
+    expect(Number(hi)).toBeGreaterThan(0);
+    expect(Number(nonzero)).toBe(Number(rows));
+
+    // And the history reached the fold: `shell-retired`'s ten uses are all more than a hundred and
+    // eighty days old, so the retention pass moved them to `mem.item_use_fold` and their weight
+    // survived the move. Under the DELETE this replaced they would be gone.
+    const folded = await database.query<{ item_id: string; uses: number }>(
+      'SELECT item_id, uses FROM mem.item_use_fold'
+    );
+    expect(folded.rows).toHaveLength(1);
+    expect(folded.rows[0]!.item_id).toBe(seed.ids.get('shell-retired'));
+    expect(folded.rows[0]!.uses).toBe(10);
+  }, 300_000);
+
+  it('retrieves and ranks under a usage prior that knows nothing about the questions', () => {
+    const report = formatMemoryEvalReport(packRun);
+    // Recall and the pack size are unmoved by the tier: it reorders, it does not admit or evict.
+    expect(packRun.recall, report).toBeGreaterThanOrEqual(MIN_USAGE_PACK_RECALL);
+    expect(packRun.packTokens, report).toBeLessThanOrEqual(MAX_USAGE_PACK_TOKENS);
+    expect(packRun.leaks, report).toEqual([]);
+    expect(packRun.mrr, report).toBeGreaterThanOrEqual(MIN_USAGE_MRR);
+    for (const probe of packRun.probes)
+      if (probe.hit && probe.rank !== null)
+        expect(probe.rank, `${probe.id} answered at rank ${probe.rank}`).toBeLessThanOrEqual(12);
+  });
+
+  it('moves when a salience constant moves, which is the whole point of the arm', async () => {
+    // The falsification. Flatten salience to the value the corpus used to carry and the ranking
+    // has to change - if it does not, this block is measuring the same thing as the one above it
+    // and the usage tier is invisible again.
+    const before = packRun.mrr;
+    await database.query('UPDATE mem.item SET salience = 0 WHERE workspace_id=$1', [workspaceId]);
+    const flattened = await runMemoryRecallEval({ store, workspaceId, key, now, seed });
+    expect(flattened.mrr).not.toBe(before);
+    expect(flattened.mrr).toBeGreaterThan(before);
+    // Restored by the real pass rather than by writing the column back, so the number this block
+    // committed is the number the nightly statement produces.
+    await store.consolidateMemory(workspaceId, { now });
+    const restored = await runMemoryRecallEval({ store, workspaceId, key, now, seed });
+    expect(restored.mrr).toBeCloseTo(before, 10);
+  }, 300_000);
+});

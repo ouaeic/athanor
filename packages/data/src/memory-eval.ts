@@ -70,6 +70,27 @@ export interface MemoryEvalItem {
   readonly pin?: boolean;
   /** How long before the eval clock this was observed. */
   readonly daysAgo: number;
+  /**
+   * When this row was packed into a task, in days before the eval clock.
+   *
+   * WHY THIS EXISTS. Before it, every row in this corpus carried `salience = 0` - minimum and
+   * maximum - because nothing here had ever written a `mem.item_use` row or called
+   * `consolidateMemory`. So `mem.prior`'s salience factor evaluated to exactly 1.0 for every row
+   * in every probe, and the entire usage half of the ranking was invisible to the repository's
+   * only retrieval instrument: an audit moved six of its constants at once, including deleting the
+   * negative term and multiplying the usage window by a hundred, and 2,296 tests stayed green.
+   *
+   * The histories below are written per row rather than derived from `daysAgo`, for the same
+   * reason the padding corpus is a pure function of its index and nothing here is generated from
+   * the query: a fixture the ranking computes for itself measures nothing. They are also
+   * deliberately NOT a reward for being a gold row - the heaviest history in the corpus belongs to
+   * a retired value that must never come back for a present-tense question.
+   */
+  readonly uses?: readonly number[];
+  /** How many of those uses the model went on to cite, taken from the most recent end. */
+  readonly citedUses?: number;
+  /** How many the harness watched fail, taken from the oldest end. */
+  readonly failedUses?: number;
 }
 
 export interface MemoryEvalSource {
@@ -123,7 +144,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'athanor-relay',
     object: '0.0.0.0:8443',
     predicate: 'runs_on',
-    daysAgo: 40
+    daysAgo: 40,
+    uses: [2, 5, 9, 16, 24, 33, 39],
+    citedUses: 3
   },
   {
     ref: 'mail-connector-host',
@@ -133,7 +156,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'mail connector',
     object: 'dovecot',
     predicate: 'runs_on',
-    daysAgo: 60
+    daysAgo: 60,
+    uses: [10, 29, 57],
+    citedUses: 2
   },
   {
     ref: 'postgres-port',
@@ -143,7 +168,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'postgres',
     object: 'localhost:5432',
     predicate: 'runs_on',
-    daysAgo: 90
+    daysAgo: 90,
+    uses: [4, 11, 27, 58, 79],
+    citedUses: 2
   },
   {
     ref: 'backup-location',
@@ -153,7 +180,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'backups',
     object: '/srv/athanor/var/backup',
     predicate: 'located_at',
-    daysAgo: 75
+    daysAgo: 75,
+    uses: [9, 31, 68],
+    citedUses: 1
   },
   {
     ref: 'shell-retired',
@@ -163,7 +192,8 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'owner',
     object: 'zsh',
     predicate: 'default_shell',
-    daysAgo: 200
+    daysAgo: 200,
+    uses: [196, 199, 203, 208, 214, 221, 229, 238, 248, 259]
   },
   {
     ref: 'shell-current',
@@ -173,7 +203,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'owner',
     object: 'fish',
     predicate: 'default_shell',
-    daysAgo: 12
+    daysAgo: 12,
+    uses: [1, 6, 12],
+    citedUses: 2
   },
   {
     ref: 'answer-style',
@@ -183,7 +215,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'owner',
     object: 'short answers',
     predicate: 'prefers',
-    daysAgo: 50
+    daysAgo: 50,
+    uses: [2, 4, 7, 11, 18, 29, 46],
+    citedUses: 4
   },
   {
     ref: 'time-zone',
@@ -193,7 +227,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'owner',
     object: 'Europe/London',
     predicate: 'prefers',
-    daysAgo: 120
+    daysAgo: 120,
+    uses: [20, 52],
+    citedUses: 1
   },
   {
     ref: 'sni-decision',
@@ -203,7 +239,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'sni proxy',
     object: '443',
     predicate: 'runs_on',
-    daysAgo: 150
+    daysAgo: 150,
+    uses: [34, 77],
+    citedUses: 1
   },
   {
     ref: 'deploy-procedure',
@@ -211,7 +249,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     title: 'Deploy athanor',
     tags: ['deploy', 'athanor'],
     body: 'pnpm build, then systemctl restart athanor.target. Watch journalctl -u athanor.target for the ready line before calling it done.',
-    daysAgo: 20
+    daysAgo: 20,
+    uses: [1, 3, 8, 14, 19],
+    citedUses: 2
   },
   {
     ref: 'certificate-procedure',
@@ -219,7 +259,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     title: 'Rotate the TLS certificate',
     tags: ['tls', 'certificate', 'nginx'],
     body: 'acme.sh --issue --dns dns_cf -d the domain, then systemctl reload nginx. The relay picks the new chain up without a restart.',
-    daysAgo: 35
+    daysAgo: 35,
+    uses: [13, 35],
+    citedUses: 1
   },
   {
     ref: 'snapshot-procedure',
@@ -227,49 +269,63 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     title: 'Take a database snapshot',
     tags: ['backup', 'postgres'],
     body: 'pg_dump -Fc athanor > /srv/athanor/var/backup/athanor.dump and check the file size before trusting it.',
-    daysAgo: 28
+    daysAgo: 28,
+    uses: [7, 21, 44],
+    citedUses: 1
   },
   {
     ref: 'pptx-clipping',
     kind: 'episode',
     title: 'A slide lost the end of a paragraph',
     body: 'A PowerPoint text box clips whatever overflows instead of growing, and neither the file nor the library warns about it. Measure the text against the box and split it across two boxes.',
-    daysAgo: 22
+    daysAgo: 22,
+    uses: [6, 19, 34],
+    citedUses: 1
   },
   {
     ref: 'relay-not-enabled',
     kind: 'episode',
     title: 'The relay did not come back after a reboot',
     body: 'After the computer rebooted, athanor-relay stayed down because its unit had never been enabled. systemctl enable --now athanor-relay fixed it for good.',
-    daysAgo: 18
+    daysAgo: 18,
+    uses: [4, 15, 29],
+    citedUses: 1
   },
   {
     ref: 'imap-idle-interval',
     kind: 'episode',
     title: 'Mail only caught up late in the morning',
     body: 'The connector was polling every half hour because imap_idle_notify_interval was left at the dovecot default. Setting it to 2 minutes made new mail arrive immediately.',
-    daysAgo: 30
+    daysAgo: 30,
+    uses: [8, 23, 45],
+    citedUses: 1
   },
   {
     ref: 'journal-disk-full',
     kind: 'episode',
     title: 'The root volume filled with journal logs',
     body: 'The disk filled up because journald had no SystemMaxUse limit. Capped it at 500M and the space came back.',
-    daysAgo: 65
+    daysAgo: 65,
+    uses: [11, 38],
+    citedUses: 1
   },
   {
     ref: 'lockfile-drift',
     kind: 'episode',
     title: 'A build failed on lockfile drift',
     body: 'CI failed because the lockfile had drifted from the manifest. Installs are pinned with --frozen-lockfile now.',
-    daysAgo: 47
+    daysAgo: 47,
+    uses: [5, 20, 43],
+    citedUses: 2
   },
   {
     ref: 'font-substitution',
     kind: 'episode',
     title: 'A document rendered with the wrong font',
     body: 'A generated document silently substituted a fallback font because the requested family was not installed, which changed every line break in it.',
-    daysAgo: 88
+    daysAgo: 88,
+    uses: [27, 71],
+    citedUses: 1
   },
   {
     ref: 'owner-languages',
@@ -279,7 +335,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'owner',
     object: 'typescript',
     predicate: 'knows_language',
-    daysAgo: 140
+    daysAgo: 140,
+    uses: [24, 63],
+    citedUses: 1
   },
   {
     ref: 'workspace-root',
@@ -290,7 +348,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     object: '/srv/athanor',
     predicate: 'located_at',
     pin: true,
-    daysAgo: 160
+    daysAgo: 160,
+    uses: [26, 66],
+    citedUses: 1
   },
 
   /* ---------------------------------------------------------------------- *
@@ -317,7 +377,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'workspace-runner',
     object: 'localhost:7070',
     predicate: 'runs_on',
-    daysAgo: 44
+    daysAgo: 44,
+    uses: [18, 47],
+    citedUses: 1
   },
   {
     ref: 'relay-health-port',
@@ -337,7 +399,10 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'pgbouncer',
     object: 'localhost:6432',
     predicate: 'runs_on',
-    daysAgo: 85
+    daysAgo: 85,
+    uses: [5, 12, 26, 40, 61],
+    citedUses: 2,
+    failedUses: 3
   },
   {
     ref: 'dovecot-port',
@@ -367,7 +432,8 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'grafana',
     object: 'localhost:3000',
     predicate: 'runs_on',
-    daysAgo: 70
+    daysAgo: 70,
+    uses: [22, 51]
   },
   {
     ref: 'prometheus-port',
@@ -387,7 +453,8 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'redis',
     object: 'localhost:6379',
     predicate: 'runs_on',
-    daysAgo: 95
+    daysAgo: 95,
+    uses: [94, 96, 99, 103, 108]
   },
   {
     ref: 'unbound-port',
@@ -397,7 +464,8 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'unbound',
     object: '127.0.0.1:53',
     predicate: 'runs_on',
-    daysAgo: 110
+    daysAgo: 110,
+    uses: [109, 112]
   },
   {
     ref: 'syncthing-port',
@@ -407,7 +475,8 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'syncthing',
     object: 'localhost:8384',
     predicate: 'runs_on',
-    daysAgo: 130
+    daysAgo: 130,
+    uses: [128, 131, 135]
   },
   {
     ref: 'wal-location',
@@ -417,7 +486,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'wal archive',
     object: '/srv/athanor/var/backup/wal',
     predicate: 'located_at',
-    daysAgo: 74
+    daysAgo: 74,
+    uses: [21, 56],
+    citedUses: 1
   },
   {
     ref: 'log-location',
@@ -427,7 +498,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'logs',
     object: '/srv/athanor/var/log',
     predicate: 'located_at',
-    daysAgo: 66
+    daysAgo: 66,
+    uses: [17, 36, 64],
+    citedUses: 1
   },
   {
     ref: 'config-location',
@@ -487,7 +560,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'owner',
     object: 'British spelling',
     predicate: 'prefers',
-    daysAgo: 45
+    daysAgo: 45,
+    uses: [6, 28, 60],
+    citedUses: 2
   },
   {
     ref: 'emoji-preference',
@@ -497,7 +572,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'owner',
     object: 'no emoji',
     predicate: 'prefers',
-    daysAgo: 33
+    daysAgo: 33,
+    uses: [13, 37],
+    citedUses: 1
   },
   {
     ref: 'units-preference',
@@ -517,7 +594,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     subject: 'node packages',
     object: 'pnpm',
     predicate: 'uses_tool',
-    daysAgo: 42
+    daysAgo: 42,
+    uses: [3, 10, 25, 41],
+    citedUses: 2
   },
   {
     ref: 'search-tool',
@@ -546,7 +625,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     title: 'Restore the database from a snapshot',
     tags: ['restore', 'postgres', 'backup'],
     body: 'systemctl stop athanor.target, then pg_restore -c -d athanor the dump, then start the target again. Never restore into a running system.',
-    daysAgo: 26
+    daysAgo: 26,
+    uses: [12, 40],
+    citedUses: 1
   },
   {
     ref: 'rollback-procedure',
@@ -554,7 +635,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     title: 'Roll back a deploy',
     tags: ['rollback', 'deploy', 'athanor'],
     body: 'git checkout the previous tag, pnpm build, systemctl restart athanor.target. The database migration is forward-only, so check it is compatible first.',
-    daysAgo: 24
+    daysAgo: 24,
+    uses: [15, 46],
+    citedUses: 1
   },
   {
     ref: 'key-rotation-procedure',
@@ -586,28 +669,36 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     kind: 'episode',
     title: 'A certificate renewal failed on DNS propagation',
     body: 'acme.sh failed the DNS-01 challenge because the TXT record had not propagated yet. Waiting sixty seconds between writing the record and asking for validation fixed it.',
-    daysAgo: 34
+    daysAgo: 34,
+    uses: [10, 30],
+    citedUses: 1
   },
   {
     ref: 'cron-utc',
     kind: 'episode',
     title: 'A scheduled task fired an hour early',
     body: 'A schedule was stored in UTC while the owner read it as local time, so through British Summer Time it ran an hour early. Schedules are written with an explicit zone now.',
-    daysAgo: 41
+    daysAgo: 41,
+    uses: [14, 42],
+    citedUses: 1
   },
   {
     ref: 'xlsx-text-numbers',
     kind: 'episode',
     title: 'A spreadsheet would not sum a column',
     body: 'The numbers had been written as text, so they left-aligned and every SUM came back zero. Writing them as numbers rather than strings fixed the column.',
-    daysAgo: 53
+    daysAgo: 53,
+    uses: [9, 32],
+    citedUses: 1
   },
   {
     ref: 'docx-toc-stale',
     kind: 'episode',
     title: 'A table of contents kept the old headings',
     body: 'A Word table of contents is a cached field, not a live view, so it kept the previous headings until the field was marked dirty for the reader to update.',
-    daysAgo: 71
+    daysAgo: 71,
+    uses: [16, 49],
+    citedUses: 1
   },
   {
     ref: 'pdf-table-split',
@@ -621,7 +712,9 @@ export const MEMORY_EVAL_ITEMS: readonly MemoryEvalItem[] = [
     kind: 'episode',
     title: 'The worker was killed during a large build',
     body: 'The build was killed by the OOM killer with no error of its own, only a truncated log. The unit has a MemoryMax now so it fails loudly instead of vanishing.',
-    daysAgo: 58
+    daysAgo: 58,
+    uses: [7, 25, 55],
+    citedUses: 2
   },
   {
     ref: 'browser-restale',
@@ -1205,6 +1298,18 @@ export const seedMemoryEvalCorpus = async (input: {
   workspaceId: string;
   key: Uint8Array;
   now: Date;
+  /**
+   * Whether to write the `uses` histories and run the nightly pass.
+   *
+   * Off by default, and that is not laziness. The committed numbers above this were measured on a
+   * corpus whose salience was uniformly zero, so `mem.prior`'s salience factor was the constant
+   * 1.0 for every row - turning usage on for the same corpus moves them, and re-baselining a
+   * retrieval gate to accommodate a fixture is how a gate stops being one. The usage arm is
+   * therefore a second corpus with its own committed numbers, and the pair is what makes the
+   * usage tier observable at all: the A/B between them is the only measurement in this repository
+   * of what the salience factor is worth.
+   */
+  withUsage?: boolean;
 }): Promise<MemoryEvalSeed> => {
   const started = process.hrtime.bigint();
   await input.store.syncMemoryPredicates();
@@ -1300,6 +1405,36 @@ export const seedMemoryEvalCorpus = async (input: {
     ids.set(source.ref, created.id);
     sourceIds.set(source.ref, created.id);
   }
+
+  /*
+   * The usage half of the ranking, made observable.
+   *
+   * Uses go in through `recordMemoryUse` and salience comes out of `consolidateMemory` - the two
+   * methods `apps/worker/src/memory-capture.ts` calls at the end of a turn - rather than being
+   * written onto the column. That is what makes a change to the salience weights, the decay
+   * exponent or the retention fold move a number in this file: without it every row scored
+   * `salience = 0` and `mem.prior`'s salience factor was the constant 1.0 for the whole corpus.
+   *
+   * One `recordMemoryUse` per instant rather than one per row: the writer stamps every id in a
+   * call with the same `used_at`, and a history is a sequence of separate turns.
+   */
+  for (const item of input.withUsage ? MEMORY_EVAL_ITEMS : []) {
+    if (!item.uses?.length) continue;
+    const id = ids.get(item.ref);
+    if (!id) continue;
+    const ordered = [...item.uses].sort((left, right) => left - right);
+    const cited = item.citedUses ?? 0;
+    const failed = item.failedUses ?? 0;
+    for (const [index, daysAgo] of ordered.entries())
+      await input.store.recordMemoryUse({
+        workspaceId: input.workspaceId,
+        itemIds: [id],
+        usedAt: daysBefore(input.now, daysAgo),
+        cited: index < cited,
+        outcome: index >= ordered.length - failed ? 'fail' : 'ok'
+      });
+  }
+  if (input.withUsage) await input.store.consolidateMemory(input.workspaceId, { now: input.now });
 
   // Incremental document frequency only ever accrues, so the recall query would be reading counts
   // that were never reconciled. Every eval measures the settled state, which is the honest one.

@@ -1274,6 +1274,10 @@ export const migrations = [
       -- rank instead of joining it as ranking channels. The 0.35 decay floor keeps an old fact
       -- retrievable forever; the 0.12 factor keeps a retired fact findable for "what did I use
       -- before?" while making it essentially never win a present-tense query.
+      --
+      -- SUPERSEDED BY MIGRATION 75, which replaces the salience factor below: greatest(salience,0)
+      -- here maps every negative salience onto the factor of a never-used row, so the half of the
+      -- score a failure produces could not reach the ranking. Read the live body there.
       CREATE OR REPLACE FUNCTION mem.prior(
         kind mem.kind, trust mem.trust, valid_to TIMESTAMPTZ, observed_at TIMESTAMPTZ,
         salience REAL, pin BOOLEAN, t_now TIMESTAMPTZ, temporal_intent BOOLEAN
@@ -2800,6 +2804,92 @@ export const migrations = [
       CREATE INDEX IF NOT EXISTS mem_cited_call_event_idx ON mem.cited_call (event_id);
 
       ALTER TABLE mem.item ADD COLUMN IF NOT EXISTS taint_origin TEXT;
+    `
+  },
+  {
+    version: 75,
+    name: 'a_use_gets_further_away_and_never_gone',
+    /*
+     * Two changes, and they are the same change: the usage half of the ranking stops having a
+     * cliff, and the prior stops throwing away the half of salience that a failure produces.
+     *
+     * `mem.item_use_fold` — the tail of the use history, kept.
+     *
+     * `consolidateMemory` deletes `mem.item_use` rows past `useRetentionDays` (180). That bound is
+     * real - the table takes one row per packed item per turn and is the only table here that
+     * grows with usage rather than with content - but a sum over EVERY prior use cannot be taken
+     * against a table that forgets. Removing the 90-day window without this would have moved the
+     * cliff to day 180 and called it fixed.
+     *
+     * So the retention statement no longer deletes; it FOLDS. What leaves `mem.item_use` arrives
+     * here as a count and a span, and the activation of the folded block is recovered from the
+     * closed form of the same power law, which for `n` uses spread over `[a, b]` is
+     *
+     *     SUM_j (T - u_j)^-d  ~=  n / (b - a) * INTEGRAL_a^b (T - u)^-d du
+     *                          =  n * [ (T-a)^(1-d) - (T-b)^(1-d) ] / ((1-d)(b-a))
+     *
+     * exact when the folded uses are uniform in their own span and correct in the limit at both
+     * ends. That integral is evaluated in `consolidateMemory`, beside the live sum it is added to,
+     * because `d` lives in `@athanor/core` and must not be written down twice.
+     *
+     * Bounded by construction: one row per item, arriving only once an item has uses older than
+     * the horizon, cascading with the item. `uses`/`cites`/`fails` mirror the three signals the
+     * live half counts; `first_at`/`last_at` are the span, widened by LEAST/GREATEST as later
+     * nights fold more in, so a second fold never double-counts and never narrows what it holds.
+     *
+     * `mem.prior` — the salience factor stops being one-sided.
+     *
+     * It read `1.0 + 0.15 * ln(1 + greatest(salience, 0))`, and `greatest(salience, 0)` is the
+     * reason negative reinforcement could not have reached the ranking even once its term was
+     * fixed: every negative salience mapped to exactly the factor of an unused row. `asinh` is the
+     * signed log - `ln(x + sqrt(x*x+1))`, odd, smooth, exactly 0 at 0, logarithmic in both tails -
+     * and wrapping it in `exp` keeps the factor strictly positive for every finite salience, which
+     * a bare `1 + c * asinh(s)` does not: salience is a weighted sum of z-scores, a z-score in a
+     * workspace of `n` rows can reach sqrt(n-1), and at large negative salience the old shape
+     * would have crossed zero and inverted the ranking it multiplies.
+     *
+     * `exp(0.15 * asinh(s))` is `1 + 0.15*s + O(s^2)` at the origin, which is what
+     * `1 + 0.15 * ln(1+s)` was, so nothing near zero moves. `0.15` is unchanged and deliberately
+     * so: the salience definition is what this migration is changing, and moving the coefficient
+     * in the same pass would leave neither measurable. It is a chosen number and the audit's
+     * finding against it stands - across this owner's measured salience range it is worth a factor
+     * of 0.94x to 1.25x, against 2.86x for the recency term beside it. What would change it: a
+     * measurement of how far the usage tier SHOULD be able to move a rank, which nothing in this
+     * repository has yet made.
+     *
+     * One new table, inline constraints, one CREATE OR REPLACE over a function body. Nothing
+     * rewrites a row: no entry in `REWRITING_MIGRATIONS`. No index - every read of the new table
+     * is by its primary key.
+     */
+    sql: `
+      CREATE TABLE IF NOT EXISTS mem.item_use_fold (
+        item_id UUID PRIMARY KEY REFERENCES mem.item(id) ON DELETE CASCADE,
+        uses INTEGER NOT NULL DEFAULT 0 CHECK (uses >= 0),
+        cites INTEGER NOT NULL DEFAULT 0 CHECK (cites >= 0),
+        fails INTEGER NOT NULL DEFAULT 0 CHECK (fails >= 0),
+        first_at TIMESTAMPTZ NOT NULL,
+        last_at TIMESTAMPTZ NOT NULL,
+        CHECK (last_at >= first_at),
+        CHECK (cites <= uses AND fails <= uses)
+      );
+
+      CREATE OR REPLACE FUNCTION mem.prior(
+        kind mem.kind, trust mem.trust, valid_to TIMESTAMPTZ, observed_at TIMESTAMPTZ,
+        salience REAL, pin BOOLEAN, t_now TIMESTAMPTZ, temporal_intent BOOLEAN
+      ) RETURNS FLOAT8 LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $ath$
+        SELECT
+            (CASE trust WHEN 'stated' THEN 1.00 WHEN 'derived' THEN 0.85 ELSE 0.60 END)
+          * (CASE WHEN valid_to IS NULL OR valid_to > t_now THEN 1.00
+                  WHEN temporal_intent THEN 0.60 ELSE 0.12 END)
+          * (0.35 + 0.65 * exp(-0.6931471805599453
+                * extract(epoch FROM t_now - observed_at) / 86400.0
+                / CASE kind WHEN 'source'    THEN 21.0
+                            WHEN 'episode'   THEN 45.0
+                            WHEN 'procedure' THEN 240.0
+                            ELSE 1200.0 END))
+          * exp(0.15 * asinh(salience))
+          * (CASE WHEN pin THEN 1.6 ELSE 1.0 END);
+      $ath$;
     `
   }
 ] as const;

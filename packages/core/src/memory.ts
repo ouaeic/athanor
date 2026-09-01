@@ -1209,6 +1209,134 @@ export const MEMORY_PROCEDURE_STALE_DAYS = 180;
 export const MEMORY_PROCEDURE_MIN_SUCCESS_RATE = 0.5;
 
 /* ------------------------------------------------------------------------ *
+ * How a memory's own history is scored
+ *
+ * `consolidateMemory` recomputes three activations per row from `mem.item_use` - how much the row
+ * has been packed, how much the model reached for it, how much it failed when used - z-scores each
+ * against the workspace, and writes the weighted sum to `mem.item.salience`, which `mem.prior`
+ * multiplies onto the fused rank at query time.
+ *
+ * WHAT WAS HERE BEFORE: `count(*) FILTER (WHERE used_at > now - INTERVAL '90 days')`. A use on day
+ * 89 counted in full and a use on day 91 counted zero, so an owner returning from a three-month
+ * break found every row's usage history erased in a single step - measured on a seeded copy of
+ * this owner's workspace, 191 of 191 rows had a nonzero salience at an 89-day break and 2 of 191
+ * at a 91-day break, the two survivors being pinned. Inside the window nothing decayed at all, so
+ * fifty uses massed into one week and fifty spread over a year scored identically. Neither
+ * behaviour is anywhere in the owner's data: on their own transcripts a power law beats an
+ * exponential on the need curve by AIC +958 (`file`, 188,290 trials) and +550 (`topic`, 320,520),
+ * and every distribution family that fits at all has a decreasing hazard and unbounded support.
+ *
+ * WHAT IS HERE NOW is Anderson & Schooler's (1991) result as ACT-R operationalises it - the
+ * probability an item is needed again decays as a power law in the time since it was last needed,
+ * and the activation of a memory is the log of a power-law sum over EVERY prior use:
+ *
+ *     B = ln( 1 + SUM_j max(age_days(j), MEMORY_USE_AGE_FLOOR_DAYS) ^ -MEMORY_USE_DECAY_EXPONENT )
+ *
+ * No window and no floor: `t^-d > 0` for every finite `t`, so "further away, never gone" is a
+ * property of the shape rather than a constant somebody had to choose. A use from ten years ago
+ * contributes 0.0166 where a use from one day ago contributes 1.0 - small, and never absent.
+ *
+ * WHAT THE WINDOW WAS ALSO DOING, AND THIS DOES NOT. `recallMemory` records a use for every row it
+ * returns (`apps/worker/src/memory-runtime.ts`), uncited and outcome `unknown`, so the score has a
+ * feedback path into itself: a row that gets packed is thereby more likely to be packed again. A
+ * count inside 90 days let an unearned lead expire; a sum that decays as `t^-d` and never reaches
+ * zero does not. Measured on two rows built identically - same body, same observation date, ten
+ * cited uses each on the same ten days - the first pack was decided by `ORDER BY score DESC, id`
+ * on a random UUID, and sixty turns later the winner held 70 uses to 10 and a salience of +0.5
+ * against -0.5, unchanged when the clock is advanced one year and ten. Nothing about the two rows
+ * differs except which id sorted first. This is a property of the loop rather than of the curve -
+ * the same lock-in happens under the window, which only releases it after ninety idle days - and
+ * it is written down here because it is the cost of removing the window and nothing measures it.
+ * The fix, if it is wanted, is on the writer and not on `d`: an uncited use with an unknown
+ * outcome is the system agreeing with itself, and it could reasonably be recorded at a lower
+ * weight than one the model cited or the harness graded.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * The power-law exponent, `d`.
+ *
+ * CHOSEN, not fitted, and the distinction is the honest one. What this owner's corpus DOES
+ * establish is the SHAPE: on 685 owner turns / 235,236 characters / 11 projects / 49 active days
+ * (2026-04-16..08-31), a power law beats an exponential on the need curve by AIC +1,525 and +922
+ * on the `file` stream under a calendar and an active-day clock, and +19,840 and +7,603 on
+ * `topic`. Four constructions, four times the same answer: decreasing hazard, unbounded support,
+ * no cliff. That is the part of Anderson & Schooler (1991) this corpus replicates, and it is the
+ * part the score depends on.
+ *
+ * THE EXPONENT ITSELF IS NOT IDENTIFIED BY THIS CORPUS, and three independent constructions of it
+ * on the same transcripts disagree by more than 4x: an aggregate need-curve fit gives 0.4589 at
+ * the memory-item grain, 0.7300 on `topic` and 1.4000 on `file` (95% bootstrap [1.3500, 1.4450],
+ * which excludes 0.5 as firmly as the item-grain interval excludes 0.25) - aggregate need curves
+ * mix items of different base rates and steepen with the mixture, so the number moves with the
+ * population, not with the memory. Held-out day-ahead ranking does not settle it either: pooled
+ * AUC rises monotonically across the band, 0.8555 at `d` = 0.25 to 0.8638 at 0.50 and 0.8656 at
+ * 0.60, and the two streams' argmaxes are 4x apart (`file` near 1.00 at 0.8689, `topic` near 0.25
+ * at 0.8751). So 0.5 is ACT-R's canonical value, taken from the literature, and what this corpus
+ * says about it is only that it is inside every interval measured here and is never the worst
+ * choice on any of them.
+ *
+ * WHAT WOULD CHANGE IT: a measurement that separates the exponent from the population it is
+ * averaged over - a per-item fit with enough returns per item to be stable, on a corpus spanning
+ * more than one project era, since roughly 90% of this one's tool volume falls inside its final
+ * 32 days. Not another aggregate need curve: that is the construction that gave three answers.
+ */
+export const MEMORY_USE_DECAY_EXPONENT = 0.5;
+
+/**
+ * The youngest age a use may be scored at, in days. 0.01 d = 14.4 minutes.
+ *
+ * DERIVED, and load-bearing rather than a formality: `t^-d` diverges at `t = 0`, and consolidation
+ * runs at the end of the same turn that recorded the use, so the most recent use of every packed
+ * row really is seconds old when this is evaluated. The floor is therefore what sets the ceiling
+ * on one use's contribution - `0.01^-0.5` = 10 activation units, against 1.0 for a use one day old.
+ *
+ * The value is the median gap between two consecutive turns inside one session on this owner's
+ * corpus: 642 gaps across 42 sessions, median 14.53 min, Q1 3.30 min, Q3 67.77 min. Two uses in
+ * one session must not read as simultaneous, so the floor cannot exceed the median inter-turn gap;
+ * and nothing finer is measurable, because a use is recorded once per turn.
+ *
+ * WHAT WOULD CHANGE IT: a shift in that median. Note that the day-grain analysis of return
+ * intervals has NO evidence about this number in either direction - ages there are whole days, so
+ * every floor from 0.001 to 1.0 days gives bit-identical held-out AUC. This is derived from the
+ * session record and from nowhere else.
+ */
+export const MEMORY_USE_AGE_FLOOR_DAYS = 0.01;
+
+/**
+ * The three weights on the three z-scored activations.
+ *
+ * The signals: `use` is a use the harness did not watch fail, `fail` is one it did, and `cite` is
+ * a use the model reached for in its answer. So `use` and `fail` PARTITION the uses and `cite` is
+ * a subset of both - which is what makes the weights comparable at all, and is the shape the
+ * shipped formula did not have.
+ *
+ * `MEMORY_SALIENCE_FAIL_WEIGHT` is DERIVED: it equals the use weight exactly. The same event,
+ * graded the other way, has to move the score by the same magnitude in the other direction;
+ * anything else asserts that a success and a failure are different sizes of evidence, and nothing
+ * here measures that. It is what makes the term reinforcement rather than a discount - a row whose
+ * every use failed scores below a row that has never been used at all, because its successes are
+ * an empty sum AND it carries the whole of the negative one.
+ *
+ * WHAT THIS REPLACES: `- 0.30 * (neg_count / use_count)`. `neg_count`'s only writer also set
+ * `status = 'retracted'`, which no admission predicate admits, so the term was identically zero
+ * for every row recall could return - a row that failed ten uses out of ten scored +0.70, the
+ * highest salience in its workspace, against -0.70 for a row that had never failed. The evidence
+ * was never missing: `recordMemoryUse` has written `outcome='fail'` onto the use row all along and
+ * only the procedure-health gate read it. And 0.30 was a weight on a rate in [0,1] sitting beside
+ * two z-scores, so "more per unit than citation" was not a comparison that could be made. All
+ * three are now z-scores of the same construction and 0.50 > 0.20 says what it looks like.
+ *
+ * WHAT WOULD CHANGE 0.50 / 0.20: they were not measured. The two signals correlate at r = 0.9344
+ * on this owner's data, which is set nesting rather than redundancy, so equalising them is not the
+ * free correction it looks like. A corpus where citation and packing genuinely diverge, or a
+ * measurement of how often a cited row answers the question against how often a merely packed one
+ * does.
+ */
+export const MEMORY_SALIENCE_USE_WEIGHT = 0.5;
+export const MEMORY_SALIENCE_CITE_WEIGHT = 0.2;
+export const MEMORY_SALIENCE_FAIL_WEIGHT = MEMORY_SALIENCE_USE_WEIGHT;
+
+/* ------------------------------------------------------------------------ *
  * Dead ends
  *
  * A procedure is written when the harness watches an acceptance command pass, and nothing at all is

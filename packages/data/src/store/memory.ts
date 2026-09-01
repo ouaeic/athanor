@@ -8,6 +8,11 @@ import {
   MEMORY_PREDICATES,
   MEMORY_PROCEDURE_MIN_SUCCESS_RATE,
   MEMORY_PROCEDURE_STALE_DAYS,
+  MEMORY_SALIENCE_CITE_WEIGHT,
+  MEMORY_SALIENCE_FAIL_WEIGHT,
+  MEMORY_SALIENCE_USE_WEIGHT,
+  MEMORY_USE_AGE_FLOOR_DAYS,
+  MEMORY_USE_DECAY_EXPONENT,
   isFunctionalMemoryPredicate,
   isMemoryToken,
   memoryPredicate,
@@ -481,6 +486,11 @@ export interface MemoryConsolidationReport {
   salienceUpdated: number;
   itemsArchived: number;
   sourcesUnindexed: number;
+  /**
+   * Rows that left `mem.item_use` this pass - folded into `mem.item_use_fold`, not discarded. The
+   * name is kept because the bound it reports is the same one: how much of the per-use table the
+   * retention horizon took out. What those rows are worth to the ranking survives them.
+   */
   usesPruned: number;
   candidatesPruned: number;
   packsPruned: number;
@@ -1967,6 +1977,22 @@ export class MemoryStore {
     });
   }
 
+  /**
+   * Retraction is a status change, and `neg_count` is not negative reinforcement.
+   *
+   * The counter is incremented in the same statement that sets `status='retracted'`, and no
+   * admission predicate in `sql/memory.ts` admits `retracted` - so `neg_count > 0` has always
+   * implied the row is unreachable, and every row recall could return had `neg_count = 0`
+   * identically. The salience formula's `- 0.30 * (neg_count / use_count)` was therefore a weight
+   * on a term that had never once been nonzero for a retrievable row, and the row that failed ten
+   * of ten uses scored the HIGHEST salience in its workspace. Negative reinforcement now lives
+   * where the evidence is - `mem.item_use.outcome='fail'`, written by `recordMemoryUse` below at
+   * the production call site - and is weighted by `MEMORY_SALIENCE_FAIL_WEIGHT`.
+   *
+   * The column stays because the retraction record stays, and it is read by nothing: the `UPDATE`
+   * refuses a row that is already retracted, so it is a boolean spelled as a counter and
+   * `status='retracted'` says the same thing. It is not a place to add a signal to.
+   */
   async retractMemoryItem(workspaceId: string, id: string): Promise<boolean> {
     const result = await this.database.query(
       `UPDATE mem.item SET status='retracted', retired_at=NOW(), valid_to=COALESCE(valid_to,NOW()),
@@ -2332,37 +2358,104 @@ export class MemoryStore {
     const candidateRetentionDays = Math.trunc(options.candidateRetentionDays ?? 180);
     const statsRebuildDays = Math.trunc(options.statsRebuildDays ?? 30);
 
-    // Reliability and usage dominate retention decisions; "did this match the last query" is
-    // deliberately not an input, because it is exactly the signal that over-weights recency.
+    /*
+     * Salience: three power-law activations over the row's own use history, z-scored.
+     *
+     * `B = ln(1 + SUM_j max(age_days, floor)^-d)` per signal, exactly the ACT-R base-level
+     * activation `MEMORY_USE_DECAY_EXPONENT` documents, plus the closed-form contribution of
+     * whatever the retention fold has already taken out of `mem.item_use` (below). `s_use` and
+     * `s_fail` partition the uses on the outcome the harness watched, and `s_cite` is the subset
+     * the model reached for - so all three are the same construction on the same clock, which is
+     * what makes their weights comparable to each other.
+     *
+     * THE `+ 1` IS NOT A FUDGE. `SUM` is zero for a row that has never been used and `ln 0` has no
+     * value to rank, so one pseudo-use is added at the unit of the clock - one day, where
+     * `t^-d = 1` for any `d`. A never-used row therefore scores exactly 0 and every row with any
+     * history at all scores strictly above it: one use ten years ago is worth `ln(1.0166)`, which
+     * is small and is not zero. That is "further away, never gone" as an identity rather than as a
+     * floor constant, and it is what the previous `INTERVAL '90 days'` could not express.
+     *
+     * The z-score against the workspace's own moments is unchanged and is what stops a busy
+     * project inflating everything: a round that uses every row raises the mean by as much as it
+     * raises each row. It is also most of the answer to whether the clock should run on calendar
+     * days or on the owner's working days. Rescaling every age by a constant `c` multiplies every
+     * SUM by the same `c^-d`, which is an additive `-d ln c` on every `ln SUM` and which a z-score
+     * removes exactly; only the NON-uniform part of a working-day clock could change a ranking,
+     * and that part is measured on one owner whose duty cycle is 0.362 over 138 days. Calendar
+     * days, therefore, and no second table to maintain.
+     *
+     * "Did this match the last query" is still deliberately not an input: it is the signal that
+     * over-weights recency, and recency already has its own factor in `mem.prior`.
+     */
     const salience = await this.database.query(
-      `WITH usage AS (
+      `WITH clock AS (SELECT COALESCE($2::timestamptz,NOW()) AS t_now),
+       live AS (
          SELECT i.id, i.pin,
-                COALESCE(NULLIF(i.neg_count,0)::float8 / NULLIF(i.use_count,0), 0) AS neg_rate,
-                count(u.id) FILTER (
-                  WHERE u.used_at > COALESCE($2::timestamptz,NOW()) - INTERVAL '90 days'
-                )::float8 AS uses,
-                count(u.id) FILTER (
-                  WHERE u.cited
-                    AND u.used_at > COALESCE($2::timestamptz,NOW()) - INTERVAL '90 days'
-                )::float8 AS cites
-         FROM mem.item i LEFT JOIN mem.item_use u ON u.item_id=i.id
+                COALESCE(SUM(power(GREATEST(
+                  EXTRACT(EPOCH FROM c.t_now - u.used_at)::float8/86400.0, $3::float8), -$4::float8))
+                  FILTER (WHERE u.outcome <> 'fail'), 0) AS s_use,
+                COALESCE(SUM(power(GREATEST(
+                  EXTRACT(EPOCH FROM c.t_now - u.used_at)::float8/86400.0, $3::float8), -$4::float8))
+                  FILTER (WHERE u.cited), 0) AS s_cite,
+                COALESCE(SUM(power(GREATEST(
+                  EXTRACT(EPOCH FROM c.t_now - u.used_at)::float8/86400.0, $3::float8), -$4::float8))
+                  FILTER (WHERE u.outcome='fail'), 0) AS s_fail
+         FROM mem.item i
+         CROSS JOIN clock c
+         LEFT JOIN mem.item_use u ON u.item_id=i.id
          WHERE i.workspace_id=$1
-         GROUP BY i.id, i.pin, i.neg_count, i.use_count
+         GROUP BY i.id, i.pin
+       ),
+       usage AS (
+         SELECT l.id, l.pin,
+                ln(1 + l.s_use  + COALESCE((f.uses - f.fails) * f.unit, 0)) AS b_use,
+                ln(1 + l.s_cite + COALESCE(f.cites * f.unit, 0)) AS b_cite,
+                ln(1 + l.s_fail + COALESCE(f.fails * f.unit, 0)) AS b_fail
+         FROM live l
+         CROSS JOIN clock c
+         LEFT JOIN LATERAL (
+           -- The folded tail, evaluated from its span. One use somewhere in [a,b] is worth the
+           -- mean of t^-d over that span; n uses are worth n times it. Exact for a block whose
+           -- uses are uniform in their own window, and exact in the limit b -> a, which is the
+           -- branch below. Both ages are floored, so a clock behind the fold cannot diverge.
+           SELECT g.uses, g.cites, g.fails,
+                  CASE WHEN g.last_at > g.first_at THEN
+                    (power(GREATEST(EXTRACT(EPOCH FROM c.t_now - g.first_at)::float8/86400.0,
+                                    $3::float8), 1 - $4::float8)
+                     - power(GREATEST(EXTRACT(EPOCH FROM c.t_now - g.last_at)::float8/86400.0,
+                                      $3::float8), 1 - $4::float8))
+                    / ((1 - $4::float8)
+                       * EXTRACT(EPOCH FROM g.last_at - g.first_at)::float8/86400.0)
+                  ELSE
+                    power(GREATEST(EXTRACT(EPOCH FROM c.t_now - g.last_at)::float8/86400.0,
+                                   $3::float8), -$4::float8)
+                  END AS unit
+           FROM mem.item_use_fold g WHERE g.item_id = l.id
+         ) f ON TRUE
        ),
        moments AS (
-         SELECT AVG(uses) AS mu, COALESCE(STDDEV_POP(uses),0) AS su,
-                AVG(cites) AS mc, COALESCE(STDDEV_POP(cites),0) AS sc
+         SELECT AVG(b_use) AS mu, COALESCE(STDDEV_POP(b_use),0) AS su,
+                AVG(b_cite) AS mc, COALESCE(STDDEV_POP(b_cite),0) AS sc,
+                AVG(b_fail) AS mf, COALESCE(STDDEV_POP(b_fail),0) AS sf
          FROM usage
        )
        UPDATE mem.item SET salience =
-           0.50 * COALESCE((g.uses - m.mu) / NULLIF(m.su,0), 0)
-         + 0.20 * COALESCE((g.cites - m.mc) / NULLIF(m.sc,0), 0)
-         - 0.30 * g.neg_rate
+           $5::float8 * COALESCE((g.b_use  - m.mu) / NULLIF(m.su,0), 0)
+         + $6::float8 * COALESCE((g.b_cite - m.mc) / NULLIF(m.sc,0), 0)
+         - $7::float8 * COALESCE((g.b_fail - m.mf) / NULLIF(m.sf,0), 0)
          + CASE WHEN g.pin THEN 1.0 ELSE 0.0 END,
          updated_at=NOW()
        FROM usage g, moments m
        WHERE mem.item.id = g.id`,
-      [workspaceId, now]
+      [
+        workspaceId,
+        now,
+        MEMORY_USE_AGE_FLOOR_DAYS,
+        MEMORY_USE_DECAY_EXPONENT,
+        MEMORY_SALIENCE_USE_WEIGHT,
+        MEMORY_SALIENCE_CITE_WEIGHT,
+        MEMORY_SALIENCE_FAIL_WEIGHT
+      ]
     );
     // An episode lends part of its salience to what was extracted from it, so a fact from a
     // heavily used episode outranks an equally unused fact from a forgotten one.
@@ -2390,8 +2483,52 @@ export class MemoryStore {
       [workspaceId, now, archiveAfterDays]
     );
 
+    /*
+     * The use history past the retention horizon is FOLDED, not forgotten.
+     *
+     * This statement used to be `DELETE FROM mem.item_use ... WHERE used_at < horizon`, and while
+     * the score above it was a count inside a 90-day window that cost nothing: the rows it dropped
+     * had already scored zero for ninety days. A sum over every prior use cannot be taken against
+     * a table that forgets, so deleting the window and leaving this alone would have moved the
+     * cliff from day 90 to day 180 rather than removing it.
+     *
+     * What leaves the table arrives in `mem.item_use_fold` as a count and a span, from which the
+     * block's activation is recovered in closed form by the LATERAL above. The bound the delete
+     * existed for is kept - one row per item, however long the history - and it is now a bound on
+     * storage rather than on memory.
+     *
+     * ONE STATEMENT, not two in a transaction. Both halves read the same snapshot, so the INSERT
+     * sees exactly the rows the DELETE removes; a crash between an INSERT and a DELETE would have
+     * double-counted a block forever, and between a DELETE and an INSERT would have lost it. A
+     * data-modifying CTE is executed to completion whether or not the primary query reads it.
+     *
+     * `LEAST`/`GREATEST` on the span rather than assignment: a later night folds a newer block
+     * onto an older one, and the union's span is the union of the spans.
+     */
     const uses = await this.database.query(
-      `DELETE FROM mem.item_use
+      `WITH stale AS (
+         SELECT u.item_id,
+                count(*)::int AS uses,
+                count(*) FILTER (WHERE u.cited)::int AS cites,
+                count(*) FILTER (WHERE u.outcome='fail')::int AS fails,
+                min(u.used_at) AS first_at, max(u.used_at) AS last_at
+         FROM mem.item_use u
+         WHERE u.workspace_id=$1
+           AND u.used_at < COALESCE($2::timestamptz,NOW()) - make_interval(days => $3::int)
+         GROUP BY u.item_id
+       ),
+       folded AS (
+         INSERT INTO mem.item_use_fold(item_id,uses,cites,fails,first_at,last_at)
+         SELECT item_id,uses,cites,fails,first_at,last_at FROM stale
+         ON CONFLICT (item_id) DO UPDATE SET
+           uses  = mem.item_use_fold.uses  + EXCLUDED.uses,
+           cites = mem.item_use_fold.cites + EXCLUDED.cites,
+           fails = mem.item_use_fold.fails + EXCLUDED.fails,
+           first_at = LEAST(mem.item_use_fold.first_at, EXCLUDED.first_at),
+           last_at  = GREATEST(mem.item_use_fold.last_at, EXCLUDED.last_at)
+         RETURNING item_id
+       )
+       DELETE FROM mem.item_use
        WHERE workspace_id=$1
          AND used_at < COALESCE($2::timestamptz,NOW()) - make_interval(days => $3::int)`,
       [workspaceId, now, useRetentionDays]
@@ -2630,9 +2767,11 @@ export class MemoryStore {
        * cascade the database already performs, and the `dst_id` arm is the only thing standing
        * between a deleted row and a `supersedes` edge that still points at it by id.
        *
-       * The same asymmetry is why `mem.evidence` and `mem.item_use` need no statement here: both
-       * carry a real cascading foreign key to `mem.item`, so the row's evidence and its usage
-       * history go with it untouched. A future migration that ADDS the missing `dst_id` foreign key
+       * The same asymmetry is why `mem.evidence`, `mem.item_use` and `mem.item_use_fold` need no
+       * statement here: all three carry a real cascading foreign key to `mem.item`, so the row's
+       * evidence, its live uses and the folded tail of them go with it untouched - which is what
+       * makes "forget" still true of a history the retention pass has already compacted. A future
+       * migration that ADDS the missing `dst_id` foreign key
        * makes this whole statement redundant and no test will notice, because a redundant DELETE
        * and a necessary one look identical from the outside - the row is gone either way.
        */
