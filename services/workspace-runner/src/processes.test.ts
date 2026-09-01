@@ -30,7 +30,13 @@ const UNREACHABLE_FLUSH_GRACE_MS = TEST_TIMEOUT_MS * 10;
 const settledStatus = async (
   manager: ProcessManager,
   sessionId: string
-): Promise<{ status: string; exitCode?: number | null; stdout?: string; stderr?: string }> => {
+): Promise<{
+  status: string;
+  exitCode?: number | null;
+  signal?: string | null;
+  stdout?: string;
+  stderr?: string;
+}> => {
   await expect
     .poll(() => manager.action('workspace-1', 'task-1', sessionId, { action: 'poll' }).status, {
       interval: 10,
@@ -191,7 +197,6 @@ describe('background process manager', () => {
           limiter,
           limits: {
             memoryBytes: 1024 ** 3,
-            fileBytes: 2 * 1024 ** 3,
             processes: 512,
             openFiles: 2048
           }
@@ -200,6 +205,7 @@ describe('background process manager', () => {
       const finished = await settledStatus(manager, started.sessionId);
       expect(finished.status).toBe('completed');
       expect(finished.stdout).toContain(`--data=${1024 ** 3}`);
+      expect(finished.stdout).not.toContain('--fsize');
       expect(finished.stdout).toContain('--nproc=512');
       expect(finished.stdout).toContain('|done');
       manager.close();
@@ -558,6 +564,33 @@ describe('the host disk floor on the background path', () => {
     TEST_TIMEOUT_MS
   );
 
+  /*
+   * The same fifth stop as on the foreground path, and it matters more here: a background session
+   * is the one that runs long enough and large enough to be the thing the cgroup picks. Guarded on
+   * the status rather than on a flag, because the timeout, the disk floor and the owner's stop all
+   * move it away from 'running' before they kill, and all three of them kill with SIGKILL.
+   */
+  it('says so when a background session is killed outright', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
+    roots.push(root);
+    await mkdir(path.join(root, 'workspace'));
+    const manager = new ProcessManager();
+    const started = await manager.start(
+      root,
+      'workspace-1',
+      'task-1',
+      { executable: '/bin/sh', args: ['-c', 'kill -9 $$'], timeoutSeconds: 30 },
+      30,
+      false,
+      {}
+    );
+    const settled = await settledStatus(manager, started.sessionId);
+    expect(settled.status).toBe('failed');
+    expect(settled.signal).toBe('SIGKILL');
+    expect(settled.stderr).toContain('killed outright by the computer');
+    manager.close();
+  });
+
   it('leaves a background session on a healthy disk alone', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
     roots.push(root);
@@ -621,6 +654,131 @@ describe('the host disk floor on the background path', () => {
       expect(
         manager.action('workspace-1', 'task-1', started.sessionId, { action: 'poll' }).service
       ).toMatchObject({ state: 'crash_looped', restarts: 0 });
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+});
+
+/**
+ * What an agent can find out about a job it started, which is the difference between supervising
+ * six hours of work and starting it again.
+ */
+describe('watching a long background job', () => {
+  const managerRoot = async (): Promise<string> => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-longwork-'));
+    roots.push(root);
+    await mkdir(path.join(root, 'workspace'));
+    return root;
+  };
+
+  it(
+    'says which bound stopped it, in its own log',
+    async () => {
+      // `status: "timed_out"` beside an empty stderr was the whole report. This is the sentence the
+      // disk floor and the owner's stop have always written, for the stop that had none.
+      const root = await managerRoot();
+      const manager = new ProcessManager();
+      const started = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        { executable: '/bin/sh', args: ['-c', 'sleep 30'], timeoutSeconds: 1 },
+        1,
+        false
+      );
+      const settled = await settledStatus(manager, started.sessionId);
+      expect(settled.status).toBe('timed_out');
+      expect(settled.stderr).toContain('1s timeout');
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
+    'refuses a deadline this path could never honour rather than killing it part-way',
+    async () => {
+      const root = await managerRoot();
+      const manager = new ProcessManager();
+      await expect(
+        manager.start(
+          root,
+          'workspace-1',
+          'task-1',
+          { executable: process.execPath, args: ['-e', ''], timeoutSeconds: 200 },
+          30,
+          false
+        )
+      ).rejects.toThrow(/200s/);
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
+    'answers a poll with something that has moved since the last one',
+    async () => {
+      /*
+       * Every other field a poll returns is fixed for the life of the session, so polling a job
+       * that is quietly working - an alignment, a build, anything writing to a file rather than to
+       * a terminal - used to return a byte-identical answer every time. The turn guard reads
+       * repeated identical results as a model going in circles: measured against the production
+       * expression, pushback at the fourth poll and the turn stopped at the eighth. The agent was
+       * stopped for supervising a long job correctly, which is the one thing this primitive is for.
+       */
+      const root = await managerRoot();
+      const manager = new ProcessManager();
+      const started = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        { executable: '/bin/sh', args: ['-c', 'sleep 30'], timeoutSeconds: 30 },
+        30,
+        false
+      );
+      const first = manager.action('workspace-1', 'task-1', started.sessionId, { action: 'poll' });
+      await expect
+        .poll(
+          () =>
+            manager.action('workspace-1', 'task-1', started.sessionId, { action: 'poll' }).ranForMs,
+          { interval: 10, timeout: 5_000 }
+        )
+        .toBeGreaterThan(first.ranForMs);
+      manager.action('workspace-1', 'task-1', started.sessionId, { action: 'kill' });
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
+    'keeps the beginning of a long log as well as its end, and says what it dropped',
+    async () => {
+      /*
+       * This path kept the last N bytes and said nothing. The beginning of a six-hour run's log is
+       * where it states what it is about to do - the command line, the version banner, the first
+       * warning - so a single poll of a chatty job silently returned a log whose head the runner
+       * had already discarded, with no marker to say any of it was ever there. The foreground path
+       * has kept head, tail and a byte count since it was written; this is the same collector.
+       */
+      const root = await managerRoot();
+      const manager = new ProcessManager();
+      const started = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        {
+          executable: process.execPath,
+          args: ['-e', "process.stdout.write('BEGIN' + 'x'.repeat(12000) + 'END')"],
+          maxOutputBytes: 4096,
+          timeoutSeconds: 5
+        },
+        5,
+        false
+      );
+      const finished = await settledStatus(manager, started.sessionId);
+      expect(finished.stdout?.startsWith('BEGIN')).toBe(true);
+      expect(finished.stdout?.endsWith('END')).toBe(true);
+      expect(finished.stdout).toContain('bytes omitted from stdout');
       manager.close();
     },
     TEST_TIMEOUT_MS

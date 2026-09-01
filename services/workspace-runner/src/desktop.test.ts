@@ -97,7 +97,7 @@ const runnerConfig = (workspaceRoot: string, secret: string): RunnerConfig => ({
   MAX_EXECUTION_SECONDS: 30,
   RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
   IMAGE_CONVERT_EXECUTABLE: 'magick',
-  COMMAND_FILE_LIMIT_BYTES: 4 * 1024 ** 3,
+  MAX_BACKGROUND_SECONDS: 120,
   COMMAND_PROCESS_LIMIT: 1024,
   COMMAND_OPEN_FILE_LIMIT: 4096,
   MAX_FILE_BYTES: 1024 * 1024,

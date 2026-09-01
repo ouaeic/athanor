@@ -23,8 +23,16 @@ const requestSignal = (timeoutMs: number): AbortSignal => {
 };
 
 /**
- * A runner that stops answering must not hold one of the worker's few task slots forever. Tool calls
- * cap their own work at 3600 s, so these ceilings only trip when the runner itself is wedged.
+ * A runner that stops answering must not hold one of the worker's few task slots forever.
+ *
+ * This is the number `MAX_EXECUTION_SECONDS` is chosen to sit inside: a FOREGROUND command caps
+ * its own work at 3,600 s and this allows 3,900, so the ceiling only trips when the runner itself
+ * is wedged rather than when a command is merely slow. The two move together or not at all.
+ *
+ * A background command is not bounded by this and must not be read as if it were. Its request is
+ * the start call, which returns a session id in milliseconds; the job then runs for up to
+ * `MAX_BACKGROUND_SECONDS` - a day - with nothing held open here, and is read back through
+ * `process(poll)`. That difference is the whole reason the two ceilings are separate numbers.
  */
 const TOOL_REQUEST_TIMEOUT_MS = 3_900_000;
 const FILE_REQUEST_TIMEOUT_MS = 300_000;

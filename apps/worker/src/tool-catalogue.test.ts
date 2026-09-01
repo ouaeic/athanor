@@ -356,7 +356,50 @@ describe('the size of the catalogue the model is sent', () => {
     // The field carries no description of its own, on the same trade `code_search` made above: the
     // sentence naming it is in the tool description, and a second copy beside the field would pay
     // the wire twice for one fact.
-    expect(bytes).toBeLessThan(55_650);
+    //
+    // Then raised from 55,650 to 55,700 for long work, 73 bytes net across two fields on `shell`,
+    // and it is a capability by this test's own definition rather than a description that grew.
+    //
+    // 40 of it is `timeoutSeconds`, whose `maximum` went from 3,600 to 86,400. That number is what
+    // the model is allowed to ask for, so at 3,600 a six-hour alignment or a variant-calling run -
+    // the work the owner actually runs on this box - could not be spelled at all, on any path. The
+    // runner's own request schemas have accepted 86,400 since they were written and no caller could
+    // ever reach it: the declaration was strictly stricter than the enforcement, which is the worst
+    // of the two directions, because the box could do the thing and the schema forbade asking. What
+    // arrives with it is the one fact a model cannot get by trying - that the two paths now have
+    // two different ceilings, an hour in the foreground because a foreground command holds the turn
+    // and the worker's HTTP request open, a day in the background because it holds neither. Trying
+    // costs the run it was trying to make, which is the discovery test at its sharpest.
+    //
+    // 33 of it is `service`, and that half is a correction rather than an addition: it said
+    // "restarted if it dies", and `#serviceDied` in services/workspace-runner/src/processes.ts
+    // reads only how long the process ran and how many times it has failed, never its exit code.
+    // So a service that finishes successfully is restarted, for ever. With `background` capped at
+    // an hour, a model with a six-hour job to run and a sentence promising no timeout had exactly
+    // one place to put it, and the audit measured what happens there: a batch job that exited 0
+    // read `state: "restarting", restarts: 2` six seconds later. Raising the background ceiling is
+    // what removes the pressure; saying what a service does to a job that completes is what stops
+    // the wording from pointing at it. Measured at 55,673, up from 55,600, so the room this leaves
+    // is 27 bytes.
+    //
+    // Both sentences were written twice, and the second version is 65 bytes shorter for the same
+    // two facts. The first one passed every assertion in this file and still cost something:
+    // `evals/context-quality`'s `owner-unbounded` row went from 5 compactions that freed nothing to
+    // 6, because that ablation runs with the owner block unbounded and a longer resident prefix
+    // pushes one more compaction into a window with nothing left to give. Which is the argument
+    // this ceiling exists to force, arriving from outside it - the wire is not the only thing a
+    // description is charged to, and the rig is where the second charge shows up.
+    //
+    // Priced against the same headroom and DECLINED: a sentence on `shell` saying that every core
+    // and every byte of memory on this computer is the model's to use, and to read `nproc` and
+    // `free -g` before choosing a thread count. 143 bytes, and the audit rates the behaviour it
+    // buys as the largest single recovery of processing power available - a model picks `-t 4` on
+    // a sixteen-core box out of habit, and nothing anywhere tells it otherwise. It is still prose
+    // by this ceiling's rule, and worse, it is a per-box fact written as a constant: the same
+    // sentence would go to a two-core laptop and a ninety-six-core server. Its home is the runtime
+    // block in apps/worker/src/context.ts, which is already dynamic, already states the machine's
+    // storage, and costs this cached prefix nothing.
+    expect(bytes).toBeLessThan(55_700);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
     // union of what twenty-four actions across mail, calendar and repositories accept. Those are
@@ -697,7 +740,13 @@ describe('the wire a box without a browser or a screen is sent', () => {
      * so it is paid for here too. 43,950 against a measured 43,908, up from 43,748. The gap to the
      * provisioned wire is still exactly 11,692, because the same 160 bytes landed on both.
      */
-    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(43_950);
+    /*
+     * And again for long work, on exactly those terms: the two `shell` fields are 73 bytes, a bare
+     * box honours both in full - a six-hour background job wants neither a browser nor a screen -
+     * so they are paid for here too. 44,000 against a measured 43,981, up from 43,908. The gap to
+     * the provisioned wire is still exactly 11,692, because the same 73 bytes landed on both.
+     */
+    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(44_000);
     // The other direction, and the one that fails silently. A gate wired to nothing returns the
     // unconditional constant on every box; this is the assertion that would go red if it did.
     expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(
@@ -868,8 +917,10 @@ describe('the wire a box is sent about the services it has actually connected', 
     const mailAndCalendar = compacted(['imap', 'caldav']);
     // Raised by the same 160 bytes as the two ceilings above and for the same reason: the reach is
     // on every wire, because a box with a mailbox connected has the same stored results behind its
-    // memories as one without. 54,307 measured, up from 54,147.
-    expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(54_350);
+    // memories as one without. 54,307 measured, up from 54,147. Then by the same 73 as those two
+    // ceilings, on the same rule: `shell` is on every wire, so a box with a mailbox connected can
+    // start a six-hour background job exactly as one without can. 54,380 measured.
+    expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(54_400);
     // The other direction, and the one that fails silently. A gate wired to nothing returns the
     // unconditional catalogue on every box; this is the assertion that would go red if it did.
     expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(

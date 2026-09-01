@@ -3,10 +3,14 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { z } from 'zod';
 import {
+  boundedCollector,
   DISK_FLOOR_POLL_MS,
   HOST_DISK_FLOOR_NOTE,
+  KILLED_NOTE,
   prepareInvocation,
+  refuseUnreachableTimeout,
   stopProcessTree,
+  timedOutNote,
   type ExecutionGuards
 } from './execution.js';
 import { ensureWorkspace } from './files.js';
@@ -31,9 +35,16 @@ import { awaitChildExit, DEFAULT_FLUSH_GRACE_MS } from './subprocess.js';
 
 const BackgroundRequest = z.object({
   executable: z.string().min(1).max(4096),
-  args: z.array(z.string().max(100_000)).max(256).default([]),
+  /** 8,192 for the reason `ExecRequest` states: a per-contig scatter is thousands of arguments. */
+  args: z.array(z.string().max(100_000)).max(8_192).default([]),
   cwd: z.string().default('workspace'),
   env: z.record(z.string(), z.string()).default({}),
+  /*
+   * An hour by default and a day at the ceiling, which `MAX_BACKGROUND_SECONDS` now allows this
+   * schema to actually mean. The DEFAULT stays an hour on purpose: it is what a caller that names
+   * nothing gets, and a job with no stated deadline should not be able to hold a slot for a day by
+   * omission. A long job says how long it is, and now it can be believed.
+   */
   timeoutSeconds: z.number().int().positive().max(86_400).default(3_600),
   stdin: z.string().max(10_000_000).optional(),
   network: z.boolean().default(false),
@@ -60,9 +71,12 @@ interface Session {
   command: string[];
   child: ChildProcessWithoutNullStreams;
   status: Status;
-  stdout: Buffer;
-  stderr: Buffer;
-  maxOutputBytes: number;
+  /**
+   * Head, tail and a byte count, the same collector the foreground path uses. These were plain
+   * Buffers holding only the tail, which is the shape a long job is worst served by.
+   */
+  stdout: OutputCollector;
+  stderr: OutputCollector;
   startedAt: string;
   finishedAt?: string;
   exitCode?: number | null;
@@ -139,9 +153,11 @@ export const ownerStopNote = (stopped: number, services: string[]): string => {
   return `${ended} The declared service${services.length === 1 ? '' : 's'} ${named} ${services.length === 1 ? 'is' : 'are'} still running: a service is meant to outlive the task that started it, so stopping one is its own action.`;
 };
 
-const appendBounded = (current: Buffer, chunk: Buffer, limit: number): Buffer => {
-  const combined = Buffer.concat([current, chunk]);
-  return combined.length <= limit ? combined : combined.subarray(combined.length - limit);
+type OutputCollector = ReturnType<typeof boundedCollector>;
+
+/** A runner-written sentence about why this session stopped, on the session's own stderr. */
+const noteOnStderr = (session: Session, note: string): void => {
+  session.stderr.push(Buffer.from(`\n${note}`));
 };
 
 export class ProcessManager {
@@ -182,6 +198,10 @@ export class ProcessManager {
         isolateNetwork,
         guards
       });
+    // Below the service branch because a service has no deadline at all, so the ceiling is not its
+    // business. Everything else is answered before it starts rather than killed part-way through:
+    // see `refuseUnreachableTimeout`, which is where the argument for refusing over clamping is.
+    refuseUnreachableTimeout(value, maximumSeconds, true);
     const session = await this.#launch(workspaceRoot, workspaceId, owner, request, {
       maximumSeconds,
       isolateNetwork,
@@ -235,17 +255,25 @@ export class ProcessManager {
     const supervised = options.onSettled !== undefined;
     // A service has no deadline. That is the whole point of it: the hour was what made a link the
     // agent handed the owner stop answering by dinner.
+    const allowedSeconds = Math.min(
+      request.timeoutSeconds,
+      options.maximumSeconds ?? request.timeoutSeconds
+    );
     const timeout = supervised
       ? undefined
-      : setTimeout(
-          () => {
-            const session = this.#sessions.get(id);
-            if (!session || session.status !== 'running') return;
-            session.status = 'timed_out';
-            stopProcessTree(child);
-          },
-          Math.min(request.timeoutSeconds, options.maximumSeconds ?? request.timeoutSeconds) * 1_000
-        );
+      : setTimeout(() => {
+          const session = this.#sessions.get(id);
+          if (!session || session.status !== 'running') return;
+          session.status = 'timed_out';
+          // The deadline states itself in the log, exactly as the disk floor and the owner's stop
+          // do. This was the one stop on this path that left `status: "timed_out"` beside an empty
+          // stderr, which reads to a model like a job that died for no reason it can name.
+          noteOnStderr(
+            session,
+            timedOutNote(allowedSeconds, options.maximumSeconds ?? allowedSeconds, true)
+          );
+          stopProcessTree(child);
+        }, allowedSeconds * 1_000);
     timeout?.unref();
     const session: Session = {
       id,
@@ -254,9 +282,8 @@ export class ProcessManager {
       command: [request.executable, ...request.args],
       child,
       status: 'running',
-      stdout: Buffer.alloc(0),
-      stderr: Buffer.alloc(0),
-      maxOutputBytes: request.maxOutputBytes,
+      stdout: boundedCollector(request.maxOutputBytes),
+      stderr: boundedCollector(request.maxOutputBytes),
       startedAt: new Date().toISOString(),
       ...(timeout ? { timeout } : {})
     };
@@ -290,12 +317,8 @@ export class ProcessManager {
     }, guards.hostStoragePollMs ?? DISK_FLOOR_POLL_MS);
     diskFloor.unref();
     session.diskFloor = diskFloor;
-    child.stdout.on('data', (chunk: Buffer) => {
-      session.stdout = appendBounded(session.stdout, chunk, session.maxOutputBytes);
-    });
-    child.stderr.on('data', (chunk: Buffer) => {
-      session.stderr = appendBounded(session.stderr, chunk, session.maxOutputBytes);
-    });
+    child.stdout.on('data', (chunk: Buffer) => session.stdout.push(chunk));
+    child.stderr.on('data', (chunk: Buffer) => session.stderr.push(chunk));
     // Settled on the drained exit rather than on 'exit' itself. The poll that reads a terminal
     // status is also the poll that reads the log, and whatever was still sitting in the pipes when
     // the process ended is exactly the tail a job's result is in - so reporting `completed` before
@@ -304,6 +327,10 @@ export class ProcessManager {
     const settle = (status: Status, exitCode: number | null, signal: NodeJS.Signals | null) => {
       if (timeout) clearTimeout(timeout);
       clearInterval(diskFloor);
+      // The kernel's own stop, said here for the reason `KILLED_NOTE` gives - and guarded on the
+      // status rather than on a flag, because the three stops this class performs all set it away
+      // from 'running' before they kill, and all three of them kill with SIGKILL.
+      if (signal === 'SIGKILL' && session.status === 'running') noteOnStderr(session, KILLED_NOTE);
       session.exitCode = exitCode;
       session.signal = signal;
       session.finishedAt = new Date().toISOString();
@@ -360,11 +387,7 @@ export class ProcessManager {
       void supervised.registry.put(record);
     }
     session.status = 'stopped';
-    session.stderr = appendBounded(
-      session.stderr,
-      Buffer.from(`\n${HOST_DISK_FLOOR_NOTE}`),
-      session.maxOutputBytes
-    );
+    noteOnStderr(session, HOST_DISK_FLOOR_NOTE);
     this.#stop(session);
   }
 
@@ -756,11 +779,7 @@ export class ProcessManager {
       if (session.timeout) clearTimeout(session.timeout);
       if (session.diskFloor) clearInterval(session.diskFloor);
       session.status = 'stopped';
-      session.stderr = appendBounded(
-        session.stderr,
-        Buffer.from(`\n${OWNER_STOPPED_NOTE}`),
-        session.maxOutputBytes
-      );
+      noteOnStderr(session, OWNER_STOPPED_NOTE);
       this.#stop(session);
       stopped.push(id);
     }
@@ -771,13 +790,33 @@ export class ProcessManager {
     stopProcessTree(session.child);
   }
 
+  /**
+   * What a poll of this session says, and why two of these fields exist.
+   *
+   * `ranForMs` and `outputBytes` are here because a supervision loop was impossible without them.
+   * Every field above them is fixed for the life of the session, so polling a job that is quietly
+   * working - an alignment, a build, anything that writes to a file rather than to a terminal -
+   * returned a byte-identical answer every time. The turn guard reads repeated identical tool
+   * results as a model going in circles, and measured against the production expression it pushed
+   * back at the fourth poll and stopped the turn at the eighth: the agent was stopped for watching
+   * a six-hour job correctly, which is the one thing this primitive exists to let it do.
+   *
+   * Both advance, and they answer different questions. `ranForMs` says the job is still there;
+   * `outputBytes` counts everything the job has ever produced, including what the collector has
+   * dropped, so it distinguishes a job that is working silently from one that is progressing. They
+   * are measured, not stored: elapsed comes from the timestamps this session already carried, and
+   * the count from the collectors that already had it.
+   */
   #view(session: Session, includeLogs: boolean) {
     const supervised = this.#supervised.get(session.id);
+    const ranToMs = session.finishedAt ? Date.parse(session.finishedAt) : Date.now();
     return {
       sessionId: session.id,
       status: session.status,
       command: session.command,
       startedAt: session.startedAt,
+      ranForMs: Math.max(0, ranToMs - Date.parse(session.startedAt)),
+      outputBytes: session.stdout.bytes + session.stderr.bytes,
       ...(session.finishedAt ? { finishedAt: session.finishedAt } : {}),
       ...(session.exitCode !== undefined ? { exitCode: session.exitCode } : {}),
       ...(session.signal !== undefined ? { signal: session.signal } : {}),
@@ -786,7 +825,7 @@ export class ProcessManager {
       // this primitive exists to end. `service` is the durable record beside it.
       ...(supervised ? { service: serviceView(supervised.record) } : {}),
       ...(includeLogs
-        ? { stdout: session.stdout.toString('utf8'), stderr: session.stderr.toString('utf8') }
+        ? { stdout: session.stdout.text('stdout'), stderr: session.stderr.text('stderr') }
         : {})
     };
   }

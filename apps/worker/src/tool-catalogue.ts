@@ -589,9 +589,9 @@ export const agentTools: ModelTool[] = [
         timeoutSeconds: {
           type: 'integer',
           minimum: 1,
-          maximum: 3600,
+          maximum: 86_400,
           description:
-            'How long the command may run before it is stopped: five minutes by default in the foreground, an hour in the background. A service ignores this.'
+            'How long the command may run before it is stopped: 5 minutes by default and 1 hour at most in the foreground; 1 hour by default and up to 24 in the background. A service ignores this.'
         },
         background: {
           type: 'boolean',
@@ -602,7 +602,7 @@ export const agentTools: ModelTool[] = [
         service: {
           type: 'string',
           description:
-            'Name it and the computer keeps it running: no timeout, restarted if it dies, still there after a restart. For anything you hand the user a link to. Needs background=true; process(action=kill) stops it for good.'
+            'Name it and the computer keeps it running: no timeout, restarted whenever it exits, even successfully - so never for work meant to finish. For anything you hand the user a link to. Needs background=true; process(action=kill) stops it for good.'
         },
         stdin: { type: 'string' },
         maxOutputBytes: {

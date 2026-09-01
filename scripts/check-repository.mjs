@@ -411,6 +411,64 @@ say(
   `Configuration example: ${exampleValues.size} keys, ${declaredDefaults.size} comparable defaults across ${schemaSources.size} schemas.`
 );
 
+// --- the per-command memory ceiling inside the cgroup that surrounds it --------------------------
+
+/**
+ * One decision written in two files that cannot import each other, and the only pairing here where
+ * agreement is an inequality rather than equality.
+ *
+ * `defaultMemoryLimitBytes` is the RLIMIT_DATA one agent command gets. The systemd unit's
+ * `MemoryHigh` and `MemoryMax` are where the cgroup holding the runner and every command it
+ * started starts reclaiming and starts killing. The fraction has to lie strictly between them, and
+ * it is wrong in a different way on each side.
+ *
+ * At or below `MemoryHigh` it refuses what the unit deliberately allows: that file says in as many
+ * words that crossing the throttle should mean a heavy build finishes slowly instead of being
+ * killed, and a single large job - an assembler, an aligner - is the shape that wants to.
+ *
+ * At or above `MemoryMax` it can never fire at all, because the cgroup counts the runner too and
+ * therefore reaches any total first. That is not a wasted limit, it is a worse failure: the
+ * per-process stop makes an allocation fail, so the program reports it in its own words on the
+ * stderr the result carries, while the cgroup's stop is a SIGKILL with an empty stdout, an empty
+ * stderr and a null exit code. Losing the reachable one turns every single-process memory death
+ * into something indistinguishable from a segfault. It shipped that way for exactly one commit,
+ * at four fifths against a `MemoryMax` of 80%, which on the owner's box put the rlimit 2,457 bytes
+ * above the ceiling that would always beat it.
+ *
+ * Compared as percentages of an arbitrary total, because that is the only form the two sides share
+ * - the unit writes percentages and the source writes a fraction of whatever the host reports.
+ */
+{
+  const unit = read('infra/native/athanor-runner.service');
+  const percentage = (key) => Number(new RegExp(`^${key}=(\\d+)%$`, 'm').exec(unit)?.[1]);
+  const high = percentage('MemoryHigh');
+  const max = percentage('MemoryMax');
+  const source = read('services/workspace-runner/src/limits.ts');
+  const fraction =
+    /defaultMemoryLimitBytes = \(totalMemoryBytes: number\): number =>\s*Math\.max\(GIB, Math\.floor\(\(totalMemoryBytes \* (\d+)\) \/ (\d+)\)\);/.exec(
+      source
+    );
+  if (!Number.isFinite(high) || !Number.isFinite(max))
+    fail(
+      'infra/native/athanor-runner.service no longer states MemoryHigh and MemoryMax as percentages, so the per-command memory ceiling cannot be compared against them'
+    );
+  else if (!fraction)
+    fail(
+      'services/workspace-runner/src/limits.ts no longer spells defaultMemoryLimitBytes as a fraction of the host, so it cannot be compared against the cgroup in infra/native/athanor-runner.service'
+    );
+  else {
+    const percent = (Number(fraction[1]) / Number(fraction[2])) * 100;
+    if (percent <= high || percent >= max)
+      fail(
+        `the per-command memory ceiling in services/workspace-runner/src/limits.ts is ${percent}% of the host, which is not strictly between MemoryHigh=${high}% and MemoryMax=${max}% in infra/native/athanor-runner.service. At or below the throttle it refuses a large single job the cgroup was written to allow; at or above the kill it can never fire, and every single-process memory death becomes a SIGKILL with nothing on either stream`
+      );
+    else
+      say(
+        `Command memory ceiling: ${percent}% of the host, between MemoryHigh=${high}% and MemoryMax=${max}%.`
+      );
+  }
+}
+
 /**
  * Nothing this project publishes judges anybody else's software.
  *

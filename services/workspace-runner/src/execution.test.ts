@@ -369,7 +369,6 @@ describe('resource limits', () => {
           limiter,
           limits: {
             memoryBytes: 1024 ** 3,
-            fileBytes: 2 * 1024 ** 3,
             processes: 512,
             openFiles: 2048
           }
@@ -380,7 +379,9 @@ describe('resource limits', () => {
     expect(result.stdout).toBe('ran');
     const applied = await readFile(record, 'utf8');
     expect(applied).toContain(`--data=${1024 ** 3}`);
-    expect(applied).toContain(`--fsize=${2 * 1024 ** 3}`);
+    // No `--fsize`, pinned at the production call site rather than only on the helper that builds
+    // the argument list: this is where a per-file ceiling would actually reach a command.
+    expect(applied).not.toContain('--fsize');
     expect(applied).toContain('--nproc=512');
     expect(applied).toContain('--nofile=2048');
     expect(applied).toContain('--core=0');
@@ -393,7 +394,7 @@ describe('resource limits', () => {
       { executable: process.execPath, args: ['-e', "process.stdout.write('ran')"] },
       {
         maximumSeconds: 30,
-        guards: { limits: { memoryBytes: 1, fileBytes: 1, processes: 1, openFiles: 1 } }
+        guards: { limits: { memoryBytes: 1, processes: 1, openFiles: 1 } }
       }
     );
     expect(result.stdout).toBe('ran');
@@ -423,6 +424,49 @@ describe('resource limits', () => {
     expect(result.stoppedReason).toBe('host_disk_floor');
     expect(result.timedOut).toBe(false);
     expect(result.stderr).toContain('last of the host disk');
+  });
+
+  /*
+   * The fifth stop, which nothing in this process performs and which the memory ceiling made the
+   * likely one. A cgroup out-of-memory kill arrives as `exitCode: null`, `signal: "SIGKILL"` and
+   * two empty streams - byte-for-byte a segfault, and the two want opposite responses. Driven with
+   * a command that kills itself, because that is the same delivery the kernel uses and the only
+   * one reproducible without a cgroup.
+   */
+  it('says so when a command is killed outright rather than exiting', async () => {
+    const root = await workspaceRoot();
+    const result = await execute(
+      root,
+      { executable: '/bin/sh', args: ['-c', 'kill -9 $$'], timeoutSeconds: 30 },
+      { maximumSeconds: 30 }
+    );
+
+    expect(result.signal).toBe('SIGKILL');
+    expect(result.exitCode).toBeNull();
+    expect(result.timedOut).toBe(false);
+    expect(result.stderr).toContain('killed outright by the computer');
+    // The move that follows, which is the whole reason the sentence exists: the wrong one is to
+    // run the identical 64-way job again and be killed at the same point.
+    expect(result.stderr).toContain('fewer threads');
+  });
+
+  /*
+   * And not when this process was the one that killed it. All three stops it performs - the
+   * timeout, the owner's cancel and the disk floor - end in SIGKILL by way of `stopProcessTree`,
+   * so a note keyed on the signal alone would overwrite every one of their sentences with a guess
+   * about memory. This is the cancel, which is the one with no flag in the result to rule it out.
+   */
+  it('does not blame memory for a command the owner cancelled', async () => {
+    const root = await workspaceRoot();
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 50);
+    const result = await execute(
+      root,
+      { executable: '/bin/sh', args: ['-c', 'sleep 30'], timeoutSeconds: 30 },
+      { maximumSeconds: 30, abortSignal: controller.signal }
+    );
+
+    expect(result.stderr).not.toContain('killed outright by the computer');
   });
 
   it('leaves a healthy disk alone', async () => {
@@ -538,5 +582,98 @@ describe('a service declared without a background', () => {
         { maximumSeconds: 30 }
       )
     ).rejects.toThrow(/background/);
+  });
+});
+
+/**
+ * The wall clock, which was the bound that stopped the work this computer is for.
+ *
+ * Two ceilings rather than one, because the two paths cost different things: a foreground command
+ * holds the turn and an HTTP request in the worker open for its whole run, and a background one
+ * holds neither. The hour they used to share was a property of the first written onto the second.
+ */
+describe('the foreground time ceiling', () => {
+  it('says which bound stopped the command, on the command’s own stderr', async () => {
+    /*
+     * It said nothing. A run killed at its deadline came back as `timedOut: true` beside an empty
+     * stderr and a null exit code, which names neither the bound nor its size nor the fact that a
+     * longer run has somewhere else to go - so a model reading it cannot tell a deadline from a
+     * crash, and the cheapest wrong move is to start the whole six hours again. The disk floor and
+     * the owner's cancel have always said their piece here; this is the same sentence for the stop
+     * that had none.
+     */
+    const root = await workspaceRoot();
+    const result = await execute(
+      root,
+      { executable: '/bin/sh', args: ['-c', 'sleep 30'], timeoutSeconds: 1 },
+      { maximumSeconds: 1 }
+    );
+
+    expect(result.timedOut).toBe(true);
+    expect(result.stderr).toContain('1s timeout');
+    // The way out, named: this is the field that turns an hour into a day.
+    expect(result.stderr).toContain('background: true');
+  });
+
+  it('refuses a run it could never finish rather than killing it part-way', async () => {
+    // The enforcement is `Math.min(request.timeoutSeconds, maximumSeconds)`, and a clamp is silent
+    // by construction: asking for six hours and being killed at one reports exactly as asking for
+    // one. Refusing costs a round trip and names the field to change; clamping costs the hour.
+    const root = await workspaceRoot();
+    await expect(
+      execute(
+        root,
+        { executable: process.execPath, args: ['-e', ''], timeoutSeconds: 21_600 },
+        { maximumSeconds: 3_600 }
+      )
+    ).rejects.toThrow(/background: true/);
+  });
+
+  it('answers only for a timeout somebody actually asked for', async () => {
+    /*
+     * The other direction, and the one that would have broken every caller on this repository. The
+     * schema defaults `timeoutSeconds` to 300 and a host may be configured below that - every
+     * runner test here runs at 30 - so a refusal read from the PARSED request would refuse
+     * commands whose caller never named a timeout at all. Only a number somebody wrote is answered
+     * for; everything else is clamped to the ceiling and runs.
+     */
+    const root = await workspaceRoot();
+    const result = await execute(
+      root,
+      { executable: process.execPath, args: ['-e', "process.stdout.write('ran')"] },
+      { maximumSeconds: 30 }
+    );
+    expect(result.stdout).toBe('ran');
+  });
+});
+
+describe('the argument list', () => {
+  /*
+   * It was capped at 256, undeclared in the catalogue and refused with a raw schema failure. A
+   * `samtools merge` over three thousand per-contig shards is 3,002 arguments and an ordinary
+   * shape in the work this box exists for, so the cap refused a routine command and explained
+   * itself in machine noise. Nothing was protected by it: the real bound on an argument list is
+   * the kernel's ARG_MAX, and the body carrying it is bounded before this by Fastify's bodyLimit.
+   */
+  it('carries a scatter-gather’s worth of arguments', async () => {
+    const root = await workspaceRoot();
+    const args = ['-e', 'process.stdout.write(String(process.argv.length - 1))'];
+    for (let index = 0; index < 2_000; index += 1) args.push(`shard-${index}.bam`);
+    const result = await execute(
+      root,
+      { executable: process.execPath, args },
+      {
+        maximumSeconds: 30
+      }
+    );
+    expect(result.stdout).toBe('2000');
+  });
+
+  it('still has a ceiling, so an unbounded list is refused rather than handed to the kernel', async () => {
+    const root = await workspaceRoot();
+    const args = Array.from({ length: 8_193 }, (_, index) => `shard-${index}.bam`);
+    await expect(
+      execute(root, { executable: process.execPath, args }, { maximumSeconds: 30 })
+    ).rejects.toThrow();
   });
 });

@@ -45,7 +45,16 @@ import { awaitChildExit, killProcessTree } from './subprocess.js';
 export const ExecRequest = z
   .object({
     executable: z.string().min(1).max(4096),
-    args: z.array(z.string().max(100_000)).max(256).default([]),
+    /*
+     * CHOSEN at 8,192, which is a count no ordinary command approaches and a scatter-gather does.
+     * It was 256, undeclared in the catalogue and refused with a raw schema failure, so `samtools
+     * merge` over three thousand per-contig shards - 3,002 arguments, an ordinary shape in the
+     * work this box is for - could not be spelled at all. Nothing here was protecting anything:
+     * the real bound on an argument list is the kernel's own ARG_MAX, which reports E2BIG, and the
+     * body carrying them is bounded before this by Fastify's `bodyLimit`. What would change it: a
+     * host whose ARG_MAX is smaller than what this allows, which no Linux this runs on has.
+     */
+    args: z.array(z.string().max(100_000)).max(8_192).default([]),
     cwd: z.string().default('workspace'),
     env: z.record(z.string(), z.string()).default({}),
     timeoutSeconds: z.number().int().positive().max(86_400).default(300),
@@ -78,7 +87,16 @@ export const ExecRequest = z
       });
   });
 
-const boundedCollector = (limit: number) => {
+/**
+ * Head, tail and a count of what went between them.
+ *
+ * Exported because the background path needs exactly this and had its own copy that did not do it:
+ * `appendBounded` kept the last N bytes and said nothing, so one poll of a long analysis returned
+ * a log whose beginning - the command line, the version banner, the first warning, which is where
+ * a six-hour run says what it is about to do - had already been discarded, with no marker to say
+ * any of it was missing. A background job is the one that runs long enough to overflow this.
+ */
+export const boundedCollector = (limit: number) => {
   const headLimit = Math.floor(limit * 0.62);
   const tailLimit = limit - headLimit;
   const head: Buffer[] = [];
@@ -105,6 +123,10 @@ const boundedCollector = (limit: number) => {
       }
       const combined = Buffer.concat([tail, chunk]);
       tail = combined.subarray(Math.max(0, combined.length - tailLimit));
+    },
+    /** Everything this stream has produced, including what was dropped. Monotonic. */
+    get bytes() {
+      return totalBytes;
     },
     text(stream: string) {
       const beginning = Buffer.concat(head);
@@ -172,6 +194,56 @@ export const DISK_FLOOR_POLL_MS = 5_000;
  */
 export const HOST_DISK_FLOOR_NOTE =
   '[stopped: this command was using the last of the host disk, which the database and the rest of the computer also need]';
+
+/**
+ * The same sentence, for the other stop that was mute.
+ *
+ * Four things can end an agent command here, and until this existed only two of them said so. The
+ * disk floor and the owner's cancel each append their reason to the command's own stderr; a
+ * timeout appended nothing, so a six-hour job killed at its deadline came back as `timedOut: true`
+ * beside an empty stderr and an exit code of null - which names neither the bound that was hit,
+ * nor the number it was set to, nor the fact that a longer run has somewhere else to go. A model
+ * reading that has no way to tell a deadline from a crash, and the cheapest wrong move is to start
+ * the whole thing again.
+ *
+ * Both numbers, because they are different facts: what the caller asked for is what the model
+ * believes it set, and the ceiling is what the box actually allows. A run stopped at its own
+ * requested deadline should not be told to go and ask for more.
+ */
+export const timedOutNote = (
+  deadlineSeconds: number,
+  ceilingSeconds: number,
+  background: boolean
+) =>
+  `[stopped: this command hit its ${deadlineSeconds}s timeout and was killed. What it had already written to a file, or printed above, is all there is; work still in progress is gone. ${
+    deadlineSeconds >= ceilingSeconds
+      ? background
+        ? `${ceilingSeconds}s is this computer's ceiling for a background command; work that needs longer than that belongs in a service.`
+        : `${ceilingSeconds}s is this computer's ceiling for a command run in the foreground. Start a long job with background: true, which allows far longer, and watch it with process(poll).`
+      : 'Ask for a longer timeoutSeconds, or start it with background: true and watch it with process(poll), if the work genuinely needs it.'
+  }]`;
+
+/**
+ * The fifth stop, and the one this file did not know it had.
+ *
+ * Four stops were named above and the wave that named them created a fifth by moving a number: a
+ * command killed outright by the kernel. On a host with the unit file that is overwhelmingly the
+ * cgroup's out-of-memory kill, and it is the only stop here that no code in this process performs
+ * - nothing sets a flag, nothing appends a sentence, and what comes back is `exitCode: null`,
+ * `signal: "SIGKILL"` and two empty streams. That is byte-for-byte what a segfaulting binary looks
+ * like, and the two want opposite responses: a crash is worth reporting, a memory kill is worth
+ * retrying with fewer threads, and a model that cannot tell them apart re-runs the same 64-way job
+ * unchanged and is killed again at the same point.
+ *
+ * Hedged rather than asserted, because this signal is not proof of a cause: a script that runs
+ * `kill -9` on itself, or a host-level OOM killer choosing this process, arrives identically. It
+ * names the likely reason and the move that follows from it and claims nothing else.
+ *
+ * Only reached when none of the four flags is set, so a timeout, an owner's cancel and the disk
+ * floor - all three of which end in SIGKILL by way of `stopProcessTree` - keep their own sentences.
+ */
+export const KILLED_NOTE =
+  '[stopped: this command was killed outright by the computer rather than exiting on its own. Nothing it held in memory was written; files it had already finished writing are still there. On this box that is almost always the memory ceiling: run it again asking for less at once - fewer threads or parallel jobs, a smaller batch or chunk size, streaming instead of loading a whole file - rather than repeating it unchanged.]';
 
 export interface ExecutionGuards {
   limits?: CommandLimits | undefined;
@@ -568,6 +640,7 @@ const startGuardedChild = async (
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  cancelled: boolean;
   diskExhausted: boolean;
 }> => {
   const { abortSignal, guards } = options;
@@ -645,8 +718,39 @@ const startGuardedChild = async (
     stdout: output.text('stdout'),
     stderr: errors.text('stderr'),
     timedOut,
+    // Returned, not just held, because the note for a SIGKILL nobody here performed can only be
+    // written by ruling out the three this process does perform - and all three end in SIGKILL.
+    cancelled,
     diskExhausted
   };
+};
+
+/**
+ * Refuses a run that could never last as long as it just asked to.
+ *
+ * `Math.min(request.timeoutSeconds, maximumSeconds)` is the enforcement on both paths, and a clamp
+ * is silent by construction: a command asked for six hours, killed at one, reports the same shape
+ * as one that asked for an hour. Six hours of a genome pipeline die at the one-hour mark with
+ * nothing in the result naming either number. Refusing before anything starts costs the caller a
+ * round trip and tells it exactly which field to change; clamping costs it the hour.
+ *
+ * Read from the RAW request rather than the parsed one, deliberately. The schema defaults
+ * `timeoutSeconds`, and a host may be configured with a ceiling below that default - every runner
+ * test on this repository runs at 30 - so refusing the parsed value would refuse commands whose
+ * caller never named a timeout at all. Only a number somebody actually wrote is answered for.
+ */
+export const refuseUnreachableTimeout = (
+  value: unknown,
+  maximumSeconds: number,
+  background: boolean
+): void => {
+  const named = (value as { timeoutSeconds?: unknown } | null | undefined)?.timeoutSeconds;
+  if (typeof named !== 'number' || named <= maximumSeconds) return;
+  throw new Error(
+    background
+      ? `This computer stops a background command after ${maximumSeconds}s and you asked for ${named}s, so it would have been killed part-way through rather than run. Ask for ${maximumSeconds}s or less, or declare it as a service if it is meant to keep running.`
+      : `This computer stops a foreground command after ${maximumSeconds}s and you asked for ${named}s, so it would have been killed part-way through rather than run. Start it with background: true, which allows much longer, and watch it with process(poll).`
+  );
 };
 
 export const execute = async (
@@ -672,6 +776,7 @@ export const execute = async (
     guards = {}
   } = options;
   const request = ExecRequest.parse(value);
+  refuseUnreachableTimeout(value, maximumSeconds, false);
   const prepared = await prepareInvocation(workspaceRoot, request, {
     isolateNetwork,
     sandbox,
@@ -682,14 +787,23 @@ export const execute = async (
   // Started after the refusals, so a PATH resolution the caller never sees is not billed to the
   // command as time it spent running.
   const started = performance.now();
+  const allowedSeconds = Math.min(request.timeoutSeconds, maximumSeconds);
   const run = await startGuardedChild(workspaceRoot, prepared, {
     stdin: request.stdin,
     maxOutputBytes: request.maxOutputBytes,
-    timeoutMs: Math.min(request.timeoutSeconds, maximumSeconds) * 1_000,
+    timeoutMs: allowedSeconds * 1_000,
     abortSignal,
     guards
   });
-  const stderr = run.diskExhausted ? `${run.stderr}\n${HOST_DISK_FLOOR_NOTE}` : run.stderr;
+  // Every stop this path can perform now says which one it was, on the stream the result carries -
+  // and the fourth branch covers the one it does not perform, which is the kernel's.
+  const stderr = run.diskExhausted
+    ? `${run.stderr}\n${HOST_DISK_FLOOR_NOTE}`
+    : run.timedOut
+      ? `${run.stderr}\n${timedOutNote(allowedSeconds, maximumSeconds, false)}`
+      : !run.cancelled && run.signal === 'SIGKILL'
+        ? `${run.stderr}\n${KILLED_NOTE}`
+        : run.stderr;
   return {
     exitCode: run.exitCode,
     signal: run.signal,

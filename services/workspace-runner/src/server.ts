@@ -315,7 +315,23 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
   // The package helper travels with the guards so the background path can refuse a command that
   // names it. It used to be handed to `execute()` alone, at the exec route, which meant the value
   // existed here and never reached `processes.start`.
-  const guards = { limits, limiter, sandbox, systemPackageHelper: config.SYSTEM_PACKAGE_HELPER };
+  /*
+   * `hostStorage` is here because it was not, and the field it fills is the one guard this runner
+   * now leans on hardest. `RunnerServerOptions.hostStorage` says it is injected so the disk floor
+   * can be exercised without filling a filesystem; it reached the pre-flight write check and the
+   * checkpoints, and it did not reach the floor that polls WHILE a command runs on either
+   * execution path - so that floor had tests against `execute` and `ProcessManager` directly and
+   * no case at all through the routes that call them. Production was never wrong: both paths
+   * default to the real probe. What was missing was any way to prove it from the outside, and with
+   * the per-file rlimit gone this floor is the whole of what stops a runaway write.
+   */
+  const guards = {
+    limits,
+    limiter,
+    sandbox,
+    systemPackageHelper: config.SYSTEM_PACKAGE_HELPER,
+    hostStorage: probeHostStorage
+  };
   const reservedPorts = reservedPreviewPorts({
     ports: [config.RUNNER_PORT, ...config.RESERVED_PREVIEW_PORTS]
   });
@@ -668,7 +684,9 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
         request.params.workspaceId,
         request.capability.sub,
         request.body,
-        config.MAX_EXECUTION_SECONDS,
+        // The background ceiling, not the foreground one. This route held an HTTP request open for
+        // no part of the command's run and was capped at the same hour as the route that does.
+        config.MAX_BACKGROUND_SECONDS,
         request.capability.role === 'agent' && config.ISOLATE_AGENT_NETWORK,
         guards
       );

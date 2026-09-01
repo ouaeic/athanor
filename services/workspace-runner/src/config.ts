@@ -23,7 +23,27 @@ const Config = z.object({
   // where there is no second account to drop to - agent commands run as the runner's own user
   // and the runner says so rather than pretending otherwise.
   AGENT_SANDBOX_HELPER: z.string().optional(),
+  // The FOREGROUND ceiling, and the only one of the two that is about this process rather than
+  // about the work. A foreground command holds an HTTP request open in the worker for its whole
+  // run and blocks the turn behind it, so the hour here is chosen to sit just inside
+  // `TOOL_REQUEST_TIMEOUT_MS` in apps/worker/src/runner-client.ts, which is 3,900 s. What would
+  // change it: moving that number too, in the same commit. A run that wants longer than this does
+  // not want to be in the foreground at all, and `execute` says so by name rather than clamping.
   MAX_EXECUTION_SECONDS: z.coerce.number().int().positive().default(3600),
+  /*
+   * The BACKGROUND ceiling. Nothing holds a request open on that path - the start call returns a
+   * session id - so the hour it used to share with the foreground was never about a resource, and
+   * it was the number that made a six-hour alignment or a variant-calling run impossible to ask
+   * for. CHOSEN as a day, to agree exactly with the 86,400 the request schemas on both paths have
+   * always accepted and no caller could ever reach: a ceiling the declaration allows and the
+   * enforcement refuses is the worst of both, and this is the half that was wrong.
+   *
+   * A day rather than none at all because a background session with no deadline is a service, and
+   * a service is a different thing with its own record, its own restart policy and its own way for
+   * the owner to see it. What would change it: a job that legitimately runs longer than a day,
+   * which on this box is a reason to declare a service, not to raise this.
+   */
+  MAX_BACKGROUND_SECONDS: z.coerce.number().int().positive().default(86_400),
   // prlimit is part of util-linux, an essential package, so it is present on every stock
   // Debian and Ubuntu host without anything being installed for athanor's benefit.
   RESOURCE_LIMIT_EXECUTABLE: z.string().default('/usr/bin/prlimit'),
@@ -36,12 +56,10 @@ const Config = z.object({
   // Left unset the ceiling is derived from the host's own memory, because a number that suits a
   // 32 GiB server would be larger than the whole of a 2 GiB one.
   COMMAND_MEMORY_LIMIT_BYTES: z.coerce.number().int().positive().optional(),
-  // A single file this large is a dataset or a video; beyond it, it is a runaway write.
-  COMMAND_FILE_LIMIT_BYTES: z.coerce
-    .number()
-    .int()
-    .positive()
-    .default(4 * 1024 ** 3),
+  // There is deliberately no COMMAND_FILE_LIMIT_BYTES. It was 4 GiB, it was the first ceiling the
+  // owner's own work reached, and it killed mutely; limits.ts states why a per-file rlimit was the
+  // wrong instrument and what the host-disk floor covers instead. A host that still has the key in
+  // its runner.env is unaffected - unknown keys are stripped here - rather than refused a start.
   COMMAND_PROCESS_LIMIT: z.coerce.number().int().positive().default(1024),
   COMMAND_OPEN_FILE_LIMIT: z.coerce.number().int().positive().default(4096),
   MAX_FILE_BYTES: z.coerce
