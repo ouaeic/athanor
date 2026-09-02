@@ -24,6 +24,13 @@
  *
  * Lifted out of `AgentWorker.run()` unchanged; the five `continue`s became `'held'` and the one
  * `return` became `'completed'`, which is the whole of the edit.
+ *
+ * Two of the five read `state.mode`, and both clauses are commented where they sit. Hold 2 is
+ * skipped in plan mode because a plan of open steps is what that mode was asked for, and hold 4
+ * does not run the checks in plan mode because running them is the owner's build and test commands
+ * executing on the owner's computer, which is the one thing the mode promises does not happen.
+ * Holds 1, 3 and 5 are correct in both modes and are untouched: hold 3 in particular never fires in
+ * plan mode, because the turn changed nothing.
  */
 import type { ModelToolCall } from '@athanor/model-gateway';
 import type { TaskRecord } from '@athanor/data';
@@ -164,8 +171,20 @@ export const handleFinishCall = async (
    * own boilerplate. Measured on one research task: the answer was written, and six of the
    * ten model turns came after it, this hold among them. Nothing is lost by dropping it -
    * the outstanding steps still travel into the completion for the turn that resumes.
+   *
+   * And not in plan mode at all, where a plan of open steps is the deliverable rather than the
+   * shortfall. The hold's premise is that open steps mean unfinished work; in plan mode the owner
+   * asked for exactly the steps and for none of them to have been taken, so every plan-mode finish
+   * would pay one whole round trip to be told to say so. It is one round trip and not a
+   * correctness matter, which is why it is a separate clause from the acceptance one below rather
+   * than folded into it.
    */
-  if (outstanding.length && !state.planCoverageNagged && !state.planIsFallback) {
+  if (
+    outstanding.length &&
+    !state.planCoverageNagged &&
+    !state.planIsFallback &&
+    state.mode !== 'plan'
+  ) {
     state.planCoverageNagged = true;
     state.repairStep = true;
     state.messages.push({
@@ -253,7 +272,34 @@ export const handleFinishCall = async (
    * worth remembering was closed.
    */
   let deadEnds: MemoryDeadEndCheck[] = [];
-  if (state.acceptance) {
+  /*
+   * And not in plan mode, which is the one place in this file where the run itself is the defect.
+   *
+   * An acceptance suite is the owner's own build and test commands, executed by the harness through
+   * a direct exec on the owner's computer. `finish` is on the plan-mode permitted set - it is not
+   * mutating and it is checkpoint-exempt, so both basis sets admit it, and refusing the model any
+   * way to end a plan-mode turn would be worse than the run. So the tool stays permitted and the
+   * run is what stops here.
+   *
+   * The record reaches this line without a plan-mode turn declaring anything: `set_acceptance` is
+   * refused in plan mode, but `startTurnState` deliberately does not launder `acceptance`,
+   * `acceptanceTurn` or `acceptanceCaveat`, so a record an earlier act-mode turn declared is still
+   * on the state when the owner switches the conversation to plan and the model calls finish. None
+   * of the three holds ahead of this one stops it: the verification hold is bounded by
+   * MAX_FINISH_REJECTIONS, the plan-coverage hold above fires once and now not at all in plan mode,
+   * and the acceptance-declared hold needs `mutatedBeyondProse`, which a plan-mode turn never sets.
+   *
+   * This is dispatch.ts's own argument applied where it lands: `set_acceptance` is refused there
+   * because "declaring a record runs the harness's red baseline, which executes the owner's build
+   * or test command on the owner's computer", and this is where the same commands run without it.
+   *
+   * `acceptanceEvidence`, `verifiedCommands` and `deadEnds` are left at their empty initialisers on
+   * purpose rather than carried over from the earlier turn: a plan-mode turn changed nothing, so
+   * there is nothing for a check to have verified about it and no route for a dead end to record.
+   * The completion therefore carries no acceptance list and no verified commands, which is the
+   * honest report of a turn that ran no checks.
+   */
+  if (state.acceptance && state.mode !== 'plan') {
     // Carrying what athanor has already run, so a check naming a command it executed
     // itself after the last change is answered by that run rather than by a second build.
     const results = await deps.runAcceptanceChecks(

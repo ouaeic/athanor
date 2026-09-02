@@ -2560,19 +2560,27 @@ export function SelfHostedSettings({
                   : 'This app can tell you through the operating system when work finishes or needs you. Turning it on asks your system for permission, once, on the press.'
                 : pushState === 'checking'
                   ? 'Checking whether this device can be told.'
-                  : pushState === 'unsupported'
-                    ? 'This browser cannot receive push notifications.'
-                    : pushState === 'unregistered'
-                      ? // The default install: no browser will run a service worker for an origin
-                        // whose certificate it does not trust, and without one there is nothing to
-                        // deliver a notification to. This used to wait on a promise that never
-                        // settles, so the section sat on "checking" for ever with a dead button.
-                        'No browser accepts notifications from a server using a self-signed certificate. On the server: sudo athanor certificate enable --agree-tos --email you@example.com'
-                      : pushState === 'unavailable'
-                        ? 'The server has no push key configured, so notifications are off.'
-                        : pushState === 'denied'
-                          ? 'This browser blocked notifications. Allow them in site settings first.'
-                          : 'Tell me when a long task finishes or needs approval, even with athanor closed.'}
+                  : pushState === 'needs_install'
+                    ? // An iPhone or iPad in a Safari tab. It has no PushManager, exactly like the
+                      // arm below, but it is the one case in this chain where the owner is the
+                      // party who can fix it - and an installed athanor is the best notification
+                      // experience this product has on a phone. The button stays disabled; the
+                      // sentence is the whole repair. See `needsHomeScreenInstall` for why this is
+                      // a user-agent test and what it deliberately does not promise.
+                      'On iPhone, notifications work once athanor is on your Home Screen: press Share, then Add to Home Screen, and open it from there.'
+                    : pushState === 'unsupported'
+                      ? 'This browser cannot receive push notifications.'
+                      : pushState === 'unregistered'
+                        ? // The default install: no browser will run a service worker for an origin
+                          // whose certificate it does not trust, and without one there is nothing to
+                          // deliver a notification to. This used to wait on a promise that never
+                          // settles, so the section sat on "checking" for ever with a dead button.
+                          'No browser accepts notifications from a server using a self-signed certificate. On the server: sudo athanor certificate enable --agree-tos --email you@example.com'
+                        : pushState === 'unavailable'
+                          ? 'The server has no push key configured, so notifications are off.'
+                          : pushState === 'denied'
+                            ? 'This browser blocked notifications. Allow them in site settings first.'
+                            : 'Tell me when a long task finishes or needs approval, even with athanor closed.'}
             </span>
           </div>
         </div>
@@ -2618,9 +2626,18 @@ export function SelfHostedSettings({
           <button
             disabled={
               busy ||
-              ['checking', 'unsupported', 'unregistered', 'unavailable', 'denied'].includes(
-                pushState
-              )
+              // `needs_install` sits here beside `unsupported` because it is the same missing
+              // PushManager: pressing this would call `enableNotifications`, which returns the
+              // state it was already in without asking the browser anything. The difference
+              // between the two is the sentence above, not what the button can do.
+              [
+                'checking',
+                'unsupported',
+                'needs_install',
+                'unregistered',
+                'unavailable',
+                'denied'
+              ].includes(pushState)
             }
             onClick={() =>
               void act(async () => {

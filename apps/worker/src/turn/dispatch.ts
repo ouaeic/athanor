@@ -1,26 +1,29 @@
 /**
- * The batch of calls the model proposed, and the eight gates each one passes before it runs.
+ * The batch of calls the model proposed, and the nine gates each one passes before it runs.
  *
  * The gates are ordered by what a call that is answered instead of run leaves behind, and every one
- * of the eight is here because the alternative was observed:
+ * of the nine is here because the alternative was observed:
  *
  *   1. **the owner**, re-asked before *every* call rather than once before the batch. A model
  *      routinely proposes several actions at a time, and a single check meant a cancel landing
  *      after the first one still sent the email, published the artifact and fired the POST -
  *      minutes after the interface said the task had stopped;
- *   2. **the parallel run**, which is the only thing here that overlaps. Reads proposed together
+ *   2. **plan mode**, which answers anything outside the derived read-only fence with a sentence
+ *      saying what to do with the step instead. It is second because everything below it can start
+ *      a tool, the run at gate 3 included;
+ *   3. **the parallel run**, which is the only thing here that overlaps. Reads proposed together
  *      stop queueing behind each other; every decision around them stays exactly where it was, and
  *      the results are recorded strictly in the order the model declared them;
- *   3. **the repeat**, for the eight tools whose answer is a pure function of their arguments;
- *   4. **arguments that would not parse**, told apart from arguments cut off at the output cap,
+ *   4. **the repeat**, for the eight tools whose answer is a pure function of their arguments;
+ *   5. **arguments that would not parse**, told apart from arguments cut off at the output cap,
  *      because what to do about it differs and they used to be told apart by guesswork;
- *   5. **a plan the owner moved** under a call that was already proposed;
- *   6. the four tools the harness answers itself - `finish`, `compact_context`, `notify`, `ask` -
+ *   6. **a plan the owner moved** under a call that was already proposed;
+ *   7. the four tools the harness answers itself - `finish`, `compact_context`, `notify`, `ask` -
  *      plus `set_acceptance`;
- *   7. **the approval floor**, memoised per model response;
- *   8. and then the call runs.
+ *   8. **the approval floor**, memoised per model response;
+ *   9. and then the call runs.
  *
- * The idempotency key is registered at gate 5 and not at gate 3, which is two gates later than it
+ * The idempotency key is registered at gate 6 and not at gate 4, which is two gates later than it
  * used to be and is the whole of one repair: the owner edits the plan mid-step, three `file_read`s
  * are answered "replan before acting" - none of them ran - the agent replans and re-issues exactly
  * those three, which is what it was just told to do, and each comes back "which already ran this
@@ -38,6 +41,7 @@ import type { AgentApprovalRequirement } from '../approval-state.js';
 import { createApprovalFloorMemo, type ApprovalFloorMemo } from '../approval-floor.js';
 import { event } from '../tool-recording.js';
 import {
+  CHECKPOINT_EXEMPT_TOOLS,
   IDEMPOTENT_WITHIN_TURN,
   MAX_ARGUMENT_TRUNCATIONS,
   idempotentCallKey,
@@ -45,6 +49,7 @@ import {
   tombstoneMalformedCall
 } from '../turn-bounds.js';
 import { textValue } from '../values.js';
+import { isMutatingToolCall } from '../write-classification.js';
 import { declareAcceptance, type AcceptanceDeclarationDeps } from './acceptance-declaration.js';
 import { parkForApproval } from './approval-park.js';
 import type { TurnRun } from './claim.js';
@@ -52,6 +57,105 @@ import { executeApprovedCall } from './execute-call.js';
 import { handleFinishCall, type TurnFinishDeps } from './finish.js';
 import type { CompactContext, TurnLoopControl, TurnStepBudget } from './loop-context.js';
 import type { TurnResumeDeps } from './resume.js';
+
+/**
+ * What a turn may still do while the owner has not yet approved the approach.
+ *
+ * DERIVED, NOT LISTED, and that is the whole of why this set is trustworthy. The obvious shape is a
+ * blocklist of the tools that change things, and a blocklist protects the names somebody thought
+ * of: the quarantined specialist's read-only fence was a four-name blocklist for years, and
+ * `file_patch` - the one tool whose entire purpose is changing a file the specialist is told it
+ * cannot change - went straight through it with the whole worker suite green. A mode whose promise
+ * is "nothing changes" cannot be defended by a list that admits every tool added after it was
+ * written.
+ *
+ * So the basis is the same conjunction the specialist fence is derived from, of the two sets that
+ * containment property actually rests on, and both are consulted here rather than restated:
+ *
+ *  - `CHECKPOINT_EXEMPT_TOOLS`, which the harness already maintains under exactly the sentence this
+ *    mode needs - "tools that cannot change the computer, so a turn made only of these needs no undo
+ *    point" - and which already subtracts `REPEATABLE_TOOLS_THAT_WRITE`, because `make -s` and
+ *    `cargo check` were measured leaving `Cargo.lock`, `target/` and `tsconfig.tsbuildinfo` behind.
+ *    That subtraction is why `code_diagnostics` is refused here: a compiler writes.
+ *  - `isMutatingToolCall`, which takes out the one member of that set the checkpoint rule does not:
+ *    `set_acceptance` needs no undo point of its own, and declaring a record runs the harness's red
+ *    baseline, which executes the owner's build or test command on the owner's computer. Two
+ *    derivations disagreed about one name and the stricter one wins, which is the whole reason both
+ *    are read. dispatch.test.ts drove that disagreement out; nobody spotted it.
+ *
+ * A tool added to the catalogue tomorrow is refused here until somebody puts it in both, which is
+ * the fail-closed direction; the cost of being wrong the other way is one refused read and a
+ * sentence telling the model to plan instead.
+ *
+ * TWO ARE ADDED BY NAME, and each is added on a proof rather than on a judgement:
+ *
+ *  - `ask` is on neither set, because it is neither repeatable - a second buzz is a second buzz -
+ *    nor something a checkpoint could hold. It changes nothing on the computer (`NON_MUTATING_TOOLS`
+ *    in write-classification.ts says so and says why: "A question changes nothing on the computer or
+ *    outside it"), and it is the channel the mode exists to end at. A plan mode the agent cannot ask
+ *    a question from is a plan mode that guesses.
+ *  - `delegate` is admitted on a third proof, not on these two: every tool a specialist can reach is
+ *    itself inside the fence, and tool-catalogue.test.ts derives that from `isMutatingToolCall` and
+ *    `REPEATABLE_TOOLS` rather than asserting it. So a delegated mission is reading, done in another
+ *    window. The test below fails if that stops being true, which is the only thing keeping this
+ *    third proof honest.
+ *
+ * WHAT THIS REFUSES THAT A READER MIGHT NOT EXPECT, said plainly because a mode is judged on what it
+ * stops rather than on what it allows:
+ *
+ *  - EVERY `shell` call, `ls` included. `shell` is on neither set, deliberately - the catalogue test
+ *    records why - and the asymmetry in `isMutatingToolCall` runs the wrong way for this mode: it
+ *    treats an unrecognised executable with no script as a check, so a bare `deploy.sh` would be
+ *    read as reading. That asymmetry is right for the completion clock, where a mislabelled write
+ *    costs a second check; here it would let plan mode deploy. `files_list`, `file_read`,
+ *    `code_search` and `repo_overview` are the reads that stay.
+ *  - EVERY `browser_action`, navigation included. The approval floor already separates the harmless
+ *    verbs from the rest, and reusing that list would mean a second copy of it drifting from the
+ *    floor's. `read_elements` goes with it and not with the reads, which is the derivation being
+ *    taken at its word rather than a judgement. The two bases disagree about it and the set is
+ *    their conjunction, so the one that refuses decides: `isMutatingToolCall` does call it a read,
+ *    and the checkpoint rule never admitted it at all, because it is absent from
+ *    `REPEATABLE_TOOLS`. It is not added back by name either.
+ *    `browser_snapshot` is the page read that stays, on the page the browser is already on, and
+ *    `web_search` and `parallel_web_read` are how a plan-mode turn reads the web.
+ *  - `audio_read`, because it is billed by the minute and writes its transcript beside the recording;
+ *    `code_diagnostics`, because a compiler writes; and `set_acceptance`, because declaring a record
+ *    runs the red baseline. All three are caught by the two sets without anybody naming them, which
+ *    is the property this whole shape was chosen for.
+ *
+ * WHAT THIS DOES NOT DO. It does not stop the model spending the owner's money: `web_search`,
+ * `parallel_web_read`, `image_read`, `document_read` and `delegate` all cost tokens or requests, and
+ * a plan-mode turn burns its step budget like any other. Plan mode is a promise about the computer
+ * and about what leaves it, not a promise about the bill - the spend ceiling is the bound for that,
+ * and it is unchanged in both modes.
+ */
+export const PLAN_MODE_PERMITTED: ReadonlySet<string> = new Set([
+  ...[...CHECKPOINT_EXEMPT_TOOLS].filter((name) => !isMutatingToolCall(name)),
+  'ask',
+  'delegate'
+]);
+
+/**
+ * What the model is told when plan mode answers a call instead of running it.
+ *
+ * It says what to do with the step instead of only saying no, which is the difference between a
+ * refusal a model can act on and one it re-proposes: every other answered call in this file is
+ * worded that way, and the two that were not were measured costing a turn its whole step budget.
+ *
+ * It also says, in as many words, that leaving the mode is not the model's to do. That sentence is
+ * not the enforcement - the enforcement is that no tool on the wire writes `state.mode`, and
+ * dispatch.test.ts drives every name in the lead catalogue to show it - but a model that is refused
+ * without being told who can lift the refusal spends its steps looking for the lever.
+ *
+ * It says what the mode stops and NOT one word more, which is a correction rather than a style. It
+ * used to end "nothing that reaches outside", and four permitted tools reach outside:
+ * `web_search` and `parallel_web_read` read the web, `delegate` opens another window on it, and
+ * `notify` reaches the owner's phone. The cost of the wider claim is not pedantry - `notify` and
+ * `ask` are the two channels this mode leaves the model, and a model told that nothing reaches
+ * outside will not try the one of them that is not a hard stop.
+ */
+const planModeRefusal = (tool: string): string =>
+  `Plan mode: ${tool} was not run and nothing changed. The user has this conversation in plan mode, so only reading, searching and delegated research run - no commands, no writes, no browser or desktop actions, nothing that reaches out of this computer except reading the web and messaging the user. Work the whole approach out from what you can read, put it on the record with set_plan, and finish with the plan and with anything you would need from the user before starting. You cannot leave plan mode; only the user can, and they do it from the conversation.`;
 
 /** What dispatching a batch needs from the worker that owns it. */
 export interface TurnDispatchDeps {
@@ -161,6 +265,36 @@ export const dispatchToolCalls = async (
     // the interface said the task had stopped. honorUserControl seals the calls that never ran,
     // so the transcript stays answerable if the task is later resumed.
     if (await honorUserControl()) return 'returned';
+    /*
+     * Plan mode, in front of everything that can start a tool rather than in front of the floor.
+     *
+     * In front of the parallel run and not behind it, which is a placement and not a formality. The
+     * run below starts tools; a gate sitting after it would be relying on `PARALLEL_SAFE_TOOLS`
+     * being a subset of the permitted set to hold the promise, and that subset relation is true
+     * today, incidental, and written down nowhere either set can see. dispatch.test.ts asserts it
+     * anyway, so the redundancy is real rather than assumed - but the gate does not lean on it.
+     *
+     * Answered, not skipped silently: a tool call with no tool result is a malformed window the
+     * provider refuses on the next step, so this takes the same shape as every other gate that
+     * answers instead of running. It deliberately does NOT register an idempotency key - the key is
+     * registered four gates below, past everything that answers a call, and the repair that put it
+     * there is the one this refusal would otherwise re-break: a model told to replan and re-issue
+     * its reads must not find those reads retired for the turn.
+     *
+     * Absent mode is `act`, so an ordinary turn pays one comparison per call and nothing else.
+     */
+    if (state.mode === 'plan' && !PLAN_MODE_PERMITTED.has(call.name)) {
+      await deps.recordToolResult(
+        task,
+        key,
+        state,
+        call,
+        { skipped: true, reason: planModeRefusal(call.name) },
+        model,
+        catalog
+      );
+      continue;
+    }
     /*
      * Reads that were proposed together stop queueing behind each other.
      *

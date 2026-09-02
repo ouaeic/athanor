@@ -74,6 +74,7 @@ const FIELDS: ReadonlyArray<keyof AgentState> = [
   'notices',
   'takeoversRaised',
   'unattended',
+  'mode',
   'lastStepUsd',
   'spendWarnings',
   'checkpoint',
@@ -172,6 +173,7 @@ const FULL: Required<AgentState> = {
   notices: 2,
   takeoversRaised: ['example.com'],
   unattended: true,
+  mode: 'plan',
   lastStepUsd: 0.0412,
   spendWarnings: ['day:2026-08-25'],
   checkpoint: { turn: 3, id: '44444444-4444-4444-8444-444444444444' },
@@ -234,14 +236,14 @@ const FULL: Required<AgentState> = {
 describe('what a turn is carrying', () => {
   it('names every field the type declares, so a new one has to be classified', () => {
     expect(Object.keys(FULL).sort()).toEqual([...FIELDS].sort());
-    expect(FIELDS).toHaveLength(60);
+    expect(FIELDS).toHaveLength(61);
   });
 
   /**
    * The checkpoint path itself: `encryptJson(state, key, 'task-state:<id>')` written by `#checkpoint`
    * and read back by `run` through `decryptJson<AgentState>`. Asserted field by field rather than in
    * one `toEqual`, because the failure that matters names a field and a whole-object diff of a
-   * fifty-seven-field structure does not.
+   * sixty-one-field structure does not.
    */
   it('survives being sealed into a checkpoint and reopened', () => {
     const restored = decryptJson<AgentState>(encryptJson(FULL, key, aad), key, aad);
@@ -358,6 +360,9 @@ describe('what a new turn inherits', () => {
       'contextOverflowRepairs',
       'takeoversRaised',
       'unattended',
+      // Carried, and it is the one field in this list whose carrying is a promise to the owner
+      // rather than bookkeeping: plan mode ends when they end it, not when the turn does.
+      'mode',
       'lastStepUsd',
       'spendWarnings',
       'checkpoint',

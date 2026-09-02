@@ -181,6 +181,23 @@ const buildHarness = async (): Promise<Harness> => {
     },
     dispatch: async (minutesAgo) => {
       /*
+       * The previous run ends before the next occurrence comes due, which is what a box does and
+       * what this suite has to assume to be about the model at all.
+       *
+       * Without it the overlap policy in `dispatchOneDueSchedule` takes every occurrence after the
+       * first successful one - correctly: a run left `queued` forever is a run still in flight, and
+       * a schedule does not start a second copy of itself beside it. Two cases in this file then
+       * read `previous_run_active` where they expect a verdict about the model, which is the
+       * overlap policy working rather than the model logic failing. Measured: without these two
+       * statements, 'does not pause a schedule that failed once and then ran' and 'leaves a
+       * schedule alone while its model is available' both go red on `lastErrorCode`.
+       */
+      await database.query(
+        `UPDATE tasks SET status='completed', completed_at=NOW(), updated_at=NOW()
+         WHERE schedule_id=$1 AND status NOT IN ('completed','failed','cancelled')`,
+        [scheduleId]
+      );
+      /*
        * A distinct `scheduled_for` per run, because `task_schedule_runs` is keyed on
        * `(schedule_id, scheduled_for)` - two runs claiming the same instant would be one row, and
        * the streak this suite is about is counted over those rows.

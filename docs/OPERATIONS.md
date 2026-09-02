@@ -13,7 +13,8 @@ sudo athanor logs
 `doctor` checks root-only configuration, service state (including push delivery), API and PostgreSQL
 health, Nginx syntax, loopback-only private ports, served-certificate expiry, dynamic-DNS state,
 whether browser sign-in is possible at all, outbound agent connectivity, managed Chromium, the
-document toolchain, and disk headroom.
+document toolchain, backup age, whether the newest backup exists anywhere but on this disk, and disk
+headroom.
 
 Lines are prefixed `ok`, `note`, `warn`, or `fail`. Only `fail` makes the command exit non-zero.
 
@@ -48,7 +49,8 @@ single-use token and happens in Settings, because only the running server can re
 the run.
 
 Monitor host disk/RAM, systemd restarts, PostgreSQL health, and failed scheduled tasks; `doctor`
-reports backup age itself.
+reports backup age itself, and says `copied locally, not yet off-host` when a configured second copy
+did not get written.
 Do not put prompt or file bodies into observability.
 
 ## Install preflight
@@ -231,7 +233,40 @@ Mutating Athanor services pause under a restart trap. A backup contains:
 The configuration archive contains the keys required to decrypt the database; the workspace archive
 contains files, browser state, installed user-scoped tooling, and publisher logins. Package binaries
 are not duplicated into the archive: a clean restore validates `packages.txt` and reinstalls those
-packages from the host's own configured repositories. Encrypt backups and copy them off-host.
+packages from the host's own configured repositories.
+
+### An off-host copy
+
+Everything above lands in `/var/backups/athanor`, on the same disk as the data it is a copy of. That
+survives a mistake and it does not survive the disk, which is the commonest way a one-box server is
+lost outright. Name a second place, on a disk this one failing does not take:
+
+```bash
+sudo athanor backup destination /mnt/backup-disk --recipient /root/backup-key.pub
+sudo athanor backup destination show
+sudo athanor backup destination off
+```
+
+Every backup is then encrypted to that recipient with `gpg` and copied there, after the services are
+back, so the copy costs no downtime. A copy that fails does not fail the backup: the verified local
+copy is complete either way, and `sudo athanor doctor` says which of the two happened rather than
+reporting a green backup that exists in exactly one place.
+
+The recipient is not optional. `configuration.tar.gz` carries this server's data key and session
+signing key, so a copy of a backup is a copy of everything the product protects; the reason that is
+tolerable in `/var/backups` is that the disk it sits on already holds those keys, and a copy that
+leaves the machine has no such excuse. **Keep the private half of that key somewhere this computer is
+not.** Without it nobody can open the off-host copies, including you.
+
+The destination is a path this computer can already write to: a removable disk, a NAS mount, anything
+mounted. It does not speak ssh, rsync, S3 or any provider's API, and that is a decision rather than a
+gap - a credential on this box that can write to the destination can also delete what is already
+there, so a server that is broken into loses every copy at once. If that trade is wrong for you,
+`sudo athanor backup /path` has always written a copy wherever you say, and `cron` and `rsync` are
+yours to point at it.
+
+A destination on the same filesystem as `/var/backups/athanor` is refused when it is configured,
+rather than discovered to have been pointless after a disk failure.
 
 ## Restore
 
@@ -241,8 +276,63 @@ sudo athanor restore /path/to/backup --yes
 
 Restore accepts only the fixed backup filenames, verifies strict checksums and archive paths,
 reinstalls the recorded approved packages, replaces the current database, home, and identity
-configuration, fixes ownership, restarts services, and waits for API health. It is destructive by
-design: make a separate backup first and test fresh-host restore before relying on it.
+configuration, fixes ownership, restarts services, waits for API health, and refreshes the connection
+manifest and certificate names. It is destructive by design: make a separate backup first.
+
+To restore an off-host copy, decrypt it first with the private half of the key it was encrypted to,
+then restore the decrypted directory:
+
+```bash
+cd /mnt/backup-disk/20260901T030000Z
+for encrypted in *.gpg; do gpg --decrypt --output "${encrypted%.gpg}" "$encrypted"; done
+sudo athanor restore . --yes
+```
+
+`SHA256SUMS.encrypted` beside them lists the checksums of the encrypted files, so you can confirm the
+copy arrived whole without holding the key. `SHA256SUMS`, decrypted with the rest, is what the
+restore itself verifies.
+
+## Moving to a new computer
+
+The backup carries `/etc/athanor` verbatim, which is what has to happen: the data key, the session
+signing key and the pinned server identity all come back exactly, or the restored server cannot open
+its own database and no paired client trusts it. `PUBLIC_APP_URL`, `WEBAUTHN_ORIGIN` and
+`WEBAUTHN_RP_ID` come back with them - and on a different computer those three name the old one. Tell
+the restore that the computer has changed:
+
+```bash
+sudo athanor restore /path/to/backup --yes --new-host
+```
+
+Without a name of its own, that re-derives the origin from the address the new machine actually has,
+refreshes the connection manifest and the certificate's addresses, and restarts. If the domain
+followed the machine - the record already points at the new box - the name is kept rather than
+replaced by an address, because replacing it would throw away every browser passkey bound to it.
+
+With a name that does not point here yet, or a new one:
+
+```bash
+sudo athanor restore /path/to/backup --yes --hostname ai.example.com
+```
+
+The whole move, on a machine that has just been built:
+
+1. Run the one-command installer on the new machine - the exact line is in `docs/DEPLOYMENT.md`
+   under "One-command installation" - so it has PostgreSQL, Nginx, the units and the checkout.
+   Passing `ATHANOR_HOSTNAME` here is wasted: step 3 replaces the whole of `/etc/athanor` with the
+   backup's copy, so the name has to be set after the restore rather than before it.
+2. Copy the backup directory onto it, decrypting it first if it came from an off-host copy.
+3. `sudo athanor restore /path/to/backup --yes --new-host` - add `--hostname NAME` if this machine
+   should answer to a domain.
+4. `sudo athanor connect` for a ticket and QR carrying the new addresses. Paired clients hold the old
+   ones; the server identity survived in the backup, so they still trust this server and their
+   passkeys still work.
+5. A passkey made in a browser is bound to the origin it was made on. If the origin changed, add
+   those again from a client that still signs in.
+6. `sudo athanor doctor`.
+
+Nothing in step 3 is fatal after the data is back: a name that does not resolve yet from a machine
+plugged in ten minutes ago prints what to run and leaves the restored server serving.
 
 ## Update
 
@@ -318,6 +408,66 @@ system packages as root, the Avahi advertisement at `/etc/avahi/services/athanor
 `magick` compatibility command if the installer had to supply one. It preserves `/home/athanor`, `/etc/athanor`, PostgreSQL data,
 and backups. Removal of preserved data is a separate, explicit operator action.
 
+## Schedules that stop running
+
+Two bounds make a schedule go quiet on purpose. Both write a code the schedule row carries, so read
+`lastErrorCode` before assuming anything is broken.
+
+- **`previous_run_active`.** The occurrence was skipped because the schedule's own previous run had
+  not finished. A schedule does not run beside itself: before this policy, an interval watcher
+  slower than its own interval started a second copy, then a third, each holding a compute
+  reservation and each spending the provider account on the same instruction, with the row reading
+  healthy throughout. The skip retries five minutes later - the same defer delay `workspace_starting`
+  uses - and is not a failure. It is not fifteen seconds: the scheduler polls every
+  `SCHEDULER_POLL_MS`, which defaults to fifteen seconds, but a deferred schedule sets its own next
+  occurrence five minutes out, so a schedule carrying this code is waiting rather than stuck. It
+  becomes a failure only when the blocking run has been untouched for more than a day, at which
+  point the schedule is paused and an owner-visible notice is written on the conversation that is
+  blocking it. Finish or cancel that conversation and turn the schedule back on.
+- **Run now is refused rather than skipped.** The rule above is for a clock. An owner pressing Run
+  on a schedule whose previous run is still open is answered `409 previous_run_active` at the button,
+  naming the run that is in the way - not deferred, and not recorded as a failure on the row. The
+  owner is not exempted from the overlap policy, because an exemption is the same duplicate spend
+  the policy exists to prevent and the button gives no way to see that a run is already open. To
+  start a second run deliberately, end the first - open it and let it finish, or cancel it - and
+  press Run again. Pause and resume are not affected: pausing a schedule whose run is open is
+  exactly what an owner does about it.
+- **`model_unavailable`.** Three consecutive runs could not start because the model the schedule
+  names is no longer available. Choose another model - a schedule keeps the model it was created
+  with, so this means a new schedule - and turn it back on.
+
+## Inbound triggers
+
+A schedule may carry a webhook, which is the only way something other than the owner or a clock
+starts a turn on this box. `docs/HEADLESS.md` has the request shape. Operationally:
+
+- The URL is `POST /v1/hooks/<43-character segment>` and it is unauthenticated in the sense that it
+  carries no session and no bearer token. What authorises it is an HMAC-SHA256 signature over its
+  own timestamp and body, keyed with a per-schedule secret this box generated and keeps only sealed
+  under the workspace key. A request without a valid signature inside a five-minute window is
+  refused before anything is written.
+- **There is no way to recover a lost signing secret.** It is served once, in the reply that created
+  the schedule. Revoking one and rotating one are the same operation: delete the schedule and make
+  another.
+- Deliveries are rate-bounded twice. `minGapMinutes` - fifteen by default, the same floor
+  `interval` uses - bounds how often a trigger may start a run, and a burst inside one gap produces
+  one run that reads all of it. Sixty deliveries an hour and sixteen unread deliveries are the
+  bounds on rows and workspace files; past either, the sender is answered `429`.
+- Payloads land in `workspace/downloads/inbound/<scheduleId>/`, which is inside the download
+  quarantine, so an agent reading one is treated as having read untrusted content. **Nothing prunes
+  that directory.** A busy trigger grows the workspace over time; it is ordinary workspace storage
+  and is deleted like any other file.
+- `journalctl -u athanor@api | grep schedule.trigger_delivery` reports every delivery and its
+  outcome - `accepted`, `duplicate`, `rate_limited`, `too_many_pending` or `not_armed`. It records
+  no payload and no signature. The size of the backlog is not in the journal; it is in the `429`
+  the sender is answered with, which says how many deliveries are unread and how many bytes they
+  come to.
+- A trigger run's payload files are written into the workspace before the run is queued, and a
+  restart in between is finished by the maintenance sweep - which writes exactly the deliveries that
+  run's instruction already named, not whatever has arrived since. Grep the journal for
+  `schedule.dispatch_recovered` to see that sweep doing it. Deliveries that arrived while the box was
+  down are untouched and stay pending for the next occurrence.
+
 ## Incident priorities
 
 1. Stop access with the firewall or `sudo athanor stop`.
@@ -344,6 +494,24 @@ and backups. Removal of preserved data is a separate, explicit operator action.
   packaged desktop and mobile clients hold no push subscription and raise notices through the
   operating system themselves, so a phone that is quiet while a browser is not is a client-side
   permission rather than a server fault.
+- **A quiet iPhone:** check the phone before checking the box. Safari on iOS has no `PushManager`
+  in an ordinary tab, so there is nothing to subscribe and nothing the server can send to. The
+  repair is on the phone and takes one gesture: Share, then Add to Home Screen, then open athanor
+  from there. Settings says so on an iPhone rather than reporting the browser as incapable. Below
+  iOS 16.4 there is no Web Push even on the Home Screen, and there is no repair on that phone: the
+  packaged client holds no push subscription either and raises its notices from a poll inside the
+  page, which a suspended app does not run.
+- **Nothing reached the owner at all:** Web Push is the only transport this box has. Every
+  notification candidate is selected through a registered push subscription, so an owner with no
+  subscribed device is offered nothing, of any kind, however much is waiting for them. Three
+  ordinary situations produce that owner: an iPhone that was never added to the Home Screen, a
+  browser that refused a self-signed certificate and therefore runs no service worker, and a device
+  whose endpoint refused every notification for a day and was retired by the notifier, which
+  deletes the subscription. All three leave the standing record intact: what the agent raised is in
+  Settings and in each conversation, and `journalctl -u athanor@notifications` records a retirement
+  when one happens. None of them is reported to the owner by any channel that does not need the
+  device that has stopped working, and neither is a box that is down, because the notifier that
+  would say so is on it. A second transport is an open item, not a hidden claim.
 - **Changed address:** inspect `/.well-known/athanor`, timer state, mDNS, provider DNS, and firewall.
 - **Dynamic DNS stale:** run `sudo athanor ddns status`, which prints the last recorded provider
   error, then `sudo athanor ddns test` to force a publish and see the provider's answer.

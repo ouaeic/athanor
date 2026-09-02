@@ -239,6 +239,70 @@ you have.
 independent: `tool-opens`, `tool-opens 30`, `tool-opens --json` and `tool-opens 30 --json` are all
 accepted, and the day count defaults to 7 whether or not `--json` is given.
 
+## Starting a run from outside: the inbound trigger
+
+Everything above is a script this box's owner runs. The inbound trigger is the other direction -
+something that is not the owner and is not a clock starting a turn here - and it is the only one.
+
+A trigger is attached to a schedule when the schedule is created:
+
+```bash
+curl -sS -X POST "$ATHANOR_URL/v1/schedules" \
+  -H "authorization: Bearer $ATHANOR_TOKEN" -H 'content-type: application/json' \
+  -H "idempotency-key: $(uuidgen)" \
+  -d '{"workspaceId":"…","prompt":"Look at the build that just failed and say what broke it.",
+       "spec":{"kind":"weekly","timeZone":"UTC","localTime":"03:00","weekdays":[0]},
+       "trigger":{"kind":"webhook","minGapMinutes":15}}'
+```
+
+The reply carries two things that are never served again together: `triggerUrlPath`, the path a
+sender posts to, and `triggerSecret`, which is **shown once** and is not stored in plaintext
+anywhere on this box. `GET /v1/schedules` returns the path afterwards and never the secret. Losing
+it means deleting the schedule and making another, which is also how a leaked secret is revoked.
+
+A sender signs each delivery:
+
+```
+POST https://<your box>/v1/hooks/<triggerUrlPath segment>
+x-athanor-timestamp: <unix seconds>
+x-athanor-signature: v1=<hex HMAC-SHA256 of "v1:<timestamp>:" followed by the exact body bytes,
+                          keyed with triggerSecret>
+```
+
+Answers: `202` accepted and the schedule armed; `200` with `duplicate: true` for the same signed
+request arriving twice, which is what a publisher retrying on a timeout gets; `401` for a missing,
+wrong or stale signature; `413` over 64 KiB; `429` when the hour's allowance or the unread backlog
+is full; `404` for an address this box never minted.
+
+Four bounds are worth knowing before you point anything at it.
+
+- **The run is a scheduled run.** The delivery does not create a task; it moves the schedule's next
+  occurrence forward, and the dispatcher materialises the run through the same statement a clock
+  occurrence uses. The spend guard, the workspace's security mode, the compute reservation, the
+  approval floor and the three-strike pause therefore apply because it is the same code.
+- **`minGapMinutes` is the bound on money**, and it bounds model turns rather than requests: a
+  thousand deliveries inside one gap produce exactly one run, which reads all of them. Fifteen
+  minutes is the floor and the default, matching the shortest `interval` this software offers.
+- **The payload is untrusted content and is treated as such.** It is never put into the
+  instruction. It is written into `workspace/downloads/inbound/<scheduleId>/`, and the run is told
+  the file names. Reading those files taints the turn exactly as a downloaded web page does, so the
+  approval floor tightens around what the run does afterwards.
+- **A one-time schedule cannot carry a trigger.** It would answer one delivery and then be a dead
+  URL; the route refuses it with `trigger_needs_repeating_schedule`. `PATCH /v1/schedules/:id` gives
+  the same refusal for moving a schedule that already has a trigger onto a `once` spec, so the dead
+  URL is not reachable in two calls either.
+
+Two more things a script driving this API should expect:
+
+- **Every schedule reply carries `trigger` and `triggerUrlPath`**, and `null` means there is no
+  trigger. That is `GET /v1/schedules`, the create reply, `PATCH /v1/schedules/:id` and
+  `POST /v1/schedules/:id/{pause,resume,run}`. Absent would have been a third answer; there is no
+  reply that omits them, so a client may refresh its row from any of these without losing the URL.
+  `triggerSecret` is on the create reply alone.
+- **`POST /v1/schedules/:id/run` is refused with `409 previous_run_active`** when that schedule
+  already has a run that has not finished. It is not deferred and it does not record a failure: an
+  owner asking for a run gets a run or a sentence. Finish or cancel the open run and ask again.
+
 ## What this does not do
 
 - It does not mint tokens, rotate them, or check the permissions on the file it reads one from.

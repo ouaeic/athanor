@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -10,18 +11,8 @@ import type { RunnerConfig } from './config.js';
 import { DesktopManager } from './desktop.js';
 import { ensureWorkspace } from './files.js';
 import { DesktopControl } from './holder.js';
-import { agentHome } from './execution.js';
+import { agentHome, hostSearchPath } from './execution.js';
 import { buildServer } from './server.js';
-
-/**
- * The host's own copy of a binary, or nothing. The runner resolves executables on the search path a
- * server would have, which is not this machine's, so a test that needs a real encoder has to put one
- * where that path already looks rather than assume the host layout.
- */
-const binaryOnPath = async (name: string): Promise<string | null> => {
-  const found = spawnSync('sh', ['-c', `command -v ${name}`], { encoding: 'utf8' });
-  return found.status === 0 ? found.stdout.trim() : null;
-};
 
 describe('a preview whose app is not running', () => {
   const disposers: Array<() => Promise<void>> = [];
@@ -661,13 +652,25 @@ describe('file organisation and toolchain routes', () => {
 
   it('says which second range it prepared, on the response that carries the bytes', async () => {
     const { app, id, root, token } = await harness();
-    const ffmpeg = await binaryOnPath('ffmpeg');
-    const ffprobe = await binaryOnPath('ffprobe');
+    /*
+     * Resolved against the HOST list, and not against the agent's, because that is what the route
+     * now does. This case used to symlink the host's ffmpeg into the agent tool directory - index 0
+     * of `agentSearchPath` - and that stopped working the day `prepareAudio` moved onto
+     * `hostSearchPath` so an agent-written file could not decide which binary the runner spawns as
+     * itself. The symlink was the test standing in the place the fix exists to close.
+     *
+     * The consequence, stated because it is a real loss: this case now skips on a machine whose
+     * ffmpeg is outside the six system directories - a Homebrew laptop - and runs on a provisioned
+     * Linux box, where the installer puts it in /usr/bin.
+     */
+    const onHostPath = (name: string): string | undefined =>
+      hostSearchPath
+        .split(path.delimiter)
+        .map((directory) => path.join(directory, name))
+        .find((candidate) => existsSync(candidate));
+    const ffmpeg = onHostPath('ffmpeg');
+    const ffprobe = onHostPath('ffprobe');
     if (!ffmpeg || !ffprobe) return;
-    const bin = path.join(root, 'workspace', '.athanor', 'tools', 'node_modules', '.bin');
-    await mkdir(bin, { recursive: true });
-    await symlink(ffmpeg, path.join(bin, 'ffmpeg'));
-    await symlink(ffprobe, path.join(bin, 'ffprobe'));
     spawnSync(ffmpeg, [
       '-v',
       'error',

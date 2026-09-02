@@ -18,6 +18,11 @@ home="$test_root/home"
 backups="$test_root/backups"
 command_log="$test_root/commands.log"
 worker_busy="$test_root/worker-busy"
+# Stands in for the PostgreSQL cluster; see the `runuser` fixture below for what that does and
+# does not prove.
+database_file="$test_root/database"
+off_host="$test_root/off-host"
+recipient_key="$test_root/backup-recipient.pub"
 mkdir -p "$seed/scripts" "$seed/infra/native" "$seed/packages/data/src" \
   "$fake_bin" "$config" "$state" "$home" "$backups"
 
@@ -93,9 +98,24 @@ cp "$1" "$2"
 chmod "$mode" "$2"'
 make_fake sha256sum '
 exec /usr/bin/shasum -a 256 "$@"'
+# The database, as one file this drill can read and write, so that a restore proves something.
+#
+# `pg_dump` used to print a literal string and `pg_restore` was silence, so the whole database half
+# of a backup was unpinned: a dump written to the wrong path, read before the drop instead of after
+# it, or never read at all would have passed every case below with the same "ok". A backup nobody
+# has restored is a hope, and this tree's own doctrine is that a check nobody watched fire is not a
+# check. The stand-in is a single file: the dump is a copy of it, dropdb and createdb empty it, and
+# pg_restore fills it from whatever it is fed on standard input.
+#
+# What that pins is the WIRING of the round trip - which file is written, which is read, and that
+# the drop happens before the read. It pins nothing whatever about PostgreSQL: custom-format dumps,
+# large objects, extensions and role grants are not in it and are not claimed. Proving those needs
+# a real cluster, which is a separate rig and not this one.
 make_fake runuser '
 case "$*" in
-  *"pg_dump"*) printf "synthetic-database\n" ;;
+  *"pg_dump"*) cat "$ATHANOR_TEST_DATABASE" ;;
+  *"pg_restore"*) cat >"$ATHANOR_TEST_DATABASE" ;;
+  *"dropdb"*|*"createdb"*) : >"$ATHANOR_TEST_DATABASE" ;;
   *"schema_migrations"*)
     if [ -f "$ATHANOR_TEST_CHECKOUT/FAIL_MIGRATION" ]; then printf "6\n"; else printf "7\n"; fi
     ;;
@@ -179,6 +199,7 @@ printf 'postgres://athanor:synthetic-password@127.0.0.1:5432/athanor\n' |
   sed 's|^|DATABASE_URL=|' >"$config/control.env"
 printf 'runner=true\n' >"$config/runner.env"
 printf 'data-before-update\n' >"$home/persistent.txt"
+printf 'database-before-update\n' >"$database_file"
 
 # The installer's database-password reuse, read out of the installer itself.
 #
@@ -289,6 +310,8 @@ run_athanor() {
     ATHANOR_BACKUP_KEEP="${ATHANOR_TEST_BACKUP_KEEP:-5}" \
     ATHANOR_BACKUP_IDLE_WAIT_SECONDS="${ATHANOR_TEST_BACKUP_IDLE_WAIT:-0}" \
     ATHANOR_TEST_WORKER_BUSY="$worker_busy" \
+    ATHANOR_TEST_DATABASE="$database_file" \
+    ATHANOR_TEST_OFF_HOST="$off_host" \
     ATHANOR_READY_TIMEOUT_SECONDS=3 \
     ATHANOR_RUNTIME_PREFIX="$runtime" \
     "$checkout/scripts/athanor" "$@"
@@ -676,6 +699,337 @@ printf 'ok  a restore that would not fit refuses before it stops or wipes anythi
 run_athanor restore "$recovery_backup" --yes >/dev/null 2>&1
 test "$(cat "$home/persistent.txt")" = "data-worth-recovering"
 printf 'ok  a restore that fits still restores\n'
+
+# The database half of that restore, which nothing used to look at.
+#
+# Everything above proves the workspace tree comes back. The database was a literal string printed
+# by a stand-in and swallowed by another, so the archive's dump could have been written from
+# nowhere, read in the wrong order, or never read, and every case still said ok. Here the row goes
+# in, a backup is taken, the row changes, the restore runs, and the row is read back out.
+printf 'row-worth-recovering\n' >"$database_file"
+printf 'files-worth-recovering\n' >"$home/persistent.txt"
+sleep 1
+run_athanor backup >/dev/null 2>&1
+database_backup=$(
+  find "$backups" -mindepth 1 -maxdepth 1 -type d -name '????????T??????Z' | sort -r | sed -n '1p'
+)
+# What went into the archive is the database as it stood, rather than something written once.
+test "$(cat "$database_backup/database.dump")" = "row-worth-recovering"
+printf 'row-written-since\n' >"$database_file"
+printf 'files-written-since\n' >"$home/persistent.txt"
+run_athanor restore "$database_backup" --yes >/dev/null 2>&1
+test "$(cat "$database_file")" = "row-worth-recovering"
+test "$(cat "$home/persistent.txt")" = "files-worth-recovering"
+printf 'ok  a restore puts the database back, not only the files\n'
+
+# Moving to a new computer, which was not merely undrilled but mechanically broken.
+#
+# A backup carries /etc/athanor verbatim, which is what has to happen: the data key, the session
+# key and the pinned server identity all come back exactly or the box cannot open its own database.
+# PUBLIC_APP_URL, WEBAUTHN_ORIGIN and WEBAUTHN_RP_ID came back with them, so a restored box served
+# an origin nobody could reach and scoped browser sign-in to an address it no longer had. Nothing
+# failed anywhere; the box simply could not be opened. `rollback` has called
+# athanor-network-refresh since the day it was written and `restore` never did.
+#
+# The two fixtures are the whole of "what computer is this": the addresses `ip` reports, and what
+# the resolver says the old origin's name points at.
+make_fake ip '
+case "$*" in
+  *-6*) exit 0 ;;
+esac
+printf "2: eth0    inet %s/24 brd 203.0.113.255 scope global eth0\n" "$ATHANOR_TEST_HOST_ADDRESS"'
+make_fake getent '
+if [ "${1:-}" = ahosts ] && [ "${2:-}" = "$ATHANOR_TEST_RESOLVES_TO_HERE" ]; then
+  printf "%s STREAM %s\n" "$ATHANOR_TEST_HOST_ADDRESS" "$2"
+  exit 0
+fi
+exit 2'
+network_refresh_binary="$runtime/usr/local/lib/athanor/athanor-network-refresh"
+printf '#!/bin/sh\nprintf "network refresh\\n" >>"$ATHANOR_TEST_COMMAND_LOG"\n' \
+  >"$network_refresh_binary"
+chmod 0755 "$network_refresh_binary"
+
+run_new_host() {
+  ATHANOR_TEST_HOST_ADDRESS="${ATHANOR_TEST_HOST_ADDRESS:-203.0.113.9}" \
+    ATHANOR_TEST_RESOLVES_TO_HERE="${ATHANOR_TEST_RESOLVES_TO_HERE:-nothing.invalid}" \
+    run_athanor "$@"
+}
+
+# Replaces in place rather than appending, because the script under test replaces in place: a
+# second PUBLIC_APP_URL line further down the file is one nothing reads, so a fixture that appends
+# would be asserting against a line no production caller ever sees.
+set_config_value() {
+  awk -v key="$1" -v value="$2" '
+    index($0, key "=") == 1 { if (!replaced) print key "=" value; replaced = 1; next }
+    { print }
+    END { if (!replaced) print key "=" value }
+  ' "$config/control.env" >"$test_root/control.env.next"
+  mv "$test_root/control.env.next" "$config/control.env"
+}
+
+# The old machine's configuration, as a backup taken there carries it.
+set_config_value PUBLIC_APP_URL https://old-box.example
+set_config_value PREVIEW_BASE_URL https://old-box.example/__athanor/preview
+set_config_value PUBLIC_RUNNER_URL wss://old-box.example/runner
+set_config_value WEBAUTHN_RP_ID old-box.example
+set_config_value WEBAUTHN_ORIGIN https://old-box.example
+sleep 1
+run_athanor backup >/dev/null 2>&1
+new_host_backup=$(
+  find "$backups" -mindepth 1 -maxdepth 1 -type d -name '????????T??????Z' | sort -r | sed -n '1p'
+)
+
+# The counter-direction first, because it is the one a fix here could break: restoring onto the
+# same computer must put the configuration back exactly as it was and change nothing about it.
+: >"$command_log"
+run_new_host restore "$new_host_backup" --yes >/dev/null 2>&1
+test "$(sed -n 's/^PUBLIC_APP_URL=//p' "$config/control.env" | sed -n '1p')" = "https://old-box.example"
+test "$(sed -n 's/^WEBAUTHN_RP_ID=//p' "$config/control.env" | sed -n '1p')" = "old-box.example"
+grep -q 'network refresh' "$command_log"
+printf 'ok  a plain restore puts the configuration back untouched, and refreshes the network\n'
+
+# And on a new computer the old name no longer points at, the origin is re-derived from the
+# address this machine actually has. All five settings move together: an origin that disagrees
+# with the WebAuthn relying party is a page no browser will create a passkey on.
+: >"$command_log"
+new_host_output=$(run_new_host restore "$new_host_backup" --yes --new-host 2>&1)
+test "$(sed -n 's/^PUBLIC_APP_URL=//p' "$config/control.env" | sed -n '1p')" = "https://203.0.113.9"
+test "$(sed -n 's/^WEBAUTHN_ORIGIN=//p' "$config/control.env" | sed -n '1p')" = "https://203.0.113.9"
+test "$(sed -n 's/^WEBAUTHN_RP_ID=//p' "$config/control.env" | sed -n '1p')" = "203.0.113.9"
+test "$(sed -n 's/^PUBLIC_RUNNER_URL=//p' "$config/control.env" | sed -n '1p')" = "wss://203.0.113.9/runner"
+test "$(sed -n 's/^PREVIEW_BASE_URL=//p' "$config/control.env" | sed -n '1p')" = \
+  "https://203.0.113.9/__athanor/preview"
+grep -q 'network refresh' "$command_log"
+# The data still came back; re-deriving the origin is an addition to the restore, not a detour
+# around it.
+test "$(cat "$home/persistent.txt")" = "files-worth-recovering"
+test "$(cat "$database_file")" = "row-worth-recovering"
+grep -q 'Restore complete' <<EOF
+$new_host_output
+EOF
+printf 'ok  a fresh-host restore re-derives the origin from the address this machine has\n'
+
+# The planned move: the domain followed the machine. Rewriting a name that already points here
+# would throw away every browser passkey bound to it, which is the opposite of the repair.
+set_config_value PUBLIC_APP_URL https://ai.example.com
+set_config_value WEBAUTHN_RP_ID ai.example.com
+set_config_value WEBAUTHN_ORIGIN https://ai.example.com
+sleep 1
+run_athanor backup >/dev/null 2>&1
+followed_backup=$(
+  find "$backups" -mindepth 1 -maxdepth 1 -type d -name '????????T??????Z' | sort -r | sed -n '1p'
+)
+kept_name_output=$(
+  ATHANOR_TEST_RESOLVES_TO_HERE=ai.example.com \
+    run_new_host restore "$followed_backup" --yes --new-host 2>&1
+)
+test "$(sed -n 's/^PUBLIC_APP_URL=//p' "$config/control.env" | sed -n '1p')" = "https://ai.example.com"
+grep -q 'already points at this computer' <<EOF
+$kept_name_output
+EOF
+printf 'ok  a name that followed the machine is kept rather than replaced by an address\n'
+rm -f "$fake_bin/ip" "$fake_bin/getent"
+
+# An off-host copy, encrypted, on a disk this computer's own failure does not take.
+#
+# Every retained copy lives in /var/backups/athanor, on the same disk as the data it is a copy of,
+# and both docs/OPERATIONS.md and the settings screen advised an off-host copy the product had no
+# way to make. The stand-in for gpg is a real round trip - a marker line naming the recipient, then
+# the plaintext - so what is pinned is that the encrypted file is what lands, that the recipient
+# was used, and that decrypting the copy yields something `restore` accepts. It pins nothing about
+# OpenPGP, which is gpg's claim and not this drill's.
+make_fake gpg '
+recipient=""
+output=""
+mode=""
+subject=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --recipient-file|--output|--trust-model)
+      case "$1" in
+        --recipient-file) recipient="$2" ;;
+        --output) output="$2" ;;
+      esac
+      shift 2
+      ;;
+    --encrypt) mode=encrypt; shift ;;
+    --decrypt) mode=decrypt; shift ;;
+    --show-keys) mode=show; shift ;;
+    --*) shift ;;
+    *) subject="$1"; shift ;;
+  esac
+done
+# The header is a fixed 78 bytes - "encrypted-to:", a sha256 of the recipient file, and a newline -
+# so decrypting is a byte count rather than a line count. Line-oriented would have been wrong:
+# workspaces.tar.gz is binary, and a round trip that is not byte-exact fails the checksum manifest
+# for a reason that has nothing to do with what is being tested.
+case "$mode" in
+  show) grep -q "PUBLIC KEY" "$subject" || exit 2 ;;
+  encrypt)
+    {
+      printf "encrypted-to:%s\n" "$(sha256sum <"$recipient" | awk "{print \$1}")"
+      cat "$subject"
+    } >"$output"
+    ;;
+  decrypt) tail -c +79 "$subject" >"$output" ;;
+  *) exit 64 ;;
+esac
+exit 0'
+# A second filesystem, which is the whole of what an off-host destination is. The drill runs
+# everything under one temporary directory, so `df` is what stands in for the second disk - the
+# same fixture the full-disk cases above use, answering per path rather than everywhere.
+make_fake df '
+for df_argument in "$@"; do
+  case "$df_argument" in
+    "$ATHANOR_TEST_OFF_HOST"*)
+      printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+      printf "/dev/second-disk 10485760 1024 10484736 1%% /mnt/second\n"
+      exit 0
+      ;;
+  esac
+done
+exec /bin/df "$@"'
+mkdir -p "$off_host"
+printf -- '-----BEGIN PGP PUBLIC KEY BLOCK-----\nsynthetic\n' >"$recipient_key"
+
+# Configured while somebody is watching, and refused there rather than at three in the morning.
+if same_disk_refusal=$(
+  run_athanor backup destination "$backups" --recipient "$recipient_key" 2>&1
+); then
+  printf 'a destination on the same filesystem as the local copies was accepted\n' >&2
+  exit 1
+fi
+grep -q 'same filesystem' <<EOF
+$same_disk_refusal
+EOF
+# And a destination with nobody to open it: the archive carries the data key and the session key,
+# so a copy of it that leaves the machine is a copy of everything this product protects.
+if no_recipient_refusal=$(run_athanor backup destination "$off_host" 2>&1); then
+  printf 'an off-host destination was accepted with no encryption recipient\n' >&2
+  exit 1
+fi
+grep -q -- '--recipient' <<EOF
+$no_recipient_refusal
+EOF
+run_athanor backup destination "$off_host" --recipient "$recipient_key" >/dev/null 2>&1
+printf 'ok  an off-host destination is refused on the same disk, and refused unencrypted\n'
+
+sleep 1
+printf 'row-for-the-second-disk\n' >"$database_file"
+printf 'files-for-the-second-disk\n' >"$home/persistent.txt"
+off_host_output=$(run_athanor backup 2>&1)
+off_host_copy=$(
+  find "$off_host" -mindepth 1 -maxdepth 1 -type d -name '????????T??????Z' | sort -r | sed -n '1p'
+)
+test -n "$off_host_copy"
+# What landed is ciphertext for the configured recipient, and the plaintext did not land at all.
+test -f "$off_host_copy/configuration.tar.gz.gpg"
+test ! -e "$off_host_copy/configuration.tar.gz"
+# And it was encrypted to the recipient this box was configured with, rather than to nothing.
+grep -q "encrypted-to:$("$fake_bin/sha256sum" <"$recipient_key" | awk '{print $1}')" \
+  "$off_host_copy/database.dump.gpg"
+# Sums of the encrypted files, in the clear, because that is the one question an owner can still
+# answer at the destination without the private key: did the copy arrive whole.
+test -f "$off_host_copy/SHA256SUMS.encrypted"
+test "$(sed -n 's/^off_host=//p' "$backup_status_file" | sed -n '1p')" = ok
+# One line, not two. The record is written pessimistically on the way in - the daily unit has a
+# start timeout and a copy killed by it reaches no further line - and corrected on the way out. A
+# field that appended would leave the pessimistic line permanently in front of the true one, and
+# every reader here takes the first match, so the status could never say anything but "running".
+test "$(grep -c '^off_host=' "$backup_status_file")" -eq 1
+grep -q 'Encrypted copy written to' <<EOF
+$off_host_output
+EOF
+printf 'ok  a backup is also encrypted to the recipient and copied to the second disk\n'
+
+# The copy is a backup rather than a hope: decrypted by hand the way the command prints, it
+# restores. This is the only end-to-end claim about the off-host copy worth making.
+decrypted="$test_root/decrypted"
+mkdir -p "$decrypted"
+for encrypted_file in "$off_host_copy"/*.gpg; do
+  plain_name=$(basename -- "$encrypted_file" .gpg)
+  PATH="$fake_bin:$PATH" gpg --decrypt --output "$decrypted/$plain_name" "$encrypted_file"
+done
+printf 'row-written-after-the-copy\n' >"$database_file"
+printf 'files-written-after-the-copy\n' >"$home/persistent.txt"
+run_athanor restore "$decrypted" --yes >/dev/null 2>&1
+test "$(cat "$database_file")" = "row-for-the-second-disk"
+test "$(cat "$home/persistent.txt")" = "files-for-the-second-disk"
+printf 'ok  the encrypted off-host copy decrypts and restores\n'
+
+# A copy that cannot be written is not a failed backup: the local copy is complete and verified,
+# and calling that a failure sends an owner hunting for a copy that is sitting right there.
+rm -rf -- "$off_host"
+sleep 1
+if ! unreachable_output=$(run_athanor backup 2>&1); then
+  printf 'a backup failed because its off-host destination was unmounted\n' >&2
+  exit 1
+fi
+test "$(sed -n 's/^outcome=//p' "$backup_status_file" | sed -n '1p')" = ok
+test "$(sed -n 's/^off_host=//p' "$backup_status_file" | sed -n '1p')" = failed
+grep -q 'is not a directory this computer can see' <<EOF
+$unreachable_output
+EOF
+# And `doctor` says which of the two happened rather than reporting a green backup that exists in
+# exactly one place.
+doctor_output=$(run_athanor doctor 2>&1 || true)
+grep -q 'copied locally, not yet off-host' <<EOF
+$doctor_output
+EOF
+printf 'ok  an unreachable destination fails the copy, not the backup, and doctor says so\n'
+
+# The ordinary day that made that report false. `record_backup_status` rewrites backup.status from
+# nothing on every run, so a run that stands down for a busy worker - the design, drilled above -
+# carries the off-host field of the copy before it away with it. Reading the record alone then left
+# `doctor` telling an owner who had already named a second disk that their backups are kept on this
+# computer only, one line after `backup destination show` says where they go, and pointing them at
+# the command they had already run.
+: >"$worker_busy"
+run_athanor backup auto run >/dev/null 2>&1
+rm -f "$worker_busy"
+test "$(status_field outcome)" = skipped
+test -z "$(sed -n 's/^off_host=//p' "$backup_status_file" | sed -n '1p')"
+configured_doctor=$(run_athanor doctor 2>&1 || true)
+if grep -q 'kept on this computer only' <<EOF
+$configured_doctor
+EOF
+then
+  printf 'doctor called a box with a named off-host destination single-disk\n' >&2
+  exit 1
+fi
+grep -q 'an off-host destination is named' <<EOF
+$configured_doctor
+EOF
+rm -f "$fake_bin/gpg" "$fake_bin/df"
+run_athanor backup destination off >/dev/null 2>&1
+# The counter-direction, and the reason the branch cannot simply be deleted: a box that has never
+# named a second place must still be told so, from the same arm and the same empty record.
+unconfigured_doctor=$(run_athanor doctor 2>&1 || true)
+grep -q 'kept on this computer only' <<EOF
+$unconfigured_doctor
+EOF
+printf 'ok  a skipped run does not turn a configured destination into no destination\n'
+
+# `athanor rollback` itself, which had no case of its own.
+#
+# The update's internal rollback is drilled three ways above, but the command an operator types
+# after a release passes every automatic gate and is still wrong went through `restore_athanor`
+# without anything watching it do so. That matters here because `restore` grew an argument parser
+# in this change and `rollback` is one of its two callers - a parser that mishandled the positional
+# would have left the command an owner reaches for on their worst day quietly restoring nothing.
+sleep 1
+printf 'row-before-the-rollback\n' >"$database_file"
+printf 'files-before-the-rollback\n' >"$home/persistent.txt"
+run_athanor backup >/dev/null 2>&1
+printf 'row-after-the-rollback\n' >"$database_file"
+printf 'files-after-the-rollback\n' >"$home/persistent.txt"
+rollback_output=$(run_athanor rollback 2>&1)
+test "$(cat "$database_file")" = "row-before-the-rollback"
+test "$(cat "$home/persistent.txt")" = "files-before-the-rollback"
+grep -q 'Rollback complete' <<EOF
+$rollback_output
+EOF
+printf 'ok  rollback with no argument consumes the newest backup and puts both halves back\n'
 
 # Uninstall, last, because it takes the runtime files every case above installed.
 #

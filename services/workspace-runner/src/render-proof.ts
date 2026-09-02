@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { resolveExecutable } from './command-policy.js';
-import { agentSearchPath } from './execution.js';
+import { hostSearchPath } from './execution.js';
 import { readWorkspaceFile, WorkspaceFileError } from './files.js';
 import { awaitChildExit, killProcessTree } from './subprocess.js';
 
@@ -320,7 +320,12 @@ const run = async (
 };
 
 /**
- * The tools this needs, resolved the way an agent command would resolve them.
+ * The tools this needs, resolved against the system directories and no others.
+ *
+ * Not the way an agent command resolves them, which is what this used to do. All three are spawned
+ * by the runner's own account, outside the sandbox, so resolving them on `agentSearchPath` meant a
+ * file the agent had written called `pdftotext` would be the one that ran on the owner's document.
+ * @see hostSearchPath.
  *
  * Held as a value the caller passes in so the measurement can be exercised against a poppler that
  * is somewhere else - which on a developer's laptop it always is.
@@ -332,11 +337,10 @@ export interface RenderTools {
 }
 
 export const findRenderTools = async (root: string): Promise<RenderTools> => {
-  const searchPath = agentSearchPath(root);
   const [pdftotext, pdftoppm, officeConvert] = await Promise.all([
-    resolveExecutable('pdftotext', searchPath, root),
-    resolveExecutable('pdftoppm', searchPath, root),
-    resolveExecutable('athanor-office-convert', searchPath, root)
+    resolveExecutable('pdftotext', hostSearchPath, root),
+    resolveExecutable('pdftoppm', hostSearchPath, root),
+    resolveExecutable('athanor-office-convert', hostSearchPath, root)
   ]);
   return { pdftotext, pdftoppm, officeConvert };
 };

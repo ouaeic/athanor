@@ -173,6 +173,23 @@ export async function executeSchedulingTool(
         return materialize(updated);
       }
       if (action === 'run') {
+        /*
+         * The same in-flight check the dispatcher takes, because this is the second door onto the
+         * same act and it was left without one. Without it the arm answered `queuedNow: true` for a
+         * run that never happened - the dispatcher's own overlap policy skips the occurrence a
+         * moment later - so the model told the owner in their own conversation that a run had
+         * started, and the schedule row was then stamped with a code the client renders as a
+         * failure. Two wrong sentences about one non-event.
+         *
+         * Refused rather than silently skipped, and the difference is who asked: a clock that finds
+         * the previous run still going should stand down quietly, and a model that asked for a run
+         * now is owed a reason it can act on and repeat to the owner.
+         */
+        if (await context.store.taskScheduleRunInFlight(existing.id))
+          throw new AthanorError(
+            'previous_run_active',
+            'This schedule already has a run that has not finished; open that conversation and let it finish or cancel it, then run this again'
+          );
         const updated = await context.store.setTaskScheduleEnabled(
           task.userId,
           existing.id,

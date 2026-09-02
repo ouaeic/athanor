@@ -14,7 +14,7 @@
  * Lifted out of `agent.ts` unchanged by Wave 7.1; `agent.ts` re-exports the names it exported
  * before, so nothing outside this package moved on the same commit.
  */
-import type { WebToolMode } from '@athanor/contracts';
+import type { TaskMode, WebToolMode } from '@athanor/contracts';
 import type { ModelMessage, ModelToolCall } from '@athanor/model-gateway';
 import type { AcceptanceRecord } from './acceptance.js';
 import type { WorkerConfig } from './config.js';
@@ -262,6 +262,36 @@ export interface AgentState {
    * scheduled conversation is still unattended work until the owner replies to it.
    */
   unattended?: boolean;
+  /**
+   * Whether this conversation may change anything yet, or is still working the approach out.
+   *
+   * Absent is `act`, which is what every task written before this field existed carries and what
+   * every task that never enters plan mode carries for ever - so the default costs an ordinary turn
+   * one `undefined` comparison per tool call and nothing else. @see `TaskMode` in @athanor/contracts
+   * for why it is two words rather than a flag.
+   *
+   * Three places read it, and they are named here because a reader looking for the enforcement
+   * finds the first and stops: the batch loop's gate and `planModeRefusal` in `turn/dispatch.ts`;
+   * the approved-call arm in `turn/resume.ts`, which is the one path that runs a tool without
+   * passing through that gate; and two of the five holds in `turn/finish.ts`, where the mode stops
+   * the acceptance suite - the owner's own build and test commands - from being executed on the
+   * owner's computer by a turn that changed nothing.
+   *
+   * NOTHING IN PRODUCTION WRITES IT, which is the honest state of this field rather than a defect
+   * in the readers. There is no owner-settable, task-scoped, persisted place to carry the mode: a
+   * task row has named scalars beside `securityMode` and no generic column, so setting it needs a
+   * migration, a store method and a route this field's own change did not own. Until those land,
+   * every conversation reads `undefined` here and behaves exactly as it did before the field
+   * existed. @see docs/CAPABILITIES.md, which says the same thing to the owner.
+   *
+   * It lives here, on the persisted trajectory, rather than in the loop frame, for the reason every
+   * bound in this file lives here: an approval park, a question, a worker handover and a restart all
+   * reload the state and carry on, and a mode a restart clears is a mode the owner never chose. It
+   * is deliberately NOT re-derived per step from anywhere - the owner's decision to leave plan mode
+   * has to be an owner action, and a re-derivation is a place that decision could arrive from
+   * somewhere else.
+   */
+  mode?: TaskMode;
   /** What the last step cost, in dollars, so the next one can be priced before it runs. */
   lastStepUsd?: number;
   /** Spend windows already warned about, so a long task says it once rather than every step. */

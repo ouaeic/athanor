@@ -114,6 +114,59 @@ and no upload of private material to compute embeddings. The agent compensates b
 queries, which it is good at. A semantic index would be a different product with its own retention
 story, not a hidden component needed to make the main path work.
 
+### A curated bench, and what is deliberately not on it
+
+The execution substrate is the owner's own persistent Linux host: seven tenths of box memory as the
+ceiling on any one command, the cores the runner's control group allows, host disk, real network
+access, and background work measured in hours. What that machine is stocked _with_ is a separate and
+much narrower decision, because every package on it is disk, install time and attack surface on a
+computer the owner uses for other things.
+
+One table carries most of it - `scripts/athanor-host.sh`, a row per capability and a column per
+supported distribution family - and the installer hands that family's whole column to the package
+manager: the office suite and the metric-compatible fonts a document needs to hold its layout,
+poppler, qpdf, ghostscript, tesseract, ImageMagick, graphviz, ffmpeg, and the distribution's own
+pandas, matplotlib, scipy, statsmodels, Pillow, lxml, openpyxl, XlsxWriter and pyarrow - numpy
+arrives with them rather than as a row of its own, and python-docx is a row only the Debian and Red
+Hat columns fill, which the installer names out loud before it installs anything on the other two.
+Two mechanisms are deliberately outside that table, because a distribution name is the wrong pin
+for what they carry: the typst release, fetched by `scripts/install-native.sh` at a version and a
+sha256, and the hash-pinned `infra/native/athanor-python-requirements.txt`, which supplies
+python-pptx and pypdf - one that Ubuntu stopped packaging after 24.04, one whose form-writer API
+changed between two packaged releases. Both land in the one pinned Python at
+`/usr/local/lib/athanor/python`, built with `--system-site-packages` so it is a superset of the
+packages above rather than a second environment competing with them. Editing the table is therefore
+the right move for an operating-system package and the wrong one for those three.
+
+pyarrow is on that list to close a claim rather than to widen the bench, and that distinction is the
+whole policy. The data-analysis skill's description triggers on a parquet file and
+`pandas.read_parquet` carries no reader without it, so the computer was offering a format it could
+not open. A package earns a place here when a skill already claims what it provides, or when its
+absence makes the first hour of a workload the product is sold on fail. Nothing earns one by being
+generally useful.
+
+These are therefore absent on purpose, and the absence is a decision rather than an oversight:
+
+- **scikit-learn, and any local model runtime.** The statistics capability exists so that a
+  confidence interval or a p-value comes from a library instead of from a model's memory, and scipy
+  and statsmodels answer that. A fitted estimator is a different question, asked far less often, and
+  costs hundreds of megabytes to keep standing by; a deep-learning runtime is gigabytes on a computer
+  whose contract says no model weights run locally. Either one is a single approved install away.
+- **R.** An owner who works in R can install it, and which CRAN packages matter is the part that
+  cannot be guessed in advance - so guessing a subset would be resident weight bought for a guess.
+- **A compiler.** gcc, cc, g++ and make are not installed. That is why a `pip install` of a package
+  publishing no wheel for the pinned interpreter fails on a missing compiler rather than on a missing
+  library, and the `scientific-computing` skill says so, so the failure is recognised in one step
+  rather than at the end of a build log. A compiler is an ordinary approved system-package install.
+
+Two honest limits on all of the above. The table is applied by the installer, and `athanor update`
+moves code without installing operating-system packages, so a box that has only ever auto-updated
+carries the packages of the release it was installed with rather than of the release it is running.
+What tells the truth about a given machine is the runtime toolchain block, which probes that machine
+instead of reading this table. And that block does not yet cover every row: pyarrow is installed and
+not probed, so on a box that missed it the model finds out from `import pyarrow` in its own script
+rather than from the block, which is why the data-analysis skill names the package itself.
+
 ### One approval boundary
 
 Browser, desktop, shell, files, media spend, external services, MCP, and coding specialists all feed
@@ -124,6 +177,45 @@ operations, and ambiguous coordinate actions still transfer to the owner or requ
 An approved action is bound to what the owner saw. The approval row stores an HMAC over the tool
 arguments, and the resume path recomputes it before executing, so an approval cannot be spent on
 different arguments than the ones it was granted for.
+
+### Plan mode, enforced rather than described
+
+Review mode cards each action one at a time, which means the owner approves steps and never the
+approach: the first wrong step is on disk before the correction channel can fire. Plan mode is the
+other half of that. A conversation in plan mode may read, search, look at the page the browser is
+already on, and send delegated read-only missions; anything that changes this computer, or reaches
+out of it other than to read or to message you, is answered with a sentence naming the mode and
+saying what to do with the step instead.
+
+It costs nothing at the head of the prompt. The tool catalogue handed to the model is byte-identical
+in both modes - 55,307 bytes, unchanged by this feature - and the model is never told the mode
+exists. The refusal is where it finds out, which is also why it cannot read its way out: no tool on
+the wire writes the mode, and dispatch drives every tool in the catalogue to prove it. Leaving plan
+mode is the owner's action and only theirs.
+
+What may still run is derived rather than listed, from the two classifications the harness already
+maintains: the checkpoint rule's set of tools that cannot change the computer, and the write
+classifier. A tool added to the catalogue is refused until it is in both. That direction is
+deliberate - being wrong the safe way costs one refused read, and being wrong the other way is a
+plan-mode turn that changed something.
+
+Said plainly, because a mode is judged on what it stops: plan mode refuses every `shell` call,
+including `ls`, because the write classifier deliberately reads an unrecognised executable as a
+check and that asymmetry runs the wrong way here. It refuses every browser action including
+navigation, because the harmless verbs are separated by the approval floor and a second copy of that
+list would drift from it. It refuses the compiler, because compilers were measured writing. It lets
+the agent finish, and does not run the acceptance checks while it does: those checks are your own
+build and test commands, executed on your computer, and a record declared on an earlier turn is
+still on the trajectory when you switch the conversation over. Nothing is lost by not running them,
+because a plan-mode turn changed nothing for them to be evidence about. And it
+is a promise about the computer, not about the bill: web reads, delegated missions and the step
+budget are unchanged, and the spending caps remain the bound for that.
+
+WHAT IS NOT WIRED YET, said here rather than left for a reader to discover: the enforcement is
+complete and tested, and the control that turns the mode on is not. The mode is carried on the
+persisted turn state, so it survives a park, a resume and a worker restart; nothing in the API or
+the web yet sets it, because that needs a task column this change did not own. Until that lands,
+every conversation is in act mode and behaves exactly as it did.
 
 ### Specialist runtimes, not competing histories
 

@@ -30,6 +30,27 @@ export type PrivacyRoute = z.infer<typeof PrivacyRoute>;
 export const SecurityMode = z.enum(['review', 'balanced', 'autonomous']);
 export type SecurityMode = z.infer<typeof SecurityMode>;
 
+/**
+ * Whether this conversation is allowed to change anything yet.
+ *
+ * `act` is every task athanor has ever run, and it is the default everywhere by absence: a state
+ * written before this field existed, and every caller that never names it, is `act` and behaves
+ * exactly as it did. `plan` is the owner saying "work the approach out and show me before you touch
+ * anything", and it is a different question from `SecurityMode` beside it - that one decides what
+ * the owner is ASKED about, this one decides what may run at all.
+ *
+ * It is enforced in `apps/worker/src/turn/dispatch.ts` and is deliberately not described to the
+ * model: the tool catalogue is byte-identical in both modes, so entering plan mode moves no byte at
+ * the head of the cached prefix, and the model cannot leave a mode it is never told the name of.
+ * What it gets instead is a refusal, per call, saying what to do with the step instead.
+ *
+ * Two words rather than a boolean because both readings have to be sayable out loud on a control
+ * the owner presses: `planOnly: false` reads as "nothing is restricted", where `act` reads as what
+ * the conversation is actually doing.
+ */
+export const TaskMode = z.enum(['plan', 'act']);
+export type TaskMode = z.infer<typeof TaskMode>;
+
 /** Where the soft spend threshold sits when the owner has never moved it. */
 export const DEFAULT_SPEND_WARN_PERCENT = 80;
 export const MAX_SPEND_CAP_USD = 1_000_000;
@@ -1337,6 +1358,60 @@ export const TaskScheduleSpec = z.discriminatedUnion('kind', [
 ]);
 export type TaskScheduleSpec = z.infer<typeof TaskScheduleSpec>;
 
+/**
+ * The one way work starts here that is neither the owner typing nor a clock.
+ *
+ * Verified before this existed: `TaskScheduleSpec` above was the whole answer to "what can begin a
+ * turn", and every one of its five kinds is a clock. There was no webhook route, no signature
+ * verification, no mail arrival, no file watch and no repository event anywhere in the tree - so an
+ * owner who wanted "when my build fails, look at it" had to buy it with a poller, which pays a full
+ * model turn on every occurrence to discover that nothing happened. That collides with the spend
+ * ceiling this software is proudest of.
+ *
+ * DELIBERATELY NOT A SIXTH `kind`. That was the first design and it cannot be built from one place:
+ * `nextScheduleRun` in @athanor/core reads `spec.timeZone` after narrowing away `once` and
+ * `interval`, and `scheduleDescription` and `specKey` in the web client both fall through to
+ * `spec.weekdays`. A sixth member makes all three stop compiling, and there is no shape for a
+ * webhook that satisfies them without lying about what it is. So the trigger is orthogonal to the
+ * timing rather than a case of it, which is also the truer statement: a schedule can have a clock,
+ * a trigger, or both, and "both" is the case a kind could not have expressed at all.
+ *
+ * What it does NOT do: there is no trigger-only schedule. A schedule still carries a real clock
+ * spec, so a purely inbound watcher costs one clock run at whatever cadence its spec names - set it
+ * weekly and that is one run a week. Removing that needs the union member above and the three
+ * call sites it breaks.
+ *
+ * ONE endpoint, one secret, one template, and no filter language: the payload is written to a file
+ * and the standing instruction reads it. Per-vendor integrations are not here and are not planned.
+ */
+export const TaskScheduleTrigger = z.object({
+  kind: z.literal('webhook'),
+  /**
+   * The shortest gap between two runs this trigger will start, in minutes.
+   *
+   * An inbound URL is a door onto the owner's provider account, so the thing that has to be bounded
+   * is model turns per hour and not requests per hour. Fifteen is the floor `interval` already
+   * uses - the same number, chosen for the same reason, so a trigger cannot start work more often
+   * than the fastest clock this software offers. A burst of a thousand deliveries inside one gap
+   * produces exactly one run, which reads all of them.
+   */
+  minGapMinutes: z.number().int().min(15).max(10_080).default(15)
+});
+export type TaskScheduleTrigger = z.infer<typeof TaskScheduleTrigger>;
+
+/**
+ * The prefix every inbound trigger URL sits under, and the directory every payload lands in.
+ *
+ * `INBOUND_QUARANTINE_DIRECTORY` is under `workspace/downloads/` on purpose and that is the whole
+ * security argument for the payload: `DOWNLOAD_QUARANTINE_PREFIXES` in the worker's
+ * `command-classification.ts` lists `'workspace/downloads/'`, and it is the one list `file_read`,
+ * `document_read`, `image_read` and `shell` all consult - so a delivery read back from here taints
+ * the turn exactly as a downloaded page does, with no new rule and no second list to drift. Move
+ * this out from under that prefix and a stranger's bytes become the owner's own.
+ */
+export const INBOUND_TRIGGER_PATH_PREFIX = '/v1/hooks';
+export const INBOUND_QUARANTINE_DIRECTORY = 'workspace/downloads/inbound';
+
 export const TaskSchedule = z.object({
   id: Id,
   workspaceId: Id,
@@ -1356,6 +1431,23 @@ export const TaskSchedule = z.object({
   maxComputeCredits: z.number().positive(),
   maxSpendUsd: z.number().positive().nullable().default(null),
   spec: TaskScheduleSpec,
+  /**
+   * The inbound trigger attached to this schedule, or that there is none.
+   *
+   * Nullable with a null default so every client that has never heard of a trigger keeps parsing
+   * every schedule it already parsed. `triggerUrlPath` is the path half of the URL a sender posts
+   * to - the random part is 256 bits, so the URL is itself a bearer secret and is served only to
+   * the owner. The SIGNING secret is not on this object at all: it is shown once, in the reply to
+   * the request that created it, and this server keeps only a copy sealed under the workspace key.
+   */
+  /*
+   * `.optional()` and not `.default(null)`, which reads like the same promise and is not: a default
+   * makes the key optional going in and REQUIRED coming out, and `TaskSchedule` is `z.infer`, so
+   * `scheduleResponseFields` in the API's `context.ts` - which does not know these fields exist -
+   * would stop compiling. Optional keeps every existing producer of a `TaskSchedule` correct.
+   */
+  trigger: TaskScheduleTrigger.nullable().optional(),
+  triggerUrlPath: z.string().nullable().optional(),
   enabled: z.boolean(),
   nextRunAt: IsoDate.nullable(),
   lastRunAt: IsoDate.nullable(),
@@ -1374,7 +1466,13 @@ export const CreateTaskScheduleRequest = z.object({
   privacyRoute: PrivacyRoute.default('provider_zdr'),
   maxComputeCredits: z.number().min(0.01).max(10_000).default(1),
   maxSpendUsd: TaskSpendUsd.optional(),
-  spec: TaskScheduleSpec
+  spec: TaskScheduleSpec,
+  /**
+   * Ask for an inbound URL as well as a clock. Omitted means the schedule has no door on it, which
+   * is what every schedule that already exists has, so this changes nothing for a client that does
+   * not send it.
+   */
+  trigger: TaskScheduleTrigger.optional()
 });
 export type CreateTaskScheduleRequest = z.input<typeof CreateTaskScheduleRequest>;
 

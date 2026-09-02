@@ -1,15 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { capabilityAudience, signCapabilityToken } from '@athanor/core';
 import type { RunnerConfig } from './config.js';
 import { ensureWorkspace } from './files.js';
+import { resolveExecutable } from './command-policy.js';
+import { agentHome, agentSearchPath, hostSearchPath } from './execution.js';
 import {
   describeRenderProof,
   edgeCrossings,
+  findRenderTools,
   inkFraction,
   MAX_BLANK_PROBE_PAGES,
   parseRenderedPages,
@@ -415,13 +419,32 @@ describe('the route the acceptance record calls', () => {
 
   const secret = 'runner-render-test-secret-at-least-32-characters';
 
-  /** A server holding one document, and optionally a page reader on the agent's own search path. */
-  const serve = async (options: { reader?: string }) => {
+  /**
+   * A page reader in one of the six system directories, or nothing.
+   *
+   * The route resolves poppler on `hostSearchPath` now, so a stub the test writes into the
+   * workspace can no longer stand in for it - which is the point, and is asserted below. What is
+   * left for the measuring case is the host's own copy, when the host has one.
+   */
+  const systemPdftotext = (): string | undefined =>
+    hostSearchPath
+      .split(path.delimiter)
+      .map((directory) => path.join(directory, 'pdftotext'))
+      .find((candidate) => existsSync(candidate));
+
+  /**
+   * A server holding one document, and optionally a page reader planted where an agent could put
+   * one - the first entry of `agentSearchPath`, which this route used to resolve against.
+   */
+  const serve = async (options: { reader?: string; document?: Buffer }) => {
     const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'athanor-render-route-'));
     disposers.push(() => rm(workspaceRoot, { recursive: true, force: true }));
     const root = path.join(workspaceRoot, WORKSPACE);
     await ensureWorkspace(root);
-    await writeFile(path.join(root, 'workspace', 'deck.pdf'), '%PDF-1.4 pretend\n');
+    await writeFile(
+      path.join(root, 'workspace', 'deck.pdf'),
+      options.document ?? '%PDF-1.4 pretend\n'
+    );
     if (options.reader) {
       const bin = path.join(root, 'workspace', '.athanor', 'tools', 'node_modules', '.bin');
       await mkdir(bin, { recursive: true });
@@ -452,29 +475,86 @@ describe('the route the acceptance record calls', () => {
       });
   };
 
-  it('answers with the measurement the acceptance record shows the owner', async () => {
+  /**
+   * The case this used to be, inverted. It planted a page reader in the workspace's own tool bin -
+   * a directory `scripts/athanor-sandbox` grants the agent write on - and the route ran it, on the
+   * owner's document, as the runner's own account. It is kept as the proof that it no longer does.
+   *
+   * The status is asserted only as "not the measurement", because which refusal arrives depends on
+   * whether this host has poppler in a system directory. The marker is the assertion that matters:
+   * it is written by the decoy itself and by nothing else.
+   */
+  it('will not run a page reader the agent left on its own search path', async () => {
+    const marker = path.join(await mkdtemp(path.join(tmpdir(), 'athanor-render-marker-')), 'ran');
     const call = await serve({
-      reader: `#!/bin/sh\ncat <<'PAGES'\n${POPPLER_BBOX}PAGES\n`
+      reader: `#!/bin/sh\n: > ${JSON.stringify(marker)}\ncat <<'PAGES'\n${POPPLER_BBOX}PAGES\n`
     });
     const response = await call({ path: 'workspace/deck.pdf', expectPages: 3 });
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({
-      passed: false,
-      pages: 3,
-      crossings: 1,
-      converted: false
-    });
-    expect(response.json<{ detail: string }>().detail).toContain('“ThisWordR” runs 8.0pt past');
+    expect(response.statusCode).not.toBe(200);
+    expect(existsSync(marker), 'the route ran a page reader the agent wrote').toBe(false);
   });
 
-  it('says it could not measure anything rather than passing the document', async () => {
-    const call = await serve({});
-    const response = await call({ path: 'workspace/deck.pdf' });
-    expect(response.statusCode).toBe(503);
-    expect(response.json<{ error: { message: string } }>().error.message).toContain(
-      'cannot say whether the document is right'
-    );
-  });
+  /**
+   * And the route still measures, with the host's own reader. Skipped where there is none, which
+   * on a developer's laptop is usual and on the runner is a broken install - so CI asserts the
+   * skip did not happen rather than counting it as a pass.
+   */
+  it.skipIf(!systemPdftotext())(
+    'answers with the measurement the acceptance record shows the owner',
+    async () => {
+      const call = await serve({
+        document: buildPdf([
+          type(72, 700, 'Quarterly results') + type(560, 400, 'ThisWordRunsOffTheEdge')
+        ])
+      });
+      const response = await call({ path: 'workspace/deck.pdf', expectPages: 3 });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({ passed: false, pages: 1, converted: false });
+      // Two faults, both from the same one-page document: it is not the three pages the job asked
+      // for, and a word runs off the right edge of the page it does have.
+      const detail = response.json<{ detail: string }>().detail;
+      expect(detail).toContain('not the 3 pages asked for');
+      expect(detail).toContain('runs');
+    }
+  );
+
+  it.runIf(process.env.GITHUB_ACTIONS)(
+    'has a system page reader on this CI runner, rather than skipping the case above',
+    () => {
+      expect(
+        systemPdftotext(),
+        'install poppler-utils in the `application` job of .github/workflows/verify.yml'
+      ).toBeTruthy();
+    }
+  );
+
+  /*
+   * The machine with no page reader, which is the only machine this arm can be asked about.
+   *
+   * The route builds its own tools from `findRenderTools` and takes none from the caller, so the
+   * "no reader at all" branch is reachable only on a host that has none. On a host that has one -
+   * every CI runner since the `application` job began installing poppler-utils, and every
+   * provisioned box - the reader runs, the placeholder document is not a PDF, and the answer is
+   * 422 rather than 503. Asserted unguarded this case therefore reported a different defect
+   * depending on who ran it, and was red on CI while green on a laptop.
+   *
+   * Nothing is lost by skipping it where a reader exists: the sentence it checks is pinned on
+   * every host by `says it could not run rather than that the document is fine` above, which calls
+   * `proveRender` with `noTools` directly, and the measuring path on such a host is pinned by
+   * `answers with the measurement the acceptance record shows the owner`. What is left here is the
+   * one thing only the route can say - that the absence maps to 503 and not to a pass.
+   */
+  it.skipIf(systemPdftotext())(
+    'says it could not measure anything rather than passing the document',
+    async () => {
+      const call = await serve({});
+      const response = await call({ path: 'workspace/deck.pdf' });
+      expect(response.statusCode).toBe(503);
+      expect(response.json<{ error: { message: string } }>().error.message).toContain(
+        'cannot say whether the document is right'
+      );
+    }
+  );
 
   it('is not a route a capability without exec can reach', async () => {
     const call = await serve({});
@@ -484,5 +564,48 @@ describe('the route the acceptance record calls', () => {
   it('refuses a path that leaves the owner’s own files', async () => {
     const call = await serve({});
     expect((await call({ path: '../../etc/passwd' })).statusCode).toBe(400);
+  });
+});
+
+/**
+ * Where the three render tools are looked for, which is not where an agent command looks.
+ *
+ * pdftotext, pdftoppm and athanor-office-convert are spawned by the runner's own account against
+ * the owner's document. Both directories planted here are ones the sandbox grants the agent write
+ * on, and one of them used to lead the list this resolved against.
+ */
+describe('the tools a render proof spawns', () => {
+  const planted = async (): Promise<{ root: string; decoy: string }> => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-render-decoy-'));
+    const decoy = path.join(root, 'workspace', '.athanor', 'tools', 'node_modules', '.bin');
+    for (const bin of [decoy, path.join(agentHome(root), '.local', 'bin')]) {
+      await mkdir(bin, { recursive: true });
+      for (const name of ['pdftotext', 'pdftoppm', 'athanor-office-convert']) {
+        await writeFile(path.join(bin, name), '#!/bin/sh\nexit 0\n');
+        await chmod(path.join(bin, name), 0o755);
+      }
+    }
+    return { root, decoy };
+  };
+
+  it('finds none of them in a directory the agent can write', async () => {
+    const { root } = await planted();
+    const inside = await realpath(root);
+    const tools = await findRenderTools(root);
+    // Asserted as "not from in there" rather than as "absent", because a provisioned host has real
+    // poppler in /usr/bin and finding it is the correct answer. `realpath` first: resolveExecutable
+    // returns the resolved path, and on macOS the temporary root is itself behind a symlink.
+    for (const found of [tools.pdftotext, tools.pdftoppm, tools.officeConvert])
+      expect(found === undefined || !found.startsWith(inside)).toBe(true);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('would have found them on the list an agent command uses', async () => {
+    const { root, decoy } = await planted();
+    // The counter-direction: without it the case above passes on decoys that were never reachable.
+    expect(await resolveExecutable('pdftotext', agentSearchPath(root), root)).toBe(
+      await realpath(path.join(decoy, 'pdftotext'))
+    );
+    await rm(root, { recursive: true, force: true });
   });
 });

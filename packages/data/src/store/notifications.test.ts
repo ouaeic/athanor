@@ -144,3 +144,128 @@ describe('a candidate for an approval that expired unanswered', () => {
     await expect(store.listPendingNotifications()).resolves.toEqual([]);
   });
 });
+
+/**
+ * What this box can tell an owner who has never registered a device.
+ *
+ * Every branch of the candidate set starts `FROM push_subscriptions ps`, so the answer is nothing,
+ * for every kind, for ever. That is not a bug in the query - it is what "content-free push" means,
+ * and each branch is correctly bounded by the subscription's own age. It is the shape of the
+ * product's only notification channel, and it is worth an executable statement of it, because the
+ * owners it silences are the ones the feature exists for: an iPhone in a Safari tab has no
+ * `PushManager` and so has no subscription to register, a browser that refused a self-signed
+ * certificate runs no service worker, and a retired endpoint is deleted outright by the notifier
+ * after a day of refusals - which removes the last subscription and, with it, every candidate.
+ *
+ * A second transport is what changes this answer. Whatever builds one must not extend the query
+ * below, because the query cannot reach these rows: it has to select on the owner rather than on
+ * the owner's devices, and carry its own delivery ledger, since `notification_deliveries` is keyed
+ * by a subscription id that a mail transport does not have.
+ */
+describe('an owner with no subscribed device', () => {
+  let database: Database;
+  let store: DataStore;
+
+  beforeEach(async () => {
+    database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+    await migrateDatabase(database);
+    store = new DataStore(database);
+  });
+
+  afterEach(async () => database.close());
+
+  /** Two live things the owner would want: an approval it is stopped on, and a notice it raised. */
+  const waiting = async () => {
+    const user = await store.createUser({ username: 'ada', displayName: 'Ada' });
+    const workspace = await store.createWorkspace({
+      userId: user.id,
+      name: 'Cloud',
+      storageLimitBytes: 10 * 1024 ** 3,
+      imageRevision: 'dev',
+      region: 'auto',
+      wrappedKey: 'wrapped'
+    });
+    const task = await store.createTask({
+      userId: user.id,
+      workspaceId: workspace.id,
+      titleCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+      nameIndex: { nameTokens: '', openingTokens: '' },
+      modelId: 'qwen',
+      privacyRoute: 'provider_zdr',
+      maxComputeCredits: 1,
+      promptCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' }
+    });
+    const approvalId = await store.createApproval({
+      userId: user.id,
+      taskId: task.id,
+      action: 'shell',
+      sideEffect: 'external_consequential',
+      previewCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+      previewHash: 'hash',
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+    });
+    await store.setTaskStatusForUser(user.id, task.id, 'awaiting_user');
+    await store.createAgentNotification({
+      userId: user.id,
+      taskId: task.id,
+      kind: 'agent_message',
+      messageCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' }
+    });
+    return { user, task, approvalId };
+  };
+
+  it('is offered nothing at all, however much is waiting for them', async () => {
+    await waiting();
+    await expect(store.listPendingNotifications()).resolves.toEqual([]);
+  });
+
+  /*
+   * The other direction, so the case above is evidence about subscriptions rather than about a
+   * fixture that never had anything to report. Same rows, one device, two notifications.
+   */
+  it('is offered all of it the moment one device is registered', async () => {
+    const { user } = await waiting();
+    await store.upsertPushSubscription({
+      userId: user.id,
+      sessionPublicId: await store.createSession(
+        user.id,
+        'session-hash',
+        new Date(Date.now() + 60_000)
+      ),
+      endpoint: 'https://fcm.googleapis.com/fcm/send/opaque',
+      p256dh: 'public-key',
+      auth: 'auth-secret'
+    });
+    // Registered before the events it is being offered, which every branch requires.
+    await database.query("UPDATE push_subscriptions SET created_at = NOW() - INTERVAL '1 day'", []);
+    await expect(
+      store.listPendingNotifications().then((rows) => rows.map((row) => row.kind).sort())
+    ).resolves.toEqual(['agent_message', 'approval_required']);
+  });
+
+  /*
+   * The path that takes the channel away from an owner who did everything right. The notifier
+   * deletes an endpoint that has refused every notification for a day (`sweep.ts`, the `exhausted`
+   * arm), and deleting the row cascades the ledger with it - so the queue does not merely stop
+   * draining, it stops existing, and the approval below is waiting for a person who will not be
+   * told. Nothing here is wrong; there is simply no second place for it to go.
+   */
+  it('is offered nothing again once its last endpoint is retired', async () => {
+    const { user } = await waiting();
+    const subscription = await store.upsertPushSubscription({
+      userId: user.id,
+      sessionPublicId: await store.createSession(
+        user.id,
+        'session-hash',
+        new Date(Date.now() + 60_000)
+      ),
+      endpoint: 'https://fcm.googleapis.com/fcm/send/opaque',
+      p256dh: 'public-key',
+      auth: 'auth-secret'
+    });
+    await database.query("UPDATE push_subscriptions SET created_at = NOW() - INTERVAL '1 day'", []);
+    await expect(store.listPendingNotifications()).resolves.toHaveLength(2);
+    await expect(store.deletePushSubscriptionById(subscription.id)).resolves.toBe(true);
+    await expect(store.listPendingNotifications()).resolves.toEqual([]);
+  });
+});

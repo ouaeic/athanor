@@ -2,7 +2,14 @@ import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { agentHome, execute, unclaimedStopNote } from './execution.js';
+import { resolveExecutable } from './command-policy.js';
+import {
+  agentHome,
+  agentSearchPath,
+  execute,
+  hostSearchPath,
+  unclaimedStopNote
+} from './execution.js';
 
 const temporaryRoots: string[] = [];
 
@@ -242,6 +249,108 @@ describe('command environment', () => {
         { maximumSeconds: 30 }
       )
     ).rejects.toThrow('does not accept LD_PRELOAD');
+  });
+});
+
+describe("what the agent's own search path reaches", () => {
+  /** A tool where `pip install --user` puts one, made runnable the way pip makes one runnable. */
+  const installUnderHome = async (root: string, directory: string, name: string): Promise<void> => {
+    const bin = path.join(agentHome(root), ...directory.split('/'));
+    await mkdir(bin, { recursive: true });
+    const tool = path.join(bin, name);
+    await writeFile(tool, `#!/bin/sh\nprintf %s ${name}\n`);
+    await chmod(tool, 0o755);
+  };
+
+  /*
+   * Asserted through `execute` rather than through `resolveExecutable`, because the two answer
+   * different questions and only one of them is the defect. `resolveExecutable` finding the file
+   * proves the runner can name it; what failed before was the child process, whose PATH comes from
+   * `agentEnvironment`. A test that stopped at resolution would stay green with the environment
+   * still wrong, which is exactly how an install that succeeds and a command that is then not
+   * found can both be true at once.
+   */
+  it('runs a tool installed into $HOME/.local/bin or $HOME/bin by its bare name', async () => {
+    const root = await workspaceRoot();
+    await installUnderHome(root, '.local/bin', 'athanor-user-installed');
+    await installUnderHome(root, 'bin', 'athanor-home-installed');
+
+    for (const name of ['athanor-user-installed', 'athanor-home-installed']) {
+      const result = await execute(root, { executable: name, args: [] }, { maximumSeconds: 30 });
+      expect(result.exitCode, `${name} did not run`).toBe(0);
+      expect(result.stdout).toBe(name);
+    }
+  });
+
+  /*
+   * The order is the content here, not decoration: an owner who installs a newer copy of a system
+   * tool expects it to win, which is what every login shell does with these two directories. The
+   * workspace's own node_modules/.bin stays first because it was first before this.
+   */
+  it('puts both home directories ahead of the system ones and behind the workspace tools', () => {
+    const root = '/srv/athanor/workspaces/one';
+    const entries = agentSearchPath(root).split(path.delimiter);
+    expect(entries[0]).toBe(
+      path.join(root, 'workspace', '.athanor', 'tools', 'node_modules', '.bin')
+    );
+    expect(entries.indexOf(path.join(agentHome(root), '.local', 'bin'))).toBe(1);
+    expect(entries.indexOf(path.join(agentHome(root), 'bin'))).toBe(2);
+    expect(entries.indexOf('/usr/local/sbin')).toBe(3);
+    expect(entries.at(-1)).toBe('/bin');
+  });
+
+  /*
+   * The split, stated as the difference between the two lists rather than as a copy of one of them.
+   * Every entry `agentSearchPath` has that this does not is a directory `scripts/athanor-sandbox`
+   * grants the agent write on, and every entry they share is a system one. That is the whole claim
+   * the helpers in audio.ts, render-proof.ts and toolchain.ts now rest on, so it is asserted as a
+   * set difference: a fourth agent-writable entry added to that list later fails here.
+   */
+  it('leaves every directory the agent can write off the list the runner spawns from', () => {
+    const root = '/srv/athanor/workspaces/one';
+    const host = hostSearchPath.split(path.delimiter);
+    expect(host).toEqual([
+      '/usr/local/sbin',
+      '/usr/local/bin',
+      '/usr/sbin',
+      '/usr/bin',
+      '/sbin',
+      '/bin'
+    ]);
+    expect(
+      agentSearchPath(root)
+        .split(path.delimiter)
+        .filter((entry) => !host.includes(entry))
+    ).toEqual([
+      path.join(root, 'workspace', '.athanor', 'tools', 'node_modules', '.bin'),
+      path.join(agentHome(root), '.local', 'bin'),
+      path.join(agentHome(root), 'bin')
+    ]);
+    for (const entry of host) {
+      expect(entry.startsWith(path.join(root, 'workspace'))).toBe(false);
+      expect(entry.startsWith(agentHome(root))).toBe(false);
+    }
+  });
+
+  /*
+   * The counter-direction, in one case so the two cannot drift apart: the reason `$HOME/.local/bin`
+   * is on the agent's list at all is that a `pip install --user` or a symlinked venv entry point
+   * has to be runnable by name afterwards, and that has to survive the split. Asserted through
+   * `execute` for the reason above, and against `hostSearchPath` by resolution, because resolution
+   * is the whole of what the runner's helpers ask of a list.
+   */
+  it('still runs what the agent installed under $HOME, and hides it from the runner', async () => {
+    const root = await workspaceRoot();
+    await installUnderHome(root, '.local/bin', 'athanor-user-installed');
+
+    const result = await execute(
+      root,
+      { executable: 'athanor-user-installed', args: [] },
+      { maximumSeconds: 30 }
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe('athanor-user-installed');
+    expect(await resolveExecutable('athanor-user-installed', hostSearchPath, root)).toBe(undefined);
   });
 });
 

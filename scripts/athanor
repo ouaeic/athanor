@@ -1036,6 +1036,35 @@ doctor() {
       fi
       ;;
   esac
+  # Whether the copies exist anywhere but on the disk they are copies of. Every check above can be
+  # green on a box whose only backups die with the data: five verified copies in /var/backups is
+  # five copies of one disk. `off` is a note rather than a warning because naming a second place
+  # needs hardware this report cannot conjure, and nagging daily about a disk the owner has not
+  # bought is how a report stops being read.
+  case "$(backup_status_field off_host)" in
+    ok) check_ok "the newest backup was also copied off-host, encrypted" ;;
+    failed)
+      check_warn "copied locally, not yet off-host - $(backup_status_field off_host_reason)"
+      ;;
+    running)
+      check_warn "copied locally; the off-host copy started and never reported back, so it was cut off by the backup unit's own time limit. The local copy is complete"
+      ;;
+    *)
+      # No off-host line at all, which two very different boxes reach. `record_backup_status`
+      # rewrites this file from nothing on every run, so a run that stood down for a busy worker -
+      # the designed ordinary outcome, not a fault - or one that failed outright takes the
+      # off-host field of the copy before it away with it. Reading the record alone therefore told
+      # an owner who had already named a second disk that their backups were on one, which is
+      # false, and pointed them at the command they had already run. The configuration is what
+      # tells the two apart, and it is asked here for that reason. It is read the way the ACME and
+      # model-catalogue checks above read theirs; `doctor` is root already.
+      if [ -n "$(control_env_value BACKUP_DESTINATION)" ]; then
+        check_note "an off-host destination is named, and the last run recorded nothing about the copy, which is what a run that stood down or failed leaves behind; sudo athanor backup destination show"
+      else
+        check_note "backups are kept on this computer only, on the same disk as the data; sudo athanor backup destination names a second place"
+      fi
+      ;;
+  esac
   available_kb=$(df -Pk "$athanor_home" | awk 'NR == 2 {print $4}')
   if [ "$available_kb" -ge 10485760 ]; then
     check_ok "disk headroom $((available_kb / 1048576)) GiB"
@@ -1177,6 +1206,119 @@ pairing_code() {
   printf '\nThis code expires in 24 hours and is consumed when the first owner is created.\n'
 }
 
+# Where this computer answers, written as the five settings that have to agree.
+#
+# They are one fact in five places and they only make sense together: an origin that disagrees with
+# the WebAuthn relying party is a server that serves pages on which a browser will refuse to create
+# a passkey at all. Written here once because two callers now move them - `set-hostname`, and the
+# fresh-host arm of `restore` - and a second copy of five lines is a second thing free to drift.
+#
+# The bracket forms are for an IPv6 literal, and match what the installer writes for the same
+# address. A DNS name takes neither branch's brackets, so this is byte-for-byte what
+# `set-hostname` wrote before it called through here.
+set_public_origin() {
+  origin_host="$1"
+  case "$origin_host" in
+    *:*)
+      origin_url="https://[$origin_host]"
+      origin_rp_id="[$origin_host]"
+      ;;
+    *)
+      origin_url="https://$origin_host"
+      origin_rp_id="$origin_host"
+      ;;
+  esac
+  set_control_value PUBLIC_APP_URL "$origin_url"
+  set_control_value PREVIEW_BASE_URL "$origin_url/__athanor/preview"
+  set_control_value PUBLIC_RUNNER_URL "$(printf 'wss://%s/runner' "${origin_url#https://}")"
+  set_control_value WEBAUTHN_RP_ID "$origin_rp_id"
+  set_control_value WEBAUTHN_ORIGIN "$origin_url"
+}
+
+# This computer's own globally routable addresses, one per line.
+#
+# The same reading, with the same interfaces left out, as athanor-network-refresh: a container
+# bridge is an address nothing outside this machine can reach, and on a box that runs containers it
+# is frequently the first one `ip` lists. Answers with nothing at all when `ip` is absent or has
+# nothing to say, and every caller here treats "no addresses" as "do not guess".
+host_global_addresses() {
+  ip -o -4 address show scope global 2>/dev/null |
+    awk '$2 !~ /^(docker|br-|veth|cni|podman|virbr)/ {
+      address = $4
+      sub(/\/.*/, "", address)
+      print address
+    }' | sort -u
+  ip -o -6 address show scope global -temporary 2>/dev/null |
+    awk '$2 !~ /^(docker|br-|veth|cni|podman|virbr)/ {
+      address = $4
+      sub(/\/.*/, "", address)
+      print address
+    }' | sort -u
+}
+
+# The address a client outside this machine should be given, chosen the way the installer chooses
+# it: a public IPv4 first, then anything at all rather than nothing. Private ranges are passed over
+# only while something better exists, because a box on a home LAN has nothing else to offer and an
+# origin on 192.168.1.20 is one its owner can actually open.
+#
+# Said plainly: this is the installer's address half and not its name half. The installer also
+# hunts for a name - `hostname -f`, then reverse DNS on each address, each forward-confirmed - and
+# none of that is repeated here, so a restored machine whose provider gave it a name gets an
+# address origin rather than that name. `--hostname NAME` is what asks for a name, and the
+# fresh-host arm prints it. Duplicating eighty lines of search into a second copy free to drift
+# from the first is the cost that was not worth paying for a case one flag already answers.
+host_primary_address() {
+  primary_address=""
+  for candidate_address in $(host_global_addresses); do
+    case "$candidate_address" in
+      10.*|127.*|169.254.*|192.168.*|*:*) continue ;;
+      172.*)
+        candidate_second_octet=$(printf '%s' "$candidate_address" | cut -d. -f2)
+        if [ "$candidate_second_octet" -ge 16 ] && [ "$candidate_second_octet" -le 31 ]; then
+          continue
+        fi
+        ;;
+    esac
+    primary_address="$candidate_address"
+    break
+  done
+  if [ -z "$primary_address" ]; then
+    primary_address=$(host_global_addresses | sed -n '1p')
+  fi
+  [ -z "$primary_address" ] || printf '%s\n' "$primary_address"
+}
+
+# Whether the origin a backup carries still names the computer it has just been restored onto.
+#
+# The commonest planned move keeps the domain and changes the machine underneath it, and on that
+# move the restored PUBLIC_APP_URL is not stale at all: replacing it with an address would throw
+# away every browser passkey bound to the name, which is the opposite of the repair. So the name is
+# forward-confirmed against this machine's own addresses, exactly as the installer confirms the one
+# it discovers, and only a name that does not land here is replaced.
+#
+# An address literal answers no whatever it resolves to. An address cannot have followed a machine:
+# that is the whole of what went wrong.
+restored_origin_reaches_here() {
+  origin_candidate="$1"
+  case "$origin_candidate" in
+    ''|*[!A-Za-z0-9.-]*|.*|-*|*.) return 1 ;;
+    *.*) ;;
+    *) return 1 ;;
+  esac
+  case "$origin_candidate" in
+    *[!0-9.]*) ;;
+    *) return 1 ;;
+  esac
+  origin_resolved=$(getent ahosts "$origin_candidate" 2>/dev/null | awk '{print $1}' | sort -u)
+  [ -n "$origin_resolved" ] || return 1
+  for local_address in $(host_global_addresses); do
+    if printf '%s\n' "$origin_resolved" | grep -Fqx "$local_address"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 set_hostname() {
   need_root set-hostname "${1:-}"
   requested_hostname="${1:-}"
@@ -1197,12 +1339,7 @@ set_hostname() {
   getent ahosts "$hostname_value" >/dev/null 2>&1 ||
     fail "$hostname_value does not resolve yet; finish dynamic-DNS setup and try again"
 
-  public_url="https://$hostname_value"
-  set_control_value PUBLIC_APP_URL "$public_url"
-  set_control_value PREVIEW_BASE_URL "$public_url/__athanor/preview"
-  set_control_value PUBLIC_RUNNER_URL "wss://$hostname_value/runner"
-  set_control_value WEBAUTHN_RP_ID "$hostname_value"
-  set_control_value WEBAUTHN_ORIGIN "$public_url"
+  set_public_origin "$hostname_value"
   "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)"
   # A trusted certificate issued before this hostname existed does not carry it, and a browser
   # reaching the new origin would get a name mismatch. Reissue now rather than leaving the
@@ -1301,6 +1438,201 @@ prune_backups() {
       rm -rf -- "$superseded"
       printf 'Removed superseded backup %s\n' "$superseded"
     done
+}
+
+# The files a backup is made of, in the order they are named in SHA256SUMS. Named here rather than
+# globbed so that a stray file in the directory - a decrypted copy somebody left behind, an editor's
+# swap file - is never quietly shipped off the machine. `packages.txt` and `revision` are absent
+# from copies made by older releases and are skipped when they are.
+athanor_backup_files="database.dump workspaces.tar.gz configuration.tar.gz packages.txt revision SHA256SUMS"
+
+# A second copy, somewhere the failure of this computer's disk cannot reach.
+#
+# WHY. All five retained copies live in /var/backups/athanor, on the same disk as the data they are
+# copies of. That is a copy of the data and it is not a backup: the commonest way a one-box product
+# is lost outright is the disk, and the disk takes both. docs/OPERATIONS.md and the settings screen
+# have advised an off-host copy since before there was any way for this product to make one.
+#
+# WHAT IT DOES NOT DO. It writes to a path this computer can already write to: a removable disk, a
+# NAS mount, anything mounted. It does not speak ssh, rsync, S3, or any provider's API, and that is
+# a decision and not a gap. A credential on this box that can write to the destination can also
+# delete what is already there, so a box that is broken into loses every copy it has ever made in
+# one command. A mount the owner controls - better, a disk they unplug - does not have that shape.
+# If that trade is wrong for a particular owner, `athanor backup /path` has always written a copy
+# wherever they say, and cron and rsync are theirs to point at it.
+#
+# ENCRYPTION IS NOT OPTIONAL HERE. configuration.tar.gz carries DATA_MASTER_KEY and
+# SESSION_SIGNING_KEY: a copy of a backup is a copy of everything this product protects. What makes
+# that tolerable in /var/backups is that the disk it sits on already holds those keys. A copy that
+# leaves the machine has no such excuse, so a destination with no recipient is refused where it is
+# configured, in daylight, rather than discovered at three in the morning by a timer.
+#
+# gpg rather than a pinned age binary: `gpg --recipient-file` needs no keyring, no state and no
+# download, and the installer already relies on gpg being present to place the NodeSource keyring.
+# A box without it is told so and keeps its local copy.
+copy_backup_off_host() {
+  off_host_source="$1"
+  off_host_destination=$(control_env_value BACKUP_DESTINATION)
+  if [ -z "$off_host_destination" ]; then
+    record_backup_off_host off ''
+    return 0
+  fi
+  # Pessimistic first and corrected on the way out, for the same reason `auto_backup_run` does it
+  # for the run as a whole: the daily unit has a start timeout, and a copy killed by it reaches no
+  # further line here. Without this, a kill during the copy left `outcome=ok` with nothing said
+  # about the second copy at all, which reads exactly like a box that has no destination configured.
+  record_backup_off_host running ''
+  off_host_recipient=$(control_env_value BACKUP_ENCRYPTION_RECIPIENT)
+  off_host_failure=""
+  if [ -z "$off_host_recipient" ]; then
+    off_host_failure="no encryption recipient is configured"
+  elif [ ! -r "$off_host_recipient" ]; then
+    off_host_failure="the encryption recipient $off_host_recipient cannot be read"
+  elif ! command -v gpg >/dev/null 2>&1; then
+    off_host_failure="gpg is not installed on this computer"
+  elif [ ! -d "$off_host_destination" ]; then
+    off_host_failure="$off_host_destination is not a directory this computer can see; is the disk mounted?"
+  fi
+  if [ -z "$off_host_failure" ]; then
+    # Written aside and renamed, the same way the local copy is and for the same reason: a run
+    # interrupted halfway leaves something obviously unfinished rather than a directory that looks
+    # like a backup and is missing the file nobody checked.
+    off_host_target="$off_host_destination/$(basename -- "$off_host_source")"
+    rm -rf -- "$off_host_target.partial"
+    if install -d -m 0700 "$off_host_target.partial" 2>/dev/null; then
+      for off_host_file in $athanor_backup_files; do
+        [ -f "$off_host_source/$off_host_file" ] || continue
+        if ! gpg --batch --yes --trust-model always \
+          --recipient-file "$off_host_recipient" \
+          --output "$off_host_target.partial/$off_host_file.gpg" \
+          --encrypt "$off_host_source/$off_host_file" >/dev/null 2>&1; then
+          off_host_failure="$off_host_file could not be encrypted to $off_host_recipient"
+          break
+        fi
+      done
+    else
+      off_host_failure="$off_host_destination could not be written to"
+    fi
+  fi
+  if [ -z "$off_host_failure" ]; then
+    # Sums of the encrypted files, in the clear. Nothing here can verify the plaintext without the
+    # private key - which is the point of the private key being elsewhere - so this is the one
+    # question the owner can still answer at the destination: did the copy arrive whole.
+    (
+      cd "$off_host_target.partial" &&
+        sha256sum ./*.gpg >SHA256SUMS.encrypted
+    ) || off_host_failure="the copied files could not be checksummed at $off_host_destination"
+  fi
+  if [ -n "$off_host_failure" ]; then
+    rm -rf -- "${off_host_target:-$off_host_destination/nowhere}.partial"
+    # Never fatal. The backup this box needed is complete and verified on the local disk; what
+    # failed is the second copy, and saying "the backup failed" about that would send an owner
+    # hunting for a copy that is sitting there.
+    warn "the local backup is complete; the off-host copy did not run: $off_host_failure"
+    record_backup_off_host failed "$off_host_failure"
+    return 0
+  fi
+  rm -rf -- "$off_host_target"
+  mv -- "$off_host_target.partial" "$off_host_target"
+  record_backup_off_host ok ''
+  printf 'Encrypted copy written to %s\n' "$off_host_target"
+}
+
+# Added to the record `record_backup_status` has just written, in the same shape as the fields above
+# it, so `doctor` and the settings screen can tell "copied locally" from "copied off-host" rather
+# than reporting a green backup that exists in exactly one place.
+#
+# It rewrites its own two lines rather than appending them, because this is called twice in one run
+# - pessimistically on the way in, corrected on the way out - and every reader here takes the first
+# match. Appending would have left the pessimistic line permanently in front of the true one, which
+# is a status field that can never say anything but "running".
+#
+# Never fatal, at any step: a backup that is complete on disk must not be reported as failed because
+# a note about it could not be written.
+record_backup_off_host() {
+  off_host_record=$(mktemp "$athanor_backup_status.XXXXXX" 2>/dev/null) || return 0
+  {
+    grep -v '^off_host' "$athanor_backup_status" 2>/dev/null || true
+    printf 'off_host=%s\n' "$1"
+    printf 'off_host_reason=%s\n' "${2:-}"
+  } >"$off_host_record" 2>/dev/null || {
+    rm -f "$off_host_record"
+    return 0
+  }
+  # World-readable like the record it is part of, so the API can read it unprivileged.
+  chmod 0644 "$off_host_record" 2>/dev/null || true
+  mv "$off_host_record" "$athanor_backup_status" 2>/dev/null || rm -f "$off_host_record"
+}
+
+# Naming the second place, and who may open what is put there.
+#
+# A command rather than an instruction to edit control.env, because the two settings are only safe
+# together: a destination with no recipient would write this product's data key onto a disk that
+# leaves the building. Refusing that here means it is refused while somebody is watching.
+backup_destination_command() {
+  need_root backup destination "$@"
+  case "${1:-show}" in
+    show)
+      destination_path=$(control_env_value BACKUP_DESTINATION)
+      if [ -z "$destination_path" ]; then
+        printf 'Off-host copy: off\n'
+        printf 'Backups are kept in %s, on the same disk as the data. To add a second copy on a\n' \
+          "$athanor_backup_root"
+        printf 'disk this one failing does not take:\n'
+        printf '  sudo athanor backup destination /mnt/backup-disk --recipient /root/backup-key.pub\n'
+        return 0
+      fi
+      printf 'Off-host copy: %s\n' "$destination_path"
+      printf 'Encrypted to:  %s\n' "$(control_env_value BACKUP_ENCRYPTION_RECIPIENT)"
+      case "$(backup_status_field off_host)" in
+        ok) printf 'Last run:      copied\n' ;;
+        failed) printf 'Last run:      not copied - %s\n' "$(backup_status_field off_host_reason)" ;;
+        running) printf 'Last run:      started copying and never reported back\n' ;;
+        *) printf 'Last run:      nothing recorded yet; the next backup will copy\n' ;;
+      esac
+      ;;
+    off)
+      set_control_value BACKUP_DESTINATION ''
+      set_control_value BACKUP_ENCRYPTION_RECIPIENT ''
+      printf 'Off-host copies are off. Backups are kept in %s only, which is the same disk as\n' \
+        "$athanor_backup_root"
+      printf 'the data. Copies already at the old destination are left where they are.\n'
+      ;;
+    *)
+      destination_path="$1"
+      [ "${2:-}" = "--recipient" ] && [ -n "${3:-}" ] ||
+        fail "usage: sudo athanor backup destination /mnt/backup-disk --recipient /root/backup-key.pub"
+      destination_recipient="$3"
+      command -v gpg >/dev/null 2>&1 ||
+        fail "gpg is not installed on this computer, and an off-host copy is not written without it: sudo apt-get install gnupg"
+      [ -d "$destination_path" ] ||
+        fail "$destination_path is not a directory; mount the disk first, then name the directory on it"
+      [ -r "$destination_recipient" ] ||
+        fail "$destination_recipient cannot be read; export the public key of the identity that will open these backups, and keep the private half off this computer"
+      gpg --batch --show-keys "$destination_recipient" >/dev/null 2>&1 ||
+        fail "$destination_recipient is not a public key gpg can read; export it with gpg --armor --export"
+      # The one thing this feature exists for. A destination on the disk that already holds the
+      # data and the local copies survives exactly the failures the local copies survive, and none
+      # of the one that costs an owner everything. `df` naming the same filesystem for both is the
+      # cheapest true form of that question; when it will not answer for either path, nothing is
+      # refused, because a guess is not a reason to reject somebody's own disk.
+      destination_device=$(df -P "$destination_path" 2>/dev/null | awk 'NR == 2 {print $1}')
+      backup_root_device=$(df -P "$athanor_backup_root" 2>/dev/null | awk 'NR == 2 {print $1}')
+      if [ -n "$destination_device" ] && [ "$destination_device" = "$backup_root_device" ]; then
+        fail "$destination_path is on the same filesystem ($destination_device) as $athanor_backup_root, so it is lost by the same disk failure. Name a path on another disk, a removable one, or a mount"
+      fi
+      set_control_value BACKUP_DESTINATION "$destination_path"
+      set_control_value BACKUP_ENCRYPTION_RECIPIENT "$destination_recipient"
+      printf 'Every backup will also be encrypted to %s and copied to %s.\n' \
+        "$destination_recipient" "$destination_path"
+      printf 'The copy runs after the services are back, so it costs no downtime, and a copy that\n'
+      printf 'fails does not fail the backup: sudo athanor doctor says which of the two happened.\n'
+      printf '\nKEEP THE PRIVATE HALF OF THAT KEY SOMEWHERE THIS COMPUTER IS NOT. Without it the\n'
+      printf 'off-host copies cannot be opened by anybody, including you. Restoring one is:\n'
+      printf '  gpg --decrypt --output database.dump database.dump.gpg   (and each other file)\n'
+      printf '  sudo athanor restore /path/to/decrypted --yes --new-host\n'
+      ;;
+  esac
 }
 
 backup_athanor() {
@@ -1403,6 +1735,11 @@ backup_athanor() {
   [ -n "${1:-}" ] || {
     prune_backups
     record_backup_status ok ''
+    # After the record, because the record truncates that file and this appends to it; and after
+    # the restart above, deliberately, because an off-host copy crosses a link this program does
+    # not control and a slow uplink has no business being outage time. Nothing it does can fail
+    # the backup: the verified local copy already exists and is what `restore` reads.
+    copy_backup_off_host "$destination"
   }
   printf 'Checksum-verified backup created at %s\n' "$destination"
   printf 'Dependency trees and package caches were skipped; the agent reinstalls those.\n'
@@ -1410,16 +1747,51 @@ backup_athanor() {
 }
 
 restore_athanor() {
-  source_directory="${1:-}"
-  confirmation="${2:-}"
+  # Parsed by reading "$@" rather than by shifting through it, because `need_root` below re-execs
+  # this whole script through sudo with exactly the arguments it is handed. Consuming them first
+  # and re-execing with what was left would drop every flag on the way to root - and the one path
+  # on which these flags matter is an owner at a shell on a machine they have just built.
+  source_directory=""
+  confirmation=""
+  restore_new_host=""
+  restore_hostname=""
+  restore_expect_hostname=""
+  for restore_argument in "$@"; do
+    if [ -n "$restore_expect_hostname" ]; then
+      restore_hostname="$restore_argument"
+      restore_expect_hostname=""
+      continue
+    fi
+    case "$restore_argument" in
+      --yes) confirmation=--yes ;;
+      --new-host) restore_new_host=yes ;;
+      --hostname)
+        restore_expect_hostname=yes
+        restore_new_host=yes
+        ;;
+      --hostname=*)
+        restore_hostname="${restore_argument#--hostname=}"
+        restore_new_host=yes
+        ;;
+      -*) fail "athanor restore: unknown option $restore_argument" ;;
+      *)
+        if [ -n "$source_directory" ]; then
+          fail "athanor restore takes one backup directory; got $source_directory and $restore_argument"
+        fi
+        source_directory="$restore_argument"
+        ;;
+    esac
+  done
+  [ -z "$restore_expect_hostname" ] ||
+    fail "athanor restore --hostname needs a name, such as --hostname ai.example.com"
   [ -f "$source_directory/database.dump" ] &&
     [ -f "$source_directory/workspaces.tar.gz" ] &&
     [ -f "$source_directory/configuration.tar.gz" ] &&
     [ -f "$source_directory/SHA256SUMS" ] ||
-    fail "usage: sudo athanor restore /path/to/backup --yes"
+    fail "usage: sudo athanor restore /path/to/backup --yes [--new-host [--hostname NAME]]"
   [ "$confirmation" = "--yes" ] ||
     fail "restore replaces the database, workspace files, and server keys; re-run with --yes"
-  need_root restore "$source_directory" "$confirmation"
+  need_root restore "$@"
   checksum_names=$(
     awk 'NF == 2 {print $2}' "$source_directory/SHA256SUMS" | sort | tr '\n' ' ' |
       sed 's/ $//'
@@ -1539,7 +1911,79 @@ SQL
       fi
     fi
   fi
+  if [ -n "$restore_new_host" ]; then
+    restore_to_new_host
+  else
+    # The line `rollback` has called since the day it was written, twelve hundred lines below in
+    # this same file, and `restore` never did. Even restoring onto the same computer, the archive
+    # can carry a hostname from before the owner changed it, and the connection manifest and the
+    # self-signed certificate's names are both derived from that setting. Non-fatal for the same
+    # reason as everything else down here: the data is back and the server is already serving.
+    "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)" >/dev/null 2>&1 ||
+      warn "the connection manifest could not be refreshed; run sudo athanor doctor"
+  fi
   printf 'Restore complete.\n'
+}
+
+# Put the origin back on the machine the data has just landed on.
+#
+# A backup carries /etc/athanor verbatim, and that is the point: the data key, the session signing
+# key and the pinned server identity all have to come back exactly, or the restored box cannot open
+# its own database and every paired client rejects it. PUBLIC_APP_URL, WEBAUTHN_ORIGIN and
+# WEBAUTHN_RP_ID came back with them, and on a different computer those three name the old one - so
+# a restored box served an origin nobody could reach and scoped browser sign-in to an address it no
+# longer had. Nothing failed; there was no error anywhere; the box simply could not be opened.
+#
+# The refresh at the end is the line `rollback` has called since the day it was written, twelve
+# hundred lines below in this same file, and `restore` never did - so the connection manifest still
+# advertised the old machine's addresses and the self-signed certificate still carried them as its
+# only SANs, on the two commands whose whole purpose is a computer that has changed.
+#
+# Everything here warns rather than fails, and it runs after the restore has already succeeded and
+# the server is serving. A name that does not resolve yet from a machine plugged in ten minutes ago
+# is an ordinary afternoon, and it is not a reason to end a recovery in an error over a box whose
+# data is already back. The price is one extra restart, which is nothing on the day this is run.
+restore_to_new_host() {
+  if [ -n "$restore_hostname" ]; then
+    # `set-hostname` is the whole of this branch: it validates the name, refuses one that does not
+    # resolve, writes the five settings, refreshes the network metadata, reissues a trusted
+    # certificate if one is configured, restarts, and prints what an owner has to do about their
+    # passkeys. In a subshell because every one of those refusals is a `fail`, and a `fail` here
+    # would exit a restore that has already put the data back.
+    if (set_hostname "$restore_hostname"); then
+      return 0
+    fi
+    warn "the restored server is running, but $restore_hostname could not be set as its name yet. Point the record at this computer, then run: sudo athanor set-hostname $restore_hostname"
+    return 0
+  fi
+  restored_origin=$(control_env_value PUBLIC_APP_URL)
+  restored_host=$(
+    printf '%s' "$restored_origin" | sed -e 's|^https\{0,1\}://||' -e 's|/.*$||' \
+      -e 's/^\[//' -e 's/\]$//'
+  )
+  if restored_origin_reaches_here "$restored_host"; then
+    # The planned move: the domain followed the machine. Rewriting it to an address here would
+    # break every browser passkey that still works, so the name is left exactly as it is and only
+    # the addresses underneath it are refreshed.
+    printf 'The name %s already points at this computer, so it has been kept.\n' "$restored_host"
+  else
+    detected_address=$(host_primary_address)
+    if [ -z "$detected_address" ]; then
+      warn "no network address could be detected, so the restored origin $restored_origin still names the old computer. Fix the network, then run: sudo athanor restore --new-host, or sudo athanor set-hostname NAME"
+      return 0
+    fi
+    set_public_origin "$detected_address"
+    printf 'This computer is not %s. The address it answers on is now %s.\n' \
+      "$restored_host" "$detected_address"
+  fi
+  "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)" ||
+    warn "the connection manifest and certificate addresses could not be refreshed; run sudo athanor doctor"
+  restart_athanor
+  printf 'Run “sudo athanor connect” for a ticket and QR carrying the addresses of this computer:\n'
+  printf 'the paired clients you have hold the old ones. The server identity survived in the\n'
+  printf 'backup, so those clients still trust this box and their passkeys still work.\n'
+  printf 'A passkey made in a browser is bound to the origin it was made on. If that origin has\n'
+  printf 'changed, those passkeys have to be added again from a client that still signs in.\n'
 }
 
 # Agent commands run as athanor-agent and reach their workspace through a group shared with the
@@ -3575,7 +4019,7 @@ task_command() {
 
 usage() {
   printf '%s\n' \
-    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...|task ...|tool-opens [DAYS] [--json]|acp --workspace ID [--approvals park|relay]}' \
+    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|backup destination [show|PATH --recipient FILE|off]|restore DIR --yes [--new-host [--hostname NAME]]|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...|task ...|tool-opens [DAYS] [--json]|acp --workspace ID [--approvals park|relay]}' \
     '' \
     'Browser sign-in needs a hostname: a passkey is bound to a domain name and the WebAuthn' \
     'standard does not allow an IP address. If this server has no name, run:' \
@@ -3621,10 +4065,13 @@ case "$command_name" in
   backup)
     case "${1:-}" in
       auto) shift; auto_backup "${1:-status}" ;;
+      destination) shift; backup_destination_command "$@" ;;
       *) backup_athanor "${1:-}" ;;
     esac
     ;;
-  restore) restore_athanor "${1:-}" "${2:-}" ;;
+  # Every argument, not the first two: `--new-host` and `--hostname NAME` arrive behind `--yes`,
+  # and passing a fixed pair silently dropped them on the one command they exist for.
+  restore) restore_athanor "$@" ;;
   update)
     case "${1:-}" in
       # One phase of an update, run by the update as a child so that the files a release adds are

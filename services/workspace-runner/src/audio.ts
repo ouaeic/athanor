@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { AUDIO_READ_MAX_SECONDS } from '@athanor/contracts';
-import { agentSearchPath } from './execution.js';
+import { hostSearchPath } from './execution.js';
 import { resolveExecutable } from './command-policy.js';
 import { assertOpenedInPlace, resolveInside, WorkspaceFileError } from './files.js';
 import { awaitChildExit, killProcessTree } from './subprocess.js';
@@ -231,9 +231,15 @@ const missing = (name: string): WorkspaceFileError =>
 export const prepareAudio = async (
   root: string,
   requested: string,
-  window: { startSeconds?: number | undefined; endSeconds?: number | undefined }
+  window: { startSeconds?: number | undefined; endSeconds?: number | undefined },
+  // The system directories and no others, because both binaries below are spawned by the runner's
+  // own account rather than through the sandbox: resolving them the way an agent command resolves
+  // its own would let a file the agent wrote called `ffprobe` be executed unconfined. Overridable
+  // for the same reason `findRenderTools` hands its result to its caller - so the round trip can be
+  // measured against a real encoder that is somewhere else, which on a developer's laptop it always
+  // is. The route in `server.ts` passes three arguments, so nothing off the wire reaches this.
+  searchPath: string = hostSearchPath
 ): Promise<PreparedAudio> => {
-  const searchPath = agentSearchPath(root);
   const [ffprobe, ffmpeg] = await Promise.all([
     resolveExecutable('ffprobe', searchPath, root),
     resolveExecutable('ffmpeg', searchPath, root)

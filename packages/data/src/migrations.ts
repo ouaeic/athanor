@@ -3048,5 +3048,87 @@ export const migrations = [
       ALTER TABLE mem.item_use_fold ADD CONSTRAINT mem_item_use_fold_graded_check
         CHECK (oks + fails <= uses);
     `
+  },
+  {
+    version: 79,
+    name: 'a_schedule_can_be_started_from_outside',
+    /*
+     * The inbound trigger: three nullable columns on `task_schedules` and one table of deliveries.
+     *
+     * Until this, the only things that could start a turn on this box were the owner and a clock -
+     * verified by grep across the whole tree: no webhook route, no HMAC verification, no mail
+     * arrival, no file watch. The substitute was a poller, which pays a full model turn on every
+     * occurrence to find out that nothing happened.
+     *
+     * COLUMNS RATHER THAN A SIXTH `spec.kind`, for the reason `TaskScheduleTrigger` in
+     * @athanor/contracts states: three exhaustive narrowings elsewhere in the tree stop compiling on
+     * a sixth member, and a webhook is orthogonal to a timing rather than a case of it. All three
+     * are NULL on every row that exists, so nothing is backfilled and no reader has to decide what
+     * an absent trigger means - `trigger_path IS NULL` is "no door", which is every schedule today.
+     *
+     * `trigger_path` is UNIQUE through a partial index rather than a column constraint, because a
+     * plain UNIQUE would index every NULL row - and almost every row is NULL. The path is the
+     * lookup key for an unauthenticated request, so it is the one index on this table that has to
+     * be exact: two rows sharing a path would make which schedule fires a race.
+     *
+     * `trigger_secret_ciphertext` is sealed under the WORKSPACE key, like `prompt_ciphertext` beside
+     * it, so the plaintext secret exists in this database at no point. Anyone who can read the
+     * table but not unwrap the workspace key cannot forge a signature.
+     *
+     * DELIVERIES ARE ROWS AND NOT FILES because the request that carries one arrives at the API,
+     * while the workspace it belongs to may be suspended: writing straight through would make an
+     * inbound delivery fail whenever the computer was asleep, which is most of the time on a box
+     * that is doing its job. The dispatcher writes them into the workspace when it wakes it.
+     *
+     * `UNIQUE(schedule_id, signature)` is the replay defence. A signature is an HMAC over the
+     * timestamp and the exact body, so a replayed request inside the five-minute window is the same
+     * signature and is refused by this index rather than by application logic that has to remember
+     * to look. It doubles as idempotency for a sender that retries, which is what GitHub, Stripe
+     * and every other webhook publisher does on a timeout.
+     *
+     * `delivered_at IS NULL` is the pending set, indexed partially for the same reason as the path:
+     * the dispatcher asks that question on every poll of a trigger schedule and never asks about
+     * the delivered ones. `body_ciphertext` is not indexed and never will be; it is a payload.
+     *
+     * `byte_size` has exactly one reader, and it is named here because a column nothing reads is a
+     * column that quietly stops being true: `recordTriggerDelivery` sums it over the pending set and
+     * the 429 that refuses a backed-up sender says how many bytes are waiting. The count on its own
+     * does not answer that - sixteen unread deliveries is sixteen bytes or a megabyte about to be
+     * written into the owner's workspace. It bounds nothing; `MAX_DELIVERY_BYTES` and the pending
+     * cap are the bounds.
+     *
+     * `task_id` is the claim, and it is not the same fact as `delivered_at`. A run's prompt is
+     * sealed naming these deliveries inside `materializeTaskSchedule`, and the files are written
+     * afterwards, outside that transaction - so `task_id` says which run PROMISED a delivery and
+     * `delivered_at` says which run got it. The stranded-run recovery reads the first to finish a
+     * promise a prompt already made; every other reader asks only the second.
+     *
+     * Three added columns and one new table. Nothing is rewritten, so there is no entry in
+     * `REWRITING_MIGRATIONS`.
+     */
+    sql: `
+      ALTER TABLE task_schedules ADD COLUMN IF NOT EXISTS trigger JSONB;
+      ALTER TABLE task_schedules ADD COLUMN IF NOT EXISTS trigger_path TEXT;
+      ALTER TABLE task_schedules ADD COLUMN IF NOT EXISTS trigger_secret_ciphertext JSONB;
+      CREATE UNIQUE INDEX IF NOT EXISTS task_schedules_trigger_path_idx
+        ON task_schedules(trigger_path) WHERE trigger_path IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS task_schedule_deliveries (
+        id UUID PRIMARY KEY,
+        schedule_id UUID NOT NULL REFERENCES task_schedules(id) ON DELETE CASCADE,
+        signature TEXT NOT NULL,
+        body_ciphertext JSONB NOT NULL,
+        byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+        task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,
+        delivered_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(schedule_id, signature)
+      );
+      CREATE INDEX IF NOT EXISTS task_schedule_deliveries_recent_idx
+        ON task_schedule_deliveries(schedule_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS task_schedule_deliveries_pending_idx
+        ON task_schedule_deliveries(schedule_id, created_at)
+        WHERE delivered_at IS NULL;
+    `
   }
 ] as const;

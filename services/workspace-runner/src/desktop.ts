@@ -32,6 +32,7 @@ import {
   privilegedHelperInvocation,
   resolveExecutable
 } from './command-policy.js';
+import { hostSearchPath } from './execution.js';
 import { resolveInside } from './files.js';
 import { DesktopControl } from './holder.js';
 import { failureCode, runnerLogger } from './log.js';
@@ -1883,7 +1884,10 @@ const scaleNodeBounds = (
 };
 
 const processEnv = (root: string): NodeJS.ProcessEnv => ({
-  PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+  // The same system-only list the runner's other helpers resolve against, read from one place
+  // rather than spelled twice. It was written out here first; `hostSearchPath` is that spelling
+  // given a name so `audio.ts`, `render-proof.ts` and `toolchain.ts` could stop using the agent's.
+  PATH: hostSearchPath,
   HOME: root,
   LANG: 'C.UTF-8'
 });

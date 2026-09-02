@@ -24,6 +24,7 @@ import { approvalArgumentsMatch, approvalOutcome } from '../approval-state.js';
 import { event, type ToolRecordingDeps } from '../tool-recording.js';
 import { sealUnansweredToolCalls, unansweredToolCallIds } from '../turn-lifecycle.js';
 import { textValue } from '../values.js';
+import { PLAN_MODE_PERMITTED } from './dispatch.js';
 
 /**
  * What settling a parked turn needs from the worker that owns it.
@@ -135,6 +136,64 @@ export const resumeParkedTurn = async (
         role: 'tool',
         toolCallId: call.id,
         content: `Refused: the arguments for ${call.name} no longer match the ones the user approved, so the approval does not cover this call. Request approval again for the exact action you intend to run.`
+      });
+      state.turnToolResults ??= {};
+      state.turnToolResults[call.id] = { name: call.name, success: false };
+    } else if (
+      approvalCoversCall &&
+      !handoffOnly &&
+      state.mode === 'plan' &&
+      !PLAN_MODE_PERMITTED.has(call.name)
+    ) {
+      /*
+       * The door beside the one plan mode closes, and it is open in exactly one direction.
+       *
+       * Not a handoff, and that conjunct is the difference between a refusal and a lie. A
+       * `handoffOnly` resumption executes nothing here in either mode - the owner already did the
+       * thing themselves, on their own screen, and this branch's whole job is to tell the model to
+       * look at what changed. Refusing it would send "it was not run and nothing changed" over an
+       * action that was run, by the owner, possibly a sign-in or a private value typed into the
+       * page - so the model would then plan against a computer in a state it has been told does not
+       * exist. There is nothing for plan mode to stop in that case, because nothing is about to run.
+       *
+       * A plan-mode turn can still park on a card, and never on one this branch would refuse.
+       * Measured through `approvalRequirement`: `parallel_web_read` is on the permitted set and
+       * raises `external_reversible` for a novel destination on a turn that has read untrusted
+       * content, in all three security modes. So the wider claim - that plan mode answers
+       * everything the floor would card - is false; what is true is that it answers everything
+       * this branch refuses, because the batch loop's gate runs long before the floor is asked. A
+       * card raised inside plan mode therefore always names a permitted tool, and a permitted tool
+       * resumes below rather than here.
+       *
+       * What reaches this branch is a card raised in act mode: the owner approves it and THEN puts
+       * the conversation into plan mode, or does both in the other order. The card is answered by
+       * id, the turn resumes here, and this branch runs the approved call without ever passing
+       * through the batch loop's gate.
+       *
+       * The later owner action wins. Approving a card says "yes, do that one thing"; entering plan
+       * mode says "stop changing things until I have seen the approach", and it is the more recent
+       * of the two. Refused rather than deferred, in the same shape as the arguments-no-longer-match
+       * refusal above and for the same reason: the model re-proposes the call, and it will be
+       * carded again, when the owner has taken the conversation back out of plan mode.
+       *
+       * `PLAN_MODE_PERMITTED` is imported from the batch loop rather than restated, because a second
+       * copy of that set is a second answer to the same question. There is no import cycle: the
+       * batch loop names this module only as a type.
+       */
+      await event(
+        deps.store,
+        task,
+        key,
+        'warning',
+        'Refused: the conversation moved into plan mode after this action was approved',
+        // Addressed to the owner: they approved something and it did not run, and nothing else in
+        // the conversation would say why.
+        { owner: true, approvalId, tool: call.name }
+      );
+      state.messages.push({
+        role: 'tool',
+        toolCallId: call.id,
+        content: `Refused: ${call.name} was approved, but the user has since put this conversation in plan mode, so it was not run and nothing changed. Fold it into the plan instead and propose it again once they take the conversation out of plan mode.`
       });
       state.turnToolResults ??= {};
       state.turnToolResults[call.id] = { name: call.name, success: false };

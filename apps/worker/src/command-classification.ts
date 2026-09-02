@@ -15,6 +15,7 @@
  * putting the predicate in write-classification.ts - which already imports this module for
  * `gitSubcommand` and the package-manager sets - would close a cycle between the two.
  */
+import { posix } from 'node:path';
 import { classifyDestination } from './egress.js';
 import { textValue } from './values.js';
 
@@ -3245,8 +3246,28 @@ export const DOWNLOAD_QUARANTINE_PREFIXES = [
   'mail/'
 ];
 
-/** A workspace path as the quarantine rule compares it: leading `./` and `/` stripped. */
-const quarantineRelative = (path: string): string => path.replace(/^\.?\//, '');
+/*
+ * A workspace path as the quarantine rule compares it.
+ *
+ * NORMALISED, not merely stripped, and that is the whole of this function. It used to be
+ * `path.replace(/^\.?\//, '')` - leading `./` or `/` removed and nothing else - while the RUNNER
+ * resolves the same string with `path.resolve` before opening it. So two spellings of one file
+ * disagreed about whether reading it taints the turn, and the model chooses the spelling. Measured
+ * against the shipped predicate: `workspace/downloads/inbound/a.json` was quarantined and
+ * `workspace/./downloads/inbound/a.json` and `workspace//downloads/inbound/a.json` were not, while
+ * all three open the same bytes. One inserted character bought a read of a stranger's file on a
+ * turn the floor then judged clean - no egress charge, no card on a write to ATHANOR.md, no card on
+ * a read of any host.
+ *
+ * `path.posix.normalize` is what the comparison needed and `path.resolve` is not: resolve would
+ * anchor a relative path to this process's working directory, which is the worker's and not the
+ * workspace's. A leading `/` is stripped first because the model writes both spellings for the same
+ * workspace-relative file, and `..` is left to normalize, which collapses what it can and leaves a
+ * leading `../` it cannot - a path that climbs out of the workspace is refused by `resolveInside`
+ * in the runner long before it is read, so it is not this predicate's job to judge it.
+ */
+const quarantineRelative = (path: string): string =>
+  posix.normalize(path.replace(/^\.?\//, '')).replace(/^\.\//, '');
 
 export const isQuarantinedDownloadPath = (path: string): boolean =>
   DOWNLOAD_QUARANTINE_PREFIXES.some((prefix) => quarantineRelative(path).startsWith(prefix));

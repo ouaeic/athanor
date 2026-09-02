@@ -79,6 +79,16 @@ interface Run {
   readonly completed: Completed | null;
   /** What the model was told, when it was told anything, which is the hold's own half. */
   readonly toldTheModel: string[];
+  /**
+   * One entry per time the harness actually executed the acceptance record.
+   *
+   * The stub above returns results whether or not it was called, so "the completion says nothing
+   * about acceptance" is not evidence that nothing ran - it is equally what a run whose results
+   * were discarded would look like. This is the only field that separates the two, and the
+   * plan-mode case below is entirely about it: an acceptance run is the owner's build and test
+   * commands executing on the owner's computer, so it is the call and not the report that matters.
+   */
+  readonly ran: string[];
 }
 
 /**
@@ -91,9 +101,12 @@ interface Run {
  */
 const finish = async (
   results: readonly AcceptanceResult[] | null,
-  state: Partial<AgentState> = {}
+  state: Partial<AgentState> = {},
+  /** What the plan says is still open, which only the plan-coverage hold reads. Empty by default. */
+  outstanding: readonly string[] = []
 ): Promise<Run> => {
   let completed: Completed | null = null;
+  const ran: string[] = [];
   const agentState = {
     messages: [],
     turn: 4,
@@ -113,8 +126,15 @@ const finish = async (
       appendTaskEvent: async () => ({ id: 'event-1' })
     } as unknown as TurnFinishDeps['store'],
     config: {} as TurnFinishDeps['config'],
-    outstandingPlanSteps: async () => [],
-    runAcceptanceChecks: async () => [...(results ?? [])],
+    outstandingPlanSteps: async () => [...outstanding],
+    runAcceptanceChecks: async (
+      _task: TaskRecord,
+      _key: Uint8Array,
+      declared: AcceptanceRecord
+    ) => {
+      ran.push(...declared.checks.map((check) => check.id));
+      return [...(results ?? [])];
+    },
     completeTurn: async (
       _task: TaskRecord,
       _key: Uint8Array,
@@ -146,7 +166,8 @@ const finish = async (
     completed,
     toldTheModel: agentState.messages
       .filter((message) => message.role === 'tool')
-      .map((message) => message.content)
+      .map((message) => message.content),
+    ran
   };
 };
 
@@ -347,5 +368,81 @@ describe('what the owner reads, in the words they read', () => {
     const run = await finish([passed], { acceptanceCaveat: ACCEPTANCE_ALREADY_PASSED_CAVEAT });
 
     expect(beside(run)).toContain(ACCEPTANCE_ALREADY_PASSED_CAVEAT);
+  });
+});
+
+/**
+ * The mode's central claim, asked of the one tool that could break it.
+ *
+ * Plan mode's own headline test is titled "answers every act that would change this computer, and
+ * runs none of them", and `finish` is on its permitted set: it is not mutating and it is
+ * checkpoint-exempt, so both basis sets admit it without anybody naming it. What `finish` does at
+ * hold 4 is execute the acceptance record, and acceptance-runner.ts says what that is - "An
+ * acceptance suite is a build and a test run: the two longest things a turn does after the model
+ * call" - through what acceptance.ts calls "a direct exec".
+ *
+ * The record gets into a plan-mode turn without a plan-mode turn declaring one. `set_acceptance` is
+ * refused by the batch loop, but `startTurnState` does not launder `acceptance`, so a record an
+ * earlier act-mode turn wrote is still on the state after the owner switches the conversation to
+ * plan. That is the path these cases drive, and it is the reason the fixture below carries
+ * `acceptanceTurn: 1` against a turn numbered 4.
+ *
+ * Driven against `ran` rather than against the completion, because the completion looks the same
+ * either way: the results are discarded in both readings and only the call separates them.
+ */
+describe('a finish call made while the conversation is in plan mode', () => {
+  /** The turn the owner switched to plan after an earlier act-mode turn declared the checks. */
+  const carried: Partial<AgentState> = {
+    mode: 'plan',
+    // A plan-mode turn cannot set this: every tool that could is answered before it runs. Written
+    // out rather than left to the default, because it is what makes hold 3 fall through to hold 4.
+    mutatedBeyondProse: false,
+    acceptanceTurn: 1
+  };
+
+  it('does not run the owner’s build and test commands', async () => {
+    const run = await finish([passed], carried);
+
+    expect(run.ran).toEqual([]);
+    expect(run.outcome).toBe('completed');
+    // And says nothing about checks it did not run. Left at the empty initialiser rather than
+    // carried over from the turn that declared them: a plan-mode turn changed nothing, so there is
+    // nothing an earlier green could be evidence of here.
+    expect(run.completed?.acceptance).toBeUndefined();
+  });
+
+  /**
+   * The control, and the only thing keeping the case above about the mode rather than about the
+   * fixture: the same state in act mode runs the same record.
+   */
+  it('runs them exactly as before when the conversation is not in plan mode', async () => {
+    const run = await finish([passed], { ...carried, mode: 'act' });
+
+    expect(run.ran).toEqual(['c1']);
+    expect(run.completed?.acceptance).toEqual(['c1: the sum is right — exit 0']);
+  });
+
+  /**
+   * And the round trip the mode should not pay. A plan whose steps are all open is the deliverable
+   * in plan mode, so holding the finish to be told so costs one model call and changes nothing.
+   */
+  it('completes rather than asking about plan steps that are open on purpose', async () => {
+    const run = await finish(null, { mode: 'plan', mutatedBeyondProse: false }, [
+      'Read the migration',
+      'Draft the column'
+    ]);
+
+    expect(run.outcome).toBe('completed');
+    expect(run.toldTheModel.join('\n')).not.toContain('plan steps are still open');
+  });
+
+  it('still asks about open plan steps in act mode', async () => {
+    const run = await finish(null, { mutatedBeyondProse: false }, [
+      'Read the migration',
+      'Draft the column'
+    ]);
+
+    expect(run.outcome).toBe('held');
+    expect(run.toldTheModel.join('\n')).toContain('2 plan steps are still open');
   });
 });

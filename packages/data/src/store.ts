@@ -691,6 +691,36 @@ export class DataStore {
     return this.#schedules.leaseDueTaskSchedule(...args);
   }
 
+  taskScheduleRunInFlight(...args: Parameters<ScheduleStore['taskScheduleRunInFlight']>) {
+    return this.#schedules.taskScheduleRunInFlight(...args);
+  }
+
+  pauseTaskScheduleWithReason(...args: Parameters<ScheduleStore['pauseTaskScheduleWithReason']>) {
+    return this.#schedules.pauseTaskScheduleWithReason(...args);
+  }
+
+  listTaskScheduleTriggers(...args: Parameters<ScheduleStore['listTaskScheduleTriggers']>) {
+    return this.#schedules.listTaskScheduleTriggers(...args);
+  }
+
+  taskScheduleByTriggerPath(...args: Parameters<ScheduleStore['taskScheduleByTriggerPath']>) {
+    return this.#schedules.taskScheduleByTriggerPath(...args);
+  }
+
+  recordTriggerDelivery(...args: Parameters<ScheduleStore['recordTriggerDelivery']>) {
+    return this.#schedules.recordTriggerDelivery(...args);
+  }
+
+  pendingTriggerDeliveries(...args: Parameters<ScheduleStore['pendingTriggerDeliveries']>) {
+    return this.#schedules.pendingTriggerDeliveries(...args);
+  }
+
+  markTriggerDeliveriesDelivered(
+    ...args: Parameters<ScheduleStore['markTriggerDeliveriesDelivered']>
+  ) {
+    return this.#schedules.markTriggerDeliveriesDelivered(...args);
+  }
+
   deferTaskSchedule(...args: Parameters<ScheduleStore['deferTaskSchedule']>) {
     return this.#schedules.deferTaskSchedule(...args);
   }

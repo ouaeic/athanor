@@ -1,0 +1,41 @@
+id: scientific-computing
+version: 1.0.0
+catalog_line: 'Install a toolchain this computer lacks, and size a large or wide run against what the box allows.'
+
+lineage:
+  origin: builtin
+  approved_by: null
+  approved_at: null
+
+requires:
+  tools: [shell, process, file_read, file_write, files_list, set_plan, set_acceptance, notify]
+  # Deliberately empty. Everything the procedure runs - python3, curl, ln, df - is coreutils or the
+  # `python` and `curl` rows of the host table, which every supported family has, and naming a
+  # binary here would add it to the chain apps/worker/src/skills.test.ts holds against the host
+  # table without changing what the box installs. The compiler this skill says is absent is
+  # deliberately NOT declared: declaring it would claim athanor installs one, and it does not.
+  binaries: []
+
+capability:
+  fs.read: ['$WORKSPACE/**']
+  fs.write: ['$WORKSPACE/**', '$TMP/**']
+  # The environment this skill builds lives outside these globs, under `$HOME`, which has no
+  # spelling in this vocabulary - a limit of the declaration, not of the procedure.
+  #
+  # The only non-empty `net.hosts` in this library, and it names exactly the hosts the PROCEDURE
+  # chooses: pip's index, because the procedure says to build an environment with pip. The dataset
+  # the job downloads is reached with `curl` too, and its host is deliberately absent - it comes
+  # from the owner's own request, so this skill selects no host for it and listing one would claim
+  # otherwise. `*` was the first spelling and the library refuses it, correctly: an unbounded grant
+  # tells a reviewer nothing, and the honest half is enumerable.
+  net.hosts: ['pypi.org', 'files.pythonhosted.org']
+  exec: []
+  connectors: []
+  spend: none
+
+verify:
+  - run: 'command -v TOOL'
+    assert: 'the installed entry point resolves by bare name, not only by its path inside the environment'
+  - check: 'The environment lives under $HOME and nothing was installed inside workspace/, so this turn still has an undo point.'
+  - check: 'Every downloaded file was checked against the size or checksum the source publishes before anything read it.'
+  - check: 'The width of the run was chosen from the Machine line cores and memory against the measured per-worker footprint, not from nproc.'

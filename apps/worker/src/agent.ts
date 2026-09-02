@@ -2050,7 +2050,7 @@ export class AgentWorker {
       const failuresBeforeBatch = state.repeatedFailures;
 
       /*
-       * The batch the model proposed, and the eight gates each call passes before it runs.
+       * The batch the model proposed, and the nine gates each call passes before it runs.
        *
        * @see dispatchToolCalls in `turn/dispatch.ts`, where the two hundred and seventy-two lines
        * that ran it - at nesting depth nine, inside the step loop inside `run()` - now live.

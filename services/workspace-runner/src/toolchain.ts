@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { agentSearchPath, packageInstallCommandLine } from './execution.js';
+import { agentSearchPath, hostSearchPath, packageInstallCommandLine } from './execution.js';
 import { resolveExecutable } from './command-policy.js';
 
 /**
@@ -486,9 +486,22 @@ export const hostPackages = async (
   return manager ? { manager, packages, unavailable } : undefined;
 };
 
+/**
+ * The families fontconfig knows, asked of the host's own fc-list and no other.
+ *
+ * The one probe here that does not resolve the way an agent command would, and the difference is
+ * that this one runs what it finds: `probeBinaries` above stops at resolution, this spawns. On
+ * `agentSearchPath` a file the agent had written called `fc-list` would be executed by the runner,
+ * outside the sandbox, and would also get to decide which fonts this report claims. @see
+ * hostSearchPath.
+ *
+ * The cost is one honest disagreement: a box whose only fc-list sits under `$HOME` reports the
+ * binary present, through `probeBinaries`, and its font families missing. Reporting a family on
+ * the word of a binary the agent supplied is the worse of the two answers.
+ */
 export const probeFonts = async (root: string, fonts: readonly string[]): Promise<Set<string>> => {
   if (!fonts.length) return new Set();
-  const listing = await resolveExecutable('fc-list', agentSearchPath(root), root);
+  const listing = await resolveExecutable('fc-list', hostSearchPath, root);
   if (!listing) return new Set();
   const output = await runProbe(listing, ['--format=%{family}\\n']);
   return output === null ? new Set() : parseFontFamilies(output);

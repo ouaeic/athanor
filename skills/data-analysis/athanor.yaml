@@ -1,5 +1,5 @@
 id: data-analysis
-version: 2.3.0
+version: 2.4.0
 catalog_line: 'Clean and analyse a dataset with a saved re-runnable script and stated assumptions.'
 
 lineage:

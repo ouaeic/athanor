@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
 import {
+  isQuarantinedDownloadPath,
   AGENT_HOME,
   callDestinations,
   CHECKPOINT_CONTENT,
@@ -2197,5 +2198,47 @@ describe('a command carried into another box', () => {
       expect(carried(tokens), tokens.join(' ')).toBeNull();
     // An exec with nothing after the container runs nothing and carries nothing.
     expect(carried(['docker', 'exec', 'pg'])).toBeNull();
+  });
+});
+
+/*
+ * The quarantine predicate is the join between "these bytes came from outside" and "this turn is
+ * tainted". It compared a path the model wrote against a literal prefix, with only a leading `./`
+ * or `/` removed, while the runner resolved the same string with `path.resolve` before opening it -
+ * so the model chose whether reading a stranger's file taints its turn, by inserting one character.
+ *
+ * Measured against the shipped predicate before the repair: the plain spelling was quarantined and
+ * `workspace/./downloads/...` and `workspace//downloads/...` were not, while all three open the
+ * same bytes. The consequence of landing on the clean side is not abstract - it is no egress
+ * charge, no card on a write to ATHANOR.md and no card on a read of any host, for a turn that has
+ * read content somebody else wrote.
+ */
+describe('the paths the quarantine rule treats as downloaded', () => {
+  it('reads every spelling of one file the same way the runner opens it', () => {
+    for (const spelling of [
+      'workspace/downloads/inbound/a/b.json',
+      './workspace/downloads/inbound/a/b.json',
+      '/workspace/downloads/inbound/a/b.json',
+      'workspace/./downloads/inbound/a/b.json',
+      'workspace//downloads/inbound/a/b.json',
+      'workspace/downloads/../downloads/inbound/a/b.json',
+      'workspace/mail/./note.eml'
+    ])
+      expect(isQuarantinedDownloadPath(spelling), spelling).toBe(true);
+  });
+
+  /*
+   * The other direction, and it is what stops the repair being "return true". A normaliser that
+   * collapsed too eagerly would quarantine the whole workspace, and a prefix match with no boundary
+   * would take `downloadsX` with `downloads`.
+   */
+  it('leaves an ordinary workspace file alone, and a near-miss directory with it', () => {
+    for (const spelling of [
+      'workspace/notes.md',
+      'workspace/downloadsX/a.json',
+      'workspace/src/downloads.ts',
+      './workspace/mailbox-notes.md'
+    ])
+      expect(isQuarantinedDownloadPath(spelling), spelling).toBe(false);
   });
 });

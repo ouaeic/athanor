@@ -61,7 +61,20 @@ const publicPaths = new Set([
   '/v1/auth/enroll/verify',
   '/v1/auth/dev',
   '/v1/connectors/mcp/oauth/callback',
-  '/v1/connectors/mcp/oauth/client-metadata'
+  '/v1/connectors/mcp/oauth/client-metadata',
+  /*
+   * The inbound trigger, which is unauthenticated in the sense this table means and not in the
+   * sense that matters: it carries no session and no bearer token, because the caller is a build
+   * server or a mail hook that has neither, and it is refused outright unless it presents an
+   * HMAC-SHA256 signature over its own timestamp and body under a secret this box generated for one
+   * schedule row. `routes/schedules.ts` verifies that before it will look at anything else, with a
+   * constant-time comparison and a five-minute acceptance window, and the path itself is 256 bits
+   * of randomness - so being on this list means "brings its own proof" rather than "needs none".
+   *
+   * Listed by ROUTE pattern and not by URL, which is what this table is read with
+   * (`request.routeOptions.url`), so the random segment does not have to be enumerated.
+   */
+  '/v1/hooks/:token'
 ]);
 
 /**

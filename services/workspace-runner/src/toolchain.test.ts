@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -7,6 +8,7 @@ import {
   parseFontFamilies,
   parseImportableModules,
   probeBinaries,
+  probeFonts,
   reportToolchain,
   summariseToolchain,
   toolchainReport,
@@ -148,6 +150,36 @@ describe('binary probing', () => {
   // rather than a fixture: it starts an interpreter and looks for seven modules, which under a
   // machine running the whole suite in parallel is comfortably slower than vitest's default five
   // seconds. A test that fails only when the machine is busy is a test nobody can trust.
+  /*
+   * The two probes in this module answer different questions and must not be merged.
+   * `probeBinaries` reports what an agent command would find, which is the whole point of the
+   * route it serves; `probeFonts` runs what it finds, as the runner, so it may only find what the
+   * host installed. This asserts the difference in one case, from a single planted file, so that
+   * putting either one back on the other's list fails here.
+   */
+  it('sees an agent-planted fc-list but will not run it', async () => {
+    const tools = path.join(root, 'workspace', '.athanor', 'tools', 'node_modules', '.bin');
+    await mkdir(tools, { recursive: true });
+    const marker = path.join(root, 'fc-list-was-run');
+    await writeFile(
+      path.join(tools, 'fc-list'),
+      `#!/bin/sh\n: > ${JSON.stringify(marker)}\nprintf 'Athanor Decoy Sans\\n'\n`
+    );
+    await chmod(path.join(tools, 'fc-list'), 0o755);
+
+    // A name no host carries, so this half is a statement about `probeBinaries` reading the agent's
+    // list rather than about whether this machine happens to have fontconfig in /usr/local/bin.
+    await writeFile(path.join(tools, 'athanor-planted-probe'), '#!/bin/sh\nexit 0\n');
+    await chmod(path.join(tools, 'athanor-planted-probe'), 0o755);
+    expect(
+      (await probeBinaries(root, ['athanor-planted-probe'])).has('athanor-planted-probe')
+    ).toBe(true);
+
+    const families = await probeFonts(root, ['Athanor Decoy Sans']);
+    expect(families.has('athanor decoy sans')).toBe(false);
+    expect(existsSync(marker), 'the runner executed an fc-list the agent wrote').toBe(false);
+  });
+
   it('answers for the real host without pretending anything is there', async () => {
     const report = await toolchainReport(root);
     expect(report.capabilities).toHaveLength(DOCUMENT_TOOLCHAIN.length);

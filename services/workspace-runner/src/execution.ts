@@ -586,10 +586,46 @@ export interface ExecutionOptions {
   guards?: ExecutionGuards;
 }
 
-/** The PATH every agent command runs with, and therefore the one a policy check must resolve in. */
+/**
+ * The PATH every agent command runs with, and therefore the one a policy check must resolve in.
+ *
+ * `$HOME/.local/bin` and `$HOME/bin` are on it because without them there was nowhere under `$HOME`
+ * an agent could put an executable and then reach it: `shell` performs no expansion, so a command
+ * cannot say `~/.local/bin/...` and have it mean anything, and `agentEnvironment` above refuses a
+ * caller-supplied `PATH` by name rather than merging it. So an install could report success, leave
+ * the file on the disk, and every later invocation still answer "command not found" with no
+ * recovery available to the agent that had just done the installing.
+ *
+ * `pip install --user` is the usual reason a login shell carries these two, and it is NOT the route
+ * here: measured on the owner's box, the system interpreter has no `pip` module and is marked
+ * EXTERNALLY-MANAGED, so PEP 668 refuses a `--user` install before it writes anything. The route
+ * that works is `python3 -m venv`, which brings its own pip - and these entries do not on their own
+ * make one runnable, because a venv's executables live in its own `<prefix>/bin`, which is not on
+ * this list and is not meant to be. What they give it is somewhere to put the symlink: the last
+ * step of such an install is to link the entry points into `$HOME/.local/bin`, and before these two
+ * entries that link led nowhere either. `skills/scientific-computing` is where the agent is told so.
+ *
+ * They sit ahead of the system directories for the reason every login shell puts them there - the
+ * owner-installed copy is meant to win over a stale packaged one - and behind the workspace's own
+ * `node_modules/.bin`, which already led the list.
+ *
+ * WHAT THIS DOES NOT DO is serve as the list the RUNNER finds its own helpers on. Its first three
+ * entries are all directories the agent can write: index 0 is inside `$ROOT/workspace` and indices
+ * 1 and 2 are inside `$ROOT/.home`, and the confine loop in `scripts/athanor-sandbox` grants write
+ * on both of those roots. A helper resolved here and then spawned by the runner's own account -
+ * outside the sandbox, outside the limiter - would therefore run whatever an agent had left under
+ * that name. `hostSearchPath` below is the list for that, and `prepareAudio`, `findRenderTools` and
+ * `probeFonts` resolve against it rather than against this.
+ *
+ * `probeBinaries` in `toolchain.ts` stays on this one on purpose, and so does `surfaces.ts`: both
+ * answer "would this name resolve for the agent", which is a question only this list can answer,
+ * and neither spawns what it resolves.
+ */
 export const agentSearchPath = (workspaceRoot: string): string =>
   [
     path.join(workspaceRoot, 'workspace', '.athanor', 'tools', 'node_modules', '.bin'),
+    path.join(agentHome(workspaceRoot), '.local', 'bin'),
+    path.join(agentHome(workspaceRoot), 'bin'),
     '/usr/local/sbin',
     '/usr/local/bin',
     '/usr/sbin',
@@ -597,6 +633,37 @@ export const agentSearchPath = (workspaceRoot: string): string =>
     '/sbin',
     '/bin'
   ].join(path.delimiter);
+
+/**
+ * The PATH the runner resolves ITS OWN helpers against, before spawning them as itself.
+ *
+ * System directories and nothing else, and no workspace root, because nothing on this list depends
+ * on one. That is the whole difference from `agentSearchPath` above and it is a privilege boundary:
+ * the three entries that list adds ahead of these are all agent-writable, and the helpers that
+ * resolve here are then run by the runner's account rather than through `scripts/athanor-sandbox`.
+ * `prepareAudio` (ffprobe, ffmpeg), `findRenderTools` (pdftotext, pdftoppm, athanor-office-convert)
+ * and `probeFonts` (fc-list) are those helpers - six names, spawned with `shell: false` and no
+ * sandboxed invocation - and they are the callers of this.
+ *
+ * Not a new list: `desktop.ts` has always written exactly these six directories inline for the
+ * spawns of its own session, and now reads this instead, so a host that ever needs a seventh has
+ * one place to gain it rather than two that drift.
+ *
+ * WHAT THIS DOES NOT DO is decide where the pinned interpreter comes from. `ATHANOR_PYTHON` is an
+ * absolute path and `resolveExecutable` short-circuits any name holding a separator, so no search
+ * path is consulted for it and moving `probePythonModules` here would change nothing.
+ *
+ * It also does not confine what it finds. A helper found on this list still runs unsandboxed as the
+ * runner; what this removes is the agent's ability to choose which file that is.
+ */
+export const hostSearchPath = [
+  '/usr/local/sbin',
+  '/usr/local/bin',
+  '/usr/sbin',
+  '/usr/bin',
+  '/sbin',
+  '/bin'
+].join(path.delimiter);
 
 /** The command as the kernel will receive it, after every refusal, the sandbox and the limiter. */
 export interface PreparedInvocation {
