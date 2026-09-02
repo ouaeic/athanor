@@ -101,6 +101,8 @@ export interface BaselineRow {
   readonly unrecoverableLosses: number;
   /** Compactions attempted that freed nothing. @see Measurement.compactionRefusals. */
   readonly compactionRefusals: number;
+  /** What the compactions handed a summarising model. @see Measurement.summariserTokens. */
+  readonly summariserTokens: number;
 }
 
 export type Baseline = Record<string, BaselineRow>;
@@ -127,7 +129,8 @@ export const baselineFrom = (measurements: readonly Measurement[]): Baseline => 
       cacheReadShare: Math.round(measurement.meanCacheReadShare * 1_000) / 1_000,
       newestReasoningSteps: measurement.newestReasoningSteps,
       unrecoverableLosses: measurement.unrecoverableLosses,
-      compactionRefusals: measurement.compactionRefusals
+      compactionRefusals: measurement.compactionRefusals,
+      summariserTokens: measurement.summariserTokens
     };
   return baseline;
 };
@@ -173,6 +176,34 @@ export const check = (
   if (tokens > expected.tokensPerTask * 1.02)
     failures.push(
       `tokens per task ${tokens.toLocaleString('en-GB')} is over the accepted ${expected.tokensPerTask.toLocaleString('en-GB')} by more than 2%`
+    );
+  /*
+   * The summariser's own spend, on the same 2% band as the step loop's and for the same reason: the
+   * system prompt is edited by unrelated work and the transcript follows the operating contract.
+   *
+   * A ceiling and never a floor. Compaction is the one stage here that spends a model call the
+   * caller did not ask for, and a change that quietly doubles it - a second pass at the boundary, a
+   * transcript that carries a channel it did not carry before, a summariser given more history -
+   * would otherwise land with nothing to say so.
+   *
+   * Absence is asked about rather than defaulted, and for the opposite reason to the check above.
+   * `?? 0` reads an absent `compactionRefusals` as "none accepted", which TIGHTENS that check. A
+   * ceiling defaulted to zero is not the lax reading of the same move: it fires on every row whose
+   * accepted figure is absent and whose compactions spent anything at all - which, on a baseline
+   * accepted before this column existed, is every compacting row - and the message it then builds
+   * reads that absent figure and throws `Cannot read properties of undefined`. Both directions were
+   * run against this tree: with the figure deleted from one baseline row the arm below skips and
+   * the run is clean, and with the arm rewritten to `?? 0` the same deletion crashes `check` on the
+   * `expected.summariserTokens.toLocaleString` in the message below. So a baseline accepted before
+   * this column existed is left unchecked on it, and the run's provenance line already says which
+   * rig accepted its numbers.
+   */
+  if (
+    expected.summariserTokens !== undefined &&
+    measurement.summariserTokens > expected.summariserTokens * 1.02
+  )
+    failures.push(
+      `the summariser was handed ${measurement.summariserTokens.toLocaleString('en-GB')} tokens, over the accepted ${expected.summariserTokens.toLocaleString('en-GB')} by more than 2%`
     );
   return failures;
 };
@@ -228,6 +259,8 @@ export const render = (
       ...PROBE_KINDS.map((kind) => padStart(kind.slice(0, 5), 6)),
       padStart('judged', 7),
       padStart('tokens/task', 12),
+      // Beside the task's own tokens and never inside them: a different model on a different route.
+      padStart('summ-in', 9),
       padStart('rework', 8),
       padStart('unrec', 6),
       padStart('refuse', 7),
@@ -255,6 +288,7 @@ export const render = (
           ...PROBE_KINDS.map((kind) => padStart(meanCeiling(row, kind).toFixed(2), 6)),
           padStart(judgedMean, 7),
           padStart(tokensPerTask(row).toLocaleString('en-GB'), 12),
+          padStart(row.summariserTokens.toLocaleString('en-GB'), 9),
           padStart(row.reworkTokens.toLocaleString('en-GB'), 8),
           padStart(String(row.unrecoverableLosses), 6),
           padStart(`${row.compactionRefusals}/${row.compactions + row.compactionRefusals}`, 7),

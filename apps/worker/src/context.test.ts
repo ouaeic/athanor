@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { acceptanceAcceptedResult } from './acceptance.js';
 import { agentToolsFor } from './tools.js';
 import { ACCEPTANCE_MARKER } from './agent.js';
@@ -59,6 +60,8 @@ import {
   serializeToolResultForModel,
   SPEND_NOTICE_SHARE,
   truncateMiddle,
+  CUT_TOOL_OUTPUT_ADVICE,
+  MAX_CUT_ADVICE_CHARS,
   type ContextBrief
 } from './context.js';
 import { recallMemories } from '@athanor/core';
@@ -128,6 +131,39 @@ describe('agent context preparation', () => {
     expect(output).toContain('BEGIN');
     expect(output).toContain('END');
     expect(output).toContain('omitted from tool output');
+  });
+
+  /**
+   * The specialist's window, pinned at the call `delegate.ts` actually makes.
+   *
+   * `runDelegatedMission` is not exported and needs a gateway, a store and a live budget to run, so
+   * what is driven here is the one line of it that matters - `serializeToolResultForModel(result,
+   * 16_000)` with no recovery - plus a read of the source to prove that line is still the line.
+   * The source check is not decoration: "the mechanism exists but no production caller reaches it"
+   * is the finding this programme has made four times, and a default that fires on `undefined` is
+   * invisible at the call site by construction.
+   */
+  it('teaches a delegated specialist, whose window never spills at all', async () => {
+    const output = serializeToolResultForModel({ text: 'p'.repeat(80_000) }, 16_000);
+    expect(output).toHaveLength(16_000);
+    expect(output).toContain(CUT_TOOL_OUTPUT_ADVICE);
+    // A specialist has no writer registered and does not go through `recordToolResult`, so there
+    // is no file behind this cut and the sentence must not suggest there is.
+    expect(output).not.toContain('the whole result is at ');
+
+    const source = await readFile(new URL('./delegate.ts', import.meta.url), 'utf8');
+    expect(source).toContain('serializeToolResultForModel(result, 16_000)');
+  });
+
+  it('holds the advice under the marker that had more to say', () => {
+    // The ceiling and the sentence, stated where the sentence lives. The relation that makes the
+    // ceiling honest - shorter than `spillRecovery`'s clause on the same result, through the same
+    // production call site - is in `output-spill.test.ts`, which can drive both halves.
+    expect(CUT_TOOL_OUTPUT_ADVICE.length).toBeLessThanOrEqual(MAX_CUT_ADVICE_CHARS);
+    // Nothing is charged for a result that fits, which is the whole reason this costs no resident
+    // bytes: the value comes back the object it went in as.
+    const fits = { stdout: 'q'.repeat(200) };
+    expect(serializeToolResultForModel(fits)).toBe(JSON.stringify(fits));
   });
 
   it('uses a soft structured summary before the hard context ceiling', () => {

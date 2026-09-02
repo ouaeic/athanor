@@ -101,9 +101,19 @@ const mean = (values: readonly number[]): number =>
  * transcript line and drops the rest, so agent prose and tool-call arguments survive and the
  * middle of a tool result does not.
  *
- * It is never given the probes, the questions or the answers. Judged mode replaces it with the
- * real summarising model, which is where the quality of athanor's actual brief is measured; this
- * is the floor beneath it.
+ * It is never given the probes, the questions or the answers.
+ *
+ * IT IS ALSO THE ONLY SUMMARISER THIS RIG HAS, IN BOTH HALVES. `--judge` replaces the model that
+ * ANSWERS a probe from a compressed window and the model that grades the answer; it does not
+ * replace this. So nothing here measures athanor's real brief, and no change to `compactionRequest`
+ * - the summariser's instructions, what it is asked to preserve, the lookup-terms line it is told
+ * to end on - can move a single number this directory prints. The comment that used to sit here
+ * said judged mode replaced this function, which is what a reader would have to believe to think
+ * the summariser prompt was under measurement. A change to that prompt is unfalsifiable here, the
+ * same way a change to `context.ts` is unfalsifiable in `evals/harness.ts`, and for the same
+ * reason: the thing that would answer differently is a function of a fixture rather than a model.
+ *
+ * What the rig can see of the summariser stage is its INPUT, which `summariserTokens` counts.
  */
 export const extractiveSummariser = ({ transcript }: { transcript: string }): Promise<string> => {
   const lines: string[] = [];
@@ -172,6 +182,25 @@ export interface Measurement {
    */
   readonly compactionRefusals: number;
   readonly promptTokensTotal: number;
+  /**
+   * Every token this task's compactions handed a summarising model, counted through the production
+   * `compactionRequest` - its system prompt, the goal, the carried brief and the transcript.
+   *
+   * It is NOT in `promptTokensTotal` and must not be added to it: that column is the sum of the
+   * step loop's own requests, and the summariser is a different model on a different route with a
+   * different price. Kept separate and printed separately for the same reason `unrecoverableLosses`
+   * is not folded into `reworkTokens` - two costs a reader has to be able to tell apart.
+   *
+   * It exists because it was the blind spot in the only cost number this rig published. Compaction
+   * is the one stage here that spends a model call, and `tokens/task` counted none of it, so an
+   * argument about spending MORE calls at a context boundary - a second pass that interrogates the
+   * summary, a third that answers from the history - had no column to be answered in. Measured at
+   * the shipped configuration it is 0.39% to 2.67% of `promptTokensTotal` across these five
+   * trajectories, rising with the number of compactions rather than with the window size. It was
+   * 0.26% to 2.24% until `transcriptLine` began carrying the reasoning channel; the
+   * `reasoning-dropped` configuration still reads the old figures, which is what that row is for.
+   */
+  readonly summariserTokens: number;
   readonly peakPromptTokens: number;
   readonly meanPrefixShare: number;
   readonly meanCacheReadShare: number;
@@ -230,6 +259,7 @@ export const measure = async (
   let compactions = 0;
   let budgetCompactions = 0;
   let compactionRefusals = 0;
+  let summariserTokens = 0;
 
   const steps: StepMeasurement[] = [];
   const readings = new Map<string, ProbeReading[]>();
@@ -286,7 +316,18 @@ export const measure = async (
           : context.compactionTargetTail(budget),
         transcriptChars: 80_000,
         citableFooter: `Citable toolCallIds from this turn, for finish: call-${step - 1} (file_read).`,
-        summarise: extractiveSummariser
+        /**
+         * Counted on the way past, through the production builder rather than by measuring the
+         * transcript: what a compaction actually sends is that transcript plus a system prompt of
+         * about 470 tokens, the goal and however much brief has accumulated, and on a long task the
+         * carried brief is the term that grows. Attributed to the request that is about to be sent,
+         * so a summariser that is never called - a refusal - costs nothing here, which is right.
+         */
+        summarise: (request) => {
+          for (const message of context.compactionRequest(request))
+            summariserTokens += Math.ceil(message.content.length / 4);
+          return extractiveSummariser(request);
+        }
       });
       if (outcome) {
         messages.splice(0, messages.length, ...outcome.messages);
@@ -430,6 +471,7 @@ export const measure = async (
     budgetCompactions,
     compactionRefusals,
     promptTokensTotal: steps.reduce((sum, measurement) => sum + measurement.promptTokens, 0),
+    summariserTokens,
     peakPromptTokens: steps.reduce(
       (peak, measurement) => Math.max(peak, measurement.promptTokens),
       0

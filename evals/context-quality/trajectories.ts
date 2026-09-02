@@ -887,8 +887,19 @@ export const TRAJECTORIES: readonly Trajectory[] = [
     probes: PROBES
   },
   {
+    /**
+     * The name is about the DECLARED pass, not about compaction. Nothing declares a phase here, so
+     * the only thing that can fire is the budget trigger - and it does, once, at step 52. Measured
+     * by printing the step of every successful `compactContext` through the shipped module: 131k
+     * and 1m compact at their declared step 30 and nowhere else, this trajectory compacts at 52,
+     * `-owner` at 34 and 47, `-owner-long` 56 times beginning at 34. The `refuse` column prints
+     * `refused/attempted`, so with no refusals its denominator is the number of compactions and the
+     * `0/1` on this row has said so all along, while the row's own summary said the opposite. Of
+     * the fourteen probes here, the twelve asked at or before step 52 are measuring truncation
+     * alone; `recall-owner-constraint` and `continuation-plan-block`, both asked at 55, are not.
+     */
     id: `pool-migration-131k-uncompacted${SHAPE_SUFFIX}`,
-    why: 'The same job with the phase never declared, so nothing is condensed and every loss is truncation alone.',
+    why: 'The same job with the phase never declared, so no compaction crosses the first fifty steps and the losses there are truncation alone. The budget trigger still fires once, at step 52.',
     contextTokens: 131_072,
     steps: 60,
     declaredCompactionStep: null,

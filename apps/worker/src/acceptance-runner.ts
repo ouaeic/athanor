@@ -34,6 +34,17 @@ import { event } from './tool-recording.js';
  * ceiling was calibrated for and nothing about it changes, while eight of them can no longer
  * multiply into a turn that holds the owner's computer for two hours after the model said it was
  * done.
+ *
+ * It is a deadline to START inside, not a wall the suite ends at, and for one branch the difference
+ * is minutes rather than seconds. A command check is clamped to `remainingSeconds` below, so it both
+ * starts and finishes inside this figure. The render proof is not: `/document/render-proof` takes no
+ * timeout in its request schema, so nothing here can hand it one, and it is bounded instead by the
+ * runner's own SIGKILL timers - 140s to convert, 60s for the bounding boxes, and 30s for each of at
+ * most `MAX_BLANK_PROBE_PAGES` = 64 blank probes (services/workspace-runner/src/render-proof.ts:
+ * 102-107). So a render started at 899s can hold the turn to roughly 3,000 seconds in the worst
+ * case, under the client's own 65-minute ceiling and over this one. Saying that rather than clamping
+ * it: the clamp needs a field the runner does not offer, and there is no measurement that a render
+ * ever runs long enough for it to matter.
  */
 export const ACCEPTANCE_SUITE_DEADLINE_SECONDS = 900;
 
@@ -167,6 +178,24 @@ export const acceptanceChecks = async (
     observed?: ReadonlyMap<string, number>;
   }
 ): Promise<AcceptanceResult[]> => {
+  /*
+   * THE VERIFIER IS NOT ISOLATED FROM THE AGENT, and a reader looking for that guarantee should
+   * stop here and read this as a no.
+   *
+   * `${root}/exec` is the identical endpoint, workspace id and `exec` scope that the model's own
+   * `shell` tool posts to (apps/worker/src/tools/workspace.ts:743). Nothing snapshots the tree
+   * between the moment the record is declared and the moment it runs, so a check CAN be written by
+   * the same turn that runs it: `bash workspace/rename-scans.sh` is a pinned-accepted declaration,
+   * and the agent wrote that script this turn. What athanor has instead is a weaker pair - the
+   * arguments are fixed before the work rather than chosen at finish time, and the red baseline
+   * falsifies the record on the paths where it runs - and neither of those is isolation.
+   *
+   * The honest repair is a runner endpoint that runs the finish-time suite against a copy of the
+   * workspace the agent has never held a handle to. It needs services/workspace-runner and this file
+   * together, so it is a wave and not a line, and it is not attempted here. The test named for this
+   * sentence pins the endpoint, so the day someone does route the suite elsewhere this comment goes
+   * red rather than quietly becoming a lie.
+   */
   const root = `/v1/workspaces/${task.workspaceId}`;
   const results: AcceptanceResult[] = [];
   /*

@@ -32,12 +32,34 @@ import * as shippedContext from '../../apps/worker/src/context.js';
 
 export type ContextModule = typeof shippedContext;
 
+/**
+ * One exact-text substitution in the copy of `context.ts` a configuration runs against.
+ *
+ * Constants cover every question this rig was built to ask, because every mechanism it compares was
+ * already reachable by moving an integer. Some are not: the change that admits the agent's
+ * reasoning to the compaction transcript is a line of code, and the choice was to measure it here
+ * or to argue about it in prose. Argued in prose, it would be the only claim in this directory with
+ * no row behind it.
+ *
+ * Held to the same discipline as a constant and for the same reason: `find` must match exactly once
+ * and must differ from `replace`, so a rename upstream fails the run loudly instead of producing a
+ * variant that is quietly the shipped module. That failure mode is not hypothetical here - see the
+ * note on `contextModuleFor` about the shortcut that used to key on constants alone.
+ */
+export interface ContextEdit {
+  /** Exact source text, matched once. Not a regex: a pattern that drifts is a silent copy. */
+  readonly find: string;
+  readonly replace: string;
+}
+
 export interface ContextConfiguration {
   readonly id: string;
   readonly label: string;
   readonly why: string;
   /** Integer literals substituted into a copy of `context.ts`. Empty means the shipped module. */
   readonly constants: Readonly<Record<string, number>>;
+  /** Source substitutions, for a mechanism no integer reaches. Empty on every row but one. */
+  readonly edits?: readonly ContextEdit[];
 }
 
 /** Named separately so the report can say which row is the one the tree currently ships. */
@@ -278,6 +300,79 @@ export const CONFIGURATIONS: readonly ContextConfiguration[] = [
     label: 'ANCHOR_INDEX_CHARS 700 -> 0',
     why: 'The anchor index off and nothing else, which is the only shipped mechanism that carried a written path through a compaction before the ledger did.',
     constants: { ANCHOR_INDEX_CHARS: 0 }
+  },
+  {
+    /**
+     * The one channel a compaction could not see, taken back out of the transcript the summariser
+     * reads. This row used to run the other way round and it is the reason the line shipped.
+     *
+     * `transcriptLine` now renders a condensed message from `content`, `toolCalls` AND `reasoning`.
+     * Before it did, the agent's working out was discarded BEFORE any model was asked to
+     * summarise, while `compactionRequest` instructed that summariser to preserve "decisions taken
+     * and the reason for them, including approaches that were tried and rejected" and athanor's own
+     * preamble told the model to put exactly that material in the reasoning channel: "Working out -
+     * options weighed, what to try next, talking yourself through it - goes in the reasoning
+     * channel, or nowhere." The harness was hiding the answer and then asking for it.
+     *
+     * That is the athanor-shaped reading of Terminus 2's summarise-interrogate-answer pass. Their
+     * third agent is given the full history and can therefore reach what their summariser dropped;
+     * athanor's summariser cannot be given a third agent's advantage by asking it better questions,
+     * because the advantage is access rather than attention. One line of source bought the access.
+     *
+     * The row is inverted rather than deleted, for the reason `owner-unbounded` and `anchorless`
+     * are switched off rather than removed: a mechanism whose absence the rig cannot show is a
+     * mechanism nobody can price, and a cost written into prose stops being re-measured the day it
+     * is written. Inverted, the `summ-in` delta on this row IS what the shipped line costs, taken
+     * fresh on every run. Do not read the delta's sign as the direction of the change: this row is
+     * the tree before the line landed, so a NEGATIVE delta here is the shipped line's positive cost.
+     *
+     * Inverting it also makes a REVERT loud, which nothing else here would. `summariserTokens` is
+     * checked as a ceiling and never as a floor, so putting `transcriptLine` back the way it was
+     * would drop every row's bill and pass `--ci` in silence. It would not pass this row: the anchor
+     * below is the shipped code, so a revert removes it and `patch` throws the way it did the day
+     * this row still asked for the edit that had just shipped.
+     *
+     * On `pool-migration-131k-uncompacted` that cost reads +10.3% against +47% elsewhere, and the
+     * reason is a bound rather than the fixture: `compactionTranscript` caps the whole transcript at
+     * 80,000 characters, and that trajectory's single compaction is the only one in the matrix that
+     * reaches it - 72,299 characters on this row and exactly 80,000 on `shipped`, measured at the
+     * summariser call. Everything past the cap is cut out of the middle instead of being billed, so
+     * that row's cost is clipped and this rig does not measure by how much.
+     *
+     * `trajectorySummary` is deliberately not part of the inversion, because it is not part of the
+     * shipped line either: its output goes straight into the window under a 12,000-character cap
+     * with no model in between, so reasoning there displaces prose one for one. It still renders
+     * content and tool NAMES only.
+     *
+     * READ THE ROW AS A COST, NOT AS A GAIN. This rig scores what reaches the prepared window, and
+     * what reaches the window is whatever the summariser kept. The summariser here is
+     * `extractiveSummariser`, which keeps the front of every transcript line - and the reasoning is
+     * appended at the END of the line, so this row moves the summariser's INPUT and cannot move its
+     * output. The availability column therefore says nothing about whether a real summarising model
+     * would keep the material, and the honest measurement of that needs the judged half to compact
+     * with a real summariser, which it does not do today. @see measure.ts on `extractiveSummariser`.
+     */
+    id: 'reasoning-dropped',
+    label: "transcriptLine drops the agent's reasoning (the tree before that line)",
+    why: 'The shipped compaction transcript carries the channel athanor tells the model to reason in. This row is that line taken back out, so what it costs is re-measured rather than remembered; it cannot show what it buys.',
+    constants: {},
+    edits: [
+      {
+        find: [
+          '  const thought = message.reasoning',
+          "    ? truncateMiddle(message.reasoning.replace(/\\s+/g, ' ').trim(), limit, 'condensed reasoning')",
+          "    : '';",
+          "  return `- ${message.role === 'user' ? 'User' : 'Agent'}${calls ? ` called ${calls}` : ''}: ${",
+          "    content || 'no prose response'",
+          "  }${thought ? ` [reasoned: ${thought}]` : ''}`;"
+        ].join('\n'),
+        replace: [
+          "  return `- ${message.role === 'user' ? 'User' : 'Agent'}${calls ? ` called ${calls}` : ''}: ${",
+          "    content || 'no prose response'",
+          '  }`;'
+        ].join('\n')
+      }
+    ]
   }
 ];
 
@@ -289,12 +384,26 @@ export const CONFIGURATIONS: readonly ContextConfiguration[] = [
  * is not a null result, it is an identity, and it reads exactly like a reassuring one - which is
  * what happened to `stride-4` when step 3.1 landed stride 4 and nothing in this directory noticed
  * for a whole wave. `configuration-fidelity` is exempt because being that copy is its entire job.
+ *
+ * THIS FUNCTION ONLY CHECKS CONSTANTS. It cannot see the same drift in a row carrying edits, and it
+ * is not the guard that catches one. An edit row goes stale the way `reasoning-in-transcript` did
+ * when its edit shipped verbatim into `transcriptLine`: the tree stopped containing the anchor, so
+ * `patch` counted zero occurrences and threw, and the whole run stopped rather than printing a row.
+ * That is the guard here, and it is loud, immediate and unmissable - but it names a missing anchor
+ * rather than a shipped mechanism, so read that error as "the tree has moved past this row" before
+ * you read it as "the anchor string has a typo". The self-replace check below `patch`'s occurrence
+ * count covers only the narrower case where somebody edits a row to replace its anchor with itself.
  */
 export const degenerateConfigurations = (): readonly string[] =>
   CONFIGURATIONS.filter(
     (configuration) =>
       configuration.id !== SHIPPED &&
       configuration.id !== FIDELITY &&
+      // A row carrying edits is never degenerate on its constants alone, and this function has no
+      // way to judge its edits: whether an edit still differs from the tree is a question about
+      // `context.ts`, which only `patch` reads. `patch` answers it - an anchor that no longer
+      // occurs, or one replaced by itself, throws there. See the note above this function.
+      !configuration.edits?.length &&
       Object.keys(configuration.constants).length > 0 &&
       Object.entries(configuration.constants).every(
         ([name, value]) => shippedConstant(name) === value
@@ -357,15 +466,34 @@ const patch = (configuration: ContextConfiguration): string => {
       );
     source = source.replace(pattern, `const ${name} = ${value};`);
   }
+  for (const edit of configuration.edits ?? []) {
+    const occurrences = source.split(edit.find).length - 1;
+    if (occurrences !== 1)
+      throw new Error(
+        `expected exactly one occurrence of the anchor for ${configuration.id} in context.ts, found ${occurrences}. A silent miss here would make this row a copy of ${SHIPPED}.`
+      );
+    if (edit.find === edit.replace)
+      throw new Error(
+        `${configuration.id} replaces its anchor with itself, so its row is a copy of ${SHIPPED} and its delta is +0.00 by construction.`
+      );
+    source = source.replace(edit.find, edit.replace);
+  }
   return source;
 };
 
 /**
  * The module a configuration runs against. `shipped` is the real import rather than a patched copy
  * of itself, so at least one row in every report is unambiguously the code that ships.
+ *
+ * The shortcut asks about edits as well as constants. Keyed on constants alone - which is what it
+ * used to be, because constants were the only kind of variant there was - a row carrying only edits
+ * would have been handed the shipped module and printed a `+0.00` that was an identity rather than
+ * a measurement. That is the exact failure `degenerateConfigurations` above exists to refuse, and
+ * it would have arrived through the loader instead of through a value.
  */
 export const contextModuleFor = (configuration: ContextConfiguration): Promise<ContextModule> => {
-  if (!Object.keys(configuration.constants).length) return Promise.resolve(shippedContext);
+  if (!Object.keys(configuration.constants).length && !configuration.edits?.length)
+    return Promise.resolve(shippedContext);
   const existing = loaded.get(configuration.id);
   if (existing) return existing;
   const directory = scratchDirectory();

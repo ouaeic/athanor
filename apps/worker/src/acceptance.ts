@@ -22,6 +22,7 @@
 import {
   COMMAND_RUNNERS,
   commandInterpreters,
+  effectiveCommands,
   inlineScriptBody,
   isDestructiveScript
 } from './command-classification.js';
@@ -211,6 +212,135 @@ export const acceptanceCommandRefusal = (
   return null;
 };
 
+/**
+ * Executables whose exit status and whose output are decided by their own arguments and by nothing
+ * else on this computer.
+ *
+ * Membership is that sentence rather than a list of names somebody disliked, and it is checkable:
+ * no state of the workspace can change what any of these six does. `pwd`, `date`, `uname` and
+ * `whoami` are deliberately NOT here - they read the box, so a check on what they print is at least
+ * a check on something.
+ */
+const CONSTANT_EXECUTABLES = new Set(['true', 'false', ':', 'echo', 'printf', 'yes']);
+
+/**
+ * A pattern the filesystem answers rather than the command. `[` is a character class.
+ *
+ * Not `{`: brace expansion is done by the shell out of the brace alone and never reads a directory,
+ * so `echo {a,b}` prints `a b` on every computer there is and is constant in exactly the sense this
+ * file means.
+ */
+const GLOB_METACHARACTER = /[*?[]/;
+
+/**
+ * The token with every quoted span removed, so only text the shell would still act on is left.
+ *
+ * The tokens `effectiveCommands` returns keep their quotes - measured: the script `echo 'ok*'` comes
+ * back as `["echo", "'ok*'"]` - which is the only reason the distinction below is available at all.
+ * A backslash-escaped `\*` is NOT understood and reads as a live glob, so it is treated as expanded;
+ * that errs toward accepting the check, which is the side to err on, because a false refusal here is
+ * an outage on honest work and a false acceptance is only this bound not firing.
+ */
+const unquotedText = (token: string): string =>
+  token.replace(/'[^']*'/g, '').replace(/"[^"]*"/g, '');
+
+/**
+ * Whether anything reads this call's arguments before the command is handed them.
+ *
+ * A glob is only a question for the filesystem when something expands it, and for an acceptance
+ * check that is a shell or nothing: the runner spawns one with `shell: false`
+ * (services/workspace-runner/src/execution.ts:846), so the bare declaration
+ * `{executable: 'echo', args: ['workspace/*.png']}` hands `echo` the pattern itself and prints it
+ * back on every computer there is. That check is constant in exactly the sense this file means and
+ * is refused; `bash -lc 'echo workspace/*.png'` is expanded before `echo` runs and is not. Without
+ * this question the two were read as one, which put the same untrue sentence in front of the model
+ * that the glob case was repaired to take out of it.
+ *
+ * The wrapped spelling is asked too, because `timeout 30 bash -lc …` still runs a shell. The set is
+ * the one `effectiveCommands` uses to decide a script was read at all, so it also says yes to
+ * `python` and `node`, which do not glob - overbroad in the direction of accepting the check, and
+ * unreachable in practice, because a constant head only ever comes out of a script this reads as
+ * shell.
+ */
+const expandedBeforeItRan = (executable: string, args: readonly string[]): boolean => {
+  const name = (token: string): string =>
+    token.split('/').filter(Boolean).pop()?.toLowerCase() ?? '';
+  const head = name(executable);
+  return (
+    commandInterpreters.has(head) ||
+    (COMMAND_RUNNERS.has(head) && args.some((argument) => commandInterpreters.has(name(argument))))
+  );
+};
+
+/**
+ * A check that no state of this computer can fail, refused at the moment it is declared.
+ *
+ * The red baseline in `declareAcceptance` is the only thing in athanor that ever falsifies a check -
+ * it runs the record against the job before the work and refuses one where nothing fails - and it
+ * is asked only `if (!state.mutated)`. The hold that demands a record at all fires on
+ * `state.mutatedBeyondProse`. So on the ordinary coding turn, where the model writes the code and is
+ * then held for a definition of done, the record is declared after the change and no baseline runs
+ * against it: `echo` was refused when declared first and accepted in silence when declared second.
+ * This asks the same question the baseline asks without running anything, so it reaches both paths.
+ *
+ * It is the declaration-side half of the SWE-bench 5.0.0 grading fix, which the standing research
+ * records as "a patch can no longer pass by printing its own PASSED lines"
+ * (docs/design/research-2026-08-25/benchmarks.md §10). That is the evidence the shape is real rather
+ * than imagined: it was live in the most-cited grader in the field until 2026-08-17.
+ *
+ * WHAT IT DOES NOT DO, because a reader will assume otherwise. It does not decide whether a check is
+ * a good check; only whether the workspace has any say in the answer. It reads the shell, so
+ * `python -c "print('ok')"` and `node -e "console.log('ok')"` are NOT caught - reading those needs a
+ * second language, and the shell is the spelling the catalogue tells the model to reach for. And it
+ * is not a security boundary: a model that wants to fake a check can write the same echo into a file
+ * and name the file. What it catches is the cheapest way to satisfy the gate, which is the one a
+ * model takes when it is not trying to cheat so much as trying to be done.
+ *
+ * Every command the call will really run has to be constant for the refusal to fire, so the honest
+ * shape that reads most like this one - `bash -lc "test -f workspace/out.pdf && echo ok"` - is
+ * accepted, because `test` is where the answer comes from and `echo` only reports it. A call whose
+ * script `effectiveCommands` cannot read comes back as no commands at all, and that is treated as
+ * unknown rather than as constant: this refuses only what it can name.
+ *
+ * An unquoted glob is the same case wearing a different coat, and it used to be refused wrongly.
+ * `echo workspace/out/*.png` prints the file names when the thumbnails are there and the literal
+ * pattern when they are not, so the workspace does decide the answer - the shell read it before the
+ * command ever ran - and the sentence this function returns was false in a case it reached. It was
+ * also refusing `echo workspace/*.jpg` while accepting
+ * `for f in workspace/*.jpg; do echo "$f"; done`, which is the same check in two spellings. So an
+ * argument carrying a live glob turns the refusal off - live meaning there is a shell to expand it,
+ * which is a question this asks rather than assumes. That widens the evasion by one spelling -
+ * `bash -lc "echo ok*"` now walks past, while `echo 'ok*'` is still refused because the quotes
+ * survive tokenisation - and that is accepted in a rule this comment already says is not a security
+ * boundary.
+ */
+export const acceptanceVacuousRefusal = (
+  executable: string,
+  args: readonly string[]
+): string | null => {
+  const commands = effectiveCommands({ executable, args: [...args] });
+  if (!commands.length) return null;
+  // Lowered here because the sibling refusal this one is chained to lowers its own binary, and two
+  // adjacent guards disagreeing about the same token is how the next reader introduces a bug: with
+  // the head read as written, `ECHO ok` was accepted and `echo ok` refused. Never a false pass on a
+  // Linux workspace - `ECHO` is not on PATH, so the check would exit 127 - which is why it was a
+  // spelling inconsistency rather than a hole, and it is fixed as one.
+  const heads = commands.map(([head = '']) => head.toLowerCase());
+  if (!heads.every((head) => CONSTANT_EXECUTABLES.has(head))) return null;
+  // The shell, not the command, is what read the workspace when an argument is a live glob - so this
+  // is off unless a shell is what runs the check. See the paragraph above for what it opens and why
+  // that is the right side to be wrong on.
+  if (
+    expandedBeforeItRan(executable, args) &&
+    commands.some((command) =>
+      command.slice(1).some((token) => GLOB_METACHARACTER.test(unquotedText(token)))
+    )
+  )
+    return null;
+  const named = heads[0] ?? '';
+  return `${named} answers the same way whatever is in the workspace, so this check cannot tell the finished job from the one nobody started. Name a check the work decides: the command that builds or tests it, the extraction that shows the file says what it should, or an artifact check on the file that has to be there.`;
+};
+
 const normalisedCwd = (value: unknown): string => {
   const cwd = textValue(value, 'workspace').trim() || 'workspace';
   return cwd.slice(0, 400);
@@ -289,7 +419,12 @@ export const parseAcceptanceChecks = (
       const args = Array.isArray(record.args)
         ? record.args.slice(0, MAX_ARGS).map((argument) => textValue(argument))
         : [];
-      const refusal = acceptanceCommandRefusal(executable, args);
+      // Two questions, asked in cost order: whether this command may be run at all, and whether
+      // running it could tell anybody anything. The second is here rather than at finish for the
+      // same reason the render clause is - a refusal at declaration costs a sentence, and the same
+      // refusal at finish costs the whole turn.
+      const refusal =
+        acceptanceCommandRefusal(executable, args) ?? acceptanceVacuousRefusal(executable, args);
       if (refusal) return { ok: false, reason: `Check ${index + 1}: ${refusal}` };
       const expectExit = Number.isFinite(Number(record.expectExit))
         ? Math.trunc(Number(record.expectExit))

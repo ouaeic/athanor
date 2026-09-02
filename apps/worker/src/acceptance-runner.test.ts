@@ -435,3 +435,71 @@ describe('one run of the suite per state of the workspace', () => {
     expect(timeouts(probed)).toHaveLength(2);
   });
 });
+
+/**
+ * Two facts about this suite that are open, held as tests so they cannot close in silence.
+ *
+ * Neither row asks for a behaviour. Each one pins a sentence written in `acceptance-runner.ts` that
+ * says plainly what the harness does NOT do, so that the day somebody makes the sentence wrong the
+ * row goes red and the comment is corrected rather than left lying. This programme has now found
+ * seven saturated assertions; a comment nothing watches is the same failure one layer up.
+ */
+describe('what the acceptance suite openly does not do', () => {
+  /**
+   * The verifier runs in the agent's own box, and a check can be written by the turn that runs it.
+   *
+   * Not an aspiration: the suite posts to the identical endpoint, workspace id and `exec` scope that
+   * the model's own `shell` tool reaches (apps/worker/src/tools/workspace.ts:743, `${root}/exec`
+   * over `/v1/workspaces/${task.workspaceId}`), with nothing snapshotting the tree in between. So
+   * `bash workspace/rename-scans.sh` - a declaration `acceptance.ts` pins as accepted - runs a
+   * script this turn wrote. Isolation would mean a different endpoint against a copy the agent never
+   * held, which is a wave of work nobody has done; until then this row is the evidence for the no.
+   */
+  it('runs the checks through the same exec endpoint the agent itself reaches', async () => {
+    const probed = probe();
+
+    await acceptanceChecks(probed.deps, task, key, record(command('a')), { purpose: 'finish' });
+
+    expect(probed.calls.map((call) => call.path)).toEqual([
+      `/v1/workspaces/${task.workspaceId}/exec`
+    ]);
+  });
+
+  /**
+   * The suite clock reaches a command check and does not reach a render proof.
+   *
+   * `remainingSeconds` clamps the exec above, so a command both starts and finishes inside
+   * `ACCEPTANCE_SUITE_DEADLINE_SECONDS`. `/document/render-proof` takes no timeout in its request
+   * schema, so nothing here can hand it one and the render is bounded only by the runner's own
+   * SIGKILL timers - which is why the constant's comment says the deadline is one to start inside
+   * rather than a wall the suite ends at. Pinned on the request body because that is where the
+   * asymmetry lives: the day the runner grows the field and this call passes it, this row fails and
+   * that paragraph gets rewritten.
+   */
+  it('hands the render proof no timeout at all, because the runner takes none', async () => {
+    const probed = probe((body) =>
+      'executable' in body
+        ? { exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false }
+        : 'marginPoints' in body
+          ? { passed: true, detail: 'renders as exactly 2 pages' }
+          : { entries: [{ name: 'deck.pptx', type: 'file', sizeBytes: 40_000 }] }
+    );
+    const artifact = {
+      id: 'art-1',
+      kind: 'artifact',
+      label: 'the deck is two slides',
+      path: 'workspace/deck.pptx',
+      minBytes: 20_000,
+      render: { expectPages: 2, marginPoints: 0 }
+    } as const satisfies AcceptanceCheck;
+
+    const results = await acceptanceChecks(probed.deps, task, key, record(artifact), {
+      purpose: 'finish'
+    });
+
+    expect(results[0]?.passed).toBe(true);
+    const proof = probed.calls.find((call) => call.path.endsWith('/document/render-proof'));
+    expect(proof, 'the render proof was asked for at all').toBeTruthy();
+    expect(Object.keys(proof?.body ?? {}).sort()).toEqual(['expectPages', 'marginPoints', 'path']);
+  });
+});

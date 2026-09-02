@@ -1213,11 +1213,78 @@ export const perPartOutputChars = (parts: number): number =>
  */
 export const toolResultText = (result: unknown): string => json(result);
 
-/** The window's bound applied to a form already serialised by `toolResultText`. */
+/**
+ * What a cut tool result says when there is no file to point at.
+ *
+ * Two production paths reach a cut with no recovery, and until this existed both of them told the
+ * model one thing: a number. `recordToolResult` passes none when `spillOverflow` answered null -
+ * the runner refused the write, or the body was past `MAX_SPILL_CHARS`. `delegate.ts` passes none
+ * because a specialist's window is not built by `recordToolResult` at all: it pushes its own tool
+ * messages through `serializeToolResultForModel(result, 16_000)`, so a specialist never spills and
+ * every over-length read it makes was answered with `[… N characters omitted from tool output …]`
+ * and nothing else. That is the window the catalogue advertises as the place to put a page likely
+ * to be hostile, run by a model on a sixteen-step budget, and the class of tool that fills it -
+ * file_read, code_search, document_read, parallel_web_read - is exactly the class that takes a
+ * narrower request.
+ *
+ * The advice itself was already in this file and arrived too late to be advice.
+ * `laterToolOutputRecovery` says the same first clause, but it is only passed by the older-output
+ * squeeze - so the model was told how to ask better on the step the floor first descended, which
+ * `spillCarriedRecovery`'s note measures at step 37 of a 131,072-token window. The call it would
+ * have changed had by then been made thirty more times. Saying it at the FIRST cut is the whole
+ * change; see benchmarks.md §11.2, where mini-swe-agent's coaching warning is called free because
+ * it changes the next call rather than merely saving tokens on this one.
+ *
+ * It opens by saying what it does NOT do, because its sibling does. A window can hold both markers
+ * at once - one result spilled, the next refused - and a model that has just been handed a path is
+ * entitled to assume the next cut kept one too. "Nothing of the middle was kept" is the sentence
+ * that stops a step being spent opening a file that was never written.
+ *
+ * Every recovery named is one this harness actually performs, checked against `tool-catalogue.ts`
+ * rather than carried over from mini-swe-agent's bash-only advice: file_read takes `startLine` and
+ * `endLine`, code_search takes `path` and `glob`, document_read takes `startPage` and `endPage`.
+ * `bash -lc` is named rather than a bare pipe because `shell` runs one executable directly and its
+ * own description says "There is no shell here, so nothing expands" - advice that names a
+ * capability this harness does not have is worse than silence, and `cmd | head` is that advice.
+ */
+export const CUT_TOOL_OUTPUT_ADVICE =
+  'nothing of the middle was kept: ask again for just the part you need - a file_read line range, a code_search narrowed by path or glob, a document_read page range - and bound output where it is made, piping to head, tail or grep through `bash -lc` or writing it to a file you then read in ranges';
+
+/**
+ * The ceiling on that sentence, and the measurement that put it there.
+ *
+ * This rides every recent tool result the window had to cut and could not park, so it is paid per
+ * result and not once - which is the only reason it needs a ceiling at all, since `truncateMiddle`
+ * would not drop it until it reached half of the smallest bound this is called with (8,000 at
+ * `delegate.ts`'s 16,000), and a sentence that long would be absurd long before it were unsafe.
+ *
+ * 369 is what the case with MORE to say costs. Measured on a 200,026-character `shell` result
+ * through `recordToolResult`: the spilled marker is 421 characters, of which 50 are the base
+ * marker and 369 are `spillRecovery` - a path, an offset, and its own coaching clause. This case
+ * has strictly less to say: no path exists and no offset is worth naming without one. So the point
+ * past which the cheaper case has become the dearer one is the bound, and the assertion that bites
+ * is not this number but the relation - `output-spill.test.ts` drives the same result through the
+ * same call site twice, once with a writer and once without, and the marker with no file to name
+ * must be the shorter of the two. Raising this constant alone changes nothing the model reads.
+ */
+export const MAX_CUT_ADVICE_CHARS = 369;
+
+/**
+ * The window's bound applied to a form already serialised by `toolResultText`.
+ *
+ * The default fires on `undefined`, so both call sites that pass a recovery they may not have -
+ * `recordToolResult`'s spill result, and nothing at all from `delegate.ts` - get the advice
+ * without either of them naming it. It costs nothing when nothing is cut: `truncateMiddle` returns
+ * the value untouched at or under `maximum` and never builds a marker, so a result that fits is
+ * byte-identical to the one this function was handed. It is not put on `truncateMiddle` itself
+ * because the advice is true of tool output and of nothing else this file cuts - an owner message,
+ * a trajectory summary and a ledger cell all go through there, and none of them can be re-asked
+ * with a line range.
+ */
 export const boundToolResultText = (
   text: string,
   maximum: number = RECENT_TOOL_OUTPUT_CHARS,
-  recovery?: TruncationRecovery
+  recovery: TruncationRecovery = CUT_TOOL_OUTPUT_ADVICE
 ): string => truncateMiddle(text, maximum, 'tool output', recovery);
 
 export const serializeToolResultForModel = (
@@ -1291,6 +1358,21 @@ export const COMPRESSED_TRAJECTORY_MARKER = 'COMPRESSED TRAJECTORY';
 const isCompressedTrajectory = (message: ModelMessage): boolean =>
   message.role === 'system' && message.content.startsWith(COMPRESSED_TRAJECTORY_MARKER);
 
+/**
+ * The brief a compaction keeps when the summarising model could not be reached.
+ *
+ * WHY THIS ONE IS NOT GIVEN THE REASONING CHANNEL, when `transcriptLine` above is. What that
+ * function builds is INPUT to a call whose output is bounded separately, so admitting reasoning
+ * there costs summariser input and nothing else. What this function builds goes STRAIGHT INTO THE
+ * WINDOW under the 12,000-character cap below, with no model in between to compress it, and it is
+ * the only thing every later step re-reads. A byte of reasoning admitted here displaces a byte of
+ * prose or an identifier one for one.
+ *
+ * It drops the tool-call ARGUMENTS as well, keeping only the names, and that half is recovered:
+ * the anchor index carries the identifiers. Nothing recovers the reasoning on this path, and that
+ * is the stated residue rather than an oversight - said here because an asymmetry with no reason
+ * written next to it is the kind a later reader helpfully removes.
+ */
 const trajectorySummary = (messages: ModelMessage[], indexes: number[]): string => {
   const lines = indexes.map((index) => {
     const message = messages[index];
@@ -1940,9 +2022,32 @@ const transcriptLine = (message: ModelMessage, limit: number): string => {
   const calls = message.toolCalls
     ?.map((call) => `${call.name}(${truncateMiddle(json(call.arguments), 600, 'call arguments')})`)
     .join('; ');
+  /*
+   * The reasoning channel, which this line used to drop before any summariser saw it.
+   *
+   * `compactionRequest` instructs the summariser to preserve "decisions taken and the reason for
+   * them, including approaches that were rejected", and the preamble tells the model to put exactly
+   * that material in the reasoning channel or nowhere. Building the transcript from content and
+   * tool calls alone therefore withheld from the summariser the one channel the harness had asked
+   * the model to put the answer in, and then asked it to keep the answer. A summariser cannot
+   * summarise what it was never shown.
+   *
+   * Bounded by the same per-message `limit` as the content and appended after it, so a long
+   * reasoning block cannot crowd out the prose or the identifiers in the call arguments. Measured
+   * cost on the five rig trajectories: summariser input +10.3% to +47.0%, which is +0.06 to +0.43
+   * percentage points of a task's prompt tokens.
+   *
+   * What this does NOT establish: that a real summarising model keeps the material now that it can
+   * see it. Both halves of `evals/context-quality` compact with an extractive summariser, so the
+   * rig can price this line and cannot score it. What decides it is that the harness had been
+   * asking for something it was itself hiding.
+   */
+  const thought = message.reasoning
+    ? truncateMiddle(message.reasoning.replace(/\s+/g, ' ').trim(), limit, 'condensed reasoning')
+    : '';
   return `- ${message.role === 'user' ? 'User' : 'Agent'}${calls ? ` called ${calls}` : ''}: ${
     content || 'no prose response'
-  }`;
+  }${thought ? ` [reasoned: ${thought}]` : ''}`;
 };
 
 /**

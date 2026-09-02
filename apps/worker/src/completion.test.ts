@@ -1,13 +1,19 @@
 import { describe, expect, it } from 'vitest';
+import type { AcceptanceCheck } from './acceptance.js';
+import { acceptanceAlreadyObserved } from './acceptance.js';
+import type { AgentState } from './agent-state.js';
 import {
   askOutcome,
   citableEvidence,
   completionVerification,
   evidenceFloor,
+  observedCommands,
   parseDelegateReport,
+  shellObservation,
   startTurnState,
   validateDelegateReport
 } from './completion.js';
+import type { ModelToolCall } from '@athanor/model-gateway';
 import { MAX_FINISH_REJECTIONS, MAX_QUESTIONS_PER_TURN } from './turn-bounds.js';
 
 describe('what a new turn keeps and what it drops', () => {
@@ -814,6 +820,82 @@ describe('reading a specialist report against its contract', () => {
     expect(parseDelegateReport(JSON.stringify({ answer: 'a' }))).toEqual({
       answer: 'a',
       evidence: []
+    });
+  });
+});
+
+/**
+ * A check the harness reports as already passed, for a command that never ran.
+ *
+ * `acceptanceAlreadyObserved` answers a finish-time check from a run athanor already made, which is
+ * the one path where a check can be reported as passed without anything executing at that moment. So
+ * the question worth pinning is whether a `shell` the harness ANSWERED rather than ran can put a
+ * fingerprint into `observedCommands` - a duplicate call inside one turn, a payload that would not
+ * parse, a plan that changed underneath it. Every one of those is recorded as
+ * `{skipped: true, reason}` with no exit code (apps/worker/src/turn/dispatch.ts:221, 266, 291), and
+ * `tool-recording.ts:542` spreads `shellObservation(call, result) ?? {}` into the stored result, so
+ * the whole of the defence is that `shellObservation` declines a result with no integer exit.
+ *
+ * Written at the acceptance seam and not at the helper, deliberately. A helper-level row goes red
+ * for mutants that change nothing an acceptance check can see - `Number(undefined)` is `NaN`, and a
+ * `NaN` exit still fails the `!==` in `acceptanceAlreadyObserved`. The mutant that matters is the
+ * plausible one, treating a missing exit code as a zero, and only the pair of functions catches it.
+ */
+describe('a command the harness answered instead of running', () => {
+  const shellCall = (id: string): ModelToolCall =>
+    ({
+      id,
+      name: 'shell',
+      arguments: { executable: 'pytest', args: ['-q'], cwd: 'workspace' }
+    }) as unknown as ModelToolCall;
+
+  /** One entry recorded exactly the way `recordToolResult` records it, harness answer or not. */
+  const recorded = (call: ModelToolCall, result: unknown, skipped: boolean) => ({
+    name: call.name,
+    success: !skipped,
+    ...(skipped ? { skipped: true } : {}),
+    mutating: false,
+    ...(shellObservation(call, result) ?? {})
+  });
+
+  const check: AcceptanceCheck = {
+    id: 'check-1',
+    kind: 'command',
+    label: 'the tests pass',
+    executable: 'pytest',
+    args: ['-q'],
+    cwd: 'workspace',
+    expectExit: 0,
+    timeoutSeconds: 900
+  };
+
+  const answered = (result: unknown, skipped: boolean) =>
+    acceptanceAlreadyObserved(
+      check,
+      observedCommands({
+        turnToolResults: { 'call-1': recorded(shellCall('call-1'), result, skipped) }
+      } as unknown as AgentState)
+    );
+
+  it('is never reported as a check that already passed', () => {
+    for (const reason of [
+      'This is the same shell call as call-0, which already ran this turn.',
+      'The arguments for shell were not valid JSON, so it was not run and nothing changed.',
+      'The user changed the active plan after this tool call was proposed. Replan before acting.'
+    ])
+      expect(answered({ skipped: true, reason }, true), reason).toBeNull();
+    // The other two shapes `shellObservation` declines, held here for the same reason: a command the
+    // runner stopped and a command that reported a session rather than an exit answered nothing
+    // either, and an acceptance check must not be able to cite them.
+    expect(answered({ exitCode: 0, stdout: '', stderr: '', timedOut: true }, false)).toBeNull();
+  });
+
+  it('is reported as passed when it really ran, so the row above is about the answer and not the wiring', () => {
+    expect(answered({ exitCode: 0, stdout: '', stderr: '', timedOut: false }, false)).toEqual({
+      id: 'check-1',
+      label: 'the tests pass',
+      passed: true,
+      detail: 'exit 0, from athanor running this same command after the last change'
     });
   });
 });

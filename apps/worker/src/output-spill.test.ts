@@ -15,7 +15,15 @@ import type { DataStore, TaskRecord } from '@athanor/data';
 import type { ModelToolCall } from '@athanor/model-gateway';
 import type { AgentState } from './agent-state.js';
 import { isQuarantinedDownloadPath } from './command-classification.js';
-import { RECENT_TOOL_OUTPUT_CHARS, toolResultText, truncateMiddle } from './context.js';
+import {
+  CUT_TOOL_OUTPUT_ADVICE,
+  MAX_CUT_ADVICE_CHARS,
+  RECENT_TOOL_OUTPUT_CHARS,
+  serializeToolResultForModel,
+  toolResultText,
+  truncateMiddle
+} from './context.js';
+import { agentTools } from './tool-catalogue.js';
 import {
   MAX_SPILL_CHARS,
   SPILL_DIRECTORY,
@@ -247,9 +255,13 @@ describe('what is claimed when the spill could not happen', () => {
     const { deps, state } = recording({ refuse: true });
     await recordToolResult(deps, task, Buffer.from(dataKey), state, shell, big);
     const window = windowEntry(state);
-    expect(window).toContain('characters omitted from tool output …]');
+    expect(window).toContain('characters omitted from tool output');
     expect(window).not.toContain(SPILL_DIRECTORY);
     expect(window).not.toContain('cut begins at character');
+    // What it does say instead is pinned below, in "what a cut result says when nothing was kept".
+    // It used to say nothing: this assertion read `'... tool output …]'` and passed on a marker
+    // that ended right there.
+    expect(window).toContain(CUT_TOOL_OUTPUT_ADVICE);
   });
 
   it('says nothing when no writer was registered, which is a delegated specialist', async () => {
@@ -459,6 +471,263 @@ describe('reading a marker back, so a later pass can carry the pointer that made
     expect(carried).not.toContain('cut begins at character');
     // Still readable by the same reader, so a third cut finds what the second one left.
     expect(spillPathIn(carried)).toBe(writes[0]!.path);
+  });
+});
+
+/**
+ * The floor line: a cut that could not park its middle must still change the NEXT call.
+ *
+ * Every case here drives `recordToolResult`, which is the production call site, because the whole
+ * finding this suite exists to avoid is a mechanism that is correct in a helper and unreached in
+ * the product. The one case that cannot be driven that way is `delegate.ts`'s, which builds its
+ * own window; it is pinned in `context.test.ts` at the exact call it makes.
+ */
+describe('what a cut result says when nothing was kept', () => {
+  const shell = {
+    id: 'call-1',
+    name: 'shell',
+    arguments: { executable: 'bash', args: ['-lc', 'pnpm test'] }
+  } as unknown as ModelToolCall;
+  const big = { exitCode: 0, stdout: body(200_000, 'out') };
+
+  /** The recovery clause of whichever marker a window ended up with, or '' when it has none. */
+  const adviceIn = (window: string): string => {
+    const opens = window.indexOf('\n[… ');
+    const closes = window.indexOf(' …]\n');
+    if (opens === -1 || closes === -1) return '';
+    const marker = window.slice(opens, closes);
+    const clause = marker.indexOf('; ');
+    return clause === -1 ? '' : marker.slice(clause + 2);
+  };
+
+  it('teaches at the first cut, not at the thirty-seventh step', async () => {
+    /*
+     * `laterToolOutputRecovery` has said the first half of this for as long as the older-output
+     * squeeze has existed, and it is only passed by that squeeze - so on a 131,072-token window
+     * the model was first told how to ask better at step 37, when the floor descends. This is the
+     * same advice at the step that can still act on it. Driven with no writer, which is the
+     * delegated-specialist shape and the commonest way a cut result has no file behind it.
+     */
+    const { deps, state } = recording({ register: false });
+    await recordToolResult(deps, task, Buffer.from(dataKey), state, shell, big);
+    const window = windowEntry(state);
+    expect(adviceIn(window)).toBe(CUT_TOOL_OUTPUT_ADVICE);
+    // The negative half, which is the reason it opens the way it does: a window can hold a marker
+    // naming a file and this one at once, and a step spent opening a file that was never written
+    // is the cost of leaving that unsaid.
+    expect(window).toContain('nothing of the middle was kept');
+    expect(window).not.toContain(SPILL_DIRECTORY);
+  });
+
+  it('costs nothing at all when nothing was cut', async () => {
+    /*
+     * The whole reason this is affordable under a 27-byte tool-catalogue headroom: it is triggered
+     * on content, so a result that fits pays zero bytes for it. Asserted as byte-identity against
+     * the serialised result rather than as an absence of the sentence, because an absence passes
+     * on a marker that merely worded it differently.
+     */
+    const { deps, state } = recording();
+    const small = { exitCode: 0, stdout: body(400, 'ok') };
+    await recordToolResult(deps, task, Buffer.from(dataKey), state, shell, small);
+    expect(windowEntry(state)).toBe(serializeToolResultForModel(small));
+    expect(windowEntry(state)).not.toContain('omitted from tool output');
+    expect(windowEntry(state)).not.toContain('nothing of the middle was kept');
+  });
+
+  it('does not fire at the boundary, and fires one character past it', async () => {
+    /*
+     * The counter-direction: a bound that teaches must not start teaching about work that was
+     * never cut. `stdout` is sized so the SERIALISED result lands exactly on the bound, since that
+     * is what `boundToolResultText` measures - `toolResultText` adds the JSON envelope and escapes.
+     */
+    const envelope = toolResultText({ exitCode: 0, stdout: '' }).length;
+    const exact = { exitCode: 0, stdout: body(RECENT_TOOL_OUTPUT_CHARS - envelope, 'fit') };
+    expect(toolResultText(exact)).toHaveLength(RECENT_TOOL_OUTPUT_CHARS);
+    const at = recording();
+    await recordToolResult(at.deps, task, Buffer.from(dataKey), at.state, shell, exact);
+    expect(windowEntry(at.state)).not.toContain('nothing of the middle was kept');
+    expect(at.writes).toHaveLength(0);
+
+    const over = { exitCode: 0, stdout: `${exact.stdout}!` };
+    const past = recording({ refuse: true });
+    await recordToolResult(past.deps, task, Buffer.from(dataKey), past.state, shell, over);
+    expect(windowEntry(past.state)).toContain(CUT_TOOL_OUTPUT_ADVICE);
+  });
+
+  it('does not double up on the case that has a file to name', async () => {
+    // A spilled result already carries its own coaching clause. Two of them in one marker would be
+    // the duplicate that is worse than nothing, and the pointer is the half worth the bytes.
+    const { deps, state, writes } = recording();
+    await recordToolResult(deps, task, Buffer.from(dataKey), state, shell, big);
+    const window = windowEntry(state);
+    expect(window).toContain(writes[0]!.path);
+    expect(window).not.toContain(CUT_TOOL_OUTPUT_ADVICE);
+    expect(window).not.toContain('nothing of the middle was kept');
+  });
+
+  it('is the shorter of the two markers, because it has less to say', async () => {
+    /*
+     * This is the bound that bites, and it is a relation between two production outputs rather
+     * than a constant a later edit can raise. The same result goes through the same call site
+     * twice: once with a writer, where the marker names a path, an offset and its own coaching
+     * clause, and once without, where there is no path and no offset worth naming. The case with
+     * less to say must cost less to say it. Grow `CUT_TOOL_OUTPUT_ADVICE` past `spillRecovery`
+     * and this goes red however `MAX_CUT_ADVICE_CHARS` is set.
+     */
+    const parked = recording();
+    await recordToolResult(parked.deps, task, Buffer.from(dataKey), parked.state, shell, big);
+    const lost = recording({ refuse: true });
+    await recordToolResult(lost.deps, task, Buffer.from(dataKey), lost.state, shell, big);
+    const richer = adviceIn(windowEntry(parked.state));
+    const poorer = adviceIn(windowEntry(lost.state));
+    expect(richer).toContain(parked.writes[0]!.path);
+    expect(poorer.length).toBeLessThan(richer.length);
+    // And the declared ceiling is that measurement rather than a number somebody liked: it may sit
+    // at or under what the richer case costs, never above it. Raising it to a million goes red
+    // here; the advice itself is held under it on the line below.
+    expect(MAX_CUT_ADVICE_CHARS).toBeLessThanOrEqual(richer.length);
+    expect(CUT_TOOL_OUTPUT_ADVICE.length).toBeLessThanOrEqual(MAX_CUT_ADVICE_CHARS);
+    // Both markers still fit the window they were cut for, advice included.
+    expect(windowEntry(parked.state)).toHaveLength(RECENT_TOOL_OUTPUT_CHARS);
+    expect(windowEntry(lost.state)).toHaveLength(RECENT_TOOL_OUTPUT_CHARS);
+  });
+
+  /** What the catalogue says about one tool, or '{}' for a name it does not carry at all. */
+  const shapeOf = (name: string): string =>
+    JSON.stringify(agentTools.find((tool) => tool.name === name) ?? {});
+
+  /**
+   * The advice's clauses, each paired with the catalogue fields that would have to exist for it to
+   * be performable.
+   *
+   * The left column is quoted far enough to carry the SHAPE of the request and not just the tool's
+   * name - "a file_read line range", not "file_read" - because the tool name alone is what the
+   * previous version of this table checked, and a sentence telling the model to re-run file_read
+   * with `offset` and `limit`, which no athanor tool takes, satisfies it. Quoting the phrase is
+   * what makes the advice's own wording load-bearing; quoting the field makes the catalogue's.
+   */
+  const performableClaims = [
+    ['a file_read line range', 'file_read', ['startLine', 'endLine']],
+    ['a code_search narrowed by path or glob', 'code_search', ['path', 'glob']],
+    ['a document_read page range', 'document_read', ['startPage', 'endPage']]
+  ] as const;
+
+  /**
+   * Reads one sentence of advice against `tool-catalogue.ts` and throws on the first thing this
+   * harness could not do.
+   *
+   * Written as a function of the advice rather than as a block that reads the constant, and that
+   * is the whole repair. The constant lives in `context.ts`, which this lane does not own, so the
+   * only way to show these lines can go red is to hand them a sentence that should fail - which
+   * the case below does, four ways. An audit that has never been watched failing is exactly what
+   * this case was: it read the catalogue at one end and the advice's length at the other and never
+   * once read one against the other, and a wholesale replacement naming `offset`/`limit`
+   * parameters no tool takes, a bare `| head -c` the shell cannot expand, and a `resume_output`
+   * tool that does not exist stayed green through all of it.
+   */
+  const auditAdvice = (advice: string): void => {
+    /*
+     * Every snake_case token is read as a tool name and looked up. '{}' is `shapeOf`'s answer for
+     * a name the catalogue does not carry, so this is the line that refuses an invented tool.
+     *
+     * The token is matched WHOLE. The pattern was `[a-z]+_[a-z]+`, which reads the first two
+     * segments of a longer name and stops, and that was wrong in both directions at once: it found
+     * `file_read` inside `file_read_all` and passed an invented tool through the audit written to
+     * refuse invented tools, and it found `parallel_web` inside `parallel_web_read` - a real tool,
+     * `tool-catalogue.ts`, and one this advice's own doc comment names as part of the class it is
+     * written for - and refused correct advice as a thing this harness cannot do. Both directions
+     * are pinned by the two cases below, because a rule with no case against it is how this line
+     * got here twice already.
+     *
+     * What it still does NOT catch is an invented name carrying no underscore, or an invented
+     * PARAMETER. `offset` and `limit` appended as prose - the parameter half of the reproduction
+     * that opened this defect - are parameters of none of the four tools this sentence offers
+     * (`limit` is real elsewhere, on `web_search`, which is why a catalogue-wide word search would
+     * not catch it either), and they carry no snake_case token and no pipe, so they pass. Closing
+     * that needs every tool's field list read against English prose, and a wrong guess there is a
+     * red test on correct advice; left open on purpose and said out loud rather than left to be
+     * discovered.
+     */
+    const namesTools = [...new Set(advice.match(/[a-z][a-z0-9]*(?:_[a-z0-9]+)+/g) ?? [])];
+    expect(namesTools.length).toBeGreaterThan(0);
+    for (const name of namesTools) expect(shapeOf(name)).not.toBe('{}');
+    for (const [phrase, tool, fields] of performableClaims) {
+      expect(advice).toContain(phrase);
+      for (const field of fields) expect(shapeOf(tool)).toContain(field);
+    }
+    // A pipe character would be advice `shell` cannot take: it runs one executable directly, and
+    // its own description says there is no shell here and nothing expands. So the only honest way
+    // to say it is the one the catalogue itself names.
+    expect(shapeOf('shell')).toContain('bash -lc');
+    expect(advice).toContain('bash -lc');
+    expect(advice).not.toContain('|');
+  };
+
+  it('names nothing this harness cannot do, and forges no pointer', async () => {
+    /*
+     * Advice naming a capability athanor does not have is worse than silence, because it spends a
+     * step of a sixteen-step budget on a call that cannot be made. So every clause is read against
+     * the catalogue entry that makes it true, and the case that proves those lines bite is the one
+     * directly below this.
+     */
+    auditAdvice(CUT_TOOL_OUTPUT_ADVICE);
+    // And it must not read as a claim that something was parked: `spillPathIn` is what every later
+    // pass asks, and a sentence that tripped it would make the harness restate a path it never
+    // wrote. @see the forged-marker note in output-spill.ts.
+    const { deps, state } = recording({ register: false });
+    await recordToolResult(deps, task, Buffer.from(dataKey), state, shell, big);
+    expect(spillPathIn(windowEntry(state))).toBeNull();
+  });
+
+  it('goes red on advice this harness cannot perform, which is the only proof the audit bites', () => {
+    /*
+     * Four sentences, each derived from the real advice by changing exactly one thing, each caught
+     * by a different line of `auditAdvice`. Derived rather than written out so that a future edit
+     * to the advice carries them with it: if the clause a case rewrites ever stops appearing,
+     * `replace` returns the sentence unchanged, the audit passes, and `toThrow` goes red here
+     * rather than quietly testing nothing.
+     *
+     * This is the assertion the old case did not have. Seven saturated assertions have now been
+     * found in this programme, one of them here, and the shape is always the same: a check nobody
+     * has watched fail. These four are the watching.
+     */
+    const invents = `${CUT_TOOL_OUTPUT_ADVICE}, or call the resume_output tool to stream the rest`;
+    expect(() => auditAdvice(invents)).toThrow(/\{\}/);
+
+    // The one the two-segment token rule let through: an invented name that OPENS with a real
+    // one. `file_read_all` is not in the catalogue and never was, and it passed this audit green.
+    const extendsARealName = `${CUT_TOOL_OUTPUT_ADVICE}, or call the file_read_all tool for the rest`;
+    expect(() => auditAdvice(extendsARealName)).toThrow(/\{\}/);
+
+    const promisesAParameterNoToolTakes = CUT_TOOL_OUTPUT_ADVICE.replace(
+      'a file_read line range',
+      'a file_read byte range'
+    );
+    expect(promisesAParameterNoToolTakes).not.toBe(CUT_TOOL_OUTPUT_ADVICE);
+    expect(() => auditAdvice(promisesAParameterNoToolTakes)).toThrow(/a file_read line range/);
+
+    const dropsTheOneShellFormThatWorks = CUT_TOOL_OUTPUT_ADVICE.replace('`bash -lc`', 'a shell');
+    expect(dropsTheOneShellFormThatWorks).not.toBe(CUT_TOOL_OUTPUT_ADVICE);
+    expect(() => auditAdvice(dropsTheOneShellFormThatWorks)).toThrow(/bash -lc/);
+
+    const pipes = `${CUT_TOOL_OUTPUT_ADVICE}, or just run cmd | head -c 4000`;
+    expect(() => auditAdvice(pipes)).toThrow(/not to contain/);
+  });
+
+  it('stays green on a real tool whose name has three parts, which the old token rule did not', () => {
+    /*
+     * The counter-direction of the line above, and the half a negative case cannot cover on its
+     * own: an audit that refuses correct advice is not a stricter audit, it is a red test nobody
+     * can act on. `parallel_web_read` is in the catalogue and is named in
+     * `CUT_TOOL_OUTPUT_ADVICE`'s own doc comment as one of the class of tools that fills this
+     * window, so advice offering it would be advice worth giving - and under `[a-z]+_[a-z]+` it
+     * was read as `parallel_web`, found under no name, and called a capability this harness does
+     * not have.
+     */
+    expect(shapeOf('parallel_web_read')).toContain('parallel_web_read');
+    expect(() =>
+      auditAdvice(`${CUT_TOOL_OUTPUT_ADVICE}, or a parallel_web_read of the same page`)
+    ).not.toThrow();
   });
 });
 

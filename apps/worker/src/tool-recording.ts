@@ -563,10 +563,22 @@ export const recordToolResult = async (
    *
    * Awaited rather than fired off, because the marker is about to name the path: a notice that
    * races the write it describes is the unperformable recovery again, one step further along.
-   * `spillOverflow` answers null when it could not write, and the marker then says exactly what it
-   * has always said - what is missing, and nothing about where to find it. @see output-spill.ts
-   * for why an untrusted result is parked inside the download quarantine and not beside a trusted
-   * one.
+   * @see output-spill.ts for why an untrusted result is parked inside the download quarantine and
+   * not beside a trusted one.
+   *
+   * `spillOverflow` answers null when it could not write - no writer registered, a body past
+   * `MAX_SPILL_CHARS`, or a runner that refused: a full disk, a wedged service, a workspace being
+   * deleted underneath the turn. The first of those cannot happen on this path - `useOutputSpill`
+   * runs once in `assemblePreamble` (window.ts), the single production registration, so a lead
+   * turn always has a writer - but it is the shape a delegated specialist's window has, since that
+   * window runs no preamble, and it is the branch the cases in `output-spill.test.ts` drive here
+   * with `register: false`. @see the three counts on `spillOverflow` itself.
+   *
+   * `undefined` here is not silence: it is the point at which
+   * `boundToolResultText` applies `CUT_TOOL_OUTPUT_ADVICE`, which says that nothing was kept and
+   * names the narrower requests this harness answers. What this line still does NOT do is give
+   * that failed spill a second try or tell the owner it happened; the model is told what is true
+   * of its own window and nothing about the runner.
    */
   const spilled =
     full.length > RECENT_TOOL_OUTPUT_CHARS
