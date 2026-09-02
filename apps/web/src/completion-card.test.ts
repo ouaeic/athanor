@@ -236,6 +236,37 @@ describe('what the harness ran', () => {
   });
 
   /*
+   * More than one of them, which is what the comment over `harnessCaveats` used to deny.
+   *
+   * `CAVEAT_BESIDE_THE_TICK` in `apps/worker/src/turn-bounds.ts` holds three sentences, and the
+   * failure and could-not-run pair are the ones a reader who never opens the receipt most needs:
+   * the card is headed "Result" with a tick on it. The behaviour was already right - nothing here
+   * counts - and this pins it so the corrected comment stays true rather than being true by luck.
+   * The two lines are the worker's own constants, quoted rather than imported because this package
+   * does not depend on the worker.
+   */
+  it('shows every caveat the worker sent both ways, not the first', () => {
+    const failedCaveat =
+      'athanor ran the checks this turn declared and they did not pass, so nothing here is verified - read the failures below before relying on it.';
+    const couldNotRun =
+      'athanor could not run the checks this turn declared, so this result is unchecked - neither proved nor disproved.';
+    const card = completionCard(
+      completed('Task completed', {
+        summary: 'Totalled the column.',
+        acceptance: [failedCaveat, couldNotRun, 'check-1: The suite passes — exit 0'],
+        verification: {
+          status: 'checks_failed',
+          evidence: [{ claim: 'Wrote total.txt', source: 'tool_result' }],
+          remainingRisks: [failedCaveat, couldNotRun, 'The chart still uses last week’s figures']
+        }
+      }),
+      ranTwoChecks
+    );
+    expect(card.harnessCaveats).toEqual([failedCaveat, couldNotRun]);
+    expect(card.caveats).toEqual(['The chart still uses last week’s figures']);
+  });
+
+  /*
    * The other half of that protocol. Everything the worker sends only as a risk - how the checks
    * were made, where they came from - is detail behind the disclosure, and the summary line says
    * there is something in there to read rather than printing it over the tick.

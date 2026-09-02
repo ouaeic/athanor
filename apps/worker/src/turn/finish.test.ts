@@ -19,7 +19,9 @@ import type { AcceptanceRecord, AcceptanceResult } from '../acceptance.js';
 import type { AgentState } from '../agent-state.js';
 import type { CompletionVerification } from '../completion.js';
 import {
+  ACCEPTANCE_ALREADY_PASSED_CAVEAT,
   ACCEPTANCE_COULD_NOT_RUN_CAVEAT,
+  ACCEPTANCE_EARLIER_TURN_CAVEAT,
   ACCEPTANCE_FAILED_CAVEAT,
   CAVEAT_BESIDE_THE_TICK,
   MAX_ACCEPTANCE_FAILURES
@@ -290,5 +292,60 @@ describe('what the owner reads, in the words they read', () => {
 
     expect(run.completed?.verification.remainingRisks).toHaveLength(20);
     expect(run.completed?.verification.remainingRisks[0]).toBe(ACCEPTANCE_FAILED_CAVEAT);
+  });
+
+  /**
+   * The two sentences about a tick that is worth less than it looks, on a completion that has no
+   * tick left.
+   *
+   * Both are written after the failure branch and, until the condition that guards them existed,
+   * unconditionally: a run whose checks failed `MAX_ACCEPTANCE_FAILURES` times carried
+   * ACCEPTANCE_FAILED_CAVEAT beside the tick and, on the same card behind the disclosure, a line
+   * saying the checks show nothing broke - or that they were already passing. The owner reads both.
+   *
+   * `acceptanceNagged` is set because a turn that mutated and holds a record from an earlier turn
+   * is sent round once to declare its own; this file is about what a completion says, not about
+   * that hold, so the nag is spent before the call.
+   */
+  it('does not tell the owner nothing broke over checks that failed', async () => {
+    const run = await finish([failed], {
+      acceptanceFailures: MAX_ACCEPTANCE_FAILURES - 1,
+      acceptanceTurn: 1,
+      acceptanceNagged: true
+    });
+
+    expect(run.completed?.verification.remainingRisks).toContain(ACCEPTANCE_FAILED_CAVEAT);
+    expect(run.completed?.verification.remainingRisks).not.toContain(
+      ACCEPTANCE_EARLIER_TURN_CAVEAT
+    );
+  });
+
+  it('does not say they were already passing over a run in which they failed', async () => {
+    const run = await finish([failed], {
+      acceptanceFailures: MAX_ACCEPTANCE_FAILURES - 1,
+      acceptanceCaveat: ACCEPTANCE_ALREADY_PASSED_CAVEAT
+    });
+
+    expect(run.completed?.verification.remainingRisks).toContain(ACCEPTANCE_FAILED_CAVEAT);
+    expect(run.completed?.verification.remainingRisks).not.toContain(
+      ACCEPTANCE_ALREADY_PASSED_CAVEAT
+    );
+  });
+
+  /**
+   * The other direction, which is the whole reason these sentences exist. A tick over checks an
+   * earlier turn wrote is worth less than a tick over checks this turn wrote, and the owner is
+   * still told so.
+   */
+  it('still qualifies a tick earned by an earlier turn’s checks', async () => {
+    const run = await finish([passed], { acceptanceTurn: 1, acceptanceNagged: true });
+
+    expect(run.completed?.verification.remainingRisks).toContain(ACCEPTANCE_EARLIER_TURN_CAVEAT);
+  });
+
+  it('still says the checks were green before anybody started, when they were', async () => {
+    const run = await finish([passed], { acceptanceCaveat: ACCEPTANCE_ALREADY_PASSED_CAVEAT });
+
+    expect(beside(run)).toContain(ACCEPTANCE_ALREADY_PASSED_CAVEAT);
   });
 });

@@ -71,4 +71,29 @@ describe('runner configuration', () => {
     process.env.RESERVED_PREVIEW_PORTS = '4100, 4400,5432, ,not-a-port';
     expect(loadConfig().RESERVED_PREVIEW_PORTS).toEqual([4100, 4400, 5432]);
   });
+
+  it('takes a background ceiling raised past a day, which is the point of the setting', () => {
+    // Forty hours, for the forty-hour assembly this box exists to run. The request schema in
+    // processes.ts used to carry its own `.max(86_400)`, so setting this did nothing above a day
+    // and the refusal named a constant instead of this box.
+    baseEnvironment();
+    process.env.MAX_BACKGROUND_SECONDS = '144000';
+    expect(loadConfig().MAX_BACKGROUND_SECONDS).toBe(144_000);
+  });
+
+  it('refuses a background ceiling past what a timer can honestly hold', () => {
+    /*
+     * An extra digit, and the deadline stops working rather than getting longer. The kill is a
+     * `setTimeout`, whose delay is a signed 32-bit millisecond count; past 2^31-1 ms Node warns and
+     * fires immediately, so a ceiling above 2,147,483 seconds would kill every background job the
+     * instant it started. Refused at startup because that is the loud version of the same fact: a
+     * runner that will not come up says so in the journal, where a job that dies in the first
+     * millisecond says nothing an owner can act on.
+     */
+    baseEnvironment();
+    process.env.MAX_BACKGROUND_SECONDS = '2147484';
+    expect(() => loadConfig()).toThrow();
+    process.env.MAX_BACKGROUND_SECONDS = '2147483';
+    expect(loadConfig().MAX_BACKGROUND_SECONDS).toBe(2_147_483);
+  });
 });

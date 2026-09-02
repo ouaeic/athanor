@@ -9056,3 +9056,207 @@ describe('the cross-process signal bridge', () => {
     expect(new Set(subscribed).size).toBe(3);
   });
 });
+
+/*
+ * The read behind the open-rate instrument.
+ *
+ * `docs/design/organs/PREAMBLE.md` §10.4 gates the tool catalogue's deferral tier on one production
+ * measurement: the share of TURNS that reach each tool at least once. Everything the decision needs
+ * that a database can answer without a key is answered here - which turn a call happened in, and
+ * how many turns there were to divide by. The names themselves are ciphertext and are opened by the
+ * route that already holds the workspace key.
+ *
+ * Its own describe with its own database, so it can be run alone: this file is nine thousand lines
+ * and the suite around it is not what these four assertions are about.
+ */
+describe('the turns a tool was reached in', () => {
+  let database: Database;
+  let tasks: TaskStore;
+  let store: DataStore;
+
+  beforeEach(async () => {
+    database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+    await migrateDatabase(database);
+    store = new DataStore(database);
+    tasks = new TaskStore(database, new TaskSignals(database));
+  });
+
+  afterEach(async () => database.close());
+
+  /** A conversation whose events are written in the order a real turn writes them. */
+  const conversation = async (): Promise<string> => {
+    const user = await store.createUser({ username: 'opens', displayName: 'Opens' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Opens'));
+    const task = await store.createTask(taskInput(user.id, workspace.id));
+    return task.id;
+  };
+
+  const append = async (
+    taskId: string,
+    kind: 'user_message' | 'tool_started' | 'assistant_delta' | 'assistant_message',
+    summary: string
+  ): Promise<void> => {
+    await store.appendTaskEvent({
+      taskId,
+      kind,
+      summary,
+      payloadCiphertext: { v: 1, iv: 'iv', tag: 'tag', ciphertext: `${kind}:${summary}` }
+    });
+  };
+
+  it('numbers the opening request as turn one and every follow-up after it', async () => {
+    const taskId = await conversation();
+    // `createTask` writes no `user_message` for the opening request - the text is the task's own
+    // prompt - so a conversation nobody followed up has to read as one turn and not as zero.
+    await append(taskId, 'tool_started', 'a');
+    await append(taskId, 'tool_started', 'b');
+    await append(taskId, 'user_message', 'and now this');
+    await append(taskId, 'tool_started', 'c');
+    await append(taskId, 'user_message', 'and this');
+    await append(taskId, 'user_message', 'and this too');
+    await append(taskId, 'tool_started', 'd');
+
+    const page = await tasks.listTurnToolStarts(taskId);
+    expect(page.rows.map((row) => [row.kind, row.turn])).toEqual([
+      ['tool_started', 1],
+      ['tool_started', 1],
+      ['user_message', 2],
+      ['tool_started', 2],
+      ['user_message', 3],
+      ['user_message', 4],
+      ['tool_started', 4]
+    ]);
+    expect(page.hasMore).toBe(false);
+  });
+
+  it('reports a turn that called nothing, because it is in the denominator', async () => {
+    const taskId = await conversation();
+    await append(taskId, 'tool_started', 'a');
+    await append(taskId, 'user_message', 'a question with an answer and no work in it');
+    await append(taskId, 'assistant_message', 'here you go');
+
+    // The rate this instrument exists to produce is per turn, so a turn in which the model answered
+    // without reaching for anything still divides. Returning only `tool_started` rows would drop
+    // this turn from the count entirely and make every share too large - which is the one error in
+    // this arithmetic that biases the deferral decision toward shipping.
+    const page = await tasks.listTurnToolStarts(taskId);
+    expect(page.rows.map((row) => [row.kind, row.turn])).toEqual([
+      ['tool_started', 1],
+      ['user_message', 2]
+    ]);
+  });
+
+  it('gives a paged read the same turn numbers as an unpaged one', async () => {
+    const taskId = await conversation();
+    await append(taskId, 'tool_started', 'a');
+    await append(taskId, 'user_message', 'second');
+    await append(taskId, 'tool_started', 'b');
+    await append(taskId, 'user_message', 'third');
+    await append(taskId, 'tool_started', 'c');
+
+    const whole = await tasks.listTurnToolStarts(taskId);
+    const paged: Array<[string, number]> = [];
+    let cursor = 0;
+    for (;;) {
+      const page = await tasks.listTurnToolStarts(taskId, { after: cursor, limit: 2 });
+      for (const row of page.rows) paged.push([row.kind, row.turn]);
+      cursor = page.nextCursor;
+      if (!page.hasMore) break;
+    }
+    // The window function is numbered inside a subquery for exactly this. Postgres applies a
+    // query level's WHERE before its window functions, so a cursor predicate written beside the
+    // running SUM restarts the count at the top of each page: the second page of this conversation
+    // would call its own rows turn 1, and a week of long conversations would report far more turns
+    // than happened and far lower rates than are real.
+    expect(paged).toEqual(whole.rows.map((row) => [row.kind, row.turn]));
+    expect(paged).toEqual([
+      ['tool_started', 1],
+      ['user_message', 2],
+      ['tool_started', 2],
+      ['user_message', 3],
+      ['tool_started', 3]
+    ]);
+  });
+
+  it('carries no ciphertext this reader has no business opening', async () => {
+    const taskId = await conversation();
+    await append(taskId, 'tool_started', 'a');
+    await append(taskId, 'user_message', 'what the owner typed');
+    await append(taskId, 'assistant_delta', 'one frame of the answer');
+    await append(taskId, 'assistant_message', 'the answer');
+
+    const page = await tasks.listTurnToolStarts(taskId);
+    // Two things at once. The message the owner typed comes back as a boundary with its payload
+    // dropped - a reader holding the workspace key cannot open by accident what it was never sent.
+    // And the delta frames, which are most of a trajectory's rows and nearly all of its bytes, are
+    // not carried out of the database at all; that narrowing is the whole reason this statement
+    // exists rather than a filter over `listTaskEventPage`.
+    expect(page.rows.map((row) => row.kind)).toEqual(['tool_started', 'user_message']);
+    expect(page.rows[0]?.payloadCiphertext).toMatchObject({ ciphertext: 'tool_started:a' });
+    expect(page.rows[1]?.payloadCiphertext).toBeNull();
+  });
+
+  it('selects one owner conversations, and only where a turn opened inside the window', async () => {
+    /*
+     * The selection half of the read, which had no assertion of its own until this was written.
+     *
+     * Added by the verifying pass rather than by the lane: with `w.user_id = $1` replaced by a
+     * tautology, every route test over this query still passed, because the route harness has one
+     * owner and one workspace. A second owner's turns would then land in this owner's DENOMINATOR
+     * while their tool names stayed unreadable - the key map holds only the asking owner's - so the
+     * failure is not a leak, it is every share on the report silently too small, which is the one
+     * direction that argues for deferring a tool that is actually hot.
+     *
+     * The three window cases are here for the same reason and are the three the SQL's two arms are
+     * made of: a conversation created in the window that wrote NO event at all is a turn (the model
+     * answered without reaching for anything, and `createTask` writes no `user_message` for the
+     * opening request); a conversation older than the window with a follow-up inside it is read, so
+     * that follow-up can be counted; and one whose every row is older is not read at all.
+     */
+    const owner = await store.createUser({ username: 'owner', displayName: 'Owner' });
+    const other = await store.createUser({ username: 'other', displayName: 'Other' });
+    const ownerSpace = await store.createWorkspace(workspaceInput(owner.id, 'Owner'));
+    const otherSpace = await store.createWorkspace(workspaceInput(other.id, 'Other'));
+
+    const quiet = await store.createTask(taskInput(owner.id, ownerSpace.id));
+    const straddler = await store.createTask(taskInput(owner.id, ownerSpace.id));
+    const stale = await store.createTask(taskInput(owner.id, ownerSpace.id));
+    const theirs = await store.createTask(taskInput(other.id, otherSpace.id));
+    await append(straddler.id, 'user_message', 'a follow-up today');
+    await append(stale.id, 'tool_started', 'a');
+    await append(theirs.id, 'tool_started', 'a');
+
+    const ageTask = async (id: string): Promise<void> => {
+      await database.query(`UPDATE tasks SET created_at = NOW() - INTERVAL '40 days' WHERE id=$1`, [
+        id
+      ]);
+    };
+    await ageTask(straddler.id);
+    await ageTask(stale.id);
+    await database.query(
+      `UPDATE task_events SET created_at = NOW() - INTERVAL '40 days' WHERE task_id=$1`,
+      [stale.id]
+    );
+
+    const until = new Date();
+    const week = new Date(until.getTime() - 7 * 86_400_000);
+    const found = await tasks.listTasksWithTurnsInWindow(owner.id, week, until);
+    // Newest first, so a truncated answer loses the oldest end of the window rather than an
+    // arbitrary end of it.
+    expect(found.tasks.map((task) => task.id)).toEqual([quiet.id, straddler.id]);
+    expect(found.hasMore).toBe(false);
+
+    // And a window that reaches all of it finds the stale conversation too, which is what proves
+    // the week's answer dropped a conversation that exists rather than one this test failed to
+    // write. The other owner's is absent from both.
+    const quarter = await tasks.listTasksWithTurnsInWindow(
+      owner.id,
+      new Date(until.getTime() - 90 * 86_400_000),
+      until
+    );
+    expect(quarter.tasks.map((task) => task.id).sort()).toEqual(
+      [quiet.id, straddler.id, stale.id].sort()
+    );
+    expect(quarter.tasks.map((task) => task.id)).not.toContain(theirs.id);
+  });
+});

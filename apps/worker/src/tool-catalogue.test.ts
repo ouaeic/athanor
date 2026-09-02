@@ -317,13 +317,58 @@ describe('the size of the catalogue the model is sent', () => {
     //     arithmetic: a resident byte is billed 1.780x per turn - a 1.25x cache write on the first
     //     of 6.30 calls plus 0.1x on the 5.30 after it - an extra round trip costs 7,338 input-
     //     token-equivalents, break-even is 0.349 opens per request, and the measured rate is
-    //     0.038. That is a 9.1x margin, 2.3x at the 95% upper bound. What is missing is the
-    //     instrument: the 0.038 comes from 83 hand-written eval turns rather than from production,
-    //     and the scheme returns nothing if a deferred tool is really touched in more than 9.2% of
-    //     turns - 59.8% if the open tool returns several schemas in one result, which it should.
-    //     One aggregate over the `tool_started` events the loop already emits, plus a week of
-    //     running, is what should decide it. Two constraints on whoever builds it, both measured
-    //     rather than argued: the opened schema arrives as a TOOL RESULT in the body and never in
+    //     0.038. That is a 9.1x margin, 2.3x at the 95% upper bound. The scheme returns nothing if
+    //     a deferred tool is really touched in more than 9.2% of turns - 59.8% if the open tool
+    //     returns several schemas in one result, which it should.
+    //
+    //     THE INSTRUMENT NOW EXISTS AND THE GATE IS STILL SHUT, because it has nothing to read
+    //     yet. `GET /v1/usage/tool-opens` - apps/api/src/routes/usage.ts, `athanor tool-opens` for
+    //     an owner without the UI - aggregates the `tool_started` events the loop already emits
+    //     into the share of TURNS that reached each tool, adding no event, no write path and no
+    //     column. It refuses to divide by fewer than 33 turns, which is where the RULE OF THREE -
+    //     the shorthand the 9.2% above is quoted against - first puts a tool nobody called once
+    //     under that threshold. It is NOT where the bound the report prints gets there: that one
+    //     is the exact binomial `1 - 0.05^(1/n)`, which is tighter and clears at 32. The looser
+    //     number is held as the floor on purpose, and MIN_TURNS_TO_ANSWER in
+    //     apps/api/src/routes/usage.ts carries the working and what the choice costs; the two
+    //     bounds at 31 and 32 are asserted in usage-tool-opens.test.ts. Below 33 no answer this
+    //     could print would move this decision. What it wants is a week of USE, not of clock: the
+    //     box this ships to made 58 turns across five active days - a figure read off the deployed
+    //     box and not off anything here - so the floor is about three of them.
+    //
+    //     Re-running the old corpus through that arithmetic is itself the warning. The 0.038 came
+    //     from 83 hand-written turns in which the model is a SCRIPT and the tool names are the
+    //     fixture author's; the same corpus today is 85 turns - four more approval scenarios and
+    //     112 more calls - and on it only 17 tools clear break-even at the 95% upper bound rather
+    //     than 22, which takes the wire to 24,575 bytes rather than 20,505. Six tools changed side
+    //     on a two-turn change to a corpus no model ever drove. The margin survives it and the SET
+    //     does not, so the set is not what may be read off a fixture suite. And 28 of that box's
+    //     58 turns called no tool at all, which is why the instrument counts them: a denominator
+    //     built from `tool_started` rows alone would have made every share on it 1.93x too large.
+    //
+    //     WHERE THE 17 AND THE 24,575 CAME FROM, AND WHY NOTHING HERE CAN CHECK THEM. They are a
+    //     recorded observation, not a figure this suite defends. The per-tool turn incidence both
+    //     are computed from was produced by a census rig that instrumented DISPATCH while the eval
+    //     harness ran over `evals/` and `evals/cards/scenarios.ts`; that rig lived outside the
+    //     repository and was not committed, so it is gone and the table with it. The six that
+    //     changed side were `browser_snapshot`, `code_diagnostics`, `code_search`,
+    //     `desktop_observe`, `process` and `publish_preview`, and `session_search` joined only
+    //     because its own entry grew 160 bytes - 22 minus six plus one is the 17, which is the most
+    //     the arithmetic above can be checked for.
+    //
+    //     What the tree does still answer, so the next reader knows which half to trust: the corpus
+    //     SIZE, from `evals/baseline.json` - 73 fixtures, 459 model calls, 71 of them running a
+    //     turn - and the per-tool BYTES both wire figures are summed from, which are what
+    //     `agentToolsFor` produces and what the assertions in this file hold. What it cannot answer
+    //     is which tools those turns reached. A static walk over the fixtures' declared
+    //     `expect.tools` is a different measurement and does not land on the same table, so
+    //     re-deriving these numbers means writing the census again rather than reading the
+    //     fixtures - and until someone does, they are the one thing in this comment that is
+    //     attributed rather than reproducible. The claim they support is unaffected either way:
+    //     that the SET is corpus-dependent is argued by six tools moving at all, not by which six.
+    //
+    //     Two constraints on whoever ships the deferral, both measured rather than argued: the
+    //     opened schema arrives as a TOOL RESULT in the body and never in
     //     the `tools:` array, because one byte changed in the first tool definition cost 99.9% of
     //     the catalogue prefix and 100% of the message prefix on that request; and every deferred
     //     tool keeps its resident index line, because a capability the model cannot discover is a

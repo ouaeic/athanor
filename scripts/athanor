@@ -488,12 +488,123 @@ doctor() {
     # registry older than this check writes nothing for it to read.
     check_note "model catalogue: the registry has not recorded a refresh pass yet"
   fi
+  # What the catalogue above knows about a model going away, said to the person it is about. The
+  # whole argument for reporting it here, and for reporting only the pinned and scheduled cases,
+  # is written over `model_retirement_dependencies`.
+  #
+  # Warnings and not failures, in both arms. A pin on a route that is withdrawn next week is a
+  # server that works today and will go on working afterwards - `support.ts` ranks instead when the
+  # pin cannot be served - so this is a setting about to stop meaning what the owner meant, which
+  # is exactly what `check_warn` is for, and a `doctor` that returned non-zero for it would return
+  # non-zero for as long as the owner left the pin alone.
+  #
+  # Three states, not two. The schema probe below answers `2` on a release that can be asked, `0`
+  # or `1` on one too old to hold both columns, and nothing at all when there is no database to ask
+  # - a stopped PostgreSQL, or a box where `runuser` or `psql` is not installed. Those are three
+  # different sentences and the last of them used to be printed as the second, which told an owner
+  # a fact about their release when what was true was "I could not look".
+  retirement_columns=$(model_retirement_columns)
+  if [ "$retirement_columns" = 2 ]; then
+    retirement_counts=$(model_retirement_counts)
+    retirement_total=${retirement_counts%%|*}
+    retirement_expiring=${retirement_counts##*|}
+    retirement_days=$(model_retirement_horizon_days)
+    # The well-formed answer is matched, and everything else is "the catalogue did not answer" -
+    # which is a different report from a catalogue with nothing being withdrawn in it and must not
+    # be rendered as the reassuring one. Written this way round because the empty answer splits
+    # into two empty halves, and a shape test on the halves is one bare `|` away from reading as a
+    # confident zero.
+    case "$retirement_counts" in
+      [0-9]*'|'[0-9]*)
+        # Whether the question was asked at all is kept apart from what it answered, because this
+        # is the one read in this arm whose function ends in `runuser` rather than in a pipeline -
+        # `model_retirement_columns` and `model_retirement_counts` both end in `| tr`, which is
+        # what has been swallowing psql's exit status for them. So a bare assignment here carries
+        # a failing status out into `set -eu` at the top of this file.
+        #
+        # Measured against the drill's fake host with the schema and count statements answering and
+        # this one exiting 2: `doctor` ended on this line. The spending brake, the update state,
+        # the backup age and the disk headroom that closes the report were all silently unreached,
+        # and the only sign of it was a bare exit 2. A dropped connection, a statement timeout, or
+        # a schema carrying `model_releases.metadata` and `task_schedules.model_id` but not
+        # `users.preferences` all land here. `and the rest of the report is still printed rather
+        # than the run ending there` in scripts/test-doctor-retirement.sh is what re-runs that.
+        #
+        # The failure is not folded into the empty answer beside it either. Empty means "nothing
+        # you depend on is going", which is the reassuring line, and a statement that errored is
+        # the same collapse this whole arm was rewritten to remove, one branch further in.
+        retirement_asked=yes
+        retirement_problems=$(model_retirement_dependencies) || retirement_asked=''
+        if [ -z "$retirement_asked" ]; then
+          check_note "model retirement: the catalogue answered, but the question of what on this server depends on a model it is withdrawing did not, so it is not known whether any pin or schedule names one; run sudo athanor logs"
+        elif [ -n "$retirement_problems" ]; then
+          printf '%s\n' "$retirement_problems" |
+            while IFS='|' read -r retire_kind retire_who retire_model retire_on retire_name; do
+              [ -n "$retire_model" ] || continue
+              # The subject and what happens next, per kind, because what happens next is not the
+              # same for the two and one sentence for both was false about the worse one.
+              #
+              # A pin degrades quietly: `pickModelUnderPriceCeiling` in apps/api/src/routes/
+              # support.ts ranks instead the moment the pinned id stops resolving, so the account
+              # keeps working on a model nobody chose and nothing says so. A schedule does not
+              # degrade at all: `dispatchOneDueSchedule` in apps/api/src/maintenance/
+              # schedule-dispatch.ts looks the id up in the catalogue itself, forces
+              # `model_unavailable` when it is not there, and the run never starts - and after
+              # `MODEL_UNAVAILABLE_PAUSE_AFTER` of those it turns the schedule off and writes the
+              # owner an event saying it did. That last part is the only reason this warning is
+              # worth printing for a schedule: it arrives before the runs start failing, where the
+              # pause message arrives after three of them have.
+              #
+              # The pause count is deliberately not named here. It lives in schedule-dispatch.ts
+              # and a second copy of it in this shell is a number that disagrees with itself the
+              # first time one of them moves - the same argument as `model_retirement_horizon_days`
+              # above, which is read rather than restated because the sentence names it.
+              case "$retire_kind" in
+                pin)
+                  retire_subject="the model $retire_who pinned in Settings"
+                  retire_after="it is used until it stops answering, and the ranking then picks for that account instead without saying so"
+                  retire_gone="every run it governs is already using the ranking's pick instead of it"
+                  retire_remedy="Choose another in Settings, or switch that account back to an automatic pick"
+                  ;;
+                *)
+                  retire_subject="the model a schedule of $retire_who runs on"
+                  retire_after="it is used until it stops answering, and then the schedule does not fall back to anything - its runs fail to start, and after a few of them athanor turns the schedule off"
+                  retire_gone="its runs are already failing to start, and athanor turns the schedule off once enough of them have"
+                  retire_remedy="Choose another model on that schedule before that happens"
+                  ;;
+              esac
+              if [ -n "$retire_on" ]; then
+                check_warn "model retirement: $retire_subject - ${retire_name:-$retire_model} ($retire_model) - is withdrawn by its provider on $retire_on. A named model is deliberately exempt from the routing that steers automatic picks away from a dying route, so $retire_after. $retire_remedy"
+              else
+                check_warn "model retirement: $retire_subject - $retire_model - is not in this server's catalogue at all, so $retire_gone. $retire_remedy"
+              fi
+            done
+        else
+          # Said even when there is nothing to warn about, because this is the check whose silence
+          # was the defect: a count of zero here is the difference between "no model you depend on
+          # is going away" and "nothing has ever looked".
+          check_note "model retirement: $retirement_expiring of $retirement_total models in the catalogue are withdrawn by their provider within $retirement_days days, and no pin or schedule on this server names one of them. Automatic picks route around them while anything else is eligible"
+        fi
+        ;;
+      *) check_note "model retirement: the catalogue did not answer, so nothing is known about withdrawals; run sudo athanor logs" ;;
+    esac
+  elif [ "$retirement_columns" = 0 ] || [ "$retirement_columns" = 1 ]; then
+    check_note "model retirement: this release's database has no column for a withdrawal date, so a model the provider is retiring goes on being offered with nothing to say so"
+  else
+    check_note "model retirement: the database did not answer, so it is not known whether this release can even record a withdrawal date; run sudo athanor logs"
+  fi
   # The pre-flight half of the spending brake, reported because a box with a ceiling and a box with
   # none look identical from outside, and the difference is whether anything stops an expensive
   # route being chosen while the owner is asleep. A note rather than a warning: no ceiling is a
   # choice an owner is allowed to make, the same way no daily cap is, and a `doctor` that scolds
   # every default box for the life of that box is a `doctor` nobody finishes reading.
-  if spend_ceiling_storable; then
+  #
+  # Three states here too, and for the identical reason as the retirement guard four lines above:
+  # this check sat beside that one printing "this release has no column to store one" over a
+  # database that had answered nothing, and two adjacent checks reading the same failure two
+  # different ways is worse than either reading alone.
+  ceiling_columns=$(spend_ceiling_columns)
+  if [ "$ceiling_columns" = 2 ]; then
     ceiling_report=$(spend_ceiling_print)
     if [ -n "$ceiling_report" ]; then
       printf '%s\n' "$ceiling_report" | while IFS= read -r ceiling_line; do
@@ -505,8 +616,10 @@ doctor() {
       # first owner, or a database that did not reply.
       check_note "model price ceiling: no account came back from the database, so there is none to report"
     fi
-  else
+  elif [ "$ceiling_columns" = 0 ] || [ "$ceiling_columns" = 1 ]; then
     check_note "model price ceiling: this release has no column to store one, so nothing limits the price of the model a task picks"
+  else
+    check_note "model price ceiling: the database did not answer, so it is not known whether anything limits the price of the model a task picks; run sudo athanor logs"
   fi
   # The running half, which is the one that halts a task, and the one no command could reach until
   # `athanor spend-cap` existed. Reported here and nowhere else on a headless box: a cap lives in
@@ -1662,6 +1775,78 @@ announce_outage() {
     printf 'athanor: stopping the server now for the backup, rebuild and restart. This run is bounded to %s minutes per step and its duration is reported at the end.\n' \
       "$((athanor_update_step_seconds / 60))"
   fi
+  # What the outage actually costs, which the two lines above never said. Stopping the server stops
+  # the workspace runner, and the runner stops every command it is holding. A DECLARED SERVICE comes
+  # back: its record is in the workspace's .athanor/services.json and the runner relaunches it on
+  # the way up. An ordinary background command does not, because nothing anywhere writes it down -
+  # so a twenty-hour alignment an agent started yesterday ends here, and the agent that polls it
+  # next is told only "Background process not found", which names no cause at all. Printed on every
+  # update rather than only when something is running, because this shell cannot always tell:
+  # `runner_background_work` below is the half of the answer that can be measured.
+  printf 'athanor: this stops every background command an agent left running, and they do not come back. Declared services do.\n'
+}
+
+# What an update is about to destroy, asked of the one process on this box that knows.
+#
+# Sets `runner_background_count` to the number of unfinished background commands, or to the EMPTY
+# STRING when the runner answered and did not report the field. That distinction is the point of
+# this function and is deliberately not collapsed into a zero: `athanor update` runs the PREVIOUS
+# release's copy of this script against whatever runner is on the disk, so this always has to cope
+# with a runner older than itself, and reading a missing field as "nothing is running" would be this
+# script quietly claiming a protection it never carried out. Callers say "could not tell".
+#
+# WHERE THE FIELD COMES FROM. The runner's `/healthz` handler in
+# services/workspace-runner/src/server.ts, which publishes `ProcessManager.backgroundWork()` under
+# exactly the two names the sed patterns below look for. Nothing checks that at build time in either
+# direction: renaming a field there, or a pattern here, leaves both halves compiling and turns this
+# gate back into the "could not tell" line, silently. long-work.test.ts runs these three functions
+# and both case blocks, cut out of this file at test time, against the real body that route answers.
+#
+# WHY THE EXISTING GATE CANNOT ANSWER IT. `wait_for_idle_worker` reads `athanor_worker_active`,
+# which counts TURNS in flight. A background command outlives the turn that started it - that is the
+# whole of what `background: true` buys - so on a box whose agent left a long job running and
+# finished its turn, the worker is idle, the weekly window opens, and the job dies. Measured on the
+# production box, which runs f02ca24 and is fifty-one commits behind this branch and therefore
+# describes an older athanor: unattended updates enabled, next run Mon 2026-09-07 03:34:33 UTC,
+# `athanor_worker_active 0`, and the runner's /healthz reporting nothing about running commands.
+#
+# A RUNNER THAT DOES NOT ANSWER COUNTS AS ZERO, not as unknown. There is nothing for a restart to
+# destroy on a runner that is not serving, and the alternative - refusing to update while the runner
+# is unreachable - would make an unreachable runner the one fault an update can never fix.
+runner_background_work() {
+  runner_background_count=""
+  runner_background_longest_ms=""
+  runner_health=$(curl -fsS --max-time 5 http://127.0.0.1:4300/healthz 2>/dev/null) || {
+    runner_background_count=0
+    return 0
+  }
+  runner_background_count=$(printf '%s' "$runner_health" | tr ',' '\n' |
+    sed -n 's/.*"backgroundCommands"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
+  runner_background_longest_ms=$(printf '%s' "$runner_health" | tr ',' '\n' |
+    sed -n 's/.*"backgroundLongestRemainingMs"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' |
+    sed -n '1p')
+}
+
+# The count and how long the longest job still has, in one sentence an operator can act on. A bare
+# count says an update would break something; "the longest has about 6 hours left" is what tells
+# them whether to wait for it or to stop it themselves. Hours past two of them, because a ceiling
+# that now runs for a day or more turns this into four-figure minutes, which nobody reads as a
+# length. Only reached on the arm where the count is a positive number, so the empty case - a runner
+# that does not report the field at all - never gets this far and is answered in its own words.
+background_work_summary() {
+  background_minutes_left=0
+  if [ -n "${runner_background_longest_ms:-}" ]; then
+    background_minutes_left=$(((runner_background_longest_ms / 1000 + 59) / 60))
+  fi
+  if [ "$background_minutes_left" -gt 120 ]; then
+    printf '%s background command(s) are still running; the longest has about %s hours left' \
+      "$runner_background_count" "$(((background_minutes_left + 59) / 60))"
+  elif [ "$background_minutes_left" -gt 0 ]; then
+    printf '%s background command(s) are still running; the longest has about %s minutes left' \
+      "$runner_background_count" "$background_minutes_left"
+  else
+    printf '%s background command(s) are still running' "$runner_background_count"
+  fi
 }
 
 # Go back to the release a backup was taken from, on purpose.
@@ -1732,6 +1917,30 @@ update_athanor() {
     printf 'athanor: a task started while the update was preparing; the next weekly window will retry.\n'
     return 0
   fi
+  # The work an idle worker does not account for, refused here rather than destroyed below.
+  #
+  # This is the by-hand arm. `auto_update_run` stands down silently and comes back next week; an
+  # operator at a terminal has neither of those, so they are told what is running and left to
+  # decide - waiting for a six-hour job is a different choice from stopping it, and this shell is
+  # not the thing that should be making it. The override is named in the same sentence, because a
+  # refusal an operator cannot get past is its own kind of broken machine.
+  #
+  # A runner that does not report the field leaves this empty, and an empty answer is not treated as
+  # a zero: the update goes ahead - stopping a box from ever updating because it cannot answer a
+  # question is worse than the risk - and says out loud that it could not tell.
+  runner_background_work
+  case "${runner_background_count:-}" in
+    '')
+      printf 'athanor: this runner does not report background commands, so this update cannot tell whether it is about to stop a long job.\n'
+      ;;
+    0) ;;
+    *)
+      [ -n "${ATHANOR_UPDATE_OVER_BACKGROUND_WORK:-}" ] ||
+        fail "$(background_work_summary), and this update would stop them for good - only declared services come back. Wait for them, stop them from the interface, or run again with ATHANOR_UPDATE_OVER_BACKGROUND_WORK=1 to update anyway"
+      printf 'athanor: %s, and ATHANOR_UPDATE_OVER_BACKGROUND_WORK is set, so this update will stop them.\n' \
+        "$(background_work_summary)"
+      ;;
+  esac
   previous_revision=$(git -C "$athanor_root" rev-parse --verify HEAD)
   announce_outage
   outage_started=$(date +%s)
@@ -2131,6 +2340,29 @@ auto_update_run() {
     record_update_status skipped 'a task was still running when the window came round'
     return 0
   fi
+  # The same stand-down for the work an idle worker cannot see.
+  #
+  # An agent's background command outlives the turn that started it, so `wait_for_idle_worker` above
+  # returns happily while a twenty-hour alignment is four hours from finishing. Stopping the server
+  # ends it, and unlike a service nothing brings it back or even records that it existed - the next
+  # poll of its id answers "Background process not found". Losing a day of the owner's compute at
+  # 03:34 on a Monday is worse than being a week behind on a release, so this waits rather than
+  # insists, and `record_update_status` is what stops the waiting from being silent: `doctor` reads
+  # that line, so a box that stands down repeatedly says so instead of quietly never updating.
+  #
+  # Not `wait_for_idle_worker`'s half-hour loop, deliberately. That length suits a turn; a job with
+  # hours left would spend the window sleeping and stand down anyway, and holding the timer's unit
+  # open for thirty minutes buys nothing here.
+  runner_background_work
+  case "${runner_background_count:-}" in
+    '' | 0) ;;
+    *)
+      printf 'athanor: %s; the next weekly window will retry.\n' "$(background_work_summary)"
+      record_update_status skipped \
+        "$runner_background_count background command(s) an agent left running would have been stopped"
+      return 0
+      ;;
+  esac
   # Pessimistic first and corrected on the way out, because a run killed by its own two-hour start
   # timeout, or by the power going off mid-update, never reaches another line of this script.
   record_update_status running ''
@@ -2255,6 +2487,159 @@ uninstall_athanor() {
 }
 
 # ---------------------------------------------------------------------------
+# The retirement warning, and who on this box it is about.
+#
+# `openrouter-catalog.ts` writes a provider's published withdrawal date onto every model it
+# refreshes, and `model-policy.ts` keeps a model within `RETIREMENT_HORIZON_DAYS` of that date out
+# of automatic selection. Both halves work. What had no reader was the warning itself: the
+# `Retires <date>` tag is computed on every refresh, stored on the row, served on /v1/models and
+# rendered by nothing anywhere in this repository, so a box routes around a dying model in silence
+# and never says which one - or that the owner's own pin is the one thing that routing does not
+# cover.
+#
+# It does not cover it by design. `rankModels` short-circuits on an explicit `requestedId` and
+# never reaches `isRetiringSoon`: the health filter, like the price ceiling beside it, governs what
+# athanor chooses for the owner and never what the owner chose for themselves. So the single case
+# where this warning has somebody to reach is the single case nothing tells - a standing pin in
+# Settings, or a schedule's `model_id`, on a route the provider is withdrawing. When the route
+# finally goes, the fallback in `support.ts` quietly ranks instead, which is correct and is also
+# the last moment anything could have said so.
+#
+# Reported by `doctor` because a headless box has nowhere else to hear it: it is a standing fact
+# about the server rather than an event, which is what the notification service carries, and it is
+# not about any one run, which is what `athanor task` answers. It sits beside the catalogue
+# freshness check above because it is only true alongside it - a date read out of a catalogue that
+# stopped refreshing in March is a date about March.
+#
+# HOW OFTEN THIS FIRES, which is the number that decides whether it is a warning or noise. Read
+# off a running box's `model_releases` on 2026-09-02, refreshed that morning: 421 rows; 10 publish
+# an expiry at all; 3 fall inside the 30-day horizon; 2 more expire 2026-12-31, and 5 carry
+# 2098-12-31, which is a provider writing "no expiry" as a date. Exactly 3 rows carry a
+# `Retires <date>` tag, and they are the same 3, because `openrouter-catalog.ts` writes that tag
+# only inside the horizon. So this speaks about 0.71% of a catalogue - neither the every-model
+# reading, which is a warning an owner learns to skip, nor the no-model reading, which is dead
+# weight.
+#
+# Re-read it rather than trusting this sentence. Nothing in this checkout holds a catalogue, so the
+# figures above cannot be re-derived from the tree and have to come off a box:
+#
+#   sudo runuser -u postgres -- psql -tAqc "SELECT COUNT(*), COUNT(*) FILTER (WHERE EXISTS (
+#     SELECT 1 FROM jsonb_array_elements_text(recommendation_tags) t WHERE t LIKE 'Retires %'))
+#     FROM model_releases" athanor
+#
+# That box, that morning, answered 421|3. It also held 1 pin and 0 enabled schedules, and the
+# pinned model carries no expiry - so the arm below printed its note there and no warning at all.
+# Nobody has yet watched it print a warning on a real box; that gap is real and is not closed by
+# the harness, which fakes the database.
+
+# The horizon read out of the policy that enforces it, the way `spend_ceiling_max` reads its bound
+# out of the contract: a number kept in two places is a number that disagrees with itself the first
+# time one of them moves.
+model_retirement_horizon_days() {
+  retirement_horizon=$(
+    sed -n 's/^export const RETIREMENT_HORIZON_DAYS = \([0-9][0-9]*\);$/\1/p' \
+      "$athanor_root/packages/core/src/model-policy.ts" 2>/dev/null | sed -n '1p'
+  )
+  [ -n "$retirement_horizon" ] || retirement_horizon=30
+  printf '%s' "$retirement_horizon"
+}
+
+# How many of the two columns this server's schema carries, echoed rather than compared against 2
+# here, and the empty string when the question could not be asked at all. Both columns are needed
+# and neither is old: the expiry travels inside `model_releases.metadata`, and a schedule could not
+# name a model before `task_schedules.model_id` existed. A report drawn from a release missing
+# either would say "nothing is being withdrawn" when what is true is "half the question was never
+# asked".
+#
+# This returned a boolean until it was measured, and the boolean collapsed three states an owner
+# has to tell apart into one. A database that is down, a `runuser` or `psql` that is not on this
+# box, and a schema that genuinely predates the columns all came back false, and the caller
+# reported the third of them as a fact: "this release's database has no column for a withdrawal
+# date" was printed on a probe box whose database answered nothing at all. Echoing the count is
+# what lets the caller say which of the three it is. The rule is the one written over
+# `model_retirement_counts` below, whose empty answer "must not be rendered as the reassuring one":
+# a check that could not run reads as silence, not as health.
+model_retirement_columns() {
+  runuser -u postgres -- psql -tAqc \
+    "SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND ((table_name = 'model_releases' AND column_name = 'metadata')
+            OR (table_name = 'task_schedules' AND column_name = 'model_id'))" \
+    athanor 2>/dev/null | tr -d '[:space:]'
+}
+
+# How many models this catalogue holds, and how many of them the provider withdraws inside the
+# horizon, as `total|expiring`.
+#
+# The expiry is compared as text rather than cast to a date, and that is the safe reading rather
+# than the lazy one: it arrives from a provider feed as free JSON, an ISO day already sorts
+# correctly as a string, and a malformed value is refused by the pattern instead of throwing out of
+# a cast and taking this whole arm of `doctor` down with it. The pattern is also what stops a value
+# like `soon` sorting below every real date and being reported as an imminent retirement.
+model_retirement_counts() {
+  runuser -u postgres -- psql -tAqc \
+    "SELECT COUNT(*) || '|' || COUNT(*) FILTER (
+       WHERE metadata->>'expiresAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+         AND substring(metadata->>'expiresAt' FROM 1 FOR 10)
+             <= to_char(CURRENT_DATE + INTERVAL '$(model_retirement_horizon_days) days','YYYY-MM-DD')
+     )
+     FROM model_releases" \
+    athanor 2>/dev/null | tr -d '[:space:]'
+}
+
+# One line per thing on this box that names a model and has a problem with the model it names,
+# as `kind|who|model id|withdrawal date or empty|display name or empty`.
+#
+# Two kinds, because there are two ways an unattended run comes to use a route nobody re-chose. A
+# pin is `users.preferences.model`, and `automatic: false` is what makes it a pin - `modelId` on
+# its own is not one, because the web app writes the currently recommended id into that field on
+# every ranking it receives, so reading it whenever it is set would report a warning about whatever
+# the picker happened to be showing when the owner last had the app open. A schedule is
+# `task_schedules.model_id`, which is the same setting for a run that starts at three in the
+# morning; disabled schedules are left out because they start nothing.
+#
+# Only the problems come back. A pin on a model that is present and not expiring is the ordinary
+# case and has nothing to report, and a `doctor` that lists every account's model on every run is
+# one nobody finishes reading.
+model_retirement_dependencies() {
+  runuser -u postgres -- psql -tAqc \
+    "WITH horizon AS (
+       SELECT to_char(CURRENT_DATE + INTERVAL '$(model_retirement_horizon_days) days','YYYY-MM-DD') AS edge
+     ),
+     depends AS (
+       SELECT 'pin' AS kind, u.username AS who, u.preferences->'model'->>'modelId' AS model_id
+         FROM users u
+        WHERE u.preferences->'model'->>'automatic' = 'false'
+          AND COALESCE(u.preferences->'model'->>'modelId', '') <> ''
+       UNION ALL
+       SELECT 'schedule', COALESCE(u.username, 'an account that is gone'), s.model_id
+         FROM task_schedules s
+         LEFT JOIN users u ON u.id = s.user_id
+        WHERE s.enabled
+          AND COALESCE(s.model_id, '') <> ''
+     ),
+     verdict AS (
+       SELECT d.kind, d.who, d.model_id,
+              COALESCE(
+                CASE
+                  WHEN m.metadata->>'expiresAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+                   AND substring(m.metadata->>'expiresAt' FROM 1 FOR 10) <= h.edge
+                  THEN substring(m.metadata->>'expiresAt' FROM 1 FOR 10)
+                END, '') AS expires_on,
+              COALESCE(m.display_name, '') AS display_name,
+              (m.id IS NULL) AS missing
+         FROM depends d
+         CROSS JOIN horizon h
+         LEFT JOIN model_releases m ON m.id = d.model_id
+     )
+     SELECT kind || '|' || who || '|' || model_id || '|' || expires_on || '|' || display_name
+       FROM verdict
+      WHERE missing OR expires_on <> ''
+      ORDER BY kind, who, model_id" \
+    athanor 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
 # The pre-flight half of the spending brake.
 #
 # The caps in Settings are the running half: they watch what a task has already spent and halt it.
@@ -2282,15 +2667,23 @@ spend_ceiling_max() {
 
 # Whether this server's schema can hold a ceiling at all. It cannot yet, and a command that printed
 # a confirmation over a database that stored nothing would be worse than no command.
+# The count, echoed, and the empty string when there was no database to ask. `doctor` needs the
+# three states apart - a schema that cannot hold a ceiling is a different report from a database
+# that did not answer - and the two command arms below only need the yes-or-no, so the predicate
+# stays and reads this. Kept in step with `model_retirement_columns` deliberately: these two guards
+# sit four lines apart in `doctor` and one of them saying "I could not look" while the other says
+# "your release cannot do this" under the identical failure is the disagreement worth avoiding.
+spend_ceiling_columns() {
+  runuser -u postgres -- psql -tAqc \
+    "SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'spend_limits'
+       AND column_name IN ('max_input_usd_per_million_tokens',
+                           'max_output_usd_per_million_tokens')" \
+    athanor 2>/dev/null | tr -d '[:space:]'
+}
+
 spend_ceiling_storable() {
-  [ "$(
-    runuser -u postgres -- psql -tAqc \
-      "SELECT COUNT(*) FROM information_schema.columns
-       WHERE table_schema = 'public' AND table_name = 'spend_limits'
-         AND column_name IN ('max_input_usd_per_million_tokens',
-                             'max_output_usd_per_million_tokens')" \
-      athanor 2>/dev/null | tr -d '[:space:]'
-  )" = 2 ]
+  [ "$(spend_ceiling_columns)" = 2 ]
 }
 
 # One rate, validated. Echoes the SQL literal - a bare number, or NULL for "no ceiling on this
@@ -2438,6 +2831,12 @@ default_monthly_cap() {
 # by whoever is holding the terminal rather than by whoever is paying. `doctor` says once, every
 # time it is run, that no cap is set. That is the right cadence for a decision the owner should make
 # with their own numbers in front of them.
+#
+# Left as a predicate, unlike `spend_ceiling_columns` above. This one has no false-health case to
+# split apart: its caller in `doctor` prints nothing at all when the answer is no, so a database
+# that did not answer already reads as silence there rather than as a fact about the release. That
+# it is silent about being unable to look is a smaller defect and a different one, and it is not
+# this change.
 spend_cap_storable() {
   [ "$(
     runuser -u postgres -- psql -tAqc \
@@ -3044,6 +3443,87 @@ task_usage() {
     '7 still running. See docs/HEADLESS.md.'
 }
 
+# How often the agent actually reaches for each tool, per turn, over a window of this box's work.
+#
+# WHY AN OWNER WOULD RUN THIS. The catalogue of tool schemas sent to the model on every request is
+# the largest fixed cost of a turn, and the largest saving anyone has priced against it - moving the
+# cold, fat two thirds behind an on-demand open - is held back on one number nobody has from a real
+# box: how often a deferred tool would actually have to be opened. The working is in
+# docs/design/organs/PREAMBLE.md; its frequencies come from 83 hand-written eval turns in which the
+# model is a script. This reads the box's own turns instead. A week of ordinary use is what it wants.
+#
+# It reports the share of TURNS that reached each tool at least once - never the number of calls,
+# because a tool called five times inside one turn is opened once - and it refuses to report any
+# share at all below the sample it names, which is 33 turns. That floor is not caution: it is where
+# the rule of three the design document quotes first puts a never-called tool under the 9.2%
+# threshold, so below it there is nothing to print that the decision could be made from. The exact
+# binomial bound the report actually carries is one turn tighter, and MIN_TURNS_TO_ANSWER in
+# apps/api/src/routes/usage.ts says why the looser number is the one held to.
+#
+# Read-only, and it costs nothing to run: no provider is called and nothing is billed.
+tool_opens() {
+  task_setup
+  # Both arguments are optional and the usage line says so, so neither may depend on the other being
+  # there: reading the day count off $1 made `athanor tool-opens --json` - the shortest form the
+  # usage line offers - refuse with "takes a whole number of days", which names the wrong argument
+  # and is the kind of error message that sends an operator to read this script.
+  tool_opens_days=''
+  tool_opens_json=''
+  for tool_opens_arg in "$@"; do
+    case "$tool_opens_arg" in
+      --json) tool_opens_json=1 ;;
+      '' | *[!0-9]*) fail "athanor tool-opens takes a whole number of days and an optional --json" ;;
+      *) tool_opens_days="$tool_opens_arg" ;;
+    esac
+  done
+  [ -n "$tool_opens_days" ] || tool_opens_days=7
+  task_call GET "/v1/usage/tool-opens?days=$tool_opens_days"
+  task_expect "reading the tool open rate" "usage:read"
+  if [ -n "$tool_opens_json" ]; then
+    jq '.' "$task_body" || fail "the answer came back as something this could not read"
+    exit "$task_exit_ok"
+  fi
+  jq -r '
+    "Window:        " + (.window.start | .[0:10]) + " to " + (.window.end | .[0:10])
+      + " (" + (.window.days | tostring) + " days)",
+    "Turns:         " + (.turns | tostring) + "  over " + (.tasksScanned | tostring)
+      + " conversations",
+    (if .unreadableCalls > 0 then
+       "Unreadable:    " + (.unreadableCalls | tostring)
+         + " tool calls this key could not open; their turns still count"
+     else empty end),
+    (if .windowTruncated then
+       "NOTE:          more conversations in this window than one read walks; the oldest were cut"
+     else empty end),
+    (if (.truncatedTasks | length) > 0 then
+       "NOTE:          cut off part-way through " + (.truncatedTasks | length | tostring)
+         + " conversation(s): " + (.truncatedTasks | join(", "))
+     else empty end),
+    "",
+    (if .decidable then
+       ("Share of turns that reached each tool at least once. The 95% column is the upper bound:",
+        "a tool is only worth deferring if that column, not the share, stays under the threshold.",
+        "Any tool absent from this list was reached in no turn at all, upper bound "
+          + ((.unseenToolUpper95 * 1000 | round / 10) | tostring) + "%.",
+        "",
+        "  tool                        turns     share    95% upper",
+        (.tools[] |
+          "  " + (.tool + "                            ")[0:26]
+            + (("     " + (.turns | tostring))[-6:])
+            + (("        " + ((.shareOfTurns * 1000 | round / 10) | tostring) + "%")[-10:])
+            + (("        " + ((.upper95 * 1000 | round / 10) | tostring) + "%")[-11:])))
+     else
+       ("This box has " + (.turns | tostring) + " turns in that window and this refuses to divide by",
+        "fewer than " + (.minimumTurns | tostring) + ". At " + (.minimumTurns | tostring)
+          + " turns a tool nobody called once has a 95% upper bound just under the",
+        "9.2% threshold the deferral decision uses, so below that this prints no share at all.",
+        "Keep using the box, or ask for a longer window:",
+        "  athanor tool-opens 30")
+     end)
+  ' "$task_body" || fail "the answer came back as something this could not read"
+  exit "$task_exit_ok"
+}
+
 task_command() {
   task_action="${1:-}"
   if [ "$#" -gt 0 ]; then shift; fi
@@ -3072,7 +3552,7 @@ task_command() {
 
 usage() {
   printf '%s\n' \
-    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...|task ...}' \
+    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...|task ...|tool-opens [DAYS] [--json]}' \
     '' \
     'Browser sign-in needs a hostname: a passkey is bound to a domain name and the WebAuthn' \
     'standard does not allow an IP address. If this server has no name, run:' \
@@ -3157,6 +3637,9 @@ case "$command_name" in
   # the running API over HTTP with an API token, so it works from this box or from anywhere else
   # that can reach it; root only matters because that is who may read a token out of /etc/athanor.
   task) task_command "$@" ;;
+  # Same plumbing as `task`: over HTTP to the running API with an API token, so it works from
+  # this box or from anywhere that can reach it. Needs the usage:read scope.
+  tool-opens) tool_opens "$@" ;;
   help)
     usage
     ;;

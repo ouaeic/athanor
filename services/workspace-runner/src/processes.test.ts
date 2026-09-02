@@ -936,3 +936,79 @@ describe('watching a long background job', () => {
     TEST_TIMEOUT_MS
   );
 });
+
+/**
+ * What this computer would destroy by restarting, counted where it is known.
+ *
+ * `athanor update` stops athanor.target for its backup and rebuild, which SIGTERMs the runner and
+ * takes every background session with it. A declared service comes back - its record is on disk and
+ * `resume` relaunches it - and an ordinary background command does not: nothing anywhere records
+ * it, so a twenty-hour alignment dies and the next poll of its id answers "Background process not
+ * found". The gate meant to stop that reads the worker's count of TURNS in flight, and a background
+ * job outlives its turn by design, so the gate cannot see it. This is the number that gate needs.
+ *
+ * The service exclusion is the half most likely to be got wrong in the safe-looking direction:
+ * counting services would stand the weekly update down for work a restart does not harm, every
+ * week, on any box with a dashboard on it - and a box that never updates is the failure this whole
+ * mechanism exists inside.
+ */
+describe('what a restart would destroy', () => {
+  it(
+    'counts a background command and not a service, with how long the longest has left',
+    async () => {
+      const root = await mkdtemp(path.join(tmpdir(), 'athanor-restart-cost-'));
+      roots.push(root);
+      await mkdir(path.join(root, 'workspace'));
+      const manager = new ProcessManager();
+      expect(manager.backgroundWork()).toEqual({ commands: 0, longestRemainingMs: null });
+
+      const short = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        { executable: '/bin/sh', args: ['-c', 'sleep 60'], timeoutSeconds: 30 },
+        120,
+        false
+      );
+      const long = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        { executable: '/bin/sh', args: ['-c', 'sleep 60'], timeoutSeconds: 90 },
+        120,
+        false
+      );
+      await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        {
+          executable: '/bin/sh',
+          args: ['-c', 'sleep 60'],
+          service: 'invoice dashboard',
+          maxOutputBytes: 4_096
+        },
+        120,
+        false
+      );
+
+      const cost = manager.backgroundWork();
+      // Two commands, not three: the service is the one thing here a restart puts back.
+      expect(cost.commands).toBe(2);
+      // The longer of the two deadlines, which is the number an operator is told to wait for.
+      expect(cost.longestRemainingMs).toBeGreaterThan(85_000);
+      expect(cost.longestRemainingMs).toBeLessThanOrEqual(90_000);
+
+      // A session that has stopped is no longer work a restart could destroy.
+      manager.action('workspace-1', 'task-1', long.sessionId, { action: 'kill' });
+      const afterKill = manager.backgroundWork();
+      expect(afterKill.commands).toBe(1);
+      expect(afterKill.longestRemainingMs).toBeLessThanOrEqual(30_000);
+
+      manager.action('workspace-1', 'task-1', short.sessionId, { action: 'kill' });
+      expect(manager.backgroundWork()).toEqual({ commands: 0, longestRemainingMs: null });
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+});

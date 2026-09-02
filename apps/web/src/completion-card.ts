@@ -108,10 +108,21 @@ export const completionCard = (
    * A line written into both the acceptance list and the risks is athanor's own sentence about the
    * worth of its own tick, and it is shown once, beside the tick. A line written only into the
    * risks is detail, and it stays behind the disclosure with everything else the agent could not
-   * rule out. Only one caveat is ever sent both ways - the checks that were already passing before
-   * the job started, where "all passed" on its own would tell a reader the opposite of what
-   * happened. The rest qualify the evidence rather than contradicting it, and a reader who is not
-   * opening the receipt is not the reader they were written for.
+   * rule out.
+   *
+   * Three caveats are sent both ways, and the register is `CAVEAT_BESIDE_THE_TICK` in
+   * `apps/worker/src/turn-bounds.ts`: the checks were already passing before the job started, the
+   * checks failed, and the checks could not be run. This comment said one - the first - and it had
+   * been one; the other two arrived with the turn that stopped a run calling itself verified when
+   * its own checks had failed, and each of them corrects the tick in the same way rather than
+   * qualifying it. Anything else the worker writes only as a risk qualifies the evidence rather
+   * than contradicting it, and a reader who is not opening the receipt is not the reader those
+   * were written for.
+   *
+   * The count is not read here, and this file deliberately does not hold a copy of the three
+   * sentences: whether a line travelled both ways is a fact the payload already carries, so a
+   * fourth caveat added over there needs no edit here. What a wrong count costs is the next
+   * reader's model of the protocol, which is why it is corrected rather than dropped.
    *
    * Matching on the whole line is what keeps a failed check out of this: a failure appears in both
    * fields too, but with the check's id in front of it in one and not the other.

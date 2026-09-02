@@ -178,6 +178,15 @@ jobs:
             $(git ls-files '*.mjs')
       - name: Exercise transactional update and rollback
         run: sh scripts/test-update.sh
+      # Beside the update drill rather than with the privileged ones in `native-units`, and the
+      # reason is the replay: its last section runs the three SQL statements the check issues
+      # against the PGlite in `packages/data/node_modules`, so it needs a completed install. The
+      # `native-units` job is checkout and drills alone, with no setup-node, so it would fail on
+      # the replay's first line. With PGlite absent this drill fails loudly rather than skipping,
+      # which is deliberate: a replay that quietly does not run is the saturated harness it exists
+      # to replace.
+      - name: Prove doctor still says a model is being withdrawn
+        run: sh scripts/test-doctor-retirement.sh
 
   # The two harnesses that prove the privileged edges of a box still behave, and the drill that
   # measures the one property every confinement directive on the runner unit can silently take

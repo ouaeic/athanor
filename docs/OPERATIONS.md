@@ -274,8 +274,34 @@ catches up after downtime. Each run is the same transactional `athanor update` d
 including the backup and the automatic rollback.
 
 The run stops early and changes nothing when the timer is disabled, when the checkout is already at
-the upstream revision, or when a task is still running after waiting up to 30 minutes for the worker
-to go idle; the next weekly window retries. A worker that cannot be reached counts as idle.
+the upstream revision, when a task is still running after waiting up to 30 minutes for the worker
+to go idle, or when the runner reports unfinished background commands; the next weekly window
+retries. A worker that cannot be reached counts as idle.
+
+### What an update stops, and what comes back
+
+An update stops the whole server for the backup and the rebuild, which stops the workspace runner,
+which stops every command it is holding. Three different things happen to them:
+
+- A **declared service** comes back. Its record lives in the workspace's `.athanor/services.json`,
+  and the runner relaunches it as it comes up.
+- A **foreground command** belongs to a task, and a task in flight already holds the update off.
+- An **ordinary background command** - what an agent starts for a long analysis - does not come
+  back and is not written down anywhere. It is killed, and the agent that polls its session id
+  afterwards is told the process was not found.
+
+That last case is why an unattended run now stands down for background work. The idle gate above
+counts tasks, and a background command deliberately outlives the task that started it, so before
+this a twenty-hour job could be killed at three in the morning by a timer with nothing to say for
+itself. `athanor update` by hand refuses for the same reason and names what is running; set
+`ATHANOR_UPDATE_OVER_BACKGROUND_WORK=1` to update anyway.
+
+A runner from before this existed does not report the count. The update then says it could not tell
+and goes ahead, rather than treating silence as an all-clear or refusing to update for ever.
+
+**Nothing resumes a background command across a restart.** A job that must survive one has to write
+its own progress to a file in the workspace and be startable from where it left off; the computer
+cannot do that for it.
 
 The unit files are installed on every install and update but are never enabled by them, so the
 choice survives updates.

@@ -87,14 +87,26 @@ sh scripts/test-relay-endpoint.sh   # what the connection manifest advertises, r
 sh scripts/test-update.sh           # transactional update and its rollback
 sh scripts/test-native-provisioning.sh  # the browser revision, the update record, the spending cap
 sh scripts/test-system-packages.sh  # which package manager an approved install actually reaches
+sh scripts/test-doctor-retirement.sh # what doctor says about a model the provider is withdrawing
 ```
 
-Three of them — `test-sandbox.sh`, `test-certificate.sh` and `test-relay-endpoint.sh` — also run in
-CI's `native-units` job, and `test-system-packages.sh` already runs inside `pnpm check` by way of
-`scripts/check-repository.mjs`. They are listed here because running one directly is how you read its
-output; `test-update.sh` and `test-native-provisioning.sh` have nothing but this list standing
-behind them. A new drill that this
+Three of them - `test-sandbox.sh`, `test-certificate.sh` and `test-relay-endpoint.sh` - also run in
+CI's `native-units` job; `test-update.sh` and `test-doctor-retirement.sh` run in the `application`
+job, at `.github/workflows/verify.yml`, after that job's `pnpm install`; and
+`test-system-packages.sh` already runs inside `pnpm check` by way of
+`scripts/check-repository.mjs`. They are listed here because running one directly is how you read
+its output; `test-native-provisioning.sh` is the one with nothing but this list standing behind it. A new drill that this
 page does not name fails `scripts/check-repository.mjs`, for the same reason as the gate list above.
+
+`test-doctor-retirement.sh` is the one that does not fit "no root, no network and no server"
+cleanly: it wants a completed `pnpm install` on Node 24, because its last section replays the three
+SQL statements the check issues against the PGlite in `packages/data/node_modules`. With PGlite
+absent it fails loudly rather than skipping, and `SKIP_SQL_REPLAY` cannot rescue it because that
+skip is tested after the PGlite guard, not before it. Both are deliberate: a replay that quietly
+does not run is the saturated harness it exists to replace. It runs in CI in `application` beside
+`test-update.sh`, which is the job that has already installed - `native-units` is
+`actions/checkout` and the drills alone, with no `setup-node` and no install, so it would fail
+there on the replay's first line.
 
 For the Tauri shell:
 

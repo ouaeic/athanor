@@ -168,3 +168,87 @@ export const TASK_NAME_SEARCH_SQL = {
   plain: taskNameSearchSql(false),
   prefixed: taskNameSearchSql(true)
 };
+
+/**
+ * One conversation's turn boundaries and its dispatched tool calls, and nothing else.
+ *
+ * Written for one reader: the per-tool turn-incidence aggregate behind `GET /v1/usage/tool-opens`,
+ * which is the instrument `docs/design/organs/PREAMBLE.md` §10.4 gates the tool catalogue's
+ * deferral tier on. That decision is per TURN and not per call - a tool called five times in one
+ * turn would be opened once - so the turn a call belongs to has to travel with it, and so do the
+ * turns that called nothing at all. Both kinds are returned for that reason: drop the boundaries
+ * and every rate is computed against a denominator of turns that happened to use a tool, which is
+ * the one arithmetic error that would make every number here too large.
+ *
+ * WHY THE TURN IS COUNTED IN SQL. It is the one part of this question that is legible without a
+ * key: `kind` is plaintext, and every message sent into a conversation after the first writes a
+ * `user_message` row - `continueTask`, `enqueueTaskMessage` and `promoteQueuedMessage` all do. So a
+ * running count of those rows numbers the turns without decrypting anything. It starts at 1 rather
+ * than 0 because `createTask` writes NO `user_message` event for the opening request - that text is
+ * the task's own `prompt_ciphertext` - so a conversation nobody followed up is one turn, not zero.
+ *
+ * The window function is in a subquery on purpose. Postgres applies a query level's WHERE before
+ * its window functions, so a cursor predicate written beside the `SUM(...) OVER` would renumber
+ * from the top of each page, and page two of a conversation would report its turns as though the
+ * conversation began there. Numbering over the whole task and filtering outside it is what makes a
+ * paged read give the same answer as an unpaged one.
+ *
+ * `kind` is narrowed to these two, and that narrowing is the whole reason this statement exists
+ * rather than the caller filtering `listTaskEventPage`: `assistant_delta` frames are most of a
+ * trajectory's rows and nearly all of its bytes, and a walk of the timeline would carry every one
+ * of them out of the database to read forty tool names.
+ *
+ * A `user_message` row comes back with its payload NULLED rather than carried. The caller wants the
+ * boundary and the time, never the words, and a ciphertext that is not sent cannot be opened by
+ * mistake by a reader that already holds the key.
+ *
+ * Parameters: $1 task id, $2 exclusive sequence cursor, $3 row limit.
+ */
+export const TURN_TOOL_STARTS_SQL = `
+SELECT id, sequence, turn, kind, created_at,
+       CASE WHEN kind='tool_started' THEN payload_ciphertext END AS payload_ciphertext
+  FROM (
+  SELECT id, sequence, kind, payload_ciphertext, created_at,
+         1 + SUM(CASE WHEN kind='user_message' THEN 1 ELSE 0 END)
+               OVER (ORDER BY sequence ROWS UNBOUNDED PRECEDING) AS turn
+    FROM task_events
+   WHERE task_id=$1 AND kind IN ('user_message','tool_started')
+) numbered
+WHERE sequence > $2
+ORDER BY sequence
+LIMIT $3`;
+
+/**
+ * The conversations that hold at least one turn opening inside a window, newest first.
+ *
+ * The other half of the open-rate instrument: which conversations `TURN_TOOL_STARTS_SQL` should be
+ * run over. Reading every conversation the box has ever held and skipping the quiet ones is what
+ * this replaces.
+ *
+ * TWO WAYS IN, and the first one is the one that is easy to leave out. A turn opens either with the
+ * conversation itself - `createTask` writes no `user_message` for the opening request - or with a
+ * `user_message` row. So a conversation created inside the window qualifies on its own timestamp
+ * even when it wrote no events at all, which is exactly what a turn the model answered without
+ * reaching for a tool looks like from here. Selecting only on events would drop those turns from
+ * the DENOMINATOR while keeping every turn that used something, and every share computed from it
+ * would be too large - the one error in this arithmetic that biases toward deferring.
+ *
+ * `tasks.updated_at` is deliberately not the test, though it would have been cheaper. `appendTaskEvent`
+ * does not touch it: it takes the task's row lock and writes only to `task_events`. A conversation
+ * is stamped when its status moves or its lease is renewed, which is frequent enough that the wrong
+ * answer would almost always agree with this one - and "almost always" in a measurement that exists
+ * to settle a byte budget is how a number nobody can reproduce gets published.
+ *
+ * Parameters: $1 user id, $2 window start, $3 window end (exclusive), $4 conversation limit.
+ */
+export const TASKS_WITH_TURNS_IN_WINDOW_SQL = `
+SELECT t.id, t.workspace_id, t.created_at
+  FROM tasks t JOIN workspaces w ON w.id = t.workspace_id
+ WHERE w.user_id = $1
+   AND ((t.created_at >= $2 AND t.created_at < $3)
+        OR EXISTS (SELECT 1 FROM task_events e
+                    WHERE e.task_id = t.id
+                      AND e.kind IN ('user_message','tool_started')
+                      AND e.created_at >= $2 AND e.created_at < $3))
+ ORDER BY t.created_at DESC, t.id DESC
+ LIMIT $4`;

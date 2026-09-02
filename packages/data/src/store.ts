@@ -783,6 +783,22 @@ export class DataStore {
     return this.#tasks.listRecentTaskEvents(...args);
   }
 
+  /*
+   * The two the tool-open aggregate reads. They are here for the reason every method in this class
+   * is here and for no other: `TaskStore` is private to this file, so a method that is not
+   * forwarded exists and cannot be called. Both were written, tested against `TaskStore` directly,
+   * and left unforwarded - `apps/api/src/routes/usage.ts` did not compile and the route answered
+   * 500 on every request, which is the computed-and-unwired shape with a passing test suite
+   * standing next to it.
+   */
+  listTasksWithTurnsInWindow(...args: Parameters<TaskStore['listTasksWithTurnsInWindow']>) {
+    return this.#tasks.listTasksWithTurnsInWindow(...args);
+  }
+
+  listTurnToolStarts(...args: Parameters<TaskStore['listTurnToolStarts']>) {
+    return this.#tasks.listTurnToolStarts(...args);
+  }
+
   createArtifact(...args: Parameters<WorkspaceStore['createArtifact']>) {
     return this.#workspaces.createArtifact(...args);
   }

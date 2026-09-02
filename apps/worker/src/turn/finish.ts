@@ -372,15 +372,30 @@ export const handleFinishCall = async (
     } else {
       state.acceptanceFailures = 0;
     }
-    // A green tick that means less than the last one did has to say so where the owner
-    // reads it, not only in the timeline entry for the step that declared the checks. Where
-    // exactly is the card's decision: a line written into both the acceptance list and the
-    // risks is shown beside the tick, and a line written only into the risks is shown with
-    // the rest of the detail, behind the disclosure. Only the caveat that would leave a
-    // reader who never opens it believing something untrue goes in both.
-    const caveat =
-      state.acceptanceCaveat ??
-      ((state.acceptanceTurn ?? 0) === turn ? undefined : ACCEPTANCE_EARLIER_TURN_CAVEAT);
+    /*
+     * A green tick that means less than the last one did has to say so where the owner
+     * reads it, not only in the timeline entry for the step that declared the checks. Where
+     * exactly is the card's decision: a line written into both the acceptance list and the
+     * risks is shown beside the tick, and a line written only into the risks is shown with
+     * the rest of the detail, behind the disclosure. Only the caveat that would leave a
+     * reader who never opens it believing something untrue goes in both.
+     *
+     * Both of these sentences are about a tick that is worth less than it looks, and neither of
+     * them is true when there is no tick. Reaching this line with failures means the branch above
+     * has just run: the status is downgraded and the completion already carries athanor's own
+     * sentence saying the checks did not pass. Written beside that, "These checks were already
+     * passing before this job started, so passing them says nothing about it" describes a passing
+     * run that did not happen, and "they show nothing broke" says the opposite of the four
+     * failures listed under it. Neither qualifies a failure; both contradict one.
+     *
+     * So they are for the run whose checks passed. The failure keeps its own sentence, which
+     * withdraws more than either of these does - nothing here is verified, rather than this tick
+     * proves less than you think.
+     */
+    const caveat = failed.length
+      ? undefined
+      : (state.acceptanceCaveat ??
+        ((state.acceptanceTurn ?? 0) === turn ? undefined : ACCEPTANCE_EARLIER_TURN_CAVEAT));
     if (caveat) {
       if (CAVEAT_BESIDE_THE_TICK.has(caveat)) acceptanceEvidence = [caveat, ...acceptanceEvidence];
       verification = {

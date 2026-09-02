@@ -326,6 +326,57 @@ because a background process is started by the same command path and lands on th
 `shell` runs one executable with an argument vector and performs no expansion at all: no pipe, glob
 or redirect unless the model explicitly runs an interpreter and passes the script as an argument.
 
+### How long work is allowed to take
+
+Three lengths, and they are different mechanisms rather than three settings on one dial.
+
+A **foreground** command holds the turn open and may run up to `MAX_EXECUTION_SECONDS`, an hour by
+default. A **background** command returns a session id immediately and runs for as long as it asked
+for, up to `MAX_BACKGROUND_SECONDS`, a day by default. A **declared service** has no deadline at all
+and is restarted whenever it exits - including when it exits successfully, so it is the wrong home
+for work that is meant to finish.
+
+Asking for longer than the box allows is refused before anything starts, in a sentence naming both
+numbers: what was asked for, and what this box allows.
+
+**Twenty-four hours is the most an agent can actually obtain, and raising `MAX_BACKGROUND_SECONDS`
+does not change that.** There are two ceilings on this path and only one of them is the owner's. The
+runner's is `MAX_BACKGROUND_SECONDS` in `/etc/athanor/runner.env`, a day by default, settable up to
+2,147,483 seconds - about twenty-four days, which is where a deadline stops fitting in the signed
+32-bit millisecond count `setTimeout` takes, and a runner given more refuses to start rather than
+kill every job the instant it begins. The other ceiling is in the agent's own tool: `shell` declares
+`timeoutSeconds` with `maximum: 86400` and describes it to the model as up to 24 hours in the
+background. That schema is a static object in `apps/worker/src/tool-catalogue.ts`, identical on
+every box that sends `shell` at all: the per-box narrowing withdraws whole tools and rewrites only
+`connector_action`, never this. Nothing in athanor validates a tool call against it either - the
+`shell` arm passes the model's arguments to the runner unchanged, so the cap is what the model is
+told rather than something the worker enforces - but a model that follows its own schema never asks
+for more than a day. So an owner with a forty-hour assembly who raises the runner ceiling has raised
+it for a caller that is not the model: the route accepts forty hours from anything holding the
+runner's shared secret, and the agent still asks for at most twenty-four. Until the `shell` schema
+changes, work longer than a day has to be split into stages that checkpoint (see below), each one
+inside the day.
+
+Every answer about a background session - the one that starts it and every poll after - carries
+`deadlineAt` and `remainingMs`, so the deadline is known from the first moment rather than
+discovered when the work is already gone. A service carries neither, because it has no deadline.
+
+Two things end a long job that the owner should know about in advance:
+
+- **The deadline.** The process is killed, whatever it wrote to a file is still there, and the
+  reason is appended to the job's own log so a poll reads a deadline rather than an unexplained
+  crash. Nothing resumes it.
+- **A restart of the computer**, including the one an update performs. A declared service comes
+  back; an ordinary background command does not, and is not recorded anywhere. The runner publishes
+  what it is holding on its own `/healthz`, and `athanor update` reads it: it refuses by hand and
+  stands down unattended while background commands are running, and
+  [docs/OPERATIONS.md](OPERATIONS.md) says exactly what survives. That gate is only as good as the
+  runner answering it - against a runner older than the field the update says out loud that it
+  cannot tell, and goes ahead.
+
+Work that must outlive either of those has to checkpoint its own progress into a file in the
+workspace and be startable from where it left off. The computer does not do that for it.
+
 ## Web search
 
 `web_search` is one call that returns a page of ranked results — rank, title, url, site and snippet —

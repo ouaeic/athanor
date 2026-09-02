@@ -487,16 +487,47 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     ).reduce((sum, bytes) => sum + bytes, 0);
   // Loopback only, and deliberately says what the sandbox is actually doing: an operator - and a
   // control plane that tells the owner an agent shell is confined - has to be able to check.
-  app.get('/healthz', async () => ({
-    ok: true,
-    service: 'workspace-runner',
-    agentSandbox: Boolean(sandbox),
-    agentNetworkIsolated: config.ISOLATE_AGENT_NETWORK,
-    // The rung this box is actually on, not the one its configuration asked for: with no helper
-    // there is nothing to apply a ruleset with, and the setting alone would be a claim rather than
-    // a fact. `athanor-sandbox check` is where the claim was measured, at install time.
-    agentFilesystemConfined: Boolean(sandbox?.confineFilesystem)
-  }));
+  app.get('/healthz', async () => {
+    const backgroundWork = processes.backgroundWork();
+    return {
+      ok: true,
+      service: 'workspace-runner',
+      agentSandbox: Boolean(sandbox),
+      agentNetworkIsolated: config.ISOLATE_AGENT_NETWORK,
+      // The rung this box is actually on, not the one its configuration asked for: with no helper
+      // there is nothing to apply a ruleset with, and the setting alone would be a claim rather
+      // than a fact. `athanor-sandbox check` is where the claim was measured, at install time.
+      agentFilesystemConfined: Boolean(sandbox?.confineFilesystem),
+      /*
+       * What stopping this runner would destroy, published where the update path already reads.
+       *
+       * `athanor update` - by hand, and unattended in a weekly window - stops athanor.target, which
+       * SIGTERMs this runner and ends every background command it holds. Nothing brings one back
+       * and nothing records that it existed. The gate that was meant to prevent that reads
+       * `athanor_worker_active` from the worker's /metrics, which counts TURNS in flight, and a
+       * background command outlives the turn that started it by design - so that gate is
+       * structurally blind to exactly the work this box exists for. This process is the only one
+       * on the machine that knows, and `/healthz` is the route the update path can already reach:
+       * loopback-only, unauthenticated, and curled by scripts/athanor before an update runs, so
+       * this adds no surface and needs no credential.
+       *
+       * THE TWO NAMES ARE LOAD-BEARING. `runner_background_work` in scripts/athanor greps this
+       * body for the literals `"backgroundCommands"` and `"backgroundLongestRemainingMs"`, and
+       * treats a missing field as "could not tell" rather than as zero. Renaming either one breaks
+       * no compile anywhere; it silently turns the stand-down back into a line saying the update
+       * cannot tell, and proceeds. That is why the end-to-end case in long-work.test.ts runs the
+       * real shell functions, cut out of scripts/athanor at test time, against the real body of
+       * this route - a test that called `backgroundWork()` directly would pass either way.
+       *
+       * A declared service is deliberately not counted, because `resume` brings one back: this
+       * number is only the work a restart destroys. `backgroundLongestRemainingMs` is null when
+       * nothing is running, and is what lets an update say "the longest has about 6 hours left",
+       * which is the sentence that makes an operator wait where a bare count does not.
+       */
+      backgroundCommands: backgroundWork.commands,
+      backgroundLongestRemainingMs: backgroundWork.longestRemainingMs
+    };
+  });
 
   app.addHook('preHandler', async (request) => {
     if (request.routeOptions.url === '/healthz') return;

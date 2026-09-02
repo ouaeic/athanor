@@ -1,12 +1,15 @@
 # Driving athanor from a script
 
-`athanor task` is the whole of athanor's headless surface. It starts work, waits for it, and
-answers with one JSON object and an exit code that says how the work ended.
+`athanor task` is almost the whole of athanor's headless surface. It starts work, waits for it, and
+answers with one JSON object and an exit code that says how the work ended. The one other command
+here is `athanor tool-opens` at the end of this page, which reads back what the box has been doing
+rather than making it do anything; it is on this page because it wants the same API token and the
+same plumbing, not because it drives a run.
 
-It drives the same HTTP API a browser drives, with an API token in place of a passkey session. No
-route it uses is new, and it adds nothing to what the model is sent: this is a command an operator
-types, not a tool the agent can see, so the tool catalogue is the same byte for byte with it and
-without it.
+Both drive the same HTTP API a browser drives, with an API token in place of a passkey session. No
+route either uses is new, and neither adds anything to what the model is sent: these are commands
+an operator types, not tools the agent can see, so the tool catalogue is the same byte for byte
+with them and without them.
 
 ## Getting a token, and why a script cannot get one for itself
 
@@ -203,6 +206,31 @@ exit "$(jq -r .exitCode outcome.json)"
 That loop is four lines and it is meant to be. Answering approvals automatically is a real decision
 about what may happen with nobody watching, and a caller that has made it should have it written
 down in its own source, where it can be read, counted and disclosed - not folded into a flag.
+
+## What the box has been reaching for
+
+```bash
+sudo athanor tool-opens [DAYS] [--json]
+```
+
+The one command on this page that is not about a run. It reports the share of this box's turns over
+the last `DAYS` - seven by default - that reached each tool at least once. Turns, not calls: a tool
+used five times inside one turn was opened once. It reads `GET /v1/usage/tool-opens`, needs
+`usage:read` and nothing else, calls no provider, and is billed nothing.
+
+It refuses to divide by a small sample. Under 33 turns in the window it prints no share at all and
+says why: at 33 a tool nobody called once has a 95% upper bound below the 9.2% threshold the
+tool-deferral decision uses, and below 33 the rule of three that decision is quoted in does not
+clear it. Thirty-three is the floor of that shorthand and not of the tighter bound the table
+actually prints, which clears at 32; the two are held together on purpose, and
+`MIN_TURNS_TO_ANSWER` in `apps/api/src/routes/usage.ts` carries the working and the cost of that
+choice. `docs/design/organs/PREAMBLE.md` is the decision it feeds - and that file is excluded by
+`.gitignore`, so it is not in a clone of this repository and the working in `usage.ts` is the copy
+you have.
+
+`--json` prints the object the route returned instead of the table. Both arguments are optional and
+independent: `tool-opens`, `tool-opens 30`, `tool-opens --json` and `tool-opens 30 --json` are all
+accepted, and the day count defaults to 7 whether or not `--json` is given.
 
 ## What this does not do
 

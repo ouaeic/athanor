@@ -25,6 +25,8 @@ import {
   HELD_LEASE_JOIN,
   TASK_LIVE_COUNTS,
   TASK_NAME_SEARCH_SQL,
+  TASKS_WITH_TURNS_IN_WINDOW_SQL,
+  TURN_TOOL_STARTS_SQL,
   taskNameTokens,
   taskNameTsv,
   WORKSPACE_IS_FREE_FOR
@@ -102,6 +104,53 @@ export interface TaskEventPage {
   /** Highest sequence seen; the cursor a forward reader or event stream resumes from. */
   nextCursor: number;
 }
+
+/**
+ * Either a turn beginning or a tool call being dispatched, with the turn it belongs to.
+ *
+ * The tool's NAME is not here, and cannot be: `tool-recording.ts` puts it inside the encrypted
+ * payload and writes `Encrypted tool started event` into the plaintext `summary` column, so a
+ * reader that wants the name has to hold the workspace's data key. That is the shape this row is
+ * built for - the store hands back what it can read, and the caller that already unwrapped the key
+ * does the opening. A plaintext tool column would make this query trivial and would also tell
+ * anyone holding the database file which of the owner's conversations touched a mailbox.
+ */
+export interface TurnToolStartRecord {
+  id: string;
+  sequence: number;
+  /** 1 for the opening request; +1 at each `user_message` row that follows. */
+  turn: number;
+  kind: 'user_message' | 'tool_started';
+  /** Null on every `user_message` row, and on a `tool_started` row written without one. */
+  payloadCiphertext: EncryptedEnvelope | null;
+  createdAt: string;
+}
+
+export interface TurnToolStartPage {
+  rows: TurnToolStartRecord[];
+  hasMore: boolean;
+  /** Highest sequence on this page; pass it back as `after` to continue. */
+  nextCursor: number;
+}
+
+/** Just enough of a conversation to open its events and place its first turn in time. */
+export interface TaskInWindow {
+  id: string;
+  workspaceId: string;
+  /** When the opening request arrived. Turn one opens here and nowhere else. */
+  createdAt: string;
+}
+
+/**
+ * How many conversations one open-rate read will walk, and what chose the number.
+ *
+ * At the longest window this read accepts - `MAX_WINDOW_DAYS`, 92 days - two thousand conversations
+ * is around twenty-two a day, every day, for three months. No box this ships to has produced that,
+ * and the ceiling is here so that one cannot make an owner's weekly read run without end rather
+ * than because it is expected to bind. Newest first, so what a truncated answer loses is the oldest
+ * end of the window, and the caller is told it happened rather than left with a short number.
+ */
+export const MAX_TASKS_PER_TOOL_OPEN_READ = 2_000;
 
 /** How much of the sidebar a page is allowed to be, whatever the caller asks for. */
 export const MAX_TASK_PAGE = 500;
@@ -1813,6 +1862,80 @@ export class TaskStore {
         nextCursor: newest ?? Math.max(0, Math.trunc(options.after ?? 0))
       };
     return { events, hasMore: overflowed, oldestSequence: oldest, nextCursor: newest ?? 0 };
+  }
+
+  /**
+   * The conversations holding at least one turn that opened inside a window, newest first.
+   *
+   * Which conversations the open-rate instrument should read, so that it does not read the rest.
+   * Bounded at `MAX_TASKS_PER_TOOL_OPEN_READ` and one row past it, so the caller can say the window
+   * was truncated instead of reporting a denominator that is quietly short.
+   */
+  async listTasksWithTurnsInWindow(
+    userId: string,
+    since: Date,
+    until: Date,
+    limit = MAX_TASKS_PER_TOOL_OPEN_READ
+  ): Promise<{ tasks: TaskInWindow[]; hasMore: boolean }> {
+    const bounded = Math.max(1, Math.min(Math.trunc(limit), MAX_TASKS_PER_TOOL_OPEN_READ));
+    const result = await this.database.query(TASKS_WITH_TURNS_IN_WINDOW_SQL, [
+      userId,
+      since.toISOString(),
+      until.toISOString(),
+      bounded + 1
+    ]);
+    const overflowed = result.rows.length > bounded;
+    return {
+      tasks: (overflowed ? result.rows.slice(0, bounded) : result.rows).map((row) => ({
+        id: String(row.id),
+        workspaceId: String(row.workspace_id),
+        createdAt: iso(row.created_at)
+      })),
+      hasMore: overflowed
+    };
+  }
+
+  /**
+   * One conversation's turn boundaries and dispatched tool calls, oldest first.
+   *
+   * The read behind the open-rate instrument (`GET /v1/usage/tool-opens`), and the reason it is a
+   * statement of its own rather than a filter over `listTaskEventPage`: the aggregate needs every
+   * `tool_started` row of a conversation and none of the `assistant_delta` frames that are most of
+   * its rows and nearly all of its bytes. Walking the timeline and discarding would carry a whole
+   * trajectory out of the database to read forty tool names.
+   *
+   * Paged for the same reason the export is: a `tool_started` payload carries the call's ARGUMENTS,
+   * so one `file_write` row can be megabytes and a conversation's worth of them held at once is the
+   * API's heap. Bounded by `MAX_TASK_EVENT_PAGE` rather than by a second number beside it, because
+   * it is the same question that number already answers - how much of one conversation may be in
+   * memory at a time.
+   *
+   * It does NOT bound how many conversations a caller walks. That bound belongs to the caller,
+   * which is the only thing that knows how many it is about to open.
+   */
+  async listTurnToolStarts(
+    taskId: string,
+    options: { after?: number; limit?: number } = {}
+  ): Promise<TurnToolStartPage> {
+    const limit = Math.max(1, Math.min(Math.trunc(options.limit ?? 200), MAX_TASK_EVENT_PAGE));
+    const after = Math.max(0, Math.trunc(options.after ?? 0));
+    // One row past the page proves there is more without a second count query, exactly as
+    // `listTaskEventPage` does it.
+    const result = await this.database.query(TURN_TOOL_STARTS_SQL, [taskId, after, limit + 1]);
+    const overflowed = result.rows.length > limit;
+    const rows: TurnToolStartRecord[] = (
+      overflowed ? result.rows.slice(0, limit) : result.rows
+    ).map((row) => ({
+      id: String(row.id),
+      sequence: Number(row.sequence),
+      turn: Number(row.turn),
+      kind: row.kind === 'user_message' ? 'user_message' : 'tool_started',
+      payloadCiphertext: row.payload_ciphertext
+        ? json<EncryptedEnvelope>(row.payload_ciphertext)
+        : null,
+      createdAt: iso(row.created_at)
+    }));
+    return { rows, hasMore: overflowed, nextCursor: rows.at(-1)?.sequence ?? after };
   }
 
   /**

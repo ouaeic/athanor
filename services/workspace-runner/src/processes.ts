@@ -40,12 +40,25 @@ const BackgroundRequest = z.object({
   cwd: z.string().default('workspace'),
   env: z.record(z.string(), z.string()).default({}),
   /*
-   * An hour by default and a day at the ceiling, which `MAX_BACKGROUND_SECONDS` now allows this
-   * schema to actually mean. The DEFAULT stays an hour on purpose: it is what a caller that names
-   * nothing gets, and a job with no stated deadline should not be able to hold a slot for a day by
-   * omission. A long job says how long it is, and now it can be believed.
+   * An hour by default, and NO maximum here. The DEFAULT stays an hour on purpose: it is what a
+   * caller that names nothing gets, and a job with no stated deadline should not be able to hold a
+   * slot for a day by omission. A long job says how long it is.
+   *
+   * The `.max(86_400)` this line used to carry was the same defect as the hour it replaced,
+   * arriving from the other side. `MAX_BACKGROUND_SECONDS` is documented as the ceiling and an
+   * owner can raise it, and until this was removed raising it above a day did nothing at all:
+   * measured on this branch with the ceiling set to 172,800 and 129,600s asked for, the answer was
+   * `runner_invalid_request - timeoutSeconds: too big: expected number to be <=86400`. A zod
+   * sentence, naming a number that was no longer this box's limit, for a run the box was configured
+   * to allow. So the owner with a forty-hour assembly - the work this computer exists for - could
+   * not ask for it by any configuration, and the message told them the wrong reason.
+   *
+   * There is exactly one authority on how long a background command may run now, and it is
+   * `refuseUnreachableTimeout` against the configured ceiling, a few lines into `start`. It names
+   * the real number of the box it is running on. What would change this line: nothing, because the
+   * number it used to hold has moved to where it can be configured.
    */
-  timeoutSeconds: z.number().int().positive().max(86_400).default(3_600),
+  timeoutSeconds: z.number().int().positive().default(3_600),
   stdin: z.string().max(10_000_000).optional(),
   network: z.boolean().default(false),
   maxOutputBytes: z
@@ -78,6 +91,12 @@ interface Session {
   stdout: OutputCollector;
   stderr: OutputCollector;
   startedAt: string;
+  /**
+   * When this session will be killed, if nothing else ends it first. Absent on a service, which
+   * has no deadline. Stored rather than derived because `allowedSeconds` is the minimum of what the
+   * caller asked for and what this box allows, and only `#launch` sees both.
+   */
+  deadlineAt?: string;
   finishedAt?: string;
   exitCode?: number | null;
   signal?: string | null;
@@ -285,7 +304,9 @@ export class ProcessManager {
       stdout: boundedCollector(request.maxOutputBytes),
       stderr: boundedCollector(request.maxOutputBytes),
       startedAt: new Date().toISOString(),
-      ...(timeout ? { timeout } : {})
+      ...(timeout
+        ? { timeout, deadlineAt: new Date(Date.now() + allowedSeconds * 1_000).toISOString() }
+        : {})
     };
     this.#sessions.set(id, session);
     /*
@@ -639,6 +660,52 @@ export class ProcessManager {
 
   // ---------------------------------------------------------------------------------------------
 
+  /**
+   * How much unfinished background work stopping this runner would destroy, across every workspace.
+   *
+   * WHAT IT IS FOR. `athanor update` - by hand, and weekly at a randomised hour, which on the
+   * production box measured as 03:34 UTC next Monday - stops athanor.target for the backup and the
+   * rebuild. That SIGTERMs this runner, `close()` stops every session, and a session that is not a
+   * declared service has no record anywhere on disk: it does not come back, and the next poll of
+   * its id answers "Background process not found" rather than anything about an update. A
+   * twenty-hour alignment started by an agent is simply gone, at three in the morning, with nobody
+   * awake. The gate that is supposed to prevent this reads `athanor_worker_active` from the
+   * worker's /metrics, which counts TURNS in flight; a background job outlives the turn that
+   * started it by design, so the gate is structurally blind to exactly the work this box exists
+   * for. This process is the only one on the machine that knows, which is why the answer lives
+   * here.
+   *
+   * A SERVICE IS NOT COUNTED, deliberately. Its record is in `.athanor/services.json`, `resume`
+   * puts it back when the runner comes up, and `hibernate.test.ts` holds that pair. Counting it
+   * would stand the weekly update down for the one kind of work a restart does not harm, and a box
+   * that stands down every week is a box that quietly stops receiving fixes.
+   *
+   * `longestRemainingMs` is null when nothing is running, and is what a caller says out loud: "six
+   * hours left" is the sentence that makes an operator wait, where a bare count is not.
+   *
+   * ITS ONE CALLER IS `/healthz` in server.ts, which publishes this as `backgroundCommands` and
+   * `backgroundLongestRemainingMs`; `runner_background_work` in scripts/athanor greps that body for
+   * those two literals, and both update arms stand down on a positive count. Nothing else calls it.
+   * Those field names are therefore part of this method's contract even though no compiler checks
+   * them: rename one and the update silently goes back to saying it could not tell and proceeding.
+   * The end-to-end case in long-work.test.ts is what holds that shut - it runs the real shell
+   * functions, cut out of scripts/athanor at test time, against the real body of the real route.
+   */
+  backgroundWork(): { commands: number; longestRemainingMs: number | null } {
+    let commands = 0;
+    let longestRemainingMs: number | null = null;
+    const now = Date.now();
+    for (const [id, session] of this.#sessions) {
+      if (session.status !== 'running' || this.#supervised.has(id)) continue;
+      commands += 1;
+      if (!session.deadlineAt) continue;
+      const remaining = Math.max(0, Date.parse(session.deadlineAt) - now);
+      if (longestRemainingMs === null || remaining > longestRemainingMs)
+        longestRemainingMs = remaining;
+    }
+    return { commands, longestRemainingMs };
+  }
+
   list(workspaceId: string, owner: string) {
     return [...this.#sessions.values()]
       .filter((session) => session.workspaceId === workspaceId && session.owner === owner)
@@ -821,6 +888,24 @@ export class ProcessManager {
    * dropped, so it distinguishes a job that is working silently from one that is progressing. They
    * are measured, not stored: elapsed comes from the timestamps this session already carried, and
    * the count from the collectors that already had it.
+   *
+   * `deadlineAt` and `remainingMs` are here so a job that is going to be killed says so BEFORE it
+   * is killed rather than after. Measured on this branch before they existed: a background session
+   * one second from its deadline answered a poll with `status: "running"` and `ranForMs: 1009` and
+   * nothing else, and the only sentence naming the deadline was `timedOutNote`, appended once the
+   * work was already gone. An agent could not have known, and neither could the owner's panel. Both
+   * are on the START response too, because that is the same `#view`: the answer to "run this for
+   * twenty hours" now carries the wall-clock moment it will be stopped, which is the earliest any
+   * warning can possibly arrive.
+   *
+   * Two fields for what looks like one fact, and they are read by different things. `remainingMs`
+   * is the only one a model can use, because a model has no reliable clock and cannot subtract an
+   * ISO timestamp from now; `deadlineAt` is fixed for the life of the session, which is what a
+   * panel renders and what survives being written into a log. Both absent on a service, which has
+   * no deadline - the absence is the statement, and a zero would be a lie.
+   *
+   * `remainingMs` stops at the end rather than going negative: a finished session's remaining time
+   * is not a number anyone should reason with, so it is simply not offered.
    */
   #view(session: Session, includeLogs: boolean) {
     const supervised = this.#supervised.get(session.id);
@@ -832,6 +917,10 @@ export class ProcessManager {
       startedAt: session.startedAt,
       ranForMs: Math.max(0, ranToMs - Date.parse(session.startedAt)),
       outputBytes: session.stdout.bytes + session.stderr.bytes,
+      ...(session.deadlineAt ? { deadlineAt: session.deadlineAt } : {}),
+      ...(session.deadlineAt && !session.finishedAt
+        ? { remainingMs: Math.max(0, Date.parse(session.deadlineAt) - Date.now()) }
+        : {}),
       ...(session.finishedAt ? { finishedAt: session.finishedAt } : {}),
       ...(session.exitCode !== undefined ? { exitCode: session.exitCode } : {}),
       ...(session.signal !== undefined ? { signal: session.signal } : {}),

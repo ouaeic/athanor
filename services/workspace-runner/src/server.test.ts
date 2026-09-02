@@ -984,6 +984,58 @@ describe('what the runner says about its own boundaries', () => {
     expect(health.json()).toMatchObject({ agentSandbox: false, agentFilesystemConfined: false });
   });
 
+  /*
+   * The other thing this route now answers: what a restart would destroy.
+   *
+   * The names are checked as exact keys rather than with `toMatchObject` on a shape, because the
+   * only consumer is a `sed` pattern in scripts/athanor and a typo in either spelling is invisible
+   * to the compiler. `backgroundLongestRemainingMs` is null and not 0 on an idle box - the update
+   * distinguishes "nothing running" from "running, no deadline", and 0 would read as the latter.
+   *
+   * This case pins the route's shape. That the SHELL then stands down on it is proved end to end
+   * in long-work.test.ts, which is a different claim and cannot be made from here.
+   */
+  it('reports the background work a restart would destroy, in the names the update greps for', async () => {
+    const { app, workspaceRoot } = await withSandbox(false, undefined);
+    const id = '00000000-0000-4000-8000-0000000000b8';
+    await ensureWorkspace(path.join(workspaceRoot, id));
+    const idle = (await app.inject({ method: 'GET', url: '/healthz' })).json<
+      Record<string, unknown>
+    >();
+    expect(idle.backgroundCommands).toBe(0);
+    expect(idle.backgroundLongestRemainingMs).toBeNull();
+
+    const started = await app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${id}/processes/start`,
+      headers: {
+        authorization: `Bearer ${signCapabilityToken(
+          {
+            sub: 'task-1',
+            workspaceId: id,
+            role: 'agent',
+            scopes: ['exec'],
+            aud: capabilityAudience('POST', `/v1/workspaces/${id}/processes/start`),
+            nonce: 'healthz-background-1'
+          },
+          'runner-rung-test-secret-at-least-32-characters'
+        )}`,
+        'content-type': 'application/json'
+      },
+      payload: { executable: '/bin/sh', args: ['-c', 'sleep 90'], timeoutSeconds: 90 }
+    });
+    expect(started.statusCode).toBe(200);
+
+    const busy = (await app.inject({ method: 'GET', url: '/healthz' })).json<
+      Record<string, unknown>
+    >();
+    expect(busy.backgroundCommands).toBe(1);
+    // Ninety seconds, minus however long this test took to get here. The window is wide because
+    // what is under test is that a real deadline reaches the wire, not the scheduler's precision.
+    expect(busy.backgroundLongestRemainingMs).toBeGreaterThan(60_000);
+    expect(busy.backgroundLongestRemainingMs).toBeLessThanOrEqual(90_000);
+  });
+
   it('prepares the agent home the toolchain will want, beside the undo point and not in it', async () => {
     // `bash` does not create a missing $HOME and `python3 -m venv $HOME/venv` fails outright when
     // its parent is absent, so a home that only appears once something has written in it is a home

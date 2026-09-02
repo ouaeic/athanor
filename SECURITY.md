@@ -177,6 +177,20 @@ links somebody substituted. Closing that race means the workspace root ceasing t
 which the move of `$HOME` into `.home` makes possible — nothing creates entries directly in that
 root any more — and which nothing has yet done.
 
+A command is also bounded in time, and it is worth being exact about what that bound is for, because
+it is easy to read it as the thing standing between the box and a runaway and it is not. A
+foreground command may run for `MAX_EXECUTION_SECONDS`, an hour by default, chosen to sit inside the
+worker's own request timeout. A background command may run for as long as it declared, up to
+`MAX_BACKGROUND_SECONDS`, a day by default; an owner can raise it, and raising it now raises what
+the box will actually run. A declared service has no deadline at all. What actually holds a runaway
+are the bounds that are not clocks: the runner unit's memory ceiling, its task limit, the per-command
+limits on memory, processes and open files, and the host-disk floor, which is polled while the
+command runs and stops it with a sentence saying why. The clock bounds a job nobody will ever come
+back for. So raising it for a forty-hour genome assembly does not lower any of the boundaries above,
+and a job that hits the ceiling is killed with its reason on its own stderr, keeps whatever it had
+already written to a file, and **is not resumed** - nothing on this computer restarts a background
+command where it left off, across a deadline or across a restart.
+
 They can intentionally read and change workspace files, which the two accounts share through a
 group, and can communicate with networks reachable from the host. They cannot read the root-owned
 control configuration, the database keys, or the runner's capability secret: that secret is removed
