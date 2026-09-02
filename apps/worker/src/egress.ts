@@ -406,8 +406,12 @@ export const classifyDestination = (
    * `estate` is charged and judged exactly like the internet below, differing only in the words on
    * the card - and it is the ORDINARY floor, not this one, that is entitled to treat the LAN as out
    * of scope, which it says by reading `verdict.reach` rather than by being handed a verdict that
-   * lies to it. Publishing something to the internet is still gated on the tool that does it:
-   * `publish_site` raises its own card and this is not a way round it.
+   * lies to it. Publishing something to the internet is still gated where it is decided:
+   * `publish_preview` with `reach: 'public'` raises its own external_consequential card in every
+   * security mode, on a clean turn and on a tainted one, and this is not a way round it. That
+   * sentence named the separate `publish_site` tool until the two publishing tools became one; it
+   * names the reach now because the floor reads the reach now - `publishReachOfCall` in
+   * approval-policy.ts - which is what let them merge without the public half losing its card.
    */
   const reach = (context.selfOrigins ?? []).some(
     (origin) => origin && host === origin.toLowerCase()

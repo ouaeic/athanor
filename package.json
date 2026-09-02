@@ -29,6 +29,7 @@
     "license:check": "node scripts/check-dependency-licenses.mjs",
     "license:rust": "node scripts/check-rust-licenses.mjs",
     "release:check": "node scripts/check-release.mjs",
+    "acp:check": "node scripts/acp/test-acp-bridge.mjs",
     "check": "pnpm license:check && pnpm release:check && node scripts/check-repository.mjs && node scripts/test-document.mjs && pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm eval:gate && pnpm eval:rigs && pnpm build",
     "native:configure": "node apps/desktop/configure-native.mjs",
     "desktop:dev": "pnpm --filter @athanor/desktop dev",

@@ -8406,6 +8406,83 @@ describe('control-plane gates', () => {
     );
   });
 
+  /*
+   * The other route that reaches past what an automation should decide, and the one the scope table
+   * missed for longer. `PATCH /v1/tasks/:taskId/security-mode` sets how much a run asks; its own
+   * route comment records that there is deliberately no second factor on it, which is right for the
+   * owner and wrong for a bearer token. It fell through to the generic `/v1/tasks` rule and needed
+   * only `tasks:write` - the same scope the bot needs to create the task in the first place - so a
+   * filing bot could set its own work to `autonomous`, where the floor stops asking before reaching
+   * the internet and before installing software.
+   *
+   * The table already refuses the spend ceiling to an automation while letting it read the spend,
+   * and refuses `/v1/notifications` outright because "an automation token that could switch off
+   * approval prompts could act unwatched". This is that sentence's stronger case.
+   */
+  test('refuses an automation token that asks to stop the run asking', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-token-mode-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const { cookie, taskId } = await seedOwnerWithTask(
+      app,
+      'token-mode',
+      'File the overnight mail'
+    );
+    const token = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/api-tokens',
+        headers: { cookie },
+        payload: { label: 'Filing bot', scopes: ['tasks:read', 'tasks:write'], expiresInDays: 7 }
+      })
+    ).json<{ token: string }>().token;
+
+    const relaxed = await app.inject({
+      method: 'PATCH',
+      url: `/v1/tasks/${taskId}/security-mode`,
+      // The idempotency key is supplied deliberately, so the refusal that follows is the credential
+      // and not a missing header: without the scope guard this exact request SUCCEEDS and the task
+      // is autonomous. A break that only reached a 400 would leave that unproved.
+      headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'token-mode-relax' },
+      payload: { securityMode: 'autonomous' }
+    });
+
+    expect(relaxed.statusCode, relaxed.body).toBe(403);
+    expect(relaxed.json<{ error: { code: string } }>().error.code).toBe('api_token_scope_required');
+    // And the mode did not move, which is the property the status code stands for.
+    const after = await app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${taskId}`,
+      headers: { cookie }
+    });
+    expect(after.json<{ securityMode?: string }>().securityMode).not.toBe('autonomous');
+
+    /*
+     * Two positive controls, because a refusal that also breaks the ordinary job is an outage
+     * wearing a fix. The same token still READS the task - a client that may not change how much a
+     * run asks still has every reason to know - and the owner at their own keyboard still changes
+     * it, which is the case the route was written for.
+     */
+    const read = await app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${taskId}`,
+      headers: { authorization: `Bearer ${token}` }
+    });
+    expect(read.statusCode, read.body).toBe(200);
+
+    const byTheOwner = await app.inject({
+      method: 'PATCH',
+      url: `/v1/tasks/${taskId}/security-mode`,
+      headers: { cookie },
+      payload: { securityMode: 'autonomous' }
+    });
+    expect(byTheOwner.json<{ error?: { code: string } }>().error?.code).not.toBe(
+      'api_token_scope_required'
+    );
+  });
+
   /**
    * The recheck route is documented as answering 200 whether or not the account replied, so its
    * failure never passes the error handler - which is the only other place a message built from an

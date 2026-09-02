@@ -279,7 +279,10 @@ export const SCENARIOS: readonly Scenario[] = [
         url: 'https://box.athanor.invalid/preview/9f2/',
         purpose: 'confirm the preview serves'
       }),
-      call('publish_site', 'put it online', { label: 'Boat club', port: 8080 }),
+      // The public reach, which is what the owner's ask ends on. It was `publish_site` until the
+      // two publishing tools merged; the card it raises has to be the same one, and the total for
+      // this scenario in every mode is what says so.
+      call('publish_preview', 'put it online', { label: 'Boat club', port: 8080, reach: 'public' }),
       call('finish', 'hand over the URL')
     ]
   },

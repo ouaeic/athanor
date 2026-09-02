@@ -90,7 +90,21 @@ sh scripts/test-system-packages.sh  # which package manager an approved install 
 sh scripts/test-doctor-retirement.sh # what doctor says about a model the provider is withdrawing
 ```
 
-Three of them - `test-sandbox.sh`, `test-certificate.sh` and `test-relay-endpoint.sh` - also run in
+Two of the server's shell commands are contracts rather than conveniences, because something outside
+this repository reads their output, so each has a drill in Node that runs the real command against a
+stand-in API on a loopback port. Both run inside `scripts/check-repository.mjs`; run one directly to
+read its output:
+
+```bash
+node scripts/test-task-cli.mjs        # athanor task: one JSON object, and an exit code per ending
+pnpm acp:check                        # athanor acp: the ACP wire shapes, and the approval floor
+```
+
+`pnpm acp:check` is `node scripts/acp/test-acp-bridge.mjs`. It is the one whose callers are code
+this repository did not write - ACP clients are somebody else's editors - so it checks the approval
+floor from four directions as well as the protocol: see docs/ACP.md.
+
+Three of the shell drills - `test-sandbox.sh`, `test-certificate.sh` and `test-relay-endpoint.sh` - also run in
 CI's `native-units` job; `test-update.sh` and `test-doctor-retirement.sh` run in the `application`
 job, at `.github/workflows/verify.yml`, after that job's `pnpm install`; and
 `test-system-packages.sh` already runs inside `pnpm check` by way of

@@ -1,10 +1,17 @@
 # Driving athanor from a script
 
-`athanor task` is almost the whole of athanor's headless surface. It starts work, waits for it, and
+`athanor task` is the larger half of athanor's headless surface. It starts work, waits for it, and
 answers with one JSON object and an exit code that says how the work ended. The one other command
 here is `athanor tool-opens` at the end of this page, which reads back what the box has been doing
 rather than making it do anything; it is on this page because it wants the same API token and the
 same plumbing, not because it drives a run.
+
+There is a third command on the same plumbing, and it is on its own page because its caller is not a
+script the owner wrote: `athanor acp` speaks Agent Client Protocol on stdin and stdout, so an editor
+or a desktop client somebody else wrote can drive this box. It creates the same tasks over the same
+routes with the same token, under the same approval floor. See [ACP](ACP.md) - and read its approval
+section before minting a token for it, because the scope you choose is what decides whether a client
+can answer a card.
 
 Both drive the same HTTP API a browser drives, with an API token in place of a passkey session. No
 route either uses is new, and neither adds anything to what the model is sent: these are commands

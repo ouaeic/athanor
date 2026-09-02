@@ -3524,6 +3524,29 @@ tool_opens() {
   exit "$task_exit_ok"
 }
 
+# Speak Agent Client Protocol on stdin and stdout, so somebody else's editor can drive this box.
+#
+# Not a server and not a daemon: an ACP client SPAWNS this, talks JSON-RPC down the pipe, and the
+# process ends when the pipe closes. So there is nothing to start, nothing listening, and nothing
+# the model can see - the same standing `task` has, for the same reason.
+#
+# The work is in scripts/acp/athanor-acp.mjs, which is Node with no dependencies. This arm is here
+# rather than the logic itself because the protocol needs a request table and two-way correlation,
+# and neither is a thing to write in shell. docs/ACP.md is the page.
+acp_command() {
+  command -v node >/dev/null 2>&1 ||
+    fail "athanor acp needs node. The API already runs on it, so this box should have it"
+  # Beside this script when run from a checkout, then under the installed root. No install step of
+  # its own: /opt/athanor is the checkout `athanor update` pulls into, so the file is already there.
+  acp_self_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+  for acp_candidate in "$acp_self_dir/acp/athanor-acp.mjs" "$athanor_root/scripts/acp/athanor-acp.mjs"; do
+    if [ -r "$acp_candidate" ]; then
+      exec node "$acp_candidate" "$@"
+    fi
+  done
+  fail "cannot find scripts/acp/athanor-acp.mjs beside $acp_self_dir or under $athanor_root"
+}
+
 task_command() {
   task_action="${1:-}"
   if [ "$#" -gt 0 ]; then shift; fi
@@ -3552,7 +3575,7 @@ task_command() {
 
 usage() {
   printf '%s\n' \
-    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...|task ...|tool-opens [DAYS] [--json]}' \
+    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...|task ...|tool-opens [DAYS] [--json]|acp --workspace ID [--approvals park|relay]}' \
     '' \
     'Browser sign-in needs a hostname: a passkey is bound to a domain name and the WebAuthn' \
     'standard does not allow an IP address. If this server has no name, run:' \
@@ -3640,6 +3663,9 @@ case "$command_name" in
   # Same plumbing as `task`: over HTTP to the running API with an API token, so it works from
   # this box or from anywhere that can reach it. Needs the usage:read scope.
   tool-opens) tool_opens "$@" ;;
+  # Spawned by an ACP client rather than typed, and it never returns to this dispatch: `acp_command`
+  # execs the bridge so the client's pipe belongs to one process and a signal reaches it directly.
+  acp) acp_command "$@" ;;
   help)
     usage
     ;;

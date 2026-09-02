@@ -173,6 +173,33 @@ if (taskCli.status !== 0)
   );
 else say(taskCli.stdout.trim());
 
+/**
+ * And the third, for a contract with somebody else's code on the other end of it.
+ *
+ * `athanor acp` speaks Agent Client Protocol, which means the callers that matter are clients this
+ * repository did not write and cannot test against. That makes two things load-bearing at once: the
+ * wire shapes, because a client is a stranger and will not be forgiving, and the approval floor,
+ * because ACP hands a client a permission call and a mode setter and either one could quietly
+ * decide what this box stops to ask.
+ *
+ * `scripts/acp/test-acp-bridge.mjs` spawns the real arm, speaks the CLIENT half down its stdin, and
+ * answers its HTTP calls from a stand-in API - so the thing under test is the bridge between two
+ * stand-ins rather than a function called with hand-made arguments. It needs no token, no model and
+ * no network beyond localhost.
+ *
+ * Same limit as the two above, said out loud: it stands in for the API, so it stays green if the
+ * API changes shape underneath it.
+ */
+const acpBridge = spawnSync(process.execPath, ['scripts/acp/test-acp-bridge.mjs'], {
+  cwd: repositoryRoot,
+  encoding: 'utf8'
+});
+if (acpBridge.status !== 0)
+  fail(
+    `athanor acp does not keep its contract:\n${[acpBridge.stdout, acpBridge.stderr].join('\n').trim()}`
+  );
+else say(acpBridge.stdout.trim());
+
 say(
   `Shipped programs: ${byInterpreter.shell.length} shell, ${byInterpreter.python.length} Python, ${byInterpreter.node.length} Node parse.`
 );
@@ -1240,7 +1267,26 @@ const unraised = phrasedTools.filter((tool) => !raisesApproval.includes(tool));
  * comment had already recorded that this comparison belonged here, "so a new branch in the worker
  * fails the build rather than one client's test suite".
  */
-const APPROVAL_FLOOR_MINIMUM = 18;
+/*
+ * Lowered again, from 18 to 17, when `publish_site` was folded into `publish_preview` as a `reach`
+ * argument - and this one is a MERGE rather than a removal, which is the other way this number can
+ * legitimately fall and the way that most resembles the failure above.
+ *
+ * Nothing stopped asking. The floor raises the same external_consequential card for the same act,
+ * in all three security modes and on clean and tainted turns alike; it reads the reach off the call
+ * (`publishReachOfCall` in apps/worker/src/approval-policy.ts) instead of reading a second tool
+ * name, which is what let the two tools become one without the public half going silent. Measured
+ * through `evals/cards` over ten owner scenarios and 178 calls: not one count moved, in any mode,
+ * on either column. What this number counts is NAMES, and one name went.
+ *
+ * The order mattered and is the whole reason this is one commit: with the floor still reading
+ * names, `publish_preview {reach:'public'}` raised NOTHING in balanced - the default - or in
+ * autonomous, on a clean turn. Floor first, merge second.
+ *
+ * `apps/web/src/approval-copy.test.ts` carries the same figure over the same regex and came down in
+ * the same change.
+ */
+const APPROVAL_FLOOR_MINIMUM = 17;
 /*
  * The witnesses answer the case where the count is right and the set is wrong.
  *

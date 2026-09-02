@@ -73,18 +73,18 @@ describe('what the owner is told about a conversation that read from outside', (
       started(4, 'file_read'),
       started(5, 'file_write'),
       started(6, 'file_write'),
-      started(7, 'publish_site')
+      started(7, 'publish_preview')
     ]);
     expect(report?.changes).toEqual([
       { label: 'Wrote a file', count: 2 },
-      { label: 'Published to the public internet', count: 1 }
+      { label: 'Published a link to something on this computer', count: 1 }
     ]);
   });
 
   it('does not count the writes that happened before the reading did', () => {
     const report = provenanceReport([
       started(1, 'file_write'),
-      started(2, 'publish_site'),
+      started(2, 'publish_preview'),
       crossing(3, ['web page a.example'], 'parallel_web_read')
     ]);
     expect(report?.changes).toEqual([]);

@@ -3,7 +3,7 @@ name: deployment
 description: Get a built application running and reachable, on this computer or the owner's own host, with the two facts about this machine that decide whether it works — bind 0.0.0.0, and choose deliberately between a process that ends and a service the computer keeps running — stated plainly to the owner along with the rollback command. Use when the owner asks to run, preview, publish or deploy an application. Do not use to publish anything publicly without explicit approval, do not use for third-party paid hosting platforms, and never claim a systemd unit was installed, because the agent account cannot install one.
 license: AGPL-3.0-or-later
 compatibility: Requires the application's own runtime. A service the computer keeps running is supervised by athanor's own workspace runtime and needs no root. systemctl and journalctl exist here but the agent account has no root, so a systemd unit file is written for the owner to install rather than installed here; neither binary is part of the document toolchain and neither is installed by athanor.
-allowed-tools: shell process publish_preview publish_site file_read file_write files_list browser_snapshot browser_action
+allowed-tools: shell process publish_preview file_read file_write files_list browser_snapshot browser_action
 metadata:
   athanor.tier: 'builtin'
   athanor.version: '2.0.0'
@@ -91,8 +91,9 @@ devices and nobody else's. It keeps working as long as they keep using it, close
 month with no visits, and they can revoke it at any time. That is the right answer for everything
 they should look at.
 
-`publish_site` makes it publicly reachable and stops for explicit approval every time. Ask with the
-specifics: what URL, what is exposed, and who will be able to reach it.
+`publish_preview` with `reach: 'public'` makes it publicly reachable and stops for explicit approval
+every time, in every security mode, on a clean turn and on a tainted one. Ask with the specifics:
+what URL, what is exposed, and who will be able to reach it.
 
 Both publish a **port**, not a running program. The link lives in athanor's database; what it
 proxies to is whatever is still listening. That is why the lifetime above has to be said out loud —

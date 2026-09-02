@@ -125,6 +125,19 @@ const DESTINATION_LIMIT = 6;
  */
 const AUDIO_READ_MAX_SECONDS = 5_400;
 
+/*
+ * Mirrors `publishesPublicly` in @athanor/contracts, the single reader the approval floor and the
+ * arm that publishes both call. Copied for the same reason as the constant above - every other use
+ * of that package here is `import type`, and pulling a runtime value in drags the whole schema
+ * library into the first paint - and `approval-facts.test.ts` imports the real one and holds this
+ * against both reaches and a value neither recognises, so the copy cannot drift in silence.
+ *
+ * The drift that would matter is one-sided: a card saying "you" about a call the worker publishes
+ * publicly. That is why the equality is against the literal, on both sides, rather than a negation
+ * of `private`.
+ */
+const publishesPublicly = (reach: unknown): boolean => reach === 'public';
+
 // Stripped before the length is measured, so the limit counts characters the owner can actually see
 // and the ellipsis lands where the text really stops. `keptTail` moves that ellipsis into the
 // middle: nothing is added to what the owner sees, and the cut is taken out of the part of a
@@ -394,10 +407,20 @@ export const approvalFacts = (approval: Approval): ApprovalFact[] => {
         ...fact('Subject', text(args.subject)),
         ...fact('Path', text(args.path))
       ];
-    case 'publish_site':
     case 'publish_preview':
+      /*
+       * The reach comes off the CALL, not off the tool name.
+       *
+       * This row read `tool === 'publish_site' ? 'anyone with the link' : 'you'` while there were
+       * two publishing tools. They are one tool with a `reach` argument now, and left as it was
+       * this line would have told the owner a public deployment was reachable by "you" - on the
+       * card whose entire job is to say how far the thing they are approving goes. The floor moved
+       * to the same reading in the same change (`publishReachOfCall`, apps/worker/src/approval-
+       * policy.ts), and `publishesPublicly` is the shared reader both worker halves use, so a
+       * value neither recognises reads as the narrow reach here exactly as it does there.
+       */
       return [
-        ...fact('Reachable by', tool === 'publish_site' ? 'anyone with the link' : 'you'),
+        ...fact('Reachable by', publishesPublicly(args.reach) ? 'anyone with the link' : 'you'),
         ...fact('Serves workspace port', text(args.port)),
         ...fact('Label', text(args.label))
       ];

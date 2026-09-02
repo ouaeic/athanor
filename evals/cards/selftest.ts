@@ -165,7 +165,11 @@ expect(
     sinks: [
       {
         id: 'planted: cards whether or not anything was read',
-        call: { name: 'publish_site', arguments: { label: 'x', port: 1 }, step: 'planted' },
+        call: {
+          name: 'publish_preview',
+          arguments: { label: 'x', port: 1, reach: 'public' },
+          step: 'planted'
+        },
         mode: 'balanced' as const
       }
     ]

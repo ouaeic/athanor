@@ -1,4 +1,4 @@
-import { AUDIO_READ_MAX_SECONDS, type SecurityMode } from '@athanor/contracts';
+import { AUDIO_READ_MAX_SECONDS, publishesPublicly, type SecurityMode } from '@athanor/contracts';
 import { connectorActions } from '@athanor/core';
 import { classifyDestination, MAX_TURN_NOVEL_BYTES, type DestinationVerdict } from './egress.js';
 import {
@@ -283,7 +283,7 @@ export interface ApprovalContext {
  * FIRST, IT WOULD RETIRE NOTHING AN OWNER MEETS. Driven through `evals/cards` at 069ac96 - ten
  * owner tasks, 178 calls - balanced raises 18 cards and autonomous 12, and every one of them is an
  * act this ruleset permits or never sees:
- *   - the network ones: `git push`, `rsync`, `ssh`, a `git clone`, `publish_site`. The ruleset is
+ *   - the network ones: `git push`, `rsync`, `ssh`, a `git clone`, a public publish. The ruleset is
  *     `--landlock-access fs` and judges no address at all.
  *   - the ones that reach a person, a subscription or a clock: the connector reply, `coding_agent`
  *     setup and run, `schedule`, and the background service declaration. None of them names a path
@@ -343,6 +343,34 @@ const APPROVAL_RANK: Record<ApprovalRequirement['sideEffect'], number> = {
   external_reversible: 1,
   external_consequential: 2
 };
+
+/**
+ * How far a publishing call reaches, which is what this floor judges it on.
+ *
+ * WHAT THIS REPLACED, because the shape it replaced is the one to watch for elsewhere in this file.
+ * There were two tools, `publish_preview` and `publish_site`, with identical required parameters
+ * and the same runner action behind them; the only thing separating a private link from a public
+ * deployment was which of the two NAMES the model wrote. Three branches here read that name - the
+ * taint branch, the ordinary branch, and the review-only `asksBeforeEveryChange` row - and a fourth
+ * read it in `apps/web/src/approval-facts.ts` to tell the owner, on the card itself, who could
+ * reach the thing. Merging the two tools onto one `reach` argument therefore could not be done as a
+ * wire saving: with the floor still reading names, `publish_preview {reach:'public'}` was measured
+ * through `approvalRequirement` at 06b0493 raising NOTHING in balanced - the default mode - or in
+ * autonomous, on a clean turn. A public deployment with no card at all.
+ *
+ * So the name is read once, here, and only to answer whether this call is a publishing call. What
+ * the three branches below then read is the reach, and `publishesPublicly` is the same expression
+ * `tools/publishing.ts` uses to decide what it actually creates - one reader, exported from
+ * @athanor/contracts, so the floor cannot judge a private link while the arm publishes a public
+ * one.
+ *
+ * `publish_artifact` is not a publishing call by this reader and deliberately does not appear: it
+ * puts a file into the conversation the owner is already reading and reaches nowhere, which is why
+ * its card is a `workspace_write` in review and nothing at all elsewhere.
+ */
+type PublishReachOfCall = 'private' | 'public' | null;
+const publishReachOfCall = (name: string, args: Record<string, unknown>): PublishReachOfCall =>
+  name === 'publish_preview' ? (publishesPublicly(args.reach) ? 'public' : 'private') : null;
 
 /**
  * The stronger of what the turn's provenance raises and what the call would need anyway.
@@ -487,7 +515,19 @@ const taintedRequirement = (
       action: `Review a change to ${durable[0]}`,
       preview: `${namedObjects(durable)} is loaded ahead of every later task on this computer, so writing it while untrusted content is in the turn (${taintSources.slice(0, 3).join(', ')}) is shown to you first.`
     };
-  if (name === 'publish_preview')
+  /*
+   * The PRIVATE reach only, and the omission is the point rather than an oversight.
+   *
+   * A public reach already raises `external_consequential` on the ordinary path below, in every
+   * mode and whatever the turn has read, and `strongestRequirement` takes the maximum of the two -
+   * so a row here would not raise the answer by a rung. What it would change is the card: the two
+   * previews are joined with a blank line when they differ, so a public deployment on a tainted
+   * turn would grow a second paragraph it does not have today. The table this merge had to
+   * preserve, measured at 06b0493 through the tool `reach:'public'` replaced, says that
+   * `publish_site` on a tainted turn was exactly `publish_site` on a clean one - one card, one
+   * paragraph - so nothing here may fire for `public`.
+   */
+  if (publishReachOfCall(name, args) === 'private')
     return {
       sideEffect: 'external_reversible',
       action: 'Publish a private preview from a turn that read untrusted content',
@@ -1730,7 +1770,12 @@ const ordinaryRequirement = (
           : `Run ${[executable, ...commandArgs].join(' ')}. It connects to somewhere this computer could not read out of the command, so where it sends data is unknown.`
       };
   }
-  if (name === 'publish_site') {
+  /*
+   * Ahead of the `asksBeforeEveryChange` row further down, which is what makes that row's private
+   * wording true: a public reach returns here first, in every mode, so the "Create a private
+   * preview" card below can only ever be answered about a private one.
+   */
+  if (publishReachOfCall(name, args) === 'public') {
     const label = textValue(args.label, 'App');
     const port = textValue(args.port, 'unknown');
     return {
@@ -1908,7 +1953,18 @@ const ordinaryRequirement = (
               : `Create or replace ${textValue(args.path, 'a workspace file')}`
       };
     }
-    if (name === 'publish_artifact' || name === 'publish_preview' || name === 'desktop_launch')
+    /*
+     * The private reach, spelled as a reach and not as a name, so this row cannot be made wrong by
+     * being moved. A public publish is answered on the ordinary path above and never arrives here;
+     * writing `name === 'publish_preview'` would leave a row headed "Create a private preview" that
+     * is only true because of where it sits in the function, which is the kind of correctness that
+     * survives exactly until somebody reorders the branches.
+     */
+    if (
+      name === 'publish_artifact' ||
+      publishReachOfCall(name, args) === 'private' ||
+      name === 'desktop_launch'
+    )
       return {
         sideEffect: 'workspace_write',
         action:

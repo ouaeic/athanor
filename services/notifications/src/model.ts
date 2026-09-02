@@ -120,9 +120,20 @@ export const approvalPhrase = (
       return 'run a command on your computer';
     case 'connector_action':
       return 'use one of your connected accounts';
-    case 'publish_site':
-      return 'publish something to a public address';
+    /*
+     * One tool, two reaches, and the difference is the whole point of the card. `publish_site` was
+     * folded into `publish_preview` as a `reach` argument, and this function is handed the action
+     * and the side effect and never the arguments - so the reach is read from the side effect,
+     * which is the only thing here that carries it. A public reach is the one publishing shape the
+     * floor raises `external_consequential` for; the private tier raises `workspace_write` on a
+     * clean turn and `external_reversible` on a tainted one. Getting this wrong understates a
+     * public deployment as "publish a file" on the owner's phone, which is the one surface where
+     * they cannot go and look before answering.
+     */
     case 'publish_preview':
+      return sideEffect === 'external_consequential'
+        ? 'publish something to a public address'
+        : 'publish a file';
     case 'publish_artifact':
       return 'publish a file';
     case 'browser_action':

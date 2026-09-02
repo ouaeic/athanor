@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 // The real constant, imported here and copied in the module under test: `approval-facts.ts` says
 // why it does not import it, and this is what stops that copy drifting in silence.
-import { AUDIO_READ_MAX_SECONDS } from '@athanor/contracts';
+import { AUDIO_READ_MAX_SECONDS, publishesPublicly } from '@athanor/contracts';
 import {
   agentSentence,
   agentWording,
@@ -92,11 +92,40 @@ describe('what the card states about the request', () => {
     });
   });
 
-  it('says who can reach a published site', () => {
-    expect(value('publish_site', { port: 3000, label: 'demo' }, 'Reachable by')).toBe(
-      'anyone with the link'
-    );
+  it('says who can reach a published link, from the call and not from the tool name', () => {
+    /*
+     * There were two publishing tools and this row read the NAME to choose between these two
+     * answers. They are one tool with a `reach` argument now, so the wrong half of this is a card
+     * telling the owner a public deployment is reachable by "you" - on the card whose whole job is
+     * to say how far the thing goes. Both directions, and the absent field, because the default is
+     * what almost every real call sends.
+     */
+    expect(
+      value('publish_preview', { port: 3000, label: 'demo', reach: 'public' }, 'Reachable by')
+    ).toBe('anyone with the link');
+    expect(value('publish_preview', { port: 3000, reach: 'private' }, 'Reachable by')).toBe('you');
     expect(value('publish_preview', { port: 3000 }, 'Reachable by')).toBe('you');
+  });
+
+  it('reads the reach exactly as the worker does, including a value neither recognises', () => {
+    /*
+     * The copy in `approval-facts.ts` against the real `publishesPublicly`, which is what the
+     * comment beside the copy promises. The drift that would matter is one-sided - this card
+     * saying "you" about a call the worker publishes publicly - so a table rather than one row.
+     */
+    const reaches: ReadonlyArray<readonly [string, unknown]> = [
+      ['public', 'public'],
+      ['private', 'private'],
+      ['the wrong case', 'PUBLIC'],
+      ['empty', ''],
+      ['absent', undefined],
+      ['null', null],
+      ['an object', {}]
+    ];
+    for (const [label, reach] of reaches)
+      expect(value('publish_preview', { port: 3000, reach }, 'Reachable by'), label).toBe(
+        publishesPublicly(reach) ? 'anyone with the link' : 'you'
+      );
   });
 
   /*

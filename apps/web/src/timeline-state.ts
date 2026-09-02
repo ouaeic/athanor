@@ -37,8 +37,10 @@ const activityLabels: Record<string, string> = {
   print_pdf: 'Printing a PDF',
   process: 'Checking a background job',
   publish_artifact: 'Preparing a result',
-  publish_preview: 'Preparing the preview',
-  publish_site: 'Publishing the site',
+  // One line for both reaches: this table is keyed on the tool name and the two publishing tools
+  // merged onto a `reach` argument it cannot see. "Preparing the preview" over a public deployment
+  // would be the wrong half of that.
+  publish_preview: 'Publishing a link',
   read_elements: 'Checking the page',
   repo_overview: 'Reading the repository',
   schedule: 'Changing scheduled work',

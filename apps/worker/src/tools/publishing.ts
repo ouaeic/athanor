@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
+import { publishesPublicly } from '@athanor/contracts';
 import { encryptJson, sha256, AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
 import { type ExecObservation } from '../agent-state.js';
@@ -11,7 +12,8 @@ import { clampNumber, finiteNumber } from './numbers.js';
  * The port the agent named, or a refusal - and the refusal comes from the parse, not from the
  * comparison.
  *
- * Both publishing arms wrote `Math.max(1024, Math.min(65_535, Number(call.arguments.port)))`,
+ * Both publishing arms wrote `Math.max(1024, Math.min(65_535, Number(call.arguments.port)))` -
+ * they were two arms then, and this is the reader the one arm below now uses for either reach -
  * which answers `NaN` for anything the model spelled wrong. Two things then happened that a wrong
  * port would not have caused. The scope handed to the runner is minted from this value, so the
  * capability token said `preview:NaN` and the check went to `/preview-check/NaN`. And the refusal
@@ -41,11 +43,15 @@ const previewPort = (value: unknown): number => {
 };
 
 /**
- * The publishing tools: the three ways bytes leave this computer for a URL someone else can open.
+ * The publishing tools: the two ways bytes leave this computer for a URL someone else can open.
  *
- * Together because they are the group the approval floor cares most about, and because all three
- * mint the same kind of token and hand back the same kind of address - the differences between them
- * are lifetime and audience, which is exactly what a reader comparing them needs to see at once.
+ * Together because they are the group the approval floor cares most about, and because both mint
+ * the same kind of token and hand back the same kind of address - the differences between them are
+ * lifetime and audience, which is exactly what a reader comparing them needs to see at once.
+ *
+ * It was three tools until `publish_site` became `publish_preview`'s `reach: 'public'`. What it did
+ * is all still here, in the one arm below; what is gone is a second NAME for it, which is what the
+ * approval floor used to have to read in order to guess how far a call reached.
  */
 export async function executePublishingTool(
   context: ToolContext,
@@ -181,9 +187,26 @@ export async function executePublishingTool(
         ...(preview ? { preview } : {})
       };
     }
+    /*
+     * ONE arm for both reaches, where there were two cases differing in about a dozen lines.
+     *
+     * `publish_site` was folded in here as the `reach` argument and its catalogue entry deleted.
+     * The two arms already did the same work - clamp the port, check something is listening, mint a
+     * token, create the preview row - and the public one then called `publishWorkspacePreview` on
+     * top. What made keeping them apart actively dangerous rather than merely repetitive is that
+     * the approval floor read the TOOL NAME to decide how far the call reached, so the two names
+     * were the only thing standing between a private link and a public deployment.
+     *
+     * `publishesPublicly` is that decision, and it is imported rather than re-spelled here: the
+     * floor calls the same function on the same argument, so the arm cannot publish publicly on a
+     * call the floor judged private. A `reach` neither of them recognises is private for both.
+     */
     case 'publish_preview': {
+      const publicReach = publishesPublicly(call.arguments.reach);
       const port = previewPort(call.arguments.port);
-      const label = textValue(call.arguments.label, 'App preview').trim().slice(0, 80);
+      const label = textValue(call.arguments.label, publicReach ? 'Published app' : 'App preview')
+        .trim()
+        .slice(0, 80);
       const check = await context.runner.call<{ available: boolean }>(
         task.workspaceId,
         task.id,
@@ -221,40 +244,18 @@ export async function executePublishingTool(
         accessTokenHash: sha256(accessToken),
         entryPath: entryPath || null
       });
-      const preview = {
-        previewId: created.id,
-        label,
-        port,
-        url: previewUrl(context.config.PREVIEW_BASE_URL, slug, accessToken, entryPath),
-        visibility: 'private',
-        expiresAt: created.expiresAt
-      };
-      await event(context.store, task, key, 'preview', `${label} is ready`, preview);
-      return preview;
-    }
-    case 'publish_site': {
-      const port = previewPort(call.arguments.port);
-      const label = textValue(call.arguments.label, 'Published app').trim().slice(0, 80);
-      const check = await context.runner.call<{ available: boolean }>(
-        task.workspaceId,
-        task.id,
-        `preview:${port}`,
-        `${root}/preview-check/${port}`
-      );
-      if (!check.available)
-        throw new AthanorError(
-          'preview_port_unavailable',
-          `No service is listening on port ${port} of this computer. Bind it to 0.0.0.0 and verify it first.`
-        );
-      const accessToken = randomBytes(32).toString('base64url');
-      const created = await context.store.createWorkspacePreview({
-        userId: task.userId,
-        workspaceId: task.workspaceId,
-        label,
-        port,
-        slug: randomBytes(16).toString('hex'),
-        accessTokenHash: sha256(accessToken)
-      });
+      if (!publicReach) {
+        const preview = {
+          previewId: created.id,
+          label,
+          port,
+          url: previewUrl(context.config.PREVIEW_BASE_URL, slug, accessToken, entryPath),
+          visibility: 'private',
+          expiresAt: created.expiresAt
+        };
+        await event(context.store, task, key, 'preview', `${label} is ready`, preview);
+        return preview;
+      }
       // Published on demand, which is the store's own default and the only mode with behaviour
       // behind it: the preview gateway wakes a hibernated computer for an on-demand site, and
       // nothing anywhere holds one awake. The agent is not offered a choice between a mode that
@@ -271,7 +272,21 @@ export async function executePublishingTool(
         previewId: published.id,
         label,
         port,
-        url: previewUrl(context.config.PREVIEW_BASE_URL, published.slug),
+        /*
+         * No access token, and the entry path kept.
+         *
+         * The token is what makes a private link private; a public URL carrying one would hand
+         * every visitor the bearer credential for the same preview, so it is dropped here and the
+         * API drops it too (`preview.visibility === 'private'` guards it in apps/api/src/context.ts).
+         *
+         * The path is the opposite case and comes with the merge rather than around it: the old
+         * `publish_site` had no `path` parameter at all, so a public deployment of a folder landed
+         * on a file index - which is the exact failure the private half's `path` was written for,
+         * and it is worse in public. `entryPath` is stored on the row above and apps/api applies it
+         * to every address it hands out, for both visibilities; this line is what stops the URL the
+         * model is handed from disagreeing with the one the owner's Preview tab shows.
+         */
+        url: previewUrl(context.config.PREVIEW_BASE_URL, published.slug, undefined, entryPath),
         visibility: 'public',
         expiresAt: null
       };

@@ -6,11 +6,13 @@
  * the model a card would be raised, and a promise in a description that the floor does not keep is
  * a defect in the description.
  */
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   BrowserAction,
   DesktopAction,
   MAX_AGENT_NOTIFICATIONS_PER_TASK,
+  publishesPublicly,
   surfaceDescribable,
   TaskScheduleSpec,
   UNKNOWN_SURFACES,
@@ -426,10 +428,15 @@ describe('the size of the catalogue the model is sent', () => {
     // what removes the pressure; saying what a service does to a job that completes is what stops
     // the wording from pointing at it. Measured at 55,673 when that landed, up from 55,600.
     //
-    // The catalogue is 55,668 as it stands: the `wait_for` clause in surface-actions.ts came down
-    // 5 bytes after the above was written. The assertion is `toBeLessThan`, so 55,699 is the last
-    // passing value and the room this leaves is 31 bytes - not the 32 the subtraction suggests,
-    // and not the 27 the sentence above computed for its own total by the same off-by-one.
+    // The catalogue is 55,307 as it stands, down from 55,668 - and the ceiling did NOT come down
+    // with it, because a ceiling that tracks every saving stops being a ceiling. The move is one
+    // merge and one clause: `publish_site` folded into `publish_preview` as a `reach` argument,
+    // which deletes a 645-byte entry and the 118 bytes of "use the other one" prose inside the two
+    // descriptions and spends 176 of it back on the merged entry, a net 470; and 109 bytes on
+    // browser_snapshot naming `elementsOmitted` and `framesOmitted`, which are fields the runner
+    // has been computing and shipping in every snapshot with nothing in the catalogue to make the
+    // model read them. The assertion is `toBeLessThan`, so 55,699 is the last passing value and
+    // the room this leaves is 392 bytes - not 393, and not the 31 it was before.
     // Re-derive rather than trust either number: `Buffer.byteLength(JSON.stringify([
     // ...agentToolsFor(), COMPACT_CONTEXT_TOOL]))` is the whole of it.
     //
@@ -1532,8 +1539,6 @@ describe('the catalogue as the model reads it', () => {
       ['desktop_action', 'browser_action'],
       ['delegate', 'coding_agent'],
       ['coding_agent', 'file_patch'],
-      ['publish_preview', 'publish_site'],
-      ['publish_site', 'publish_preview'],
       ['image_read', 'generate_media'],
       ['image_read', 'document_read']
     ];
@@ -1572,6 +1577,71 @@ describe('the catalogue as the model reads it', () => {
     ];
     for (const [tool, other] of thenPairs)
       expect(clauseNaming(tool, other), `${tool} never mentions ${other}`).toBeDefined();
+  });
+
+  it('names only result fields the runner really ships, for the two surfaces that omit things', () => {
+    /*
+     * THE DEFECT THIS PROGRAMME HAS SHIPPED FIVE TIMES, caught from the description side.
+     *
+     * A tool description that names a field of its own result is the strongest thing this
+     * catalogue says, because the model cannot check it: it reads "framesOmitted says how many did
+     * not fit", finds no such key, and has no way to tell a field that is absent from a field that
+     * is zero. Both omission clauses here were written AFTER the field existed - `nodesOmitted` on
+     * `desktop_observe`, and `elementsOmitted`/`framesOmitted` on `browser_snapshot`, which the
+     * browser lane shipped through `composeBrowserSnapshot` - and the previous catalogue wave
+     * declined to write the second one precisely because the fields did not exist yet. This is what
+     * keeps that decision from having to be made by memory next time.
+     *
+     * WHAT EACH ROW IS ANCHORED ON, because the two surfaces are not built the same way and an
+     * anchor on the wrong literal is this check wearing the costume it exists to strip off.
+     * `composeBrowserSnapshot` is a single funnel - all three snapshot returns in browser.ts go
+     * through it and it names every key it emits - so its body is what the model receives. The
+     * desktop has no such funnel: `snapshot()` in desktop.ts returns an object literal at three
+     * places, and two of them are the fallbacks for a box without the GUI dependencies and for a
+     * desktop held in secure input, both of which write `nodesOmitted: 0` as a CONSTANT. Anchoring
+     * this row on the first `screenshotMimeType` in the file matched the first of those fallbacks,
+     * and deleting `nodesOmitted: selected.omitted` from the real observation left this test green
+     * - measured, by doing exactly that. It is anchored on `nodes: selected.kept` instead, which
+     * appears once and only in the observation the agent actually reads.
+     *
+     * A field added to the payload TYPE and not to the literal is computed and never shipped, which
+     * is the same defect from the other end and is asserted where those functions live.
+     */
+    const emitted = (tool: string, path: string, find: RegExp): string => {
+      const body = readFileSync(new URL(path, import.meta.url), 'utf8').match(find);
+      // A pattern that stops matching passes this test by comparing a description against nothing,
+      // which is the costume every check in this repository has to be stopped from wearing.
+      expect(
+        body?.[1],
+        `${tool}: ${path} no longer parses, so nothing is being compared`
+      ).toBeTruthy();
+      return body?.[1] ?? '';
+    };
+    const rows: ReadonlyArray<readonly [string, string, RegExp, readonly string[]]> = [
+      [
+        'browser_snapshot',
+        '../../../services/workspace-runner/src/browser.ts',
+        /composeBrowserSnapshot = \(parts: BrowserSnapshotParts\): BrowserSnapshotParts => \(\{([\s\S]*?)\n\}\);/,
+        ['elementsOmitted', 'framesOmitted']
+      ],
+      [
+        'desktop_observe',
+        '../../../services/workspace-runner/src/desktop.ts',
+        /nodes: selected\.kept,([\s\S]*?)screenshotBase64: screenshot\.toString/,
+        ['nodesOmitted']
+      ]
+    ];
+    for (const [tool, path, find, fields] of rows) {
+      const description = agentTools.find((entry) => entry.name === tool)?.description ?? '';
+      const payload = emitted(tool, path, find);
+      for (const field of fields) {
+        expect(description, `${tool} never names ${field}`).toContain(field);
+        expect(
+          payload,
+          `${tool} names ${field}, which the runner does not put in the result`
+        ).toContain(field);
+      }
+    }
   });
 });
 
@@ -1947,72 +2017,75 @@ describe('declared action shapes', () => {
   });
 });
 
-describe('the reach each publishing tool has, and the card the floor raises for it', () => {
+describe('the reach each publishing call has, and the card the floor raises for it', () => {
   /*
-   * THE TRIPWIRE FOR MERGING `publish_site` INTO `publish_preview`. Read this before you do it.
+   * THE TRIPWIRE THAT SURVIVED THE MERGE IT WAS WRITTEN AGAINST. Read this before touching either
+   * side of it.
    *
-   * The merge is worth doing and was costed this wave: publish_site is 645 wire bytes against
-   * publish_preview's 860, their required pair is identical (port, label), preview adds one
-   * optional path, they share a domain module and a runner action, and 188 bytes of the two
-   * descriptions go on telling the model which name to pick - 76 for "Use publish_site only when
-   * they asked for a deployment the public can reach." and 112 for "Deploy publicly only when the
-   * user asked for it; use publish_preview for the private link everything else wants." Roughly
-   * 450 bytes come back: 646 gross, measured by deleting the entry and re-running the byte
-   * assertion above, less about 200 for the reach enum and an honest description of what it does.
-   *
-   * WHAT STOPS IT BEING A FREE SAVING IS THIS FILE'S OWN HEADER RULE - a promise in a description
-   * the floor does not keep is a defect in the description - pointed the other way. The two tools
-   * differ in REACH, private tier against the public internet, and the approval floor cannot see
-   * reach: both branches key on the TOOL NAME, at approval-policy.ts:490 (publish_preview, taint
-   * path) and :1733 (publish_site, ordinary path). A third name-keyed row sits at :1911, inside the
-   * `asksBeforeEveryChange` arm that only `review` reaches, and it is what makes the review row in
-   * the table below workspace_write rather than NONE. It does not have to move with the other two:
-   * `strongestRequirement` takes the maximum, and external_consequential outranks workspace_write.
-   * Measured through `approvalRequirement` at
-   * 06b0493, which is what the table below asserts:
+   * It stood here as a refusal. `publish_site` and `publish_preview` took the same required pair,
+   * ran the same runner action and minted the same kind of token; 188 bytes of their two
+   * descriptions went on telling the model which NAME to pick, and folding one into the other as a
+   * `reach` argument was measured at about 450 bytes of a cached prefix. What blocked it was that
+   * the approval floor could not see reach at all. Three branches in approval-policy.ts read the
+   * tool NAME - the taint branch, the ordinary branch, and the review-only `asksBeforeEveryChange`
+   * row - and a FOURTH read it in apps/web/src/approval-facts.ts to tell the owner, on the card
+   * itself, who could reach the thing. Measured through `approvalRequirement` at 06b0493:
    *
    *   publish_site      review/balanced/autonomous  clean AND tainted -> external_consequential
    *   publish_preview   review                      clean -> workspace_write
    *   publish_preview   balanced/autonomous         clean -> NONE
    *   publish_preview   any mode                    tainted -> external_reversible
    *
-   * And measured for the merged shape, with the floor left as it is:
+   * and, for the merged shape with the floor left alone:
    *
    *   publish_preview {reach:'public'}   balanced (the default) and autonomous, clean -> NONE
    *
-   * So a merge that moves the wire without moving the floor deploys to the public internet with NO
-   * approval card at all in the default security mode, silently, while apps/worker/src/context.ts
-   * still tells the model publishing publicly "always stops for the user's approval" and
-   * egress.ts:410 still says "`publish_site` raises its own card and this is not a way round it".
-   * A byte saving that blinds the floor is not a saving, so the merge is blocked on the floor
-   * moving FIRST: both branches read `args.reach` instead of `name`, external_consequential for
-   * public and external_reversible for private. The precedent is in the same file at :1742-1745,
-   * where browser_action collapsed a twenty-variant union onto a sibling field for about five
-   * kilobytes and every gate below kept reading the fields it always read.
+   * A tool that puts something on the public internet with no card at all in the default security
+   * mode, silently, while context.ts told the model public publishing "always stops for the user's
+   * approval". So the floor moved first and the merge came with it, in one change: the three
+   * branches read `publishReachOfCall` and the card reads `args.reach`, and the two tools are one.
    *
-   * `declared` is asserted as an exact set, not a superset, so the merge cannot land quietly: the
-   * moment publish_site leaves the catalogue this test fails here and the reader arrives at this
-   * comment. Replace it then with the same table keyed on reach, and keep BOTH rows - a merge
-   * proved only for `public` downgrades nothing and a merge proved only for `private` is the
-   * defect above.
+   * WHAT THIS TEST IS NOW. The same table, keyed on reach instead of on a name, and BOTH rows are
+   * still here because each is the other's counter-direction. A merge proved only for `public`
+   * would be satisfied by carding every private preview in every mode, which is the card that
+   * fires on everything and that this file's own floor says nobody reads. A merge proved only for
+   * `private` is the defect above. The set below is asserted as an EXACT set, not a superset, for
+   * the same reason it always was: a fourth publishing tool, or `publish_site` coming back, fails
+   * here and the reader arrives at this comment.
+   *
+   * The precedent for the shape is in approval-policy.ts, where browser_action collapsed a
+   * twenty-variant union onto a sibling field for about five kilobytes and every gate below kept
+   * reading the fields it always read.
    */
   const declared = agentTools.map((tool) => tool.name).filter((name) => name.startsWith('publish'));
 
-  it('declares exactly the three publishing tools the floor has branches for', () => {
-    expect([...declared].sort()).toEqual(['publish_artifact', 'publish_preview', 'publish_site']);
+  it('declares exactly the two publishing tools the floor has branches for', () => {
+    expect([...declared].sort()).toEqual(['publish_artifact', 'publish_preview']);
+    // The reach the floor judges on has to be a declared, closed field or the model cannot ask for
+    // the public one at all - and an undeclared argument is the shape this programme has shipped
+    // five times: computed, and reachable by nothing.
+    const preview = agentTools.find((tool) => tool.name === 'publish_preview');
+    const reach = (preview?.parameters.properties as Record<string, { enum?: string[] }>).reach;
+    expect(reach?.enum).toEqual(['private', 'public']);
+    // Absent must be the NARROW reach on both sides. `publishesPublicly` in @athanor/contracts is
+    // the single reader the floor and `tools/publishing.ts` share, so this is the one place the
+    // default and the reader are checked to agree.
+    expect(publishesPublicly(undefined)).toBe(false);
+    expect(publishesPublicly('private')).toBe(false);
+    expect(publishesPublicly('public')).toBe(true);
   });
 
   it('stops for the owner every time something is put on the public internet', () => {
-    const args = { port: 8080, label: 'Demo' };
+    const args = { port: 8080, label: 'Demo', reach: 'public' };
     for (const mode of ['review', 'balanced', 'autonomous'] as const) {
-      expect(approvalRequirement('publish_site', args, mode, {})?.sideEffect, mode).toBe(
+      expect(approvalRequirement('publish_preview', args, mode, {})?.sideEffect, mode).toBe(
         'external_consequential'
       );
       // Not merely "still carded": the tainted path used to REPLACE the ordinary card rather than
       // sit above it, so a public deployment on the turn that had read a hostile page is exactly
       // where a downgrade would hide.
       expect(
-        approvalRequirement('publish_site', args, mode, { taintSources: ['a web page'] })
+        approvalRequirement('publish_preview', args, mode, { taintSources: ['a web page'] })
           ?.sideEffect,
         `${mode}, tainted`
       ).toBe('external_consequential');
@@ -2020,16 +2093,43 @@ describe('the reach each publishing tool has, and the card the floor raises for 
   });
 
   it('leaves the private tier free on a clean turn, which is what the merge must not lose', () => {
-    // The other direction, and the reason the merge cannot simply be done under the publish_site
+    // The other direction, and the reason the merge could not simply be done under the publish_site
     // name to keep the floor honest: that would card every private preview in every mode. This
     // file's own floor says a card that fires on everything is a card nobody reads.
-    const args = { port: 8080, label: 'Demo' };
+    //
+    // Driven with the reach spelled AND with it omitted, because the default is what almost every
+    // real call will send and a table that only ever states the field would not notice the default
+    // flipping.
+    for (const args of [
+      { port: 8080, label: 'Demo' },
+      { port: 8080, label: 'Demo', reach: 'private' }
+    ]) {
+      expect(approvalRequirement('publish_preview', args, 'balanced', {})).toBeNull();
+      expect(approvalRequirement('publish_preview', args, 'autonomous', {})).toBeNull();
+      expect(approvalRequirement('publish_preview', args, 'review', {})?.sideEffect).toBe(
+        'workspace_write'
+      );
+      expect(
+        approvalRequirement('publish_preview', args, 'balanced', { taintSources: ['a web page'] })
+          ?.sideEffect
+      ).toBe('external_reversible');
+    }
+  });
+
+  it('reads a reach it does not recognise as the narrow one, on both sides of the call', () => {
+    /*
+     * The floor and the arm must not be able to disagree, and this is the case where they could:
+     * a `reach` the schema should have refused. Both call `publishesPublicly`, which is an equality
+     * against the literal `public`, so a misspelling is private for the floor AND private for
+     * `tools/publishing.ts` - the safe pairing, because the dangerous one is a floor reading
+     * private on a call the arm publishes publicly. It is asserted rather than assumed because
+     * "the schema stops it" is a promise about a different file.
+     */
+    const args = { port: 8080, label: 'Demo', reach: 'PUBLIC' };
     expect(approvalRequirement('publish_preview', args, 'balanced', {})).toBeNull();
-    expect(approvalRequirement('publish_preview', args, 'autonomous', {})).toBeNull();
-    expect(
-      approvalRequirement('publish_preview', args, 'balanced', { taintSources: ['a web page'] })
-        ?.sideEffect
-    ).toBe('external_reversible');
+    expect(approvalRequirement('publish_preview', args, 'review', {})?.action).toBe(
+      'Create a private preview'
+    );
   });
 });
 

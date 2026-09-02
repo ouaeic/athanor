@@ -46,14 +46,14 @@ describe('approval wording', () => {
   });
 
   it('says what the tool touches and how far the effect reaches, never only one of them', () => {
-    expect(approvalReach(approval({ preview: { tool: 'publish_site' } }))).toBe(
-      'Puts something on the public internet · reaches outside your computer, and may not be undoable'
+    expect(approvalReach(approval({ preview: { tool: 'publish_preview' } }))).toBe(
+      'Publishes a link to something on this computer · reaches outside your computer, and may not be undoable'
     );
     expect(approvalReach(approval({ preview: { tool: 'connector_action' } }))).toBe(
       'Uses a connected account · reaches outside your computer, and may not be undoable'
     );
     // Same reach, different tools: the sentence is about the request, not about its class.
-    expect(approvalReach(approval({ preview: { tool: 'publish_site' } }))).not.toBe(
+    expect(approvalReach(approval({ preview: { tool: 'publish_preview' } }))).not.toBe(
       approvalReach(approval({ preview: { tool: 'shell' } }))
     );
   });
@@ -97,8 +97,18 @@ describe('approval wording', () => {
     const raised = new Set(
       [...floor.matchAll(/\bname === '([a-z_]+)'/g)].flatMap((match) => match[1] ?? [])
     );
-    // A regex that stopped matching would otherwise pass this test by covering nothing.
-    expect(raised.size).toBeGreaterThanOrEqual(18);
+    /*
+     * A regex that stopped matching would otherwise pass this test by covering nothing.
+     *
+     * Lowered from 18 to 17 when `publish_site` was folded into `publish_preview` as a `reach`
+     * argument. Nothing stopped asking: the floor raises the same external_consequential card for
+     * the same act, in all three modes and on clean and tainted turns alike, from
+     * `publishReachOfCall` rather than from a second tool name - measured over ten owner scenarios
+     * and 178 calls in `evals/cards`, where not one count moved. What went is a NAME, which is what
+     * this number counts. `scripts/check-repository.mjs` carries the same figure and the same
+     * argument; both had to come down together, which is exactly the loudness this floor is for.
+     */
+    expect(raised.size).toBeGreaterThanOrEqual(17);
     expect([...raised].filter((tool) => !(tool in approvalToolPhrases))).toEqual([]);
     expect([...raised]).toContain('audio_read');
     expect([...raised]).toContain('parallel_web_read');
@@ -323,12 +333,12 @@ describe('what the card is allowed to say out loud', () => {
   /* The buttons are reused across requests, so the owner has to hear that this is a new one. */
   it('speaks again when a different request takes its place', () => {
     const next = approvalAnnouncement({
-      approval: approval({ id: 'ap-2', preview: { tool: 'publish_site' } }),
+      approval: approval({ id: 'ap-2', preview: { tool: 'publish_preview' } }),
       waiting: 1,
       announcedId: 'ap-1'
     });
     expect(next?.id).toBe('ap-2');
-    expect(next?.message).toContain('Puts something on the public internet');
+    expect(next?.message).toContain('Publishes a link to something on this computer');
   });
 
   it('counts the queue only when there is one', () => {

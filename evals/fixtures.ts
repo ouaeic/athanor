@@ -2393,7 +2393,13 @@ export const fixtures: readonly Fixture[] = [
     request: 'Put the demo up on a public address so I can send the link round.',
     why: 'Public publishing is on the floor that always asks. The turn has to park before anything is published, not after.',
     model: sequence({
-      calls: [{ id: 'call-1', name: 'publish_site', args: { port: 8080, label: 'Demo' } }]
+      calls: [
+        {
+          id: 'call-1',
+          name: 'publish_preview',
+          args: { port: 8080, label: 'Demo', reach: 'public' }
+        }
+      ]
     }),
     expect: {
       modelCalls: 1,

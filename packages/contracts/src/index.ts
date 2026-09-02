@@ -469,6 +469,36 @@ export const PublishWorkspacePreviewRequest = z.object({
 });
 export type PublishWorkspacePreviewRequest = z.input<typeof PublishWorkspacePreviewRequest>;
 
+/**
+ * Which of the two audiences above a publishing call is asking for - the same word the preview it
+ * creates is then stored under, `WorkspacePreview.visibility`.
+ *
+ * It exists as a value the agent passes because the alternative, which shipped for several waves,
+ * was two tools with identical required parameters whose only difference was their names:
+ * `publish_preview` for the private link and `publish_site` for the public one. That difference was
+ * invisible to the approval floor, which judges a call by what it reaches and had to read the name
+ * to guess at it.
+ */
+export const PublishReach = z.enum(['private', 'public']);
+export type PublishReach = z.infer<typeof PublishReach>;
+
+/**
+ * Whether a publishing call puts something on the public internet, from the call's own argument.
+ *
+ * ONE exported reader, and the approval floor and the arm that publishes both call it, because the
+ * failure this merge could have shipped is precisely the two of them disagreeing: a floor reading
+ * "private" on a call the arm publishes publicly is a public deployment with no approval card, in
+ * the default security mode, silently. Measured before the floor moved, `publish_preview` with a
+ * reach argument raised NOTHING in balanced or autonomous on a clean turn.
+ *
+ * Anything that is not the literal `public` is private, on both sides. That is the same expression
+ * in both places rather than two readings that agree today, so a value neither of them recognises -
+ * a misspelling, a null, an object - is the narrow reach for the floor and for the arm alike, and
+ * the two cannot come apart. The schema refuses such a value before either sees it; this is what
+ * holds if it ever stops.
+ */
+export const publishesPublicly = (reach: unknown): boolean => reach === PublishReach.enum.public;
+
 /*
  * There is no `SetWorkspacePreviewDomainRequest`, and there is deliberately no note here about one
  * arriving. A schema of that name stood here validating a hostname for a route that was never

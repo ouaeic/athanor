@@ -151,7 +151,6 @@ const DOMAIN_OF: Readonly<Record<string, ToolDomain>> = {
   desktop_action: executeSurfaceTool,
   publish_artifact: executePublishingTool,
   publish_preview: executePublishingTool,
-  publish_site: executePublishingTool,
   session_search: executeKnowledgeTool,
   memory_recall: executeKnowledgeTool,
   memory: executeKnowledgeTool,

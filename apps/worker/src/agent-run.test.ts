@@ -1449,8 +1449,12 @@ describe('what actually reaches the provider', () => {
     // the model has had to put a question to the owner and stop - before it, a blocker came back as
     // a finish nobody could tell from finished work. Forty since `audio_read`: thirty-nine of them
     // could open a recording, none could hear it, so a voice memo or a meeting recording sat in the
-    // workspace as bytes nothing on this computer could act on.
-    expect(names).toHaveLength(40);
+    // workspace as bytes nothing on this computer could act on. THIRTY-NINE again since
+    // `publish_site` was folded into `publish_preview` as a `reach` argument - the only fall in this
+    // number's history, and the one direction it is allowed to move without a capability being lost:
+    // both reaches are still reachable, and the approval floor reads the reach off the call rather
+    // than off the tool name, so nothing the owner used to be asked about goes unasked.
+    expect(names).toHaveLength(39);
     expect(names).toEqual(
       expect.arrayContaining([
         'document_read',

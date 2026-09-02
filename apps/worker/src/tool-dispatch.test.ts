@@ -38,8 +38,8 @@ import { forgetReads, recordRead } from './edit/index.js';
  * unknown tool: `set_plan`, `shell`, `process`, `files_list`, `file_read`, `document_read`,
  * `audio_read`, `document_search`, `code_search`, `repo_overview`, `code_diagnostics`,
  * `coding_agent`, `file_patch`, `session_search`, `memory_recall`, `schedule`, `memory`, `skill`,
- * `delegate`, `image_read`, `file_write`, `generate_media`, `publish_artifact`, `publish_preview`,
- * `publish_site`, `browser_snapshot`, `read_elements`, `print_pdf`, `web_search` on both routes,
+ * `delegate`, `image_read`, `file_write`, `generate_media`, `publish_artifact`, `publish_preview`
+ * at both reaches, `browser_snapshot`, `read_elements`, `print_pdf`, `web_search` on both routes,
  * `parallel_web_read`, `browser_action`, `desktop_observe`, `desktop_launch`, `desktop_action`,
  * `connector_list`, `connector_action`. The arms that branch again inside themselves - `schedule`,
  * `memory`, `skill`, `coding_agent`, `process` - carry a case per branch, because a sub-branch is
@@ -2806,10 +2806,13 @@ describe('the publishing arms', () => {
     );
   });
 
-  /** The same on the public half, which mints the same scope from the same clamp. */
+  /**
+   * The same on the public half, which is now the same arm reached through `reach: 'public'` and
+   * therefore the same clamp by construction rather than by two copies agreeing.
+   */
   it('refuses an unreadable port on a public deployment too', async () => {
     const executed = await dispatch(
-      { name: 'publish_site', arguments: { port: '80 80', label: 'Docs' } },
+      { name: 'publish_preview', arguments: { port: '80 80', label: 'Docs', reach: 'public' } },
       { approved: true }
     );
 
@@ -2819,7 +2822,7 @@ describe('the publishing arms', () => {
 
   it('publishes an approved site publicly, on demand, from the same port check', async () => {
     const executed = await dispatch(
-      { name: 'publish_site', arguments: { port: 8080, label: 'Docs' } },
+      { name: 'publish_preview', arguments: { port: 8080, label: 'Docs', reach: 'public' } },
       {
         approved: true,
         route: (url) =>
@@ -2842,6 +2845,70 @@ describe('the publishing arms', () => {
     ]);
     expect(executed.result).toMatchObject({ visibility: 'public', expiresAt: null });
   });
+
+  /*
+   * `path` has to keep working at the public reach, and this is the row that says it does.
+   *
+   * The tool `reach: 'public'` replaced had no `path` parameter at all, so a public deployment of a
+   * folder landed the visitor on a file index - which is the exact failure the private half's
+   * `path` was written for after an owner received it, and it is worse in public. One arm serves
+   * both reaches now, so the entry path is stored on the row either way; what this pins is that the
+   * URL handed back to the model carries it too, because apps/api applies `entryPath` to every
+   * address it hands out for both visibilities and a model told a different address from the one in
+   * the owner's Preview tab is two readers disagreeing about one link.
+   */
+  it('lands a public visitor on the entry path, not on a file index', async () => {
+    const executed = await dispatch(
+      {
+        name: 'publish_preview',
+        arguments: { port: 8080, label: 'Docs', reach: 'public', path: 'dashboard' }
+      },
+      {
+        approved: true,
+        route: (url) =>
+          url.endsWith(`${root}/preview-check/8080`) ? json({ available: true }) : undefined
+      }
+    );
+
+    expect(executed.asked('createWorkspacePreview')?.[0]).toMatchObject({
+      entryPath: 'dashboard'
+    });
+    const { url } = executed.result as { url: string };
+    expect(url).toContain('/dashboard');
+    // And no bearer token on an address anyone may hold, which is the whole difference between the
+    // two reaches: the private link's `access` parameter IS the credential.
+    expect(url).not.toContain('access=');
+  });
+
+  /*
+   * The reach decides what is created, and a reach nothing recognises creates the PRIVATE one.
+   *
+   * Both halves of this used to be their own tool name, so there was no third answer to give. There
+   * is now, and it has to fall the same way the approval floor falls: `publishesPublicly` in
+   * @athanor/contracts is one exported equality against the literal `public`, called here and in
+   * `approval-policy.ts`, so a value neither recognises is private for the card AND private for the
+   * thing that gets made. The other pairing - a floor reading private on a call this arm publishes
+   * publicly - is the defect that blocked this merge for a wave.
+   */
+  it.each([['omitted', undefined] as const, ['a reach nothing recognises', 'PUBLIC'] as const])(
+    'creates a private preview when the reach is %s',
+    async (_name, reach) => {
+      const executed = await dispatch(
+        {
+          name: 'publish_preview',
+          arguments: { port: 8080, label: 'Docs', ...(reach ? { reach } : {}) }
+        },
+        {
+          approved: true,
+          route: (url) =>
+            url.endsWith(`${root}/preview-check/8080`) ? json({ available: true }) : undefined
+        }
+      );
+
+      expect(executed.asked('publishWorkspacePreview')).toBeUndefined();
+      expect(executed.result).toMatchObject({ visibility: 'private' });
+    }
+  );
 
   it('generates a picture, records the charge, and writes it where it resolved the path to', async () => {
     const executed = await dispatch(

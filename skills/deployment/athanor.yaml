@@ -13,7 +13,6 @@ requires:
       shell,
       process,
       publish_preview,
-      publish_site,
       file_read,
       file_write,
       browser_snapshot,

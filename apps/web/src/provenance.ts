@@ -75,8 +75,17 @@ const consequences: Record<string, string> = {
   desktop_action: 'Used an application',
   desktop_launch: 'Opened an application',
   connector_action: 'Used a connected account',
-  publish_site: 'Published to the public internet',
-  publish_preview: 'Created a preview link',
+  /*
+   * Reach-neutral, because this table is keyed on the tool name alone and a `tool_started` payload
+   * carries no arguments to read a reach from. It held two rows, `publish_site` for "Published to
+   * the public internet" and `publish_preview` for "Created a preview link", until the two
+   * publishing tools became one with a `reach` argument. Keeping the private wording under the
+   * surviving name would have told the owner "Created a preview link" about a public deployment,
+   * on the panel whose whole subject is what the box did after it read something hostile. The
+   * approval card CAN say which reach it was, because it has the call in front of it - see
+   * `approval-facts.ts`.
+   */
+  publish_preview: 'Published a link to something on this computer',
   publish_artifact: 'Published a file into this conversation',
   generate_media: 'Generated media at a provider',
   coding_agent: 'Handed work to a coding agent',

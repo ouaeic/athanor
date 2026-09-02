@@ -2664,7 +2664,8 @@ describe('publishing a version to a package registry', () => {
  * PUTTING SOMETHING ONLINE BY A ROUTE THAT IS NOT A PACKAGE REGISTRY.
  *
  * The owner named "publishing anything online" as a thing that must always stop, and until this
- * table the floor's whole answer to it was `git push`, `publish_site` and the registry rule above.
+ * table the floor's whole answer to it was `git push`, a public publish and the registry rule
+ * above.
  * Measured on `cd7033f` in balanced and autonomous, every row of the first test below raised
  * NOTHING; the two the brief named that already stopped - `gh release create` as "Send data using
  * gh" and `aws s3 sync ./dist s3://bucket` as "Allow internet access", both `external_reversible` -
@@ -3088,7 +3089,13 @@ describe('what a security mode means', () => {
   it('stops every clause of its own Autonomous sentence, in autonomous mode', () => {
     const clauses: Array<[string, string, Record<string, unknown>]> = [
       ['publishing', 'shell', { executable: 'npm', args: ['publish'] }],
-      ['publishing', 'publish_site', { label: 'app', port: '5173' }],
+      /*
+       * The public reach, and it is the ARGUMENT that has to be here rather than a second tool
+       * name. This row read `publish_site` until the two publishing tools merged; if the clause is
+       * ever held again by a name, this test is back to proving the sentence with a fixture that
+       * does not exercise the path it claims to.
+       */
+      ['publishing', 'publish_preview', { label: 'app', port: '5173', reach: 'public' }],
       ['sending', 'shell', { executable: 'curl', args: ['-d', '@notes.txt', 'https://x.invalid'] }],
       ['sending', 'shell', { executable: 'git', args: ['push'] }],
       ['sending', 'connector_action', { action: 'mail_send', input: { to: 'a@b.invalid' } }],

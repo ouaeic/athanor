@@ -1381,15 +1381,34 @@ export const agentTools: ModelTool[] = [
   },
   {
     name: 'publish_preview',
+    /**
+     * ONE entry, where there were two: `publish_site` was folded in here as `reach` and its
+     * catalogue entry deleted.
+     *
+     * The two tools took the same required pair, ran the same runner action and minted the same
+     * kind of token; the only thing separating a private link from a public deployment was which
+     * NAME the model wrote, and 188 bytes of the two descriptions went on telling it which. The
+     * approval floor could not see the difference at all - it read the name too, in three places -
+     * so the merge was blocked until `approval-policy.ts` learned to read the reach. Measured:
+     * 645 bytes of entry recovered, 118 of "use the other one" prose deleted with it, and about
+     * 200 spent on the enum and an honest sentence about what each reach does.
+     *
+     * `hostingMode` used to be a parameter on the public half, described as the difference between
+     * a computer that idles between visits and one held awake for the site. Nothing hibernates a
+     * workspace on a timer and nothing holds one awake, so both halves of that choice were prose -
+     * and the one place the mode is read wakes a sleeping computer for an on-demand site and
+     * refuses an always-ready one, which is the opposite of what it said. There is no mode here
+     * either.
+     */
     description:
       /*
-       * The middle clause is here because of what the owner actually received. Asked to build a
+       * The `path` clause is here because of what the owner actually received. Asked to build a
        * page and publish a link, the agent started a plain file server on the workspace and
        * published its port - so the link opened on an index of every file in the workspace, the
        * research PDFs included, and not on the page it had just written. The page was one path
        * away and worked. Nothing in the tool had ever said which address the owner arrives at.
        */
-      'Expose an app already listening on a port of this computer as a private link only the user can open, and place an Open button directly in chat. It closes after a month with no visits, and they can revoke it whenever they like. Start the server first and bind it to 0.0.0.0. The user lands on that port’s root, so give path when the root is a file index rather than your app. Use publish_site only when they asked for a deployment the public can reach.',
+      'Expose an app already listening on a port of this computer as a link, and place an Open button directly in chat. Start the server first and bind it to 0.0.0.0. The user lands on that port’s root, so give path when the root is a file index rather than your app, and the link answers only while that port keeps listening. A private reach only they can open closes after a month with no visits; a public one anyone holding the address can open stays up until they revoke it and always stops for their approval, so ask for public only when they wanted that.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1397,33 +1416,23 @@ export const agentTools: ModelTool[] = [
       properties: {
         port: { type: 'integer', minimum: 1024, maximum: 65535 },
         label: { type: 'string' },
+        /*
+         * The field the approval floor judges this call on, so it is an enum with a default rather
+         * than a boolean or free text: `approval-policy.ts` and `tools/publishing.ts` both read it
+         * through `publishesPublicly`, which treats anything that is not exactly `public` as
+         * private - and a default of `private` is what makes an omitted field the narrow reach on
+         * both sides instead of an argument about what absence meant.
+         *
+         * No description of its own, on the trade `code_search`'s fields make above: both sentences
+         * a model needs - what each reach is, and when to ask for the wide one - are in the tool
+         * description, and a second copy here would pay this cached prefix twice for one fact.
+         */
+        reach: { type: 'string', enum: ['private', 'public'], default: 'private' },
         path: {
           type: 'string',
           description:
             'Where inside that port the user should land - "index.html" for a file server aimed at a folder. Omit when the root is already the app.'
         }
-      }
-    }
-  },
-  {
-    name: 'publish_site',
-    /**
-     * `hostingMode` used to be a parameter here, described as the difference between a computer
-     * that idles between visits and one held awake for the site. Nothing hibernates a workspace on
-     * a timer and nothing holds one awake, so both halves of that choice were prose - and the one
-     * place the mode is read wakes a sleeping computer for an on-demand site and refuses an
-     * always-ready one, which is the opposite of what it said. The tool offers what publishing
-     * actually does and no mode at all.
-     */
-    description:
-      'Publish a verified app port to a persistent public URL that anyone holding the address can open. It stays up until the user unpublishes or revokes it, and it serves whatever is listening on that port - so the app has to keep running for the URL to answer. Deploy publicly only when the user asked for it; use publish_preview for the private link everything else wants. Publishing always stops for the user’s approval.',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      required: ['port', 'label'],
-      properties: {
-        port: { type: 'integer', minimum: 1024, maximum: 65535 },
-        label: { type: 'string' }
       }
     }
   },
@@ -1478,7 +1487,7 @@ export const agentTools: ModelTool[] = [
      * restates the system prompt is what this file gives back.
      */
     description:
-      'Open the persistent server browser if needed and read the page in front of it, with a screenshot and the interactive elements of the page and its frames. Each element carries: its selector, accessible name, submitted field name, current value, checked state, whether it is required, disabled or currently invalid, the hint or error text the site is showing beside it, and every option of a select. This is how you read a page on the internet once you have its address: navigate browser_action to the website, then snapshot it to read what is on screen. Use web_search to find that address rather than driving this at a search engine. Snapshot once to see the page, then use read_elements for every re-check after that - it returns the same element list without the screenshot or the page text. A snapshot carrying botWall is that page raising an anti-bot challenge: do not reload it, open it in another tab, or touch the challenge.',
+      'Open the persistent server browser if needed and read the page in front of it, with a screenshot and the interactive elements of the page and its frames. Each element carries: its selector, accessible name, submitted field name, current value, checked state, whether it is required, disabled or currently invalid, the hint or error text the site is showing beside it, and every option of a select. elementsOmitted and framesOmitted count what did not fit: above zero, bring it into view and snapshot again. This is how you read a page on the internet once you have its address: navigate browser_action to the website, then snapshot it to read what is on screen. Use web_search to find that address rather than driving this at a search engine. Snapshot once to see the page, then use read_elements for every re-check after that - it returns the same element list without the screenshot or the page text. A snapshot carrying botWall is that page raising an anti-bot challenge: do not reload it, open it in another tab, or touch the challenge.',
     parameters: { type: 'object', additionalProperties: false, properties: {} }
   },
   {

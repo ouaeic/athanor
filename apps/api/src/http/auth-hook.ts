@@ -143,6 +143,27 @@ const requiredApiTokenScope = (method: string, route: string): ApiTokenScope | u
    * `DELETE /v1/account` is on the same prefix.
    */
   if (route === '/v1/account/preferences') return writing ? undefined : 'models:read';
+  /*
+   * The one `/v1/tasks` route no scope reaches, and it is the same rule the notification surface
+   * below is refused under, applied where it matters more.
+   *
+   * `PATCH /v1/tasks/:taskId/security-mode` sets how much a run asks. Its own route comment records
+   * that there is deliberately no second factor on it - which is right for the owner at their own
+   * keyboard, and wrong for a bearer token, because it fell through to the generic rule below and
+   * needed only `tasks:write`: the minimum scope any automation holds, the same one it needs to
+   * start the work at all. So a token minted to let a script create tasks could set those tasks to
+   * `autonomous`, where `SECURITY_MODE_FLOOR` turns off asking before reaching the internet and
+   * before installing software. The task-owner check on the route does not help: the task belongs
+   * to the token's own user by construction.
+   *
+   * This table already says the same thing twice - changing the spend ceiling is refused to an
+   * automation while reading it is `usage:read`, and no scope reaches `/v1/notifications` because
+   * "an automation token that could switch off approval prompts could act unwatched". Switching the
+   * prompts off outright is the stronger form of exactly that, and it was the case the table missed.
+   * Reading the mode stays available: a client that must not change how much a run asks still has
+   * every reason to know.
+   */
+  if (route === '/v1/tasks/:taskId/security-mode') return writing ? undefined : 'tasks:read';
   // One `/v1/tasks` write is not a task write: `POST /v1/tasks/:taskId/trajectory` with a
   // `computer` or `both` rewind replaces the filesystem. This table is read from `onRequest`,
   // before a body exists, so that one is refused at its own route instead.
