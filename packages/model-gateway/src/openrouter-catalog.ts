@@ -8,6 +8,7 @@ import {
 } from '@athanor/core';
 import { seedMediaModels } from './catalog.js';
 import { currentCommercialLicenseReview } from './license-manifest.js';
+import { readOpenRouterModels } from './openrouter-shape.js';
 import { promptCacheStyleFor, type PromptCacheStyle } from './prompt-cache.js';
 
 /**
@@ -37,53 +38,66 @@ interface Options {
   previous?: ModelRelease[];
 }
 
+/*
+ * These five describe a model AFTER `readOpenRouterModels` has read it, not as it arrives on the
+ * wire. That distinction is the whole point of the module beside this one: what arrives is
+ * `unknown`, exactly one function ever looks at it, and everything below here reads the result.
+ *
+ * So the optional fields are gone. Every field is present and every one carries its own answer for
+ * "the feed said nothing" - an empty list, a null number, an undefined rate - which is what lets
+ * the code below stop guessing whether a field it is about to index exists. Two stay nullable, and
+ * for one reason: `alias_target` is the one whose absence is load-bearing - the ranking pass reads
+ * it as "this model was measured in its own right", so an always-present object would make every
+ * model an alias and empty the benchmark population - and `reasoning` is nullable to match it, the
+ * same decision the twin declaration in openrouter-shape.ts records.
+ */
 interface OpenRouterPriceTier {
-  min_prompt_tokens?: number;
-  prompt?: string;
-  completion?: string;
-  input_cache_read?: string;
-  input_cache_write?: string;
+  min_prompt_tokens: number | null;
+  prompt: string | undefined;
+  completion: string | undefined;
+  input_cache_read: string | undefined;
+  input_cache_write: string | undefined;
 }
 
 interface OpenRouterPricing {
-  prompt?: string;
-  completion?: string;
-  input_cache_read?: string;
-  input_cache_write?: string;
-  overrides?: OpenRouterPriceTier[];
+  prompt: string | undefined;
+  completion: string | undefined;
+  input_cache_read: string | undefined;
+  input_cache_write: string | undefined;
+  overrides: OpenRouterPriceTier[];
 }
 
 interface ArtificialAnalysisBenchmark {
-  intelligence_index?: number;
-  coding_index?: number;
-  agentic_index?: number;
+  intelligence_index: number | null;
+  coding_index: number | null;
+  agentic_index: number | null;
 }
 
 interface DesignArenaEntry {
-  arena?: string;
-  category?: string;
-  elo?: number;
-  win_rate?: number;
-  rank?: number;
+  arena: string | undefined;
+  category: string | undefined;
+  elo: number | null;
+  win_rate: number | null;
+  rank: number | null;
 }
 
 interface OpenRouterModel {
   id: string;
-  name?: string;
-  context_length?: number;
-  architecture?: { input_modalities?: string[]; output_modalities?: string[] };
-  pricing?: OpenRouterPricing;
-  supported_parameters?: string[];
-  top_provider?: { max_completion_tokens?: number | null };
-  knowledge_cutoff?: string | null;
-  expiration_date?: string | null;
+  name: string | undefined;
+  context_length: number | null;
+  architecture: { input_modalities: string[]; output_modalities: string[] };
+  pricing: OpenRouterPricing;
+  supported_parameters: string[];
+  top_provider: { max_completion_tokens: number | null };
+  knowledge_cutoff: string | null;
+  expiration_date: string | null;
   /** Set on the `~vendor/model-latest` entries, which carry no benchmarks of their own. */
-  alias_target?: { slug?: string; name?: string } | null;
-  reasoning?: { mandatory?: boolean } | null;
-  benchmarks?: {
-    artificial_analysis?: ArtificialAnalysisBenchmark | null;
-    design_arena?: DesignArenaEntry[] | null;
-  } | null;
+  alias_target: { slug: string | undefined; name: string | undefined } | null;
+  reasoning: { mandatory: boolean } | null;
+  benchmarks: {
+    artificial_analysis: ArtificialAnalysisBenchmark | null;
+    design_arena: DesignArenaEntry[];
+  };
 }
 
 /**
@@ -131,6 +145,46 @@ const MAX_CREDIBLE_USD_PER_MILLION_TOKENS = 10_000;
 const DEFAULT_CONTEXT_TOKENS = 128_000;
 /** How many dropped routes the journal line names before it counts the rest. */
 const JOURNALLED_DROP_LIMIT = 5;
+/**
+ * How much of one dropped route's id the journal line may spend on it.
+ *
+ * CHOSEN at 80. The longest model id anywhere in this repository's catalogues and fixtures is 36
+ * characters, so no id a provider has actually published comes near this and the line reads exactly
+ * as it did before; 80 also fits inside a terminal's traditional width, so five of them plus the
+ * surrounding sentence cannot push the count of the remainder off the screen.
+ */
+const JOURNALLED_ID_CHARS = 80;
+/**
+ * One dropped route's id, as it may appear on a line an owner reads.
+ *
+ * These ids are the feed's own strings and not this repository's. `readOpenRouterModels` passes a
+ * stated id through exactly as written - it is the name the provider will be called back with, so
+ * tidying it would invent an id nobody published - which makes every id here untrusted text on its
+ * way to `athanor logs`. That module is careful that its own `malformed` strings never quote the
+ * document, and there is a test holding it to that; the two id clauses beside it in `journalDrops`
+ * print the document directly, so the bound has to be here.
+ *
+ * Two things are done to it, and nothing else. Anything outside printable ASCII becomes a dot,
+ * because a newline inside an id would end athanor's line and begin one the feed wrote, in the
+ * journal's own voice and indistinguishable from it. Then it is cut to `JOURNALLED_ID_CHARS`.
+ *
+ * This does NOT make the id safe to act on, and nothing does act on it: it is one line of evidence
+ * about a route that was already dropped. It is also not a general escape - a dot is not reversible,
+ * so an owner reading a mangled id here is being told the provider published a strange one.
+ */
+const journalSafeId = (id: string): string => {
+  const printable = id.replace(/[^\x20-\x7e]/g, '.');
+  return printable.length > JOURNALLED_ID_CHARS
+    ? `${printable.slice(0, JOURNALLED_ID_CHARS)}...`
+    : printable;
+};
+/**
+ * What `refreshOpenRouterMediaCatalog` below can actually offer. A model that emits none of these
+ * and no text has no route anywhere in this build, which is the one drop the chat refresh used to
+ * make without a word - see `journalDrops`. Adding a kind here is not enough to serve it; this list
+ * exists so the journal stays true to what the media catalogue does, not to widen it.
+ */
+const MEDIA_OUTPUT_MODALITIES = ['image', 'audio', 'transcription'];
 
 /** Price per million input tokens decides how a run is weighed against the owner's usage windows. */
 const usageClassForPrice = (inputUsdPerMillion: number | null): ModelRelease['usageClass'] => {
@@ -366,21 +420,27 @@ export const refreshOpenRouterCatalog = async (
   const headers = { authorization: `Bearer ${options.apiKey}` };
   const [modelsResult, zdrResult] = await Promise.allSettled([
     request(`${baseUrl}/models`, { headers, signal: AbortSignal.timeout(15_000) }).then(
-      (response) => checkedJson<{ data?: OpenRouterModel[] }>(response, 'OpenRouter models')
+      (response) => checkedJson<unknown>(response, 'OpenRouter models')
     ),
     request(`${baseUrl}/endpoints/zdr`, {
       headers,
       signal: AbortSignal.timeout(15_000)
-    }).then((response) =>
-      checkedJson<{ data?: ZdrEndpoint[] }>(response, 'OpenRouter ZDR endpoints')
-    )
+    }).then((response) => checkedJson<{ data?: unknown }>(response, 'OpenRouter ZDR endpoints'))
   ]);
   // Without the model list there is no catalogue to build, so that failure still propagates.
   if (modelsResult.status === 'rejected') throw modelsResult.reason;
-  const modelsBody = modelsResult.value;
   const zdrBody = zdrResult.status === 'fulfilled' ? zdrResult.value : null;
 
-  const models = new Map((modelsBody.data ?? []).map((model) => [model.id, model]));
+  /*
+   * The feed is read once, here, and everything below this line works on the narrowed rows.
+   *
+   * `checkedJson` asks only whether the response was ok, so what it hands back is a document, not a
+   * catalogue. Four reshapes of that document each used to throw a raw TypeError out of this whole
+   * function - see openrouter-shape.ts, which names them - and a reshaped field now costs its own
+   * row that field rather than costing the owner the refresh.
+   */
+  const { models: listed, malformed } = readOpenRouterModels(modelsResult.value);
+  const models = new Map<string, OpenRouterModel>(listed.map((model) => [model.id, model]));
   /*
    * An empty list is an outage wearing a 200, and it has to be refused here rather than believed.
    *
@@ -397,9 +457,27 @@ export const refreshOpenRouterCatalog = async (
       'The provider answered but listed no models, so the catalogue was left as it was',
       502
     );
+  /*
+   * The endpoint feed is read with the same suspicion as the model feed, and for the same measured
+   * reason: `data` arriving as an object threw "object is not iterable" out of this function, and
+   * the `Promise.allSettled` above cannot catch it, because the request succeeded and it is the
+   * body that is wrong. So one failing shape on the feed that only carries privacy and uptime took
+   * down the refresh that carries every model.
+   *
+   * It gets a guard rather than a narrowing module of its own. Three fields are read off an
+   * endpoint below and every one of them is already asked `typeof` before it is believed, so the
+   * only thing missing was the shape of the list itself and of the rows in it.
+   */
+  const zdrRows: unknown[] = Array.isArray(zdrBody?.data) ? zdrBody.data : [];
   const zdr = new Map<string, ZdrEndpoint[]>();
-  for (const endpoint of zdrBody?.data ?? []) {
-    if (!endpoint.model_id || (endpoint.status !== undefined && endpoint.status !== 0)) continue;
+  for (const row of zdrRows) {
+    const endpoint = row as ZdrEndpoint | null;
+    if (
+      typeof endpoint?.model_id !== 'string' ||
+      endpoint.model_id === '' ||
+      (endpoint.status !== undefined && endpoint.status !== 0)
+    )
+      continue;
     const current = zdr.get(endpoint.model_id) ?? [];
     current.push(endpoint);
     zdr.set(endpoint.model_id, current);
@@ -411,7 +489,9 @@ export const refreshOpenRouterCatalog = async (
   const retirementHorizon = now.getTime() + RETIREMENT_HORIZON_DAYS * 86_400_000;
 
   /** An alias entry carries no benchmarks of its own; it inherits its target's. */
-  const benchmarksOf = (model: OpenRouterModel | undefined): OpenRouterModel['benchmarks'] => {
+  const benchmarksOf = (
+    model: OpenRouterModel | undefined
+  ): OpenRouterModel['benchmarks'] | null => {
     if (!model) return null;
     if (model.benchmarks?.artificial_analysis || model.benchmarks?.design_arena?.length)
       return model.benchmarks;
@@ -464,7 +544,7 @@ export const refreshOpenRouterCatalog = async (
   const qualityOf = (model: OpenRouterModel | undefined): Quality => {
     const benchmarks = benchmarksOf(model);
     const analysis = benchmarks?.artificial_analysis ?? null;
-    const index = (value: number | undefined): number | null =>
+    const index = (value: number | null | undefined): number | null =>
       typeof value === 'number' && Number.isFinite(value) ? value : null;
     const agenticIndex = index(analysis?.agentic_index);
     const codingIndex = index(analysis?.coding_index);
@@ -541,6 +621,56 @@ export const refreshOpenRouterCatalog = async (
   };
 
   const scope: ModelCatalogScope = options.scope ?? 'provider_catalog';
+
+  /** Routes left out of the answer because their stated price could not be one. */
+  const unbelievablyPriced: string[] = [];
+  /** Routes left out because nothing in this build can carry what they emit. */
+  const unroutableOutput: string[] = [];
+
+  /*
+   * One line for the whole refresh, at the same cadence and in the same place as the registry's own
+   * failure line: the journal, read through `athanor logs`. A route that quietly stopped being
+   * offered is otherwise unaccountable - this service has one owner, no listener and no metrics
+   * endpoint - and a line per dropped route would bury the rest of the unit's log the first time a
+   * provider shipped a broken price column across a vendor's whole range.
+   *
+   * Three clauses, because there are three ways to lose a route here and only one of them used to
+   * be said out loud. An absurd price was journalled from the start; a row too reshaped to read and
+   * a model emitting something this build has no route for were both dropped in silence, and the
+   * second of those is how a new output modality would arrive - dropped from the chat catalogue for
+   * not emitting text and from the media catalogue for not emitting one of the three kinds it
+   * offers, with nothing anywhere to say the provider had shipped it.
+   *
+   * It is written from both of this function's exits rather than only from the last one, because a
+   * `reviewed_open_weight` refresh returns before the loop below and reads the same feed: the rows
+   * it could not parse are a fact about the document, not about the owner's scope.
+   */
+  const journalDrops = (): void => {
+    const named = (ids: string[]): string =>
+      `${ids.slice(0, JOURNALLED_DROP_LIMIT).map(journalSafeId).join(', ')}${
+        ids.length > JOURNALLED_DROP_LIMIT ? ` and ${ids.length - JOURNALLED_DROP_LIMIT} more` : ''
+      }`;
+    const clauses = [
+      unbelievablyPriced.length
+        ? `${unbelievablyPriced.length} live ${
+            unbelievablyPriced.length === 1 ? 'route was' : 'routes were'
+          } left out because the provider stated a rate above $${MAX_CREDIBLE_USD_PER_MILLION_TOKENS} per million tokens: ${named(unbelievablyPriced)}`
+        : null,
+      unroutableOutput.length
+        ? `${unroutableOutput.length} live ${
+            unroutableOutput.length === 1 ? 'route was' : 'routes were'
+          } left out because this build has no route for what ${
+            unroutableOutput.length === 1 ? 'it emits' : 'they emit'
+          }: ${named(unroutableOutput)}`
+        : null,
+      malformed.length
+        ? `${malformed.length} ${
+            malformed.length === 1 ? 'row was' : 'rows were'
+          } skipped as unreadable: ${named(malformed)}`
+        : null
+    ].filter((clause): clause is string => clause !== null);
+    if (clauses.length) process.stderr.write(`[athanor] model catalogue: ${clauses.join('; ')}\n`);
+  };
 
   /** Live metadata shared by reviewed and unreviewed models alike. */
   const enrich = (providerModelId: string, catalogueId: string) => {
@@ -673,17 +803,24 @@ export const refreshOpenRouterCatalog = async (
     };
   });
 
-  if (scope === 'reviewed_open_weight') return reviewedEntries;
+  if (scope === 'reviewed_open_weight') {
+    journalDrops();
+    return reviewedEntries;
+  }
 
   const reviewedIds = new Set(allowlist.map((entry) => entry.providerModelId));
   const liveEntries: CatalogModelRelease[] = [];
-  /** Routes left out of the answer because their stated price could not be one. */
-  const unbelievablyPriced: string[] = [];
   for (const [providerModelId, live] of models) {
     if (reviewedIds.has(providerModelId)) continue;
-    const outputModalities = live.architecture?.output_modalities;
+    const outputModalities = live.architecture.output_modalities;
     // Image, audio and video generators are reached through the media service, not the chat loop.
-    if (outputModalities?.length && !outputModalities.includes('text')) continue;
+    if (outputModalities.length && !outputModalities.includes('text')) {
+      // ...unless the media service has no route for it either, in which case the model is gone
+      // from both catalogues and this is the only place that can say so.
+      if (!outputModalities.some((modality) => MEDIA_OUTPUT_MODALITIES.includes(modality)))
+        unroutableOutput.push(providerModelId);
+      continue;
+    }
     /*
      * A route whose price cannot be a price is left out rather than offered with the price removed.
      * `perMillion` has already refused the figure, and an entry carrying no price is not a cautious
@@ -753,25 +890,7 @@ export const refreshOpenRouterCatalog = async (
     });
   }
 
-  /*
-   * One line for the whole refresh, at the same cadence and in the same place as the registry's own
-   * failure line: the journal, read through `athanor logs`. A route that quietly stopped being
-   * offered is otherwise unaccountable - this service has one owner, no listener and no metrics
-   * endpoint - and a line per dropped route would bury the rest of the unit's log the first time a
-   * provider shipped a broken price column across a vendor's whole range.
-   */
-  if (unbelievablyPriced.length)
-    process.stderr.write(
-      `[athanor] model catalogue: ${unbelievablyPriced.length} live ${
-        unbelievablyPriced.length === 1 ? 'route was' : 'routes were'
-      } left out because the provider stated a rate above $${MAX_CREDIBLE_USD_PER_MILLION_TOKENS} per million tokens: ${unbelievablyPriced
-        .slice(0, JOURNALLED_DROP_LIMIT)
-        .join(', ')}${
-        unbelievablyPriced.length > JOURNALLED_DROP_LIMIT
-          ? ` and ${unbelievablyPriced.length - JOURNALLED_DROP_LIMIT} more`
-          : ''
-      }\n`
-    );
+  journalDrops();
 
   return [...reviewedEntries, ...liveEntries];
 };
@@ -847,14 +966,27 @@ export const refreshOpenRouterMediaCatalog = async (options: {
   const updatedAt = now.toISOString();
   const [modelsResult, zdrResult] = await Promise.allSettled([
     request(`${baseUrl}/models`, { headers, signal: AbortSignal.timeout(15_000) }).then(
-      (response) => checkedJson<{ data?: OpenRouterModel[] }>(response, 'OpenRouter models')
+      (response) => checkedJson<unknown>(response, 'OpenRouter models')
     ),
     request(`${baseUrl}/endpoints/zdr`, { headers, signal: AbortSignal.timeout(15_000) }).then(
-      (response) => checkedJson<{ data?: ZdrEndpoint[] }>(response, 'OpenRouter ZDR endpoints')
+      (response) => checkedJson<{ data?: unknown }>(response, 'OpenRouter ZDR endpoints')
     )
   ]);
   if (modelsResult.status === 'rejected') throw modelsResult.reason;
-  const listed = modelsResult.value.data ?? [];
+  /*
+   * The same narrowing as the chat refresh, for the same reason: this path walks the same document
+   * and would throw the same TypeErrors out of it.
+   *
+   * It does NOT journal the rows it could not read, and that is a gap rather than a saving. The
+   * claim that stood here - that the chat refresh runs against the same feed on the same box and
+   * has already named them - is not true of every entry into this function: `mediaCatalogFor` in
+   * apps/api/src/routes/support.ts calls it directly when the Settings media picker is opened,
+   * behind its own five-minute cache, with no chat refresh anywhere on that path. So a reshaped row
+   * can be dropped from the media picker here with nothing said, which is the exact silence
+   * `journalDrops` was written to end. Closing it means moving the journal below both entry points;
+   * that is a larger change than this one and it has not been made.
+   */
+  const listed: OpenRouterModel[] = readOpenRouterModels(modelsResult.value).models;
   if (listed.length === 0)
     throw new AthanorError(
       'provider_catalog_empty',
@@ -862,10 +994,16 @@ export const refreshOpenRouterMediaCatalog = async (options: {
       502
     );
   const zdrBody = zdrResult.status === 'fulfilled' ? zdrResult.value : null;
+  /** The same guard as the chat refresh above, against the same measured crash. */
+  const zdrRows = (Array.isArray(zdrBody?.data) ? zdrBody.data : []) as Array<ZdrEndpoint | null>;
   const zdrModelIds = new Set(
-    (zdrBody?.data ?? [])
-      .filter((endpoint) => endpoint.status === undefined || endpoint.status === 0)
-      .flatMap((endpoint) => (endpoint.model_id ? [endpoint.model_id] : []))
+    zdrRows
+      .filter((endpoint) => endpoint?.status === undefined || endpoint.status === 0)
+      .flatMap((endpoint) =>
+        typeof endpoint?.model_id === 'string' && endpoint.model_id !== ''
+          ? [endpoint.model_id]
+          : []
+      )
   );
   const listedIds = new Set(listed.map((model) => model.id));
   const seeds = seedMediaModels(now).map((seed) => ({

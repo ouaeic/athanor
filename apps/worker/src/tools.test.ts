@@ -84,9 +84,16 @@ describe('which calls count as changing something', () => {
       'balanced'
     );
     expect(launched?.sideEffect).toBe('external_consequential');
+    // `~/.ssh` rather than `x`, because `desktop_launch` defaults its `cwd` to `workspace` exactly
+    // as `shell` does, so `rm -rf x` there is `workspace/x` - inside the turn's own undo point, and
+    // no longer a card by this floor's own rule. @see `insideCheckpointContent`. The claim this
+    // line makes is about the window and not about the path, so the path is one nothing restores.
     expect(
-      approvalRequirement('desktop_launch', { executable: 'rm', args: ['-rf', 'x'] }, 'autonomous')
-        ?.sideEffect
+      approvalRequirement(
+        'desktop_launch',
+        { executable: 'rm', args: ['-rf', '~/.ssh'] },
+        'autonomous'
+      )?.sideEffect
     ).toBe('external_consequential');
     // An ordinary application still opens without one.
     expect(

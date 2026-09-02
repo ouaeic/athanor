@@ -238,6 +238,20 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
         }
       }
     }
+    /*
+     * The owner rewrote the FIRST message, so there is nothing behind it to inherit.
+     *
+     * Named here and used twice below: it is what makes `agentStateCiphertext` null, and it is why
+     * the fork's opening window is the new request alone. It is also the reason `cachePrefixTaskId`
+     * in `apps/worker/src/window.ts` admits `retry` and NOT `edit` - a fork with no inherited
+     * trajectory that ranked its knowledge block and packed its memory against the parent's prompt
+     * would be answering the question its owner had just thrown away.
+     *
+     * It is computed and not stored, which is the whole of what stops the worker distinguishing the
+     * two kinds of edit: `tasks.fork_kind` is 'edit' for both, and an edit of a LATER message does
+     * keep a full inherited trajectory and is the case where inheriting the parent's prefix pays.
+     * Reinstating `edit` there wants a column this route can write with this value.
+     */
     const editingInitialPrompt =
       input.operation === 'edit' && copiedEvents.length === 0 && target === conversational[0];
     if (!editingInitialPrompt && systemMessages.length === 0)

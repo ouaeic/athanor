@@ -159,7 +159,20 @@ export const WRITING_GIT_SUBCOMMANDS = new Set([
   'rm',
   'stash',
   'switch',
-  'tag'
+  'tag',
+  /*
+   * `git worktree add` creates a second checkout and `git worktree remove --force` deletes one
+   * along with whatever was uncommitted in it, and neither was scored as a change - so
+   * `writtenPaths` named no path for either and every rule downstream of it was answering about a
+   * command it thought had written nothing.
+   *
+   * A reading `git worktree list` is scored a write by this set too, because a set of subcommands
+   * cannot see its own operands. That costs the completion rule one extra check and raises no card,
+   * which is the asymmetry write-classification.ts states in its own words: a command wrongly
+   * called a change costs a second check, and a change wrongly called a check cannot be recovered
+   * from.
+   */
+  'worktree'
 ]);
 
 export const consequentialExecutables = new Set([
@@ -172,12 +185,58 @@ export const consequentialExecutables = new Set([
   'reboot',
   'poweroff',
   'halt',
-  'kill',
-  'killall',
-  'pkill',
   'dd',
   'wipefs'
 ]);
+
+/**
+ * Signalling a process, which is not destroying data and used to be filed as though it were.
+ *
+ * `kill`, `killall` and `pkill` sat in the set above beside `rm` and `dd`. Measured through the
+ * shipped `approvalRequirement` at bfbbd00, `kill -0 1234` - a liveness probe that sends no signal
+ * at all - `pkill -f vite` and `killall node` each stopped the turn in ALL THREE modes under a
+ * preview reading "This can remove or overwrite data", which is false of every one of them.
+ * Stopping the dev server this agent started two calls earlier is ordinary work, and a card in
+ * front of ordinary work is a card the owner learns to tap through.
+ *
+ * They are named here rather than simply deleted, because `placeableExecutable` is the list of
+ * words this file can NAME and the publish walk reads straight past a word it cannot place:
+ * dropping the three outright would have made `pkill -f "npm publish"` read on to `npm`.
+ *
+ * What signalling can still do to this computer is held by `signalStopsThisComputer` below instead,
+ * because it is a property of the target and not of the program.
+ */
+export const SIGNALLING_EXECUTABLES = new Set(['kill', 'killall', 'pkill']);
+
+/**
+ * A signal whose target is the computer rather than a process on it.
+ *
+ * PID 1 is the init process: signalling it ends every process on this machine, the turn asking the
+ * question included, and nothing here brings it back - which is the `shutdown` family's card
+ * arriving by another spelling. `-1` is the other target that means everything, since to `kill` it
+ * is every process the caller may signal.
+ *
+ * ONE token is dropped, and only when it begins with a dash, so `kill -9 1` stops and `kill -1 1234`
+ * - SIGHUP to one process - does not. It does not parse `-s`, and the consequence is worth saying
+ * in both directions rather than only the flattering one: the VALUE of a `-s` stays in the target
+ * list, so `kill -s SIGKILL 1` is still caught by the `1` after it, and `kill -s 1 1234` - SIGHUP
+ * by number to one ordinary process - is carded when it should not be. That last one is a card
+ * nobody needs and it was carded before this function existed too, so it costs nothing new; the
+ * alternative, teaching this the option grammar of every `kill` on every platform, buys one card
+ * back and risks reading a target as a signal, which frees the one act this exists to stop.
+ *
+ * A PID arriving through a substitution is not read at all, and `killall`/`pkill` are not asked,
+ * since neither names PID 1 by number. Both land on the no-card path, which is where a signal to an
+ * ordinary process belongs, and both are a walk-past a determined caller can take.
+ */
+export const signalStopsThisComputer = (
+  executable: string,
+  commandArgs: readonly string[]
+): boolean =>
+  executable === 'kill' &&
+  commandArgs
+    .slice(commandArgs[0]?.startsWith('-') ? 1 : 0)
+    .some((argument) => argument === '1' || argument === '-1');
 /**
  * Commands whose whole job is to run another command. What they run is what matters; the wrapper
  * itself changes nothing.
@@ -592,6 +651,17 @@ export const isDestructiveScript = (body: string): boolean =>
     `(?<![\\w.])(?:${[...consequentialExecutables].join('|')}|mkfs[\\w.-]*|shutil\\.rmtree|os\\.(?:remove|removedirs|rmdir|unlink))(?![\\w])`
   ).test(body) ||
   DESTRUCTIVE_RUNTIME_CALL.test(body) ||
+  /*
+   * The one destruction in here that no name in the scan above spells. Every other member is a
+   * program whose name says what it does; `git worktree remove --force ../wt` is spelled with
+   * `git`, which is in `safeNetworkExecutables` and in nothing destructive. Read from the
+   * decomposed commands rather than from a pattern over the body, so `git worktree list` and the
+   * word `remove` in a commit message are not it.
+   */
+  scriptCommands(body).some(
+    ([head = '', ...rest]) =>
+      (unquoted(head).split('/').pop() ?? '').toLowerCase() === 'git' && gitRemovesAWorktree(rest)
+  ) ||
   escapingRedirect(body);
 export const safeNetworkExecutables = new Set([
   'apt',
@@ -941,6 +1011,366 @@ export const shellWriteTargets = (args: Record<string, unknown>): string[] | nul
     }
   }
   return targets.filter(Boolean);
+};
+
+/* ------------------------------------- what a rewind puts back, and what it does not ---------- */
+
+/**
+ * The trees the turn's undo point restores, as the path segments they are.
+ *
+ * `CHECKPOINT_CONTENT` (services/workspace-runner/src/checkpoints.ts) is
+ * `['workspace', '.athanor/artifacts']`. It is copied rather than imported because `apps/worker`
+ * does not depend on the runner package and must not start to for one array; the copy is pinned to
+ * the original by a test in `command-classification.test.ts` that reads the runner's own source, so
+ * a third entry appearing there fails here rather than silently narrowing what this file is willing
+ * to call recoverable.
+ */
+export const CHECKPOINT_CONTENT: readonly (readonly string[])[] = [
+  ['workspace'],
+  ['.athanor', 'artifacts']
+];
+
+/**
+ * Whether a path a command names lands somewhere a rewind puts back.
+ *
+ * This is the test DESIGN.md's own rule has always implied and the floor did not apply: a card is
+ * owed when the act cannot be taken back by this computer, and the checkpoint's actual coverage is
+ * what decides that. Measured through the shipped `approvalRequirement` at bfbbd00, in AUTONOMOUS:
+ * `rm -rf dist`, `rm workspace/tmp.log`, `rmdir build`, `truncate -s 0 server.log`,
+ * `find workspace/downloads -name '*.tmp' -delete` and `rm -rf node_modules` all raised
+ * `external_consequential` and stopped the turn - every one of them inside `workspace/`, every one
+ * of them restored by the undo point the same turn had already taken.
+ *
+ * TWO SPELLINGS OF ONE PLACE. `shell` runs in `workspace/`, so a bare `dist` is `workspace/dist`;
+ * and the rest of this repository writes that same file as `workspace/dist`, because `resolveInside`
+ * in the runner accepts either. So a leading `workspace` or `.athanor` segment is read from the
+ * workspace root and every other relative path is read from the cwd, which makes the two spellings
+ * one answer - the same equivalence `isDurableInstructionPath` already relies on. It is one answer
+ * only where the cwd is at or inside a checkpointed tree, which is the ordinary case and the only
+ * case where the two readings cannot differ; from a cwd anywhere else the literal reading is taken
+ * instead, and `rootRelative` says what that costs and why.
+ *
+ * STRICTLY inside, and the word is load-bearing three ways.
+ *   - `HOME` is `<workspaceRoot>/.home` - at the container root, BESIDE `workspace/` and not
+ *     inside it (services/workspace-runner/src/execution.ts `agentHome`, over
+ *     `AGENT_HOME` in files.ts). So `~/.cargo`, `~/.ssh` and `~/.bashrc` are under the root and
+ *     inside no checkpoint at all. A rule that asked "inside the root" would have freed a delete
+ *     of the agent's own shell configuration. @see `AGENT_HOME` below for why `~` cannot be read
+ *     as the root itself.
+ *   - `workspace` and `.athanor/artifacts` are not inside themselves. Whether a rewind recreates a
+ *     top-level tree that was removed outright is not something this file can know, so
+ *     `rm -rf workspace` keeps its card.
+ *   - An absolute path is outside by construction. The workspace root is a real directory whose
+ *     name this pure function is never handed, so `/home/athanor/ws-1/workspace/dist` is not
+ *     recognised as the workspace and keeps its card. That is a card the owner did not need, and it
+ *     is the direction to be wrong in: the alternative is matching `workspace` anywhere inside an
+ *     absolute path, which would free `/home/other/workspace-backup`.
+ *
+ * A target carrying `$` or a backtick answers false, because `$HOME/.ssh` and `workspace/$D` are
+ * decided by an expansion this function cannot see, and `shell` performs none of it itself.
+ *
+ * WHAT THIS ANSWERS IS A PLACE, NOT A GUARANTEE, and the gap between the two is a residue rather
+ * than a decision. `CHECKPOINT_CONTENT` is the set of trees a checkpoint WALKS; what it actually
+ * holds is narrower in two measured ways, both in services/workspace-runner/src/checkpoints.ts. A
+ * file over `CHECKPOINT_MAX_FILE_BYTES` - 2 GiB by default, a disk image or a model weight - is
+ * recorded as `uncovered` and its content is never copied, so `rm workspace/model.gguf` is inside
+ * this test and outside the rewind. And a tree over `CHECKPOINT_MAX_FILES` - 250,000 by default -
+ * makes TAKING a checkpoint throw `checkpoint_workspace_too_large`, so a workspace that has just
+ * had a large dependency tree unpacked into it may have no undo point for this turn at all.
+ * Neither is visible from here: `approvalRequirement` is a pure function of the tool name and the
+ * arguments the model wrote, with no filesystem and no runner to ask. Closing it needs a fact
+ * carried on `ApprovalContext` by whoever took - or failed to take - the checkpoint, and nothing
+ * has measured how often either ceiling is crossed on a real workspace.
+ *
+ * THE WORKING DIRECTORY IS AN ARGUMENT, not an assumption. `shell` and `desktop_launch` both take a
+ * `cwd` that the catalogue shows the model and both default it to `workspace`, and `resolveInside`
+ * accepts any path inside the ROOT for it - so `{ cwd: '.', executable: 'rm', args: ['-rf',
+ * '.ssh'] }` deletes the agent's own SSH directory while naming a bare relative path. Reading a
+ * bare name against a hard-coded `workspace/` would have freed exactly that call. The caller passes
+ * the cwd it was given; a cwd that is itself outside the checkpoints makes every bare name outside
+ * them too, which is the answer that call deserves.
+ */
+/**
+ * Where `~` lands, as the segments below the workspace root that `$HOME` actually is.
+ *
+ * `HOME` is `<workspaceRoot>/.home`: services/workspace-runner/src/execution.ts builds it as
+ * `path.join(workspaceRoot, AGENT_HOME)` and files.ts declares `AGENT_HOME = '.home'`. It sits at
+ * the container root and NOT under `workspace/`, because a home inside `workspace/` is inside
+ * `CHECKPOINT_CONTENT` - every toolchain cache would be walked and hashed on every turn and
+ * counted against `CHECKPOINT_MAX_FILES` = 250,000, and crossing that throws
+ * `CheckpointRefusedError` and costs the turn the very undo point this whole rule is written
+ * against.
+ *
+ * This function read `~` as the root ITSELF, which was true while `HOME` was `workspaceRoot` and
+ * became a live hole the moment it stopped being. Measured through the shipped
+ * `approvalRequirement` in autonomous with `~` read as the root: `rm -rf ~/workspace/dist` and
+ * `rm -rf ~/.athanor/artifacts/a.png` both raised NO card, because they resolved to
+ * `<root>/workspace/dist` and `<root>/.athanor/artifacts/a.png` and answered "inside the
+ * checkpoint" - while what they actually delete is `<root>/.home/workspace/dist` and
+ * `<root>/.home/.athanor/artifacts/a.png`, which no rewind walks and nothing puts back. Both card
+ * again with the segment in front. Nothing was freed by adding it: `~/.ssh` and `~/.cargo/registry`
+ * were outside the checkpoint under either reading, and `~/../workspace/dist` - which used to climb
+ * out of the root and answer null - now resolves to the real `workspace/dist` and is correctly
+ * free.
+ *
+ * One segment, spelled the way everything else here is spelled, relative to the workspace root.
+ * `command-classification.test.ts` pins it against `AGENT_HOME` in the runner's own source, so a
+ * later move of `$HOME` fails there rather than quietly freeing a delete here - which is exactly
+ * how this defect arrived.
+ */
+export const AGENT_HOME: readonly string[] = ['.home'];
+
+/**
+ * Whether resolved segments sit under one of the checkpointed trees.
+ *
+ * `strictly` is what the exported test needs, because a tree is not inside itself and nothing here
+ * knows whether a rewind recreates one removed outright. The base check in `rootRelative` needs the
+ * other form: `cwd: 'workspace'` is AT a root rather than under one, and it is the ordinary case.
+ */
+const underCheckpointContent = (resolved: readonly string[], strictly: boolean): boolean =>
+  CHECKPOINT_CONTENT.some(
+    (prefix) =>
+      (strictly ? resolved.length > prefix.length : resolved.length >= prefix.length) &&
+      prefix.every((part, index) => resolved[index] === part)
+  );
+
+const rootRelative = (spelling: string, base: readonly string[]): string[] | null => {
+  const cleaned = spelling.replace(/^['"]+|['"]+$/g, '');
+  if (cleaned.startsWith('/') || /[$`]/.test(cleaned)) return null;
+  const written = cleaned.split(/[\\/]+/).filter((segment) => segment && segment !== '.');
+  const first = written[0] ?? '';
+  // `~other` is somebody else's home directory and is not the agent's; only a bare `~` is HOME.
+  if (first.startsWith('~') && first !== '~') return null;
+  /*
+   * The root-relative reading of `workspace/…` and `.athanor/…` is an EQUIVALENCE, and it holds
+   * only where the two spellings really are one place.
+   *
+   * A relative path means whatever the working directory is when the command runs, so
+   * `workspace/dist` is literally `<cwd>/workspace/dist`. Reading it from the root instead is
+   * right while the cwd is inside a checkpointed tree - `<root>/workspace/workspace/dist` and
+   * `<root>/workspace/dist` are both recoverable, so the divergence cannot change the answer - and
+   * right at the root itself, where the two readings are the same path. Anywhere else it is the
+   * `~` hole in the other argument: measured through the shipped `approvalRequirement` in
+   * autonomous with this condition absent, `{ executable: 'rm', args: ['-rf', 'workspace/dist'],
+   * cwd: '.home' }` raised NO card, while what it removes is `<root>/.home/workspace/dist` - a
+   * directory under the agent's own HOME wearing the prefix that means "recoverable", inside
+   * nothing a rewind walks. `cwd` is an argument the catalogue shows the model and
+   * `resolveInside` accepts any path inside the container root for it, so `.home` is a cwd the
+   * model may simply write.
+   *
+   * Falling through to `[...base, ...written]` is the literal reading, which is what every other
+   * relative path already gets.
+   */
+  const rootRelativeSpellingHolds = base.length === 0 || underCheckpointContent(base, false);
+  const rooted =
+    first === '~'
+      ? [...AGENT_HOME, ...written.slice(1)]
+      : (first === 'workspace' || first === '.athanor') && rootRelativeSpellingHolds
+        ? written
+        : [...base, ...written];
+  const resolved: string[] = [];
+  for (const segment of rooted) {
+    if (segment !== '..') {
+      resolved.push(segment);
+      continue;
+    }
+    // A `..` with nothing left to pop has climbed out of the workspace root altogether.
+    if (!resolved.pop()) return null;
+  }
+  return resolved;
+};
+
+export const insideCheckpointContent = (target: string, cwd = 'workspace'): boolean => {
+  const base = rootRelative(cwd, []);
+  const resolved = base && target ? rootRelative(target, base) : null;
+  return resolved !== null && underCheckpointContent(resolved, true);
+};
+
+/**
+ * Whether removing `target` would take a file the checkpoint walked past with it.
+ *
+ * `insideCheckpointContent` answers where a delete lands; this answers whether what lands there
+ * comes back. A file over `CHECKPOINT_MAX_FILE_BYTES` - 2 GiB - is recorded by the scan and not
+ * held (services/workspace-runner/src/checkpoints.ts, `scan.uncovered`), so `rm workspace/model.gguf`
+ * on a 4 GiB weight file is strictly inside `CHECKPOINT_CONTENT`, is freed by the location rule,
+ * and is restored by nothing. On a box holding model weights or sequencing reads that is the single
+ * most likely large irreversible delete there is.
+ *
+ * The match is a PREFIX and not an equality, because the directory containing the file destroys it
+ * just as thoroughly: `rm -rf workspace/models` has to card while `workspace/models/llama.gguf` is
+ * uncovered. `uncovered` arrives root-relative from the runner's own walk, which is the same frame
+ * `rootRelative` resolves into, so the two are compared segment by segment rather than as strings -
+ * `workspace/model` must not match `workspace/model.gguf`.
+ *
+ * An unplaceable target answers true. The caller has already required every target to be inside
+ * `CHECKPOINT_CONTENT`, so this cannot normally happen; if it ever does, "cannot tell" belongs on
+ * the side that keeps the card, exactly as null does everywhere else in this file.
+ *
+ * AND A SEGMENT THE SHELL WILL EXPAND MATCHES ANY SEGMENT, which is the only reading of a glob
+ * that is not a hole. `shell` performs no expansion, but the tool catalogue tells the model to
+ * reach for the wrapped spelling the moment it wants one, and that is the spelling this rule is
+ * asked about: measured through `approvalRequirement` in autonomous with
+ * `uncovered: ['workspace/models/llama.gguf']`, `bash -lc 'rm -f workspace/models/*.gguf'` and
+ * `bash -lc 'rm -rf workspace/*'` were both FREE, because `*.gguf` is not the string `llama.gguf`.
+ * That is the same 4 GiB weight file this function exists for, deleted through the spelling a
+ * model actually writes for "clear out the old ones".
+ *
+ * It costs an ordinary workspace nothing: `uncovered` is empty there and the first line answers.
+ * On a workspace that does hold an oversize file the cost is one card, and only for a glob on the
+ * path to it - `workspace/downloads/*.dmg` still frees itself against an uncovered
+ * `workspace/models/llama.gguf`, because the segments before the glob still have to match.
+ */
+const EXPANDS_TO_MORE_THAN_ITSELF = /[*?[\]{}]/;
+
+export const removesUncoveredFile = (
+  target: string,
+  cwd: string,
+  uncovered: readonly string[]
+): boolean => {
+  if (!uncovered.length) return false;
+  const base = rootRelative(cwd, []);
+  const resolved = base && target ? rootRelative(target, base) : null;
+  if (!resolved) return true;
+  return uncovered.some((path) => {
+    const walked = path.split(/[\\/]+/).filter((segment) => segment && segment !== '.');
+    return (
+      walked.length >= resolved.length &&
+      resolved.every(
+        (segment, at) => walked[at] === segment || EXPANDS_TO_MORE_THAN_ITSELF.test(segment)
+      )
+    );
+  });
+};
+
+/**
+ * The removers whose damage is exactly the paths they are handed.
+ *
+ * `dd`, `wipefs` and `mkfs*` are deliberately absent even though they remove data, because what
+ * they write is a device rather than a path in this tree and `of=/dev/sda` is not a question about
+ * the checkpoint. They keep their card in every mode, which costs the owner nothing measurable: no
+ * scenario in `evals/cards` runs one.
+ */
+const PATH_SCOPED_REMOVERS = new Set(['rm', 'rmdir', 'unlink', 'shred', 'truncate']);
+
+/** Everything a command names that is not an option. Over-naming here can only add a constraint. */
+const operandsOf = (commandArgs: readonly string[]): string[] =>
+  commandArgs.filter((argument) => !argument.startsWith('-'));
+
+/** The language-runtime deletes `isDestructiveScript` reads, whose target lives inside a string. */
+const RUNTIME_DELETE_NAME = /(?:shutil\.rmtree|os\.(?:remove|removedirs|rmdir|unlink))\s*\(/;
+
+/**
+ * Whether a command this file cannot place as a removal might still remove something.
+ *
+ * The stopping condition for the script walk below, and the reason it is a separate question: a
+ * script is only recoverable if EVERY command in it is, so a command that yields no targets has to
+ * be shown to remove nothing rather than assumed to. `xargs rm`, `sudo rm` and `find . -exec rm`
+ * all name their remover in a non-head position and their paths nowhere in the command text.
+ */
+const mayRemoveSomething = (name: string, tokens: readonly string[]): boolean => {
+  if (consequentialExecutables.has(name) || name.startsWith('mkfs')) return true;
+  const lower = tokens.map((token) => token.toLowerCase());
+  if (name === 'find')
+    return lower.some((token) => ['-delete', '-exec', '-execdir', '-ok'].includes(token));
+  if (name === 'rsync') return lower.includes('--delete');
+  // `git worktree remove` names its remover nowhere: the head is `git` and not one token below is
+  // a removal program, so the walk read `rm -rf dist && git worktree remove --force ../wt` as one
+  // recoverable delete and nothing else. It is the one destructive shape here that cannot be seen
+  // by looking at names.
+  if (name === 'git' && gitRemovesAWorktree(tokens)) return true;
+  return tokens.some((token) => {
+    const inner = unquoted(token).split('/').pop() ?? '';
+    return consequentialExecutables.has(inner) || inner.startsWith('mkfs');
+  });
+};
+
+/**
+ * The commands that move the ground every relative path after them is read against.
+ *
+ * A removal target is resolved against the working directory the CALL names, and a `cd` earlier in
+ * the same command line makes that resolution wrong in the one direction that costs something.
+ * Measured through `approvalRequirement` in autonomous, with the location rule in place and this
+ * set absent: `bash -lc 'cd ~ && rm -rf .ssh'`, `sh -c 'cd /home/other && rm -rf photos'` and
+ * `bash -lc 'cd /etc && rm -rf nginx'` all raised NO card, because `.ssh`, `photos` and `nginx`
+ * were each read as bare names under `workspace/`. All three card without the `cd`, and all three
+ * carded before the location rule existed. This file's own header names `sh -c` with a `cd` in
+ * front as one of the four shapes a model actually writes.
+ *
+ * REFUSED RATHER THAN FOLLOWED, and the choice is the same one `removalTargets` makes everywhere
+ * else. Carrying a base through the script would mean reading `cd -`, `cd "$D"`, a `pushd`/`popd`
+ * pair and a subshell that restores the directory on the way out, and every one of those read
+ * wrongly frees a delete rather than costing a card. So a command line that re-bases itself is
+ * unplaceable: `cd workspace/app && rm -rf dist` keeps a card it does not need, which is the
+ * direction a resolver whose whole job is to drop cards has to be wrong in.
+ */
+const REBASING_COMMANDS = new Set(['cd', 'chdir', 'pushd', 'popd']);
+
+/** The head of a decomposed command, as the bare program name this file compares. */
+const commandName = (head: string): string => (unquoted(head).split('/').pop() ?? '').toLowerCase();
+
+export const commandsChangeDirectory = (commands: readonly (readonly string[])[]): boolean =>
+  commands.some(([head = '']) => REBASING_COMMANDS.has(commandName(head)));
+
+const scriptRemovalTargets = (script: string): string[] | null => {
+  /*
+   * The two shapes `isDestructiveScript` catches that no decomposed command carries: an escaping
+   * redirect names its target after a `>`, and a delete through a language runtime names it inside
+   * a string. Neither is placeable here, and both keep the card.
+   */
+  if (!script || escapingRedirect(script)) return null;
+  if (DESTRUCTIVE_RUNTIME_CALL.test(script) || RUNTIME_DELETE_NAME.test(script)) return null;
+  const commands = scriptCommands(script);
+  // A script this cannot read at all is unknown rather than safe, as it is for every other reader.
+  if (!commands.length) return null;
+  if (commandsChangeDirectory(commands)) return null;
+  const targets: string[] = [];
+  for (const [head = '', ...rest] of commands) {
+    const name = commandName(head);
+    const removals = removalTargets(name, rest);
+    if (removals) {
+      targets.push(...removals);
+      continue;
+    }
+    if (mayRemoveSomething(name, rest)) return null;
+  }
+  return targets.length ? targets : null;
+};
+
+/**
+ * The paths a destructive command would remove, or null when what it removes cannot be shown.
+ *
+ * Null is the answer for every shape this cannot place, and every caller reads it as "card": a
+ * wrapper (`sudo rm`, `xargs rm`), a device writer, a `find` that runs a command on what it finds,
+ * a delete through a language runtime, an interpreter whose script cannot be parsed, and a
+ * `rm` with no operand at all - which is either a no-op or `find … | xargs rm`, whose paths are not
+ * in the command text.
+ *
+ * It does NOT resolve through a wrapper. `sudo rm -rf dist` is judged by the wrapped arm above and
+ * keeps its card even though the path is recoverable, and so does `bash -lc 'sh -c "rm -rf dist"'`;
+ * both are one card the owner did not need, and both are the safe direction for a resolver whose
+ * whole job is to say when a card may be dropped.
+ */
+export const removalTargets = (
+  executable: string,
+  commandArgs: readonly string[],
+  script = ''
+): string[] | null => {
+  if (commandInterpreters.has(executable)) return scriptRemovalTargets(script);
+  if (PATH_SCOPED_REMOVERS.has(executable)) {
+    const operands = operandsOf(commandArgs);
+    return operands.length ? operands : null;
+  }
+  if (executable === 'find') {
+    const lower = commandArgs.map((argument) => argument.toLowerCase());
+    if (!lower.includes('-delete')) return null;
+    if (lower.some((argument) => ['-exec', '-execdir', '-ok'].includes(argument))) return null;
+    const operands = operandsOf(commandArgs);
+    return operands.length ? operands : null;
+  }
+  // The one destructive git shape whose damage is exactly the path it names, so a worktree the
+  // agent made for itself under `workspace/` is placed and freed like any other delete.
+  if (executable === 'git') return worktreeRemovalTargets(commandArgs);
+  return null;
 };
 
 /*
@@ -1479,6 +1909,57 @@ const gitSubcommandIndex = (args: readonly string[]): number => {
 export const gitSubcommand = (args: string[]): string | null => {
   const index = gitSubcommandIndex(args);
   return index < 0 ? null : (args[index] ?? '').toLowerCase();
+};
+
+/**
+ * Whether a git command deletes a whole second checkout.
+ *
+ * `git worktree remove --force ../wt` deletes the directory and everything uncommitted in it, and
+ * it was free in balanced and autonomous: `WRITING_GIT_SUBCOMMANDS` scored `worktree` a change for
+ * the completion clock and nothing in the destructive vocabulary read it, so the tree documented a
+ * destruction it did not card. Measured through the shipped `approvalRequirement` in autonomous
+ * with an undo point before this existed: `git worktree remove --force ~/wt` raised no card, and
+ * neither did `bash -lc 'rm -rf dist && git worktree remove --force ../wt'` - the script walk
+ * placed `dist` and read the git command as removing nothing at all.
+ *
+ * Narrowed to the verb, the way `clean -f`, `reset --hard` and `restore` are narrowed beside it.
+ * `git worktree list` prints, `git worktree add` creates, and `git worktree lock`/`unlock` set a
+ * flag; none of them removes anything and none of them may cost a card. `prune` is deliberately
+ * out too: it clears the administrative record of worktrees whose directories are ALREADY gone, so
+ * there is nothing left for it to delete.
+ *
+ * The verb is the first non-option token after the subcommand, because `git worktree --help remove`
+ * is help and `git worktree remove --force x` is the act.
+ */
+const worktreeVerb = (args: readonly string[]): { verb: string; operands: string[] } | null => {
+  const at = gitSubcommandIndex(args);
+  if (at < 0 || (args[at] ?? '').toLowerCase() !== 'worktree') return null;
+  const rest = args.slice(at + 1);
+  const verbAt = rest.findIndex((argument) => !argument.startsWith('-'));
+  if (verbAt < 0) return null;
+  return {
+    verb: (rest[verbAt] ?? '').toLowerCase(),
+    operands: rest.slice(verbAt + 1).filter((argument) => !argument.startsWith('-'))
+  };
+};
+
+export const gitRemovesAWorktree = (args: readonly string[]): boolean =>
+  worktreeVerb(args)?.verb === 'remove';
+
+/**
+ * The directory `git worktree remove` deletes, or null when it cannot be shown.
+ *
+ * Answered so a worktree the agent made for itself inside `workspace/` costs nothing: that one is
+ * strictly inside `CHECKPOINT_CONTENT` and a rewind puts it back, which is the same test every
+ * other removal in this file gets. `~/wt` and `../wt` resolve outside it and keep the card.
+ *
+ * Null for a `remove` with no operand - which is not a command git runs either - because null is
+ * how everything else here says "cannot place this", and the caller reads it as a card.
+ */
+const worktreeRemovalTargets = (args: readonly string[]): string[] | null => {
+  const parsed = worktreeVerb(args);
+  if (parsed?.verb !== 'remove') return null;
+  return parsed.operands.length ? parsed.operands : null;
 };
 
 /** The options that only say which file `git config` is talking about. */
@@ -2763,6 +3244,7 @@ const placeableExecutable = (name: string): boolean =>
   noEgressExecutables.has(name) ||
   FILE_WRITING_EXECUTABLES.has(name) ||
   consequentialExecutables.has(name) ||
+  SIGNALLING_EXECUTABLES.has(name) ||
   packageRemovalExecutables.has(name) ||
   safeNetworkExecutables.has(name) ||
   commandInterpreters.has(name) ||

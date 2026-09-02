@@ -680,32 +680,111 @@ export const hasPriceCeiling = (request: ModelRequest): boolean =>
   typeof request.maxOutputUsdPerMillionTokens === 'number';
 
 /**
- * Why the ceiling excludes this model, or null when it does not. The sentence is the one the
- * interface shows, so "no published price" reads as a reason rather than as a silent omission.
+ * Which of the two things went wrong.
+ *
+ * - `over_ceiling` - a rate the provider publishes, and the owner has said it is more than they
+ *   will pay.
+ * - `no_published_price` - the catalogue does not answer the question, on either rate the ceiling
+ *   would compare. A route can be free and land here; every row in the reviewed open-weight seed
+ *   allowlist does, and so does any row on a box whose live price refresh has not run yet, and so
+ *   does a row whose stated rate this software refused to believe. It does NOT mean "cheap", and it
+ *   is reported only after both published rates have been compared - see the ordering below.
+ *
+ * They are one string in `priceCeilingBreach` and they are not one fact, which is why this type
+ * exists: a caller deciding whether the ceiling should overrule something has to be able to tell
+ * "too expensive" from "unknown".
  */
-export const priceCeilingBreach = (model: RoutableModel, request: ModelRequest): string | null => {
+export type PriceCeilingBreachKind = 'over_ceiling' | 'no_published_price';
+
+export interface PriceCeilingBreach {
+  readonly kind: PriceCeilingBreachKind;
+  /** The sentence the interface shows, already formatted. */
+  readonly reason: string;
+}
+
+/**
+ * Why the ceiling excludes this model, or null when it does not, with the two reasons kept apart.
+ *
+ * This exists because inferring the reason from the sentence is what a caller was doing and it was
+ * wrong: `apps/api/src/routes/support.ts` read a non-null advisory message as "over the ceiling"
+ * and so dropped an owner's standing pin for every route the catalogue does not price - free routes
+ * included, and the whole seed catalogue on a box whose price refresh has not run. Prose is not an
+ * API. A caller that must branch on the reason branches on `kind` here; `priceCeilingBreach` below
+ * is for callers that only want the sentence.
+ *
+ * The blended-ceiling shape (`maxUsdPerMillionTokens`) never produces `no_published_price`: an
+ * unpriced route blends to null and is admitted. Only the two-rate shape refuses one, and that
+ * asymmetry predates this and is left alone here - `isModelEligible` still keeps unpriced routes
+ * out of an automatic ranking under a two-rate ceiling, because a rate nobody published is not a
+ * rate the owner approved.
+ */
+export const priceCeilingBreachReason = (
+  model: RoutableModel,
+  request: ModelRequest
+): PriceCeilingBreach | null => {
   if (!hasPriceCeiling(request)) {
     if (typeof request.maxUsdPerMillionTokens !== 'number') return null;
     const blended = blendedPricePerMillionTokens(model);
     if (blended === null || blended <= request.maxUsdPerMillionTokens + PRICE_EPSILON_USD)
       return null;
-    return `${formatUsd(blended)} blended is above the ${formatUsd(request.maxUsdPerMillionTokens)} ceiling`;
+    return {
+      kind: 'over_ceiling',
+      reason: `${formatUsd(blended)} blended is above the ${formatUsd(request.maxUsdPerMillionTokens)} ceiling`
+    };
   }
   const { input, output } = pricesAtPromptSize(model, request.minContextTokens);
   const maxInput = request.maxInputUsdPerMillionTokens;
   const maxOutput = request.maxOutputUsdPerMillionTokens;
-  if (typeof maxInput === 'number') {
-    if (input === null) return 'no published price';
-    if (input > maxInput + PRICE_EPSILON_USD)
-      return `${formatUsd(input)} per million input is above the ${formatUsd(maxInput)} ceiling`;
-  }
-  if (typeof maxOutput === 'number') {
-    if (output === null) return 'no published price';
-    if (output > maxOutput + PRICE_EPSILON_USD)
-      return `${formatUsd(output)} per million output is above the ${formatUsd(maxOutput)} ceiling`;
-  }
+  /*
+   * Every published rate is compared before any missing one is reported, and the order matters
+   * because one caller now spends the owner's money on the difference.
+   *
+   * A row can carry one rate and not the other. `perMillion` in
+   * `packages/model-gateway/src/openrouter-catalog.ts` reads prompt and completion independently,
+   * so a feed that omits one side, or states one side above the credible ceiling, yields a row that
+   * is priced on one side and null on the other - and on a `reviewed_open_weight` box such a row is
+   * deliberately KEPT with the price removed rather than dropped (openrouter-catalog.ts, the
+   * `pricedAbsurdly` block), because dropping one of four would empty the strict catalogue.
+   *
+   * Checking `input === null` first, as this did, returned `no_published_price` for a route whose
+   * OUTPUT rate the catalogue publishes and the owner's ceiling refuses - the over-ceiling side was
+   * never reached. `isModelEligible` did not care, since it only asks null or not, but the standing
+   * pin in `apps/api/src/routes/support.ts` does: it honours `no_published_price` and drops
+   * `over_ceiling`, so a pin on a $900-per-million-output route ran unattended under a $15 output
+   * ceiling. Measured through POST /v1/schedules: the pin was returned rather than the $3/$9 ranked
+   * pick on the same box.
+   *
+   * `no_published_price` therefore means what it says - no rate this ceiling could be compared
+   * against - and never "a rate that is over the ceiling on the side we did not look at".
+   */
+  if (typeof maxInput === 'number' && input !== null && input > maxInput + PRICE_EPSILON_USD)
+    return {
+      kind: 'over_ceiling',
+      reason: `${formatUsd(input)} per million input is above the ${formatUsd(maxInput)} ceiling`
+    };
+  if (typeof maxOutput === 'number' && output !== null && output > maxOutput + PRICE_EPSILON_USD)
+    return {
+      kind: 'over_ceiling',
+      reason: `${formatUsd(output)} per million output is above the ${formatUsd(maxOutput)} ceiling`
+    };
+  if (
+    (typeof maxInput === 'number' && input === null) ||
+    (typeof maxOutput === 'number' && output === null)
+  )
+    return { kind: 'no_published_price', reason: 'no published price' };
   return null;
 };
+
+/**
+ * Why the ceiling excludes this model, or null when it does not. The sentence is the one the
+ * interface shows, so "no published price" reads as a reason rather than as a silent omission.
+ *
+ * Both reasons flatten to a string here, deliberately: for showing and for `isModelEligible` they
+ * are the same answer. Do not read the string back to recover which one it was - that is
+ * `priceCeilingBreachReason`.
+ */
+export const priceCeilingBreach = (model: RoutableModel, request: ModelRequest): string | null =>
+  priceCeilingBreachReason(model, request)?.reason ?? null;
 
 export const isModelEligible = (model: RoutableModel, request: ModelRequest): boolean =>
   meetsRequirements(model, request) && priceCeilingBreach(model, request) === null;
@@ -950,15 +1029,28 @@ export const rankModels = (models: RoutableModel[], request: ModelRequest): Rank
  * Read it as a statement about the *ceiling*, not about the pool: the question a caller has is
  * "did my ceiling cause this", and only `blocked` answers yes.
  *
- * - `no_ceiling` - the ceiling took no part. No ceiling was set; or the owner named the model, which
- *   the ceiling never overrides; or nothing was eligible for reasons the ceiling had no hand in.
+ * - `no_ceiling` - the ceiling took no part. No ceiling was set; or the owner named a model the
+ *   ceiling has no objection to; or nothing was eligible for reasons the ceiling had no hand in.
  * - `within` - a model was picked and the ceiling did not have to give anything up to pick it.
  * - `relaxed_unbenchmarked` - every benchmarked model that could do the work is above the ceiling, so
  *   an unmeasured one was used and said so.
  * - `blocked` - nothing fits at all. Nothing is picked, because silently spending over a ceiling the
  *   owner set while they are asleep is the one outcome a ceiling exists to prevent.
+ * - `requested_over_ceiling` - the owner named a model whose published rate is above their ceiling.
+ *   It is still the choice, because an explicit pick outranks the ceiling; the outcome is here so a
+ *   caller that has decided otherwise for its own path can act on it.
+ * - `requested_unpriced` - the owner named a model the catalogue publishes no price for, so the
+ *   ceiling could not be applied either way. Distinct from `requested_over_ceiling` because these
+ *   two carried the same advisory sentence and a caller that told them apart by that sentence
+ *   revoked pins for unpriced routes, free ones included.
  */
-export type CeilingOutcome = 'no_ceiling' | 'within' | 'relaxed_unbenchmarked' | 'blocked';
+export type CeilingOutcome =
+  | 'no_ceiling'
+  | 'within'
+  | 'relaxed_unbenchmarked'
+  | 'blocked'
+  | 'requested_over_ceiling'
+  | 'requested_unpriced';
 
 export interface ModelSelection {
   /** Every eligible model in rank order. Empty when the ceiling blocked the whole catalogue. */
@@ -1073,15 +1165,29 @@ export const selectModel = (models: RoutableModel[], request: ModelRequest): Mod
   if (!carriesPriceCeiling(request)) return none;
 
   if (request.requestedId) {
-    // An explicit pick is never constrained by the ceiling - it governs what athanor chooses for
-    // the owner, never what the owner chooses for themselves - but it is not silent about it
-    // either. A model the owner named that is over their own ceiling is worth one sentence.
-    const breach = choice ? priceCeilingBreach(choice.model, request) : null;
-    return breach === null
-      ? none
+    /*
+     * An explicit pick is never constrained by the ceiling - it governs what athanor chooses for
+     * the owner, never what the owner chooses for themselves - but it is not silent about it
+     * either. A model the owner named that is over their own ceiling is worth one sentence.
+     *
+     * The outcome says which of the two reasons produced that sentence, because one caller has to
+     * overrule the explicit pick on its own path: the standing pin in
+     * `apps/api/src/routes/support.ts` governs runs the owner is not present for, so there the
+     * ceiling wins. It used to decide by `message !== null`, which is true for an unpriced route as
+     * well as an expensive one, and so it revoked pins the ceiling had no verdict on at all.
+     */
+    const breach = choice ? priceCeilingBreachReason(choice.model, request) : null;
+    if (!choice || !breach) return none;
+    return breach.kind === 'over_ceiling'
+      ? {
+          ...none,
+          ceilingOutcome: 'requested_over_ceiling',
+          message: `You chose ${choice.model.displayName}, which is above your price ceiling: ${breach.reason}.`
+        }
       : {
           ...none,
-          message: `You chose ${choice?.model.displayName ?? request.requestedId}, which is above your price ceiling: ${breach}.`
+          ceilingOutcome: 'requested_unpriced',
+          message: `You chose ${choice.model.displayName}, and its price is not published, so your price ceiling cannot be checked against it.`
         };
   }
 

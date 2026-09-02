@@ -9,7 +9,7 @@ import {
   privilegedHelperInvocation,
   resolveExecutable
 } from './command-policy.js';
-import { resolveInside } from './files.js';
+import { AGENT_HOME, resolveInside } from './files.js';
 import {
   belowHostStorageFloor,
   hostStorage as probeHostStorage,
@@ -157,6 +157,48 @@ export const SAFE_ENV_KEYS =
  * policy is in force that never reached the process - which for a deny-list is the difference
  * between a guard and the belief in one. Saying so costs one failed call and nothing else.
  */
+/**
+ * Where the agent's `$HOME` is: `.home` at the container root, beside `workspace/` and not inside
+ * it. It used to be the container root itself, which is why every dotfile a toolchain wrote landed
+ * in the same directory as `workspace/` and `.athanor`.
+ *
+ * IT IS NOT INSIDE THE UNDO POINT, and nothing here claims it is. `CHECKPOINT_CONTENT` is
+ * `['workspace', '.athanor/artifacts']` (checkpoints.ts), so a rewind puts the project tree back
+ * and leaves the toolchain caches and the coding CLIs' OAuth state exactly as the failed run left
+ * them. That is deliberate. A home under `workspace/` would be walked and hashed on EVERY turn and
+ * counted against `CHECKPOINT_MAX_FILES` = 250,000: measured for scale on the lead's machine, a
+ * Rust toolchain alone is 88,021 files (`~/.rustup` 66,157, `~/.cargo` 21,864) before a conda
+ * environment, which is routinely 30,000-60,000. Crossing that ceiling throws
+ * `CheckpointRefusedError` and the turn loses its rewind point - so a home inside the checkpoint
+ * costs the checkpoint, which is the thing it was supposed to protect. Rolling a CLI's OAuth state
+ * back to yesterday morning would also sign the agent out mid-task, which is the exact harm
+ * checkpoints.ts already excludes `.athanor/browser` to avoid.
+ *
+ * IT IS ALSO OUT OF THE STORAGE FIGURE, and that is a cost as well as a consequence: server.ts's
+ * `storageUsage` walks `workspace`, `.athanor/artifacts` and `.athanor/browser`, so a per-workspace
+ * limit does not bound what a task writes into its `$HOME`. Decided rather than inherited, with the
+ * argument written out at `storageUsage` itself; the host-disk floor is what stops a `$HOME` filling
+ * the box.
+ *
+ * Being outside `workspace/` means the Landlock ruleset has to name it, and it does:
+ * `scripts/athanor-sandbox` grants `$ROOT/.home` the write verbs beside `$ROOT/workspace`, because
+ * a confined command may otherwise write only in `workspace/`, `/tmp`, `/var/tmp` and `/dev/shm` -
+ * and a boundary that refuses `pip install` is an outage rather than a boundary. `$ROOT/.athanor`
+ * is granted nowhere and remains unreachable.
+ *
+ * The other reason for the container root: files.ts's `assertUserDataPath` folds a bare relative
+ * name into `workspace/`, so with `$HOME` at `workspace/.home` a `file_write('.home/.bashrc')`
+ * would have written the real login-shell startup file - and the owner's own interactive terminal
+ * below runs with this same `HOME`, so that file would then be sourced by the owner's shell.
+ * Here the fold cannot reach it: `.home/.bashrc` folds to `workspace/.home/.bashrc`, a file no
+ * shell reads. `.home` is in files.ts's `CONTAINER_ONLY` so the fold does not even happen quietly.
+ *
+ * A dotted name so it does not appear in an `ls` of the project the agent is working on, and one
+ * declaration because the runner sets it in three places - here, the owner's terminal, and the
+ * directory the workspace is prepared with - and two of them would eventually disagree.
+ */
+export const agentHome = (workspaceRoot: string): string => path.join(workspaceRoot, AGENT_HOME);
+
 export const agentEnvironment = (
   workspaceRoot: string,
   searchPath: string,
@@ -171,7 +213,7 @@ export const agentEnvironment = (
     );
   return {
     PATH: searchPath,
-    HOME: workspaceRoot,
+    HOME: agentHome(workspaceRoot),
     LANG: 'C.UTF-8',
     ...requested
   };
@@ -244,6 +286,152 @@ export const timedOutNote = (
  */
 export const KILLED_NOTE =
   '[stopped: this command was killed outright by the computer rather than exiting on its own. Nothing it held in memory was written; files it had already finished writing are still there. On this box that is almost always the memory ceiling: run it again asking for less at once - fewer threads or parallel jobs, a smaller batch or chunk size, streaming instead of loading a whole file - rather than repeating it unchanged.]';
+
+/**
+ * The sixth thing that can go wrong, and the one the filesystem boundary itself created: a command
+ * refused by the Landlock ruleset rather than by the file it named.
+ *
+ * The kernel answers a rule violation with EACCES, which every tool on the box prints as the same
+ * `Permission denied` it prints for a file mode, a missing directory it may not create, or a file
+ * that is not there at all under some shells. Measured in the real-kernel drill for this boundary:
+ * `cat: /home/athanor/<other>/workspace/notes.md: Permission denied` and `mv: cannot move ... :
+ * Permission denied`, with nothing in either to distinguish policy from a broken path. A model
+ * reading that retries with sudo, or retries the same path, or concludes the file does not exist
+ * and writes around it - three wrong moves, all cheaper to make than to diagnose.
+ *
+ * IT GUESSES, and it says so in the sentence it appends. There is no errno on the result: this
+ * reads the command's own stderr, which is text a program chose, in whatever words it chose. What
+ * makes the guess narrow rather than wide is the second half - the message must also name an
+ * absolute path that lies outside EVERY hierarchy the ruleset names, the read list as much as the
+ * write list. A denial inside `workspace/` is an ordinary Unix mode and gets no sentence, which is
+ * the case that would otherwise be told a lie.
+ *
+ * WHAT IT DOES NOT DO: it does not fire on a box that is not confining the filesystem, on a command
+ * that exited zero, on a message in a language other than the one the C locale produces, or on a
+ * tool that reports a denial without naming the path. All four are silences rather than wrong
+ * answers. Both execution paths reach it through `unclaimedStopNote` below, so a background command
+ * refused by the ruleset gets the same sentence a foreground one does.
+ */
+
+/**
+ * Every hierarchy scripts/athanor-sandbox names in a rule, spelled here the way it spells them,
+ * and the reason the read half is in the list at all.
+ *
+ * The write half is obvious. The read half is the one that was wrong: while this held only the
+ * writable directories, `cat: /etc/shadow: Permission denied` on a confined box got the sentence -
+ * and `/etc` is granted for reading, so that denial is a mode bit and the sentence was a lie that
+ * contradicted itself in its own next clause, which offers "may read the system directories" as
+ * the reason the path is out of reach. The same shape arrives far more often through an
+ * interpreter, which names its own path ahead of the file it could not open:
+ * `/usr/bin/python3: can't open file '<workspace>/build.py': ... Permission denied` matched
+ * `/usr/bin/python3` first and told the reader the sandbox refused a file the sandbox grants.
+ *
+ * Adding the read list costs a silence in one direction: a genuine ruleset refusal to WRITE in
+ * `/etc` or `/var` says nothing now. That costs nothing measurable, because the agent account is
+ * unprivileged and ordinary Unix permissions refuse those writes with or without Landlock - the
+ * VPS drill for this boundary recorded `/etc` unwritable at the same exit status with the ruleset
+ * removed. What the boundary actually took away is named nowhere here and still gets the sentence:
+ * `/home`, and with it every other task's workspace, and the container root that holds `.athanor`.
+ */
+const GRANTED_OUTSIDE_WORKSPACE = [
+  '/tmp',
+  '/var/tmp',
+  '/dev/shm',
+  '/dev',
+  '/usr',
+  '/bin',
+  '/lib',
+  '/lib64',
+  '/sbin',
+  '/opt',
+  '/etc',
+  '/var',
+  '/srv',
+  '/run',
+  '/proc',
+  '/sys'
+];
+
+const confinementNote = (
+  stderr: string,
+  workspaceRoot: string,
+  confined: boolean
+): string | undefined => {
+  if (!confined) return undefined;
+  const granted = [
+    path.join(workspaceRoot, 'workspace'),
+    agentHome(workspaceRoot),
+    ...GRANTED_OUTSIDE_WORKSPACE
+  ];
+  const denied = stderr
+    .split('\n')
+    .filter((line) => /permission denied|operation not permitted/i.test(line))
+    // Anything that starts at the root and runs to a delimiter a message would use around a path.
+    // Over-matching is harmless here: a token that is not really a path is simply one more string
+    // that fails the grant test below, and one that trails a quote or a colon still starts with the
+    // hierarchy it belongs to, which is what the test asks about.
+    .flatMap((line) => line.match(/\/[^\s'"`,)\]]*/g) ?? [])
+    .map((candidate) => candidate.replace(/[:.'"`]+$/, ''))
+    .find(
+      (candidate) =>
+        candidate.length > 1 &&
+        !granted.some((root) => candidate === root || candidate.startsWith(`${root}${path.sep}`))
+    );
+  if (!denied) return undefined;
+  return `[the sandbox on this computer probably refused that, rather than the file: ${denied} is outside what a command here may touch. This task may write in its own workspace, in $HOME and in /tmp, and may read the system directories; everything else on the box - including other tasks' files - is refused with the same "Permission denied" a missing file would give. Nothing is wrong with the path and nothing here can be escalated: do the work inside the workspace instead.]`;
+};
+
+/**
+ * The one seam both execution paths ask about how a command ended when this process did not end it.
+ *
+ * Four of the six endings are performed here - the deadline, the owner's cancel, the host-disk
+ * floor, and a refusal before the command ever starts - and each of them sets a flag and writes its
+ * own sentence at the moment it acts. The remaining two are read off the corpse: the kernel's
+ * SIGKILL, and a ruleset refusal that arrives as nothing but the word "denied" in the command's own
+ * stderr. Those two are what this function decides.
+ *
+ * IT IS A FUNCTION BECAUSE THE TWO PATHS KEPT DISAGREEING. `execute` had the SIGKILL branch and
+ * then grew the confinement branch beside it; `ProcessManager.settle` had a hand-written copy of
+ * the SIGKILL branch and did not grow the second, so a background command refused by the ruleset
+ * got a bare "Permission denied" while a foreground one got the sentence - and the background path
+ * is the one that runs for an hour, where a boundary is most likely to be met and least likely to
+ * be diagnosed by rerunning. A line added to `settle` would have closed that instance and left the
+ * next one open; asking both paths the same question closes the shape.
+ *
+ * `claimed` is the caller saying one of its own four stops already spoke. `cancelled` is separate
+ * from it only because the foreground path can carry a cancel that did not change any other flag:
+ * an owner who stopped the command knows why it stopped, and telling them the memory ceiling
+ * probably did it would be a guess about an ending nobody was guessing at.
+ *
+ * Ordered SIGKILL first. Both can be true at once - a command killed by the cgroup after printing a
+ * denial - and the kill is the ending, while the denial is something that happened on the way.
+ *
+ * `stderr` arrives as a function because the background path does not have one: a session's log
+ * lives in a `boundedCollector` and is assembled into a string on demand, up to the 20 MB a caller
+ * may ask for. Every question above is answered from flags, and on most boxes the last one is not
+ * asked at all, so a plain string parameter would have built that log at the end of every
+ * background command on every host - including the ones that confine nothing and can never use it.
+ */
+export const unclaimedStopNote = (
+  outcome: {
+    stderr: () => string;
+    exitCode: number | null;
+    signal: string | null;
+    /** One of this process's own stops already fired and wrote its own sentence. */
+    claimed: boolean;
+    /** The owner asked for this to stop, so its ending needs no explaining. */
+    cancelled: boolean;
+  },
+  workspaceRoot: string,
+  confined: boolean
+): string | undefined => {
+  if (outcome.claimed) return undefined;
+  if (!outcome.cancelled && outcome.signal === 'SIGKILL') return KILLED_NOTE;
+  if (!confined) return undefined;
+  // A command killed by a signal has no exit code, and one that exited zero has nothing to explain.
+  if (outcome.exitCode === null || outcome.exitCode === 0) return undefined;
+  return confinementNote(outcome.stderr(), workspaceRoot, confined);
+};
 
 export interface ExecutionGuards {
   limits?: CommandLimits | undefined;
@@ -573,7 +761,12 @@ export const prepareInvocation = async (
           { executable, args },
           environment,
           sandbox,
-          policy.isolateNetwork && !request.network
+          policy.isolateNetwork && !request.network,
+          // The workspace this command belongs to, which is the one directory tree a confined
+          // command may write in. Named here rather than derived inside the helper's caller
+          // because this is the only place that knows it, and both execution paths - the
+          // foreground command and the background session - arrive at this line.
+          workspaceRoot
         )
       : { executable, args },
     policy.limits,
@@ -795,14 +988,28 @@ export const execute = async (
     abortSignal,
     guards
   });
-  // Every stop this path can perform now says which one it was, on the stream the result carries -
-  // and the fourth branch covers the one it does not perform, which is the kernel's.
+  // Every stop this path can perform says which one it was, on the stream the result carries. The
+  // two it does not perform - the kernel's kill and the ruleset's refusal - are decided in
+  // `unclaimedStopNote`, which the background path asks the same question, and are asked for only
+  // when none of the stops above happened: a command killed at its deadline is not also told about
+  // the filesystem boundary.
+  const unclaimed = unclaimedStopNote(
+    {
+      stderr: () => run.stderr,
+      exitCode: run.exitCode,
+      signal: run.signal,
+      claimed: run.diskExhausted || run.timedOut,
+      cancelled: run.cancelled
+    },
+    workspaceRoot,
+    Boolean(sandbox?.confineFilesystem)
+  );
   const stderr = run.diskExhausted
     ? `${run.stderr}\n${HOST_DISK_FLOOR_NOTE}`
     : run.timedOut
       ? `${run.stderr}\n${timedOutNote(allowedSeconds, maximumSeconds, false)}`
-      : !run.cancelled && run.signal === 'SIGKILL'
-        ? `${run.stderr}\n${KILLED_NOTE}`
+      : unclaimed
+        ? `${run.stderr}\n${unclaimed}`
         : run.stderr;
   return {
     exitCode: run.exitCode,

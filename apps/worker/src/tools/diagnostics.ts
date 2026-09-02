@@ -37,17 +37,50 @@
  *      `isUserData` is not applied to an exec cwd. So the ordinary call - `workspace`, or a
  *      directory under it - runs inside `CHECKPOINT_CONTENT` and is fully rewindable, and a call
  *      naming `.athanor/browser` would not be, since the roots pick that up only when
- *      `CHECKPOINT_INCLUDE_BROWSER_PROFILE` is on and it ships off. Nothing confines where the
- *      command writes once it has started; that is rung 0, below.
- *   3. And the limit, unhedged: beyond that, a build recipe runs with whatever this task can reach.
- *      The sandbox is an IDENTITY boundary and not a filesystem one. `scripts/athanor-sandbox` is
- *      `setpriv --reuid --regid --clear-groups --no-new-privs`; there is no bwrap, no landlock and
- *      no filter on what a command may open. `execution.ts` sets `HOME` to the workspace root,
- *      which is one level ABOVE `CHECKPOINT_CONTENT`, so a recipe that writes to `$HOME/.cargo` or
- *      `$HOME/.gradle` writes outside what bound 1 can rewind. And `ISOLATE_AGENT_NETWORK` ships
- *      false, so the recipe has the host's ordinary network access whatever the call declared.
- *      `docs/design/floor/DIAGNOSTICS.md` argues that rather than mentioning it: it is rung-0 work,
- *      it is not this wave's, and a card on rung 3 was never going to substitute for it.
+ *      `CHECKPOINT_INCLUDE_BROWSER_PROFILE` is on and it ships off - though on a box that reports
+ *      Landlock the command cannot write there at all. Where the command writes once it has
+ *      started is a separate question and no longer an unanswered one; it is rung 3.
+ *   3. And the limit, which is now a boundary with a hole in it rather than no boundary at all.
+ *      The sandbox is an identity boundary AND, where the kernel can apply one, a filesystem one.
+ *      `scripts/athanor-sandbox run ... confine $ROOT` is `setpriv --reuid --regid --clear-groups
+ *      --no-new-privs` plus a Landlock ruleset: read and execute over the system hierarchies
+ *      (/usr /bin /lib /lib64 /sbin /opt /etc /var /srv /run /proc /sys), write over
+ *      `$ROOT/workspace`, `$ROOT/.home`, /tmp, /var/tmp and /dev/shm, and a device list over /dev.
+ *      /home is granted nowhere, which is the whole boundary: every workspace on the box is mode
+ *      2770 with the agent account's group, so a build recipe run for this task could previously
+ *      read and rewrite every other task's tree, and `$ROOT/.athanor` - the checkpoints, the
+ *      browser profile, the artifacts - sat one level above the only directory it needed.
+ *      Traversal is not restricted by Landlock, so the command still reaches its own
+ *      `$ROOT/workspace` through a `$ROOT` it may not read, list, write or rename.
+ *
+ *      IT IS REPORTED RATHER THAN ASSUMED, and `filesystem=none` is a real answer on a real box.
+ *      `athanor-sandbox check` applies the shipped read rules to `/bin/sh -c :` and prints
+ *      `filesystem=landlock` or `filesystem=none`. The probe program is a shell and not
+ *      `/bin/true`, which is what this sentence said for one wave after the helper had stopped
+ *      doing it: POSIX pins a shell at `/bin/sh` and pins nothing at `/bin/true`, so on a host
+ *      carrying it only at `/usr/bin/true` the probe answered about its own missing binary rather
+ *      than about the kernel. Re-read the helper before restating this line rather than carrying
+ *      it across. The installer writes `CONFINE_AGENT_FILESYSTEM`
+ *      from that line, and `sandboxedInvocation` asks the helper for `open` when it is off, so a
+ *      kernel or a util-linux without Landlock runs these commands with the identity boundary
+ *      only - the state this paragraph used to describe as the only one there is. A box with no
+ *      helper configured at all has neither boundary. Read what the box answered before relying on
+ *      either.
+ *
+ *      WHAT BOUND 1 STILL CANNOT REWIND IS UNCHANGED. `execution.ts` sets `HOME` to `$ROOT/.home`
+ *      at the container root, and the ruleset grants it write precisely because pip, cargo, npm and
+ *      the coding CLIs have to write there. `CHECKPOINT_CONTENT` is `['workspace',
+ *      '.athanor/artifacts']`, so a recipe that writes `$HOME/.cargo` or `$HOME/.gradle` writes
+ *      where a rewind will not reach it, and that is chosen rather than overlooked: a home inside
+ *      the checkpoint would be walked and hashed every turn against `CHECKPOINT_MAX_FILES` of
+ *      250,000, and a Rust toolchain alone is 88,021 files - crossing it throws and the turn loses
+ *      the undo point that bound 1 is.
+ *
+ *      Two things the ruleset deliberately does not cover. The owner's own interactive terminal
+ *      goes through the helper's `shell` mode, which has no confine word and never will: that is
+ *      the owner at their own computer, reaching files the file browser hands them anyway. And
+ *      `ISOLATE_AGENT_NETWORK` ships false, so the recipe has the host's ordinary network access
+ *      whatever the call declared. `docs/design/floor/DIAGNOSTICS.md` argues the rest.
  *
  * Measured on this machine rather than assumed, and it is why the bound is unconditional rather
  * than per-language: `make -s` on a Makefile whose target writes a file wrote it; `cargo check` on
@@ -300,4 +333,230 @@ export const diagnosticsSelection = (
       reason: `This directory has no ${missing}, so there is no ${language} project here to check. Running ${[command.executable, ...command.args].join(' ')} would fail for want of one rather than report anything about the code. Point path at a directory that holds it, or use the shell tool for this project's own command.`
     };
   return { command };
+};
+
+/**
+ * ── The post-edit trigger: the same tables, reached without the model asking ───────────────────
+ *
+ * Everything above answers a question the model put: `code_diagnostics` names a path and a
+ * language and this file says what runs there. What follows answers no question at all. It is the
+ * trigger `file_patch` fires on the files it just wrote, and it exists because the manual route is
+ * measurably worse than it looks: `code_diagnostics` at its own default path - `workspace`, this
+ * repository's root - resolves to TypeScript by `package.json`, finds no `tsconfig.json`, and
+ * returns the refusal sentence and no command. A model that does the right thing at the default
+ * path learns nothing about the code it just changed.
+ *
+ * Nothing here is a second copy of the ladder. `nearestProject` walks up from a written file and
+ * hands each directory's listing to `diagnosticsLanguage` and `diagnosticsSelection` unchanged, so
+ * a repository that resolves one way under `code_diagnostics` resolves the same way here. Two
+ * rules are added by the walk and both of them are subtractive.
+ */
+
+/**
+ * The languages a written file may trigger a checker for, and the extensions that name each.
+ *
+ * RULE (a) OF THE WALK, and it is the one that protects the owner's machine. Nine of the fifteen
+ * commands in the table above are the project's own build recipe - the header of this file lists
+ * which and why - and a build recipe is a program somebody else wrote. `code_diagnostics` runs
+ * them because the model asked for them by name; a trigger that fires on every edit did not ask
+ * anybody, so it may not compile and execute a `build.rs`, evaluate a `build.gradle`, or run a
+ * repository's test suite. The six that remain - TypeScript, Python, Julia, Ruby, PHP, Dart -
+ * name a fixed parser or type-checker over files the repository supplies as data.
+ *
+ * WHAT IS NOT HERE, and it is four of those six. Julia, Ruby, PHP and Dart are admissible by the
+ * rule and absent from this map anyway, because a trigger has to PARSE what its checker printed
+ * and `postEditDiagnostics` below carries two measured grammars, not six. An unparsed checker is
+ * not a quiet checker: it is a run whose whole output either reaches the model as noise or is
+ * dropped as silence, and silence dropped from a real error is the false health this whole trigger
+ * is written to avoid. They come back when their output has been driven on a real tree the way
+ * TypeScript's and Python's were, and the rest of the machinery is already language-agnostic.
+ *
+ * Extensions rather than a content sniff, because the alternative is reading the file a second
+ * time to guess at what its own name already says. `.js` and its four spellings are here because
+ * `tsc` under `allowJs` checks them and a repository that has turned that off simply reports
+ * nothing about them, which is the cheap failure of the two.
+ */
+export const POST_EDIT_CHECKED_LANGUAGES: ReadonlyMap<string, readonly string[]> = new Map([
+  ['typescript', ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs']],
+  ['python', ['.py', '.pyi']]
+]);
+
+/** Which of the admitted languages this file's name claims to be, if any. */
+export const postEditLanguage = (path: string): string | undefined => {
+  const dot = path.lastIndexOf('.');
+  if (dot <= 0) return undefined;
+  const extension = path.slice(dot).toLowerCase();
+  for (const [language, extensions] of POST_EDIT_CHECKED_LANGUAGES)
+    if (extensions.includes(extension)) return language;
+  return undefined;
+};
+
+/**
+ * How far up the tree the walk may look before it gives up.
+ *
+ * CHOSEN at 16, from the tree rather than from taste: the deepest path tracked in this repository
+ * is 13 directories - `apps/desktop/src-tauri/gen/android/app/...` - and every workspace path
+ * carries one more segment above that for `workspace` itself. 16 clears the deepest real file here
+ * with room, and it is a bound rather than a limit anybody should hit: each rung is one `files`
+ * round trip to the runner, so an unbounded walk on a pathological path is unbounded latency on a
+ * check nobody asked for. A file deeper than this reports nothing, which is the same answer as a
+ * file with no project above it.
+ */
+const NEAREST_PROJECT_MAX_DEPTH = 16;
+
+/**
+ * Whether this directory holds a marker for THIS language, asked of the ladder one name at a time.
+ *
+ * `diagnosticsLanguage` over the whole listing answers a different question, and answering it here
+ * was measured getting a real tree wrong: its order is load-bearing and deliberate - a directory
+ * with both a `package.json` and a `Cargo.toml` is TypeScript - because it is resolving ambiguity
+ * for a caller who named no language at all. Here the file's own extension has already named one,
+ * so there is no ambiguity to resolve, and asking the ordered ladder means a `pyproject.toml`
+ * beside a `package.json` reports TypeScript and the Python package it is sitting in is never
+ * found.
+ *
+ * One name at a time is the same table read without its precedence: a set of one has nothing to
+ * come before it. No copy of the marker list is made here, which is the point - a marker added to
+ * the ladder is admitted by this with no further edit.
+ */
+const holdsMarkerFor = (language: string, names: ReadonlySet<string>): boolean =>
+  [...names].some((name) => diagnosticsLanguage('auto', new Set([name])) === language);
+
+export interface NearestProject {
+  /** The directory the command runs in, as a workspace path. */
+  readonly dir: string;
+  readonly language: string;
+  readonly command: DiagnosticsCommand;
+}
+
+/**
+ * The project a just-written file belongs to, or nothing.
+ *
+ * Walks up from the file's own directory to the first one holding a marker for the SAME language
+ * the file's extension named, and asks `diagnosticsSelection` what runs there. The walk stops at
+ * the first directory that matches rather than at the first directory holding any marker at all: a
+ * Python package inside a JavaScript monorepo has a `package.json` between it and its
+ * `pyproject.toml`, and stopping there would either run `tsc` over an edit to a `.py` file or
+ * report nothing about a project that has a perfectly good checker two rungs up.
+ *
+ * RULE (b) OF THE WALK: a `reason` produces NOTHING. `diagnosticsSelection` returns a sentence
+ * where it cannot return a command - "This directory has no tsconfig.json, so there is no
+ * typescript project here to check" - and that sentence is advice, addressed to a model that asked
+ * a question and pointed at the `path` argument it should have used. Nobody asked this. Injecting
+ * it after an edit would be the harness talking to itself in the model's context window, and on
+ * this repository's root it would be doing so after every single patch.
+ *
+ * `listing` is handed in rather than taken, because this module imports nothing and is worth
+ * keeping that way: the runner client and the dispatch table stay on the other side of it. The
+ * caller is expected to memoise it - one patch of four files in one package asks about the same
+ * directories four times otherwise.
+ */
+export const nearestProject = async (
+  path: string,
+  listing: (dir: string) => Promise<ReadonlySet<string>>
+): Promise<NearestProject | undefined> => {
+  const language = postEditLanguage(path);
+  if (!language) return undefined;
+  const segments = path.split('/').filter(Boolean);
+  // The file's own directory is the first rung; a bare `workspace/a.ts` leaves `workspace`.
+  segments.pop();
+  for (let rung = 0; rung < NEAREST_PROJECT_MAX_DEPTH && segments.length; rung += 1) {
+    const dir = segments.join('/');
+    let names: ReadonlySet<string>;
+    try {
+      names = await listing(dir);
+    } catch {
+      // A directory that cannot be listed is not a project and is not an error worth reporting to
+      // anybody: the patch it followed has already succeeded and said so.
+      return undefined;
+    }
+    if (holdsMarkerFor(language, names)) {
+      const { command } = diagnosticsSelection(language, names);
+      return command ? { dir, language, command } : undefined;
+    }
+    segments.pop();
+  }
+  return undefined;
+};
+
+/** One line of a checker's output that names a file and says something about it. */
+export interface PostEditDiagnostic {
+  /** The workspace path, rebuilt from the project directory the checker printed relative to. */
+  readonly path: string;
+  readonly text: string;
+}
+
+/**
+ * What the checker actually said, or nothing at all.
+ *
+ * THIS FUNCTION IS THE NO-FALSE-HEALTH BOUND, and it is worth saying where the property lives
+ * because it does not live in a flag: there is no vocabulary anywhere in this trigger for a check
+ * that passed. A run reaches the model only through the lines this parser recognised, so exit 0,
+ * a checker that is not installed, a checker killed by its timeout and a checker whose output
+ * changed shape all produce the identical answer - an empty array, and therefore silence. The
+ * failure mode that leaves is "athanor did not tell me about an error", which a model repairs by
+ * running the tool. The failure mode it forecloses is "athanor told me this file was clean", which
+ * a model does not repair at all.
+ *
+ * The two grammars were driven on this machine on 2026-09-01 rather than recalled:
+ *
+ *   `tsc --noEmit --pretty false` on a file with two errors printed exactly
+ *     `src/a.ts(1,14): error TS2322: Type 'string' is not assignable to type 'number'.`
+ *   and exited 2. One line per diagnostic, path first, always relative to the project directory.
+ *
+ *   `python3 -I -m compileall -q .` on an unclosed `def` printed a four-line block -
+ *     `*** Error compiling './bad.py'...`, then `  File "./bad.py", line 1`, the source line, a
+ *   caret line, and `SyntaxError: '(' was never closed` - and exited 1. Only the first line names
+ *   the file, so the block is gathered up to its blank line and reported as one diagnostic;
+ *   `compileall` reports at most one syntax error per file, so a block is a file.
+ *
+ * And the case that proves the rule, measured the same day: `npx --no-install tsc` where
+ * TypeScript is not installed exits 1 with 544 bytes of "This is not the tsc command you are
+ * looking for" and npm's install advice. Not one line of it matches either grammar, so it is
+ * silence. That is the same shape as the 4,994-byte usage page the header of `diagnosticsSelection`
+ * records being returned as `passed: false`; the difference is that this trigger has no `passed`
+ * to return it as.
+ */
+export const postEditDiagnostics = (
+  language: string,
+  dir: string,
+  output: string
+): readonly PostEditDiagnostic[] => {
+  const found: PostEditDiagnostic[] = [];
+  const under = (relative: string): string => `${dir}/${relative.replace(/^\.\//, '')}`;
+  const lines = output.split('\n');
+  if (language === 'typescript') {
+    for (const line of lines) {
+      const match = /^(\S[^(]*)\(\d+,\d+\): (?:error|warning) TS\d+: /.exec(line);
+      const relative = match?.[1];
+      /*
+       * The compiler's line with its path rewritten to a workspace path, and it is the one thing
+       * here that is not verbatim. `tsc` prints `src/a.ts(1,14): ...` relative to the directory it
+       * ran in, and this block arrives beside `filesChanged`, `wrote` and every other path the
+       * model has been handed this turn, all of which are workspace paths. A relative path in that
+       * company is one the model will hand straight back to `file_read` and be refused for.
+       */
+      if (relative)
+        found.push({
+          path: under(relative),
+          text: `${under(relative)}${line.slice(relative.length)}`.trimEnd()
+        });
+    }
+    return found;
+  }
+  if (language === 'python') {
+    for (let index = 0; index < lines.length; index += 1) {
+      const relative = /^\*\*\* Error compiling '(.+)'\.\.\.$/.exec(lines[index] ?? '')?.[1];
+      if (!relative) continue;
+      const block: string[] = [];
+      // The compiler's own explanation, which is everything up to the blank line it ends with. The
+      // caret line is kept: it is the column, and a column with no line number above it is why the
+      // three lines travel together.
+      for (let scan = index + 1; scan < lines.length && (lines[scan] ?? '').trim(); scan += 1)
+        block.push((lines[scan] ?? '').trimEnd());
+      found.push({ path: under(relative), text: [`${under(relative)}:`, ...block].join('\n') });
+    }
+    return found;
+  }
+  return found;
 };

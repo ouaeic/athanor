@@ -285,6 +285,11 @@ export const HOST_DISK_FULL_CHECKPOINT_CODE = 'checkpoint_host_disk_full';
  * on, and was told by the rewind dialog that the turn "changed nothing on the computer" about turns
  * that changed a great deal. It is owner-fixable in the plainest way - delete something, or take a
  * named recovery point - which is exactly why it has to reach them.
+ *
+ * It now decides cards as well as dialogs. A turn refused a checkpoint has no undo point, so the
+ * approval floor's location rule - which frees a delete strictly inside `CHECKPOINT_CONTENT`
+ * because a rewind puts it back - must keep the card for the whole of that turn. The fact travels
+ * as `ApprovalContext.undoPoint`, written from `state.checkpoint` by `approval-floor.ts`.
  */
 export const WORKSPACE_TOO_LARGE_CHECKPOINT_CODE = 'checkpoint_workspace_too_large';
 

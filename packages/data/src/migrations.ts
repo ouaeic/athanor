@@ -2961,5 +2961,44 @@ export const migrations = [
                            0)::int
       WHERE NOT indexed AND tsv IS NULL AND body_tokens <> '';
     `
+  },
+  {
+    version: 77,
+    name: 'a_resumed_schedule_gets_its_patience_back',
+    /*
+     * The streak that decides whether a schedule has stopped being worth retrying, kept on the
+     * schedule instead of derived from the run ledger.
+     *
+     * Derivation was chosen first, on the argument that `task_schedule_runs` already records every
+     * outcome and a column would be a second copy of a fact. It was measured wrong twice.
+     *
+     * (1) Resume had no effect on it. `setTaskScheduleEnabled` touches `enabled`, `next_run_at`,
+     *     the lease and `last_error_code`, and nothing in `task_schedule_runs`, so the three
+     *     failures that paused a schedule were still the three newest rows the moment the owner
+     *     turned it back on. Measured through the real resume route: paused after three failures,
+     *     resumed, then re-paused by ONE more. The threshold's own justification - "three is the
+     *     smallest number that cannot be reached by a single bad moment" - was false in exactly the
+     *     minutes after a resume, which is when the transients it names are most likely to still be
+     *     going.
+     * (2) The evidence expires before a slow schedule can accumulate it. `task_schedule_runs` is
+     *     pruned at NOTIFICATION_LEDGER_INTERVAL - thirty days - by `cleanupExpired`, while a cron
+     *     spec may be monthly. Three consecutive monthly failures span about sixty-two days, so the
+     *     oldest row was deleted before the third arrived: the derived streak topped out at two and
+     *     a monthly schedule failed forever, which is the behaviour the pause exists to end. A
+     *     column is not pruned by anything.
+     *
+     * Not backfilled. A schedule that is mid-streak when this applies starts again at zero and gets
+     * at most three more failed runs before it pauses, once. That is the direction that errs toward
+     * a schedule staying on, and the alternative - a windowed read over the ledger at migration time
+     * - would risk pausing a schedule on evidence nobody could see afterwards.
+     *
+     * DEFAULT 0 and NOT NULL, so every row already has the value the readers below expect and no
+     * code has to decide what a null streak means. Postgres 11 and later add a defaulted column
+     * without rewriting the table, so this takes no long lock on a box with many schedules.
+     */
+    sql: `
+      ALTER TABLE task_schedules ADD COLUMN IF NOT EXISTS consecutive_failures
+        INTEGER NOT NULL DEFAULT 0;
+    `
   }
 ] as const;

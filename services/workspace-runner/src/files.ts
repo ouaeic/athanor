@@ -67,6 +67,18 @@ export const resolveInside = (root: string, requested = '.'): string => {
 
 const ARTIFACTS = path.join('.athanor', 'artifacts');
 
+/**
+ * The agent's `$HOME`, named once. `ensureWorkspace` below is what creates it and execution.ts's
+ * `agentHome` is what puts it in a command's environment; while those were two literals, moving
+ * one of them left the runner setting a `HOME` that nothing had made - which `bash` does not create
+ * for itself and `python3 -m venv $HOME/venv` does not either.
+ *
+ * At the container root rather than inside `workspace/`, for the two reasons execution.ts's
+ * `agentHome` sets out: `workspace/` is the checkpoint's content, and a bare name folds into
+ * `workspace/`.
+ */
+export const AGENT_HOME = '.home';
+
 const isUserData = (relative: string): boolean =>
   relative === 'workspace' ||
   relative.startsWith(`workspace${path.sep}`) ||
@@ -75,11 +87,20 @@ const isUserData = (relative: string): boolean =>
 
 /**
  * The container's own directories, which are not the agent's and are never a bare name's meaning.
- * `.athanor` holds the runner's private state - the browser profile among it - and `.config` the
- * guest's settings. `workspace` is left out on purpose: a path already rooted there is user data
- * and is accepted above before this is consulted.
+ * `.athanor` holds the runner's private state - the browser profile among it - `.config` the
+ * guest's settings, and `.home` the agent's `$HOME` (execution.ts `agentHome`), which holds the
+ * coding CLIs' OAuth credentials and the `.bashrc` the owner's own terminal sources. `workspace`
+ * is left out on purpose: a path already rooted there is user data and is accepted above before
+ * this is consulted.
+ *
+ * `.home` is here for the fold rather than for the resolve. Nothing under the container root has
+ * ever been reachable - `isUserData` admits `workspace/` and `.athanor/artifacts` and nothing else,
+ * so `.home/.bashrc` could only ever have become `workspace/.home/.bashrc`, an inert file. Naming
+ * it says no outright instead, which is the honest answer and is also the answer that stays right
+ * if `$HOME` is ever moved back under `workspace/`. It refuses no legitimate work: a real
+ * `workspace/.home` is still reachable by writing that prefix, which the branch above accepts.
  */
-const CONTAINER_ONLY = new Set(['.athanor', '.config']);
+const CONTAINER_ONLY = new Set(['.athanor', '.config', AGENT_HOME]);
 
 /**
  * Where a path the agent gave means what the agent meant by it.
@@ -173,6 +194,13 @@ const RUNNER_ONLY_MODE = 0o700;
 export const ensureWorkspace = async (root: string): Promise<void> => {
   await mkdir(root, { recursive: true, mode: SHARED_MODE });
   await mkdir(path.join(root, 'workspace'), { recursive: true, mode: SHARED_MODE });
+  // The agent's own home, made by the runner rather than left to the first program that wants it:
+  // `bash` does not create a missing `$HOME` and neither does `python3 -m venv $HOME/venv`, so a
+  // home that appears only once something has already tried to write in it is a home half the
+  // toolchain trips over. Shared with the agent account the same way `workspace/` is - both
+  // accounts read and write these files through the group - and unlike `.athanor`, which is the
+  // runner's alone.
+  await mkdir(path.join(root, AGENT_HOME), { recursive: true, mode: SHARED_MODE });
   await mkdir(path.join(root, '.athanor', 'browser'), { recursive: true, mode: RUNNER_ONLY_MODE });
   await mkdir(path.join(root, '.athanor', 'desktop'), { recursive: true, mode: RUNNER_ONLY_MODE });
   await mkdir(path.join(root, '.athanor', 'artifacts'), {

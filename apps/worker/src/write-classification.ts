@@ -24,6 +24,7 @@ import {
   packageRemovalCommands,
   packageRemovalExecutables,
   shellWriteTargets,
+  SIGNALLING_EXECUTABLES,
   WRITING_GIT_SUBCOMMANDS
 } from './command-classification.js';
 import { textValue } from './values.js';
@@ -119,6 +120,15 @@ export const isMutatingToolCall = (name: string, args: Record<string, unknown> =
     if (executable === 'sed') return lowerArgs.some((argument) => argument.startsWith('-i'));
     return (
       consequentialExecutables.has(executable) ||
+      // Read separately from the set above because `kill`, `killall` and `pkill` LEFT that set -
+      // they are not removals of data and the card they were borrowing said they were. They are
+      // still changes to this computer, and this clock asks a different question from the card:
+      // stopping a process ends whatever it was serving, and an agent that runs `kill -9 <server
+      // pid>` and then cites a curl from three calls earlier has cited a result from a machine that
+      // no longer exists. Dropping the names from both mechanisms at once would have been the one
+      // error this file's own asymmetry names as unrecoverable - a change wrongly called a check.
+      // The pair is asserted together in write-classification.test.ts: true here, no card there.
+      SIGNALLING_EXECUTABLES.has(executable) ||
       FILE_WRITING_EXECUTABLES.has(executable) ||
       executable.startsWith('mkfs') ||
       ['curl', 'wget', 'gh', 'ssh', 'scp', 'systemctl', 'apt', 'apt-get'].includes(executable)
@@ -229,10 +239,11 @@ export const isDurableInstructionPath = (path: string): boolean => {
  *
  * The durable-instruction rule above is about text that becomes *instructions* in a later task.
  * This is the harder case: text that becomes *execution* in a later process, without a model, a
- * task or a card anywhere near it. The agent's `HOME` is the workspace root (execution.ts sets it),
- * and the subscription coding CLIs run from there - so a written `.bashrc` runs at the next login
- * shell, a written `.git/hooks/pre-commit` runs at the next commit, a written `.gitconfig` alias or
- * `core.hooksPath` runs at the next git invocation of any kind, and a written CLI configuration
+ * task or a card anywhere near it. The agent's `HOME` is `<workspaceRoot>/.home` (execution.ts
+ * `agentHome`), and the subscription coding CLIs read out of it - so a written `.bashrc` runs at
+ * the next login shell, a written `.git/hooks/pre-commit` runs at the next commit, a written
+ * `.gitconfig` alias or `core.hooksPath` runs at the next git invocation of any kind, and a
+ * written CLI configuration
  * runs inside a process holding somebody's subscription credentials. Every one of them executes
  * after this task is over and outside every approval this task could have raised, which is why the
  * card these raise is not gated on the turn being tainted: the write is deferred code execution
@@ -292,10 +303,19 @@ const XDG_DEFERRED_EXECUTION_DIRECTORIES = new Set(['claude', 'codex', 'opencode
  * cannot, and the reason is a bound rather than a habit: every path they are given goes through
  * `assertUserDataPath` (services/workspace-runner/src/files.ts), which admits only `workspace/` and
  * `.athanor/artifacts`, refuses anything absolute or stepping up through `..`, and folds a bare
- * name into `workspace/`. `HOME` is the container root one level ABOVE `workspace/`
- * (execution.ts: `HOME: workspaceRoot`), so `file_write('.bashrc')` writes
- * `workspace/.bashrc` - a file no login shell has ever read - and `file_write('../.zshenv')` and
- * `file_write('/home/athanor/ws-1/.bash_profile')` are refused outright before any of this runs.
+ * name into `workspace/`. `HOME` is `<workspaceRoot>/.home` - at the container root, BESIDE
+ * `workspace/` and not inside it (execution.ts `agentHome`, over `AGENT_HOME` in files.ts) - so
+ * `file_write('.bashrc')` writes `workspace/.bashrc`, a file no login shell has ever read, and
+ * `file_write('../.zshenv')` and `file_write('/home/athanor/ws-1/.bash_profile')` are refused
+ * outright before any of this runs.
+ *
+ * WHAT WOULD BREAK IT is `$HOME` moving back under `workspace/`, which is where the build wave
+ * first put it: the fold would then carry `file_write('.home/.bashrc')` to the real login-shell
+ * startup file, sourced by the owner's own interactive terminal, with no card and in every
+ * security mode. That is closed twice over rather than once, and both halves are load-bearing: the
+ * location above puts HOME outside anything a bare name can reach, and `.home` is named in
+ * files.ts's `CONTAINER_ONLY`, so the fold refuses that spelling outright instead of quietly
+ * answering with an inert `workspace/.home/.bashrc`.
  *
  * Measured before this parameter existed: eleven of the thirteen names in the deferred set were
  * unreachable by those three tools, and the card fired `external_consequential` in every mode on a

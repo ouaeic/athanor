@@ -23,6 +23,38 @@ const scheduleErrorMessage = (code: string): string =>
     spend_cap_reached: 'The run would have gone past your spending cap.'
   })[code] ?? 'The scheduled run could not start safely.';
 
+/**
+ * How many runs in a row a schedule may lose to a model that is no longer there before it stops
+ * trying.
+ *
+ * CHOSEN at 3. Nothing here counted at all: a schedule pinned to a route the provider withdrew took
+ * the `model_unavailable` arm, advanced `next_run_at`, and did it again on the next occurrence -
+ * weekly, forever, with no escalation anywhere in this directory. Three is the smallest number that
+ * cannot be reached by a single bad moment. A model is `unavailable` for reasons that pass on their
+ * own: the registry's hourly refresh flattening the catalogue - which `repairFlattenedCatalog` in
+ * `routes/support.ts` exists to undo - a ZDR endpoint feed that did not answer, a provider key
+ * being re-saved. Pausing on the first of those would be worse than the failing-forever it
+ * replaces, because a paused schedule needs a human to start it again and a failing one does not.
+ * Raising it costs the owner more silent runs before anything says so; lowering it risks pausing a
+ * watcher over an outage that had already ended.
+ *
+ * Counted in runs rather than in time, so the wall-clock patience varies with the spec: three weeks
+ * on a weekly watcher, forty-five minutes on the fifteen-minute interval that is the shortest this
+ * software offers. There is no upper bound on that any more. The count used to be derived from
+ * `task_schedule_runs`, which `cleanupExpired` prunes at thirty days, so a monthly cron spec could
+ * never reach three - about sixty-two days of evidence, of which the oldest row was already deleted
+ * - and failed forever, which is the behaviour this threshold exists to end. It is a column on the
+ * schedule now (`consecutive_failures`, migration 77) and no retention policy erases it.
+ *
+ * The count is a streak that ends at the newest run, not a lifetime total: `materializeTaskSchedule`
+ * resets it to zero on a queued run and on a failure with any other code, and
+ * `setTaskScheduleEnabled` resets it when an owner turns the schedule back on - without that, the
+ * three failures that paused a schedule were still on the row after a resume and the very next
+ * failure re-paused it, which made this threshold one rather than three for exactly the owner who
+ * had just decided to try again.
+ */
+const MODEL_UNAVAILABLE_PAUSE_AFTER = 3;
+
 export const createScheduleDispatch = (context: SupportedContext) => {
   const { log, database, store, masterKey, runner, modelsForUser, config } = context;
   /**
@@ -261,6 +293,59 @@ export const createScheduleDispatch = (context: SupportedContext) => {
         taskId,
         code: materialized.errorCode ?? 'schedule_failed'
       });
+      /**
+       * A schedule whose model is gone is not going to fix itself, so at some point it has to stop
+       * asking and say so.
+       *
+       * Only `model_unavailable` escalates. The other two force codes describe the computer rather
+       * than the route - a workspace that is starting, resizing or being deleted is a state that
+       * ends - and `spend_cap_reached` is a cap the owner set that will roll over into the next
+       * window on its own. A model the provider withdrew is the one failure here that no amount of
+       * waiting resolves.
+       *
+       * Two writes rather than one because `setTaskScheduleEnabled` clears `last_error_code` - it
+       * is the route an owner turning a schedule back on takes, where clearing is right - and a
+       * paused schedule that does not say why is the silence this whole change is about.
+       * `failMaterializedTaskSchedule` puts the code back onto the row this run just stamped as
+       * `last_task_id`. A dedicated store method that paused and gave a reason in one statement
+       * would be better; that is a change in `packages/data`.
+       *
+       * The streak is the one `materializeTaskSchedule` just wrote, not a read of its own: the run
+       * this dispatch created is already counted, and asking the database again would be a second
+       * answer to a question the transaction above has already settled.
+       */
+      if (
+        materialized.errorCode === 'model_unavailable' &&
+        materialized.consecutiveFailures >= MODEL_UNAVAILABLE_PAUSE_AFTER
+      ) {
+        await store.setTaskScheduleEnabled(user.id, schedule.id, false, null);
+        await store.failMaterializedTaskSchedule(schedule.id, taskId, 'model_unavailable');
+        await store.appendTaskEvent({
+          taskId,
+          kind: 'error',
+          summary: 'Encrypted schedule error event',
+          payloadCiphertext: encryptJson(
+            {
+              __athanorEventVersion: 1,
+              summary: `${schedule.modelId} is no longer available, so this scheduled task has been paused after ${MODEL_UNAVAILABLE_PAUSE_AFTER} runs that could not start. Choose another model and turn it back on.`,
+              payload: {
+                owner: true,
+                code: 'schedule_paused',
+                scheduleId: schedule.id,
+                modelId: schedule.modelId
+              }
+            },
+            key,
+            `task-event:${taskId}`
+          )
+        });
+        log.warn('schedule.paused', {
+          scheduleId: schedule.id,
+          modelId: schedule.modelId,
+          code: 'model_unavailable',
+          count: MODEL_UNAVAILABLE_PAUSE_AFTER
+        });
+      }
       return true;
     }
     await promoteScheduledTask({

@@ -359,6 +359,50 @@ for workspace_directory in /home/athanor/*/; do
     chgrp -R "$agent_user" {} + 2>/dev/null || true
   find "$workspace_directory" -mindepth 1 -maxdepth 1 ! -name .athanor -exec \
     chmod -R g+rwX {} + 2>/dev/null || true
+  # The agent's HOME was the workspace root itself and is now `.home` inside it (execution.ts
+  # `agentHome`), which is what gives it a Landlock write grant of its own without putting a
+  # toolchain's caches inside `workspace/`, where the turn checkpoint would walk and hash them every
+  # turn. Everything the old home accumulated is carried across rather than abandoned: without this,
+  # a workspace where Codex or Claude Code was signed in comes up signed out after an upgrade, and
+  # on a box that then confines the filesystem the old copies at the root are not readable to go and
+  # fetch - $ROOT is granted nowhere, only $ROOT/workspace and $ROOT/.home are.
+  #
+  # ONE old home is carried and only one: the container root, which is where every released version
+  # has put HOME. `workspace/.home` is DELIBERATELY LEFT WHERE IT IS, and this is the decision in
+  # this block that matters.
+  #
+  # An intermediate build on this branch put HOME at `workspace/.home`, and carrying that across
+  # looks like kindness. It is not: under every version an owner can actually be running,
+  # `workspace/.home` is a directory the AGENT can write with no card and no prompt, because
+  # `assertUserDataPath` folds a bare `.home/.bashrc` into it and the worker's write classification
+  # declines the card on the stated ground that a `.bashrc` there is inert
+  # (apps/worker/src/write-classification.ts). Moving that directory into `$ROOT/.home` would make
+  # it the real one - the file `agentHome` hands every agent command, and the file the OWNER's own
+  # interactive terminal sources, since services/workspace-runner/src/server.ts points its pty at
+  # the same HOME. An upgrade would take a write nobody was asked about and promote it into the
+  # owner's login shell. That is the exact hole moving HOME to the container root was for.
+  #
+  # Nothing is lost by leaving it: it stays in `workspace/`, readable and writable by the agent,
+  # inside the checkpoint and the snapshot, and visible to the owner in the file browser. A box that
+  # ran the intermediate build comes up needing its coding CLIs signed in again, with the old
+  # credentials still on disk where a person can look at them and decide. That is the right way
+  # round: a re-sign-in is a minute, and a promoted `.bashrc` is not noticed at all.
+  #
+  # `mv -n` for the move that is made, so nothing is overwritten and a second run moves nothing -
+  # this loop runs on every install and must be safe to repeat.
+  #
+  # `workspace/` gates all of it, as the one test that this directory is a workspace rather than
+  # something an operator left under /home/athanor by hand.
+  [ -d "$workspace_directory/workspace" ] || continue
+  install -d -m 2770 -o "$runner_user" -g "$agent_user" "$workspace_directory/.home"
+  # Everything at the root except `workspace`, `.athanor` and `.home` itself, because that is
+  # exactly what the ORIGINAL HOME was. What this leaves behind is a root entry whose name the new
+  # home already has; it stays at the root, where a confined command cannot read it. Deliberate:
+  # litter is cheaper than clobbering a live credential, and the file is still there to be read by
+  # the owner's own terminal, which is not confined.
+  find "$workspace_directory" -mindepth 1 -maxdepth 1 \
+    ! -name .athanor ! -name workspace ! -name .home -exec \
+    mv -n {} "$workspace_directory/.home/" \; 2>/dev/null || true
 done
 
 say "Building athanor"
@@ -573,6 +617,22 @@ esac
 case "$sandbox_report" in
   *network-isolation=yes*) ;;
   *) warn "this kernel refused a network namespace, so ISOLATE_AGENT_NETWORK cannot be turned on" ;;
+esac
+# The filesystem rung, warned on rather than hard-gated, and the difference from the check above is
+# the difference between the two boundaries. A box that cannot drop to the agent account is a box
+# where every command runs as the runner, which is not something to come up believing; a box that
+# cannot apply a Landlock ruleset still confines every command to the agent account and to the
+# network policy, and refusing to install there would take the whole computer away over the newest
+# of its three boundaries. So it is measured here, said out loud, and written into runner.env below
+# - which is what stops the runner asking for a ruleset the kernel would reject and turning every
+# command into exit 125.
+case "$sandbox_report" in
+  *filesystem=landlock*) agent_filesystem_confinement=true ;;
+  *)
+    agent_filesystem_confinement=false
+    warn "this kernel or util-linux cannot apply a Landlock ruleset, so agent commands will run\
+ with the identity boundary only and can read and write every workspace on this box"
+    ;;
 esac
 
 say "Preparing the private database"
@@ -932,6 +992,12 @@ set_env_value "$runner_env" DESKTOP_SESSION_EXECUTABLE \
   /usr/local/lib/athanor/start-desktop-session.sh
 set_env_value "$runner_env" SYSTEM_PACKAGE_HELPER /usr/local/lib/athanor/athanor-package-helper
 set_env_value "$runner_env" AGENT_SANDBOX_HELPER /usr/local/lib/athanor/athanor-sandbox
+# Written from what `athanor-sandbox check` measured on this kernel a few hundred lines above, not
+# from a preference. `set_env_value` rather than `set_env_default` on purpose: a box that gains
+# Landlock through a kernel upgrade, or loses it, has this rewritten by the next install rather than
+# keeping whatever the first one found. The runner refuses to start if this is on and the helper is
+# unset, so the two keys are written together.
+set_env_value "$runner_env" CONFINE_AGENT_FILESYSTEM "$agent_filesystem_confinement"
 # Publishing a preview points the public internet at a loopback port, so the runner is told every
 # port this installation already serves something private on: the API, the preview gateway, the
 # database, and the worker and notification health endpoints. Its own port is added in code.

@@ -17,9 +17,11 @@ import {
   EGRESS,
   FREE_PACKAGE_WORK,
   FREE_STORE_WORK,
+  FREE_WORKSPACE_DELETES,
   PUBLISHES,
   READS,
   SINKS,
+  STOPS_THE_COMPUTER,
   WRITES,
   egressCall,
   noEgressUncovered,
@@ -154,12 +156,40 @@ export interface GuardFailure {
     | 'confined'
     | 'egress'
     | 'destroys'
-    | 'free-store';
+    | 'free-store'
+    | 'free-workspace-deletes'
+    | 'stops-the-computer';
   readonly id: string;
   readonly detail: string;
 }
 
 const modesOf = (entry: Guard): readonly Mode[] => entry.modes ?? MODES;
+
+/**
+ * A turn that has an undo point, which is what every call after a turn's first one is.
+ *
+ * The destructive rule drops a card only when the caller has said a checkpoint exists for THIS
+ * turn (`ApprovalContext.undoPoint`, approval-policy.ts): absent keeps the card, because a
+ * workspace over `CHECKPOINT_MAX_FILES` makes taking the checkpoint throw and every delete inside
+ * `workspace/` would otherwise be free on a turn nothing can rewind. The guard tables handed `{}`
+ * were therefore measuring a turn with no undo point and reporting the floor as broken - `rm -rf
+ * dist` carded in all three modes and every `FREE_WORKSPACE_DELETES` row failed at once.
+ *
+ * The id is a literal because nothing here reads it; only whether it is there. `uncovered` is the
+ * empty list rather than omitted, and the difference is a whole table: it is the set of files the
+ * checkpoint WALKED and did not HOLD - each over `CHECKPOINT_MAX_FILE_BYTES`, 2 GiB - and omitting
+ * it means "nobody knows", which keeps the card on every delete and would satisfy every
+ * `DESTROYS` row here for the wrong reason while failing every `FREE_WORKSPACE_DELETES` row. Empty
+ * is what an ordinary workspace produces and it is the answer that makes both tables mean
+ * something.
+ *
+ * This models every call of a turn, first one included. The undo point is taken in
+ * `turn/dispatch.ts` immediately before the floor is asked, so there is no longer a first call the
+ * fact is missing for - which is what it used to model around.
+ */
+const AFTER_THE_UNDO_POINT = {
+  undoPoint: { id: 'checkpoint-for-this-turn', uncovered: [] }
+} as const;
 
 /**
  * The two directions, checked on every run rather than under a flag.
@@ -183,7 +213,9 @@ export const guardFailures = (
    */
   uncovered: readonly string[] = noEgressUncovered(),
   destroys: readonly Guard[] = DESTROYS,
-  freeStore: readonly Guard[] = FREE_STORE_WORK
+  freeStore: readonly Guard[] = FREE_STORE_WORK,
+  freeWorkspaceDeletes: readonly Guard[] = FREE_WORKSPACE_DELETES,
+  stopsTheComputer: readonly Guard[] = STOPS_THE_COMPUTER
 ): GuardFailure[] => {
   const failures: GuardFailure[] = [];
   for (const entry of publishes)
@@ -354,10 +386,21 @@ export const guardFailures = (
    * things that must not is satisfied by deleting the rule. `psql -c 'DROP DATABASE'` must stop and
    * `psql tracker -f migrations/001_init.sql` must not, and the second of those is a call the
    * owner's own scenario makes twice.
+   *
+   * Asked of a turn that HAS an undo point, which makes the claim stronger rather than kinder: a
+   * table of deletes that must card is otherwise satisfied by the checkpoint fact simply being
+   * absent, and would go on passing after the location rule was widened into an exemption for the
+   * word `rm`. Every row here has to card while the turn is holding the very thing the rule below
+   * drops cards for.
    */
   for (const entry of destroys)
     for (const mode of modesOf(entry)) {
-      const requirement = approvalRequirement(entry.call.name, entry.call.arguments, mode, {});
+      const requirement = approvalRequirement(
+        entry.call.name,
+        entry.call.arguments,
+        mode,
+        AFTER_THE_UNDO_POINT
+      );
       if (!requirement)
         failures.push({
           table: 'destroys',
@@ -373,6 +416,54 @@ export const guardFailures = (
           table: 'free-store',
           id: entry.id,
           detail: `cards in ${mode} mode as "${requirement.action}", and it destroys nothing the turn's undo point is not already holding`
+        });
+    }
+  /*
+   * Where a delete lands, in both directions and in one loop for the third time in this file - and
+   * here it is not a stylistic echo. The location test drops a card when every path a command names
+   * is strictly inside `CHECKPOINT_CONTENT`, and the way that rule fails is by widening into an
+   * exemption for the word `rm`: every count in the table falls at once and the run reads like the
+   * saving it is supposed to be. The second half of `DESTROYS` is what catches that, and it is
+   * walked above; this is the half that catches the rule being reverted or never consulted.
+   */
+  for (const entry of freeWorkspaceDeletes)
+    for (const mode of modesOf(entry)) {
+      const requirement = approvalRequirement(
+        entry.call.name,
+        entry.call.arguments,
+        mode,
+        AFTER_THE_UNDO_POINT
+      );
+      if (requirement)
+        failures.push({
+          table: 'free-workspace-deletes',
+          id: entry.id,
+          detail: `cards in ${mode} mode as "${requirement.action}", and everything it removes is strictly inside CHECKPOINT_CONTENT, which the undo point this turn already took puts back`
+        });
+      /*
+       * THE THIRD DIRECTION, and the one the other two cannot cover between them. The saving above
+       * is bought entirely with "a rewind puts it back", so it is owed only on a turn that has a
+       * rewind. `CHECKPOINT_MAX_FILES` = 250,000 makes taking the checkpoint throw on a workspace
+       * that has just had a large dependency tree unpacked into it, and `#ensureTurnUndoPoint`
+       * writes that into the timeline and carries on - so the turn where this exemption is least
+       * affordable is exactly the turn it would otherwise be widest on. Same rows, same modes, one
+       * fact removed: every one of them must card again.
+       */
+      if (!approvalRequirement(entry.call.name, entry.call.arguments, mode, {}))
+        failures.push({
+          table: 'free-workspace-deletes',
+          id: entry.id,
+          detail: `raises no card in ${mode} mode on a turn with NO undo point, so the exemption is being granted on a rewind that does not exist`
+        });
+    }
+  for (const entry of stopsTheComputer)
+    for (const mode of modesOf(entry)) {
+      const requirement = approvalRequirement(entry.call.name, entry.call.arguments, mode, {});
+      if (!requirement)
+        failures.push({
+          table: 'stops-the-computer',
+          id: entry.id,
+          detail: `raises no card in ${mode} mode, and it ends every process on this computer, the turn asking the question included`
         });
     }
   for (const name of uncovered)

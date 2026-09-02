@@ -33,6 +33,25 @@ const GC_DEBT_THRESHOLD = 8;
  * and the live desktop session - the cookie jar for every site the owner has ever signed into - and
  * rolling them back to yesterday morning signs the owner out of all of them. A rewind undoes what
  * the agent did to the work; it is not meant to undo the owner's own logins.
+ *
+ * The agent's `$HOME` is absent for the same kind of reason and a second one. It is `.home` at the
+ * container root, beside `workspace/` rather than inside it (execution.ts), so a rewind does not
+ * sign the agent out of its own coding-CLI sessions - and a toolchain cache under it is enormous:
+ * a Rust toolchain is 88,021 files counted on a development machine (`~/.rustup` 66,157 plus
+ * `~/.cargo` 21,864), and a conda environment is routinely another 30-60k. Those would be walked
+ * and hashed every turn and counted against `maxFiles` below, so putting HOME in here would spend
+ * the very undo point it was meant to strengthen.
+ *
+ * THIS LIST IS THE SET OF TREES A CHECKPOINT WALKS, NOT WHAT IT HOLDS, and it is read as if it
+ * were both. The worker's approval floor keeps a copy of it and drops the card on a delete strictly
+ * inside it, on the grounds that a rewind puts the file back (`apps/worker/src/approval-policy.ts`,
+ * the location test in `destructiveCommand`). Two ceilings below separate walking from holding:
+ * `maxFiles` refuses the checkpoint outright and the turn then has no undo point at all, and
+ * `maxFileBytes` records a larger file as uncovered and walks past it. Both are now carried to the
+ * floor on `ApprovalContext.undoPoint`: the first as a missing checkpoint id, the second as
+ * `CheckpointSummary.uncoveredPaths`, which cards a delete naming one of those files and leaves
+ * every other delete on the turn free. Anyone widening or narrowing this list is moving that rule
+ * too.
  */
 export const CHECKPOINT_CONTENT = ['workspace', '.athanor/artifacts'] as const;
 export const CHECKPOINT_BROWSER_PROFILE = '.athanor/browser';
@@ -97,8 +116,43 @@ export interface CheckpointSummary {
   storedBytes: number;
   changedFileCount: number;
   uncoveredFileCount: number;
+  /**
+   * WHICH files those were, root-relative, so the worker's approval floor can card a delete that
+   * names one of them and go on freeing every other delete on the turn.
+   *
+   * The count alone cannot do that. A workspace built for model weights or sequencing reads holds
+   * an oversize file more or less permanently, so a floor reading only the count would keep the
+   * card on `rm -rf dist` for the whole life of that workspace - which is the friction the location
+   * rule was written to remove, reintroduced on exactly the machines this ceiling exists for.
+   *
+   * Empty under btrfs and ZFS, and truthfully so: those mechanisms snapshot the subvolume and hold
+   * everything in it, and this branch is the only one with a ceiling.
+   */
+  uncoveredPaths: string[];
+  /**
+   * Whether the list above was cut off at `UNCOVERED_PATHS_ON_THE_WIRE`, in which case it names
+   * some of the uncovered files and not all of them. The worker reads a truncated list as no list
+   * at all and keeps the card on every delete, which is why this is a separate flag rather than a
+   * short array nothing distinguishes from a complete one.
+   */
+  uncoveredPathsTruncated: boolean;
   durationMs: number;
 }
+
+/**
+ * How many uncovered paths ride back to the worker on the checkpoint response.
+ *
+ * Sixty-four. Every one of these files is over `maxFileBytes` - 2 GiB by default - so sixty-four of
+ * them is 128 GiB of oversize content in one workspace, more than any workspace on this box has
+ * held. The number is a bound on the WORKER's state row rather than on this response: the worker
+ * records the list in `AgentState.checkpoint` and rewrites that row on every step of the turn, and
+ * sixty-four paths is about four kilobytes there.
+ *
+ * The one way past it that costs nothing is sparse files, which are over the ceiling by size and
+ * take no disk at all - so passing it is a real possibility rather than a theoretical one, and it
+ * is reported as truncation rather than quietly trimmed. A truncated list keeps every card.
+ */
+const UNCOVERED_PATHS_ON_THE_WIRE = 64;
 
 export interface CheckpointChange {
   path: string;
@@ -421,6 +475,11 @@ const scanTree = async (
             next.push({ relative: child, mode: details.mode & 0o7777 });
             return;
           }
+          // Recorded rather than held, and recorded rather than dropped: the preview tells the
+          // owner a restore leaves this file as it is, and the paths ride back to the worker on
+          // `CheckpointSummary.uncoveredPaths` so its approval floor cards a delete that names one.
+          // It is the one place a tree this checkpoint WALKS contains something it does not HOLD -
+          // @see the CHECKPOINT_CONTENT declaration above.
           if (details.size > limits.maxFileBytes) {
             scan.uncovered.set(child, details.size);
             return;
@@ -435,6 +494,10 @@ const scanTree = async (
           });
         })
       );
+      // A refusal, not a partial checkpoint: the worker catches it, tells the owner this turn has
+      // no undo point and lets the work carry on. That is right for the work and it is why
+      // `ApprovalContext.undoPoint` exists - on this turn a rewind is not an answer for anything,
+      // so the floor must keep the card on every delete inside these same trees.
       if (scan.files.size > limits.maxFiles)
         throw new CheckpointRefusedError(
           'checkpoint_workspace_too_large',
@@ -715,6 +778,8 @@ export class WorkspaceCheckpoints {
     };
     let changedFileCount = 0;
     let uncoveredFileCount = 0;
+    let uncoveredPaths: string[] = [];
+    let uncoveredPathsTruncated = false;
 
     if (resolved.mechanism === 'btrfs') {
       const target = path.join(directory, id);
@@ -762,6 +827,12 @@ export class WorkspaceCheckpoints {
         files.push([relative, details.mode, hashed.size, hashed.mtimeMs, hashed.hash]);
       });
       uncoveredFileCount = scan.uncovered.size;
+      // Sorted before it is cut, so a truncated list is the same list twice running rather than
+      // whichever sixty-four the parallel walk happened to reach first - the floor's answer would
+      // otherwise move between two checkpoints of an unchanged tree.
+      const walked = [...scan.uncovered.keys()].sort();
+      uncoveredPathsTruncated = walked.length > UNCOVERED_PATHS_ON_THE_WIRE;
+      uncoveredPaths = walked.slice(0, UNCOVERED_PATHS_ON_THE_WIRE);
       const manifest: CheckpointManifest = {
         version: 1,
         files: files.sort((left, right) => (left[0] < right[0] ? -1 : 1)),
@@ -790,6 +861,8 @@ export class WorkspaceCheckpoints {
       storedBytes: meta.storedBytes,
       changedFileCount,
       uncoveredFileCount,
+      uncoveredPaths,
+      uncoveredPathsTruncated,
       durationMs: meta.durationMs
     };
   }

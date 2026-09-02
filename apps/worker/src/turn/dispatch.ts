@@ -395,6 +395,32 @@ export const dispatchToolCalls = async (
       await declareAcceptance(deps.acceptance, task, key, state, call, turn);
       continue;
     }
+    /*
+     * The undo point, in front of the floor rather than behind it.
+     *
+     * It used to be taken inside `executeApprovedCall`, one gate later, and that put the floor in
+     * the position of answering a question about a fact that did not exist yet. The destructive
+     * rule frees a delete strictly inside `CHECKPOINT_CONTENT` because a rewind puts it back, and
+     * it reads `ApprovalContext.undoPoint` to know there is a rewind; absent keeps the card. So a
+     * turn whose FIRST non-exempt call was itself a recoverable delete paid a card, and the same
+     * `rm -rf dist` two calls later did not. Nothing about the delete decided that - only where it
+     * happened to fall in the batch, which is not a bound, and no rig row could see it.
+     *
+     * Moving it here answers the question the rule is actually asking. `#ensureTurnUndoPoint` is
+     * unconditional for a non-exempt tool and returns immediately for an exempt one, so this costs
+     * an exempt call nothing; and it records `{ turn, id: null }` when the runner REFUSES - a
+     * workspace over `CHECKPOINT_MAX_FILES`, a full host disk - which the floor reads as no rewind
+     * and cards. The fail-closed direction is not traded away by the move, it is made exact: before
+     * it, "the checkpoint has not been taken yet" and "the checkpoint could not be taken" were the
+     * same absent fact.
+     *
+     * What it costs, said plainly: a call the floor CARDS now takes a checkpoint it did not take
+     * before, and if the owner declines it, that walk bought nothing. An approved one pays it
+     * either way - `turn/resume.ts` takes the undo point before running the approved call - so the
+     * new cost is exactly one workspace walk per declined or unanswered card. A turn that only
+     * reads still costs nothing, because every tool in it is exempt.
+     */
+    await deps.resume.ensureTurnUndoPoint(task, key, state, call.name);
     const approval = await deps.approvalForCallOnce(approvalMemo, task, call, state);
     if (approval) {
       // The card, the calls behind it, and the saved state, in that order and together.

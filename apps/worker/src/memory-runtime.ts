@@ -192,6 +192,53 @@ const openStoredPack = (
 };
 
 /**
+ * Gives a fork the bytes its parent already paid for, sealed under the fork's own context.
+ *
+ * It DECRYPTS and RE-ENCRYPTS rather than pointing the fork at the parent's row, and that is the
+ * whole of why this function exists rather than an `INSERT ... SELECT`. `openStoredPack` above is
+ * an equality against `memoryPackAad(taskId)`, so an aliased row is refused, returns null, and the
+ * fork re-ranks - which is exactly the behaviour a copy is supposed to remove, arriving silently
+ * and looking fixed. The re-encryption is what makes the row readable by the one task allowed to
+ * read it.
+ *
+ * `sha256`, `itemIds` and `tokensEst` are carried across unchanged because they describe the body,
+ * and the body is the same body. A different sha here would make the fork's first save look like a
+ * losing race to `buildTaskMemoryPack` below.
+ *
+ * Returns null and says nothing when there is nothing to copy: a parent with no pack row (a branch
+ * that never ran), a row whose context is not the parent's, or a decrypt that fails. Every one of
+ * those means the fork ranks its own pack, which is what every fork does today.
+ */
+export const copyMemoryPack = async (input: {
+  store: MemoryPackStore;
+  fromTaskId: string;
+  toTaskId: string;
+  workspaceId: string;
+  dataKey: Uint8Array;
+}): Promise<TaskMemoryPack | null> => {
+  const source = await input.store.getMemoryPack(input.fromTaskId);
+  if (!source) return null;
+  const opened = openStoredPack(source, input.fromTaskId, input.dataKey);
+  if (!opened) return null;
+  const saved = await input.store.saveMemoryPack({
+    taskId: input.toTaskId,
+    workspaceId: input.workspaceId,
+    bodyCiphertext: encryptJson(
+      { body: opened.body },
+      input.dataKey,
+      memoryPackAad(input.toTaskId)
+    ),
+    sha256: source.sha256,
+    itemIds: source.itemIds,
+    tokensEst: source.tokensEst,
+    briefVersion: source.briefVersion
+  });
+  // Read back rather than returned from what was written. The store is first-writer-wins, so a
+  // worker that got here second must emit the row that is there and not the copy it just lost.
+  return openStoredPack(saved, input.toTaskId, input.dataKey);
+};
+
+/**
  * One fusion query per task, never per turn.
  *
  * A resume must re-emit the bytes it emitted the first time rather than re-rank against a newer
@@ -208,11 +255,30 @@ export const buildTaskMemoryPack = async (input: {
   query: string;
   /** Task start: the clock anchor for every decayed score in the ranking. */
   clockAnchor: Date;
+  /**
+   * The task this one was forked out of and must emit the same bytes as, when there is one. Equal
+   * to `taskId` for anything that is not a retry, which is the ordinary case and costs one
+   * comparison. @see forkCacheAnchor in `window.ts`, which is what computes it and which refuses
+   * the inheritance for age, for a foreign encryption context or for a deleted ancestor.
+   */
+  inheritFromTaskId?: string;
   budgetTokens?: number;
 }): Promise<TaskMemoryPack> => {
   const stored = await input.store.getMemoryPack(input.taskId);
   const reused = stored ? openStoredPack(stored, input.taskId, input.dataKey) : null;
   if (reused) return reused;
+  // Between the task's own row and a fresh ranking, because a fork that has already saved a pack
+  // has bytes a provider may have cached and those win over its parent's. @see copyMemoryPack.
+  if (input.inheritFromTaskId && input.inheritFromTaskId !== input.taskId) {
+    const inherited = await copyMemoryPack({
+      store: input.store,
+      fromTaskId: input.inheritFromTaskId,
+      toTaskId: input.taskId,
+      workspaceId: input.workspaceId,
+      dataKey: input.dataKey
+    });
+    if (inherited) return inherited;
+  }
 
   const candidates = await input.store.recallMemoryCandidates({
     workspaceId: input.workspaceId,

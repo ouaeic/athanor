@@ -112,6 +112,44 @@ export const existingSkillFor = async (
   }
 };
 
+/**
+ * What this turn's undo point holds, for the one rule that spends it.
+ *
+ * The destructive rule frees a delete strictly inside `CHECKPOINT_CONTENT` because a rewind puts it
+ * back, and that is only true of a turn that HAS a rewind. `#ensureTurnUndoPoint` writes
+ * `{ turn, id: null }` when the runner refuses the checkpoint - a workspace over
+ * `CHECKPOINT_MAX_FILES`, or a full host disk - and lets the turn carry on, which is right for the
+ * work and would otherwise free every delete inside `workspace/` on the one turn nothing can undo.
+ *
+ * The turn is compared rather than trusted. `state.checkpoint` survives a resume, an approval park
+ * and a worker handover, so a fact left by turn 4 is still sitting there in turn 5 before that
+ * turn's undo point is taken, and reading it would answer this turn's question with last turn's
+ * measurement. A workspace crosses the file ceiling by having a dependency tree unpacked into it,
+ * which is something a turn does to itself, so the turn where the stale fact goes wrong is exactly
+ * the turn that would be leaning on it.
+ *
+ * No state, or no checkpoint yet for this turn, means the field is absent and every delete keeps
+ * its card. @see `ApprovalContext.undoPoint` for why absent is a real answer here and not a gap.
+ *
+ * `uncovered` is the second ceiling and it is spread rather than defaulted. It carries the paths the
+ * checkpoint's own walk skipped for being over `CHECKPOINT_MAX_FILE_BYTES`, and a delete naming one
+ * of them keeps its card while the rest of the turn's deletes stay free. Spread, because absent and
+ * empty are different answers: empty says the walk held everything, absent says nobody knows - which
+ * is what a runner one release behind, a list the runner had to cut off, and a state row written
+ * before the field existed all produce - and absent keeps the card on every delete. Writing
+ * `uncovered: state.checkpoint.uncovered ?? []` here would turn all three of those into "there is
+ * nothing over the ceiling", which is the one reading none of them supports.
+ */
+const undoPointFor = (state?: AgentState): Pick<ApprovalContext, 'undoPoint'> =>
+  state?.checkpoint && state.checkpoint.turn === (state.turn ?? 0)
+    ? {
+        undoPoint: {
+          id: state.checkpoint.id,
+          ...(state.checkpoint.uncovered ? { uncovered: state.checkpoint.uncovered } : {})
+        }
+      }
+    : {};
+
 export const approvalForCall = async (
   deps: ApprovalFloorDeps,
   task: TaskRecord,
@@ -164,6 +202,7 @@ export const approvalForCall = async (
       : {}),
     ...(existingSkill ? { existingSkill } : {}),
     ...(state?.taint ? { taintSources: state.taint.sources } : {}),
+    ...undoPointFor(state),
     ...deps.destinationContext(state)
   });
   if (!['browser_action', 'desktop_action'].includes(call.name)) return declared;

@@ -225,3 +225,52 @@ describe('what the runner measured, and what it could not', () => {
     expect(picture.convertedFrom).toBe('image/jpeg');
   });
 });
+
+/*
+ * The one fact this client adds rather than passes through, and the reason it adds it here.
+ *
+ * `POST /checkpoints` answers with the paths the scan walked past for being over
+ * `CHECKPOINT_MAX_FILE_BYTES`, cut off at sixty-four, and a second field saying whether it had to
+ * cut. Three places downstream spend that - `AgentState.checkpoint`, `undoPointFor` and the location
+ * test in `destructiveCommand` - and a partial list is worth nothing to any of them: a delete naming
+ * the sixty-fifth oversize file would be freed by a list that does not mention it. So the two fields
+ * collapse to one answer on arrival: the complete set, or null for "not known", which keeps the card
+ * on every delete for that turn.
+ */
+describe('what the checkpoint response says about what it could not hold', () => {
+  const checkpoint = (
+    body: Record<string, unknown>
+  ): Promise<{ uncovered: readonly string[] | null }> => {
+    vi.stubGlobal(
+      'fetch',
+      async () =>
+        new Response(JSON.stringify({ id: 'cp-1', mechanism: 'content', pruned: [], ...body }), {
+          headers: { 'content-type': 'application/json' }
+        })
+    );
+    return client.checkpoint(workspaceId, taskId, { checkpointId: 'cp-1', turn: 0 });
+  };
+
+  it('carries a complete list through as it stands', async () => {
+    await expect(
+      checkpoint({ uncoveredPaths: ['workspace/model.gguf'], uncoveredPathsTruncated: false })
+    ).resolves.toMatchObject({ uncovered: ['workspace/model.gguf'] });
+    // The ordinary workspace. Empty is an answer - the walk held everything - and it is the one
+    // that frees a delete, so it must never collapse to null.
+    await expect(
+      checkpoint({ uncoveredPaths: [], uncoveredPathsTruncated: false })
+    ).resolves.toMatchObject({ uncovered: [] });
+  });
+
+  it('reads a list it cannot trust as no list at all', async () => {
+    // Cut off by the runner: what arrived names some of the uncovered files and not all of them.
+    await expect(
+      checkpoint({ uncoveredPaths: ['workspace/a.bin'], uncoveredPathsTruncated: true })
+    ).resolves.toMatchObject({ uncovered: null });
+    // A runner one release behind this worker, which sends no list at all. Read as an empty set
+    // this would tell the floor that a workspace holds no oversize files on precisely the boxes
+    // whose runner has not been updated.
+    await expect(checkpoint({})).resolves.toMatchObject({ uncovered: null });
+    await expect(checkpoint({ uncoveredPaths: null })).resolves.toMatchObject({ uncovered: null });
+  });
+});

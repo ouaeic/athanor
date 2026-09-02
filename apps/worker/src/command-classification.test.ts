@@ -7,20 +7,33 @@
  * evasions lived in, so the questions are asked here directly, of the four shapes a model actually
  * writes: the bare command, `bash -lc`, `sh -c` with a `cd` in front, and a runner wrapping either.
  */
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it } from 'vitest';
 import {
+  AGENT_HOME,
   callDestinations,
+  CHECKPOINT_CONTENT,
+  consequentialExecutables,
   destructionOperation,
   effectiveCommands,
   forcedGitPush,
+  insideCheckpointContent,
   isScheduledExecutionPath,
   gitConfigRunsCode,
   gitConfigWrite,
+  gitRemovesAWorktree,
+  isDestructiveScript,
   registryPublishOperation,
+  removalTargets,
+  removesUncoveredFile,
   scriptDestroysAStore,
   sendsDataOverNetwork,
   shellWriteTargets,
-  untrustedShellOrigin
+  signalStopsThisComputer,
+  SIGNALLING_EXECUTABLES,
+  untrustedShellOrigin,
+  WRITING_GIT_SUBCOMMANDS
 } from './command-classification.js';
 import { classifyDestination } from './egress.js';
 
@@ -1598,5 +1611,448 @@ describe('forcedGitPush and isScheduledExecutionPath', () => {
       '~/.config/systemd/user/tracker.service'
     ])
       expect(isScheduledExecutionPath(path), path).toBe(true);
+  });
+});
+
+/*
+ * Where a delete lands, which is the question the destructive arm asked about the command's name
+ * and never about its path.
+ *
+ * `insideCheckpointContent` decides whether a card may be dropped at all, so its two directions are
+ * asked here of the helper and again through `approvalRequirement` in approval-policy.test.ts -
+ * the helper says what the rule is, the floor says the production path actually consults it.
+ */
+describe('what a rewind puts back', () => {
+  it('reads the two spellings of one place as one place', () => {
+    // `shell` runs in `workspace/`, so a bare name lands there; and the rest of this repository
+    // writes the same file root-relative, because `resolveInside` accepts either.
+    for (const target of [
+      'dist',
+      'node_modules',
+      'build/out',
+      './server.log',
+      'workspace/tmp.log',
+      'workspace/downloads/*.dmg',
+      '.athanor/artifacts/report.pdf',
+      "'workspace/quoted path'",
+      // Through HOME and back out of it. This is `<root>/workspace/tracker/target` however far
+      // round the houses the spelling goes, and it is the counter-direction for the `~` segment:
+      // reading `~` as HOME must not cost a card on a path that really does reach the workspace.
+      '~/../workspace/tracker/target'
+    ])
+      expect(insideCheckpointContent(target), target).toBe(true);
+  });
+
+  it('keeps the card for everything the undo point does not hold', () => {
+    for (const target of [
+      // HOME is `<workspaceRoot>/.home`, beside `workspace/` and not inside it, so these are under
+      // the root and inside no checkpoint. This is the whole reason the test is `strictly inside`.
+      '~/.ssh',
+      '~/.cargo/registry',
+      '~/.bashrc',
+      // These two were asserted RECOVERABLE here while `~` was read as the workspace root, which
+      // was true only while HOME was the root. They are `<root>/.home/workspace/tracker/target` and
+      // `<root>/.home/.athanor/artifacts/report.pdf`: directories the agent can create under its own
+      // HOME, wearing the two prefixes that mean "recoverable", inside nothing a rewind walks.
+      '~/workspace/tracker/target',
+      '~/.athanor/artifacts/report.pdf',
+      // Climbing out of `workspace/`, and out of the root altogether.
+      '../secrets',
+      '../../etc/nginx',
+      'workspace/../.ssh',
+      // Absolute: the root's real name is not something this pure function is ever handed.
+      '/home/other/photos',
+      '/etc/nginx',
+      '/',
+      // The checkpoint roots are not inside themselves.
+      'workspace',
+      '~/workspace',
+      '.athanor/artifacts',
+      // Somebody else's home, and an expansion this cannot see.
+      '~root/.ssh',
+      '$HOME/.ssh',
+      '`echo ~`/.ssh',
+      'workspace/$DIR',
+      ''
+    ])
+      expect(insideCheckpointContent(target), target).toBe(false);
+  });
+
+  /*
+   * The working directory is an argument the catalogue shows the model, not an assumption. Both
+   * `shell` and `desktop_launch` default it to `workspace` and `resolveInside` will accept any path
+   * inside the ROOT for it, so `{ cwd: '.', args: ['-rf', '.ssh'] }` deletes the agent's own SSH
+   * directory while naming a bare relative path. A rule that read every bare name against a
+   * hard-coded `workspace/` would have freed exactly that call.
+   */
+  it('reads a bare name against the working directory the call names', () => {
+    expect(insideCheckpointContent('dist', 'workspace/tracker')).toBe(true);
+    expect(insideCheckpointContent('.ssh', '.')).toBe(false);
+    expect(insideCheckpointContent('dist', '.')).toBe(false);
+    expect(insideCheckpointContent('.ssh', '')).toBe(false);
+    expect(insideCheckpointContent('x', '.athanor')).toBe(false);
+    expect(insideCheckpointContent('x', '.athanor/artifacts')).toBe(true);
+    expect(insideCheckpointContent('x', '~')).toBe(false);
+    expect(insideCheckpointContent('x', '/etc')).toBe(false);
+  });
+
+  /*
+   * The `~` hole again, in the other argument.
+   *
+   * `workspace/…` and `.athanor/…` are read from the workspace root because from a cwd inside a
+   * checkpointed tree the two readings are both recoverable and the divergence cannot change the
+   * answer. From a cwd that is NOT, the root-relative reading answers about a different place
+   * entirely: `cwd: '.home'` with `workspace/dist` removes `<root>/.home/workspace/dist`, a
+   * directory under the agent's own HOME wearing the prefix that means "recoverable", and no
+   * rewind walks it. Measured through `approvalRequirement` in autonomous before this condition:
+   * FREE, for both prefixes. `cwd` is an argument the catalogue shows the model and `resolveInside`
+   * accepts any path inside the container root for it, so `.home` is a cwd the model may write.
+   */
+  it('reads the root-relative spelling only from a cwd where it means the same place', () => {
+    expect(insideCheckpointContent('workspace/dist', '.home')).toBe(false);
+    expect(insideCheckpointContent('.athanor/artifacts/report.pdf', '.home')).toBe(false);
+    expect(insideCheckpointContent('workspace/dist', '.home/tools')).toBe(false);
+    // `.athanor` alone is not `.athanor/artifacts`, and only the second is checkpointed.
+    expect(insideCheckpointContent('workspace/dist', '.athanor')).toBe(false);
+    // The counter-direction, and it is documentation rather than a pin: from the container root
+    // the two readings ARE one path, and from inside a checkpointed tree the literal reading lands
+    // inside that same tree, so these answer true however the condition above is mutated. Nothing
+    // legitimate is refused by narrowing it - what narrowing costs is a card, and that is pinned by
+    // `rm -rf workspace` being false below and by the row of the same name in evals/cards.
+    expect(insideCheckpointContent('workspace/dist', '.')).toBe(true);
+    expect(insideCheckpointContent('workspace/dist', '')).toBe(true);
+    expect(insideCheckpointContent('workspace/dist', 'workspace')).toBe(true);
+    expect(insideCheckpointContent('workspace/dist', 'workspace/tracker')).toBe(true);
+    expect(insideCheckpointContent('.athanor/artifacts/a.png', 'workspace')).toBe(true);
+    expect(insideCheckpointContent('workspace/dist', '.athanor/artifacts')).toBe(true);
+  });
+
+  /*
+   * The list this rule is drawn from lives in another package the worker does not depend on, so it
+   * is copied. This is the pin that stops the copy drifting: a third entry, a rename or a removal
+   * in the runner fails here rather than silently changing what the floor calls recoverable.
+   */
+  it('agrees with the runner about what a checkpoint contains', () => {
+    const source = readFileSync(
+      new URL('../../../services/workspace-runner/src/checkpoints.ts', import.meta.url),
+      'utf8'
+    );
+    const declaration = /export const CHECKPOINT_CONTENT = \[([^\]]*)\]/.exec(source)?.[1];
+    expect(declaration, 'CHECKPOINT_CONTENT is no longer declared as a literal array').toBeTruthy();
+    // Compared against the copy this file actually uses, not against a literal repeated here: a
+    // check that reads only the far side of a copy is green while the near side says anything at
+    // all, which is the shape a pin is supposed to be immune to.
+    expect([...(declaration ?? '').matchAll(/'([^']+)'/g)].map((match) => match[1])).toEqual(
+      CHECKPOINT_CONTENT.map((segments) => segments.join('/'))
+    );
+  });
+
+  /*
+   * `~` is HOME, and HOME is not the workspace root.
+   *
+   * It was the root, and this file read `~` as the root because of it. When HOME moved to
+   * `<workspaceRoot>/.home`, that reading became a hole rather than an approximation: `~/workspace`
+   * and `~/.athanor/artifacts` are the two prefixes that answer "recoverable", and read against the
+   * root they answered it for a directory the checkpoint has never walked. Measured through
+   * `approvalRequirement` in autonomous before the segment was added: `rm -rf ~/workspace/dist` and
+   * `rm -rf ~/.athanor/artifacts/a.png` were FREE.
+   */
+  it('reads ~ as the agent HOME rather than as the workspace root', () => {
+    expect(insideCheckpointContent('~/workspace/dist')).toBe(false);
+    expect(insideCheckpointContent('~/.athanor/artifacts/a.png')).toBe(false);
+    // Unmoved by the change, and named so a later reader can see the segment costs nothing here:
+    // these were outside the checkpoint under either reading of `~`.
+    expect(insideCheckpointContent('~/.ssh')).toBe(false);
+    expect(insideCheckpointContent('~/.cargo/registry')).toBe(false);
+    // The counter-direction, twice. The real `workspace/` is still recoverable under every
+    // spelling that actually reaches it, including the one that climbs back out of HOME - which
+    // used to answer null by walking off the top of the root.
+    expect(insideCheckpointContent('workspace/dist')).toBe(true);
+    expect(insideCheckpointContent('dist')).toBe(true);
+    expect(insideCheckpointContent('~/../workspace/dist')).toBe(true);
+    // HOME is beside `workspace/`, so a `.home` INSIDE the workspace is an ordinary directory the
+    // rewind puts back, and nothing here should confuse the two.
+    expect(insideCheckpointContent('.home/.bashrc')).toBe(true);
+  });
+
+  /*
+   * The second copy-and-pin, for the other half of the same question. `AGENT_HOME` is a literal in
+   * the runner and a literal here because `apps/worker` does not depend on the runner package; the
+   * hole above is precisely what a silent divergence between the two costs, so it is read off the
+   * runner's own source rather than believed.
+   */
+  it('agrees with the runner about where the agent HOME is', () => {
+    const source = readFileSync(
+      new URL('../../../services/workspace-runner/src/files.ts', import.meta.url),
+      'utf8'
+    );
+    const declaration = /export const AGENT_HOME = '([^']+)';/.exec(source)?.[1];
+    expect(declaration, 'AGENT_HOME is no longer declared as a string literal').toBeTruthy();
+    // Against the copy this file actually resolves `~` with, not against a literal repeated here.
+    expect(declaration?.split('/')).toEqual([...AGENT_HOME]);
+  });
+
+  /*
+   * Null is "card", so the shapes that answer null are the safety half of this rule. Each of these
+   * removes something whose path is not in the command text, and each of them used to be - and
+   * still is - a card.
+   */
+  it('answers null for every removal it cannot place', () => {
+    expect(removalTargets('sudo', ['rm', '-rf', 'dist'])).toBeNull();
+    expect(removalTargets('xargs', ['rm', '-f'])).toBeNull();
+    // A list of paths arriving on stdin rather than in the arguments.
+    expect(removalTargets('rm', ['-rf'])).toBeNull();
+    expect(
+      removalTargets('find', ['.', '-name', '*.pyc', '-exec', 'rm', '-f', '{}', '+'])
+    ).toBeNull();
+    expect(removalTargets('find', ['workspace', '-name', '*.log'])).toBeNull();
+    // A device is not a path in this tree, so `dd`, `wipefs` and `mkfs*` keep their card.
+    expect(removalTargets('dd', ['if=/dev/zero', 'of=out.img'])).toBeNull();
+    expect(removalTargets('wipefs', ['-a', 'sda'])).toBeNull();
+    // An escaping redirect names its target after a `>`; a runtime delete names it inside a string.
+    expect(removalTargets('bash', ['-lc', 'echo x > ~/.bashrc'], 'echo x > ~/.bashrc')).toBeNull();
+    expect(
+      removalTargets('node', ['-e', "require('fs').rmSync('dist')"], "require('fs').rmSync('dist')")
+    ).toBeNull();
+    expect(
+      removalTargets(
+        'python3',
+        ['-c', "import shutil; shutil.rmtree('dist')"],
+        "import shutil; shutil.rmtree('dist')"
+      )
+    ).toBeNull();
+    // An interpreter whose script cannot be read is unknown, not safe.
+    expect(removalTargets('bash', ['script.sh'], '')).toBeNull();
+  });
+
+  it('names what a removal it can place would remove, wherever the command was written down', () => {
+    expect(removalTargets('rm', ['-rf', 'dist'])).toEqual(['dist']);
+    expect(removalTargets('rmdir', ['build'])).toEqual(['build']);
+    expect(removalTargets('truncate', ['-s', '0', 'server.log'])).toEqual(['0', 'server.log']);
+    expect(removalTargets('find', ['workspace/downloads', '-name', '*.tmp', '-delete'])).toEqual([
+      'workspace/downloads',
+      '*.tmp'
+    ]);
+    expect(removalTargets('bash', ['-lc', 'rm -rf dist'], 'rm -rf dist')).toEqual(['dist']);
+    // Every command in the script, because a script is only recoverable if all of it is.
+    expect(
+      removalTargets(
+        'bash',
+        ['-lc', 'rm -rf dist && rm -rf ~/.ssh'],
+        'rm -rf dist && rm -rf ~/.ssh'
+      )
+    ).toEqual(['dist', '~/.ssh']);
+    // A command in the script that this cannot place, beside one it can, takes the whole script
+    // back to null rather than reporting only the half it could read.
+    expect(
+      removalTargets(
+        'bash',
+        ['-lc', 'rm -rf dist && find . -exec rm {} +'],
+        'rm -rf dist && find . -exec rm {} +'
+      )
+    ).toBeNull();
+    expect(
+      removalTargets(
+        'bash',
+        ['-lc', 'rm -rf dist && shutdown -h now'],
+        'rm -rf dist && shutdown -h now'
+      )
+    ).toBeNull();
+    // And ordinary work beside a recoverable delete is not a reason to card it.
+    expect(
+      removalTargets('bash', ['-lc', 'pnpm build && rm -rf dist'], 'pnpm build && rm -rf dist')
+    ).toEqual(['dist']);
+  });
+});
+
+/*
+ * Signalling a process is not destroying data, and PID 1 is not a process.
+ */
+describe('what a signal can do to this computer', () => {
+  it('no longer files the three signalling programs beside rm and dd', () => {
+    for (const name of SIGNALLING_EXECUTABLES)
+      expect(consequentialExecutables.has(name)).toBe(false);
+    // The machine-state family stays where it is; it is not what this narrowing was about.
+    for (const name of ['shutdown', 'reboot', 'poweroff', 'halt', 'rm', 'dd'])
+      expect(consequentialExecutables.has(name), name).toBe(true);
+  });
+
+  it('reads the target rather than the program', () => {
+    expect(signalStopsThisComputer('kill', ['-9', '1'])).toBe(true);
+    expect(signalStopsThisComputer('kill', ['1'])).toBe(true);
+    expect(signalStopsThisComputer('kill', ['-9', '-1'])).toBe(true);
+    expect(signalStopsThisComputer('kill', ['-0', '1234'])).toBe(false);
+    expect(signalStopsThisComputer('kill', ['1234'])).toBe(false);
+    // `-1` in the first position is SIGHUP, not the target.
+    expect(signalStopsThisComputer('kill', ['-1', '1234'])).toBe(false);
+    // Neither of the other two can name PID 1 by number, so neither is asked.
+    expect(signalStopsThisComputer('pkill', ['-f', 'vite'])).toBe(false);
+    expect(signalStopsThisComputer('killall', ['node'])).toBe(false);
+  });
+});
+
+/*
+ * `git worktree` was in no set at all, so `writtenPaths` named no path for a subcommand that
+ * removes a checkout along with whatever was uncommitted in it.
+ */
+describe('which git subcommands change the tree', () => {
+  it('counts worktree, and keeps the reading forms cheap rather than free', () => {
+    expect(WRITING_GIT_SUBCOMMANDS.has('worktree')).toBe(true);
+  });
+
+  /*
+   * And the destructive half of the same subcommand, which the set above only counted.
+   *
+   * `git worktree remove --force ../wt` deletes a second checkout and everything uncommitted in it.
+   * Narrowed to the verb: `list` prints, `add` creates, `lock` sets a flag and `prune` clears the
+   * record of worktrees whose directories are already gone.
+   */
+  it('tells a worktree removal from the rest of the subcommand', () => {
+    for (const args of [
+      ['worktree', 'remove', '../wt'],
+      ['worktree', 'remove', '--force', '~/wt'],
+      ['-C', 'workspace/app', 'worktree', 'remove', '../wt'],
+      ['worktree', '--porcelain', 'remove', 'x'],
+      // No operand is still the act; `removalTargets` is what says it cannot be placed.
+      ['worktree', 'remove'],
+      /*
+       * And the two spellings that only print the help page for it. Both are read as the act and
+       * both cost a card the owner does not need - the verb is a token here, not a parse of git's
+       * option grammar. It is the direction a rule that drops cards has to be wrong in, and it is
+       * cheap: `--help` is not a thing a model writes on the way to deleting a checkout.
+       */
+      ['worktree', 'remove', '--help'],
+      ['worktree', '--help', 'remove']
+    ])
+      expect(gitRemovesAWorktree(args), args.join(' ')).toBe(true);
+    for (const args of [
+      ['worktree', 'list'],
+      ['worktree', 'add', '../wt', 'main'],
+      ['worktree', 'lock', '../wt'],
+      ['worktree', 'prune'],
+      ['worktree'],
+      ['rm', '-r', 'remove'],
+      ['commit', '-m', 'remove the worktree']
+    ])
+      expect(gitRemovesAWorktree(args), args.join(' ')).toBe(false);
+  });
+
+  /*
+   * The path it names, so a worktree the agent made for itself under `workspace/` costs nothing:
+   * that one is strictly inside `CHECKPOINT_CONTENT` and a rewind puts it back.
+   */
+  it('places the worktree a removal names, and refuses to place one it does not', () => {
+    expect(removalTargets('git', ['worktree', 'remove', '--force', '../wt'])).toEqual(['../wt']);
+    expect(removalTargets('git', ['worktree', 'remove', 'workspace/wt'])).toEqual(['workspace/wt']);
+    expect(removalTargets('git', ['worktree', 'remove'])).toBeNull();
+    expect(removalTargets('git', ['worktree', 'list'])).toBeNull();
+    expect(removalTargets('git', ['clean', '-fd'])).toBeNull();
+  });
+
+  /*
+   * The script walk's own contract, which is stronger than the card the floor happens to raise.
+   *
+   * `removalTargets` promises the WHOLE effect of a script or null, and every caller reads null as
+   * "card". A removal it cannot place has to stop the walk rather than be dropped from it: without
+   * that, `rm -rf dist && git worktree remove` answers `['dist']` - a script whose stated whole
+   * effect is one recoverable delete, while a checkout goes with it. The floor is currently saved
+   * from that by a second reading of the same line (the decomposed commands are each judged on
+   * their own, and the bare `git worktree remove` cards there), so this is asserted here, on the
+   * function's own answer, rather than through a card that would pass either way.
+   */
+  it('stops the script walk at a worktree removal it cannot place', () => {
+    expect(removalTargets('bash', ['-lc', ''], 'rm -rf dist && git worktree remove')).toBeNull();
+    expect(removalTargets('bash', ['-lc', ''], 'rm -rf dist && git worktree remove ../wt')).toEqual(
+      ['dist', '../wt']
+    );
+    expect(removalTargets('bash', ['-lc', ''], 'rm -rf dist && git worktree list')).toEqual([
+      'dist'
+    ]);
+  });
+
+  /*
+   * And the reading `acceptance.ts` takes of a script body, which is the one consumer of
+   * `isDestructiveScript` that the approval floor does not reach. A check must never be the thing
+   * that destroys data, and `sh -c 'git worktree remove --force ../wt'` was passing that gate: the
+   * body scan matches removal programs by NAME, and this destruction is spelled `git`.
+   */
+  it('reads a worktree removal inside a script body as destructive', () => {
+    expect(isDestructiveScript('git worktree remove --force ../wt')).toBe(true);
+    expect(isDestructiveScript('pnpm build && git worktree remove ../wt')).toBe(true);
+    expect(isDestructiveScript('git worktree list')).toBe(false);
+    expect(isDestructiveScript('git commit -m "remove the worktree"')).toBe(false);
+  });
+});
+
+/*
+ * The second checkpoint ceiling, read where a delete is placed.
+ *
+ * A file over `CHECKPOINT_MAX_FILE_BYTES` (2 GiB) is recorded by the runner's scan and walked past,
+ * so it is inside `CHECKPOINT_CONTENT` and inside nothing a rewind restores. `insideCheckpointContent`
+ * answers where a delete lands; this answers whether what lands there comes back.
+ */
+describe('what the checkpoint walked past', () => {
+  const weights = ['workspace/models/llama.gguf', '.athanor/artifacts/recording.mov'];
+
+  it('reaches an uncovered file through the directories above it', () => {
+    for (const [target, cwd] of [
+      ['workspace/models/llama.gguf', 'workspace'],
+      ['models/llama.gguf', 'workspace'],
+      ['llama.gguf', 'workspace/models'],
+      ['workspace/models', 'workspace'],
+      ['workspace', 'workspace'],
+      ['.athanor/artifacts/recording.mov', 'workspace'],
+      ['.athanor/artifacts', 'workspace']
+    ] as const)
+      expect(removesUncoveredFile(target, cwd, weights), `${target} from ${cwd}`).toBe(true);
+  });
+
+  it('leaves every other delete in the same workspace alone', () => {
+    for (const [target, cwd] of [
+      ['dist', 'workspace'],
+      ['workspace/notes.md', 'workspace'],
+      // Segments, not strings: `workspace/models` matches and `workspace/model` must not.
+      ['workspace/model', 'workspace'],
+      ['workspace/models2', 'workspace'],
+      ['workspace/models/llama.gguf.bak', 'workspace'],
+      ['dist', 'workspace/tracker']
+    ] as const)
+      expect(removesUncoveredFile(target, cwd, weights), `${target} from ${cwd}`).toBe(false);
+    // An empty set is the ordinary workspace and must free everything the location test freed.
+    expect(removesUncoveredFile('workspace/models/llama.gguf', 'workspace', [])).toBe(false);
+  });
+
+  /*
+   * The spelling that expands, which the segment comparison read as a literal and freed.
+   *
+   * `*.gguf` is not the string `llama.gguf`, so before this the glob spelling of the very delete
+   * this function exists to card was free - and the wrapped spelling is the one the tool catalogue
+   * tells the model to reach for whenever it wants a glob at all. A segment the shell will expand
+   * matches any segment; the segments in front of it still have to match, which is what keeps
+   * `workspace/downloads/*.dmg` free against an uncovered file under `workspace/models`.
+   */
+  it('reads a segment the shell will expand as matching any segment', () => {
+    for (const [target, cwd] of [
+      ['workspace/models/*.gguf', 'workspace'],
+      ['workspace/*', 'workspace'],
+      ['*', 'workspace'],
+      ['workspace/mode?s/llama.gguf', 'workspace'],
+      ['workspace/{models,dist}', 'workspace'],
+      ['workspace/models/llama.[gG]guf', 'workspace']
+    ] as const)
+      expect(removesUncoveredFile(target, cwd, weights), `${target} from ${cwd}`).toBe(true);
+    // And the segments in front of the glob still decide: this one cannot reach either weight.
+    for (const target of ['workspace/downloads/*.dmg', 'dist/*', 'workspace/models2/*'])
+      expect(removesUncoveredFile(target, 'workspace', weights), target).toBe(false);
+    // An ordinary workspace has no uncovered file, so a glob costs it nothing at all.
+    expect(removesUncoveredFile('workspace/*', 'workspace', [])).toBe(false);
+  });
+
+  // Unplaceable answers "yes" for the same reason null does everywhere else here: cannot tell
+  // belongs on the side that keeps the card.
+  it('keeps the card for a target it cannot place', () => {
+    expect(removesUncoveredFile('$HOME/x', 'workspace', weights)).toBe(true);
+    expect(removesUncoveredFile('workspace/x', '/etc', weights)).toBe(true);
+    expect(removesUncoveredFile('', 'workspace', weights)).toBe(true);
   });
 });

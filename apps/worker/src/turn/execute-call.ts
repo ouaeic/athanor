@@ -4,9 +4,12 @@
  * Everything here is ordered by what a worker that dies mid-call would leave behind, which is the
  * only reason it is not four straight lines:
  *
- *   - the **undo point** is taken before the call runs, because the whole point is to hold the
- *     state the turn started from. At most once a turn, and never at all for a turn that only
- *     reads;
+ *   - the **undo point** used to be taken here, first, and is now taken one gate earlier, in
+ *     `turn/dispatch.ts` in front of the approval floor. The floor's destructive rule reads whether
+ *     this turn has a rewind, so taking it after the floor was asked meant a turn whose first
+ *     non-exempt call was a recoverable delete paid a card that the identical delete two calls
+ *     later did not. It is still at most once a turn and still never at all for a turn that only
+ *     reads; it is simply taken before the decision that spends it rather than after;
  *   - **intent** is written before the **action**, so a worker killed between sending an email and
  *     recording that it sent one resumes saying "this was running" instead of silently sending it
  *     again. State used to be written once per step, after the whole batch;
@@ -49,9 +52,6 @@ export const executeApprovedCall = async (
   refreshActivePlan: () => Promise<boolean>
 ): Promise<void> => {
   const { model, catalog, webPlan } = run;
-  // Before the call runs, not after: the whole point is to hold the state the turn started
-  // from. It happens at most once a turn, and never at all for a turn that only reads.
-  await deps.ensureTurnUndoPoint(task, key, state, call.name);
   // Recorded on intent rather than on success, because a write that failed is still a turn
   // doing material work, and that is what the user-visible plan is for.
   if (isMutatingToolCall(call.name, call.arguments)) {

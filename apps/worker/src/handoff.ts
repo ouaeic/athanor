@@ -45,6 +45,7 @@ import {
 } from './turn-bounds.js';
 import { withRequestDeadline } from './turn-lifecycle.js';
 import { textValue } from './values.js';
+import { turnRoutingTaskId } from './window.js';
 
 /**
  * How long one leased execution of a turn may run before the harness writes the handoff.
@@ -497,6 +498,21 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
       }).catch(() => undefined);
     });
   };
+  /*
+   * The SAME routing key the step requests of this turn presented, from the same call that decided
+   * the preamble. @see turnRoutingTaskId in `window.ts`.
+   *
+   * This is the same window and the same preamble the loop has been sending all turn - by the
+   * comment above, the largest request the turn sends - so a key derived differently from the one
+   * `turn/generate.ts` derives would present that prefix under a name nothing was cached under, on
+   * the closing call, after the steps had just paid to write it. The two are pinned against each
+   * OTHER in `turn/generate-session.test.ts` rather than each against a literal, because the
+   * property that matters here is that they agree.
+   *
+   * Free by the time it is reached: the anchor was resolved for this task record by the preamble
+   * and again by the first step, and the answer is memoised on the record itself.
+   */
+  const sessionId = sha256(`athanor-task:${await turnRoutingTaskId(deps, task, key)}`).slice(0, 64);
   const response = await deps.withLeaseRenewal(task, () =>
     withRequestDeadline((signal) =>
       gateway.chat(provider, {
@@ -506,7 +522,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         temperature: 0.2,
         maxTokens: maxOutputTokens,
         reasoningEffort,
-        sessionId: sha256(`athanor-task:${task.id}`).slice(0, 64),
+        sessionId,
         signal,
         onTextDelta: (delta) => {
           const frame = flusher.push(delta);

@@ -6,11 +6,11 @@ import {
   boundedCollector,
   DISK_FLOOR_POLL_MS,
   HOST_DISK_FLOOR_NOTE,
-  KILLED_NOTE,
   prepareInvocation,
   refuseUnreachableTimeout,
   stopProcessTree,
   timedOutNote,
+  unclaimedStopNote,
   type ExecutionGuards
 } from './execution.js';
 import { ensureWorkspace } from './files.js';
@@ -327,10 +327,25 @@ export class ProcessManager {
     const settle = (status: Status, exitCode: number | null, signal: NodeJS.Signals | null) => {
       if (timeout) clearTimeout(timeout);
       clearInterval(diskFloor);
-      // The kernel's own stop, said here for the reason `KILLED_NOTE` gives - and guarded on the
-      // status rather than on a flag, because the three stops this class performs all set it away
-      // from 'running' before they kill, and all three of them kill with SIGKILL.
-      if (signal === 'SIGKILL' && session.status === 'running') noteOnStderr(session, KILLED_NOTE);
+      // The two endings this class does not perform - the kernel's kill and the ruleset's refusal -
+      // asked of the same function the foreground path asks, so the two paths cannot drift again.
+      // This was a hand-written copy of the SIGKILL branch alone, so a background command refused
+      // by Landlock got a bare "Permission denied" while an identical foreground one was told the
+      // sandbox had refused it. `claimed` is the status rather than a flag, because the three stops
+      // this class performs all set it away from 'running' before they kill, and all three of them
+      // kill with SIGKILL; there is no separate cancel here for the same reason.
+      const unclaimed = unclaimedStopNote(
+        {
+          stderr: () => session.stderr.text('stderr'),
+          exitCode,
+          signal,
+          claimed: session.status !== 'running',
+          cancelled: false
+        },
+        workspaceRoot,
+        Boolean(guards.sandbox?.confineFilesystem)
+      );
+      if (unclaimed) noteOnStderr(session, unclaimed);
       session.exitCode = exitCode;
       session.signal = signal;
       session.finishedAt = new Date().toISOString();

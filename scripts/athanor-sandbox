@@ -6,11 +6,19 @@ set -eu
 # asks for it here, through a sudoers rule only the runner's account may use.
 #
 # The helper only ever hands back *less* privilege than its caller already has: a different
-# unprivileged user, no route to a higher one, and optionally no network. That is why it is safe
-# for it to accept an arbitrary command line - there is nothing a caller could gain by lying to
-# it that it did not already have.
+# unprivileged user, no route to a higher one, optionally no network, and optionally a Landlock
+# ruleset that admits one workspace and nothing else under /home. That is why it is safe for it to
+# accept an arbitrary command line - there is nothing a caller could gain by lying to it that it
+# did not already have.
 
 agent_user="athanor-agent"
+
+# Where a confinable workspace root has to live, hard-coded for the same reason the account name is.
+# The helper's whole property is that a caller gains nothing by lying to it, and a caller free to
+# name its own root could pass `/` and be handed write access to the box. `WORKSPACE_ROOT` in the
+# runner's environment is set to this same path by scripts/install-native.sh; if the two ever
+# disagree, `confine` refuses every command rather than confining the wrong tree.
+workspace_parent="/home/athanor"
 
 fail() {
   printf 'athanor-sandbox: %s\n' "$1" >&2
@@ -30,14 +38,175 @@ agent_gid=$(id -g "$agent_user" 2>/dev/null) || fail "the $agent_user account ha
 # .athanor stay owner-only, which is what keeps the cookie jar out of the agent's reach.
 umask 0007
 
+# The three Landlock verb lists, spelled the way setpriv(1) spells them. Measured against util-linux
+# 2.41.3 on the owner's box, whose `setpriv --help` lists exactly these fifteen rule verbs.
+#
+# READ is read plus execute, which is what a command needs to run the programs the box installs and
+# read their configuration. It grants nothing that lets a command change any of it.
+#
+# WRITE is every verb this setpriv knows, `refer` included. Without `refer` a rename is refused even
+# when both sides are inside the same granted hierarchy, which breaks every editor, compiler and
+# package manager that writes a temporary file and moves it into place - `mv` inside the workspace
+# was measured to fail without it.
+#
+# DEVICE is the trap this list exists to avoid. A ruleset with no write grant on /dev kills
+# `echo x > /dev/null` outright and turns every `2>/dev/null` redirect into a shell error: measured
+# on the owner's box, where with /dev ungranted the redirect case printed
+# `/bin/sh: 1: cannot create /dev/null: Permission denied` before running anything. `truncate` is
+# deliberately absent from it - the kernel does not apply that check to a character device, and
+# `echo x > /dev/null` was measured to work without it.
+landlock_read="execute,read-file,read-dir"
+landlock_write="execute,write-file,read-file,read-dir,remove-dir,remove-file,make-char,make-dir,make-reg,make-sock,make-fifo,make-block,make-sym,refer,truncate"
+landlock_device="write-file,read-file,make-char,make-dir,make-reg,make-sock,make-fifo,make-block,make-sym"
+
+# Empty means no filesystem boundary at all, which is what `open` asks for and what the owner's
+# interactive shell always gets.
+landlock_arguments=""
+
+# The shape files.ts:28 requires of a workspace id: 8-4-4-4-12 hexadecimal digits, with the version
+# nibble 1-8 and the variant nibble one of 8, 9, a or b. Spelled as shell globs because /bin/sh has
+# no regular expressions, and without an external command because the helper deliberately reaches
+# for nothing it does not already need. The leading glob pins every length and separator position at
+# once; the hexadecimal checks are what `?` cannot say.
+workspace_id_shape() {
+  case "$1" in
+    ????????-????-????-????-????????????) ;;
+    *) return 1 ;;
+  esac
+  shape_rest="${1#*-}"
+  shape_a="${1%%-*}"
+  shape_b="${shape_rest%%-*}"
+  shape_rest="${shape_rest#*-}"
+  shape_c="${shape_rest%%-*}"
+  shape_rest="${shape_rest#*-}"
+  shape_d="${shape_rest%%-*}"
+  shape_e="${shape_rest#*-}"
+  for shape_segment in "$shape_a" "$shape_b" "$shape_c" "$shape_d" "$shape_e"; do
+    case "$shape_segment" in
+      *[!0-9A-Fa-f]*) return 1 ;;
+    esac
+  done
+  case "$shape_c" in
+    [1-8]*) ;;
+    *) return 1 ;;
+  esac
+  case "$shape_d" in
+    [89AaBb]*) ;;
+    *) return 1 ;;
+  esac
+}
+
+# A root is confinable only if it is a direct child of $workspace_parent, is named like a workspace,
+# and both it and the `workspace` directory inside it exist as real directories.
+#
+# Four separate questions, asked so that each one can be watched failing on its own: the last
+# component is a workspace id, the path starts at the workspace parent, it stops one level below it,
+# and neither it nor its `workspace` is a symbolic link. Deriving the id from the path instead of
+# from the prefix is what keeps them separable - `/somewhere/else/<a real id>` is refused by the
+# second question alone, and a guard no input can distinguish from its neighbour is a guard nobody
+# can watch fail. `case` globs match `/`, unlike pathname expansion, which is why the two-star
+# pattern says "deeper than one level" and why `${1##*/}` on a trailing slash yields nothing and is
+# refused by the first.
+#
+# NO PATH THIS GRANTS MAY BE A SYMBOLIC LINK, and this is the check with teeth. setpriv opens each
+# rule path and follows links, so a `workspace` replaced by a link to `/` would be a rule granting
+# write to the whole disk - and the workspace root is mode 2770 with the agent account's own group,
+# which means the agent can perform that replacement. `.home` is checked for the same reason and
+# only since it became a write grant of its own: it is the agent's `$HOME` (execution.ts
+# `agentHome`), it sits at the container root beside `workspace`, and a link there would buy exactly
+# as much as a link at `workspace`. A `.home` that does not exist at all is a different case and is
+# not refused here - `confine_to` skips a missing directory, which grants less.
+#
+# What this does NOT close is the race: the check and setpriv's open are two operations, and a
+# command already running in the workspace can swap either entry between them. Closing it needs the
+# workspace root itself to stop being agent-writable - now possible, since with `$HOME` at
+# `$ROOT/.home` the agent creates nothing directly in `$ROOT` any more, but it is a mode change in
+# the runner and in the installer's workspace loop rather than anything this helper can do.
+confinable_root() {
+  workspace_id_shape "${1##*/}" || return 1
+  case "$1" in
+    "$workspace_parent"/*/*) return 1 ;;
+    "$workspace_parent"/*) ;;
+    *) return 1 ;;
+  esac
+  if [ -L "$1" ] || [ -L "$1/workspace" ] || [ -L "$1/.home" ]; then return 1; fi
+  [ -d "$1" ] || return 1
+  [ -d "$1/workspace" ] || return 1
+}
+
+# Builds the ruleset for one workspace.
+#
+# /home is granted nowhere, and that single omission is the whole boundary. Every workspace on this
+# box is mode 2770 with the agent account's primary group, so before this a command run for one task
+# could read and rewrite every other task's files; and $ROOT/.athanor - the checkpoints, the browser
+# profile's parent, the artifacts - sat one level above the only granted directory, reachable and
+# renameable. Neither is reachable now: Landlock does not restrict directory traversal, so a command
+# still reaches its own $ROOT/workspace through a $ROOT it may not read, list, write or rename.
+#
+# THE TWO GRANTS INSIDE $ROOT ARE NAMED ONE BY ONE, and $ROOT itself is never named. $ROOT/.home is
+# the agent's $HOME (execution.ts `agentHome`) and has to be written - it is where pip, cargo, npm
+# and the coding CLIs keep their caches and their sign-in state, and a boundary that refuses `pip
+# install` is an outage rather than a boundary. It is not under workspace/ because workspace/ is
+# what the turn checkpoint walks and hashes, and a Rust toolchain alone is 88,021 files against a
+# 250,000-file ceiling. Granting $ROOT instead would be one rule rather than two and would hand the
+# command $ROOT/.athanor with it, which is the second of the two things this boundary exists to
+# stop; scripts/test-sandbox.sh asserts that neither $ROOT nor $ROOT/.athanor is ever a rule path.
+#
+# /run is in the read list and is not in the design this implements, because the design would have
+# taken DNS away from every command. On Ubuntu /etc/resolv.conf is a symbolic link to
+# /run/systemd/resolve/stub-resolv.conf, so a ruleset without /run makes the resolver unreadable:
+# measured on the owner's box, `curl https://example.com` failed with "Could not resolve host" and
+# `cat /etc/resolv.conf` with "Permission denied", and both were fixed by this one line.
+#
+# A directory that is not there is skipped rather than refused. /lib64 and /srv do not exist on every
+# distribution this installs on, and setpriv exits before running anything when a rule names a path
+# it cannot open - so refusing would turn a missing directory into a box where no command runs. A
+# skip can only ever grant less, which is the safe direction for it to be wrong in.
+#
+# The read half is its own function because `check` probes with exactly it, and a probe that grants
+# less than the shipped ruleset does can fail for want of a rule on a host whose kernel is perfectly
+# capable - see the `check` branch below for the one that did.
+add_read_rules() {
+  for confine_directory in /usr /bin /lib /lib64 /sbin /opt /etc /var /srv /run /proc /sys; do
+    [ -d "$confine_directory" ] || continue
+    landlock_arguments="$landlock_arguments --landlock-rule path-beneath:$landlock_read:$confine_directory"
+  done
+}
+
+confine_to() {
+  confine_root="$1"
+  landlock_arguments="--landlock-access fs"
+  add_read_rules
+  # $ROOT/workspace first, and its absence is already refused by `confinable_root`: a ruleset that
+  # silently omitted it would leave the command with a confinement and nowhere to work. $ROOT/.home
+  # is skipped when absent instead, because a workspace made before the runner started creating it
+  # still has to run - the command loses its $HOME writes, which is less than losing every command.
+  for confine_directory in "$confine_root/workspace" "$confine_root/.home" /tmp /var/tmp /dev/shm; do
+    [ -d "$confine_directory" ] || continue
+    landlock_arguments="$landlock_arguments --landlock-rule path-beneath:$landlock_write:$confine_directory"
+  done
+  if [ -d /dev ]; then
+    landlock_arguments="$landlock_arguments --landlock-rule path-beneath:$landlock_device:/dev"
+  fi
+}
+
 # --no-new-privs is what actually stops a command reaching a higher account. It is inherited by
 # every descendant and cannot be removed, so a set-user-ID binary - sudo, su, pkexec, or a
 # symbolic link to one under any name - confers nothing, no matter which interpreter spelled the
 # command. The kernel clears every capability on the transition away from root, so the command
-# starts with none.
+# starts with none. It is also Landlock's precondition: a ruleset may only be applied by a process
+# that has already given up the ability to gain privilege.
+#
+# $landlock_arguments is split on whitespace on purpose. Every word in it is a fixed literal from
+# the three verb lists above or a path under $workspace_parent whose last component has already been
+# checked to be a workspace id, so there is no whitespace and no glob character in it for the split
+# to get wrong. It is carried in a variable rather than in "$@" because the command itself already
+# occupies the positional parameters, and /bin/sh has no second array.
 run_as_agent() {
+  # shellcheck disable=SC2086
   exec /usr/bin/setpriv \
     --reuid "$agent_uid" --regid "$agent_gid" --clear-groups --no-new-privs \
+    $landlock_arguments \
     -- /usr/bin/env -i "$@"
 }
 
@@ -48,7 +217,27 @@ case "$mode" in
   run)
     network="${1:-}"
     shift || true
+    confinement="${1:-}"
+    shift || true
+    # Present in the grammar even under `open`, where it is ignored, so that the word order is one
+    # fact rather than two: a caller that forgets the root is refused for a missing command instead
+    # of having its first environment assignment read as a mode.
+    root="${1:-}"
+    shift || true
     [ "$#" -gt 0 ] || fail "no command was given"
+    case "$confinement" in
+      confine)
+        confinable_root "$root" ||
+          fail "a confined command needs an existing workspace directly under $workspace_parent"
+        confine_to "$root"
+        ;;
+      open)
+        landlock_arguments=""
+        ;;
+      *)
+        fail "the filesystem mode must be confine or open"
+        ;;
+    esac
     case "$network" in
       network)
         run_as_agent "$@"
@@ -58,11 +247,13 @@ case "$mode" in
         # port its own subprocess is listening on, which breaks ordinary local tooling for no
         # security benefit. The shell text is fixed and the command arrives through "$@", so
         # nothing from the caller is ever interpreted.
+        # shellcheck disable=SC2086
         exec /usr/bin/unshare --net -- /bin/sh -c '
           ip link set lo up 2>/dev/null || true
           exec "$@"
         ' athanor-sandbox /usr/bin/setpriv \
           --reuid "$agent_uid" --regid "$agent_gid" --clear-groups --no-new-privs \
+          $landlock_arguments \
           -- /usr/bin/env -i "$@"
         ;;
       *)
@@ -74,6 +265,11 @@ case "$mode" in
     # The owner's interactive terminal. Separated from `run` only so the sudoers policy can give
     # this one a pseudo-terminal: without one the shell has no controlling terminal of its own
     # and loses job control, which is the difference between a usable terminal and a broken one.
+    #
+    # Never confined, and this is not an oversight. This mode is the owner sitting at their own
+    # computer, and a filesystem boundary here would stop them reading their own files from their
+    # own terminal - which is ease of use destroyed for no boundary gained, since the owner already
+    # reaches every one of those files through the file browser.
     [ "$#" -gt 0 ] || fail "no command was given"
     run_as_agent "$@"
     ;;
@@ -84,13 +280,52 @@ case "$mode" in
       /usr/bin/setpriv --reuid "$agent_uid" --regid "$agent_gid" --clear-groups --no-new-privs \
         -- /usr/bin/id -un
     )"
-    if /usr/bin/unshare --net -- /bin/true >/dev/null 2>&1; then
+    # `/bin/sh -c :` rather than `/bin/true`, here and in the filesystem probe below, and it is the
+    # same argument in both places: POSIX pins a shell at /bin/sh and pins nothing at /bin/true.
+    # `true` is a coreutils binary whose location is exactly the merged/non-merged question the
+    # filesystem probe already got wrong once - on a host that puts it at /usr/bin/true with no /bin
+    # symlink, or on a macOS-shaped box where /bin has no `true` at all, a probe spelled /bin/true
+    # reports a rung this box does not deserve. Nothing about either probe needs a smaller program
+    # than a shell that exits.
+    if /usr/bin/unshare --net -- /bin/sh -c : >/dev/null 2>&1; then
       printf 'network-isolation=yes\n'
     else
       printf 'network-isolation=no\n'
     fi
+    # The filesystem rung, reported rather than assumed. The installer reads this line and writes
+    # CONFINE_AGENT_FILESYSTEM from it, so a kernel or a util-linux that cannot do this is told to
+    # stop asking rather than left failing every command - and an operator can read the same line.
+    #
+    # Two answers and not three. /usr/bin/bwrap is present on a stock Ubuntu and would be a second
+    # way to draw this boundary, but nothing in this helper uses it, and a line naming a
+    # confinement no code performs is exactly the lie the whole ladder exists to prevent. It
+    # becomes a third answer on the day something here actually runs it.
+    #
+    # The probe carries the same read rules a confined command gets, and this is the point of it.
+    # It used to grant /usr alone and then exec a program under /bin, which resolves inside that one
+    # hierarchy only where /bin is a symbolic link into it. On the owner's box it is (`/bin ->
+    # usr/bin`, `/lib -> usr/lib`, `/lib64 -> usr/lib64`), so the probe passed and said nothing about
+    # a host where /bin is a real directory - and on that host it failed for want of a rule rather
+    # than for want of Landlock, the installer took the `*)` arm, warned about the kernel, and wrote
+    # CONFINE_AGENT_FILESYSTEM=false on a box that could have enforced it. A silent downgrade
+    # reported as a kernel limitation. install-native.sh installs on several host families, so that
+    # host is not hypothetical, and the helper's own comment above already says /lib64 and /srv are
+    # not universal. Probing with the shipped list also means the probe fails if the list itself is
+    # ever wrong, which is the failure worth learning about at install time.
+    #
+    # scripts/test-sandbox.sh stands a non-merged host up for this: its setpriv recorder decides
+    # rule coverage by literal path prefix, which is what a real /bin costs, and it asserts the
+    # OUTCOME of both this probe and a copy of the old /usr-only one.
+    landlock_arguments="--landlock-access fs"
+    add_read_rules
+    # shellcheck disable=SC2086
+    if /usr/bin/setpriv --no-new-privs $landlock_arguments -- /bin/sh -c : >/dev/null 2>&1; then
+      printf 'filesystem=landlock\n'
+    else
+      printf 'filesystem=none\n'
+    fi
     ;;
   *)
-    fail "usage: athanor-sandbox {run network|isolated [VAR=VALUE...] COMMAND [ARG...]|shell [VAR=VALUE...] COMMAND [ARG...]|check}"
+    fail "usage: athanor-sandbox {run network|isolated confine|open ROOT [VAR=VALUE...] COMMAND [ARG...]|shell [VAR=VALUE...] COMMAND [ARG...]|check}"
     ;;
 esac

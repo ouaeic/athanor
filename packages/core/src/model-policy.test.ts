@@ -15,6 +15,7 @@ import {
   modelFit,
   modelTaskKinds,
   priceCeilingBreach,
+  priceCeilingBreachReason,
   preferIncumbent,
   priceCeilingFields,
   qualityScore,
@@ -445,6 +446,21 @@ const sonnet: RoutableModel = {
 
 const unpriced: RoutableModel = { ...base, id: 'unpriced', displayName: 'Unpriced' };
 
+/**
+ * Priced on one side and not the other, which is a shape the live catalogue really produces:
+ * `perMillion` reads `pricing.prompt` and `pricing.completion` independently, and a
+ * `reviewed_open_weight` box keeps a row whose stated rate was refused as implausible rather than
+ * dropping it. $900 out is sixty times the $10 ceiling below, so nothing here rests on the input
+ * side being missing.
+ */
+const halfPriced: RoutableModel = {
+  ...base,
+  id: 'half-priced',
+  displayName: 'Half Priced',
+  inputUsdPerMillionTokens: null,
+  outputUsdPerMillionTokens: 900
+};
+
 /** "The best benchmarked model for the task under $2 per million in and $10 per million out." */
 const ceiling: ModelRequest = {
   ...request,
@@ -478,6 +494,66 @@ describe('the owner price ceiling', () => {
     expect(isModelEligible(unpriced, ceiling)).toBe(false);
     // With no ceiling set, an unpublished price still must not shrink the pool.
     expect(isModelEligible(unpriced, request)).toBe(true);
+  });
+
+  /**
+   * The two exclusions are one sentence and two facts, and a caller that has to tell them apart
+   * gets the kind rather than the prose. `apps/api/src/routes/support.ts` told them apart by the
+   * prose and revoked standing pins for every route the catalogue does not price.
+   *
+   * Collapse `kind` to the single literal 'over_ceiling' in `priceCeilingBreachReason` and this
+   * goes red on the unpriced row while every string assertion in this file stays green - which is
+   * the whole point of the type existing.
+   */
+  it('names which of the two exclusions it is, not only the sentence', () => {
+    expect(priceCeilingBreachReason(opus, ceiling)).toEqual({
+      kind: 'over_ceiling',
+      reason: '$5.00 per million input is above the $2.00 ceiling'
+    });
+    expect(priceCeilingBreachReason(unpriced, ceiling)).toEqual({
+      kind: 'no_published_price',
+      reason: 'no published price'
+    });
+    expect(priceCeilingBreachReason(sonnet, ceiling)).toBeNull();
+    // The blended shape admits an unpriced route outright, so it has no second kind to report.
+    expect(
+      priceCeilingBreachReason(unpriced, { ...request, maxUsdPerMillionTokens: 4 })
+    ).toBeNull();
+    expect(priceCeilingBreachReason(opus, { ...request, maxUsdPerMillionTokens: 4 })?.kind).toBe(
+      'over_ceiling'
+    );
+  });
+
+  /**
+   * A rate the catalogue does publish is compared before a rate it does not, and the order is
+   * load-bearing rather than cosmetic: the standing pin in `apps/api/src/routes/support.ts` honours
+   * `no_published_price` and drops `over_ceiling`, so calling this row unpriced put an unattended
+   * run on a $900-per-million-output route under a $10 output ceiling.
+   *
+   * Put the `input === null` test back in front of the comparisons in `priceCeilingBreachReason`
+   * and this goes red at `no_published_price`, while every other assertion in this file - including
+   * the eligibility one below, which only ever asks null or not - stays green.
+   */
+  it('reports a published rate over the ceiling even when the other rate is missing', () => {
+    expect(priceCeilingBreachReason(halfPriced, ceiling)).toEqual({
+      kind: 'over_ceiling',
+      reason: '$900.00 per million output is above the $10.00 ceiling'
+    });
+    // Eligibility is unchanged by the ordering, which is why nothing caught this.
+    expect(isModelEligible(halfPriced, ceiling)).toBe(false);
+    // The counter-direction: a missing rate beside a rate the ceiling admits is still unknown, not
+    // a breach to be blamed on the side that is present.
+    expect(
+      priceCeilingBreachReason({ ...halfPriced, outputUsdPerMillionTokens: 4 }, ceiling)
+    ).toEqual({ kind: 'no_published_price', reason: 'no published price' });
+    // And a ceiling on the missing side only leaves the present side to answer for itself.
+    expect(
+      priceCeilingBreachReason(halfPriced, {
+        ...request,
+        taskKind: 'agentic',
+        maxOutputUsdPerMillionTokens: 10
+      })?.kind
+    ).toBe('over_ceiling');
   });
 
   it('judges the tier the task will actually reach', () => {
@@ -1180,8 +1256,31 @@ describe('selecting a model under the owner price ceiling', () => {
   it('never blocks a model the owner named, and says it is over the ceiling rather than hiding it', () => {
     const selection = selectModel([opus, sonnet], { ...ceiling, requestedId: 'opus' });
     expect(selection.choice?.model.id).toBe('opus');
-    expect(selection.ceilingOutcome).toBe('no_ceiling');
+    expect(selection.ceilingOutcome).toBe('requested_over_ceiling');
     expect(selection.message).toContain('$5.00 per million input is above the $2.00 ceiling');
+  });
+
+  /**
+   * The negative control the pin guard rests on, and it lives here because the guard cannot hold it
+   * from `apps/api`: a named model with no published price is a different answer from a named model
+   * over the ceiling, and the outcome has to say so. It did not, and one advisory sentence covering
+   * both is what cost an owner their pin on every unpriced route.
+   *
+   * Return `'requested_over_ceiling'` from both arms in `selectModel` and this goes red while the
+   * test above stays green. Note the choice is the named model either way - an explicit pick is
+   * never refused here - so `choice` alone can never tell the two apart.
+   */
+  it('separates a named model with no published price from a named model over the ceiling', () => {
+    const selection = selectModel([unpriced, sonnet], { ...ceiling, requestedId: 'unpriced' });
+    expect(selection.choice?.model.id).toBe('unpriced');
+    expect(selection.ceilingOutcome).toBe('requested_unpriced');
+    // The sentence follows the fact: an unknown price is not "above your price ceiling".
+    expect(selection.message).toContain('price is not published');
+    expect(selection.message).not.toContain('above your price ceiling');
+    // And a named model the ceiling has no objection to still reports no ceiling involvement.
+    expect(selectModel([sonnet], { ...ceiling, requestedId: 'sonnet' }).ceilingOutcome).toBe(
+      'no_ceiling'
+    );
   });
 
   it('says so when the only model under the ceiling is one nobody has benchmarked', () => {

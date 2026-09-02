@@ -2,6 +2,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { agentHome } from './execution.js';
 import { ProcessManager } from './processes.js';
 
 const roots: string[] = [];
@@ -234,10 +235,11 @@ describe('background process manager', () => {
       const elevate = path.join(root, 'elevate');
       await writeFile(elevate, `#!/bin/sh\nprintf '%s\\n' "$*" >"${record}"\nshift\nexec "$@"\n`);
       await chmod(elevate, 0o700);
-      // Stands in for athanor-sandbox: drops its own two leading arguments the way the real helper
-      // consumes `run <network mode>`, then applies the environment and execs, as `env -i` does.
+      // Stands in for athanor-sandbox: drops its own four leading arguments the way the real helper
+      // consumes `run <network mode> <filesystem mode> <root>`, then applies the environment and
+      // execs, as `env -i` does.
       const helper = path.join(root, 'sandbox');
-      await writeFile(helper, '#!/bin/sh\nshift 2\nexec /usr/bin/env -i "$@"\n');
+      await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
       await chmod(helper, 0o700);
       const manager = new ProcessManager();
       const started = await manager.start(
@@ -253,10 +255,18 @@ describe('background process manager', () => {
       expect(finished.status).toBe('completed');
       // The environment reached the process, which is only true if the helper was handed it as
       // arguments - the spawn itself passes an empty one, because sudo resets it anyway.
-      expect(finished.stdout).toBe(root);
+      expect(finished.stdout).toBe(agentHome(root));
       const elevated = await readFile(record, 'utf8');
       expect(elevated).toContain(`-n ${helper} run isolated`);
-      expect(elevated).toContain(`HOME=${root}`);
+      expect(elevated).toContain(`HOME=${agentHome(root)}`);
+      // WHERE that home is, spelled without `agentHome` on both sides. The two assertions above
+      // compare the background path's answer against the same function the background path calls,
+      // so they hold whatever that function returns: with `agentHome` reverted to the bare
+      // workspace root - the value this wave moved away from - all 21 tests in this file stayed
+      // green. `.home` at the container root, written out, is what actually pins the move: outside
+      // `workspace/`, so a Rust toolchain's 88,021 files are not walked by every checkpoint, and
+      // outside `.athanor`, which is the runner's alone.
+      expect(path.relative(root, finished.stdout ?? '')).toBe('.home');
       manager.close();
     },
     TEST_TIMEOUT_MS
@@ -591,6 +601,98 @@ describe('the host disk floor on the background path', () => {
     manager.close();
   });
 
+  /*
+   * The sixth stop, on the path that had five.
+   *
+   * A ruleset refusal arrives as nothing but the word "denied" in the command's own stderr, and the
+   * foreground path has explained it since the boundary shipped while this one did not - so the same
+   * command, refused the same way, was diagnosable in front of the agent and mute when it ran for an
+   * hour in the background. That is the wrong way round: a background job is where a boundary is
+   * most likely to be met and least likely to be found by rerunning.
+   *
+   * Pinned at `start` rather than at the note, because the note was never the missing part - it was
+   * exported and correct while nothing on this path called it. There is no kernel here, so the
+   * denial's own words are what the fixture prints, which is honest about what the production code
+   * reads: it reads the command's stderr and nothing else.
+   */
+  const deniedInBackground = async (
+    message: string,
+    confineFilesystem: boolean
+  ): Promise<string> => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
+    roots.push(root);
+    await mkdir(path.join(root, 'workspace'));
+    const elevate = path.join(root, 'elevate');
+    await writeFile(elevate, '#!/bin/sh\nshift\nexec "$@"\n');
+    await chmod(elevate, 0o700);
+    const helper = path.join(root, 'sandbox');
+    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await chmod(helper, 0o700);
+    const manager = new ProcessManager();
+    const started = await manager.start(
+      root,
+      'workspace-1',
+      'task-1',
+      {
+        executable: '/bin/sh',
+        args: ['-c', `printf '%s\\n' "${message}" >&2; exit 1`],
+        timeoutSeconds: 30
+      },
+      30,
+      false,
+      { sandbox: { elevate, helper, confineFilesystem } }
+    );
+    const settled = await settledStatus(manager, started.sessionId);
+    expect(settled.status).toBe('failed');
+    expect(settled.exitCode).toBe(1);
+    manager.close();
+    return settled.stderr ?? '';
+  };
+
+  it(
+    'tells a background command the sandbox refused it, as the foreground path does',
+    async () => {
+      // Written as an installed-host path rather than built from this test's root, because a
+      // temporary root here lives under `/var`, which the ruleset grants for reading - so a
+      // root-derived path would be silenced by the read list and would pin nothing.
+      const stderr = await deniedInBackground(
+        'cat: /home/athanor/00000000-0000-4000-8000-00000000000a/workspace/notes.md: Permission denied',
+        true
+      );
+      expect(stderr).toContain('the sandbox on this computer probably refused that');
+      // Which path, because a job that touched several files needs to know which one of them met
+      // the boundary.
+      expect(stderr).toContain(
+        '/home/athanor/00000000-0000-4000-8000-00000000000a/workspace/notes.md'
+      );
+      // The command's own message survives ahead of it: the note is added to the log, not put in
+      // place of it.
+      expect(stderr).toContain('Permission denied');
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
+    'stays silent in the background on a denial the ruleset did not cause',
+    async () => {
+      // The direction that decides whether this can ship at all. `/etc` is granted for reading, so
+      // this is an ordinary mode bit, and answering it with "the sandbox refused that" would be a
+      // false explanation of a real problem - worse than the silence it replaced.
+      expect(await deniedInBackground('cat: /etc/shadow: Permission denied', true)).not.toContain(
+        'the sandbox on this computer'
+      );
+      // And nothing at all on a box that never applied a ruleset, where the sentence would be a
+      // plain fabrication.
+      expect(
+        await deniedInBackground(
+          'cat: /home/athanor/00000000-0000-4000-8000-00000000000a/workspace/notes.md: Permission denied',
+          false
+        )
+      ).not.toContain('the sandbox on this computer');
+    },
+    TEST_TIMEOUT_MS
+  );
+
   it('leaves a background session on a healthy disk alone', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
     roots.push(root);
@@ -690,6 +792,56 @@ describe('watching a long background job', () => {
       const settled = await settledStatus(manager, started.sessionId);
       expect(settled.status).toBe('timed_out');
       expect(settled.stderr).toContain('1s timeout');
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
+    'does not also tell a job that hit its deadline that the computer killed it for memory',
+    async () => {
+      /*
+       * The guard on the shared seam, which nothing else in this file reaches.
+       *
+       * All three stops this class performs kill with SIGKILL, so the branch that explains a
+       * SIGKILL has to ask first whether one of them already spoke - that is what `claimed:
+       * session.status !== 'running'` is for, and it is the whole reason the seam takes a `claimed`
+       * at all. The deadline test above cannot see it, twice over: `settledStatus` returns the
+       * moment the status leaves 'running', which the deadline does BEFORE it signals anything, and
+       * a `sleep` dies on the SIGTERM so the escalation to SIGKILL never happens. Measured: with
+       * `claimed` forced to `false`, all 23 tests in this file stayed green while a timed-out job
+       * was being handed, in one log, both the sentence saying it hit its 1s deadline and the
+       * sentence saying the computer killed it outright and it should ask for less memory - two
+       * different endings for one stop, and the second one an invention.
+       *
+       * So this command ignores SIGTERM, the way a build harness that installs its own handler
+       * does, and this test waits for the settle itself rather than for the status.
+       */
+      const root = await managerRoot();
+      const manager = new ProcessManager();
+      const started = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        {
+          executable: process.execPath,
+          args: ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'],
+          timeoutSeconds: 1
+        },
+        1,
+        false
+      );
+      const poll = () =>
+        manager.action('workspace-1', 'task-1', started.sessionId, { action: 'poll' });
+      await expect
+        .poll(() => poll().finishedAt, { interval: 20, timeout: SETTLE_TIMEOUT_MS })
+        .toBeDefined();
+      const settled = poll();
+      // The escalation was reached, so the branch this test is about really ran.
+      expect(settled.signal).toBe('SIGKILL');
+      expect(settled.status).toBe('timed_out');
+      expect(settled.stderr).toContain('1s timeout');
+      expect(settled.stderr).not.toContain('killed outright by the computer');
       manager.close();
     },
     TEST_TIMEOUT_MS

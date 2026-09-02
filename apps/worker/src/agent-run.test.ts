@@ -150,6 +150,7 @@ interface AgentStateShape {
   messages: Array<{ role: string; content: string; toolCallId?: string }>;
   inFlight?: { toolCallId: string; tool: string; startedAt: string };
   step: number;
+  checkpoint?: { turn: number; id: string | null; uncovered?: readonly string[] };
 }
 
 const probeStore = (task: () => TaskRecord): StoreProbe => {
@@ -509,7 +510,10 @@ interface FetchLog {
   readonly mediaRequests?: Array<Record<string, unknown>>;
 }
 
-const checkpointResponse = (pruned: string[] = []): Response =>
+const checkpointResponse = (
+  pruned: string[] = [],
+  oversize?: { uncoveredPaths?: unknown; uncoveredPathsTruncated?: boolean }
+): Response =>
   new Response(
     JSON.stringify({
       id: 'checkpoint',
@@ -521,7 +525,8 @@ const checkpointResponse = (pruned: string[] = []): Response =>
       changedFileCount: 2,
       uncoveredFileCount: 0,
       durationMs: 21,
-      pruned
+      pruned,
+      ...(oversize ?? {})
     }),
     { headers: { 'content-type': 'application/json' } }
   );
@@ -1254,6 +1259,54 @@ describe('the undo point a turn leaves behind', () => {
     await worker.run(task).catch(() => undefined);
 
     expect(probe.forgottenUndoPoints).toEqual([['old-checkpoint-1', 'old-checkpoint-2']]);
+  });
+
+  /*
+   * The join between the scan that knows which files it walked past and the floor that spends the
+   * answer. Everything either side of it - the runner's `uncoveredPaths`, the client's collapse to
+   * `uncovered`, `undoPointFor`, the location test - was built and proved in isolation, and the
+   * whole chain still did nothing, because the one line that records the field on the state was
+   * never written. Pinned HERE, at the only writer, rather than beside any of the halves: a test
+   * that builds the state by hand cannot tell a wired chain from an unwired one.
+   */
+  it('carries the files the undo point walked past into the state the floor reads', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([toolFrame('call-u', 'shell', { executable: 'ls' })], log, {
+      checkpoint: () => checkpointResponse([], { uncoveredPaths: ['workspace/model.gguf'] })
+    });
+    const worker = new AgentWorker(probe.store, config(), masterKey, runnerSecret);
+
+    await worker.run(task).catch(() => undefined);
+
+    const state = decryptCheckpoints(probe.checkpoints).find((entry) => entry.checkpoint?.id);
+    expect(state?.checkpoint?.uncovered).toEqual(['workspace/model.gguf']);
+  });
+
+  it.each([
+    // Cut off at the runner's cap, so the list names some of the oversize files and not all of
+    // them. Recording it would free a delete of the one it omits.
+    ['a list the runner had to cut off', { uncoveredPaths: ['a'], uncoveredPathsTruncated: true }],
+    // A runner one release behind this worker sends no list at all, which is not the same fact as
+    // a walk that held everything.
+    ['a runner that does not send the field', {}]
+  ])('records nothing about oversize files for %s', async (_name, oversize) => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([toolFrame('call-u', 'shell', { executable: 'ls' })], log, {
+      checkpoint: () => checkpointResponse([], oversize)
+    });
+    const worker = new AgentWorker(probe.store, config(), masterKey, runnerSecret);
+
+    await worker.run(task).catch(() => undefined);
+
+    const state = decryptCheckpoints(probe.checkpoints).find((entry) => entry.checkpoint?.id);
+    // Absent, not empty: empty would tell the floor this walk held everything, and the floor frees
+    // a delete on that. Absent keeps the card, which is the direction to fail in.
+    expect(state?.checkpoint?.id).toBeTruthy();
+    expect(state?.checkpoint).not.toHaveProperty('uncovered');
   });
 
   it('carries on when the computer cannot be checkpointed, and says so where it shows', async () => {

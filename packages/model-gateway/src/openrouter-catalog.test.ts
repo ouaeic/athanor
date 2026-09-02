@@ -1048,3 +1048,465 @@ describe('the media catalogue the chat refresh throws away', () => {
     expect(live?.unavailableReason).toBeUndefined();
   });
 });
+
+/*
+ * The feed is a document from a service nobody here controls, and until `readOpenRouterModels` was
+ * put in front of it the parser read that document through a TypeScript interface alone - which
+ * describes what the wire was expected to hold and checks nothing at run time.
+ *
+ * Every fixture below was measured against the parser as it stood. The first four threw a raw
+ * TypeError out of `refreshOpenRouterCatalog` itself, so one reshaped field cost the owner the
+ * whole refresh rather than costing one model one capability, and the sentence they read in
+ * `athanor doctor` was "object is not iterable". The fifth cost a million-token model 87% of its
+ * window without throwing anything at all, which is worse, because nothing said so.
+ */
+describe('a feed that changed shape underneath the parser', () => {
+  const feedOf = (rows: unknown[]) =>
+    vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.endsWith('/models')) return respondWith({ data: rows });
+      return respondWith({ data: [] });
+    }) as unknown as typeof fetch;
+
+  /** One well-formed row, so every reshape below is the only thing wrong with its feed. */
+  const wellFormed = {
+    id: 'vendor/steady',
+    name: 'Vendor: Steady',
+    context_length: 200_000,
+    architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] },
+    pricing: {
+      prompt: '0.000001',
+      completion: '0.000004',
+      overrides: [{ min_prompt_tokens: 100_000, prompt: '0.000002', completion: '0.000008' }]
+    },
+    supported_parameters: ['tools', 'reasoning']
+  };
+
+  /** The refresh, with the journal captured rather than written to the test runner's output. */
+  const refresh = async (rows: unknown[]) => {
+    const written: string[] = [];
+    const stderr = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: string | Uint8Array) => {
+        written.push(String(chunk));
+        return true;
+      });
+    try {
+      const models = await refreshOpenRouterCatalog([], {
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: 'registry-key',
+        fetch: feedOf(rows),
+        now: NOW
+      });
+      return {
+        byId: new Map(models.map((model) => [model.providerModelId, model])),
+        journal: written.filter((line) => line.includes('model catalogue'))
+      };
+    } finally {
+      stderr.mockRestore();
+    }
+  };
+
+  it('keeps the row when supported_parameters arrives as an object instead of a list', async () => {
+    // Measured before the narrowing existed: TypeError: object is not iterable, thrown out of
+    // `enrich` and up through the whole refresh, so every other model in the feed went with it.
+    const { byId, journal } = await refresh([
+      { ...wellFormed, supported_parameters: { tools: true } },
+      { ...wellFormed, id: 'vendor/bystander' }
+    ]);
+    const reshaped = byId.get('vendor/steady');
+    expect(reshaped).toBeDefined();
+    // The row loses exactly the field that could not be read, and nothing else it stated.
+    expect(reshaped?.capabilities).toEqual(['chat', 'vision']);
+    expect(reshaped?.recommendationTags).toEqual(['Vision']);
+    expect(reshaped?.contextTokens).toBe(200_000);
+    expect(reshaped?.inputUsdPerMillionTokens).toBeCloseTo(1, 6);
+    // ...and the model that was standing next to it in the same document is untouched.
+    expect(byId.get('vendor/bystander')?.capabilities).toEqual([
+      'chat',
+      'tools',
+      'vision',
+      'reasoning'
+    ]);
+    // Nothing was dropped, so there is nothing for the journal to account for.
+    expect(journal).toEqual([]);
+  });
+
+  it('keeps the row when architecture.input_modalities arrives as an object', async () => {
+    const { byId, journal } = await refresh([
+      {
+        ...wellFormed,
+        architecture: { input_modalities: { text: true, image: true }, output_modalities: ['text'] }
+      }
+    ]);
+    const reshaped = byId.get('vendor/steady');
+    expect(reshaped).toBeDefined();
+    // Unreadable is not "no image": it is "the feed did not say", which is what an absent field
+    // already meant here, and the picker offers text alone rather than an image route nobody stated.
+    expect(reshaped?.modalities).toEqual(['text']);
+    expect(reshaped?.capabilities).toEqual(['chat', 'tools', 'reasoning']);
+    expect(reshaped?.contextTokens).toBe(200_000);
+    expect(journal).toEqual([]);
+  });
+
+  it('keeps the row when pricing.overrides arrives as an object', async () => {
+    // Measured: TypeError: ((intermediate value) ?? []).flatMap is not a function, thrown out of
+    // `pricedAbsurdly` - which is the guard that decides whether the route is offered at all.
+    const { byId, journal } = await refresh([
+      { ...wellFormed, pricing: { ...wellFormed.pricing, overrides: { tier1: {} } } }
+    ]);
+    const reshaped = byId.get('vendor/steady');
+    expect(reshaped).toBeDefined();
+    expect(reshaped?.priceTiers).toEqual([]);
+    // The rates the feed did state are still read, and still set the usage class.
+    expect(reshaped?.inputUsdPerMillionTokens).toBeCloseTo(1, 6);
+    expect(reshaped?.outputUsdPerMillionTokens).toBeCloseTo(4, 6);
+    expect(reshaped?.usageClass).toBe('light');
+    expect(journal).toEqual([]);
+  });
+
+  it('skips a row that is not a model, and says in the journal that it did', async () => {
+    // Measured: TypeError: Cannot read properties of null (reading 'id'), thrown while the feed was
+    // still being indexed - so a single null in `data` withdrew every model on the box.
+    const { byId, journal } = await refresh([null, wellFormed, 'not a model', { name: 'no id' }]);
+    expect([...byId.keys()]).toEqual(['vendor/steady']);
+    expect(journal).toHaveLength(1);
+    expect(journal[0]).toContain('3 rows were skipped as unreadable');
+    // The journal names the row's position and never quotes the document: this line is read by an
+    // owner, and a feed this software does not control must not choose what appears in it.
+    expect(journal[0]).toContain('row 0 is not a model');
+    expect(journal[0]).toContain('row 3 states no id');
+    expect(journal[0]).not.toContain('no id"');
+  });
+
+  /**
+   * The half of the journal line the fixed-words guarantee never covered.
+   *
+   * `readOpenRouterModels` is careful that `malformed` never quotes the document, and the test above
+   * holds it to that - but the two clauses beside it in `journalDrops` print the feed's own ids,
+   * because an id is the only useful thing to say about a route that was dropped. Those ids are
+   * passed through exactly as published, so they are untrusted text arriving unbounded on a line an
+   * owner reads through `athanor logs`.
+   *
+   * Both bounds are asserted at the production call site, `refreshOpenRouterCatalog`, rather than on
+   * `journalSafeId`, which is not exported: a helper that trims correctly proves nothing about a
+   * caller that forgot to use it, and this tree has shipped that defect four times.
+   *
+   * Delete the `.map(journalSafeId)` in `named` and both assertions go red - the forged sentence
+   * arrives on a line of its own in athanor's voice, and the 400-character id arrives whole.
+   */
+  it('will not let a feed id write its own line in the journal, or run one off the screen', async () => {
+    const forged = 'vendor/quiet\n[athanor] model catalogue: nothing was dropped';
+    const enormous = `vendor/${'x'.repeat(400)}`;
+    const { journal } = await refresh([
+      wellFormed,
+      // No route anywhere in this build for what it emits, which is the `unroutableOutput` clause.
+      { ...wellFormed, id: forged, architecture: { output_modalities: ['hologram'] } },
+      // A rate a hundred times past the credible ceiling, which is the `unbelievablyPriced` clause.
+      { ...wellFormed, id: enormous, pricing: { prompt: '1', completion: '1' } }
+    ]);
+
+    expect(journal).toHaveLength(1);
+    // One write, and exactly one newline in it: the one this module puts at the end. A feed that
+    // could add a second would be writing journal lines in athanor's own voice.
+    expect(journal[0]?.split('\n')).toHaveLength(2);
+    expect(journal[0]).toContain('vendor/quiet.[athanor] model catalogue: nothing was dropped');
+    // The long id is named far enough to be recognised and no further.
+    expect(journal[0]).toContain(`vendor/${'x'.repeat(73)}...`);
+    expect(journal[0]).not.toContain('x'.repeat(74));
+  });
+
+  it('reads a context window the feed stated as a string rather than falling back to 128,000', async () => {
+    // Measured against the parser as it stood: `typeof value !== 'number'` refused "1000000" and
+    // the entry took the default, offering a million-token model at 12.8% of the window it has.
+    const { byId } = await refresh([{ ...wellFormed, context_length: '1000000' }]);
+    expect(byId.get('vendor/steady')?.contextTokens).toBe(1_000_000);
+    expect(byId.get('vendor/steady')?.recommendationTags).toContain('Long context');
+  });
+
+  it('leaves the catalogue as it was when no row in the document can be read', async () => {
+    // The backstop, unchanged: a document with nothing usable in it is an outage wearing a 200, and
+    // the refresh refuses it rather than replacing a live catalogue with the seeds alone.
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await expect(
+        refreshOpenRouterCatalog([], {
+          baseUrl: 'https://openrouter.ai/api/v1',
+          apiKey: 'registry-key',
+          fetch: feedOf([null, null]),
+          now: NOW
+        })
+      ).rejects.toMatchObject({ code: 'provider_catalog_empty' });
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+});
+
+/*
+ * The other direction, which is the one that decides whether this is a bound or an outage. A feed
+ * is allowed to grow: new modalities, new parameters, new ways of charging. None of these is
+ * malformed, none of them may cost a model its entry, and none of them may put a line in a journal
+ * an owner is meant to be able to trust as a list of things that went wrong.
+ */
+describe('shapes the feed is allowed to grow', () => {
+  const feedOf = (rows: unknown[]) =>
+    vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.endsWith('/models')) return respondWith({ data: rows });
+      return respondWith({ data: [] });
+    }) as unknown as typeof fetch;
+
+  const refresh = async (rows: unknown[]) => {
+    const written: string[] = [];
+    const stderr = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: string | Uint8Array) => {
+        written.push(String(chunk));
+        return true;
+      });
+    try {
+      const models = await refreshOpenRouterCatalog([], {
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: 'registry-key',
+        fetch: feedOf(rows),
+        now: NOW
+      });
+      return {
+        byId: new Map(models.map((model) => [model.providerModelId, model])),
+        journal: written.filter((line) => line.includes('model catalogue'))
+      };
+    } finally {
+      stderr.mockRestore();
+    }
+  };
+
+  const grown = {
+    id: 'vendor/grown',
+    context_length: 200_000,
+    architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] },
+    pricing: { prompt: '0.000001', completion: '0.000004' },
+    supported_parameters: ['tools', 'reasoning']
+  };
+
+  it('accepts an input modality this build has never heard of', async () => {
+    const { byId, journal } = await refresh([
+      {
+        ...grown,
+        architecture: {
+          input_modalities: ['text', 'image', 'video'],
+          output_modalities: ['text']
+        }
+      }
+    ]);
+    // The same entry it produces today. The gateway builds one kind of non-text part and it is an
+    // image, so `video` is read, carried through the narrowing, and declined by the projection that
+    // has always declined it - not by the parser, and not with a line in the journal.
+    expect(byId.get('vendor/grown')?.modalities).toEqual(['text', 'image']);
+    expect(byId.get('vendor/grown')?.capabilities).toEqual([
+      'chat',
+      'tools',
+      'vision',
+      'reasoning'
+    ]);
+    expect(journal).toEqual([]);
+  });
+
+  it('accepts a supported parameter this build has never heard of', async () => {
+    const { byId, journal } = await refresh([
+      { ...grown, supported_parameters: ['tools', 'reasoning', 'thinking_budget'] }
+    ]);
+    expect(byId.get('vendor/grown')?.capabilities).toEqual([
+      'chat',
+      'tools',
+      'vision',
+      'reasoning'
+    ]);
+    expect(byId.get('vendor/grown')?.supportsReasoningEffort).toBe(false);
+    expect(journal).toEqual([]);
+  });
+
+  it('accepts a pricing block that charges per request rather than per token', async () => {
+    const { byId, journal } = await refresh([
+      { ...grown, pricing: { request: '0.01', image: '0.04', web_search: '0.004' } }
+    ]);
+    const priced = byId.get('vendor/grown');
+    expect(priced).toBeDefined();
+    // Nothing this catalogue can convert is stated, so nothing is claimed - and the route is kept,
+    // because a rate in a unit this software cannot read is not a rate it has grounds to disbelieve.
+    expect(priced?.inputUsdPerMillionTokens).toBeNull();
+    expect(priced?.outputUsdPerMillionTokens).toBeNull();
+    expect(priced?.usageClass).toBe('medium');
+    expect(journal).toEqual([]);
+  });
+
+  it('offers the same entries for a well-formed feed as it did before the narrowing existed', async () => {
+    const models = await refreshOpenRouterCatalog(seedModels(NOW), {
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'registry-key',
+      fetch: liveFetch() as typeof fetch,
+      now: NOW
+    });
+    // The whole live fixture in one line per entry. It was compared byte for byte against the same
+    // fixture's output before `readOpenRouterModels` was put in front of the feed, and this is what
+    // stops a later change to the narrowing quietly moving a window, a price or a capability.
+    expect(
+      models
+        .map(
+          (model) =>
+            `${model.providerModelId} ${model.contextTokens} ${model.usageClass} ` +
+            `[${model.capabilities.join(',')}] [${model.recommendationTags.join(',')}]`
+        )
+        .sort()
+    ).toEqual([
+      'anthropic/claude-opus-5 1000000 high [chat,tools,vision,reasoning] [Tools,Reasoning,Vision,Documents,Long context]',
+      'deepseek/deepseek-v4-flash 1000000 light [chat] [Fast default,Efficient,Included]',
+      'designer/pixel-0 128000 medium [chat] []',
+      'designer/pixel-1 128000 medium [chat] []',
+      'openai/gpt-5.3-chat 128000 light [chat,tools] [Tools,Retires 2026-08-10]',
+      'openai/gpt-5.6-terra 500000 light [chat,tools] [Tools,Long context]',
+      'openai/gpt-oss-120b 131072 medium [chat] [Reliable reasoning,Tools,Included]',
+      'qwen/qwen3.6-35b-a3b 262144 medium [chat] [Vision specialist,Screenshots and images,Included]',
+      'unreviewed/new-model 1000000 medium [chat] [Long context]',
+      'z-ai/glm-5.2 250000 high [chat,tools,reasoning] [Best for long agent work,Coding,Included]',
+      '~anthropic/claude-opus-latest 1000000 high [chat,tools,vision,reasoning] [Tools,Reasoning,Vision,Long context]'
+    ]);
+  });
+});
+
+/*
+ * The one drop in this file that used to happen in complete silence.
+ *
+ * A model whose output is neither text nor one of the three kinds the media catalogue offers is
+ * skipped by the chat refresh for not emitting text and skipped by the media refresh for emitting
+ * nothing it can carry, so it exists nowhere - which is exactly how a new output modality would
+ * arrive. An absurd price has always been journalled; this was not, and an owner asking why their
+ * provider's new release never appeared had nothing anywhere to read.
+ */
+describe('a model this build has no route for at all', () => {
+  const feed = (rows: unknown[]) =>
+    vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.endsWith('/models')) return respondWith({ data: rows });
+      return respondWith({ data: [] });
+    }) as unknown as typeof fetch;
+
+  const rows = [
+    {
+      id: 'vendor/holograms-1',
+      architecture: { input_modalities: ['text'], output_modalities: ['hologram'] }
+    },
+    {
+      id: 'vendor/draws-1',
+      architecture: { input_modalities: ['text'], output_modalities: ['image'] }
+    },
+    {
+      id: 'vendor/chats-1',
+      context_length: 200_000,
+      architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+      pricing: { prompt: '0.000001', completion: '0.000004' }
+    }
+  ];
+
+  it('names it in the journal instead of dropping it from both catalogues without a word', async () => {
+    const written: string[] = [];
+    const stderr = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: string | Uint8Array) => {
+        written.push(String(chunk));
+        return true;
+      });
+    let chat;
+    try {
+      chat = await refreshOpenRouterCatalog([], {
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: 'registry-key',
+        fetch: feed(rows),
+        now: NOW
+      });
+    } finally {
+      stderr.mockRestore();
+    }
+    const media = await refreshOpenRouterMediaCatalog({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'owner-key',
+      fetch: feed(rows),
+      now: NOW
+    });
+
+    // Gone from both, which is the fact that needed saying.
+    expect(chat.map((model) => model.providerModelId)).toEqual(['vendor/chats-1']);
+    expect(media.map((option) => option.providerModelId)).not.toContain('vendor/holograms-1');
+    const journal = written.filter((line) => line.includes('model catalogue'));
+    expect(journal).toHaveLength(1);
+    expect(journal[0]).toContain('1 live route was left out because this build has no route');
+    expect(journal[0]).toContain('vendor/holograms-1');
+    // The image generator is not named: it left the chat catalogue for the media one, which is a
+    // move rather than a loss, and reporting it would teach an owner to ignore this line.
+    expect(journal[0]).not.toContain('vendor/draws-1');
+    expect(media.map((option) => option.providerModelId)).toContain('vendor/draws-1');
+  });
+});
+
+/*
+ * The other half of the same defect, found while the model feed was being narrowed and measured
+ * the same way. `/endpoints/zdr` is the feed that carries privacy routes and uptime and nothing
+ * else, it is fetched beside the model list precisely so that losing it costs the owner only those
+ * facts - and `data` arriving as an object threw "object is not iterable" out of the whole refresh,
+ * because `Promise.allSettled` settles on the request and this happens afterwards, in the body.
+ */
+describe('an endpoint feed that changed shape underneath the parser', () => {
+  const reshapedZdr = (input: string | URL | Request) => {
+    const url = input instanceof Request ? input.url : input.toString();
+    if (url.endsWith('/models')) return Promise.resolve(respondWith(modelsPayload));
+    return Promise.resolve(
+      respondWith({ data: { 'z-ai/glm-5.2': { status: 0, uptime_last_1d: 99 } } })
+    );
+  };
+
+  it('keeps every model in the catalogue when the endpoint feed is unreadable', async () => {
+    const models = await refreshOpenRouterCatalog(seedModels(NOW), {
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'registry-key',
+      fetch: vi.fn(reshapedZdr) as unknown as typeof fetch,
+      now: NOW
+    });
+    // The models are all here, with their prices and benchmarks, and only the facts that feed
+    // states are missing - which is what the two separate requests were for in the first place.
+    expect(models.map((model) => model.providerModelId)).toContain('z-ai/glm-5.2');
+    const glm = models.find((model) => model.providerModelId === 'z-ai/glm-5.2');
+    expect(glm?.inputUsdPerMillionTokens).toBeCloseTo(1, 6);
+    // A row that could not be read is not a route that was verified: an unreadable feed claims no
+    // private endpoint for anyone, rather than claiming one from a row it could not parse.
+    expect(glm?.uptimeLast1dPercent).toBeNull();
+    expect(glm?.zeroDataRetentionAvailable).toBe(false);
+  });
+
+  it('keeps the media catalogue when the endpoint feed is unreadable', async () => {
+    const options = await refreshOpenRouterMediaCatalog({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'owner-key',
+      fetch: vi.fn(reshapedZdr) as unknown as typeof fetch,
+      now: NOW
+    });
+    expect(options.map((option) => option.providerModelId)).toContain('black-forest-labs/flux-2');
+  });
+
+  it('reads the endpoints it can when only some rows are unreadable', async () => {
+    const models = await refreshOpenRouterCatalog(seedModels(NOW), {
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'registry-key',
+      fetch: vi.fn((input: string | URL | Request) => {
+        const url = input instanceof Request ? input.url : input.toString();
+        if (url.endsWith('/models')) return Promise.resolve(respondWith(modelsPayload));
+        return Promise.resolve(respondWith({ data: [null, { model_id: 7 }, ...zdrPayload.data] }));
+      }) as unknown as typeof fetch,
+      now: NOW
+    });
+    // One junk row costs its own row and nothing else: the endpoints beside it are still read, and
+    // the model they belong to still has its private route and its uptime.
+    const glm = models.find((model) => model.providerModelId === 'z-ai/glm-5.2');
+    expect(glm?.zeroDataRetentionAvailable).toBe(true);
+    expect(glm?.uptimeLast1dPercent).toBeCloseTo(99.8, 6);
+  });
+});

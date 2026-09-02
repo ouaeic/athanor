@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -10,6 +10,7 @@ import type { RunnerConfig } from './config.js';
 import { DesktopManager } from './desktop.js';
 import { ensureWorkspace } from './files.js';
 import { DesktopControl } from './holder.js';
+import { agentHome } from './execution.js';
 import { buildServer } from './server.js';
 
 /**
@@ -561,6 +562,38 @@ describe('file organisation and toolchain routes', () => {
     expect(differentQuery.statusCode).toBe(200);
   });
 
+  it('counts the owner data in the storage figure and leaves the agent home out of it', async () => {
+    /*
+     * The decision, pinned as a number rather than left to be inferred from the entry list.
+     *
+     * `.home` is the agent's `$HOME` and holds toolchain caches - a Rust toolchain alone is 88,021
+     * files - and it is deliberately not counted: the figure is a tree walk behind the API's
+     * five-second metering timeout, and the quota it feeds has no way to let an owner clear that
+     * directory, because `.home` is in `CONTAINER_ONLY` and the file routes cannot reach it. What
+     * that costs is a per-workspace limit that does not bound `$HOME`; the host-disk floor is what
+     * does. Written as an exact total so it fails in both directions - adding `.home` to the list,
+     * and dropping any of the three that are on it.
+     */
+    const { app, id, root, token } = await harness();
+    await writeFile(path.join(root, 'workspace', 'report.md'), 'w'.repeat(1_000));
+    await writeFile(path.join(root, '.athanor', 'artifacts', 'chart.png'), 'a'.repeat(200));
+    await writeFile(path.join(root, '.athanor', 'browser', 'Cookies'), 'b'.repeat(30));
+    // Four hundred times the owner's own data, which is the ratio a real toolchain cache arrives in.
+    await mkdir(path.join(agentHome(root), '.cargo'), { recursive: true });
+    await writeFile(path.join(agentHome(root), '.cargo', 'registry'), 'h'.repeat(500_000));
+
+    const usagePath = `/v1/workspaces/${id}/usage`;
+    const usage = await app.inject({
+      method: 'GET',
+      url: usagePath,
+      headers: {
+        authorization: `Bearer ${token(['files.read'], { method: 'GET', path: usagePath })}`
+      }
+    });
+    expect(usage.statusCode).toBe(200);
+    expect(usage.json<{ storageBytes: number }>().storageBytes).toBe(1_230);
+  });
+
   it('answers what the computer can actually do with documents', async () => {
     const { app, id, token } = await harness();
     const report = await app.inject({
@@ -863,5 +896,135 @@ describe('taking the machine over on one surface', () => {
     });
     expect(acted.statusCode).toBeGreaterThanOrEqual(400);
     expect(JSON.stringify(acted.json())).toMatch(/held by user/);
+  });
+});
+
+/**
+ * The ladder, reported rather than assumed.
+ *
+ * `/healthz` is the one place an operator, and the control plane that tells the owner their shell
+ * is confined, can read what this box actually does - and until this wave `agentSandbox` had no
+ * production reader at all. What it must never do is answer from the setting: a box with
+ * CONFINE_AGENT_FILESYSTEM on and no helper to apply a ruleset with is a box running every command
+ * unconfined, and a health endpoint that reported otherwise would be worse than one that said
+ * nothing.
+ */
+describe('what the runner says about its own boundaries', () => {
+  const disposers: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    while (disposers.length) await disposers.pop()!();
+  });
+
+  const withSandbox = async (
+    confine: boolean | undefined,
+    helper: string | undefined
+  ): Promise<{ app: Awaited<ReturnType<typeof buildServer>>; workspaceRoot: string }> => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'athanor-rung-'));
+    disposers.push(() => rm(workspaceRoot, { recursive: true, force: true }));
+    const config = {
+      RUNNER_HOST: '127.0.0.1',
+      RUNNER_PORT: 4300,
+      RUNNER_SHARED_SECRET: 'runner-rung-test-secret-at-least-32-characters',
+      WORKSPACE_ROOT: workspaceRoot,
+      TAR_EXECUTABLE: '/usr/bin/tar',
+      SNAPSHOT_EXECUTABLE: path.resolve('../../scripts/athanor-snapshot'),
+      BROWSER_USE_DESKTOP_DISPLAY: false,
+      MAX_EXECUTION_SECONDS: 30,
+      RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
+      IMAGE_CONVERT_EXECUTABLE: 'magick',
+      MAX_BACKGROUND_SECONDS: 120,
+      COMMAND_PROCESS_LIMIT: 1024,
+      COMMAND_OPEN_FILE_LIMIT: 4096,
+      MAX_FILE_BYTES: 1024 * 1024,
+      RESERVED_PREVIEW_PORTS: [],
+      CHECKPOINT_BTRFS_EXECUTABLE: '/nonexistent/btrfs',
+      CHECKPOINT_ZFS_EXECUTABLE: '/nonexistent/zfs',
+      CHECKPOINT_PACKAGE_MANIFEST: path.join(workspaceRoot, 'dpkg-status'),
+      CHECKPOINT_INCLUDE_BROWSER_PROFILE: false,
+      CHECKPOINT_RETAIN_TURNS: 20,
+      CHECKPOINT_RETAIN_DAILY_DAYS: 14,
+      CHECKPOINT_MAX_FILES: 250_000,
+      CHECKPOINT_MAX_FILE_BYTES: 2 * 1024 ** 3,
+      ISOLATE_AGENT_NETWORK: false,
+      AGENT_SANDBOX_HELPER: helper,
+      CONFINE_AGENT_FILESYSTEM: confine
+    } as RunnerConfig;
+    const app = await buildServer(config);
+    disposers.push(() => app.close());
+    return { app, workspaceRoot };
+  };
+
+  const stubHelper = async (): Promise<string> => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-helper-'));
+    disposers.push(() => rm(root, { recursive: true, force: true }));
+    const helper = path.join(root, 'athanor-sandbox');
+    await writeFile(helper, '#!/bin/sh\nexit 0\n');
+    await chmod(helper, 0o755);
+    return helper;
+  };
+
+  it('reports the filesystem rung it is actually on', async () => {
+    const { app } = await withSandbox(true, await stubHelper());
+    const health = await app.inject({ method: 'GET', url: '/healthz' });
+    expect(health.json()).toMatchObject({ agentSandbox: true, agentFilesystemConfined: true });
+  });
+
+  it('reports no filesystem boundary on a box whose installer found none', async () => {
+    const { app } = await withSandbox(false, await stubHelper());
+    const health = await app.inject({ method: 'GET', url: '/healthz' });
+    expect(health.json()).toMatchObject({ agentSandbox: true, agentFilesystemConfined: false });
+  });
+
+  it('answers from the helper it has, not from the setting it was given', async () => {
+    // A laptop: the setting says confine, there is no second account to drop to, and every command
+    // runs as the runner with no ruleset anywhere. Answering `true` here would tell the owner a
+    // boundary is in force that nothing on the box performs.
+    const { app } = await withSandbox(true, undefined);
+    const health = await app.inject({ method: 'GET', url: '/healthz' });
+    expect(health.json()).toMatchObject({ agentSandbox: false, agentFilesystemConfined: false });
+  });
+
+  it('prepares the agent home the toolchain will want, beside the undo point and not in it', async () => {
+    // `bash` does not create a missing $HOME and `python3 -m venv $HOME/venv` fails outright when
+    // its parent is absent, so a home that only appears once something has written in it is a home
+    // half the toolchain trips over.
+    const { app, workspaceRoot } = await withSandbox(false, undefined);
+    const id = '00000000-0000-4000-8000-0000000000b7';
+    const token = signCapabilityToken(
+      {
+        sub: 'user',
+        workspaceId: id,
+        role: 'user',
+        scopes: ['workspace.manage'],
+        aud: capabilityAudience('PUT', `/v1/workspaces/${id}`),
+        nonce: 'home-test'
+      },
+      'runner-rung-test-secret-at-least-32-characters'
+    );
+    const created = await app.inject({
+      method: 'PUT',
+      url: `/v1/workspaces/${id}`,
+      headers: { authorization: `Bearer ${token}` }
+    });
+    expect(created.statusCode).toBe(200);
+    const root = path.join(workspaceRoot, id);
+    const home = agentHome(root);
+    expect((await stat(home)).isDirectory()).toBe(true);
+    // WHERE it is, spelled as one equality rather than as a prefix test. `.home` at the container
+    // root: outside `workspace/`, which is what keeps a Rust toolchain's 88,021 files out of
+    // CHECKPOINT_CONTENT and out of the workspace storage quota, and outside `.athanor`, which is
+    // the runner's alone. A prefix test would pass on `workspace/.home` and on `.home/anything`
+    // alike; this one fails the moment the location moves in either direction, which is the whole
+    // reason it is written this way - the assertion it replaced read the first path segment and
+    // would have passed on any depth of nesting under `workspace/`.
+    expect(path.relative(root, home)).toBe('.home');
+    // And the mode, because the two accounts reach these files through the group they share: a
+    // home the agent account cannot write is a home every `pip install` fails in. `0o770` from
+    // files.ts's SHARED_MODE, masked by the process umask the same way `workspace/` is.
+    const [homeStat, workspaceStat] = await Promise.all([
+      stat(home),
+      stat(path.join(root, 'workspace'))
+    ]);
+    expect(homeStat.mode & 0o777).toBe(workspaceStat.mode & 0o777);
   });
 });

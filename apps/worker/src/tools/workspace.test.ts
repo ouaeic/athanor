@@ -1,10 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
-import { executeWorkspaceTool } from './workspace.js';
+import { countPostEditPaths, executeWorkspaceTool, forgetPostEditChecks } from './workspace.js';
+import { POST_EDIT_CHECKED_LANGUAGES } from './diagnostics.js';
 import { forgetReads, recordRead, toLines } from '../edit/index.js';
 import { RECENT_TOOL_OUTPUT_CHARS, serializeToolResultForModel } from '../context.js';
 import { type AgentState } from '../agent-state.js';
+import { CHECKPOINT_EXEMPT_TOOLS } from '../turn-bounds.js';
 import { type ToolContext } from '../tool-dispatch.js';
 
 /**
@@ -53,6 +55,19 @@ interface Applied {
  * other fourteen are deliberately absent rather than stubbed: standing them up would be fourteen
  * ways for this file to go red for a reason that has nothing to do with a patch.
  */
+/*
+ * The armed post-edit checks are module state keyed by task id, and every helper below drives the
+ * same task id, so without this a check left armed by one test would attach its `diagnostics` to
+ * an unrelated patch result in the next one. It was harmless only by accident until now - the
+ * older helpers hand the runner a stub that makes the arm's directory walk throw, and the tests
+ * that do arm sit last in the file - and both of those accidents are one fixture change or one
+ * `sequence.shuffle` away from not holding. Reads are NOT cleared here: the helpers clear those
+ * themselves, per call rather than per test, and several tests call a helper twice.
+ */
+beforeEach(() => {
+  forgetPostEditChecks();
+});
+
 const patch = async (
   patches: unknown,
   files: Record<string, string> = { 'workspace/queue.ts': QUEUE },
@@ -931,5 +946,846 @@ describe('a file too long to be remembered four windows at a time', () => {
     expect((refusal as Error).message).toMatch(/Transform it with a program from the shell/);
     expect((refusal as Error).message).not.toMatch(/file_read using startLine/);
     expect(written.get('workspace/acl.json')).toHaveLength(76_478);
+  });
+});
+
+/**
+ * The post-edit check, driven through the shipped `file_patch` arm.
+ *
+ * Every assertion below that matters is a COUNT of runner `exec` calls rather than a reading of
+ * what came back, because the property being defended is about what ran on the owner's computer
+ * and an implementation that runs `cargo check` and then discards its output has already done the
+ * harm. `diagnostics.test.ts` covers the walk and the two output grammars as units; nothing here
+ * re-tests those. What is tested here is the trigger as the model reaches it.
+ */
+
+/** A tree the walk can climb: what each directory holds, by workspace path. */
+type Tree = Record<string, readonly string[]>;
+
+/** The measured shape of a real `tsc --noEmit --pretty false` line. @see postEditDiagnostics. */
+const tscError = (relative: string, code = 2322): string =>
+  `${relative}(3,7): error TS${code}: Type 'string' is not assignable to type 'number'.`;
+
+interface Rig {
+  readonly written: Map<string, string>;
+  readonly execs: Array<Record<string, unknown>>;
+  /** Held closed, every `exec` waits here - which is how a run is kept in flight across a call. */
+  hold: boolean;
+  release: () => void;
+  /** What the Nth `exec` prints, so two runs of the same checker can be told apart. */
+  output: (index: number) => Partial<ExecObservationShape>;
+  /**
+   * Fires once, inside the next runner call the tool makes, and is what lets a test reach the
+   * moment between the drain's two reads: the tool has been entered, the report is in hand, and
+   * the awaited call has not returned. Nothing in the product sets it.
+   */
+  duringCall: (() => void) | undefined;
+  patch: (patches: unknown) => Promise<Record<string, unknown>>;
+  run: (name: string, args?: Record<string, unknown>) => Promise<Record<string, unknown>>;
+  settle: () => Promise<void>;
+}
+
+interface ExecObservationShape {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}
+
+const rigFor = (files: Record<string, string>, tree: Tree): Rig => {
+  forgetReads();
+  forgetPostEditChecks();
+  const written = new Map<string, string>(Object.entries(files));
+  for (const path of Object.keys(files)) recordRead('task-1', path, 1, written.get(path) ?? '');
+  const execs: Array<Record<string, unknown>> = [];
+  let releaseGate = (): void => undefined;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  const rig: Rig = {
+    written,
+    execs,
+    hold: false,
+    release: () => releaseGate(),
+    output: () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }),
+    duringCall: undefined,
+    patch: async () => ({}),
+    run: async () => ({}),
+    /*
+     * One `setImmediate` drains every microtask queued behind it, and the detached arming chain is
+     * microtasks all the way down - a listing walk and one `exec`, all of them promises this fake
+     * resolves without a timer. Three turns of it is slack, not a race: there is no timer anywhere
+     * in the chain for a fourth to be waiting on.
+     */
+    settle: async () => {
+      for (let turn = 0; turn < 3; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+    }
+  };
+  const context = {
+    task: { workspaceId: 'ws-1', id: 'task-1', userId: 'user-1' },
+    state: {} as AgentState,
+    store: { setWorkspaceStorage: async () => undefined },
+    runner: {
+      readFileWithHash: async (_workspace: string, _task: string, path: string) => {
+        const content = written.get(path);
+        if (content === undefined) throw new Error(`no such file ${path}`);
+        return { content, sha256: `sha-${path}` };
+      },
+      writeFile: async (_workspace: string, _task: string, path: string, content: string) => {
+        written.set(path, content);
+        return { sha256: `written-${path}` };
+      },
+      readFileForDisplay: async (_workspace: string, _task: string, path: string) => {
+        const content = written.get(path) ?? '';
+        const total = toLines(content).length;
+        return {
+          content,
+          sha256: `sha-${path}`,
+          totalLines: total,
+          displayedLines: total,
+          partialLine: false
+        };
+      },
+      call: async (
+        _workspace: string,
+        _task: string,
+        _capability: unknown,
+        url: string,
+        body?: Record<string, unknown>
+      ) => {
+        const during = rig.duringCall;
+        rig.duringCall = undefined;
+        during?.();
+        if (url.endsWith('/usage')) return { storageBytes: 1 };
+        if (url.includes('/exec')) {
+          const index = execs.length;
+          execs.push({ ...(body ?? {}) });
+          if (rig.hold) await gate;
+          return {
+            exitCode: 1,
+            stdout: '',
+            stderr: '',
+            timedOut: false,
+            signal: null,
+            durationMs: 1,
+            ...rig.output(index)
+          };
+        }
+        const dir = decodeURIComponent(/path=([^&]*)/.exec(url)?.[1] ?? '');
+        return { entries: (tree[dir] ?? []).map((name) => ({ name })) };
+      }
+    }
+  } as unknown as ToolContext;
+  rig.patch = async (patches: unknown) =>
+    (await executeWorkspaceTool(context, {
+      id: 'call-1',
+      name: 'file_patch',
+      arguments: { patches }
+    } as unknown as ModelToolCall)) as Record<string, unknown>;
+  rig.run = async (name: string, args: Record<string, unknown> = {}) =>
+    (await executeWorkspaceTool(context, {
+      id: 'call-2',
+      name,
+      arguments: args
+    } as unknown as ModelToolCall)) as Record<string, unknown>;
+  return rig;
+};
+
+/** A package that has a checker: a `tsconfig.json` one directory above the file being patched. */
+const PACKAGE_TREE: Tree = {
+  workspace: ['package.json', 'pnpm-lock.yaml', 'pkg'],
+  'workspace/pkg': ['package.json', 'tsconfig.json', 'src'],
+  'workspace/pkg/src': ['a.ts', 'b.ts', 'notes.md']
+};
+const PACKAGE_FILES = {
+  'workspace/pkg/src/a.ts': 'export const n: number = 1;\n',
+  'workspace/pkg/src/b.ts': 'export const m: number = 2;\n',
+  'workspace/pkg/src/notes.md': '# notes\n'
+};
+const swap = (path: string, text: string) => [{ path, edit: `PUT 1:\n+${text}\n` }];
+
+describe('the checker a patch triggers on what it just wrote', () => {
+  it('names the patched file and carries the compiler’s own message, on the next call', async () => {
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    rig.output = () => ({
+      exitCode: 2,
+      stdout: `${tscError('src/a.ts')}\n`,
+      stderr: '',
+      timedOut: false
+    });
+    const patched = await rig.patch(
+      swap('workspace/pkg/src/a.ts', "export const n: number = 'x';")
+    );
+    // The patch itself carries nothing: the run it armed cannot have finished, and the whole
+    // point of the deferral is that it did not wait to find out.
+    expect(patched).toMatchObject({ patchCount: 1 });
+    expect(patched.diagnostics).toBeUndefined();
+
+    await rig.settle();
+    const next = await rig.run('files_list', { path: 'workspace/pkg' });
+    const block = typeof next.diagnostics === 'string' ? next.diagnostics : '';
+    expect(block).toContain('workspace/pkg/src/a.ts(3,7): error TS2322');
+    expect(block).toContain('npx --no-install tsc --noEmit --pretty false in workspace/pkg');
+  });
+
+  /**
+   * A green tree has to cost nothing, and the property is guarded in three places rather than one:
+   * the parser returns nothing it did not recognise, the drain keeps an empty check out, and the
+   * renderer refuses a header with no lines under it. Deleting any single one of those leaves this
+   * green, which is worth knowing before trusting it - it went red only against all three deleted
+   * at once.
+   */
+  it('costs a green tree zero bytes: no key at all, not an empty one', async () => {
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    // The same patch against a project that compiles. `exitCode: 0` is not consulted anywhere -
+    // what makes this silent is that no line of the output parses as a diagnostic.
+    const patched = await rig.patch(swap('workspace/pkg/src/a.ts', 'export const n: number = 2;'));
+    expect(patched).toMatchObject({ patchCount: 1 });
+    await rig.settle();
+    const next = await rig.run('files_list', { path: 'workspace/pkg' });
+    expect(rig.execs).toHaveLength(1);
+    expect('diagnostics' in next).toBe(false);
+  });
+});
+
+describe('what a patch must never run, counted on the wire', () => {
+  it('runs nothing for a file with no project marker anywhere above it', async () => {
+    const rig = rigFor(
+      { 'workspace/loose/a.ts': 'export const a = 1;\n' },
+      { workspace: ['notes.md', 'loose'], 'workspace/loose': ['a.ts'] }
+    );
+    await rig.patch(swap('workspace/loose/a.ts', 'export const a = 2;'));
+    await rig.settle();
+    expect(rig.execs).toHaveLength(0);
+  });
+
+  /**
+   * The refusal sentence is model-facing advice for a question the model did not ask, and running
+   * the command it declines to run would be worse. This is this repository's own root: a
+   * `package.json`, no `tsconfig.json`, and `tsc` there prints 4,994 bytes of its own usage page.
+   */
+  it('runs nothing where the marker names a language whose project file is missing', async () => {
+    const rig = rigFor(
+      { 'workspace/a.ts': 'export const a = 1;\n' },
+      { workspace: ['package.json', 'pnpm-lock.yaml', 'a.ts'] }
+    );
+    await rig.patch(swap('workspace/a.ts', 'export const a = 2;'));
+    await rig.settle();
+    expect(rig.execs).toHaveLength(0);
+  });
+
+  /**
+   * The case that protects the owner's machine, and the reason the admission list is six languages
+   * and not fifteen. `cargo check` compiles and runs the crate's `build.rs` and its procedural
+   * macros, which is a program whoever wrote the repository chose. `code_diagnostics` runs it
+   * because the model asked for it by name; an edit to a `.rs` file is not asking.
+   *
+   * Asserted by counting rather than by reading, because an implementation that runs the build and
+   * throws the output away has already done the whole of the harm this is about.
+   */
+  it('does not run cargo check when a .rs file inside a real crate is patched', async () => {
+    const rig = rigFor(
+      { 'workspace/crate/src/main.rs': 'fn main() {}\n' },
+      {
+        workspace: ['crate'],
+        'workspace/crate': ['Cargo.toml', 'src'],
+        'workspace/crate/src': ['main.rs']
+      }
+    );
+    const patched = await rig.patch(swap('workspace/crate/src/main.rs', 'fn main() { }'));
+    await rig.settle();
+    expect(patched).toMatchObject({ patchCount: 1 });
+    expect(rig.execs).toHaveLength(0);
+    expect(POST_EDIT_CHECKED_LANGUAGES.has('rust')).toBe(false);
+  });
+
+  it('runs nothing for a patch that wrote no code, in a package that has a checker', async () => {
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    await rig.patch(swap('workspace/pkg/src/notes.md', '# other notes'));
+    await rig.settle();
+    expect(rig.execs).toHaveLength(0);
+  });
+
+  it('runs the project once for two files in it, not once per file', async () => {
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    await rig.patch([
+      ...swap('workspace/pkg/src/a.ts', 'export const n: number = 3;'),
+      ...swap('workspace/pkg/src/b.ts', 'export const m: number = 4;')
+    ]);
+    await rig.settle();
+    expect(rig.execs).toHaveLength(1);
+    expect(rig.execs[0]).toMatchObject({ cwd: 'workspace/pkg', executable: 'npx' });
+  });
+});
+
+describe('the check may not refuse work, and may not claim health', () => {
+  /**
+   * A hundred pre-existing errors nobody in this turn wrote. The patch succeeds and says so; the
+   * block is capped and says how much it left out; and the one error in the file that was actually
+   * patched is at the top, because that is the one the model is about to act on.
+   */
+  it('reports a patch into a broken project as success, capped, and says how much it dropped', async () => {
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    const noise = Array.from({ length: 99 }, (_, index) =>
+      tscError(`src/old/legacy-${index}.ts`, 2345)
+    );
+    rig.output = () => ({
+      exitCode: 2,
+      stdout: [...noise, tscError('src/a.ts')].join('\n'),
+      stderr: '',
+      timedOut: false
+    });
+    const patched = await rig.patch(
+      swap('workspace/pkg/src/a.ts', "export const n: number = 'x';")
+    );
+    const changed = patched.filesChanged as Array<{ path: string; sha256: string; lines: number }>;
+    expect(changed).toHaveLength(1);
+    expect(changed[0]?.path).toBe('workspace/pkg/src/a.ts');
+    expect(changed[0]?.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(patched).toMatchObject({ patchCount: 1 });
+    expect(patched.failed).toBeUndefined();
+
+    await rig.settle();
+    const next = await rig.run('files_list', { path: 'workspace/pkg' });
+    const block = typeof next.diagnostics === 'string' ? next.diagnostics : '';
+    const lines = block.split('\n');
+    expect(lines[1]).toContain('workspace/pkg/src/a.ts');
+    expect(block).toContain('and 88 more.');
+    expect(block.length).toBeLessThanOrEqual(1_600);
+  });
+
+  /**
+   * The byte bound, on the block the count bound cannot reach: ONE diagnostic.
+   *
+   * The renderer admits its first line whatever the length, so that a block is never a header with
+   * nothing under it, and that exemption is where the byte bound leaked. `tsc --noEmit --pretty
+   * false` prints the inferred type inline, so a single mismatch between two large object types is
+   * one line of several kilobytes; driven through this arm at 60,000 bytes of type text, the block
+   * came back 60,198 bytes long against its declared 1,600 - past `RECENT_TOOL_OUTPUT_CHARS`
+   * entirely, so an uninvited block would have evicted the result the model asked for.
+   *
+   * Pinned in bytes rather than by looking for the cut marker, because a marker is a string a
+   * future edit can keep while the length runs away underneath it.
+   */
+  it('cuts one diagnostic that is longer than the whole block’s budget', async () => {
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    const type = 'A'.repeat(60_000);
+    rig.output = () => ({
+      exitCode: 2,
+      stdout: `src/a.ts(3,7): error TS2322: Type '${type}' is not assignable to type 'number'.\n`,
+      stderr: '',
+      timedOut: false
+    });
+    await rig.patch(swap('workspace/pkg/src/a.ts', "export const n: number = 'x';"));
+    await rig.settle();
+    const next = await rig.run('files_list', { path: 'workspace/pkg' });
+    const block = typeof next.diagnostics === 'string' ? next.diagnostics : '';
+    // The stated cap and not the stated cap plus a residue: one check reserves nothing for a tail
+    // that cannot be written, so the whole 1,600 is this block's.
+    expect(block.length).toBeLessThanOrEqual(1_600);
+    // And the other direction, or a renderer that met the bound by going quiet would pass: one
+    // check reserves nothing for a tail, so this block is entitled to very nearly all of it.
+    expect(block.length).toBeGreaterThan(1_500);
+    expect(block).toContain('workspace/pkg/src/a.ts(3,7): error TS2322');
+    expect(block).toContain('code_diagnostics');
+    // Well inside the window the whole result is bounded to, which is the point of the cap.
+    expect(block.length).toBeLessThan(RECENT_TOOL_OUTPUT_CHARS);
+  });
+
+  /**
+   * The byte bound on the block the ONE-check bound cannot reach: a patch across a monorepo.
+   *
+   * A check is one project, and one `file_patch` may span eight of them - this repository has more
+   * than eight packages - so eight landed checks are joined onto one result. The cap was per check
+   * and nothing counted the total: eight over-long `tsc` lines delivered 14,246 bytes under a cap
+   * that reads 1,600, which is three fifths of `RECENT_TOOL_OUTPUT_CHARS` taken by a block nobody
+   * asked for. Pinned in bytes on the whole `diagnostics` value, and asserted to still NAME the
+   * projects it could not fit, so a renderer that met the bound by going silent does not pass.
+   */
+  it('holds the whole block to the budget when one patch arms a check in eight projects', async () => {
+    const PROJECTS = 8;
+    const rig = rigFor(
+      Object.fromEntries(
+        Array.from({ length: PROJECTS }, (_unused, index) => [
+          `workspace/p${index}/src/a.ts`,
+          `export const n${index}: number = 1;\n`
+        ])
+      ),
+      {
+        workspace: [
+          'package.json',
+          'pnpm-lock.yaml',
+          ...Array.from({ length: PROJECTS }, (_unused, index) => `p${index}`)
+        ],
+        ...Object.fromEntries(
+          Array.from({ length: PROJECTS }, (_unused, index) => [
+            `workspace/p${index}`,
+            ['package.json', 'tsconfig.json', 'src']
+          ])
+        ),
+        ...Object.fromEntries(
+          Array.from({ length: PROJECTS }, (_unused, index) => [
+            `workspace/p${index}/src`,
+            ['a.ts']
+          ])
+        )
+      }
+    );
+    const type = 'A'.repeat(60_000);
+    rig.output = () => ({
+      exitCode: 2,
+      stdout: `src/a.ts(3,7): error TS2322: Type '${type}' is not assignable to type 'number'.\n`,
+      stderr: '',
+      timedOut: false
+    });
+    await rig.patch(
+      Array.from({ length: PROJECTS }, (_unused, index) => ({
+        path: `workspace/p${index}/src/a.ts`,
+        edit: `PUT 1:\n+export const n${index}: number = 'x';\n`
+      }))
+    );
+    await rig.settle();
+    const next = await rig.run('files_list', { path: 'workspace' });
+    const block = typeof next.diagnostics === 'string' ? next.diagnostics : '';
+    expect(rig.execs).toHaveLength(PROJECTS);
+    // EVERY byte, not the blocks alone: the `\n\n` joins and the tail line are inside the budget
+    // now, and this is the assertion that says so. It was written `1_600 + 200` while they sat
+    // outside it, which is a cap that admits its own residue.
+    expect(block.length).toBeLessThanOrEqual(1_600);
+    // What it could not fit is named, not swallowed.
+    expect(block).toContain('7 more projects');
+    expect(block).toContain('workspace/p0/src/a.ts(3,7): error TS2322');
+    expect(block.length).toBeLessThan(RECENT_TOOL_OUTPUT_CHARS);
+  });
+
+  /**
+   * The same eight projects with diagnostics small enough that SEVERAL blocks land, which is the
+   * only shape in which the `\n\n` between them costs anything.
+   *
+   * The case above never reaches it: one 60,000-byte line eats the whole budget, one block is
+   * emitted and there is no join to pay for. So the separator could be left out of the accounting
+   * and every assertion in this file stayed green - it was, and they did. Sized so the budget is
+   * SATURATED, six blocks and two counted: the delivered value is 1,600 bytes on the nose, and
+   * putting the joins back outside the budget makes it 1,608.
+   */
+  it('counts the bytes that join the blocks, when more than one of them lands', async () => {
+    const PROJECTS = 8;
+    const rig = rigFor(
+      Object.fromEntries(
+        Array.from({ length: PROJECTS }, (_unused, index) => [
+          `workspace/p${index}/src/a.ts`,
+          `export const n${index}: number = 1;\n`
+        ])
+      ),
+      {
+        workspace: [
+          'package.json',
+          'pnpm-lock.yaml',
+          ...Array.from({ length: PROJECTS }, (_unused, index) => `p${index}`)
+        ],
+        ...Object.fromEntries(
+          Array.from({ length: PROJECTS }, (_unused, index) => [
+            `workspace/p${index}`,
+            ['package.json', 'tsconfig.json', 'src']
+          ])
+        ),
+        ...Object.fromEntries(
+          Array.from({ length: PROJECTS }, (_unused, index) => [
+            `workspace/p${index}/src`,
+            ['a.ts']
+          ])
+        )
+      }
+    );
+    // 140 characters once the parser has prefixed the project directory, which is the size that
+    // leaves the budget with nothing to spare after the sixth block.
+    const head = 'src/a.ts(3,7): error TS2322: ';
+    const raw = `${head}${'A'.repeat(140 - 'workspace/p0/'.length - head.length)}`;
+    rig.output = () => ({ exitCode: 2, stdout: `${raw}\n`, stderr: '', timedOut: false });
+    await rig.patch(
+      Array.from({ length: PROJECTS }, (_unused, index) => ({
+        path: `workspace/p${index}/src/a.ts`,
+        edit: `PUT 1:\n+export const n${index}: number = 'x';\n`
+      }))
+    );
+    await rig.settle();
+    const next = await rig.run('files_list', { path: 'workspace' });
+    const block = typeof next.diagnostics === 'string' ? next.diagnostics : '';
+    // More than one block, or the joins cost nothing and this case is the one above again.
+    expect(block.split('\n\n').length).toBeGreaterThan(2);
+    expect(block).toContain('workspace/p0/src/a.ts(3,7)');
+    expect(block).toContain('workspace/p1/src/a.ts(3,7)');
+    expect(block).toContain('more projects');
+    expect(block.length).toBeLessThanOrEqual(1_600);
+  });
+
+  /**
+   * The one shape in which POST_EDIT_MIN_DIAGNOSTIC is load-bearing rather than a matter of taste,
+   * and until this case existed nothing pinned it: setting it to 0 left all 56 tests green.
+   *
+   * `clipDiagnostic` spends the 68-byte cut marker FROM its budget, but only down to zero - below
+   * the marker's own length the `Math.max` hands back the marker alone, which is longer than the
+   * budget it was given. The minimum is what stops a caller ever reaching that: a header is not
+   * written unless the line under it has room for the marker plus 40 bytes. Take the minimum away
+   * and the seventh header here is written over a line with 21 bytes of room that delivers 68, so
+   * the value the two cases above pin at 1,600 comes back at 1,646.
+   *
+   * SIZED, not guessed. Eight projects, one 115-byte diagnostic each: six blocks fit, the seventh
+   * header has 132 bytes to sit in, and what is left for the line under it is 21 - inside the
+   * marker and outside what the minimum admits. The arithmetic is
+   * `1,600 - tail - 6 x (header + 3 + 115) - header - 1`, so it moves if the header wording or the
+   * tail sentence moves, which is why the assertion is on the delivered bytes rather than on 21.
+   */
+  it('refuses a block it cannot fit a usable line into, rather than delivering a bare cut marker', async () => {
+    const PROJECTS = 8;
+    const rig = rigFor(
+      Object.fromEntries(
+        Array.from({ length: PROJECTS }, (_unused, index) => [
+          `workspace/p${index}/src/a.ts`,
+          `export const n${index}: number = 1;\n`
+        ])
+      ),
+      {
+        workspace: [
+          'package.json',
+          'pnpm-lock.yaml',
+          ...Array.from({ length: PROJECTS }, (_unused, index) => `p${index}`)
+        ],
+        ...Object.fromEntries(
+          Array.from({ length: PROJECTS }, (_unused, index) => [
+            `workspace/p${index}`,
+            ['package.json', 'tsconfig.json', 'src']
+          ])
+        ),
+        ...Object.fromEntries(
+          Array.from({ length: PROJECTS }, (_unused, index) => [
+            `workspace/p${index}/src`,
+            ['a.ts']
+          ])
+        )
+      }
+    );
+    const head = 'src/a.ts(3,7): error TS2322: ';
+    const raw = `${head}${'A'.repeat(115 - 'workspace/p0/'.length - head.length)}`;
+    rig.output = () => ({ exitCode: 2, stdout: `${raw}\n`, stderr: '', timedOut: false });
+    await rig.patch(
+      Array.from({ length: PROJECTS }, (_unused, index) => ({
+        path: `workspace/p${index}/src/a.ts`,
+        edit: `PUT 1:\n+export const n${index}: number = 'x';\n`
+      }))
+    );
+    await rig.settle();
+    const next = await rig.run('files_list', { path: 'workspace' });
+    const block = typeof next.diagnostics === 'string' ? next.diagnostics : '';
+    expect(block.length).toBeLessThanOrEqual(1_600);
+    // The refused project is COUNTED and not swallowed, or the bound could be met by going quiet.
+    expect(block).toContain('more projects');
+    // And no block is a header over nothing but the truncation notice. A cut marker with no line
+    // in front of it is the shape the minimum exists to refuse, so its absence is the assertion.
+    for (const one of block.split('\n\n')) {
+      const lines = one.split('\n');
+      if (lines.length > 1) expect(lines[1]?.startsWith(' [cut here')).toBe(false);
+    }
+  });
+
+  /**
+   * The measured shape of `npx --no-install tsc` where TypeScript is not installed: exit 1 and 544
+   * bytes of npm's own advice, not one line of which is a diagnostic. It has to read as silence,
+   * and nothing in the result may say the file is fine.
+   */
+  it('says nothing at all when the checker is not installed', async () => {
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    rig.output = () => ({
+      exitCode: 1,
+      stdout: '',
+      stderr:
+        'This is not the tsc command you are looking for\n\nTo get access to the TypeScript compiler, tsc, from the command line either:\n\n- Use npm install typescript to first add TypeScript to your project before using npx\n',
+      timedOut: false
+    });
+    await rig.patch(swap('workspace/pkg/src/a.ts', 'export const n: number = 5;'));
+    await rig.settle();
+    const next = await rig.run('files_list', { path: 'workspace/pkg' });
+    expect(rig.execs).toHaveLength(1);
+    expect('diagnostics' in next).toBe(false);
+    expect(JSON.stringify(next)).not.toMatch(/passed|clean|healthy|no errors/i);
+  });
+});
+
+describe('a check is only worth reporting while it is still about this tree', () => {
+  it('reports the newer run and drops the one the second patch outran', async () => {
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    rig.hold = true;
+    rig.output = (index) => ({
+      exitCode: 2,
+      stdout: `${tscError(index === 0 ? 'src/stale.ts' : 'src/fresh.ts')}\n`,
+      stderr: '',
+      timedOut: false
+    });
+    // Both patches are issued before either checker returns, which is the ordinary shape: patch,
+    // read the echo, notice the typo, patch again.
+    await rig.patch(swap('workspace/pkg/src/a.ts', "export const n: number = 'x';"));
+    await rig.patch(swap('workspace/pkg/src/a.ts', "export const n: number = 'y';"));
+    rig.release();
+    await rig.settle();
+
+    const next = await rig.run('files_list', { path: 'workspace/pkg' });
+    const block = typeof next.diagnostics === 'string' ? next.diagnostics : '';
+    expect(rig.execs).toHaveLength(2);
+    expect(block).toContain('src/fresh.ts');
+    expect(block).not.toContain('src/stale.ts');
+  });
+
+  /**
+   * The same staleness one beat later, and the case the outstanding-run test above cannot reach:
+   * the first check has LANDED before the second patch is issued, so it is fresh at the moment the
+   * drain reads it and stale by the moment it is rendered. It must not ride on the result of the
+   * write that invalidated it.
+   *
+   * Asserted as an absence on the second patch AND as the PRESENCE of the second run's own answer
+   * on the call after it, because a guard that silenced the drain outright would pass the first
+   * half alone. The two runs are told apart by the path each prints.
+   */
+  it('drops a landed check on the result of the patch that superseded it', async () => {
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    rig.output = (index) => ({
+      exitCode: 2,
+      stdout: `${tscError(index === 0 ? 'src/stale.ts' : 'src/fresh.ts')}\n`,
+      stderr: '',
+      timedOut: false
+    });
+    await rig.patch(swap('workspace/pkg/src/a.ts', "export const n: number = 'x';"));
+    await rig.settle();
+    // The repair. What must not appear on it is the answer the checker gave about the file this
+    // patch has just replaced.
+    const repaired = await rig.patch(swap('workspace/pkg/src/a.ts', 'export const n: number = 9;'));
+    expect(repaired).toMatchObject({ patchCount: 1 });
+    expect(repaired.diagnostics).toBeUndefined();
+
+    await rig.settle();
+    const next = await rig.run('files_list', { path: 'workspace/pkg' });
+    const block = typeof next.diagnostics === 'string' ? next.diagnostics : '';
+    expect(rig.execs).toHaveLength(2);
+    expect(block).toContain('src/fresh.ts');
+    expect(block).not.toContain('src/stale.ts');
+  });
+
+  /**
+   * The ledger going while the report is in hand, which is the one shape that reached the second
+   * read with nothing to date the answer against.
+   *
+   * The drain reads the landed checks BEFORE the tool runs and asks again after it, and the second
+   * read used to return every captured check unfiltered when the ledger had gone - the opposite
+   * direction from every other guard here. Reachable in the product when 64 other tasks arm during
+   * one awaited tool call, which is why it is constructed rather than argued: the eviction is
+   * driven from inside the call itself, which is exactly where it would happen.
+   *
+   * Both directions in one case. Without the eviction the same rig delivers the report, so a
+   * renderer that had simply gone silent would fail the first half.
+   */
+  it('delivers nothing when the ledger that dated the answer is gone by the time it is rendered', async () => {
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    rig.output = () => ({
+      exitCode: 2,
+      stdout: `${tscError('src/a.ts')}\n`,
+      stderr: '',
+      timedOut: false
+    });
+    await rig.patch(swap('workspace/pkg/src/a.ts', "export const n: number = 'x';"));
+    await rig.settle();
+    // The ledger is emptied inside the awaited call, after the drain has already captured the
+    // check and before the render asks whether it is still about the tree.
+    rig.duringCall = () => forgetPostEditChecks();
+    const evicted = await rig.run('files_list', { path: 'workspace/pkg' });
+    expect(evicted.diagnostics).toBeUndefined();
+
+    // The counter-direction, on the same fixture with the eviction taken away: the check is real,
+    // it landed, and it is delivered.
+    const again = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    again.output = () => ({
+      exitCode: 2,
+      stdout: `${tscError('src/a.ts')}\n`,
+      stderr: '',
+      timedOut: false
+    });
+    await again.patch(swap('workspace/pkg/src/a.ts', "export const n: number = 'x';"));
+    await again.settle();
+    const kept = await again.run('files_list', { path: 'workspace/pkg' });
+    expect(kept.diagnostics).toContain('workspace/pkg/src/a.ts(3,7): error TS2322');
+  });
+});
+
+describe('what the patch call is charged for, and what has to exist before it runs', () => {
+  /**
+   * The deferral, asserted where it is falsifiable: at the instant the patch's own promise
+   * resolves, the checker has not been dispatched at all - not the walk, not the `exec`. Measured
+   * on this machine, `npx --no-install tsc --noEmit` over `apps/worker` is 4.17 s wall, and this is
+   * the assertion that says none of it is on the patch's clock.
+   */
+  it('resolves the patch before the checker has even been dispatched', async () => {
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    rig.hold = true;
+    const patched = await rig.patch(swap('workspace/pkg/src/a.ts', 'export const n: number = 6;'));
+    expect(patched).toMatchObject({ patchCount: 1 });
+    expect(rig.execs).toHaveLength(0);
+    rig.release();
+  });
+
+  /**
+   * A triggered run may not execute before the turn has something to rewind to, and the way that
+   * is guaranteed is that the only arm which arms one is not exempt from the undo point. Pinned
+   * from both ends: `file_patch` is outside `CHECKPOINT_EXEMPT_TOOLS`, and the workspace arms that
+   * ARE exempt arm nothing, so no exempt tool can reach a checker.
+   */
+  it('can only be armed by a tool that has already taken the turn’s undo point', async () => {
+    expect(CHECKPOINT_EXEMPT_TOOLS.has('file_patch')).toBe(false);
+    const rig = rigFor(PACKAGE_FILES, PACKAGE_TREE);
+    for (const name of ['file_read', 'files_list']) {
+      expect(CHECKPOINT_EXEMPT_TOOLS.has(name), name).toBe(true);
+      await rig.run(name, { path: 'workspace/pkg/src/a.ts' });
+    }
+    await rig.settle();
+    expect(rig.execs).toHaveLength(0);
+  });
+});
+
+/**
+ * The one structure here that grows with the SIZE OF THE TREE rather than with the number of runs.
+ *
+ * `checks` is capped and the task map is capped; the stamp map was neither, and it took an entry
+ * per distinct path a task ever patched and never gave one back. The product shape that finds it
+ * is the ordinary one: a long autonomous run over a large repository. The numbers below are the
+ * module's own - 40 paths is the `file_patch` cap, 8 is `MAX_ARMED_CHECKS`, and their product is
+ * what a live check can still be compared against - so a change to either of them should land
+ * here.
+ */
+describe('what a task holding a stamp per patched path is allowed to accumulate', () => {
+  const BATCH = 40;
+  const TRACKED = 320;
+  const BATCHES = 9;
+
+  const FLOOD_NAMES = Array.from({ length: BATCHES * BATCH }, (_unused, index) => `f${index}.ts`);
+  const FLOOD_FILES = Object.fromEntries(
+    FLOOD_NAMES.map((name, index) => [
+      `workspace/pkg/src/${name}`,
+      `export const n${index}: number = 1;\n`
+    ])
+  );
+  const FLOOD_TREE: Tree = {
+    workspace: ['package.json', 'pnpm-lock.yaml', 'pkg'],
+    'workspace/pkg': ['package.json', 'tsconfig.json', 'src'],
+    'workspace/pkg/src': FLOOD_NAMES
+  };
+
+  /** Nine full patches, so the oldest of them is past the eight a check can be armed for. */
+  const flood = async (rig: Rig): Promise<void> => {
+    for (let batch = 0; batch < BATCHES; batch += 1) {
+      await rig.patch(
+        FLOOD_NAMES.slice(batch * BATCH, (batch + 1) * BATCH).map((name) => ({
+          path: `workspace/pkg/src/${name}`,
+          edit: `PUT 1:\n+export const changed${batch}: number = 1;\n`
+        }))
+      );
+      await rig.settle();
+    }
+  };
+
+  it('drops the stamps of paths no armed check can still ask about', async () => {
+    const rig = rigFor(FLOOD_FILES, FLOOD_TREE);
+    await flood(rig);
+    expect(rig.execs).toHaveLength(BATCHES);
+    // 360 distinct paths went through the arm and 320 stamps are held: the bound bites, and it
+    // bites at the reachable set rather than at a round number somebody liked.
+    expect(FLOOD_NAMES).toHaveLength(360);
+    expect(countPostEditPaths('task-1')).toBe(TRACKED);
+  });
+
+  /**
+   * The other direction, which is the one a cap gets wrong: pruning may not cost a report. A full
+   * 40-path patch is what a too-small cap loses first, because ONE missing stamp among the paths a
+   * check names is enough to read the whole run as superseded - so this re-patches all of batch
+   * zero, every stamp of which the flood had dropped. Each takes a NEW stamp, higher than the
+   * pruned entry held, and the run armed for them is delivered whole.
+   */
+  it('still delivers the check armed by a full patch of paths the prune had dropped', async () => {
+    const rig = rigFor(FLOOD_FILES, FLOOD_TREE);
+    await flood(rig);
+    rig.output = () => ({
+      exitCode: 2,
+      stdout: `${tscError('src/f0.ts')}\n`,
+      stderr: '',
+      timedOut: false
+    });
+    await rig.patch(
+      FLOOD_NAMES.slice(0, BATCH).map((name) => ({
+        path: `workspace/pkg/src/${name}`,
+        edit: `PUT 1:\n+export const repaired: number = 1;\n`
+      }))
+    );
+    await rig.settle();
+    const next = await rig.run('files_list', { path: 'workspace/pkg' });
+    const block = typeof next.diagnostics === 'string' ? next.diagnostics : '';
+    expect(block).toContain('workspace/pkg/src/f0.ts(3,7): error TS2322');
+  });
+
+  /**
+   * Why the number is a STAMP and not a per-path write count, pinned rather than reasoned.
+   *
+   * An arm whose files have no project marker above them arms no check, so it spends stamps
+   * without spending one of the eight check slots - which is how a check that is still in flight
+   * gets its own path pruned while it is alive. Eight of them here, and the held check's path is
+   * gone. Patch that path again and a write count would restart at 1, which is exactly what the
+   * dead check is holding, so `superseded` would read it as fresh and the checker's answer about
+   * the file before BOTH writes would be rendered onto the result of the repair.
+   *
+   * Asserted as the absence of the first run's answer AND the presence of the second's, so a
+   * change that silenced the drain outright does not pass it. The two runs are told apart by the
+   * path each prints, as in the staleness describe above.
+   */
+  it('drops an in-flight check whose path the prune dropped and a later patch rewrote', async () => {
+    const LOOSE = Array.from({ length: TRACKED }, (_unused, index) => `l${index}.ts`);
+    const rig = rigFor(
+      {
+        'workspace/pkg/src/a.ts': 'export const n: number = 1;\n',
+        ...Object.fromEntries(
+          LOOSE.map((name, index) => [`workspace/loose/${name}`, `export const q${index} = 1;\n`])
+        )
+      },
+      {
+        workspace: ['package.json', 'pnpm-lock.yaml', 'pkg', 'loose'],
+        'workspace/pkg': ['package.json', 'tsconfig.json', 'src'],
+        'workspace/pkg/src': ['a.ts'],
+        // No marker of its own, and the climb stops at a `workspace` that has a `package.json`
+        // with no `tsconfig.json` beside it - so nothing here can ever arm a check.
+        'workspace/loose': LOOSE
+      }
+    );
+    rig.hold = true;
+    rig.output = (index) => ({
+      exitCode: 2,
+      stdout: `${tscError(index === 0 ? 'src/stale.ts' : 'src/fresh.ts')}\n`,
+      stderr: '',
+      timedOut: false
+    });
+    await rig.patch(swap('workspace/pkg/src/a.ts', "export const n: number = 'x';"));
+    await rig.settle();
+    for (let batch = 0; batch < BATCHES - 1; batch += 1) {
+      await rig.patch(
+        LOOSE.slice(batch * BATCH, (batch + 1) * BATCH).map((name) => ({
+          path: `workspace/loose/${name}`,
+          edit: `PUT 1:\n+export const changed${batch} = 1;\n`
+        }))
+      );
+      await rig.settle();
+    }
+    expect(rig.execs).toHaveLength(1);
+    await rig.patch(swap('workspace/pkg/src/a.ts', 'export const n: number = 9;'));
+    rig.release();
+    await rig.settle();
+
+    const next = await rig.run('files_list', { path: 'workspace/pkg' });
+    const block = typeof next.diagnostics === 'string' ? next.diagnostics : '';
+    expect(rig.execs).toHaveLength(2);
+    expect(block).not.toContain('src/stale.ts');
+    expect(block).toContain('src/fresh.ts');
   });
 });

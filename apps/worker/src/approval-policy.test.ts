@@ -68,8 +68,13 @@ describe('agent approval policy', () => {
         purpose: 'Submit the job application'
       })?.sideEffect
     ).toBe('external_consequential');
+    // `~/.ssh` and not `build`, and the swap is the rule being given its missing half rather than
+    // this assertion being weakened. `build` is inside `workspace/`, which the turn's own undo
+    // point restores, so it is no longer a destructive command by this floor's own definition -
+    // @see `insideCheckpointContent`. The agent's HOME is `.home` beside `workspace/` and not
+    // inside it, so this one is a delete nothing here can take back.
     expect(
-      approvalRequirement('shell', { executable: 'rm', args: ['-rf', 'build'] })?.sideEffect
+      approvalRequirement('shell', { executable: 'rm', args: ['-rf', '~/.ssh'] })?.sideEffect
     ).toBe('external_consequential');
     expect(
       approvalRequirement('desktop_action', {
@@ -3087,14 +3092,22 @@ describe('what a security mode means', () => {
       ['sending', 'shell', { executable: 'curl', args: ['-d', '@notes.txt', 'https://x.invalid'] }],
       ['sending', 'shell', { executable: 'git', args: ['push'] }],
       ['sending', 'connector_action', { action: 'mail_send', input: { to: 'a@b.invalid' } }],
-      ['destroying data', 'shell', { executable: 'rm', args: ['-rf', 'node_modules'] }],
       /*
-       * The clause used to be held here by `rm` alone, and `rm -rf node_modules` is the one act in
-       * the list whose damage a rewind undoes - `CHECKPOINT_CONTENT` is `workspace` and
-       * `.athanor/artifacts`, and `node_modules` is inside it. So the exhaustive clause was proved
-       * by the single member of it that needed proving least, while `dropdb production` and
-       * `redis-cli FLUSHALL`, which nothing here restores, were free in balanced and autonomous.
+       * The clause used to be held here by `rm -rf node_modules`, which was the one act in the list
+       * whose damage a rewind undoes - `CHECKPOINT_CONTENT` is `workspace` and `.athanor/artifacts`,
+       * and `node_modules` is inside it. So the exhaustive clause was proved by the single member of
+       * it that needed proving least, while `dropdb production` and `redis-cli FLUSHALL`, which
+       * nothing here restores, were free in balanced and autonomous.
+       *
+       * It has gone rather than moved, because the floor now agrees with the reason it was wrong:
+       * a delete strictly inside a tree the undo point holds raises no card on any turn that has
+       * one (@see `insideCheckpointContent` and `ApprovalContext.undoPoint`), and asserting that
+       * this clause stops one would be pinning
+       * the clunk twice over: this table passes no context, so a row for `node_modules` would
+       * pass here on the absent-undo-point rule rather than on the clause it claims to hold.
+       * `rm -rf ~/.ssh` is the delete the clause is really about, and it is one line down.
        */
+      ['destroying data', 'shell', { executable: 'rm', args: ['-rf', '~/.ssh'] }],
       ['destroying data', 'shell', { executable: 'dropdb', args: ['production'] }],
       [
         'destroying data',
@@ -3466,5 +3479,451 @@ describe('what a security mode means', () => {
         ),
         purpose
       ).toMatchObject({ sideEffect: 'external_consequential' });
+  });
+});
+
+/*
+ * The location half of the destructive rule, driven through the shipped floor rather than through
+ * the resolver it consults.
+ *
+ * DESIGN.md:168-175 says a card is owed when the act cannot be taken back by this computer, and
+ * defines that as the checkpoint's coverage. Measured through this function at bfbbd00, in
+ * AUTONOMOUS: every row in the free table below raised `external_consequential` and stopped the
+ * turn, and every one of them is inside `workspace/`, which the undo point the same turn had
+ * already taken puts straight back. `approval-policy.ts:1123-1125` and `PUBLISH.md:494-495` both
+ * recorded the contradiction as open.
+ *
+ * Both directions in one describe, deliberately. A table of deletes that must be free is satisfied
+ * by deleting the rule; a table of deletes that must card is satisfied by carding every `rm`. The
+ * counterweight is the arm that matters, and it is the second `it` below.
+ */
+describe('where a delete lands, not what it is called', () => {
+  const modes = ['balanced', 'autonomous'] as const;
+  const script = (body: string) => ({ executable: 'bash', args: ['-lc', body] });
+  /*
+   * The turn really did get an undo point, said by the only thing that knows: whoever took it.
+   *
+   * `CHECKPOINT_CONTENT` is the set of trees a checkpoint WALKS, and this whole describe is about
+   * what it HOLDS. A scan over `CHECKPOINT_MAX_FILES` throws and the turn carries on with no undo
+   * point at all, so without this fact every row in the free table below is a card dropped on a
+   * turn nothing can rewind. @see `ApprovalContext.undoPoint`.
+   *
+   * `uncovered: []` is the second half of the same statement and carries the second ceiling: the
+   * files the scan WALKED and did not HOLD because each is over `CHECKPOINT_MAX_FILE_BYTES`. Empty
+   * says this workspace has none, which is what an ordinary one produces; omitting it says the set
+   * is unknown, and unknown keeps the card.
+   */
+  const undone = { undoPoint: { id: 'cp-1', uncovered: [] } } as const;
+
+  it('stops asking about a delete the turn can undo by itself', () => {
+    const recoverable: Array<[string, Record<string, unknown>]> = [
+      ['rm -rf dist', { executable: 'rm', args: ['-rf', 'dist'] }],
+      ['rm -rf node_modules', { executable: 'rm', args: ['-rf', 'node_modules'] }],
+      ['rm on a workspace path', { executable: 'rm', args: ['workspace/tmp.log'] }],
+      ['rmdir', { executable: 'rmdir', args: ['build'] }],
+      ['truncate', { executable: 'truncate', args: ['-s', '0', 'server.log'] }],
+      ['unlink', { executable: 'unlink', args: ['workspace/a.sock'] }],
+      ['shred', { executable: 'shred', args: ['-u', 'workspace/secret.txt'] }],
+      [
+        'find -delete',
+        { executable: 'find', args: ['workspace/downloads', '-name', '*.tmp', '-delete'] }
+      ],
+      ['an artifact', { executable: 'rm', args: ['.athanor/artifacts/report.pdf'] }],
+      // The spelling the shell tool's own description tells the model to reach for.
+      ['bash -lc rm', script('rm -rf dist')],
+      ['bash -lc with a glob', script('rm -f workspace/downloads/*.dmg')],
+      ['bash -lc beside ordinary work', script('pnpm build && rm -rf dist')],
+      [
+        'a working directory further in',
+        { executable: 'rm', args: ['-rf', 'dist'], cwd: 'workspace/tracker' }
+      ]
+    ];
+    for (const mode of modes)
+      for (const [label, args] of recoverable)
+        expect(approvalRequirement('shell', args, mode, undone), `${label} in ${mode}`).toBeNull();
+  });
+
+  /*
+   * THE OTHER HALF OF THE SAME TABLE, and the reason it is a second `it` rather than a third mode.
+   *
+   * Every row above is free ONLY because the caller said this turn has an undo point that holds
+   * the whole tree. Three ways it does not: nobody has said, which is a worker that never reached
+   * `#ensureTurnUndoPoint`; the runner refused, which it records as `{ turn, id: null }` after
+   * telling the owner the turn has no undo point; and a checkpoint whose uncovered set is unknown -
+   * a runner one release behind this worker, or a list the runner had to cut off - where the id is
+   * good and what the walk skipped is not established. All three must card, in every mode, on every
+   * row.
+   *
+   * Measured: with the fact ignored, `rm -rf dist` is free on a turn whose checkpoint was refused
+   * for a workspace over `CHECKPOINT_MAX_FILES` - which is exactly the turn that has just unpacked
+   * a dependency tree and has the most to lose.
+   */
+  it('keeps the card on the same deletes when no undo point holds them', () => {
+    const recoverable: Array<[string, Record<string, unknown>]> = [
+      ['rm -rf dist', { executable: 'rm', args: ['-rf', 'dist'] }],
+      ['rm -rf node_modules', { executable: 'rm', args: ['-rf', 'node_modules'] }],
+      ['rm on a workspace path', { executable: 'rm', args: ['workspace/tmp.log'] }],
+      ['rmdir', { executable: 'rmdir', args: ['build'] }],
+      ['truncate', { executable: 'truncate', args: ['-s', '0', 'server.log'] }],
+      ['an artifact', { executable: 'rm', args: ['.athanor/artifacts/report.pdf'] }],
+      ['bash -lc rm', script('rm -rf dist')],
+      [
+        'find -delete',
+        { executable: 'find', args: ['workspace/downloads', '-name', '*.tmp', '-delete'] }
+      ]
+    ];
+    // The fail-closed direction: both fields are optional and neither absence may read as "yes".
+    const withoutTheFact = [
+      ['nobody has said', {}],
+      ['the checkpoint was refused', { undoPoint: { id: null } }],
+      ['the uncovered set is not known', { undoPoint: { id: 'cp-1' } }]
+    ] as const;
+    for (const mode of modes)
+      for (const [why, context] of withoutTheFact)
+        for (const [label, args] of recoverable)
+          expect(
+            approvalRequirement('shell', args, mode, context),
+            `${label} in ${mode} when ${why}`
+          ).toMatchObject({ sideEffect: 'external_consequential' });
+  });
+
+  /*
+   * THE 2 GiB HOLE, which is the half of the location rule that survived two waves.
+   *
+   * `CHECKPOINT_MAX_FILE_BYTES` - 2 GiB - makes the runner's scan record a larger file as uncovered
+   * and walk past it, so `rm workspace/model.gguf` on a 4 GiB weight file is strictly inside
+   * `CHECKPOINT_CONTENT`, was freed by the rule above, and is restored by nothing. Measured through
+   * this function in autonomous with `{ undoPoint: { id: 'cp-1' } }` before the set was carried:
+   * FREE. On a box that holds model weights and sequencing reads it is the single most likely large
+   * irreversible delete there is.
+   *
+   * The prefix rows are the point of carrying paths rather than a count. The directory ABOVE an
+   * uncovered file destroys it just as completely, and the file whose name merely starts the same
+   * way does not - `workspace/model` and `workspace/model.gguf` are two different paths.
+   */
+  it('keeps the card on a delete the checkpoint walked past', () => {
+    const holding = (uncovered: readonly string[]) => ({ undoPoint: { id: 'cp-1', uncovered } });
+    const reaches: Array<[string, Record<string, unknown>, string[]]> = [
+      [
+        'the oversize file itself',
+        { executable: 'rm', args: ['workspace/model.gguf'] },
+        ['workspace/model.gguf']
+      ],
+      [
+        'the same file by a bare name under the default cwd',
+        { executable: 'rm', args: ['model.gguf'] },
+        ['workspace/model.gguf']
+      ],
+      [
+        'the directory above it',
+        { executable: 'rm', args: ['-rf', 'workspace/models'] },
+        ['workspace/models/llama.gguf']
+      ],
+      [
+        'a tree several levels above it',
+        { executable: 'rm', args: ['-rf', 'workspace'] },
+        ['workspace/data/reads.bam']
+      ],
+      [
+        'the wrapped spelling',
+        script('pnpm build && rm -rf workspace/models'),
+        ['workspace/models/llama.gguf']
+      ],
+      [
+        'one recoverable delete beside one that is not',
+        script('rm -rf dist && rm workspace/model.gguf'),
+        ['workspace/model.gguf']
+      ],
+      [
+        'an uncovered artifact',
+        { executable: 'rm', args: ['.athanor/artifacts/recording.mov'] },
+        ['.athanor/artifacts/recording.mov']
+      ],
+      /*
+       * The glob, which is the spelling this reached the owner through and the one the segment
+       * comparison read as a literal. `shell` expands nothing, so the wrapped form is the only one
+       * that globs - and `tool-catalogue.ts` tells the model to reach for it the moment it wants
+       * one. Measured through this function with the set carried and the segments compared as
+       * strings: both rows below were FREE while the 4 GiB weight file they delete was uncovered.
+       */
+      [
+        'a glob over the uncovered file',
+        script('rm -f workspace/models/*.gguf'),
+        ['workspace/models/llama.gguf']
+      ],
+      [
+        'a glob over the whole workspace',
+        script('rm -rf workspace/*'),
+        ['workspace/models/llama.gguf']
+      ]
+    ];
+    for (const mode of ['review', ...modes] as const)
+      for (const [label, args, uncovered] of reaches)
+        expect(
+          approvalRequirement('shell', args, mode, holding(uncovered)),
+          `${label} in ${mode}`
+        ).toMatchObject({ sideEffect: 'external_consequential' });
+
+    /*
+     * AND THE OTHER DIRECTION, which is what makes the set a set. One oversize file in a workspace
+     * must not card every other delete in it - a count would, and a workspace built for model
+     * weights holds one permanently, so a count would put the card back on `rm -rf dist` for the
+     * life of that machine.
+     */
+    const stillFree: Array<[string, Record<string, unknown>]> = [
+      ['an unrelated build directory', { executable: 'rm', args: ['-rf', 'dist'] }],
+      ['a sibling of the oversize file', { executable: 'rm', args: ['workspace/notes.md'] }],
+      // Not a prefix of `workspace/model.gguf`: the segments are compared, not the strings.
+      [
+        'a name the oversize one merely starts with',
+        { executable: 'rm', args: ['workspace/model'] }
+      ],
+      // A glob is only unreadable from the segment it sits in on: everything in front of it still
+      // has to match, so the owner's own "clear out the old installers" keeps costing nothing on a
+      // workspace whose oversize file lives somewhere else.
+      ['a glob that cannot reach it', script('rm -f workspace/downloads/*.dmg')]
+    ];
+    for (const mode of modes)
+      for (const [label, args] of stillFree)
+        expect(
+          approvalRequirement('shell', args, mode, holding(['workspace/model.gguf'])),
+          `${label} in ${mode}`
+        ).toBeNull();
+  });
+
+  /*
+   * A WHOLE SECOND CHECKOUT, which the tree documented and did not card.
+   *
+   * `git worktree remove --force ../wt` deletes the directory and everything uncommitted in it.
+   * `worktree` was added to `WRITING_GIT_SUBCOMMANDS` with a comment naming exactly that, wired to
+   * the completion clock, and read by nothing in the destructive vocabulary. Measured through this
+   * function in autonomous with an undo point before this row existed: FREE, bare and inside a
+   * script both, because the script walk placed `dist` and read the git command as removing
+   * nothing at all.
+   */
+  it('cards a worktree removal that lands outside the checkpoint, and only a removal', () => {
+    const removals: Array<[string, Record<string, unknown>]> = [
+      [
+        'a worktree under HOME',
+        { executable: 'git', args: ['worktree', 'remove', '--force', '~/wt'] }
+      ],
+      [
+        'a worktree beside the workspace',
+        { executable: 'git', args: ['worktree', 'remove', '../wt'] }
+      ],
+      [
+        'the same behind git’s own options',
+        { executable: 'git', args: ['-C', 'workspace/app', 'worktree', 'remove', '../wt'] }
+      ],
+      [
+        'inside a script beside a recoverable delete',
+        script('rm -rf dist && git worktree remove --force ../wt')
+      ],
+      /*
+       * Inside a script with no other destructive name in it, which is the row that pins
+       * `isDestructiveScript`. The row above passes on the `rm` alone: the body scan matches the
+       * removal programs by name, and `git` is in none of those lists - so a script whose only
+       * destruction is the worktree never reached the location test at all and was free.
+       */
+      ['inside a script that names nothing else', script('git worktree remove --force ../wt')],
+      [
+        'inside a script beside ordinary work',
+        script('pnpm build && git worktree remove --force ~/wt')
+      ],
+      // No operand: unplaceable, and unplaceable keeps the card everywhere else in this file too.
+      ['a removal naming nothing', { executable: 'git', args: ['worktree', 'remove'] }],
+      // The same shape inside a script, which is the one row `mayRemoveSomething` decides: the
+      // walk gets no target from it and has to be told the command may still remove something,
+      // or a script is judged by the one delete in it that could be placed.
+      ['an unplaceable removal inside a script', script('rm -rf dist && git worktree remove')]
+    ];
+    for (const mode of ['review', ...modes] as const)
+      for (const [label, args] of removals)
+        expect(
+          approvalRequirement('shell', args, mode, undone),
+          `${label} in ${mode}`
+        ).toMatchObject({ sideEffect: 'external_consequential' });
+
+    // Narrowed to the verb, exactly as `clean -f`, `reset --hard` and `restore` are. A card in
+    // front of `git worktree list` is a card the owner learns to tap through.
+    const notRemovals: Array<[string, Record<string, unknown>]> = [
+      ['listing them', { executable: 'git', args: ['worktree', 'list'] }],
+      ['adding one', { executable: 'git', args: ['worktree', 'add', '../wt', 'main'] }],
+      ['locking one', { executable: 'git', args: ['worktree', 'lock', '../wt'] }],
+      // Clears the administrative record of worktrees whose directories are already gone.
+      ['pruning the record', { executable: 'git', args: ['worktree', 'prune'] }],
+      ['the word in a message', { executable: 'git', args: ['commit', '-m', 'remove worktree'] }],
+      // Inside the checkpoint, so a rewind puts it back and the same rule that frees `rm -rf dist`
+      // frees this.
+      [
+        'a worktree the agent made under the workspace',
+        { executable: 'git', args: ['worktree', 'remove', 'workspace/wt'] }
+      ]
+    ];
+    for (const mode of modes)
+      for (const [label, args] of notRemovals)
+        expect(approvalRequirement('shell', args, mode, undone), `${label} in ${mode}`).toBeNull();
+  });
+
+  /*
+   * THE COUNTERWEIGHT. `HOME` is `.home` at the container root, BESIDE `workspace/` and not inside
+   * it (execution.ts), so a delete under `~` that is not under `workspace/` is unrecoverable until
+   * a checkpoint covers the root - which is why the test is STRICTLY inside and not "inside the
+   * root". Every row here must card in every mode, review included, and with the strongest undo
+   * point the caller can claim: a rewind is not an answer for any of them.
+   */
+  it('keeps the card for every delete nothing here restores', () => {
+    const unrecoverable: Array<[string, Record<string, unknown>]> = [
+      ['somebody else’s files', { executable: 'rm', args: ['-rf', '/home/other/photos'] }],
+      ['the agent’s own keys', { executable: 'rm', args: ['-rf', '~/.ssh'] }],
+      ['a toolchain cache under HOME', { executable: 'rm', args: ['-rf', '~/.cargo/registry'] }],
+      ['a coding CLI’s own configuration', { executable: 'rm', args: ['-rf', '~/.config/claude'] }],
+      ['a system directory', { executable: 'rm', args: ['-rf', '/etc/nginx'] }],
+      ['the same behind sudo', { executable: 'sudo', args: ['rm', '-rf', '/etc/nginx'] }],
+      ['the root itself', { executable: 'rm', args: ['-rf', '/'] }],
+      ['the workspace tree itself', { executable: 'rm', args: ['-rf', 'workspace'] }],
+      ['climbing out of the workspace', { executable: 'rm', args: ['-rf', '../secrets'] }],
+      ['a path this cannot expand', { executable: 'rm', args: ['-rf', '$HOME/.ssh'] }],
+      [
+        'a find that leaves the workspace',
+        { executable: 'find', args: ['~', '-name', '*.pem', '-delete'] }
+      ],
+      [
+        'a truncate under HOME',
+        { executable: 'truncate', args: ['-s', '0', '~/.ssh/known_hosts'] }
+      ],
+      ['paths arriving on stdin', { executable: 'xargs', args: ['rm', '-f'] }],
+      [
+        'a find that runs the remover',
+        { executable: 'find', args: ['.', '-exec', 'rm', '-rf', '{}', '+'] }
+      ],
+      ['the wrapped spelling', script('rm -rf ~/.ssh')],
+      ['one recoverable delete and one that is not', script('rm -rf dist && rm -rf ~/.ssh')],
+      [
+        'a delete through a language runtime',
+        { executable: 'node', args: ['-e', "require('fs').rmSync('dist')"] }
+      ],
+      // A working directory the model chose, outside `workspace/`. `resolveInside` accepts any path
+      // inside the ROOT for `cwd`, so a bare relative name here is not a workspace path at all.
+      ['a bare name outside the workspace', { executable: 'rm', args: ['-rf', '.ssh'], cwd: '.' }],
+      /*
+       * A `cd` earlier on the same line, which is the way this rule leaked when it was first
+       * written and is the reason `commandsChangeDirectory` exists. A relative path means whatever
+       * the working directory is when the command runs, so these name `.ssh`, `photos` and `nginx`
+       * and were each read as bare names under `workspace/` - free in balanced and autonomous,
+       * while all of them card without the `cd` and all of them carded before the location rule
+       * existed. This file's sibling header calls `sh -c` with a `cd` in front one of the four
+       * shapes a model actually writes.
+       */
+      ['a cd to HOME first', script('cd ~ && rm -rf .ssh')],
+      [
+        'a cd out of the workspace first',
+        { executable: 'sh', args: ['-c', 'cd /home/other && rm -rf photos'] }
+      ],
+      ['a cd on the near side of a semicolon', script('cd .. ; rm -rf .ssh')],
+      ['a subshell that does the cd', script('(cd ~; rm -rf .ssh)')],
+      // `env` hides the interpreter, so nothing inside the resolver ever sees the whole line: only
+      // the caller that decomposed it knows a `pushd` came first. That is what `rebased` carries.
+      [
+        'a pushd behind a wrapper the resolver never reads',
+        { executable: 'env', args: ['bash', '-lc', 'pushd /etc; rm -rf nginx'] }
+      ]
+    ];
+    for (const mode of ['review', ...modes] as const)
+      for (const [label, args] of unrecoverable)
+        expect(
+          approvalRequirement('shell', args, mode, undone),
+          `${label} in ${mode}`
+        ).toMatchObject({
+          sideEffect: 'external_consequential'
+        });
+  });
+
+  /*
+   * Signalling a process is not destroying data. Measured at bfbbd00: `kill -0 1234` - a liveness
+   * probe that sends no signal at all - `pkill -f vite` and `killall node` each stopped the turn in
+   * all three modes under a preview reading "This can remove or overwrite data".
+   */
+  it('does not call a signal a delete, and still stops one aimed at the computer', () => {
+    for (const mode of modes)
+      for (const args of [
+        { executable: 'kill', args: ['1234'] },
+        { executable: 'kill', args: ['-0', '1234'] },
+        { executable: 'kill', args: ['-TERM', '4321'] },
+        { executable: 'pkill', args: ['-f', 'vite'] },
+        { executable: 'killall', args: ['node'] }
+      ])
+        expect(
+          approvalRequirement('shell', args, mode),
+          `${args.executable} in ${mode}`
+        ).toBeNull();
+    for (const mode of ['review', ...modes] as const)
+      for (const args of [
+        { executable: 'kill', args: ['-9', '1'] },
+        { executable: 'kill', args: ['1'] },
+        { executable: 'kill', args: ['-9', '-1'] },
+        { executable: 'shutdown', args: ['-h', 'now'] },
+        { executable: 'reboot', args: [] },
+        { executable: 'poweroff', args: [] },
+        { executable: 'halt', args: [] }
+      ])
+        expect(
+          approvalRequirement('shell', args, mode),
+          `${args.executable} ${args.args.join(' ')} in ${mode}`
+        ).toMatchObject({ sideEffect: 'external_consequential' });
+    // And the card says what it does rather than borrowing the removal preview, which claimed a
+    // signal "can remove or overwrite data" - false of every one of the three names.
+    expect(
+      approvalRequirement('shell', { executable: 'kill', args: ['-9', '1'] }, 'autonomous')?.preview
+    ).toMatch(/init process/);
+  });
+
+  /*
+   * `git restore --staged` unstages: the index moves and the working file is neither read nor
+   * written. It carded in every mode while `reset --hard` and `checkout --` two lines away in the
+   * same expression were correctly flag-narrowed.
+   */
+  it('narrows git restore to the spelling that rewrites a file', () => {
+    for (const mode of modes) {
+      expect(
+        approvalRequirement(
+          'shell',
+          { executable: 'git', args: ['restore', '--staged', 'src/a.ts'] },
+          mode
+        ),
+        `--staged in ${mode}`
+      ).toBeNull();
+      expect(
+        approvalRequirement(
+          'shell',
+          { executable: 'git', args: ['restore', '-S', 'src/a.ts'] },
+          mode
+        ),
+        `-S in ${mode}`
+      ).toBeNull();
+      for (const args of [
+        ['restore', 'src/a.ts'],
+        ['restore', '--staged', '--worktree', 'src/a.ts'],
+        ['restore', '-S', '-W', 'src/a.ts'],
+        // `-s` is `--source` and `-S` is `--staged`; a lowercased comparison would read this one as
+        // an unstage, and it overwrites the working file.
+        ['restore', '-s', 'HEAD~1', 'src/a.ts']
+      ])
+        expect(
+          approvalRequirement('shell', { executable: 'git', args }, mode),
+          `${args.join(' ')} in ${mode}`
+        ).toMatchObject({ sideEffect: 'external_consequential' });
+      // The two arms beside it keep their own narrowing, which is what this one was matched to.
+      expect(
+        approvalRequirement('shell', { executable: 'git', args: ['reset', 'HEAD~1'] }, mode)
+      ).toBeNull();
+      expect(
+        approvalRequirement('shell', { executable: 'git', args: ['reset', '--hard'] }, mode)
+      ).toMatchObject({ sideEffect: 'external_consequential' });
+      // A worktree listing is a read and raises nothing, whatever the write set says about it.
+      expect(
+        approvalRequirement('shell', { executable: 'git', args: ['worktree', 'list'] }, mode)
+      ).toBeNull();
+    }
   });
 });

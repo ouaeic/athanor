@@ -244,6 +244,22 @@ export class AgentRunnerClient {
     storedBytes: number;
     durationMs: number;
     pruned: string[];
+    /** How many files the walk was too large to hold. Zero under btrfs and ZFS, which hold everything. */
+    uncoveredFileCount: number;
+    /**
+     * WHICH files those were, root-relative - or null when that set is not known.
+     *
+     * The approval floor spends this: a delete strictly inside `CHECKPOINT_CONTENT` is freed on the
+     * grounds that a rewind puts it back, and that is untrue of a file the scan recorded as
+     * uncovered and walked past. Null keeps the card on every delete for the turn.
+     *
+     * Null rather than an empty array in two cases, and they are the same case: the runner capped
+     * the list, so what arrived names some of the uncovered files and not all of them; or the
+     * runner is a release behind this worker and sent no list at all, so the field is absent and
+     * `Array.isArray` is false. An empty array from a current runner means the walk held
+     * everything, which is the ordinary answer and the one that frees a delete.
+     */
+    uncovered: readonly string[] | null;
   }> {
     const route = `/v1/workspaces/${workspaceId}/checkpoints`;
     const token = signCapabilityToken(
@@ -280,7 +296,34 @@ export class AgentRunnerClient {
      * fallback for a runner one release behind this worker.
      */
     if (!response.ok) throw await runnerFailure(response);
-    return (await response.json()) as Awaited<ReturnType<AgentRunnerClient['checkpoint']>>;
+    const summary = (await response.json()) as Awaited<
+      ReturnType<AgentRunnerClient['checkpoint']>
+    > & {
+      uncoveredPaths?: unknown;
+      uncoveredPathsTruncated?: unknown;
+    };
+    /*
+     * The one reading of a capped list that is not a lie, decided here rather than in each reader.
+     *
+     * `uncoveredPaths` is cut off at sixty-four by the runner and says so in a second field. Three
+     * places downstream spend this fact - `AgentState.checkpoint`, `undoPointFor` and the location
+     * test in `destructiveCommand` - and a partial list is worth nothing to any of them: a delete
+     * that names the sixty-fifth oversize file would be freed by a list that does not mention it.
+     * So the truncation collapses to "not known" once, on arrival, and every reader sees a complete
+     * set or nothing.
+     *
+     * The `Array.isArray` guard is the same collapse for a runner one release behind this worker,
+     * which sends no list at all. That direction has to fail towards the card: a missing field read
+     * as an empty set would tell the floor a workspace holds no oversize files on precisely the
+     * boxes whose runner has not been updated.
+     */
+    return {
+      ...summary,
+      uncovered:
+        Array.isArray(summary.uncoveredPaths) && summary.uncoveredPathsTruncated !== true
+          ? (summary.uncoveredPaths as string[])
+          : null
+    };
   }
 
   async readFile(workspaceId: string, taskId: string, requestedPath: string): Promise<string> {

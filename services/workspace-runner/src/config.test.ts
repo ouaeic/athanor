@@ -40,6 +40,32 @@ describe('runner configuration', () => {
     expect(loadConfig().ISOLATE_AGENT_NETWORK).toBe(true);
   });
 
+  it('refuses to promise a filesystem boundary it has nowhere to apply', () => {
+    // A Landlock ruleset is installed on the privileged side of the drop to the agent account.
+    // Without the helper there is no privileged side, so the setting would have described a
+    // boundary while every command ran with exactly the reach it had before - a silence rather
+    // than a failure, which is the worse of the two.
+    baseEnvironment();
+    process.env.CONFINE_AGENT_FILESYSTEM = 'true';
+    expect(() => loadConfig()).toThrow('AGENT_SANDBOX_HELPER is unset');
+  });
+
+  it('confines the filesystem when the privileged helper is configured', () => {
+    baseEnvironment();
+    process.env.CONFINE_AGENT_FILESYSTEM = 'true';
+    process.env.AGENT_SANDBOX_HELPER = '/usr/local/lib/athanor/athanor-sandbox';
+    expect(loadConfig().CONFINE_AGENT_FILESYSTEM).toBe(true);
+  });
+
+  it('reads a runner.env written before any of this as unmeasured rather than as refused', () => {
+    // The upgrade case, and the reason this key is optional where its neighbour is defaulted: a
+    // box whose installer has not yet looked has not answered no, and it must start unconfined
+    // rather than fail to parse or claim a boundary nobody measured.
+    baseEnvironment();
+    process.env.AGENT_SANDBOX_HELPER = '/usr/local/lib/athanor/athanor-sandbox';
+    expect(loadConfig().CONFINE_AGENT_FILESYSTEM).toBeUndefined();
+  });
+
   it('reads the ports athanor already serves on so a preview cannot publish them', () => {
     baseEnvironment();
     process.env.RESERVED_PREVIEW_PORTS = '4100, 4400,5432, ,not-a-port';

@@ -86,7 +86,12 @@ export const registerScheduleRoutes = (context: RouteContext): void => {
       }
       const catalog = await modelsForUser(user);
       // A schedule is the unattended case the ceiling exists for: nobody is at the keyboard when it
-      // fires, so the pick it makes months from now is held to the limit set today.
+      // fires, so the pick it makes months from now is held to the limit set today. That covers the
+      // owner's standing pin as well, which `pickModelUnderPriceCeiling` drops in favour of the
+      // ranking when it breaches the ceiling - and it drops it silently, because the picker's
+      // advisory sentence has nowhere to go on this route: `TaskSchedule` carries no message field.
+      // An explicit `modelId` on this request is the owner choosing for themselves and is not held
+      // to the ceiling at all; it does not reach the picker.
       const selected = input.modelId
         ? catalog.find((model) => model.id === input.modelId)
         : (

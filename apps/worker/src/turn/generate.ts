@@ -45,6 +45,7 @@ import { agentToolsFor } from '../tools.js';
 import { MAX_CONTEXT_OVERFLOW_REPAIRS } from '../turn-bounds.js';
 import { requestDerivationBreach } from '../turn-control.js';
 import { startStopWatch, withRequestDeadline } from '../turn-lifecycle.js';
+import { turnRoutingTaskId } from '../window.js';
 import type { TurnRun } from './claim.js';
 import type { CompactContext, TurnLoopControl, TurnStepBudget } from './loop-context.js';
 import type { PreparedStepRequest } from './request.js';
@@ -192,6 +193,29 @@ export const generateModelStep = async (
       'request_not_derivable',
       `This turn stopped before sending a request it could not account for: ${derivationBreach}. Nothing it produced was rolled back - reply to carry on.`
     );
+  /*
+   * The routing key the cached prefix was written under, which on a recent enough retry is the
+   * parent's and not this fork's.
+   *
+   * Such a retry's whole preamble is the parent's byte for byte - the two frozen blocks are built
+   * from the family's request and instant, and the memory pack is the parent's row copied - so
+   * presenting a fresh key here would hand a matching prefix to a route that had been told it
+   * belongs to a conversation it has never seen. "Recent enough" is not this line's judgement to
+   * make: the same call the preamble makes is what answers it, so a fork whose inheritance was
+   * refused for age, for a foreign encryption context or for a deleted ancestor cannot be offered
+   * under a name it does not match. @see turnRoutingTaskId in `window.ts`.
+   *
+   * Derived before the request rather than inside it because it is now awaited. It costs one
+   * primary-key read per TURN on a fork and none at all otherwise - `assemblePreamble` has already
+   * resolved the same anchor for this same task record before the first step runs, and the answer
+   * is memoised on it - which is what makes a per-step derivation affordable where the previous
+   * comment here said it was not.
+   *
+   * `handoff.ts` derives the same key from the same call: the closing handoff of this turn sends
+   * the same window, so the two must agree, and they are pinned against each OTHER rather than
+   * against a literal in `generate-session.test.ts`.
+   */
+  const sessionId = sha256(`athanor-task:${await turnRoutingTaskId(deps, task, key)}`).slice(0, 64);
   const stopWatch = startStopWatch(() => deps.store.taskClaim(task.id), deps.config.WORKER_ID);
   const response = await deps
     .withLeaseRenewal(task, () =>
@@ -208,7 +232,7 @@ export const generateModelStep = async (
           temperature: 0.2,
           maxTokens: maxOutputTokens,
           reasoningEffort,
-          sessionId: sha256(`athanor-task:${task.id}`).slice(0, 64),
+          sessionId,
           signal: AbortSignal.any([signal, looping.signal, stopWatch.signal]),
           onTextDelta: (delta) => {
             const frame = channel.streamFlusher.push(delta);

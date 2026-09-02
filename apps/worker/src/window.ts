@@ -88,14 +88,249 @@ export interface PreambleInput {
   readonly key: Uint8Array;
   readonly state: AgentState;
   /**
-   * The task's opening request, which is what both memory surfaces are ranked against. Passed as
-   * the goal rather than read from the window: `tasks.prompt_ciphertext` is never rewritten by a
-   * follow-up turn, and that is precisely the property the "frozen for this run" header claims.
+   * THIS task's own opening request, which is what both memory surfaces are ranked against unless
+   * `forkCacheAnchor` replaces it with the fork family's. Passed as the goal rather than read from
+   * the window: `tasks.prompt_ciphertext` is never rewritten by a follow-up turn, and that is
+   * precisely the property the "frozen for this run" header claims. @see forkCacheAnchor for the
+   * one case where the value ranked against is not this one.
    */
   readonly goal: string;
   /** The lead model's window, which the memory pack's budget is a share of. */
   readonly contextTokens: number;
 }
+
+/**
+ * Whose cached prefix this task's requests belong to: its own, or the task it was forked out of.
+ *
+ * A fork busts its own cache by construction, and the reason is that two blocks in the anchored
+ * preamble are keyed to the task rather than to the conversation. The reviewed knowledge block is
+ * ranked against the task's opening request and clocked to its creation instant; the memory pack is
+ * stored per task id and re-ranked from scratch when no row exists. A retry therefore re-ranks both
+ * against text it invented for itself - the prompt a `branch` carries is the literal sentence
+ * "Continue from this conversation branch.", which is a query about nothing - and the first request
+ * of the one action an owner takes when something went wrong serves none of the 70.4% of a request
+ * this repository measures as cache-servable on a 131k window.
+ *
+ * Scoped to `retry` ALONE, and it is the whole of the rule the four call sites share. A retry exists
+ * to send the SAME request down the same road again, so its preamble must be the parent's byte for
+ * byte. A `branch` exists to take the conversation somewhere else and keeps ranking against its own
+ * text; it is deliberately not made to match, because a preamble that matched whatever it was forked
+ * from would be a frozen preamble, which is a worse defect than the one this fixes.
+ *
+ * `edit` WAS admitted here and has been taken back out, because the product cannot yet tell the two
+ * kinds of edit apart and one of them is harmed. An edit of the FIRST message
+ * (`editingInitialPrompt` in `apps/api/src/routes/trajectory.ts`) writes `agentStateCiphertext:
+ * null`, so the fork carries no inherited trajectory at all and its whole window is the NEW request
+ * - and inheriting there ranks the knowledge block and packs the memory pack against the question
+ * the owner deliberately threw away. The owner rewrote it because they wanted a different answer.
+ * An edit of a LATER message keeps the full inherited trajectory and is the case where inheriting
+ * genuinely pays, so this should be reinstated the moment the row can say which of the two it is -
+ * that needs a column the route can write, since `forkKind` is 'edit' for both. Until then an edit
+ * pays the cache miss every fork paid before this rule existed, which is a cost and not a defect.
+ *
+ * This resolves ONE link. `assemblePreamble` applies it transitively to reach the family root,
+ * because a retry of a retry must match the same bytes as the retry it came from; the session key
+ * in `turn/generate.ts` applies it once and says there why.
+ *
+ * Four call sites, and two others that deliberately do NOT use it. `turn/generate.ts` and
+ * `handoff.ts` both address the turn's MAIN prefix - the same window, the same preamble - and must
+ * agree or the closing call presents a key nothing was written under. `compaction.ts` derives
+ * `:compaction` and `agent.ts` derives `:search:<call id>`: those are sub-keys of a different
+ * prefix (a summariser request, a provider search request), built from different messages against
+ * a different model, so inheriting a parent's key there would offer a route a prefix that was never
+ * sent under it. They are left on `task.id` on purpose and not by omission.
+ *
+ * IT IS NOT THE WHOLE OF WHAT THE TWO ROUTING-KEY SITES ASK, and a reader here will otherwise
+ * assume it is. This answers "whose prefix would this fork's be"; the preamble also applies
+ * FORK_ANCHOR_MAX_AGE_MS, the ancestor's encryption context and the ancestor still existing, and a
+ * key that skipped those presented the parent's name over a preamble that was the fork's own. So
+ * `turn/generate.ts` and `handoff.ts` call `turnRoutingTaskId` below, which asks the same question
+ * `assemblePreamble` asks and answers this only when the answer was yes. This function stays the
+ * one-link rule they are both built on.
+ *
+ * MODULE-INTERNAL, which it was not while the two key sites derived their own answer from it. It is
+ * still the name four files' comments point at, because it is still where the rule is written down;
+ * what changed is that nothing outside this file may apply it without the refusals that go with it.
+ */
+const cachePrefixTaskId = (task: TaskRecord): string =>
+  task.parentTaskId && task.forkKind === 'retry' ? task.parentTaskId : task.id;
+
+/**
+ * How many links of a fork family the walk below will follow.
+ *
+ * CHOSEN at 32, which is a number of consecutive retries of one message no owner reaches and which
+ * bounds a per-turn cost nothing else bounds: each link is one primary-key read, taken once per
+ * turn rather than once per step. `tasks.parent_task_id` cannot cycle - a parent exists before its
+ * child - so this is a ceiling on work and not a termination condition. Past it the fork anchors to
+ * its thirty-second ancestor and pays a cache miss, which is what it pays today on every fork.
+ */
+const FORK_ANCHOR_MAX_LINKS = 32;
+
+/**
+ * How far back a retry may reach for the request and the clock it inherits: the gap between the
+ * family root's creation and THIS fork's own, and not the gap to the present moment.
+ *
+ * ONE HOUR, and the provider's cache TTL is what chose the number rather than taste. A prefix cache
+ * lives minutes to about an hour across the routes this repository sends to, so past that the
+ * inheritance is buying an entry that has already gone while still being paid for in staleness -
+ * the clock is what decides temporal admissibility, so an unbounded anchor re-admits workspace
+ * memory rows the owner's own `validUntil` retired months ago. Retrying a task from last year would
+ * otherwise tell the model facts that expired between then and now, which is the same harm the
+ * "owner has edited their block since" arm exists to prevent arriving through the other door. The
+ * walk was bounded (FORK_ANCHOR_MAX_LINKS) while the clock was not.
+ *
+ * MEASURED BETWEEN TWO STORED COLUMNS, both immutable, and that is the load-bearing half rather
+ * than the number. `assemblePreamble` runs once per TURN, so an age taken against `Date.now()`
+ * is re-decided on every turn of the same run: a retry that starts inside the hour and is still
+ * working when the root ages out flips its goal and its clock between one turn and the next,
+ * rewrites the block whose header says "frozen for this run", and re-bills every byte behind it at
+ * the write premium - the exact harm the flatMap below refuses to let a `validUntil` boundary do.
+ * `task.createdAt` and `anchor.createdAt` never move, so the answer a run gets on its first turn is
+ * the answer it gets on its last. A fork that then sits in a queue for a day inherits a clock a day
+ * stale, which is precisely what an unforked task that waited the same day already does.
+ *
+ * Past the ceiling a retry ranks and clocks against itself and pays the cache miss every fork paid
+ * before this rule existed. It is degradation, not refusal. What would move the number is a
+ * measured cache TTL: raise it if a route is found to hold a prefix materially longer, and note
+ * that raising it also widens the staleness window by exactly the same amount.
+ */
+const FORK_ANCHOR_MAX_AGE_MS = 60 * 60 * 1_000;
+
+/**
+ * The task whose opening request and creation instant the two frozen blocks are built from, and
+ * whether the memory pack may be copied from the fork's parent rather than ranked.
+ *
+ * For anything that is not a retry this is the task itself and no read is taken. For a retry it
+ * walks to the root of the retry family and reads that task's own prompt, so the fork ranks and
+ * clocks exactly as the parent did and the leading system run comes out byte-identical.
+ *
+ * The two answers are returned together rather than derived separately at the two call sites,
+ * because they must agree: ranking against the family's request while packing the fork's own bytes
+ * (or the reverse) is a preamble assembled from two different questions. Whenever this falls back,
+ * `inheritFromTaskId` falls back with it and the pack is ranked fresh.
+ *
+ * Every failure falls back to the fork's own goal and clock rather than throwing. The parent may
+ * have been deleted, and its prompt is encrypted under a context this checks by equality rather
+ * than trusts: a fork that cannot read its ancestor pays the cache miss it pays today, which is not
+ * a reason to refuse the turn.
+ */
+interface ForkAnchor {
+  /** The family root, reached transitively. Its instant is the clock the whole family shares. */
+  readonly anchor: TaskRecord;
+  /** The root's own opening request, decrypted here so nobody downstream needs the key again. */
+  readonly prompt: string;
+}
+
+/**
+ * The whole admissibility question in one place: is there an ancestor this fork may present as its
+ * own, and which row is it. `null` is every refusal - not a fork, no ancestor, past the ceiling,
+ * sealed for another workspace, unreadable - because the callers do not act differently on any of
+ * them and a caller that could would be a caller that could disagree with the preamble.
+ */
+const resolveForkAnchor = async (
+  deps: Pick<WindowDeps, 'store'>,
+  task: TaskRecord,
+  key: Uint8Array
+): Promise<ForkAnchor | null> => {
+  let anchor = task;
+  for (let link = 0; link < FORK_ANCHOR_MAX_LINKS; link += 1) {
+    const next = cachePrefixTaskId(anchor);
+    if (next === anchor.id) break;
+    const parent = await deps.store.getTask(task.userId, next).catch(() => null);
+    if (!parent) break;
+    anchor = parent;
+  }
+  if (anchor.id === task.id) return null;
+  const anchorAgeMs = Date.parse(task.createdAt) - Date.parse(anchor.createdAt);
+  // NaN when either column is unparseable, and `!(NaN > x)` would admit it. Written as a positive
+  // test so an unreadable instant refuses the inheritance rather than being granted it.
+  if (!(anchorAgeMs >= 0 && anchorAgeMs <= FORK_ANCHOR_MAX_AGE_MS)) return null;
+  try {
+    // Against the CURRENT task's workspace, not the ancestor's own column, matching
+    // `tools/scheduling.ts:30`: `key` is this fork's workspace data key, so that is the only
+    // workspace whose rows this code is entitled to open, and the check should say so rather than
+    // compare a row against a label it carries itself.
+    if (anchor.promptCiphertext.aad !== `task-prompt:${task.workspaceId}`) return null;
+    const { prompt } = decryptJson<{ prompt: string }>(anchor.promptCiphertext, key);
+    if (typeof prompt !== 'string') return null;
+    return { anchor, prompt };
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * One resolution per turn, shared by the preamble and by every request the turn sends.
+ *
+ * Keyed on the TaskRecord OBJECT rather than on its id, which is what makes this a cache with no
+ * eviction policy and no cross-task retention to reason about: a worker holds one record for the
+ * life of a run and hands the same one to `assemblePreamble`, to every step and to the closing
+ * handoff, and when the run ends the entry is collectable. An id-keyed map would need a bound and
+ * a sweep, and would answer for a task whose row had since changed.
+ *
+ * It is a cache and NOT a correctness device. Everything it memoises is immutable -
+ * `parent_task_id`, `created_at` and `prompt_ciphertext` are never rewritten - so a miss costs one
+ * primary-key read and returns the same answer. That is why the routing key can afford to ask a
+ * question that reads the database: in the product `assemblePreamble` has already asked it, once,
+ * before the first step runs, and a non-fork never reads at all because the walk ends on its own id.
+ */
+const forkAnchors = new WeakMap<TaskRecord, Promise<ForkAnchor | null>>();
+
+const forkAnchorFor = (
+  deps: Pick<WindowDeps, 'store'>,
+  task: TaskRecord,
+  key: Uint8Array
+): Promise<ForkAnchor | null> => {
+  const asked = forkAnchors.get(task);
+  if (asked) return asked;
+  // The PROMISE is memoised, not the value, so two steps that ask before the first read returns
+  // take one read between them rather than one each.
+  const pending = resolveForkAnchor(deps, task, key).catch(() => null);
+  forkAnchors.set(task, pending);
+  return pending;
+};
+
+/**
+ * The name the provider is asked to look this turn's prefix up under, on every request the turn
+ * sends: the parent's on a retry whose preamble IS the parent's, and its own otherwise.
+ *
+ * This exists because `cachePrefixTaskId` alone was not the same question. It answers one link and
+ * nothing else, while the preamble also refuses an ancestor past FORK_ANCHOR_MAX_AGE_MS, one sealed
+ * for another workspace and one that has been deleted - so a retry of a root two hours old
+ * presented the parent's key over a preamble that was ranked and clocked to itself. What that costs
+ * is not a miss: a route asked to match a name it holds a different prefix under writes the new one
+ * there, so the fork EVICTS the bytes the family's next retry would have hit. The two now come out
+ * of one call, so a preamble that fell back cannot be offered under a name it does not match.
+ *
+ * Asynchronous, and that is the cost of the close: the ceiling is a fact about the ancestor's row
+ * and no rule that ignores the ancestor can apply it. It is one read per TURN and none for a task
+ * that was not forked - `assemblePreamble` resolves the same anchor before the first step and the
+ * memo above is what makes every later ask free.
+ */
+export const turnRoutingTaskId = async (
+  deps: Pick<WindowDeps, 'store'>,
+  task: TaskRecord,
+  key: Uint8Array
+): Promise<string> => ((await forkAnchorFor(deps, task, key)) ? cachePrefixTaskId(task) : task.id);
+
+const forkCacheAnchor = async (
+  deps: WindowDeps,
+  task: TaskRecord,
+  key: Uint8Array,
+  goal: string
+): Promise<{ goal: string; clockAnchor: Date; inheritFromTaskId: string }> => {
+  const anchored = await forkAnchorFor(deps, task, key);
+  if (!anchored) return { goal, clockAnchor: new Date(task.createdAt), inheritFromTaskId: task.id };
+  return {
+    goal: anchored.prompt,
+    clockAnchor: new Date(anchored.anchor.createdAt),
+    // The immediate parent and not the root, deliberately: the parent's own row was itself a copy
+    // of the root's, so at any depth the bytes are the same ones, and one link is one read. Pinned
+    // at depth 2 in `window-fork.test.ts`, on the pack READ rather than on its bytes - a copy
+    // carries the sha across, so the root's row and the parent's row are byte-identical answers.
+    inheritFromTaskId: cachePrefixTaskId(task)
+  };
+};
 
 export const refreshRuntimeContext = (deps: WindowDeps, input: RuntimeContextInput): void => {
   const {
@@ -134,7 +369,21 @@ export const refreshRuntimeContext = (deps: WindowDeps, input: RuntimeContextInp
 };
 
 export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): Promise<void> => {
-  const { task, key, state, goal, contextTokens } = input;
+  const { task, key, state, contextTokens } = input;
+  /*
+   * The two facts both frozen blocks are built from, taken from the fork family's root when this
+   * task is a retry inside the anchor's age ceiling. @see forkCacheAnchor above for the rule and
+   * what it deliberately leaves alone. Resolved here, ahead of everything, because three separate
+   * things below are clocked by it: the temporal admissibility of a memory row, the ranking of the
+   * two tiers, and the memory pack's own fusion query - and a fourth, whether that pack may be
+   * copied at all, which comes back from the same call so it cannot disagree with them.
+   */
+  const { goal, clockAnchor, inheritFromTaskId } = await forkCacheAnchor(
+    deps,
+    task,
+    key,
+    input.goal
+  );
   /*
    * The turn's overflow writer, named here because this is the one function that holds both the
    * worker's runner client and the state object every later step mutates.
@@ -247,9 +496,13 @@ export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): 
       // task starting and the current step was in this block on one request and gone from the
       // next: the block the header calls frozen rewriting itself mid-run, and every byte behind
       // it - the pack, the goal, the whole trajectory - re-billed at the write premium because a
-      // boundary nobody crossed on purpose went past. `task.createdAt` is a fixed point for as
-      // long as the task exists, which is exactly the life the header promises.
-      if (memoryTemporalStatus(document, new Date(task.createdAt)) !== 'active') return [];
+      // boundary nobody crossed on purpose went past. `clockAnchor` is a fixed point for as long
+      // as the task exists, which is exactly the life the header promises - and on a retry it is
+      // the parent's instant rather than the fork's, so the fork admits and drops the same rows
+      // the parent did instead of rewriting the block it inherited. That inheritance is itself
+      // bounded by FORK_ANCHOR_MAX_AGE_MS, because an unbounded one would re-admit rows the owner
+      // has since let expire.
+      if (memoryTemporalStatus(document, clockAnchor) !== 'active') return [];
       return [
         {
           id: record.id,
@@ -280,6 +533,12 @@ export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): 
    * and the block rewrote itself anyway. The task's own creation instant is a fixed point for as
    * long as the task exists, which is exactly the life the header promises. The memory pack a few
    * lines below already anchors to it under the name `clockAnchor`.
+   *
+   * Both of them are the FORK FAMILY's request and instant on a recent-enough retry rather than
+   * the fork's own. @see forkCacheAnchor. The claim the header makes is about a conversation, and a
+   * retry is the same conversation sent again: ranking it against the sentence the fork invented
+   * for itself rewrote the block, and everything behind it, on the one request the owner makes
+   * when something has already gone wrong.
    */
   /*
    * Two tiers, two pools, one total - and the split is what makes the label on this tier true.
@@ -314,7 +573,6 @@ export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): 
    * (`packages/data/src/memory-eval.test.ts`) is measured on `mem.item`/`mem.source` rows this
    * function never sees.
    */
-  const clockAnchor = new Date(task.createdAt);
   const ownerMemoryEntries = recallMemories(
     activeMemoryEntries.filter((entry) => entry.target === 'user'),
     goal,
@@ -430,6 +688,33 @@ Open a full procedure with skill(action=view,id=...) - by id for a workspace ski
       dataKey: key,
       query: goal,
       clockAnchor,
+      /*
+       * A retry takes the parent's rendered bytes rather than ranking its own.
+       *
+       * Passing the anchor's request and clock above is not enough on its own: `mem.pack` is keyed
+       * by task id, so a fork with no row of its own re-runs the fusion query, and a fusion query
+       * re-run over a store the parent's turns have since written to does not have to come back
+       * with the same rows in the same order. The copy makes the fork's pack the parent's bytes by
+       * construction rather than by hoping the ranking is stable. @see copyMemoryPack, which
+       * re-encrypts under the fork's own context rather than aliasing the row - an aliased row
+       * fails `openStoredPack`'s AAD equality, returns null, and re-ranks silently, which is
+       * today's behaviour wearing a fix as a hat.
+       *
+       * It is `forkCacheAnchor`'s answer and not `cachePrefixTaskId(task)`, so that the bytes and
+       * the question they were ranked against always come from the same task: an anchor refused for
+       * age, for a foreign encryption context or for a deleted parent refuses the copy with it.
+       *
+       * WHAT THIS DOES NOT DO: it does not re-fit the copied bytes to the fork's own budget.
+       * `openStoredPack` returns `reused` without consulting `budgetTokens`, and a fork may pick a
+       * different model from its parent (`routes/trajectory.ts` reads `input.modelId`), so a retry
+       * that moves to a smaller window can inherit a pack rendered against a larger one. The
+       * overshoot is bounded by MEMORY_PACK_BUDGET_TOKENS (6,000) minus this fork's own budget, so
+       * at the worst reachable window it is about 1,200 tokens of a share that is 12% of the window
+       * anyway. Accepted rather than fixed here because refusing the copy costs the whole cache win
+       * on the request the win exists for, and the refusal belongs in `openStoredPack` where the
+       * stored size is in hand.
+       */
+      inheritFromTaskId,
       budgetTokens: memoryPackBudgetTokens(contextTokens)
     });
     injectMemoryPack(state.messages, pack);

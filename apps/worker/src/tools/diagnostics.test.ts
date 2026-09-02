@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { agentTools } from '../tool-catalogue.js';
 import { CHECKPOINT_EXEMPT_TOOLS, REPEATABLE_TOOLS } from '../turn-bounds.js';
-import { diagnosticsCommand, diagnosticsLanguage, diagnosticsSelection } from './diagnostics.js';
+import {
+  POST_EDIT_CHECKED_LANGUAGES,
+  diagnosticsCommand,
+  diagnosticsLanguage,
+  diagnosticsSelection,
+  nearestProject,
+  postEditDiagnostics,
+  postEditLanguage
+} from './diagnostics.js';
 
 const catalogueLanguages = (): string[] => {
   const diagnostics = agentTools.find((tool) => tool.name === 'code_diagnostics');
@@ -305,5 +313,146 @@ describe('what a diagnostic refuses to run, and says instead', () => {
     expect(diagnosticsSelection('typescript', new Set(['package.json'])).reason).not.toContain(
       'No supported project marker'
     );
+  });
+});
+
+/**
+ * The walk a written file takes to find its checker, and the two output grammars it can read.
+ *
+ * `workspace.test.ts` drives the trigger through the shipped `file_patch` arm and counts what
+ * reached the runner; that is where the bound that protects the owner's machine is pinned. This is
+ * the unit underneath it: which languages are admitted, where the walk stops, and what the two
+ * checkers were measured printing.
+ */
+
+/** A tree the walk can climb, listed the way the runner lists a directory. */
+const listingOf =
+  (tree: Record<string, readonly string[]>) =>
+  async (dir: string): Promise<ReadonlySet<string>> =>
+    new Set(tree[dir] ?? []);
+
+describe('the checker a written file triggers, and the nine it may not', () => {
+  /**
+   * The six/nine split, asserted as a subtraction from the fifteen the manual tool offers rather
+   * than as a list. Nine of those fifteen run the repository's own build recipe - `cargo check`
+   * compiles and runs `build.rs`, `go test` builds and runs the tests, `gradle` evaluates
+   * `build.gradle` as a program - and a trigger nobody asked for may not do that. A sixteenth
+   * language added to the catalogue is out of this map by default, which is the right default.
+   */
+  it('admits no language whose command is somebody else’s build recipe', () => {
+    const recipes = ['rust', 'go', 'java', 'kotlin', 'csharp', 'cpp', 'r', 'terraform', 'swift'];
+    for (const language of recipes)
+      expect(POST_EDIT_CHECKED_LANGUAGES.has(language), language).toBe(false);
+    expect(postEditLanguage('workspace/crate/src/main.rs')).toBeUndefined();
+    expect(postEditLanguage('workspace/pkg/notes.md')).toBeUndefined();
+    expect(postEditLanguage('workspace/pkg/package.json')).toBeUndefined();
+    expect(postEditLanguage('workspace/pkg/src/a.ts')).toBe('typescript');
+    expect(postEditLanguage('workspace/pkg/app.py')).toBe('python');
+  });
+
+  it('climbs past directories that are not the file’s own project', async () => {
+    const tree = {
+      workspace: ['package.json', 'pnpm-lock.yaml'],
+      'workspace/pkg': ['package.json', 'tsconfig.json'],
+      'workspace/pkg/src': ['a.ts']
+    };
+    const found = await nearestProject('workspace/pkg/src/a.ts', listingOf(tree));
+    expect(found?.dir).toBe('workspace/pkg');
+    expect([found?.command.executable, ...(found?.command.args ?? [])].join(' ')).toBe(
+      'npx --no-install tsc --noEmit --pretty false'
+    );
+  });
+
+  /**
+   * The reason branch, which is rule (b) of the walk. This is this repository's own root - a
+   * `package.json`, no `tsconfig.json` - and `diagnosticsSelection` returns a sentence there
+   * telling a model to point `path` somewhere else. Nobody pointed `path` anywhere; the trigger
+   * fired on a write. Injecting advice for a question that was never asked is worse than silence,
+   * and running the command it declines to run is worse than both.
+   */
+  it('says nothing where the marker names a language with no project file under it', async () => {
+    const found = await nearestProject(
+      'workspace/a.ts',
+      listingOf({ workspace: ['package.json'] })
+    );
+    expect(found).toBeUndefined();
+  });
+
+  it('says nothing for a file with no marker anywhere above it', async () => {
+    const tree = { workspace: ['notes.md'], 'workspace/loose': ['a.ts'] };
+    expect(await nearestProject('workspace/loose/a.ts', listingOf(tree))).toBeUndefined();
+  });
+
+  /**
+   * A Python package inside a JavaScript monorepo, which is why the walk stops at the first
+   * directory matching the FILE's language rather than at the first directory holding any marker.
+   * Stopping at the `package.json` would have run `tsc` over an edit to a `.py` file.
+   */
+  it('does not stop at a marker for a language the written file is not', async () => {
+    const tree = {
+      workspace: ['pyproject.toml', 'package.json'],
+      'workspace/tools': ['package.json'],
+      'workspace/tools/scripts': ['run.py']
+    };
+    const found = await nearestProject('workspace/tools/scripts/run.py', listingOf(tree));
+    expect(found?.dir).toBe('workspace');
+    expect(found?.language).toBe('python');
+  });
+});
+
+describe('what the checker said, read as it was measured printing it', () => {
+  /**
+   * Driven on this machine on 2026-09-01, `tsc --noEmit --pretty false` over a file with two
+   * errors. The path is rewritten to a workspace path and the rest of the line is the compiler's
+   * own words: a relative path arriving beside `filesChanged` is a path the model hands back to
+   * `file_read` and is refused for.
+   */
+  it('reads a tsc line and rebuilds the path the model can actually open', () => {
+    const output = [
+      "src/a.ts(1,14): error TS2322: Type 'string' is not assignable to type 'number'.",
+      "src/a.ts(2,18): error TS2304: Cannot find name 'missingSymbol'."
+    ].join('\n');
+    const found = postEditDiagnostics('typescript', 'workspace/pkg', output);
+    expect(found).toHaveLength(2);
+    expect(found[0]?.path).toBe('workspace/pkg/src/a.ts');
+    expect(found[0]?.text).toBe(
+      "workspace/pkg/src/a.ts(1,14): error TS2322: Type 'string' is not assignable to type 'number'."
+    );
+  });
+
+  /**
+   * And `python3 -I -m compileall -q .` on an unclosed `def`, measured the same day. Only the
+   * `*** Error compiling` line names the file, so the explanation under it travels with it - a
+   * caret with no line number above it says nothing at all.
+   */
+  it('reads a compileall block as one diagnostic, explanation and all', () => {
+    const output =
+      "*** Error compiling './bad.py'...\n" +
+      '  File "./bad.py", line 1\n' +
+      '    def broken(\n' +
+      '              ^\n' +
+      "SyntaxError: '(' was never closed\n" +
+      '\n';
+    const found = postEditDiagnostics('python', 'workspace/svc', output);
+    expect(found).toHaveLength(1);
+    expect(found[0]?.path).toBe('workspace/svc/bad.py');
+    expect(found[0]?.text).toContain("SyntaxError: '(' was never closed");
+  });
+
+  /**
+   * THE NO-FALSE-HEALTH BOUND, at the unit. Measured: `npx --no-install tsc` where TypeScript is
+   * not installed exits 1 with 544 bytes of npm's own advice. Not one line of it parses, so it is
+   * silence - the same answer as a clean project, which is the whole design. There is no flag
+   * anywhere in this trigger that could have said otherwise.
+   */
+  it('reads a checker that could not run as nothing, not as a clean project', () => {
+    const banner =
+      'This is not the tsc command you are looking for\n\n' +
+      'To get access to the TypeScript compiler, tsc, from the command line either:\n\n' +
+      '- Use npm install typescript to first add TypeScript to your project before using npx\n';
+    expect(postEditDiagnostics('typescript', 'workspace/pkg', banner)).toEqual([]);
+    expect(postEditDiagnostics('typescript', 'workspace/pkg', '')).toEqual([]);
+    // And a language with no grammar here reads as nothing rather than as anything at all.
+    expect(postEditDiagnostics('rust', 'workspace/crate', 'error: whatever')).toEqual([]);
   });
 });

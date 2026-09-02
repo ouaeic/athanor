@@ -27,7 +27,36 @@ export const registerAccountRoutes = (context: RouteContext): void => {
     requireRecentStepUp,
     idempotent
   } = context;
-  app.get('/v1/auth/me', async (request) => ({ user: requireUser(request.user) }));
+  /**
+   * Who this request is signed in as.
+   *
+   * The whole `UserRecord` used to be the answer, and `UserRecord` carries `recoveryHash` - the
+   * scrypt hash of the account recovery code, which is the credential that reassigns the account
+   * when every passkey is gone. Handing it to the browser puts it in every heap dump, devtools tab
+   * and error report the page can produce, and it is offline-crackable at whatever cost scrypt was
+   * configured with rather than at the rate `POST /v1/auth/recover` will answer. Nothing has ever
+   * read it from here: the only readers of `recoveryHash` anywhere in this repository are the two
+   * recovery routes in auth-routes.ts, which read it from the store.
+   *
+   * The reach was the browser and nothing else - `requiredApiTokenScope` has no entry for
+   * `/v1/auth`, so a bearer token is refused this route outright - which is why this is a leak into
+   * the page rather than into an automation.
+   *
+   * Named fields rather than a delete, so a field added to `UserRecord` later is not published by
+   * default; a client that needs the new one asks for it here.
+   */
+  app.get('/v1/auth/me', async (request) => {
+    const user = requireUser(request.user);
+    return {
+      user: {
+        id: user.id,
+        username: user.username,
+        displayName: user.displayName,
+        preferences: user.preferences,
+        createdAt: user.createdAt
+      }
+    };
+  });
 
   app.get('/v1/sessions', async (request) => {
     const user = requireUser(request.user);
@@ -137,6 +166,27 @@ export const registerAccountRoutes = (context: RouteContext): void => {
       });
     }
   );
+
+  /**
+   * The stored preferences, for a caller that is not the browser.
+   *
+   * The browser never needed this - it is handed the whole object in the bootstrap - so the write
+   * route below shipped without a read beside it. That was survivable while nothing on the server
+   * read the preferences either; it is not now that an automatic model pick honours them, because a
+   * headless client was then governed by a setting it had no way to see.
+   *
+   * A bearer token gets the `model` key and nothing else. The scope this route sits under is
+   * `models:read` (see `requiredApiTokenScope`), and `place` names the conversation and computer the
+   * owner last had open, which is `tasks:read` by any honest reading. The session caller is the
+   * owner at their own keyboard and gets the row.
+   */
+  app.get('/v1/account/preferences', async (request) => {
+    const user = requireUser(request.user);
+    const preferences = request.apiToken
+      ? { ...(user.preferences.model === undefined ? {} : { model: user.preferences.model }) }
+      : user.preferences;
+    return { preferences };
+  });
 
   app.put('/v1/account/preferences', async (request) => {
     const user = requireUser(request.user);

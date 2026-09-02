@@ -2,7 +2,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { execute } from './execution.js';
+import { agentHome, execute, unclaimedStopNote } from './execution.js';
 
 const temporaryRoots: string[] = [];
 
@@ -259,9 +259,10 @@ describe('agent sandbox', () => {
     const record = path.join(root, 'elevated');
     const elevate = await recordingElevator(root, record);
     const helper = path.join(root, 'sandbox');
-    // Stands in for athanor-sandbox: drops its own two leading arguments the way the real helper
-    // consumes `run <network mode>`, then applies the environment and execs, as `env -i` does.
-    await writeFile(helper, '#!/bin/sh\nshift 2\nexec /usr/bin/env -i "$@"\n');
+    // Stands in for athanor-sandbox: drops its own four leading arguments the way the real helper
+    // consumes `run <network mode> <filesystem mode> <root>`, then applies the environment and
+    // execs, as `env -i` does.
+    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
     await chmod(helper, 0o700);
 
     const result = await execute(
@@ -271,10 +272,191 @@ describe('agent sandbox', () => {
     );
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toBe(root);
+    // `.home` at the container root: beside `workspace/` rather than inside it, so a toolchain's
+    // caches are not walked by the checkpoint, and named in the Landlock write grant of its own
+    // accord. It used to be the container root itself. server.test.ts is where the location is
+    // pinned; this asserts only that the command is given the home the runner made.
+    expect(result.stdout).toBe(agentHome(root));
     const elevated = await readFile(record, 'utf8');
-    expect(elevated).toContain(`-n ${helper} run network`);
-    expect(elevated).toContain(`HOME=${root}`);
+    expect(elevated).toContain(`-n ${helper} run network open -`);
+    expect(elevated).toContain(`HOME=${agentHome(root)}`);
+  });
+
+  it('confines the command to its own workspace when the box says it can', async () => {
+    // The production call site, and the reason this assertion is here rather than only in
+    // sandbox.test.ts: the confinement root is not a caller's argument, it is the workspace
+    // `execute` was invoked for, and a helper test that passed one in by hand would pass while
+    // this path handed the helper the wrong tree or none at all.
+    const root = await workspaceRoot();
+    const record = path.join(root, 'elevated');
+    const elevate = await recordingElevator(root, record);
+    const helper = path.join(root, 'sandbox');
+    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await chmod(helper, 0o700);
+
+    const result = await execute(
+      root,
+      { executable: '/bin/sh', args: ['-c', 'true'] },
+      { maximumSeconds: 30, sandbox: { elevate, helper, confineFilesystem: true } }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(await readFile(record, 'utf8')).toContain(`run network confine ${root}`);
+  });
+
+  it('asks for no confinement on a box whose installer found no way to enforce one', async () => {
+    // The other direction, and the one that decides whether this ships. A kernel without Landlock
+    // makes setpriv exit before the command runs, so the helper must be asked for `open` there -
+    // an unenforceable boundary has to become no boundary rather than no commands.
+    const root = await workspaceRoot();
+    const record = path.join(root, 'elevated');
+    const elevate = await recordingElevator(root, record);
+    const helper = path.join(root, 'sandbox');
+    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await chmod(helper, 0o700);
+
+    const result = await execute(
+      root,
+      { executable: '/bin/sh', args: ['-c', 'printf ran'] },
+      { maximumSeconds: 30, sandbox: { elevate, helper, confineFilesystem: false } }
+    );
+
+    expect(result.stdout).toBe('ran');
+    const elevated = await readFile(record, 'utf8');
+    expect(elevated).toContain(`run network open -`);
+    expect(elevated).not.toContain('confine');
+  });
+
+  /*
+   * The ease-of-use half of the filesystem boundary, at the production call site rather than at the
+   * helper: `execute` is what has the workspace root and the resolved sandbox in hand, and a helper
+   * test would pass while nothing ever called it.
+   *
+   * There is no kernel here to produce a real EACCES, so the denial's own words are what the fake
+   * command prints - which is honest about what the production code reads, because it reads the
+   * command's stderr and nothing else. What is being pinned is the decision: which denials get the
+   * sentence and which get silence.
+   */
+  const denyingCommand = (message: string) => ({
+    executable: '/bin/sh',
+    args: ['-c', `printf '%s\\n' "${message}" >&2; exit 1`]
+  });
+  const sandboxedRun = async (
+    message: string,
+    confineFilesystem: boolean
+  ): Promise<{ root: string; stderr: string }> => {
+    const root = await workspaceRoot();
+    const record = path.join(root, 'elevated');
+    const elevate = await recordingElevator(root, record);
+    const helper = path.join(root, 'sandbox');
+    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await chmod(helper, 0o700);
+    const result = await execute(root, denyingCommand(message), {
+      maximumSeconds: 30,
+      sandbox: { elevate, helper, confineFilesystem }
+    });
+    expect(result.exitCode).toBe(1);
+    return { root, stderr: result.stderr };
+  };
+
+  it('says a refusal came from the sandbox when the path it names is outside the grant', async () => {
+    const { stderr } = await sandboxedRun(
+      'cat: /home/athanor/00000000-0000-4000-8000-00000000000a/workspace/notes.md: Permission denied',
+      true
+    );
+    expect(stderr).toContain('the sandbox on this computer probably refused that');
+    // The path is quoted back, because a command that touched several files needs to know which
+    // one, and the sentence is otherwise indistinguishable from a general note about the box.
+    expect(stderr).toContain(
+      '/home/athanor/00000000-0000-4000-8000-00000000000a/workspace/notes.md'
+    );
+    // The command's own message survives ahead of it: the note is added to the stream, not put in
+    // place of it.
+    expect(stderr).toContain('Permission denied');
+
+    // The other load-bearing true case, and the reason the grant list may not simply grow until
+    // everything is silent: `.athanor` is the checkpoints and the browser profile's parent, it sits
+    // at the container root beside the two directories that ARE granted, and a command that meets
+    // it has met the boundary rather than a mode bit. Written as an installed-host path rather than
+    // built from this test's root, because a temporary root here lives under `/var`, which the
+    // ruleset grants for reading - so a root-derived path would be silenced by the read list and
+    // would pin nothing.
+    const own = await sandboxedRun(
+      'tar: /home/athanor/00000000-0000-4000-8000-00000000000a/.athanor/checkpoints: Cannot open: Permission denied',
+      true
+    );
+    expect(own.stderr).toContain('the sandbox on this computer probably refused that');
+  });
+
+  it('stays silent on a denial inside the grant, and on a box that confines nothing', async () => {
+    // The direction that decides whether this can ship. A mode bit inside the workspace, a file the
+    // owner made root-owned, a directory the agent account genuinely may not write - all of those
+    // print exactly the same words, and telling their reader "the sandbox refused that" would be a
+    // false explanation of a real problem, which is worse than the silence it replaced.
+    const inside = await sandboxedRun('DENIED_INSIDE Permission denied', true);
+    const stderr = (
+      await execute(
+        inside.root,
+        denyingCommand(
+          `cat: ${path.join(inside.root, 'workspace', 'notes.md')}: Permission denied`
+        ),
+        {
+          maximumSeconds: 30,
+          sandbox: {
+            elevate: path.join(inside.root, 'elevate'),
+            helper: path.join(inside.root, 'sandbox'),
+            confineFilesystem: true
+          }
+        }
+      )
+    ).stderr;
+    expect(stderr).not.toContain('the sandbox on this computer');
+    // A denial naming no path at all is a silence too, rather than a guess.
+    expect(inside.stderr).not.toContain('the sandbox on this computer');
+    // And nothing is said on a box that never applied a ruleset, where the sentence would be a
+    // plain fabrication.
+    //
+    // THE PATH HAS TO BE ONE THAT WOULD OTHERWISE EARN THE SENTENCE, which is why it is a
+    // neighbouring workspace and not `/etc/shadow`. This assertion was written with `/etc/shadow`
+    // and pinned nothing: `/etc` is in the grant list, so that message is silent on a confined box
+    // too, and the assertion held with the `confined` question deleted from both places that ask
+    // it - measured, with the whole of this file still green while the same case at
+    // `ProcessManager.start` went red. A silence test whose message is silent for a second reason
+    // is a silence test about the second reason.
+    const unconfined = await sandboxedRun(
+      'cat: /home/athanor/00000000-0000-4000-8000-00000000000a/workspace/notes.md: Permission denied',
+      false
+    );
+    expect(unconfined.stderr).not.toContain('the sandbox on this computer');
+  });
+
+  it('stays silent on a denial in a directory the ruleset grants for reading', async () => {
+    // The saturation the test above leaves standing. It asks about `/etc/shadow` only on a box that
+    // confines nothing, so it holds while the same message on a CONFINED box gets the sentence -
+    // and the ruleset grants `/etc` for reading, so that denial is a mode bit and the sentence is a
+    // lie. It is a lie that contradicts itself in its own second clause, which offers "may read the
+    // system directories" as the reason `/etc/shadow` is out of reach.
+    const shadow = await sandboxedRun('cat: /etc/shadow: Permission denied', true);
+    expect(shadow.stderr).not.toContain('the sandbox on this computer');
+
+    // The same defect in the shape it will actually arrive in. An interpreter names its own path
+    // ahead of the file it could not open, so the first absolute token on the line is the
+    // interpreter's - and the file itself is inside the workspace, which is the case the test above
+    // requires silence for. Whichever token the note quotes, the answer here is nothing.
+    const interpreter = await workspaceRoot();
+    const record = path.join(interpreter, 'elevated');
+    const elevate = await recordingElevator(interpreter, record);
+    const helper = path.join(interpreter, 'sandbox');
+    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await chmod(helper, 0o700);
+    const result = await execute(
+      interpreter,
+      denyingCommand(
+        `/usr/bin/python3: can't open file ${path.join(interpreter, 'workspace', 'build.py')}: [Errno 13] Permission denied`
+      ),
+      { maximumSeconds: 30, sandbox: { elevate, helper, confineFilesystem: true } }
+    );
+    expect(result.stderr).not.toContain('the sandbox on this computer');
   });
 
   it('asks for a network namespace when the command did not ask for the network', async () => {
@@ -282,15 +464,21 @@ describe('agent sandbox', () => {
     const record = path.join(root, 'elevated');
     const elevate = await recordingElevator(root, record);
     const helper = path.join(root, 'sandbox');
-    await writeFile(helper, '#!/bin/sh\nshift 2\nexec /usr/bin/env -i "$@"\n');
+    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
     await chmod(helper, 0o700);
 
     await execute(
       root,
       { executable: '/bin/sh', args: ['-c', 'true'] },
-      { maximumSeconds: 30, isolateNetwork: true, sandbox: { elevate, helper } }
+      {
+        maximumSeconds: 30,
+        isolateNetwork: true,
+        sandbox: { elevate, helper, confineFilesystem: true }
+      }
     );
-    expect(await readFile(record, 'utf8')).toContain(`-n ${helper} run isolated`);
+    // Both boundaries on one exec line, which is the whole shape of this helper: the namespace and
+    // the ruleset are asked for together or a command gets whichever one the caller remembered.
+    expect(await readFile(record, 'utf8')).toContain(`-n ${helper} run isolated confine ${root}`);
   });
 
   it('keeps the approved package install on the runner account, which is the only way it works', async () => {
@@ -344,6 +532,64 @@ describe('agent sandbox', () => {
     await expect(
       execute(root, { executable: './s', args: ['id'] }, { maximumSeconds: 30 })
     ).rejects.toThrow('Direct privilege escalation is disabled');
+  });
+});
+
+/*
+ * The half of the confinement note's grant list that no test above can reach, and why this one is
+ * not written at a production call site the way every other assertion in this file is.
+ *
+ * The note asks whether the path a denial names lies outside EVERY hierarchy the ruleset grants,
+ * and two of those are derived from the workspace the command was run for: `<root>/workspace` and
+ * `<root>/.home`. Every test in this file builds its root with `mkdtemp(tmpdir())`, which is
+ * `/tmp` on Linux and `/var/folders/...` on macOS - and `/tmp` and `/var` are each in the grant
+ * list in their own right. So on both hosts this suite runs on, a root-derived path is silenced by
+ * the SYSTEM half of the list no matter what the workspace half says. Measured rather than
+ * supposed: deleting both workspace-derived entries left all 152 tests in this package green,
+ * while on the installed host - root `/home/athanor/<id>`, `/home` granted nowhere - their absence
+ * would put the sentence on every ordinary mode bit inside a task's own `workspace/`, which is the
+ * exact lie the grant list was widened to stop telling.
+ *
+ * There is no writable directory on either host that lies outside those granted hierarchies, so a
+ * root shaped like an installed one cannot be a real directory here, and `execute` needs a real
+ * one. `unclaimedStopNote` is the seam both production paths call, and each path's call is pinned
+ * by its own test - this file's `agent sandbox` block and processes.test.ts's background pair, both
+ * watched going red with the call removed. What is left is the answer, for the root shape only the
+ * installed host has.
+ *
+ * The first assertion of each pair is the guard that keeps this from being another silence that
+ * proves nothing: the same root, one level above `workspace/`, still speaks. So a silence below it
+ * is attributable to the two workspace-derived entries and not to a system hierarchy that happened
+ * to cover the path.
+ */
+describe('the workspace half of the confinement grant list', () => {
+  const installedRoot = '/home/athanor/00000000-0000-4000-8000-00000000000a';
+  const denialOf = (file: string) => ({
+    stderr: () => `cat: ${file}: Permission denied`,
+    exitCode: 1,
+    signal: null,
+    claimed: false,
+    cancelled: false
+  });
+  const noteFor = (file: string): string | undefined =>
+    unclaimedStopNote(denialOf(file), installedRoot, true);
+
+  it('speaks for the container root that holds the undo point', () => {
+    expect(noteFor(`${installedRoot}/notes.md`)).toContain('the sandbox on this computer');
+    expect(noteFor(`${installedRoot}/.athanor/checkpoints/turn-4`)).toContain(
+      'the sandbox on this computer'
+    );
+    expect(noteFor('/home/athanor/00000000-0000-4000-8000-00000000000b/workspace/x')).toContain(
+      'the sandbox on this computer'
+    );
+  });
+
+  it('stays silent inside the two directories that command may write', () => {
+    // A mode bit on a file the owner uploaded read-only, an npm cache directory the last run left
+    // owned by another account: real problems, inside the grant, and answering them with "the
+    // sandbox refused that" sends the reader to look for a boundary that is not involved.
+    expect(noteFor(`${installedRoot}/workspace/notes.md`)).toBeUndefined();
+    expect(noteFor(`${installedRoot}/.home/.cargo/registry/index`)).toBeUndefined();
   });
 });
 

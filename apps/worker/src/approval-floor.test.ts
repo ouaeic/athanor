@@ -199,3 +199,91 @@ describe('what the floor no longer has to look up before a diagnostic runs', () 
     expect(await judge(['Makefile', 'main.c'], { language: 'ruby' })).toBeNull();
   });
 });
+
+/*
+ * The undo point the destructive rule spends, measured through the floor the worker actually calls.
+ *
+ * `approvalRequirement` is pure - no filesystem, no runner - so the only place the difference
+ * between "this turn can be rewound" and "this turn cannot" can enter is the context this file
+ * builds. Pinning it on `approvalRequirement` alone would prove the rule and not the wiring, which
+ * is the defect this tree has shipped four times; every assertion here goes through
+ * `approvalForCallOnce`.
+ *
+ * `rm -rf dist` is the row to pin it with because it is the whole saving: strictly inside
+ * `CHECKPOINT_CONTENT`, carded in balanced before the location rule existed, and free after it -
+ * but only ever honestly free on a turn that has an undo point.
+ */
+describe('what the floor tells the destructive rule about this turn’s undo point', () => {
+  const state = (fields: Partial<AgentState>): AgentState =>
+    ({ messages: [], toolsStarted: 0, turn: 3, ...fields }) as unknown as AgentState;
+  const remove = call('call-rm', 'shell', { executable: 'rm', args: ['-rf', 'dist'] });
+  const ask = (agentState?: AgentState) =>
+    approvalForCallOnce(countingFloor().deps, createApprovalFloorMemo(), task, remove, agentState);
+
+  it('drops the card for a delete this turn can undo by itself', async () => {
+    await expect(
+      ask(state({ checkpoint: { turn: 3, id: 'checkpoint-3', uncovered: [] } }))
+    ).resolves.toBeNull();
+  });
+
+  /*
+   * The second ceiling, wired the same way and through the same call.
+   *
+   * `CHECKPOINT_MAX_FILE_BYTES` makes the runner's scan record a file over 2 GiB as uncovered and
+   * walk past it, so a delete of one is strictly inside `CHECKPOINT_CONTENT` and is restored by
+   * nothing. The paths are carried on `AgentState.checkpoint.uncovered`; `undoPointFor` spreads
+   * them onto the context, and a set that is not known is spread as nothing rather than as empty.
+   *
+   * Both directions, because a blanket would satisfy the first: one oversize file in a workspace
+   * must card the delete that reaches it and leave `rm -rf dist` alone.
+   */
+  it('carries which files the checkpoint walked past, and only cards the ones it reaches', async () => {
+    const held = (uncovered: readonly string[]) =>
+      state({ checkpoint: { turn: 3, id: 'checkpoint-3', uncovered } });
+    const weights = call('call-weights', 'shell', {
+      executable: 'rm',
+      args: ['workspace/model.gguf']
+    });
+    const askFor = (agentState: AgentState, which = remove) =>
+      approvalForCallOnce(countingFloor().deps, createApprovalFloorMemo(), task, which, agentState);
+
+    await expect(askFor(held(['workspace/model.gguf']), weights)).resolves.toMatchObject({
+      sideEffect: 'external_consequential'
+    });
+    await expect(askFor(held(['workspace/model.gguf']))).resolves.toBeNull();
+    await expect(askFor(held([]), weights)).resolves.toBeNull();
+  });
+
+  /*
+   * Every way the fact can be missing, and all of them card. The refusal is the one that matters
+   * most: `#ensureTurnUndoPoint` catches `CheckpointRefusedError` - a workspace over
+   * `CHECKPOINT_MAX_FILES`, or a full host disk - writes `{ turn, id: null }`, tells the owner the
+   * turn has no undo point and lets the work carry on. Without this, that is the turn on which
+   * every delete inside `workspace/` becomes free.
+   *
+   * The stale row is not hypothetical either: `state.checkpoint` is persisted and survives a
+   * resume, an approval park and a worker handover, so turn 2's answer is sitting in state
+   * throughout turn 3 until turn 3 takes its own.
+   */
+  it('keeps it wherever the turn cannot be shown to have one', async () => {
+    for (const [why, agentState] of [
+      ['the runner refused the checkpoint', state({ checkpoint: { turn: 3, id: null } })],
+      [
+        'the fact belongs to an earlier turn',
+        state({ checkpoint: { turn: 2, id: 'checkpoint-2', uncovered: [] } })
+      ],
+      /*
+       * A good checkpoint whose uncovered set nobody established: a runner one release behind this
+       * worker, a list the runner had to cut off, or a state row written before the field existed.
+       * The id is fine and what the walk skipped is not known, so every delete keeps its card - the
+       * one reading of "unknown" that does not free a delete nothing restores.
+       */
+      ['the uncovered set is not known', state({ checkpoint: { turn: 3, id: 'checkpoint-3' } })],
+      ['this turn has not taken one yet', state({})],
+      ['there is no state at all', undefined]
+    ] as const)
+      await expect(ask(agentState), why).resolves.toMatchObject({
+        sideEffect: 'external_consequential'
+      });
+  });
+});

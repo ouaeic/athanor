@@ -76,6 +76,12 @@ export const summariseForCompaction = async (
           // The one call whose output every later step re-reads. It used to send no effort at
           // all, which on a reasoning route is the least thinking of anything in the run.
           reasoningEffort: 'medium',
+          // The task's OWN id even on a retry, unlike the step and handoff requests, which present
+          // the parent's. @see cachePrefixTaskId in `window.ts`. This is a different prefix, not a
+          // different key for the same one: a summariser request to a different model carrying the
+          // transcript rather than the window. Inheriting a parent's key would point a route at a
+          // prefix that was never sent under it, and the `:compaction` suffix keeps it off the
+          // main conversation's prefix for the same reason.
           sessionId: sha256(`athanor-task:${task.id}:compaction`).slice(0, 64),
           signal
         }),

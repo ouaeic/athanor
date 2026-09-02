@@ -28,6 +28,13 @@ export const seedModelCatalog = async (context: ServerBase): Promise<void> => {
         baseUrl:
           config.AI_PROVIDER === 'openrouter' ? config.AI_BASE_URL : config.OPENROUTER_BASE_URL,
         apiKey: configuredOpenRouterKey,
+        // The boot seed was the one caller of four that omitted this, and `MODEL_CATALOG_SCOPE`
+        // says what that costs in its own words: a box where two writers disagree has each of them
+        // undoing the other's answer about which models exist. On a `reviewed_open_weight` box
+        // every restart wrote the whole provider catalogue over the reviewed allowlist, and the
+        // registry's next hourly pass took it away again - so which models the owner was offered
+        // depended on how recently the API had been restarted.
+        scope: config.MODEL_CATALOG_SCOPE,
         ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
       });
       await store.upsertModels(liveModels);

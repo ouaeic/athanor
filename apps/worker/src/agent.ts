@@ -582,7 +582,16 @@ export class AgentWorker {
       const created = await this.#withLeaseRenewal(task, () =>
         this.#runner.checkpoint(task.workspaceId, task.id, { checkpointId, turn })
       );
-      state.checkpoint = { turn, id: checkpointId };
+      // Spread rather than assigned, and never `?? []`: `exactOptionalPropertyTypes` refuses the
+      // bare assignment of a nullable field to an optional one, and an empty array would tell the
+      // approval floor this walk held everything when what the runner actually said was that it
+      // could not say. Absent keeps the card on every delete for the turn, which is the direction
+      // to fail in.
+      state.checkpoint = {
+        turn,
+        id: checkpointId,
+        ...(created.uncovered ? { uncovered: created.uncovered } : {})
+      };
       await this.store.recordWorkspaceCheckpoint({
         id: checkpointId,
         workspaceId: task.workspaceId,

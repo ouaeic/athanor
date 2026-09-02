@@ -111,7 +111,39 @@ const Config = z.object({
   ISOLATE_AGENT_NETWORK: z
     .string()
     .default('false')
+    .transform((value) => value === 'true'),
+  /*
+   * Whether an agent command is confined to its own workspace by a Landlock ruleset on the same
+   * exec line that already drops it to the agent account.
+   *
+   * Off by default and turned on by the installer from a measurement rather than from a guess:
+   * `athanor-sandbox check` reports `filesystem=landlock` or `filesystem=none`, and
+   * scripts/install-native.sh writes this key from that line. Defaulting it on would have been the
+   * braver spelling and the wrong one - a kernel without Landlock, or a util-linux older than 2.41,
+   * makes setpriv exit before the command runs, so an upgrade would have turned every command on
+   * that box into exit 125 in exchange for a boundary it cannot enforce anyway.
+   *
+   * It needs the sandbox helper for the same reason ISOLATE_AGENT_NETWORK does, and refuses the
+   * same way: applying a ruleset happens on the privileged side of the drop, so without the helper
+   * there is nowhere to apply it and every command would run exactly as unconfined as before while
+   * this key said otherwise.
+   *
+   * It also needs WORKSPACE_ROOT to be /home/athanor, which the helper hard-codes and will not take
+   * from a caller. That is not checked here, because a runner started with a different workspace
+   * root is a development configuration where AGENT_SANDBOX_HELPER is unset and this is moot; on a
+   * box where it is set, the same installer writes both values.
+   *
+   * Optional rather than defaulted, which is the one place a setting in this file differs in shape
+   * from its neighbours, and the difference is the kind of setting it is. ISOLATE_AGENT_NETWORK is
+   * a policy an operator chooses and can be asked of any configuration. This is a measurement the
+   * installer took of the kernel, so an absent key is not the same fact as `false`: `false` is a
+   * box that was looked at and has no Landlock, and absence is a runner.env written before anything
+   * looked. Both run unconfined, and `resolveAgentSandbox` reads absence as no.
+   */
+  CONFINE_AGENT_FILESYSTEM: z
+    .string()
     .transform((value) => value === 'true')
+    .optional()
 });
 
 export type RunnerConfig = z.infer<typeof Config>;
@@ -129,6 +161,11 @@ export const loadConfig = (): RunnerConfig => {
   if (config.ISOLATE_AGENT_NETWORK && !config.AGENT_SANDBOX_HELPER) {
     throw new Error(
       'ISOLATE_AGENT_NETWORK is on but AGENT_SANDBOX_HELPER is unset. Creating a network namespace needs privilege the runner does not have, so every command would fail rather than run isolated.'
+    );
+  }
+  if (config.CONFINE_AGENT_FILESYSTEM && !config.AGENT_SANDBOX_HELPER) {
+    throw new Error(
+      'CONFINE_AGENT_FILESYSTEM is on but AGENT_SANDBOX_HELPER is unset. A Landlock ruleset is applied on the privileged side of the drop to the agent account, so without the helper every command would run with no filesystem boundary at all while this setting said it had one.'
     );
   }
   return config;

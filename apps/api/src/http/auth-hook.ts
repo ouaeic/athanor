@@ -131,6 +131,18 @@ const requiredApiTokenScope = (method: string, route: string): ApiTokenScope | u
   const writing = !['GET', 'HEAD', 'OPTIONS'].includes(method);
   if (streamCredentialRoutes.has(route)) return undefined;
   if (route.startsWith('/v1/models')) return 'models:read';
+  /*
+   * Read-only, and under the model scope, because the only thing on this surface an automation has
+   * any business with is which model an automatic pick will make.
+   *
+   * Nothing under `/v1/account` matched any entry in this table, so it fell through to `return
+   * undefined` and a bearer token was refused the setting outright - while the server had just
+   * started honouring that same setting on every task the token creates. A headless client could be
+   * governed by a preference it had no way to read. Writing it stays refused: a standing choice
+   * about which model answers for the owner is theirs to change at their own keyboard, and
+   * `DELETE /v1/account` is on the same prefix.
+   */
+  if (route === '/v1/account/preferences') return writing ? undefined : 'models:read';
   // One `/v1/tasks` write is not a task write: `POST /v1/tasks/:taskId/trajectory` with a
   // `computer` or `both` rewind replaces the filesystem. This table is read from `onRequest`,
   // before a body exists, so that one is refused at its own route instead.

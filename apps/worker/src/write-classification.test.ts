@@ -8,7 +8,12 @@
  * mutation that removed the fix went green in every other file.
  */
 import { describe, expect, it } from 'vitest';
-import { isMutatingToolCall, writtenPaths } from './write-classification.js';
+import { approvalRequirement } from './approval-policy.js';
+import {
+  deferredExecutionPaths,
+  isMutatingToolCall,
+  writtenPaths
+} from './write-classification.js';
 
 const shell = (executable: string, ...args: string[]) => ({ executable, args });
 
@@ -68,5 +73,88 @@ describe('what a call changed', () => {
     ).toContain('~/.bashrc');
     // Not a writer at all, so nothing to name.
     expect(writtenPaths('shell', shell('cat', '~/.bashrc'))).toEqual([]);
+  });
+});
+
+/*
+ * `git worktree` was in no set in this file at all.
+ *
+ * `git worktree remove --force x` deletes a whole second checkout with whatever was uncommitted in
+ * it, and `git worktree add` creates one; both were scored a check, so `writtenPaths` returned
+ * nothing for either and every rule downstream - the deferred-execution card among them - was
+ * answering about a command it believed had written no file. Measured before this line:
+ * `writtenPaths('shell', { executable: 'git', args: ['worktree', 'remove', '--force', 'x'] })` was
+ * `[]`.
+ */
+describe('a second checkout is a change to the tree', () => {
+  it('counts git worktree, and names what it was pointed at', () => {
+    const removal = { executable: 'git', args: ['worktree', 'remove', '--force', 'x'] };
+    expect(isMutatingToolCall('shell', removal)).toBe(true);
+    // The whole answer rather than `toContain('x')`, because "it names `x`" reads as exhaustive and
+    // is not: the wide net names the subcommand words too. Nothing downstream recognises `worktree`
+    // or `remove` - `deferredExecutionPaths` is empty for this call and it raises no card outside
+    // review - so the over-naming costs nothing, and the row saying so is what stops the next
+    // reader tightening a fallback that is deliberately loose.
+    expect(writtenPaths('shell', removal)).toEqual(['worktree', 'remove', 'x']);
+    expect(deferredExecutionPaths('shell', removal)).toEqual([]);
+    expect(
+      isMutatingToolCall('shell', { executable: 'git', args: ['worktree', 'add', '../wt'] })
+    ).toBe(true);
+    /*
+     * The reading form is scored a change too, and that is the documented direction to be wrong in
+     * rather than an oversight: a set of subcommands cannot see its own operands, and this file's
+     * own asymmetry says a command wrongly called a change costs one extra check while a change
+     * wrongly called a check can never be recovered from. What it must not do is name a path a
+     * later process executes, which is what would turn the extra check into a card.
+     */
+    const listing = { executable: 'git', args: ['worktree', 'list'] };
+    expect(isMutatingToolCall('shell', listing)).toBe(true);
+    expect(writtenPaths('shell', listing)).toEqual(['worktree', 'list']);
+  });
+});
+
+/*
+ * Two mechanisms, one call, two different answers ON PURPOSE.
+ *
+ * `kill`, `killall` and `pkill` were taken out of `consequentialExecutables` because the card they
+ * were borrowing said "This can remove or overwrite data", which is false of all three - `kill -0
+ * 1234` sends no signal at all and stopped the turn in every mode. Nothing was put back into any
+ * set feeding the completion clock, so `isMutatingToolCall('shell', { executable: 'kill', args:
+ * ['-9','1234'] })` answered FALSE: a turn could kill the server it was told to test and then
+ * satisfy `finish` with a `curl` from before the kill, because nothing after the kill counted as
+ * being after a change.
+ *
+ * BOTH HALVES ARE ASSERTED HERE TOGETHER, and that is the whole point of the shape. Each assertion
+ * on its own reads like a bug in the other, so a reader who found only one of them would "fix" the
+ * one that is right. The card asks whether the owner should be interrupted; the clock asks whether
+ * the computer moved. Stopping a dev server is a yes to the second and a no to the first.
+ */
+describe('signalling is a change to the computer and not a card', () => {
+  it('counts kill, killall and pkill as changes while none of them raises a card', () => {
+    for (const args of [
+      { executable: 'kill', args: ['-9', '1234'] },
+      { executable: 'kill', args: ['-0', '1234'] },
+      { executable: 'pkill', args: ['-f', 'vite'] },
+      { executable: 'killall', args: ['node'] }
+    ]) {
+      expect(isMutatingToolCall('shell', args), `clock: ${JSON.stringify(args)}`).toBe(true);
+      // Autonomous is the mode with the fewest cards, so a null here is a null in all three.
+      expect(approvalRequirement('shell', args, 'autonomous'), JSON.stringify(args)).toBeNull();
+    }
+    /*
+     * The one target that is not a process. A signal to PID 1 ends everything on this computer, so
+     * it keeps its card - and it is a change on the clock too, which is the pair holding in the
+     * direction where the two mechanisms happen to agree.
+     */
+    const init = { executable: 'kill', args: ['-9', '1'] };
+    expect(isMutatingToolCall('shell', init)).toBe(true);
+    expect(approvalRequirement('shell', init, 'autonomous')).not.toBeNull();
+    /*
+     * The counter-direction: this must not turn every unrecognised program into a change. A reader
+     * that is not a writer stays a check, which is what keeps the completion rule satisfiable at
+     * all - the model has to have something it can cite after its last change.
+     */
+    expect(isMutatingToolCall('shell', { executable: 'ps', args: ['aux'] })).toBe(false);
+    expect(isMutatingToolCall('shell', { executable: 'pgrep', args: ['-f', 'vite'] })).toBe(false);
   });
 });

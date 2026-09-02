@@ -127,6 +127,56 @@ root-owned helper that only ever hands back less privilege than it was called wi
 `no_new_privs` — which is inherited by every descendant and cannot be removed, so a set-user-ID
 binary confers nothing no matter which interpreter spelled the command.
 
+On a host whose kernel and util-linux can do it, that identity boundary carries a filesystem one on
+the same exec line: a Landlock ruleset that admits the task's own `workspace/` and its agent `$HOME`
+at `.home` for writing, the system directories for reading and running, and `/tmp`, `/var/tmp` and
+`/dev/shm` for scratch. `/home` is granted nowhere, and that omission is the boundary. Every workspace on the box is group-writable
+by the agent account, so without it a command run for one task could read and rewrite every other
+task's files, and could rename the runner's own `.athanor` directory - the checkpoints, the browser
+profile's parent - out from under it. Re-measured on a 7.0 kernel with util-linux 2.41.3 after
+`$HOME` moved to `.home`: reading a neighbouring workspace, reading or writing `.athanor`, renaming
+`.athanor`, listing or writing anything in the container root, moving a file out of the container -
+into that root, into a neighbour or into an ungranted `/tmp` - and reading anything through a
+symbolic link that points outside the grant all fail, while the command's own `workspace/` and
+`.home` are writable, renames between those two succeed, `echo x > /dev/null` and `2>/dev/null` work,
+and `/etc/resolv.conf` still resolves through `/run`. `pip`, `npm`, `pnpm`, `git`, a pty and a
+sixty-four-way parallel write are unaffected, at a cost of about 10 ms on a 145,403-file `find` over
+`/usr`. What that measurement does not establish: it was run against a stand-in root under `/tmp`,
+because `/home/athanor` is not writable by an account a drill may use, so no ruleset in it was ever
+applied to a real workspace - and the shipped helper hard-codes the parent those workspaces live
+under, so the drill exercised the mechanism rather than the installed helper. What it does
+establish, and the reason the deny cases mean anything at all: every one of them was re-run with the
+ruleset removed and came back permitted, so it was the ruleset that refused and not ordinary Unix
+permissions.
+
+The two grants inside a task's own directory are named one by one, and the directory that holds them
+is not. That is what keeps `.athanor` — the checkpoints, the artifact store, the browser profile's
+parent — out of reach while the two directories beside it are writable. The agent's `$HOME` is one of
+them and it sits outside `workspace/` deliberately: `workspace/` is what the turn checkpoint walks
+and hashes, and a single Rust toolchain is 88,021 files against a 250,000-file ceiling that, once
+crossed, costs the turn its rewind point. **A rewind therefore does not restore `$HOME`.** The
+project tree goes back; the toolchain caches and the coding CLIs' sign-in state stay as the failed
+run left them, for the same reason the browser profile is excluded from checkpoints — rolling a
+session back signs the account out.
+
+It is a rung and it says which rung it is on. The installer runs `athanor-sandbox check`, which
+reports `filesystem=landlock` or `filesystem=none`, and writes `CONFINE_AGENT_FILESYSTEM` in the
+runner's environment from that answer rather than from a preference; `/healthz` reports
+`agentFilesystemConfined` from the sandbox the runner actually resolved, not from the setting it was
+given. A kernel that cannot apply a ruleset gets the identity and network boundaries and says so,
+because a host that fails every command is worse than one that confines fewer of them. The owner's
+own interactive terminal is deliberately never confined.
+
+What it is not: it does not stop a command reading `/etc`, `/usr` or `/proc`, which it needs in
+order to run anything at all; it does not bound how much a command writes, which is the host-disk
+floor's job - and the per-workspace storage figure covers `workspace/`, the artifact store and the
+browser profile but deliberately not `$HOME`, so a toolchain cache is bounded by that floor alone;
+and it is applied when the command starts, so a command already running in a workspace
+races the check that its `workspace/` and its `.home` are real directories rather than symbolic
+links somebody substituted. Closing that race means the workspace root ceasing to be agent-writable,
+which the move of `$HOME` into `.home` makes possible — nothing creates entries directly in that
+root any more — and which nothing has yet done.
+
 They can intentionally read and change workspace files, which the two accounts share through a
 group, and can communicate with networks reachable from the host. They cannot read the root-owned
 control configuration, the database keys, or the runner's capability secret: that secret is removed

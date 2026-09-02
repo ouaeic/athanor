@@ -30,7 +30,7 @@ import { BotWallError, BrowserManager, type BrowserStreamState } from './browser
 import { CheckpointRefusedError, WorkspaceCheckpoints } from './checkpoints.js';
 import type { RunnerConfig } from './config.js';
 import { DesktopManager, type DesktopStreamState } from './desktop.js';
-import { agentSearchPath, execute } from './execution.js';
+import { agentHome, agentSearchPath, execute } from './execution.js';
 import { assertHostStorageWrite, hostStorage, type HostStorage } from './host-storage.js';
 import {
   conversionTargetFor,
@@ -252,7 +252,10 @@ export interface RunnerServerOptions {
 
 export const buildServer = async (config: RunnerConfig, options: RunnerServerOptions = {}) => {
   const app = Fastify({ logger: false, bodyLimit: config.MAX_FILE_BYTES });
-  const sandbox = await resolveAgentSandbox(config.AGENT_SANDBOX_HELPER);
+  const sandbox = await resolveAgentSandbox(
+    config.AGENT_SANDBOX_HELPER,
+    config.CONFINE_AGENT_FILESYSTEM
+  );
   const privilegedHelpers = [config.SYSTEM_PACKAGE_HELPER, sandbox?.helper];
   const probeHostStorage = options.hostStorage ?? hostStorage;
   const desktop =
@@ -444,6 +447,36 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       });
   });
 
+  /**
+   * What the workspace's storage figure counts, and the one directory it deliberately does not.
+   *
+   * `.home` - the agent's `$HOME` (execution.ts `agentHome`) - is NOT on this list, and that is a
+   * decision rather than an omission left over from the move. It is the same answer the released
+   * tree gave, where `$HOME` was the container root and `~/.cargo` was `$ROOT/.cargo`, equally
+   * uncounted; naming it here is what makes it a decision.
+   *
+   * WHY NOT: this figure is a walk of every file under each entry, it runs behind the API's
+   * five-second metering timeout, and the API's own comment already puts a coding tree at hundreds
+   * of milliseconds. A `$HOME` holds toolchain caches - a Rust toolchain alone is 88,021 files, a
+   * conda environment routinely 30,000-60,000 - so counting it would add that walk to every
+   * metering pass. When such a pass crosses the timeout the whole figure stops updating, including
+   * the owner's own files: a cache would cost the owner the number it was added to make accurate.
+   * The quota this feeds is also the wrong instrument for it. It gates the owner's uploads, and its
+   * remedy is deleting files - but `.home` is in files.ts's `CONTAINER_ONLY`, so the file browser
+   * cannot show it and the file routes cannot delete it. The owner would be told to free space in a
+   * directory this API gives them no way to reach.
+   *
+   * WHAT IT COSTS, said plainly: a per-workspace storage limit does not bound what a task writes
+   * into its `$HOME`. An agent that fills the disk through `~/.cache` is stopped by the host-disk
+   * floor - which counts every byte on the filesystem and is what actually protects the box - and
+   * not by this number. `.athanor/browser` IS counted and is also a machine-written cache the owner
+   * cannot browse, which is the inconsistency in this list; it stays counted because a browser
+   * profile is bounded at tens of megabytes and does not move the walk.
+   *
+   * WHAT WOULD CHANGE IT: a cheaper measurement. If this becomes a figure the runner keeps as
+   * commands write rather than a tree walk per request, the timeout argument goes away and `.home`
+   * should be counted - at which point the file routes owe the owner a way to clear it.
+   */
   const storageUsage = async (root: string): Promise<number> =>
     (
       await Promise.all(
@@ -452,17 +485,17 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
         )
       )
     ).reduce((sum, bytes) => sum + bytes, 0);
-  const ensureRuntimeWorkspace = async (root: string): Promise<void> => {
-    await ensureWorkspace(root);
-  };
-
   // Loopback only, and deliberately says what the sandbox is actually doing: an operator - and a
   // control plane that tells the owner an agent shell is confined - has to be able to check.
   app.get('/healthz', async () => ({
     ok: true,
     service: 'workspace-runner',
     agentSandbox: Boolean(sandbox),
-    agentNetworkIsolated: config.ISOLATE_AGENT_NETWORK
+    agentNetworkIsolated: config.ISOLATE_AGENT_NETWORK,
+    // The rung this box is actually on, not the one its configuration asked for: with no helper
+    // there is nothing to apply a ruleset with, and the setting alone would be a claim rather than
+    // a fact. `athanor-sandbox check` is where the claim was measured, at install time.
+    agentFilesystemConfined: Boolean(sandbox?.confineFilesystem)
   }));
 
   app.addHook('preHandler', async (request) => {
@@ -473,7 +506,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
   app.put<{ Params: { workspaceId: string } }>('/v1/workspaces/:workspaceId', async (request) => {
     requireScope(request, 'workspace.manage');
     const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-    await ensureRuntimeWorkspace(root);
+    await ensureWorkspace(root);
     return { id: request.params.workspaceId, state: 'running', root };
   });
 
@@ -496,7 +529,12 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       { executable: '/bin/rm', args: ['-rf', '--', root] },
       { PATH: '/usr/bin:/bin' },
       sandbox,
-      false
+      false,
+      // Deliberately unconfined, and the only `null` in the runner. This command exists to delete
+      // the workspace, and a ruleset that admits `workspace/` and nothing above it would let it
+      // empty the tree and then refuse to remove the tree - leaving the delete half done and the
+      // runner's own `rm` below to report a failure with no cause a reader could see.
+      null
     );
     await new Promise<void>((resolve) => {
       const child = spawn(invocation.executable, invocation.args, {
@@ -531,7 +569,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'workspace.manage');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       processes.stopWorkspace(request.params.workspaceId);
       await browser.close(request.params.workspaceId);
       await desktop.close(request.params.workspaceId);
@@ -567,7 +605,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'workspace.manage');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       processes.stopWorkspace(request.params.workspaceId);
       await browser.close(request.params.workspaceId);
       await desktop.close(request.params.workspaceId);
@@ -599,7 +637,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
   }>('/v1/workspaces/:workspaceId/checkpoints', async (request) => {
     requireScope(request, 'workspace.manage');
     const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-    await ensureRuntimeWorkspace(root);
+    await ensureWorkspace(root);
     const created = await checkpoints.create(request.params.workspaceId, root, {
       checkpointId: request.body.checkpointId,
       taskId: request.body.taskId ?? null,
@@ -614,7 +652,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'workspace.manage');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return checkpoints.preview(request.params.workspaceId, root, request.params.checkpointId);
     }
   );
@@ -624,7 +662,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'workspace.manage');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       // Long-running commands are stopped because a build writing into the tree mid-restore would
       // leave a mixture of both states. The browser and the desktop are deliberately left running:
       // their profiles are outside what a checkpoint covers, so a rewind cannot disturb them.
@@ -657,7 +695,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request, reply) => {
       requireScope(request, 'exec');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       // Every byte a command writes used to bypass the disk guard, which only covered the file
       // upload route. Refusing to start is the cheap half; execute() also watches the floor while
       // the command runs, because a command that fills the disk does it after this check.
@@ -685,7 +723,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'exec');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       await assertHostStorageWrite(root, 0, probeHostStorage);
       return processes.start(
         root,
@@ -767,7 +805,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'files.read');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return { entries: await listFiles(root, assertUserDataPath(root, request.query.path)) };
     }
   );
@@ -777,7 +815,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'files.read');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       const storageBytes = await storageUsage(root);
       return { storageBytes, ...(await probeHostStorage(root)) };
     }
@@ -788,7 +826,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request, reply) => {
       requireScope(request, 'files.read');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       const archive = spawn(
         config.TAR_EXECUTABLE,
         [
@@ -978,7 +1016,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
   }>('/v1/workspaces/:workspaceId/file', async (request) => {
     requireScope(request, 'files.write');
     const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-    await ensureRuntimeWorkspace(root);
+    await ensureWorkspace(root);
     const requestedPath = assertUserDataPath(root, request.query.path);
     const body = Buffer.isBuffer(request.body)
       ? request.body
@@ -1024,7 +1062,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'files.write');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       const requested = FolderRequest.parse(request.body);
       return createWorkspaceFolder(root, assertUserDataPath(root, requested.path));
     }
@@ -1035,7 +1073,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'files.write');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       const requested = RenameRequest.parse(request.body);
       return renameWorkspaceEntry(
         root,
@@ -1058,7 +1096,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request, reply) => {
       requireScope(request, 'files.read');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       const asked = PrepareAudioRequest.parse(request.body);
       const prepared = await prepareAudio(root, assertUserDataPath(root, asked.path), asked);
       reply.headers({
@@ -1084,7 +1122,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'exec');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return toolchainReport(root);
     }
   );
@@ -1107,7 +1145,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'exec');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return machineReport({
         root,
         // The rlimit this runner actually applies to every agent command, not a second derivation
@@ -1137,7 +1175,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'exec');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return workspaceSurfaces({
         root,
         browserExecutablePath: config.BROWSER_EXECUTABLE_PATH,
@@ -1152,7 +1190,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'exec');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       const requested = BinaryProbeRequest.parse(request.body);
       const present = await probeBinaries(root, requested.binaries);
       return {
@@ -1175,7 +1213,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'exec');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       const requested = RenderProofRequest.parse(request.body);
       return proveRender(
         root,
@@ -1324,7 +1362,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'browser.read');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return browser.snapshot(
         request.params.workspaceId,
         root,
@@ -1340,7 +1378,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'browser.read');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return browser.readElements(
         request.params.workspaceId,
         root,
@@ -1356,7 +1394,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       requireScope(request, 'browser.read');
       requireScope(request, 'files.write');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       const input = PrintPdfRequest.parse(request.body);
       await assertHostStorageWrite(root, 0, probeHostStorage);
       return browser.printPdf(
@@ -1398,7 +1436,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'browser.read');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return browser.preflight(
         request.params.workspaceId,
         root,
@@ -1413,7 +1451,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'browser.control');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return browser.act(
         request.params.workspaceId,
         root,
@@ -1454,7 +1492,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     };
     const expiresIn = Math.max(1, request.capability.exp * 1000 - Date.now());
     const expiry = setTimeout(() => socket.close(1008, 'Capability expired'), expiresIn);
-    void ensureRuntimeWorkspace(root)
+    void ensureWorkspace(root)
       .then(() =>
         browser.subscribeStream(workspaceId, root, {
           state: sendState,
@@ -1513,7 +1551,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'desktop.read');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return desktop.snapshot(
         request.params.workspaceId,
         root,
@@ -1527,7 +1565,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'desktop.control');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return desktop.launch(
         request.params.workspaceId,
         root,
@@ -1541,7 +1579,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'desktop.read');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return desktop.preflight(
         request.params.workspaceId,
         root,
@@ -1556,7 +1594,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'desktop.control');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       return desktop.act(
         request.params.workspaceId,
         root,
@@ -1607,7 +1645,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
      * session in JPEG and upgrading - spends bandwidth on a case that is rare.
      */
     let canDecodeVideo = true;
-    void ensureRuntimeWorkspace(root)
+    void ensureWorkspace(root)
       .then(() =>
         desktop.subscribeStream(workspaceId, root, {
           state: sendState,
@@ -1708,7 +1746,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     async (request) => {
       requireScope(request, 'workspace.manage');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      await ensureRuntimeWorkspace(root);
+      await ensureWorkspace(root);
       // The other half of hibernate, and the same call a snapshot or a checkpoint restore makes:
       // waking the computer has to bring back the services the owner left running on it.
       await restoreServices(root, request.params.workspaceId);
@@ -1759,7 +1797,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
      * The shell is born the size the client says its pane is, and nothing sent before it exists is
      * lost.
      *
-     * `ensureRuntimeWorkspace` is a filesystem round trip, and the message handler used to be
+     * `ensureWorkspace` is a filesystem round trip, and the message handler used to be
      * registered inside its `.then`, so every frame that arrived first was dropped on the floor -
      * including the opening `resize` the client now sends. The pty was therefore always born the
      * hardcoded 120x32 whatever the pane measured; against the ~70 columns a desktop pane actually
@@ -1840,13 +1878,16 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       clearTimeout(expiry);
       terminal?.kill();
     });
-    void ensureRuntimeWorkspace(root)
+    void ensureWorkspace(root)
       .then(() => {
         if (hungUp) return;
         const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash';
         const environment = {
           PATH: `${agentSearchPath(root)}${path.delimiter}${process.env.PATH ?? ''}`,
-          HOME: root,
+          // The same home the agent's own commands get. Two homes per workspace would mean the
+          // owner's terminal and the agent read different `.bashrc` files and different coding-CLI
+          // credentials, so signing a CLI in from the terminal would not sign it in for the task.
+          HOME: agentHome(root),
           TERM: 'xterm-256color',
           LANG: 'C.UTF-8'
         };

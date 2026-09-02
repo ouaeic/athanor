@@ -93,6 +93,29 @@ describe('workspace files', () => {
   });
 
   /*
+   * The agent's `$HOME` is `.home` at the container root (execution.ts `agentHome`), and it holds
+   * the coding CLIs' OAuth credentials and the `.bashrc` the owner's own interactive terminal
+   * sources. Nothing at the container root has ever resolved - `isUserData` admits `workspace/` and
+   * `.athanor/artifacts` alone - so the question this pins is what a BARE name means. Answered no,
+   * the way `.athanor` and `.config` are answered no, rather than folded into `workspace/.home`,
+   * which would be a write that looks like it landed somewhere and did not.
+   *
+   * The refusal is on the container's own name, not on the string: a project directory the agent
+   * genuinely made at `workspace/.home` is still reachable by saying so, and this asserts that too,
+   * because a bound that refuses legitimate work is the failure on the other side.
+   */
+  it('answers a bare .home rather than folding it into the workspace', () => {
+    expect(() => assertUserDataPath(root, '.home')).toThrow('Only workspace files');
+    expect(() => assertUserDataPath(root, '.home/.bashrc')).toThrow('Only workspace files');
+    expect(() => assertUserDataPath(root, '.home/.claude/.credentials.json')).toThrow(
+      'Only workspace files'
+    );
+    expect(assertUserDataPath(root, 'workspace/.home/notes.md')).toBe(
+      path.join('workspace', '.home', 'notes.md')
+    );
+  });
+
+  /*
    * Commands run in `workspace/`, so a bare name has to mean there and not in the container above
    * it. It used to mean the container, which is unwritable, and the agent was told only that the
    * path was wrong - so it burned turns guessing prefixes. The refusals above are the other half:

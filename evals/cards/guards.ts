@@ -1,5 +1,5 @@
 /**
- * The nine tables that stop this rig from arguing for no approval floor at all.
+ * The eleven tables that stop this rig from arguing for no approval floor at all.
  *
  * A card count is a number with two directions and only one of them is obviously good. Fewer cards
  * is the improvement everybody wants; fewer cards is also exactly what a broken floor produces, and
@@ -35,7 +35,22 @@
  *   FREE_STORE_WORK
  *             the other direction, and the expensive one. `psql -f migrations/001_init.sql` and
  *             `psql -c "select count(*) …"` are in the owner's own scenario twice each; a rule
- *             keyed on `psql` rather than on the statement takes it from four cards to six.
+ *             keyed on `psql` rather than on the statement takes it from four cards to six. The
+ *             signalling rows and the `git restore --staged` pair are here for the same reason:
+ *             each was a card in front of a call that removes nothing at all.
+ *   FREE_WORKSPACE_DELETES
+ *             a delete strictly inside `CHECKPOINT_CONTENT`, which the turn's own undo point puts
+ *             straight back. Measured at `bfbbd00`, `rm -rf dist`, `rmdir build`,
+ *             `truncate -s 0 server.log` and `find … -delete` inside `workspace/` all stopped the
+ *             turn in autonomous. Its counterweight is the second half of `DESTROYS`, which is
+ *             where the `~/.ssh` and `/etc/nginx` spellings live: a location test is one careless
+ *             widening away from being an exemption for the word `rm`, and the widening makes
+ *             every count in the table fall at once.
+ *   STOPS_THE_COMPUTER
+ *             `kill -9 1`, `shutdown`, `reboot`, `poweroff`, `halt`. Each must card in every mode.
+ *             The `shutdown` family was asserted nowhere in this rig, so the set membership that
+ *             decides four cards had no row anywhere - which is what made removing `kill`,
+ *             `killall` and `pkill` from that set a change nothing here would have felt.
  *
  * Every entry is a claim about the shipped classifier that a mutation to it would break. They are
  * assertions rather than baseline rows on purpose: a baseline row can be re-accepted by whoever
@@ -268,8 +283,9 @@ export const SINKS: readonly Sink[] = [
  * Six rows of `WRITES` used to assert that `file_write('~/.bashrc')` cards in every mode. It did,
  * and the card was fired on a write that accomplishes nothing: `assertUserDataPath` folds a bare
  * or tilde-prefixed name into `workspace/`, refuses an absolute path and refuses `..`, and the
- * agent's HOME is the container root one directory ABOVE `workspace/`. So the bytes land at
- * `workspace/.bashrc`, which no login shell has ever read, and eleven of the thirteen names in the
+ * agent's HOME is `<workspaceRoot>/.home`, beside `workspace/` and not inside it. So the bytes land
+ * at `workspace/.bashrc` - or at `workspace/~/.bashrc`, a directory literally named `~`, for the
+ * tilde spelling - and no login shell has ever read either, and eleven of the thirteen names in the
  * deferred set were unreachable by `file_write`, `file_patch` and `print_pdf` altogether.
  *
  * `C-set-up-coding` in the scenario table still carries that write, under the step name "put the
@@ -1183,6 +1199,269 @@ export const DESTROYS: readonly Guard[] = [
   guard('docker volume rm through desktop_launch', 'desktop_launch', {
     executable: 'docker',
     args: ['volume', 'rm', 'pgdata']
+  }),
+  /*
+   * THE COUNTERWEIGHT TO `FREE_WORKSPACE_DELETES`, and the arm that matters most in this file.
+   *
+   * The destructive rule now resolves where a delete lands and drops the card when every path it
+   * names is strictly inside `CHECKPOINT_CONTENT`. A location test is one careless widening away
+   * from being an exemption for the word `rm`, and the widening is invisible: every count in the
+   * table above falls and the run reads like a saving. So the deletes nothing here restores are
+   * written down, in the spellings a model really produces.
+   *
+   * `HOME` is `<workspaceRoot>/.home` - beside `workspace/` and not inside it (execution.ts
+   * `agentHome`, over `AGENT_HOME` in files.ts) - which is why `~/.ssh` and `~/.cargo` are here:
+   * they are under the root and inside no checkpoint, and a rule that asked "inside the root"
+   * rather than "strictly inside the checkpointed trees" would have freed every one of them. `cwd`
+   * is on the last row because it is an argument the catalogue shows the model, so a bare relative
+   * name is only a workspace path while the call says it is.
+   *
+   * THE LAST TWO ROWS ARE ABOUT WHERE `~` LANDS, and they exist because HOME moved. While HOME was
+   * the workspace root, reading `~` as the root was exactly right; once HOME became
+   * `<workspaceRoot>/.home`, it freed the two prefixes that mean "recoverable" wherever they
+   * appeared under HOME. Measured through `approvalRequirement` in autonomous before the fix:
+   * `rm -rf ~/workspace/dist` and `rm -rf ~/.athanor/artifacts/report.pdf` raised NO card, while
+   * what they delete is `<root>/.home/workspace/dist` and `<root>/.home/.athanor/artifacts/…` -
+   * directories the agent may create under its own HOME and that no rewind walks. They are here
+   * rather than only in the unit test because this is the production call site, and because the
+   * next move of HOME must fail somewhere the whole rig can see.
+   */
+  guard('rm -rf on somebody else’s files', 'shell', {
+    executable: 'rm',
+    args: ['-rf', '/home/other/photos']
+  }),
+  guard('rm -rf on the agent’s own keys', 'shell', { executable: 'rm', args: ['-rf', '~/.ssh'] }),
+  guard('rm -rf on a toolchain cache under HOME', 'shell', {
+    executable: 'rm',
+    args: ['-rf', '~/.cargo/registry']
+  }),
+  // A coding CLI's own configuration directory, and the row that makes this table sensitive to the
+  // copied `CHECKPOINT_CONTENT` itself rather than only to the rule that reads it: a third entry
+  // added to that array is a card that stops firing here.
+  guard('rm -rf on a coding CLI’s own configuration', 'shell', {
+    executable: 'rm',
+    args: ['-rf', '~/.config/claude']
+  }),
+  guard('rm -rf on a system directory', 'shell', {
+    executable: 'rm',
+    args: ['-rf', '/etc/nginx']
+  }),
+  guard('sudo rm -rf on a system directory', 'shell', {
+    executable: 'sudo',
+    args: ['rm', '-rf', '/etc/nginx']
+  }),
+  guard('rm -rf on the workspace tree itself', 'shell', {
+    executable: 'rm',
+    args: ['-rf', 'workspace']
+  }),
+  guard('rm -rf climbing out of the workspace', 'shell', {
+    executable: 'rm',
+    args: ['-rf', '../secrets']
+  }),
+  guard('rm -rf behind an expansion nothing here can read', 'shell', {
+    executable: 'rm',
+    args: ['-rf', '$HOME/.ssh']
+  }),
+  guard('bash -lc rm -rf on the agent’s own keys', 'shell', shell('rm -rf ~/.ssh')),
+  guard(
+    'one recoverable delete and one that is not',
+    'shell',
+    shell('rm -rf dist && rm -rf ~/.ssh')
+  ),
+  guard('a find that deletes outside the workspace', 'shell', {
+    executable: 'find',
+    args: ['~', '-name', '*.pem', '-delete']
+  }),
+  guard('a truncate under HOME', 'shell', {
+    executable: 'truncate',
+    args: ['-s', '0', '~/.ssh/known_hosts']
+  }),
+  guard('paths arriving on stdin rather than in the command', 'shell', {
+    executable: 'xargs',
+    args: ['rm', '-f']
+  }),
+  guard('a find that runs the remover on what it finds', 'shell', {
+    executable: 'find',
+    args: ['.', '-exec', 'rm', '-rf', '{}', '+']
+  }),
+  guard('a delete through a language runtime', 'shell', {
+    executable: 'node',
+    args: ['-e', "require('fs').rmSync('dist')"]
+  }),
+  guard('a bare name under a working directory outside workspace/', 'shell', {
+    executable: 'rm',
+    args: ['-rf', '.ssh'],
+    cwd: '.'
+  }),
+  /*
+   * A `cd` earlier on the same line, which is the way the location rule leaked the first time it
+   * was written. A relative path means whatever the working directory is when the command runs, so
+   * these three name `.ssh`, `photos` and `nginx` and were each read as bare names under
+   * `workspace/` - measured free in balanced AND autonomous, while all three card without the `cd`
+   * and all three carded before the location rule existed. The last one is the shape that cannot be
+   * refused inside the resolver at all: `env` hides the interpreter, so the only reader that ever
+   * sees the whole line is the caller that decomposed it.
+   */
+  guard('a delete after a cd to the agent’s HOME', 'shell', shell('cd ~ && rm -rf .ssh')),
+  guard('a delete after a cd out of the workspace', 'shell', {
+    executable: 'sh',
+    args: ['-c', 'cd /home/other && rm -rf photos']
+  }),
+  guard('a delete after a pushd, through a wrapper', 'shell', {
+    executable: 'env',
+    args: ['bash', '-lc', 'pushd /etc; rm -rf nginx']
+  }),
+  guard('a workspace-shaped name under HOME', 'shell', {
+    executable: 'rm',
+    args: ['-rf', '~/workspace/dist']
+  }),
+  guard('an artifacts-shaped name under HOME', 'shell', {
+    executable: 'rm',
+    args: ['-rf', '~/.athanor/artifacts/report.pdf']
+  }),
+  /*
+   * The same two places, reached by the other argument. `~` is one way to say "under HOME" and a
+   * `cwd` is the other, and the two rows above closed only the first: measured through
+   * `approvalRequirement` in autonomous with the `~` fix in place,
+   * `{ executable: 'rm', args: ['-rf', 'workspace/dist'], cwd: '.home' }` still raised NO card,
+   * because `workspace/…` was read from the workspace root whatever the working directory was.
+   * `resolveInside` accepts any path inside the container root for a `cwd`, so `.home` is one the
+   * model may simply write.
+   *
+   * The counter-direction has no row of its own here, and the reason is worth writing down rather
+   * than filling the gap with one that cannot fail. Narrowing the condition costs no legitimate
+   * exemption: from a `cwd` at or inside a checkpointed tree the literal reading lands inside that
+   * same tree, so both readings answer "recoverable" and the row would pass however the condition
+   * was mutated. What narrowing it DOES cost is a card, and that is already pinned above -
+   * `rm -rf on the workspace tree itself` is carded only by the root-relative reading, and
+   * disabling the equivalence outright frees it in balanced and autonomous.
+   */
+  guard('a workspace-shaped name from a working directory under HOME', 'shell', {
+    executable: 'rm',
+    args: ['-rf', 'workspace/dist'],
+    cwd: '.home'
+  }),
+  guard('an artifacts-shaped name from a working directory under HOME', 'shell', {
+    executable: 'rm',
+    args: ['-rf', '.athanor/artifacts/report.pdf'],
+    cwd: '.home'
+  }),
+  /*
+   * A WHOLE SECOND CHECKOUT, which is the largest thing any git subcommand deletes and which this
+   * tree documented without carding. `worktree` was added to `WRITING_GIT_SUBCOMMANDS` with a
+   * comment naming exactly this destruction - the directory and everything uncommitted in it - and
+   * wired only to the completion clock; nothing in the destructive vocabulary read it. Measured
+   * through `approvalRequirement` in autonomous with an undo point before these rows existed:
+   * `git worktree remove --force ~/wt` raised no card, and neither did the script spelling, where
+   * the walk placed `dist` and read the git command as removing nothing at all.
+   */
+  guard('git worktree remove under HOME', 'shell', {
+    executable: 'git',
+    args: ['worktree', 'remove', '--force', '~/wt']
+  }),
+  guard('git worktree remove beside a recoverable delete', 'shell', {
+    executable: 'bash',
+    args: ['-lc', 'rm -rf dist && git worktree remove --force ../wt']
+  })
+];
+
+/**
+ * Deletes the turn's own undo point puts straight back, which stopped the turn anyway.
+ *
+ * Measured through the shipped `approvalRequirement` at bfbbd00, in AUTONOMOUS: every row here
+ * raised `external_consequential` under a preview reading "This can remove or overwrite data" -
+ * true of all of them, and beside the point, because `CHECKPOINT_CONTENT` is `workspace` and
+ * `.athanor/artifacts` and every one of these is strictly inside it. DESIGN.md:168-175 says the
+ * card is owed when the act cannot be taken back by this computer; the rewind takes all of these
+ * back. The owner's own `H-tidy-downloads` - "clear out the old installers" - paid two cards in
+ * every mode for two deletes inside `workspace/downloads`.
+ *
+ * This is the direction a card count rewards, so `DESTROYS` above holds the other one and the two
+ * are read in the same walk. Outside review, because review cards every shell call by definition.
+ */
+export const FREE_WORKSPACE_DELETES: readonly Guard[] = (
+  [
+    guard('rm -rf a build directory', 'shell', { executable: 'rm', args: ['-rf', 'dist'] }),
+    guard('rm -rf node_modules', 'shell', { executable: 'rm', args: ['-rf', 'node_modules'] }),
+    guard('rm on a path spelled from the root', 'shell', {
+      executable: 'rm',
+      args: ['workspace/tmp.log']
+    }),
+    guard('rmdir', 'shell', { executable: 'rmdir', args: ['build'] }),
+    guard('truncate a log', 'shell', {
+      executable: 'truncate',
+      args: ['-s', '0', 'server.log']
+    }),
+    guard('unlink', 'shell', { executable: 'unlink', args: ['workspace/a.sock'] }),
+    guard('shred a scratch file', 'shell', {
+      executable: 'shred',
+      args: ['-u', 'workspace/secret.txt']
+    }),
+    guard('find -delete inside the workspace', 'shell', {
+      executable: 'find',
+      args: ['workspace/downloads', '-name', '*.tmp', '-delete']
+    }),
+    guard('rm on an artifact', 'shell', {
+      executable: 'rm',
+      args: ['.athanor/artifacts/report.pdf']
+    }),
+    // The spelling `shell`'s own description tells the model to reach for the moment it needs a
+    // glob, and the one `H-tidy-downloads` uses.
+    guard('bash -lc rm -rf', 'shell', shell('rm -rf dist')),
+    guard('bash -lc rm with a glob', 'shell', shell('rm -f workspace/downloads/*.dmg')),
+    guard('bash -lc a delete after ordinary work', 'shell', shell('pnpm build && rm -rf dist')),
+    guard('a working directory further inside the workspace', 'shell', {
+      executable: 'rm',
+      args: ['-rf', 'dist'],
+      cwd: 'workspace/tracker'
+    }),
+    // `desktop_launch` defaults its `cwd` to `workspace` exactly as `shell` does, so the same
+    // delete is the same answer through the window as through the pipe.
+    guard('rm -rf a build directory through desktop_launch', 'desktop_launch', {
+      executable: 'rm',
+      args: ['-rf', 'dist']
+    }),
+    // The counter-direction for the two `git worktree remove` rows in `DESTROYS`: a worktree the
+    // agent made for itself inside the workspace is strictly inside `CHECKPOINT_CONTENT`, so the
+    // same location test that frees `rm -rf dist` frees it. Without this row the new card would be
+    // satisfied by carding every worktree removal, which is the shape a narrowing has to disprove.
+    guard('git worktree remove inside the workspace', 'shell', {
+      executable: 'git',
+      args: ['worktree', 'remove', 'workspace/wt']
+    })
+  ] as const
+).map((entry) => ({ ...entry, modes: OUTSIDE_REVIEW }));
+
+/**
+ * The acts that end every process on this computer, which are not deletions and were filed as
+ * though they were.
+ *
+ * `kill`, `killall` and `pkill` sat in `consequentialExecutables` beside `rm` and `dd`, so
+ * `kill -0 1234` - a liveness probe that sends no signal at all - stopped the turn in all three
+ * modes under "This can remove or overwrite data". Removing the three names from that set is the
+ * saving; this table is what stops the saving from taking the machine-state family with it. The
+ * `shutdown` family was asserted nowhere in this rig before it, so a set membership that decides
+ * four cards had no row anywhere.
+ *
+ * PID 1 is the init process and `-1` is every process the caller may signal: both end this turn
+ * along with everything else running here, and nothing on this computer starts it again.
+ */
+export const STOPS_THE_COMPUTER: readonly Guard[] = [
+  guard('kill -9 1', 'shell', { executable: 'kill', args: ['-9', '1'] }),
+  guard('kill 1', 'shell', { executable: 'kill', args: ['1'] }),
+  guard('kill -9 -1, which is every process', 'shell', {
+    executable: 'kill',
+    args: ['-9', '-1']
+  }),
+  guard('bash -lc kill -9 1', 'shell', shell('kill -9 1')),
+  guard('shutdown', 'shell', { executable: 'shutdown', args: ['-h', 'now'] }),
+  guard('sudo shutdown', 'shell', { executable: 'sudo', args: ['shutdown', '-r', 'now'] }),
+  guard('reboot', 'shell', { executable: 'reboot', args: [] }),
+  guard('poweroff', 'shell', { executable: 'poweroff', args: [] }),
+  guard('halt', 'shell', { executable: 'halt', args: [] }),
+  guard('kill -9 1 through desktop_launch', 'desktop_launch', {
+    executable: 'kill',
+    args: ['-9', '1']
   })
 ];
 
@@ -1425,6 +1704,43 @@ export const FREE_STORE_WORK: readonly Guard[] = (
     guard('staging one of them', 'shell', {
       executable: 'git',
       args: ['add', 'deploy/init.d/app']
+    }),
+    /*
+     * Signalling a process, which the floor filed beside `rm` and `dd` until this wave. Measured at
+     * bfbbd00, in ALL THREE modes: `kill -0 1234` - which sends no signal and only asks whether a
+     * process is alive - `pkill -f vite` and `killall node` each stopped the turn under a preview
+     * reading "This can remove or overwrite data", which is false of every one of them. Stopping
+     * the dev server this agent started two calls earlier is the shape, and `STOPS_THE_COMPUTER`
+     * above holds the other direction.
+     */
+    guard('kill a process by pid', 'shell', { executable: 'kill', args: ['1234'] }),
+    guard('kill -0, which asks whether it is alive', 'shell', {
+      executable: 'kill',
+      args: ['-0', '1234']
+    }),
+    guard('kill -TERM a process', 'shell', { executable: 'kill', args: ['-TERM', '4321'] }),
+    guard('pkill the dev server', 'shell', { executable: 'pkill', args: ['-f', 'vite'] }),
+    guard('killall node', 'shell', { executable: 'killall', args: ['node'] }),
+    /*
+     * The unstage, which moves the index and neither reads nor writes the working file. It carded
+     * in every mode while `reset --hard` and `checkout --` - decided two lines away in the same
+     * expression - were correctly flag-narrowed. The spelling that DOES rewrite the file keeps its
+     * card, and that half is asserted at the production call site in
+     * `apps/worker/src/approval-policy.test.ts`: `git restore src/a.ts` overwrites a file inside
+     * `workspace/`, so `DESTROYS` is the wrong table for it - every sentence in that table's
+     * failure detail is about a store this computer does not hold.
+     */
+    guard('git restore --staged, which unstages', 'shell', {
+      executable: 'git',
+      args: ['restore', '--staged', 'src/a.ts']
+    }),
+    guard('the short spelling of the same unstage', 'shell', {
+      executable: 'git',
+      args: ['restore', '-S', 'src/a.ts']
+    }),
+    guard('git worktree list, which is a read', 'shell', {
+      executable: 'git',
+      args: ['worktree', 'list']
     })
   ] as const
 ).map((entry) => ({ ...entry, modes: OUTSIDE_REVIEW }));

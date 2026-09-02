@@ -409,6 +409,15 @@ describe('turn checkpoints', () => {
 
     const created = await checkpoints.create(WORKSPACE_ID, root, { checkpointId: randomUUID() });
     expect(created.uncoveredFileCount).toBe(1);
+    /*
+     * And WHICH file, because the count alone cannot be spent. The worker's approval floor frees a
+     * delete strictly inside `CHECKPOINT_CONTENT` on the grounds that a rewind puts it back, which
+     * is untrue of exactly this file; with only a count it would have to card every delete on the
+     * turn, and a workspace built for weights or sequencing reads holds a file like this
+     * permanently. `small.txt` is here to be absent from the list.
+     */
+    expect(created.uncoveredPaths).toEqual(['workspace/disk.img']);
+    expect(created.uncoveredPathsTruncated).toBe(false);
     await writeFile(path.join(root, 'workspace', 'disk.img'), randomBytes(4096));
 
     const preview = await checkpoints.preview(WORKSPACE_ID, root, created.id);
@@ -419,6 +428,32 @@ describe('turn checkpoints', () => {
     const before = await readFile(path.join(root, 'workspace', 'disk.img'));
     await checkpoints.restore(WORKSPACE_ID, root, created.id);
     await expect(readFile(path.join(root, 'workspace', 'disk.img'))).resolves.toEqual(before);
+  });
+
+  /*
+   * The bound on the list, and the reason it is signalled rather than silently short.
+   *
+   * Sixty-four paths is 128 GiB of oversize content at the shipped 2 GiB ceiling, more than any
+   * workspace on this box has held - but a sparse file is over the ceiling by size and costs no
+   * disk at all, so passing it is reachable rather than theoretical. A short list that did not say
+   * it was short would tell the worker's floor that a workspace holds sixty-four oversize files
+   * when it holds two hundred, and a delete naming the sixty-fifth would be freed by a list that
+   * does not mention it. The worker reads the flag as "no list at all" and keeps every card.
+   */
+  it('says so when there are more uncovered files than it can name', async () => {
+    const { workspaceRoot, root } = await workspace();
+    const checkpoints = new WorkspaceCheckpoints(config(workspaceRoot, { maxFileBytes: 16 }));
+    for (let index = 0; index < 70; index += 1)
+      await writeFile(path.join(root, 'workspace', `big-${index}.img`), randomBytes(64));
+
+    const created = await checkpoints.create(WORKSPACE_ID, root, { checkpointId: randomUUID() });
+
+    expect(created.uncoveredFileCount).toBe(70);
+    expect(created.uncoveredPathsTruncated).toBe(true);
+    expect(created.uncoveredPaths).toHaveLength(64);
+    // Sorted before it is cut, so two checkpoints of an unchanged tree name the same sixty-four
+    // rather than whichever the parallel walk reached first.
+    expect(created.uncoveredPaths).toEqual([...created.uncoveredPaths].sort());
   });
 
   it('keeps the recent turns and collects the content nothing names any more', async () => {

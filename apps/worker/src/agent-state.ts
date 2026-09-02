@@ -272,7 +272,26 @@ export interface AgentState {
    * one. A null id means it was attempted and could not be taken - recorded so the turn does not
    * retry a failing checkpoint before every subsequent call.
    */
-  checkpoint?: { turn: number; id: string | null };
+  checkpoint?: {
+    turn: number;
+    id: string | null;
+    /**
+     * The files inside the checkpointed trees that this checkpoint WALKED and did not HOLD - each
+     * one over `CHECKPOINT_MAX_FILE_BYTES`, recorded by the scan and skipped - or absent when that
+     * set is not known.
+     *
+     * The approval floor is the only reader. It frees a delete strictly inside `CHECKPOINT_CONTENT`
+     * because a rewind puts it back, and that is false of exactly these paths, so a delete naming
+     * one of them keeps its card while every other delete on the turn stays free.
+     *
+     * Absent keeps the card on ALL of them, and absent is what an old persisted state, a runner one
+     * release behind, or a capped list all produce. The sole writer is
+     * `AgentWorker.#ensureTurnUndoPoint`, which records `AgentRunnerClient.checkpoint`'s `uncovered`
+     * verbatim; a refused checkpoint writes `{ turn, id: null }` and no set, which is right twice
+     * over - there is nothing to rewind to.
+     */
+    uncovered?: readonly string[];
+  };
   pending?: { approvalId: string; toolCall: ModelToolCall; handoffOnly?: boolean };
   /**
    * The question this turn is parked on, and how many it has asked.

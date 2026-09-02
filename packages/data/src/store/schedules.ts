@@ -120,6 +120,19 @@ export class ScheduleStore {
     return result.rows[0] ? mapTaskSchedule(result.rows[0]) : null;
   }
 
+  /**
+   * The switch an owner throws, on either side.
+   *
+   * `consecutive_failures=0` is here because this is the statement a resume goes through, and a
+   * schedule that has just been turned back on has to get its full patience back: the streak that
+   * paused it is over the moment a person decides to try again. Before the counter existed the
+   * streak was read out of `task_schedule_runs`, which this statement does not touch, so the three
+   * failures that caused the pause were still the three newest rows and the very next failure
+   * re-paused the schedule - measured through the resume route, one failure rather than three.
+   *
+   * It resets on the pause side too, which costs nothing: a disabled schedule is not dispatched, so
+   * the only reader of the counter cannot run until something enables it again.
+   */
   async setTaskScheduleEnabled(
     userId: string,
     id: string,
@@ -129,7 +142,7 @@ export class ScheduleStore {
     const result = await this.database.query(
       `UPDATE task_schedules SET enabled=$3,
        next_run_at=CASE WHEN $3 THEN $4 ELSE next_run_at END,lease_owner=NULL,
-       lease_expires_at=NULL,last_error_code=NULL,updated_at=NOW()
+       lease_expires_at=NULL,last_error_code=NULL,consecutive_failures=0,updated_at=NOW()
        WHERE id=$2 AND EXISTS (
          SELECT 1 FROM workspaces w
          WHERE w.id=task_schedules.workspace_id AND w.user_id=$1
@@ -228,7 +241,20 @@ export class ScheduleStore {
     preparingEventCiphertext: EncryptedEnvelope;
     failureEventCiphertext: EncryptedEnvelope;
     forceFailureCode?: string;
-  }): Promise<{ task: TaskRecord; outcome: 'queued' | 'failed'; errorCode: string | null } | null> {
+  }): Promise<{
+    task: TaskRecord;
+    outcome: 'queued' | 'failed';
+    errorCode: string | null;
+    /**
+     * How many runs in a row, ending with this one, have failed for `model_unavailable`. Zero after
+     * any other outcome, including a queued run and a failure with a different code.
+     *
+     * Returned rather than left for the caller to query, because the value the caller needs is the
+     * one this transaction just wrote: a separate read afterwards is a second answer to the same
+     * question, and on a box with two schedulers it is a read of somebody else's write.
+     */
+    consecutiveFailures: number;
+  } | null> {
     const materialized = await this.database.transaction(async (tx) => {
       const locked = await tx.query(
         `SELECT * FROM task_schedules WHERE id=$1 AND lease_owner=$2
@@ -316,10 +342,23 @@ export class ScheduleStore {
          VALUES ($1,$2,$3,$4,$5)`,
         [input.scheduleId, schedule.next_run_at, input.taskId, outcome, errorCode]
       );
-      await tx.query(
+      /*
+       * The streak moves in the same statement that records the run, so there is no window in which
+       * the ledger and the counter disagree, and it is `RETURNING` rather than read back because a
+       * second SELECT on a box running two schedulers reads whichever write landed last.
+       *
+       * `model_unavailable` is the only code that increments, matching the only code the dispatcher
+       * escalates on: a workspace that is starting or being deleted is a state that ends, and
+       * `spend_cap_reached` rolls over into the next window on its own. Every other outcome - a
+       * queued run included - resets to zero, so the count is a streak ending at this run and not a
+       * lifetime total.
+       */
+      const counted = await tx.query<{ consecutive_failures: number }>(
         `UPDATE task_schedules SET enabled=$3,next_run_at=$4,last_run_at=$5,last_task_id=$6,
-         last_error_code=$7,lease_owner=NULL,lease_expires_at=NULL,updated_at=NOW()
-         WHERE id=$1 AND lease_owner=$2`,
+         last_error_code=$7,consecutive_failures=CASE WHEN $7='model_unavailable'
+           THEN consecutive_failures + 1 ELSE 0 END,
+         lease_owner=NULL,lease_expires_at=NULL,updated_at=NOW()
+         WHERE id=$1 AND lease_owner=$2 RETURNING consecutive_failures`,
         [
           input.scheduleId,
           input.workerId,
@@ -330,7 +369,12 @@ export class ScheduleStore {
           errorCode
         ]
       );
-      return { task: mapTask(taskResult.rows[0]!), outcome, errorCode };
+      return {
+        task: mapTask(taskResult.rows[0]!),
+        outcome,
+        errorCode,
+        consecutiveFailures: Number(counted.rows[0]?.consecutive_failures ?? 0)
+      };
     });
     if (materialized) {
       if (materialized.task.status === 'queued') this.#signal(TASK_QUEUE_CHANNEL, input.taskId);

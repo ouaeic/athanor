@@ -13,6 +13,7 @@ import { textValue } from './values.js';
 import {
   callDestinations,
   commandInterpreters,
+  commandsChangeDirectory,
   commandScript,
   consequentialExecutables,
   COMMAND_RUNNERS,
@@ -20,7 +21,9 @@ import {
   effectiveCommands,
   forcedGitPush,
   gitConfigRunsCode,
+  gitRemovesAWorktree,
   gitSubcommand,
+  insideCheckpointContent,
   isDestructiveScript,
   isScheduledExecutionPath,
   reachesAnUnreadableFarEnd,
@@ -30,9 +33,12 @@ import {
   packageRemovalCommands,
   packageRemovalExecutables,
   publishingOperation,
+  removalTargets,
+  removesUncoveredFile,
   safeNetworkExecutables,
   scriptDestroysAStore,
-  sendsDataOverNetwork
+  sendsDataOverNetwork,
+  signalStopsThisComputer
 } from './command-classification.js';
 import {
   deferredExecutionPaths,
@@ -187,6 +193,63 @@ export interface ApprovalContext {
     enabled: boolean;
     useCount: number;
     updatedAt: string;
+  };
+  /**
+   * What this turn's undo point actually holds, written by whoever took it - or failed to take it.
+   *
+   * The location half of the destructive rule below drops a card on the grounds that a rewind puts
+   * the delete back, and `CHECKPOINT_CONTENT` is the set of trees a checkpoint WALKS, not what it
+   * HOLDS. Two ceilings separate those, and neither is visible to a pure function of the model's
+   * arguments: a scan over `CHECKPOINT_MAX_FILES` (250,000 by default) throws
+   * `CheckpointRefusedError` and the turn gets NO undo point at all
+   * (services/workspace-runner/src/checkpoints.ts:438-442), and a file over
+   * `CHECKPOINT_MAX_FILE_BYTES` (2 GiB) is recorded uncovered and walked past (:424-427). So the
+   * fact is carried here rather than looked up, and `approvalRequirement` stays a pure function of
+   * the tool name and the arguments plus what its caller hands it.
+   *
+   * Absent means nobody has said yet, and absent keeps the card.
+   *
+   * It used to mean two different things at once, and one of them was a mistake nothing measured.
+   * `turn/execute-call.ts` took the checkpoint AFTER `turn/dispatch.ts` had asked the floor, so on
+   * the first non-exempt call of a turn the fact was absent because nobody had got round to it -
+   * indistinguishable here from a checkpoint the runner had refused. The cost was one card for a
+   * turn whose opening act was itself a recoverable delete, while the identical delete two calls
+   * later was free: a verdict decided by position in the batch rather than by anything about the
+   * command. The undo point is now taken in `turn/dispatch.ts` immediately before the floor is
+   * asked, so absent here means what it says - this turn has no rewind - and every call of a turn
+   * gets the same answer as every other.
+   *
+   * A previous turn's checkpoint is deliberately not accepted as evidence for this one. The way a
+   * workspace crosses the file ceiling is by having a dependency tree unpacked into it, which is
+   * something a turn does to itself - so the turn where the fact stops being true is exactly the
+   * turn that would be relying on the stale one.
+   */
+  undoPoint?: {
+    /**
+     * The checkpoint a rewind of this turn would land on, or null when the attempt was refused.
+     * Null and absent both keep the card; they are kept apart because only null means the owner
+     * was told, in the timeline, that this turn has no undo point.
+     */
+    id: string | null;
+    /**
+     * The files that checkpoint WALKED and did not HOLD, root-relative - each over
+     * `CHECKPOINT_MAX_FILE_BYTES` (2 GiB) - or absent when the set is not known.
+     *
+     * This is the second ceiling, and it is the one that costs real data. A 4 GiB weight file inside
+     * `workspace/` is recorded uncovered by the scan and walked past, so `rm workspace/model.gguf`
+     * is strictly inside `CHECKPOINT_CONTENT`, was freed by the location rule below, and is restored
+     * by nothing. A delete naming one of these paths - or a directory above one - keeps its card.
+     *
+     * A SET rather than a count, because a count is a blanket. A workspace built for model weights
+     * or sequencing reads holds an oversize file more or less permanently, so a count would keep the
+     * card on `rm -rf dist` for the life of that workspace: the friction the location rule exists to
+     * remove, reinstated on exactly the machines the ceiling exists for.
+     *
+     * Absent keeps the card on every delete, and absent is the honest answer for a runner one
+     * release behind this worker, a list the runner had to cut off, and a state row written before
+     * this field existed. Empty means the walk held everything and is the ordinary answer.
+     */
+    uncovered?: readonly string[];
   };
   /** Origins that put untrusted content in this turn. Empty means the turn is clean. */
   taintSources?: readonly string[];
@@ -572,6 +635,25 @@ const serviceRequirement = (
  * `forcedGitPush` and a card that says what a forced push does. Counted, and the residue named, in
  * docs/design/itself/DESTRUCTION.md.
  *
+ * AND THE HALF OF "DESTROYING DATA" THE CODE HAD BACKWARDS, this wave. The sentence's first four
+ * words are the whole rule - "Only what this computer cannot take back for you" - and the branch
+ * under it asked what a command was CALLED and never where it pointed. Measured through this
+ * function at bfbbd00, in autonomous: `rm -rf dist`, `rm workspace/tmp.log`, `rmdir build`,
+ * `truncate -s 0 server.log` and `find workspace/downloads -name '*.tmp' -delete` all stopped the
+ * turn, and this computer takes every one of them back by itself - they are strictly inside
+ * `CHECKPOINT_CONTENT` and the turn's own undo point already holds them. So the sentence is
+ * unchanged here too, for the second time in this comment and for the opposite reason: the words
+ * were right and the code was reading only half of them. `destructiveCommand` now resolves where a
+ * delete lands, and `insideCheckpointContent` is where the resolution and its three refusals live.
+ * The counterweight is in `evals/cards/guards.ts`, because a location test that widens into an
+ * exemption for the word `rm` makes every count in that rig fall at once and reads like a saving.
+ *
+ * WHAT THAT DID NOT REACH, said plainly rather than implied. The git arms beside it - `clean -f`,
+ * `reset --hard`, `checkout --` and a `restore` that rewrites a file - throw away uncommitted work
+ * inside `workspace/`, which is inside the undo point, and they keep their cards. They are not
+ * resolved by the same test because what they discard is not a path either of them names, and
+ * nothing has measured what dropping them would cost or save. It is a residue, not a decision.
+ *
  * WHAT IS STILL DELIBERATELY LEFT ALONE. "Publishing" is a category name and carries the gaps its
  * category has. It reaches `vercel --prod`, `flyctl deploy` and `kubectl apply` now, through
  * `deploymentOperation`'s tables and the walk in `publishingOperation` - the sentence was written
@@ -779,7 +861,8 @@ const ordinaryRequirement = (
    * A write that runs later, outside every approval, checked before anything else this function
    * asks.
    *
-   * The agent's HOME is the workspace root and the subscription coding CLIs run from it, so
+   * The agent's HOME is `.home` at the container root, beside `workspace/` and not inside it
+   * (execution.ts), and the subscription coding CLIs run from it, so
    * `~/.bashrc`, `~/.gitconfig`, `.git/hooks/pre-commit` and a CLI's own configuration are not
    * files the agent wrote - they are code a longer-lived and more privileged process will execute
    * on its own schedule, after this task and every card in it is over. Nothing in this floor named
@@ -802,10 +885,13 @@ const ordinaryRequirement = (
    *
    * KEPT WHERE IT BITES AND DROPPED WHERE IT CANNOT. `shell` is not path-confined and `~/.bashrc`
    * there is the real one; `file_write`, `file_patch` and `print_pdf` are, because every path they
-   * are handed goes through `assertUserDataPath` and comes back inside `workspace/` - one directory
-   * BELOW the agent's HOME. So eleven of the thirteen names in the deferred set were unreachable by
-   * those three tools and the card was firing `external_consequential`, in every mode, on a write
-   * that lands where no login shell and no git ever looks. `deferredExecutionPaths` is the one
+   * are handed goes through `assertUserDataPath` and comes back inside `workspace/`, which is a
+   * SIBLING of the agent's HOME and not a parent or a child of it. So eleven of the thirteen names
+   * in the deferred set were unreachable by those three tools and the card was firing
+   * `external_consequential`, in every mode, on a write that lands where no login shell and no git
+   * ever looks. Those three tools cannot reach HOME at all now that it is `.home` at the container
+   * root: the fold to `workspace/` is what used to put `file_write('.home/.bashrc')` on the real
+   * one when HOME lived under `workspace/`. `deferredExecutionPaths` is the one
    * reader that holds both halves; the two names that execute wherever they sit, the git hooks and
    * config, and the coding-CLI directories all keep their card through every tool, because a coding
    * CLI and git read those out of the project directory the agent is working in.
@@ -837,10 +923,14 @@ const ordinaryRequirement = (
    * separately and which is a bound rather than a habit: every path `file_write`, `file_patch` and
    * `print_pdf` are handed goes through `assertUserDataPath`, which refuses anything absolute or
    * stepping up through `..` and folds a bare name into `workspace/`. So
-   * `file_write('.config/systemd/user/x.service')` writes
-   * `workspace/.config/systemd/user/x.service`, which no scheduler has ever read, and carding it
-   * would be the exact defect eleven rows of the deferred set were fixed for. The pair is held in
-   * `CONFINED` in evals/cards.
+   * `file_write('.config/systemd/user/x.service')` is refused outright - `.config` is one of
+   * files.ts's `CONTAINER_ONLY` names (`['.athanor', '.config', AGENT_HOME]`, files.ts:103), and
+   * the bare-name fold is conditional on the first segment NOT being one of them, so the write ends
+   * at "Only workspace files and published artifacts are accessible" rather than landing anywhere.
+   * The conclusion is the one this clause was always making and it holds for a stronger reason: no
+   * card is owed, and carding it would be the exact defect eleven rows of the deferred set were
+   * fixed for. A name that IS folded - `crontab`, say - lands at `workspace/crontab`, which no
+   * scheduler reads. The pair is held in `CONFINED` in evals/cards.
    */
   const scheduled = (name === 'shell' ? writtenPaths(name, args) : [])
     .filter((path) => isScheduledExecutionPath(path))
@@ -1001,15 +1091,44 @@ const ordinaryRequirement = (
    */
   const destructiveCommand = (
     executable: string,
-    commandArgs: string[]
+    commandArgs: string[],
+    // True when an earlier command on the same line moved the working directory, which is only ever
+    // known by the caller that decomposed the line. See the location test at the foot of this
+    // function: a re-based relative path is not the path this function would resolve.
+    rebased = false
   ): { action: string; preview: string } | null => {
     const lowerArgs = commandArgs.map((argument) => argument.toLowerCase());
     const gitCommand = executable === 'git' ? gitSubcommand(commandArgs) : null;
+    /*
+     * `git restore` covers two acts and only one of them touches a file.
+     *
+     * `git restore --staged src/a.ts` unstages: the index moves and the file on disk is neither
+     * read nor written, so the card in front of it - `external_consequential`, in every mode, under
+     * a preview reading "This can remove or overwrite data" - was asking the owner to approve a
+     * delete that could not happen. `git restore src/a.ts` and `git restore --staged --worktree
+     * src/a.ts` both overwrite the working file from the index and both keep their card. That is
+     * the same flag narrowing `clean` and `reset` two lines up already had and this arm did not.
+     *
+     * The short forms are compared RAW, for the reason the curl option sets in
+     * command-classification.ts give: `-S` is `--staged` and `-s` is `--source`, so a lowercased
+     * comparison would read `git restore -s HEAD~1 src/a.ts` - which does rewrite the file - as an
+     * unstage. A bundled `-SW` is not read and falls to the carding side.
+     */
+    const unstageOnly =
+      commandArgs.some((argument) => argument === '--staged' || argument === '-S') &&
+      !commandArgs.some((argument) => argument === '--worktree' || argument === '-W');
     const gitDestructive =
       (gitCommand === 'clean' && lowerArgs.some((argument) => /^-[a-z]*f/.test(argument))) ||
       (gitCommand === 'reset' && lowerArgs.includes('--hard')) ||
-      gitCommand === 'restore' ||
-      (gitCommand === 'checkout' && lowerArgs.includes('--'));
+      (gitCommand === 'restore' && !unstageOnly) ||
+      (gitCommand === 'checkout' && lowerArgs.includes('--')) ||
+      // A whole second checkout and everything uncommitted in it, which is the largest thing any
+      // git subcommand deletes. It was documented and uncarded: `worktree` is in
+      // `WRITING_GIT_SUBCOMMANDS` with a comment naming this exact destruction, and nothing in this
+      // vocabulary read it. Narrowed to the verb like the three arms above - `git worktree list`,
+      // `add`, `lock` and `prune` remove no checkout and stay free - and routed through the same
+      // location test below, so a worktree the agent made under `workspace/` costs nothing.
+      (executable === 'git' && gitRemovesAWorktree(commandArgs));
     const findDelete = executable === 'find' && lowerArgs.includes('-delete');
     const rsyncDelete = executable === 'rsync' && lowerArgs.includes('--delete');
     // A command that runs another one is judged by what it runs. `find . -exec rm -rf {} +` and
@@ -1029,6 +1148,18 @@ const ordinaryRequirement = (
       lowerArgs.some((argument) => packageRemovalCommands.has(argument));
     const destructiveScript =
       commandInterpreters.has(executable) && isDestructiveScript(commandScript(args));
+    /*
+     * A signal to PID 1 is the `shutdown` family arriving by another spelling, and it is here
+     * because `kill`, `killall` and `pkill` have left `consequentialExecutables`. It is its own
+     * card rather than a membership, because it is decided by the target and not by the program -
+     * `kill -0 1234` and `kill -9 1` are the same executable and are not the same act - and it says
+     * what it does rather than borrowing the removal preview, which was false of all three names.
+     */
+    if (signalStopsThisComputer(executable, commandArgs))
+      return {
+        action: `Stop this computer with ${executable}`,
+        preview: `Run ${[executable, ...commandArgs].join(' ')}. PID 1 is this computer's init process and -1 is every process on it: signalling either ends everything running here, this turn included, and nothing on this computer starts it again.`
+      };
     if (
       !(
         consequentialExecutables.has(executable) ||
@@ -1039,6 +1170,79 @@ const ordinaryRequirement = (
         wrapped ||
         packageRemoval ||
         destructiveScript
+      )
+    )
+      return null;
+    /*
+     * WHERE IT LANDS, which is the half of the house rule this arm never asked.
+     *
+     * DESIGN.md:168-175 says a card is owed when the act cannot be taken back by this computer, and
+     * defines that as the checkpoint's actual coverage. Measured through this function at bfbbd00,
+     * in autonomous: `rm -rf dist`, `rm workspace/tmp.log`, `rmdir build`,
+     * `truncate -s 0 server.log`, `find workspace/downloads -name '*.tmp' -delete` and
+     * `rm -rf node_modules` ALL stopped the turn, and every one of them is inside
+     * `CHECKPOINT_CONTENT` and put straight back by the undo point the same turn had already taken.
+     * The owner's own housekeeping task - "clear out the old installers" - cost two cards in every
+     * mode for two deletes inside `workspace/downloads`.
+     *
+     * So the targets are resolved and the card is dropped only when EVERY path the command names
+     * is strictly inside a tree a rewind restores. `removalTargets` answers null for every shape it
+     * cannot place - a wrapper, a device writer, a delete through a language runtime, an escaping
+     * redirect, an unreadable script - and null keeps the card, so this can only ever remove a card
+     * from a command whose whole effect it has read.
+     *
+     * `insideCheckpointContent` carries the reason `strictly` is not `inside the root`:
+     * execution.ts puts `HOME` at `.home` beside `workspace/` and not inside it, so `rm -rf ~/.ssh`
+     * and `rm -rf ~/.cargo` are inside the container root and inside no checkpoint, and they keep
+     * their card.
+     *
+     * AND A TREE THE CHECKPOINT WALKS IS NOT A TREE IT HOLDS, which is the second way this rule
+     * leaked. `CHECKPOINT_CONTENT` names what the scan descends into; two ceilings decide what
+     * comes back out. Over `CHECKPOINT_MAX_FILES` - 250,000, config.ts:84 - the scan throws
+     * `CheckpointRefusedError` and the turn has no undo point at all, and `#ensureTurnUndoPoint`
+     * writes that into the timeline and carries on, which is right for the work and fatal for this
+     * rule: every delete inside `workspace/` would be free on a turn nothing can rewind. So the
+     * card is dropped only when the caller has said an undo point exists for THIS turn.
+     * `context.undoPoint` is that fact and absent keeps the card - @see `ApprovalContext.undoPoint`
+     * for why absent is the honest answer on a turn's first call rather than a gap.
+     *
+     * The second ceiling is `CHECKPOINT_MAX_FILE_BYTES` - 2 GiB, config.ts:87-91 - which makes the
+     * scan record a larger file as uncovered and walk past it, so `rm workspace/model.gguf` on a
+     * 4 GiB weight file is strictly inside `CHECKPOINT_CONTENT` and is restored by nothing. It rides
+     * the same fact, as `context.undoPoint.uncovered`: the paths the walk skipped, carried from the
+     * runner's own scan. A delete naming one of them - or a directory above one - keeps its card,
+     * and every other delete on the turn stays free. Absent keeps the card on all of them, which is
+     * what an old state row, a capped list and a runner one release behind all produce.
+     *
+     * A set and not a count, and that is the whole reason this took a second field on the wire. A
+     * workspace built for model weights or sequencing reads holds an oversize file permanently, so a
+     * count would card `rm -rf dist` for the life of that workspace - the friction this rule exists
+     * to remove, reinstated on exactly the machines the ceiling exists for.
+     *
+     * AND A `cd` EARLIER ON THE SAME LINE ANSWERS NOTHING, which is where this rule first leaked.
+     * The relative path a command names means whatever the working directory is when it runs, so
+     * `cd ~ && rm -rf .ssh` names `.ssh` and removes the agent's own keys. The script spelling is
+     * refused inside `removalTargets` by `commandsChangeDirectory`; the decomposed spelling -
+     * `env bash -lc '…'`, where this function is handed one command out of a line it never saw -
+     * can only be refused by the caller that did the decomposing, which is why `rebased` is a
+     * parameter and not something read here.
+     */
+    const removals = rebased
+      ? null
+      : removalTargets(
+          executable,
+          commandArgs,
+          commandInterpreters.has(executable) ? commandScript(args) : ''
+        );
+    const workingDirectory = textValue(args.cwd) || 'workspace';
+    const uncovered = context.undoPoint?.uncovered;
+    if (
+      context.undoPoint?.id &&
+      uncovered !== undefined &&
+      removals?.every(
+        (target) =>
+          insideCheckpointContent(target, workingDirectory) &&
+          !removesUncoveredFile(target, workingDirectory, uncovered)
       )
     )
       return null;
@@ -1105,9 +1309,12 @@ const ordinaryRequirement = (
       };
     };
     const commands = effectiveCommands(args);
+    const rebased = commandsChangeDirectory(commands);
     const destructive =
       destructiveCommand(executable, commandArgs) ??
-      commands.map(([command = '', ...rest]) => destructiveCommand(command, rest)).find(Boolean);
+      commands
+        .map(([command = '', ...rest]) => destructiveCommand(command, rest, rebased))
+        .find(Boolean);
     if (destructive) return { sideEffect: 'external_consequential', ...destructive };
     /*
      * A store this computer does not hold, and work that outlives the turn - the two halves of the

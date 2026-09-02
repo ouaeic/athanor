@@ -17,6 +17,7 @@ import {
   MEDIA_APPROVAL_USD,
   MEDIA_VIDEO_UNAVAILABLE_REASON,
   ModelRelease,
+  OwnerPreferences,
   resolveWebToolPlan
 } from '@athanor/contracts';
 import type {
@@ -61,6 +62,32 @@ import { providerWalls } from '../maintenance/provider-walls.js';
 import { serverLimits } from '../plans.js';
 import { TITLE_SYSTEM_PROMPT } from '../task-titles.js';
 import type { TitleCompletion } from '../task-titles.js';
+
+/**
+ * The model dial as the owner left it, read from the row rather than from whichever browser wrote
+ * it last.
+ *
+ * Two traps are why this is a named function and not an inline property read. The stored object is
+ * open at the top level by contract - an older build has to be able to read a row a newer one wrote
+ * - so only the `model` key is validated here and a malformed `place` or `inspector` beside it can
+ * never cost the owner their preference. And `modelId` is NOT a pin on its own:
+ * `apps/web/src/app/use-model-choice.ts` writes the currently recommended id into that field on
+ * every ranking it receives, so a run that read it whenever it was set would be frozen on whatever
+ * the picker happened to be showing the last time the owner had the app open. Only
+ * `automatic: false` makes it a choice.
+ */
+const ownerModelChoice = (
+  preferences: UserRecord['preferences'] | undefined
+): { preference: 'fast' | 'balanced' | 'best'; pinnedModelId: string | null } | undefined => {
+  const parsed = OwnerPreferences.shape.model.safeParse(
+    (preferences as { model?: unknown } | undefined)?.model
+  );
+  if (!parsed.success || !parsed.data) return undefined;
+  return {
+    preference: parsed.data.preference,
+    pinnedModelId: parsed.data.automatic ? null : parsed.data.modelId || null
+  };
+};
 
 export const createServerSupport = (context: ServerBase) => {
   const { log, database, store, keyRelease, masterKey, runner, config, overrides } = context;
@@ -173,24 +200,94 @@ export const createServerSupport = (context: ServerBase) => {
    * with the cheapest route that could have done the work and what it costs, in the same 402 family
    * as the running cap, because both are "this would cost more than you allowed".
    *
-   * An explicit `modelId` never reaches here: the ceiling governs what athanor chooses for the
-   * owner, never what the owner chooses for themselves - `rankModels` is deliberately built that
-   * way and this does not change it.
+   * An explicit `modelId` on the request never reaches here: the ceiling governs what athanor
+   * chooses for the owner, never what the owner chooses for themselves - `rankModels` is
+   * deliberately built that way and this does not change it.
+   *
+   * What it now also reads is the dial the owner already set. `OwnerPreferences.model` was
+   * validated, persisted and read back by exactly one consumer - the browser - so every pick this
+   * server made for itself used the literal 'balanced'. That is precisely the half of the product
+   * nobody is watching: every scheduled run, and every task an API token creates without naming a
+   * model. An owner who chose Higher quality got balanced at three in the morning.
    */
   const pickModelUnderPriceCeiling = async (
     userId: string,
     catalog: RoutableModel[],
     request: { privacyRoute: PrivacyRoute; taskKind: ModelTaskKind }
   ): Promise<{ model: RoutableModel | undefined; message: string | null }> => {
-    const selection = selectModel(catalog, {
-      privacyRoute: request.privacyRoute,
-      requiredCapabilities: ['chat', 'tools'],
-      requiredModalities: ['text'],
-      minContextTokens: 16_000,
-      preference: 'balanced',
-      taskKind: request.taskKind,
-      ...priceCeilingFields(ownerPriceCeiling(await store.effectiveSpendLimits(userId)))
-    });
+    // Two independent reads of the same owner, so the preference costs no round-trip of its own.
+    const [limits, owner] = await Promise.all([
+      store.effectiveSpendLimits(userId),
+      store.getUserById(userId)
+    ]);
+    const choice = ownerModelChoice(owner?.preferences);
+    const ceiling = priceCeilingFields(ownerPriceCeiling(limits));
+    const select = (requestedId?: string) =>
+      selectModel(catalog, {
+        privacyRoute: request.privacyRoute,
+        requiredCapabilities: ['chat', 'tools'],
+        requiredModalities: ['text'],
+        minContextTokens: 16_000,
+        preference: choice?.preference ?? 'balanced',
+        taskKind: request.taskKind,
+        ...ceiling,
+        ...(requestedId ? { requestedId } : {})
+      });
+    /**
+     * A standing pin is asked for by name first, and falls back to the ranking when it cannot be
+     * served or when serving it would breach the ceiling.
+     *
+     * `requestedId` is the same door the composer sends an explicit pick through, which is what
+     * makes an unattended run agree with the owner's own screen rather than quietly choosing
+     * something else. That door is deliberately exempt from the price ceiling - `rankModels` drops
+     * the ceiling for an explicit id, and `selectModel`'s `requestedId` arm can never answer
+     * `blocked` - because the ceiling governs what athanor chooses for the owner, never what the
+     * owner chooses for themselves. A pin is not that. It is a setting made once on a screen, and
+     * it then governs runs the owner is not present for, so on this path the ceiling wins:
+     * measured before this line existed, a pin at 30x the input ceiling and 45x the output ceiling
+     * was honoured for a schedule while the ranked pick on the same box was correctly held.
+     *
+     * `ceilingOutcome === 'requested_over_ceiling'` is the whole test, and it is the price rather
+     * than the sentence about the price. The first version of this guard read `message !== null`,
+     * which is a defect the code it replaced did not have: `selectModel`'s `requestedId` arm says
+     * one sentence for a rate over the ceiling AND for a rate the catalogue does not publish, so an
+     * owner who set a ceiling lost their standing pin on every unpriced route - free routes
+     * included, and every row of the reviewed open-weight seed allowlist, which is the catalogue on
+     * any box whose live price refresh has not run. Measured through POST /v1/schedules: 201 on the
+     * pinned model before that guard, 402 after it. Prose is not an API; `selectModel` now carries
+     * the distinction in the outcome and this reads that.
+     *
+     * So the two halves are ruled separately. A published rate above the ceiling: the ceiling wins,
+     * for the reason in the paragraph above. No published rate: the pin stands, because an absent
+     * price is not a breach and refusing on it would revoke a setting the owner made over a fact
+     * about the catalogue. A row can carry one rate and not the other, and that is ruled by the
+     * rate it does carry: `priceCeilingBreachReason` compares every published rate before it
+     * reports a missing one, so `requested_unpriced` here means the ceiling had nothing to compare
+     * on either side - not that the side nobody looked at was fine. Before that ordering, a pin on
+     * a route publishing $900 per million out ran unattended under a $15 output ceiling because its
+     * input rate was null. That deliberately does not agree with the ranked path, and should not:
+     * `isModelEligible` keeps an unpriced route out of an automatic pick under a ceiling, where
+     * nobody named anything and the box is choosing how to spend the owner's money on its own.
+     *
+     * The fallback is the part that matters. A pin the catalogue can no longer serve - a withdrawn
+     * route, or one that does not answer on the privacy route this run asked for - would otherwise
+     * turn a working schedule into `model_unavailable` for a setting the owner made months ago in a
+     * different context. A boundary that refuses legitimate work is an outage, so the ranking
+     * answers instead. An over-ceiling pin takes the same road, and the ranking is then held to the
+     * ceiling in the ordinary way, up to and including a 402 when nothing fits under it - which on
+     * a wholly unpriced catalogue is every ranked pick, so the honoured unpriced pin above is also
+     * the only thing standing between such a box and a 402 on every unattended run.
+     *
+     * What this does NOT do is tell the owner a pin the ceiling overruled was set aside.
+     * `routes/tasks.ts` posts `message` into the transcript, but the dropped pin's sentence is not
+     * that message - the selection returned here is the ranking's - and `routes/schedules.ts` reads
+     * no message at all, because `TaskSchedule` has no field to carry one. An unpriced pin is the
+     * one case that does reach the owner, since it is honoured and its own advisory travels with
+     * it.
+     */
+    const pinned = choice?.pinnedModelId ? select(choice.pinnedModelId) : null;
+    const selection =
+      pinned?.choice && pinned.ceilingOutcome !== 'requested_over_ceiling' ? pinned : select();
     if (selection.ceilingOutcome === 'blocked')
       throw new AthanorError(
         'price_ceiling_blocked',

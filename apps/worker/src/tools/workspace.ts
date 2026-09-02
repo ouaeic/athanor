@@ -12,9 +12,16 @@ import {
   toLines
 } from '../edit/index.js';
 import { RECENT_TOOL_OUTPUT_CHARS, recordArtifactWrite } from '../context.js';
+import { type ExecObservation } from '../agent-state.js';
 import { HELPER_PACKAGE_MANAGERS, PACKAGE_VERBS } from '../turn-bounds.js';
 import { textValue } from '../values.js';
 import { type ToolContext } from '../tool-dispatch.js';
+import {
+  type NearestProject,
+  type PostEditDiagnostic,
+  nearestProject,
+  postEditDiagnostics
+} from './diagnostics.js';
 import { finiteNumber } from './numbers.js';
 
 /**
@@ -166,6 +173,517 @@ const shiftPartialRead = (
 const firstUnshown = (taskId: string, path: string, reachTo: number): number | undefined =>
   firstUnshownLine(displayedRanges(taskId, path), reachTo);
 
+/*
+ * ── The post-edit check: deferred, version-guarded, and silent unless it has something ─────────
+ *
+ * `file_patch` computes exactly the input a trigger needs and nothing consulted it. What follows
+ * runs the project's own type-checker over the files a patch just wrote and puts what it said in
+ * front of the model. `tools/diagnostics.ts` owns which languages may be triggered this way and
+ * how their output is read; this owns when it runs, whether it is still worth reporting when it
+ * finishes, and how much of it the model is charged for.
+ *
+ * IT IS DEFERRED, and that is a measurement rather than a preference. `npx --no-install tsc
+ * --noEmit` over `apps/worker` on this machine took 4.17 s wall on 2026-09-01, and the range
+ * across this repository's packages is 0.98 s to 5.70 s. Blocking every edit on that is a worse
+ * harness than no check at all: the model's own next thought costs less than the checker, so the
+ * check overlaps it for free and costs the patch nothing. The patch arms the run and returns
+ * without awaiting it; whatever has finished is attached to the NEXT workspace call, and a run
+ * that never finishes before the turn ends is never reported. That is the trade, stated: this
+ * trigger can be late or absent, and it can never be wrong about a file being clean.
+ *
+ * WHAT IT DOES NOT COVER. Only `file_patch` arms it. `file_write` writes code too and one line
+ * here would arm it as well; it is left alone in this cut because the proof burden is per call
+ * site and this one had the evidence. Only the workspace tools can carry a report, because
+ * `executeWorkspaceTool` is where the drain sits - a patch followed immediately by
+ * `code_diagnostics` or `delegate` holds its report until the next file or shell call. Widening
+ * that is a hook in `tool-dispatch.ts`, which is not this file's to write.
+ */
+
+/** One armed check: what will run, where, and which writes it was armed for. */
+interface PostEditCheck {
+  readonly project: NearestProject;
+  /**
+   * The stamp each written path stood at when this was armed. A path patched again while this was
+   * in flight has a higher stamp by the time it lands, and the whole run is dropped: the checker
+   * read the file between the two writes and its answer is about neither of them.
+   */
+  readonly versions: ReadonlyMap<string, number>;
+  /** Set exactly once, by the run itself. `undefined` means still in flight. */
+  found?: readonly PostEditDiagnostic[];
+}
+
+interface PostEditLedger {
+  /**
+   * The stamp each path was last written under, which is the whole staleness guard.
+   *
+   * A STAMP AND NOT A WRITE COUNT, and the difference is what makes the prune below safe. The
+   * number is `stamp` at the moment of the arm, so it only ever climbs, and a path whose entry the
+   * prune dropped cannot be patched back onto a number an older check is still holding. With a
+   * per-path count it could: a path written once, dropped, then written again would read 1 both
+   * times, and a dead check holding 1 would pass `superseded` as fresh.
+   */
+  readonly versions: Map<string, number>;
+  /** The last stamp handed out. One per arm, not one per path. */
+  stamp: number;
+  checks: PostEditCheck[];
+}
+
+/**
+ * The armed checks of every live task.
+ *
+ * Module state keyed by task id, the same shape and for the same reason as the read snapshots in
+ * `edit/snapshots.ts`: this is a working set that a worker restart is free to lose. Losing it
+ * costs a check nobody asked for; putting it on `AgentState` would put an in-flight promise into
+ * something that is serialised and handed across a turn boundary.
+ *
+ * CHOSEN at 64 tasks, 8 checks each, and 320 path stamps each. 8 is more armed runs than a single
+ * turn can plausibly outrun - one patch arms one run per project it touched - and the point of the
+ * cap is not the number but that an entry nobody ever drains is dropped rather than held: a turn
+ * that patches and then does nothing but talk would otherwise keep its checks for the life of the
+ * process.
+ *
+ * The third bound is the one that was missing, and it was the only field here with no bound at
+ * all: `versions` grew one entry per distinct path a task ever patched and nothing deleted from
+ * it, so a long autonomous run over a large tree held a path string per file for the life of the
+ * worker while this comment reasoned carefully about the other two. It is DERIVED rather than
+ * chosen, from the size of the set eight live checks can name between them: `MAX_ARMED_CHECKS`
+ * checks, each armed by one `file_patch`, which caps at `MAX_PATCH_FILES` paths.
+ *
+ * WHAT IT KEEPS IS THE 320 MOST RECENTLY PATCHED PATHS, which is that set only while nothing else
+ * is patched in between - so this is not a window of eight arms, and the gap is reachable rather
+ * than theoretical. An arm whose files have no project marker above them arms no check, so it
+ * spends stamps without spending one of the eight check slots. Measured through the shipped arm:
+ * one check held in flight, then eight 40-path patches into a directory with no marker, and the
+ * held check's own path was pruned - the checker had run and had something to say, and its answer
+ * was dropped. That is the direction this fails in and the reason it is left here: a check whose
+ * stamp has gone missing reads as superseded and is discarded, so an over-eager prune costs a
+ * report nobody was promised and can never produce one about a file that has moved on. Making it
+ * exact means pruning against the paths the live checks name rather than against a count, which
+ * is more machinery than that failure is worth.
+ */
+const MAX_TRACKED_TASKS = 64;
+const MAX_ARMED_CHECKS = 8;
+const MAX_PATCH_FILES = 40;
+const MAX_TRACKED_PATHS = MAX_ARMED_CHECKS * MAX_PATCH_FILES;
+const armed = new Map<string, PostEditLedger>();
+
+const ledgerFor = (taskId: string): PostEditLedger => {
+  const existing = armed.get(taskId);
+  if (existing) {
+    // Insertion order is recency order, so re-setting the key is what makes the eviction below
+    // drop the least recently armed task rather than the first one this process ever saw.
+    armed.delete(taskId);
+    armed.set(taskId, existing);
+    return existing;
+  }
+  const fresh: PostEditLedger = { versions: new Map(), stamp: 0, checks: [] };
+  armed.set(taskId, fresh);
+  while (armed.size > MAX_TRACKED_TASKS) {
+    const oldest = armed.keys().next();
+    if (oldest.done) break;
+    armed.delete(oldest.value);
+  }
+  return fresh;
+};
+
+/** Drops every armed check. Only a test that wants a cold store has any business calling it. */
+export const forgetPostEditChecks = (): void => armed.clear();
+
+/**
+ * How many path stamps one task is holding. Only a test that has to watch the bound hold has any
+ * business calling it; nothing in the product asks, and the answer is not part of any result.
+ */
+export const countPostEditPaths = (taskId: string): number => armed.get(taskId)?.versions.size ?? 0;
+
+/**
+ * Drops the oldest path stamps once a task is holding more than any check can ask about.
+ *
+ * Least recently patched first, the same eviction as the task map above and for the same reason:
+ * `armPostEditChecks` re-sets each path through a delete, so insertion order is recency order.
+ * Run from the arm, which is the only place this map grows.
+ *
+ * The number it prunes to is derived where `MAX_TRACKED_PATHS` is declared. What matters here is
+ * the direction of the error: because the stamp only climbs, a check holding a stamp for a path
+ * that has been pruned finds no entry, `superseded` reads `0`, and the check is dropped. An
+ * over-eager prune therefore loses a report the model might have wanted; it cannot produce one
+ * about a file that has moved on.
+ */
+const pruneVersions = (ledger: PostEditLedger): void => {
+  while (ledger.versions.size > MAX_TRACKED_PATHS) {
+    const oldest = ledger.versions.keys().next();
+    if (oldest.done) break;
+    ledger.versions.delete(oldest.value);
+  }
+};
+
+/**
+ * Whether the answer this run came back with is still about the file that is on disk.
+ *
+ * Compared against the live stamp rather than against a timestamp, because the question is not how
+ * old the answer is but whether anything has happened to the files since. Two patches to the same
+ * path with the first check outstanding is the shape this exists for, and it is the shape a model
+ * produces constantly: patch, notice a typo in the echo, patch again.
+ *
+ * A path the prune has dropped reads `0`, which no stamp ever is, so a check about it is
+ * superseded. That is the direction this has to fail in: an answer nobody can date is an answer
+ * that does not go in front of the model.
+ */
+const superseded = (ledger: PostEditLedger, check: PostEditCheck): boolean =>
+  [...check.versions].some(([path, version]) => (ledger.versions.get(path) ?? 0) !== version);
+
+/**
+ * How much of what the checker said the model is charged for.
+ *
+ * CHOSEN at 12 diagnostics and 1,600 bytes, against `RECENT_TOOL_OUTPUT_CHARS` of 24,000: this is
+ * an uninvited block on somebody else's tool result, so it may take a fifteenth of the window a
+ * requested result gets and no more. Twelve is chosen from the failure it is for - one bad edit in
+ * a TypeScript package produces a handful of errors and a badly bad one produces a cascade, and the
+ * twelfth line of a cascade has already said what the first line said. Both bounds are real
+ * because either alone is not: twelve lines of a minified file's `tsc` output is not 1,600 bytes,
+ * and 1,600 bytes of short lines is not twelve of them.
+ *
+ * THE BYTE BOUND IS THE WHOLE BLOCK'S, ACROSS EVERY CHECK, and it says so here because it was
+ * once per check and the difference is a factor of eight. A check is one project, and one
+ * `file_patch` may span eight of them - which is what this repository is - so eight blocks were
+ * joined onto one result with nothing counting the total. Measured through the shipped arm, eight
+ * packages patched in one call with one over-long `tsc` line each: 14,246 bytes delivered under a
+ * cap that reads 1,600, three fifths of the window the requested result was supposed to get. The
+ * count bound stays per check, because twelve is about how much of one cascade is worth reading
+ * and that does not get smaller when a second project also has something to say.
+ */
+const POST_EDIT_MAX_DIAGNOSTICS = 12;
+const POST_EDIT_MAX_BYTES = 1_600;
+
+/**
+ * One diagnostic cut to fit, because the byte bound has to hold for a block of ONE.
+ *
+ * The loop below admits the first diagnostic whatever its length, so that a block is never a
+ * header with nothing under it, and that exemption was the whole byte bound's hole: `tsc --noEmit
+ * --pretty false` prints the inferred type inline, so one mismatch between two large object types
+ * is a single line of several kilobytes. Measured through the shipped arm against a 60,000-byte
+ * type: a block that declares 1,600 bytes delivered 60,198 - past `RECENT_TOOL_OUTPUT_CHARS` of
+ * 24,000, so the uninvited block would have evicted the result the model actually asked for.
+ *
+ * Cutting rather than dropping, because the head of a `tsc` line is the part that identifies the
+ * error - path, position, code, and the beginning of the offending type - and the recovery named
+ * is one the model can perform: `code_diagnostics` on that directory prints the whole thing.
+ *
+ * The budget is what is LEFT of the block's, not the block's whole allowance, so the exemption
+ * cannot be spent twice by two checks on one result.
+ *
+ * THE MARKER IS SPENT FROM THE BUDGET, not added after the cut. Slicing to the budget and then
+ * appending returned `budget + 68` bytes, which is how a block declaring 1,600 delivered 1,669 -
+ * the same residue-outside-the-bound this file has now been caught with three times, at the
+ * innermost of the three levels. The caller guarantees `budget >= POST_EDIT_MIN_DIAGNOSTIC` on the
+ * only path that can reach this branch; the `Math.max` is what a future caller that forgets gets,
+ * and it returns the marker alone rather than a cut line that reads as a whole one.
+ */
+const CUT_MARKER = ' [cut here; run code_diagnostics on this directory to read the rest]';
+
+const clipDiagnostic = (text: string, budget: number): string =>
+  text.length <= budget
+    ? text
+    : `${text.slice(0, Math.max(0, budget - CUT_MARKER.length))}${CUT_MARKER}`;
+
+/**
+ * The smallest first line worth writing a header above.
+ *
+ * The cut marker plus 40 bytes, and the 40 is the length of the part of a `tsc` line that
+ * identifies the error rather than describes it - `workspace/pkg/src/a.ts(3,7): error TS2322:` is
+ * 42 - so a block that cannot carry that much is a header, a truncation notice and nothing the
+ * model can act on. Refusing it counts the project in the tail instead, which names the same
+ * recovery in a tenth of the bytes.
+ */
+const POST_EDIT_MIN_DIAGNOSTIC = CUT_MARKER.length + 40;
+
+/** The remainder line inside one block, as a function so the reservation is derived from it. */
+const moreDiagnosticsLine = (remaining: number): string => `and ${remaining} more.`;
+
+/**
+ * One project's block, inside whatever the budget has left, or nothing.
+ *
+ * The written files come first and everything else in the project follows, because a pre-existing
+ * error four packages away is true and is not what the model is about to act on. The remainder is
+ * counted rather than dropped silently - "and N more" is the difference between a short list and a
+ * short list the reader believes is the whole list.
+ *
+ * A clean tree costs zero bytes, and that is guarded three times over rather than once: the parser
+ * returns an empty array for anything it did not recognise, `readyPostEditChecks` keeps a check
+ * with nothing in it out of the drain, and the empty return below refuses to write a header with
+ * no lines under it. Measured while proving it - deleting any ONE of those three leaves the
+ * property intact, so the test that pins it had to delete all three before it went red. The
+ * redundancy is deliberate: an empty block is the harness telling the model a file is fine, which
+ * is the one thing this trigger has no standing to say.
+ */
+const renderPostEditCheck = (check: PostEditCheck, budget: number): string | undefined => {
+  const found = check.found ?? [];
+  if (!found.length) return undefined;
+  const ran = [check.project.command.executable, ...check.project.command.args].join(' ');
+  const header = `${ran} in ${check.project.dir}, run over the files patched earlier in this turn:`;
+  const written = new Set(check.versions.keys());
+  const ordered = [
+    ...found.filter((one) => written.has(one.path)),
+    ...found.filter((one) => !written.has(one.path))
+  ];
+  // Room held back for the remainder line, which is written after the loop and used to be counted
+  // by nobody. Reserved at the largest count that can reach it - every diagnostic unshown - so the
+  // reservation cannot be smaller than the line it pays for. A block with one diagnostic in it
+  // reserves nothing, because the loop admits the first whatever its length and there is then no
+  // remainder to name.
+  const room = budget - (ordered.length > 1 ? moreDiagnosticsLine(ordered.length).length + 1 : 0);
+  // The header is spent from the budget rather than added on top of it, and a header with no room
+  // for a usable line under it is not written at all: a block that says a checker ran and says
+  // nothing the model can act on is the empty-block failure the drain already refuses.
+  if (header.length + 1 + POST_EDIT_MIN_DIAGNOSTIC > room) return undefined;
+  const shown: string[] = [];
+  let bytes = header.length;
+  for (const one of ordered) {
+    if (shown.length >= POST_EDIT_MAX_DIAGNOSTICS) break;
+    // `+ 1` for the newline that joins it on, which is the third thing that was outside the count.
+    if (bytes + 1 + one.text.length > room && shown.length) break;
+    const text = clipDiagnostic(one.text, room - bytes - 1);
+    shown.push(text);
+    bytes += text.length + 1;
+  }
+  const remaining = ordered.length - shown.length;
+  return [header, ...shown, ...(remaining ? [moreDiagnosticsLine(remaining)] : [])].join('\n');
+};
+
+/** The tail line, as a function so the reservation below is derived from it and not typed twice. */
+const droppedProjectsLine = (dropped: number): string =>
+  `and ${dropped} more project${dropped === 1 ? '' : 's'} the checker had something to say about; run code_diagnostics there to read it.`;
+
+/**
+ * What the tail line costs at its longest, held back from the block budget before the loop starts.
+ *
+ * Derived from the sentence itself at the largest count that can reach it rather than written down
+ * as a number, so editing the wording moves the reservation with it. `MAX_ARMED_CHECKS` is that
+ * count: a task holds at most eight checks and the tail can name every one of them. The `+ 2` is
+ * the `\n\n` that joins it on.
+ */
+const POST_EDIT_TAIL_BYTES = droppedProjectsLine(MAX_ARMED_CHECKS).length + 2;
+
+/**
+ * Every landed check on one result, under ONE budget rather than one budget each.
+ *
+ * Oldest first, which is arm order, because that is the run the model has been waiting on longest.
+ * A project that finds no room left is COUNTED rather than dropped silently, for the same reason
+ * the diagnostics inside a block are: a short list a reader believes is the whole list is worse
+ * than a short list that says what it left out. The recovery named is one the model can perform.
+ *
+ * EVERY BYTE DELIVERED IS INSIDE THE BUDGET, including the two the joins add and the tail line,
+ * which used to sit outside it and made the real worst case about 1,790 against a cap that reads
+ * 1,600. A budget with things outside it stops being a budget, so the separator is spent with the
+ * block it precedes and the tail is reserved before the first block is measured.
+ *
+ * The reservation is taken only when more than one check landed, and that is exact rather than
+ * thrifty: the tail is written only when a block was emitted AND another was refused, which needs
+ * two checks. With one check there is nothing to hold back and the single block gets the whole
+ * 1,600. What the reservation costs when two or more land and none is dropped is about 110 bytes
+ * of diagnostics that would have fitted - paid so that the stated number is the delivered number.
+ */
+const renderPostEditChecks = (checks: readonly PostEditCheck[]): string | undefined => {
+  const blocks: string[] = [];
+  let budget = POST_EDIT_MAX_BYTES - (checks.length > 1 ? POST_EDIT_TAIL_BYTES : 0);
+  let dropped = 0;
+  for (const check of checks) {
+    const separator = blocks.length ? 2 : 0;
+    const block = renderPostEditCheck(check, budget - separator);
+    if (block) {
+      blocks.push(block);
+      budget -= block.length + separator;
+    } else if (check.found?.length) dropped += 1;
+  }
+  if (!blocks.length) return undefined;
+  return [...blocks, ...(dropped ? [droppedProjectsLine(dropped)] : [])].join('\n\n');
+};
+
+/**
+ * The checks that have landed and are still about the tree as it stands.
+ *
+ * Read before the arm runs and consumed after it, which is what makes "the NEXT tool result"
+ * literal: a patch cannot be handed its own check, because at the moment this is called the run it
+ * is about to arm does not exist. Superseded checks are dropped here rather than at landing time,
+ * since the write that superseded them may not have happened yet when they land.
+ */
+const readyPostEditChecks = (taskId: string): readonly PostEditCheck[] => {
+  const ledger = armed.get(taskId);
+  if (!ledger) return [];
+  ledger.checks = ledger.checks.filter((check) => !(check.found && superseded(ledger, check)));
+  return ledger.checks.filter((check) => check.found?.length);
+};
+
+/**
+ * The same question asked a second time, after the arm has run, because the arm may have been the
+ * write that invalidated the answer.
+ *
+ * Reading the drain BEFORE the arm is what stops a patch being handed its own check, and it was
+ * also a hole: a check that had already landed was fresh at the moment it was read and stale by
+ * the time it was rendered, because the call it was about to ride on was another patch of the same
+ * file. Measured through the shipped arm - patch, let the checker land, patch the same path again,
+ * and the second patch's result carried the first run's error about a line that no longer existed.
+ * That is the exact shape the version counter is for, "patch, read the echo, notice the typo,
+ * patch again", and it is worse in this form than in the one the counter already caught: the
+ * report rides on the result of the very write that repaired it.
+ *
+ * The dead ones are still consumed by the caller rather than left armed. There is nothing to wait
+ * for - a newer run for the same path is already in flight, and holding this one would only offer
+ * it to the call after next, by which time it is no less wrong.
+ *
+ * A LEDGER THAT HAS GONE RETURNS NOTHING, which is the same direction `superseded` chooses and the
+ * opposite of what this line did: it returned every captured check unfiltered, so the one shape
+ * that empties the store between the two reads - 64 other tasks arming inside the awaited tool
+ * call, or a test clearing it - delivered a block nothing could date. An answer nobody can date is
+ * an answer that does not go in front of the model, and the stamps are only comparable inside the
+ * ledger that issued them, so a ledger that has been evicted and recreated cannot date them
+ * either. The cost of the refusal is a report nobody was promised; the cost of the old line was a
+ * stale block rendered as fresh, which is the one thing this feature may not do.
+ */
+const stillAboutTheTree = (
+  taskId: string,
+  checks: readonly PostEditCheck[]
+): readonly PostEditCheck[] => {
+  const ledger = armed.get(taskId);
+  if (!ledger) return [];
+  return checks.filter((check) => !superseded(ledger, check));
+};
+
+const consumePostEditChecks = (taskId: string, taken: readonly PostEditCheck[]): void => {
+  const ledger = armed.get(taskId);
+  if (ledger) ledger.checks = ledger.checks.filter((check) => !taken.includes(check));
+};
+
+/**
+ * Arms one check per project the patch touched, and returns without waiting for any of them.
+ *
+ * The stamp bump is SYNCHRONOUS and everything after the first `await` is not, which is the whole
+ * of the deferral and the whole of the staleness guard in one shape. A second patch to the same
+ * path entering this function one line later takes a higher stamp, so the first run is already
+ * dead by the time it lands even though its own walk has not finished. Doing the walk before
+ * returning would have put four runner round trips on the patch's wall clock for a check the patch
+ * does not report.
+ *
+ * Nothing in here may throw into the caller and nothing in here may reject: this is a detached
+ * promise on a path whose work has already succeeded and been reported, and an unhandled rejection
+ * from a type-checker would take the worker down over a file nobody asked about.
+ */
+const armPostEditChecks = (context: ToolContext, paths: readonly string[]): void => {
+  const { task } = context;
+  const ledger = ledgerFor(task.id);
+  ledger.stamp += 1;
+  const versions = new Map<string, number>();
+  for (const path of paths) {
+    // Re-set through a delete because `Map.set` on a key that is already there leaves it where it
+    // was, and the prune below reads insertion order as recency order.
+    ledger.versions.delete(path);
+    ledger.versions.set(path, ledger.stamp);
+    versions.set(path, ledger.stamp);
+  }
+  pruneVersions(ledger);
+  void (async () => {
+    const listings = new Map<string, Promise<ReadonlySet<string>>>();
+    const listing = (dir: string): Promise<ReadonlySet<string>> => {
+      const already = listings.get(dir);
+      if (already) return already;
+      const asked = context.runner
+        .call<{
+          entries: Array<{ name: string }>;
+        }>(
+          task.workspaceId,
+          task.id,
+          'files.read',
+          `/v1/workspaces/${task.workspaceId}/files?path=${encodeURIComponent(dir)}`
+        )
+        .then(
+          (answer) => new Set(answer.entries.map((entry) => entry.name)) as ReadonlySet<string>
+        );
+      listings.set(dir, asked);
+      return asked;
+    };
+    // One run per project, not one per file: four files in one package are one `tsc --noEmit`,
+    // and the checker reads the whole project whichever of them asked for it.
+    const byProject = new Map<string, { project: NearestProject; paths: string[] }>();
+    for (const path of paths) {
+      const project = await nearestProject(path, listing).catch(() => undefined);
+      if (!project) continue;
+      const group = byProject.get(project.dir);
+      if (group) group.paths.push(path);
+      else byProject.set(project.dir, { project, paths: [path] });
+    }
+    for (const { project, paths: grouped } of byProject.values()) {
+      const check: PostEditCheck = {
+        project,
+        versions: new Map(grouped.map((path) => [path, versions.get(path) ?? 0]))
+      };
+      // The SAME ledger, by identity, and not merely a ledger under this task id. Stamps are only
+      // comparable inside the ledger that issued them, so a check armed against one that has since
+      // been evicted and recreated - 64 other tasks arming during this walk, or a test clearing the
+      // store - would be comparing its stamps against a counter that restarted at zero. Dropping
+      // the check is the same silence a task that ended mid-walk already gets.
+      const live = armed.get(task.id);
+      if (live !== ledger) return;
+      // Oldest first, so a turn that arms faster than it drains loses the report it is least
+      // likely to still want.
+      live.checks = [...live.checks, check].slice(-MAX_ARMED_CHECKS);
+      const observed = await context.runner
+        .call<ExecObservation>(
+          task.workspaceId,
+          task.id,
+          'exec',
+          `/v1/workspaces/${task.workspaceId}/exec`,
+          {
+            ...project.command,
+            cwd: project.dir,
+            /*
+             * CHOSEN at 120 s against the 300 s default of `code_diagnostics`, because the two
+             * are answering different questions. A checker the model asked for by name may take
+             * as long as the project takes; one nobody asked for is only worth reporting while
+             * the answer is still about work the model remembers doing, and the slowest package
+             * measured on this repository is 5.70 s. A run that hits this ceiling reports
+             * nothing, which is the same silence as a checker that is not installed.
+             */
+            timeoutSeconds: 120,
+            maxOutputBytes: 4_000_000
+          }
+        )
+        .catch(() => undefined);
+      const output = observed ? `${observed.stdout ?? ''}\n${observed.stderr ?? ''}` : '';
+      // Assigned even when empty: `found` is what distinguishes a run still in flight from a run
+      // that landed with nothing to say, and both of them report nothing.
+      check.found = observed?.timedOut
+        ? []
+        : postEditDiagnostics(project.language, project.dir, output);
+    }
+  })().catch(() => undefined);
+};
+
+/**
+ * The workspace tools, with whatever a previous patch's checker found attached.
+ *
+ * The wrapper is where the deferred report lands, and it is a wrapper rather than a line in each
+ * arm so that there is exactly one place to read the answer to "can this tool carry a report".
+ * A result that is not a plain object carries nothing and CONSUMES nothing - the check stays armed
+ * for the next call rather than being thrown away against a shape it could not ride on - and a
+ * result that already has a `diagnostics` key is left exactly as the arm wrote it.
+ */
+export async function executeWorkspaceTool(
+  context: ToolContext,
+  call: ModelToolCall
+): Promise<unknown> {
+  const ready = readyPostEditChecks(context.task.id);
+  const result = await runWorkspaceTool(context, call);
+  if (!ready.length) return result;
+  // Every early return here leaves the checks ARMED rather than dropping them: a result that could
+  // not carry the report is a reason to wait for the next call, not a reason to throw the answer
+  // away. Only the line below, which has somewhere to put it, consumes.
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) return result;
+  if ('diagnostics' in result) return result;
+  const rendered = renderPostEditChecks(stillAboutTheTree(context.task.id, ready));
+  consumePostEditChecks(context.task.id, ready);
+  if (rendered === undefined) return result;
+  return { ...(result as Record<string, unknown>), diagnostics: rendered };
+}
+
 /**
  * The workspace tools: commands, processes and files on the owner's own computer.
  *
@@ -173,10 +691,7 @@ const firstUnshown = (taskId: string, path: string, reachTo: number): number | u
  * remember across calls - the SHA the file was read at, which is what makes a blind overwrite
  * refusable rather than merely regrettable.
  */
-export async function executeWorkspaceTool(
-  context: ToolContext,
-  call: ModelToolCall
-): Promise<unknown> {
+async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Promise<unknown> {
   const { task, state } = context;
   const root = `/v1/workspaces/${task.workspaceId}`;
   switch (call.name) {
@@ -471,8 +986,8 @@ export async function executeWorkspaceTool(
       const patches = Array.isArray(call.arguments.patches)
         ? (call.arguments.patches as Array<Record<string, unknown>>)
         : [];
-      if (!patches.length || patches.length > 40)
-        throw new AthanorError('patch_invalid', 'Provide between 1 and 40 patches');
+      if (!patches.length || patches.length > MAX_PATCH_FILES)
+        throw new AthanorError('patch_invalid', `Provide between 1 and ${MAX_PATCH_FILES} patches`);
       const applied: Array<{
         path: string;
         sha256: string;
@@ -598,6 +1113,23 @@ export async function executeWorkspaceTool(
         `${root}/usage`
       );
       await context.store.setWorkspaceStorage(task.userId, task.workspaceId, usage.storageBytes);
+      /*
+       * The trigger, on the paths the workspace confirmed rather than on the paths that were asked
+       * for: a patch that failed has already `continue`d into `failures` and is not in `applied`,
+       * and running a checker over a file that was not written would report the tree as it was.
+       *
+       * Detached on purpose - see `armPostEditChecks`. It is armed here rather than anywhere
+       * earlier because this is the last line at which the patch is known to have succeeded, and
+       * it is armed inside `file_patch` rather than around it because that is what puts it after
+       * the turn's undo point: `file_patch` is not in `CHECKPOINT_EXEMPT_TOOLS`, so a checkpoint
+       * exists before this arm ran and anything the checker writes - a `.tsbuildinfo` under
+       * `incremental`, a `__pycache__` - is inside it. `turn-bounds.ts` records why that set is
+       * the bound that replaced an approval card.
+       */
+      armPostEditChecks(
+        context,
+        applied.map(({ path }) => path)
+      );
       return {
         filesChanged: applied.map(({ path, sha256: digest, lines }) => ({
           path,
