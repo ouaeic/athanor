@@ -6,6 +6,7 @@
  *   pnpm eval:bench --observe          re-sweep the fixtures and rewrite routes.json
  *   pnpm eval:bench --observe --filter research   sweep a selection (a FLOOR of a floor; say so)
  *   pnpm eval:bench --routes           print the committed observation and the shim's coverage
+ *   pnpm eval:bench --score            drive a real AgentWorker against the shim and score it
  *
  * Everything here runs offline, with no key, no network and no provider. Nothing in this rig can
  * spend money; the paid step is a command in README.md that the owner runs, not a flag on this.
@@ -24,6 +25,7 @@ import { benchmarkBoxCatalogueBytes, catalogueWeights } from './catalogue.js';
 import { allFixtures, observe } from './observe.js';
 import { COLUMNS, renderCsv } from './parity.js';
 import { coverageOf, IMPLEMENTED_ROUTES, type RouteObservation } from './routes.js';
+import { runScore } from './score.js';
 import { selfTest } from './selftest.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -173,6 +175,28 @@ if (flag('routes')) {
       `  implemented but unobserved (proved only by selftest.ts): ${coverage.unexercised.join(', ')}`
     );
   process.exit(coverage.missing.length === 0 ? 0 : 1);
+}
+
+/*
+ * The join, driven to a score. Still offline, still free: the model is a script and no provider is
+ * reached. See `score.ts` for what that does and does not prove, and README.md section 5 for the
+ * command that produces a number about athanor rather than about the wire.
+ *
+ * `--arm` is accepted and only `shipped` can currently be honoured, because `evals/harness.ts`
+ * mints its task `balanced`. An arm this driver cannot run under is refused here rather than
+ * printed into a row, which is the same discipline `rowFrom` applies.
+ */
+if (flag('score')) {
+  const arm = argument('arm') ?? 'shipped';
+  if (arm !== 'shipped') {
+    process.stderr.write(
+      `--arm ${arm} needs a task minted under a different security mode than evals/harness.ts mints, and an auto-approver for "unattended". This driver runs "shipped" only; see README.md section 5.\n`
+    );
+    process.exit(2);
+  }
+  process.exit(
+    await runScore({ arm, trustLocal: flag('trust-local'), filter: argument('task'), out })
+  );
 }
 
 const observation = committed();

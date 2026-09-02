@@ -209,6 +209,76 @@ applies approval policy, but an allowed process can use the host's ordinary netw
 Operators who want the stronger boundary can turn it on, or dedicate the machine and enforce
 ingress and egress at their host or cloud firewall.
 
+## The two dials
+
+An owner sets two independent things. Neither is a position on the other, and this section says so
+plainly because the natural request is for a single slider from “careful” to “let it run”, and that
+is not what this is.
+
+**What the agent computer is allowed to be.** A ladder, and the installer measures which rung this
+host is on rather than taking a preference for it.
+
+- _No sandbox helper._ Commands run as the runner's own account, with no identity boundary and no
+  filesystem one. This is a developer laptop with no second account to drop to, and the runner says
+  so instead of pretending otherwise.
+- _`AGENT_SANDBOX_HELPER` set._ Commands run as `athanor-agent` with `no_new_privs`, so a
+  set-user-ID binary confers nothing, but they still reach every file that account can reach -
+  including every other task's workspace.
+- _`CONFINE_AGENT_FILESYSTEM=true`._ The same exec line also carries a Landlock ruleset: this task's
+  `workspace/` and `.home` writable, the system directories readable, `/home` granted nowhere - so
+  a neighbouring workspace and the runner's own `.athanor` stop being reachable at all.
+- _`ISOLATE_AGENT_NETWORK=true`._ The command additionally gets a network namespace of its own. It
+  ships off, because that namespace has a loopback of its own and published previews then stop
+  answering.
+
+**When it stops and asks you.** Three positions, each one everything the position below it asks
+about plus more.
+
+- _Autonomous_ stops only for what this computer cannot take back for you.
+- _Balanced_ is Autonomous plus reaching an address out on the internet, and installing software.
+- _Review_ is Balanced plus a card in front of every command, every file written, and every browser
+  or desktop action.
+
+The authoritative wording of all three is `SECURITY_MODE_FLOOR` in
+`apps/worker/src/approval-policy.ts`, which sits beside the branches that enforce it and is held
+against the page the owner reads by `scripts/check-repository.mjs`. It is deliberately not restated
+here in full: three descriptions of this behaviour once existed in three files and had drifted
+apart, and a fourth copy in a document no check reads is how that happens again.
+
+### Why two dials and not one
+
+Each ladder is ordered on its own, so either could be a slider. Joining them into one cannot be
+done honestly, because they answer different questions: the sandbox decides what a command is
+_able_ to do, and the mode decides what you are _asked_ about. A rung of one does not stand in for
+a position of the other, and the concerns underneath them - local file churn, network egress, and
+what gets installed - do not dominate each other, so a single slider would assert an order the code
+does not have. Spend is a fourth thing again, with its own ceiling.
+
+### They do not compose, and that is measured rather than assumed
+
+The approval floor does not read which sandbox rung this host is on. A card is raised identically on
+a confined box and an unconfined one, and there is no setting that trades one for the other.
+
+That is a deliberate gap rather than an unfinished one. Driven through `evals/cards` - ten ordinary
+owner tasks, 178 tool calls - Balanced raises 18 cards and Autonomous 12, and the filesystem
+boundary retires none of them. They are: sending a message through a connector; installing a
+subscription coding CLI and handing it work; publishing a site; a Git push and two commands that
+reach another machine; creating a scheduled job; keeping a background service running; installing
+software; and two writes to the agent's own `$HOME` - a shell startup file and a Git hooks path -
+which the ruleset grants precisely so that `pip`, `cargo` and `npm` can work at all. The one card
+that looks retirable is `apt-get install`, and it is not: an approved package install is rewritten
+onto the root-owned package helper and runs with no ruleset at all, because it needs the runner's
+identity to reach `sudo`. Review's cards are a promise that you see what your computer is doing, which a kernel
+boundary is not a reason to withdraw.
+
+There is also a trap worth naming, because it is what a future version of this composition would
+walk into. Measured on a 7.0 kernel with util-linux 2.41.3: `rm -rf $ROOT/workspace` under the
+shipped ruleset _exits non-zero_, because removing the directory entry itself needs a right granted
+nowhere - and it still empties the tree first, because everything inside it is writable. A refusal
+from the kernel is not evidence that nothing was destroyed. The full argument, and what would have
+to change for the two dials to be worth joining, is recorded beside `ApprovalContext` in
+`apps/worker/src/approval-policy.ts`.
+
 ## External trust boundaries
 
 - The configured model provider sees inference content and service metadata according to its terms.

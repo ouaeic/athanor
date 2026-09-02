@@ -1832,6 +1832,29 @@ export interface Fixture {
    * schedule is a claim nobody checks.
    */
   readonly schema?: () => readonly string[];
+  /**
+   * A REAL workspace, listening at this URL, instead of the scripted runner stub.
+   *
+   * THE SEAM `evals/bench` NEEDED AND THE ONLY ONE IT ADDS. That rig builds a shim that speaks the
+   * runner protocol over a real box, and every part of it was proved in isolation while nothing
+   * ever ran an `AgentWorker` against it - the computed-and-unwired shape this programme keeps
+   * finding. Closing it needs the loop's own runner traffic to leave this process, and there was no
+   * way to ask for that: `runFixture` installs its own `globalThis.fetch` for the duration of a run,
+   * so an outer wrapper never sees a runner request, and `WORKSPACE_RUNNER_URL` is a module
+   * constant. This field is the smallest thing that reaches it - one config value and one branch.
+   *
+   * Absent on every fixture in `evals/fixtures.ts` and inert when absent: the config keeps the same
+   * `RUNNER_URL` and the same `runnerResponse` answers it always did, so no committed baseline row
+   * can move because this exists. Only requests whose URL starts with this value are forwarded;
+   * anything else the loop asks for still meets the stub, so a fixture cannot accidentally reach
+   * the network by naming one host.
+   *
+   * WHAT IT COSTS THE OUTCOME, because three fields below are records the STUB keeps and a real box
+   * does not report: `filesAfter`, `mediaGenerated` and `mediaModels` are empty under it. The
+   * workspace is the ground truth for those and the caller has to read the box. `commandsRun` and
+   * `observedRoutes` are counted off the wire here, so they stay true.
+   */
+  readonly workspaceUrl?: string;
   readonly expect: Expectation;
 }
 
@@ -2157,6 +2180,11 @@ export interface RunOutcome {
    *
    * Text and not bytes, so an expectation reads as the file rather than as a digest, and a failure
    * says what the file actually holds.
+   *
+   * EMPTY UNDER `Fixture.workspaceUrl`. It is the stub's own record of what it was handed, and a
+   * real box on the other end of a socket keeps its own filesystem this rig never sees. A caller
+   * running against a live workspace reads the box; reading this would be reading a record of
+   * nothing and calling it an empty workspace.
    */
   readonly filesAfter: Readonly<Record<string, string>>;
   /** Generations the provider was actually billed for, which is the only real money a turn spends. */
@@ -2322,6 +2350,18 @@ export interface RunOutcome {
   readonly status: string;
   readonly verification: string;
   readonly askedOwner: boolean;
+  /**
+   * How many approval cards the turn actually raised, rather than whether it raised any.
+   *
+   * `askedOwner` is `approvalsRaised > 0` and was the only reading of the approval floor this rig
+   * published. That is enough for a fixture, which asks whether a card fired at all, and not enough
+   * for `evals/bench`: the artefact it builds has an `approval_cards_fired_mean` column whose whole
+   * purpose is to price the approval floor in benchmark points, and a boolean widened into a count
+   * would report one card for a turn that raised four. The number was already here - the store stub
+   * has counted every `createApproval` for the life of this file - and nothing in `report.ts` reads
+   * it, so no committed baseline row can move because this is published.
+   */
+  readonly approvalsRaised: number;
   readonly fallbackPlan: boolean;
   readonly untrusted: boolean;
   readonly replies: number;
@@ -2642,6 +2682,7 @@ const schemaOutcome = (findings: readonly string[]): RunOutcome => ({
   status: 'completed',
   verification: 'none',
   askedOwner: false,
+  approvalsRaised: 0,
   fallbackPlan: false,
   untrusted: false,
   replies: 0,
@@ -3298,6 +3339,19 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
           )
         : json(completionBody(turn));
     }
+    /*
+     * A real workspace, when the fixture named one. See `Fixture.workspaceUrl`.
+     *
+     * Recorded before it is forwarded, for the same reason `runnerResponse` records before it
+     * branches: the question is what the loop ASKED for. `execs` is counted here rather than left
+     * to the stub, because `commandsRun` is read off it and a live run that counted none would
+     * report a turn that ran no commands while the box was building.
+     */
+    if (fixture.workspaceUrl !== undefined && url.startsWith(fixture.workspaceUrl)) {
+      execState.observed.push(routeName(url, init));
+      if (url.includes('/exec') || url.includes('/processes/start')) execState.execs += 1;
+      return await original(input, init);
+    }
     return runnerResponse(fixture.runner ?? {}, execState, url, init);
   }) as typeof fetch;
 
@@ -3312,7 +3366,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
         PGLITE_PATH: ':memory:',
         DATA_MASTER_KEY: masterKey.toString('base64'),
         RUNNER_SHARED_SECRET: 'x'.repeat(48),
-        WORKSPACE_RUNNER_URL: RUNNER_URL,
+        WORKSPACE_RUNNER_URL: fixture.workspaceUrl ?? RUNNER_URL,
         PREVIEW_BASE_URL: 'http://preview.localhost:4400',
         OPENROUTER_BASE_URL: PROVIDER_URL,
         AI_PROVIDER: 'openai-compatible',
@@ -3569,6 +3623,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
           ?.status
       ) || 'none',
     askedOwner: approvals.length > 0,
+    approvalsRaised: approvals.length,
     fallbackPlan,
     untrusted: events.some(
       (entry) => entry.kind === 'warning' && entry.summary.startsWith('Untrusted content entered')

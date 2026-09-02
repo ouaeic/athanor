@@ -159,9 +159,16 @@ const runProcess = async (
  *
  * WHAT IT IS NOT. It is not a sandbox and it does not pretend to be one. Commands run as this
  * user, with this user's network and this user's filesystem, bounded only by `cwd`. It must never
- * be used to run a benchmark task written by someone else, and `shim.ts` refuses to accept a task
- * command on it unless the caller passes `--trust-local`, because the difference between "run my
- * own test" and "run a downloaded task" is the difference between a rig and a foothold.
+ * be used to run a benchmark task written by someone else, so `score.ts` refuses a task whose
+ * `origin` is not `builtin` on this backend unless the caller passes `--trust-local`, because the
+ * difference between "run my own test" and "run a downloaded task" is the difference between a rig
+ * and a foothold.
+ *
+ * That sentence named `shim.ts` and a flag that existed NOWHERE IN THIS REPOSITORY until the
+ * `--score` driver was written: the guard was described and never built, which is the shape this
+ * whole directory exists to catch, wearing a comment's clothes. `selftest.ts` now drives an
+ * external-origin task at the local backend and asserts the refusal, so the sentence has a check
+ * under it rather than a reader's good faith.
  */
 export const localBackend = async (root?: string): Promise<WorkspaceBackend> => {
   const base = root ?? (await mkdtemp(path.join(tmpdir(), 'athanor-bench-')));

@@ -265,6 +265,70 @@ export interface ApprovalContext {
   spentNoveltyBytes?: number;
 }
 
+/*
+ * THERE IS DELIBERATELY NO REACH FIELD ON THE INTERFACE ABOVE, and this note is here so the next
+ * audit reads the decision rather than rediscovering the hole.
+ *
+ * aa06ff6 shipped a real filesystem boundary: `scripts/athanor-sandbox run … confine $ROOT` applies
+ * a Landlock ruleset on the same exec line that drops the command to the agent account, granting
+ * read and execute on the system hierarchies, write on `$ROOT/workspace`, `$ROOT/.home`, /tmp,
+ * /var/tmp and /dev/shm, a device list on /dev, and /home nowhere. The obvious next move is to let
+ * it buy back the cards that stood in for it - give this interface a reach fact the way it has
+ * `undoPoint`, absent meaning CARD, and drop the card wherever the kernel already refuses the act.
+ * It is not built, for three measured reasons, in the order they were found.
+ *
+ * FIRST, IT WOULD RETIRE NOTHING AN OWNER MEETS. Driven through `evals/cards` at 069ac96 - ten
+ * owner tasks, 178 calls - balanced raises 18 cards and autonomous 12, and every one of them is an
+ * act this ruleset permits or never sees:
+ *   - the network ones: `git push`, `rsync`, `ssh`, a `git clone`, `publish_site`. The ruleset is
+ *     `--landlock-access fs` and judges no address at all.
+ *   - the ones that reach a person, a subscription or a clock: the connector reply, `coding_agent`
+ *     setup and run, `schedule`, and the background service declaration. None of them names a path
+ *     the ruleset judges.
+ *   - `npm install`, twice each in the two build scenarios. It writes `workspace/node_modules` and
+ *     an npm cache under `.home`, and both of those are write grants, so the ruleset permits every
+ *     byte of it.
+ *   - the deferred-execution ones, `echo … >> ~/.bashrc` and `git config --global core.hooksPath`.
+ *     `$HOME` is `$ROOT/.home` and the ruleset GRANTS it write, deliberately, because pip, cargo,
+ *     npm and the coding CLIs have to write there or the boundary is an outage. Measured on the
+ *     owner's own box (7.0 kernel, util-linux 2.41.3) against a stand-in container root, since
+ *     /home/athanor is not writable by an account a drill may use: a delete under `.home` is
+ *     permitted with the shipped ruleset applied and permitted without it. The boundary does not
+ *     touch that card's premise.
+ *   - `apt-get install`, which is the one that looks retirable from the commit message and is not.
+ *     `execution.ts` rewrites an approved system-package install onto the root-owned package helper
+ *     and sets `sandbox = undefined` on the way, because that install has to keep the runner's own
+ *     identity to reach sudo - so it runs under no ruleset at all.
+ * Review's 127 cards are a visibility promise rather than a containment one, and a kernel boundary
+ * is not an argument for showing the owner less of what their computer is doing.
+ *
+ * SECOND, THE EXIT CODE IS NOT THE OUTCOME, which is the trap a reach test walks into. Measured
+ * with the shipped verb lists against that same stand-in root: `rm -rf $ROOT/workspace` exits 1
+ * under the ruleset, because the final `rmdir` needs a right on `$ROOT` that is granted nowhere -
+ * and the four entries under `workspace/` come back as one, because every file inside it was
+ * removed first. The whole of the owner's project is gone and the command reports failure.
+ * `evals/cards` holds `rm -rf on the workspace tree itself` as a card that must fire, and a rule
+ * reading "no write right on the target, so nothing can happen there" frees exactly that row.
+ *
+ * THIRD, THE FACT HAS NO CARRIER. `sandbox.confineFilesystem` is resolved in the runner and read in
+ * four places, all of them inside `services/workspace-runner`: `sandboxedInvocation`, which picks
+ * the helper's `confine` or `open` word; the foreground and background `unclaimedStopNote`, which
+ * tell a refused command that the sandbox refused it; and `/healthz`, which reports
+ * `agentFilesystemConfined` to an operator. Nothing in `apps/worker` reads any of them, and no
+ * runner response this worker parses carries it. So the field could be added and `approval-floor.ts`
+ * could read it, and on every real box it would be absent for ever - which fails closed, and which
+ * is a mechanism that looks wired and is not.
+ *
+ * WHAT WOULD CHANGE IT. A grant list that stopped including the agent's `$HOME`, or an
+ * `ISOLATE_AGENT_NETWORK` a published preview could survive, would each intersect cards an owner
+ * actually meets, and the composition would then be worth its carrier. Carrying it needs three
+ * edits nothing in this file can make: the runner naming its rung on a response the worker already
+ * parses, `runner-client.ts` reading it, and `agent.ts` writing it onto `AgentState` beside the
+ * checkpoint. Absent must go on meaning CARD - `filesystem=none` is not a legacy-kernel
+ * hypothetical but the owner's own box today, whose installed helper contains no Landlock rule and
+ * whose runner.env has no `CONFINE_AGENT_FILESYSTEM` key at all.
+ */
+
 interface ApprovalRequirement {
   sideEffect: 'workspace_write' | 'external_reversible' | 'external_consequential';
   action: string;

@@ -177,21 +177,28 @@ export const ABSENT_ROUTES: Readonly<Record<string, string>> = {
  * only sound because the gate is proved elsewhere: `tool-catalogue.test.ts` asserts the withdrawal
  * by name, and `apps/worker/src/turn/claim.ts:245` is the one line that applies it.
  *
- * WHAT THIS RIG HAS NOT PROVED, and it is the honest limit of this file: it has not OBSERVED a run
- * with `absent, absent` surfaces and watched these routes not appear. It reads the gate's own test
- * and the one production line that applies it. A sweep under absent surfaces would prove it, and
- * it cannot be run from here without changing the `/surfaces` answer every committed baseline row
- * in `evals/baseline.json` was measured under.
+ * WHAT THIS RIG HAS NOW OBSERVED, and where the limit still is. This used to say the subtraction
+ * was read and never watched. `--score` closed half of it: a real `AgentWorker` runs against a shim
+ * answering `/surfaces` with `absent, absent`, and `selftest.ts` asserts that the catalogue offered
+ * on that turn's last request contains none of the seven tools - derived through `agentToolsFor`
+ * rather than listed here, so the check cannot fall behind the product. Measured 2026-09-02: with
+ * the runner pointed back at `evals/harness.ts`'s stub, whose `/surfaces` answers with both
+ * surfaces available, all seven reappear in the same check.
+ *
+ * WHAT IS STILL READ RATHER THAN WATCHED: that a turn on that box never REACHES these routes. The
+ * gate withdrawing the tools is now observed; a model determined to reach the route anyway is not,
+ * because the scripted model does not try. Only a paid run with a task that wants a browser can
+ * close that, and if it ever does reach one the miss voids the row, which is the point.
  */
-export const SURFACE_GATED_ROUTES: readonly string[] = [
-  'POST /v1/workspaces/:workspaceId/browser/snapshot',
-  'POST /v1/workspaces/:workspaceId/browser/elements',
-  'POST /v1/workspaces/:workspaceId/browser/action',
-  'POST /v1/workspaces/:workspaceId/browser/print-pdf',
-  'POST /v1/workspaces/:workspaceId/desktop/snapshot',
-  'POST /v1/workspaces/:workspaceId/desktop/launch',
-  'POST /v1/workspaces/:workspaceId/desktop/action'
-];
+export const SURFACE_GATED_ROUTES: Readonly<Record<string, 'browser' | 'desktop'>> = {
+  'POST /v1/workspaces/:workspaceId/browser/snapshot': 'browser',
+  'POST /v1/workspaces/:workspaceId/browser/elements': 'browser',
+  'POST /v1/workspaces/:workspaceId/browser/action': 'browser',
+  'POST /v1/workspaces/:workspaceId/browser/print-pdf': 'browser',
+  'POST /v1/workspaces/:workspaceId/desktop/snapshot': 'desktop',
+  'POST /v1/workspaces/:workspaceId/desktop/launch': 'desktop',
+  'POST /v1/workspaces/:workspaceId/desktop/action': 'desktop'
+};
 
 export const isAbsent = (route: string): boolean =>
   Object.prototype.hasOwnProperty.call(ABSENT_ROUTES, route);
@@ -249,12 +256,28 @@ export const coverageOf = (
   readonly unexercised: string[];
 } => {
   const observed = new Set(observation.observed.map((row) => row.route));
-  const gated = new Set(SURFACE_GATED_ROUTES);
-  // Only when the sweep itself ran with a surface this shim's box does not have. A route gated out
-  // is a claim about a DIFFERENCE between two boxes, so with no difference there is nothing to
-  // subtract and a gated route in the observed set would be a genuine miss.
+  /*
+   * Only when the sweep itself ran with the surface THIS ROUTE NEEDS and this shim's box lacks.
+   *
+   * Per route rather than per sweep, and the correction matters in both directions. This asked
+   * `observation.surfaces.browser !== 'absent'` and applied the answer to all seven, including the
+   * three desktop routes - so a sweep on a box with a screen and no browser had its desktop routes
+   * reported as MISSES the shim ought to implement, and a sweep on a box with a browser and no
+   * screen would have excused desktop routes that could not have been reached at all, hiding a real
+   * miss behind a surface the box did not have. `agentToolsFor` gates the two families
+   * independently - `apps/worker/src/tool-catalogue.ts:1866-1867` filters `BROWSER_SURFACE_TOOLS`
+   * on `surfaces.browser` and `DESKTOP_SURFACE_TOOLS` on `surfaces.desktop`, in two separate
+   * clauses - so reading one answer for both was never a fair reading of the gate.
+   *
+   * It is invisible on the committed observation, whose sweep box has BOTH surfaces: the two
+   * spellings agree there, which is exactly why this needed a constructed observation to go red
+   * against rather than the artefact in the repository. See `selftest.ts`.
+   */
   const gatedOut = [...observed]
-    .filter((route) => gated.has(route) && observation.surfaces.browser !== 'absent')
+    .filter((route) => {
+      const surface = SURFACE_GATED_ROUTES[route];
+      return surface !== undefined && observation.surfaces[surface] !== 'absent';
+    })
     .sort();
   const excused = new Set(gatedOut);
   return {

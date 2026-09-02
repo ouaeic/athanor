@@ -52,6 +52,26 @@ export const AGGREGATOR = 'mean' as const;
  */
 export type Arm = 'shipped' | 'autonomous' | 'unattended';
 
+/**
+ * The security mode each arm IS, both ways round.
+ *
+ * The guard used to run in one direction only: an `unattended` row had to be autonomous, and
+ * nothing said anything about the other two. That left the flattering direction wide open, and it
+ * is the direction that matters here. `shipped` is the arm that is supposed to COST points -
+ * `balanced` stops for what the computer cannot take back and a card that fires with nobody at the
+ * keyboard parks the task at 0 - so a row labelled `shipped` and measured under `autonomous` prints
+ * a smaller gap between the arms than exists. The gap between `shipped` and `unattended` is the one
+ * number this artefact exists to publish, and shrinking it flatters athanor.
+ *
+ * A map rather than three conditions, so an arm added to the ladder has to declare its mode here or
+ * fail to compile, rather than silently arriving with no guard on it.
+ */
+export const ARM_SECURITY_MODE: Readonly<Record<Arm, 'review' | 'balanced' | 'autonomous'>> = {
+  shipped: 'balanced',
+  autonomous: 'autonomous',
+  unattended: 'autonomous'
+};
+
 /** One task's outcome in one run. `resolved: null` means the run never produced a verdict. */
 export interface TaskResult {
   readonly taskId: string;
@@ -258,10 +278,34 @@ export const rowFrom = (input: RowInput, digest: (value: string) => string): str
     throw new Error(
       `${input.approvalsAutoAnswered} approval card(s) were auto-answered under arm "${input.arm}". Only "unattended" declares an auto-approver, so this row would name a configuration it was not measured under. No row.`
     );
-  if (input.arm === 'unattended' && input.securityMode !== 'autonomous')
+  if (input.securityMode !== ARM_SECURITY_MODE[input.arm])
     throw new Error(
-      `arm "unattended" is autonomous plus an auto-approver, and this run was ${input.securityMode}. No row.`
+      `arm "${input.arm}" is ${ARM_SECURITY_MODE[input.arm]} and this run was ${input.securityMode}. No row.`
     );
+  /*
+   * And the other half of the auto-approver's story: an `unattended` row where cards fired and none
+   * were answered.
+   *
+   * `unattended` is autonomous PLUS an auto-approver, and the auto-approver is the whole difference
+   * between it and `autonomous`. A run whose approver was never attached raises cards, parks the
+   * tasks at 0 and produces an `autonomous` number wearing the `unattended` label - so the
+   * published gap between `shipped` and `unattended` reads smaller than it is, which is the
+   * flattering direction: it says the approval floor costs less than it does.
+   *
+   * Only when cards actually fired. A task set where nothing reaches the floor legitimately answers
+   * none, and refusing that would be refusing an honest row for having had nothing to do.
+   */
+  if (input.arm === 'unattended' && input.approvalsAutoAnswered === 0) {
+    const fired = input.runs.reduce(
+      (total, run) =>
+        total + run.tasks.reduce((cards, task) => cards + (task.approvalCardsFired ?? 0), 0),
+      0
+    );
+    if (fired > 0)
+      throw new Error(
+        `arm "unattended" declares an auto-approver and ${fired} approval card(s) fired with none auto-answered, so this run was "autonomous" under an "unattended" label. No row.`
+      );
+  }
 
   const scores = input.runs.map((run) => scoreOf(run, input.nTasks));
   const score = aggregate(scores);

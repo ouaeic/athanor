@@ -1,8 +1,9 @@
 # The external-benchmark instrument
 
 ```
-pnpm eval:bench                  self-test, catalogue weights, route coverage   (~3 s, offline)
-pnpm eval:bench --observe        re-sweep all 73 fixtures, rewrite routes.json  (~10 s, offline)
+pnpm eval:bench                  self-test, THE END-TO-END JOIN, catalogue weights, coverage  (~2.5 s, offline)
+pnpm eval:bench --score          drive a real AgentWorker against the shim and score it       (~2 s, offline)
+pnpm eval:bench --observe        re-sweep all 73 fixtures, rewrite routes.json                (~10 s, offline)
 pnpm eval:bench --routes         print the committed observation and coverage
 ```
 
@@ -12,7 +13,11 @@ Not part of `pnpm check`, like every other rig in `evals/`.
 **This is an instrument, not a result.** There is no athanor benchmark score in this repository and
 there is not one in this directory. What is here is the thing that has to exist and be trusted
 before a score means anything, plus the exact command that would produce the first one and what it
-costs. `parity.csv` is committed with its 43 columns and **zero rows**, on purpose.
+costs. `parity.csv` is committed with its 44 columns and **zero rows**, on purpose.
+
+`parity-wire.csv` is the one file here with a row in it, and it is **not a score**: see section 2.5.
+It is one task, solved by a scripted model, verified by a command in a real directory. Its `model`
+column says `scripted-no-provider` in every row it will ever have.
 
 ---
 
@@ -49,6 +54,9 @@ available inside the design that replaced it, which is why this instrument was b
 fixture reaches, modelled or not. That is a four-line additive change: a `string[]` on the stub's
 state, one `push` at the top of `runnerResponse`, the field on the outcome, and the empty default.
 Nothing in `evals/report.ts` reads it and no committed baseline row can move because of it.
+
+(That is the first of two changes to `evals/harness.ts` this directory has needed. The second is
+`Fixture.workspaceUrl`, and it is in section 2.5.)
 
 **Why the harness had to be touched at all.** `RunnerState.unstubbed` already existed, but it is the
 _complement_ of this list: it records only routes the stub does not model, and a shim built from it
@@ -150,8 +158,7 @@ lines, and athanor's client said six. `services/workspace-runner/src/files.ts:37
 number to the model and `file_patch` addresses lines by it. A route table could not have found
 that, because the rig would have been agreeing with itself.
 
-It still does not prove a whole turn: no `AgentWorker` runs and no model is called. That is the
-first paid command below.
+It does not prove a whole turn on its own. That is section 2.5, which does.
 
 **Every file operation is built on `exec`** rather than on `node:fs`. That is the load-bearing
 choice: the file code proved by the local backend on a laptop is byte-identical to the code the
@@ -177,6 +184,96 @@ none` would print "egress gated" on the strength of nothing.
 - **Stopping background work.** `processes/stop-owner` answers honestly that it stopped nothing.
 - **The EXIF strip on `/image`.** The real runner re-encodes; this one passes through a type the
   gateway already accepts and refuses anything else by name.
+
+---
+
+## 2.5 The join, whole: `--score`
+
+Everything above this line was proved in isolation. `wiring.ts` drove athanor's own client over the
+socket, which is the wire; **no `AgentWorker` had ever run against this shim**, so the loop, the
+tool dispatch, the approval floor, the acceptance hold and the score were each argued for and never
+joined. That is the computed-and-unwired shape this programme has now shipped three times.
+`score.ts` is the line that was never written.
+
+```
+pnpm eval:bench --score
+```
+
+builds the real `AgentWorker` the way `evals/harness.ts` builds it, points `WORKSPACE_RUNNER_URL` at
+this shim's listening port, runs one task to completion against a real temporary directory, and
+lets **a command in that directory** decide whether it was solved. It is also part of
+`pnpm eval:bench` itself, as a self-test check rather than behind a flag: the join is the thing this
+directory was three times found not to have, and a check that runs only when somebody remembers a
+flag is a check that is not running when it breaks. It costs about 0.4 s.
+
+**Real:** `AgentWorker.run`, the catalogue, the tool dispatch, the plan and acceptance holds, the
+approval floor, compaction, the runner protocol, the shim, the box, the files, the verifier.
+**Not real:** the model. It is a script, so no provider is called and nothing is billed. A benchmark
+task whose solution is a fixed sequence of shell commands is exactly the shape a script can drive.
+
+**So the row is not a score.** It goes to `parity-wire.csv`, never to `parity.csv`, through the same
+`rowFrom` and the same 44 columns and the same refusals. `model` reads `scripted-no-provider`. The
+file is rewritten by every `--score`, and `run_started_at` and `wall_seconds_mean` move each time -
+it is a record of the last run, like `routes.json` is of the last sweep, not a tracked baseline.
+
+### The one harness seam it needed
+
+`Fixture.workspaceUrl` in `evals/harness.ts`. `runFixture` installs its own `globalThis.fetch` for
+the duration of a run, so an outer wrapper never sees a runner request, and `WORKSPACE_RUNNER_URL`
+was a module constant - there was no way to ask for the loop's runner traffic to leave the process.
+The field is one config value and one branch, forwarding only URLs that start with it. Every fixture
+in `evals/fixtures.ts` leaves it absent and is byte-for-byte unaffected: measured by running
+`--observe --filter files-helper-script-then-run` against `HEAD`'s harness and against this one, and
+diffing the output. Identical. `pnpm eval:gate --filter files-helper-script-then-run` passes.
+`RunOutcome.approvalsRaised` was published beside it, because `askedOwner` is a boolean and
+`approval_cards_fired_mean` is a column.
+
+### What the join taught us, which is the point of building it
+
+1. **Neither `status` nor `verification` separates a solved task from a knowingly unsolved one.**
+   Break the solution so it writes the LINE COUNT (7) instead of the sum (1260) and the run reports
+   `status=completed verification=verified`, **identically to the correct run**. The turn's own
+   acceptance check ran in the box and failed, four times
+   (`MAX_ACCEPTANCE_FAILURES`, `apps/worker/src/turn-bounds.ts:360`); past the ceiling
+   `apps/worker/src/turn/finish.ts:320` appends the failures to `remainingRisks` and leaves the
+   status the model declared. That is a defensible product decision - the owner reads the risks -
+   and it means **a benchmark adapter that scored on either field would have scored that run 1**.
+   The verifier in the box was the only thing that told them apart. It is the whole argument for
+   taking the verdict from the box, and it is now measured rather than asserted.
+2. **The surface gate is observed at last, not read.** `routes.ts` stated as its honest limit that
+   nothing here had ever watched a run under `absent, absent` and seen the seven surface tools gone.
+   The scored turn is that run, and `selftest.ts` asserts the catalogue it was offered - names
+   derived through `agentToolsFor`, never listed. Point the runner back at the fixture stub, whose
+   `/surfaces` says both available, and all seven reappear.
+3. **The holds cost three steps on a wrong answer and one on a right one.** Right answer: 5 model
+   calls, **65,569 prompt tokens**, one `acceptance_hold`. Wrong answer: 8 calls, **107,419 prompt
+   tokens**, one `acceptance_hold` and three `acceptance_failed`. Both measured, both in
+   `parity-wire.csv`'s own `input_tokens_mean` column. So discovering the work was wrong cost
+   **41,850 tokens, 64% again on top of the whole task** - which on a paid run is real money, and
+   which no other harness in this field pays or reports. It is also, on a benchmark, entirely
+   wasted: the task scores 0 either way. That is the `shipped`-arm tax made concrete.
+4. **The catalogue is 64% of what a short task's prompt weighs.** 65,569 prompt tokens over 5 calls,
+   of which 8,389 per call is catalogue: 41,945 of 65,569. On the _benchmark_ box, after the
+   withdrawals - the provisioned box would be worse.
+5. **The stationary watch caught this rig's own bug.** The first script read the whole window for a
+   hold marker rather than the last message, so it answered the acceptance hold four times with
+   byte-identical arguments. `NOTHING HAS CHANGED FOR 3 STEPS. Every one of them made the same call
+   - set_acceptance - with byte-identical arguments.` The mechanism worked; the script was wrong.
+6. **A missing route is a refused run, driven live.** Remove `POST /exec` from `IMPLEMENTED_ROUTES`
+   and the real turn burns all 12 steps, hits `STEP BUDGET EXHAUSTED`, reports its acceptance check
+   as "could not run" - and `rowFrom` refuses the row. `parity-wire.csv` is left with its header and
+   nothing else, so a voided run cannot leave a stale row behind. Exit 1.
+
+### What `--score` still cannot do
+
+- **Only the `shipped` arm.** `evals/harness.ts`'s `taskFor` mints the task `balanced`. `autonomous`
+  needs that field settable and `unattended` needs an auto-approver as well. `--arm` refuses
+  anything else rather than printing a row that names a configuration it was not measured under.
+- **One task, and its solution is written here.** It measures the wire, not the agent.
+- **`local` backend only.** The docker backend is still unexercised on this machine, and `score.ts`
+  refuses a task whose `origin` is not `builtin` on the local backend without `--trust-local` -
+  which is a guard `backend.ts` had promised in prose since it was written and which existed nowhere
+  in the repository until now.
 
 ---
 
@@ -254,7 +351,7 @@ never has to go and find a default in a Python file.
 
 ## 4. The parity CSV
 
-43 columns, zero rows. Three disciplines are **enforced in code**, not documented:
+44 columns, zero rows. Four disciplines are **enforced in code**, not documented:
 
 1. **The aggregator is `mean` and it is a column.** `Max` over n attempts silently turns pass^1 into
    pass@k. `aggregate()` has no other mode.
@@ -262,6 +359,12 @@ never has to go and find a default in a Python file.
    by what the run produced.
 3. **Infra-failure classification is advisory and never moves the denominator.** It is its own
    column so a reader can discount the row themselves.
+4. **A task that starts solved is not a task.** `scoreTask` runs the verifier _before_ the turn and
+   refuses the run if it passes. Measured 2026-09-02 without it: a `seed` carrying the answer and a
+   solution replaced by `true` scored 1, exited 0, and the self-test said "clean" - every other
+   signal, `commandsRun` included, read exactly as on the honest run. This is the guard the
+   Terminal-Bench loader will need on its first day, because a leaked answer arrives as a free
+   point and looks like a score.
 
 `score_std` is a **sample** standard deviation and is empty below two runs - a zero standard
 deviation from one run is the most flattering lie available here. Three runs is the floor for a
@@ -297,8 +400,15 @@ OPENROUTER_API_KEY=…  pnpm eval:bench --score \
     --backend docker --container-per-task --surfaces absent
 ```
 
-- **needs**: the `--score` driver, which is **not built** - see honest limits below; a provider key,
-  which this repository holds nowhere by design; the 20 task images pulled.
+- **needs**: a provider key, which this repository holds nowhere by design; the 20 task images
+  pulled; `--trust-local` is not enough - a benchmark's own task commands belong in a container, so
+  this is `--backend docker`. **`--score` now exists** and drives a real `AgentWorker` end to end
+  (section 2.5). What it does not yet have is the four flags above it: `--benchmark` and `--tasks`
+  need a Terminal-Bench task loader (prompt, seed files, verifier argv - the `WireTask` shape in
+  `task.ts` is already that shape, so it is a loader and not a redesign); `--model`, `--runs` and
+  `--backend docker` need the provider seam and the container backend that `dockerExecArgv` is
+  already written for; `--arm unattended` needs a settable `securityMode` and an auto-approver,
+  which is the one part `rowFrom` will refuse a row for until it exists.
 - **costs**: about **$17** in tokens at a mini-class model, call it **$40** with retries. Derived
   from `evals/baseline.json`'s own measured numbers, adjusted for the 37,340-byte benchmark
   catalogue rather than the 50,404-byte provisioned one.
@@ -318,7 +428,11 @@ Two days on the VPS. Do not start at SWE-bench Verified: 500 instances at 3 runs
 
 ## Why this is not a gate
 
-`pnpm eval:bench` exits non-zero on a self-test failure or on a route athanor asks for that the shim
-does not implement, so it is usable in CI on its own schedule. It is deliberately not in
-`pnpm check`: it sweeps 73 fixtures through the real `AgentWorker`, and a suite that blocks every
-commit is a suite somebody deletes the first week it is wrong about something.
+`pnpm eval:bench` exits non-zero on a self-test failure, on a route athanor asks for that the shim
+does not implement, or on the end-to-end task failing its verifier; `--score` exits non-zero when a
+task does not resolve or when `rowFrom` refuses the row. So it is usable in CI on its own schedule.
+
+It is deliberately not in `pnpm check`. The default run is about 2.5 s and drives one real turn;
+`--observe` sweeps all 73 fixtures through the real `AgentWorker` and takes minutes. A suite that
+blocks every commit is a suite somebody deletes the first week it is wrong about something - and
+this one is deliberately coupled to the loop's own holds, which move for good reasons.

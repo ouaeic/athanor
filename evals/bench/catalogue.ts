@@ -90,3 +90,27 @@ export const catalogueWeights = (): CatalogueWeight[] => {
 
 /** The benchmark box's own figure, which is what a parity row's `catalogue_bytes` column carries. */
 export const benchmarkBoxCatalogueBytes = (): number => bytesOf('absent', []);
+
+/**
+ * The tools a box with neither surface loses, DERIVED rather than listed.
+ *
+ * `BROWSER_SURFACE_TOOLS` and `DESKTOP_SURFACE_TOOLS` are file-local sets in
+ * `apps/worker/src/tool-catalogue.ts` and nothing exports them, so a rig that wanted the seven
+ * names had two choices: copy them, or take the difference the production function itself makes.
+ * Copying is how a list rots - a tool added to either set would leave the copy quietly short, and
+ * the check below would go on passing while describing six of seven.
+ *
+ * `score.ts` uses this to ask a live run whether the gate actually held, which is the one thing
+ * `routes.ts` says out loud it had never observed: it read the gate's own test and the single line
+ * that applies it, and never watched a turn under `absent, absent` and found the tools gone.
+ */
+export const surfaceGatedToolNames = (): string[] => {
+  const withSurfaces = new Set(
+    agentToolsFor('lead', { browser: 'available', desktop: 'available' }, []).map(
+      (tool) => tool.name
+    )
+  );
+  for (const tool of agentToolsFor('lead', { browser: 'absent', desktop: 'absent' }, []))
+    withSurfaces.delete(tool.name);
+  return [...withSurfaces].sort();
+};
